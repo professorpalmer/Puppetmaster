@@ -1,0 +1,15 @@
+{
+  "lease_seconds": 10,
+  "workers": [
+    {
+      "role": "cursor-plan",
+      "instruction": "Plan a safe implementation without editing files.",
+      "adapter": "cursor",
+      "payload": {
+        "prompt": "Plan the requested implementation. Produce a patch plan, risks, and verification commands. Do not edit files.",
+        "model": "default",
+        "timeout_seconds": 600
+      }
+    }
+  ]
+}

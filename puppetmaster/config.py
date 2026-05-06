@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Union
 from typing import Any
 
 from puppetmaster.adapters import ADAPTERS
@@ -15,7 +16,7 @@ class SwarmConfig:
     lease_seconds: int = 5
 
 
-def load_config(path: Path | str) -> SwarmConfig:
+def load_config(path: Union[Path, str]) -> SwarmConfig:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     workers = [_worker_spec_from_dict(item) for item in data.get("workers", [])]
     if not workers:

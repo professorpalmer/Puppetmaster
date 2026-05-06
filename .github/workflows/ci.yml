@@ -24,8 +24,42 @@ jobs:
         run: npm run smoke:cursor-runner
       - name: Run Python tests
         run: python -m unittest discover -s tests -v
+      - name: Smoke check CLI metadata
+        run: |
+          python -m puppetmaster --help
+          python -m puppetmaster adapters
       - name: Run doctor
         run: python -m puppetmaster doctor
       - name: Run SQLite demo
         run: python -m puppetmaster run "CI enterprise workflow" --config examples/enterprise-workflow.json
+      - name: Smoke check memory retrieval
+        run: python -m puppetmaster run "CI memory reuse independent workers" --config examples/memory-reuse.json
+      - name: Smoke check daily-driver CLI
+        run: |
+          python -m puppetmaster last
+          python -m puppetmaster logs
+          python -m puppetmaster diff
+          python -m puppetmaster rerun --config examples/enterprise-workflow.json
+          python -m puppetmaster crash-demo
+          python -m puppetmaster clean --completed
+      - name: Check README links
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          readme = Path("README.md").read_text(encoding="utf-8")
+          missing = []
+          for match in re.finditer(r"\[[^\]]+\]\(([^)]+)\)", readme):
+              target = match.group(1)
+              if target.startswith(("http://", "https://", "#")):
+                  continue
+              if not Path(target).exists():
+                  missing.append(target)
+          if missing:
+              print("missing README links:", ", ".join(missing))
+              sys.exit(1)
+          print("README local links ok")
+          PY
 

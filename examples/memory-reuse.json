@@ -1,0 +1,14 @@
+{
+  "lease_seconds": 5,
+  "workers": [
+    {
+      "role": "explore",
+      "instruction": "Use any retrieved Puppetmaster memory to identify what changed and what should be verified next."
+    },
+    {
+      "role": "test",
+      "instruction": "Turn retrieved memory and current findings into verification results.",
+      "depends_on": ["explore"]
+    }
+  ]
+}

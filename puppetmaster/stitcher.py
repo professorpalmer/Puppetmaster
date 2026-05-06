@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from textwrap import indent
+from typing import Optional
 
 from puppetmaster.models import Artifact, ArtifactType, MemoryRecord
 from puppetmaster.store import SwarmStore, group_by_type
@@ -101,7 +102,7 @@ class Stitcher:
         return bullets
 
     @staticmethod
-    def _statement_for(artifact: Artifact) -> str | None:
+    def _statement_for(artifact: Artifact) -> Optional[str]:
         keys = {
             ArtifactType.FINDING: "claim",
             ArtifactType.DECISION: "decision",

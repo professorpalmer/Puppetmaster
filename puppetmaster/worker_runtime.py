@@ -6,6 +6,7 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
+from typing import Optional
 
 from puppetmaster.models import AgentRun, TaskStatus, now_iso
 from puppetmaster.store_factory import create_store
@@ -83,6 +84,26 @@ class WorkerRuntime:
             )
             for artifact in artifacts:
                 self.store.save_artifact(artifact)
+        except Exception as exc:
+            failed_run = replace(
+                run,
+                status=TaskStatus.FAILED,
+                heartbeat_at=now_iso(),
+                completed_at=now_iso(),
+            )
+            self.store.save_run(failed_run)
+            self.store.update_task_status(task, TaskStatus.FAILED)
+            self.store.emit(
+                self.job_id,
+                "worker.failed_task",
+                {
+                    "worker_id": self.worker_id,
+                    "task_id": task.id,
+                    "role": self.role,
+                    "error": str(exc),
+                },
+            )
+            return True
         finally:
             stop_heartbeats.set()
             heartbeat.join(timeout=1)
@@ -146,7 +167,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     runtime = WorkerRuntime(
         store=create_store(args.backend, Path(args.state_dir)),

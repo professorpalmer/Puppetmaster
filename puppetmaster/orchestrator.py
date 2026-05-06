@@ -3,8 +3,9 @@ from __future__ import annotations
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Optional
 
 from puppetmaster.models import Artifact, Job, JobStatus, Task, TaskStatus
 from puppetmaster.stitcher import Stitcher
@@ -28,82 +29,90 @@ class Orchestrator:
     def run(
         self,
         goal: str,
-        roles: list[str] | None = None,
-        specs: list[WorkerSpec] | None = None,
+        roles: Optional[list[str]] = None,
+        specs: Optional[list[WorkerSpec]] = None,
         lease_seconds: int = 5,
     ) -> RunResult:
-        specs = specs or specs_for_roles(roles)
         job = self.store.create_job(goal)
-        self.store.update_job_status(job.id, JobStatus.RUNNING)
-        tasks = self._create_tasks(job, specs)
-        self._run_workers(job, tasks, lease_seconds=lease_seconds)
-        artifacts = self.store.list_artifacts(job.id)
+        try:
+            specs = self._with_retrieved_memory(specs or specs_for_roles(roles), goal)
+            self.store.update_job_status(job.id, JobStatus.RUNNING)
+            tasks = self._create_tasks(job, specs)
+            self._run_workers(job, tasks, lease_seconds=lease_seconds)
+            artifacts = self.store.list_artifacts(job.id)
 
-        self.store.update_job_status(job.id, JobStatus.STITCHING)
-        summary = Stitcher(self.store).stitch(job.id)
-        completed = self.store.update_job_status(job.id, JobStatus.COMPLETE)
-        summary_path = self.store.job_dir(job.id) / "summaries" / "stitched.md"
-        return RunResult(
-            job=completed,
-            artifacts=artifacts,
-            summary=summary,
-            summary_path=summary_path,
-        )
+            self.store.update_job_status(job.id, JobStatus.STITCHING)
+            summary = Stitcher(self.store).stitch(job.id)
+            completed = self.store.update_job_status(job.id, JobStatus.COMPLETE)
+            summary_path = self.store.job_dir(job.id) / "summaries" / "stitched.md"
+            return RunResult(
+                job=completed,
+                artifacts=artifacts,
+                summary=summary,
+                summary_path=summary_path,
+            )
+        except Exception:
+            self.store.update_job_status(job.id, JobStatus.FAILED)
+            raise
 
     def run_crash_recovery_demo(
         self,
         goal: str,
         crash_role: str = "implement",
-        roles: list[str] | None = None,
+        roles: Optional[list[str]] = None,
     ) -> RunResult:
-        specs = specs_for_roles(roles)
         job = self.store.create_job(goal)
-        self.store.update_job_status(job.id, JobStatus.RUNNING)
-        tasks = self._create_tasks(job, specs)
-        self._run_prerequisites(job, tasks, crash_role, lease_seconds=2)
-        self.store.refresh_blocked_tasks(job.id)
-
-        target = next((task for task in self.store.list_tasks(job.id) if task.role == crash_role), None)
-        if target is None:
-            raise RuntimeError(f"crash role not found: {crash_role}")
-        while not self.store.dependencies_complete(target):
-            current_tasks = self.store.list_tasks(job.id)
-            dependencies = self._dependency_closure(current_tasks, target.id)
-            self._run_workers(job, dependencies, lease_seconds=2)
+        try:
+            specs = self._with_retrieved_memory(specs_for_roles(roles), goal)
+            self.store.update_job_status(job.id, JobStatus.RUNNING)
+            tasks = self._create_tasks(job, specs)
+            self._run_prerequisites(job, tasks, crash_role, lease_seconds=2)
             self.store.refresh_blocked_tasks(job.id)
-            target = self.store.get_task_by_id(target.id)
-        claimed = self.store.claim_task(
-            target.id,
-            worker_id=f"crashed-{crash_role}-worker",
-            lease_seconds=1,
-        )
-        if claimed is None:
-            raise RuntimeError(f"crash role was not claimable: {crash_role}")
-        self.store.emit(
-            job.id,
-            "worker.crashed_after_claim",
-            {
-                "worker_id": f"crashed-{crash_role}-worker",
-                "task_id": target.id,
-                "role": crash_role,
-            },
-        )
-        time.sleep(1.2)
-        recovered = self.store.recover_stale_tasks(job.id)
 
-        self._run_workers(job, tasks, lease_seconds=2)
-        artifacts = self.store.list_artifacts(job.id)
-        self.store.update_job_status(job.id, JobStatus.STITCHING)
-        summary = Stitcher(self.store).stitch(job.id)
-        completed = self.store.update_job_status(job.id, JobStatus.COMPLETE)
-        summary_path = self.store.job_dir(job.id) / "summaries" / "stitched.md"
-        return RunResult(
-            job=completed,
-            artifacts=artifacts,
-            summary=summary,
-            summary_path=summary_path,
-            recovered_tasks=len(recovered),
-        )
+            target = next((task for task in self.store.list_tasks(job.id) if task.role == crash_role), None)
+            if target is None:
+                raise RuntimeError(f"crash role not found: {crash_role}")
+            while not self.store.dependencies_complete(target):
+                current_tasks = self.store.list_tasks(job.id)
+                dependencies = self._dependency_closure(current_tasks, target.id)
+                self._run_workers(job, dependencies, lease_seconds=2)
+                self.store.refresh_blocked_tasks(job.id)
+                target = self.store.get_task_by_id(target.id)
+            claimed = self.store.claim_task(
+                target.id,
+                worker_id=f"crashed-{crash_role}-worker",
+                lease_seconds=1,
+            )
+            if claimed is None:
+                raise RuntimeError(f"crash role was not claimable: {crash_role}")
+            self.store.emit(
+                job.id,
+                "worker.crashed_after_claim",
+                {
+                    "worker_id": f"crashed-{crash_role}-worker",
+                    "task_id": target.id,
+                    "role": crash_role,
+                },
+            )
+            time.sleep(1.2)
+            recovered = self.store.recover_stale_tasks(job.id)
+
+            self._run_workers(job, tasks, lease_seconds=2)
+            artifacts = self.store.list_artifacts(job.id)
+            self.store.update_job_status(job.id, JobStatus.STITCHING)
+            summary = Stitcher(self.store).stitch(job.id)
+            completed = self.store.update_job_status(job.id, JobStatus.COMPLETE)
+            summary_path = self.store.job_dir(job.id) / "summaries" / "stitched.md"
+            return RunResult(
+                job=completed,
+                artifacts=artifacts,
+                summary=summary,
+                summary_path=summary_path,
+                recovered_tasks=len(recovered),
+            )
+        except Exception:
+            self.store.update_job_status(job.id, JobStatus.FAILED)
+            raise
 
     def _create_tasks(self, job: Job, specs: list[WorkerSpec]) -> list[Task]:
         tasks_by_role: dict[str, Task] = {}
@@ -145,6 +154,21 @@ class Orchestrator:
             self.store.save_task(task)
         return tasks
 
+    def _with_retrieved_memory(self, specs: list[WorkerSpec], goal: str) -> list[WorkerSpec]:
+        memory = self.store.retrieve_memory(goal)
+        if not memory:
+            return specs
+        return [
+            replace(
+                spec,
+                payload={
+                    **spec.payload,
+                    "retrieved_memory": memory,
+                },
+            )
+            for spec in specs
+        ]
+
     @staticmethod
     def _initial_task_status(depends_on: list[str]) -> TaskStatus:
         return TaskStatus.BLOCKED if depends_on else TaskStatus.QUEUED
@@ -182,7 +206,7 @@ class Orchestrator:
         job: Job,
         tasks: list[Task],
         lease_seconds: int = 5,
-        allowed_task_ids: set[str] | None = None,
+        allowed_task_ids: Optional[set[str]] = None,
     ) -> None:
         allowed_task_ids = allowed_task_ids or {task.id for task in tasks}
         tasks = [
@@ -214,7 +238,21 @@ class Orchestrator:
             for role in roles
         ]
         for process in processes:
-            process.wait(timeout=self._worker_wait_timeout(tasks))
+            try:
+                process.wait(timeout=self._worker_wait_timeout(tasks))
+            except subprocess.TimeoutExpired as exc:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+                self.store.emit(
+                    job.id,
+                    "worker.timed_out",
+                    {"returncode": process.returncode, "timeout_seconds": self._worker_wait_timeout(tasks)},
+                )
+                raise RuntimeError("worker process timed out") from exc
             if process.returncode != 0:
                 raise RuntimeError(f"worker process failed with exit code {process.returncode}")
 

@@ -56,9 +56,49 @@ Requirements:
 }
 ```
 
+### `claude-code`
+
+Runs the Claude Code CLI in non-interactive mode and allows real repository edits.
+
+Requirements:
+
+- Claude Code CLI installed as `claude`, or `CLAUDE_CODE_COMMAND` / `payload.executable` set.
+- Claude Code authenticated locally.
+- A reviewed workflow config, because this adapter can modify files.
+
+Quick setup without a global install:
+
+```bash
+npx -y @anthropic-ai/claude-code --version
+CLAUDE_CODE_COMMAND="npx -y @anthropic-ai/claude-code" puppetmaster claude "Review this repo" --permission-mode acceptEdits
+```
+
+If the adapter returns `failure=not_authenticated`, run Claude Code interactively and complete `/login`, then retry.
+If it returns `failure=billing_or_quota`, Claude Code is authenticated but the configured billing/quota cannot run the request yet.
+If it returns `failure=dirty_worktree`, run from a clean repo/worktree or set `payload.allow_dirty=true` after reviewing the existing diff.
+
+Default permission mode is `acceptEdits`, which is intentionally edit-capable. Use `bypassPermissions` only in isolated worktrees or disposable sandboxes.
+
+```json
+{
+  "role": "claude-implement",
+  "instruction": "Use Claude Code to implement the requested change.",
+  "adapter": "claude-code",
+  "payload": {
+    "prompt": "Implement the change and run the relevant tests.",
+    "cwd": ".",
+    "permission_mode": "acceptEdits",
+    "allowed_tools": ["Read", "Edit", "Bash"],
+    "timeout_seconds": 900
+  }
+}
+```
+
+If Claude Code edits tracked files, Puppetmaster records a `patch` artifact containing the resulting unified diff, changed files, base SHA, and revert guidance.
+
 ## Provider Stubs
 
-`claude-code` and `codex` are intentionally present as stubs. They return structured `blocked` verification artifacts until a concrete provider integration is added.
+`codex` is intentionally present as a stub. It returns structured `blocked` verification artifacts until a concrete provider integration is added.
 
 That lets configs reference future providers without breaking the runtime contract.
 

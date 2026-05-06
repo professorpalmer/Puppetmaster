@@ -1,0 +1,15 @@
+{
+  "lease_seconds": 10,
+  "workers": [
+    {
+      "role": "cursor-review",
+      "instruction": "Review this repository and emit findings, risks, and verification suggestions.",
+      "adapter": "cursor",
+      "payload": {
+        "prompt": "Review this repository. Return findings, risks, evidence, and verification suggestions. Do not edit files.",
+        "model": "default",
+        "timeout_seconds": 600
+      }
+    }
+  ]
+}

@@ -1,14 +1,24 @@
 from __future__ import annotations
 
+import contextlib
+import io
+import subprocess
 import unittest
 import sys
 from dataclasses import replace
 from tempfile import TemporaryDirectory
 from pathlib import Path
 
+from puppetmaster.adapters import (
+    ClaudeCodeAdapter,
+    build_claude_code_command,
+    classify_claude_code_failure,
+    classify_cursor_failure,
+)
 from puppetmaster.config import load_config
-from puppetmaster.diagnostics import adapter_status, starter_config
-from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus, seconds_from_now
+from puppetmaster.cli import cursor_prompt, main as cli_main
+from puppetmaster.diagnostics import adapter_status, run_doctor, starter_config
+from puppetmaster.models import Artifact, ArtifactType, JobStatus, Task, TaskStatus, seconds_from_now
 from puppetmaster.orchestrator import Orchestrator
 from puppetmaster.sqlite_store import SQLiteSwarmStore
 from puppetmaster.stitcher import Stitcher
@@ -70,6 +80,24 @@ class PuppetmasterTests(unittest.TestCase):
             self.assertEqual(reclaimed.lease_owner, "worker-b")
             self.assertEqual(reclaimed.attempts, 2)
 
+    def test_max_attempts_marks_poison_task_failed(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("stop poison retries")
+            task = Task(
+                job_id=job.id,
+                role="coder",
+                instruction="will not converge",
+                attempts=store.max_task_attempts,
+            )
+            store.save_task(task)
+
+            claimed = store.claim_task(task.id, "worker-a")
+            failed = store.get_task_by_id(task.id)
+
+            self.assertIsNone(claimed)
+            self.assertEqual(failed.status, TaskStatus.FAILED)
+
     def test_status_snapshot_reports_counts_and_stale_tasks(self) -> None:
         with TemporaryDirectory() as tmp:
             store = SwarmStore(Path(tmp) / ".puppetmaster")
@@ -94,6 +122,27 @@ class PuppetmasterTests(unittest.TestCase):
             second = Stitcher(store).stitch(result.job.id)
 
             self.assertEqual(first, second)
+
+    def test_retrieved_memory_matches_goal_terms(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            result = Orchestrator(store).run("make stitching replayable", roles=["explore"])
+
+            matches = store.retrieve_memory("independent workers", limit=3)
+
+            self.assertEqual(store.latest_job().id, result.job.id)
+            self.assertTrue(matches)
+
+    def test_memory_retrieval_supports_scope_filters(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            Orchestrator(store).run("make workers independent", roles=["explore"])
+
+            scoped = store.retrieve_memory("workers", scope="swarm.findings")
+            missing = store.retrieve_memory("workers", scope="swarm.decisions")
+
+            self.assertTrue(scoped)
+            self.assertFalse(any(memory["scope"] == "swarm.findings" for memory in missing))
 
     def test_subprocess_swarm_emits_worker_process_events(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -129,6 +178,24 @@ class PuppetmasterTests(unittest.TestCase):
             self.assertIn("task.recovered", event_names)
             self.assertEqual(implement_tasks[0].status, TaskStatus.COMPLETE)
             self.assertEqual(implement_tasks[0].attempts, 2)
+
+    def test_worker_failure_marks_job_failed(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+
+            with self.assertRaises(RuntimeError):
+                Orchestrator(store).run(
+                    "fail closed",
+                    specs=[
+                        WorkerSpec(
+                            role="broken",
+                            instruction="use unsupported adapter",
+                            adapter="missing-adapter",
+                        )
+                    ],
+                )
+
+            self.assertEqual(store.latest_job().status, JobStatus.FAILED)
 
     def test_dependency_graph_blocks_until_upstream_completes(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -236,21 +303,135 @@ class PuppetmasterTests(unittest.TestCase):
             self.assertEqual(config.workers[0].adapter, "cursor")
             self.assertEqual(config.workers[0].payload["model"], "default")
 
+    def test_cursor_prompt_modes_are_composable(self) -> None:
+        prompt = cursor_prompt("Inspect repo", review=True, plan=True, dry_run=True)
+
+        self.assertIn("Review mode", prompt)
+        self.assertIn("Plan mode", prompt)
+        self.assertIn("Dry-run constraint", prompt)
+
+    def test_cursor_failure_classification_is_actionable(self) -> None:
+        self.assertEqual(classify_cursor_failure("CURSOR_API_KEY is required"), "missing_api_key")
+        self.assertEqual(classify_cursor_failure("model invalid"), "model_unavailable")
+        self.assertEqual(classify_cursor_failure("operation timed out"), "timeout")
+
+    def test_claude_code_command_uses_full_edit_permission_mode(self) -> None:
+        command = build_claude_code_command(
+            prompt="Implement the change",
+            executable="claude",
+            model="sonnet",
+            permission_mode="acceptEdits",
+            allowed_tools=["Read", "Edit", "Bash"],
+        )
+
+        self.assertEqual(command[:2], ["claude", "--print"])
+        self.assertIn("--permission-mode", command)
+        self.assertIn("acceptEdits", command)
+        self.assertIn("--allowedTools", command)
+        self.assertIn("Read,Edit,Bash", command)
+
+    def test_claude_code_missing_cli_returns_blocked_artifact(self) -> None:
+        task = Task(
+            job_id="job",
+            role="claude-code",
+            instruction="run claude",
+            adapter="claude-code",
+            payload={"executable": "definitely-not-claude-code"},
+        )
+
+        artifact = ClaudeCodeAdapter().run(task, "goal", "worker")[0]
+
+        self.assertEqual(artifact.payload["result"], "blocked")
+        self.assertEqual(artifact.payload["failure"], "missing_cli")
+
+    def test_claude_code_failure_classification_is_actionable(self) -> None:
+        self.assertEqual(classify_claude_code_failure("please login first"), "not_authenticated")
+        self.assertEqual(classify_claude_code_failure("Credit balance is too low"), "billing_or_quota")
+        self.assertEqual(classify_claude_code_failure("permission denied"), "permission_denied")
+        self.assertEqual(classify_claude_code_failure("model invalid"), "model_unavailable")
+
+    def test_claude_code_adapter_captures_tracked_git_diff(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            target = repo / "sample.txt"
+            target.write_text("before\n", encoding="utf-8")
+            subprocess.run(["git", "add", "sample.txt"], cwd=repo, check=True, capture_output=True)
+            fake_claude = root / "fake_claude.py"
+            fake_claude.write_text(
+                """#!/usr/bin/env python3
+from pathlib import Path
+Path("sample.txt").write_text("after\\n", encoding="utf-8")
+print('{"result":"ok"}')
+""",
+                encoding="utf-8",
+            )
+            fake_claude.chmod(0o755)
+            task = Task(
+                job_id="job",
+                role="claude-code",
+                instruction="edit the file",
+                adapter="claude-code",
+                payload={
+                    "executable": str(fake_claude),
+                    "cwd": str(repo),
+                    "timeout_seconds": 10,
+                },
+            )
+
+            artifacts = ClaudeCodeAdapter().run(task, "goal", "worker")
+            patch_artifacts = [artifact for artifact in artifacts if artifact.type == ArtifactType.PATCH]
+
+            self.assertEqual(artifacts[0].payload["result"], "passed")
+            self.assertEqual(patch_artifacts[0].payload["files"], ["sample.txt"])
+            self.assertIn("-before", patch_artifacts[0].payload["unified_diff"])
+            self.assertIn("+after", patch_artifacts[0].payload["unified_diff"])
+
+    def test_claude_code_blocks_dirty_worktree_by_default(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            target = repo / "sample.txt"
+            target.write_text("before\n", encoding="utf-8")
+            subprocess.run(["git", "add", "sample.txt"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+            target.write_text("dirty\n", encoding="utf-8")
+            task = Task(
+                job_id="job",
+                role="claude-code",
+                instruction="edit the file",
+                adapter="claude-code",
+                payload={
+                    "executable": sys.executable,
+                    "extra_args": ["-c", "print('should not run')"],
+                    "cwd": str(repo),
+                },
+            )
+
+            artifact = ClaudeCodeAdapter().run(task, "goal", "worker")[0]
+
+            self.assertEqual(artifact.payload["result"], "blocked")
+            self.assertEqual(artifact.payload["failure"], "dirty_worktree")
+
     def test_provider_stub_returns_blocked_verification_artifact(self) -> None:
         with TemporaryDirectory() as tmp:
             store = SwarmStore(Path(tmp) / ".puppetmaster")
             specs = [
                 WorkerSpec(
-                    role="claude-review",
-                    instruction="Ask Claude Code to review the repo.",
-                    adapter="claude-code",
+                    role="codex-review",
+                    instruction="Ask Codex to review the repo.",
+                    adapter="codex",
                 )
             ]
             result = Orchestrator(store).run("exercise provider stub", specs=specs)
             artifact = store.list_artifacts(result.job.id)[0]
 
             self.assertEqual(artifact.type, ArtifactType.VERIFICATION)
-            self.assertEqual(artifact.payload["adapter"], "claude-code")
+            self.assertEqual(artifact.payload["adapter"], "codex")
             self.assertEqual(artifact.payload["result"], "blocked")
 
     def test_diagnostics_list_provider_neutral_adapters(self) -> None:
@@ -294,6 +475,104 @@ class PuppetmasterTests(unittest.TestCase):
             self.assertEqual(len(tasks), 2)
             self.assertEqual(len(store.list_artifacts(result.job.id)), 3)
             self.assertIn("task.unblocked", {event["event"] for event in events})
+
+    def test_sqlite_reopens_existing_jobs(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / ".puppetmaster"
+            store = SQLiteSwarmStore(root)
+            result = Orchestrator(store).run("persist across process restart", roles=["explore"])
+
+            reopened = SQLiteSwarmStore(root)
+
+            self.assertEqual(reopened.get_job(result.job.id).status, JobStatus.COMPLETE)
+            self.assertEqual(len(reopened.list_artifacts(result.job.id)), 2)
+
+    def test_sqlite_schema_status_and_doctor_are_available(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = SQLiteSwarmStore(root / ".puppetmaster")
+            store.init()
+
+            status = store.schema_status()
+            checks = {check.name: check for check in run_doctor(root)}
+
+            self.assertEqual(status["schema_version"], "1")
+            self.assertEqual(status["expected_schema_version"], "1")
+            self.assertEqual(checks["sqlite-state"].status, "ok")
+
+    def test_cli_last_and_clean_support_daily_run_management(self) -> None:
+        with TemporaryDirectory() as tmp:
+            state_dir = str(Path(tmp) / ".puppetmaster")
+
+            run_code = cli_main([
+                "--state-dir",
+                state_dir,
+                "--backend",
+                "file",
+                "run",
+                "daily driver check",
+                "--workers",
+                "explore",
+            ])
+            clean_code = cli_main([
+                "--state-dir",
+                state_dir,
+                "--backend",
+                "file",
+                "clean",
+                "--completed",
+            ])
+
+            self.assertEqual(run_code, 0)
+            self.assertEqual(clean_code, 0)
+
+    def test_cli_approve_and_reject_accept_job_targets(self) -> None:
+        with TemporaryDirectory() as tmp:
+            state_dir = str(Path(tmp) / ".puppetmaster")
+            cli_main([
+                "--state-dir",
+                state_dir,
+                "--backend",
+                "file",
+                "run",
+                "approval gate check",
+            ])
+            store = SwarmStore(Path(state_dir))
+            job_id = store.latest_job().id
+
+            approve_code = cli_main(["--state-dir", state_dir, "--backend", "file", "approve", job_id])
+            reject_code = cli_main([
+                "--state-dir",
+                state_dir,
+                "--backend",
+                "file",
+                "reject",
+                job_id,
+                "--reason",
+                "unit test",
+            ])
+            events = [event["event"] for event in store.read_events(job_id)]
+
+            self.assertEqual(approve_code, 0)
+            self.assertEqual(reject_code, 0)
+            self.assertIn("artifact.approved", events)
+            self.assertIn("artifact.rejected", events)
+
+    def test_cli_missing_config_returns_setup_failure(self) -> None:
+        with TemporaryDirectory() as tmp:
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code = cli_main([
+                    "--state-dir",
+                    str(Path(tmp) / ".puppetmaster"),
+                    "run",
+                    "missing config",
+                    "--config",
+                    str(Path(tmp) / "missing.json"),
+                ])
+
+            self.assertEqual(code, 1)
+            self.assertIn("missing.json", stderr.getvalue())
 
 
 if __name__ == "__main__":
