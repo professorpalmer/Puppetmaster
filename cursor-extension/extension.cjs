@@ -246,11 +246,15 @@ async function processEnvironment(context) {
   const env = { ...process.env };
   const cursorKey = await context.secrets.get(SECRET_CURSOR_API_KEY);
   const anthropicKey = await context.secrets.get(SECRET_ANTHROPIC_API_KEY);
+  const runtimePath = config.get("runtimePath", "");
   if (cursorKey) {
     env.CURSOR_API_KEY = cursorKey;
   }
   if (anthropicKey) {
     env.ANTHROPIC_API_KEY = anthropicKey;
+  }
+  if (runtimePath) {
+    env.PYTHONPATH = env.PYTHONPATH ? `${runtimePath}${path.delimiter}${env.PYTHONPATH}` : runtimePath;
   }
   env.CLAUDE_CODE_COMMAND = config.get("claudeCodeCommand", "npx -y @anthropic-ai/claude-code");
   return env;

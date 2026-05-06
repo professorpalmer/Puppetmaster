@@ -30,6 +30,20 @@ python -m puppetmaster
 
 That means Puppetmaster must be importable in the selected Python environment. When developing this repo, opening `/Users/cary/Desktop/Puppetmaster` in Cursor is enough. For normal users, the packaged runtime should be installed first once Puppetmaster is published.
 
+For source-checkout development from another workspace, either install Puppetmaster into the Python Cursor uses:
+
+```bash
+python -m pip install -e /Users/cary/Desktop/Puppetmaster
+```
+
+Or set `puppetmaster.runtimePath` in Cursor settings:
+
+```json
+{
+  "puppetmaster.runtimePath": "/Users/cary/Desktop/Puppetmaster"
+}
+```
+
 ## Control Panel Workflow
 
 1. Open the Puppetmaster activity-bar icon.
