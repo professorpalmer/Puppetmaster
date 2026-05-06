@@ -23,6 +23,7 @@ dependencies = []
 
 [project.scripts]
 puppetmaster = "puppetmaster.cli:main"
+puppetmaster-mcp = "puppetmaster.mcp_server:main"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

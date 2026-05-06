@@ -72,7 +72,12 @@ python -m puppetmaster run "Map this repo" --config examples/enterprise-workflow
 
 Puppetmaster includes a Cursor/VS Code extension in `cursor-extension/`.
 
-It adds a Puppetmaster activity-bar panel so you can run swarms from Cursor instead of copying terminal commands:
+It ships with two Cursor integration surfaces:
+
+- `cursor-extension/`: an activity-bar control panel for buttons, logs, and artifacts
+- `.cursor/mcp.json` plus `puppetmaster.mcp_server`: Agent-chat tools for Cursor's Agent surface
+
+The control panel lets you run swarms from Cursor instead of copying terminal commands:
 
 - configure provider keys in Cursor secret storage
 - run `doctor`
@@ -91,6 +96,18 @@ npx -y @vscode/vsce package --no-dependencies
 Then run `Extensions: Install from VSIX...` in Cursor and choose the generated `.vsix`.
 
 The extension calls `python -m puppetmaster` from the open workspace, so Puppetmaster must be importable in the selected Python environment. See [Cursor Extension](docs/CURSOR_EXTENSION.md).
+
+For Cursor Agent chat, use the MCP integration:
+
+```text
+Use Puppetmaster to run doctor in this repo.
+Use Puppetmaster to run a Cursor review dry run focused on release blockers.
+Use Puppetmaster with Claude Code to implement the approved fix in a clean worktree.
+```
+
+MCP does not patch Cursor's internal model picker or force Cursor's native subagents to change their resource model. It gives Cursor Agent a tool surface that invokes Puppetmaster. Once invoked, Puppetmaster owns the run: it starts independent worker processes, coordinates them through SQLite/shared state, captures structured artifacts, and returns summaries back to Cursor. That is how the Agent chat can delegate work without stuffing every worker's context back into the same conversation.
+
+See [Cursor Agent MCP](docs/CURSOR_AGENT_MCP.md).
 
 Inspect the run:
 
@@ -323,6 +340,7 @@ If you paste a key into a terminal, chat, issue, screenshot, or transcript, rota
 - [Architecture](docs/ARCHITECTURE.md)
 - [Adapters](docs/ADAPTERS.md)
 - [Cursor Extension](docs/CURSOR_EXTENSION.md)
+- [Cursor Agent MCP](docs/CURSOR_AGENT_MCP.md)
 - [Daily Driver](docs/DAILY_DRIVER.md)
 - [Production Notes](docs/PRODUCTION.md)
 - [Security](docs/SECURITY.md)
