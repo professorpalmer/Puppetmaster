@@ -25,6 +25,10 @@ dependencies = []
 puppetmaster = "puppetmaster.cli:main"
 puppetmaster-mcp = "puppetmaster.mcp_server:main"
 
+[tool.setuptools.packages.find]
+include = ["puppetmaster*"]
+exclude = ["node_modules*", "cursor-extension*", "docs*", "examples*", "tests*"]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]

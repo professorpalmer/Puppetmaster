@@ -39,6 +39,11 @@
           "default": "python",
           "description": "Python executable used to run `python -m puppetmaster`."
         },
+        "puppetmaster.runtimePath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional path to a Puppetmaster source checkout. Added to PYTHONPATH for local development installs."
+        },
         "puppetmaster.stateDir": {
           "type": "string",
           "default": ".puppetmaster",
