@@ -1,0 +1,30 @@
+[project]
+name = "puppetmaster"
+version = "0.1.0"
+description = "Gunicorn-style agent swarms with Redis-like shared memory and artifact stitching."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "Cary" }]
+license = { file = "LICENSE" }
+keywords = ["agents", "swarm", "orchestration", "cursor", "llm", "redis", "sqlite"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Build Tools",
+]
+dependencies = []
+
+[project.scripts]
+puppetmaster = "puppetmaster.cli:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+

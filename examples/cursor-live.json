@@ -1,0 +1,17 @@
+{
+  "lease_seconds": 10,
+  "workers": [
+    {
+      "role": "repo-agent",
+      "instruction": "Run a local Cursor agent against this repository and return a structured verification artifact.",
+      "adapter": "cursor",
+      "payload": {
+        "prompt": "Inspect this repository and summarize the highest leverage next engineering step. Return concise, evidence-grounded output.",
+        "model": "default",
+        "cwd": ".",
+        "timeout_seconds": 300
+      }
+    }
+  ]
+}
+
