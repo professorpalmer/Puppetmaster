@@ -398,7 +398,21 @@ print('{"result":"ok"}')
             target = repo / "sample.txt"
             target.write_text("before\n", encoding="utf-8")
             subprocess.run(["git", "add", "sample.txt"], cwd=repo, check=True, capture_output=True)
-            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Puppetmaster Tests",
+                    "-c",
+                    "user.email=tests@example.com",
+                    "commit",
+                    "-m",
+                    "init",
+                ],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
             target.write_text("dirty\n", encoding="utf-8")
             task = Task(
                 job_id="job",
