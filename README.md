@@ -90,7 +90,7 @@ Use Cursor for review, planning, and dry-run implementation workflows.
 
 ```bash
 npm install
-export CURSOR_API_KEY="crsr_..."
+export CURSOR_API_KEY="<your-cursor-api-key>"
 
 python -m puppetmaster cursor "Review this repo and propose the next patch" --review --dry-run
 python -m puppetmaster cursor "Plan the next implementation slice" --plan --dry-run
@@ -103,7 +103,7 @@ The Cursor adapter runs isolated one-shot agents through `@cursor/sdk`.
 Use Claude Code when you want a real terminal coding agent to edit a clean repo or worktree.
 
 ```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
+export ANTHROPIC_API_KEY="<your-anthropic-api-key>"
 export CLAUDE_CODE_COMMAND="npx -y @anthropic-ai/claude-code"
 
 python -m puppetmaster claude \
@@ -139,7 +139,7 @@ Use `shell` for bounded verification steps:
 This is the proof that Puppetmaster can orchestrate a full-edit coding agent and capture the resulting diff:
 
 ```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
+export ANTHROPIC_API_KEY="<your-anthropic-api-key>"
 export CLAUDE_CODE_COMMAND="npx -y @anthropic-ai/claude-code"
 
 tmp_root=$(mktemp -d)
