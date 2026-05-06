@@ -4,52 +4,94 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](pyproject.toml)
 
-**Provider-neutral swarms for coding agents.**
+**Agent swarms without parent-context collapse.**
 
-Puppetmaster treats AI coding agents like distributed workers: independent processes, shared coordination state, structured artifacts, replayable memory, leases, recovery, and human approval gates.
+Puppetmaster is a local runtime for serious coding-agent work. It lets Cursor, Claude Code, shell checks, and future providers run as independent workers that coordinate through durable state instead of one giant chat transcript.
 
-Think **Redis/Gunicorn for agentic engineering work**.
+Think **Redis/Gunicorn for agentic engineering**:
 
 ```text
-Cursor / Claude Code / Shell / Codex
+Cursor Agent / Claude Code / shell / future providers
         |
         v
-independent workers -> SQLite coordination -> structured artifacts -> stitched memory
+Puppetmaster supervisor
+        |
+        v
+independent worker processes -> SQLite state -> structured artifacts -> stitched summary
 ```
 
-## Why This Exists
+## The Problem
 
-Most agent swarms still behave like group chats:
+Most multi-agent coding workflows still use a fragile shape:
 
 ```text
-One parent context
-  |- child agent
-  |- child agent
-  `- child agent
+One parent chat
+  |- subagent
+  |- subagent
+  `- subagent
 ```
 
-That shape collapses under real work. Context bloats. Workers inherit stale assumptions. Results return as prose blobs. The final synthesis has to trust vibes.
+That works for demos. It breaks down during real repo work.
 
-Puppetmaster uses a systems shape instead:
+- The parent context bloats until the important details are buried.
+- Subagents inherit stale assumptions from the same conversation.
+- Results come back as prose blobs instead of evidence-backed records.
+- There is no durable state, replay, lease, failure recovery, or memory promotion.
+- A crashed or confused worker often becomes a mystery instead of an inspectable event.
+- Full-edit agents can mix old local changes with new changes unless the workflow guards against it.
 
-- Workers do not share full transcript context.
-- Workers claim tasks through leases.
-- Workers emit typed JSON artifacts with evidence and confidence.
-- A stitcher reads artifacts, not raw chats.
-- Useful facts become promoted memory for later runs.
-- Patch proposals and full-edit diffs are reviewable artifacts.
-
-The rule:
+Puppetmaster is built around a different rule:
 
 > Agents should not share transcript history. They should share durable state.
+
+## What Puppetmaster Solves
+
+### 1. Context Collapse
+
+Workers do not coordinate by stuffing every thought into one parent conversation. They claim tasks, write structured artifacts, and let the stitcher summarize durable outputs back to the operator.
+
+### 2. Subagent Resource Contention
+
+Puppetmaster does not rely on one parent agent spawning children inside the same chat surface. It runs workers as separate local subprocesses, each with its own adapter invocation and lifecycle.
+
+### 3. Vibe-Based Handoffs
+
+Workers emit typed artifacts with payloads, evidence, confidence, source files, and `sha256` integrity. The final synthesis reads artifacts, not raw worker transcripts.
+
+### 4. Lost Work and Dead Workers
+
+Tasks are lease-based. Stale workers can be recovered. Jobs fail closed. Failures become events and verification artifacts instead of disappearing into chat history.
+
+### 5. Unsafe Code Edits
+
+Claude Code full-edit runs are blocked on dirty worktrees by default. When edits happen, Puppetmaster captures patch artifacts with changed files, base SHA, unified diff, and revert guidance.
+
+### 6. No Long-Term Recall
+
+Useful artifacts can be promoted into memory and retrieved by later workers. The next run does not need the entire old conversation to remember what mattered.
+
+## What It Is
+
+Puppetmaster is not another group-chat swarm. It is a local coordination runtime:
+
+- `Job`: one user goal
+- `Task`: role-specific work, optionally dependency-gated
+- `Worker`: separate subprocess that claims work through a lease
+- `Adapter`: Cursor SDK, Claude Code CLI, shell, or future provider
+- `Artifact`: structured finding, decision, patch, verification result, risk, or memory summary
+- `Stitcher`: final synthesis from artifacts only
+- `Memory`: promoted facts for future retrieval
+
+SQLite is the default coordination backend. WAL mode, schema metadata, integrity checks, task leases, retries, event streams, and patch artifacts are built in.
 
 ## What Works Today
 
 | Area | Status |
 | --- | --- |
-| Cursor extension | Activity-bar control panel for running Puppetmaster inside Cursor |
 | Local runtime | Daily-driver beta: subprocess workers, task DAGs, leases, recovery, failure states |
 | SQLite backend | Default backend with WAL mode, schema metadata, integrity checks, and persisted events |
+| Cursor Agent MCP | Agent-chat tools for doctor, review, plan, Claude implement, logs, artifacts, summaries |
+| Cursor extension | Activity-bar control panel for running Puppetmaster inside Cursor |
 | Cursor adapter | Live adapter through `@cursor/sdk`; best for review/plan/dry-run workflows |
 | Claude Code adapter | Live full-edit adapter through Claude Code CLI; validated with real tracked diffs |
 | Shell adapter | Built-in bounded command runner for verification |
@@ -57,27 +99,109 @@ The rule:
 | Patch workflow | Patch artifacts, path locks, approval/rejection events, dirty-worktree guard |
 | Codex | Stubbed provider slot; next adapter target |
 
-## Quickstart
+## Install
 
 ```bash
 git clone https://github.com/professorpalmer/Puppetmaster.git
 cd Puppetmaster
 
-python -m unittest discover -s tests -v
+python -m pip install -e .
+npm install --package-lock=false --no-audit
 python -m puppetmaster doctor
-python -m puppetmaster run "Map this repo" --config examples/enterprise-workflow.json
 ```
 
-## Cursor-Native Control Panel
+Run the local demo:
 
-Puppetmaster includes a Cursor/VS Code extension in `cursor-extension/`.
+```bash
+python -m puppetmaster run "Map this repo" --config examples/enterprise-workflow.json
+python -m puppetmaster show $(python -m puppetmaster last)
+```
 
-It ships with two Cursor integration surfaces:
+Prove worker recovery:
 
-- `cursor-extension/`: an activity-bar control panel for buttons, logs, and artifacts
-- `.cursor/mcp.json` plus `puppetmaster.mcp_server`: Agent-chat tools for Cursor's Agent surface
+```bash
+python -m puppetmaster crash-demo
+```
 
-The control panel lets you run swarms from Cursor instead of copying terminal commands:
+## Daily Driver Prompts
+
+In Cursor Agent, with MCP enabled:
+
+```text
+Use Puppetmaster to run doctor in this repo and summarize what is missing.
+```
+
+```text
+Use Puppetmaster to swarm this repo.
+Problem: users are getting logged out after refresh and token refresh tests are flaky.
+Constraints: keep the patch focused, preserve public API behavior, and run relevant tests.
+Do review/plan first. Do not edit until you summarize findings and ask for approval.
+```
+
+After review/approval:
+
+```text
+Use Puppetmaster with Claude Code to implement the approved fix in a clean worktree.
+```
+
+From the CLI:
+
+```bash
+python -m puppetmaster doctor
+python -m puppetmaster cursor "Review this repo for release blockers" --review --dry-run
+python -m puppetmaster cursor "Plan the next safe implementation slice" --plan --dry-run
+python -m puppetmaster claude "Implement the approved change and run focused tests" --permission-mode acceptEdits
+python -m puppetmaster show $(python -m puppetmaster last)
+python -m puppetmaster logs
+```
+
+For real edits, prefer a clean worktree:
+
+```bash
+git worktree add /tmp/puppetmaster-work -b puppetmaster-work
+python -m puppetmaster claude "Implement the approved fix" --cwd /tmp/puppetmaster-work --permission-mode acceptEdits
+```
+
+## Cursor Integration
+
+Puppetmaster ships with two Cursor integration surfaces.
+
+### Cursor Agent MCP
+
+The MCP server lets Cursor Agent call Puppetmaster tools directly:
+
+- `puppetmaster_doctor`
+- `puppetmaster_cursor_review`
+- `puppetmaster_cursor_plan`
+- `puppetmaster_claude_implement`
+- `puppetmaster_last_job`
+- `puppetmaster_logs`
+- `puppetmaster_artifacts`
+- `puppetmaster_show`
+
+Example `.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "puppetmaster": {
+      "command": "python",
+      "args": ["-m", "puppetmaster.mcp_server"],
+      "env": {
+        "CLAUDE_CODE_COMMAND": "npx -y @anthropic-ai/claude-code"
+      }
+    }
+  }
+}
+```
+
+MCP does not patch Cursor's private model picker or force Cursor's native subagents to change their resource model. It gives Cursor Agent a tool surface that invokes Puppetmaster. Once invoked, Puppetmaster owns the run: independent worker processes, SQLite coordination, structured artifacts, and a stitched result returned to Cursor.
+
+See [Cursor Agent MCP](docs/CURSOR_AGENT_MCP.md).
+
+### Cursor Extension
+
+The extension adds a Puppetmaster activity-bar control panel:
 
 - configure provider keys in Cursor secret storage
 - run `doctor`
@@ -85,7 +209,7 @@ The control panel lets you run swarms from Cursor instead of copying terminal co
 - launch Claude Code full-edit jobs
 - inspect latest job, logs, and artifacts
 
-Install it locally:
+Download the VSIX from the latest GitHub release or build it locally:
 
 ```bash
 cd cursor-extension
@@ -95,34 +219,7 @@ npx -y @vscode/vsce package --no-dependencies
 
 Then run `Extensions: Install from VSIX...` in Cursor and choose the generated `.vsix`.
 
-The extension calls `python -m puppetmaster` from the open workspace, so Puppetmaster must be importable in the selected Python environment. See [Cursor Extension](docs/CURSOR_EXTENSION.md).
-
-For Cursor Agent chat, use the MCP integration:
-
-```text
-Use Puppetmaster to run doctor in this repo.
-Use Puppetmaster to run a Cursor review dry run focused on release blockers.
-Use Puppetmaster with Claude Code to implement the approved fix in a clean worktree.
-```
-
-MCP does not patch Cursor's internal model picker or force Cursor's native subagents to change their resource model. It gives Cursor Agent a tool surface that invokes Puppetmaster. Once invoked, Puppetmaster owns the run: it starts independent worker processes, coordinates them through SQLite/shared state, captures structured artifacts, and returns summaries back to Cursor. That is how the Agent chat can delegate work without stuffing every worker's context back into the same conversation.
-
-See [Cursor Agent MCP](docs/CURSOR_AGENT_MCP.md).
-
-Inspect the run:
-
-```bash
-python -m puppetmaster last
-python -m puppetmaster watch $(python -m puppetmaster last) --ticks 1
-python -m puppetmaster show $(python -m puppetmaster last)
-python -m puppetmaster logs
-```
-
-Prove failure recovery:
-
-```bash
-python -m puppetmaster crash-demo
-```
+See [Cursor Extension](docs/CURSOR_EXTENSION.md).
 
 ## Live Adapters
 
@@ -131,7 +228,6 @@ python -m puppetmaster crash-demo
 Use Cursor for review, planning, and dry-run implementation workflows.
 
 ```bash
-npm install
 export CURSOR_API_KEY="<your-cursor-api-key>"
 
 python -m puppetmaster cursor "Review this repo and propose the next patch" --review --dry-run
@@ -142,7 +238,7 @@ The Cursor adapter runs isolated one-shot agents through `@cursor/sdk`.
 
 ### Claude Code
 
-Use Claude Code when you want a real terminal coding agent to edit a clean repo or worktree.
+Use Claude Code when you want a real coding agent to edit a clean repo or worktree.
 
 ```bash
 export ANTHROPIC_API_KEY="<your-anthropic-api-key>"
@@ -176,66 +272,6 @@ Use `shell` for bounded verification steps:
 }
 ```
 
-## Full Claude Code Smoke Test
-
-This is the proof that Puppetmaster can orchestrate a full-edit coding agent and capture the resulting diff:
-
-```bash
-export ANTHROPIC_API_KEY="<your-anthropic-api-key>"
-export CLAUDE_CODE_COMMAND="npx -y @anthropic-ai/claude-code"
-
-tmp_root=$(mktemp -d)
-tmp_repo="$tmp_root/repo"
-tmp_state="$tmp_root/.puppetmaster"
-
-mkdir "$tmp_repo"
-git init "$tmp_repo"
-printf 'before\n' > "$tmp_repo/hello.txt"
-git -C "$tmp_repo" add hello.txt
-git -C "$tmp_repo" commit -m init
-
-python -m puppetmaster \
-  --state-dir "$tmp_state" \
-  claude "Change hello.txt so its entire contents are exactly: after. Do not modify any other file." \
-  --cwd "$tmp_repo" \
-  --permission-mode acceptEdits \
-  --timeout-seconds 300
-
-job_id=$(python -m puppetmaster --state-dir "$tmp_state" last)
-python -m puppetmaster --state-dir "$tmp_state" artifacts "$job_id"
-git -C "$tmp_repo" diff -- hello.txt
-```
-
-Expected result:
-
-```diff
--before
-+after
-```
-
-## Daily Driver Loop
-
-```bash
-python -m puppetmaster doctor
-python -m puppetmaster adapters
-
-python -m puppetmaster cursor "Review this repo" --review --dry-run
-python -m puppetmaster claude "Implement the approved change" --permission-mode acceptEdits
-
-python -m puppetmaster last
-python -m puppetmaster show $(python -m puppetmaster last)
-python -m puppetmaster logs
-python -m puppetmaster diff
-python -m puppetmaster approve <job_id>
-```
-
-For real repo edits, prefer a worktree:
-
-```bash
-git worktree add /tmp/puppetmaster-claude-test -b puppetmaster-claude-test
-python -m puppetmaster claude "Implement X" --cwd /tmp/puppetmaster-claude-test --permission-mode acceptEdits
-```
-
 ## CLI Reference
 
 ```bash
@@ -260,8 +296,6 @@ python -m puppetmaster reject <job_id-or-artifact-id> --reason "why"
 python -m puppetmaster clean --completed
 python -m puppetmaster memory
 ```
-
-SQLite is the default backend. Use `--backend file` when you want maximally inspectable JSON state.
 
 ## Workflow Config
 
@@ -291,7 +325,7 @@ SQLite is the default backend. Use `--backend file` when you want maximally insp
 }
 ```
 
-More examples:
+Examples:
 
 - [Enterprise Workflow](examples/enterprise-workflow.json)
 - [Cursor Live](examples/cursor-live.json)
@@ -339,8 +373,8 @@ If you paste a key into a terminal, chat, issue, screenshot, or transcript, rota
 
 - [Architecture](docs/ARCHITECTURE.md)
 - [Adapters](docs/ADAPTERS.md)
-- [Cursor Extension](docs/CURSOR_EXTENSION.md)
 - [Cursor Agent MCP](docs/CURSOR_AGENT_MCP.md)
+- [Cursor Extension](docs/CURSOR_EXTENSION.md)
 - [Daily Driver](docs/DAILY_DRIVER.md)
 - [Production Notes](docs/PRODUCTION.md)
 - [Security](docs/SECURITY.md)
@@ -351,7 +385,7 @@ If you paste a key into a terminal, chat, issue, screenshot, or transcript, rota
 
 ## Status
 
-Puppetmaster is **daily-driver beta software**. The runtime contract is real, tests are automated, SQLite is the default backend, jobs fail closed, Cursor is live, and Claude Code has been validated as a full-edit adapter that emits patch artifacts.
+Puppetmaster is **daily-driver beta software**. The runtime contract is real, tests are automated, SQLite is the default backend, jobs fail closed, Cursor Agent MCP is live, the Cursor extension is installable, and Claude Code has been validated as a full-edit adapter that emits patch artifacts.
 
 It is credible for supervised local engineering workflows. It is not yet a hosted multi-user production service.
 
