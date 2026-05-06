@@ -1,0 +1,19 @@
+{
+  "lease_seconds": 10,
+  "workers": [
+    {
+      "role": "claude-implement",
+      "instruction": "Use Claude Code to implement the requested change and leave a reviewable diff.",
+      "adapter": "claude-code",
+      "payload": {
+        "prompt": "Implement the requested change, run focused verification, and keep the result easy to review.",
+        "cwd": ".",
+        "permission_mode": "acceptEdits",
+        "allowed_tools": ["Read", "Edit", "MultiEdit", "Write", "Bash"],
+        "output_format": "json",
+        "timeout_seconds": 900,
+        "allow_dirty": false
+      }
+    }
+  ]
+}

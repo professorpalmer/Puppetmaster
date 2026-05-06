@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, Union
 
 from puppetmaster.models import (
     AgentRun,
@@ -25,8 +25,9 @@ class SQLiteSwarmStore(SwarmStore):
     """SQLite-backed coordination store for multi-process worker coordination."""
 
     backend_name = "sqlite"
+    schema_version = 1
 
-    def __init__(self, root: Path | str = ".puppetmaster") -> None:
+    def __init__(self, root: Union[Path, str] = ".puppetmaster") -> None:
         super().__init__(root)
         self.db_path = self.root / "state.sqlite3"
 
@@ -85,7 +86,19 @@ class SQLiteSwarmStore(SwarmStore):
                 );
                 CREATE INDEX IF NOT EXISTS idx_events_job
                   ON events(job_id, id);
+                CREATE TABLE IF NOT EXISTS metadata (
+                  key TEXT PRIMARY KEY,
+                  value TEXT NOT NULL
+                );
                 """
+            )
+            connection.execute(
+                """
+                INSERT INTO metadata(key, value)
+                VALUES('schema_version', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (str(self.schema_version),),
             )
 
     def connect(self) -> sqlite3.Connection:
@@ -112,7 +125,9 @@ class SQLiteSwarmStore(SwarmStore):
             goal=job.goal,
             status=status,
             created_at=job.created_at,
-            completed_at=now_iso() if status == JobStatus.COMPLETE else job.completed_at,
+            completed_at=now_iso()
+            if status in {JobStatus.COMPLETE, JobStatus.FAILED}
+            else job.completed_at,
         )
         with self.connect() as connection:
             connection.execute(
@@ -235,6 +250,12 @@ class SQLiteSwarmStore(SwarmStore):
             for row in self._all("SELECT data FROM jobs ORDER BY id")
         ]
 
+    def latest_job(self) -> Optional[Job]:
+        jobs = self.list_jobs()
+        if not jobs:
+            return None
+        return max(jobs, key=lambda job: job.created_at)
+
     def list_tasks(self, job_id: str) -> list[Task]:
         self.init()
         return [
@@ -262,6 +283,55 @@ class SQLiteSwarmStore(SwarmStore):
             for row in self._all("SELECT data FROM memory ORDER BY id")
         ]
 
+    def retrieve_memory(
+        self,
+        query: str,
+        limit: int = 5,
+        scope: Optional[str] = None,
+        adapter: Optional[str] = None,
+        role: Optional[str] = None,
+        topic: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        terms = {term.lower() for term in query.split() if len(term) > 2}
+        scored = []
+        for memory in self.list_memory():
+            if not self._memory_matches_filters(memory, scope, adapter, role, topic):
+                continue
+            haystack = " ".join(
+                str(memory.get(key, ""))
+                for key in ["scope", "statement", "evidence", "adapter", "role", "topic"]
+            ).lower()
+            score = sum(1 for term in terms if term in haystack)
+            confidence = float(memory.get("confidence", 0))
+            scored.append((score, confidence, memory))
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [memory for score, _, memory in scored[:limit] if score > 0 or not terms]
+
+    def delete_job(self, job_id: str) -> None:
+        self.init()
+        with self.connect() as connection:
+            for table in ["events", "artifacts", "runs", "tasks"]:
+                connection.execute(f"DELETE FROM {table} WHERE job_id = ?", (job_id,))
+            connection.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+        job_dir = self.job_dir(job_id)
+        if job_dir.exists():
+            for path in sorted(job_dir.rglob("*"), reverse=True):
+                if path.is_file():
+                    path.unlink()
+                elif path.is_dir():
+                    path.rmdir()
+            job_dir.rmdir()
+
+    def schema_status(self) -> dict[str, str]:
+        self.init()
+        row = self._one("SELECT value FROM metadata WHERE key = 'schema_version'")
+        journal = self._one("PRAGMA journal_mode")
+        return {
+            "schema_version": row["value"] if row else "unknown",
+            "expected_schema_version": str(self.schema_version),
+            "journal_mode": journal[0] if journal else "unknown",
+        }
+
     def emit(self, job_id: str, event: str, payload: dict[str, Any]) -> None:
         self.init()
         with self.connect() as connection:
@@ -284,7 +354,7 @@ class SQLiteSwarmStore(SwarmStore):
             )
         ]
 
-    def _one(self, query: str, params: tuple[Any, ...] = ()) -> sqlite3.Row | None:
+    def _one(self, query: str, params: tuple[Any, ...] = ()) -> Optional[sqlite3.Row]:
         with self.connect() as connection:
             return connection.execute(query, params).fetchone()
 

@@ -1,12 +1,24 @@
 # Roadmap
 
-## Near Term
+## Production Runtime
 
-- Memory retrieval into worker context.
-- Human approval gates for patch application and memory promotion.
-- Path-level locks around real repository edits.
+- Tighten approval-gated patch application with generated unified diffs.
+- Add optional worktree creation for apply flows, not just existing worktree targets.
+- Add richer exit-code and JSON output coverage for automation.
+- Add signed artifact manifests and tamper-evident event exports.
+
+## Daily-Driver UX
+
 - Live Cursor SDK integration test gated by `CURSOR_API_KEY`.
 - Better watch output or a small terminal UI.
+- Saved workflow presets for review, plan, implement, redteam, and verify loops.
+
+## Research Work
+
+- Measurable comparisons against parent-child swarms.
+- Artifact quality scoring.
+- Memory promotion policies and expiration.
+- Multi-agent evaluation harnesses.
 
 ## Provider Integrations
 
@@ -45,8 +57,10 @@ Puppetmaster needs measurable comparisons before any serious research claim:
 
 ### `v0.2.0`
 
-- Memory retrieval.
-- Patch approval workflow.
+- Daily-driver Cursor UX.
+- Memory retrieval into worker context.
+- Patch approval workflow with path locks.
+- SQLite schema metadata and doctor checks.
 - Provider adapter expansion.
 - TUI/watch improvements.
 

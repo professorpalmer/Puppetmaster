@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Optional
 
 from puppetmaster.adapters import get_adapter
 from puppetmaster.models import AgentRun, Artifact, Task, TaskStatus, now_iso
@@ -46,7 +47,7 @@ DEFAULT_WORKERS = [
 class LocalWorker:
     """Task executor used by real worker processes."""
 
-    def __init__(self, role: str, worker_id: str | None = None) -> None:
+    def __init__(self, role: str, worker_id: Optional[str] = None) -> None:
         self.role = role
         self.worker_id = worker_id or f"local-{role}"
 
@@ -66,7 +67,7 @@ class LocalWorker:
         return run, get_adapter(task.adapter).run(task, goal, self.worker_id)
 
 
-def specs_for_roles(roles: list[str] | None = None) -> list[WorkerSpec]:
+def specs_for_roles(roles: Optional[list[str]] = None) -> list[WorkerSpec]:
     if not roles:
         return DEFAULT_WORKERS
     known = {spec.role: spec for spec in DEFAULT_WORKERS}

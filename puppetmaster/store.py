@@ -6,7 +6,7 @@ import os
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional, Union
 
 from puppetmaster.models import (
     AgentRun,
@@ -30,8 +30,9 @@ class SwarmStore:
     """File-backed coordination store with Redis-like key spaces."""
 
     backend_name = "file"
+    max_task_attempts = 3
 
-    def __init__(self, root: Path | str = ".puppetmaster") -> None:
+    def __init__(self, root: Union[Path, str] = ".puppetmaster") -> None:
         self.root = Path(root)
         self.jobs_dir = self.root / "jobs"
         self.memory_dir = self.root / "memory"
@@ -71,7 +72,9 @@ class SwarmStore:
             goal=job.goal,
             status=status,
             created_at=job.created_at,
-            completed_at=now_iso() if status == JobStatus.COMPLETE else job.completed_at,
+            completed_at=now_iso()
+            if status in {JobStatus.COMPLETE, JobStatus.FAILED}
+            else job.completed_at,
         )
         self.write_json(self.job_dir(job_id) / "job.json", updated)
         self.emit(job_id, "job.status", {"status": str(status)})
@@ -108,13 +111,28 @@ class SwarmStore:
         task_id: str,
         worker_id: str,
         lease_seconds: int = 60,
-    ) -> Task | None:
+    ) -> Optional[Task]:
         task = self.get_task_by_id(task_id)
         if not self.dependencies_complete(task):
             blocked = replace(task, status=TaskStatus.BLOCKED, updated_at=now_iso())
             self.save_task(blocked)
             return None
         if task.status == TaskStatus.COMPLETE:
+            return None
+        if task.attempts >= self.max_task_attempts:
+            failed = replace(
+                task,
+                status=TaskStatus.FAILED,
+                lease_owner=None,
+                lease_expires_at=None,
+                updated_at=now_iso(),
+            )
+            self.save_task(failed)
+            self.emit(
+                task.job_id,
+                "task.max_attempts_exceeded",
+                {"task_id": task.id, "attempts": task.attempts},
+            )
             return None
         if task.status == TaskStatus.RUNNING and not self.is_task_stale(task):
             return None
@@ -145,7 +163,7 @@ class SwarmStore:
         task_id: str,
         worker_id: str,
         lease_seconds: int = 60,
-    ) -> Task | None:
+    ) -> Optional[Task]:
         task = self.get_task_by_id(task_id)
         if task.status != TaskStatus.RUNNING or task.lease_owner != worker_id:
             return None
@@ -170,9 +188,9 @@ class SwarmStore:
         self,
         job_id: str,
         worker_id: str,
-        role: str | None = None,
+        role: Optional[str] = None,
         lease_seconds: int = 60,
-    ) -> Task | None:
+    ) -> Optional[Task]:
         self.refresh_blocked_tasks(job_id)
         for task in self.list_tasks(job_id):
             if task.status != TaskStatus.QUEUED:
@@ -292,6 +310,12 @@ class SwarmStore:
             jobs.append(job_from_dict(self.read_json(path)))
         return jobs
 
+    def latest_job(self) -> Optional[Job]:
+        jobs = self.list_jobs()
+        if not jobs:
+            return None
+        return max(jobs, key=lambda job: job.created_at)
+
     def list_tasks(self, job_id: str) -> list[Task]:
         return [
             task_from_dict(self.read_json(path))
@@ -325,6 +349,56 @@ class SwarmStore:
     def list_memory(self) -> list[dict[str, Any]]:
         self.init()
         return [self.read_json(path) for path in sorted(self.memory_dir.glob("*.json"))]
+
+    def retrieve_memory(
+        self,
+        query: str,
+        limit: int = 5,
+        scope: Optional[str] = None,
+        adapter: Optional[str] = None,
+        role: Optional[str] = None,
+        topic: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        terms = {term.lower() for term in query.split() if len(term) > 2}
+        scored = []
+        for memory in self.list_memory():
+            if not self._memory_matches_filters(memory, scope, adapter, role, topic):
+                continue
+            haystack = " ".join(
+                str(memory.get(key, ""))
+                for key in ["scope", "statement", "evidence", "adapter", "role", "topic"]
+            ).lower()
+            score = sum(1 for term in terms if term in haystack)
+            confidence = float(memory.get("confidence", 0))
+            scored.append((score, confidence, memory))
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [memory for score, _, memory in scored[:limit] if score > 0 or not terms]
+
+    @staticmethod
+    def _memory_matches_filters(
+        memory: dict[str, Any],
+        scope: Optional[str],
+        adapter: Optional[str],
+        role: Optional[str],
+        topic: Optional[str],
+    ) -> bool:
+        filters = {
+            "scope": scope,
+            "adapter": adapter,
+            "role": role,
+            "topic": topic,
+        }
+        return all(value is None or memory.get(key) == value for key, value in filters.items())
+
+    def delete_job(self, job_id: str) -> None:
+        job_dir = self.job_dir(job_id)
+        if job_dir.exists():
+            for path in sorted(job_dir.rglob("*"), reverse=True):
+                if path.is_file():
+                    path.unlink()
+                elif path.is_dir():
+                    path.rmdir()
+            job_dir.rmdir()
 
     def acquire_lock(self, name: str, owner: str) -> bool:
         self.init()

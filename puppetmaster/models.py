@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Optional
 from uuid import uuid4
 
 
@@ -62,7 +62,7 @@ class Job:
     id: str = field(default_factory=lambda: new_id("job"))
     status: JobStatus = JobStatus.QUEUED
     created_at: str = field(default_factory=now_iso)
-    completed_at: str | None = None
+    completed_at: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -76,11 +76,11 @@ class Task:
     payload: dict[str, Any] = field(default_factory=dict)
     depends_on: list[str] = field(default_factory=list)
     attempts: int = 0
-    lease_owner: str | None = None
-    lease_expires_at: str | None = None
+    lease_owner: Optional[str] = None
+    lease_expires_at: Optional[str] = None
     created_at: str = field(default_factory=now_iso)
     updated_at: str = field(default_factory=now_iso)
-    completed_at: str | None = None
+    completed_at: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -93,7 +93,7 @@ class AgentRun:
     status: TaskStatus = TaskStatus.RUNNING
     started_at: str = field(default_factory=now_iso)
     heartbeat_at: str = field(default_factory=now_iso)
-    completed_at: str | None = None
+    completed_at: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -107,7 +107,7 @@ class Artifact:
     evidence: list[str]
     id: str = field(default_factory=lambda: new_id("artifact"))
     created_at: str = field(default_factory=now_iso)
-    sha256: str | None = None
+    sha256: Optional[str] = None
 
     def validate(self) -> None:
         if not 0 <= self.confidence <= 1:
