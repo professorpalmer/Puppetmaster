@@ -47,6 +47,7 @@ The rule:
 
 | Area | Status |
 | --- | --- |
+| Cursor extension | Activity-bar control panel for running Puppetmaster inside Cursor |
 | Local runtime | Daily-driver beta: subprocess workers, task DAGs, leases, recovery, failure states |
 | SQLite backend | Default backend with WAL mode, schema metadata, integrity checks, and persisted events |
 | Cursor adapter | Live adapter through `@cursor/sdk`; best for review/plan/dry-run workflows |
@@ -66,6 +67,30 @@ python -m unittest discover -s tests -v
 python -m puppetmaster doctor
 python -m puppetmaster run "Map this repo" --config examples/enterprise-workflow.json
 ```
+
+## Cursor-Native Control Panel
+
+Puppetmaster includes a Cursor/VS Code extension in `cursor-extension/`.
+
+It adds a Puppetmaster activity-bar panel so you can run swarms from Cursor instead of copying terminal commands:
+
+- configure provider keys in Cursor secret storage
+- run `doctor`
+- launch Cursor review/plan dry runs
+- launch Claude Code full-edit jobs
+- inspect latest job, logs, and artifacts
+
+Install it locally:
+
+```bash
+cd cursor-extension
+npm run check
+npx -y @vscode/vsce package --no-dependencies
+```
+
+Then run `Extensions: Install from VSIX...` in Cursor and choose the generated `.vsix`.
+
+The extension calls `python -m puppetmaster` from the open workspace, so Puppetmaster must be importable in the selected Python environment. See [Cursor Extension](docs/CURSOR_EXTENSION.md).
 
 Inspect the run:
 
@@ -297,6 +322,7 @@ If you paste a key into a terminal, chat, issue, screenshot, or transcript, rota
 
 - [Architecture](docs/ARCHITECTURE.md)
 - [Adapters](docs/ADAPTERS.md)
+- [Cursor Extension](docs/CURSOR_EXTENSION.md)
 - [Daily Driver](docs/DAILY_DRIVER.md)
 - [Production Notes](docs/PRODUCTION.md)
 - [Security](docs/SECURITY.md)

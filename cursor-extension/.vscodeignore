@@ -1,0 +1,4 @@
+node_modules/**
+*.vsix
+npm-debug.log*
+.DS_Store

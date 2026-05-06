@@ -5,7 +5,8 @@
   "type": "module",
   "description": "Optional Cursor SDK bridge for Puppetmaster worker adapters.",
   "scripts": {
-    "smoke:cursor-runner": "node --check puppetmaster/cursor_sdk_runner.mjs"
+    "smoke:cursor-runner": "node --check puppetmaster/cursor_sdk_runner.mjs",
+    "smoke:cursor-extension": "npm --prefix cursor-extension run check"
   },
   "optionalDependencies": {
     "@cursor/sdk": "latest"
