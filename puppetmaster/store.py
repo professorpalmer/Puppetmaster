@@ -1,0 +1,401 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from dataclasses import replace
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+from puppetmaster.models import (
+    AgentRun,
+    Artifact,
+    Job,
+    JobStatus,
+    MemoryRecord,
+    Task,
+    TaskStatus,
+    artifact_from_dict,
+    job_from_dict,
+    now_iso,
+    parse_iso,
+    seconds_from_now,
+    task_from_dict,
+    to_jsonable,
+)
+
+
+class SwarmStore:
+    """File-backed coordination store with Redis-like key spaces."""
+
+    backend_name = "file"
+
+    def __init__(self, root: Path | str = ".puppetmaster") -> None:
+        self.root = Path(root)
+        self.jobs_dir = self.root / "jobs"
+        self.memory_dir = self.root / "memory"
+        self.stream_dir = self.root / "streams"
+        self.locks_dir = self.root / "locks"
+
+    def init(self) -> None:
+        for directory in [
+            self.root,
+            self.jobs_dir,
+            self.memory_dir,
+            self.stream_dir,
+            self.locks_dir,
+        ]:
+            directory.mkdir(parents=True, exist_ok=True)
+
+    def create_job(self, goal: str) -> Job:
+        self.init()
+        job = Job(goal=goal)
+        job_dir = self.job_dir(job.id)
+        for directory in [
+            job_dir,
+            job_dir / "tasks",
+            job_dir / "runs",
+            job_dir / "artifacts",
+            job_dir / "summaries",
+        ]:
+            directory.mkdir(parents=True, exist_ok=True)
+        self.write_json(job_dir / "job.json", job)
+        self.emit(job.id, "job.created", {"goal": goal})
+        return job
+
+    def update_job_status(self, job_id: str, status: JobStatus) -> Job:
+        job = self.get_job(job_id)
+        updated = Job(
+            id=job.id,
+            goal=job.goal,
+            status=status,
+            created_at=job.created_at,
+            completed_at=now_iso() if status == JobStatus.COMPLETE else job.completed_at,
+        )
+        self.write_json(self.job_dir(job_id) / "job.json", updated)
+        self.emit(job_id, "job.status", {"status": str(status)})
+        return updated
+
+    def save_task(self, task: Task) -> None:
+        self.write_json(self.job_dir(task.job_id) / "tasks" / f"{task.id}.json", task)
+        self.emit(
+            task.job_id,
+            "task.saved",
+            {
+                "task_id": task.id,
+                "role": task.role,
+                "status": str(task.status),
+                "adapter": task.adapter,
+            },
+        )
+
+    def update_task_status(self, task: Task, status: TaskStatus) -> Task:
+        terminal = status in {TaskStatus.COMPLETE, TaskStatus.FAILED}
+        updated = replace(
+            task,
+            status=status,
+            lease_owner=None if terminal else task.lease_owner,
+            lease_expires_at=None if terminal else task.lease_expires_at,
+            updated_at=now_iso(),
+            completed_at=now_iso() if status == TaskStatus.COMPLETE else task.completed_at,
+        )
+        self.save_task(updated)
+        return updated
+
+    def claim_task(
+        self,
+        task_id: str,
+        worker_id: str,
+        lease_seconds: int = 60,
+    ) -> Task | None:
+        task = self.get_task_by_id(task_id)
+        if not self.dependencies_complete(task):
+            blocked = replace(task, status=TaskStatus.BLOCKED, updated_at=now_iso())
+            self.save_task(blocked)
+            return None
+        if task.status == TaskStatus.COMPLETE:
+            return None
+        if task.status == TaskStatus.RUNNING and not self.is_task_stale(task):
+            return None
+
+        claimed = replace(
+            task,
+            status=TaskStatus.RUNNING,
+            attempts=task.attempts + 1,
+            lease_owner=worker_id,
+            lease_expires_at=seconds_from_now(lease_seconds),
+            updated_at=now_iso(),
+        )
+        self.save_task(claimed)
+        self.emit(
+            task.job_id,
+            "task.claimed",
+            {
+                "task_id": task.id,
+                "worker_id": worker_id,
+                "lease_expires_at": claimed.lease_expires_at,
+                "attempts": claimed.attempts,
+            },
+        )
+        return claimed
+
+    def renew_task_lease(
+        self,
+        task_id: str,
+        worker_id: str,
+        lease_seconds: int = 60,
+    ) -> Task | None:
+        task = self.get_task_by_id(task_id)
+        if task.status != TaskStatus.RUNNING or task.lease_owner != worker_id:
+            return None
+        renewed = replace(
+            task,
+            lease_expires_at=seconds_from_now(lease_seconds),
+            updated_at=now_iso(),
+        )
+        self.save_task(renewed)
+        self.emit(
+            task.job_id,
+            "task.lease_renewed",
+            {
+                "task_id": task.id,
+                "worker_id": worker_id,
+                "lease_expires_at": renewed.lease_expires_at,
+            },
+        )
+        return renewed
+
+    def claim_next_task(
+        self,
+        job_id: str,
+        worker_id: str,
+        role: str | None = None,
+        lease_seconds: int = 60,
+    ) -> Task | None:
+        self.refresh_blocked_tasks(job_id)
+        for task in self.list_tasks(job_id):
+            if task.status != TaskStatus.QUEUED:
+                continue
+            if not self.dependencies_complete(task):
+                self.save_task(replace(task, status=TaskStatus.BLOCKED, updated_at=now_iso()))
+                continue
+            if role is not None and task.role != role:
+                continue
+            lock_name = f"task:{task.id}"
+            if not self.acquire_lock(lock_name, worker_id):
+                continue
+            try:
+                return self.claim_task(task.id, worker_id, lease_seconds=lease_seconds)
+            finally:
+                self.release_lock(lock_name)
+        return None
+
+    def recover_stale_tasks(self, job_id: str) -> list[Task]:
+        recovered: list[Task] = []
+        for task in self.list_tasks(job_id):
+            if not self.is_task_stale(task):
+                continue
+            queued = replace(
+                task,
+                status=TaskStatus.QUEUED,
+                lease_owner=None,
+                lease_expires_at=None,
+                updated_at=now_iso(),
+            )
+            self.save_task(queued)
+            self.emit(
+                job_id,
+                "task.recovered",
+                {"task_id": task.id, "previous_owner": task.lease_owner},
+            )
+            recovered.append(queued)
+        return recovered
+
+    def refresh_blocked_tasks(self, job_id: str) -> list[Task]:
+        ready: list[Task] = []
+        for task in self.list_tasks(job_id):
+            if task.status != TaskStatus.BLOCKED:
+                continue
+            if not self.dependencies_complete(task):
+                continue
+            queued = replace(task, status=TaskStatus.QUEUED, updated_at=now_iso())
+            self.save_task(queued)
+            self.emit(job_id, "task.unblocked", {"task_id": task.id, "role": task.role})
+            ready.append(queued)
+        return ready
+
+    def dependencies_complete(self, task: Task) -> bool:
+        for dependency_id in task.depends_on:
+            try:
+                dependency = self.get_task_by_id(dependency_id)
+            except FileNotFoundError:
+                return False
+            if dependency.status != TaskStatus.COMPLETE:
+                return False
+        return True
+
+    def heartbeat_run(self, run: AgentRun) -> AgentRun:
+        updated = replace(run, heartbeat_at=now_iso())
+        self.save_run(updated)
+        self.emit(
+            run.job_id,
+            "run.heartbeat",
+            {"run_id": run.id, "worker_id": run.worker_id, "task_id": run.task_id},
+        )
+        return updated
+
+    def save_run(self, run: AgentRun) -> None:
+        self.write_json(self.job_dir(run.job_id) / "runs" / f"{run.id}.json", run)
+        self.emit(run.job_id, "run.saved", {"run_id": run.id, "role": run.role})
+
+    def save_artifact(self, artifact: Artifact) -> None:
+        artifact.validate()
+        if artifact.sha256 is None:
+            artifact = replace(artifact, sha256=self.artifact_hash(artifact))
+        path = self.job_dir(artifact.job_id) / "artifacts" / f"{artifact.id}.json"
+        self.write_json(path, artifact)
+        self.emit(
+            artifact.job_id,
+            "artifact.saved",
+            {
+                "artifact_id": artifact.id,
+                "task_id": artifact.task_id,
+                "type": str(artifact.type),
+                "confidence": artifact.confidence,
+                "sha256": artifact.sha256,
+            },
+        )
+
+    def promote_memory(self, memory: MemoryRecord) -> None:
+        path = self.memory_dir / f"{memory.id}.json"
+        self.write_json(path, memory)
+
+    def write_summary(self, job_id: str, name: str, body: str) -> Path:
+        path = self.job_dir(job_id) / "summaries" / name
+        path.write_text(body, encoding="utf-8")
+        self.emit(job_id, "summary.written", {"path": str(path)})
+        return path
+
+    def get_job(self, job_id: str) -> Job:
+        return job_from_dict(self.read_json(self.job_dir(job_id) / "job.json"))
+
+    def get_task_by_id(self, task_id: str) -> Task:
+        for path in self.jobs_dir.glob(f"*/tasks/{task_id}.json"):
+            return task_from_dict(self.read_json(path))
+        raise FileNotFoundError(f"task not found: {task_id}")
+
+    def list_jobs(self) -> list[Job]:
+        self.init()
+        jobs = []
+        for path in sorted(self.jobs_dir.glob("*/job.json")):
+            jobs.append(job_from_dict(self.read_json(path)))
+        return jobs
+
+    def list_tasks(self, job_id: str) -> list[Task]:
+        return [
+            task_from_dict(self.read_json(path))
+            for path in sorted((self.job_dir(job_id) / "tasks").glob("*.json"))
+        ]
+
+    def list_artifacts(self, job_id: str) -> list[Artifact]:
+        return [
+            artifact_from_dict(self.read_json(path))
+            for path in sorted((self.job_dir(job_id) / "artifacts").glob("*.json"))
+        ]
+
+    def status_snapshot(self, job_id: str) -> dict[str, Any]:
+        self.refresh_blocked_tasks(job_id)
+        tasks = self.list_tasks(job_id)
+        artifacts = self.list_artifacts(job_id)
+        status_counts: dict[str, int] = {}
+        for task in tasks:
+            status_counts[str(task.status)] = status_counts.get(str(task.status), 0) + 1
+        return {
+            "job": to_jsonable(self.get_job(job_id)),
+            "tasks": [to_jsonable(task) for task in tasks],
+            "task_counts": status_counts,
+            "artifact_count": len(artifacts),
+            "stale_task_ids": [task.id for task in tasks if self.is_task_stale(task)],
+        }
+
+    def has_incomplete_tasks(self, job_id: str) -> bool:
+        return any(task.status != TaskStatus.COMPLETE for task in self.list_tasks(job_id))
+
+    def list_memory(self) -> list[dict[str, Any]]:
+        self.init()
+        return [self.read_json(path) for path in sorted(self.memory_dir.glob("*.json"))]
+
+    def acquire_lock(self, name: str, owner: str) -> bool:
+        self.init()
+        path = self.locks_dir / f"{self._safe_key(name)}.lock"
+        try:
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(owner)
+            return True
+        except FileExistsError:
+            return False
+
+    def release_lock(self, name: str) -> None:
+        path = self.locks_dir / f"{self._safe_key(name)}.lock"
+        if path.exists():
+            path.unlink()
+
+    def emit(self, job_id: str, event: str, payload: dict[str, Any]) -> None:
+        self.init()
+        stream = self.stream_dir / f"{job_id}.jsonl"
+        record = {"at": now_iso(), "event": event, "payload": payload}
+        with stream.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+    def read_events(self, job_id: str) -> list[dict[str, Any]]:
+        stream = self.stream_dir / f"{job_id}.jsonl"
+        if not stream.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in stream.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    @staticmethod
+    def is_task_stale(task: Task) -> bool:
+        if task.status != TaskStatus.RUNNING or not task.lease_expires_at:
+            return False
+        return parse_iso(task.lease_expires_at) <= datetime.now(timezone.utc)
+
+    def job_dir(self, job_id: str) -> Path:
+        return self.jobs_dir / job_id
+
+    @staticmethod
+    def write_json(path: Path, value: Any) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temp_path.write_text(
+            json.dumps(to_jsonable(value), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temp_path, path)
+
+    @staticmethod
+    def read_json(path: Path) -> dict[str, Any]:
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    @staticmethod
+    def artifact_hash(artifact: Artifact) -> str:
+        value = to_jsonable(replace(artifact, sha256=None))
+        encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _safe_key(value: str) -> str:
+        return "".join(char if char.isalnum() or char in "-_" else "_" for char in value)
+
+
+def group_by_type(artifacts: Iterable[Artifact]) -> dict[str, list[Artifact]]:
+    grouped: dict[str, list[Artifact]] = {}
+    for artifact in artifacts:
+        grouped.setdefault(str(artifact.type), []).append(artifact)
+    return grouped
+

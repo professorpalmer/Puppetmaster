@@ -1,0 +1,40 @@
+{
+  "lease_seconds": 5,
+  "workers": [
+    {
+      "role": "explore",
+      "instruction": "Map the problem, extract constraints, and emit evidenced findings."
+    },
+    {
+      "role": "python-version-check",
+      "instruction": "Verify the local Python runtime is available.",
+      "adapter": "shell",
+      "depends_on": ["explore"],
+      "payload": {
+        "command": ["python", "--version"],
+        "timeout_seconds": 10
+      }
+    },
+    {
+      "role": "architect",
+      "instruction": "Choose the smallest viable architecture and record explicit decisions.",
+      "depends_on": ["python-version-check"]
+    },
+    {
+      "role": "implement",
+      "instruction": "Produce implementation artifacts and patch plans, not prose blobs.",
+      "depends_on": ["architect"]
+    },
+    {
+      "role": "test",
+      "instruction": "Convert claims into checks and verification results.",
+      "depends_on": ["implement"]
+    },
+    {
+      "role": "redteam",
+      "instruction": "Find failure modes, stale assumptions, and missing verification.",
+      "depends_on": ["implement"]
+    }
+  ]
+}
+

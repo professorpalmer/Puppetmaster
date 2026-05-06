@@ -1,0 +1,164 @@
+from __future__ import annotations
+
+import argparse
+import os
+import threading
+import time
+from dataclasses import replace
+from pathlib import Path
+
+from puppetmaster.models import AgentRun, TaskStatus, now_iso
+from puppetmaster.store_factory import create_store
+from puppetmaster.workers import LocalWorker
+
+
+def worker_id_for(role: str) -> str:
+    return f"worker-{role}-{os.getpid()}"
+
+
+class WorkerRuntime:
+    def __init__(
+        self,
+        store: SwarmStore,
+        job_id: str,
+        role: str,
+        worker_id: str,
+        lease_seconds: int = 5,
+        poll_seconds: float = 0.1,
+        simulate_seconds: float = 0.0,
+        crash_after_claim: bool = False,
+    ) -> None:
+        self.store = store
+        self.job_id = job_id
+        self.role = role
+        self.worker_id = worker_id
+        self.lease_seconds = lease_seconds
+        self.poll_seconds = poll_seconds
+        self.simulate_seconds = simulate_seconds
+        self.crash_after_claim = crash_after_claim
+
+    def run_once(self) -> bool:
+        task = self.store.claim_next_task(
+            self.job_id,
+            self.worker_id,
+            role=self.role,
+            lease_seconds=self.lease_seconds,
+        )
+        if task is None:
+            return False
+
+        if self.crash_after_claim:
+            self.store.emit(
+                self.job_id,
+                "worker.crashed_after_claim",
+                {"worker_id": self.worker_id, "task_id": task.id, "role": self.role},
+            )
+            raise SystemExit(77)
+
+        run = AgentRun(
+            job_id=self.job_id,
+            task_id=task.id,
+            role=task.role,
+            worker_id=self.worker_id,
+        )
+        self.store.save_run(run)
+
+        deadline = time.monotonic() + self.simulate_seconds
+        while time.monotonic() < deadline:
+            time.sleep(min(self.poll_seconds, max(0.0, deadline - time.monotonic())))
+            run = self.store.heartbeat_run(run)
+            self.store.renew_task_lease(task.id, self.worker_id, self.lease_seconds)
+
+        stop_heartbeats = threading.Event()
+        heartbeat = threading.Thread(
+            target=self._heartbeat_until_stopped,
+            args=(run, task.id, stop_heartbeats),
+            daemon=True,
+        )
+        heartbeat.start()
+        try:
+            _, artifacts = LocalWorker(task.role, worker_id=self.worker_id).run(
+                task,
+                self.store.get_job(self.job_id).goal,
+            )
+            for artifact in artifacts:
+                self.store.save_artifact(artifact)
+        finally:
+            stop_heartbeats.set()
+            heartbeat.join(timeout=1)
+
+        completed_run = replace(
+            run,
+            status=TaskStatus.COMPLETE,
+            heartbeat_at=now_iso(),
+            completed_at=now_iso(),
+        )
+        self.store.save_run(completed_run)
+        self.store.update_task_status(task, TaskStatus.COMPLETE)
+        self.store.emit(
+            self.job_id,
+            "worker.completed_task",
+            {"worker_id": self.worker_id, "task_id": task.id, "role": self.role},
+        )
+        return True
+
+    def _heartbeat_until_stopped(
+        self,
+        run: AgentRun,
+        task_id: str,
+        stop: threading.Event,
+    ) -> None:
+        while not stop.wait(self.poll_seconds):
+            run = self.store.heartbeat_run(run)
+            self.store.renew_task_lease(task_id, self.worker_id, self.lease_seconds)
+
+    def run_until_idle(self) -> int:
+        completed = 0
+        while True:
+            self.store.recover_stale_tasks(self.job_id)
+            if self.run_once():
+                completed += 1
+                continue
+            if not self._has_role_work():
+                return completed
+            time.sleep(self.poll_seconds)
+
+    def _has_role_work(self) -> bool:
+        for task in self.store.list_tasks(self.job_id):
+            if task.role == self.role and task.status != TaskStatus.COMPLETE:
+                return True
+        return False
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run a Puppetmaster worker process.")
+    parser.add_argument("--state-dir", default=".puppetmaster")
+    parser.add_argument("--backend", choices=["file", "sqlite"], default="file")
+    parser.add_argument("--job-id", required=True)
+    parser.add_argument("--role", required=True)
+    parser.add_argument("--worker-id")
+    parser.add_argument("--lease-seconds", type=int, default=5)
+    parser.add_argument("--poll-seconds", type=float, default=0.1)
+    parser.add_argument("--simulate-seconds", type=float, default=0.0)
+    parser.add_argument("--crash-after-claim", action="store_true")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    runtime = WorkerRuntime(
+        store=create_store(args.backend, Path(args.state_dir)),
+        job_id=args.job_id,
+        role=args.role,
+        worker_id=args.worker_id or worker_id_for(args.role),
+        lease_seconds=args.lease_seconds,
+        poll_seconds=args.poll_seconds,
+        simulate_seconds=args.simulate_seconds,
+        crash_after_claim=args.crash_after_claim,
+    )
+    return 0 if runtime.run_until_idle() >= 0 else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+

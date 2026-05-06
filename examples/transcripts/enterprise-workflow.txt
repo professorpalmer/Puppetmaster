@@ -1,0 +1,8 @@
+$ python -m puppetmaster run "Enterprise workflow" --config examples/enterprise-workflow.json
+job_id: job_abc123
+artifacts: 9
+summary: .puppetmaster/jobs/job_abc123/summaries/stitched.md
+
+$ python -m puppetmaster watch job_abc123 --ticks 1
+job_abc123 complete tasks[complete=6] artifacts=9 stale=0
+

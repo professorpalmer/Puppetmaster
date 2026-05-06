@@ -1,0 +1,6 @@
+$ python -m puppetmaster crash-demo
+job_id: job_def456
+artifacts: 8
+summary: .puppetmaster/jobs/job_def456/summaries/stitched.md
+recovered_tasks: 1
+
