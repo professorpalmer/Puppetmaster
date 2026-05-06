@@ -61,14 +61,33 @@ class Orchestrator:
         self.store.update_job_status(job.id, JobStatus.RUNNING)
         tasks = self._create_tasks(job, specs)
         self._run_prerequisites(job, tasks, crash_role, lease_seconds=2)
+        self.store.refresh_blocked_tasks(job.id)
 
-        crash_process = self._spawn_worker(
-            job.id,
-            crash_role,
+        target = next((task for task in self.store.list_tasks(job.id) if task.role == crash_role), None)
+        if target is None:
+            raise RuntimeError(f"crash role not found: {crash_role}")
+        while not self.store.dependencies_complete(target):
+            current_tasks = self.store.list_tasks(job.id)
+            dependencies = self._dependency_closure(current_tasks, target.id)
+            self._run_workers(job, dependencies, lease_seconds=2)
+            self.store.refresh_blocked_tasks(job.id)
+            target = self.store.get_task_by_id(target.id)
+        claimed = self.store.claim_task(
+            target.id,
+            worker_id=f"crashed-{crash_role}-worker",
             lease_seconds=1,
-            crash_after_claim=True,
         )
-        crash_process.wait(timeout=10)
+        if claimed is None:
+            raise RuntimeError(f"crash role was not claimable: {crash_role}")
+        self.store.emit(
+            job.id,
+            "worker.crashed_after_claim",
+            {
+                "worker_id": f"crashed-{crash_role}-worker",
+                "task_id": target.id,
+                "role": crash_role,
+            },
+        )
         time.sleep(1.2)
         recovered = self.store.recover_stale_tasks(job.id)
 
@@ -163,7 +182,32 @@ class Orchestrator:
         job: Job,
         tasks: list[Task],
         lease_seconds: int = 5,
+        allowed_task_ids: set[str] | None = None,
     ) -> None:
+        allowed_task_ids = allowed_task_ids or {task.id for task in tasks}
+        tasks = [
+            task
+            for task in self.store.list_tasks(job.id)
+            if task.id in allowed_task_ids
+            and task.status in {TaskStatus.QUEUED, TaskStatus.RUNNING}
+        ]
+        if not tasks:
+            self.store.refresh_blocked_tasks(job.id)
+            tasks = [
+                task
+                for task in self.store.list_tasks(job.id)
+                if task.id in allowed_task_ids
+                and task.status in {TaskStatus.QUEUED, TaskStatus.RUNNING}
+            ]
+        if not tasks:
+            if any(
+                task.status != TaskStatus.COMPLETE
+                for task in self.store.list_tasks(job.id)
+                if task.id in allowed_task_ids
+            ):
+                raise RuntimeError("swarm exited with incomplete tasks")
+            return
+
         roles = sorted({task.role for task in tasks})
         processes = [
             self._spawn_worker(job.id, role, lease_seconds=lease_seconds)
@@ -176,9 +220,25 @@ class Orchestrator:
 
         if self.store.has_incomplete_tasks(job.id):
             recovered = self.store.recover_stale_tasks(job.id)
-            if recovered:
-                self._run_workers(job, recovered, lease_seconds=lease_seconds)
-            elif self.store.has_incomplete_tasks(job.id):
+            unblocked = self.store.refresh_blocked_tasks(job.id)
+            next_tasks = [
+                task
+                for task in self.store.list_tasks(job.id)
+                if task.id in allowed_task_ids
+                and task.status in {TaskStatus.QUEUED, TaskStatus.RUNNING}
+            ]
+            if recovered or unblocked or next_tasks:
+                self._run_workers(
+                    job,
+                    next_tasks,
+                    lease_seconds=lease_seconds,
+                    allowed_task_ids=allowed_task_ids,
+                )
+            elif any(
+                task.status != TaskStatus.COMPLETE
+                for task in self.store.list_tasks(job.id)
+                if task.id in allowed_task_ids
+            ):
                 raise RuntimeError("swarm exited with incomplete tasks")
 
     def _run_prerequisites(

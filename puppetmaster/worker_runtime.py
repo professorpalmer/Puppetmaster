@@ -125,7 +125,9 @@ class WorkerRuntime:
 
     def _has_role_work(self) -> bool:
         for task in self.store.list_tasks(self.job_id):
-            if task.role == self.role and task.status != TaskStatus.COMPLETE:
+            if task.role != self.role:
+                continue
+            if task.status in {TaskStatus.QUEUED, TaskStatus.RUNNING}:
                 return True
         return False
 
