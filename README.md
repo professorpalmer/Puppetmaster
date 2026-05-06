@@ -43,7 +43,7 @@ The rule is simple:
 ## 60-Second Demo
 
 ```bash
-git clone <your-puppetmaster-repo-url>
+git clone https://github.com/professorpalmer/Puppetmaster.git
 cd Puppetmaster
 
 python -m unittest discover -s tests -v
