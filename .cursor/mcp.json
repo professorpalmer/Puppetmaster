@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "puppetmaster": {
+      "command": "python",
+      "args": ["-m", "puppetmaster.mcp_server"],
+      "env": {
+        "CLAUDE_CODE_COMMAND": "npx -y @anthropic-ai/claude-code"
+      }
+    }
+  }
+}

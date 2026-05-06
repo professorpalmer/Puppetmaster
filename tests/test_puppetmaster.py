@@ -8,6 +8,7 @@ import sys
 from dataclasses import replace
 from tempfile import TemporaryDirectory
 from pathlib import Path
+from unittest.mock import patch
 
 from puppetmaster.adapters import (
     ClaudeCodeAdapter,
@@ -18,6 +19,7 @@ from puppetmaster.adapters import (
 from puppetmaster.config import load_config
 from puppetmaster.cli import cursor_prompt, main as cli_main
 from puppetmaster.diagnostics import adapter_status, run_doctor, starter_config
+from puppetmaster.mcp_server import call_tool, handle_message
 from puppetmaster.models import Artifact, ArtifactType, JobStatus, Task, TaskStatus, seconds_from_now
 from puppetmaster.orchestrator import Orchestrator
 from puppetmaster.sqlite_store import SQLiteSwarmStore
@@ -27,6 +29,33 @@ from puppetmaster.workers import WorkerSpec
 
 
 class PuppetmasterTests(unittest.TestCase):
+    def test_mcp_lists_puppetmaster_agent_tools(self) -> None:
+        response = handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        tool_names = {tool["name"] for tool in response["result"]["tools"]}
+
+        self.assertIn("puppetmaster_doctor", tool_names)
+        self.assertIn("puppetmaster_cursor_review", tool_names)
+        self.assertIn("puppetmaster_claude_implement", tool_names)
+
+    def test_mcp_tool_call_wraps_cli_result(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["python"],
+            returncode=0,
+            stdout="job_123\n",
+            stderr="",
+        )
+        with TemporaryDirectory() as tmp:
+            with patch("puppetmaster.mcp_server.subprocess.run", return_value=completed) as run:
+                result = call_tool(
+                    "puppetmaster_last_job",
+                    {"cwd": tmp, "state_dir": ".pm-test"},
+                )
+
+        called_args = run.call_args.args[0]
+        self.assertEqual(called_args[-1], "last")
+        self.assertIn("job_123", result["content"][0]["text"])
+        self.assertFalse(result["isError"])
+
     def test_run_creates_artifacts_summary_and_memory(self) -> None:
         with TemporaryDirectory() as tmp:
             store = SwarmStore(Path(tmp) / ".puppetmaster")
