@@ -20,6 +20,15 @@ Use `puppetmaster claude` when you intentionally want Claude Code to make real e
 
 `puppetmaster cursor` and `puppetmaster claude` default to `--worker-mode inline` for daily-driver speed. That skips an extra Puppetmaster Python worker subprocess while preserving job state, task leases, artifacts, stitching, and the provider's own process boundary. Pass `--worker-mode subprocess` when strict worker process isolation matters more than latency.
 
+For repeated local-role swarms, keep workers warm:
+
+```bash
+python -m puppetmaster daemon --roles explore architect implement redteam test
+python -m puppetmaster run "Review this repo" --worker-mode daemon
+```
+
+The daemon watches running jobs, claims ready tasks by lease, and keeps processing until stopped. Use `--max-idle-seconds` or `--max-tasks` for bounded test/dev runs.
+
 ## Operator Gates
 
 Puppetmaster records patch artifacts and approval events, but it does not auto-apply repository changes yet.

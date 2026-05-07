@@ -12,6 +12,7 @@ from puppetmaster.config import load_config
 from puppetmaster.diagnostics import adapter_status, run_doctor, starter_config
 from puppetmaster.orchestrator import Orchestrator
 from puppetmaster.store_factory import create_store
+from puppetmaster.worker_runtime import WorkerDaemon
 from puppetmaster.workers import WorkerSpec
 
 
@@ -60,9 +61,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--config", help="Path to a Puppetmaster JSON workflow config.")
     run.add_argument(
         "--worker-mode",
-        choices=["subprocess", "inline"],
+        choices=["subprocess", "inline", "daemon"],
         default="subprocess",
-        help="Use subprocess workers for maximum isolation or inline workers to reduce local orchestration overhead.",
+        help="Use subprocess workers, inline workers, or wait for warm daemon workers.",
     )
 
     subcommands.add_parser("jobs", help="List known jobs.")
@@ -128,6 +129,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Delete complete and failed jobs only.",
     )
 
+    daemon = subcommands.add_parser("daemon", help="Run warm workers that claim tasks from running jobs.")
+    daemon.add_argument(
+        "--roles",
+        nargs="+",
+        help="Optional task roles to claim. Defaults to any role.",
+    )
+    daemon.add_argument("--job-id", help="Optional job id to watch.")
+    daemon.add_argument("--worker-id", help="Stable worker id prefix for this daemon.")
+    daemon.add_argument("--lease-seconds", type=int, default=10)
+    daemon.add_argument("--poll-seconds", type=float, default=0.25)
+    daemon.add_argument(
+        "--max-tasks",
+        type=int,
+        help="Exit after processing this many tasks. Useful for tests and one-shot warm workers.",
+    )
+    daemon.add_argument(
+        "--max-idle-seconds",
+        type=float,
+        help="Exit after being idle this long. Omit to keep the daemon running.",
+    )
+
     cursor = subcommands.add_parser("cursor", help="Run a Cursor daily-driver one-shot worker.")
     cursor.add_argument("prompt", help="Prompt for the Cursor worker.")
     cursor.add_argument("--cwd", default=str(Path.cwd()), help="Workspace for the Cursor SDK agent.")
@@ -135,7 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
     cursor.add_argument("--timeout-seconds", type=int, default=600)
     cursor.add_argument(
         "--worker-mode",
-        choices=["subprocess", "inline"],
+        choices=["subprocess", "inline", "daemon"],
         default="inline",
         help="Cursor daily-driver runs default to inline orchestration to avoid an extra Python worker cold start.",
     )
@@ -170,7 +192,7 @@ def build_parser() -> argparse.ArgumentParser:
     claude.add_argument("--timeout-seconds", type=int, default=900)
     claude.add_argument(
         "--worker-mode",
-        choices=["subprocess", "inline"],
+        choices=["subprocess", "inline", "daemon"],
         default="inline",
         help="Claude daily-driver runs default to inline orchestration while Claude Code remains a separate process.",
     )
@@ -435,6 +457,18 @@ def _main(argv: Optional[list[str]] = None) -> int:
                 store.delete_job(job.id)
                 deleted += 1
         print(f"deleted: {deleted}")
+        return 0
+
+    if args.command == "daemon":
+        completed = WorkerDaemon(
+            store=store,
+            roles=args.roles,
+            worker_id=args.worker_id,
+            job_id=args.job_id,
+            lease_seconds=args.lease_seconds,
+            poll_seconds=args.poll_seconds,
+        ).run(max_tasks=args.max_tasks, max_idle_seconds=args.max_idle_seconds)
+        print(f"processed_tasks: {completed}")
         return 0
 
     return 1
