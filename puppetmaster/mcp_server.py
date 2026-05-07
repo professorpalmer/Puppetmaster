@@ -265,7 +265,7 @@ def start_cli(command: list[str], args: JsonObject) -> JsonObject:
     process = subprocess.Popen(
         full_command,
         cwd=cwd(args),
-        env=environment(args),
+        env=launcher_environment(args),
         stdout=stdout_handle,
         stderr=stderr_handle,
         text=True,
@@ -274,7 +274,7 @@ def start_cli(command: list[str], args: JsonObject) -> JsonObject:
     ASYNC_PROCESSES.append(process)
     stdout_handle.close()
     stderr_handle.close()
-    job_id = wait_for_job_id(stdout_path, process, timeout_seconds=5)
+    job_id = wait_for_job_id(stdout_path, stderr_path, process, timeout_seconds=5)
     body = {
         "run_id": run_id,
         "job_id": job_id,
@@ -292,7 +292,12 @@ def start_cli(command: list[str], args: JsonObject) -> JsonObject:
     return {"content": [{"type": "text", "text": json.dumps(body, indent=2)}], "isError": False}
 
 
-def wait_for_job_id(stdout_path: Path, process: subprocess.Popen, timeout_seconds: float) -> str:
+def wait_for_job_id(
+    stdout_path: Path,
+    stderr_path: Path,
+    process: subprocess.Popen,
+    timeout_seconds: float,
+) -> str:
     deadline = time.monotonic() + timeout_seconds
     pattern = re.compile(r"job_id:\s*(job_[A-Za-z0-9]+)")
     while time.monotonic() < deadline:
@@ -306,7 +311,22 @@ def wait_for_job_id(stdout_path: Path, process: subprocess.Popen, timeout_second
             if process.poll() is not None:
                 break
         time.sleep(0.05)
-    raise RuntimeError(f"started Puppetmaster process but did not receive early job_id; pid={process.pid}")
+    stderr = stderr_path.read_text(encoding="utf-8")[-1000:] if stderr_path.exists() else ""
+    raise RuntimeError(
+        f"started Puppetmaster process but did not receive early job_id; "
+        f"pid={process.pid}; returncode={process.poll()}; stderr={stderr}"
+    )
+
+
+def launcher_environment(args: JsonObject) -> dict[str, str]:
+    env = environment(args)
+    source_root = str(Path(__file__).resolve().parents[1])
+    env["PYTHONPATH"] = (
+        f"{source_root}{os.pathsep}{env['PYTHONPATH']}"
+        if env.get("PYTHONPATH")
+        else source_root
+    )
+    return env
 
 
 def environment(args: JsonObject) -> dict[str, str]:
