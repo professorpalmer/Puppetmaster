@@ -36,7 +36,16 @@ flowchart TD
 
 ## Backends
 
-The default backend is SQLite with WAL enabled. It stores jobs, tasks, runs, artifacts, memory, and events in `.puppetmaster/state.sqlite3`.
+The default backend is SQLite with WAL enabled. It stores jobs, tasks, runs, artifacts, memory, and events in the resolved Puppetmaster state directory.
+
+By default that directory is outside the target repository, under per-user app state:
+
+```text
+macOS: ~/Library/Application Support/puppetmaster/projects/<workspace>-<hash>/
+Linux: ~/.local/state/puppetmaster/projects/<workspace>-<hash>/
+```
+
+Use `python -m puppetmaster state` to print the resolved path. Use `--state-dir` or `PUPPETMASTER_STATE_DIR` when you intentionally want a different location, such as CI state or explicit repo-local `.puppetmaster/`.
 
 The file backend remains useful for debugging because every object is a readable JSON file.
 

@@ -27,7 +27,7 @@ class SQLiteSwarmStore(SwarmStore):
     backend_name = "sqlite"
     schema_version = 1
 
-    def __init__(self, root: Union[Path, str] = ".puppetmaster") -> None:
+    def __init__(self, root: Optional[Union[Path, str]] = None) -> None:
         super().__init__(root)
         self.db_path = self.root / "state.sqlite3"
 

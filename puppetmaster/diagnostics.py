@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 from puppetmaster.adapters import ADAPTER_INFO, AdapterInfo
+from puppetmaster.state import resolve_state_dir
 
 
 @dataclass(frozen=True)
@@ -21,7 +22,7 @@ class Check:
 
 
 def run_doctor(root: Path, state_dir: Optional[Path] = None) -> list[Check]:
-    state_path = state_dir or root / ".puppetmaster"
+    state_path = state_dir or resolve_state_dir(cwd=root)
     checks = [
         Check("python", "ok", sys.version.split()[0]),
         Check("sqlite", "ok", sqlite3.sqlite_version),

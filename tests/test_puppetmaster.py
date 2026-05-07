@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import subprocess
 import threading
 import time
@@ -26,6 +27,7 @@ from puppetmaster.mcp_server import ASYNC_PROCESSES, call_tool, handle_message
 from puppetmaster.models import Artifact, ArtifactType, JobStatus, Task, TaskStatus, seconds_from_now
 from puppetmaster.orchestrator import Orchestrator
 from puppetmaster.sqlite_store import SQLiteSwarmStore
+from puppetmaster.state import resolve_state_dir
 from puppetmaster.stitcher import Stitcher
 from puppetmaster.store import SwarmStore
 from puppetmaster.worker_runtime import WorkerDaemon
@@ -47,6 +49,22 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertIn("puppetmaster_status", tool_names)
         self.assertIn("puppetmaster_live_artifacts", tool_names)
         self.assertIn("puppetmaster_partial_summary", tool_names)
+
+    def test_default_state_dir_stays_outside_workspace(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            resolved = resolve_state_dir(cwd=workspace)
+
+            self.assertNotEqual(resolved, workspace / ".puppetmaster")
+            self.assertIn("puppetmaster", str(resolved))
+
+    def test_state_dir_env_override_can_be_workspace_relative(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            with patch.dict(os.environ, {"PUPPETMASTER_STATE_DIR": ".pm-env"}):
+                resolved = resolve_state_dir(cwd=workspace)
+
+            self.assertEqual(resolved, workspace / ".pm-env")
 
     def test_mcp_tool_call_wraps_cli_result(self) -> None:
         completed = subprocess.CompletedProcess(
@@ -195,15 +213,17 @@ class PuppetmasterTests(unittest.TestCase):
             stdout="[]\n",
             stderr="",
         )
-        with patch("puppetmaster.mcp_server.subprocess.run", return_value=completed) as run:
-            artifacts = call_tool(
-                "puppetmaster_live_artifacts",
-                {"job_id": "job_123", "limit": 2},
-            )
-            summary = call_tool(
-                "puppetmaster_partial_summary",
-                {"job_id": "job_123"},
-            )
+        with TemporaryDirectory() as tmp:
+            arguments = {"job_id": "job_123", "state_dir": str(Path(tmp) / ".pm-test")}
+            with patch("puppetmaster.mcp_server.subprocess.run", return_value=completed) as run:
+                artifacts = call_tool(
+                    "puppetmaster_live_artifacts",
+                    {**arguments, "limit": 2},
+                )
+                summary = call_tool(
+                    "puppetmaster_partial_summary",
+                    arguments,
+                )
 
         calls = [call.args[0] for call in run.call_args_list]
         self.assertIn("feed", calls[0])
@@ -735,7 +755,7 @@ print('{"result":"ok"}')
             store.init()
 
             status = store.schema_status()
-            checks = {check.name: check for check in run_doctor(root)}
+            checks = {check.name: check for check in run_doctor(root, root / ".puppetmaster")}
 
             self.assertEqual(status["schema_version"], "1")
             self.assertEqual(status["expected_schema_version"], "1")

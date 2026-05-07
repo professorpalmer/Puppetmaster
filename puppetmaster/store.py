@@ -24,6 +24,7 @@ from puppetmaster.models import (
     task_from_dict,
     to_jsonable,
 )
+from puppetmaster.state import resolve_state_dir
 
 
 class SwarmStore:
@@ -32,8 +33,8 @@ class SwarmStore:
     backend_name = "file"
     max_task_attempts = 3
 
-    def __init__(self, root: Union[Path, str] = ".puppetmaster") -> None:
-        self.root = Path(root)
+    def __init__(self, root: Optional[Union[Path, str]] = None) -> None:
+        self.root = resolve_state_dir(root)
         self.jobs_dir = self.root / "jobs"
         self.memory_dir = self.root / "memory"
         self.stream_dir = self.root / "streams"
