@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 from puppetmaster.adapters import (
     ClaudeCodeAdapter,
+    CursorAdapter,
     build_claude_code_command,
     classify_claude_code_failure,
     classify_cursor_failure,
@@ -561,6 +562,78 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertEqual(classify_cursor_failure("CURSOR_API_KEY is required"), "missing_api_key")
         self.assertEqual(classify_cursor_failure("model invalid"), "model_unavailable")
         self.assertEqual(classify_cursor_failure("operation timed out"), "timeout")
+
+    def test_cursor_adapter_parses_sdk_result_into_artifacts(self) -> None:
+        task = Task(
+            job_id="job",
+            role="pipeline-mapper",
+            instruction="inspect repo",
+            adapter="cursor",
+            payload={"prompt": "Inspect repo", "cwd": "."},
+        )
+        sdk_result = {
+            "status": "finished",
+            "result": json.dumps(
+                {
+                    "artifacts": [
+                        {
+                            "type": "finding",
+                            "claim": "Streaming filters probable starters before waiver competition.",
+                            "evidence": ["dugout/services/bot_transactions.py:123"],
+                            "confidence": 0.87,
+                        },
+                        {
+                            "type": "risk",
+                            "risk": "Bots may skip valid pitcher stream candidates.",
+                            "mitigation": "Add a regression test for probable starters outside the FA pool.",
+                            "evidence": ["tests/test_bot_waivers.py"],
+                            "confidence": 0.82,
+                        },
+                    ]
+                }
+            ),
+        }
+        completed = subprocess.CompletedProcess(
+            args=["node"],
+            returncode=0,
+            stdout=json.dumps(sdk_result),
+            stderr="",
+        )
+
+        with patch("puppetmaster.adapters.subprocess.run", return_value=completed) as run:
+            artifacts = CursorAdapter().run(task, "goal", "worker-cursor")
+
+        cursor_input = json.loads(run.call_args.kwargs["env"]["PUPPETMASTER_CURSOR_INPUT"])
+        artifact_types = [artifact.type for artifact in artifacts]
+        self.assertIn(ArtifactType.VERIFICATION, artifact_types)
+        self.assertIn(ArtifactType.FINDING, artifact_types)
+        self.assertIn(ArtifactType.RISK, artifact_types)
+        self.assertEqual(artifacts[0].payload["result"], "passed")
+        self.assertIn("Puppetmaster artifact contract", cursor_input["prompt"])
+
+    def test_cursor_adapter_degrades_empty_success(self) -> None:
+        task = Task(
+            job_id="job",
+            role="pipeline-mapper",
+            instruction="inspect repo",
+            adapter="cursor",
+            payload={"prompt": "Inspect repo", "cwd": "."},
+        )
+        completed = subprocess.CompletedProcess(
+            args=["node"],
+            returncode=0,
+            stdout=json.dumps({"status": "finished", "result": ""}),
+            stderr="",
+        )
+
+        with patch("puppetmaster.adapters.subprocess.run", return_value=completed):
+            artifacts = CursorAdapter().run(task, "goal", "worker-cursor")
+
+        self.assertEqual(artifacts[0].type, ArtifactType.VERIFICATION)
+        self.assertEqual(artifacts[0].payload["result"], "degraded")
+        self.assertEqual(artifacts[0].payload["failure"], "empty_or_unstructured_cursor_result")
+        self.assertEqual(artifacts[1].type, ArtifactType.RISK)
+        self.assertIn("without structured Puppetmaster findings", artifacts[1].payload["risk"])
 
     def test_claude_code_command_uses_full_edit_permission_mode(self) -> None:
         command = build_claude_code_command(

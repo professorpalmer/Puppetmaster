@@ -293,7 +293,8 @@ def write_generated_swarm_config(args: JsonObject, roles: list[str], adapter: st
             f"Role: {role}\n"
             f"Goal: {goal}\n\n"
             "Return structured findings with concrete file/function evidence. "
-            "Do not modify files unless the user explicitly requested implementation."
+            "Do not modify files unless the user explicitly requested implementation. "
+            "Return only Puppetmaster artifact JSON with an artifacts array."
         )
         payload: JsonObject = {"prompt": prompt, "cwd": cwd(args), "timeout_seconds": timeout_seconds}
         if adapter == "cursor":
