@@ -18,6 +18,8 @@ Use `--dry-run` for normal daily planning and review tasks. The Cursor adapter r
 
 Use `puppetmaster claude` when you intentionally want Claude Code to make real edits. It defaults to Claude Code `acceptEdits` permission mode and records tracked diffs as Puppetmaster patch artifacts.
 
+`puppetmaster cursor` and `puppetmaster claude` default to `--worker-mode inline` for daily-driver speed. That skips an extra Puppetmaster Python worker subprocess while preserving job state, task leases, artifacts, stitching, and the provider's own process boundary. Pass `--worker-mode subprocess` when strict worker process isolation matters more than latency.
+
 ## Operator Gates
 
 Puppetmaster records patch artifacts and approval events, but it does not auto-apply repository changes yet.

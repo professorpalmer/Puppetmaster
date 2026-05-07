@@ -10,6 +10,7 @@ from typing import Optional
 from puppetmaster.models import Artifact, Job, JobStatus, Task, TaskStatus
 from puppetmaster.stitcher import Stitcher
 from puppetmaster.store import SwarmStore
+from puppetmaster.worker_runtime import WorkerRuntime
 from puppetmaster.workers import WorkerSpec, specs_for_roles
 
 
@@ -32,13 +33,14 @@ class Orchestrator:
         roles: Optional[list[str]] = None,
         specs: Optional[list[WorkerSpec]] = None,
         lease_seconds: int = 5,
+        worker_mode: str = "subprocess",
     ) -> RunResult:
         job = self.store.create_job(goal)
         try:
             specs = self._with_retrieved_memory(specs or specs_for_roles(roles), goal)
             self.store.update_job_status(job.id, JobStatus.RUNNING)
             tasks = self._create_tasks(job, specs)
-            self._run_workers(job, tasks, lease_seconds=lease_seconds)
+            self._run_workers(job, tasks, lease_seconds=lease_seconds, worker_mode=worker_mode)
             artifacts = self.store.list_artifacts(job.id)
 
             self.store.update_job_status(job.id, JobStatus.STITCHING)
@@ -207,7 +209,19 @@ class Orchestrator:
         tasks: list[Task],
         lease_seconds: int = 5,
         allowed_task_ids: Optional[set[str]] = None,
+        worker_mode: str = "subprocess",
     ) -> None:
+        if worker_mode == "inline":
+            self._run_inline_workers(
+                job,
+                tasks,
+                lease_seconds=lease_seconds,
+                allowed_task_ids=allowed_task_ids,
+            )
+            return
+        if worker_mode != "subprocess":
+            raise ValueError(f"unsupported worker mode: {worker_mode}")
+
         allowed_task_ids = allowed_task_ids or {task.id for task in tasks}
         tasks = [
             task
@@ -271,8 +285,53 @@ class Orchestrator:
                     next_tasks,
                     lease_seconds=lease_seconds,
                     allowed_task_ids=allowed_task_ids,
+                    worker_mode=worker_mode,
                 )
             elif any(
+                task.status != TaskStatus.COMPLETE
+                for task in self.store.list_tasks(job.id)
+                if task.id in allowed_task_ids
+            ):
+                raise RuntimeError("swarm exited with incomplete tasks")
+
+    def _run_inline_workers(
+        self,
+        job: Job,
+        tasks: list[Task],
+        lease_seconds: int = 5,
+        allowed_task_ids: Optional[set[str]] = None,
+    ) -> None:
+        allowed_task_ids = allowed_task_ids or {task.id for task in tasks}
+        while True:
+            self.store.recover_stale_tasks(job.id)
+            self.store.refresh_blocked_tasks(job.id)
+            ready_tasks = [
+                task
+                for task in self.store.list_tasks(job.id)
+                if task.id in allowed_task_ids
+                and task.status in {TaskStatus.QUEUED, TaskStatus.RUNNING}
+            ]
+            if not ready_tasks:
+                incomplete = [
+                    task
+                    for task in self.store.list_tasks(job.id)
+                    if task.id in allowed_task_ids and task.status != TaskStatus.COMPLETE
+                ]
+                if incomplete:
+                    raise RuntimeError("swarm exited with incomplete tasks")
+                return
+
+            completed = 0
+            for role in sorted({task.role for task in ready_tasks}):
+                runtime = WorkerRuntime(
+                    store=self.store,
+                    job_id=job.id,
+                    role=role,
+                    worker_id=f"worker-{role}-inline",
+                    lease_seconds=lease_seconds,
+                )
+                completed += runtime.run_until_idle()
+            if completed == 0 and any(
                 task.status != TaskStatus.COMPLETE
                 for task in self.store.list_tasks(job.id)
                 if task.id in allowed_task_ids
