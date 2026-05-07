@@ -18,6 +18,7 @@ Puppetmaster exposes these MCP tools:
 - `puppetmaster_claude_implement`
 - `puppetmaster_start_claude_implement`
 - `puppetmaster_start_swarm`
+- `puppetmaster_start_cursor_swarm`
 - `puppetmaster_last_job`
 - `puppetmaster_status`
 - `puppetmaster_logs`
@@ -27,6 +28,8 @@ Puppetmaster exposes these MCP tools:
 Cursor's Agent can call those tools during a chat, so you can ask it to run a Puppetmaster review, plan, or Claude Code implementation from inside Cursor.
 
 For anything longer than a quick health check, prefer the `puppetmaster_start_*` tools. They return a `job_id` immediately and let Cursor poll `puppetmaster_status`, `puppetmaster_logs`, and `puppetmaster_show` instead of holding one long MCP request open.
+
+Use `puppetmaster_start_cursor_swarm` for real multi-role code analysis. It generates a temporary workflow config with each role backed by the Cursor SDK adapter. Bare custom roles on `puppetmaster_start_swarm` require an explicit config or adapter; otherwise Puppetmaster returns an error instead of silently running deterministic demo workers.
 
 ## How It Respects Independent Workers
 
@@ -97,6 +100,10 @@ Use Puppetmaster to run doctor in this repo and tell me what is missing.
 
 ```text
 Use Puppetmaster to start a Cursor review dry run for this repo. Return the job id immediately, then poll status and summarize the result when complete. Focus on release blockers.
+```
+
+```text
+Use Puppetmaster to start a Cursor swarm for this repo with roles pipeline-mapper, decision-explainer, conflict-auditor, and test-coverage-reviewer. Return the job id immediately, then poll status/logs and summarize concrete file-backed findings.
 ```
 
 ```text

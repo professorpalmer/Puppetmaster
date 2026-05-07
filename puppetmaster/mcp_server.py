@@ -124,6 +124,12 @@ def tools() -> list[McpTool]:
             handler=start_swarm,
         ),
         McpTool(
+            name="puppetmaster_start_cursor_swarm",
+            description="Start a multi-role Cursor SDK analysis swarm asynchronously and return job_id immediately.",
+            input_schema=cursor_swarm_schema(),
+            handler=start_cursor_swarm,
+        ),
+        McpTool(
             name="puppetmaster_last_job",
             description="Return the most recent Puppetmaster job id.",
             input_schema=base_schema(),
@@ -210,16 +216,85 @@ def claude_command(args: JsonObject) -> list[str]:
 def start_swarm(args: JsonObject) -> JsonObject:
     goal = require_string(args, "goal")
     command = ["run", goal]
-    roles = args.get("roles")
-    if isinstance(roles, list) and roles:
-        command.append("--workers")
-        command.extend(str(role) for role in roles)
+    roles = normalized_roles(args)
+    adapter = args.get("adapter")
     if args.get("config"):
         command.extend(["--config", str(args["config"])])
+    elif adapter:
+        config_path = write_generated_swarm_config(args, roles or ["explore"], str(adapter))
+        command.extend(["--config", str(config_path)])
+    elif roles:
+        if not args.get("allow_local_demo"):
+            return tool_error(
+                "Custom-role MCP swarms require a workflow config or adapter. "
+                "Otherwise Puppetmaster would use the demo local adapter and return generic artifacts.",
+                {
+                    "roles": roles,
+                    "fix": "Use puppetmaster_start_cursor_swarm, pass adapter='cursor', pass config, or set allow_local_demo=true for tests/demos.",
+                },
+            )
+        command.append("--workers")
+        command.extend(roles)
     worker_mode = args.get("worker_mode")
     if worker_mode:
         command.extend(["--worker-mode", str(worker_mode)])
     return start_cli(command, args)
+
+
+def start_cursor_swarm(args: JsonObject) -> JsonObject:
+    roles = normalized_roles(args) or [
+        "pipeline-mapper",
+        "decision-explainer",
+        "conflict-auditor",
+        "test-coverage-reviewer",
+    ]
+    config_path = write_generated_swarm_config(args, roles, "cursor")
+    command = ["run", require_string(args, "goal"), "--config", str(config_path)]
+    worker_mode = args.get("worker_mode")
+    if worker_mode:
+        command.extend(["--worker-mode", str(worker_mode)])
+    return start_cli(command, args)
+
+
+def normalized_roles(args: JsonObject) -> list[str]:
+    roles = args.get("roles")
+    if not isinstance(roles, list):
+        return []
+    return [str(role) for role in roles if str(role).strip()]
+
+
+def write_generated_swarm_config(args: JsonObject, roles: list[str], adapter: str) -> Path:
+    if adapter not in {"cursor", "local"}:
+        raise ValueError(f"MCP swarm adapter is not supported yet: {adapter}")
+    state_dir = Path(str(args.get("state_dir") or ".puppetmaster"))
+    root = state_dir if state_dir.is_absolute() else Path(cwd(args)) / state_dir
+    config_dir = root / "mcp-configs"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config_path = config_dir / f"swarm_{int(time.time() * 1000)}_{os.getpid()}.json"
+    goal = require_string(args, "goal")
+    timeout_seconds = int(args.get("timeout_seconds") or 900)
+    model = str(args.get("model") or "default")
+    workers = []
+    for role in roles:
+        prompt = (
+            f"Role: {role}\n"
+            f"Goal: {goal}\n\n"
+            "Return structured findings with concrete file/function evidence. "
+            "Do not modify files unless the user explicitly requested implementation."
+        )
+        payload: JsonObject = {"prompt": prompt, "cwd": cwd(args), "timeout_seconds": timeout_seconds}
+        if adapter == "cursor":
+            payload["model"] = model
+        workers.append(
+            {
+                "role": role,
+                "instruction": prompt,
+                "adapter": adapter,
+                "payload": payload,
+            }
+        )
+    config_path.write_text(json.dumps({"lease_seconds": 10, "workers": workers}, indent=2), encoding="utf-8")
+    return config_path
 
 
 def run_cli(command: list[str], args: JsonObject) -> JsonObject:
@@ -415,6 +490,16 @@ def swarm_schema() -> JsonObject:
                 "description": "Optional local worker roles to run.",
             },
             "config": {"type": "string", "description": "Optional workflow config path."},
+            "adapter": {
+                "type": "string",
+                "enum": ["cursor", "local"],
+                "description": "Adapter to use for generated role configs. Required for custom roles unless config or allow_local_demo is set.",
+            },
+            "allow_local_demo": {
+                "type": "boolean",
+                "default": False,
+                "description": "Allow custom roles to use the deterministic local demo adapter.",
+            },
             "worker_mode": {
                 "type": "string",
                 "enum": ["subprocess", "inline", "daemon"],
@@ -423,6 +508,14 @@ def swarm_schema() -> JsonObject:
             },
         }
     )
+    return schema
+
+
+def cursor_swarm_schema() -> JsonObject:
+    schema = swarm_schema()
+    schema["properties"].pop("adapter", None)
+    schema["properties"].pop("allow_local_demo", None)
+    schema["properties"]["worker_mode"]["default"] = "subprocess"
     return schema
 
 
@@ -459,6 +552,13 @@ def tool_to_json(tool: McpTool) -> JsonObject:
         "description": tool.description,
         "inputSchema": tool.input_schema,
     }
+
+
+def tool_error(message: str, payload: Optional[JsonObject] = None) -> JsonObject:
+    body: JsonObject = {"error": message}
+    if payload:
+        body.update(payload)
+    return {"content": [{"type": "text", "text": json.dumps(body, indent=2)}], "isError": True}
 
 
 def error_response(request_id: Any, code: int, message: str) -> JsonObject:

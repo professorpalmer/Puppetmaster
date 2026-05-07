@@ -43,6 +43,7 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertIn("puppetmaster_claude_implement", tool_names)
         self.assertIn("puppetmaster_start_claude_implement", tool_names)
         self.assertIn("puppetmaster_start_swarm", tool_names)
+        self.assertIn("puppetmaster_start_cursor_swarm", tool_names)
         self.assertIn("puppetmaster_status", tool_names)
 
     def test_mcp_tool_call_wraps_cli_result(self) -> None:
@@ -74,6 +75,7 @@ class PuppetmasterTests(unittest.TestCase):
                     "state_dir": ".pm-test",
                     "goal": "async mcp smoke",
                     "roles": ["explore"],
+                    "allow_local_demo": True,
                     "worker_mode": "inline",
                 },
             )
@@ -101,6 +103,57 @@ class PuppetmasterTests(unittest.TestCase):
 
             self.assertEqual(status_payload["job"]["status"], "complete")
             self.assertEqual(status_payload["artifact_count"], 2)
+
+    def test_mcp_custom_roles_fail_without_real_adapter_or_config(self) -> None:
+        with TemporaryDirectory() as tmp:
+            result = call_tool(
+                "puppetmaster_start_swarm",
+                {
+                    "cwd": tmp,
+                    "state_dir": ".pm-test",
+                    "goal": "must not silently use demo workers",
+                    "roles": ["pipeline-mapper", "decision-explainer"],
+                },
+            )
+            payload = json.loads(result["content"][0]["text"])
+
+            self.assertTrue(result["isError"])
+            self.assertIn("demo local adapter", payload["error"])
+            self.assertIn("puppetmaster_start_cursor_swarm", payload["fix"])
+
+    def test_mcp_adapter_generates_config_for_custom_roles(self) -> None:
+        with TemporaryDirectory() as tmp:
+            before_process_count = len(ASYNC_PROCESSES)
+            result = call_tool(
+                "puppetmaster_start_swarm",
+                {
+                    "cwd": tmp,
+                    "state_dir": ".pm-test",
+                    "goal": "explicit adapter mcp smoke",
+                    "roles": ["pipeline-mapper"],
+                    "adapter": "local",
+                    "worker_mode": "inline",
+                },
+            )
+            payload = json.loads(result["content"][0]["text"])
+            spawned = ASYNC_PROCESSES[before_process_count:]
+            for process in spawned:
+                process.wait(timeout=15)
+
+            status = call_tool(
+                "puppetmaster_status",
+                {
+                    "cwd": tmp,
+                    "state_dir": ".pm-test",
+                    "job_id": payload["job_id"],
+                },
+            )
+            status_body = json.loads(status["content"][0]["text"])
+            status_payload = json.loads(status_body["stdout"])
+
+            self.assertFalse(result["isError"])
+            self.assertEqual(status_payload["job"]["status"], "complete")
+            self.assertEqual(status_payload["tasks"][0]["adapter"], "local")
 
     def test_run_creates_artifacts_summary_and_memory(self) -> None:
         with TemporaryDirectory() as tmp:
