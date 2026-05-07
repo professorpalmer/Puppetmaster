@@ -155,6 +155,8 @@ python -m puppetmaster show $(python -m puppetmaster last)
 python -m puppetmaster logs
 ```
 
+`cursor` and `claude` use inline orchestration by default to avoid an extra Python worker cold start. The provider still runs in its own process (`node` for Cursor SDK, Claude Code CLI for Claude), while Puppetmaster keeps the same job/task/artifact/lease state model. Use `--worker-mode subprocess` when you want the stricter worker-process boundary for a run.
+
 For real edits, prefer a clean worktree:
 
 ```bash

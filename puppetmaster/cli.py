@@ -58,6 +58,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Worker roles to run. Defaults to explore architect implement redteam test.",
     )
     run.add_argument("--config", help="Path to a Puppetmaster JSON workflow config.")
+    run.add_argument(
+        "--worker-mode",
+        choices=["subprocess", "inline"],
+        default="subprocess",
+        help="Use subprocess workers for maximum isolation or inline workers to reduce local orchestration overhead.",
+    )
 
     subcommands.add_parser("jobs", help="List known jobs.")
     subcommands.add_parser("last", help="Print the most recent job id.")
@@ -128,6 +134,12 @@ def build_parser() -> argparse.ArgumentParser:
     cursor.add_argument("--model", default="default")
     cursor.add_argument("--timeout-seconds", type=int, default=600)
     cursor.add_argument(
+        "--worker-mode",
+        choices=["subprocess", "inline"],
+        default="inline",
+        help="Cursor daily-driver runs default to inline orchestration to avoid an extra Python worker cold start.",
+    )
+    cursor.add_argument(
         "--dry-run",
         action="store_true",
         help="Instruct the agent to inspect and propose artifacts without editing files.",
@@ -156,6 +168,12 @@ def build_parser() -> argparse.ArgumentParser:
     claude.add_argument("--disallowed-tools", help="Comma-separated Claude Code disallowed tools.")
     claude.add_argument("--executable", help="Claude Code executable or command.")
     claude.add_argument("--timeout-seconds", type=int, default=900)
+    claude.add_argument(
+        "--worker-mode",
+        choices=["subprocess", "inline"],
+        default="inline",
+        help="Claude daily-driver runs default to inline orchestration while Claude Code remains a separate process.",
+    )
     claude.add_argument(
         "--allow-dirty",
         action="store_true",
@@ -224,9 +242,14 @@ def _main(argv: Optional[list[str]] = None) -> int:
                 args.goal,
                 specs=config.workers,
                 lease_seconds=config.lease_seconds,
+                worker_mode=args.worker_mode,
             )
         else:
-            result = Orchestrator(store).run(args.goal, roles=args.workers)
+            result = Orchestrator(store).run(
+                args.goal,
+                roles=args.workers,
+                worker_mode=args.worker_mode,
+            )
         print_run_result(result.job.id, len(result.artifacts), result.summary_path)
         return 0
 
@@ -248,6 +271,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
                 )
             ],
             lease_seconds=10,
+            worker_mode=args.worker_mode,
         )
         print_run_result(result.job.id, len(result.artifacts), result.summary_path)
         return 0
@@ -274,6 +298,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
                 )
             ],
             lease_seconds=10,
+            worker_mode=args.worker_mode,
         )
         print_run_result(result.job.id, len(result.artifacts), result.summary_path)
         return 0

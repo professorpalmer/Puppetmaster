@@ -189,6 +189,21 @@ class PuppetmasterTests(unittest.TestCase):
                 )
             )
 
+    def test_inline_worker_mode_avoids_subprocess_cold_start(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            result = Orchestrator(store).run(
+                "prove fast inline orchestration",
+                roles=["explore"],
+                worker_mode="inline",
+            )
+
+            artifacts = store.list_artifacts(result.job.id)
+
+            self.assertTrue(artifacts)
+            self.assertTrue(all(artifact.created_by == "worker-explore-inline" for artifact in artifacts))
+            self.assertEqual(store.latest_job().status, JobStatus.COMPLETE)
+
     def test_crash_recovery_demo_reclaims_abandoned_task(self) -> None:
         with TemporaryDirectory() as tmp:
             store = SwarmStore(Path(tmp) / ".puppetmaster")
