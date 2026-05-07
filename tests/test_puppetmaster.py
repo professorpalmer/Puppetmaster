@@ -22,7 +22,7 @@ from puppetmaster.adapters import (
 from puppetmaster.config import load_config
 from puppetmaster.cli import cursor_prompt, main as cli_main
 from puppetmaster.diagnostics import adapter_status, run_doctor, starter_config
-from puppetmaster.mcp_server import call_tool, handle_message
+from puppetmaster.mcp_server import ASYNC_PROCESSES, call_tool, handle_message
 from puppetmaster.models import Artifact, ArtifactType, JobStatus, Task, TaskStatus, seconds_from_now
 from puppetmaster.orchestrator import Orchestrator
 from puppetmaster.sqlite_store import SQLiteSwarmStore
@@ -66,6 +66,7 @@ class PuppetmasterTests(unittest.TestCase):
 
     def test_mcp_start_tool_returns_job_id_without_waiting_for_completion(self) -> None:
         with TemporaryDirectory() as tmp:
+            before_process_count = len(ASYNC_PROCESSES)
             result = call_tool(
                 "puppetmaster_start_swarm",
                 {
@@ -82,21 +83,34 @@ class PuppetmasterTests(unittest.TestCase):
             self.assertIn("pid", payload)
             self.assertFalse(result["isError"])
 
-            deadline = time.monotonic() + 5
-            status_payload = None
-            while time.monotonic() < deadline:
-                status = call_tool(
-                    "puppetmaster_status",
-                    {
-                        "cwd": tmp,
-                        "state_dir": ".pm-test",
-                        "job_id": payload["job_id"],
-                    },
-                )
-                status_payload = json.loads(json.loads(status["content"][0]["text"])["stdout"])
-                if status_payload["job"]["status"] == "complete":
-                    break
-                time.sleep(0.05)
+            spawned = ASYNC_PROCESSES[before_process_count:]
+            try:
+                deadline = time.monotonic() + 5
+                status_payload = None
+                while time.monotonic() < deadline:
+                    status = call_tool(
+                        "puppetmaster_status",
+                        {
+                            "cwd": tmp,
+                            "state_dir": ".pm-test",
+                            "job_id": payload["job_id"],
+                        },
+                    )
+                    status_body = json.loads(status["content"][0]["text"])
+                    if status["isError"] or not status_body.get("stdout"):
+                        time.sleep(0.05)
+                        continue
+                    try:
+                        status_payload = json.loads(status_body["stdout"])
+                    except json.JSONDecodeError:
+                        time.sleep(0.05)
+                        continue
+                    if status_payload["job"]["status"] == "complete":
+                        break
+                    time.sleep(0.05)
+            finally:
+                for process in spawned:
+                    process.wait(timeout=5)
 
             self.assertEqual(status_payload["job"]["status"], "complete")
             self.assertEqual(status_payload["artifact_count"], 2)
