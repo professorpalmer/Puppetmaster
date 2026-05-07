@@ -183,6 +183,7 @@ The MCP server lets Cursor Agent call Puppetmaster tools directly:
 
 - `puppetmaster_doctor`
 - `puppetmaster_start_swarm`
+- `puppetmaster_start_cursor_swarm`
 - `puppetmaster_start_cursor_review`
 - `puppetmaster_start_cursor_plan`
 - `puppetmaster_start_claude_implement`
@@ -192,6 +193,8 @@ The MCP server lets Cursor Agent call Puppetmaster tools directly:
 - `puppetmaster_show`
 
 The older blocking tools are still available for short calls, but the daily-driver path should use `puppetmaster_start_*`. Start tools return a `job_id` immediately, so Cursor does not keep one long MCP call open while workers run.
+
+For real multi-role code analysis from Cursor Agent, use `puppetmaster_start_cursor_swarm`. Bare custom roles on `puppetmaster_start_swarm` require a config or adapter; otherwise Puppetmaster fails fast instead of silently using the deterministic local demo adapter.
 
 Blocking tools:
 
