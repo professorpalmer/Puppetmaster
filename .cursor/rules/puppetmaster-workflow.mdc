@@ -1,0 +1,23 @@
+---
+description: Use Puppetmaster Cursor Swarm for broad repo investigation and controlled implementation handoffs
+alwaysApply: true
+---
+
+# Puppetmaster Workflow
+
+Use Puppetmaster Cursor Swarm for broad repo investigation, messy debugging, audit/remediation planning, multi-file risk analysis, or any request that benefits from parallel findings and durable artifacts.
+
+For real code analysis, prefer `puppetmaster_start_cursor_swarm`. Do not use the local/demo swarm unless the user explicitly asks for a demo or passes an explicit adapter/config.
+
+After starting a Puppetmaster swarm:
+
+1. Return the `job_id` immediately.
+2. Poll `puppetmaster_status`, `puppetmaster_logs`, `puppetmaster_live_artifacts`, and `puppetmaster_partial_summary`.
+3. Summarize concrete file-backed findings, risks, and open questions.
+4. Ask for approval before implementation unless the user already approved edits.
+
+If the swarm completes with empty findings, only verification artifacts, or a degraded Cursor SDK artifact, report Puppetmaster as degraded and do not treat the run as a successful analysis.
+
+Use Cursor's normal Build flow for small approved implementation slices. Use Puppetmaster/Claude implementation when the user wants durable patch artifacts, logs, and stricter auditability.
+
+Keep implementation scoped to one approved slice at a time, then use Puppetmaster again to verify or redteam the result before moving to the next slice.

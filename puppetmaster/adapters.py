@@ -8,7 +8,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Protocol, Union
+from typing import Any, Optional, Protocol, Union
 
 from puppetmaster.models import Artifact, ArtifactType, Task
 
@@ -227,7 +227,10 @@ class CursorAdapter:
     name = "cursor"
 
     def run(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
-        prompt = self._prompt_with_memory(task.payload.get("prompt") or task.instruction, task)
+        prompt = self._prompt_with_memory(
+            self._structured_prompt(task.payload.get("prompt") or task.instruction),
+            task,
+        )
         cwd = task.payload.get("cwd")
         model = task.payload.get("model", "default")
         runner = Path(__file__).with_name("cursor_sdk_runner.mjs")
@@ -267,24 +270,65 @@ class CursorAdapter:
                 )
             ]
         failure = classify_cursor_failure(completed.stderr + completed.stdout)
-        return [
+        status, result_text = cursor_result_text(completed.stdout)
+        parsed_artifacts = (
+            cursor_result_artifacts(task, worker_id, result_text)
+            if completed.returncode == 0
+            else []
+        )
+        degraded = completed.returncode == 0 and not parsed_artifacts
+        artifacts = [
             verification_artifact(
                 task=task,
                 worker_id=worker_id,
                 adapter="cursor",
                 check=task.instruction,
-                result="passed" if completed.returncode == 0 else "failed",
-                confidence=0.9 if completed.returncode == 0 else 0.55,
+                result=(
+                    "degraded"
+                    if degraded
+                    else "passed"
+                    if completed.returncode == 0
+                    else "failed"
+                ),
+                confidence=0.65 if degraded else 0.9 if completed.returncode == 0 else 0.55,
                 evidence=["adapter:cursor-sdk", f"node:{sys.platform}"],
                 payload={
                     "returncode": completed.returncode,
                     "stdout": completed.stdout[-8000:],
                     "stderr": completed.stderr[-8000:],
                     "model": model,
-                    "failure": failure if completed.returncode != 0 else None,
+                    "cursor_status": status,
+                    "failure": (
+                        "empty_or_unstructured_cursor_result"
+                        if degraded
+                        else failure
+                        if completed.returncode != 0
+                        else None
+                    ),
                 },
             )
         ]
+        if degraded:
+            artifacts.append(cursor_degraded_artifact(task, worker_id, result_text))
+        artifacts.extend(parsed_artifacts)
+        return artifacts
+
+    @staticmethod
+    def _structured_prompt(prompt: str) -> str:
+        return "\n".join(
+            [
+                prompt,
+                "",
+                "Puppetmaster artifact contract:",
+                "Return only JSON, with no markdown wrapper, in this shape:",
+                '{"artifacts":[{"type":"finding","claim":"...","evidence":["path or symbol"],"confidence":0.8}]}',
+                "Allowed artifact types:",
+                '- finding: requires "claim", "evidence", "confidence".',
+                '- risk: requires "risk", "mitigation", "evidence", "confidence".',
+                '- decision: requires "decision", "why", "evidence", "confidence".',
+                "Use concrete file/function evidence. If there are no concrete findings, return a risk artifact explaining why the run is degraded.",
+            ]
+        )
 
     @staticmethod
     def _prompt_with_memory(prompt: str, task: Task) -> str:
@@ -596,6 +640,163 @@ def git_untracked_files(cwd: Path) -> list[str]:
         if line.startswith("?? "):
             files.append(line[3:])
     return files
+
+
+def cursor_result_text(stdout: str) -> tuple[Optional[str], str]:
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None, stdout.strip()
+    if not isinstance(payload, dict):
+        return None, stdout.strip()
+    if "result" not in payload and (
+        "artifacts" in payload or "findings" in payload or "risks" in payload or "decisions" in payload
+    ):
+        return None, stdout.strip()
+    result = payload.get("result")
+    return (
+        str(payload.get("status")) if payload.get("status") is not None else None,
+        str(result).strip() if result is not None else "",
+    )
+
+
+def cursor_result_artifacts(task: Task, worker_id: str, result_text: str) -> list[Artifact]:
+    payload = parse_cursor_artifact_payload(result_text)
+    if payload is None:
+        return []
+
+    raw_artifacts = []
+    if isinstance(payload, list):
+        raw_artifacts = payload
+    elif isinstance(payload, dict):
+        if isinstance(payload.get("artifacts"), list):
+            raw_artifacts = payload["artifacts"]
+        else:
+            raw_artifacts.extend(_typed_items(payload, "findings", "finding"))
+            raw_artifacts.extend(_typed_items(payload, "risks", "risk"))
+            raw_artifacts.extend(_typed_items(payload, "decisions", "decision"))
+
+    artifacts = []
+    for item in raw_artifacts:
+        artifact = cursor_artifact_from_item(task, worker_id, item)
+        if artifact is not None:
+            artifacts.append(artifact)
+    return artifacts
+
+
+def parse_cursor_artifact_payload(result_text: str) -> Optional[Any]:
+    text = result_text.strip()
+    if not text:
+        return None
+    for candidate in [text, _strip_json_fence(text), _json_object_slice(text)]:
+        if not candidate:
+            continue
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def cursor_artifact_from_item(task: Task, worker_id: str, item: object) -> Optional[Artifact]:
+    if not isinstance(item, dict):
+        return None
+    artifact_type = str(item.get("type") or "").lower().strip()
+    if artifact_type in {"findings", "swarm.finding"}:
+        artifact_type = "finding"
+    if artifact_type not in {"finding", "risk", "decision"}:
+        return None
+
+    evidence = _string_list(item.get("evidence")) or ["adapter:cursor-sdk"]
+    confidence = _confidence(item.get("confidence"))
+    payload = {key: value for key, value in item.items() if key not in {"type", "evidence", "confidence"}}
+
+    if artifact_type == "finding":
+        claim = payload.get("claim") or payload.get("finding") or payload.get("summary")
+        if not claim:
+            return None
+        payload["claim"] = str(claim)
+        kind = ArtifactType.FINDING
+    elif artifact_type == "risk":
+        risk = payload.get("risk") or payload.get("claim") or payload.get("summary")
+        if not risk:
+            return None
+        payload["risk"] = str(risk)
+        payload["mitigation"] = str(payload.get("mitigation") or "Review and verify before implementation.")
+        kind = ArtifactType.RISK
+    else:
+        decision = payload.get("decision") or payload.get("claim") or payload.get("summary")
+        if not decision:
+            return None
+        payload["decision"] = str(decision)
+        payload["why"] = str(payload.get("why") or "Recommended by Cursor SDK analysis.")
+        kind = ArtifactType.DECISION
+
+    return Artifact(
+        job_id=task.job_id,
+        task_id=task.id,
+        type=kind,
+        created_by=worker_id,
+        confidence=confidence,
+        evidence=evidence,
+        payload=payload,
+    )
+
+
+def cursor_degraded_artifact(task: Task, worker_id: str, result_text: str) -> Artifact:
+    return Artifact(
+        job_id=task.job_id,
+        task_id=task.id,
+        type=ArtifactType.RISK,
+        created_by=worker_id,
+        confidence=0.85,
+        evidence=["adapter:cursor-sdk", "cursor-result:empty-or-unstructured"],
+        payload={
+            "risk": "Cursor SDK completed without structured Puppetmaster findings.",
+            "mitigation": "Treat this swarm as degraded; rerun with a stricter prompt or inspect the repo directly before implementation.",
+            "stdout_excerpt": result_text[:1000],
+        },
+    )
+
+
+def _typed_items(payload: dict[str, Any], key: str, artifact_type: str) -> list[dict[str, Any]]:
+    items = payload.get(key)
+    if not isinstance(items, list):
+        return []
+    return [{**item, "type": item.get("type", artifact_type)} for item in items if isinstance(item, dict)]
+
+
+def _strip_json_fence(text: str) -> Optional[str]:
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return None
+    lines = stripped.splitlines()
+    if len(lines) < 3:
+        return None
+    return "\n".join(lines[1:-1]).strip()
+
+
+def _json_object_slice(text: str) -> Optional[str]:
+    starts = [index for index in [text.find("{"), text.find("[")] if index >= 0]
+    if not starts:
+        return None
+    start = min(starts)
+    end = max(text.rfind("}"), text.rfind("]"))
+    return text[start : end + 1] if end > start else None
+
+
+def _string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if str(item).strip()]
+
+
+def _confidence(value: object) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.75
+    return min(1.0, max(0.0, parsed))
 
 
 ADAPTERS: dict[str, WorkerAdapter] = {
