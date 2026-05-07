@@ -189,12 +189,16 @@ The MCP server lets Cursor Agent call Puppetmaster tools directly:
 - `puppetmaster_start_claude_implement`
 - `puppetmaster_status`
 - `puppetmaster_logs`
+- `puppetmaster_live_artifacts`
+- `puppetmaster_partial_summary`
 - `puppetmaster_artifacts`
 - `puppetmaster_show`
 
 The older blocking tools are still available for short calls, but the daily-driver path should use `puppetmaster_start_*`. Start tools return a `job_id` immediately, so Cursor does not keep one long MCP call open while workers run.
 
 For real multi-role code analysis from Cursor Agent, use `puppetmaster_start_cursor_swarm`. Bare custom roles on `puppetmaster_start_swarm` require a config or adapter; otherwise Puppetmaster fails fast instead of silently using the deterministic local demo adapter.
+
+Workers emit artifacts as they run. You do not have to wait for the final stitched summary: use `puppetmaster_live_artifacts` for the live evidence board and `puppetmaster_partial_summary` for a current synthesis. Final stitching is the publishable report built from the same artifact stream.
 
 Blocking tools:
 
@@ -310,6 +314,7 @@ python -m puppetmaster crash-demo
 python -m puppetmaster status <job_id>
 python -m puppetmaster watch <job_id>
 python -m puppetmaster events <job_id>
+python -m puppetmaster feed [job_id]
 python -m puppetmaster artifacts <job_id>
 python -m puppetmaster logs [job_id]
 python -m puppetmaster open [job_id]

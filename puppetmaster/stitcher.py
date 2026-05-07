@@ -21,9 +21,16 @@ class Stitcher:
         for memory in memories:
             self.store.promote_memory(memory)
 
-        summary = self._render_summary(job.goal, artifacts, memories)
+        summary = self._render_summary("Puppetmaster Stitched Summary", job.goal, artifacts, memories)
         self.store.write_summary(job_id, "stitched.md", summary)
         return summary
+
+    def preview(self, job_id: str) -> str:
+        """Render a live summary from current artifacts without promoting memory."""
+        job = self.store.get_job(job_id)
+        artifacts = self.store.list_artifacts(job_id)
+        memories = self._promote_memories(artifacts)
+        return self._render_summary("Puppetmaster Live Summary", job.goal, artifacts, memories)
 
     def _promote_memories(self, artifacts: list[Artifact]) -> list[MemoryRecord]:
         promoted: list[MemoryRecord] = []
@@ -46,6 +53,7 @@ class Stitcher:
 
     def _render_summary(
         self,
+        title: str,
         goal: str,
         artifacts: list[Artifact],
         memories: list[MemoryRecord],
@@ -54,7 +62,7 @@ class Stitcher:
         counts = Counter(str(artifact.type) for artifact in artifacts)
 
         lines = [
-            "# Puppetmaster Stitched Summary",
+            f"# {title}",
             "",
             f"Goal: {goal}",
             "",

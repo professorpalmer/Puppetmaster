@@ -12,6 +12,7 @@ from puppetmaster.config import load_config
 from puppetmaster.diagnostics import adapter_status, run_doctor, starter_config
 from puppetmaster.orchestrator import Orchestrator
 from puppetmaster.store_factory import create_store
+from puppetmaster.stitcher import Stitcher
 from puppetmaster.worker_runtime import WorkerDaemon
 from puppetmaster.workers import WorkerSpec
 
@@ -91,6 +92,11 @@ def build_parser() -> argparse.ArgumentParser:
     logs = subcommands.add_parser("logs", help="Print event logs for a job, defaulting to the latest.")
     logs.add_argument("job_id", nargs="?")
 
+    feed = subcommands.add_parser("feed", help="Print live artifact feed for a job, defaulting to latest.")
+    feed.add_argument("job_id", nargs="?")
+    feed.add_argument("--limit", type=int, help="Limit feed to the most recent N artifacts.")
+    feed.add_argument("--json", action="store_true", help="Print feed as JSON.")
+
     open_cmd = subcommands.add_parser("open", help="Open or print a local job artifact path.")
     open_cmd.add_argument("job_id", nargs="?")
     open_cmd.add_argument(
@@ -100,8 +106,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Which path to open.",
     )
 
-    show = subcommands.add_parser("show", help="Show the stitched summary for a job.")
+    show = subcommands.add_parser("show", help="Show the stitched or live summary for a job.")
     show.add_argument("job_id")
+    show.add_argument(
+        "--partial",
+        action="store_true",
+        help="Render a live summary from current artifacts without waiting for final stitching.",
+    )
 
     artifacts = subcommands.add_parser("artifacts", help="Print artifacts for a job as JSON.")
     artifacts.add_argument("job_id")
@@ -394,6 +405,21 @@ def _main(argv: Optional[list[str]] = None) -> int:
             print(f"{event['at']}\t{event['event']}\t{json.dumps(event['payload'], sort_keys=True)}")
         return 0
 
+    if args.command == "feed":
+        job_id = args.job_id or require_latest_job_id(store)
+        feed = artifact_feed(store, job_id, limit=args.limit)
+        if args.json:
+            print(json.dumps(feed, indent=2, default=str))
+        else:
+            for item in feed:
+                artifact = item["artifact"]
+                print(
+                    f"{item['at']}\t{artifact['type']}\t{artifact['id']}\t"
+                    f"task={artifact['task_id']}\tconfidence={artifact['confidence']}"
+                )
+                print(f"  {artifact_headline(artifact)}")
+        return 0
+
     if args.command == "open":
         job_id = args.job_id or require_latest_job_id(store)
         path = (
@@ -407,8 +433,11 @@ def _main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     if args.command == "show":
-        path = store.job_dir(args.job_id) / "summaries" / "stitched.md"
-        print(path.read_text(encoding="utf-8"))
+        if args.partial:
+            print(Stitcher(store).preview(args.job_id))
+        else:
+            path = store.job_dir(args.job_id) / "summaries" / "stitched.md"
+            print(path.read_text(encoding="utf-8"))
         return 0
 
     if args.command == "artifacts":
@@ -488,6 +517,34 @@ def print_run_result(job_id: str, artifact_count: int, summary_path: Path) -> No
     print(f"job_id: {job_id}")
     print(f"artifacts: {artifact_count}")
     print(f"summary: {summary_path}")
+
+
+def artifact_feed(store, job_id: str, limit: Optional[int] = None) -> list[dict]:
+    artifacts = {artifact.id: artifact.__dict__ for artifact in store.list_artifacts(job_id)}
+    items = []
+    seen = set()
+    for event in store.read_events(job_id):
+        if event.get("event") != "artifact.saved":
+            continue
+        artifact_id = event.get("payload", {}).get("artifact_id")
+        artifact = artifacts.get(artifact_id)
+        if artifact is None or artifact_id in seen:
+            continue
+        seen.add(artifact_id)
+        items.append({"at": event["at"], "event": event["event"], "artifact": artifact})
+    if limit is not None:
+        return items[-limit:]
+    return items
+
+
+def artifact_headline(artifact: dict) -> str:
+    payload = artifact.get("payload", {})
+    if not isinstance(payload, dict):
+        return str(payload)
+    for key in ["claim", "decision", "risk", "check", "change"]:
+        if key in payload:
+            return str(payload[key])
+    return json.dumps(payload, sort_keys=True)
 
 
 def early_job_printer(job) -> None:
