@@ -227,7 +227,7 @@ def run_cli(command: list[str], args: JsonObject) -> JsonObject:
     process = subprocess.run(
         [sys.executable, "-m", "puppetmaster", "--state-dir", state_dir] + command,
         cwd=cwd(args),
-        env=environment(args),
+        env=launcher_environment(args),
         capture_output=True,
         text=True,
         timeout=int(args.get("runner_timeout_seconds") or 1800),
