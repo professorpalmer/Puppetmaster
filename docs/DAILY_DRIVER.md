@@ -44,6 +44,7 @@ This keeps the daily-driver workflow serious without handing write access to eve
 ## Run Management
 
 ```bash
+python -m puppetmaster state
 python -m puppetmaster jobs
 python -m puppetmaster last
 python -m puppetmaster status <job_id>
@@ -52,4 +53,6 @@ python -m puppetmaster open [job_id]
 python -m puppetmaster clean --completed
 ```
 
-SQLite is the default backend. Use `--backend file` only when you want fully inspectable JSON state for debugging.
+SQLite is the default backend. Runtime state is stored outside the repository by default so Puppetmaster jobs, logs, artifacts, and SQLite files do not inflate `git status`. Use `--state-dir .puppetmaster` or `PUPPETMASTER_STATE_DIR=.puppetmaster` only when you intentionally want repo-local state.
+
+Use `--backend file` only when you want fully inspectable JSON state for debugging.

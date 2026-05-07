@@ -90,6 +90,8 @@ This repo includes `.cursor/mcp.json`:
 
 Open the Puppetmaster repo in Cursor, then enable/reload MCP servers from Cursor settings if prompted.
 
+MCP uses Puppetmaster's normal state resolution. Unless a tool call passes `state_dir`, jobs and MCP run logs go to per-workspace app state outside the repository. Ask Cursor Agent to call `puppetmaster_doctor` or run `python -m puppetmaster state` if you need the exact path.
+
 ## Provider Keys
 
 Do not commit provider keys.

@@ -11,6 +11,7 @@ from typing import Optional
 from puppetmaster.config import load_config
 from puppetmaster.diagnostics import adapter_status, run_doctor, starter_config
 from puppetmaster.orchestrator import Orchestrator
+from puppetmaster.state import resolve_state_dir
 from puppetmaster.store_factory import create_store
 from puppetmaster.stitcher import Stitcher
 from puppetmaster.worker_runtime import WorkerDaemon
@@ -24,8 +25,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--state-dir",
-        default=".puppetmaster",
-        help="Directory for jobs, streams, artifacts, locks, and promoted memory.",
+        help=(
+            "Directory for jobs, streams, artifacts, locks, and promoted memory. "
+            "Defaults to per-workspace app state outside the repository."
+        ),
     )
     parser.add_argument(
         "--backend",
@@ -42,6 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands = parser.add_subparsers(dest="command", required=True)
 
     subcommands.add_parser("init", help="Create the local Puppetmaster state store.")
+    subcommands.add_parser("state", help="Print the resolved Puppetmaster state directory.")
     subcommands.add_parser("doctor", help="Check local runtime dependencies.")
     subcommands.add_parser("adapters", help="List available worker adapters.")
 
@@ -249,7 +253,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 def _main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
-    store = create_store(args.backend, Path(args.state_dir))
+    state_dir = resolve_state_dir(args.state_dir)
+    store = create_store(args.backend, state_dir)
     on_job_created = early_job_printer if args.emit_job_id_early else None
 
     if args.command == "init":
@@ -257,8 +262,12 @@ def _main(argv: Optional[list[str]] = None) -> int:
         print(f"Initialized Puppetmaster state at {store.root}")
         return 0
 
+    if args.command == "state":
+        print(store.root)
+        return 0
+
     if args.command == "doctor":
-        for check in run_doctor(Path.cwd(), Path(args.state_dir)):
+        for check in run_doctor(Path.cwd(), state_dir):
             print(f"{check.status:8} {check.name:16} {check.detail}")
         return 0
 

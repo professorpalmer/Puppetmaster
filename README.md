@@ -393,16 +393,38 @@ Examples:
 
 ## State Model
 
-Puppetmaster writes local state under `.puppetmaster/`:
+By default, Puppetmaster keeps runtime state outside the repository so `git status` stays focused on source changes:
 
 ```text
-.puppetmaster/
+macOS: ~/Library/Application Support/puppetmaster/projects/<workspace>-<hash>/
+Linux: ~/.local/state/puppetmaster/projects/<workspace>-<hash>/
+```
+
+Print the resolved location:
+
+```bash
+python -m puppetmaster state
+```
+
+Override it when you intentionally want repo-local or CI-specific state:
+
+```bash
+python -m puppetmaster --state-dir .puppetmaster run "Map this repo"
+PUPPETMASTER_STATE_DIR=.puppetmaster python -m puppetmaster doctor
+```
+
+The state directory contains:
+
+```text
+<state-dir>/
   state.sqlite3
   jobs/
   memory/
   streams/
   locks/
 ```
+
+`.puppetmaster/` remains in `.gitignore` as a compatibility fallback for explicit local state.
 
 Core objects:
 

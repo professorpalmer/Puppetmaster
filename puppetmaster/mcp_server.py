@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from puppetmaster.state import resolve_state_dir
+
 
 JsonObject = dict[str, Any]
 ASYNC_PROCESSES: list[subprocess.Popen] = []
@@ -278,8 +280,7 @@ def normalized_roles(args: JsonObject) -> list[str]:
 def write_generated_swarm_config(args: JsonObject, roles: list[str], adapter: str) -> Path:
     if adapter not in {"cursor", "local"}:
         raise ValueError(f"MCP swarm adapter is not supported yet: {adapter}")
-    state_dir = Path(str(args.get("state_dir") or ".puppetmaster"))
-    root = state_dir if state_dir.is_absolute() else Path(cwd(args)) / state_dir
+    root = mcp_state_dir(args)
     config_dir = root / "mcp-configs"
     config_dir.mkdir(parents=True, exist_ok=True)
     config_path = config_dir / f"swarm_{int(time.time() * 1000)}_{os.getpid()}.json"
@@ -310,7 +311,7 @@ def write_generated_swarm_config(args: JsonObject, roles: list[str], adapter: st
 
 
 def run_cli(command: list[str], args: JsonObject) -> JsonObject:
-    state_dir = str(args.get("state_dir") or ".puppetmaster")
+    state_dir = str(mcp_state_dir(args))
     process = subprocess.run(
         [sys.executable, "-m", "puppetmaster", "--state-dir", state_dir] + command,
         cwd=cwd(args),
@@ -340,8 +341,8 @@ def run_feed(args: JsonObject) -> JsonObject:
 
 
 def start_cli(command: list[str], args: JsonObject) -> JsonObject:
-    state_dir = str(args.get("state_dir") or ".puppetmaster")
-    run_dir = Path(cwd(args)) / state_dir / "mcp-runs"
+    state_dir = str(mcp_state_dir(args))
+    run_dir = Path(state_dir) / "mcp-runs"
     run_dir.mkdir(parents=True, exist_ok=True)
     run_id = f"mcp_{int(time.time() * 1000)}_{os.getpid()}"
     stdout_path = run_dir / f"{run_id}.stdout.log"
@@ -438,6 +439,11 @@ def cwd(args: JsonObject) -> str:
     return str(args.get("cwd") or os.getcwd())
 
 
+def mcp_state_dir(args: JsonObject) -> Path:
+    value = args.get("state_dir")
+    return resolve_state_dir(str(value) if value else None, cwd=Path(cwd(args)))
+
+
 def require_string(args: JsonObject, name: str) -> str:
     value = args.get(name)
     if not isinstance(value, str) or not value.strip():
@@ -457,7 +463,10 @@ def base_schema() -> JsonObject:
             "cwd": {"type": "string", "description": "Workspace/repository path."},
             "state_dir": {
                 "type": "string",
-                "description": "Puppetmaster state directory, relative to cwd unless absolute.",
+                "description": (
+                    "Optional Puppetmaster state directory, relative to cwd unless absolute. "
+                    "Defaults to per-workspace app state outside the repository."
+                ),
             },
             "runner_timeout_seconds": {
                 "type": "integer",

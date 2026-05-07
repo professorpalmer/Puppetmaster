@@ -5,10 +5,10 @@ import os
 import threading
 import time
 from dataclasses import replace
-from pathlib import Path
 from typing import Optional
 
 from puppetmaster.models import AgentRun, JobStatus, TaskStatus, now_iso
+from puppetmaster.state import resolve_state_dir
 from puppetmaster.store_factory import create_store
 from puppetmaster.workers import LocalWorker
 
@@ -218,7 +218,7 @@ class WorkerDaemon:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a Puppetmaster worker process.")
-    parser.add_argument("--state-dir", default=".puppetmaster")
+    parser.add_argument("--state-dir")
     parser.add_argument("--backend", choices=["file", "sqlite"], default="file")
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--role", required=True)
@@ -233,7 +233,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     runtime = WorkerRuntime(
-        store=create_store(args.backend, Path(args.state_dir)),
+        store=create_store(args.backend, resolve_state_dir(args.state_dir)),
         job_id=args.job_id,
         role=args.role,
         worker_id=args.worker_id or worker_id_for(args.role),
