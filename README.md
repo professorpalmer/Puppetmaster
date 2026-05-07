@@ -17,8 +17,10 @@ Cursor Agent / Claude Code / shell / future providers
 Puppetmaster supervisor
         |
         v
-independent worker processes -> SQLite state -> structured artifacts -> stitched summary
+independent worker processes -> SQLite state -> live artifacts -> stitched summary
 ```
+
+Puppetmaster is not trying to beat native IDE subagents at every tiny task. It is for the work that gets messy: long repo investigations, conflicting hypotheses, repeated handoffs, flaky memory, and code changes that need evidence, replay, and approval gates.
 
 ## The Problem
 
@@ -58,6 +60,8 @@ Puppetmaster does not rely on one parent agent spawning children inside the same
 
 Workers emit typed artifacts with payloads, evidence, confidence, source files, and `sha256` integrity. The final synthesis reads artifacts, not raw worker transcripts.
 
+Artifacts are available as soon as they are emitted. The final stitch is the publishable synthesis, not the first moment the work becomes visible.
+
 ### 4. Lost Work and Dead Workers
 
 Tasks are lease-based. Stale workers can be recovered. Jobs fail closed. Failures become events and verification artifacts instead of disappearing into chat history.
@@ -84,13 +88,28 @@ Puppetmaster is not another group-chat swarm. It is a local coordination runtime
 
 SQLite is the default coordination backend. WAL mode, schema metadata, integrity checks, task leases, retries, event streams, and patch artifacts are built in.
 
+## Why Not Just Use Subagents?
+
+Native IDE subagents are great for quick parallel help inside one product surface. Puppetmaster solves a different problem: making agent work durable and inspectable outside a single parent context.
+
+| Native subagents | Puppetmaster |
+| --- | --- |
+| Fast for small tasks | Better for long, stateful investigations |
+| Shared chat surface | Shared durable state |
+| Transcript-heavy handoffs | Typed artifacts with evidence |
+| Harder to replay | Jobs, events, artifacts, and summaries persist locally |
+| Usually opaque failure model | Leases, recovery, logs, and failed-task artifacts |
+| Final answer often hides process | Live artifact board while workers run |
+
+The goal is not “one more chat.” The goal is a local runtime where the operator can start a swarm, get a `job_id`, watch artifacts appear, inspect partial summaries, and only then approve edits.
+
 ## What Works Today
 
 | Area | Status |
 | --- | --- |
 | Local runtime | Daily-driver beta: subprocess workers, task DAGs, leases, recovery, failure states |
 | SQLite backend | Default backend with WAL mode, schema metadata, integrity checks, and persisted events |
-| Cursor Agent MCP | Agent-chat tools for doctor, review, plan, Claude implement, logs, artifacts, summaries |
+| Cursor Agent MCP | Async start tools, status polling, logs, live artifacts, partial summaries |
 | Cursor extension | Activity-bar control panel for running Puppetmaster inside Cursor |
 | Cursor adapter | Live adapter through `@cursor/sdk`; best for review/plan/dry-run workflows |
 | Claude Code adapter | Live full-edit adapter through Claude Code CLI; validated with real tracked diffs |
@@ -136,6 +155,14 @@ Use Puppetmaster to start a swarm for this repo and return the job id immediatel
 Problem: users are getting logged out after refresh and token refresh tests are flaky.
 Constraints: keep the patch focused, preserve public API behavior, and run relevant tests.
 Do review/plan first. Poll status/logs by job id. Do not edit until you summarize findings and ask for approval.
+```
+
+For real multi-role analysis, prefer `puppetmaster_start_cursor_swarm` through Cursor Agent. It creates real Cursor SDK-backed worker roles. Bare custom roles on the generic `puppetmaster_start_swarm` require a config or adapter so Puppetmaster does not accidentally run deterministic demo workers.
+
+While the job runs, ask Cursor Agent to inspect:
+
+```text
+Poll Puppetmaster status, live artifacts, and partial summary for <job_id>. Summarize concrete findings as they arrive.
 ```
 
 After review/approval:
