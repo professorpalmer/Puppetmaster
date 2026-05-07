@@ -148,6 +148,18 @@ def tools() -> list[McpTool]:
             handler=lambda args: run_cli(["logs"] + optional_job(args), args),
         ),
         McpTool(
+            name="puppetmaster_live_artifacts",
+            description="Return the live artifact feed for a job without waiting for final stitching.",
+            input_schema=feed_schema(),
+            handler=lambda args: run_feed(args),
+        ),
+        McpTool(
+            name="puppetmaster_partial_summary",
+            description="Return a live summary from current artifacts without waiting for final stitching.",
+            input_schema=job_schema(required=True),
+            handler=lambda args: run_cli(["show", require_string(args, "job_id"), "--partial"], args),
+        ),
+        McpTool(
             name="puppetmaster_artifacts",
             description="Return structured JSON artifacts for a Puppetmaster job.",
             input_schema=job_schema(required=True),
@@ -320,6 +332,13 @@ def run_cli(command: list[str], args: JsonObject) -> JsonObject:
     }
 
 
+def run_feed(args: JsonObject) -> JsonObject:
+    command = ["feed", require_string(args, "job_id"), "--json"]
+    if args.get("limit"):
+        command.extend(["--limit", str(args["limit"])])
+    return run_cli(command, args)
+
+
 def start_cli(command: list[str], args: JsonObject) -> JsonObject:
     state_dir = str(args.get("state_dir") or ".puppetmaster")
     run_dir = Path(cwd(args)) / state_dir / "mcp-runs"
@@ -453,6 +472,15 @@ def job_schema(required: bool = False) -> JsonObject:
     schema["properties"]["job_id"] = {"type": "string", "description": "Puppetmaster job id."}
     if required:
         schema["required"] = ["job_id"]
+    return schema
+
+
+def feed_schema() -> JsonObject:
+    schema = job_schema(required=True)
+    schema["properties"]["limit"] = {
+        "type": "integer",
+        "description": "Limit feed to the most recent N artifacts.",
+    }
     return schema
 
 

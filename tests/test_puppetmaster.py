@@ -20,7 +20,7 @@ from puppetmaster.adapters import (
     classify_cursor_failure,
 )
 from puppetmaster.config import load_config
-from puppetmaster.cli import cursor_prompt, main as cli_main
+from puppetmaster.cli import artifact_feed, cursor_prompt, main as cli_main
 from puppetmaster.diagnostics import adapter_status, run_doctor, starter_config
 from puppetmaster.mcp_server import ASYNC_PROCESSES, call_tool, handle_message
 from puppetmaster.models import Artifact, ArtifactType, JobStatus, Task, TaskStatus, seconds_from_now
@@ -45,6 +45,8 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertIn("puppetmaster_start_swarm", tool_names)
         self.assertIn("puppetmaster_start_cursor_swarm", tool_names)
         self.assertIn("puppetmaster_status", tool_names)
+        self.assertIn("puppetmaster_live_artifacts", tool_names)
+        self.assertIn("puppetmaster_partial_summary", tool_names)
 
     def test_mcp_tool_call_wraps_cli_result(self) -> None:
         completed = subprocess.CompletedProcess(
@@ -168,6 +170,48 @@ class PuppetmasterTests(unittest.TestCase):
             self.assertIn("Final synthesis used structured JSON artifacts only", result.summary)
             self.assertGreaterEqual(len(memory), 4)
             self.assertTrue(all(artifact.sha256 for artifact in artifacts))
+
+    def test_live_artifact_feed_and_partial_summary_are_available(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            result = Orchestrator(store).run(
+                "make live artifacts inspectable",
+                roles=["explore"],
+                worker_mode="inline",
+            )
+
+            feed = artifact_feed(store, result.job.id)
+            partial = Stitcher(store).preview(result.job.id)
+
+            self.assertEqual(len(feed), 2)
+            self.assertIn("artifact", feed[0])
+            self.assertIn("# Puppetmaster Live Summary", partial)
+            self.assertIn("make live artifacts inspectable", partial)
+
+    def test_mcp_live_artifacts_and_partial_summary_wrap_cli(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["python"],
+            returncode=0,
+            stdout="[]\n",
+            stderr="",
+        )
+        with patch("puppetmaster.mcp_server.subprocess.run", return_value=completed) as run:
+            artifacts = call_tool(
+                "puppetmaster_live_artifacts",
+                {"job_id": "job_123", "limit": 2},
+            )
+            summary = call_tool(
+                "puppetmaster_partial_summary",
+                {"job_id": "job_123"},
+            )
+
+        calls = [call.args[0] for call in run.call_args_list]
+        self.assertIn("feed", calls[0])
+        self.assertIn("--json", calls[0])
+        self.assertIn("--limit", calls[0])
+        self.assertEqual(calls[1][-2:], ["job_123", "--partial"])
+        self.assertFalse(artifacts["isError"])
+        self.assertFalse(summary["isError"])
 
     def test_custom_workers_still_emit_structured_artifacts(self) -> None:
         with TemporaryDirectory() as tmp:

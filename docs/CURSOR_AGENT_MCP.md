@@ -22,6 +22,8 @@ Puppetmaster exposes these MCP tools:
 - `puppetmaster_last_job`
 - `puppetmaster_status`
 - `puppetmaster_logs`
+- `puppetmaster_live_artifacts`
+- `puppetmaster_partial_summary`
 - `puppetmaster_artifacts`
 - `puppetmaster_show`
 
@@ -30,6 +32,18 @@ Cursor's Agent can call those tools during a chat, so you can ask it to run a Pu
 For anything longer than a quick health check, prefer the `puppetmaster_start_*` tools. They return a `job_id` immediately and let Cursor poll `puppetmaster_status`, `puppetmaster_logs`, and `puppetmaster_show` instead of holding one long MCP request open.
 
 Use `puppetmaster_start_cursor_swarm` for real multi-role code analysis. It generates a temporary workflow config with each role backed by the Cursor SDK adapter. Bare custom roles on `puppetmaster_start_swarm` require an explicit config or adapter; otherwise Puppetmaster returns an error instead of silently running deterministic demo workers.
+
+## Live Artifact Board
+
+Puppetmaster is not meant to hide all useful work until the end. Workers write artifacts and events as they run. Cursor Agent can inspect the job mid-run:
+
+- `puppetmaster_status`: current task/artifact counts
+- `puppetmaster_logs`: event stream
+- `puppetmaster_live_artifacts`: live evidence board from saved artifacts
+- `puppetmaster_partial_summary`: current synthesis from artifacts already emitted
+- `puppetmaster_show`: final stitched summary after completion
+
+Final stitching is the publishable report. The live artifact board is the shared coordination surface.
 
 ## How It Respects Independent Workers
 
@@ -40,11 +54,11 @@ The control flow is:
 ```text
 Cursor Agent chat
   -> MCP start tool
-  -> puppetmaster.mcp_server
   -> detached python -m puppetmaster job
   -> independent worker subprocesses
-  -> SQLite/shared state/artifacts
-  -> Cursor polls status/logs/show by job_id
+  -> SQLite events + artifacts as workers run
+  -> Cursor polls status/logs/live_artifacts/partial_summary
+  -> final stitched summary when complete
 ```
 
 So Puppetmaster does not force Cursor's built-in subagents to use our process model. It gives the Agent a way to delegate work to Puppetmaster instead. After that handoff, the important guarantees come from the Puppetmaster runtime:
@@ -103,7 +117,7 @@ Use Puppetmaster to start a Cursor review dry run for this repo. Return the job 
 ```
 
 ```text
-Use Puppetmaster to start a Cursor swarm for this repo with roles pipeline-mapper, decision-explainer, conflict-auditor, and test-coverage-reviewer. Return the job id immediately, then poll status/logs and summarize concrete file-backed findings.
+Use Puppetmaster to start a Cursor swarm for this repo with roles pipeline-mapper, decision-explainer, conflict-auditor, and test-coverage-reviewer. Return the job id immediately, then poll status/logs/live artifacts and summarize concrete file-backed findings as they arrive.
 ```
 
 ```text
