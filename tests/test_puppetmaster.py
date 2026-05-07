@@ -3,6 +3,8 @@ from __future__ import annotations
 import contextlib
 import io
 import subprocess
+import threading
+import time
 import unittest
 import sys
 from dataclasses import replace
@@ -25,6 +27,7 @@ from puppetmaster.orchestrator import Orchestrator
 from puppetmaster.sqlite_store import SQLiteSwarmStore
 from puppetmaster.stitcher import Stitcher
 from puppetmaster.store import SwarmStore
+from puppetmaster.worker_runtime import WorkerDaemon
 from puppetmaster.workers import WorkerSpec
 
 
@@ -203,6 +206,46 @@ class PuppetmasterTests(unittest.TestCase):
             self.assertTrue(artifacts)
             self.assertTrue(all(artifact.created_by == "worker-explore-inline" for artifact in artifacts))
             self.assertEqual(store.latest_job().status, JobStatus.COMPLETE)
+
+    def test_daemon_worker_mode_uses_warm_worker(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            result_holder = {}
+
+            def run_job() -> None:
+                try:
+                    result_holder["result"] = Orchestrator(store).run(
+                        "prove warm daemon orchestration",
+                        roles=["explore"],
+                        worker_mode="daemon",
+                    )
+                except Exception as exc:
+                    result_holder["error"] = exc
+
+            thread = threading.Thread(target=run_job)
+            thread.start()
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and store.latest_job() is None:
+                time.sleep(0.01)
+
+            processed = WorkerDaemon(
+                store,
+                roles=["explore"],
+                worker_id="daemon-test",
+            ).run(max_tasks=1, max_idle_seconds=2)
+            thread.join(timeout=3)
+
+            self.assertFalse(thread.is_alive())
+            self.assertNotIn("error", result_holder)
+            self.assertEqual(processed, 1)
+            result = result_holder["result"]
+            self.assertEqual(result.job.status, JobStatus.COMPLETE)
+            self.assertTrue(
+                all(
+                    artifact.created_by == "daemon-test-explore"
+                    for artifact in store.list_artifacts(result.job.id)
+                )
+            )
 
     def test_crash_recovery_demo_reclaims_abandoned_task(self) -> None:
         with TemporaryDirectory() as tmp:

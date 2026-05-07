@@ -8,13 +8,13 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
-from puppetmaster.models import AgentRun, TaskStatus, now_iso
+from puppetmaster.models import AgentRun, JobStatus, TaskStatus, now_iso
 from puppetmaster.store_factory import create_store
 from puppetmaster.workers import LocalWorker
 
 
-def worker_id_for(role: str) -> str:
-    return f"worker-{role}-{os.getpid()}"
+def worker_id_for(role: Optional[str]) -> str:
+    return f"worker-{role or 'any'}-{os.getpid()}"
 
 
 class WorkerRuntime:
@@ -22,7 +22,7 @@ class WorkerRuntime:
         self,
         store: SwarmStore,
         job_id: str,
-        role: str,
+        role: Optional[str],
         worker_id: str,
         lease_seconds: int = 5,
         poll_seconds: float = 0.1,
@@ -146,11 +146,74 @@ class WorkerRuntime:
 
     def _has_role_work(self) -> bool:
         for task in self.store.list_tasks(self.job_id):
-            if task.role != self.role:
+            if self.role is not None and task.role != self.role:
                 continue
             if task.status in {TaskStatus.QUEUED, TaskStatus.RUNNING}:
                 return True
         return False
+
+
+class WorkerDaemon:
+    """Warm worker loop that claims tasks from running jobs without process cold starts."""
+
+    def __init__(
+        self,
+        store: SwarmStore,
+        roles: Optional[list[str]] = None,
+        worker_id: Optional[str] = None,
+        job_id: Optional[str] = None,
+        lease_seconds: int = 5,
+        poll_seconds: float = 0.25,
+    ) -> None:
+        self.store = store
+        self.roles = roles or [None]
+        self.worker_id = worker_id or f"daemon-{os.getpid()}"
+        self.job_id = job_id
+        self.lease_seconds = lease_seconds
+        self.poll_seconds = poll_seconds
+
+    def run(
+        self,
+        max_tasks: Optional[int] = None,
+        max_idle_seconds: Optional[float] = None,
+    ) -> int:
+        completed = 0
+        idle_since = time.monotonic()
+        while True:
+            if self.run_once():
+                completed += 1
+                idle_since = time.monotonic()
+                if max_tasks is not None and completed >= max_tasks:
+                    return completed
+                continue
+            if max_idle_seconds is not None and time.monotonic() - idle_since >= max_idle_seconds:
+                return completed
+            time.sleep(self.poll_seconds)
+
+    def run_once(self) -> bool:
+        for job in self._running_jobs():
+            self.store.recover_stale_tasks(job.id)
+            self.store.refresh_blocked_tasks(job.id)
+            for role in self.roles:
+                runtime = WorkerRuntime(
+                    store=self.store,
+                    job_id=job.id,
+                    role=role,
+                    worker_id=f"{self.worker_id}-{role or 'any'}",
+                    lease_seconds=self.lease_seconds,
+                    poll_seconds=self.poll_seconds,
+                )
+                if runtime.run_once():
+                    return True
+        return False
+
+    def _running_jobs(self) -> list:
+        jobs = [
+            job
+            for job in self.store.list_jobs()
+            if job.status == JobStatus.RUNNING and (self.job_id is None or job.id == self.job_id)
+        ]
+        return sorted(jobs, key=lambda job: job.created_at)
 
 
 def build_parser() -> argparse.ArgumentParser:

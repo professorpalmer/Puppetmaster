@@ -219,6 +219,9 @@ class Orchestrator:
                 allowed_task_ids=allowed_task_ids,
             )
             return
+        if worker_mode == "daemon":
+            self._wait_for_daemon_workers(job, tasks, allowed_task_ids=allowed_task_ids)
+            return
         if worker_mode != "subprocess":
             raise ValueError(f"unsupported worker mode: {worker_mode}")
 
@@ -337,6 +340,35 @@ class Orchestrator:
                 if task.id in allowed_task_ids
             ):
                 raise RuntimeError("swarm exited with incomplete tasks")
+
+    def _wait_for_daemon_workers(
+        self,
+        job: Job,
+        tasks: list[Task],
+        allowed_task_ids: Optional[set[str]] = None,
+    ) -> None:
+        allowed_task_ids = allowed_task_ids or {task.id for task in tasks}
+        timeout_seconds = self._worker_wait_timeout(tasks)
+        deadline = time.monotonic() + timeout_seconds
+        self.store.emit(
+            job.id,
+            "job.waiting_for_daemon_workers",
+            {"timeout_seconds": timeout_seconds},
+        )
+        while time.monotonic() < deadline:
+            self.store.recover_stale_tasks(job.id)
+            self.store.refresh_blocked_tasks(job.id)
+            current_tasks = [
+                task
+                for task in self.store.list_tasks(job.id)
+                if task.id in allowed_task_ids
+            ]
+            if any(task.status == TaskStatus.FAILED for task in current_tasks):
+                raise RuntimeError("daemon worker failed a task")
+            if current_tasks and all(task.status == TaskStatus.COMPLETE for task in current_tasks):
+                return
+            time.sleep(0.2)
+        raise RuntimeError("timed out waiting for daemon workers")
 
     def _run_prerequisites(
         self,
