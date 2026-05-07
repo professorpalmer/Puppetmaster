@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 
 JsonObject = dict[str, Any]
+ASYNC_PROCESSES: list[subprocess.Popen] = []
 
 
 @dataclass(frozen=True)
@@ -75,29 +79,61 @@ def tools() -> list[McpTool]:
         ),
         McpTool(
             name="puppetmaster_cursor_review",
-            description="Run a Cursor SDK review worker through Puppetmaster and return job output.",
+            description="Run a Cursor SDK review worker through Puppetmaster and wait for completion.",
             input_schema=goal_schema(
                 "Review this repo and identify risks, findings, and verification gaps."
             ),
             handler=lambda args: run_cursor(args, review=True),
         ),
         McpTool(
+            name="puppetmaster_start_cursor_review",
+            description="Start a Cursor SDK review worker asynchronously and return job_id immediately.",
+            input_schema=goal_schema(
+                "Review this repo and identify risks, findings, and verification gaps."
+            ),
+            handler=lambda args: start_cursor(args, review=True),
+        ),
+        McpTool(
             name="puppetmaster_cursor_plan",
-            description="Run a Cursor SDK planning worker through Puppetmaster and return job output.",
+            description="Run a Cursor SDK planning worker through Puppetmaster and wait for completion.",
             input_schema=goal_schema("Plan the next safe implementation slice for this repo."),
             handler=lambda args: run_cursor(args, plan=True),
         ),
         McpTool(
+            name="puppetmaster_start_cursor_plan",
+            description="Start a Cursor SDK planning worker asynchronously and return job_id immediately.",
+            input_schema=goal_schema("Plan the next safe implementation slice for this repo."),
+            handler=lambda args: start_cursor(args, plan=True),
+        ),
+        McpTool(
             name="puppetmaster_claude_implement",
-            description="Run Claude Code as a full-edit Puppetmaster worker in a clean repo/worktree.",
+            description="Run Claude Code as a full-edit Puppetmaster worker and wait for completion.",
             input_schema=claude_schema(),
             handler=run_claude,
+        ),
+        McpTool(
+            name="puppetmaster_start_claude_implement",
+            description="Start Claude Code as a full-edit worker asynchronously and return job_id immediately.",
+            input_schema=claude_schema(),
+            handler=start_claude,
+        ),
+        McpTool(
+            name="puppetmaster_start_swarm",
+            description="Start a local Puppetmaster swarm asynchronously and return job_id immediately.",
+            input_schema=swarm_schema(),
+            handler=start_swarm,
         ),
         McpTool(
             name="puppetmaster_last_job",
             description="Return the most recent Puppetmaster job id.",
             input_schema=base_schema(),
             handler=lambda args: run_cli(["last"], args),
+        ),
+        McpTool(
+            name="puppetmaster_status",
+            description="Return task, artifact, and stale lease state for a Puppetmaster job.",
+            input_schema=job_schema(required=True),
+            handler=lambda args: run_cli(["status", require_string(args, "job_id")], args),
         ),
         McpTool(
             name="puppetmaster_logs",
@@ -121,6 +157,14 @@ def tools() -> list[McpTool]:
 
 
 def run_cursor(args: JsonObject, review: bool = False, plan: bool = False) -> JsonObject:
+    return run_cli(cursor_command(args, review=review, plan=plan), args)
+
+
+def start_cursor(args: JsonObject, review: bool = False, plan: bool = False) -> JsonObject:
+    return start_cli(cursor_command(args, review=review, plan=plan), args)
+
+
+def cursor_command(args: JsonObject, review: bool = False, plan: bool = False) -> list[str]:
     goal = require_string(args, "goal")
     command = ["cursor", goal, "--cwd", cwd(args), "--dry-run"]
     if review:
@@ -133,10 +177,18 @@ def run_cursor(args: JsonObject, review: bool = False, plan: bool = False) -> Js
     timeout_seconds = args.get("timeout_seconds")
     if timeout_seconds:
         command.extend(["--timeout-seconds", str(timeout_seconds)])
-    return run_cli(command, args)
+    return command
 
 
 def run_claude(args: JsonObject) -> JsonObject:
+    return run_cli(claude_command(args), args)
+
+
+def start_claude(args: JsonObject) -> JsonObject:
+    return start_cli(claude_command(args), args)
+
+
+def claude_command(args: JsonObject) -> list[str]:
     goal = require_string(args, "goal")
     command = [
         "claude",
@@ -152,7 +204,22 @@ def run_claude(args: JsonObject) -> JsonObject:
         command.extend(["--timeout-seconds", str(args["timeout_seconds"])])
     if args.get("allow_dirty"):
         command.append("--allow-dirty")
-    return run_cli(command, args)
+    return command
+
+
+def start_swarm(args: JsonObject) -> JsonObject:
+    goal = require_string(args, "goal")
+    command = ["run", goal]
+    roles = args.get("roles")
+    if isinstance(roles, list) and roles:
+        command.append("--workers")
+        command.extend(str(role) for role in roles)
+    if args.get("config"):
+        command.extend(["--config", str(args["config"])])
+    worker_mode = args.get("worker_mode")
+    if worker_mode:
+        command.extend(["--worker-mode", str(worker_mode)])
+    return start_cli(command, args)
 
 
 def run_cli(command: list[str], args: JsonObject) -> JsonObject:
@@ -176,6 +243,70 @@ def run_cli(command: list[str], args: JsonObject) -> JsonObject:
         "content": [{"type": "text", "text": json.dumps(body, indent=2)}],
         "isError": process.returncode != 0,
     }
+
+
+def start_cli(command: list[str], args: JsonObject) -> JsonObject:
+    state_dir = str(args.get("state_dir") or ".puppetmaster")
+    run_dir = Path(cwd(args)) / state_dir / "mcp-runs"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    run_id = f"mcp_{int(time.time() * 1000)}_{os.getpid()}"
+    stdout_path = run_dir / f"{run_id}.stdout.log"
+    stderr_path = run_dir / f"{run_id}.stderr.log"
+    full_command = [
+        sys.executable,
+        "-m",
+        "puppetmaster",
+        "--state-dir",
+        state_dir,
+        "--emit-job-id-early",
+    ] + command
+    stdout_handle = stdout_path.open("w", encoding="utf-8")
+    stderr_handle = stderr_path.open("w", encoding="utf-8")
+    process = subprocess.Popen(
+        full_command,
+        cwd=cwd(args),
+        env=environment(args),
+        stdout=stdout_handle,
+        stderr=stderr_handle,
+        text=True,
+        start_new_session=True,
+    )
+    ASYNC_PROCESSES.append(process)
+    stdout_handle.close()
+    stderr_handle.close()
+    job_id = wait_for_job_id(stdout_path, process, timeout_seconds=5)
+    body = {
+        "run_id": run_id,
+        "job_id": job_id,
+        "pid": process.pid,
+        "command": "python -m puppetmaster " + " ".join(command),
+        "cwd": cwd(args),
+        "stdout_path": str(stdout_path),
+        "stderr_path": str(stderr_path),
+        "next_steps": [
+            f"Call puppetmaster_status with job_id={job_id}",
+            f"Call puppetmaster_logs with job_id={job_id}",
+            f"Call puppetmaster_show with job_id={job_id} after completion",
+        ],
+    }
+    return {"content": [{"type": "text", "text": json.dumps(body, indent=2)}], "isError": False}
+
+
+def wait_for_job_id(stdout_path: Path, process: subprocess.Popen, timeout_seconds: float) -> str:
+    deadline = time.monotonic() + timeout_seconds
+    pattern = re.compile(r"job_id:\s*(job_[A-Za-z0-9]+)")
+    while time.monotonic() < deadline:
+        if process.poll() is not None and not stdout_path.exists():
+            break
+        if stdout_path.exists():
+            text = stdout_path.read_text(encoding="utf-8")
+            match = pattern.search(text)
+            if match:
+                return match.group(1)
+            if process.poll() is not None:
+                break
+        time.sleep(0.05)
+    raise RuntimeError(f"started Puppetmaster process but did not receive early job_id; pid={process.pid}")
 
 
 def environment(args: JsonObject) -> dict[str, str]:
@@ -251,6 +382,27 @@ def goal_schema(default_goal: str) -> JsonObject:
         }
     )
     schema["required"] = ["goal"]
+    return schema
+
+
+def swarm_schema() -> JsonObject:
+    schema = goal_schema("Review this repo and produce structured artifacts.")
+    schema["properties"].update(
+        {
+            "roles": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional local worker roles to run.",
+            },
+            "config": {"type": "string", "description": "Optional workflow config path."},
+            "worker_mode": {
+                "type": "string",
+                "enum": ["subprocess", "inline", "daemon"],
+                "default": "subprocess",
+                "description": "Worker execution mode.",
+            },
+        }
+    )
     return schema
 
 

@@ -132,16 +132,16 @@ Use Puppetmaster to run doctor in this repo and summarize what is missing.
 ```
 
 ```text
-Use Puppetmaster to swarm this repo.
+Use Puppetmaster to start a swarm for this repo and return the job id immediately.
 Problem: users are getting logged out after refresh and token refresh tests are flaky.
 Constraints: keep the patch focused, preserve public API behavior, and run relevant tests.
-Do review/plan first. Do not edit until you summarize findings and ask for approval.
+Do review/plan first. Poll status/logs by job id. Do not edit until you summarize findings and ask for approval.
 ```
 
 After review/approval:
 
 ```text
-Use Puppetmaster with Claude Code to implement the approved fix in a clean worktree.
+Use Puppetmaster to start Claude Code implementation for the approved fix in a clean worktree. Return the job id immediately and poll status until complete.
 ```
 
 From the CLI:
@@ -182,13 +182,23 @@ Puppetmaster ships with two Cursor integration surfaces.
 The MCP server lets Cursor Agent call Puppetmaster tools directly:
 
 - `puppetmaster_doctor`
+- `puppetmaster_start_swarm`
+- `puppetmaster_start_cursor_review`
+- `puppetmaster_start_cursor_plan`
+- `puppetmaster_start_claude_implement`
+- `puppetmaster_status`
+- `puppetmaster_logs`
+- `puppetmaster_artifacts`
+- `puppetmaster_show`
+
+The older blocking tools are still available for short calls, but the daily-driver path should use `puppetmaster_start_*`. Start tools return a `job_id` immediately, so Cursor does not keep one long MCP call open while workers run.
+
+Blocking tools:
+
 - `puppetmaster_cursor_review`
 - `puppetmaster_cursor_plan`
 - `puppetmaster_claude_implement`
 - `puppetmaster_last_job`
-- `puppetmaster_logs`
-- `puppetmaster_artifacts`
-- `puppetmaster_show`
 
 Example `.cursor/mcp.json`:
 

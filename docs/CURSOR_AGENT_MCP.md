@@ -12,14 +12,21 @@ Puppetmaster exposes these MCP tools:
 
 - `puppetmaster_doctor`
 - `puppetmaster_cursor_review`
+- `puppetmaster_start_cursor_review`
 - `puppetmaster_cursor_plan`
+- `puppetmaster_start_cursor_plan`
 - `puppetmaster_claude_implement`
+- `puppetmaster_start_claude_implement`
+- `puppetmaster_start_swarm`
 - `puppetmaster_last_job`
+- `puppetmaster_status`
 - `puppetmaster_logs`
 - `puppetmaster_artifacts`
 - `puppetmaster_show`
 
 Cursor's Agent can call those tools during a chat, so you can ask it to run a Puppetmaster review, plan, or Claude Code implementation from inside Cursor.
+
+For anything longer than a quick health check, prefer the `puppetmaster_start_*` tools. They return a `job_id` immediately and let Cursor poll `puppetmaster_status`, `puppetmaster_logs`, and `puppetmaster_show` instead of holding one long MCP request open.
 
 ## How It Respects Independent Workers
 
@@ -29,12 +36,12 @@ The control flow is:
 
 ```text
 Cursor Agent chat
-  -> MCP tool call
+  -> MCP start tool
   -> puppetmaster.mcp_server
-  -> python -m puppetmaster
+  -> detached python -m puppetmaster job
   -> independent worker subprocesses
   -> SQLite/shared state/artifacts
-  -> stitched summary back to Cursor Agent
+  -> Cursor polls status/logs/show by job_id
 ```
 
 So Puppetmaster does not force Cursor's built-in subagents to use our process model. It gives the Agent a way to delegate work to Puppetmaster instead. After that handoff, the important guarantees come from the Puppetmaster runtime:
@@ -89,11 +96,11 @@ Use Puppetmaster to run doctor in this repo and tell me what is missing.
 ```
 
 ```text
-Use Puppetmaster to run a Cursor review dry run for this repo. Focus on release blockers.
+Use Puppetmaster to start a Cursor review dry run for this repo. Return the job id immediately, then poll status and summarize the result when complete. Focus on release blockers.
 ```
 
 ```text
-Use Puppetmaster with Claude Code to implement the approved fix in a clean worktree.
+Use Puppetmaster to start Claude Code implementation for the approved fix in a clean worktree. Return the job id immediately, poll status/logs, and show me the stitched summary when complete.
 ```
 
 ## Current Boundary

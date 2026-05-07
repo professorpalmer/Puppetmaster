@@ -32,6 +32,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="sqlite",
         help="Coordination backend.",
     )
+    parser.add_argument(
+        "--emit-job-id-early",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
 
     subcommands = parser.add_subparsers(dest="command", required=True)
 
@@ -234,6 +239,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 def _main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     store = create_store(args.backend, Path(args.state_dir))
+    on_job_created = early_job_printer if args.emit_job_id_early else None
 
     if args.command == "init":
         store.init()
@@ -265,12 +271,14 @@ def _main(argv: Optional[list[str]] = None) -> int:
                 specs=config.workers,
                 lease_seconds=config.lease_seconds,
                 worker_mode=args.worker_mode,
+                on_job_created=on_job_created,
             )
         else:
             result = Orchestrator(store).run(
                 args.goal,
                 roles=args.workers,
                 worker_mode=args.worker_mode,
+                on_job_created=on_job_created,
             )
         print_run_result(result.job.id, len(result.artifacts), result.summary_path)
         return 0
@@ -294,6 +302,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
             ],
             lease_seconds=10,
             worker_mode=args.worker_mode,
+            on_job_created=on_job_created,
         )
         print_run_result(result.job.id, len(result.artifacts), result.summary_path)
         return 0
@@ -321,6 +330,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
             ],
             lease_seconds=10,
             worker_mode=args.worker_mode,
+            on_job_created=on_job_created,
         )
         print_run_result(result.job.id, len(result.artifacts), result.summary_path)
         return 0
@@ -478,6 +488,10 @@ def print_run_result(job_id: str, artifact_count: int, summary_path: Path) -> No
     print(f"job_id: {job_id}")
     print(f"artifacts: {artifact_count}")
     print(f"summary: {summary_path}")
+
+
+def early_job_printer(job) -> None:
+    print(f"job_id: {job.id}", flush=True)
 
 
 def print_watch_snapshot(snapshot: dict) -> None:
