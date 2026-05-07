@@ -84,33 +84,20 @@ class PuppetmasterTests(unittest.TestCase):
             self.assertFalse(result["isError"])
 
             spawned = ASYNC_PROCESSES[before_process_count:]
-            try:
-                deadline = time.monotonic() + 5
-                status_payload = None
-                while time.monotonic() < deadline:
-                    status = call_tool(
-                        "puppetmaster_status",
-                        {
-                            "cwd": tmp,
-                            "state_dir": ".pm-test",
-                            "job_id": payload["job_id"],
-                        },
-                    )
-                    status_body = json.loads(status["content"][0]["text"])
-                    if status["isError"] or not status_body.get("stdout"):
-                        time.sleep(0.05)
-                        continue
-                    try:
-                        status_payload = json.loads(status_body["stdout"])
-                    except json.JSONDecodeError:
-                        time.sleep(0.05)
-                        continue
-                    if status_payload["job"]["status"] == "complete":
-                        break
-                    time.sleep(0.05)
-            finally:
-                for process in spawned:
-                    process.wait(timeout=5)
+            for process in spawned:
+                process.wait(timeout=15)
+
+            status = call_tool(
+                "puppetmaster_status",
+                {
+                    "cwd": tmp,
+                    "state_dir": ".pm-test",
+                    "job_id": payload["job_id"],
+                },
+            )
+            status_body = json.loads(status["content"][0]["text"])
+            self.assertFalse(status["isError"], status_body)
+            status_payload = json.loads(status_body["stdout"])
 
             self.assertEqual(status_payload["job"]["status"], "complete")
             self.assertEqual(status_payload["artifact_count"], 2)
