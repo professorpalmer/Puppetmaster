@@ -5,7 +5,7 @@ import sys
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from puppetmaster.models import Artifact, Job, JobStatus, Task, TaskStatus
 from puppetmaster.stitcher import Stitcher
@@ -34,8 +34,11 @@ class Orchestrator:
         specs: Optional[list[WorkerSpec]] = None,
         lease_seconds: int = 5,
         worker_mode: str = "subprocess",
+        on_job_created: Optional[Callable[[Job], None]] = None,
     ) -> RunResult:
         job = self.store.create_job(goal)
+        if on_job_created is not None:
+            on_job_created(job)
         try:
             specs = self._with_retrieved_memory(specs or specs_for_roles(roles), goal)
             self.store.update_job_status(job.id, JobStatus.RUNNING)

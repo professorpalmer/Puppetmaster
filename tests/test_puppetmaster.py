@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import subprocess
 import threading
 import time
@@ -38,7 +39,11 @@ class PuppetmasterTests(unittest.TestCase):
 
         self.assertIn("puppetmaster_doctor", tool_names)
         self.assertIn("puppetmaster_cursor_review", tool_names)
+        self.assertIn("puppetmaster_start_cursor_review", tool_names)
         self.assertIn("puppetmaster_claude_implement", tool_names)
+        self.assertIn("puppetmaster_start_claude_implement", tool_names)
+        self.assertIn("puppetmaster_start_swarm", tool_names)
+        self.assertIn("puppetmaster_status", tool_names)
 
     def test_mcp_tool_call_wraps_cli_result(self) -> None:
         completed = subprocess.CompletedProcess(
@@ -58,6 +63,43 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertEqual(called_args[-1], "last")
         self.assertIn("job_123", result["content"][0]["text"])
         self.assertFalse(result["isError"])
+
+    def test_mcp_start_tool_returns_job_id_without_waiting_for_completion(self) -> None:
+        with TemporaryDirectory() as tmp:
+            result = call_tool(
+                "puppetmaster_start_swarm",
+                {
+                    "cwd": tmp,
+                    "state_dir": ".pm-test",
+                    "goal": "async mcp smoke",
+                    "roles": ["explore"],
+                    "worker_mode": "inline",
+                },
+            )
+            payload = json.loads(result["content"][0]["text"])
+
+            self.assertIn("job_", payload["job_id"])
+            self.assertIn("pid", payload)
+            self.assertFalse(result["isError"])
+
+            deadline = time.monotonic() + 5
+            status_payload = None
+            while time.monotonic() < deadline:
+                status = call_tool(
+                    "puppetmaster_status",
+                    {
+                        "cwd": tmp,
+                        "state_dir": ".pm-test",
+                        "job_id": payload["job_id"],
+                    },
+                )
+                status_payload = json.loads(json.loads(status["content"][0]["text"])["stdout"])
+                if status_payload["job"]["status"] == "complete":
+                    break
+                time.sleep(0.05)
+
+            self.assertEqual(status_payload["job"]["status"], "complete")
+            self.assertEqual(status_payload["artifact_count"], 2)
 
     def test_run_creates_artifacts_summary_and_memory(self) -> None:
         with TemporaryDirectory() as tmp:
