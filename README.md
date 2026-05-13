@@ -228,6 +228,28 @@ CodeGraph gives those agents shared code intelligence before they spend tokens e
 
 Cursor Agent can also query CodeGraph directly through Puppetmaster's MCP — no second MCP server required for the daily-driver case. See [Bundled CodeGraph tools](#bundled-codegraph-tools-no-second-mcp) below.
 
+### Does CodeGraph actually save the agent work? (measured)
+
+The `bench/codegraph_ab.py` harness runs an A/B against Puppetmaster's `CursorAdapter` with CodeGraph on vs. off. There's a `--dry-run` mode that needs no API key and measures just the prompt enrichment.
+
+Sample dry-run on this repo (20 source files indexed, 574 nodes):
+
+| Metric | Value |
+|---|---|
+| raw prompt characters | 345 |
+| CodeGraph injected characters | 4,000 |
+| injection ratio (injected / raw) | **11.59×** |
+| CodeGraph context query | **0.180s** |
+
+The agent starts every worker run with ~11× more pre-resolved structural context for ~180ms of work, instead of paying for that same surface with grep / read / list tool calls per worker. Reproduce on your own repo:
+
+```bash
+npm install -g @colbymchenry/codegraph && codegraph init && codegraph index
+python -m bench.codegraph_ab --cwd . --prompt @bench/prompts/example.txt --dry-run
+```
+
+Live A/B with the Cursor SDK requires `CURSOR_API_KEY`. See [`bench/README.md`](bench/README.md) for the full methodology and what we measure / don't measure (yet).
+
 ## Cursor Integration
 
 Puppetmaster ships with two Cursor integration surfaces.
