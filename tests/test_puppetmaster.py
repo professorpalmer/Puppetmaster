@@ -1213,6 +1213,85 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertEqual(classify_claude_code_failure("permission denied"), "permission_denied")
         self.assertEqual(classify_claude_code_failure("model invalid"), "model_unavailable")
 
+    def test_claude_code_adapter_injects_codegraph_context_when_available(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+
+            fake_claude = root / "fake_claude.py"
+            fake_claude.write_text(
+                """#!/usr/bin/env python3
+print('{"result":"ok"}')
+""",
+                encoding="utf-8",
+            )
+            fake_claude.chmod(0o755)
+
+            task = Task(
+                job_id="job",
+                role="claude-code",
+                instruction="map the auth flow",
+                adapter="claude-code",
+                payload={
+                    "executable": str(fake_claude),
+                    "cwd": str(repo),
+                    "timeout_seconds": 10,
+                    "prompt": "Inspect the repo and propose a small fix.",
+                },
+            )
+
+            with patch(
+                "puppetmaster.adapters.enrich_prompt_with_codegraph",
+                return_value=(
+                    "Inspect the repo and propose a small fix.\n\n"
+                    "Shared CodeGraph context for this task:\n```\nauth.py:42\n```\n",
+                    True,
+                ),
+            ) as enrich:
+                artifacts = ClaudeCodeAdapter().run(task, "goal", "worker")
+
+            self.assertEqual(enrich.call_count, 1)
+            self.assertIn("context:codegraph", artifacts[0].evidence)
+
+    def test_claude_code_adapter_skips_codegraph_when_unavailable(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+
+            fake_claude = root / "fake_claude.py"
+            fake_claude.write_text(
+                """#!/usr/bin/env python3
+print('{"result":"ok"}')
+""",
+                encoding="utf-8",
+            )
+            fake_claude.chmod(0o755)
+
+            task = Task(
+                job_id="job",
+                role="claude-code",
+                instruction="ship a tiny change",
+                adapter="claude-code",
+                payload={
+                    "executable": str(fake_claude),
+                    "cwd": str(repo),
+                    "timeout_seconds": 10,
+                    "prompt": "Make the change.",
+                },
+            )
+
+            with patch(
+                "puppetmaster.adapters.enrich_prompt_with_codegraph",
+                return_value=("Make the change.", False),
+            ):
+                artifacts = ClaudeCodeAdapter().run(task, "goal", "worker")
+
+            self.assertNotIn("context:codegraph", artifacts[0].evidence)
+
     def test_claude_code_adapter_captures_tracked_git_diff(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

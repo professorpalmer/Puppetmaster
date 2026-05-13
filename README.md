@@ -232,6 +232,20 @@ Cursor Agent can also query CodeGraph directly through Puppetmaster's MCP — no
 
 Puppetmaster ships with two Cursor integration surfaces.
 
+### Default subagent routing (no more "Utilize Puppetmaster..." prompts)
+
+This repo includes `.cursor/rules/puppetmaster-workflow.mdc` with `alwaysApply: true` and a top-level `AGENTS.md`. Together they tell Cursor Agent (and any agent that reads `AGENTS.md`) to route the following work through Puppetmaster **by default**, without the user having to invoke it explicitly:
+
+- broad investigation, audit, or risk analysis
+- multi-file refactors, migrations, cross-cutting cleanups
+- debugging that spans call graphs or test coverage
+- planning when scope or risks are unclear
+- comparing approaches / producing decision artifacts
+
+Native Cursor tooling is still used directly for trivial single-file edits, follow-up questions, and anything the user explicitly framed as "just answer, no swarm."
+
+Copy `.cursor/rules/puppetmaster-workflow.mdc` and `AGENTS.md` into any repo where you want the same default behavior.
+
 ### Cursor Agent MCP
 
 The MCP server lets Cursor Agent call Puppetmaster tools directly:
