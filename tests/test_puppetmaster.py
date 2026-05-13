@@ -37,6 +37,15 @@ from bench.codegraph_ab import (
     measure_enrichment,
     render_markdown,
 )
+from bench.three_way import (
+    ArtifactFacts,
+    ConfigCost,
+    RepoFacts,
+    load_artifact_facts,
+    model_costs,
+    render_markdown as render_three_way_markdown,
+    scan_repo,
+)
 from puppetmaster.config import load_config
 from puppetmaster.cli import (
     artifact_feed,
@@ -1118,6 +1127,143 @@ class PuppetmasterTests(unittest.TestCase):
             self.assertTrue(measurement.codegraph_available)
             self.assertTrue(measurement.codegraph_initialized)
             self.assertGreater(measurement.injection_ratio, 0.0)
+
+    def test_three_way_scan_repo_picks_up_python_sources(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "src" / "main.py").write_text("print('hi')\n", encoding="utf-8")
+            (root / "src" / "lib.py").write_text("x = 1\n" * 50, encoding="utf-8")
+            (root / "node_modules").mkdir()
+            (root / "node_modules" / "ignored.py").write_text("x", encoding="utf-8")
+
+            facts = scan_repo(root)
+
+            self.assertEqual(facts.file_count, 2)
+            self.assertGreater(facts.source_bytes, 0)
+            self.assertIn("python", facts.languages)
+
+    def test_three_way_load_artifact_facts_falls_back_to_defaults_when_missing(
+        self,
+    ) -> None:
+        facts = load_artifact_facts(None)
+        self.assertEqual(facts.sample_count, 0)
+        self.assertGreater(facts.avg_artifact_bytes, 0)
+        self.assertGreater(facts.avg_worker_stdout_bytes, 0)
+
+    def test_three_way_load_artifact_facts_reads_real_sqlite_store(self) -> None:
+        with TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state"
+            store = SQLiteSwarmStore(state)
+            result = Orchestrator(store).run(
+                "exercise the bench loader",
+                roles=["explore"],
+                worker_mode="inline",
+            )
+            self.assertTrue(result.summary_path.exists())
+
+            facts = load_artifact_facts(state)
+            self.assertGreater(facts.sample_count, 0)
+            self.assertGreater(facts.avg_artifact_bytes, 0)
+            self.assertIn("state.sqlite3", facts.source)
+
+    def test_three_way_model_costs_assigns_zero_resume_to_config_c(self) -> None:
+        repo = RepoFacts(file_count=10, source_bytes=100_000, languages={"python": 100_000})
+        artifacts = ArtifactFacts(
+            source="test",
+            sample_count=10,
+            avg_artifact_bytes=800,
+            avg_worker_stdout_bytes=2_500,
+            avg_artifacts_per_worker=3.0,
+        )
+        configs = model_costs(
+            repo=repo, artifacts=artifacts, workers=4, codegraph_context_bytes=4_000
+        )
+        self.assertEqual([c.label for c in configs[:3]], [
+            "A. Agent only",
+            "B. CodeGraph alone",
+            "C. Puppetmaster + CodeGraph",
+        ])
+        a_cfg, b_cfg, c_cfg = configs
+        self.assertEqual(c_cfg.resume_bytes, 0)
+        self.assertEqual(a_cfg.resume_bytes, a_cfg.fresh_task_bytes)
+        self.assertEqual(b_cfg.resume_bytes, b_cfg.fresh_task_bytes)
+
+    def test_three_way_session_cost_amortizes_for_puppetmaster(self) -> None:
+        repo = RepoFacts(file_count=10, source_bytes=100_000, languages={"python": 100_000})
+        artifacts = ArtifactFacts(
+            source="test",
+            sample_count=10,
+            avg_artifact_bytes=800,
+            avg_worker_stdout_bytes=2_500,
+            avg_artifacts_per_worker=3.0,
+        )
+        a_cfg, b_cfg, c_cfg = model_costs(
+            repo=repo, artifacts=artifacts, workers=4, codegraph_context_bytes=4_000
+        )
+
+        for follow_ups in (0, 1):
+            self.assertGreaterEqual(b_cfg.session_bytes(follow_ups), 0)
+
+        large_k = 25
+        c_at_k = c_cfg.session_bytes(large_k)
+        b_at_k = b_cfg.session_bytes(large_k)
+        a_at_k = a_cfg.session_bytes(large_k)
+
+        self.assertEqual(c_at_k, c_cfg.fresh_task_bytes)
+        self.assertLess(c_at_k, b_at_k)
+        self.assertLess(c_at_k, a_at_k)
+
+    def test_three_way_render_markdown_includes_session_table(self) -> None:
+        repo = RepoFacts(file_count=10, source_bytes=100_000, languages={"python": 100_000})
+        artifacts = ArtifactFacts(
+            source="test",
+            sample_count=10,
+            avg_artifact_bytes=800,
+            avg_worker_stdout_bytes=2_500,
+            avg_artifacts_per_worker=3.0,
+        )
+        configs = model_costs(
+            repo=repo, artifacts=artifacts, workers=4, codegraph_context_bytes=4_000
+        )
+        report = {
+            "ran_at": "2026-05-13T17:00:00+00:00",
+            "command": "python -m bench.three_way --cwd .",
+            "repo_path": "/tmp/repo",
+            "workers": 4,
+            "discovery_scan_ratio": 0.10,
+            "repo": {
+                "file_count": repo.file_count,
+                "source_bytes": repo.source_bytes,
+                "languages": repo.languages,
+            },
+            "artifacts": {
+                "source": artifacts.source,
+                "sample_count": artifacts.sample_count,
+                "avg_artifact_bytes": artifacts.avg_artifact_bytes,
+                "avg_worker_stdout_bytes": artifacts.avg_worker_stdout_bytes,
+                "avg_artifacts_per_worker": artifacts.avg_artifacts_per_worker,
+            },
+            "codegraph_available": True,
+            "codegraph_initialized": True,
+            "codegraph_context_bytes": 4_000,
+            "codegraph_query_seconds": 0.15,
+            "configs": [
+                {
+                    "label": c.label,
+                    "fresh_task_bytes": c.fresh_task_bytes,
+                    "resume_bytes": c.resume_bytes,
+                }
+                for c in configs
+            ],
+        }
+        markdown = render_three_way_markdown(report, price_per_million=3.0)
+
+        self.assertIn("Three-way cost comparison", markdown)
+        self.assertIn("Fresh task cost", markdown)
+        self.assertIn("Session cost", markdown)
+        self.assertIn("durable resume", markdown.lower())
+        self.assertIn("K=25", markdown)
 
     def test_bench_render_markdown_includes_enrichment_section(self) -> None:
         with TemporaryDirectory() as tmp:

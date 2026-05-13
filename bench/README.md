@@ -2,6 +2,63 @@
 
 Reproducible measurements you can run on any repo to validate the Puppetmaster + CodeGraph combo. Numbers in the main README come from running these harnesses locally — they're not synthetic.
 
+Two scripts, two different questions:
+
+| Script | Question it answers |
+|---|---|
+| `three_way.py` | What does **Puppetmaster** add on top of CodeGraph? (compares Agent-only vs CodeGraph alone vs Puppetmaster + CodeGraph) |
+| `codegraph_ab.py` | What does **CodeGraph** add to a Cursor SDK worker? (A/B with CodeGraph on vs. off; live A/B requires `CURSOR_API_KEY`) |
+
+If you only run one, run `three_way.py` — it's the one that answers the cost question users actually have.
+
+## `three_way.py` — Agent vs CodeGraph alone vs Puppetmaster + CodeGraph
+
+A cost-structure model that maps three different deployment configurations onto the same investigation task, then reports bytes / tokens / dollars per fresh task and per session.
+
+### Run it
+
+```bash
+# Default: 4 workers, $3/1M tokens, uses repo-local data only
+python -m bench.three_way --cwd .
+
+# With real past artifact data from one of your previous swarms:
+python -m bench.three_way \
+    --cwd . \
+    --workers 4 \
+    --artifacts-state ~/Library/Application\ Support/puppetmaster/projects/your-project
+```
+
+Output (markdown + JSON) lands in `bench/results/three_way_<timestamp>.{md,json}`.
+
+### What it actually models
+
+| Config | Per-worker prompt | Tool-call frames | Synthesis | Resume |
+|---|---|---|---|---|
+| A. Agent only | discovery_scan (~10% of repo) + agent output | many (grep/read/list) | agent self-summary | full re-run |
+| B. CodeGraph alone | one `codegraph_explore` result + agent output | one MCP frame per worker | agent self-summary | full re-run |
+| C. Puppetmaster + CodeGraph | inlined CodeGraph context + worker artifact output | **zero** (context is pre-injected) | stitcher reads structured artifacts | **read SQLite, 0 model tokens** |
+
+The headline finding (on this repo): **for a single fresh task, Puppetmaster ≈ CodeGraph alone in raw tokens**. The real wins are on the **session axis** — every follow-up read against a Puppetmaster job is free at the model level, so cost flatlines while A and B keep paying per re-run.
+
+### What's measured vs. what's modelled
+
+Measured:
+
+- Repo file count and total source bytes (walks the target).
+- CodeGraph context size and query latency (real `codegraph context` call).
+- Avg Puppetmaster artifact size by type, avg worker stdout size, avg artifacts per worker (real, from past `state.sqlite3` if `--artifacts-state` is supplied).
+
+Modelled with stated constants (override with flags):
+
+- Tool-call frame size (`~250 bytes`).
+- Typical agent self-output per task (`~2,000 bytes`).
+- Stitcher output (`~1,500 bytes`).
+- Agent-only discovery scan ratio (`10%` of repo).
+- Bytes → tokens (`÷ 4`).
+- $ per 1M tokens (`--price-per-million`, default `$3.00`).
+
+We do **not** capture exact per-task token billing from a live agent stream. That requires SDK-side instrumentation (on the roadmap).
+
 ## `codegraph_ab.py` — does CodeGraph actually save the agent work?
 
 A/B benchmark that runs the **same Cursor SDK task twice** through Puppetmaster's `CursorAdapter`:
