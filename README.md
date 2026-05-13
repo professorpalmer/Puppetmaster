@@ -228,27 +228,58 @@ CodeGraph gives those agents shared code intelligence before they spend tokens e
 
 Cursor Agent can also query CodeGraph directly through Puppetmaster's MCP — no second MCP server required for the daily-driver case. See [Bundled CodeGraph tools](#bundled-codegraph-tools-no-second-mcp) below.
 
-### Does CodeGraph actually save the agent work? (measured)
+### What does Puppetmaster + CodeGraph actually save vs. each baseline?
 
-The `bench/codegraph_ab.py` harness runs an A/B against Puppetmaster's `CursorAdapter` with CodeGraph on vs. off. There's a `--dry-run` mode that needs no API key and measures just the prompt enrichment.
+Three configurations matter:
 
-Sample dry-run on this repo (20 source files indexed, 574 nodes):
+- **A. Agent only** — one agent (Cursor or Claude Code) doing the work alone, discovering the repo with grep/read/list.
+- **B. CodeGraph alone** — same agent, with CodeGraph's MCP installed; the agent issues `codegraph_explore` calls itself.
+- **C. Puppetmaster + CodeGraph** — Puppetmaster swarm with CodeGraph context pre-injected into every worker prompt, structured artifacts in a durable SQLite store, stitcher reads JSON not transcripts.
 
-| Metric | Value |
-|---|---|
-| raw prompt characters | 345 |
-| CodeGraph injected characters | 4,000 |
-| injection ratio (injected / raw) | **11.59×** |
-| CodeGraph context query | **0.180s** |
+The honest result, modelled from real measurements on this repo (`bench/three_way.py`, swarm of 4 workers, artifact sizes from a real past Puppetmaster run, $3/1M token input price):
 
-The agent starts every worker run with ~11× more pre-resolved structural context for ~180ms of work, instead of paying for that same surface with grep / read / list tool calls per worker. Reproduce on your own repo:
+#### Fresh task cost (one investigation)
+
+| Config | Tokens | Cost |
+|---|---|---|
+| A. Agent only | ~30,695 | ~$0.0921 |
+| B. CodeGraph alone | ~6,250 | ~$0.0187 |
+| C. Puppetmaster + CodeGraph | ~21,231 | ~$0.0637 |
+
+**On a single fresh task, Puppetmaster does not beat CodeGraph alone in raw tokens.** Puppetmaster is doing more work — N parallel workers and a stitcher pass instead of one agent — so its token bill is higher than a single agent with CodeGraph. That's an honest, measured trade-off, and you should know it before believing any "99% reduction" copy.
+
+#### Session cost (1 swarm + K follow-up reads at $3/1M)
+
+This is where Puppetmaster actually wins. Real workflows are not one-shot: you investigate, then ask follow-up questions about the same task. In Configs A and B every follow-up is a fresh agent re-run (no persisted state). In Config C, every follow-up is just SQLite — **0 model tokens.**
+
+| Config | K=0 | K=1 | K=5 | K=10 | K=25 |
+|---|---|---|---|---|---|
+| A. Agent only | ~$0.0921 | ~$0.1842 | ~$0.5525 | ~$1.0129 | ~$2.3942 |
+| B. CodeGraph alone | ~$0.0187 | ~$0.0375 | ~$0.1125 | ~$0.2062 | ~$0.4875 |
+| **C. Puppetmaster + CodeGraph** | **~$0.0637** | **~$0.0637** | **~$0.0637** | **~$0.0637** | **~$0.0637** |
+
+At K=25 follow-ups, **Puppetmaster + CodeGraph is ~7.6× cheaper than CodeGraph alone and ~38× cheaper than agent-only.** The crossover where C catches up to B is around K=3-4 in this dataset.
+
+#### Where Puppetmaster's savings actually come from
+
+1. **Shared CodeGraph query** — one `codegraph context` call seeds N workers; B issues N separate `codegraph_explore` calls.
+2. **Zero tool-call frames** — workers receive context inline; no MCP round-trip envelope per worker.
+3. **Structured synthesis** — the stitcher reads typed JSON artifacts instead of raw worker stdout.
+4. **Durable resume** — the killer feature. Every follow-up read against a completed Puppetmaster job is free at the model level.
+
+#### Reproduce on your own repo
 
 ```bash
 npm install -g @colbymchenry/codegraph && codegraph init && codegraph index
+
+# Three-way cost-structure benchmark
+python -m bench.three_way --cwd . --workers 4 --artifacts-state /path/to/past/puppetmaster/state
+
+# Just CodeGraph's prompt enrichment (A/B, no API key required)
 python -m bench.codegraph_ab --cwd . --prompt @bench/prompts/example.txt --dry-run
 ```
 
-Live A/B with the Cursor SDK requires `CURSOR_API_KEY`. See [`bench/README.md`](bench/README.md) for the full methodology and what we measure / don't measure (yet).
+See [`bench/README.md`](bench/README.md) for full methodology, what's measured vs. modelled, and the honest caveats (no live token billing yet — that's on the roadmap and needs SDK-side stream instrumentation).
 
 ## Cursor Integration
 
