@@ -21,6 +21,16 @@ from puppetmaster.adapters import (
     classify_claude_code_failure,
     classify_cursor_failure,
 )
+from puppetmaster.codegraph import (
+    codegraph_affected,
+    codegraph_context,
+    codegraph_files_listing,
+    codegraph_initialized,
+    codegraph_query,
+    codegraph_ready,
+    enrich_prompt_with_codegraph,
+    run_codegraph_cli,
+)
 from puppetmaster.config import load_config
 from puppetmaster.cli import artifact_feed, cursor_prompt, main as cli_main
 from puppetmaster.diagnostics import adapter_status, run_doctor, starter_config
@@ -610,6 +620,369 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertIn(ArtifactType.RISK, artifact_types)
         self.assertEqual(artifacts[0].payload["result"], "passed")
         self.assertIn("Puppetmaster artifact contract", cursor_input["prompt"])
+
+    def test_codegraph_helper_returns_none_when_cli_missing(self) -> None:
+        with TemporaryDirectory() as tmp:
+            (Path(tmp) / ".codegraph").mkdir()
+            with patch("puppetmaster.codegraph.shutil.which", return_value=None):
+                self.assertFalse(codegraph_ready(tmp))
+                self.assertIsNone(codegraph_context("map auth", tmp))
+
+    def test_codegraph_helper_requires_initialized_workspace(self) -> None:
+        with TemporaryDirectory() as tmp:
+            with patch("puppetmaster.codegraph.shutil.which", return_value="/usr/local/bin/codegraph"):
+                self.assertFalse(codegraph_initialized(tmp))
+                self.assertFalse(codegraph_ready(tmp))
+                self.assertIsNone(codegraph_context("map auth", tmp))
+
+    def test_codegraph_helper_returns_context_when_command_succeeds(self) -> None:
+        with TemporaryDirectory() as tmp:
+            (Path(tmp) / ".codegraph").mkdir()
+            completed = subprocess.CompletedProcess(
+                args=["codegraph"],
+                returncode=0,
+                stdout="### Entry points\n- streaming.py:42\n",
+                stderr="",
+            )
+            with patch(
+                "puppetmaster.codegraph.shutil.which",
+                return_value="/usr/local/bin/codegraph",
+            ), patch(
+                "puppetmaster.codegraph.subprocess.run",
+                return_value=completed,
+            ) as run:
+                context = codegraph_context("map auth", tmp)
+
+            command = run.call_args.args[0]
+            self.assertIn("streaming.py:42", context)
+            self.assertEqual(command[:2], ["codegraph", "context"])
+
+    def test_enrich_prompt_returns_unchanged_when_disabled(self) -> None:
+        prompt, used = enrich_prompt_with_codegraph(
+            "Inspect repo",
+            task_description="map auth",
+            cwd="/tmp",
+            disabled=True,
+        )
+
+        self.assertEqual(prompt, "Inspect repo")
+        self.assertFalse(used)
+
+    def test_run_codegraph_cli_reports_missing_cli(self) -> None:
+        with TemporaryDirectory() as tmp:
+            (Path(tmp) / ".codegraph").mkdir()
+            with patch("puppetmaster.codegraph.shutil.which", return_value=None):
+                payload = run_codegraph_cli(["status"], tmp)
+
+            self.assertFalse(payload["ok"])
+            self.assertIn("codegraph CLI not on PATH", payload["error"])
+
+    def test_run_codegraph_cli_reports_uninitialized_workspace(self) -> None:
+        with TemporaryDirectory() as tmp:
+            with patch(
+                "puppetmaster.codegraph.shutil.which",
+                return_value="/usr/local/bin/codegraph",
+            ):
+                payload = run_codegraph_cli(["query", "Foo"], tmp)
+
+            self.assertFalse(payload["ok"])
+            self.assertIn("not initialized", payload["error"])
+
+    def test_run_codegraph_cli_returns_structured_success(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["codegraph"],
+            returncode=0,
+            stdout='{"results": []}',
+            stderr="",
+        )
+        with TemporaryDirectory() as tmp:
+            (Path(tmp) / ".codegraph").mkdir()
+            with patch(
+                "puppetmaster.codegraph.shutil.which",
+                return_value="/usr/local/bin/codegraph",
+            ), patch(
+                "puppetmaster.codegraph.subprocess.run",
+                return_value=completed,
+            ) as run:
+                payload = run_codegraph_cli(["query", "Foo", "--json"], tmp)
+
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["returncode"], 0)
+            self.assertEqual(payload["stdout"], '{"results": []}')
+            self.assertEqual(run.call_args.args[0][:3], ["codegraph", "query", "Foo"])
+
+    def test_codegraph_query_builds_expected_args(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["codegraph"],
+            returncode=0,
+            stdout="[]",
+            stderr="",
+        )
+        with TemporaryDirectory() as tmp:
+            (Path(tmp) / ".codegraph").mkdir()
+            with patch(
+                "puppetmaster.codegraph.shutil.which",
+                return_value="/usr/local/bin/codegraph",
+            ), patch(
+                "puppetmaster.codegraph.subprocess.run",
+                return_value=completed,
+            ) as run:
+                codegraph_query("UserService", tmp, kind="class", limit=5)
+
+            command = run.call_args.args[0]
+            self.assertEqual(command[:2], ["codegraph", "query"])
+            self.assertIn("UserService", command)
+            self.assertIn("--kind", command)
+            self.assertIn("class", command)
+            self.assertIn("--limit", command)
+            self.assertIn("5", command)
+            self.assertIn("--json", command)
+
+    def test_codegraph_query_rejects_blank_search(self) -> None:
+        payload = codegraph_query("   ", "/tmp")
+        self.assertFalse(payload["ok"])
+        self.assertIn("search term is required", payload["error"])
+
+    def test_codegraph_affected_requires_files(self) -> None:
+        payload = codegraph_affected([], "/tmp")
+        self.assertFalse(payload["ok"])
+        self.assertIn("at least one changed file path", payload["error"])
+
+    def test_codegraph_affected_passes_files_and_options(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["codegraph"],
+            returncode=0,
+            stdout='{"affected": ["tests/test_auth.py"]}',
+            stderr="",
+        )
+        with TemporaryDirectory() as tmp:
+            (Path(tmp) / ".codegraph").mkdir()
+            with patch(
+                "puppetmaster.codegraph.shutil.which",
+                return_value="/usr/local/bin/codegraph",
+            ), patch(
+                "puppetmaster.codegraph.subprocess.run",
+                return_value=completed,
+            ) as run:
+                payload = codegraph_affected(
+                    ["src/auth.py", "src/api.py"],
+                    tmp,
+                    depth=4,
+                    filter_pattern="tests/**/*.py",
+                )
+
+            command = run.call_args.args[0]
+            self.assertTrue(payload["ok"])
+            self.assertIn("affected", command)
+            self.assertIn("src/auth.py", command)
+            self.assertIn("src/api.py", command)
+            self.assertIn("--depth", command)
+            self.assertIn("4", command)
+            self.assertIn("--filter", command)
+            self.assertIn("tests/**/*.py", command)
+
+    def test_codegraph_files_listing_serializes_options(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["codegraph"],
+            returncode=0,
+            stdout="[]",
+            stderr="",
+        )
+        with TemporaryDirectory() as tmp:
+            (Path(tmp) / ".codegraph").mkdir()
+            with patch(
+                "puppetmaster.codegraph.shutil.which",
+                return_value="/usr/local/bin/codegraph",
+            ), patch(
+                "puppetmaster.codegraph.subprocess.run",
+                return_value=completed,
+            ) as run:
+                codegraph_files_listing(
+                    tmp,
+                    path="src",
+                    fmt="tree",
+                    filter_pattern="*.ts",
+                    max_depth=3,
+                )
+
+            command = run.call_args.args[0]
+            self.assertEqual(command[:2], ["codegraph", "files"])
+            self.assertIn("src", command)
+            self.assertIn("--format", command)
+            self.assertIn("tree", command)
+            self.assertIn("--max-depth", command)
+            self.assertIn("3", command)
+            self.assertIn("--json", command)
+
+    def test_mcp_exposes_codegraph_proxy_tools(self) -> None:
+        response = handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        tool_names = {tool["name"] for tool in response["result"]["tools"]}
+
+        self.assertIn("puppetmaster_codegraph_search", tool_names)
+        self.assertIn("puppetmaster_codegraph_context", tool_names)
+        self.assertIn("puppetmaster_codegraph_affected", tool_names)
+        self.assertIn("puppetmaster_codegraph_files", tool_names)
+        self.assertIn("puppetmaster_codegraph_status", tool_names)
+        self.assertIn("puppetmaster_codegraph_init", tool_names)
+
+    def test_mcp_codegraph_search_returns_payload_when_cli_succeeds(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["codegraph"],
+            returncode=0,
+            stdout='{"results": [{"name": "Foo"}]}',
+            stderr="",
+        )
+        with TemporaryDirectory() as tmp:
+            (Path(tmp) / ".codegraph").mkdir()
+            with patch(
+                "puppetmaster.codegraph.shutil.which",
+                return_value="/usr/local/bin/codegraph",
+            ), patch(
+                "puppetmaster.codegraph.subprocess.run",
+                return_value=completed,
+            ):
+                result = call_tool(
+                    "puppetmaster_codegraph_search",
+                    {"cwd": tmp, "query": "Foo"},
+                )
+
+        self.assertFalse(result["isError"])
+        body = json.loads(result["content"][0]["text"])
+        self.assertTrue(body["ok"])
+        self.assertIn("Foo", body["stdout"])
+
+    def test_mcp_codegraph_search_reports_missing_cli_as_error(self) -> None:
+        with TemporaryDirectory() as tmp:
+            (Path(tmp) / ".codegraph").mkdir()
+            with patch("puppetmaster.codegraph.shutil.which", return_value=None):
+                result = call_tool(
+                    "puppetmaster_codegraph_search",
+                    {"cwd": tmp, "query": "Foo"},
+                )
+
+        self.assertTrue(result["isError"])
+        body = json.loads(result["content"][0]["text"])
+        self.assertFalse(body["ok"])
+        self.assertIn("codegraph CLI not on PATH", body["error"])
+
+    def test_mcp_codegraph_affected_requires_files(self) -> None:
+        with TemporaryDirectory() as tmp:
+            result = call_tool(
+                "puppetmaster_codegraph_affected",
+                {"cwd": tmp, "files": []},
+            )
+
+        self.assertTrue(result["isError"])
+        body = json.loads(result["content"][0]["text"])
+        self.assertIn("non-empty array", body["error"])
+
+    def test_mcp_codegraph_status_does_not_require_init(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["codegraph"],
+            returncode=0,
+            stdout="Backend: native\nNodes: 0",
+            stderr="",
+        )
+        with TemporaryDirectory() as tmp:
+            with patch(
+                "puppetmaster.codegraph.shutil.which",
+                return_value="/usr/local/bin/codegraph",
+            ), patch(
+                "puppetmaster.codegraph.subprocess.run",
+                return_value=completed,
+            ) as run:
+                result = call_tool(
+                    "puppetmaster_codegraph_status",
+                    {"cwd": tmp},
+                )
+
+        self.assertFalse(result["isError"])
+        body = json.loads(result["content"][0]["text"])
+        self.assertTrue(body["ok"])
+        self.assertIn("Backend: native", body["stdout"])
+        self.assertEqual(run.call_args.args[0][:2], ["codegraph", "status"])
+
+    def test_mcp_codegraph_init_passes_index_flag(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["codegraph"],
+            returncode=0,
+            stdout="initialized",
+            stderr="",
+        )
+        with TemporaryDirectory() as tmp:
+            with patch(
+                "puppetmaster.codegraph.shutil.which",
+                return_value="/usr/local/bin/codegraph",
+            ), patch(
+                "puppetmaster.codegraph.subprocess.run",
+                return_value=completed,
+            ) as run:
+                result = call_tool(
+                    "puppetmaster_codegraph_init",
+                    {"cwd": tmp, "index": True},
+                )
+
+        self.assertFalse(result["isError"])
+        command = run.call_args.args[0]
+        self.assertEqual(command[:2], ["codegraph", "init"])
+        self.assertIn("--index", command)
+
+    def test_cursor_adapter_injects_codegraph_context_when_available(self) -> None:
+        task = Task(
+            job_id="job",
+            role="pipeline-mapper",
+            instruction="map pitcher streaming logic",
+            adapter="cursor",
+            payload={"prompt": "Inspect repo", "cwd": "/tmp/codegraph-repo"},
+        )
+        completed = subprocess.CompletedProcess(
+            args=["node"],
+            returncode=0,
+            stdout=json.dumps({"status": "finished", "result": ""}),
+            stderr="",
+        )
+
+        with patch(
+            "puppetmaster.adapters.enrich_prompt_with_codegraph",
+            return_value=(
+                "Inspect repo\n\nShared CodeGraph context for this task:\n```\nstreaming.py:42\n```\n",
+                True,
+            ),
+        ), patch(
+            "puppetmaster.adapters.subprocess.run",
+            return_value=completed,
+        ) as run:
+            artifacts = CursorAdapter().run(task, "goal", "worker-cursor")
+
+        cursor_input = json.loads(run.call_args.kwargs["env"]["PUPPETMASTER_CURSOR_INPUT"])
+        self.assertIn("Shared CodeGraph context for this task", cursor_input["prompt"])
+        self.assertIn("context:codegraph", artifacts[0].evidence)
+
+    def test_cursor_adapter_skips_codegraph_when_unavailable(self) -> None:
+        task = Task(
+            job_id="job",
+            role="pipeline-mapper",
+            instruction="inspect repo",
+            adapter="cursor",
+            payload={"prompt": "Inspect repo", "cwd": "/tmp/no-codegraph"},
+        )
+        completed = subprocess.CompletedProcess(
+            args=["node"],
+            returncode=0,
+            stdout=json.dumps({"status": "finished", "result": ""}),
+            stderr="",
+        )
+
+        with patch(
+            "puppetmaster.adapters.enrich_prompt_with_codegraph",
+            return_value=("Inspect repo", False),
+        ), patch(
+            "puppetmaster.adapters.subprocess.run",
+            return_value=completed,
+        ):
+            artifacts = CursorAdapter().run(task, "goal", "worker-cursor")
+
+        self.assertNotIn("context:codegraph", artifacts[0].evidence)
 
     def test_cursor_adapter_degrades_empty_success(self) -> None:
         task = Task(

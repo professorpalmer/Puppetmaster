@@ -115,6 +115,7 @@ The goal is not “one more chat.” The goal is a local runtime where the opera
 | Claude Code adapter | Live full-edit adapter through Claude Code CLI; validated with real tracked diffs |
 | Shell adapter | Built-in bounded command runner for verification |
 | Memory | Promoted memory retrieval into later worker context and prompts |
+| CodeGraph | Optional shared repo intelligence: workers auto-inject CodeGraph context when available |
 | Patch workflow | Patch artifacts, path locks, approval/rejection events, dirty-worktree guard |
 | Codex | Stubbed provider slot; next adapter target |
 
@@ -200,6 +201,33 @@ git worktree add /tmp/puppetmaster-work -b puppetmaster-work
 python -m puppetmaster claude "Implement the approved fix" --cwd /tmp/puppetmaster-work --permission-mode acceptEdits
 ```
 
+## Shared Repo Intelligence (CodeGraph)
+
+Puppetmaster optionally hands every Cursor and Claude Code worker a pre-built repo map instead of letting them each rediscover the codebase with grep/read passes. We use [CodeGraph](https://github.com/colbymchenry/codegraph) for that map.
+
+```bash
+npm install -g @colbymchenry/codegraph
+cd your-target-repo
+codegraph init -i
+```
+
+After that, Puppetmaster's `doctor` will show `codegraph ok`, and every Cursor/Claude worker run against that workspace will:
+
+- query CodeGraph for task-relevant symbols, files, and routes
+- inject the result into the worker prompt as authoritative starting context
+- tag the resulting verification artifact with `context:codegraph` so the operator can confirm shared intelligence was used
+
+This is fully optional and graceful. If `codegraph` is not installed, or the target repo is not initialized, workers fall back to their normal exploration path with no error. Pass `disable_codegraph: true` in a task payload to skip CodeGraph for a specific worker.
+
+The architectural framing:
+
+```text
+Puppetmaster orchestrates independent agents.
+CodeGraph gives those agents shared code intelligence before they spend tokens exploring.
+```
+
+Cursor Agent can also query CodeGraph directly through Puppetmaster's MCP — no second MCP server required for the daily-driver case. See [Bundled CodeGraph tools](#bundled-codegraph-tools-no-second-mcp) below.
+
 ## Cursor Integration
 
 Puppetmaster ships with two Cursor integration surfaces.
@@ -220,8 +248,31 @@ The MCP server lets Cursor Agent call Puppetmaster tools directly:
 - `puppetmaster_partial_summary`
 - `puppetmaster_artifacts`
 - `puppetmaster_show`
+- `puppetmaster_codegraph_search`
+- `puppetmaster_codegraph_context`
+- `puppetmaster_codegraph_affected`
+- `puppetmaster_codegraph_files`
+- `puppetmaster_codegraph_status`
+- `puppetmaster_codegraph_init`
 
 The older blocking tools are still available for short calls, but the daily-driver path should use `puppetmaster_start_*`. Start tools return a `job_id` immediately, so Cursor does not keep one long MCP call open while workers run.
+
+### Bundled CodeGraph tools (no second MCP)
+
+Puppetmaster's MCP server bundles the most useful CodeGraph CLI commands so Cursor Agent only needs the Puppetmaster MCP to get both orchestration and repo intelligence:
+
+| Tool | Wraps | Use for |
+|---|---|---|
+| `puppetmaster_codegraph_search` | `codegraph query` | Find symbols by name (`{query, kind?, limit?}`) |
+| `puppetmaster_codegraph_context` | `codegraph context` | Pull task-relevant entry points and related symbols (`{task}`) |
+| `puppetmaster_codegraph_affected` | `codegraph affected` | Resolve impacted tests from changed source files (`{files[]}`) |
+| `puppetmaster_codegraph_files` | `codegraph files` | Inspect the indexed file structure without scanning the FS |
+| `puppetmaster_codegraph_status` | `codegraph status` | Check index health and backend |
+| `puppetmaster_codegraph_init` | `codegraph init` | Initialize CodeGraph in a workspace (`{index?: true}` to also build immediately) |
+
+Every tool degrades cleanly: if the `codegraph` CLI is not installed or the workspace is not initialized, the response is a non-fatal `isError: true` payload with `error` set to a one-line fix-it hint, not a runtime crash.
+
+Power users who want CodeGraph's full MCP surface (`codegraph_callers`, `codegraph_callees`, `codegraph_impact`, `codegraph_node`) — only available through its own MCP server — can still run `codegraph serve --mcp` alongside Puppetmaster's MCP. Bundling covers the daily-driver case so two MCP entries are no longer required by default.
 
 For real multi-role code analysis from Cursor Agent, use `puppetmaster_start_cursor_swarm`. Bare custom roles on `puppetmaster_start_swarm` require a config or adapter; otherwise Puppetmaster fails fast instead of silently using the deterministic local demo adapter.
 
