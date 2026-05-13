@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 from puppetmaster.adapters import ADAPTER_INFO, AdapterInfo
+from puppetmaster.codegraph import codegraph_available, codegraph_initialized
 from puppetmaster.state import resolve_state_dir
 
 
@@ -31,11 +32,28 @@ def run_doctor(root: Path, state_dir: Optional[Path] = None) -> list[Check]:
         _command_check("npm", ["npm", "--version"]),
         _cursor_sdk_check(root),
         _claude_code_check(),
+        _codegraph_check(root),
         _env_check("CURSOR_API_KEY"),
         _sqlite_state_check(state_path / "state.sqlite3"),
         _git_clean_check(root),
     ]
     return checks
+
+
+def _codegraph_check(root: Path) -> Check:
+    if not codegraph_available():
+        return Check(
+            "codegraph",
+            "optional",
+            "install codegraph for shared repo intelligence (npx @colbymchenry/codegraph)",
+        )
+    if not codegraph_initialized(root):
+        return Check(
+            "codegraph",
+            "optional",
+            "codegraph installed; run `codegraph init` in target repos to enable shared context",
+        )
+    return Check("codegraph", "ok", "codegraph installed and target workspace initialized")
 
 
 def adapter_status(root: Path) -> list[dict[str, object]]:

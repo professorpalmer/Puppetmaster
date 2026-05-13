@@ -18,6 +18,10 @@ After starting a Puppetmaster swarm:
 
 If the swarm completes with empty findings, only verification artifacts, or a degraded Cursor SDK artifact, report Puppetmaster as degraded and do not treat the run as a successful analysis.
 
+If the target repository has CodeGraph installed and initialized (`.codegraph/` exists and `codegraph` is on PATH), Puppetmaster will automatically inject shared repo intelligence into every Cursor and Claude Code worker prompt. Look for `context:codegraph` in verification artifact evidence to confirm shared context was used.
+
+For quick, direct repo lookups without spinning up a swarm, prefer Puppetmaster's bundled CodeGraph tools: `puppetmaster_codegraph_search` (find symbols), `puppetmaster_codegraph_context` (task-relevant entry points), `puppetmaster_codegraph_affected` (impacted tests for changed files), `puppetmaster_codegraph_files`, and `puppetmaster_codegraph_status`. If CodeGraph isn't initialized in the target repo, call `puppetmaster_codegraph_init` once before using the other CodeGraph tools.
+
 Use Cursor's normal Build flow for small approved implementation slices. Use Puppetmaster/Claude implementation when the user wants durable patch artifacts, logs, and stricter auditability.
 
 Keep implementation scoped to one approved slice at a time, then use Puppetmaster again to verify or redteam the result before moving to the next slice.

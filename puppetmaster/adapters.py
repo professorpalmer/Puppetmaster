@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Protocol, Union
 
+from puppetmaster.codegraph import enrich_prompt_with_codegraph
 from puppetmaster.models import Artifact, ArtifactType, Task
 
 
@@ -227,12 +228,18 @@ class CursorAdapter:
     name = "cursor"
 
     def run(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
-        prompt = self._prompt_with_memory(
-            self._structured_prompt(task.payload.get("prompt") or task.instruction),
-            task,
-        )
+        base_prompt = task.payload.get("prompt") or task.instruction
         cwd = task.payload.get("cwd")
         model = task.payload.get("model", "default")
+        prompt, codegraph_used = enrich_prompt_with_codegraph(
+            self._prompt_with_memory(
+                self._structured_prompt(base_prompt),
+                task,
+            ),
+            task_description=task.payload.get("codegraph_task") or task.instruction or goal,
+            cwd=cwd,
+            disabled=bool(task.payload.get("disable_codegraph", False)),
+        )
         runner = Path(__file__).with_name("cursor_sdk_runner.mjs")
         environment = os.environ.copy()
         environment["PUPPETMASTER_CURSOR_INPUT"] = json.dumps(
@@ -291,7 +298,10 @@ class CursorAdapter:
                     else "failed"
                 ),
                 confidence=0.65 if degraded else 0.9 if completed.returncode == 0 else 0.55,
-                evidence=["adapter:cursor-sdk", f"node:{sys.platform}"],
+                evidence=(
+                    ["adapter:cursor-sdk", f"node:{sys.platform}"]
+                    + (["context:codegraph"] if codegraph_used else [])
+                ),
                 payload={
                     "returncode": completed.returncode,
                     "stdout": completed.stdout[-8000:],
@@ -353,8 +363,14 @@ class ClaudeCodeAdapter:
     name = "claude-code"
 
     def run(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
-        prompt = prompt_with_memory(task.payload.get("prompt") or task.instruction, task)
+        base_prompt = task.payload.get("prompt") or task.instruction
         cwd = Path(task.payload.get("cwd") or ".").resolve()
+        prompt, codegraph_used = enrich_prompt_with_codegraph(
+            prompt_with_memory(base_prompt, task),
+            task_description=task.payload.get("codegraph_task") or task.instruction or goal,
+            cwd=cwd,
+            disabled=bool(task.payload.get("disable_codegraph", False)),
+        )
         timeout_seconds = int(task.payload.get("timeout_seconds", 600))
         executable = task.payload.get("executable") or os.environ.get("CLAUDE_CODE_COMMAND") or "claude"
         command_base = command_parts(executable)
@@ -455,7 +471,13 @@ class ClaudeCodeAdapter:
             check=task.instruction,
             result="passed" if completed.returncode == 0 else "failed",
             confidence=0.9 if completed.returncode == 0 else 0.55,
-            evidence=["adapter:claude-code", f"permission_mode:{task.payload.get('permission_mode', 'acceptEdits')}"],
+            evidence=(
+                [
+                    "adapter:claude-code",
+                    f"permission_mode:{task.payload.get('permission_mode', 'acceptEdits')}",
+                ]
+                + (["context:codegraph"] if codegraph_used else [])
+            ),
             payload={
                 "failure": None if completed.returncode == 0 else classify_claude_code_failure(completed.stderr + completed.stdout),
                 "returncode": completed.returncode,

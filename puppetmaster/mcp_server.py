@@ -10,6 +10,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from puppetmaster.codegraph import (
+    codegraph_affected,
+    codegraph_context_command,
+    codegraph_files_listing,
+    codegraph_init_command,
+    codegraph_query,
+    codegraph_status_command,
+)
 from puppetmaster.state import resolve_state_dir
 
 
@@ -173,7 +181,122 @@ def tools() -> list[McpTool]:
             input_schema=job_schema(required=True),
             handler=lambda args: run_cli(["show", require_string(args, "job_id")], args),
         ),
+        McpTool(
+            name="puppetmaster_codegraph_search",
+            description=(
+                "Find symbols by name using the local CodeGraph index. "
+                "Bundles `codegraph query` so Cursor Agent only needs the Puppetmaster MCP."
+            ),
+            input_schema=codegraph_search_schema(),
+            handler=run_codegraph_search,
+        ),
+        McpTool(
+            name="puppetmaster_codegraph_context",
+            description=(
+                "Build task-relevant CodeGraph context (entry points, related symbols) "
+                "without spawning a worker. Use for quick repo intel before editing."
+            ),
+            input_schema=codegraph_context_schema(),
+            handler=run_codegraph_context,
+        ),
+        McpTool(
+            name="puppetmaster_codegraph_affected",
+            description=(
+                "Resolve which test files are impacted by changed source files using "
+                "CodeGraph's import graph. Great for targeted CI/test selection."
+            ),
+            input_schema=codegraph_affected_schema(),
+            handler=run_codegraph_affected,
+        ),
+        McpTool(
+            name="puppetmaster_codegraph_files",
+            description="Return the indexed file structure from CodeGraph (faster than fs scans).",
+            input_schema=codegraph_files_schema(),
+            handler=run_codegraph_files,
+        ),
+        McpTool(
+            name="puppetmaster_codegraph_status",
+            description="Return CodeGraph index health and statistics for the target workspace.",
+            input_schema=base_schema(),
+            handler=run_codegraph_status,
+        ),
+        McpTool(
+            name="puppetmaster_codegraph_init",
+            description=(
+                "Initialize CodeGraph in the target workspace (creates .codegraph/). "
+                "Pass index=true to also build the full index immediately."
+            ),
+            input_schema=codegraph_init_schema(),
+            handler=run_codegraph_init,
+        ),
     ]
+
+
+def run_codegraph_search(args: JsonObject) -> JsonObject:
+    payload = codegraph_query(
+        require_string(args, "query"),
+        cwd(args),
+        kind=args.get("kind") if isinstance(args.get("kind"), str) else None,
+        limit=int(args["limit"]) if args.get("limit") is not None else None,
+        json_output=bool(args.get("json", True)),
+    )
+    return codegraph_response(payload)
+
+
+def run_codegraph_context(args: JsonObject) -> JsonObject:
+    payload = codegraph_context_command(
+        require_string(args, "task"),
+        cwd(args),
+        max_nodes=int(args.get("max_nodes") or 15),
+        fmt=str(args.get("format") or "markdown"),
+    )
+    return codegraph_response(payload)
+
+
+def run_codegraph_affected(args: JsonObject) -> JsonObject:
+    files = args.get("files")
+    if not isinstance(files, list) or not files:
+        return tool_error("files must be a non-empty array of changed source paths.")
+    payload = codegraph_affected(
+        [str(item) for item in files if str(item).strip()],
+        cwd(args),
+        depth=int(args["depth"]) if args.get("depth") is not None else None,
+        filter_pattern=str(args["filter"]) if args.get("filter") else None,
+        json_output=bool(args.get("json", True)),
+    )
+    return codegraph_response(payload)
+
+
+def run_codegraph_files(args: JsonObject) -> JsonObject:
+    payload = codegraph_files_listing(
+        cwd(args),
+        path=str(args["path"]) if args.get("path") else None,
+        fmt=str(args["format"]) if args.get("format") else None,
+        filter_pattern=str(args["filter"]) if args.get("filter") else None,
+        max_depth=int(args["max_depth"]) if args.get("max_depth") is not None else None,
+        json_output=bool(args.get("json", True)),
+    )
+    return codegraph_response(payload)
+
+
+def run_codegraph_status(args: JsonObject) -> JsonObject:
+    payload = codegraph_status_command(cwd(args))
+    return codegraph_response(payload)
+
+
+def run_codegraph_init(args: JsonObject) -> JsonObject:
+    payload = codegraph_init_command(
+        cwd(args),
+        index=bool(args.get("index", False)),
+    )
+    return codegraph_response(payload)
+
+
+def codegraph_response(payload: JsonObject) -> JsonObject:
+    return {
+        "content": [{"type": "text", "text": json.dumps(payload, indent=2)}],
+        "isError": not payload.get("ok", False),
+    }
 
 
 def run_cursor(args: JsonObject, review: bool = False, plan: bool = False) -> JsonObject:
@@ -554,6 +677,126 @@ def cursor_swarm_schema() -> JsonObject:
     schema["properties"].pop("adapter", None)
     schema["properties"].pop("allow_local_demo", None)
     schema["properties"]["worker_mode"]["default"] = "subprocess"
+    return schema
+
+
+def codegraph_search_schema() -> JsonObject:
+    schema = base_schema()
+    schema["properties"].update(
+        {
+            "query": {
+                "type": "string",
+                "description": "Symbol name or substring to search the local CodeGraph index for.",
+            },
+            "kind": {
+                "type": "string",
+                "description": "Optional symbol kind filter (e.g. function, class, method, route).",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of matches to return.",
+            },
+            "json": {
+                "type": "boolean",
+                "default": True,
+                "description": "Return CodeGraph output as JSON. Set false for human-readable text.",
+            },
+        }
+    )
+    schema["required"] = ["query"]
+    return schema
+
+
+def codegraph_context_schema() -> JsonObject:
+    schema = base_schema()
+    schema["properties"].update(
+        {
+            "task": {
+                "type": "string",
+                "description": "Natural-language task description; CodeGraph returns relevant entry points and symbols.",
+            },
+            "max_nodes": {
+                "type": "integer",
+                "default": 15,
+                "description": "Upper bound on graph nodes returned in the context bundle.",
+            },
+            "format": {
+                "type": "string",
+                "enum": ["markdown", "json", "text"],
+                "default": "markdown",
+                "description": "Output format for the context bundle.",
+            },
+        }
+    )
+    schema["required"] = ["task"]
+    return schema
+
+
+def codegraph_affected_schema() -> JsonObject:
+    schema = base_schema()
+    schema["properties"].update(
+        {
+            "files": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Changed source file paths (relative to cwd) whose tests should be discovered.",
+            },
+            "depth": {
+                "type": "integer",
+                "description": "Max dependency traversal depth (CodeGraph default: 5).",
+            },
+            "filter": {
+                "type": "string",
+                "description": "Custom glob used to identify test files (e.g. 'tests/**/*.py').",
+            },
+            "json": {
+                "type": "boolean",
+                "default": True,
+                "description": "Return CodeGraph output as JSON. Set false for human-readable text.",
+            },
+        }
+    )
+    schema["required"] = ["files"]
+    return schema
+
+
+def codegraph_files_schema() -> JsonObject:
+    schema = base_schema()
+    schema["properties"].update(
+        {
+            "path": {
+                "type": "string",
+                "description": "Optional sub-path to scope the file listing.",
+            },
+            "format": {
+                "type": "string",
+                "description": "CodeGraph format option for the listing (e.g. tree, list).",
+            },
+            "filter": {
+                "type": "string",
+                "description": "Glob filter applied to the listing.",
+            },
+            "max_depth": {
+                "type": "integer",
+                "description": "Maximum directory depth to display.",
+            },
+            "json": {
+                "type": "boolean",
+                "default": True,
+                "description": "Return CodeGraph output as JSON. Set false for human-readable text.",
+            },
+        }
+    )
+    return schema
+
+
+def codegraph_init_schema() -> JsonObject:
+    schema = base_schema()
+    schema["properties"]["index"] = {
+        "type": "boolean",
+        "default": False,
+        "description": "If true, run a full index immediately after initialization.",
+    }
     return schema
 
 

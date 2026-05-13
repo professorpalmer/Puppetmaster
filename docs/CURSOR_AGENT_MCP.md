@@ -26,8 +26,30 @@ Puppetmaster exposes these MCP tools:
 - `puppetmaster_partial_summary`
 - `puppetmaster_artifacts`
 - `puppetmaster_show`
+- `puppetmaster_codegraph_search`
+- `puppetmaster_codegraph_context`
+- `puppetmaster_codegraph_affected`
+- `puppetmaster_codegraph_files`
+- `puppetmaster_codegraph_status`
+- `puppetmaster_codegraph_init`
 
 Cursor's Agent can call those tools during a chat, so you can ask it to run a Puppetmaster review, plan, or Claude Code implementation from inside Cursor.
+
+## Bundled CodeGraph (no second MCP)
+
+The `puppetmaster_codegraph_*` tools proxy the most useful CodeGraph CLI commands (`codegraph query`, `codegraph context`, `codegraph affected`, `codegraph files`, `codegraph status`, `codegraph init`). With these tools registered, Cursor Agent gets both Puppetmaster orchestration and CodeGraph repo intelligence through a single MCP server.
+
+Use them for quick repo lookups between (or instead of) swarm runs:
+
+```text
+Use puppetmaster_codegraph_search to find every implementation of UserService.
+Use puppetmaster_codegraph_context for "fix login redirect bug" before opening files.
+Use puppetmaster_codegraph_affected for the files I just changed so we only run impacted tests.
+```
+
+Each tool degrades cleanly: if the `codegraph` CLI is not installed, or the workspace is not initialized, the response is a non-fatal `isError: true` payload with a one-line fix-it hint. Run `puppetmaster_codegraph_init` once to bootstrap a workspace.
+
+Power users who want CodeGraph's full MCP surface (`codegraph_callers`, `codegraph_callees`, `codegraph_impact`, `codegraph_node`) — only exposed through CodeGraph's own MCP server — can still run `codegraph serve --mcp` alongside Puppetmaster's MCP. Bundling covers the daily-driver case so two MCP entries are no longer required by default.
 
 For anything longer than a quick health check, prefer the `puppetmaster_start_*` tools. They return a `job_id` immediately and let Cursor poll `puppetmaster_status`, `puppetmaster_logs`, and `puppetmaster_show` instead of holding one long MCP request open.
 
