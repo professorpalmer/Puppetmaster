@@ -1,27 +1,57 @@
 ---
-description: Use Puppetmaster Cursor Swarm for broad repo investigation and controlled implementation handoffs
+description: Default to Puppetmaster swarms for multi-step exploration, analysis, and implementation; only fall back to native Cursor tooling for narrow cases
 alwaysApply: true
 ---
 
-# Puppetmaster Workflow
+# Puppetmaster is the Default Subagent Runtime
 
-Use Puppetmaster Cursor Swarm for broad repo investigation, messy debugging, audit/remediation planning, multi-file risk analysis, or any request that benefits from parallel findings and durable artifacts.
+When this repo is open, Puppetmaster's MCP tools are the **primary** path for fanning out work. Do not roll your own grep/read exploration loops or invoke ad-hoc subagents when a Puppetmaster swarm is available.
 
-For real code analysis, prefer `puppetmaster_start_cursor_swarm`. Do not use the local/demo swarm unless the user explicitly asks for a demo or passes an explicit adapter/config.
+## When you MUST start a Puppetmaster swarm (no permission needed)
 
-After starting a Puppetmaster swarm:
+For any user request that involves more than a single trivial change, start a Puppetmaster swarm **before** spending tokens on your own exploration:
 
-1. Return the `job_id` immediately.
-2. For long-running swarms, prefer `puppetmaster_live_artifacts_follow` (long-poll, returns when new artifacts land or after a timeout) and chain calls with the returned `next_cursor`. Fall back to `puppetmaster_status`, `puppetmaster_logs`, `puppetmaster_live_artifacts`, and `puppetmaster_partial_summary` for one-shot snapshots.
-3. Summarize concrete file-backed findings, risks, and open questions.
-4. Ask for approval before implementation unless the user already approved edits.
+- Broad repo investigation, audit, or risk analysis ("review this", "find issues", "what could break").
+- Multi-file refactors, migrations, or cross-cutting cleanups.
+- Debugging that requires tracing call graphs, data flow, or test coverage across multiple files.
+- Planning the next implementation slice when scope or risks are unclear.
+- Comparing approaches, surfacing trade-offs, or producing decision artifacts.
 
-If the swarm completes with empty findings, only verification artifacts, or a degraded Cursor SDK artifact, report Puppetmaster as degraded and do not treat the run as a successful analysis.
+The default routing is:
 
-If the target repository has CodeGraph installed and initialized (`.codegraph/` exists and `codegraph` is on PATH), Puppetmaster will automatically inject shared repo intelligence into every Cursor and Claude Code worker prompt. Look for `context:codegraph` in verification artifact evidence to confirm shared context was used.
+1. Call `puppetmaster_start_cursor_swarm` (read-only multi-role analysis) — this is the daily-driver entry point.
+2. For implementation that needs durable patches, logs, and dirty-tree guards, use `puppetmaster_start_claude_implement` in a clean worktree.
+3. For a single fast review or plan pass, `puppetmaster_start_cursor_review` / `puppetmaster_start_cursor_plan` are acceptable lighter alternatives.
 
-For quick, direct repo lookups without spinning up a swarm, prefer Puppetmaster's bundled CodeGraph tools: `puppetmaster_codegraph_search` (find symbols), `puppetmaster_codegraph_context` (task-relevant entry points), `puppetmaster_codegraph_affected` (impacted tests for changed files), `puppetmaster_codegraph_files`, and `puppetmaster_codegraph_status`. If CodeGraph isn't initialized in the target repo, call `puppetmaster_codegraph_init` once before using the other CodeGraph tools.
+Start tools return a `job_id` immediately. Do **not** wait inside one long MCP call.
 
-Use Cursor's normal Build flow for small approved implementation slices. Use Puppetmaster/Claude implementation when the user wants durable patch artifacts, logs, and stricter auditability.
+## When you MUST NOT route through Puppetmaster
 
-Keep implementation scoped to one approved slice at a time, then use Puppetmaster again to verify or redteam the result before moving to the next slice.
+Use native Cursor tooling directly for:
+
+- Trivial single-file edits with obvious intent (rename, add comment, fix typo).
+- Questions answerable from the current visible file or recent context.
+- Conversational follow-ups that don't change repo state.
+- Anything explicitly framed as "just answer me" / "no swarm".
+
+## How to drive a started swarm
+
+After kicking off a swarm:
+
+1. Return the `job_id` to the user immediately, in one line.
+2. Prefer `puppetmaster_live_artifacts_follow` (long-poll, push-style stream) over polling `puppetmaster_status` in a loop. Chain calls with the returned `next_cursor`.
+3. Use `puppetmaster_partial_summary` for a current synthesis without waiting for final stitching.
+4. Summarize concrete file-backed findings, risks, and open questions — never raw worker transcripts.
+5. Ask for approval before implementation unless the user already approved edits.
+
+If the swarm completes with empty findings, only verification artifacts, or a degraded Cursor SDK artifact, report Puppetmaster as **degraded** and do not treat the run as a successful analysis.
+
+## Repo intelligence (CodeGraph)
+
+Puppetmaster auto-injects CodeGraph context into every Cursor and Claude Code worker prompt when `.codegraph/` exists in the target repo. Look for `context:codegraph` in verification artifact evidence to confirm shared context was used.
+
+For quick, direct repo lookups without spinning up a swarm, prefer the bundled tools: `puppetmaster_codegraph_search`, `puppetmaster_codegraph_context`, `puppetmaster_codegraph_affected`, `puppetmaster_codegraph_files`, `puppetmaster_codegraph_status`. If CodeGraph isn't initialized in the target repo, call `puppetmaster_codegraph_init` once before using the other CodeGraph tools.
+
+## Why this is the default
+
+Puppetmaster workers run as independent OS subprocesses with durable SQLite-backed state, leases, and structured JSON artifacts. That gives you parallelism, replayable runs, and a stitched summary instead of a single long transcript. Defaulting to this path keeps the main session lean and the work auditable.
