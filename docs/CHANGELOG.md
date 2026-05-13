@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.4.0-beta.1
+
+- Bundle six CodeGraph CLI commands into the Puppetmaster MCP (`puppetmaster_codegraph_search`, `_context`, `_affected`, `_files`, `_status`, `_init`) so Cursor Agent only needs one MCP server for both orchestration and repo intelligence.
+- Auto-inject CodeGraph context into Cursor and Claude Code worker prompts when the target repo is initialized; tag verification artifacts with `context:codegraph` so the operator can confirm shared intelligence was used.
+- Make MCP swarm starts asynchronous: `puppetmaster_start_swarm`, `_start_cursor_swarm`, and friends return a `job_id` immediately instead of holding the MCP call open.
+- Add push-style live artifact streaming: `puppetmaster_live_artifacts_follow` (MCP) and `python -m puppetmaster feed <job> --follow` (CLI) long-poll the durable SQLite event cursor and return as soon as a new artifact lands.
+- Add warm worker daemon mode (`python -m puppetmaster daemon --roles ...`) for local swarms that want to avoid repeated worker process startup.
+- Make Puppetmaster the default subagent runtime: `.cursor/rules/puppetmaster-workflow.mdc` (`alwaysApply: true`) plus a top-level `AGENTS.md` direct Cursor Agent and Claude Code to route non-trivial work through Puppetmaster by default.
+- Move runtime state out of the repository by default (macOS: `~/Library/Application Support/puppetmaster/projects/...`, Linux: `~/.local/state/puppetmaster/projects/...`). Override with `--state-dir` or `PUPPETMASTER_STATE_DIR`.
+- Parse Cursor SDK swarm output into typed artifacts instead of leaving raw stdout blobs.
+- Add cost-structure benchmark `bench/three_way.py` (Agent only vs CodeGraph alone vs Puppetmaster + CodeGraph) and prompt-enrichment harness `bench/codegraph_ab.py`. Numbers in the README and `bench/README.md` are reproducible from these scripts.
+- Reposition the README so Puppetmaster's standalone identity (durable state for parallel coding-agent swarms) is the headline, with CodeGraph as an explicit optional integration.
+
+## v0.3.0-beta.1
+
+- Ship the Cursor / VS Code extension with a Puppetmaster activity-bar control panel.
+- Add the Cursor Agent MCP server so Agent chat can call Puppetmaster tools directly.
+- Add MCP tools for `doctor`, Cursor review/plan, Claude Code implementation, logs, artifacts, and partial summaries.
+- Add the Claude Code full-edit adapter with dirty-worktree protection and patch artifact capture.
+- Fix editable Python install for local source-checkout usage.
+- Expand Cursor, MCP, Claude Code, and daily-driver docs.
+
 ## v0.2.0-beta.1
 
 - Position Puppetmaster as a supervised daily-driver beta for Cursor swarm workflows.
