@@ -341,18 +341,33 @@ class SQLiteSwarmStore(SwarmStore):
             )
 
     def read_events(self, job_id: str) -> list[dict[str, Any]]:
+        return self.read_events_since(job_id, since=0)
+
+    def read_events_since(
+        self, job_id: str, since: int = 0
+    ) -> list[dict[str, Any]]:
         self.init()
         return [
             {
+                "id": int(row["id"]),
                 "at": row["at"],
                 "event": row["event"],
                 "payload": json.loads(row["payload"]),
             }
             for row in self._all(
-                "SELECT at, event, payload FROM events WHERE job_id = ? ORDER BY id",
-                (job_id,),
+                "SELECT id, at, event, payload FROM events "
+                "WHERE job_id = ? AND id > ? ORDER BY id",
+                (job_id, int(since)),
             )
         ]
+
+    def event_cursor(self, job_id: str) -> int:
+        self.init()
+        row = self._one(
+            "SELECT COALESCE(MAX(id), 0) AS cursor FROM events WHERE job_id = ?",
+            (job_id,),
+        )
+        return int(row["cursor"]) if row is not None else 0
 
     def _one(self, query: str, params: tuple[Any, ...] = ()) -> Optional[sqlite3.Row]:
         with self.connect() as connection:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -425,14 +426,60 @@ class SwarmStore:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
 
     def read_events(self, job_id: str) -> list[dict[str, Any]]:
+        return self.read_events_since(job_id, since=0)
+
+    def read_events_since(
+        self, job_id: str, since: int = 0
+    ) -> list[dict[str, Any]]:
+        """Return events for `job_id` whose monotonic id exceeds `since`.
+
+        Each event dict gains a synthetic ``id`` (1-indexed) so callers can
+        use the same cursor protocol across backends.
+        """
         stream = self.stream_dir / f"{job_id}.jsonl"
         if not stream.exists():
             return []
-        return [
-            json.loads(line)
-            for line in stream.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
+        results: list[dict[str, Any]] = []
+        with stream.open("r", encoding="utf-8") as handle:
+            for index, line in enumerate(handle, start=1):
+                if index <= since or not line.strip():
+                    continue
+                record = json.loads(line)
+                record["id"] = index
+                results.append(record)
+        return results
+
+    def event_cursor(self, job_id: str) -> int:
+        """Return the highest event id currently stored for `job_id`."""
+        stream = self.stream_dir / f"{job_id}.jsonl"
+        if not stream.exists():
+            return 0
+        with stream.open("rb") as handle:
+            return sum(1 for _ in handle)
+
+    def wait_for_events(
+        self,
+        job_id: str,
+        since: int = 0,
+        timeout_seconds: float = 10.0,
+        poll_interval: float = 0.1,
+    ) -> list[dict[str, Any]]:
+        """Block up to ``timeout_seconds`` waiting for events newer than ``since``.
+
+        Returns the new events (potentially empty if the deadline is reached).
+        Uses a cheap ``event_cursor`` check between polls so the underlying
+        storage isn't re-read until something actually changed.
+        """
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        cursor = self.event_cursor(job_id)
+        if cursor > since:
+            return self.read_events_since(job_id, since=since)
+        while time.monotonic() < deadline:
+            time.sleep(max(0.005, poll_interval))
+            cursor = self.event_cursor(job_id)
+            if cursor > since:
+                return self.read_events_since(job_id, since=since)
+        return []
 
     @staticmethod
     def is_task_stale(task: Task) -> bool:

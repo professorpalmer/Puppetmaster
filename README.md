@@ -245,6 +245,7 @@ The MCP server lets Cursor Agent call Puppetmaster tools directly:
 - `puppetmaster_status`
 - `puppetmaster_logs`
 - `puppetmaster_live_artifacts`
+- `puppetmaster_live_artifacts_follow`
 - `puppetmaster_partial_summary`
 - `puppetmaster_artifacts`
 - `puppetmaster_show`
@@ -276,7 +277,9 @@ Power users who want CodeGraph's full MCP surface (`codegraph_callers`, `codegra
 
 For real multi-role code analysis from Cursor Agent, use `puppetmaster_start_cursor_swarm`. Bare custom roles on `puppetmaster_start_swarm` require a config or adapter; otherwise Puppetmaster fails fast instead of silently using the deterministic local demo adapter.
 
-Workers emit artifacts as they run. You do not have to wait for the final stitched summary: use `puppetmaster_live_artifacts` for the live evidence board and `puppetmaster_partial_summary` for a current synthesis. Final stitching is the publishable report built from the same artifact stream.
+Workers emit artifacts as they run. You do not have to wait for the final stitched summary: use `puppetmaster_live_artifacts` for the live evidence board and `puppetmaster_partial_summary` for a current synthesis. For a push-feeling stream, use `puppetmaster_live_artifacts_follow` — it long-polls the durable SQLite event log and returns as soon as a new artifact lands (or after `timeout_seconds`), with a `next_cursor` Cursor Agent can chain to receive the next batch. Final stitching is the publishable report built from the same artifact stream.
+
+CLI users can do the same with `python -m puppetmaster feed <job_id> --follow`, which streams new artifacts as they arrive without re-reading already-seen events.
 
 Blocking tools:
 

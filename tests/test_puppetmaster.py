@@ -32,7 +32,12 @@ from puppetmaster.codegraph import (
     run_codegraph_cli,
 )
 from puppetmaster.config import load_config
-from puppetmaster.cli import artifact_feed, cursor_prompt, main as cli_main
+from puppetmaster.cli import (
+    artifact_feed,
+    artifact_feed_since,
+    cursor_prompt,
+    main as cli_main,
+)
 from puppetmaster.diagnostics import adapter_status, run_doctor, starter_config
 from puppetmaster.mcp_server import ASYNC_PROCESSES, call_tool, handle_message
 from puppetmaster.models import Artifact, ArtifactType, JobStatus, Task, TaskStatus, seconds_from_now
@@ -216,6 +221,171 @@ class PuppetmasterTests(unittest.TestCase):
             self.assertIn("artifact", feed[0])
             self.assertIn("# Puppetmaster Live Summary", partial)
             self.assertIn("make live artifacts inspectable", partial)
+
+    def _store_for_backend(self, backend: str, root: Path):
+        if backend == "file":
+            return SwarmStore(root)
+        return SQLiteSwarmStore(root)
+
+    def test_event_cursor_and_since_read_are_consistent_across_backends(self) -> None:
+        for backend in ("file", "sqlite"):
+            with self.subTest(backend=backend), TemporaryDirectory() as tmp:
+                store = self._store_for_backend(backend, Path(tmp) / ".puppetmaster")
+                store.init()
+
+                self.assertEqual(store.event_cursor("job-x"), 0)
+                self.assertEqual(store.read_events_since("job-x", since=0), [])
+
+                store.emit("job-x", "first", {"n": 1})
+                store.emit("job-x", "second", {"n": 2})
+                store.emit("job-x", "third", {"n": 3})
+
+                self.assertEqual(store.event_cursor("job-x"), 3)
+
+                first_batch = store.read_events_since("job-x", since=0)
+                self.assertEqual([e["event"] for e in first_batch], ["first", "second", "third"])
+                self.assertEqual([e["id"] for e in first_batch], [1, 2, 3])
+
+                resumed = store.read_events_since("job-x", since=2)
+                self.assertEqual([e["event"] for e in resumed], ["third"])
+                self.assertEqual([e["id"] for e in resumed], [3])
+
+                self.assertEqual(store.read_events_since("job-x", since=3), [])
+
+    def test_wait_for_events_returns_immediately_when_events_present(self) -> None:
+        for backend in ("file", "sqlite"):
+            with self.subTest(backend=backend), TemporaryDirectory() as tmp:
+                store = self._store_for_backend(backend, Path(tmp) / ".puppetmaster")
+                store.init()
+                store.emit("job-x", "ready", {"hint": "go"})
+
+                start = time.monotonic()
+                events = store.wait_for_events(
+                    "job-x", since=0, timeout_seconds=5.0, poll_interval=0.05
+                )
+                elapsed = time.monotonic() - start
+
+                self.assertEqual([e["event"] for e in events], ["ready"])
+                self.assertLess(elapsed, 0.2)
+
+    def test_wait_for_events_times_out_when_nothing_new(self) -> None:
+        for backend in ("file", "sqlite"):
+            with self.subTest(backend=backend), TemporaryDirectory() as tmp:
+                store = self._store_for_backend(backend, Path(tmp) / ".puppetmaster")
+                store.init()
+                store.emit("job-x", "already-seen", {})
+
+                start = time.monotonic()
+                events = store.wait_for_events(
+                    "job-x", since=1, timeout_seconds=0.2, poll_interval=0.05
+                )
+                elapsed = time.monotonic() - start
+
+                self.assertEqual(events, [])
+                self.assertGreaterEqual(elapsed, 0.15)
+                self.assertLess(elapsed, 1.0)
+
+    def test_wait_for_events_wakes_up_when_event_is_emitted_concurrently(self) -> None:
+        for backend in ("file", "sqlite"):
+            with self.subTest(backend=backend), TemporaryDirectory() as tmp:
+                store = self._store_for_backend(backend, Path(tmp) / ".puppetmaster")
+                store.init()
+
+                def emit_later() -> None:
+                    time.sleep(0.05)
+                    store.emit("job-x", "arrived", {"v": 1})
+
+                emitter = threading.Thread(target=emit_later)
+                emitter.start()
+                try:
+                    start = time.monotonic()
+                    events = store.wait_for_events(
+                        "job-x", since=0, timeout_seconds=2.0, poll_interval=0.02
+                    )
+                    elapsed = time.monotonic() - start
+                finally:
+                    emitter.join()
+
+                self.assertEqual([e["event"] for e in events], ["arrived"])
+                self.assertLess(elapsed, 1.0)
+
+    def test_artifact_feed_since_resumes_with_cursor(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            result = Orchestrator(store).run(
+                "exercise the feed cursor",
+                roles=["explore"],
+                worker_mode="inline",
+            )
+
+            first_pass, cursor = artifact_feed_since(store, result.job.id, since=0)
+            self.assertGreater(len(first_pass), 0)
+            self.assertGreater(cursor, 0)
+
+            second_pass, second_cursor = artifact_feed_since(
+                store, result.job.id, since=cursor
+            )
+            self.assertEqual(second_pass, [])
+            self.assertEqual(second_cursor, cursor)
+
+    def test_mcp_follow_returns_existing_artifacts_immediately(self) -> None:
+        with TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / ".pm-state"
+            store = SQLiteSwarmStore(state_dir)
+            result = Orchestrator(store).run(
+                "feed the follow tool",
+                roles=["explore"],
+                worker_mode="inline",
+            )
+
+            response = call_tool(
+                "puppetmaster_live_artifacts_follow",
+                {
+                    "job_id": result.job.id,
+                    "state_dir": str(state_dir),
+                    "since_cursor": 0,
+                    "timeout_seconds": 1.0,
+                },
+            )
+
+            self.assertFalse(response["isError"])
+            body = json.loads(response["content"][0]["text"])
+            self.assertGreater(body["item_count"], 0)
+            self.assertFalse(body["timed_out"])
+            self.assertGreater(body["next_cursor"], 0)
+            self.assertEqual(body["job_id"], result.job.id)
+
+    def test_mcp_follow_times_out_cleanly_when_no_new_artifacts(self) -> None:
+        with TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / ".pm-state"
+            store = SQLiteSwarmStore(state_dir)
+            result = Orchestrator(store).run(
+                "feed the follow tool",
+                roles=["explore"],
+                worker_mode="inline",
+            )
+            current = store.event_cursor(result.job.id)
+
+            start = time.monotonic()
+            response = call_tool(
+                "puppetmaster_live_artifacts_follow",
+                {
+                    "job_id": result.job.id,
+                    "state_dir": str(state_dir),
+                    "since_cursor": current,
+                    "timeout_seconds": 0.2,
+                    "poll_interval_seconds": 0.05,
+                },
+            )
+            elapsed = time.monotonic() - start
+
+            self.assertFalse(response["isError"])
+            body = json.loads(response["content"][0]["text"])
+            self.assertEqual(body["item_count"], 0)
+            self.assertTrue(body["timed_out"])
+            self.assertEqual(body["next_cursor"], current)
+            self.assertGreaterEqual(elapsed, 0.15)
+            self.assertLess(elapsed, 1.5)
 
     def test_mcp_live_artifacts_and_partial_summary_wrap_cli(self) -> None:
         completed = subprocess.CompletedProcess(
