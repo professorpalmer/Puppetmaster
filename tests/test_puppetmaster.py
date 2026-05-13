@@ -31,6 +31,12 @@ from puppetmaster.codegraph import (
     enrich_prompt_with_codegraph,
     run_codegraph_cli,
 )
+from bench.codegraph_ab import (
+    build_report,
+    load_prompt,
+    measure_enrichment,
+    render_markdown,
+)
 from puppetmaster.config import load_config
 from puppetmaster.cli import (
     artifact_feed,
@@ -1071,6 +1077,65 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertTrue(body["ok"])
         self.assertIn("Backend: native", body["stdout"])
         self.assertEqual(run.call_args.args[0][:2], ["codegraph", "status"])
+
+    def test_bench_load_prompt_reads_file_when_arg_starts_with_at(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "prompt.txt"
+            path.write_text("the goal", encoding="utf-8")
+
+            self.assertEqual(load_prompt(f"@{path}"), "the goal")
+            self.assertEqual(load_prompt("inline prompt"), "inline prompt")
+
+    def test_bench_measure_enrichment_reports_zero_when_codegraph_missing(self) -> None:
+        with TemporaryDirectory() as tmp:
+            with patch("puppetmaster.codegraph.shutil.which", return_value=None):
+                measurement = measure_enrichment("explore auth", tmp)
+
+            self.assertEqual(measurement.raw_prompt_chars, len("explore auth"))
+            self.assertEqual(measurement.injected_context_chars, 0)
+            self.assertFalse(measurement.codegraph_available)
+            self.assertEqual(measurement.injection_ratio, 0.0)
+
+    def test_bench_measure_enrichment_captures_injected_context(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["codegraph"],
+            returncode=0,
+            stdout="### Entry points\n- streaming.py:42\n" + "x" * 200,
+            stderr="",
+        )
+        with TemporaryDirectory() as tmp:
+            (Path(tmp) / ".codegraph").mkdir()
+            with patch(
+                "puppetmaster.codegraph.shutil.which",
+                return_value="/usr/local/bin/codegraph",
+            ), patch(
+                "puppetmaster.codegraph.subprocess.run",
+                return_value=completed,
+            ):
+                measurement = measure_enrichment("map streaming", tmp)
+
+            self.assertGreater(measurement.injected_context_chars, 0)
+            self.assertTrue(measurement.codegraph_available)
+            self.assertTrue(measurement.codegraph_initialized)
+            self.assertGreater(measurement.injection_ratio, 0.0)
+
+    def test_bench_render_markdown_includes_enrichment_section(self) -> None:
+        with TemporaryDirectory() as tmp:
+            with patch("puppetmaster.codegraph.shutil.which", return_value=None):
+                measurement = measure_enrichment("a tiny prompt", tmp)
+            report = build_report(
+                cwd=tmp,
+                prompt="a tiny prompt",
+                model="default",
+                command="python -m bench.codegraph_ab --dry-run",
+                enrichment=measurement,
+            )
+            markdown = render_markdown(report)
+
+        self.assertIn("CodeGraph prompt enrichment", markdown)
+        self.assertIn("injection ratio", markdown)
+        self.assertIn("python -m bench.codegraph_ab --dry-run", markdown)
+        self.assertNotIn("Live Cursor SDK A/B", markdown)
 
     def test_mcp_codegraph_init_passes_index_flag(self) -> None:
         completed = subprocess.CompletedProcess(

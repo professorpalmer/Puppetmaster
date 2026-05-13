@@ -1,4 +1,8 @@
 .puppetmaster/
+.codegraph/codegraph.db
+.codegraph/codegraph.db-*
+bench/results/*.md
+bench/results/*.json
 __pycache__/
 *.py[cod]
 .pytest_cache/

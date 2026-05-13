@@ -1,0 +1,9 @@
+Map this repository's worker orchestration flow.
+
+Identify:
+- where workers are spawned and how they claim tasks
+- how durable state is persisted and read back
+- which artifacts the live feed and stitcher consume
+- where CodeGraph context is injected into worker prompts
+
+Return Puppetmaster JSON artifacts with concrete file/function evidence.
