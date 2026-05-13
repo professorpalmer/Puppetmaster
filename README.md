@@ -4,9 +4,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](pyproject.toml)
 
-**Agent swarms without parent-context collapse.**
+**Durable state for parallel coding-agent swarms.** Workers coordinate through typed artifacts in SQLite instead of passing transcripts around — so follow-up questions about a completed swarm cost zero model tokens.
 
-Puppetmaster is a local runtime for serious coding-agent work. It lets Cursor, Claude Code, shell checks, and future providers run as independent workers that coordinate through durable state instead of one giant chat transcript.
+Puppetmaster is a local runtime that lets Cursor, Claude Code, shell checks, and future providers run as independent workers with leases, replay, and structured outputs. It works **standalone** — just `pip install` and you have an orchestrator. Pair it with optional [CodeGraph](https://github.com/colbymchenry/codegraph) integration when you want cheaper per-worker context; the two stack on different axes (CodeGraph optimizes per-call context resolution, Puppetmaster optimizes per-session coordination + state).
 
 Think **Redis/Gunicorn for agentic engineering**:
 
@@ -201,9 +201,14 @@ git worktree add /tmp/puppetmaster-work -b puppetmaster-work
 python -m puppetmaster claude "Implement the approved fix" --cwd /tmp/puppetmaster-work --permission-mode acceptEdits
 ```
 
-## Shared Repo Intelligence (CodeGraph)
+## Works great with CodeGraph (optional)
 
-Puppetmaster optionally hands every Cursor and Claude Code worker a pre-built repo map instead of letting them each rediscover the codebase with grep/read passes. We use [CodeGraph](https://github.com/colbymchenry/codegraph) for that map.
+Puppetmaster runs fine without CodeGraph — workers will fall back to grep/read for context discovery, and the orchestration / durable state / parallel-worker machinery is unchanged. When you pair it with [CodeGraph](https://github.com/colbymchenry/codegraph), every Cursor/Claude worker gets a pre-built repo map (symbols, refs, call graph) injected into its prompt instead of having to rediscover the codebase. The two tools optimize different axes and stack cleanly:
+
+- **CodeGraph** = per-call context resolution. Static facts about your *code* (symbols, refs, routes).
+- **Puppetmaster** = per-session coordination + state. Dynamic facts about the *agents' work* (tasks, leases, typed artifacts, replayable events).
+
+Install CodeGraph globally and initialize it once per target repo:
 
 ```bash
 npm install -g @colbymchenry/codegraph
@@ -217,26 +222,19 @@ After that, Puppetmaster's `doctor` will show `codegraph ok`, and every Cursor/C
 - inject the result into the worker prompt as authoritative starting context
 - tag the resulting verification artifact with `context:codegraph` so the operator can confirm shared intelligence was used
 
-This is fully optional and graceful. If `codegraph` is not installed, or the target repo is not initialized, workers fall back to their normal exploration path with no error. Pass `disable_codegraph: true` in a task payload to skip CodeGraph for a specific worker.
-
-The architectural framing:
-
-```text
-Puppetmaster orchestrates independent agents.
-CodeGraph gives those agents shared code intelligence before they spend tokens exploring.
-```
+Fully optional and graceful. If `codegraph` is not installed, or the target repo is not initialized, workers fall back to their normal exploration path with no error. Pass `disable_codegraph: true` in a task payload to skip CodeGraph for a specific worker.
 
 Cursor Agent can also query CodeGraph directly through Puppetmaster's MCP — no second MCP server required for the daily-driver case. See [Bundled CodeGraph tools](#bundled-codegraph-tools-no-second-mcp) below.
 
-### What does Puppetmaster + CodeGraph actually save vs. each baseline?
+### Cost: what changes when you switch to durable state
 
-Three configurations matter:
+The whole point of Puppetmaster is that durable state turns repeated questions about the same task into a database read instead of another agent run. The benchmark below shows that effect against two baselines:
 
-- **A. Agent only** — one agent (Cursor or Claude Code) doing the work alone, discovering the repo with grep/read/list.
-- **B. CodeGraph alone** — same agent, with CodeGraph's MCP installed; the agent issues `codegraph_explore` calls itself.
-- **C. Puppetmaster + CodeGraph** — Puppetmaster swarm with CodeGraph context pre-injected into every worker prompt, structured artifacts in a durable SQLite store, stitcher reads JSON not transcripts.
+- **A. Agent only** — one agent (Cursor or Claude Code) doing the work alone, discovering the repo with grep/read/list. No shared state across sessions.
+- **B. CodeGraph alone** — same agent, with CodeGraph's MCP installed; the agent issues `codegraph_explore` calls itself. Still no shared state across sessions.
+- **C. Puppetmaster + CodeGraph** — Puppetmaster swarm with CodeGraph context pre-injected into every worker prompt, structured artifacts in a durable SQLite store, stitcher reads JSON not transcripts. Follow-up queries read SQLite, not the model.
 
-The honest result, modelled from real measurements on this repo (`bench/three_way.py`, swarm of 4 workers, artifact sizes from a real past Puppetmaster run, $3/1M token input price):
+Result, modelled from real measurements on this repo (`bench/three_way.py`, swarm of 4 workers, artifact sizes from a real past Puppetmaster run, $3/1M token input price):
 
 #### Fresh task cost (one investigation)
 
@@ -260,12 +258,14 @@ This is where Puppetmaster actually wins. Real workflows are not one-shot: you i
 
 At K=25 follow-ups, **Puppetmaster + CodeGraph is ~7.6× cheaper than CodeGraph alone and ~38× cheaper than agent-only.** The crossover where C catches up to B is around K=3-4 in this dataset.
 
-#### Where Puppetmaster's savings actually come from
+#### Where the savings come from
 
-1. **Shared CodeGraph query** — one `codegraph context` call seeds N workers; B issues N separate `codegraph_explore` calls.
-2. **Zero tool-call frames** — workers receive context inline; no MCP round-trip envelope per worker.
-3. **Structured synthesis** — the stitcher reads typed JSON artifacts instead of raw worker stdout.
-4. **Durable resume** — the killer feature. Every follow-up read against a completed Puppetmaster job is free at the model level.
+1. **Durable resume (Puppetmaster)** — the headline. Every follow-up read against a completed swarm is a SQLite query, costing 0 model tokens. This is what flatlines the C column above.
+2. **Typed-artifact coordination (Puppetmaster)** — workers communicate through structured rows instead of raw transcripts; the stitcher reads JSON, not stdout.
+3. **Amortized context query (CodeGraph + Puppetmaster)** — one `codegraph context` call seeds N workers in a swarm; B issues N separate `codegraph_explore` calls.
+4. **Zero tool-call frames (CodeGraph + Puppetmaster)** — workers receive context inline in the initial prompt; no MCP round-trip envelope per worker.
+
+The first two are Puppetmaster's standalone contribution and work even without CodeGraph (you'd just lose the cheap per-call context, so worker prompts get more expensive). The last two only show up when both are installed.
 
 #### Reproduce on your own repo
 
