@@ -12,7 +12,7 @@ For real code analysis, prefer `puppetmaster_start_cursor_swarm`. Do not use the
 After starting a Puppetmaster swarm:
 
 1. Return the `job_id` immediately.
-2. Poll `puppetmaster_status`, `puppetmaster_logs`, `puppetmaster_live_artifacts`, and `puppetmaster_partial_summary`.
+2. For long-running swarms, prefer `puppetmaster_live_artifacts_follow` (long-poll, returns when new artifacts land or after a timeout) and chain calls with the returned `next_cursor`. Fall back to `puppetmaster_status`, `puppetmaster_logs`, `puppetmaster_live_artifacts`, and `puppetmaster_partial_summary` for one-shot snapshots.
 3. Summarize concrete file-backed findings, risks, and open questions.
 4. Ask for approval before implementation unless the user already approved edits.
 

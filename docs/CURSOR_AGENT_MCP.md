@@ -23,6 +23,7 @@ Puppetmaster exposes these MCP tools:
 - `puppetmaster_status`
 - `puppetmaster_logs`
 - `puppetmaster_live_artifacts`
+- `puppetmaster_live_artifacts_follow`
 - `puppetmaster_partial_summary`
 - `puppetmaster_artifacts`
 - `puppetmaster_show`
@@ -62,10 +63,25 @@ Puppetmaster is not meant to hide all useful work until the end. Workers write a
 - `puppetmaster_status`: current task/artifact counts
 - `puppetmaster_logs`: event stream
 - `puppetmaster_live_artifacts`: live evidence board from saved artifacts
+- `puppetmaster_live_artifacts_follow`: long-poll for new artifacts since a cursor (push-style stream over MCP)
 - `puppetmaster_partial_summary`: current synthesis from artifacts already emitted
 - `puppetmaster_show`: final stitched summary after completion
 
 Final stitching is the publishable report. The live artifact board is the shared coordination surface.
+
+### Push-style live feed (no polling loop in the Agent)
+
+`puppetmaster_live_artifacts_follow` blocks server-side until new artifacts arrive (or `timeout_seconds` elapses, default 10s) and returns a `next_cursor`. Chain calls with that cursor to get a push-feeling stream of new artifacts without the Agent running its own polling loop:
+
+```text
+1. Call puppetmaster_live_artifacts_follow with since_cursor=0.
+   Server returns immediately with the current artifacts and next_cursor=N.
+2. Call again with since_cursor=N.
+   Server blocks up to timeout_seconds and returns the next batch (or {timed_out: true}).
+3. Repeat with the latest next_cursor.
+```
+
+Internally this is a cursor-based read over the durable SQLite event log (or the file-backed `.jsonl` stream when `backend=file`). The store wakes up within ~50ms of the next artifact write, so latency feels real-time without taking on Redis or any extra daemon.
 
 ## How It Respects Independent Workers
 

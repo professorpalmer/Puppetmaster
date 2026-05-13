@@ -100,6 +100,29 @@ def build_parser() -> argparse.ArgumentParser:
     feed.add_argument("job_id", nargs="?")
     feed.add_argument("--limit", type=int, help="Limit feed to the most recent N artifacts.")
     feed.add_argument("--json", action="store_true", help="Print feed as JSON.")
+    feed.add_argument(
+        "--follow",
+        action="store_true",
+        help="Long-poll for new artifacts and stream them as they arrive.",
+    )
+    feed.add_argument(
+        "--since",
+        type=int,
+        default=0,
+        help="Resume the follow stream from this event cursor (defaults to 0).",
+    )
+    feed.add_argument(
+        "--follow-timeout-seconds",
+        type=float,
+        default=0.0,
+        help="Stop following after this many seconds of inactivity (0 = run until interrupted).",
+    )
+    feed.add_argument(
+        "--follow-poll-seconds",
+        type=float,
+        default=0.1,
+        help="Polling interval between cursor checks while following.",
+    )
 
     open_cmd = subcommands.add_parser("open", help="Open or print a local job artifact path.")
     open_cmd.add_argument("job_id", nargs="?")
@@ -416,17 +439,24 @@ def _main(argv: Optional[list[str]] = None) -> int:
 
     if args.command == "feed":
         job_id = args.job_id or require_latest_job_id(store)
-        feed = artifact_feed(store, job_id, limit=args.limit)
+        if args.follow:
+            return run_feed_follow(
+                store,
+                job_id,
+                since=args.since,
+                limit=args.limit,
+                as_json=args.json,
+                idle_timeout_seconds=args.follow_timeout_seconds,
+                poll_interval_seconds=args.follow_poll_seconds,
+            )
+        items, _ = artifact_feed_since(
+            store, job_id, since=args.since, limit=args.limit
+        )
         if args.json:
-            print(json.dumps(feed, indent=2, default=str))
+            print(json.dumps(items, indent=2, default=str))
         else:
-            for item in feed:
-                artifact = item["artifact"]
-                print(
-                    f"{item['at']}\t{artifact['type']}\t{artifact['id']}\t"
-                    f"task={artifact['task_id']}\tconfidence={artifact['confidence']}"
-                )
-                print(f"  {artifact_headline(artifact)}")
+            for item in items:
+                print_feed_item(item)
         return 0
 
     if args.command == "open":
@@ -529,10 +559,30 @@ def print_run_result(job_id: str, artifact_count: int, summary_path: Path) -> No
 
 
 def artifact_feed(store, job_id: str, limit: Optional[int] = None) -> list[dict]:
+    items, _ = artifact_feed_since(store, job_id, since=0, limit=limit)
+    return items
+
+
+def artifact_feed_since(
+    store,
+    job_id: str,
+    since: int = 0,
+    limit: Optional[int] = None,
+) -> tuple[list[dict], int]:
+    """Return (items, next_cursor) of new ``artifact.saved`` events.
+
+    ``since`` is the event cursor returned by a previous call (use 0 for a
+    fresh read). ``next_cursor`` is the highest event id observed, regardless
+    of whether it was an artifact event, so callers can resume reliably.
+    """
     artifacts = {artifact.id: artifact.__dict__ for artifact in store.list_artifacts(job_id)}
-    items = []
-    seen = set()
-    for event in store.read_events(job_id):
+    items: list[dict] = []
+    seen: set = set()
+    cursor = since
+    for event in store.read_events_since(job_id, since=since):
+        event_id = event.get("id")
+        if isinstance(event_id, int) and event_id > cursor:
+            cursor = event_id
         if event.get("event") != "artifact.saved":
             continue
         artifact_id = event.get("payload", {}).get("artifact_id")
@@ -540,10 +590,80 @@ def artifact_feed(store, job_id: str, limit: Optional[int] = None) -> list[dict]
         if artifact is None or artifact_id in seen:
             continue
         seen.add(artifact_id)
-        items.append({"at": event["at"], "event": event["event"], "artifact": artifact})
+        items.append(
+            {
+                "at": event["at"],
+                "event": event["event"],
+                "id": event_id,
+                "artifact": artifact,
+            }
+        )
     if limit is not None:
-        return items[-limit:]
-    return items
+        items = items[-limit:]
+    return items, cursor
+
+
+def print_feed_item(item: dict) -> None:
+    artifact = item["artifact"]
+    print(
+        f"{item['at']}\t{artifact['type']}\t{artifact['id']}\t"
+        f"task={artifact['task_id']}\tconfidence={artifact['confidence']}"
+    )
+    print(f"  {artifact_headline(artifact)}")
+
+
+def run_feed_follow(
+    store,
+    job_id: str,
+    *,
+    since: int = 0,
+    limit: Optional[int] = None,
+    as_json: bool = False,
+    idle_timeout_seconds: float = 0.0,
+    poll_interval_seconds: float = 0.1,
+) -> int:
+    cursor = since
+    initial_items, cursor = artifact_feed_since(store, job_id, since=cursor, limit=limit)
+    for item in initial_items:
+        emit_feed_item(item, as_json=as_json)
+
+    poll_budget = max(0.05, poll_interval_seconds)
+    block_seconds = max(poll_budget, 1.0)
+    idle_deadline = (
+        time.monotonic() + idle_timeout_seconds if idle_timeout_seconds > 0 else None
+    )
+    try:
+        while True:
+            events = store.wait_for_events(
+                job_id,
+                since=cursor,
+                timeout_seconds=block_seconds,
+                poll_interval=poll_budget,
+            )
+            if events:
+                new_items, cursor = artifact_feed_since(
+                    store, job_id, since=cursor, limit=None
+                )
+                for item in new_items:
+                    emit_feed_item(item, as_json=as_json)
+                idle_deadline = (
+                    time.monotonic() + idle_timeout_seconds
+                    if idle_timeout_seconds > 0
+                    else None
+                )
+                continue
+            if idle_deadline is not None and time.monotonic() >= idle_deadline:
+                return 0
+    except KeyboardInterrupt:
+        return 0
+
+
+def emit_feed_item(item: dict, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(item, default=str), flush=True)
+    else:
+        print_feed_item(item)
+        sys.stdout.flush()
 
 
 def artifact_headline(artifact: dict) -> str:

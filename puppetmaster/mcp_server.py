@@ -19,6 +19,7 @@ from puppetmaster.codegraph import (
     codegraph_status_command,
 )
 from puppetmaster.state import resolve_state_dir
+from puppetmaster.store_factory import create_store
 
 
 JsonObject = dict[str, Any]
@@ -162,6 +163,16 @@ def tools() -> list[McpTool]:
             description="Return the live artifact feed for a job without waiting for final stitching.",
             input_schema=feed_schema(),
             handler=lambda args: run_feed(args),
+        ),
+        McpTool(
+            name="puppetmaster_live_artifacts_follow",
+            description=(
+                "Long-poll for new artifacts since a cursor. Returns immediately when new "
+                "artifacts arrive, or after timeout_seconds with an empty items array. "
+                "Chain calls with the returned next_cursor for a push-feeling stream."
+            ),
+            input_schema=follow_schema(),
+            handler=run_feed_follow,
         ),
         McpTool(
             name="puppetmaster_partial_summary",
@@ -464,6 +475,41 @@ def run_feed(args: JsonObject) -> JsonObject:
     return run_cli(command, args)
 
 
+def run_feed_follow(args: JsonObject) -> JsonObject:
+    from puppetmaster.cli import artifact_feed_since
+
+    job_id = require_string(args, "job_id")
+    since = int(args.get("since_cursor") or args.get("since") or 0)
+    timeout_seconds = float(args.get("timeout_seconds") or 10.0)
+    poll_interval = float(args.get("poll_interval_seconds") or 0.1)
+    limit_value = args.get("limit")
+    limit = int(limit_value) if limit_value is not None else None
+    backend = str(args.get("backend") or "sqlite")
+
+    state_dir = mcp_state_dir(args)
+    store = create_store(backend, state_dir)
+
+    items, cursor = artifact_feed_since(store, job_id, since=since, limit=limit)
+    if not items:
+        store.wait_for_events(
+            job_id,
+            since=cursor,
+            timeout_seconds=timeout_seconds,
+            poll_interval=poll_interval,
+        )
+        items, cursor = artifact_feed_since(store, job_id, since=since, limit=limit)
+
+    body = {
+        "job_id": job_id,
+        "since_cursor": since,
+        "next_cursor": cursor,
+        "item_count": len(items),
+        "items": items,
+        "timed_out": len(items) == 0,
+    }
+    return {"content": [{"type": "text", "text": json.dumps(body, indent=2, default=str)}], "isError": False}
+
+
 def start_cli(command: list[str], args: JsonObject) -> JsonObject:
     state_dir = str(mcp_state_dir(args))
     run_dir = Path(state_dir) / "mcp-runs"
@@ -614,6 +660,40 @@ def feed_schema() -> JsonObject:
         "type": "integer",
         "description": "Limit feed to the most recent N artifacts.",
     }
+    return schema
+
+
+def follow_schema() -> JsonObject:
+    schema = job_schema(required=True)
+    schema["properties"].update(
+        {
+            "since_cursor": {
+                "type": "integer",
+                "default": 0,
+                "description": "Resume from this event cursor (use the previous next_cursor).",
+            },
+            "timeout_seconds": {
+                "type": "number",
+                "default": 10,
+                "description": "Maximum seconds to block waiting for new artifacts.",
+            },
+            "poll_interval_seconds": {
+                "type": "number",
+                "default": 0.1,
+                "description": "Internal poll interval; lower = lower latency, higher = lighter on storage.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Optional cap on the number of artifacts returned in one batch.",
+            },
+            "backend": {
+                "type": "string",
+                "enum": ["file", "sqlite"],
+                "default": "sqlite",
+                "description": "Coordination backend to open. Match the one used by your jobs.",
+            },
+        }
+    )
     return schema
 
 
