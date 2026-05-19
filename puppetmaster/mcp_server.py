@@ -1,20 +1,30 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from puppetmaster.codegraph import (
+    CODEGRAPH_COMMAND,
+    CODEGRAPH_MISSING_HINT,
+    CODEGRAPH_NATIVE_SQLITE_HINT,
+    CodegraphLockBusy,
+    acquire_codegraph_lock,
     codegraph_affected,
+    codegraph_available,
     codegraph_context_command,
     codegraph_files_listing,
     codegraph_init_command,
+    codegraph_lock_path,
+    codegraph_native_sqlite_broken,
     codegraph_query,
     codegraph_status_command,
 )
@@ -24,6 +34,35 @@ from puppetmaster.store_factory import create_store
 
 JsonObject = dict[str, Any]
 ASYNC_PROCESSES: list[subprocess.Popen] = []
+
+# Concurrency primitives for the stdio loop.
+#
+# The original implementation ran tools synchronously on the same thread
+# that read stdin, so any long-running handler (most painfully
+# `puppetmaster_codegraph_init(index=true)` with its 600-second timeout)
+# blocked every subsequent JSON-RPC message. Cursor's agent would treat
+# that frozen stdio pipe as a dead transport and surface
+# "Tool execution error. Not connected" even though the server process
+# was alive and the underlying swarm/index job was still making progress.
+#
+# We now dispatch every incoming message to a worker thread. Each thread
+# writes its response under a shared stdout lock so JSON-RPC frames stay
+# whole. JSON-RPC over stdio does not require responses to be returned
+# in request order — every response carries the original `id` — so
+# concurrent handling is correct as long as we don't interleave bytes.
+_STDOUT_LOCK = threading.Lock()
+_DEFAULT_WORKER_COUNT = 8
+
+
+def _resolve_worker_count() -> int:
+    raw = os.environ.get("PUPPETMASTER_MCP_WORKERS")
+    if not raw:
+        return _DEFAULT_WORKER_COUNT
+    try:
+        value = int(raw)
+    except ValueError:
+        return _DEFAULT_WORKER_COUNT
+    return max(1, min(value, 64))
 
 
 @dataclass(frozen=True)
@@ -35,14 +74,36 @@ class McpTool:
 
 
 def main() -> int:
-    for line in sys.stdin:
-        if not line.strip():
-            continue
-        response = handle_message(json.loads(line))
-        if response is not None:
-            sys.stdout.write(json.dumps(response) + "\n")
-            sys.stdout.flush()
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=_resolve_worker_count(),
+        thread_name_prefix="pm-mcp",
+    )
+    try:
+        for line in sys.stdin:
+            if not line.strip():
+                continue
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            executor.submit(_process_message_safely, message)
+    finally:
+        executor.shutdown(wait=False)
     return 0
+
+
+def _process_message_safely(message: JsonObject) -> None:
+    """Run handle_message on a worker thread and write any response."""
+    try:
+        response = handle_message(message)
+    except Exception as exc:
+        response = error_response(message.get("id"), -32000, str(exc))
+    if response is None:
+        return
+    serialized = json.dumps(response) + "\n"
+    with _STDOUT_LOCK:
+        sys.stdout.write(serialized)
+        sys.stdout.flush()
 
 
 def handle_message(message: JsonObject) -> Optional[JsonObject]:
@@ -235,10 +296,24 @@ def tools() -> list[McpTool]:
             name="puppetmaster_codegraph_init",
             description=(
                 "Initialize CodeGraph in the target workspace (creates .codegraph/). "
-                "Pass index=true to also build the full index immediately."
+                "Pass index=true to also build the full index in the background — the "
+                "tool returns immediately with a run_id and log paths instead of "
+                "blocking the MCP transport for minutes."
             ),
             input_schema=codegraph_init_schema(),
             handler=run_codegraph_init,
+        ),
+        McpTool(
+            name="puppetmaster_codegraph_index",
+            description=(
+                "Kick off `codegraph index` in the background for the target workspace. "
+                "Returns immediately with a run_id, pid, and stdout/stderr log paths. "
+                "Poll progress with puppetmaster_codegraph_status. Only one indexer is "
+                "allowed at a time per machine — concurrent calls fail fast with a clear "
+                "lock-busy error so SQLite never gets clobbered."
+            ),
+            input_schema=base_schema(),
+            handler=run_codegraph_index,
         ),
     ]
 
@@ -292,15 +367,119 @@ def run_codegraph_files(args: JsonObject) -> JsonObject:
 
 def run_codegraph_status(args: JsonObject) -> JsonObject:
     payload = codegraph_status_command(cwd(args))
+    if codegraph_native_sqlite_broken(payload.get("stdout", "") or payload.get("stderr", "")):
+        payload = dict(payload)
+        payload["native_sqlite_broken"] = True
+        existing_hint = payload.get("hint") or ""
+        payload["hint"] = (existing_hint + "\n\n" + CODEGRAPH_NATIVE_SQLITE_HINT).strip()
     return codegraph_response(payload)
 
 
 def run_codegraph_init(args: JsonObject) -> JsonObject:
-    payload = codegraph_init_command(
-        cwd(args),
-        index=bool(args.get("index", False)),
-    )
+    """Initialize CodeGraph; when index=true, dispatch indexing in the background.
+
+    Synchronous `codegraph init` is fast (creates `.codegraph/` and writes a
+    small scaffold) and stays inline. When the caller asks for `index=true`
+    we run init synchronously, then fork `codegraph index` as a detached
+    subprocess so the MCP transport returns immediately. The agent polls
+    `puppetmaster_codegraph_status` to watch indexing progress.
+    """
+    target_cwd = cwd(args)
+    init_payload = codegraph_init_command(target_cwd, index=False)
+    if not init_payload.get("ok", False):
+        return codegraph_response(init_payload)
+    if not args.get("index", False):
+        return codegraph_response(init_payload)
+    index_payload = _spawn_codegraph_indexer(args, target_cwd)
+    init_payload = dict(init_payload)
+    init_payload["index_run"] = index_payload
+    return codegraph_response(init_payload)
+
+
+def run_codegraph_index(args: JsonObject) -> JsonObject:
+    """Dispatch `codegraph index` in the background; never block stdio."""
+    target_cwd = cwd(args)
+    if not codegraph_available():
+        return codegraph_response(
+            {
+                "ok": False,
+                "command": "codegraph index",
+                "cwd": target_cwd,
+                "error": CODEGRAPH_MISSING_HINT,
+            }
+        )
+    payload = _spawn_codegraph_indexer(args, target_cwd)
     return codegraph_response(payload)
+
+
+def _spawn_codegraph_indexer(args: JsonObject, target_cwd: str) -> JsonObject:
+    """Launch `codegraph index` as a detached background process.
+
+    Returns a JSON payload with the run metadata. Acquires the global
+    indexer lock first — if another indexer is already running anywhere
+    on this machine, we fail fast instead of stacking work onto a broken
+    SQLite. The lock is released by an atexit hook in the launched
+    process; if it dies abnormally the next caller will see a stale lock
+    file with a holder PID and can decide to clean it up.
+    """
+    lock_path = codegraph_lock_path()
+    try:
+        lock = acquire_codegraph_lock(lock_path=lock_path)
+    except CodegraphLockBusy as exc:
+        return {
+            "ok": False,
+            "command": "codegraph index",
+            "cwd": target_cwd,
+            "error": str(exc),
+            "lock_path": str(exc.lock_path),
+            "holder_pid": exc.holder_pid,
+        }
+    # We acquired the lock just to validate availability; the background
+    # process will re-acquire and hold it for its lifetime. Release the
+    # parent's handle now so the child can take ownership cleanly.
+    lock.release()
+
+    state_dir = str(mcp_state_dir(args))
+    run_dir = Path(state_dir) / "mcp-runs"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    run_id = f"codegraph_index_{int(time.time() * 1000)}_{os.getpid()}"
+    stdout_path = run_dir / f"{run_id}.stdout.log"
+    stderr_path = run_dir / f"{run_id}.stderr.log"
+    launcher = [
+        sys.executable,
+        "-m",
+        "puppetmaster.codegraph_index_runner",
+        target_cwd,
+        str(lock_path),
+    ]
+    stdout_handle = stdout_path.open("w", encoding="utf-8")
+    stderr_handle = stderr_path.open("w", encoding="utf-8")
+    process = subprocess.Popen(
+        launcher,
+        cwd=target_cwd,
+        env=launcher_environment(args),
+        stdout=stdout_handle,
+        stderr=stderr_handle,
+        text=True,
+        start_new_session=True,
+    )
+    ASYNC_PROCESSES.append(process)
+    stdout_handle.close()
+    stderr_handle.close()
+    return {
+        "ok": True,
+        "command": "codegraph index",
+        "cwd": target_cwd,
+        "run_id": run_id,
+        "pid": process.pid,
+        "stdout_path": str(stdout_path),
+        "stderr_path": str(stderr_path),
+        "lock_path": str(lock_path),
+        "next_steps": [
+            "Call puppetmaster_codegraph_status to watch index progress.",
+            f"Tail {stdout_path} for raw indexer output if status looks stuck.",
+        ],
+    }
 
 
 def codegraph_response(payload: JsonObject) -> JsonObject:

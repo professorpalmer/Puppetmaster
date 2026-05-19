@@ -11,7 +11,12 @@ from pathlib import Path
 from typing import Optional
 
 from puppetmaster.adapters import ADAPTER_INFO, AdapterInfo
-from puppetmaster.codegraph import codegraph_available, codegraph_initialized
+from puppetmaster.codegraph import (
+    codegraph_available,
+    codegraph_initialized,
+    codegraph_native_sqlite_broken,
+    codegraph_status_command,
+)
 from puppetmaster.state import resolve_state_dir
 
 
@@ -52,6 +57,16 @@ def _codegraph_check(root: Path) -> Check:
             "codegraph",
             "optional",
             "codegraph installed; run `codegraph init` in target repos to enable shared context",
+        )
+    status = codegraph_status_command(root)
+    combined = (status.get("stdout") or "") + "\n" + (status.get("stderr") or "")
+    if codegraph_native_sqlite_broken(combined):
+        return Check(
+            "codegraph",
+            "warn",
+            "native better-sqlite3 broken; codegraph is using the slow WASM fallback. "
+            "Rebuild with `cd \"$(npm root -g)/@colbymchenry/codegraph\" && "
+            "npm rebuild better-sqlite3`, then re-run `codegraph status`.",
         )
     return Check("codegraph", "ok", "codegraph installed and target workspace initialized")
 
