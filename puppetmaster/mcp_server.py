@@ -28,6 +28,7 @@ from puppetmaster.codegraph import (
     codegraph_query,
     codegraph_status_command,
 )
+from puppetmaster.codegraph_repair import repair_codegraph_sqlite
 from puppetmaster.state import resolve_state_dir
 from puppetmaster.store_factory import create_store
 
@@ -315,6 +316,18 @@ def tools() -> list[McpTool]:
             input_schema=base_schema(),
             handler=run_codegraph_index,
         ),
+        McpTool(
+            name="puppetmaster_repair_codegraph",
+            description=(
+                "Rebuild CodeGraph's better-sqlite3 native module for Cursor's bundled "
+                "Node so the MCP server stops falling back to slow WASM SQLite. Run this "
+                "whenever puppetmaster_codegraph_status or puppetmaster_doctor reports "
+                "the native-SQLite-broken hint. Returns the rebuild stdout/stderr plus a "
+                "verification of Backend: native."
+            ),
+            input_schema=repair_codegraph_schema(),
+            handler=run_repair_codegraph,
+        ),
     ]
 
 
@@ -409,6 +422,40 @@ def run_codegraph_index(args: JsonObject) -> JsonObject:
             }
         )
     payload = _spawn_codegraph_indexer(args, target_cwd)
+    return codegraph_response(payload)
+
+
+def run_repair_codegraph(args: JsonObject) -> JsonObject:
+    """Rebuild better-sqlite3 against Cursor's bundled Node.
+
+    Designed for agent self-healing: when puppetmaster_codegraph_status
+    surfaces the native-SQLite-broken hint, the agent can call this tool
+    directly with no arguments and get a structured success/failure
+    payload back. We delegate to ``codegraph_repair.repair_codegraph_sqlite``
+    so the CLI command and the MCP tool share identical behaviour.
+    """
+    verify_cwd = args.get("verify_cwd")
+    if not verify_cwd:
+        verify_cwd = cwd(args)
+    cursor_node = args.get("cursor_node")
+    codegraph_install = args.get("codegraph_install")
+    npm_command = args.get("npm_command") or "npm"
+    rebuild_timeout = args.get("rebuild_timeout_seconds") or 180
+    verify = bool(args.get("verify", True))
+    result = repair_codegraph_sqlite(
+        cursor_node=cursor_node if isinstance(cursor_node, str) and cursor_node else None,
+        codegraph_install=(
+            codegraph_install
+            if isinstance(codegraph_install, str) and codegraph_install
+            else None
+        ),
+        npm_command=str(npm_command),
+        rebuild_timeout_seconds=int(rebuild_timeout),
+        verify=verify,
+        verify_cwd=str(verify_cwd) if verify_cwd else None,
+    )
+    payload = result.to_payload()
+    payload.setdefault("command", "npm rebuild better-sqlite3")
     return codegraph_response(payload)
 
 
@@ -1056,6 +1103,51 @@ def codegraph_init_schema() -> JsonObject:
         "default": False,
         "description": "If true, run a full index immediately after initialization.",
     }
+    return schema
+
+
+def repair_codegraph_schema() -> JsonObject:
+    schema = base_schema()
+    schema["properties"].update(
+        {
+            "cursor_node": {
+                "type": "string",
+                "description": (
+                    "Path to Cursor's bundled Node binary. Auto-detected from common "
+                    "macOS/Linux/Windows install locations when omitted."
+                ),
+            },
+            "codegraph_install": {
+                "type": "string",
+                "description": (
+                    "Path to the global @colbymchenry/codegraph install directory. "
+                    "Resolved from `npm root -g` when omitted."
+                ),
+            },
+            "npm_command": {
+                "type": "string",
+                "default": "npm",
+                "description": "npm binary to invoke (default: npm).",
+            },
+            "rebuild_timeout_seconds": {
+                "type": "integer",
+                "default": 180,
+                "description": "Hard timeout for the npm rebuild step.",
+            },
+            "verify": {
+                "type": "boolean",
+                "default": True,
+                "description": "Run `codegraph status` under Cursor's Node after the rebuild.",
+            },
+            "verify_cwd": {
+                "type": "string",
+                "description": (
+                    "Workspace to run the verification `codegraph status` in. "
+                    "Defaults to the cwd argument or process cwd."
+                ),
+            },
+        }
+    )
     return schema
 
 

@@ -64,9 +64,10 @@ def _codegraph_check(root: Path) -> Check:
         return Check(
             "codegraph",
             "warn",
-            "native better-sqlite3 broken; codegraph is using the slow WASM fallback. "
-            "Rebuild with `cd \"$(npm root -g)/@colbymchenry/codegraph\" && "
-            "npm rebuild better-sqlite3`, then re-run `codegraph status`.",
+            "native better-sqlite3 broken; codegraph is on slow WASM fallback. "
+            "Fix in one shot with `python -m puppetmaster repair-codegraph` "
+            "(rebuilds against Cursor's bundled Node so MCP picks it up). "
+            "Common cause: shell Node ABI != Cursor Node ABI.",
         )
     return Check("codegraph", "ok", "codegraph installed and target workspace initialized")
 

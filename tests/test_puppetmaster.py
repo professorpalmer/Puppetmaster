@@ -1473,7 +1473,10 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertFalse(result["isError"])
         payload = json.loads(result["content"][0]["text"])
         self.assertTrue(payload.get("native_sqlite_broken"))
-        self.assertIn("npm rebuild better-sqlite3", payload["hint"])
+        # New hint points users at the dedicated repair command and surfaces the
+        # Cursor-vs-shell Node ABI trap so they don't waste time on the wrong fix.
+        self.assertIn("puppetmaster repair-codegraph", payload["hint"])
+        self.assertIn("Cursor", payload["hint"])
 
     def test_codegraph_native_sqlite_broken_detects_known_markers(self) -> None:
         from puppetmaster.codegraph import codegraph_native_sqlite_broken
@@ -1486,6 +1489,197 @@ class PuppetmasterTests(unittest.TestCase):
         )
         self.assertFalse(codegraph_native_sqlite_broken("Backend: native; nodes: 12345"))
         self.assertFalse(codegraph_native_sqlite_broken(""))
+
+    def test_repair_codegraph_finds_cursor_node_from_known_path(self) -> None:
+        """find_cursor_node walks the per-platform candidate list."""
+        from puppetmaster import codegraph_repair
+
+        with TemporaryDirectory() as tmp:
+            fake_node = Path(tmp) / "node"
+            fake_node.write_text("#!/bin/sh\necho v22.22.0\n", encoding="utf-8")
+            fake_node.chmod(0o755)
+            # Override the macOS candidate list so the test is hermetic.
+            with patch.object(
+                codegraph_repair,
+                "_CURSOR_NODE_CANDIDATES_MAC",
+                (str(fake_node),),
+            ), patch.object(codegraph_repair.sys, "platform", "darwin"):
+                resolved = codegraph_repair.find_cursor_node()
+            self.assertIsNotNone(resolved)
+            self.assertEqual(str(resolved), str(fake_node))
+
+    def test_repair_codegraph_explicit_override_wins(self) -> None:
+        from puppetmaster import codegraph_repair
+
+        with TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "node"
+            fake.write_text("ok", encoding="utf-8")
+            self.assertEqual(
+                codegraph_repair.find_cursor_node(str(fake)),
+                fake,
+            )
+            self.assertIsNone(
+                codegraph_repair.find_cursor_node(str(Path(tmp) / "missing"))
+            )
+
+    def test_repair_codegraph_returns_failure_without_cursor_node(self) -> None:
+        """Without a discoverable Cursor Node we surface a clear next-step list."""
+        from puppetmaster import codegraph_repair
+
+        with patch.object(codegraph_repair, "find_cursor_node", return_value=None):
+            result = codegraph_repair.repair_codegraph_sqlite(verify=False)
+
+        self.assertFalse(result.ok)
+        self.assertIn("Cursor", result.message)
+        self.assertTrue(result.next_steps)
+
+    def test_repair_codegraph_runs_npm_rebuild_with_cursor_node_in_path(self) -> None:
+        """Happy path: rebuild is invoked with Cursor's Node ahead of $PATH."""
+        from puppetmaster import codegraph_repair
+
+        with TemporaryDirectory() as tmp:
+            cursor_node = Path(tmp) / "node"
+            cursor_node.write_text("#!/bin/sh\necho v22.22.0\n", encoding="utf-8")
+            cursor_node.chmod(0o755)
+            install_dir = Path(tmp) / "codegraph"
+            install_dir.mkdir()
+            (install_dir / "dist").mkdir()
+            (install_dir / "dist" / "bin").mkdir()
+            (install_dir / "dist" / "bin" / "codegraph.js").write_text(
+                "// stub", encoding="utf-8"
+            )
+
+            recorded: dict = {}
+
+            def fake_run(cmd, **kwargs):  # noqa: ANN001
+                recorded.setdefault("cmds", []).append((cmd, kwargs))
+                if cmd[0].endswith("node") and len(cmd) > 1 and cmd[1] == "--version":
+                    return subprocess.CompletedProcess(cmd, 0, "v22.22.0\n", "")
+                if cmd[0].endswith("node") and len(cmd) >= 3 and cmd[2] == "status":
+                    return subprocess.CompletedProcess(
+                        cmd, 0, "Backend: native\nNodes: 1234\n", ""
+                    )
+                if Path(cmd[0]).name.startswith("npm"):
+                    return subprocess.CompletedProcess(cmd, 0, "rebuilt!\n", "")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            with patch.object(
+                codegraph_repair.shutil,
+                "which",
+                return_value="/usr/local/bin/npm",
+            ), patch.object(codegraph_repair.subprocess, "run", side_effect=fake_run):
+                result = codegraph_repair.repair_codegraph_sqlite(
+                    cursor_node=str(cursor_node),
+                    codegraph_install=str(install_dir),
+                    verify=True,
+                    verify_cwd=tmp,
+                )
+
+        self.assertTrue(result.ok, msg=result.message)
+        self.assertEqual(result.verify_backend, "native")
+        self.assertEqual(result.cursor_node_version, "v22.22.0")
+        npm_calls = [c for c, _ in recorded["cmds"] if c[0].endswith("npm")]
+        self.assertEqual(len(npm_calls), 1)
+        self.assertEqual(npm_calls[0][1:], ["rebuild", "better-sqlite3"])
+        # Cursor's Node directory must be ahead of inherited PATH so the rebuild
+        # picks up the right runtime, not whichever Node is on the user's shell.
+        rebuild_kwargs = next(
+            kw for c, kw in recorded["cmds"] if c[0].endswith("npm")
+        )
+        env_path = rebuild_kwargs["env"]["PATH"]
+        self.assertTrue(env_path.startswith(str(cursor_node.parent)))
+
+    def test_repair_codegraph_reports_rebuild_failure(self) -> None:
+        from puppetmaster import codegraph_repair
+
+        with TemporaryDirectory() as tmp:
+            cursor_node = Path(tmp) / "node"
+            cursor_node.write_text("ok", encoding="utf-8")
+            install_dir = Path(tmp) / "codegraph"
+            install_dir.mkdir()
+
+            def fake_run(cmd, **kwargs):  # noqa: ANN001
+                if cmd[0].endswith("node") and len(cmd) > 1 and cmd[1] == "--version":
+                    return subprocess.CompletedProcess(cmd, 0, "v22.22.0\n", "")
+                return subprocess.CompletedProcess(
+                    cmd, 1, "", "node-gyp: command not found\n"
+                )
+
+            with patch.object(
+                codegraph_repair.shutil,
+                "which",
+                return_value="/usr/local/bin/npm",
+            ), patch.object(codegraph_repair.subprocess, "run", side_effect=fake_run):
+                result = codegraph_repair.repair_codegraph_sqlite(
+                    cursor_node=str(cursor_node),
+                    codegraph_install=str(install_dir),
+                    verify=False,
+                )
+
+        self.assertFalse(result.ok)
+        self.assertIn("non-zero", result.message)
+        self.assertIn("node-gyp", result.rebuild_stderr)
+
+    def test_mcp_repair_codegraph_invokes_repair_module(self) -> None:
+        """The MCP tool wires straight into repair_codegraph_sqlite."""
+        from puppetmaster.codegraph_repair import RepairResult
+
+        sentinel = RepairResult(
+            ok=True,
+            message="rebuilt",
+            cursor_node_path="/Applications/Cursor.app/.../node",
+            cursor_node_version="v22.22.0",
+            codegraph_install_path="/usr/local/lib/node_modules/@colbymchenry/codegraph",
+            rebuild_stdout="rebuilt!\n",
+            rebuild_stderr="",
+            verify_backend="native",
+            next_steps=["Restart MCP."],
+        )
+        with TemporaryDirectory() as tmp, patch(
+            "puppetmaster.mcp_server.repair_codegraph_sqlite",
+            return_value=sentinel,
+        ) as mcp_repair:
+            result = call_tool(
+                "puppetmaster_repair_codegraph",
+                {"cwd": tmp, "verify": False},
+            )
+
+        self.assertFalse(result["isError"])
+        payload = json.loads(result["content"][0]["text"])
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["verify_backend"], "native")
+        self.assertEqual(payload["command"], "npm rebuild better-sqlite3")
+        self.assertEqual(mcp_repair.call_count, 1)
+        kwargs = mcp_repair.call_args.kwargs
+        # The MCP tool defaults verify_cwd to the cwd argument so verification
+        # runs against the user's actual workspace, not the MCP server's cwd.
+        self.assertTrue(kwargs["verify_cwd"])
+        self.assertFalse(kwargs["verify"])
+
+    def test_cli_repair_codegraph_returns_zero_on_success(self) -> None:
+        """`python -m puppetmaster repair-codegraph` exits 0 when the rebuild works."""
+        from puppetmaster import cli as cli_module
+        from puppetmaster.codegraph_repair import RepairResult
+
+        sentinel = RepairResult(
+            ok=True,
+            message="rebuilt",
+            cursor_node_path="/Applications/Cursor.app/.../node",
+            cursor_node_version="v22.22.0",
+            codegraph_install_path="/usr/local/lib/node_modules/@colbymchenry/codegraph",
+            rebuild_stdout="",
+            rebuild_stderr="",
+            verify_backend="native",
+            next_steps=["Restart Puppetmaster MCP."],
+        )
+        with patch.object(
+            cli_module,
+            "repair_codegraph_sqlite",
+            return_value=sentinel,
+        ) as repair:
+            rc = cli_module.main(["repair-codegraph", "--no-verify"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(repair.call_count, 1)
 
     def test_mcp_main_loop_dispatches_messages_concurrently(self) -> None:
         """Slow tool calls must not block fast ones — the original 'Not

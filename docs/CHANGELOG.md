@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.5.1-beta.1
+
+- **Self-healing CodeGraph SQLite repair.** New `python -m puppetmaster repair-codegraph` CLI command and matching `puppetmaster_repair_codegraph` MCP tool that auto-detect Cursor's bundled Node, locate the global `@colbymchenry/codegraph` install, and `npm rebuild better-sqlite3` against the right runtime — then verify the backend reports as native. This closes the most common Cursor footgun: a shell-Node `npm rebuild` builds for the wrong ABI (Homebrew Node 23 vs. Cursor's bundled Node 22), so the Puppetmaster MCP keeps falling back to slow WASM SQLite and emits spurious `database is locked` errors.
+- Rewrite `CODEGRAPH_NATIVE_SQLITE_HINT` and `puppetmaster doctor`'s warn message to explain the dual-Node ABI trap and point users at `puppetmaster repair-codegraph` instead of the generic `npm rebuild` command that lands on the wrong runtime.
+- New `puppetmaster/codegraph_repair.py` module with `find_cursor_node()`, `find_codegraph_install()`, and `repair_codegraph_sqlite()` — covered by tests for macOS/Linux/Windows candidate paths, explicit overrides, rebuild failure surfacing, and verification parsing.
+- README: new Troubleshooting section documenting the dual-Node-ABI gotcha, the ABI tradeoff (rebuilding for Cursor breaks the terminal until you rebuild back), and the one-command fix.
+
 ## v0.5.0-beta.1
 
 - **Multi-threaded MCP request dispatch.** Replace the single-threaded `for line in sys.stdin` loop with a `ThreadPoolExecutor` so long-running tool calls never block the stdio transport. This fixes the "Tool execution error. Not connected" failure mode where a heavy CodeGraph call would silently freeze every other agent tool call. Worker count is configurable via `PUPPETMASTER_MCP_WORKERS` (default 8).
