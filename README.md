@@ -707,6 +707,54 @@ Escape hatches for weird installs:
 
 Both must be set together; auto-detection runs otherwise.
 
+### `puppetmaster adapters` says `cursor: configured=false`, but my swarms work
+
+You're probably running it from a workspace where you don't have `@cursor/sdk`
+installed locally. The Puppetmaster MCP loads the SDK from the **package
+install dir's** `node_modules`, not from your cwd — so the swarm worked fine
+while diagnostics lied. v0.5.4 fixes the detection: `_cursor_sdk_installed`
+now checks both the workspace and the package install dir, and reports the
+location it found:
+
+```text
+ok  cursor-sdk   @cursor/sdk installed (/Users/.../Puppetmaster/node_modules/@cursor/sdk)
+```
+
+`PUPPETMASTER_HOME` is an explicit escape hatch if your install lives somewhere unusual.
+
+### `puppetmaster show <job_id>` fails from any cwd other than the workspace that ran the job
+
+Pre-v0.5.4, each workspace had its own per-project SQLite state dir hashed
+from the resolved git root. If you ran a swarm in `/Users/you/ff-ios` and
+later tried `puppetmaster show job_X` from `/tmp` (or any other repo),
+it would fail with `job not found` even though the job was alive — and the
+workaround was exporting `PUPPETMASTER_STATE_DIR` to the right hashed
+path, which you'd have to look up.
+
+v0.5.4 auto-pivots. Read-only commands (`show`, `artifacts`, `diff`,
+`feed`, `logs`, `events`, `status`, `memory`, `open`) scan every project
+state dir on the machine and use the one that owns the job, with a
+single `note:` on stderr telling you which it picked:
+
+```text
+$ cd /tmp && python -m puppetmaster show job_4fc8c7148d65
+note: job job_4fc8c7148d65 not in current workspace state dir; using /Users/.../projects/Puppetmaster-7b41939e66e6
+# Puppetmaster Stitched Summary
+...
+```
+
+Two new commands round it out:
+
+- `python -m puppetmaster projects` — lists every project state dir on
+  this machine with job counts and last activity.
+- `python -m puppetmaster jobs --all-projects` — flattens jobs from
+  every project into one stream with a project column.
+
+Write-side commands (`run`, `cursor`, `claude`, `daemon`, ...) intentionally do
+*not* pivot. Those always use the caller's workspace state. Explicit
+`--state-dir` or `$PUPPETMASTER_STATE_DIR` overrides also disable the
+pivot.
+
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md)

@@ -44,6 +44,42 @@ def app_state_root() -> Path:
     return Path.home() / ".local" / "state" / "puppetmaster"
 
 
+def list_project_state_dirs() -> list[Path]:
+    """Return every project-scoped state directory currently on disk.
+
+    The MCP server and CLI both compute a per-workspace state dir hashed
+    from the resolved workspace path, so `puppetmaster show <job_id>`
+    only finds jobs created from the same workspace by default. This
+    helper lets callers iterate every known project to support cross-
+    workspace job lookup without forcing users to memorize the hash.
+    """
+    projects_root = app_state_root() / "projects"
+    if not projects_root.is_dir():
+        return []
+    return sorted(p for p in projects_root.iterdir() if p.is_dir())
+
+
+def find_state_dir_for_job(job_id: str) -> Optional[Path]:
+    """Locate the project state dir that owns ``job_id``, if any.
+
+    Scans every project state dir and returns the first one whose
+    ``jobs/<job_id>`` directory exists. The SQLite store stores jobs
+    on disk under ``<state_dir>/jobs/<job_id>/`` (we don't need to
+    actually open the DB to detect ownership — a directory check is
+    enough and avoids spinning up the WAL writer just for a search).
+
+    Returns None when no project knows about the job — callers should
+    surface the user-facing error in that case rather than swallowing.
+    """
+    if not job_id:
+        return None
+    for project in list_project_state_dirs():
+        job_dir = project / "jobs" / job_id
+        if job_dir.is_dir():
+            return project
+    return None
+
+
 def _resolve_user_path(value: Union[Path, str], cwd: Path) -> Path:
     path = Path(value).expanduser()
     return path if path.is_absolute() else cwd / path
