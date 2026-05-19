@@ -593,6 +593,22 @@ pay zero protocol cost. Tune or disable with:
 - `PUPPETMASTER_MCP_KEEPALIVE_INTERVAL_SECONDS` (default 10)
 - `PUPPETMASTER_MCP_KEEPALIVE_DISABLED=1` (turn off entirely)
 
+**Self-healing layer (v0.5.4+):** Cursor's MCP client uses a "lease"
+lifecycle that periodically re-creates the logical client without
+killing the previous Python MCP server. Without the keepalive above,
+that left one orphan server per lease cycle holding open SQLite handles
+and competing for the CodeGraph indexer lock. The new
+`_InputStalenessWatcher` measures **inbound** JSON-RPC traffic
+directly: if no stdin message has arrived in 10 minutes **and** there
+are zero in-flight tool calls, the server closes stdin and exits
+through the normal `finally` block (deregister, stop heartbeat, shut
+down executor). Active sessions are never interrupted; only true
+orphans reap. Tune or disable:
+
+- `PUPPETMASTER_MCP_INPUT_STALE_SECONDS` (default 600)
+- `PUPPETMASTER_MCP_INPUT_STALE_CHECK_SECONDS` (default 30)
+- `PUPPETMASTER_MCP_INPUT_STALE_DISABLED=1`
+
 If the transport still drops, the recovery layer below catches the
 fallout.
 
@@ -671,6 +687,25 @@ Node 22 may break native SQLite in your terminal (Node 23) until you
 rebuild again with the shell's Node. For day-to-day Cursor use, optimize
 for Cursor's Node. If you upgrade Cursor and the bundled Node ABI changes,
 re-run `puppetmaster repair-codegraph`.
+
+**v0.5.4 makes this self-correcting at runtime.** Puppetmaster now
+invokes `codegraph` by explicitly running its `codegraph.js` entrypoint
+**under Cursor's bundled Node** whenever both are discoverable (via the
+new `resolve_codegraph_invocation()` helper), regardless of which Node
+sits first on `$PATH`. That eliminates the failure mode where a stray
+shell shim under Homebrew Node spins up an indexer in WASM mode and
+locks the DB for hours. The corresponding `puppetmaster doctor`
+`codegraph` check now also verifies against the runtime Puppetmaster
+actually uses — not whichever shim happens to be on PATH — so you get
+`ok (verified under Cursor's bundled Node)` instead of a misleading
+`warn` when MCP is healthy.
+
+Escape hatches for weird installs:
+
+- `PUPPETMASTER_CODEGRAPH_NODE` — full path to the Node binary to use.
+- `PUPPETMASTER_CODEGRAPH_JS` — full path to `codegraph.js`.
+
+Both must be set together; auto-detection runs otherwise.
 
 ## Documentation
 

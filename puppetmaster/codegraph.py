@@ -65,6 +65,63 @@ def codegraph_available() -> bool:
     return shutil.which(CODEGRAPH_COMMAND) is not None
 
 
+def resolve_codegraph_invocation() -> list[str]:
+    """Return the argv prefix used to invoke CodeGraph.
+
+    Prefers running ``codegraph.js`` under Cursor's bundled Node binary
+    so the runtime ABI matches whatever ``better-sqlite3`` was built
+    against (see ``puppetmaster repair-codegraph``). This is the
+    deterministic fix for the 18-hour runaway scenario where a stray
+    ``codegraph`` invoked from a Homebrew-Node shim falls back to the
+    slow WASM SQLite driver because better-sqlite3 was built for
+    Cursor's Node ABI.
+
+    Order of preference, falling through to the next on miss:
+
+    1. ``PUPPETMASTER_CODEGRAPH_NODE`` + ``PUPPETMASTER_CODEGRAPH_JS``
+       envs (escape hatch for non-standard installs).
+    2. Cursor's bundled Node + the global ``@colbymchenry/codegraph``
+       JS entrypoint resolved via ``npm root -g``.
+    3. The bare ``codegraph`` shim on PATH (preserves prior behavior
+       when Cursor is not installed and on non-macOS hosts).
+    """
+    env_node = os.environ.get("PUPPETMASTER_CODEGRAPH_NODE")
+    env_js = os.environ.get("PUPPETMASTER_CODEGRAPH_JS")
+    if env_node and env_js and Path(env_node).is_file() and Path(env_js).is_file():
+        return [env_node, env_js]
+
+    cursor_invocation = _cursor_codegraph_invocation()
+    if cursor_invocation is not None:
+        return cursor_invocation
+
+    return [CODEGRAPH_COMMAND]
+
+
+def _cursor_codegraph_invocation() -> Optional[list[str]]:
+    """Return ``[cursor_node, codegraph.js]`` when both are discoverable."""
+    # Imports deferred to avoid module-import-time cost in code paths
+    # that never actually invoke codegraph (e.g. pure Puppetmaster swarm runs).
+    try:
+        from puppetmaster.codegraph_repair import (
+            find_codegraph_install,
+            find_cursor_node,
+        )
+    except Exception:
+        return None
+    node = find_cursor_node()
+    if node is None:
+        return None
+    install = find_codegraph_install()
+    if install is None:
+        return None
+    js = install / "dist" / "bin" / "codegraph.js"
+    if not js.is_file():
+        js = install / "bin" / "codegraph.js"
+    if not js.is_file():
+        return None
+    return [str(node), str(js)]
+
+
 def codegraph_initialized(cwd: Union[Path, str, None]) -> bool:
     """Return True when the target workspace has a .codegraph/ directory."""
     if not cwd:
@@ -88,8 +145,8 @@ def codegraph_context(
         return None
     try:
         completed = subprocess.run(
-            [
-                CODEGRAPH_COMMAND,
+            resolve_codegraph_invocation()
+            + [
                 "context",
                 task,
                 "--max-nodes",
@@ -123,7 +180,7 @@ def codegraph_status_line(
         return None
     try:
         completed = subprocess.run(
-            [CODEGRAPH_COMMAND, "status"],
+            resolve_codegraph_invocation() + ["status"],
             cwd=str(cwd),
             capture_output=True,
             text=True,
@@ -209,7 +266,7 @@ def run_codegraph_cli(
 
     try:
         completed = subprocess.run(
-            [CODEGRAPH_COMMAND] + cli_args,
+            resolve_codegraph_invocation() + cli_args,
             cwd=cwd_str or None,
             capture_output=True,
             text=True,

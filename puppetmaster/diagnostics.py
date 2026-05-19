@@ -16,6 +16,7 @@ from puppetmaster.codegraph import (
     codegraph_initialized,
     codegraph_native_sqlite_broken,
     codegraph_status_command,
+    resolve_codegraph_invocation,
 )
 from puppetmaster.mcp_registry import list_entries as registry_list_entries
 from puppetmaster.state import resolve_state_dir
@@ -99,6 +100,21 @@ def _mcp_servers_check() -> Check:
 
 
 def _codegraph_check(root: Path) -> Check:
+    """Verify codegraph is healthy from the runtime Puppetmaster MCP uses.
+
+    Pre-v0.5.4 this called ``codegraph status`` via the shim on PATH,
+    which on macOS-with-Homebrew machines is invoked under Homebrew's
+    Node — a *different* runtime from the one Puppetmaster's MCP server
+    actually runs ``codegraph`` under after v0.5.4. The shell-side
+    backend could report WASM (because better-sqlite3 was built for
+    Cursor's Node) while MCP's backend was happily native, producing a
+    misleading ``warn``.
+
+    We now verify against the same invocation Puppetmaster uses at
+    runtime: :func:`resolve_codegraph_invocation` returns Cursor's Node
+    + ``codegraph.js`` when available. That is the *real* signal that
+    matters for MCP operation.
+    """
     if not codegraph_available():
         return Check(
             "codegraph",
@@ -117,12 +133,17 @@ def _codegraph_check(root: Path) -> Check:
         return Check(
             "codegraph",
             "warn",
-            "native better-sqlite3 broken; codegraph is on slow WASM fallback. "
-            "Fix in one shot with `python -m puppetmaster repair-codegraph` "
-            "(rebuilds against Cursor's bundled Node so MCP picks it up). "
-            "Common cause: shell Node ABI != Cursor Node ABI.",
+            "native better-sqlite3 broken under the runtime Puppetmaster MCP uses; "
+            "codegraph is falling back to slow WASM SQLite. "
+            "Fix with `python -m puppetmaster repair-codegraph` (rebuilds against "
+            "Cursor's bundled Node so MCP picks it up). Common cause: shell Node "
+            "ABI differs from Cursor Node ABI.",
         )
-    return Check("codegraph", "ok", "codegraph installed and target workspace initialized")
+    invocation = resolve_codegraph_invocation()
+    detail = "codegraph installed and target workspace initialized"
+    if len(invocation) >= 2 and "Cursor.app" in invocation[0]:
+        detail += " (verified under Cursor's bundled Node)"
+    return Check("codegraph", "ok", detail)
 
 
 def adapter_status(root: Path) -> list[dict[str, object]]:
