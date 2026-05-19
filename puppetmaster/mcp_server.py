@@ -75,6 +75,24 @@ _DEFAULT_WORKER_COUNT = 8
 _DEFAULT_KEEPALIVE_AFTER_SECONDS = 5.0
 _DEFAULT_KEEPALIVE_INTERVAL_SECONDS = 10.0
 
+# Input-staleness self-termination defaults. Cursor's MCP "lease" lifecycle
+# can re-create a logical client without killing the previous Python
+# server process, so we accumulate orphan servers across lease cycles.
+# Each orphan still holds open SQLite handles and competes for the
+# CodeGraph indexer lock. We close that loop by self-terminating any
+# server that has not received an inbound JSON-RPC message in
+# ``_DEFAULT_INPUT_STALE_SECONDS`` AND currently has zero in-flight tool
+# calls. Active sessions are unaffected; only true orphans reap.
+_DEFAULT_INPUT_STALE_SECONDS = 600.0  # 10 minutes
+_DEFAULT_INPUT_STALE_CHECK_SECONDS = 30.0
+
+# Module-level state for stdin-liveness tracking. Initialized at startup
+# by ``main()`` and mutated by the stdin reader + tool-call dispatcher.
+_INPUT_STATE_LOCK = threading.Lock()
+_LAST_INBOUND_MESSAGE_AT = time.time()
+_ACTIVE_TOOL_CALLS = 0
+_SHUTDOWN_REQUESTED = threading.Event()
+
 
 def _resolve_worker_count() -> int:
     raw = os.environ.get("PUPPETMASTER_MCP_WORKERS")
@@ -226,6 +244,141 @@ class _ToolCallKeepalive:
         return ok
 
 
+def _input_staleness_disabled() -> bool:
+    raw = os.environ.get("PUPPETMASTER_MCP_INPUT_STALE_DISABLED")
+    if raw is None:
+        return False
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _resolve_input_stale_seconds(env_key: str, default: float) -> float:
+    raw = os.environ.get(env_key)
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return max(10.0, value)
+
+
+def _mark_inbound_message() -> None:
+    """Record that a JSON-RPC message arrived on stdin.
+
+    Called from the stdin reader for every parsed line so the
+    staleness watcher can tell a live conversation apart from an
+    orphan whose Cursor parent has stopped talking to it.
+    """
+    global _LAST_INBOUND_MESSAGE_AT
+    with _INPUT_STATE_LOCK:
+        _LAST_INBOUND_MESSAGE_AT = time.time()
+
+
+def _tool_call_started() -> None:
+    global _ACTIVE_TOOL_CALLS
+    with _INPUT_STATE_LOCK:
+        _ACTIVE_TOOL_CALLS += 1
+
+
+def _tool_call_finished() -> None:
+    global _ACTIVE_TOOL_CALLS
+    with _INPUT_STATE_LOCK:
+        _ACTIVE_TOOL_CALLS = max(0, _ACTIVE_TOOL_CALLS - 1)
+
+
+def _input_state_snapshot() -> tuple[float, int]:
+    with _INPUT_STATE_LOCK:
+        return _LAST_INBOUND_MESSAGE_AT, _ACTIVE_TOOL_CALLS
+
+
+class _InputStalenessWatcher(threading.Thread):
+    """Self-terminate the MCP server when it looks like an orphan.
+
+    Cursor's MCP "lease" lifecycle re-creates a logical client without
+    killing the previous Python server process. The old process keeps
+    running, holds SQLite handles, and competes for the CodeGraph
+    indexer lock. Heartbeat thread can't detect this — heartbeat
+    measures Python process liveness, not stdin liveness — so we
+    measure inbound JSON-RPC traffic directly.
+
+    A server is "orphaned" when both:
+      - No stdin message has arrived in ``stale_after_seconds``.
+      - There are zero in-flight tool calls.
+
+    On detection we close stdin, which causes the ``for line in sys.stdin``
+    loop in ``main()`` to terminate with EOF. The existing finally
+    block then runs cleanly: deregister from the registry, shut down
+    the executor, exit. No ``os._exit``, no leaked SQLite handles.
+    """
+
+    def __init__(
+        self,
+        *,
+        stale_after_seconds: float,
+        check_interval_seconds: float,
+        on_shutdown: Callable[[], None],
+    ) -> None:
+        super().__init__(daemon=True, name="puppetmaster-mcp-input-stale-watcher")
+        self._stale_after = stale_after_seconds
+        self._interval = check_interval_seconds
+        self._on_shutdown = on_shutdown
+        self._stop = threading.Event()
+        self._triggered = False
+
+    @property
+    def triggered(self) -> bool:
+        return self._triggered
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run(self) -> None:  # pragma: no cover - exercised via integration tests
+        while not self._stop.wait(self._interval):
+            last_msg, active = _input_state_snapshot()
+            age = time.time() - last_msg
+            if age < self._stale_after:
+                continue
+            if active > 0:
+                continue
+            self._triggered = True
+            _SHUTDOWN_REQUESTED.set()
+            try:
+                self._on_shutdown()
+            except Exception:
+                pass
+            return
+
+
+def _request_clean_shutdown() -> None:
+    """Interrupt the main stdio loop so it exits through the finally block.
+
+    We deliberately do NOT call ``os._exit`` — sending SIGINT to ourselves
+    raises ``KeyboardInterrupt`` in the main thread, which propagates out
+    of ``for line in sys.stdin`` and lets the existing ``finally`` block
+    in :func:`main` deregister from the MCP registry, stop the
+    heartbeat/watcher threads, and shut down the executor. A hard exit
+    would skip all that and leave a stale tracking file.
+
+    Closing fd 0 (the obvious approach) does not reliably unblock
+    CPython's buffered stdin reader on macOS — once the underlying
+    ``read(2)`` is in flight, closing the fd from another thread may
+    return EBADF on the next syscall but does not interrupt the
+    currently blocked read.
+    """
+    try:
+        import signal as _signal
+        os.kill(os.getpid(), _signal.SIGINT)
+    except (OSError, ValueError):
+        # ValueError if SIGINT isn't a valid signal (unlikely);
+        # OSError if the process is in some weird signal state.
+        # Fall back to closing stdin — better than leaving the
+        # orphan running indefinitely.
+        try:
+            os.close(0)
+        except OSError:
+            pass
+
+
 @dataclass(frozen=True)
 class McpTool:
     name: str
@@ -259,21 +412,53 @@ def main() -> int:
         registration_path = None
         heartbeat_thread = None
 
+    # Reset the staleness counter at startup so a slow Cursor handshake
+    # doesn't immediately look orphaned to the watcher.
+    global _LAST_INBOUND_MESSAGE_AT, _ACTIVE_TOOL_CALLS
+    with _INPUT_STATE_LOCK:
+        _LAST_INBOUND_MESSAGE_AT = time.time()
+        _ACTIVE_TOOL_CALLS = 0
+    _SHUTDOWN_REQUESTED.clear()
+
+    input_watcher: Optional[_InputStalenessWatcher] = None
+    if not _input_staleness_disabled():
+        input_watcher = _InputStalenessWatcher(
+            stale_after_seconds=_resolve_input_stale_seconds(
+                "PUPPETMASTER_MCP_INPUT_STALE_SECONDS",
+                _DEFAULT_INPUT_STALE_SECONDS,
+            ),
+            check_interval_seconds=_resolve_input_stale_seconds(
+                "PUPPETMASTER_MCP_INPUT_STALE_CHECK_SECONDS",
+                _DEFAULT_INPUT_STALE_CHECK_SECONDS,
+            ),
+            on_shutdown=_request_clean_shutdown,
+        )
+        input_watcher.start()
+
     executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=_resolve_worker_count(),
         thread_name_prefix="pm-mcp",
     )
     try:
-        for line in sys.stdin:
-            if not line.strip():
-                continue
-            try:
-                message = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            executor.submit(_process_message_safely, message)
+        try:
+            for line in sys.stdin:
+                if not line.strip():
+                    continue
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                _mark_inbound_message()
+                executor.submit(_process_message_safely, message)
+        except KeyboardInterrupt:
+            # InputStalenessWatcher (or an actual Ctrl-C) signalled
+            # SIGINT to trigger a clean shutdown. Fall through to the
+            # finally block instead of letting Python print a traceback.
+            pass
     finally:
         executor.shutdown(wait=False)
+        if input_watcher is not None:
+            input_watcher.stop()
         if heartbeat_thread is not None:
             heartbeat_thread.stop()
         if registration_path is not None:
@@ -304,11 +489,9 @@ def _process_message_safely(message: JsonObject) -> None:
     handler doesn't starve the stdio pipe. The keepalive is torn down in
     ``finally`` so a slow handler that raises still gets cleaned up.
     """
+    is_tool_call = message.get("method") == "tools/call"
     keepalive: Optional[_ToolCallKeepalive] = None
-    if (
-        not _keepalive_disabled()
-        and message.get("method") == "tools/call"
-    ):
+    if is_tool_call and not _keepalive_disabled():
         params = message.get("params") or {}
         tool_name = params.get("name") if isinstance(params, dict) else None
         keepalive = _ToolCallKeepalive(
@@ -316,6 +499,8 @@ def _process_message_safely(message: JsonObject) -> None:
             request_id=message.get("id"),
         )
         keepalive.start()
+    if is_tool_call:
+        _tool_call_started()
     try:
         response = handle_message(message)
     except Exception as exc:
@@ -323,6 +508,8 @@ def _process_message_safely(message: JsonObject) -> None:
     finally:
         if keepalive is not None:
             keepalive.stop()
+        if is_tool_call:
+            _tool_call_finished()
     if response is None:
         return
     serialized = json.dumps(response) + "\n"

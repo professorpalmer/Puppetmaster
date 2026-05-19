@@ -2040,6 +2040,183 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertEqual(notifications[0]["method"], "notifications/message")
         self.assertEqual(responses[0]["id"], 1)
 
+    def test_resolve_codegraph_invocation_prefers_cursor_node(self) -> None:
+        """When Cursor Node + codegraph.js are both discoverable, prefer that pair."""
+        from puppetmaster import codegraph as codegraph_mod
+        from puppetmaster import codegraph_repair
+
+        with TemporaryDirectory() as tmp:
+            node = Path(tmp) / "Cursor.app/Contents/Resources/app/resources/helpers/node"
+            node.parent.mkdir(parents=True)
+            node.write_text("ok", encoding="utf-8")
+            install = Path(tmp) / "codegraph"
+            (install / "dist" / "bin").mkdir(parents=True)
+            (install / "dist" / "bin" / "codegraph.js").write_text("// stub", encoding="utf-8")
+
+            with patch.object(codegraph_repair, "find_cursor_node", return_value=node), patch.object(
+                codegraph_repair, "find_codegraph_install", return_value=install
+            ):
+                argv = codegraph_mod.resolve_codegraph_invocation()
+            self.assertEqual(len(argv), 2)
+            self.assertEqual(argv[0], str(node))
+            self.assertEqual(argv[1], str(install / "dist" / "bin" / "codegraph.js"))
+
+    def test_resolve_codegraph_invocation_falls_back_to_shim(self) -> None:
+        """Without a Cursor install, we fall back to the codegraph shim on PATH."""
+        from puppetmaster import codegraph as codegraph_mod
+        from puppetmaster import codegraph_repair
+
+        with patch.object(codegraph_repair, "find_cursor_node", return_value=None), patch.object(
+            codegraph_repair, "find_codegraph_install", return_value=None
+        ):
+            argv = codegraph_mod.resolve_codegraph_invocation()
+        self.assertEqual(argv, [codegraph_mod.CODEGRAPH_COMMAND])
+
+    def test_resolve_codegraph_invocation_honors_env_override(self) -> None:
+        """Explicit env vars short-circuit auto-detection (escape hatch for weird installs)."""
+        from puppetmaster import codegraph as codegraph_mod
+
+        with TemporaryDirectory() as tmp:
+            node = Path(tmp) / "alt-node"
+            js = Path(tmp) / "alt-codegraph.js"
+            node.write_text("ok", encoding="utf-8")
+            js.write_text("// stub", encoding="utf-8")
+            os.environ["PUPPETMASTER_CODEGRAPH_NODE"] = str(node)
+            os.environ["PUPPETMASTER_CODEGRAPH_JS"] = str(js)
+            try:
+                argv = codegraph_mod.resolve_codegraph_invocation()
+            finally:
+                del os.environ["PUPPETMASTER_CODEGRAPH_NODE"]
+                del os.environ["PUPPETMASTER_CODEGRAPH_JS"]
+        self.assertEqual(argv, [str(node), str(js)])
+
+    def test_input_staleness_watcher_triggers_when_idle(self) -> None:
+        """No inbound messages for `stale_after_seconds` -> shutdown callback fires."""
+        from puppetmaster import mcp_server
+
+        triggered = threading.Event()
+        try:
+            with mcp_server._INPUT_STATE_LOCK:
+                mcp_server._LAST_INBOUND_MESSAGE_AT = time.time() - 3600
+                mcp_server._ACTIVE_TOOL_CALLS = 0
+            watcher = mcp_server._InputStalenessWatcher(
+                stale_after_seconds=0.05,
+                check_interval_seconds=0.02,
+                on_shutdown=triggered.set,
+            )
+            watcher.start()
+            self.assertTrue(triggered.wait(timeout=1.0))
+            self.assertTrue(watcher.triggered)
+        finally:
+            watcher.stop()
+            # Reset module state so other tests see a fresh server.
+            with mcp_server._INPUT_STATE_LOCK:
+                mcp_server._LAST_INBOUND_MESSAGE_AT = time.time()
+                mcp_server._ACTIVE_TOOL_CALLS = 0
+            mcp_server._SHUTDOWN_REQUESTED.clear()
+
+    def test_input_staleness_watcher_holds_off_during_active_call(self) -> None:
+        """Even if input is stale, an in-flight tool call defers shutdown."""
+        from puppetmaster import mcp_server
+
+        triggered = threading.Event()
+        try:
+            with mcp_server._INPUT_STATE_LOCK:
+                mcp_server._LAST_INBOUND_MESSAGE_AT = time.time() - 3600
+                mcp_server._ACTIVE_TOOL_CALLS = 2  # something is in flight
+            watcher = mcp_server._InputStalenessWatcher(
+                stale_after_seconds=0.05,
+                check_interval_seconds=0.02,
+                on_shutdown=triggered.set,
+            )
+            watcher.start()
+            self.assertFalse(triggered.wait(timeout=0.3))
+            self.assertFalse(watcher.triggered)
+        finally:
+            watcher.stop()
+            with mcp_server._INPUT_STATE_LOCK:
+                mcp_server._LAST_INBOUND_MESSAGE_AT = time.time()
+                mcp_server._ACTIVE_TOOL_CALLS = 0
+            mcp_server._SHUTDOWN_REQUESTED.clear()
+
+    def test_input_staleness_watcher_resets_when_message_arrives(self) -> None:
+        """A new inbound message bumps the timestamp; watcher then ignores the staleness."""
+        from puppetmaster import mcp_server
+
+        triggered = threading.Event()
+        try:
+            with mcp_server._INPUT_STATE_LOCK:
+                mcp_server._LAST_INBOUND_MESSAGE_AT = time.time() - 3600
+                mcp_server._ACTIVE_TOOL_CALLS = 0
+            watcher = mcp_server._InputStalenessWatcher(
+                stale_after_seconds=0.2,
+                check_interval_seconds=0.02,
+                on_shutdown=triggered.set,
+            )
+            watcher.start()
+            mcp_server._mark_inbound_message()  # simulate Cursor sending us something
+            # Heartbeat refresh should keep us alive for at least one check cycle.
+            self.assertFalse(triggered.wait(timeout=0.1))
+        finally:
+            watcher.stop()
+            with mcp_server._INPUT_STATE_LOCK:
+                mcp_server._LAST_INBOUND_MESSAGE_AT = time.time()
+                mcp_server._ACTIVE_TOOL_CALLS = 0
+            mcp_server._SHUTDOWN_REQUESTED.clear()
+
+    def test_input_staleness_can_be_disabled_via_env(self) -> None:
+        from puppetmaster.mcp_server import _input_staleness_disabled
+
+        os.environ["PUPPETMASTER_MCP_INPUT_STALE_DISABLED"] = "1"
+        try:
+            self.assertTrue(_input_staleness_disabled())
+        finally:
+            del os.environ["PUPPETMASTER_MCP_INPUT_STALE_DISABLED"]
+        self.assertFalse(_input_staleness_disabled())
+
+    def test_tool_call_counter_tracks_inflight_calls(self) -> None:
+        """The dispatcher must increment/decrement the active-call counter."""
+        from puppetmaster import mcp_server
+
+        with mcp_server._INPUT_STATE_LOCK:
+            mcp_server._ACTIVE_TOOL_CALLS = 0
+        try:
+            with patch.object(mcp_server, "handle_message", return_value=None):
+                mcp_server._process_message_safely(
+                    {"method": "tools/call", "id": 1, "params": {"name": "puppetmaster_doctor"}}
+                )
+            _, active_after = mcp_server._input_state_snapshot()
+            self.assertEqual(active_after, 0)
+        finally:
+            with mcp_server._INPUT_STATE_LOCK:
+                mcp_server._ACTIVE_TOOL_CALLS = 0
+
+    def test_doctor_codegraph_check_runs_under_cursor_node_invocation(self) -> None:
+        """When Cursor Node is the runtime, the ok-message says so so users know which Node it verified against."""
+        from puppetmaster import diagnostics
+
+        with TemporaryDirectory() as tmp:
+            (Path(tmp) / ".codegraph").mkdir()
+            with patch.object(diagnostics, "codegraph_available", return_value=True), patch.object(
+                diagnostics, "codegraph_initialized", return_value=True
+            ), patch.object(
+                diagnostics,
+                "codegraph_status_command",
+                return_value={"stdout": "Backend: native", "stderr": ""},
+            ), patch.object(
+                diagnostics, "codegraph_native_sqlite_broken", return_value=False
+            ), patch.object(
+                diagnostics,
+                "resolve_codegraph_invocation",
+                return_value=[
+                    "/Applications/Cursor.app/Contents/Resources/app/resources/helpers/node",
+                    "/opt/homebrew/lib/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js",
+                ],
+            ):
+                check = diagnostics._codegraph_check(Path(tmp))
+        self.assertEqual(check.status, "ok")
+        self.assertIn("Cursor's bundled Node", check.detail)
+
     def test_doctor_flags_orphan_mcp_servers(self) -> None:
         """`puppetmaster doctor` warns when dead tracking files exist."""
         from puppetmaster.diagnostics import run_doctor

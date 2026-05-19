@@ -31,6 +31,7 @@ from puppetmaster.codegraph import (
     CODEGRAPH_COMMAND,
     CodegraphLock,
     CodegraphLockBusy,
+    resolve_codegraph_invocation,
 )
 
 
@@ -64,7 +65,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     try:
         completed = subprocess.run(
-            [CODEGRAPH_COMMAND, "index"],
+            resolve_codegraph_invocation() + ["index"],
             cwd=target_cwd or None,
             env=os.environ.copy(),
             check=False,
