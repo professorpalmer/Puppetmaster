@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import os
 import sys
 import time
 from pathlib import Path
@@ -18,7 +19,11 @@ from puppetmaster.mcp_registry import (
     summarize as registry_summarize,
 )
 from puppetmaster.orchestrator import Orchestrator
-from puppetmaster.state import resolve_state_dir
+from puppetmaster.state import (
+    find_state_dir_for_job,
+    list_project_state_dirs,
+    resolve_state_dir,
+)
 from puppetmaster.store_factory import create_store
 from puppetmaster.stitcher import Stitcher
 from puppetmaster.worker_runtime import WorkerDaemon
@@ -83,8 +88,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use subprocess workers, inline workers, or wait for warm daemon workers.",
     )
 
-    subcommands.add_parser("jobs", help="List known jobs.")
+    jobs_parser = subcommands.add_parser("jobs", help="List known jobs.")
+    jobs_parser.add_argument(
+        "--all-projects",
+        action="store_true",
+        help=(
+            "List jobs across every Puppetmaster project state dir on this "
+            "machine instead of just the workspace's. Useful when you ran a "
+            "swarm in one repo and want to find the job from another shell."
+        ),
+    )
     subcommands.add_parser("last", help="Print the most recent job id.")
+    subcommands.add_parser(
+        "projects",
+        help=(
+            "List every Puppetmaster project state dir on this machine with "
+            "job counts and last activity. Helps you find which workspace "
+            "owns a job without exporting PUPPETMASTER_STATE_DIR."
+        ),
+    )
 
     status = subcommands.add_parser("status", help="Show task, artifact, and stale lease state.")
     status.add_argument("job_id")
@@ -373,11 +395,72 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
 
 
+def _resolve_store_for_job(
+    job_id: Optional[str],
+    state_dir: Path,
+    store,
+    backend: str,
+    explicit_state_dir: Optional[str],
+):
+    """Auto-pivot to the project that owns ``job_id`` when needed.
+
+    Pre-fix, ``puppetmaster show job_X`` from a directory whose state
+    dir didn't contain the job would emit a confusing "job not found"
+    error, even though the job was alive in a sibling project's state
+    dir. Users compensated by exporting
+    ``PUPPETMASTER_STATE_DIR=~/Library/Application Support/...`` —
+    which means they had to know the workspace hash. Now we scan
+    every known project state dir for the job and pivot silently
+    (with a single stderr note) when we find it elsewhere.
+
+    Respects an explicit ``--state-dir`` or ``$PUPPETMASTER_STATE_DIR``
+    override: if the user named a dir explicitly, we trust them and
+    don't pivot.
+    """
+    if not job_id:
+        return state_dir, store
+    if explicit_state_dir or os.environ.get("PUPPETMASTER_STATE_DIR"):
+        return state_dir, store
+    if (state_dir / "jobs" / job_id).is_dir():
+        return state_dir, store
+    found = find_state_dir_for_job(job_id)
+    if found is None or found.resolve() == state_dir.resolve():
+        return state_dir, store
+    sys.stderr.write(
+        f"note: job {job_id} not in current workspace state dir; using {found}\n"
+    )
+    return found, create_store(backend, found)
+
+
 def _main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     state_dir = resolve_state_dir(args.state_dir)
     store = create_store(args.backend, state_dir)
     on_job_created = early_job_printer if args.emit_job_id_early else None
+
+    # Read-only inspectors: pivot to whichever project state dir owns
+    # the requested job_id. Write-side commands (run/cursor/claude/
+    # daemon/...) intentionally do NOT pivot — those should always
+    # use the caller's workspace state.
+    if args.command in {
+        "show",
+        "artifacts",
+        "diff",
+        "memory",
+        "feed",
+        "logs",
+        "events",
+        "status",
+        "open",
+    }:
+        candidate_job_id = getattr(args, "job_id", None)
+        state_dir, store = _resolve_store_for_job(
+            candidate_job_id,
+            state_dir,
+            store,
+            args.backend,
+            args.state_dir,
+        )
 
     if args.command == "init":
         store.init()
@@ -500,8 +583,48 @@ def _main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     if args.command == "jobs":
+        if getattr(args, "all_projects", False):
+            for project in list_project_state_dirs():
+                project_store = create_store(args.backend, project)
+                try:
+                    project_jobs = project_store.list_jobs()
+                except Exception:
+                    continue
+                for job in project_jobs:
+                    print(
+                        f"{job.id}\t{job.status}\t{job.created_at}\t{project.name}\t{job.goal}"
+                    )
+            return 0
         for job in store.list_jobs():
             print(f"{job.id}\t{job.status}\t{job.created_at}\t{job.goal}")
+        return 0
+
+    if args.command == "projects":
+        projects = list_project_state_dirs()
+        if not projects:
+            print("no Puppetmaster projects found on this machine yet")
+            return 0
+        for project in projects:
+            jobs_dir = project / "jobs"
+            job_count = (
+                sum(1 for _ in jobs_dir.iterdir() if _.is_dir())
+                if jobs_dir.is_dir()
+                else 0
+            )
+            last_activity = (
+                max(
+                    (p.stat().st_mtime for p in jobs_dir.iterdir() if p.is_dir()),
+                    default=None,
+                )
+                if jobs_dir.is_dir()
+                else None
+            )
+            last_str = (
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_activity))
+                if last_activity is not None
+                else "(never)"
+            )
+            print(f"{project.name}\t{job_count} jobs\tlast: {last_str}\t{project}")
         return 0
 
     if args.command == "last":

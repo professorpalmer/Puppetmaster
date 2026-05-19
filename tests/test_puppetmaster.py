@@ -2614,6 +2614,97 @@ print('{"result":"ok"}')
         self.assertIn("claude-code", names)
         self.assertIn("codex", names)
 
+    def test_cursor_sdk_detected_in_puppetmaster_package_dir(self) -> None:
+        """`puppetmaster adapters` from an unrelated workspace must still see
+        the bundled @cursor/sdk install — the adapter resolves the SDK from
+        the Puppetmaster package's own node_modules at runtime, not from cwd."""
+        from puppetmaster import diagnostics
+
+        with TemporaryDirectory() as tmp:
+            unrelated_repo = Path(tmp) / "ff-data-engineering"
+            unrelated_repo.mkdir()
+            fake_package_root = Path(tmp) / "Puppetmaster"
+            (fake_package_root / "node_modules" / "@cursor" / "sdk").mkdir(parents=True)
+            fake_diagnostics_file = fake_package_root / "puppetmaster" / "diagnostics.py"
+            fake_diagnostics_file.parent.mkdir()
+            fake_diagnostics_file.write_text("# stub", encoding="utf-8")
+            with patch.object(diagnostics, "__file__", str(fake_diagnostics_file)):
+                self.assertTrue(diagnostics._cursor_sdk_installed(unrelated_repo))
+                location = diagnostics._find_cursor_sdk_install(unrelated_repo)
+            self.assertIsNotNone(location)
+            # macOS resolves /var -> /private/var; compare resolved paths.
+            expected = (fake_package_root / "node_modules" / "@cursor" / "sdk").resolve()
+            self.assertEqual(location.resolve(), expected)
+
+    def test_cursor_sdk_detection_honors_workspace_install(self) -> None:
+        """Local repo node_modules install still counts (precedence over package dir)."""
+        from puppetmaster import diagnostics
+
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "workspace"
+            (workspace / "node_modules" / "@cursor" / "sdk").mkdir(parents=True)
+            fake_pkg_root = Path(tmp) / "nowhere"  # no SDK here
+            fake_diagnostics_file = fake_pkg_root / "puppetmaster" / "diagnostics.py"
+            fake_diagnostics_file.parent.mkdir(parents=True)
+            with patch.object(diagnostics, "__file__", str(fake_diagnostics_file)):
+                self.assertTrue(diagnostics._cursor_sdk_installed(workspace))
+
+    def test_cursor_sdk_detection_returns_false_when_neither_exists(self) -> None:
+        from puppetmaster import diagnostics
+
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            fake_pkg_root = Path(tmp) / "nowhere"
+            fake_diagnostics_file = fake_pkg_root / "puppetmaster" / "diagnostics.py"
+            fake_diagnostics_file.parent.mkdir(parents=True)
+            old_home = os.environ.pop("PUPPETMASTER_HOME", None)
+            try:
+                with patch.object(diagnostics, "__file__", str(fake_diagnostics_file)):
+                    self.assertFalse(diagnostics._cursor_sdk_installed(workspace))
+            finally:
+                if old_home is not None:
+                    os.environ["PUPPETMASTER_HOME"] = old_home
+
+    def test_find_state_dir_for_job_locates_owning_project(self) -> None:
+        """`puppetmaster show <job_id>` must work from any cwd by auto-discovering
+        which project state dir owns the job — no PUPPETMASTER_STATE_DIR export required."""
+        from puppetmaster import state as state_module
+
+        with TemporaryDirectory() as tmp:
+            projects_root = Path(tmp) / "projects"
+            project_a = projects_root / "ff-data-engineering-cfbfad67d9fc"
+            project_b = projects_root / "ff-ios-589b71a4121f"
+            (project_a / "jobs" / "job_476cbf98144f").mkdir(parents=True)
+            (project_b / "jobs" / "job_83a3481f7ae8").mkdir(parents=True)
+
+            with patch.object(state_module, "app_state_root", return_value=Path(tmp)):
+                self.assertEqual(
+                    state_module.find_state_dir_for_job("job_476cbf98144f"),
+                    project_a,
+                )
+                self.assertEqual(
+                    state_module.find_state_dir_for_job("job_83a3481f7ae8"),
+                    project_b,
+                )
+                self.assertIsNone(
+                    state_module.find_state_dir_for_job("job_does_not_exist")
+                )
+
+    def test_find_state_dir_for_job_returns_none_when_root_missing(self) -> None:
+        from puppetmaster import state as state_module
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(state_module, "app_state_root", return_value=Path(tmp)):
+                self.assertIsNone(state_module.find_state_dir_for_job("job_abc"))
+
+    def test_list_project_state_dirs_handles_missing_root(self) -> None:
+        from puppetmaster import state as state_module
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(state_module, "app_state_root", return_value=Path(tmp)):
+                self.assertEqual(state_module.list_project_state_dirs(), [])
+
     def test_starter_config_is_loadable(self) -> None:
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "puppetmaster.json"

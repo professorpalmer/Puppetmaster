@@ -209,13 +209,51 @@ def _command_check(name: str, command: list[str]) -> Check:
 
 
 def _cursor_sdk_check(root: Path) -> Check:
-    if _cursor_sdk_installed(root):
-        return Check("cursor-sdk", "ok", "@cursor/sdk installed")
-    return Check("cursor-sdk", "optional", "run npm install to enable the cursor adapter")
+    location = _find_cursor_sdk_install(root)
+    if location is not None:
+        return Check("cursor-sdk", "ok", f"@cursor/sdk installed ({location})")
+    return Check(
+        "cursor-sdk",
+        "optional",
+        "run `npm install` in the Puppetmaster package dir to enable the cursor adapter",
+    )
 
 
 def _cursor_sdk_installed(root: Path) -> bool:
-    return (root / "node_modules" / "@cursor" / "sdk").exists()
+    """Whether the @cursor/sdk package is resolvable for Puppetmaster's runtime.
+
+    This intentionally checks BOTH the user's workspace ``root/node_modules``
+    AND the Puppetmaster package install dir, because the SDK is bundled
+    with the Puppetmaster package itself (`cursor_sdk_runner.mjs` resolves
+    `@cursor/sdk` from there at runtime) — not from whatever repo the
+    user happens to be cd'd in. Before this fix, ``puppetmaster doctor``
+    and ``puppetmaster adapters`` would falsely report
+    ``cursor: configured=false`` from any non-Puppetmaster workspace.
+    """
+    return _find_cursor_sdk_install(root) is not None
+
+
+def _find_cursor_sdk_install(root: Path) -> Optional[Path]:
+    """Return the on-disk location of @cursor/sdk, or None if not found."""
+    candidates: list[Path] = []
+    if root is not None:
+        candidates.append(Path(root) / "node_modules" / "@cursor" / "sdk")
+    # The Puppetmaster package directory ships its own package.json and
+    # node_modules; cursor_sdk_runner.mjs uses Node's resolution which
+    # walks upward from its own file path. We mirror that here so
+    # diagnostics agree with runtime behavior.
+    package_root = Path(__file__).resolve().parent.parent
+    candidates.append(package_root / "node_modules" / "@cursor" / "sdk")
+    # An editable install ($PUPPETMASTER_HOME / install dir) may live
+    # somewhere else entirely; honor an explicit override so users on
+    # weird layouts can self-correct without code changes.
+    env_root = os.environ.get("PUPPETMASTER_HOME")
+    if env_root:
+        candidates.append(Path(env_root).expanduser() / "node_modules" / "@cursor" / "sdk")
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def _claude_code_check() -> Check:
