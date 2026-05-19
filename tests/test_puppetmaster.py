@@ -1681,6 +1681,241 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(repair.call_count, 1)
 
+    def test_mcp_registry_round_trip(self) -> None:
+        """register -> list -> heartbeat -> deregister flows correctly."""
+        from puppetmaster import mcp_registry
+
+        with TemporaryDirectory() as tmp:
+            os.environ["PUPPETMASTER_MCP_REGISTRY_DIR"] = tmp
+            try:
+                path = mcp_registry.register(
+                    pid=os.getpid(),
+                    workspace="/tmp/test-workspace",
+                    version="0.5.2-test",
+                )
+                self.assertTrue(path.exists())
+
+                entries = mcp_registry.list_entries()
+                self.assertEqual(len(entries), 1)
+                self.assertEqual(entries[0].pid, os.getpid())
+                self.assertEqual(entries[0].workspace, "/tmp/test-workspace")
+                self.assertTrue(entries[0].is_alive())
+                self.assertFalse(entries[0].is_stale())
+
+                before = entries[0].last_heartbeat
+                time.sleep(0.01)
+                self.assertTrue(mcp_registry.heartbeat(path))
+                refreshed = mcp_registry.list_entries()[0]
+                self.assertGreater(refreshed.last_heartbeat, before)
+
+                mcp_registry.deregister(path)
+                self.assertFalse(path.exists())
+                self.assertEqual(mcp_registry.list_entries(), [])
+            finally:
+                del os.environ["PUPPETMASTER_MCP_REGISTRY_DIR"]
+
+    def test_mcp_registry_prune_dead_removes_dead_pids(self) -> None:
+        """Tracking files whose PIDs are no longer alive get cleaned up."""
+        from puppetmaster import mcp_registry
+
+        with TemporaryDirectory() as tmp:
+            os.environ["PUPPETMASTER_MCP_REGISTRY_DIR"] = tmp
+            try:
+                # Live registration (our own PID).
+                live_path = mcp_registry.register(
+                    pid=os.getpid(),
+                    workspace="/live",
+                )
+                # Synthetic dead registration — PID 1 is init/launchd and
+                # *is* alive, so pick an obviously-impossible PID. 2**31 - 1
+                # is well outside any kernel's PID range on Linux/macOS.
+                dead_path = Path(tmp) / "2147483647.json"
+                dead_path.write_text(
+                    json.dumps(
+                        {
+                            "pid": 2147483647,
+                            "workspace": "/dead",
+                            "started_at": time.time() - 3600,
+                            "last_heartbeat": time.time() - 3600,
+                            "transport": "stdio",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                cleaned = mcp_registry.prune_dead()
+                self.assertEqual(len(cleaned), 1)
+                self.assertEqual(cleaned[0].pid, 2147483647)
+                self.assertFalse(dead_path.exists())
+                self.assertTrue(live_path.exists())
+                mcp_registry.deregister(live_path)
+            finally:
+                del os.environ["PUPPETMASTER_MCP_REGISTRY_DIR"]
+
+    def test_mcp_registry_stale_detection(self) -> None:
+        """An alive entry with an old heartbeat is reported as stale."""
+        from puppetmaster import mcp_registry
+
+        with TemporaryDirectory() as tmp:
+            os.environ["PUPPETMASTER_MCP_REGISTRY_DIR"] = tmp
+            try:
+                path = Path(tmp) / f"{os.getpid()}.json"
+                path.write_text(
+                    json.dumps(
+                        {
+                            "pid": os.getpid(),
+                            "workspace": "/stale",
+                            "started_at": time.time() - 3600,
+                            "last_heartbeat": time.time() - 3600,
+                            "transport": "stdio",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                entries = mcp_registry.list_entries()
+                self.assertEqual(len(entries), 1)
+                self.assertTrue(entries[0].is_alive())
+                self.assertTrue(entries[0].is_stale())
+
+                summary = mcp_registry.summarize(entries)
+                self.assertEqual(summary["count"], 1)
+                self.assertEqual(summary["alive"], 1)
+                self.assertEqual(summary["stale"], 1)
+                self.assertEqual(summary["dead"], 0)
+                mcp_registry.deregister(path)
+            finally:
+                del os.environ["PUPPETMASTER_MCP_REGISTRY_DIR"]
+
+    def test_mcp_registry_kill_stale_never_signals_self(self) -> None:
+        """kill_stale must refuse to SIGTERM the current process."""
+        from puppetmaster import mcp_registry
+
+        with TemporaryDirectory() as tmp:
+            os.environ["PUPPETMASTER_MCP_REGISTRY_DIR"] = tmp
+            try:
+                path = Path(tmp) / f"{os.getpid()}.json"
+                path.write_text(
+                    json.dumps(
+                        {
+                            "pid": os.getpid(),
+                            "workspace": "/self",
+                            "started_at": time.time() - 3600,
+                            "last_heartbeat": time.time() - 3600,
+                            "transport": "stdio",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                killed = mcp_registry.kill_stale(self_pid=os.getpid())
+                self.assertEqual(killed, [])
+                self.assertTrue(path.exists())  # we did not kill ourselves
+                mcp_registry.deregister(path)
+            finally:
+                del os.environ["PUPPETMASTER_MCP_REGISTRY_DIR"]
+
+    def test_mcp_status_tool_reports_self(self) -> None:
+        """puppetmaster_mcp_status returns the running server in its snapshot."""
+        from puppetmaster import mcp_registry
+
+        with TemporaryDirectory() as tmp:
+            os.environ["PUPPETMASTER_MCP_REGISTRY_DIR"] = tmp
+            try:
+                mcp_registry.register(
+                    pid=os.getpid(),
+                    workspace="/test-workspace",
+                )
+                result = call_tool("puppetmaster_mcp_status", {})
+            finally:
+                del os.environ["PUPPETMASTER_MCP_REGISTRY_DIR"]
+
+        self.assertFalse(result["isError"])
+        payload = json.loads(result["content"][0]["text"])
+        self.assertEqual(payload["self_pid"], os.getpid())
+        self.assertGreaterEqual(payload["count"], 1)
+        pids = [row["pid"] for row in payload["servers"]]
+        self.assertIn(os.getpid(), pids)
+
+    def test_mcp_cleanup_tool_prunes_dead_files(self) -> None:
+        """puppetmaster_mcp_cleanup prunes dead tracking files end-to-end."""
+        with TemporaryDirectory() as tmp:
+            os.environ["PUPPETMASTER_MCP_REGISTRY_DIR"] = tmp
+            try:
+                dead_path = Path(tmp) / "2147483647.json"
+                dead_path.write_text(
+                    json.dumps(
+                        {
+                            "pid": 2147483647,
+                            "workspace": "/dead",
+                            "started_at": time.time() - 3600,
+                            "last_heartbeat": time.time() - 3600,
+                            "transport": "stdio",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                result = call_tool("puppetmaster_mcp_cleanup", {})
+            finally:
+                del os.environ["PUPPETMASTER_MCP_REGISTRY_DIR"]
+
+        self.assertFalse(result["isError"])
+        payload = json.loads(result["content"][0]["text"])
+        self.assertTrue(payload["ok"])
+        self.assertEqual(len(payload["pruned"]), 1)
+        self.assertEqual(payload["pruned"][0]["pid"], 2147483647)
+        self.assertEqual(payload["killed"], [])
+        self.assertFalse(dead_path.exists())
+
+    def test_cli_mcp_list_outputs_json_when_requested(self) -> None:
+        """`python -m puppetmaster mcp list --json` prints a parseable snapshot."""
+        import io
+        from puppetmaster import cli as cli_module
+        from puppetmaster import mcp_registry
+
+        with TemporaryDirectory() as tmp:
+            os.environ["PUPPETMASTER_MCP_REGISTRY_DIR"] = tmp
+            try:
+                mcp_registry.register(pid=os.getpid(), workspace="/listed")
+                buf = io.StringIO()
+                with patch("sys.stdout", buf):
+                    rc = cli_module.main(["mcp", "list", "--json"])
+            finally:
+                del os.environ["PUPPETMASTER_MCP_REGISTRY_DIR"]
+
+        self.assertEqual(rc, 0)
+        snapshot = json.loads(buf.getvalue())
+        self.assertGreaterEqual(snapshot["count"], 1)
+
+    def test_doctor_flags_orphan_mcp_servers(self) -> None:
+        """`puppetmaster doctor` warns when dead tracking files exist."""
+        from puppetmaster.diagnostics import run_doctor
+
+        with TemporaryDirectory() as tmp_state, TemporaryDirectory() as registry_dir:
+            os.environ["PUPPETMASTER_MCP_REGISTRY_DIR"] = registry_dir
+            try:
+                dead_path = Path(registry_dir) / "2147483647.json"
+                dead_path.write_text(
+                    json.dumps(
+                        {
+                            "pid": 2147483647,
+                            "workspace": "/dead",
+                            "started_at": time.time() - 3600,
+                            "last_heartbeat": time.time() - 3600,
+                            "transport": "stdio",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                checks = run_doctor(Path(tmp_state), Path(tmp_state))
+            finally:
+                del os.environ["PUPPETMASTER_MCP_REGISTRY_DIR"]
+
+        mcp_check = next(c for c in checks if c.name == "mcp-servers")
+        self.assertEqual(mcp_check.status, "warn")
+        self.assertIn("puppetmaster mcp cleanup", mcp_check.detail)
+
     def test_mcp_main_loop_dispatches_messages_concurrently(self) -> None:
         """Slow tool calls must not block fast ones — the original 'Not
         connected' bug came from a single-threaded `for line in sys.stdin`.

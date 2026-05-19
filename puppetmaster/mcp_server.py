@@ -29,6 +29,15 @@ from puppetmaster.codegraph import (
     codegraph_status_command,
 )
 from puppetmaster.codegraph_repair import repair_codegraph_sqlite
+from puppetmaster.mcp_registry import (
+    HeartbeatThread,
+    deregister as registry_deregister,
+    kill_stale as registry_kill_stale,
+    list_entries as registry_list_entries,
+    prune_dead as registry_prune_dead,
+    register as registry_register,
+    summarize as registry_summarize,
+)
 from puppetmaster.state import resolve_state_dir
 from puppetmaster.store_factory import create_store
 
@@ -75,6 +84,30 @@ class McpTool:
 
 
 def main() -> int:
+    # Sweep dead tracking files from prior server runs before we
+    # advertise ourselves. This is how Cursor users escape the
+    # "Restart MCP, see 3 orphan PIDs in `ps`" trap without typing
+    # any pkill commands.
+    try:
+        registry_prune_dead()
+    except Exception:
+        pass
+
+    registration_path = None
+    heartbeat_thread: Optional[HeartbeatThread] = None
+    try:
+        registration_path = registry_register(
+            workspace=str(Path.cwd()),
+            version=_server_version(),
+        )
+        heartbeat_thread = HeartbeatThread(registration_path)
+        heartbeat_thread.start()
+    except Exception:
+        # The registry is a diagnostic affordance; never refuse to
+        # serve MCP traffic just because we can't write to it.
+        registration_path = None
+        heartbeat_thread = None
+
     executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=_resolve_worker_count(),
         thread_name_prefix="pm-mcp",
@@ -90,7 +123,27 @@ def main() -> int:
             executor.submit(_process_message_safely, message)
     finally:
         executor.shutdown(wait=False)
+        if heartbeat_thread is not None:
+            heartbeat_thread.stop()
+        if registration_path is not None:
+            try:
+                registry_deregister(registration_path)
+            except Exception:
+                pass
     return 0
+
+
+def _server_version() -> Optional[str]:
+    """Best-effort lookup of the installed puppetmaster version."""
+    try:
+        from importlib.metadata import PackageNotFoundError, version as _version
+
+        try:
+            return _version("puppetmaster")
+        except PackageNotFoundError:
+            return None
+    except Exception:
+        return None
 
 
 def _process_message_safely(message: JsonObject) -> None:
@@ -328,6 +381,28 @@ def tools() -> list[McpTool]:
             input_schema=repair_codegraph_schema(),
             handler=run_repair_codegraph,
         ),
+        McpTool(
+            name="puppetmaster_mcp_status",
+            description=(
+                "List every Puppetmaster MCP server tracked on this machine, with PID, "
+                "workspace, age, last heartbeat, and alive/stale flags. Use this right "
+                "after a `Tool execution error. Not connected` to see whether the swarm "
+                "is still alive in a sibling server before tearing things down."
+            ),
+            input_schema={"type": "object", "properties": {}},
+            handler=run_mcp_status,
+        ),
+        McpTool(
+            name="puppetmaster_mcp_cleanup",
+            description=(
+                "Prune dead tracking files for MCP servers that exited without cleanup, "
+                "and (with kill_stale=true) SIGTERM/SIGKILL stale-but-alive Puppetmaster "
+                "MCP servers whose Cursor parent appears to be gone. Never signals the "
+                "current process. Returns the before/after registry snapshot."
+            ),
+            input_schema=mcp_cleanup_schema(),
+            handler=run_mcp_cleanup,
+        ),
     ]
 
 
@@ -457,6 +532,82 @@ def run_repair_codegraph(args: JsonObject) -> JsonObject:
     payload = result.to_payload()
     payload.setdefault("command", "npm rebuild better-sqlite3")
     return codegraph_response(payload)
+
+
+def run_mcp_status(args: JsonObject) -> JsonObject:
+    """Report every tracked Puppetmaster MCP server on this machine.
+
+    The payload mirrors the CLI output so an agent can render it
+    directly. We always prune dead tracking files first so the answer
+    is fresh — there's no point reporting servers we already know are
+    gone.
+    """
+    try:
+        cleaned = registry_prune_dead()
+    except Exception:
+        cleaned = []
+    snapshot = registry_summarize(registry_list_entries())
+    snapshot["self_pid"] = os.getpid()
+    snapshot["pruned_dead"] = [entry.to_payload() for entry in cleaned]
+    snapshot["ok"] = True
+    return _mcp_diagnostic_response(snapshot)
+
+
+def run_mcp_cleanup(args: JsonObject) -> JsonObject:
+    """Prune dead tracking files and optionally kill stale-but-alive MCP servers.
+
+    Defensive defaults: ``kill_stale`` is opt-in, the current PID is
+    never signalled, and we surface the before/after snapshots so the
+    caller can see exactly what changed.
+    """
+    before = registry_summarize(registry_list_entries())
+    try:
+        pruned = registry_prune_dead()
+    except Exception as exc:
+        return _mcp_diagnostic_response(
+            {
+                "ok": False,
+                "error": f"prune_dead failed: {exc}",
+                "before": before,
+            }
+        )
+    killed: list = []
+    if bool(args.get("kill_stale", False)):
+        stale_after = float(args.get("stale_after_seconds") or 300)
+        try:
+            killed_entries = registry_kill_stale(
+                stale_after_seconds=stale_after,
+                self_pid=os.getpid(),
+            )
+        except Exception as exc:
+            return _mcp_diagnostic_response(
+                {
+                    "ok": False,
+                    "error": f"kill_stale failed: {exc}",
+                    "before": before,
+                    "pruned": [entry.to_payload() for entry in pruned],
+                }
+            )
+        killed = [entry.to_payload() for entry in killed_entries]
+    after = registry_summarize(registry_list_entries())
+    return _mcp_diagnostic_response(
+        {
+            "ok": True,
+            "before": before,
+            "after": after,
+            "pruned": [entry.to_payload() for entry in pruned],
+            "killed": killed,
+            "self_pid": os.getpid(),
+        }
+    )
+
+
+def _mcp_diagnostic_response(payload: JsonObject) -> JsonObject:
+    """Wrap an MCP registry payload in the standard tool-result envelope."""
+    return {
+        "content": [{"type": "text", "text": json.dumps(payload, indent=2)}],
+        "isError": not payload.get("ok", False),
+    }
 
 
 def _spawn_codegraph_indexer(args: JsonObject, target_cwd: str) -> JsonObject:
@@ -1104,6 +1255,28 @@ def codegraph_init_schema() -> JsonObject:
         "description": "If true, run a full index immediately after initialization.",
     }
     return schema
+
+
+def mcp_cleanup_schema() -> JsonObject:
+    return {
+        "type": "object",
+        "properties": {
+            "kill_stale": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "If true, SIGTERM/SIGKILL Puppetmaster MCP servers whose "
+                    "heartbeat is older than stale_after_seconds. The current "
+                    "process is never signalled."
+                ),
+            },
+            "stale_after_seconds": {
+                "type": "integer",
+                "default": 300,
+                "description": "Heartbeat age in seconds beyond which a server is considered stale.",
+            },
+        },
+    }
 
 
 def repair_codegraph_schema() -> JsonObject:

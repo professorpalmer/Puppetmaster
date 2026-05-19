@@ -11,6 +11,12 @@ from typing import Optional
 from puppetmaster.codegraph_repair import repair_codegraph_sqlite
 from puppetmaster.config import load_config
 from puppetmaster.diagnostics import adapter_status, run_doctor, starter_config
+from puppetmaster.mcp_registry import (
+    kill_stale as registry_kill_stale,
+    list_entries as registry_list_entries,
+    prune_dead as registry_prune_dead,
+    summarize as registry_summarize,
+)
 from puppetmaster.orchestrator import Orchestrator
 from puppetmaster.state import resolve_state_dir
 from puppetmaster.store_factory import create_store
@@ -310,6 +316,49 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print the full repair payload as JSON instead of a human-readable summary.",
     )
 
+    mcp = subcommands.add_parser(
+        "mcp",
+        help=(
+            "Inspect or clean up tracked Puppetmaster MCP servers. Use after a "
+            "`Tool execution error. Not connected` to see if orphan servers are left over."
+        ),
+    )
+    mcp_sub = mcp.add_subparsers(dest="mcp_command", required=True)
+
+    mcp_list = mcp_sub.add_parser(
+        "list",
+        help="List every Puppetmaster MCP server tracked on this machine.",
+    )
+    mcp_list.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the full registry payload as JSON.",
+    )
+
+    mcp_cleanup = mcp_sub.add_parser(
+        "cleanup",
+        help=(
+            "Prune dead tracking files; with --kill-stale, terminate stale-but-alive "
+            "MCP servers whose Cursor parent is gone."
+        ),
+    )
+    mcp_cleanup.add_argument(
+        "--kill-stale",
+        action="store_true",
+        help="SIGTERM (then SIGKILL after grace) stale-but-alive Puppetmaster MCP servers.",
+    )
+    mcp_cleanup.add_argument(
+        "--stale-after-seconds",
+        type=int,
+        default=300,
+        help="Heartbeat age that defines a stale server (default: 300).",
+    )
+    mcp_cleanup.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the before/after registry payload as JSON.",
+    )
+
     return parser
 
 
@@ -346,6 +395,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
 
     if args.command == "repair-codegraph":
         return _run_repair_codegraph(args)
+
+    if args.command == "mcp":
+        return _run_mcp_subcommand(args)
 
     if args.command == "adapters":
         print(json.dumps(adapter_status(Path.cwd()), indent=2))
@@ -770,6 +822,90 @@ def _run_repair_codegraph(args) -> int:
         for line in result.rebuild_stderr.strip().splitlines()[-20:]:
             print(f"    {line}")
     return 0 if result.ok else 1
+
+
+def _run_mcp_subcommand(args) -> int:
+    """Dispatch the `python -m puppetmaster mcp ...` family of commands."""
+    if args.mcp_command == "list":
+        return _run_mcp_list(args)
+    if args.mcp_command == "cleanup":
+        return _run_mcp_cleanup(args)
+    raise SystemExit(f"unknown mcp subcommand: {args.mcp_command}")
+
+
+def _run_mcp_list(args) -> int:
+    snapshot = registry_summarize(registry_list_entries())
+    if args.json:
+        print(json.dumps(snapshot, indent=2))
+        return 0
+    if snapshot["count"] == 0:
+        print("No Puppetmaster MCP servers tracked.")
+        return 0
+    print(
+        f"{snapshot['count']} tracked  "
+        f"({snapshot['alive']} alive, {snapshot['stale']} stale, "
+        f"{snapshot['dead']} dead)"
+    )
+    print(
+        f"  {'PID':>7}  {'STATE':<6}  {'AGE':>8}  {'HBEAT':>8}  WORKSPACE"
+    )
+    for row in snapshot["servers"]:
+        if not row["alive"]:
+            state = "dead"
+        elif row["stale"]:
+            state = "stale"
+        else:
+            state = "ok"
+        workspace = row.get("workspace") or "-"
+        print(
+            f"  {row['pid']:>7}  {state:<6}  "
+            f"{row['age_seconds']:>8.0f}s  "
+            f"{row['heartbeat_age_seconds']:>8.0f}s  "
+            f"{workspace}"
+        )
+    return 0
+
+
+def _run_mcp_cleanup(args) -> int:
+    before = registry_summarize(registry_list_entries())
+    pruned = registry_prune_dead()
+    killed: list = []
+    if args.kill_stale:
+        killed_entries = registry_kill_stale(
+            stale_after_seconds=float(args.stale_after_seconds),
+        )
+        killed = [entry.to_payload() for entry in killed_entries]
+    after = registry_summarize(registry_list_entries())
+    payload = {
+        "before": before,
+        "after": after,
+        "pruned": [entry.to_payload() for entry in pruned],
+        "killed": killed,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return 0
+    print(
+        f"before: {before['count']} tracked "
+        f"({before['alive']} alive, {before['stale']} stale, {before['dead']} dead)"
+    )
+    print(f"pruned dead: {len(pruned)}")
+    for entry in pruned:
+        print(f"  - PID {entry.pid} ({entry.workspace or '-'})")
+    if args.kill_stale:
+        print(f"killed stale: {len(killed)}")
+        for row in killed:
+            print(f"  - PID {row['pid']} ({row.get('workspace') or '-'})")
+    elif before["stale"]:
+        print(
+            f"note: {before['stale']} stale-but-alive server(s) detected; "
+            "pass --kill-stale to terminate them."
+        )
+    print(
+        f"after: {after['count']} tracked "
+        f"({after['alive']} alive, {after['stale']} stale, {after['dead']} dead)"
+    )
+    return 0
 
 
 def print_watch_snapshot(snapshot: dict) -> None:
