@@ -86,6 +86,17 @@ _DEFAULT_KEEPALIVE_INTERVAL_SECONDS = 10.0
 _DEFAULT_INPUT_STALE_SECONDS = 600.0  # 10 minutes
 _DEFAULT_INPUT_STALE_CHECK_SECONDS = 30.0
 
+# Idle MCP-pipe keepalive defaults. The v0.5.3 tool-call keepalive
+# keeps bytes flowing during long handler executions, but the stdio
+# pipe still goes silent between tool calls. Some Cursor builds appear
+# to close MCP transports they consider "inactive", manifesting to the
+# agent as a sudden `Tool execution error. Not connected` on a
+# previously healthy session. v0.5.5 adds a server-wide idle ping that
+# emits a small `notifications/message` every ~25s when no traffic has
+# moved either direction for a while. Cost: ~150 bytes per ping; total
+# bandwidth per hour ≈ 22 KB. Disabled with PUPPETMASTER_MCP_IDLE_KEEPALIVE_DISABLED.
+_DEFAULT_IDLE_KEEPALIVE_INTERVAL_SECONDS = 25.0
+
 # Module-level state for stdin-liveness tracking. Initialized at startup
 # by ``main()`` and mutated by the stdin reader + tool-call dispatcher.
 _INPUT_STATE_LOCK = threading.Lock()
@@ -349,6 +360,88 @@ class _InputStalenessWatcher(threading.Thread):
             return
 
 
+def _idle_keepalive_disabled() -> bool:
+    raw = os.environ.get("PUPPETMASTER_MCP_IDLE_KEEPALIVE_DISABLED")
+    if raw is None:
+        return False
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _resolve_idle_keepalive_interval() -> float:
+    raw = os.environ.get("PUPPETMASTER_MCP_IDLE_KEEPALIVE_INTERVAL_SECONDS")
+    if not raw:
+        return _DEFAULT_IDLE_KEEPALIVE_INTERVAL_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return _DEFAULT_IDLE_KEEPALIVE_INTERVAL_SECONDS
+    # Refuse intervals shorter than 5s to avoid log spam.
+    return max(5.0, value)
+
+
+class _IdleKeepalive(threading.Thread):
+    """Emit a small notification every N seconds to keep the stdio pipe live.
+
+    Complement to :class:`_ToolCallKeepalive`: that one keeps bytes
+    flowing while a specific handler runs. This one keeps bytes flowing
+    when *nothing* is running, which is when Cursor's "transport looks
+    idle" heuristic can otherwise close the pipe and surface
+    ``Tool execution error. Not connected`` on the agent's very next
+    call.
+
+    The keepalive is suppressed while a tool call is in flight because
+    the per-call keepalive already covers that window. It also
+    suppresses if the server is shutting down, so we don't fight the
+    finally block.
+    """
+
+    def __init__(
+        self,
+        *,
+        interval_seconds: float,
+        emitter: Callable[[JsonObject], bool] = _emit_notification,
+    ) -> None:
+        super().__init__(daemon=True, name="puppetmaster-mcp-idle-keepalive")
+        self._interval = interval_seconds
+        self._emit = emitter
+        self._stop = threading.Event()
+        self._emitted = 0
+
+    @property
+    def emitted_count(self) -> int:
+        return self._emitted
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run(self) -> None:  # pragma: no cover - timing covered via direct tests
+        while not self._stop.wait(self._interval):
+            if _SHUTDOWN_REQUESTED.is_set():
+                return
+            _, active = _input_state_snapshot()
+            if active > 0:
+                continue
+            ok = self._emit(self._build_notification())
+            if not ok:
+                return
+            self._emitted += 1
+
+    def _build_notification(self) -> JsonObject:
+        return {
+            "jsonrpc": "2.0",
+            "method": "notifications/message",
+            "params": {
+                "level": "debug",
+                "logger": "puppetmaster",
+                "data": {
+                    "kind": "idle_keepalive",
+                    "message": "puppetmaster mcp server idle, pipe live",
+                    "interval_seconds": self._interval,
+                },
+            },
+        }
+
+
 def _request_clean_shutdown() -> None:
     """Interrupt the main stdio loop so it exits through the finally block.
 
@@ -435,6 +528,13 @@ def main() -> int:
         )
         input_watcher.start()
 
+    idle_keepalive: Optional[_IdleKeepalive] = None
+    if not _idle_keepalive_disabled():
+        idle_keepalive = _IdleKeepalive(
+            interval_seconds=_resolve_idle_keepalive_interval(),
+        )
+        idle_keepalive.start()
+
     executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=_resolve_worker_count(),
         thread_name_prefix="pm-mcp",
@@ -459,6 +559,8 @@ def main() -> int:
         executor.shutdown(wait=False)
         if input_watcher is not None:
             input_watcher.stop()
+        if idle_keepalive is not None:
+            idle_keepalive.stop()
         if heartbeat_thread is not None:
             heartbeat_thread.stop()
         if registration_path is not None:
@@ -971,14 +1073,16 @@ def _mcp_diagnostic_response(payload: JsonObject) -> JsonObject:
 def _spawn_codegraph_indexer(args: JsonObject, target_cwd: str) -> JsonObject:
     """Launch `codegraph index` as a detached background process.
 
-    Returns a JSON payload with the run metadata. Acquires the global
-    indexer lock first — if another indexer is already running anywhere
-    on this machine, we fail fast instead of stacking work onto a broken
-    SQLite. The lock is released by an atexit hook in the launched
-    process; if it dies abnormally the next caller will see a stale lock
-    file with a holder PID and can decide to clean it up.
+    Returns a JSON payload with the run metadata. Acquires the
+    per-repo indexer lock first — if another indexer is already
+    running against the **same repo's** SQLite DB, we fail fast
+    instead of stacking work onto a broken SQLite. Different repos
+    (post-v0.5.5) run in parallel because they have separate DBs.
+    The lock is released by an atexit hook in the launched process;
+    a stale lock left by a killed indexer is auto-cleared on the
+    next acquire by the staleness check.
     """
-    lock_path = codegraph_lock_path()
+    lock_path = codegraph_lock_path(target_cwd)
     try:
         lock = acquire_codegraph_lock(lock_path=lock_path)
     except CodegraphLockBusy as exc:

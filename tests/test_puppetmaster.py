@@ -1421,14 +1421,15 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertEqual(len(indexer_launches), 1)
 
     def test_mcp_codegraph_index_fails_fast_when_lock_is_held(self) -> None:
-        """A second indexer call sees `lock busy` immediately, no blocking."""
-        from puppetmaster.codegraph import acquire_codegraph_lock, codegraph_lock_path
+        """A second indexer call against the SAME repo sees `lock busy` immediately."""
+        from puppetmaster.codegraph import acquire_codegraph_lock
 
         with TemporaryDirectory() as tmp, TemporaryDirectory() as lock_dir:
             os.environ["PUPPETMASTER_CODEGRAPH_LOCK_DIR"] = lock_dir
             try:
-                lock_path = codegraph_lock_path()
-                held = acquire_codegraph_lock(lock_path=lock_path)
+                # Hold the per-repo lock for `tmp` so the MCP call
+                # (which keys its lock on the same repo) sees it busy.
+                held = acquire_codegraph_lock(repo_root=tmp)
                 try:
                     with patch(
                         "puppetmaster.codegraph.shutil.which",
@@ -2704,6 +2705,195 @@ print('{"result":"ok"}')
         with TemporaryDirectory() as tmp:
             with patch.object(state_module, "app_state_root", return_value=Path(tmp)):
                 self.assertEqual(state_module.list_project_state_dirs(), [])
+
+    def test_codegraph_lock_path_is_per_repo(self) -> None:
+        """Different repos get different lock files so they can index in parallel."""
+        from puppetmaster import codegraph as codegraph_mod
+
+        with TemporaryDirectory() as tmp:
+            os.environ["PUPPETMASTER_CODEGRAPH_LOCK_DIR"] = tmp
+            try:
+                repo_a = Path(tmp) / "ff-data-engineering"
+                repo_b = Path(tmp) / "ff-ios"
+                repo_a.mkdir()
+                repo_b.mkdir()
+                lock_a = codegraph_mod.codegraph_lock_path(repo_a)
+                lock_b = codegraph_mod.codegraph_lock_path(repo_b)
+                self.assertNotEqual(lock_a, lock_b)
+                self.assertIn("ff-data-engineering", lock_a.name)
+                self.assertIn("ff-ios", lock_b.name)
+                # And legacy callers still get the global lock.
+                legacy = codegraph_mod.codegraph_lock_path()
+                self.assertEqual(legacy.name, "codegraph-indexer.lock")
+            finally:
+                del os.environ["PUPPETMASTER_CODEGRAPH_LOCK_DIR"]
+
+    def test_codegraph_lock_allows_different_repos_in_parallel(self) -> None:
+        """Two repos can hold their per-repo locks at the same time."""
+        from puppetmaster import codegraph as codegraph_mod
+
+        with TemporaryDirectory() as tmp:
+            os.environ["PUPPETMASTER_CODEGRAPH_LOCK_DIR"] = tmp
+            try:
+                repo_a = Path(tmp) / "repo-a"
+                repo_b = Path(tmp) / "repo-b"
+                repo_a.mkdir()
+                repo_b.mkdir()
+                lock_a = codegraph_mod.acquire_codegraph_lock(repo_root=repo_a)
+                try:
+                    # This MUST succeed: a different repo holds an
+                    # unrelated lock.
+                    lock_b = codegraph_mod.acquire_codegraph_lock(
+                        repo_root=repo_b
+                    )
+                    lock_b.release()
+                finally:
+                    lock_a.release()
+            finally:
+                del os.environ["PUPPETMASTER_CODEGRAPH_LOCK_DIR"]
+
+    def test_codegraph_lock_busy_when_same_repo(self) -> None:
+        """Second acquire on the SAME repo's lock raises CodegraphLockBusy."""
+        from puppetmaster import codegraph as codegraph_mod
+
+        with TemporaryDirectory() as tmp:
+            os.environ["PUPPETMASTER_CODEGRAPH_LOCK_DIR"] = tmp
+            try:
+                repo = Path(tmp) / "shared-repo"
+                repo.mkdir()
+                first = codegraph_mod.acquire_codegraph_lock(repo_root=repo)
+                try:
+                    with self.assertRaises(codegraph_mod.CodegraphLockBusy):
+                        codegraph_mod.acquire_codegraph_lock(repo_root=repo)
+                finally:
+                    first.release()
+            finally:
+                del os.environ["PUPPETMASTER_CODEGRAPH_LOCK_DIR"]
+
+    def test_codegraph_lock_stale_pid_auto_clear(self) -> None:
+        """When the lock file records a dead PID, the next acquire takes over."""
+        from puppetmaster import codegraph as codegraph_mod
+
+        with TemporaryDirectory() as tmp:
+            os.environ["PUPPETMASTER_CODEGRAPH_LOCK_DIR"] = tmp
+            try:
+                repo = Path(tmp) / "stale-repo"
+                repo.mkdir()
+                lock_path = codegraph_mod.codegraph_lock_path(repo)
+                lock_path.write_text("99999999\n", encoding="utf-8")
+                # The PID 99999999 is essentially guaranteed dead.
+                # Acquire should still work because the file was never
+                # actually flock'd by anything alive.
+                acquired = codegraph_mod.acquire_codegraph_lock(repo_root=repo)
+                try:
+                    self.assertIsNotNone(acquired._fd)
+                    self.assertEqual(
+                        lock_path.read_text(encoding="utf-8").strip(),
+                        str(os.getpid()),
+                    )
+                finally:
+                    acquired.release()
+            finally:
+                del os.environ["PUPPETMASTER_CODEGRAPH_LOCK_DIR"]
+
+    def test_pid_is_alive_helper(self) -> None:
+        from puppetmaster.codegraph import _pid_is_alive
+
+        self.assertTrue(_pid_is_alive(os.getpid()))
+        self.assertFalse(_pid_is_alive(99999999))
+        self.assertFalse(_pid_is_alive(0))
+        self.assertFalse(_pid_is_alive(-1))
+
+    def test_idle_keepalive_emits_when_no_tool_call_active(self) -> None:
+        """The idle keepalive fires periodic notifications while nothing is running."""
+        from puppetmaster import mcp_server
+
+        emitted: list[dict] = []
+
+        def fake_emit(notification):
+            emitted.append(notification)
+            return True
+
+        with mcp_server._INPUT_STATE_LOCK:
+            mcp_server._ACTIVE_TOOL_CALLS = 0
+        mcp_server._SHUTDOWN_REQUESTED.clear()
+        keepalive = mcp_server._IdleKeepalive(
+            interval_seconds=0.05,
+            emitter=fake_emit,
+        )
+        keepalive.start()
+        try:
+            time.sleep(0.25)
+        finally:
+            keepalive.stop()
+        self.assertGreaterEqual(len(emitted), 2)
+        for notification in emitted:
+            self.assertEqual(notification["method"], "notifications/message")
+            self.assertEqual(notification["params"]["data"]["kind"], "idle_keepalive")
+            self.assertNotIn("id", notification)
+
+    def test_idle_keepalive_suppressed_during_tool_call(self) -> None:
+        """An in-flight tool call shouldn't get extra keepalive traffic from the idle pinger."""
+        from puppetmaster import mcp_server
+
+        emitted: list[dict] = []
+
+        def fake_emit(notification):
+            emitted.append(notification)
+            return True
+
+        with mcp_server._INPUT_STATE_LOCK:
+            mcp_server._ACTIVE_TOOL_CALLS = 1
+        mcp_server._SHUTDOWN_REQUESTED.clear()
+        keepalive = mcp_server._IdleKeepalive(
+            interval_seconds=0.05,
+            emitter=fake_emit,
+        )
+        keepalive.start()
+        try:
+            time.sleep(0.25)
+        finally:
+            keepalive.stop()
+            with mcp_server._INPUT_STATE_LOCK:
+                mcp_server._ACTIVE_TOOL_CALLS = 0
+        self.assertEqual(emitted, [])
+
+    def test_idle_keepalive_stops_on_broken_pipe(self) -> None:
+        """A failed write should terminate the keepalive thread cleanly."""
+        from puppetmaster import mcp_server
+
+        emitted: list[dict] = []
+        calls = {"n": 0}
+
+        def fake_emit(notification):
+            calls["n"] += 1
+            emitted.append(notification)
+            return False  # simulate pipe down
+
+        with mcp_server._INPUT_STATE_LOCK:
+            mcp_server._ACTIVE_TOOL_CALLS = 0
+        mcp_server._SHUTDOWN_REQUESTED.clear()
+        keepalive = mcp_server._IdleKeepalive(
+            interval_seconds=0.05,
+            emitter=fake_emit,
+        )
+        keepalive.start()
+        try:
+            time.sleep(0.25)
+        finally:
+            keepalive.stop()
+        # Exactly one emit attempt (we returned False on the first one).
+        self.assertEqual(calls["n"], 1)
+
+    def test_idle_keepalive_can_be_disabled_via_env(self) -> None:
+        from puppetmaster.mcp_server import _idle_keepalive_disabled
+
+        os.environ["PUPPETMASTER_MCP_IDLE_KEEPALIVE_DISABLED"] = "1"
+        try:
+            self.assertTrue(_idle_keepalive_disabled())
+        finally:
+            del os.environ["PUPPETMASTER_MCP_IDLE_KEEPALIVE_DISABLED"]
+        self.assertFalse(_idle_keepalive_disabled())
 
     def test_starter_config_is_loadable(self) -> None:
         with TemporaryDirectory() as tmp:

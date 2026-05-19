@@ -13,7 +13,9 @@ times out, so adapters can call it without conditional plumbing.
 
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -452,26 +454,47 @@ def _decode_stream(stream: Any) -> str:
     return str(stream)
 
 
-# --- Global indexer lock ----------------------------------------------------
+# --- Per-repo indexer lock --------------------------------------------------
 #
-# CodeGraph's SQLite backend cannot tolerate two `codegraph index` (or
-# `init --index`) runs against overlapping repos at the same time without
-# eventually hitting "database is locked" / "unable to open database file".
-# Even when the workspaces differ, broken native SQLite drivers (Node ABI
-# mismatch -> WASM fallback) can make concurrent indexers degrade the whole
-# machine. We serialize via a tiny user-scoped lock file; callers should
-# acquire before launching an indexer and release when it finishes.
+# Each repo's CodeGraph index lives in its own SQLite database at
+# ``<repo>/.codegraph/codegraph.db``, so two indexers on two **different**
+# repos can never trash each other's data. The original implementation
+# took out one machine-wide lock to defend against a much narrower
+# concern: two indexers on the **same** repo (or two against the same
+# DB file). That over-served the requirement and serialized unrelated
+# repos for no real reason — users with 3 repos open in 3 chats kept
+# hitting "Another CodeGraph indexer is already running" even when the
+# repos had nothing to do with each other.
+#
+# v0.5.5 keys the lock by the resolved repo root path hash, so two
+# repos run in parallel and the lock only blocks legitimate overlap on
+# the same SQLite DB. Stale-PID auto-clear handles the case where a
+# previous indexer died ungracefully and left an advisory ``flock``
+# orphan (rare, but observable when ``codegraph init --index`` is
+# killed via ``kill -9``).
 
 
-def codegraph_lock_path() -> Path:
-    """Return the per-user lock file used to serialize CodeGraph indexers."""
+def codegraph_lock_path(repo_root: Optional[Union[Path, str]] = None) -> Path:
+    """Return the per-repo lock file used to serialize CodeGraph indexers.
+
+    Passing ``repo_root=None`` returns the legacy machine-wide lock path
+    for backwards compatibility with callers that haven't been updated
+    (tests, third-party tooling). Production callers should always pass
+    the target repo's root path so different repos can index in
+    parallel.
+    """
     base = os.environ.get("PUPPETMASTER_CODEGRAPH_LOCK_DIR")
     if base:
         directory = Path(base)
     else:
         directory = _default_cache_root() / "puppetmaster"
     directory.mkdir(parents=True, exist_ok=True)
-    return directory / "codegraph-indexer.lock"
+    if repo_root is None:
+        return directory / "codegraph-indexer.lock"
+    resolved = Path(repo_root).expanduser().resolve()
+    digest = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:12]
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", resolved.name).strip("-") or "repo"
+    return directory / f"codegraph-indexer-{safe_name}-{digest}.lock"
 
 
 def _default_cache_root() -> Path:
@@ -487,13 +510,18 @@ def _default_cache_root() -> Path:
 
 
 class CodegraphLockBusy(RuntimeError):
-    """Raised when another indexer already holds the global lock."""
+    """Raised when another indexer already holds the per-repo lock.
+
+    Pre-v0.5.5 the lock was machine-wide, so this also fired for
+    unrelated repos. Now it only fires when a legitimately overlapping
+    indexer is already running against the *same* SQLite DB.
+    """
 
     def __init__(self, holder_pid: Optional[int], lock_path: Path):
         self.holder_pid = holder_pid
         self.lock_path = lock_path
         message = (
-            "Another CodeGraph indexer is already running"
+            "Another CodeGraph indexer is already running for this repo"
             + (f" (pid {holder_pid})" if holder_pid else "")
             + ". Wait for it to finish, or kill it with "
             + f"`pkill -f 'codegraph init --index'` if it is stuck. Lock file: {lock_path}."
@@ -501,16 +529,26 @@ class CodegraphLockBusy(RuntimeError):
         super().__init__(message)
 
 
-def acquire_codegraph_lock(*, lock_path: Optional[Path] = None) -> "CodegraphLock":
-    """Acquire the global CodeGraph indexer lock.
+def acquire_codegraph_lock(
+    *,
+    lock_path: Optional[Path] = None,
+    repo_root: Optional[Union[Path, str]] = None,
+) -> "CodegraphLock":
+    """Acquire the CodeGraph indexer lock for ``repo_root``.
 
-    Returns a ``CodegraphLock`` that should be ``release()``-d (or used as a
-    context manager) once the indexer terminates. Raises ``CodegraphLockBusy``
-    immediately if another holder is active — we never block, because that
-    would defeat the purpose of the multi-threaded MCP server.
+    Returns a ``CodegraphLock`` that should be ``release()``-d (or used
+    as a context manager) once the indexer terminates. Raises
+    :class:`CodegraphLockBusy` immediately if another holder is active —
+    we never block, because that would defeat the purpose of the
+    multi-threaded MCP server.
+
+    Either pass an explicit ``lock_path`` (legacy callers) or pass the
+    target ``repo_root`` and let the helper derive the per-repo path
+    via :func:`codegraph_lock_path`.
     """
-    path = lock_path or codegraph_lock_path()
-    return CodegraphLock(path).acquire()
+    if lock_path is None:
+        lock_path = codegraph_lock_path(repo_root)
+    return CodegraphLock(lock_path).acquire()
 
 
 class CodegraphLock:
@@ -534,10 +572,31 @@ class CodegraphLock:
             try:
                 fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except (OSError, BlockingIOError):
+                # Stale-PID auto-clear: if the lock file records a PID
+                # that isn't alive anymore, the previous indexer died
+                # ungracefully and its kernel-level flock has already
+                # been released — what we just observed is a different
+                # holder, *or* macOS keeping the file flag a moment
+                # longer than expected. Re-check the PID; if dead,
+                # truncate and retry once. If alive, surface the busy
+                # error so the caller can decide whether to wait.
                 holder_pid = _read_holder_pid(self.path)
-                os.close(self._fd)
-                self._fd = None
-                raise CodegraphLockBusy(holder_pid, self.path)
+                if holder_pid is not None and not _pid_is_alive(holder_pid):
+                    try:
+                        os.ftruncate(self._fd, 0)
+                        fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except (OSError, BlockingIOError):
+                        # Someone else grabbed it between the staleness
+                        # check and the retry. Treat as busy.
+                        os.close(self._fd)
+                        self._fd = None
+                        raise CodegraphLockBusy(
+                            _read_holder_pid(self.path), self.path
+                        )
+                else:
+                    os.close(self._fd)
+                    self._fd = None
+                    raise CodegraphLockBusy(holder_pid, self.path)
         os.ftruncate(self._fd, 0)
         os.write(self._fd, f"{os.getpid()}\n".encode("utf-8"))
         return self
@@ -574,6 +633,27 @@ def _read_holder_pid(path: Path) -> Optional[int]:
     if not contents.isdigit():
         return None
     return int(contents)
+
+
+def _pid_is_alive(pid: int) -> bool:
+    """Return True if a process with ``pid`` exists for this user.
+
+    ``os.kill(pid, 0)`` sends no signal but errors out when the pid
+    doesn't exist or we lack permission. We treat "no such process"
+    (ESRCH) as dead and "permission denied" (EPERM) as alive — if a
+    different user owns the pid, we shouldn't blow away their lock.
+    """
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
 
 
 # --- Native SQLite health check ---------------------------------------------

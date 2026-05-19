@@ -62,3 +62,29 @@ For quick, direct repo lookups without spinning up a swarm, prefer the bundled t
 Orchestration: `puppetmaster_doctor`, `puppetmaster_start_swarm`, `puppetmaster_start_cursor_swarm`, `puppetmaster_start_cursor_review`, `puppetmaster_start_cursor_plan`, `puppetmaster_start_claude_implement`, `puppetmaster_status`, `puppetmaster_logs`, `puppetmaster_live_artifacts`, `puppetmaster_live_artifacts_follow`, `puppetmaster_partial_summary`, `puppetmaster_artifacts`, `puppetmaster_show`, `puppetmaster_last_job`.
 
 Bundled CodeGraph: `puppetmaster_codegraph_search`, `puppetmaster_codegraph_context`, `puppetmaster_codegraph_affected`, `puppetmaster_codegraph_files`, `puppetmaster_codegraph_status`, `puppetmaster_codegraph_init`.
+
+## When MCP fails: fall back to the CLI
+
+If any `puppetmaster_*` MCP tool returns `Tool execution error. Not connected`, the daemon is almost certainly still running — only Cursor's stdio link for this chat dropped. **Do not stop work.** Every MCP tool has a CLI equivalent that talks to the same SQLite state:
+
+| MCP | CLI |
+| --- | --- |
+| `puppetmaster_doctor` | `python -m puppetmaster doctor` |
+| `puppetmaster_status` | `python -m puppetmaster status <job_id>` |
+| `puppetmaster_logs` | `python -m puppetmaster logs <job_id>` |
+| `puppetmaster_live_artifacts` | `python -m puppetmaster feed <job_id>` |
+| `puppetmaster_live_artifacts_follow` | `python -m puppetmaster feed <job_id> --follow` |
+| `puppetmaster_partial_summary` | `python -m puppetmaster show <job_id> --partial` |
+| `puppetmaster_artifacts` | `python -m puppetmaster artifacts <job_id>` |
+| `puppetmaster_show` | `python -m puppetmaster show <job_id>` |
+| `puppetmaster_last_job` | `python -m puppetmaster last` |
+| `puppetmaster_jobs` | `python -m puppetmaster jobs [--all-projects]` |
+| `puppetmaster_mcp_status` | `python -m puppetmaster mcp list` |
+| `puppetmaster_mcp_cleanup` | `python -m puppetmaster mcp cleanup --kill-stale` |
+| `puppetmaster_repair_codegraph` | `python -m puppetmaster repair-codegraph` |
+| `puppetmaster_codegraph_status` | `codegraph status` |
+| `puppetmaster_codegraph_search` | `codegraph search '<query>'` |
+| `puppetmaster_codegraph_context` | `codegraph context '<task>' --max-nodes 15 --format markdown` |
+| `puppetmaster_codegraph_init` | `codegraph init --index` |
+
+Read-only commands (`show`/`artifacts`/`logs`/`feed`/`status`) auto-pivot to whichever project state dir owns the job — no need to export `PUPPETMASTER_STATE_DIR`. Only ask the user to restart MCP in Cursor Settings when `python -m puppetmaster mcp list` shows zero alive servers.
