@@ -1888,6 +1888,158 @@ class PuppetmasterTests(unittest.TestCase):
         snapshot = json.loads(buf.getvalue())
         self.assertGreaterEqual(snapshot["count"], 1)
 
+    def test_tool_call_keepalive_skips_fast_handlers(self) -> None:
+        """Handlers that finish before the start_after grace period emit no notifications.
+
+        This is the desired default: short reads/writes pay zero
+        protocol-level cost and only long-running calls keep the pipe warm.
+        """
+        from puppetmaster.mcp_server import _ToolCallKeepalive
+
+        emitted: list[dict] = []
+
+        def fake_emit(payload):
+            emitted.append(payload)
+            return True
+
+        keepalive = _ToolCallKeepalive(
+            tool_name="puppetmaster_fast",
+            request_id=42,
+            start_after_seconds=1.0,
+            interval_seconds=1.0,
+            emitter=fake_emit,
+        )
+        keepalive.start()
+        time.sleep(0.05)
+        keepalive.stop(wait=True)
+        self.assertEqual(emitted, [])
+        self.assertEqual(keepalive.emitted_count, 0)
+
+    def test_tool_call_keepalive_emits_for_slow_handlers(self) -> None:
+        """Tools that exceed start_after produce at least one well-formed notification."""
+        from puppetmaster.mcp_server import _ToolCallKeepalive
+
+        emitted: list[dict] = []
+
+        def fake_emit(payload):
+            emitted.append(payload)
+            return True
+
+        keepalive = _ToolCallKeepalive(
+            tool_name="puppetmaster_codegraph_index",
+            request_id="req-7",
+            start_after_seconds=0.05,
+            interval_seconds=0.05,
+            emitter=fake_emit,
+        )
+        keepalive.start()
+        time.sleep(0.2)
+        keepalive.stop(wait=True)
+        self.assertGreaterEqual(len(emitted), 1)
+        first = emitted[0]
+        self.assertEqual(first["jsonrpc"], "2.0")
+        self.assertEqual(first["method"], "notifications/message")
+        # Notifications must NEVER carry an `id` field — that's how the
+        # client distinguishes them from responses.
+        self.assertNotIn("id", first)
+        params = first["params"]
+        self.assertEqual(params["level"], "debug")
+        self.assertEqual(params["logger"], "puppetmaster")
+        data = params["data"]
+        self.assertEqual(data["kind"], "tool_call_progress")
+        self.assertEqual(data["tool"], "puppetmaster_codegraph_index")
+        self.assertEqual(data["request_id"], "req-7")
+        self.assertGreaterEqual(data["elapsed_seconds"], 0.05)
+
+    def test_tool_call_keepalive_stops_when_pipe_is_broken(self) -> None:
+        """A failing emitter (BrokenPipeError surrogate) shuts the loop down."""
+        from puppetmaster.mcp_server import _ToolCallKeepalive
+
+        call_count = {"value": 0}
+
+        def failing_emit(payload):
+            call_count["value"] += 1
+            return False  # mimics BrokenPipeError swallowed by _emit_notification
+
+        keepalive = _ToolCallKeepalive(
+            tool_name="puppetmaster_slow",
+            request_id=99,
+            start_after_seconds=0.02,
+            interval_seconds=0.02,
+            emitter=failing_emit,
+        )
+        keepalive.start()
+        time.sleep(0.2)
+        keepalive.stop(wait=True)
+        # The keepalive should have attempted at most a single emit before
+        # bailing out on the broken pipe — we never spin in a tight failure
+        # loop that would spam stderr or hold CPU.
+        self.assertLessEqual(call_count["value"], 1)
+
+    def test_tool_call_keepalive_disabled_via_env(self) -> None:
+        """PUPPETMASTER_MCP_KEEPALIVE_DISABLED short-circuits the wiring in _process_message_safely."""
+        from puppetmaster.mcp_server import _keepalive_disabled
+
+        os.environ["PUPPETMASTER_MCP_KEEPALIVE_DISABLED"] = "1"
+        try:
+            self.assertTrue(_keepalive_disabled())
+        finally:
+            del os.environ["PUPPETMASTER_MCP_KEEPALIVE_DISABLED"]
+        self.assertFalse(_keepalive_disabled())
+
+    def test_process_message_safely_emits_keepalives_under_slow_handler(self) -> None:
+        """End-to-end: a slow tools/call yields at least one keepalive
+        notification on stdout before the response, proving the
+        notification bytes flow through the same lock the response uses.
+        """
+        import io
+
+        from puppetmaster import mcp_server
+
+        slow_started = threading.Event()
+        allow_finish = threading.Event()
+
+        def slow_handler(message):
+            slow_started.set()
+            # Hold the handler open long enough for the keepalive to fire.
+            allow_finish.wait(timeout=2.0)
+            return {
+                "jsonrpc": "2.0",
+                "id": message.get("id"),
+                "result": {"ok": True},
+            }
+
+        fake_stdout = io.StringIO()
+        with patch.object(mcp_server, "handle_message", side_effect=slow_handler), patch.object(
+            mcp_server, "_DEFAULT_KEEPALIVE_AFTER_SECONDS", 0.05
+        ), patch.object(
+            mcp_server, "_DEFAULT_KEEPALIVE_INTERVAL_SECONDS", 0.05
+        ), patch.object(
+            mcp_server.sys, "stdout", fake_stdout
+        ):
+            worker = threading.Thread(
+                target=mcp_server._process_message_safely,
+                args=({"method": "tools/call", "id": 1, "params": {"name": "puppetmaster_status"}},),
+                daemon=True,
+            )
+            worker.start()
+            self.assertTrue(slow_started.wait(timeout=1.0))
+            time.sleep(0.2)
+            allow_finish.set()
+            worker.join(timeout=2.0)
+        self.assertFalse(worker.is_alive())
+
+        frames = [json.loads(line) for line in fake_stdout.getvalue().splitlines() if line.strip()]
+        # We should see at least one notification (no id) followed by the
+        # response (has id). Order is enforced because both write under
+        # _STDOUT_LOCK and the handler emits its frame last.
+        notifications = [frame for frame in frames if "id" not in frame]
+        responses = [frame for frame in frames if "id" in frame]
+        self.assertGreaterEqual(len(notifications), 1)
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(notifications[0]["method"], "notifications/message")
+        self.assertEqual(responses[0]["id"], 1)
+
     def test_doctor_flags_orphan_mcp_servers(self) -> None:
         """`puppetmaster doctor` warns when dead tracking files exist."""
         from puppetmaster.diagnostics import run_doctor

@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.5.3-beta.1
+
+- **Tool-call keepalive notifications.** Every long-running MCP `tools/call` now spawns a per-call `_ToolCallKeepalive` daemon thread that emits MCP-spec `notifications/message` frames every 10 seconds (after a 5-second grace period) for as long as the handler runs. Short calls pay zero protocol cost; the goal is to keep bytes flowing on the stdio pipe so Cursor's MCP client stops treating slow tool calls as a dead transport. This is the prevention complement to v0.5.2's cleanup — together they cover both "stop the drop from happening" and "recover cleanly when it does."
+- All keepalive frames are unidentified JSON-RPC notifications (no `id`) and carry a structured `data.kind = tool_call_progress` payload with the tool name, request id, and elapsed time so logs and progress UIs can render them.
+- Tunable via `PUPPETMASTER_MCP_KEEPALIVE_AFTER_SECONDS`, `PUPPETMASTER_MCP_KEEPALIVE_INTERVAL_SECONDS`, and `PUPPETMASTER_MCP_KEEPALIVE_DISABLED`. Default behaviour is on and conservative.
+- Broken-pipe detection: if the emitter sees a dead stdio (`BrokenPipeError`/`OSError`), the keepalive thread shuts down cleanly instead of spinning. Post-response races are also closed via a stop-check inside the `_STDOUT_LOCK`.
+- README troubleshooting section now distinguishes the prevention layer (this release) from the recovery layer (v0.5.2 mcp registry + cleanup tools).
+
 ## v0.5.2-beta.1
 
 - **MCP server process registry + orphan cleanup.** Every Puppetmaster MCP server now writes a tracking file (PID, workspace, started_at, last_heartbeat) at startup, bumps its heartbeat from a daemon thread, and removes its file on a clean exit. New servers prune dead tracking files on startup so orphans from prior `Tool execution error. Not connected` cycles get reaped automatically — no more `pkill -f puppetmaster.mcp_server` from a shell.
