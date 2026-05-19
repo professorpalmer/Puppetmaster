@@ -609,6 +609,44 @@ orphans reap. Tune or disable:
 - `PUPPETMASTER_MCP_INPUT_STALE_CHECK_SECONDS` (default 30)
 - `PUPPETMASTER_MCP_INPUT_STALE_DISABLED=1`
 
+**Idle-pipe keepalive (v0.5.5+):** Some Cursor builds close MCP
+transports that have been quiet for a while, even between successful
+calls. The new `_IdleKeepalive` thread emits a tiny
+`notifications/message` every ~25s while no tool call is running, so
+the stdio pipe is never silent long enough to look dead. Cost is
+trivial (~22 KB/hour). The per-call keepalive (v0.5.3) and idle
+keepalive together cover both "tool in flight" and "tool not in
+flight" cases. Tune or disable:
+
+- `PUPPETMASTER_MCP_IDLE_KEEPALIVE_INTERVAL_SECONDS` (default 25, min 5)
+- `PUPPETMASTER_MCP_IDLE_KEEPALIVE_DISABLED=1`
+
+**Agent-side CLI fallback (v0.5.5+):** When the transport drops anyway
+(e.g., during the lease transition itself), the bundled Cursor rule
+(`.cursor/rules/puppetmaster-workflow.mdc`) and `AGENTS.md` instruct
+the AI agent to call the equivalent `python -m puppetmaster ...`
+command via its shell tool instead of giving up. Every MCP tool has a
+matching CLI; read-only commands (show/artifacts/logs/feed/status)
+auto-pivot to the project state dir that owns the job, so no manual
+`PUPPETMASTER_STATE_DIR` export is needed.
+
+### CodeGraph indexes for different repos now run concurrently
+
+Pre-v0.5.5, Puppetmaster used a single machine-wide lock to serialize
+**all** CodeGraph indexers, so running `puppetmaster_codegraph_index`
+against `ff-data-engineering` would block the same call for `ff-ios`
+with `Another CodeGraph indexer is already running (pid 80417)` — even
+though the two repos have separate SQLite databases that can't trash
+each other.
+
+v0.5.5 keys the lock on the resolved repo root path
+(`codegraph-indexer-<repo>-<digest>.lock`). Different repos index in
+parallel; the lock only fires when two indexers are actually pointed
+at the same repo's DB. Stale-PID auto-clear handles the post-`kill -9`
+case: if the recorded PID isn't alive, the new claimant takes over
+instead of refusing forever. Manual `rm /Users/.../codegraph-indexer*.lock`
+is no longer needed after a runaway indexer dies.
+
 If the transport still drops, the recovery layer below catches the
 fallout.
 

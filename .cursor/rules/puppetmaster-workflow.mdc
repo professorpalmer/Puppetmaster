@@ -55,3 +55,36 @@ For quick, direct repo lookups without spinning up a swarm, prefer the bundled t
 ## Why this is the default
 
 Puppetmaster workers run as independent OS subprocesses with durable SQLite-backed state, leases, and structured JSON artifacts. That gives you parallelism, replayable runs, and a stitched summary instead of a single long transcript. Defaulting to this path keeps the main session lean and the work auditable.
+
+## When MCP fails: fall back to the CLI, don't give up
+
+If a `puppetmaster_*` MCP call returns **`Tool execution error. Not connected`** (or similar transport-level error), **do not stop**. The daemon and CodeGraph are almost certainly still running — Cursor's MCP client lost the stdio pipe for this chat. Puppetmaster ships a CLI surface that mirrors every MCP tool. Switch to it immediately via the Shell tool. Examples:
+
+| MCP tool | CLI equivalent |
+| --- | --- |
+| `puppetmaster_doctor` | `python -m puppetmaster doctor` |
+| `puppetmaster_status` | `python -m puppetmaster status <job_id>` |
+| `puppetmaster_logs` | `python -m puppetmaster logs <job_id>` |
+| `puppetmaster_live_artifacts` | `python -m puppetmaster feed <job_id>` |
+| `puppetmaster_live_artifacts_follow` | `python -m puppetmaster feed <job_id> --follow` |
+| `puppetmaster_partial_summary` | `python -m puppetmaster show <job_id> --partial` |
+| `puppetmaster_artifacts` | `python -m puppetmaster artifacts <job_id>` |
+| `puppetmaster_show` | `python -m puppetmaster show <job_id>` |
+| `puppetmaster_last_job` | `python -m puppetmaster last` |
+| `puppetmaster_jobs` | `python -m puppetmaster jobs` (add `--all-projects` to see every workspace) |
+| `puppetmaster_mcp_status` | `python -m puppetmaster mcp list` |
+| `puppetmaster_mcp_cleanup` | `python -m puppetmaster mcp cleanup --kill-stale` |
+| `puppetmaster_repair_codegraph` | `python -m puppetmaster repair-codegraph` |
+| `puppetmaster_codegraph_status` | `codegraph status` (in the repo) |
+| `puppetmaster_codegraph_search` | `codegraph search '<query>'` (in the repo) |
+| `puppetmaster_codegraph_context` | `codegraph context '<task>' --max-nodes 15 --format markdown` |
+| `puppetmaster_codegraph_init` | `codegraph init --index` (in the repo) |
+
+`PYTHONPATH=/Users/cary/Desktop/Puppetmaster` (or the actual Puppetmaster install dir) needs to be set on the shell call if Puppetmaster isn't on `sys.path`. Use `python -m puppetmaster projects` to find which workspace owns a given job — `show`/`artifacts`/`logs`/`feed`/`status` auto-pivot to that workspace's state dir, so you do **not** need to manually export `PUPPETMASTER_STATE_DIR`.
+
+If the user asks "is MCP broken?", check both at once: `python -m puppetmaster doctor` and `python -m puppetmaster mcp list` from the shell. Report:
+- ✅ daemon healthy / ❌ daemon dead
+- which MCP servers are registered, alive, stale
+- whether `Tool execution error. Not connected` means the transport, not Puppetmaster
+
+Only ask the user to restart MCP in Cursor Settings if `mcp list` shows zero alive servers. Otherwise just use the CLI and keep working — that's what durable state is for.
