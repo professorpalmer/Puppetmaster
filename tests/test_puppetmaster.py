@@ -63,6 +63,63 @@ from puppetmaster.stitcher import Stitcher
 from puppetmaster.store import SwarmStore
 from puppetmaster.worker_runtime import WorkerDaemon
 from puppetmaster.workers import WorkerSpec
+from typing import Optional
+
+
+class _ContextManagerFakeProcess:
+    """Drop-in fake for ``subprocess.Popen`` that supports ``with`` blocks.
+
+    Patching ``subprocess.Popen`` affects ``subprocess.run`` too (the
+    latter uses ``with Popen(...) as p:`` internally), so any fake we
+    return has to behave like a context manager.
+    """
+
+    def __init__(self, pid: int = 1000, returncode: int = 0) -> None:
+        self.pid = pid
+        self.returncode = returncode
+        self.args: list[str] = []
+        self.stdout = None
+        self.stderr = None
+        self.stdin = None
+
+    def __enter__(self) -> "_ContextManagerFakeProcess":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    def poll(self) -> Optional[int]:
+        return self.returncode
+
+    def wait(self, timeout: Optional[float] = None) -> int:
+        return self.returncode
+
+    def communicate(
+        self, input: Optional[str] = None, timeout: Optional[float] = None
+    ) -> tuple[str, str]:
+        return ("", "")
+
+    def kill(self) -> None:
+        return None
+
+    def terminate(self) -> None:
+        return None
+
+
+def _find_indexer_launches(popen_mock) -> list[list[str]]:
+    """Return the calls to ``subprocess.Popen`` that launched our background
+    indexer runner. Other paths (notably ``git rev-parse`` from state
+    resolution) also go through ``Popen`` when patched globally, so we
+    can't just count total calls.
+    """
+    launches: list[list[str]] = []
+    for call in popen_mock.call_args_list:
+        argv = call.args[0] if call.args else []
+        if not isinstance(argv, (list, tuple)):
+            continue
+        if any("codegraph_index_runner" in str(part) for part in argv):
+            launches.append(list(argv))
+    return launches
 
 
 class PuppetmasterTests(unittest.TestCase):
@@ -1283,30 +1340,220 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertIn("python -m bench.codegraph_ab --dry-run", markdown)
         self.assertNotIn("Live Cursor SDK A/B", markdown)
 
-    def test_mcp_codegraph_init_passes_index_flag(self) -> None:
+    def test_mcp_codegraph_init_dispatches_indexer_in_background(self) -> None:
+        """`index=true` runs init synchronously and forks the indexer
+        instead of blocking the MCP transport on `codegraph init --index`.
+        """
         completed = subprocess.CompletedProcess(
-            args=["codegraph"],
+            args=["codegraph", "init"],
             returncode=0,
             stdout="initialized",
             stderr="",
         )
+        fake_proc = _ContextManagerFakeProcess(pid=99999)
+
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as lock_dir:
+            os.environ["PUPPETMASTER_CODEGRAPH_LOCK_DIR"] = lock_dir
+            try:
+                with patch(
+                    "puppetmaster.codegraph.shutil.which",
+                    return_value="/usr/local/bin/codegraph",
+                ), patch(
+                    "puppetmaster.codegraph.subprocess.run",
+                    return_value=completed,
+                ) as run, patch(
+                    "puppetmaster.mcp_server.subprocess.Popen",
+                    return_value=fake_proc,
+                ) as popen:
+                    result = call_tool(
+                        "puppetmaster_codegraph_init",
+                        {"cwd": tmp, "index": True},
+                    )
+            finally:
+                del os.environ["PUPPETMASTER_CODEGRAPH_LOCK_DIR"]
+
+        self.assertFalse(result["isError"])
+        payload = json.loads(result["content"][0]["text"])
+        # The synchronous init step should NOT have used --index. Other
+        # subprocess.run calls (e.g. `git rev-parse` from state resolution)
+        # also flow through this patch, so find the codegraph call by name.
+        codegraph_calls = [
+            call.args[0]
+            for call in run.call_args_list
+            if call.args and isinstance(call.args[0], list)
+            and call.args[0] and call.args[0][0] == "codegraph"
+        ]
+        self.assertEqual(len(codegraph_calls), 1)
+        self.assertEqual(codegraph_calls[0][:2], ["codegraph", "init"])
+        self.assertNotIn("--index", codegraph_calls[0])
+        # The async indexer should have been spawned via Popen via our launcher.
+        indexer_launches = _find_indexer_launches(popen)
+        self.assertEqual(len(indexer_launches), 1)
+        # The response should expose run metadata for polling.
+        self.assertIn("index_run", payload)
+        self.assertIn("run_id", payload["index_run"])
+        self.assertIn("stdout_path", payload["index_run"])
+
+    def test_mcp_codegraph_index_returns_immediately_with_run_id(self) -> None:
+        """`puppetmaster_codegraph_index` is the dedicated background-only tool."""
+        fake_proc = _ContextManagerFakeProcess(pid=12345)
+
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as lock_dir:
+            os.environ["PUPPETMASTER_CODEGRAPH_LOCK_DIR"] = lock_dir
+            try:
+                with patch(
+                    "puppetmaster.codegraph.shutil.which",
+                    return_value="/usr/local/bin/codegraph",
+                ), patch(
+                    "puppetmaster.mcp_server.subprocess.Popen",
+                    return_value=fake_proc,
+                ) as popen:
+                    result = call_tool("puppetmaster_codegraph_index", {"cwd": tmp})
+            finally:
+                del os.environ["PUPPETMASTER_CODEGRAPH_LOCK_DIR"]
+
+        self.assertFalse(result["isError"])
+        payload = json.loads(result["content"][0]["text"])
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["pid"], 12345)
+        self.assertIn("run_id", payload)
+        indexer_launches = _find_indexer_launches(popen)
+        self.assertEqual(len(indexer_launches), 1)
+
+    def test_mcp_codegraph_index_fails_fast_when_lock_is_held(self) -> None:
+        """A second indexer call sees `lock busy` immediately, no blocking."""
+        from puppetmaster.codegraph import acquire_codegraph_lock, codegraph_lock_path
+
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as lock_dir:
+            os.environ["PUPPETMASTER_CODEGRAPH_LOCK_DIR"] = lock_dir
+            try:
+                lock_path = codegraph_lock_path()
+                held = acquire_codegraph_lock(lock_path=lock_path)
+                try:
+                    with patch(
+                        "puppetmaster.codegraph.shutil.which",
+                        return_value="/usr/local/bin/codegraph",
+                    ):
+                        result = call_tool(
+                            "puppetmaster_codegraph_index", {"cwd": tmp}
+                        )
+                finally:
+                    held.release()
+            finally:
+                del os.environ["PUPPETMASTER_CODEGRAPH_LOCK_DIR"]
+
+        self.assertTrue(result["isError"])
+        payload = json.loads(result["content"][0]["text"])
+        self.assertFalse(payload["ok"])
+        self.assertIn("Another CodeGraph indexer", payload["error"])
+        self.assertEqual(payload["holder_pid"], os.getpid())
+
+    def test_mcp_codegraph_status_surfaces_native_sqlite_breakage(self) -> None:
+        broken = subprocess.CompletedProcess(
+            args=["codegraph", "status"],
+            returncode=0,
+            stdout=(
+                "CodeGraph index ok.\n"
+                "Warning: better-sqlite3 native module failed to load "
+                "(NODE_MODULE_VERSION mismatch); falling back to WASM driver."
+            ),
+            stderr="",
+        )
         with TemporaryDirectory() as tmp:
+            (Path(tmp) / ".codegraph").mkdir()
             with patch(
                 "puppetmaster.codegraph.shutil.which",
                 return_value="/usr/local/bin/codegraph",
             ), patch(
                 "puppetmaster.codegraph.subprocess.run",
-                return_value=completed,
-            ) as run:
-                result = call_tool(
-                    "puppetmaster_codegraph_init",
-                    {"cwd": tmp, "index": True},
-                )
+                return_value=broken,
+            ):
+                result = call_tool("puppetmaster_codegraph_status", {"cwd": tmp})
 
         self.assertFalse(result["isError"])
-        command = run.call_args.args[0]
-        self.assertEqual(command[:2], ["codegraph", "init"])
-        self.assertIn("--index", command)
+        payload = json.loads(result["content"][0]["text"])
+        self.assertTrue(payload.get("native_sqlite_broken"))
+        self.assertIn("npm rebuild better-sqlite3", payload["hint"])
+
+    def test_codegraph_native_sqlite_broken_detects_known_markers(self) -> None:
+        from puppetmaster.codegraph import codegraph_native_sqlite_broken
+
+        self.assertTrue(codegraph_native_sqlite_broken("backend: wasm"))
+        self.assertTrue(
+            codegraph_native_sqlite_broken(
+                "better-sqlite3 was compiled against a different Node ABI"
+            )
+        )
+        self.assertFalse(codegraph_native_sqlite_broken("Backend: native; nodes: 12345"))
+        self.assertFalse(codegraph_native_sqlite_broken(""))
+
+    def test_mcp_main_loop_dispatches_messages_concurrently(self) -> None:
+        """Slow tool calls must not block fast ones — the original 'Not
+        connected' bug came from a single-threaded `for line in sys.stdin`.
+        We submit one slow + one fast request via the same dispatcher and
+        assert the fast response is written first.
+        """
+        import io
+        import threading
+
+        from puppetmaster import mcp_server
+
+        order: list[str] = []
+        order_lock = threading.Lock()
+        slow_started = threading.Event()
+        fast_arrived = threading.Event()
+
+        original_handle = mcp_server.handle_message
+
+        def _fake_handle(message):  # noqa: ANN001
+            method = message.get("method") or ""
+            params = (message.get("params") or {}).get("name")
+            if params == "slow":
+                slow_started.set()
+                fast_arrived.wait(timeout=2.0)
+                with order_lock:
+                    order.append("slow")
+                return {"jsonrpc": "2.0", "id": message.get("id"), "result": {"ok": "slow"}}
+            if params == "fast":
+                with order_lock:
+                    order.append("fast")
+                fast_arrived.set()
+                return {"jsonrpc": "2.0", "id": message.get("id"), "result": {"ok": "fast"}}
+            return original_handle(message)
+
+        captured = io.StringIO()
+        capture_lock = threading.Lock()
+
+        def _drain(message):
+            try:
+                response = _fake_handle(message)
+            except Exception as exc:  # pragma: no cover - defensive
+                response = {"jsonrpc": "2.0", "id": message.get("id"), "error": str(exc)}
+            if response is None:
+                return
+            with capture_lock:
+                captured.write(json.dumps(response) + "\n")
+
+        slow_msg = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": "slow"}}
+        fast_msg = {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": "fast"}}
+
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            slow_future = pool.submit(_drain, slow_msg)
+            self.assertTrue(slow_started.wait(timeout=2.0))
+            fast_future = pool.submit(_drain, fast_msg)
+            fast_future.result(timeout=2.0)
+            slow_future.result(timeout=2.0)
+
+        with order_lock:
+            self.assertEqual(order, ["fast", "slow"],
+                             "fast response must complete while slow handler is still blocked")
+        output_lines = [line for line in captured.getvalue().splitlines() if line]
+        first_response = json.loads(output_lines[0])
+        self.assertEqual(first_response["result"]["ok"], "fast")
 
     def test_cursor_adapter_injects_codegraph_context_when_available(self) -> None:
         task = Task(

@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.5.0-beta.1
+
+- **Multi-threaded MCP request dispatch.** Replace the single-threaded `for line in sys.stdin` loop with a `ThreadPoolExecutor` so long-running tool calls never block the stdio transport. This fixes the "Tool execution error. Not connected" failure mode where a heavy CodeGraph call would silently freeze every other agent tool call. Worker count is configurable via `PUPPETMASTER_MCP_WORKERS` (default 8).
+- **Background CodeGraph indexer.** `puppetmaster_codegraph_init(index=true)` now runs the fast init synchronously and dispatches the slow `codegraph index` to a detached subprocess via the new `puppetmaster/codegraph_index_runner.py` launcher, returning immediately with a `run_id`, `pid`, and stdout/stderr log paths. Added a dedicated `puppetmaster_codegraph_index` MCP tool for the standalone background-index case.
+- **Global indexer lock.** A user-scoped lock file (`~/Library/Caches/puppetmaster/codegraph-indexer.lock` on macOS, `$XDG_CACHE_HOME/puppetmaster/...` on Linux, overridable with `PUPPETMASTER_CODEGRAPH_LOCK_DIR`) serializes CodeGraph indexers so two parallel runs can never trash a SQLite database. Lock-busy returns a clear `CodegraphLockBusy` payload with the holder PID and a `pkill` hint.
+- **Broken native-SQLite detection.** `puppetmaster doctor` and `puppetmaster_codegraph_status` now flag the `better-sqlite3` WASM fallback (Node ABI mismatch) and surface the `npm rebuild better-sqlite3` fix-it hint. `codegraph_native_sqlite_broken(status_output)` is the helper.
+- Shorten `DEFAULT_INIT_TIMEOUT_SECONDS` from 600 → 60 since synchronous init is now bounded to the fast scaffold-creation step; indexing is always asynchronous.
+
 ## v0.4.0-beta.1
 
 - Bundle six CodeGraph CLI commands into the Puppetmaster MCP (`puppetmaster_codegraph_search`, `_context`, `_affected`, `_files`, `_status`, `_init`) so Cursor Agent only needs one MCP server for both orchestration and repo intelligence.

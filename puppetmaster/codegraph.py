@@ -13,6 +13,7 @@ times out, so adapters can call it without conditional plumbing.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -26,7 +27,12 @@ DEFAULT_STATUS_TIMEOUT_SECONDS = 10
 DEFAULT_QUERY_TIMEOUT_SECONDS = 15
 DEFAULT_AFFECTED_TIMEOUT_SECONDS = 30
 DEFAULT_FILES_TIMEOUT_SECONDS = 15
-DEFAULT_INIT_TIMEOUT_SECONDS = 600
+# Synchronous init (without --index) is the only path that should ever block
+# the caller. The CodeGraph `init` step is fast (creates `.codegraph/` and a
+# minimal scaffold); indexing is what takes minutes-to-hours. Indexing now
+# dispatches through `puppetmaster_codegraph_index` as a background
+# subprocess, so this timeout only bounds the small init step.
+DEFAULT_INIT_TIMEOUT_SECONDS = 60
 
 
 CODEGRAPH_MISSING_HINT = (
@@ -36,6 +42,14 @@ CODEGRAPH_MISSING_HINT = (
 CODEGRAPH_NOT_INITIALIZED_HINT = (
     "workspace is not initialized for CodeGraph. Run `puppetmaster_codegraph_init` "
     "or `codegraph init` in the target repository first."
+)
+CODEGRAPH_NATIVE_SQLITE_HINT = (
+    "CodeGraph's native SQLite (better-sqlite3) is broken on this machine — most "
+    "commonly a Node ABI mismatch between the version that built the module and "
+    "the version running it. CodeGraph falls back to a much slower WASM driver and "
+    "may report `database is locked` or `unable to open database file`. Fix with: "
+    "`cd \"$(npm root -g)/@colbymchenry/codegraph\" && npm rebuild better-sqlite3` "
+    "and then re-run `codegraph status` to confirm the backend reports as native."
 )
 
 
@@ -372,3 +386,152 @@ def _decode_stream(stream: Any) -> str:
         except UnicodeDecodeError:
             return stream.decode(errors="replace")
     return str(stream)
+
+
+# --- Global indexer lock ----------------------------------------------------
+#
+# CodeGraph's SQLite backend cannot tolerate two `codegraph index` (or
+# `init --index`) runs against overlapping repos at the same time without
+# eventually hitting "database is locked" / "unable to open database file".
+# Even when the workspaces differ, broken native SQLite drivers (Node ABI
+# mismatch -> WASM fallback) can make concurrent indexers degrade the whole
+# machine. We serialize via a tiny user-scoped lock file; callers should
+# acquire before launching an indexer and release when it finishes.
+
+
+def codegraph_lock_path() -> Path:
+    """Return the per-user lock file used to serialize CodeGraph indexers."""
+    base = os.environ.get("PUPPETMASTER_CODEGRAPH_LOCK_DIR")
+    if base:
+        directory = Path(base)
+    else:
+        directory = _default_cache_root() / "puppetmaster"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / "codegraph-indexer.lock"
+
+
+def _default_cache_root() -> Path:
+    """Resolve the per-user cache root, respecting XDG_CACHE_HOME."""
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    if xdg:
+        return Path(xdg)
+    import sys
+
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Caches"
+    return Path.home() / ".cache"
+
+
+class CodegraphLockBusy(RuntimeError):
+    """Raised when another indexer already holds the global lock."""
+
+    def __init__(self, holder_pid: Optional[int], lock_path: Path):
+        self.holder_pid = holder_pid
+        self.lock_path = lock_path
+        message = (
+            "Another CodeGraph indexer is already running"
+            + (f" (pid {holder_pid})" if holder_pid else "")
+            + ". Wait for it to finish, or kill it with "
+            + f"`pkill -f 'codegraph init --index'` if it is stuck. Lock file: {lock_path}."
+        )
+        super().__init__(message)
+
+
+def acquire_codegraph_lock(*, lock_path: Optional[Path] = None) -> "CodegraphLock":
+    """Acquire the global CodeGraph indexer lock.
+
+    Returns a ``CodegraphLock`` that should be ``release()``-d (or used as a
+    context manager) once the indexer terminates. Raises ``CodegraphLockBusy``
+    immediately if another holder is active — we never block, because that
+    would defeat the purpose of the multi-threaded MCP server.
+    """
+    path = lock_path or codegraph_lock_path()
+    return CodegraphLock(path).acquire()
+
+
+class CodegraphLock:
+    """File-based advisory lock for CodeGraph indexer operations."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._fd: Optional[int] = None
+
+    def acquire(self) -> "CodegraphLock":
+        # We avoid fcntl on platforms that don't have it (Windows). On POSIX
+        # we use a non-blocking flock so the call fails fast when another
+        # indexer is running.
+        try:
+            import fcntl  # type: ignore[import-not-found]
+        except ImportError:  # pragma: no cover - non-POSIX fallback
+            fcntl = None
+        flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+        self._fd = os.open(self.path, flags, 0o644)
+        if fcntl is not None:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (OSError, BlockingIOError):
+                holder_pid = _read_holder_pid(self.path)
+                os.close(self._fd)
+                self._fd = None
+                raise CodegraphLockBusy(holder_pid, self.path)
+        os.ftruncate(self._fd, 0)
+        os.write(self._fd, f"{os.getpid()}\n".encode("utf-8"))
+        return self
+
+    def release(self) -> None:
+        if self._fd is None:
+            return
+        try:
+            import fcntl  # type: ignore[import-not-found]
+
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        except ImportError:  # pragma: no cover - non-POSIX
+            pass
+        try:
+            os.close(self._fd)
+        finally:
+            self._fd = None
+
+    def __enter__(self) -> "CodegraphLock":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.release()
+
+
+def _read_holder_pid(path: Path) -> Optional[int]:
+    try:
+        contents = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not contents.isdigit():
+        return None
+    return int(contents)
+
+
+# --- Native SQLite health check ---------------------------------------------
+
+
+def codegraph_native_sqlite_broken(status_output: str) -> bool:
+    """Return True when `codegraph status` output suggests the native SQLite
+    driver (better-sqlite3) failed to load and the WASM fallback is active.
+
+    We pattern-match on the known surface symptoms because CodeGraph itself
+    emits these strings when the native module can't be required.
+    """
+    if not status_output:
+        return False
+    lowered = status_output.lower()
+    fallback_markers = (
+        "wasm",
+        "wasm fallback",
+        "different node abi",
+        "node abi",
+        "better-sqlite3",
+        "backend: fallback",
+        "backend: wasm",
+    )
+    return any(marker in lowered for marker in fallback_markers)
