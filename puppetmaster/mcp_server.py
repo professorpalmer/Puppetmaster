@@ -63,6 +63,18 @@ ASYNC_PROCESSES: list[subprocess.Popen] = []
 _STDOUT_LOCK = threading.Lock()
 _DEFAULT_WORKER_COUNT = 8
 
+# Tool-call keepalive defaults. The v0.5.0 thread pool fix kept the stdin
+# loop responsive, but Cursor's MCP client appears to treat a stdio pipe
+# with no bytes flowing during a single long-running tool call as a dead
+# transport — at which point it closes the pipe and surfaces
+# "Tool execution error. Not connected" even though the server is alive.
+# We defeat that heuristic by emitting a JSON-RPC ``notifications/message``
+# every N seconds while a tool is still running. The notification is a
+# debug-level log that clients are free to ignore; the point is that any
+# bytes flowing through stdio keep the transport alive.
+_DEFAULT_KEEPALIVE_AFTER_SECONDS = 5.0
+_DEFAULT_KEEPALIVE_INTERVAL_SECONDS = 10.0
+
 
 def _resolve_worker_count() -> int:
     raw = os.environ.get("PUPPETMASTER_MCP_WORKERS")
@@ -73,6 +85,145 @@ def _resolve_worker_count() -> int:
     except ValueError:
         return _DEFAULT_WORKER_COUNT
     return max(1, min(value, 64))
+
+
+def _resolve_keepalive_seconds(env_key: str, default: float) -> float:
+    raw = os.environ.get(env_key)
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return max(0.5, value)
+
+
+def _keepalive_disabled() -> bool:
+    raw = os.environ.get("PUPPETMASTER_MCP_KEEPALIVE_DISABLED")
+    if raw is None:
+        return False
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _emit_notification(notification: JsonObject) -> bool:
+    """Serialize and write a JSON-RPC notification under the stdout lock.
+
+    Returns False when the pipe is gone (BrokenPipeError or general OSError),
+    so callers running on a daemon thread can stop trying. Notifications
+    must never have an ``id`` field — that's how clients distinguish them
+    from responses.
+    """
+    serialized = json.dumps(notification) + "\n"
+    try:
+        with _STDOUT_LOCK:
+            sys.stdout.write(serialized)
+            sys.stdout.flush()
+    except (BrokenPipeError, OSError):
+        return False
+    return True
+
+
+class _ToolCallKeepalive:
+    """Emit periodic JSON-RPC log notifications while a tool call is in flight.
+
+    Lifecycle: caller constructs, calls :meth:`start`, runs the handler,
+    then calls :meth:`stop` (or relies on the daemon thread reaping with
+    the process). The background thread waits ``start_after_seconds``
+    before emitting anything — short calls never produce keepalive
+    traffic — then emits one notification per ``interval_seconds`` until
+    stop is signalled or the pipe is closed.
+
+    The notifications use the MCP-spec ``notifications/message`` method
+    with a ``debug`` level, which clients are free to log or ignore. They
+    intentionally carry no ``id`` field so Cursor doesn't try to match
+    them against an outstanding request.
+    """
+
+    def __init__(
+        self,
+        *,
+        tool_name: str,
+        request_id: Any,
+        interval_seconds: Optional[float] = None,
+        start_after_seconds: Optional[float] = None,
+        emitter: Callable[[JsonObject], bool] = _emit_notification,
+    ) -> None:
+        self._tool_name = tool_name or "unknown"
+        self._request_id = request_id
+        self._interval = (
+            interval_seconds
+            if interval_seconds is not None
+            else _resolve_keepalive_seconds(
+                "PUPPETMASTER_MCP_KEEPALIVE_INTERVAL_SECONDS",
+                _DEFAULT_KEEPALIVE_INTERVAL_SECONDS,
+            )
+        )
+        self._start_after = (
+            start_after_seconds
+            if start_after_seconds is not None
+            else _resolve_keepalive_seconds(
+                "PUPPETMASTER_MCP_KEEPALIVE_AFTER_SECONDS",
+                _DEFAULT_KEEPALIVE_AFTER_SECONDS,
+            )
+        )
+        self._emit = emitter
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name=f"pm-mcp-keepalive-{self._tool_name}",
+        )
+        self._emitted = 0
+
+    @property
+    def emitted_count(self) -> int:
+        """How many keepalive notifications have actually been written."""
+        return self._emitted
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self, *, wait: bool = False) -> None:
+        self._stop.set()
+        if wait:
+            self._thread.join(timeout=2.0)
+
+    def _run(self) -> None:
+        if self._stop.wait(self._start_after):
+            return
+        elapsed = self._start_after
+        while True:
+            if not self._safe_emit(elapsed):
+                return
+            if self._stop.wait(self._interval):
+                return
+            elapsed += self._interval
+
+    def _safe_emit(self, elapsed: float) -> bool:
+        notification = {
+            "jsonrpc": "2.0",
+            "method": "notifications/message",
+            "params": {
+                "level": "debug",
+                "logger": "puppetmaster",
+                "data": {
+                    "kind": "tool_call_progress",
+                    "tool": self._tool_name,
+                    "request_id": self._request_id,
+                    "elapsed_seconds": round(elapsed, 1),
+                    "message": (
+                        f"Puppetmaster tool '{self._tool_name}' still running "
+                        f"({elapsed:.0f}s elapsed)"
+                    ),
+                },
+            },
+        }
+        if self._stop.is_set():
+            return False
+        ok = self._emit(notification)
+        if ok:
+            self._emitted += 1
+        return ok
 
 
 @dataclass(frozen=True)
@@ -147,11 +298,31 @@ def _server_version() -> Optional[str]:
 
 
 def _process_message_safely(message: JsonObject) -> None:
-    """Run handle_message on a worker thread and write any response."""
+    """Run handle_message on a worker thread and write any response.
+
+    Wraps every ``tools/call`` in a :class:`_ToolCallKeepalive` so a long
+    handler doesn't starve the stdio pipe. The keepalive is torn down in
+    ``finally`` so a slow handler that raises still gets cleaned up.
+    """
+    keepalive: Optional[_ToolCallKeepalive] = None
+    if (
+        not _keepalive_disabled()
+        and message.get("method") == "tools/call"
+    ):
+        params = message.get("params") or {}
+        tool_name = params.get("name") if isinstance(params, dict) else None
+        keepalive = _ToolCallKeepalive(
+            tool_name=str(tool_name or ""),
+            request_id=message.get("id"),
+        )
+        keepalive.start()
     try:
         response = handle_message(message)
     except Exception as exc:
         response = error_response(message.get("id"), -32000, str(exc))
+    finally:
+        if keepalive is not None:
+            keepalive.stop()
     if response is None:
         return
     serialized = json.dumps(response) + "\n"

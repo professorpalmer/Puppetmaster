@@ -583,6 +583,19 @@ triggers:
   Cursor itself.
 - An in-flight tool call exceeding Cursor's internal timeout.
 
+**Prevention layer (v0.5.3+):** every long-running tool call now emits
+JSON-RPC `notifications/message` keepalive frames every 10 seconds after
+a 5-second grace period. Bytes flowing on the stdio pipe defeat the
+"transport looks dead" heuristic in Cursor's MCP client. Short calls
+pay zero protocol cost. Tune or disable with:
+
+- `PUPPETMASTER_MCP_KEEPALIVE_AFTER_SECONDS` (default 5)
+- `PUPPETMASTER_MCP_KEEPALIVE_INTERVAL_SECONDS` (default 10)
+- `PUPPETMASTER_MCP_KEEPALIVE_DISABLED=1` (turn off entirely)
+
+If the transport still drops, the recovery layer below catches the
+fallout.
+
 When this happens, in-flight Puppetmaster swarms keep running in the
 background (that's the whole point of durable state — see `python -m
 puppetmaster jobs` from a shell to confirm), but you typically end up
