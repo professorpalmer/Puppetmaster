@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from puppetmaster.codegraph_repair import repair_codegraph_sqlite
 from puppetmaster.config import load_config
 from puppetmaster.diagnostics import adapter_status, run_doctor, starter_config
 from puppetmaster.orchestrator import Orchestrator
@@ -260,6 +261,55 @@ def build_parser() -> argparse.ArgumentParser:
         default="Prove Puppetmaster can recover abandoned agent work.",
     )
     crash_demo.add_argument("--crash-role", default="implement")
+
+    repair = subcommands.add_parser(
+        "repair-codegraph",
+        help=(
+            "Rebuild CodeGraph's better-sqlite3 native module for Cursor's bundled "
+            "Node so the MCP server stops falling back to slow WASM SQLite."
+        ),
+    )
+    repair.add_argument(
+        "--cursor-node",
+        help="Path to Cursor's bundled Node binary. Auto-detected if omitted.",
+    )
+    repair.add_argument(
+        "--codegraph-install",
+        help=(
+            "Path to the global @colbymchenry/codegraph install directory. "
+            "Resolved from `npm root -g` if omitted."
+        ),
+    )
+    repair.add_argument(
+        "--npm-command",
+        default="npm",
+        help="npm binary to use (default: npm).",
+    )
+    repair.add_argument(
+        "--rebuild-timeout-seconds",
+        type=int,
+        default=180,
+        help="Hard timeout for the rebuild step (default: 180).",
+    )
+    repair.add_argument(
+        "--no-verify",
+        dest="verify",
+        action="store_false",
+        help="Skip the post-rebuild `codegraph status` check.",
+    )
+    repair.add_argument(
+        "--verify-cwd",
+        help=(
+            "Target repo to run the verification `codegraph status` in. "
+            "Defaults to the current working directory."
+        ),
+    )
+    repair.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the full repair payload as JSON instead of a human-readable summary.",
+    )
+
     return parser
 
 
@@ -293,6 +343,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
         for check in run_doctor(Path.cwd(), state_dir):
             print(f"{check.status:8} {check.name:16} {check.detail}")
         return 0
+
+    if args.command == "repair-codegraph":
+        return _run_repair_codegraph(args)
 
     if args.command == "adapters":
         print(json.dumps(adapter_status(Path.cwd()), indent=2))
@@ -678,6 +731,45 @@ def artifact_headline(artifact: dict) -> str:
 
 def early_job_printer(job) -> None:
     print(f"job_id: {job.id}", flush=True)
+
+
+def _run_repair_codegraph(args) -> int:
+    """CLI entrypoint for `python -m puppetmaster repair-codegraph`.
+
+    Returns 0 when the rebuild succeeds and 1 otherwise. Output mode is
+    JSON when ``--json`` is passed and a human-readable summary otherwise.
+    """
+    result = repair_codegraph_sqlite(
+        cursor_node=args.cursor_node,
+        codegraph_install=args.codegraph_install,
+        npm_command=args.npm_command,
+        rebuild_timeout_seconds=args.rebuild_timeout_seconds,
+        verify=args.verify,
+        verify_cwd=args.verify_cwd,
+    )
+    if args.json:
+        print(json.dumps(result.to_payload(), indent=2))
+        return 0 if result.ok else 1
+
+    status = "ok" if result.ok else "fail"
+    print(f"repair-codegraph: {status}")
+    print(f"  message: {result.message}")
+    if result.cursor_node_path:
+        version = f" ({result.cursor_node_version})" if result.cursor_node_version else ""
+        print(f"  cursor-node: {result.cursor_node_path}{version}")
+    if result.codegraph_install_path:
+        print(f"  codegraph: {result.codegraph_install_path}")
+    if result.verify_backend:
+        print(f"  verify: Backend: {result.verify_backend}")
+    if result.next_steps:
+        print("  next:")
+        for step in result.next_steps:
+            print(f"    - {step}")
+    if not result.ok and result.rebuild_stderr.strip():
+        print("  stderr (last 20 lines):")
+        for line in result.rebuild_stderr.strip().splitlines()[-20:]:
+            print(f"    {line}")
+    return 0 if result.ok else 1
 
 
 def print_watch_snapshot(snapshot: dict) -> None:

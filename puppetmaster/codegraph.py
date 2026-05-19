@@ -44,12 +44,19 @@ CODEGRAPH_NOT_INITIALIZED_HINT = (
     "or `codegraph init` in the target repository first."
 )
 CODEGRAPH_NATIVE_SQLITE_HINT = (
-    "CodeGraph's native SQLite (better-sqlite3) is broken on this machine — most "
-    "commonly a Node ABI mismatch between the version that built the module and "
-    "the version running it. CodeGraph falls back to a much slower WASM driver and "
-    "may report `database is locked` or `unable to open database file`. Fix with: "
-    "`cd \"$(npm root -g)/@colbymchenry/codegraph\" && npm rebuild better-sqlite3` "
-    "and then re-run `codegraph status` to confirm the backend reports as native."
+    "CodeGraph's native SQLite (better-sqlite3) is broken on this machine — almost "
+    "always a Node ABI mismatch. The common Cursor trap: your terminal's Node "
+    "(e.g. Homebrew v23, ABI 131) and Cursor's bundled Node (v22, ABI 127) "
+    "have different ABIs, so a plain `npm rebuild` from your shell builds "
+    "better-sqlite3 for the wrong runtime and Puppetmaster's MCP keeps falling "
+    "back to slow WASM SQLite (you'll see `database is locked` errors). "
+    "Easiest fix: run `python -m puppetmaster repair-codegraph` (or call the "
+    "`puppetmaster_repair_codegraph` MCP tool) — it rebuilds better-sqlite3 "
+    "against Cursor's Node automatically and verifies Backend: native. Manual "
+    "equivalent: `CURSOR_NODE=\"/Applications/Cursor.app/Contents/Resources/app/"
+    "resources/helpers/node\" && cd \"$(npm root -g)/@colbymchenry/codegraph\" && "
+    "PATH=\"$(dirname \"$CURSOR_NODE\"):$PATH\" npm rebuild better-sqlite3`. "
+    "Restart the Puppetmaster MCP server in Cursor afterwards."
 )
 
 

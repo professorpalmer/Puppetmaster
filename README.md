@@ -569,6 +569,47 @@ Puppetmaster is powerful because it can orchestrate tools that edit code. The sa
 
 If you paste a key into a terminal, chat, issue, screenshot, or transcript, rotate it before publishing.
 
+## Troubleshooting
+
+### CodeGraph reports `database is locked` from MCP, but works fine in the terminal
+
+This is the most common gotcha on macOS Cursor installs. CodeGraph's native
+SQLite driver (`better-sqlite3`) is locked to a specific Node ABI. You have
+**two** Node runtimes that touch the same global CodeGraph install:
+
+| Runtime | Typical Node | NODE_MODULE_VERSION |
+| ------- | ------------ | ------------------- |
+| Your shell (`/opt/homebrew/bin/node`) | v23.x | 131 |
+| Cursor's bundled Node (`Cursor.app/.../helpers/node`) | v22.22.0 | 127 |
+
+If you ran `npm rebuild better-sqlite3` in your shell, it built for the
+**shell's** Node, which means Puppetmaster's MCP (running under Cursor's
+Node) silently falls back to the slow WASM driver and you'll see
+`database is locked` / `unable to open database file`. `puppetmaster doctor`
+will flag this as `native better-sqlite3 broken; codegraph is on slow WASM
+fallback.`
+
+**One-command fix:**
+
+```bash
+python -m puppetmaster repair-codegraph
+```
+
+It auto-detects Cursor's bundled Node, locates the global CodeGraph install,
+runs `npm rebuild better-sqlite3` with Cursor's Node on PATH, and verifies
+the backend reports as native. Then restart the Puppetmaster MCP server in
+Cursor (Settings → MCP → toggle off/on).
+
+You can also call it from inside the agent itself via the
+`puppetmaster_repair_codegraph` MCP tool — useful if an agent hits the WASM
+fallback mid-session and can self-heal.
+
+**Tradeoff:** `better-sqlite3` is ABI-specific. Rebuilding for Cursor's
+Node 22 may break native SQLite in your terminal (Node 23) until you
+rebuild again with the shell's Node. For day-to-day Cursor use, optimize
+for Cursor's Node. If you upgrade Cursor and the bundled Node ABI changes,
+re-run `puppetmaster repair-codegraph`.
+
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md)
