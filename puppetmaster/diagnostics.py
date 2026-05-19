@@ -17,6 +17,7 @@ from puppetmaster.codegraph import (
     codegraph_native_sqlite_broken,
     codegraph_status_command,
 )
+from puppetmaster.mcp_registry import list_entries as registry_list_entries
 from puppetmaster.state import resolve_state_dir
 
 
@@ -38,11 +39,63 @@ def run_doctor(root: Path, state_dir: Optional[Path] = None) -> list[Check]:
         _cursor_sdk_check(root),
         _claude_code_check(),
         _codegraph_check(root),
+        _mcp_servers_check(),
         _env_check("CURSOR_API_KEY"),
         _sqlite_state_check(state_path / "state.sqlite3"),
         _git_clean_check(root),
     ]
     return checks
+
+
+def _mcp_servers_check() -> Check:
+    """Flag dead-but-tracked or stale-but-alive Puppetmaster MCP servers.
+
+    Either condition is the smoking gun behind a stale `Tool execution
+    error. Not connected` symptom: dead entries mean a prior server
+    crashed and left state behind; stale-but-alive entries mean a
+    Cursor parent went away but the MCP child is still consuming
+    resources.
+    """
+    try:
+        entries = registry_list_entries()
+    except Exception as exc:
+        return Check("mcp-servers", "warn", f"registry unreadable: {exc}")
+    alive = [entry for entry in entries if entry.is_alive()]
+    dead = [entry for entry in entries if not entry.is_alive()]
+    stale_alive = [entry for entry in alive if entry.is_stale()]
+    if dead and stale_alive:
+        return Check(
+            "mcp-servers",
+            "warn",
+            (
+                f"{len(dead)} dead tracking file(s) and {len(stale_alive)} stale-but-alive "
+                "server(s) detected. Run `python -m puppetmaster mcp cleanup --kill-stale` "
+                "to clean up; this is the common root cause of `Tool execution error. "
+                "Not connected` after a Cursor MCP restart."
+            ),
+        )
+    if dead:
+        return Check(
+            "mcp-servers",
+            "warn",
+            (
+                f"{len(dead)} dead tracking file(s) from prior MCP server crashes. "
+                "Run `python -m puppetmaster mcp cleanup` to reclaim them."
+            ),
+        )
+    if stale_alive:
+        return Check(
+            "mcp-servers",
+            "warn",
+            (
+                f"{len(stale_alive)} Puppetmaster MCP server(s) alive but stale "
+                "(no heartbeat in >5min). Cursor parent likely gone. Run "
+                "`python -m puppetmaster mcp cleanup --kill-stale` to terminate."
+            ),
+        )
+    if alive:
+        return Check("mcp-servers", "ok", f"{len(alive)} healthy server(s) tracked")
+    return Check("mcp-servers", "ok", "no MCP servers currently tracked")
 
 
 def _codegraph_check(root: Path) -> Check:

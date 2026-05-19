@@ -571,6 +571,55 @@ If you paste a key into a terminal, chat, issue, screenshot, or transcript, rota
 
 ## Troubleshooting
 
+### `Tool execution error. Not connected` from Cursor
+
+This is Cursor's MCP client telling you it lost the stdio transport to the
+Puppetmaster MCP server — **not** that your swarm or jobs died. Common
+triggers:
+
+- Heavy concurrent load (parallel Cursor SDK swarm + CodeGraph index +
+  large status payloads in the same window).
+- Cursor reloading MCP settings, toggling the server, or restarting
+  Cursor itself.
+- An in-flight tool call exceeding Cursor's internal timeout.
+
+When this happens, in-flight Puppetmaster swarms keep running in the
+background (that's the whole point of durable state — see `python -m
+puppetmaster jobs` from a shell to confirm), but you typically end up
+with one or more orphan `python -m puppetmaster.mcp_server` processes
+holding open SQLite handles and contending for the CodeGraph indexer
+lock.
+
+**Diagnose:**
+
+```bash
+python -m puppetmaster mcp list
+# 3 tracked  (1 alive, 0 stale, 2 dead)
+#    PID  STATE        AGE     HBEAT  WORKSPACE
+#  12345  ok            12s        8s  /Users/you/repo
+#  11111  dead        4231s     4231s  /Users/you/repo
+#  11112  dead        4231s     4231s  /Users/you/repo
+```
+
+`puppetmaster doctor` also flags this automatically.
+
+**Clean up:**
+
+```bash
+python -m puppetmaster mcp cleanup --kill-stale
+```
+
+Then restart the Puppetmaster MCP server in Cursor
+(Settings → MCP → toggle off/on). Inside an agent session you can call
+`puppetmaster_mcp_status` / `puppetmaster_mcp_cleanup` directly — handy
+for letting the agent self-diagnose right after a reconnect.
+
+Each running Puppetmaster MCP server now registers itself in
+`~/Library/Caches/puppetmaster/mcp-servers/<pid>.json` (or
+`$XDG_CACHE_HOME/puppetmaster/mcp-servers/` on Linux) and updates a
+heartbeat from a background thread, so dead and stale entries are
+detectable without grepping `ps`.
+
 ### CodeGraph reports `database is locked` from MCP, but works fine in the terminal
 
 This is the most common gotcha on macOS Cursor installs. CodeGraph's native

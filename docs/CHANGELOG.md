@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.5.2-beta.1
+
+- **MCP server process registry + orphan cleanup.** Every Puppetmaster MCP server now writes a tracking file (PID, workspace, started_at, last_heartbeat) at startup, bumps its heartbeat from a daemon thread, and removes its file on a clean exit. New servers prune dead tracking files on startup so orphans from prior `Tool execution error. Not connected` cycles get reaped automatically — no more `pkill -f puppetmaster.mcp_server` from a shell.
+- New `puppetmaster/mcp_registry.py` module with `register()`, `heartbeat()`, `deregister()`, `list_entries()`, `prune_dead()`, `kill_stale()`, and a `HeartbeatThread`. Per-user storage lives under `~/Library/Caches/puppetmaster/mcp-servers/` on macOS and `$XDG_CACHE_HOME/puppetmaster/mcp-servers/` on Linux; overridable via `PUPPETMASTER_MCP_REGISTRY_DIR`.
+- New CLI surface: `python -m puppetmaster mcp list` (with `--json`) and `python -m puppetmaster mcp cleanup` (`--kill-stale`, `--stale-after-seconds`, `--json`). Lists every tracked server with alive/stale/dead flags and reclaims dead entries; `--kill-stale` SIGTERMs (and SIGKILLs after a grace period) servers whose heartbeat is older than the threshold. The current PID is never signalled.
+- New MCP tools `puppetmaster_mcp_status` and `puppetmaster_mcp_cleanup` so an agent can self-diagnose and self-heal right after a transport reconnect without you running anything in a shell.
+- `puppetmaster doctor` now includes an `mcp-servers` check that warns when dead tracking files or stale-but-alive servers are present, and points at the new cleanup command. This is the smoking gun behind a stale `Tool execution error. Not connected` symptom.
+- README: new "`Tool execution error. Not connected` from Cursor" Troubleshooting section explaining the failure mode (Cursor closes the stdio transport while the swarm keeps running), the diagnostic command, the cleanup command, and the durable-state implication that orphan reconnects are recoverable.
+
 ## v0.5.1-beta.1
 
 - **Self-healing CodeGraph SQLite repair.** New `python -m puppetmaster repair-codegraph` CLI command and matching `puppetmaster_repair_codegraph` MCP tool that auto-detect Cursor's bundled Node, locate the global `@colbymchenry/codegraph` install, and `npm rebuild better-sqlite3` against the right runtime — then verify the backend reports as native. This closes the most common Cursor footgun: a shell-Node `npm rebuild` builds for the wrong ABI (Homebrew Node 23 vs. Cursor's bundled Node 22), so the Puppetmaster MCP keeps falling back to slow WASM SQLite and emits spurious `database is locked` errors.
