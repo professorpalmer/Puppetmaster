@@ -593,6 +593,8 @@ pay zero protocol cost. Tune or disable with:
 - `PUPPETMASTER_MCP_KEEPALIVE_INTERVAL_SECONDS` (default 10)
 - `PUPPETMASTER_MCP_KEEPALIVE_DISABLED=1` (turn off entirely)
 
+**Root-cause fix (v0.5.6+):** Pre-v0.5.6, parallel `puppetmaster_doctor` calls (or any other tool that fanned out to multiple `subprocess.run` invocations) could silently kill the MCP server with `exit_code=0` because subprocess children inherited the parent's stdin by default. Concurrent spawn pressure somehow caused the parent's `for line in sys.stdin` loop to receive a phantom EOF and exit cleanly — looking from Cursor's side exactly like `Tool execution error. Not connected`. Every subprocess call in the server's code path now passes `stdin=subprocess.DEVNULL`, severing the inheritance chain. Verified by `bench/mcp_stress.py` (run it any time: 6 scenarios in ~90s).
+
 **Self-healing layer (v0.5.4+):** Cursor's MCP client uses a "lease"
 lifecycle that periodically re-creates the logical client without
 killing the previous Python MCP server. Without the keepalive above,

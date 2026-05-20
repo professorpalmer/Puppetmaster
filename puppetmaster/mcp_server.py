@@ -539,6 +539,8 @@ def main() -> int:
         max_workers=_resolve_worker_count(),
         thread_name_prefix="pm-mcp",
     )
+    diag = os.environ.get("PUPPETMASTER_MCP_DIAG_EXIT") == "1"
+    exit_reason = "stdin_eof"
     try:
         try:
             for line in sys.stdin:
@@ -549,13 +551,27 @@ def main() -> int:
                 except json.JSONDecodeError:
                     continue
                 _mark_inbound_message()
-                executor.submit(_process_message_safely, message)
+                try:
+                    executor.submit(_process_message_safely, message)
+                except RuntimeError as exc:
+                    exit_reason = f"executor_submit_failed: {exc}"
+                    raise
         except KeyboardInterrupt:
+            exit_reason = "sigint_clean_shutdown"
             # InputStalenessWatcher (or an actual Ctrl-C) signalled
             # SIGINT to trigger a clean shutdown. Fall through to the
             # finally block instead of letting Python print a traceback.
             pass
+        except BaseException as exc:  # pragma: no cover - smoke-only
+            exit_reason = f"main_loop_exception: {type(exc).__name__}: {exc}"
+            if diag:
+                import traceback
+                traceback.print_exc(file=sys.stderr)
+            raise
     finally:
+        if diag:
+            sys.stderr.write(f"[pm-mcp] main exiting; reason={exit_reason}\n")
+            sys.stderr.flush()
         executor.shutdown(wait=False)
         if input_watcher is not None:
             input_watcher.stop()
@@ -1118,6 +1134,7 @@ def _spawn_codegraph_indexer(args: JsonObject, target_cwd: str) -> JsonObject:
         launcher,
         cwd=target_cwd,
         env=launcher_environment(args),
+        stdin=subprocess.DEVNULL,
         stdout=stdout_handle,
         stderr=stderr_handle,
         text=True,
@@ -1290,6 +1307,7 @@ def run_cli(command: list[str], args: JsonObject) -> JsonObject:
         [sys.executable, "-m", "puppetmaster", "--state-dir", state_dir] + command,
         cwd=cwd(args),
         env=launcher_environment(args),
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
         timeout=int(args.get("runner_timeout_seconds") or 1800),
@@ -1370,6 +1388,7 @@ def start_cli(command: list[str], args: JsonObject) -> JsonObject:
         full_command,
         cwd=cwd(args),
         env=launcher_environment(args),
+        stdin=subprocess.DEVNULL,
         stdout=stdout_handle,
         stderr=stderr_handle,
         text=True,

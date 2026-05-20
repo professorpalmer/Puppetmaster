@@ -2885,6 +2885,102 @@ print('{"result":"ok"}')
         # Exactly one emit attempt (we returned False on the first one).
         self.assertEqual(calls["n"], 1)
 
+    def test_parallel_doctor_calls_do_not_kill_mcp_server(self) -> None:
+        """Regression: 30 parallel doctor MCP calls used to silently kill the
+        server (exit 0 via stdin EOF) because subprocess.run children
+        inherited the parent's fd 0 and somehow caused the parent's stdin
+        reader to receive a phantom EOF. Every subprocess in the server's
+        code path now passes stdin=DEVNULL. This test spawns the real
+        server over stdio, sends 30 parallel doctor calls, and asserts the
+        server stays alive and every call returns a response."""
+        import subprocess
+        import threading
+
+        repo_root = Path(__file__).resolve().parent.parent
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "puppetmaster.mcp_server"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=str(repo_root),
+            env={
+                **os.environ,
+                "PUPPETMASTER_MCP_INPUT_STALE_DISABLED": "1",
+                "PUPPETMASTER_MCP_IDLE_KEEPALIVE_DISABLED": "1",
+            },
+            bufsize=0,
+        )
+        responses: dict = {}
+        reader_done = threading.Event()
+
+        def reader():
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                try:
+                    msg = json.loads(line.decode("utf-8", errors="replace"))
+                except json.JSONDecodeError:
+                    continue
+                if "id" in msg and "method" not in msg:
+                    responses[msg["id"]] = msg
+            reader_done.set()
+
+        threading.Thread(target=reader, daemon=True).start()
+
+        write_lock = threading.Lock()
+
+        def send(rid):
+            payload = json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": rid,
+                    "method": "tools/call",
+                    "params": {"name": "puppetmaster_doctor", "arguments": {}},
+                }
+            ) + "\n"
+            with write_lock:
+                assert proc.stdin is not None
+                proc.stdin.write(payload.encode("utf-8"))
+                proc.stdin.flush()
+
+        try:
+            # Handshake.
+            send(0)
+            deadline = time.time() + 15
+            while time.time() < deadline and 0 not in responses:
+                time.sleep(0.05)
+            self.assertIn(0, responses, "handshake never returned")
+
+            # Hammer with 30 parallel doctor calls.
+            senders = []
+            for i in range(30):
+                t = threading.Thread(target=send, args=(1000 + i,))
+                t.start()
+                senders.append(t)
+            for t in senders:
+                t.join()
+
+            deadline = time.time() + 60
+            missing = set(range(1000, 1030))
+            while time.time() < deadline and missing:
+                missing = {r for r in range(1000, 1030) if r not in responses}
+                if missing:
+                    time.sleep(0.2)
+
+            self.assertEqual(
+                set(), missing, f"missing responses for ids: {sorted(missing)}"
+            )
+            self.assertIsNone(
+                proc.poll(),
+                f"server unexpectedly died with exit={proc.poll()}",
+            )
+        finally:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
+
     def test_idle_keepalive_can_be_disabled_via_env(self) -> None:
         from puppetmaster.mcp_server import _idle_keepalive_disabled
 

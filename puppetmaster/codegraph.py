@@ -157,6 +157,7 @@ def codegraph_context(
                 "markdown",
             ],
             cwd=str(cwd),
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
@@ -184,6 +185,7 @@ def codegraph_status_line(
         completed = subprocess.run(
             resolve_codegraph_invocation() + ["status"],
             cwd=str(cwd),
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
@@ -270,6 +272,7 @@ def run_codegraph_cli(
         completed = subprocess.run(
             resolve_codegraph_invocation() + cli_args,
             cwd=cwd_str or None,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=timeout_seconds,

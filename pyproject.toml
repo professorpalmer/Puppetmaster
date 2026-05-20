@@ -1,6 +1,6 @@
 [project]
 name = "puppetmaster"
-version = "0.5.5-beta.1"
+version = "0.5.6-beta.1"
 description = "Gunicorn-style agent swarms with Redis-like shared memory and artifact stitching."
 readme = "README.md"
 requires-python = ">=3.9"

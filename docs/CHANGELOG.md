@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.5.6-beta.1
+
+- **Root-cause fix for "MCP drops on robust questions".** Found via a new live-fire stress harness (`bench/mcp_stress.py`) that drives the real MCP server over stdio with six load patterns. The failing pattern: `puppetmaster_doctor` (which fans out to multiple `subprocess.run` calls for `git`/`node`/`npm`/`codegraph status`) called in parallel from many requests would silently kill the server with `exit_code=0` and `stdin EOF`. Every `subprocess.run`/`subprocess.Popen` in the server-touched code path was inheriting the parent's fd 0 by default. Under concurrent spawn pressure, that inheritance somehow caused the parent's `for line in sys.stdin` loop to receive a phantom EOF and exit cleanly — looking from Cursor's side exactly like "Tool execution error. Not connected". The fix: every subprocess call in `codegraph.py`, `codegraph_repair.py`, `codegraph_index_runner.py`, `state.py`, `diagnostics.py`, and `mcp_server.py` now passes `stdin=subprocess.DEVNULL`, so children never touch the parent's stdin.
+- **New stress harness for regression detection.** `python -m bench.mcp_stress` runs six scenarios against a real-spawned MCP server: 20 parallel doctor calls, 64 simultaneous senders, large payload, doctor + codegraph mixed, sustained 5-rps traffic, and idle->busy->idle transitions for the idle keepalive. All six pass on v0.5.6. Run anytime to verify the production server behavior in <90s.
+- **New `PUPPETMASTER_MCP_DIAG_EXIT=1` env flag** that prints the main-loop exit reason on stderr (`stdin_eof`, `sigint_clean_shutdown`, `main_loop_exception: ...`). Off by default; turn on temporarily when an orphan server exits unexpectedly to learn why.
+- New regression test (`test_parallel_doctor_calls_do_not_kill_mcp_server`) spawns the real server over stdio, sends 30 parallel doctor calls from 30 sender threads, and asserts every response returns and the server stays alive. This is the unit-level guard for the v0.5.6 fix.
+- Tests: 135 passing (added 1 regression). The stress harness was the diagnostic that surfaced the bug; the unit test is the day-to-day guard.
+
 ## v0.5.5-beta.1
 
 - **CodeGraph indexes are now per-repo, not machine-wide.** The previous lock was over-eager: each repo has its own SQLite DB at `<repo>/.codegraph/codegraph.db`, so two indexers on two different repos can't trash each other's data. The lock now keys on the resolved repo root path hash (`codegraph-indexer-<repo>-<digest>.lock`), so `ff-data-engineering`, `ff-ios`, and `ios-qa-agent-1` can index in parallel. The lock only blocks legitimate overlap on the same SQLite DB. Legacy callers passing no `repo_root` still get the global lock file for backwards compatibility.

@@ -68,6 +68,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             resolve_codegraph_invocation() + ["index"],
             cwd=target_cwd or None,
             env=os.environ.copy(),
+            stdin=subprocess.DEVNULL,
             check=False,
         )
         return completed.returncode
