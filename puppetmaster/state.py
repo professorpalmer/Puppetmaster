@@ -90,6 +90,7 @@ def _git_root(cwd: Path) -> Optional[Path]:
         completed = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
             cwd=str(cwd),
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=2,

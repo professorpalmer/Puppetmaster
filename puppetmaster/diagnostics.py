@@ -202,7 +202,19 @@ def starter_config() -> str:
 def _command_check(name: str, command: list[str]) -> Check:
     if shutil.which(command[0]) is None:
         return Check(name, "missing", f"{command[0]} not found on PATH")
-    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    # stdin=DEVNULL is critical when this runs inside the MCP server: by
+    # default subprocess inherits fd 0 from the parent, and certain
+    # children (or just the kernel under fd pressure from many parallel
+    # spawns) can cause the parent's stdin reader to receive a phantom
+    # EOF — silently exiting the server with code 0. See
+    # bench/mcp_stress.py for the repro.
+    completed = subprocess.run(
+        command,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
     output = (completed.stdout or completed.stderr).strip()
     status = "ok" if completed.returncode == 0 else "warn"
     return Check(name, status, output or f"exit code {completed.returncode}")
@@ -315,6 +327,7 @@ def _git_clean_check(root: Path) -> Check:
     completed = subprocess.run(
         ["git", "status", "--short"],
         cwd=root,
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
         check=False,

@@ -137,6 +137,7 @@ def find_codegraph_install(npm_command: str = "npm") -> Optional[Path]:
     try:
         completed = subprocess.run(
             [npm_path, "root", "-g"],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=10,
@@ -160,6 +161,7 @@ def detect_node_version(node_path: Path, timeout_seconds: int = 5) -> Optional[s
     try:
         completed = subprocess.run(
             [str(node_path), "--version"],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
@@ -255,6 +257,7 @@ def repair_codegraph_sqlite(
             [npm_path, "rebuild", "better-sqlite3"],
             cwd=str(install_path),
             env=env,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=rebuild_timeout_seconds,
@@ -360,6 +363,7 @@ def _verify_native_backend(
         completed = subprocess.run(
             [str(node_path), str(entry), "status"],
             cwd=target_cwd or None,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
