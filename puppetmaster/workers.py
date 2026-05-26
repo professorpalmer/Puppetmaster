@@ -16,29 +16,44 @@ class WorkerSpec:
     depends_on_roles: list[str] = field(default_factory=list)
 
 
+# Built-in worker specs ship with ``auto_route: True`` so any swarm
+# started via the MCP ``puppetmaster_start_*`` tools or ``python -m
+# puppetmaster run`` consults the router and lets each role land on
+# the appropriate tier (cheap for explore/test, mid for architect,
+# frontier for redteam/audit). If the user has not run
+# ``puppetmaster models init``, the orchestrator quietly skips routing
+# and falls back to the spec's declared adapter — opting in is safe.
+_DEFAULT_AUTO_ROUTE_PAYLOAD = {"auto_route": True}
+
+
 DEFAULT_WORKERS = [
     WorkerSpec(
         role="explore",
         instruction="Map the problem, extract constraints, and emit evidenced findings.",
+        payload=dict(_DEFAULT_AUTO_ROUTE_PAYLOAD),
     ),
     WorkerSpec(
         role="architect",
         instruction="Choose the smallest viable architecture and record explicit decisions.",
+        payload=dict(_DEFAULT_AUTO_ROUTE_PAYLOAD),
         depends_on_roles=["explore"],
     ),
     WorkerSpec(
         role="implement",
         instruction="Produce implementation artifacts and patch plans, not prose blobs.",
+        payload=dict(_DEFAULT_AUTO_ROUTE_PAYLOAD),
         depends_on_roles=["architect"],
     ),
     WorkerSpec(
         role="redteam",
         instruction="Find failure modes, stale assumptions, and missing verification.",
+        payload=dict(_DEFAULT_AUTO_ROUTE_PAYLOAD),
         depends_on_roles=["implement"],
     ),
     WorkerSpec(
         role="test",
         instruction="Convert claims into checks and verification results.",
+        payload=dict(_DEFAULT_AUTO_ROUTE_PAYLOAD),
         depends_on_roles=["implement"],
     ),
 ]

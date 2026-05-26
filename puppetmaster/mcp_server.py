@@ -680,6 +680,42 @@ def tools() -> list[McpTool]:
             handler=lambda args: run_cli(["doctor"], args),
         ),
         McpTool(
+            name="puppetmaster_route_task",
+            description=(
+                "Show which model the Puppetmaster router would pick for a task, "
+                "including estimated cost in USD and a list of rejected alternatives "
+                "with the reason each was rejected. Pure decision tool — does not "
+                "run the model. Use this to estimate spend before kicking off a swarm "
+                "or to debug 'why did this go to model X?' artifacts."
+            ),
+            input_schema=route_task_schema(),
+            handler=run_route_task,
+        ),
+        McpTool(
+            name="puppetmaster_list_models",
+            description=(
+                "Print the user-owned LLM model registry (~/.puppetmaster/models.json "
+                "by default). Shows model ids, adapters, capability scores, and per-token "
+                "prices that the router uses."
+            ),
+            input_schema=list_models_schema(),
+            handler=run_list_models,
+        ),
+        McpTool(
+            name="puppetmaster_job_cost",
+            description=(
+                "Sum the estimated USD cost of every router decision for a job. "
+                "Returns per-model breakdown + grand total. Use to answer "
+                "'how much did this swarm cost?' or 'which model ate the most tokens?'. "
+                "Estimates are based on user-asserted prices in the registry — "
+                "Puppetmaster does not call a billing API."
+            ),
+            input_schema=job_schema(required=True),
+            handler=lambda args: run_cli(
+                ["cost", require_string(args, "job_id"), "--json"], args
+            ),
+        ),
+        McpTool(
             name="puppetmaster_cursor_review",
             description="Run a Cursor SDK review worker through Puppetmaster and wait for completion.",
             input_schema=goal_schema(
@@ -1299,6 +1335,155 @@ def write_generated_swarm_config(args: JsonObject, roles: list[str], adapter: st
         )
     config_path.write_text(json.dumps({"lease_seconds": 10, "workers": workers}, indent=2), encoding="utf-8")
     return config_path
+
+
+def route_task_schema() -> JsonObject:
+    schema = base_schema()
+    schema["properties"].update(
+        {
+            "instruction": {
+                "type": "string",
+                "description": "Task instruction text. Drives the capability classifier.",
+            },
+            "role": {
+                "type": "string",
+                "description": (
+                    "Task role (e.g. explore, architect, implement, audit). "
+                    "Drives the base capability score. Defaults to 'explore'."
+                ),
+                "default": "explore",
+            },
+            "policy": {
+                "type": "string",
+                "enum": ["balanced", "cheap", "quality", "escalating"],
+                "default": "balanced",
+                "description": (
+                    "Routing policy. balanced=cheapest sufficient; cheap=lowest cost; "
+                    "quality=highest capability; escalating=ordered chain for retries."
+                ),
+            },
+            "min_capability": {
+                "type": "integer",
+                "description": "Force classifier output to this value (0..100).",
+            },
+            "max_cost_usd": {
+                "type": "number",
+                "description": "Hard cap on estimated per-call USD cost.",
+            },
+            "required_tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Only consider models whose tags include ALL of these.",
+            },
+            "registry_path": {
+                "type": "string",
+                "description": (
+                    "Optional override for the models registry path. Defaults to "
+                    "$PUPPETMASTER_MODELS_PATH or ~/.puppetmaster/models.json."
+                ),
+            },
+        }
+    )
+    schema["required"] = ["instruction"]
+    return schema
+
+
+def list_models_schema() -> JsonObject:
+    schema = base_schema()
+    schema["properties"]["registry_path"] = {
+        "type": "string",
+        "description": (
+            "Optional override for the models registry path. Defaults to "
+            "$PUPPETMASTER_MODELS_PATH or ~/.puppetmaster/models.json."
+        ),
+    }
+    return schema
+
+
+def run_route_task(args: JsonObject) -> JsonObject:
+    """Run the router and return the decision as a JSON content block."""
+    from puppetmaster.model_registry import default_registry_path, load_registry
+    from puppetmaster.router import NoEligibleModelError, TaskSignals, route_task
+
+    instruction = require_string(args, "instruction")
+    role = (args.get("role") or "explore").strip() or "explore"
+    policy = (args.get("policy") or "balanced").strip() or "balanced"
+    registry_path_arg = args.get("registry_path")
+    registry_path = (
+        Path(str(registry_path_arg)).expanduser()
+        if registry_path_arg
+        else default_registry_path()
+    )
+
+    try:
+        specs = load_registry(registry_path)
+    except RuntimeError as exc:
+        return {
+            "content": [{"type": "text", "text": f"registry error: {exc}"}],
+            "isError": True,
+        }
+    if not specs:
+        msg = (
+            f"No models registered at {registry_path}. "
+            "Run `puppetmaster models init` to write a starter registry, "
+            "then edit capability scores + prices to match your subscriptions."
+        )
+        return {"content": [{"type": "text", "text": msg}], "isError": True}
+
+    signals = TaskSignals(
+        instruction=instruction,
+        role=role,
+        explicit_min_capability=(
+            int(args["min_capability"]) if "min_capability" in args and args["min_capability"] is not None else None
+        ),
+        explicit_max_cost_usd=(
+            float(args["max_cost_usd"]) if "max_cost_usd" in args and args["max_cost_usd"] is not None else None
+        ),
+        required_tags=list(args.get("required_tags") or []),
+    )
+
+    try:
+        decision = route_task(signals, specs, policy=policy)
+    except NoEligibleModelError as exc:
+        return {"content": [{"type": "text", "text": str(exc)}], "isError": True}
+    except ValueError as exc:
+        return {"content": [{"type": "text", "text": str(exc)}], "isError": True}
+
+    payload = decision.to_artifact_payload()
+    payload["registry_path"] = str(registry_path)
+    return {
+        "content": [{"type": "text", "text": json.dumps(payload, indent=2)}],
+        "isError": False,
+    }
+
+
+def run_list_models(args: JsonObject) -> JsonObject:
+    """Return the registry as JSON. Mirrors `puppetmaster models list --json`."""
+    from dataclasses import asdict
+
+    from puppetmaster.model_registry import default_registry_path, load_registry
+
+    registry_path_arg = args.get("registry_path")
+    registry_path = (
+        Path(str(registry_path_arg)).expanduser()
+        if registry_path_arg
+        else default_registry_path()
+    )
+    try:
+        specs = load_registry(registry_path)
+    except RuntimeError as exc:
+        return {
+            "content": [{"type": "text", "text": f"registry error: {exc}"}],
+            "isError": True,
+        }
+    payload = {
+        "registry_path": str(registry_path),
+        "models": [asdict(s) for s in specs],
+    }
+    return {
+        "content": [{"type": "text", "text": json.dumps(payload, indent=2)}],
+        "isError": False,
+    }
 
 
 def run_cli(command: list[str], args: JsonObject) -> JsonObject:

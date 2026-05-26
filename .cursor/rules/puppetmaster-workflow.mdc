@@ -46,6 +46,16 @@ After kicking off a swarm:
 
 If the swarm completes with empty findings, only verification artifacts, or a degraded Cursor SDK artifact, report Puppetmaster as **degraded** and do not treat the run as a successful analysis.
 
+## Model routing (auto_route)
+
+Puppetmaster ships a task-aware **model router** that picks the right LLM per task. Prefer it over hardcoding `model` in every spec.
+
+- User registry lives at `~/.puppetmaster/models.json`. Inspect with `puppetmaster_list_models`. If empty, ask the user to run `python -m puppetmaster models init`.
+- Opt a worker in by setting `payload.auto_route = true`. The orchestrator picks the cheapest sufficient model, stamps `adapter` + `payload.model`, and persists a `ROUTING` artifact tied to the task.
+- Call `puppetmaster_route_task` to dry-run a decision when the user asks "how much will this cost" / "what model would this use" / "why did task X run on model Y" — the response includes the picked model, estimated USD cost, and every rejected alternative with the reason.
+- Per-task overrides: `payload.min_capability`, `payload.max_cost_usd`, `payload.required_tags`, `payload.routing_policy` (one of `balanced`/`cheap`/`quality`/`escalating`).
+- Read `ROUTING` artifacts to answer "why this model" — the audit trail is in `payload.rejected`.
+
 ## Repo intelligence (CodeGraph)
 
 Puppetmaster auto-injects CodeGraph context into every Cursor and Claude Code worker prompt when `.codegraph/` exists in the target repo. Look for `context:codegraph` in verification artifact evidence to confirm shared context was used.

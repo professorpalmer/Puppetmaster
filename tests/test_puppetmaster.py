@@ -3124,6 +3124,545 @@ print('{"result":"ok"}')
             self.assertIn("missing.json", stderr.getvalue())
 
 
+class ModelRouterTests(unittest.TestCase):
+    """Tests for the user-owned LLM model registry and routing engine.
+
+    These exercise the pure-function pieces (classifier, policy engine,
+    cost estimation) and the orchestrator integration that stamps the
+    chosen model + adapter into the task and persists a ROUTING
+    artifact for the audit trail.
+    """
+
+    def _three_tier_registry(self):
+        from puppetmaster.model_registry import ModelSpec
+
+        return [
+            ModelSpec(
+                id="cheap-model",
+                adapter="claude-code",
+                adapter_model_name="cheap-v1",
+                capability_score=40,
+                input_per_mtok_usd=0.10,
+                output_per_mtok_usd=0.50,
+                tags=["cheap", "fast"],
+            ),
+            ModelSpec(
+                id="mid-model",
+                adapter="claude-code",
+                adapter_model_name="mid-v1",
+                capability_score=80,
+                input_per_mtok_usd=3.0,
+                output_per_mtok_usd=15.0,
+                tags=["balanced"],
+            ),
+            ModelSpec(
+                id="frontier-model",
+                adapter="claude-code",
+                adapter_model_name="frontier-v1",
+                capability_score=95,
+                input_per_mtok_usd=15.0,
+                output_per_mtok_usd=75.0,
+                tags=["frontier", "reasoning"],
+            ),
+        ]
+
+    def test_classifier_assigns_higher_score_to_harder_roles(self) -> None:
+        from puppetmaster.router import TaskSignals, classify_capability_needed
+
+        easy = classify_capability_needed(
+            TaskSignals(instruction="format this file", role="verify-runtime")
+        )
+        hard = classify_capability_needed(
+            TaskSignals(
+                instruction="security audit of authentication across every endpoint",
+                role="audit",
+            )
+        )
+        self.assertLess(easy, hard)
+        self.assertGreaterEqual(hard, 90)
+        self.assertLessEqual(easy, 35)
+
+    def test_classifier_honors_explicit_min_capability_override(self) -> None:
+        from puppetmaster.router import TaskSignals, classify_capability_needed
+
+        # Even a "verify-runtime" role gets escalated when the user pins it.
+        signal = TaskSignals(
+            instruction="ignored", role="verify-runtime", explicit_min_capability=80
+        )
+        self.assertEqual(classify_capability_needed(signal), 80)
+
+    def test_balanced_policy_picks_cheapest_sufficient_model(self) -> None:
+        from puppetmaster.router import TaskSignals, route_task
+
+        # Need ~70 (implement role). Cheapest model that clears the bar is mid-model.
+        signal = TaskSignals(instruction="add a feature", role="implement")
+        decision = route_task(signal, self._three_tier_registry(), policy="balanced")
+        self.assertEqual(decision.model.id, "mid-model")
+        rejected_ids = {spec.id for spec, _ in decision.rejected}
+        self.assertEqual(rejected_ids, {"cheap-model", "frontier-model"})
+
+    def test_balanced_policy_escalates_to_frontier_for_audits(self) -> None:
+        from puppetmaster.router import TaskSignals, route_task
+
+        signal = TaskSignals(
+            instruction="security audit across every module",
+            role="audit",
+        )
+        decision = route_task(signal, self._three_tier_registry(), policy="balanced")
+        self.assertEqual(decision.model.id, "frontier-model")
+
+    def test_cheap_policy_always_picks_lowest_cost(self) -> None:
+        from puppetmaster.router import TaskSignals, route_task
+
+        signal = TaskSignals(
+            instruction="security audit across every module",
+            role="audit",
+        )
+        decision = route_task(signal, self._three_tier_registry(), policy="cheap")
+        # Even though the task needs high capability, cheap policy ignores fit.
+        self.assertEqual(decision.model.id, "cheap-model")
+
+    def test_quality_policy_always_picks_highest_capability(self) -> None:
+        from puppetmaster.router import TaskSignals, route_task
+
+        signal = TaskSignals(instruction="trivial task", role="verify-runtime")
+        decision = route_task(signal, self._three_tier_registry(), policy="quality")
+        self.assertEqual(decision.model.id, "frontier-model")
+
+    def test_required_tag_filter_excludes_models_lacking_tag(self) -> None:
+        from puppetmaster.router import NoEligibleModelError, TaskSignals, route_task
+
+        signal = TaskSignals(
+            instruction="cheap fast task",
+            role="explore",
+            required_tags=["cheap"],
+        )
+        decision = route_task(signal, self._three_tier_registry(), policy="balanced")
+        self.assertEqual(decision.model.id, "cheap-model")
+
+        impossible = TaskSignals(
+            instruction="task", role="explore", required_tags=["nonexistent"]
+        )
+        with self.assertRaises(NoEligibleModelError):
+            route_task(impossible, self._three_tier_registry(), policy="balanced")
+
+    def test_max_cost_budget_rejects_pricier_models(self) -> None:
+        from puppetmaster.router import TaskSignals, route_task
+
+        signal = TaskSignals(
+            instruction="security audit across every module",
+            role="audit",
+            explicit_max_cost_usd=0.01,
+        )
+        decision = route_task(signal, self._three_tier_registry(), policy="balanced")
+        # Frontier is over budget; mid and cheap remain.
+        rejected_ids = {spec.id for spec, _ in decision.rejected}
+        self.assertIn("frontier-model", rejected_ids)
+        # No sufficient model in budget → falls back to highest-capability under cap.
+        self.assertIn("budget", "".join(r for _, r in decision.rejected if r))
+
+    def test_routing_decision_records_rejection_reasons(self) -> None:
+        from puppetmaster.router import TaskSignals, route_task
+
+        signal = TaskSignals(instruction="add a feature", role="implement")
+        decision = route_task(signal, self._three_tier_registry(), policy="balanced")
+        rejected_map = {spec.id: why for spec, why in decision.rejected}
+        self.assertIn("capability_score", rejected_map["cheap-model"])
+        self.assertIn("pricier", rejected_map["frontier-model"])
+
+    def test_artifact_payload_carries_audit_fields(self) -> None:
+        from puppetmaster.router import TaskSignals, route_task
+
+        signal = TaskSignals(instruction="add a feature", role="implement")
+        decision = route_task(signal, self._three_tier_registry(), policy="balanced")
+        payload = decision.to_artifact_payload()
+        for key in (
+            "model_id",
+            "adapter",
+            "adapter_model_name",
+            "policy",
+            "capability_needed",
+            "capability_score",
+            "estimated_cost_usd",
+            "reason",
+            "rejected",
+        ):
+            self.assertIn(key, payload)
+        self.assertEqual(payload["policy"], "balanced")
+        self.assertIsInstance(payload["rejected"], list)
+
+    def test_registry_round_trips_through_disk(self) -> None:
+        from puppetmaster.model_registry import (
+            load_registry,
+            save_registry,
+            starter_registry,
+        )
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "models.json"
+            specs = starter_registry()
+            save_registry(specs, path)
+            loaded = load_registry(path)
+            self.assertEqual(len(loaded), len(specs))
+            self.assertEqual({s.id for s in loaded}, {s.id for s in specs})
+
+    def test_registry_environment_override(self) -> None:
+        from puppetmaster.model_registry import default_registry_path
+
+        with TemporaryDirectory() as tmp:
+            override = str(Path(tmp) / "custom.json")
+            with patch.dict(os.environ, {"PUPPETMASTER_MODELS_PATH": override}):
+                self.assertEqual(default_registry_path(), Path(override))
+
+    def test_cost_estimate_scales_linearly_with_tokens(self) -> None:
+        spec = self._three_tier_registry()[0]
+        small = spec.estimate_cost_usd(1_000, 1_000)
+        big = spec.estimate_cost_usd(10_000, 10_000)
+        self.assertAlmostEqual(big, small * 10, places=6)
+
+    def test_models_init_writes_starter_registry(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "models.json"
+            code = cli_main(["models", "init", "--registry-path", str(path)])
+            self.assertEqual(code, 0)
+            self.assertTrue(path.is_file())
+            payload = json.loads(path.read_text())
+            self.assertIn("models", payload)
+            self.assertGreater(len(payload["models"]), 0)
+
+    def test_models_init_refuses_overwrite_without_force(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "models.json"
+            path.write_text("{}")
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code = cli_main(["models", "init", "--registry-path", str(path)])
+            self.assertEqual(code, 1)
+            self.assertIn("already exists", stderr.getvalue())
+
+    def test_cli_route_command_emits_json(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "models.json"
+            cli_main(["models", "init", "--registry-path", str(path)])
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = cli_main(
+                    [
+                        "route",
+                        "Audit the auth subsystem for security flaws",
+                        "--role",
+                        "audit",
+                        "--registry-path",
+                        str(path),
+                        "--json",
+                    ]
+                )
+            self.assertEqual(code, 0)
+            data = json.loads(stdout.getvalue())
+            self.assertIn("model_id", data)
+            self.assertIn("rejected", data)
+            self.assertEqual(data["policy"], "balanced")
+
+    def test_orchestrator_auto_routes_and_emits_routing_artifact(self) -> None:
+        """End-to-end check: an auto_route spec gets adapter swapped
+        and a ROUTING artifact persisted with the chosen model id."""
+        from puppetmaster.model_registry import save_registry
+        from puppetmaster.models import ArtifactType
+        from puppetmaster.workers import WorkerSpec
+
+        with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "models.json"
+            save_registry(self._three_tier_registry(), registry_path)
+            state_dir = Path(tmp) / ".puppetmaster"
+
+            from puppetmaster.orchestrator import Orchestrator
+            from puppetmaster.store_factory import create_store
+
+            store = create_store("file", state_dir)
+            store.init()
+
+            orchestrator = Orchestrator(store)
+            spec = WorkerSpec(
+                role="audit",
+                instruction="security audit across every endpoint and module",
+                adapter="local",  # router must override this
+                payload={
+                    "auto_route": True,
+                    "registry_path": str(registry_path),
+                    "routing_policy": "balanced",
+                },
+                depends_on_roles=[],
+            )
+
+            # We don't want to actually run an adapter — just inspect that
+            # _create_tasks stamps the chosen model into the task and
+            # persists a ROUTING artifact. Drive _create_tasks directly.
+            job = store.create_job("router integration check")
+            tasks = orchestrator._create_tasks(job, [spec])
+            self.assertEqual(len(tasks), 1)
+            task = tasks[0]
+            self.assertEqual(task.adapter, "claude-code")
+            self.assertEqual(task.payload.get("model"), "frontier-v1")
+            self.assertEqual(task.payload.get("router_model_id"), "frontier-model")
+
+            artifacts = store.list_artifacts(job.id)
+            routing = [a for a in artifacts if a.type == ArtifactType.ROUTING]
+            self.assertEqual(len(routing), 1)
+            self.assertEqual(routing[0].task_id, task.id)
+            self.assertEqual(routing[0].payload["model_id"], "frontier-model")
+            self.assertEqual(routing[0].payload["adapter"], "claude-code")
+            self.assertIn("rejected", routing[0].payload)
+
+    def test_vision_signal_detection_finds_image_references(self) -> None:
+        from puppetmaster.router import has_detailed_vision_signal, has_vision_signal
+
+        self.assertTrue(has_vision_signal("describe the screenshot"))
+        self.assertTrue(has_vision_signal("read this diagram"))
+        self.assertTrue(has_vision_signal("look at the image"))
+        self.assertFalse(has_vision_signal("read this file"))
+        self.assertFalse(has_vision_signal("refactor the database layer"))
+
+        self.assertTrue(
+            has_detailed_vision_signal(
+                "OCR every detail of the diagram"
+            )
+        )
+        self.assertTrue(
+            has_detailed_vision_signal("read this screenshot")
+        )
+        self.assertFalse(has_detailed_vision_signal("describe the screenshot"))
+
+    def test_router_auto_requires_vision_tag_for_image_tasks(self) -> None:
+        from puppetmaster.router import TaskSignals, route_task
+
+        # cheap-model has no vision tag → filtered out automatically.
+        registry = self._three_tier_registry()
+        from dataclasses import replace as dc_replace
+
+        registry = [
+            dc_replace(registry[0], tags=registry[0].tags),  # no vision
+            dc_replace(registry[1], tags=registry[1].tags + ["vision"]),
+            dc_replace(registry[2], tags=registry[2].tags + ["vision"]),
+        ]
+        signal = TaskSignals(
+            instruction="describe this screenshot for me",
+            role="explore",
+        )
+        decision = route_task(signal, registry, policy="balanced")
+        self.assertNotEqual(decision.model.id, "cheap-model")
+        rejected_ids = {spec.id for spec, _ in decision.rejected}
+        self.assertIn("cheap-model", rejected_ids)
+        cheap_reason = next(why for spec, why in decision.rejected if spec.id == "cheap-model")
+        self.assertIn("vision", cheap_reason)
+
+    def test_router_routes_detailed_vision_to_detailed_vision_tagged_model(self) -> None:
+        from puppetmaster.model_registry import starter_registry
+        from puppetmaster.router import TaskSignals, route_task
+
+        signal = TaskSignals(
+            instruction="OCR every detail of the diagram and extract every element in the image",
+            role="explore",
+        )
+        decision = route_task(signal, starter_registry(), policy="balanced")
+        self.assertEqual(decision.model.id, "claude-code/opus-4-7")
+
+    def test_starter_registry_encodes_four_tiers(self) -> None:
+        from puppetmaster.model_registry import starter_registry
+
+        specs = starter_registry()
+        ids = {s.id for s in specs}
+        self.assertIn("cursor/composer-2-5", ids)
+        self.assertIn("cursor/gpt-5-5", ids)
+        self.assertIn("claude-code/opus-4-6", ids)
+        self.assertIn("claude-code/opus-4-7", ids)
+        # Capability scores are monotone across tiers.
+        by_id = {s.id: s for s in specs}
+        self.assertLess(
+            by_id["cursor/composer-2-5"].capability_score,
+            by_id["cursor/gpt-5-5"].capability_score,
+        )
+        self.assertLess(
+            by_id["cursor/gpt-5-5"].capability_score,
+            by_id["claude-code/opus-4-6"].capability_score,
+        )
+        self.assertLess(
+            by_id["claude-code/opus-4-6"].capability_score,
+            by_id["claude-code/opus-4-7"].capability_score,
+        )
+        # Vision tagging matches the user-stated preferences.
+        self.assertNotIn("vision", by_id["cursor/composer-2-5"].tags)
+        self.assertIn("vision", by_id["cursor/gpt-5-5"].tags)
+        self.assertIn("vision", by_id["claude-code/opus-4-6"].tags)
+        self.assertIn("detailed-vision", by_id["claude-code/opus-4-7"].tags)
+        self.assertNotIn(
+            "detailed-vision", by_id["claude-code/opus-4-6"].tags
+        )
+
+    def test_starter_registry_routes_easy_task_to_composer(self) -> None:
+        from puppetmaster.model_registry import starter_registry
+        from puppetmaster.router import TaskSignals, route_task
+
+        decision = route_task(
+            TaskSignals(instruction="format these files", role="verify-runtime"),
+            starter_registry(),
+            policy="balanced",
+        )
+        self.assertEqual(decision.model.id, "cursor/composer-2-5")
+
+    def test_balanced_tie_break_picks_lower_capability_when_costs_equal(self) -> None:
+        from puppetmaster.model_registry import ModelSpec
+        from puppetmaster.router import TaskSignals, route_task
+
+        # Two free models, both sufficient for the task. Tie-break: the
+        # smaller (right-sized) wins instead of wasting the bigger one.
+        registry = [
+            ModelSpec(
+                id="small-free",
+                adapter="cursor",
+                adapter_model_name="small",
+                capability_score=60,
+                input_per_mtok_usd=0.0,
+                output_per_mtok_usd=0.0,
+                tags=["cursor"],
+            ),
+            ModelSpec(
+                id="big-free",
+                adapter="cursor",
+                adapter_model_name="big",
+                capability_score=90,
+                input_per_mtok_usd=0.0,
+                output_per_mtok_usd=0.0,
+                tags=["cursor"],
+            ),
+        ]
+        decision = route_task(
+            TaskSignals(instruction="map the auth module", role="explore"),
+            registry,
+            policy="balanced",
+        )
+        self.assertEqual(decision.model.id, "small-free")
+
+    def test_default_workers_opt_into_auto_routing(self) -> None:
+        from puppetmaster.workers import DEFAULT_WORKERS
+
+        for spec in DEFAULT_WORKERS:
+            self.assertTrue(
+                spec.payload.get("auto_route"),
+                f"DEFAULT_WORKERS[{spec.role}] should auto-route by default",
+            )
+
+    def test_orchestrator_silently_passes_through_when_registry_missing(self) -> None:
+        """If the user hasn't run `models init`, auto-routing must be
+        a no-op — no exception, no orphan ROUTING artifacts."""
+        from puppetmaster.workers import WorkerSpec
+
+        with TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / ".puppetmaster"
+            missing_registry = Path(tmp) / "does-not-exist.json"
+            from puppetmaster.orchestrator import Orchestrator
+            from puppetmaster.store_factory import create_store
+
+            store = create_store("file", state_dir)
+            store.init()
+            orchestrator = Orchestrator(store)
+
+            spec = WorkerSpec(
+                role="explore",
+                instruction="map repo",
+                adapter="local",
+                payload={
+                    "auto_route": True,
+                    "registry_path": str(missing_registry),
+                },
+            )
+            job = store.create_job("empty registry check")
+            tasks = orchestrator._create_tasks(job, [spec])
+            self.assertEqual(tasks[0].adapter, "local")
+
+            from puppetmaster.models import ArtifactType
+
+            artifacts = store.list_artifacts(job.id)
+            self.assertFalse(
+                any(a.type == ArtifactType.ROUTING for a in artifacts)
+            )
+
+    def test_cost_command_sums_routing_artifacts_for_job(self) -> None:
+        from puppetmaster.model_registry import save_registry
+        from puppetmaster.workers import WorkerSpec
+
+        with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "models.json"
+            save_registry(self._three_tier_registry(), registry_path)
+            state_dir = Path(tmp) / ".puppetmaster"
+            from puppetmaster.orchestrator import Orchestrator
+            from puppetmaster.store_factory import create_store
+
+            store = create_store("file", state_dir)
+            store.init()
+            orchestrator = Orchestrator(store)
+            spec = WorkerSpec(
+                role="audit",
+                instruction="security audit across every endpoint",
+                payload={
+                    "auto_route": True,
+                    "registry_path": str(registry_path),
+                },
+            )
+            job = store.create_job("cost check")
+            orchestrator._create_tasks(job, [spec])
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = cli_main(
+                    [
+                        "--state-dir",
+                        str(state_dir),
+                        "--backend",
+                        "file",
+                        "cost",
+                        job.id,
+                        "--json",
+                    ]
+                )
+            self.assertEqual(code, 0)
+            data = json.loads(stdout.getvalue())
+            self.assertEqual(data["job_id"], job.id)
+            self.assertGreater(data["total_estimated_cost_usd"], 0.0)
+            self.assertEqual(len(data["tasks"]), 1)
+            self.assertEqual(data["tasks"][0]["role"], "audit")
+
+    def test_orchestrator_passes_through_specs_without_auto_route(self) -> None:
+        from puppetmaster.workers import WorkerSpec
+
+        with TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / ".puppetmaster"
+            from puppetmaster.orchestrator import Orchestrator
+            from puppetmaster.store_factory import create_store
+
+            store = create_store("file", state_dir)
+            store.init()
+            orchestrator = Orchestrator(store)
+
+            spec = WorkerSpec(
+                role="explore",
+                instruction="map the repo",
+                adapter="local",
+                payload={"model": "user-chosen-model"},
+            )
+            job = store.create_job("no auto-route")
+            tasks = orchestrator._create_tasks(job, [spec])
+            self.assertEqual(tasks[0].adapter, "local")
+            self.assertEqual(tasks[0].payload["model"], "user-chosen-model")
+
+            # No routing artifact when auto_route is off.
+            from puppetmaster.models import ArtifactType
+
+            artifacts = store.list_artifacts(job.id)
+            self.assertFalse(
+                any(a.type == ArtifactType.ROUTING for a in artifacts)
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
 
