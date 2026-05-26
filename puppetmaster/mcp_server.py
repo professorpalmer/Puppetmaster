@@ -756,6 +756,21 @@ def tools() -> list[McpTool]:
             handler=start_claude,
         ),
         McpTool(
+            name="puppetmaster_openai",
+            description=(
+                "Run an OpenAI Chat Completions worker through Puppetmaster and wait for "
+                "completion. Uses OPENAI_API_KEY; returns structured artifacts."
+            ),
+            input_schema=openai_schema(),
+            handler=run_openai,
+        ),
+        McpTool(
+            name="puppetmaster_start_openai",
+            description="Start an OpenAI worker asynchronously and return job_id immediately.",
+            input_schema=openai_schema(),
+            handler=start_openai,
+        ),
+        McpTool(
             name="puppetmaster_start_swarm",
             description="Start a local Puppetmaster swarm asynchronously and return job_id immediately.",
             input_schema=swarm_schema(),
@@ -1253,6 +1268,38 @@ def claude_command(args: JsonObject) -> list[str]:
     return command
 
 
+def run_openai(args: JsonObject) -> JsonObject:
+    return run_cli(openai_command(args), args)
+
+
+def start_openai(args: JsonObject) -> JsonObject:
+    return start_cli(openai_command(args), args)
+
+
+def openai_command(args: JsonObject) -> list[str]:
+    goal = require_string(args, "goal")
+    command = ["openai", goal, "--cwd", cwd(args)]
+    if args.get("model"):
+        command.extend(["--model", str(args["model"])])
+    if args.get("timeout_seconds"):
+        command.extend(["--timeout-seconds", str(args["timeout_seconds"])])
+    if args.get("openai_base_url"):
+        command.extend(["--base-url", str(args["openai_base_url"])])
+    if args.get("openai_organization"):
+        command.extend(["--organization", str(args["openai_organization"])])
+    if args.get("max_output_tokens") is not None:
+        command.extend(["--max-output-tokens", str(int(args["max_output_tokens"]))])
+    if args.get("legacy_max_tokens"):
+        command.append("--legacy-max-tokens")
+    if args.get("temperature") is not None:
+        command.extend(["--temperature", str(float(args["temperature"]))])
+    if args.get("reasoning_effort"):
+        command.extend(["--reasoning-effort", str(args["reasoning_effort"])])
+    if args.get("disable_codegraph"):
+        command.append("--disable-codegraph")
+    return command
+
+
 def start_swarm(args: JsonObject) -> JsonObject:
     goal = require_string(args, "goal")
     command = ["run", goal]
@@ -1312,7 +1359,20 @@ def write_generated_swarm_config(args: JsonObject, roles: list[str], adapter: st
     config_path = config_dir / f"swarm_{int(time.time() * 1000)}_{os.getpid()}.json"
     goal = require_string(args, "goal")
     timeout_seconds = int(args.get("timeout_seconds") or 900)
-    model = str(args.get("model") or "default")
+    explicit_model = args.get("model")
+    model = str(explicit_model or "default")
+    # Auto-routing is ON by default for MCP swarms (matches DEFAULT_WORKERS and the
+    # v0.6.0 docs). It is suppressed only if the caller (a) pinned a specific model
+    # via the `model` arg, or (b) explicitly passed auto_route=false.
+    auto_route_arg = args.get("auto_route")
+    if auto_route_arg is not None:
+        auto_route_enabled = bool(auto_route_arg)
+    else:
+        auto_route_enabled = not bool(explicit_model)
+    routing_policy = args.get("routing_policy")
+    max_cost_usd = args.get("max_cost_usd")
+    min_capability = args.get("min_capability")
+    required_tags = args.get("required_tags")
     workers = []
     for role in roles:
         prompt = (
@@ -1325,6 +1385,16 @@ def write_generated_swarm_config(args: JsonObject, roles: list[str], adapter: st
         payload: JsonObject = {"prompt": prompt, "cwd": cwd(args), "timeout_seconds": timeout_seconds}
         if adapter == "cursor":
             payload["model"] = model
+        if auto_route_enabled:
+            payload["auto_route"] = True
+            if isinstance(routing_policy, str) and routing_policy:
+                payload["routing_policy"] = routing_policy
+            if isinstance(max_cost_usd, (int, float)):
+                payload["max_cost_usd"] = float(max_cost_usd)
+            if isinstance(min_capability, int):
+                payload["min_capability"] = int(min_capability)
+            if isinstance(required_tags, list) and required_tags:
+                payload["required_tags"] = [str(tag) for tag in required_tags if str(tag).strip()]
         workers.append(
             {
                 "role": role,
@@ -1645,6 +1715,12 @@ def environment(args: JsonObject) -> dict[str, str]:
         env["ANTHROPIC_API_KEY"] = str(args["anthropic_api_key"])
     if args.get("claude_code_command"):
         env["CLAUDE_CODE_COMMAND"] = str(args["claude_code_command"])
+    if args.get("openai_api_key"):
+        env["OPENAI_API_KEY"] = str(args["openai_api_key"])
+    if args.get("openai_base_url"):
+        env["OPENAI_BASE_URL"] = str(args["openai_base_url"])
+    if args.get("openai_organization"):
+        env["OPENAI_ORG_ID"] = str(args["openai_organization"])
     return env
 
 
@@ -1789,6 +1865,31 @@ def swarm_schema() -> JsonObject:
                 "enum": ["subprocess", "inline", "daemon"],
                 "default": "subprocess",
                 "description": "Worker execution mode.",
+            },
+            "auto_route": {
+                "type": "boolean",
+                "description": (
+                    "Enable per-task model routing. Defaults to true when no `model` is pinned, "
+                    "false otherwise. Pass true to force-route even with a pinned model, or false to disable."
+                ),
+            },
+            "routing_policy": {
+                "type": "string",
+                "enum": ["balanced", "cheap", "quality", "escalating"],
+                "description": "Routing policy for auto-routed workers. Defaults to 'balanced'.",
+            },
+            "max_cost_usd": {
+                "type": "number",
+                "description": "Hard cap on estimated per-call USD cost for auto-routed workers.",
+            },
+            "min_capability": {
+                "type": "integer",
+                "description": "Force classifier output to this value (0..100) for auto-routed workers.",
+            },
+            "required_tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Only consider models whose tags include ALL of these for auto-routed workers.",
             },
         }
     )
@@ -2011,6 +2112,59 @@ def claude_schema() -> JsonObject:
             "claude_code_command": {
                 "type": "string",
                 "description": "Optional Claude Code command, such as npx -y @anthropic-ai/claude-code.",
+            },
+        }
+    )
+    return schema
+
+
+def openai_schema() -> JsonObject:
+    schema = goal_schema("Produce structured findings/risks/decisions for the requested task.")
+    schema["properties"].update(
+        {
+            "openai_api_key": {
+                "type": "string",
+                "description": "Optional OpenAI API key. Prefer MCP env config instead.",
+            },
+            "openai_base_url": {
+                "type": "string",
+                "description": "Override the OpenAI base URL (e.g. for OpenAI-compatible providers).",
+            },
+            "openai_organization": {
+                "type": "string",
+                "description": "Optional OpenAI organization id.",
+            },
+            "max_output_tokens": {
+                "type": "integer",
+                "description": "Cap on completion tokens. Off by default to let the model finish.",
+            },
+            "legacy_max_tokens": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "Send the deprecated `max_tokens` field instead of "
+                    "`max_completion_tokens`. Use for OpenAI-compatible providers."
+                ),
+            },
+            "temperature": {
+                "type": "number",
+                "description": "Sampling temperature override (only sent if provided).",
+            },
+            "reasoning_effort": {
+                "type": "string",
+                "enum": ["none", "low", "medium", "high", "xhigh"],
+                "description": "Reasoning effort level for GPT-5+ models.",
+            },
+            "disable_codegraph": {
+                "type": "boolean",
+                "default": False,
+                "description": "Skip CodeGraph context injection (e.g. for non-repo prompts).",
+            },
+            "worker_mode": {
+                "type": "string",
+                "enum": ["subprocess", "inline", "daemon"],
+                "default": "inline",
+                "description": "Worker execution mode.",
             },
         }
     )

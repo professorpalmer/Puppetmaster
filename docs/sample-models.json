@@ -54,6 +54,50 @@
       "context_window": 200000,
       "tags": ["claude", "frontier", "vision", "detailed-vision", "reasoning", "code"],
       "notes": "Frontier tier. Slow + expensive, but best for detailed vision, complex reasoning, audits, security review. PLACEHOLDER: edit adapter_model_name to 'claude-opus-4-7' when Opus 4.7 ships."
+    },
+    {
+      "id": "openai/gpt-5-5",
+      "adapter": "openai",
+      "adapter_model_name": "gpt-5.5",
+      "capability_score": 96,
+      "input_per_mtok_usd": 5.0,
+      "output_per_mtok_usd": 30.0,
+      "context_window": 1000000,
+      "tags": ["openai", "frontier", "vision", "detailed-vision", "reasoning", "code"],
+      "notes": "OpenAI frontier coding/reasoning model. 1M context, 128K max output. Routes through the openai adapter (needs OPENAI_API_KEY)."
+    },
+    {
+      "id": "openai/gpt-5-4",
+      "adapter": "openai",
+      "adapter_model_name": "gpt-5.4",
+      "capability_score": 86,
+      "input_per_mtok_usd": 2.5,
+      "output_per_mtok_usd": 15.0,
+      "context_window": 1000000,
+      "tags": ["openai", "quality", "fast", "vision", "code", "reasoning"],
+      "notes": "OpenAI workhorse. 1M context at half the price of GPT-5.5. Good default for implementation tasks where you don't need frontier reasoning."
+    },
+    {
+      "id": "openai/gpt-5-4-mini",
+      "adapter": "openai",
+      "adapter_model_name": "gpt-5.4-mini",
+      "capability_score": 70,
+      "input_per_mtok_usd": 0.75,
+      "output_per_mtok_usd": 4.5,
+      "context_window": 400000,
+      "tags": ["openai", "balanced", "fast", "vision", "code"],
+      "notes": "OpenAI mini. 400K context. Cheap enough to run as a default for exploration and verification while staying capable."
+    },
+    {
+      "id": "openai/gpt-5-4-nano",
+      "adapter": "openai",
+      "adapter_model_name": "gpt-5.4-nano",
+      "capability_score": 52,
+      "input_per_mtok_usd": 0.15,
+      "output_per_mtok_usd": 0.9,
+      "context_window": 400000,
+      "tags": ["openai", "cheap", "fast", "reading"],
+      "notes": "OpenAI nano. Cheapest GPT-5 tier for high-throughput reading and trivial edits. Pricing is an estimate; update when nano pricing is public."
     }
   ]
 }

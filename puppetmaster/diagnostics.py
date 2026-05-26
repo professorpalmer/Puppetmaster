@@ -42,6 +42,7 @@ def run_doctor(root: Path, state_dir: Optional[Path] = None) -> list[Check]:
         _codegraph_check(root),
         _mcp_servers_check(),
         _env_check("CURSOR_API_KEY"),
+        _env_check("OPENAI_API_KEY"),
         _sqlite_state_check(state_path / "state.sqlite3"),
         _git_clean_check(root),
     ]

@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import socket
 import subprocess
 import threading
 import time
@@ -17,9 +18,11 @@ from unittest.mock import patch
 from puppetmaster.adapters import (
     ClaudeCodeAdapter,
     CursorAdapter,
+    OpenAIAdapter,
     build_claude_code_command,
     classify_claude_code_failure,
     classify_cursor_failure,
+    classify_openai_failure,
 )
 from puppetmaster.codegraph import (
     codegraph_affected,
@@ -3464,7 +3467,19 @@ class ModelRouterTests(unittest.TestCase):
             role="explore",
         )
         decision = route_task(signal, starter_registry(), policy="balanced")
-        self.assertEqual(decision.model.id, "claude-code/opus-4-7")
+        # Must land on a detailed-vision-tagged model. Under balanced policy the
+        # cheapest qualifying one wins (so the OpenAI tier may beat the Claude
+        # tier here on price). Both options carry detailed-vision.
+        self.assertIn("detailed-vision", decision.model.tags)
+        # Non-detailed-vision models must show up in rejected with the tag reason.
+        rejected_ids = {spec.id for spec, _ in decision.rejected}
+        self.assertIn("cursor/composer-2-5", rejected_ids)
+        self.assertIn("cursor/gpt-5-5", rejected_ids)
+        # And under quality policy, opus-4-7 (cap 98) still wins over gpt-5.5 (cap 96).
+        quality_decision = route_task(
+            signal, starter_registry(), policy="quality"
+        )
+        self.assertEqual(quality_decision.model.id, "claude-code/opus-4-7")
 
     def test_starter_registry_encodes_four_tiers(self) -> None:
         from puppetmaster.model_registry import starter_registry
@@ -3661,6 +3676,431 @@ class ModelRouterTests(unittest.TestCase):
             self.assertFalse(
                 any(a.type == ArtifactType.ROUTING for a in artifacts)
             )
+
+    def test_mcp_swarm_config_writer_enables_auto_route_by_default(self) -> None:
+        """Regression: MCP start_cursor_swarm / start_swarm must stamp auto_route on
+        every generated worker payload, otherwise the orchestrator's auto-routing path
+        is silently bypassed for the very entry points users hit from Cursor.
+        """
+        from puppetmaster.mcp_server import write_generated_swarm_config
+
+        with TemporaryDirectory() as tmp:
+            args = {"goal": "regression check", "cwd": tmp, "state_dir": str(Path(tmp) / "state")}
+            config_path = write_generated_swarm_config(args, ["explore", "audit"], "cursor")
+            cfg = json.loads(Path(config_path).read_text())
+
+            self.assertEqual(len(cfg["workers"]), 2)
+            for worker in cfg["workers"]:
+                payload = worker["payload"]
+                self.assertTrue(
+                    payload.get("auto_route"),
+                    f"auto_route should default to True for MCP swarm role={worker['role']}, "
+                    f"got payload={payload}",
+                )
+
+    def test_mcp_swarm_config_writer_respects_pinned_model(self) -> None:
+        """When the MCP caller pins a model, auto_route should default to off so the
+        user's pin is honored.
+        """
+        from puppetmaster.mcp_server import write_generated_swarm_config
+
+        with TemporaryDirectory() as tmp:
+            args = {
+                "goal": "pin check",
+                "cwd": tmp,
+                "state_dir": str(Path(tmp) / "state"),
+                "model": "opus-4-7",
+            }
+            config_path = write_generated_swarm_config(args, ["audit"], "cursor")
+            cfg = json.loads(Path(config_path).read_text())
+
+            payload = cfg["workers"][0]["payload"]
+            self.assertEqual(payload["model"], "opus-4-7")
+            self.assertNotIn("auto_route", payload)
+
+    def test_mcp_swarm_config_writer_force_route_with_pinned_model(self) -> None:
+        """Caller can force auto_route=True even with a pinned model; routing knobs
+        (routing_policy, max_cost_usd, min_capability, required_tags) propagate.
+        """
+        from puppetmaster.mcp_server import write_generated_swarm_config
+
+        with TemporaryDirectory() as tmp:
+            args = {
+                "goal": "force route",
+                "cwd": tmp,
+                "state_dir": str(Path(tmp) / "state"),
+                "model": "opus-4-7",
+                "auto_route": True,
+                "routing_policy": "quality",
+                "max_cost_usd": 1.5,
+                "min_capability": 90,
+                "required_tags": ["vision"],
+            }
+            config_path = write_generated_swarm_config(args, ["audit"], "cursor")
+            cfg = json.loads(Path(config_path).read_text())
+
+            payload = cfg["workers"][0]["payload"]
+            self.assertTrue(payload.get("auto_route"))
+            self.assertEqual(payload.get("routing_policy"), "quality")
+            self.assertEqual(payload.get("max_cost_usd"), 1.5)
+            self.assertEqual(payload.get("min_capability"), 90)
+            self.assertEqual(payload.get("required_tags"), ["vision"])
+
+    def test_mcp_swarm_config_writer_explicit_opt_out(self) -> None:
+        """auto_route=False from MCP must keep generated payloads routing-free."""
+        from puppetmaster.mcp_server import write_generated_swarm_config
+
+        with TemporaryDirectory() as tmp:
+            args = {
+                "goal": "opt out",
+                "cwd": tmp,
+                "state_dir": str(Path(tmp) / "state"),
+                "auto_route": False,
+            }
+            config_path = write_generated_swarm_config(args, ["explore"], "cursor")
+            cfg = json.loads(Path(config_path).read_text())
+
+            payload = cfg["workers"][0]["payload"]
+            self.assertNotIn("auto_route", payload)
+
+
+class _FakeUrlopenResponse:
+    """Stand-in for a urlopen() context manager returning a fixed body + status."""
+
+    def __init__(self, body: str, status: int = 200) -> None:
+        self._body = body.encode("utf-8")
+        self._status = status
+
+    def __enter__(self) -> "_FakeUrlopenResponse":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def getcode(self) -> int:
+        return self._status
+
+    def read(self) -> bytes:
+        return self._body
+
+
+class OpenAIAdapterTests(unittest.TestCase):
+    """Covers the OpenAI adapter end-to-end: happy path, error paths, env handling.
+
+    The adapter calls urllib.request.urlopen against the Chat Completions API.
+    We mock that call surface so the tests are hermetic (no network, no API key
+    required).
+    """
+
+    def _task(self, **payload_overrides: object) -> "Task":
+        from puppetmaster.models import Task
+
+        payload = {
+            "prompt": "Inspect the auth module and surface findings.",
+            "cwd": ".",
+            "model": "gpt-5.4-mini",
+            "timeout_seconds": 30,
+            "disable_codegraph": True,
+        }
+        payload.update(payload_overrides)
+        return Task(
+            job_id="job-openai",
+            role="openai-explore",
+            instruction="Inspect the auth module and surface findings.",
+            adapter="openai",
+            payload=payload,
+        )
+
+    def test_openai_adapter_parses_chat_completion_into_artifacts(self) -> None:
+        from puppetmaster.models import ArtifactType
+
+        response_body = {
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "model": "gpt-5.4-mini",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps(
+                            {
+                                "artifacts": [
+                                    {
+                                        "type": "finding",
+                                        "claim": "auth.login swallows DB exceptions.",
+                                        "evidence": ["app/auth.py:42"],
+                                        "confidence": 0.86,
+                                    },
+                                    {
+                                        "type": "risk",
+                                        "risk": "Silent failure on DB outage.",
+                                        "mitigation": "Re-raise after logging.",
+                                        "evidence": ["app/auth.py:42"],
+                                        "confidence": 0.82,
+                                    },
+                                ]
+                            }
+                        ),
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 420, "completion_tokens": 180, "total_tokens": 600},
+        }
+        fake_response = _FakeUrlopenResponse(json.dumps(response_body))
+
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test"}, clear=False), patch(
+            "puppetmaster.adapters.urllib.request.urlopen", return_value=fake_response
+        ) as urlopen:
+            artifacts = OpenAIAdapter().run(self._task(), "goal", "worker-openai")
+
+        # Request built correctly
+        request = urlopen.call_args[0][0]
+        self.assertEqual(request.method or "POST", "POST")
+        self.assertEqual(request.full_url, "https://api.openai.com/v1/chat/completions")
+        body = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(body["model"], "gpt-5.4-mini")
+        self.assertEqual(body["response_format"], {"type": "json_object"})
+        self.assertEqual(body["messages"][0]["role"], "user")
+        self.assertIn("Puppetmaster artifact contract", body["messages"][0]["content"])
+        self.assertEqual(request.headers["Authorization"], "Bearer sk-test")
+
+        # Artifacts parsed
+        types = [a.type for a in artifacts]
+        self.assertIn(ArtifactType.VERIFICATION, types)
+        self.assertIn(ArtifactType.FINDING, types)
+        self.assertIn(ArtifactType.RISK, types)
+        verification = next(a for a in artifacts if a.type == ArtifactType.VERIFICATION)
+        self.assertEqual(verification.payload["result"], "passed")
+        self.assertEqual(verification.payload["tokens_in"], 420)
+        self.assertEqual(verification.payload["tokens_out"], 180)
+        self.assertEqual(verification.payload["tokens_total"], 600)
+        self.assertEqual(verification.payload["finish_reason"], "stop")
+        self.assertEqual(verification.payload["model"], "gpt-5.4-mini")
+
+    def test_openai_adapter_missing_api_key_fails_fast_without_http(self) -> None:
+        with patch.dict(os.environ, {}, clear=True), patch(
+            "puppetmaster.adapters.urllib.request.urlopen"
+        ) as urlopen:
+            artifacts = OpenAIAdapter().run(self._task(), "goal", "worker-openai")
+
+        urlopen.assert_not_called()
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(artifacts[0].payload["failure"], "missing_api_key")
+        self.assertEqual(artifacts[0].payload["result"], "failed")
+
+    def test_openai_adapter_accepts_api_key_from_payload(self) -> None:
+        """payload['openai_api_key'] should override missing env var."""
+        fake_response = _FakeUrlopenResponse(
+            json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {"content": '{"artifacts":[]}'},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+                }
+            )
+        )
+        with patch.dict(os.environ, {}, clear=True), patch(
+            "puppetmaster.adapters.urllib.request.urlopen", return_value=fake_response
+        ) as urlopen:
+            artifacts = OpenAIAdapter().run(
+                self._task(openai_api_key="sk-payload-override"),
+                "goal",
+                "worker-openai",
+            )
+        request = urlopen.call_args[0][0]
+        self.assertEqual(request.headers["Authorization"], "Bearer sk-payload-override")
+        # No artifacts -> degraded (success but no structured findings)
+        self.assertEqual(artifacts[0].payload["result"], "degraded")
+
+    def test_openai_adapter_http_401_maps_to_missing_api_key(self) -> None:
+        import urllib.error
+
+        error = urllib.error.HTTPError(
+            "https://api.openai.com/v1/chat/completions",
+            401,
+            "Unauthorized",
+            {},
+            io.BytesIO(b'{"error":{"message":"invalid api key"}}'),
+        )
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-bogus"}, clear=False), patch(
+            "puppetmaster.adapters.urllib.request.urlopen", side_effect=error
+        ):
+            artifacts = OpenAIAdapter().run(self._task(), "goal", "worker-openai")
+
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(artifacts[0].payload["failure"], "missing_api_key")
+        self.assertEqual(artifacts[0].payload["returncode"], 401)
+
+    def test_openai_adapter_http_429_maps_to_rate_limit(self) -> None:
+        import urllib.error
+
+        error = urllib.error.HTTPError(
+            "https://api.openai.com/v1/chat/completions",
+            429,
+            "Too Many Requests",
+            {},
+            io.BytesIO(b"rate limit reached"),
+        )
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "sk"}, clear=False), patch(
+            "puppetmaster.adapters.urllib.request.urlopen", side_effect=error
+        ):
+            artifacts = OpenAIAdapter().run(self._task(), "goal", "worker-openai")
+
+        self.assertEqual(artifacts[0].payload["failure"], "rate_limit")
+        self.assertEqual(artifacts[0].payload["returncode"], 429)
+
+    def test_openai_adapter_timeout_surfaces_as_failure(self) -> None:
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "sk"}, clear=False), patch(
+            "puppetmaster.adapters.urllib.request.urlopen",
+            side_effect=socket.timeout("timed out"),
+        ):
+            artifacts = OpenAIAdapter().run(self._task(), "goal", "worker-openai")
+
+        self.assertEqual(artifacts[0].payload["failure"], "timeout")
+        self.assertEqual(artifacts[0].payload["result"], "failed")
+
+    def test_openai_adapter_passes_base_url_organization_and_optional_knobs(self) -> None:
+        fake_response = _FakeUrlopenResponse(
+            json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {"content": '{"artifacts":[]}'},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {},
+                }
+            )
+        )
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "sk"}, clear=False), patch(
+            "puppetmaster.adapters.urllib.request.urlopen", return_value=fake_response
+        ) as urlopen:
+            OpenAIAdapter().run(
+                self._task(
+                    openai_base_url="https://api.example.invalid/v1",
+                    openai_organization="org-puppetmaster",
+                    max_output_tokens=2048,
+                    temperature=0.4,
+                ),
+                "goal",
+                "worker-openai",
+            )
+
+        request = urlopen.call_args[0][0]
+        self.assertEqual(
+            request.full_url, "https://api.example.invalid/v1/chat/completions"
+        )
+        # urllib lowercases custom header keys
+        header_keys = {k.lower(): v for k, v in request.headers.items()}
+        self.assertEqual(header_keys.get("openai-organization"), "org-puppetmaster")
+        body = json.loads(request.data.decode("utf-8"))
+        # GPT-5+ family uses `max_completion_tokens`; we default to that name.
+        self.assertEqual(body["max_completion_tokens"], 2048)
+        self.assertNotIn("max_tokens", body)
+        self.assertEqual(body["temperature"], 0.4)
+
+    def test_openai_adapter_legacy_max_tokens_opt_in(self) -> None:
+        """Some OpenAI-compatible providers still want the old `max_tokens` key.
+        legacy_max_tokens=True forces the legacy parameter name.
+        """
+        fake_response = _FakeUrlopenResponse(
+            json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {"content": '{"artifacts":[]}'},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {},
+                }
+            )
+        )
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "sk"}, clear=False), patch(
+            "puppetmaster.adapters.urllib.request.urlopen", return_value=fake_response
+        ) as urlopen:
+            OpenAIAdapter().run(
+                self._task(max_output_tokens=512, legacy_max_tokens=True),
+                "goal",
+                "worker-openai",
+            )
+        body = json.loads(urlopen.call_args[0][0].data.decode("utf-8"))
+        self.assertEqual(body["max_tokens"], 512)
+        self.assertNotIn("max_completion_tokens", body)
+
+    def test_openai_adapter_reasoning_effort_passthrough(self) -> None:
+        fake_response = _FakeUrlopenResponse(
+            json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {"content": '{"artifacts":[]}'},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {},
+                }
+            )
+        )
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "sk"}, clear=False), patch(
+            "puppetmaster.adapters.urllib.request.urlopen", return_value=fake_response
+        ) as urlopen:
+            OpenAIAdapter().run(
+                self._task(reasoning_effort="high"),
+                "goal",
+                "worker-openai",
+            )
+        body = json.loads(urlopen.call_args[0][0].data.decode("utf-8"))
+        self.assertEqual(body["reasoning_effort"], "high")
+
+    def test_classify_openai_failure_covers_known_buckets(self) -> None:
+        self.assertEqual(classify_openai_failure("", 401), "missing_api_key")
+        self.assertEqual(classify_openai_failure("", 403), "forbidden")
+        self.assertEqual(classify_openai_failure("", 404), "model_unavailable")
+        self.assertEqual(classify_openai_failure("", 429), "rate_limit")
+        self.assertEqual(classify_openai_failure("", 503), "openai_server_error")
+        self.assertEqual(
+            classify_openai_failure("Rate limit exceeded", None), "rate_limit"
+        )
+        self.assertEqual(
+            classify_openai_failure("model not found", None), "model_unavailable"
+        )
+        self.assertEqual(
+            classify_openai_failure("maximum context length", None),
+            "context_length_exceeded",
+        )
+        self.assertEqual(classify_openai_failure("weird error", None), "unknown")
+
+    def test_openai_starter_registry_includes_gpt_5_family(self) -> None:
+        from puppetmaster.model_registry import starter_registry
+
+        registry = {spec.id: spec for spec in starter_registry()}
+        for expected in (
+            "openai/gpt-5-5",
+            "openai/gpt-5-4",
+            "openai/gpt-5-4-mini",
+            "openai/gpt-5-4-nano",
+        ):
+            self.assertIn(expected, registry, f"missing {expected}")
+
+        gpt55 = registry["openai/gpt-5-5"]
+        self.assertEqual(gpt55.adapter, "openai")
+        self.assertEqual(gpt55.adapter_model_name, "gpt-5.5")
+        self.assertEqual(gpt55.input_per_mtok_usd, 5.0)
+        self.assertEqual(gpt55.output_per_mtok_usd, 30.0)
+        self.assertGreater(gpt55.capability_score, 90)
+        self.assertIn("vision", gpt55.tags)
+
+        nano = registry["openai/gpt-5-4-nano"]
+        self.assertEqual(nano.adapter_model_name, "gpt-5.4-nano")
+        self.assertIn("cheap", nano.tags)
+        self.assertLess(nano.capability_score, 60)
 
 
 if __name__ == "__main__":
