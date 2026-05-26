@@ -208,7 +208,7 @@ def starter_registry() -> list[ModelSpec]:
             id="claude-code/opus-4-7",
             adapter="claude-code",
             adapter_model_name="claude-opus-4-5",
-            capability_score=96,
+            capability_score=98,
             input_per_mtok_usd=15.0,
             output_per_mtok_usd=75.0,
             context_window=200_000,
