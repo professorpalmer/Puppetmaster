@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.6.0-beta.3
+
+- **Opus 4.7 starter score 96 → 98.** A real-world audit task scores 98 on the classifier (audit base 85 + `security` +15 + `every endpoint` +10, capped at 98). With the previous 96, every audit dry-run printed a noisy *"NO model meets capability need (98); falling back to highest-capability available"* — cosmetic, not actually broken, but it looked like a misconfiguration. Bumping Opus 4.7 to 98 makes it an exact-clear of the audit bar so the warning only fires when a user explicitly sets `payload.min_capability = 100`. `docs/sample-models.json` synced to the same value.
+- **Test isolation: `tests/conftest.py` forces an empty registry during `pytest`.** After v0.6.0-beta.2's `auto_route: True` default on `DEFAULT_WORKERS`, any developer who had run `puppetmaster models init` on their machine would see Orchestrator tests start invoking the real `claude-code` / `cursor` adapters during the suite — tests are now hermetic regardless of `~/.puppetmaster/models.json` state. The fixture sets `PUPPETMASTER_MODELS_PATH` to a nonexistent path, which makes `_apply_auto_routing` a clean no-op. Tests that exercise routing directly still write their own registry into a `TemporaryDirectory` and pass `payload.registry_path` explicitly, so this fixture does not interfere with them.
+- 162/162 tests passing on a machine with a populated user registry (previously: 8 regressions).
+
 ## v0.6.0-beta.2
 
 - **Auto-routing is now the default on built-in swarm workers.** `DEFAULT_WORKERS` (used by `puppetmaster_start_cursor_swarm`, `puppetmaster_start_swarm`, and `python -m puppetmaster run`) now ship with `payload.auto_route = True`. Any swarm started through Puppetmaster's MCP surface now consults the router automatically — no per-spec opt-in required. If `~/.puppetmaster/models.json` doesn't exist yet, the orchestrator emits one `router.registry_empty` event and falls back to the spec's declared adapter, so this change is safe even before running `models init`.
