@@ -1,0 +1,71 @@
+{
+  "_about": "Sample LLM model registry for the Puppetmaster router. Copy to ~/.puppetmaster/models.json (or run `puppetmaster models init`), then edit capability_score and prices to match your actual subscriptions. Anything in this file is user-asserted — Puppetmaster does not benchmark or fetch live prices.",
+  "_format": {
+    "id": "user-chosen unique id, e.g. 'anthropic/claude-opus'",
+    "adapter": "puppetmaster adapter name: 'claude-code', 'cursor', or a future raw HTTP adapter",
+    "adapter_model_name": "literal model name passed through to the adapter",
+    "capability_score": "0..100, user-asserted skill (40=cheap helper, 70=balanced, 95=frontier)",
+    "input_per_mtok_usd": "$ per million input tokens",
+    "output_per_mtok_usd": "$ per million output tokens",
+    "context_window": "tokens",
+    "tags": "free-form tags; routing policies can filter on these",
+    "enabled": "set false to skip without deleting",
+    "notes": "optional human-readable notes"
+  },
+  "models": [
+    {
+      "id": "claude-code/sonnet",
+      "adapter": "claude-code",
+      "adapter_model_name": "claude-sonnet-4-5",
+      "capability_score": 82,
+      "input_per_mtok_usd": 3.0,
+      "output_per_mtok_usd": 15.0,
+      "context_window": 200000,
+      "tags": ["claude", "balanced", "code"],
+      "notes": "Default Claude Code workhorse."
+    },
+    {
+      "id": "claude-code/haiku",
+      "adapter": "claude-code",
+      "adapter_model_name": "claude-haiku-4-5",
+      "capability_score": 58,
+      "input_per_mtok_usd": 0.8,
+      "output_per_mtok_usd": 4.0,
+      "context_window": 200000,
+      "tags": ["claude", "cheap", "fast"],
+      "notes": "Cheap tier. Verification, summaries, low-stakes work."
+    },
+    {
+      "id": "claude-code/opus",
+      "adapter": "claude-code",
+      "adapter_model_name": "claude-opus-4-5",
+      "capability_score": 95,
+      "input_per_mtok_usd": 15.0,
+      "output_per_mtok_usd": 75.0,
+      "context_window": 200000,
+      "tags": ["claude", "frontier", "reasoning"],
+      "notes": "Frontier tier. Architecture, hard audits, security reviews."
+    },
+    {
+      "id": "cursor/auto",
+      "adapter": "cursor",
+      "adapter_model_name": "auto",
+      "capability_score": 78,
+      "input_per_mtok_usd": 0.0,
+      "output_per_mtok_usd": 0.0,
+      "context_window": 0,
+      "tags": ["cursor", "balanced"],
+      "notes": "Whatever Cursor's auto-routing picks. Cost depends on your Cursor plan; we don't model it (treated as $0 here, but the router still respects capability)."
+    },
+    {
+      "id": "cursor/sonnet",
+      "adapter": "cursor",
+      "adapter_model_name": "claude-sonnet-4",
+      "capability_score": 82,
+      "input_per_mtok_usd": 0.0,
+      "output_per_mtok_usd": 0.0,
+      "tags": ["cursor", "claude", "code"],
+      "notes": "Pin the Cursor SDK to a Claude variant."
+    }
+  ]
+}

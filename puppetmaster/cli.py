@@ -381,6 +381,89 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print the before/after registry payload as JSON.",
     )
 
+    models_cmd = subcommands.add_parser(
+        "models",
+        help=(
+            "Manage the LLM model registry the router uses. Lives at "
+            "~/.puppetmaster/models.json by default (override with "
+            "$PUPPETMASTER_MODELS_PATH)."
+        ),
+    )
+    models_sub = models_cmd.add_subparsers(dest="models_command", required=True)
+    models_init = models_sub.add_parser(
+        "init",
+        help="Write a starter models.json with claude-code + cursor entries.",
+    )
+    models_init.add_argument("--registry-path", help="Override the registry path.")
+    models_init.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an existing registry file.",
+    )
+    models_list = models_sub.add_parser(
+        "list",
+        help="Print the model registry.",
+    )
+    models_list.add_argument("--registry-path", help="Override the registry path.")
+    models_list.add_argument("--json", action="store_true", help="Emit JSON.")
+    models_path = models_sub.add_parser(
+        "path",
+        help="Print the resolved model registry path.",
+    )
+    models_path.add_argument("--registry-path", help="Override the registry path.")
+
+    route_cmd = subcommands.add_parser(
+        "route",
+        help=(
+            "Show which model the router would pick for an instruction, "
+            "including estimated cost and rejected alternatives."
+        ),
+    )
+    route_cmd.add_argument("instruction", help="The task instruction text.")
+    route_cmd.add_argument(
+        "--role",
+        default="explore",
+        help="Task role (drives the capability classifier). Default: explore.",
+    )
+    route_cmd.add_argument(
+        "--policy",
+        default="balanced",
+        choices=["balanced", "cheap", "quality", "escalating"],
+        help="Routing policy. Default: balanced.",
+    )
+    route_cmd.add_argument(
+        "--min-capability",
+        type=int,
+        help="Force the classifier output to this value (0..100).",
+    )
+    route_cmd.add_argument(
+        "--max-cost-usd",
+        type=float,
+        help="Hard cap on estimated USD cost per call.",
+    )
+    route_cmd.add_argument(
+        "--required-tag",
+        action="append",
+        default=[],
+        help="Filter to models whose tags include this. Repeat for multiple.",
+    )
+    route_cmd.add_argument(
+        "--registry-path",
+        help="Override the registry path.",
+    )
+    route_cmd.add_argument("--json", action="store_true", help="Emit JSON.")
+
+    cost_cmd = subcommands.add_parser(
+        "cost",
+        help=(
+            "Sum the estimated USD cost of router decisions for a job. "
+            "Reads ROUTING artifacts that the orchestrator wrote at task "
+            "creation. Auto-pivots across project state dirs."
+        ),
+    )
+    cost_cmd.add_argument("job_id", help="Puppetmaster job id.")
+    cost_cmd.add_argument("--json", action="store_true", help="Emit JSON.")
+
     return parser
 
 
@@ -452,6 +535,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
         "events",
         "status",
         "open",
+        "cost",
     }:
         candidate_job_id = getattr(args, "job_id", None)
         state_dir, store = _resolve_store_for_job(
@@ -481,6 +565,15 @@ def _main(argv: Optional[list[str]] = None) -> int:
 
     if args.command == "mcp":
         return _run_mcp_subcommand(args)
+
+    if args.command == "models":
+        return _run_models_subcommand(args)
+
+    if args.command == "route":
+        return _run_route_command(args)
+
+    if args.command == "cost":
+        return _run_cost_command(args, store)
 
     if args.command == "adapters":
         print(json.dumps(adapter_status(Path.cwd()), indent=2))
@@ -954,6 +1047,246 @@ def _run_mcp_subcommand(args) -> int:
     if args.mcp_command == "cleanup":
         return _run_mcp_cleanup(args)
     raise SystemExit(f"unknown mcp subcommand: {args.mcp_command}")
+
+
+def _registry_path_from_args(args) -> Optional[Path]:
+    raw = getattr(args, "registry_path", None)
+    return Path(raw).expanduser() if raw else None
+
+
+def _run_models_subcommand(args) -> int:
+    """Dispatch `python -m puppetmaster models ...`.
+
+    Three subcommands:
+
+    * ``init`` — write a starter registry the user can edit.
+    * ``list`` — show what's registered, including price + capability.
+    * ``path`` — print the resolved registry path (handy in scripts).
+    """
+    from puppetmaster.model_registry import (
+        default_registry_path,
+        load_registry,
+        save_registry,
+        starter_registry,
+    )
+
+    path = _registry_path_from_args(args) or default_registry_path()
+
+    if args.models_command == "path":
+        print(path)
+        return 0
+
+    if args.models_command == "init":
+        if path.is_file() and not args.force:
+            print(
+                f"error: {path} already exists; pass --force to overwrite",
+                file=sys.stderr,
+            )
+            return 1
+        save_registry(starter_registry(), path)
+        print(f"wrote starter model registry to {path}")
+        print("Edit capability_score / prices to match your subscriptions.")
+        return 0
+
+    if args.models_command == "list":
+        try:
+            specs = load_registry(path)
+        except RuntimeError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        if args.json:
+            from dataclasses import asdict
+
+            print(json.dumps({"path": str(path), "models": [asdict(s) for s in specs]}, indent=2))
+            return 0
+        if not specs:
+            print(f"No models registered (looked at {path}).")
+            print("Run `puppetmaster models init` to write a starter registry.")
+            return 0
+        print(f"{len(specs)} model(s) registered  ({path})")
+        print(
+            f"  {'ID':<28}  {'ADAPTER':<12}  {'CAP':>3}  "
+            f"{'IN $/Mtok':>10}  {'OUT $/Mtok':>10}  TAGS"
+        )
+        for spec in specs:
+            tags = ",".join(spec.tags) if spec.tags else "-"
+            disabled = "" if spec.enabled else "  [disabled]"
+            print(
+                f"  {spec.id:<28}  {spec.adapter:<12}  "
+                f"{spec.capability_score:>3}  "
+                f"{spec.input_per_mtok_usd:>10.3f}  "
+                f"{spec.output_per_mtok_usd:>10.3f}  {tags}{disabled}"
+            )
+        return 0
+
+    raise SystemExit(f"unknown models subcommand: {args.models_command}")
+
+
+def _run_route_command(args) -> int:
+    """Run the router against a free-form instruction and print the decision.
+
+    Use this to sanity-check capability scores and policies before
+    putting them in front of a real swarm. Pairs with the
+    ``puppetmaster_route_task`` MCP tool.
+    """
+    from puppetmaster.model_registry import default_registry_path, load_registry
+    from puppetmaster.router import (
+        NoEligibleModelError,
+        TaskSignals,
+        route_task,
+    )
+
+    path = _registry_path_from_args(args) or default_registry_path()
+    try:
+        specs = load_registry(path)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if not specs:
+        print(
+            f"error: no models registered at {path}. "
+            "Run `puppetmaster models init` first.",
+            file=sys.stderr,
+        )
+        return 1
+
+    signals = TaskSignals(
+        instruction=args.instruction,
+        role=args.role,
+        explicit_min_capability=args.min_capability,
+        explicit_max_cost_usd=args.max_cost_usd,
+        required_tags=list(args.required_tag),
+    )
+    try:
+        decision = route_task(signals, specs, policy=args.policy)
+    except NoEligibleModelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(decision.to_artifact_payload(), indent=2))
+        return 0
+
+    print(
+        f"picked: {decision.model.id}  (adapter={decision.model.adapter}, "
+        f"model_name={decision.model.adapter_model_name})"
+    )
+    print(f"policy: {decision.policy}")
+    print(
+        f"capability needed: {decision.capability_needed}  "
+        f"chosen capability: {decision.model.capability_score}"
+    )
+    print(
+        f"estimated tokens: in={decision.estimated_tokens_in}  "
+        f"out={decision.estimated_tokens_out}  "
+        f"estimated cost: ${decision.estimated_cost_usd:.6f}"
+    )
+    print(f"why: {decision.reason}")
+    if decision.rejected:
+        print("rejected:")
+        for spec, why in decision.rejected:
+            print(f"  - {spec.id}: {why}")
+    return 0
+
+
+def _run_cost_command(args, store) -> int:
+    """Summarize estimated USD spend for a job from its ROUTING artifacts.
+
+    The router writes one ``ArtifactType.ROUTING`` artifact per
+    auto-routed task at task creation, with the chosen model + the
+    estimated USD cost in ``payload.estimated_cost_usd``. This command
+    sums them up and prints a per-model breakdown plus the grand total.
+
+    These are **estimates** based on user-asserted prices in
+    ``~/.puppetmaster/models.json`` — Puppetmaster doesn't call a
+    billing API. They're useful for budgeting, not invoicing.
+    """
+    from puppetmaster.models import ArtifactType
+
+    job_id = args.job_id
+    artifacts = store.list_artifacts(job_id)
+    routing = [a for a in artifacts if a.type == ArtifactType.ROUTING]
+
+    if not routing:
+        msg = (
+            f"No ROUTING artifacts on job {job_id}. Either the job didn't "
+            "auto-route any tasks, or it predates the router (v0.6.0)."
+        )
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "job_id": job_id,
+                        "total_estimated_cost_usd": 0.0,
+                        "tasks": [],
+                        "note": msg,
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            print(msg)
+        return 0
+
+    by_model: dict[str, dict] = {}
+    rows = []
+    total = 0.0
+    for artifact in routing:
+        payload = artifact.payload or {}
+        model_id = payload.get("model_id", "<unknown>")
+        cost = float(payload.get("estimated_cost_usd") or 0.0)
+        total += cost
+        rows.append(
+            {
+                "task_id": artifact.task_id,
+                "role": payload.get("role"),
+                "model_id": model_id,
+                "adapter": payload.get("adapter"),
+                "policy": payload.get("policy"),
+                "capability_needed": payload.get("capability_needed"),
+                "estimated_cost_usd": cost,
+            }
+        )
+        bucket = by_model.setdefault(model_id, {"calls": 0, "cost": 0.0})
+        bucket["calls"] += 1
+        bucket["cost"] += cost
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "job_id": job_id,
+                    "total_estimated_cost_usd": round(total, 6),
+                    "by_model": {
+                        mid: {
+                            "calls": v["calls"],
+                            "estimated_cost_usd": round(v["cost"], 6),
+                        }
+                        for mid, v in by_model.items()
+                    },
+                    "tasks": rows,
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    print(f"job {job_id}: estimated total cost = ${total:.6f}")
+    print()
+    print(f"  {'MODEL':<28}  {'CALLS':>5}  {'COST':>12}")
+    for mid, v in sorted(by_model.items(), key=lambda kv: -kv[1]["cost"]):
+        print(f"  {mid:<28}  {v['calls']:>5}  ${v['cost']:>10.6f}")
+    print()
+    print(f"  {'TASK':<14}  {'ROLE':<14}  {'MODEL':<28}  {'COST':>12}")
+    for row in rows:
+        task_id = (row["task_id"] or "")[:14]
+        role = (row["role"] or "")[:14]
+        model_id = (row["model_id"] or "")[:28]
+        print(
+            f"  {task_id:<14}  {role:<14}  {model_id:<28}  "
+            f"${row['estimated_cost_usd']:>10.6f}"
+        )
+    return 0
 
 
 def _run_mcp_list(args) -> int:

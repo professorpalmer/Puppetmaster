@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Optional
 
-from puppetmaster.models import Artifact, Job, JobStatus, Task, TaskStatus
+from puppetmaster.models import Artifact, ArtifactType, Job, JobStatus, Task, TaskStatus
 from puppetmaster.stitcher import Stitcher
 from puppetmaster.store import SwarmStore
 from puppetmaster.worker_runtime import WorkerRuntime
@@ -120,6 +120,7 @@ class Orchestrator:
             raise
 
     def _create_tasks(self, job: Job, specs: list[WorkerSpec]) -> list[Task]:
+        specs, routing_decisions = self._apply_auto_routing(job, specs)
         tasks_by_role: dict[str, Task] = {}
         for spec in specs:
             task = Task(
@@ -157,7 +158,148 @@ class Orchestrator:
         self._validate_task_graph(tasks)
         for task in tasks:
             self.store.save_task(task)
+        self._emit_routing_artifacts(job, tasks_by_role, routing_decisions)
         return tasks
+
+    def _emit_routing_artifacts(
+        self,
+        job: Job,
+        tasks_by_role: dict[str, Task],
+        routing_decisions: list[tuple[str, dict]],
+    ) -> None:
+        """Persist one ROUTING artifact per auto-routed task.
+
+        Done after task creation so the artifact carries the real
+        ``task_id`` (rather than a placeholder), keeping the audit
+        story consistent with the rest of the store.
+        """
+        for role, artifact_payload in routing_decisions:
+            task = tasks_by_role.get(role)
+            if task is None:
+                continue
+            self.store.save_artifact(
+                Artifact(
+                    job_id=job.id,
+                    task_id=task.id,
+                    type=ArtifactType.ROUTING,
+                    created_by="router",
+                    payload=artifact_payload,
+                    confidence=0.9,
+                    evidence=[
+                        f"role:{role}",
+                        f"policy:{artifact_payload.get('policy')}",
+                        f"capability_needed:{artifact_payload.get('capability_needed')}",
+                    ],
+                )
+            )
+
+    def _apply_auto_routing(
+        self, job: Job, specs: list[WorkerSpec]
+    ) -> tuple[list[WorkerSpec], list[tuple[str, dict]]]:
+        """Resolve ``payload.auto_route`` specs through the model router.
+
+        Specs opt in by setting ``payload["auto_route"] = True``. When set:
+
+        * The router picks a :class:`ModelSpec` based on the spec's role +
+          instruction + payload overrides (``min_capability``,
+          ``max_cost_usd``, ``required_tags``, ``routing_policy``).
+        * The chosen ``adapter`` and model name are stamped into the
+          spec so the existing adapter pipeline runs the right model
+          without any further plumbing.
+        * Routing decisions are returned so the caller can persist them
+          as :class:`ArtifactType.ROUTING` artifacts after task creation
+          (when real ``task_id``s exist).
+
+        Specs that don't opt in are passed through unchanged. The
+        router never silently overrides an explicit choice — opt-in
+        only.
+        """
+        from puppetmaster.model_registry import default_registry_path, load_registry
+        from puppetmaster.router import (
+            NoEligibleModelError,
+            route_task,
+            signals_from_worker_spec,
+        )
+
+        result: list[WorkerSpec] = []
+        decisions: list[tuple[str, dict]] = []
+        registry_cache: Optional[list] = None
+        registry_path: Optional[Path] = None
+        empty_registry_announced = False
+        for spec in specs:
+            payload = spec.payload or {}
+            if not payload.get("auto_route"):
+                result.append(spec)
+                continue
+            if registry_cache is None:
+                registry_path_override = payload.get("registry_path")
+                registry_path = (
+                    Path(str(registry_path_override)).expanduser()
+                    if registry_path_override
+                    else default_registry_path()
+                )
+                registry_cache = load_registry(registry_path)
+            if not registry_cache:
+                # No registry on disk yet (user hasn't run `models init`).
+                # Don't fail the run — pass the spec through unmodified.
+                # Emit one diagnostic event per run so the user can spot
+                # the opportunity to opt in, without spamming.
+                if not empty_registry_announced:
+                    self.store.emit(
+                        job.id,
+                        "router.registry_empty",
+                        {
+                            "registry_path": str(registry_path)
+                            if registry_path
+                            else None,
+                            "hint": (
+                                "Run `python -m puppetmaster models init` "
+                                "to enable per-task model routing."
+                            ),
+                        },
+                    )
+                    empty_registry_announced = True
+                result.append(spec)
+                continue
+            policy = payload.get("routing_policy") or "balanced"
+            signals = signals_from_worker_spec(spec)
+            try:
+                decision = route_task(signals, registry_cache, policy=policy)
+            except NoEligibleModelError as exc:
+                self.store.emit(
+                    job.id,
+                    "router.no_eligible_model",
+                    {
+                        "role": spec.role,
+                        "policy": policy,
+                        "reason": str(exc),
+                        "registry_path": str(registry_path) if registry_path else None,
+                    },
+                )
+                result.append(spec)
+                continue
+
+            new_payload = {
+                **payload,
+                "model": decision.model.adapter_model_name,
+                "router_model_id": decision.model.id,
+                "router_policy": decision.policy,
+                "router_capability_needed": decision.capability_needed,
+                "router_estimated_cost_usd": decision.estimated_cost_usd,
+            }
+            routed_spec = replace(
+                spec,
+                adapter=decision.model.adapter,
+                payload=new_payload,
+            )
+            result.append(routed_spec)
+
+            artifact_payload = decision.to_artifact_payload()
+            artifact_payload["role"] = spec.role
+            artifact_payload["registry_path"] = str(registry_path) if registry_path else None
+            decisions.append((spec.role, artifact_payload))
+
+        return result, decisions
 
     def _with_retrieved_memory(self, specs: list[WorkerSpec], goal: str) -> list[WorkerSpec]:
         memory = self.store.retrieve_memory(goal)

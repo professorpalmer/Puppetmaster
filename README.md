@@ -201,6 +201,159 @@ git worktree add /tmp/puppetmaster-work -b puppetmaster-work
 python -m puppetmaster claude "Implement the approved fix" --cwd /tmp/puppetmaster-work --permission-mode acceptEdits
 ```
 
+## Intelligent model orchestration (new in v0.6.0)
+
+Puppetmaster ships a task-aware **model router** that picks the right LLM for each task instead of pinning one model per adapter. Cheap models handle trivial work, capable models handle hard work, vision tasks land on a vision-capable model, and you see exactly why.
+
+The router is built around three pillars:
+
+1. **A user-owned registry.** You describe your own models, prices, and asserted capability scores in `~/.puppetmaster/models.json` (override with `$PUPPETMASTER_MODELS_PATH`). No hardcoded model names, no live price fetching — your subscriptions, your numbers.
+2. **A transparent classifier.** Pure-function heuristic that assigns a 0..100 capability-needed score from the task's role + instruction + payload (e.g. `verify-runtime` ≈ 25, `explore` ≈ 50, `implement` ≈ 75, `audit/security-review` ≈ 90+). Vision tasks auto-add a `vision` required-tag so non-vision models are filtered out cleanly. Override per-task with `payload.min_capability`.
+3. **Four policies.** `balanced` (default — cheapest sufficient, ties broken toward right-sized smaller models), `cheap`, `quality`, `escalating` (ordered chain for retries). Override per-task with `payload.routing_policy`.
+
+**Every routing decision is a durable artifact.** Picked model, classifier output, estimated USD cost, and the full list of rejected alternatives with the reason each was rejected — all stored as an `ArtifactType.ROUTING` artifact tied to the task. Run `puppetmaster artifacts <job_id>` to see why each task went where, or `puppetmaster cost <job_id>` to sum spend across the run.
+
+### Where it kicks in automatically (and where it doesn't)
+
+This is the part to be honest about:
+
+| Surface                                         | Auto-routes? |
+| ----------------------------------------------- | ------------ |
+| `puppetmaster_start_cursor_swarm` (MCP)         | **YES** — default workers ship with `auto_route: true`. |
+| `puppetmaster_start_swarm` (MCP)                | **YES** — same default workers. |
+| `puppetmaster_start_claude_implement` (MCP)     | Opt-in per call — pass a spec with `auto_route: true` or accept the default. |
+| `python -m puppetmaster run`                    | **YES** for built-in workers; opt-in per spec in a custom config. |
+| Cursor's main chat window (typing `@cursor`)    | **NO.** Cursor's own model picker chooses the chat model — Puppetmaster is not in that loop. The router applies *when Puppetmaster runs a swarm*, not when Cursor's agent is having a conversation with you. |
+| Claude Code's main session                      | **NO** — same reason. Claude Code picks its own session model. |
+
+In other words: **the router governs how Puppetmaster fans work out across its swarm workers; it does not (and cannot) hijack the model your IDE's primary chat agent uses.** If you want the cheap-tier model for trivial chat work, set that as your IDE's default in Cursor settings. The router is for *every task Puppetmaster delegates*, which on a real workflow is far more model invocations than the chat itself.
+
+If you haven't run `puppetmaster models init` yet, auto-routing is a clean no-op: the orchestrator emits one `router.registry_empty` event per run, then falls back to each spec's declared adapter. Nothing breaks.
+
+### The four tiers in the starter registry
+
+`puppetmaster models init` writes four tiered model entries that map directly to the "easy / balanced / high / extra-high" mental model. **The `adapter_model_name` values default to model ids that already work today** (e.g. `composer-1`, `gpt-5`, `claude-opus-4-5`) — when newer versions land, edit `adapter_model_name` in `~/.puppetmaster/models.json` and the tier ids stay stable:
+
+| Tier ID                  | Adapter       | Mental model                                       | Tags |
+| ------------------------ | ------------- | -------------------------------------------------- | ---- |
+| `cursor/composer-2-5`    | `cursor`      | fast / cheap / reading                             | `cheap`, `fast`, `reading`, `code` |
+| `cursor/gpt-5-5`         | `cursor`      | balanced — medium speed, medium capability        | `balanced`, `fast`, `vision` |
+| `claude-code/opus-4-6`   | `claude-code` | high-quality — medium speed, higher cost          | `quality`, `vision`, `reasoning` |
+| `claude-code/opus-4-7`   | `claude-code` | frontier — slow, expensive, best for hard reasoning + detailed vision | `frontier`, `vision`, `detailed-vision`, `reasoning` |
+
+With the starter registry, balanced-policy routing lands roughly:
+
+| Task                                            | Picked model |
+| ----------------------------------------------- | ------------ |
+| `format these files`                            | `cursor/composer-2-5` |
+| `map the auth module`                           | `cursor/composer-2-5` |
+| `add password reset endpoint`                   | `cursor/gpt-5-5` |
+| `decision: which caching strategy fits`         | `claude-code/opus-4-6` |
+| `security audit every endpoint`                 | `claude-code/opus-4-7` |
+| `describe what you see in the screenshot`       | `cursor/gpt-5-5` (vision-tagged) |
+| `OCR every detail of the diagram`               | `claude-code/opus-4-7` (detailed-vision) |
+
+### Quick start
+
+```bash
+# 1. Write a starter registry (claude-code/sonnet, /haiku, /opus + cursor/auto)
+python -m puppetmaster models init
+
+# 2. Inspect the registry
+python -m puppetmaster models list
+
+# 3. Dry-run a routing decision before kicking off a swarm
+python -m puppetmaster route "Security audit across every endpoint" --role audit
+# picked: claude-code/opus  (adapter=claude-code, model_name=claude-opus-4-5)
+# policy: balanced
+# capability needed: 95  chosen capability: 95
+# estimated tokens: in=510  out=5000  estimated cost: $0.382650
+# why: policy=balanced: cheapest model whose capability_score (95) >= needed (95)
+# rejected:
+#   - claude-code/sonnet: capability_score 82 < needed 95
+#   - claude-code/haiku:  capability_score 58 < needed 95
+#   - cursor/auto:        capability_score 78 < needed 95
+
+python -m puppetmaster route "Format these files" --role verify-runtime
+# picked: cursor/auto  (adapter=cursor, model_name=auto)
+# capability needed: 20  chosen capability: 78
+# rejected:
+#   - claude-code/sonnet: sufficient capability but pricier than cursor/auto
+#   - claude-code/haiku:  sufficient capability but pricier than cursor/auto
+#   - claude-code/opus:   sufficient capability but pricier than cursor/auto
+```
+
+### Wiring auto-routing into a swarm
+
+Set `payload.auto_route = true` on any worker spec. The orchestrator replaces the spec's `adapter` and stamps `payload.model` from the router's decision before the task runs, and persists a `ROUTING` artifact:
+
+```python
+from puppetmaster.workers import WorkerSpec
+
+specs = [
+    WorkerSpec(
+        role="explore",
+        instruction="Map the auth subsystem",
+        payload={"auto_route": True},
+    ),
+    WorkerSpec(
+        role="audit",
+        instruction="Find auth bypasses in every endpoint",
+        payload={"auto_route": True, "routing_policy": "quality"},
+    ),
+    WorkerSpec(
+        role="verify-runtime",
+        instruction="Run pytest and report results",
+        payload={"auto_route": True, "max_cost_usd": 0.01},
+    ),
+]
+```
+
+After the run:
+
+```bash
+python -m puppetmaster artifacts <job_id> | jq '.[] | select(.type=="routing") | .payload'
+# {
+#   "model_id": "claude-code/opus",
+#   "adapter": "claude-code",
+#   "policy": "balanced",
+#   "capability_needed": 95,
+#   "capability_score": 95,
+#   "estimated_cost_usd": 0.382650,
+#   "reason": "policy=balanced: cheapest model whose capability_score (95) >= needed (95)",
+#   "rejected": [
+#     {"id": "claude-code/sonnet", "reason": "capability_score 82 < needed 95"},
+#     {"id": "claude-code/haiku",  "reason": "capability_score 58 < needed 95"},
+#     {"id": "cursor/auto",        "reason": "capability_score 78 < needed 95"}
+#   ]
+# }
+```
+
+### Per-task overrides
+
+| Override                       | Effect                                                                 |
+| ------------------------------ | ---------------------------------------------------------------------- |
+| `payload.min_capability` (int) | Force classifier output to this value (0..100).                        |
+| `payload.max_cost_usd` (float) | Hard cap on estimated per-call USD cost. Models over budget are excluded with a clear rejection reason. |
+| `payload.required_tags` (list) | Only consider models whose `tags` include ALL of these.                |
+| `payload.routing_policy` (str) | One of `balanced` (default), `cheap`, `quality`, `escalating`.         |
+| `payload.registry_path` (str)  | Use a different registry file for this task.                           |
+
+### Scope and honesty
+
+v1 routes to adapters that already exist in Puppetmaster (`claude-code` and `cursor`). Those alone cover Sonnet / Haiku / Opus and any Cursor SDK model variant. **Raw HTTP adapters for additional providers (Gemini, DeepSeek, Kimi, OpenAI direct) are not in this release.** They slot in cleanly as new `adapter` values — the registry + router/classifier framework doesn't need to change — but actually building 5 new HTTP clients would have been scope creep without enough quality to ship.
+
+Capability scores and prices stay **user-asserted**. Puppetmaster makes the **decision** transparent (full audit trail of why each task went where); it does not make the **value judgments** for you (whether Sonnet really is an 82, or whether Cursor's "auto" should be treated as $0). Edit the registry to match your reality.
+
+### MCP
+
+Two new MCP tools for agent-side use:
+
+| MCP tool                       | What it does                                                                 |
+| ------------------------------ | ---------------------------------------------------------------------------- |
+| `puppetmaster_route_task`      | Dry-run the router on an instruction. Returns the picked model + cost + rejected alternatives. |
+| `puppetmaster_list_models`     | Print the registry as JSON (path + each model spec).                          |
+
 ## Works great with CodeGraph (optional)
 
 Puppetmaster runs fine without CodeGraph — workers will fall back to grep/read for context discovery, and the orchestration / durable state / parallel-worker machinery is unchanged. When you pair it with [CodeGraph](https://github.com/colbymchenry/codegraph), every Cursor/Claude worker gets a pre-built repo map (symbols, refs, call graph) injected into its prompt instead of having to rediscover the codebase. The two tools optimize different axes and stack cleanly:

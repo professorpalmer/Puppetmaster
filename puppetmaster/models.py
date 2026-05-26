@@ -54,6 +54,7 @@ class ArtifactType(StringEnum):
     VERIFICATION = "verification"
     RISK = "risk"
     MEMORY_SUMMARY = "memory_summary"
+    ROUTING = "routing"
 
 
 @dataclass(frozen=True)
@@ -123,6 +124,7 @@ class Artifact:
             ArtifactType.VERIFICATION: ["check", "result"],
             ArtifactType.RISK: ["risk", "mitigation"],
             ArtifactType.MEMORY_SUMMARY: ["summary"],
+            ArtifactType.ROUTING: ["model_id", "adapter", "policy"],
         }
         for key in required_keys.get(self.type, []):
             if key not in self.payload:
