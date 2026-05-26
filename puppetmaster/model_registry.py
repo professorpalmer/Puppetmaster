@@ -227,6 +227,76 @@ def starter_registry() -> list[ModelSpec]:
                 "(or the exact Anthropic id) when Opus 4.7 is released."
             ),
         ),
+        # OpenAI tier — uses the openai adapter directly with OPENAI_API_KEY,
+        # bypassing Cursor's SDK entirely. Pricing and model IDs are
+        # the publicly-listed GPT-5.4 / GPT-5.5 catalog.
+        ModelSpec(
+            id="openai/gpt-5-5",
+            adapter="openai",
+            adapter_model_name="gpt-5.5",
+            capability_score=96,
+            input_per_mtok_usd=5.0,
+            output_per_mtok_usd=30.0,
+            context_window=1_000_000,
+            tags=[
+                "openai",
+                "frontier",
+                "vision",
+                "detailed-vision",
+                "reasoning",
+                "code",
+            ],
+            notes=(
+                "OpenAI frontier coding/reasoning model. 1M context, 128K "
+                "max output. Comparable capability to Opus 4.7 but cheaper. "
+                "Routes through the openai adapter (needs OPENAI_API_KEY)."
+            ),
+        ),
+        ModelSpec(
+            id="openai/gpt-5-4",
+            adapter="openai",
+            adapter_model_name="gpt-5.4",
+            capability_score=86,
+            input_per_mtok_usd=2.5,
+            output_per_mtok_usd=15.0,
+            context_window=1_000_000,
+            tags=["openai", "quality", "fast", "vision", "code", "reasoning"],
+            notes=(
+                "OpenAI workhorse model. Same 1M context as GPT-5.5 at half "
+                "the price. Good default for implementation tasks where you "
+                "don't need frontier reasoning."
+            ),
+        ),
+        ModelSpec(
+            id="openai/gpt-5-4-mini",
+            adapter="openai",
+            adapter_model_name="gpt-5.4-mini",
+            capability_score=70,
+            input_per_mtok_usd=0.75,
+            output_per_mtok_usd=4.5,
+            context_window=400_000,
+            tags=["openai", "balanced", "fast", "vision", "code"],
+            notes=(
+                "OpenAI mini for coding, computer use, and subagents. 400K "
+                "context. Cheap enough to run as a default for exploration "
+                "and verification while staying capable."
+            ),
+        ),
+        ModelSpec(
+            id="openai/gpt-5-4-nano",
+            adapter="openai",
+            adapter_model_name="gpt-5.4-nano",
+            capability_score=52,
+            input_per_mtok_usd=0.15,
+            output_per_mtok_usd=0.9,
+            context_window=400_000,
+            tags=["openai", "cheap", "fast", "reading"],
+            notes=(
+                "OpenAI nano tier. Cheapest member of the GPT-5 family for "
+                "high-throughput reading, classification, and trivial edits. "
+                "Pricing is an estimate; update once nano pricing is public."
+            ),
+        ),
     ]
 
 

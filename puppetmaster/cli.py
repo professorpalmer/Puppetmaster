@@ -7,7 +7,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from puppetmaster.codegraph_repair import repair_codegraph_sqlite
 from puppetmaster.config import load_config
@@ -272,6 +272,65 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-dirty",
         action="store_true",
         help="Allow Claude Code to run in a dirty working tree.",
+    )
+
+    openai = subcommands.add_parser(
+        "openai",
+        help="Run an OpenAI worker via the Chat Completions API (uses OPENAI_API_KEY).",
+    )
+    openai.add_argument("prompt", help="Prompt for the OpenAI worker.")
+    openai.add_argument(
+        "--cwd",
+        default=str(Path.cwd()),
+        help="Workspace path used for CodeGraph context enrichment.",
+    )
+    openai.add_argument(
+        "--model",
+        default="gpt-5.4-mini",
+        help="OpenAI model id (gpt-5.5, gpt-5.4, gpt-5.4-mini, gpt-5.4-nano, ...).",
+    )
+    openai.add_argument(
+        "--base-url",
+        help="Override the OpenAI base URL (e.g. for OpenAI-compatible providers).",
+    )
+    openai.add_argument(
+        "--organization",
+        help="Optional OpenAI organization id.",
+    )
+    openai.add_argument(
+        "--max-output-tokens",
+        type=int,
+        help="Cap on completion tokens. Off by default to let the model finish.",
+    )
+    openai.add_argument(
+        "--legacy-max-tokens",
+        action="store_true",
+        help=(
+            "Send the deprecated `max_tokens` field instead of `max_completion_tokens`. "
+            "Use for OpenAI-compatible providers that haven't migrated yet."
+        ),
+    )
+    openai.add_argument(
+        "--temperature",
+        type=float,
+        help="Sampling temperature override (only sent if provided).",
+    )
+    openai.add_argument(
+        "--reasoning-effort",
+        choices=["none", "low", "medium", "high", "xhigh"],
+        help="Reasoning effort level for GPT-5+ models.",
+    )
+    openai.add_argument("--timeout-seconds", type=int, default=300)
+    openai.add_argument(
+        "--worker-mode",
+        choices=["subprocess", "inline", "daemon"],
+        default="inline",
+        help="OpenAI daily-driver runs default to inline orchestration.",
+    )
+    openai.add_argument(
+        "--disable-codegraph",
+        action="store_true",
+        help="Skip CodeGraph context injection (e.g. for non-repo prompts).",
     )
 
     demo = subcommands.add_parser("demo", help="Run the Puppetmaster concept demo.")
@@ -650,6 +709,44 @@ def _main(argv: Optional[list[str]] = None) -> int:
                         "timeout_seconds": args.timeout_seconds,
                         "allow_dirty": args.allow_dirty,
                     },
+                )
+            ],
+            lease_seconds=10,
+            worker_mode=args.worker_mode,
+            on_job_created=on_job_created,
+        )
+        print_run_result(result.job.id, len(result.artifacts), result.summary_path)
+        return 0
+
+    if args.command == "openai":
+        payload: dict[str, Any] = {
+            "prompt": args.prompt,
+            "cwd": args.cwd,
+            "model": args.model,
+            "timeout_seconds": args.timeout_seconds,
+        }
+        if args.base_url:
+            payload["openai_base_url"] = args.base_url
+        if args.organization:
+            payload["openai_organization"] = args.organization
+        if args.max_output_tokens is not None:
+            payload["max_output_tokens"] = args.max_output_tokens
+        if args.legacy_max_tokens:
+            payload["legacy_max_tokens"] = True
+        if args.temperature is not None:
+            payload["temperature"] = args.temperature
+        if args.reasoning_effort:
+            payload["reasoning_effort"] = args.reasoning_effort
+        if args.disable_codegraph:
+            payload["disable_codegraph"] = True
+        result = Orchestrator(store).run(
+            args.prompt,
+            specs=[
+                WorkerSpec(
+                    role="openai",
+                    instruction=args.prompt,
+                    adapter="openai",
+                    payload=payload,
                 )
             ],
             lease_seconds=10,
