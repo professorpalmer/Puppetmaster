@@ -232,8 +232,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    state_dir = resolve_state_dir(args.state_dir)
+    # Export the resolved state dir so adapter subprocesses (e.g. CursorAdapter,
+    # ClaudeCodeAdapter) can spool full stdout/stderr to a sidecar log under
+    # the same jobs/<job_id>/tasks/<task_id>/ tree the store already owns.
+    # Without this the adapter would fall back to the workspace-hashed default,
+    # which can land logs in a project state dir that doesn't own the job.
+    os.environ["PUPPETMASTER_STATE_DIR"] = str(state_dir)
     runtime = WorkerRuntime(
-        store=create_store(args.backend, resolve_state_dir(args.state_dir)),
+        store=create_store(args.backend, state_dir),
         job_id=args.job_id,
         role=args.role,
         worker_id=args.worker_id or worker_id_for(args.role),

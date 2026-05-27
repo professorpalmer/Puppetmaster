@@ -17,6 +17,85 @@ from puppetmaster.codegraph import enrich_prompt_with_codegraph
 from puppetmaster.models import Artifact, ArtifactType, Task
 
 
+# Default truncation budgets. Match what the codebase used pre-spool so existing
+# verification / risk artifacts keep their inline excerpts; the new sidecar file
+# preserves whatever falls in the middle so nothing is silently dropped.
+_STDOUT_HEAD_CHARS = 1000
+_STDOUT_TAIL_CHARS = 8000
+
+
+def _resolve_sidecar_state_dir() -> Optional[Path]:
+    """Locate the active Puppetmaster state directory for sidecar spooling.
+
+    Returns ``None`` if no state dir is in scope (e.g. direct adapter unit
+    tests). Falling back to the default state dir would write logs into a
+    workspace-hashed path that may not own the job, so we only honor an
+    explicit ``PUPPETMASTER_STATE_DIR`` env var (which ``worker_runtime``
+    exports after resolving its --state-dir flag).
+    """
+    raw = os.environ.get("PUPPETMASTER_STATE_DIR")
+    if not raw:
+        return None
+    try:
+        return Path(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def capture_subprocess_stdout(
+    *,
+    text: str,
+    task: Task,
+    sidecar_name: str,
+    head_chars: int = _STDOUT_HEAD_CHARS,
+    tail_chars: int = _STDOUT_TAIL_CHARS,
+) -> dict[str, Any]:
+    """Build the stdout-capture metadata dict for an adapter artifact payload.
+
+    Returns a dict with explicit truncation markers and (when the content
+    exceeds head+tail and a state dir is available) a sidecar log file that
+    preserves the full subprocess output. The dict is meant to be merged
+    into the artifact payload alongside the legacy ``stdout`` (tail) and
+    ``stdout_excerpt`` (head) fields so older callers keep working.
+
+    Keys returned:
+
+    - ``stdout_total_chars`` (int): total length of ``text``.
+    - ``stdout_truncated`` (bool): True when head+tail can't fit the full text.
+    - ``stdout_head_excerpt`` (str): first N chars when truncated, else full text.
+    - ``stdout_tail_excerpt`` (str): last N chars when truncated, else "".
+    - ``stdout_sidecar_path`` (str | None): absolute path to the spooled
+      sidecar file when truncated and the spool succeeded, else None.
+    - ``stdout_sidecar_error`` (str, optional): only set when spooling was
+      attempted but failed (filesystem error).
+    """
+    total = len(text)
+    truncated = total > (head_chars + tail_chars)
+    result: dict[str, Any] = {
+        "stdout_total_chars": total,
+        "stdout_truncated": truncated,
+        "stdout_head_excerpt": text[:head_chars] if truncated else text,
+        "stdout_tail_excerpt": text[-tail_chars:] if truncated else "",
+    }
+    if not truncated:
+        return result
+
+    state_dir = _resolve_sidecar_state_dir()
+    if state_dir is None:
+        result["stdout_sidecar_path"] = None
+        return result
+    try:
+        sidecar_dir = state_dir / "jobs" / task.job_id / "tasks" / task.id
+        sidecar_dir.mkdir(parents=True, exist_ok=True)
+        sidecar_path = sidecar_dir / f"{sidecar_name}.log"
+        sidecar_path.write_text(text, encoding="utf-8", errors="replace")
+        result["stdout_sidecar_path"] = str(sidecar_path)
+    except OSError as exc:
+        result["stdout_sidecar_path"] = None
+        result["stdout_sidecar_error"] = repr(exc)
+    return result
+
+
 @dataclass(frozen=True)
 class AdapterInfo:
     name: str
@@ -261,6 +340,16 @@ class CursorAdapter:
         except subprocess.TimeoutExpired as exc:
             stderr = exc.stderr or ""
             stdout = exc.stdout or ""
+            stdout_capture = capture_subprocess_stdout(
+                text=stdout,
+                task=task,
+                sidecar_name="cursor_stdout_timeout",
+            )
+            stderr_capture = capture_subprocess_stdout(
+                text=stderr,
+                task=task,
+                sidecar_name="cursor_stderr_timeout",
+            )
             return [
                 verification_artifact(
                     task=task,
@@ -272,8 +361,10 @@ class CursorAdapter:
                     evidence=["adapter:cursor-sdk", "timeout"],
                     payload={
                         "returncode": None,
-                        "stdout": stdout[-8000:],
-                        "stderr": stderr[-8000:],
+                        "stdout": stdout[-_STDOUT_TAIL_CHARS:],
+                        "stderr": stderr[-_STDOUT_TAIL_CHARS:],
+                        "stdout_capture": stdout_capture,
+                        "stderr_capture": stderr_capture,
                         "model": model,
                         "failure": classify_cursor_failure(stderr + stdout),
                     },
@@ -287,6 +378,16 @@ class CursorAdapter:
             else []
         )
         degraded = completed.returncode == 0 and not parsed_artifacts
+        stdout_capture = capture_subprocess_stdout(
+            text=completed.stdout,
+            task=task,
+            sidecar_name="cursor_stdout",
+        )
+        stderr_capture = capture_subprocess_stdout(
+            text=completed.stderr,
+            task=task,
+            sidecar_name="cursor_stderr",
+        )
         artifacts = [
             verification_artifact(
                 task=task,
@@ -307,8 +408,10 @@ class CursorAdapter:
                 ),
                 payload={
                     "returncode": completed.returncode,
-                    "stdout": completed.stdout[-8000:],
-                    "stderr": completed.stderr[-8000:],
+                    "stdout": completed.stdout[-_STDOUT_TAIL_CHARS:],
+                    "stderr": completed.stderr[-_STDOUT_TAIL_CHARS:],
+                    "stdout_capture": stdout_capture,
+                    "stderr_capture": stderr_capture,
                     "model": model,
                     "cursor_status": status,
                     "failure": (
@@ -322,7 +425,14 @@ class CursorAdapter:
             )
         ]
         if degraded:
-            artifacts.append(cursor_degraded_artifact(task, worker_id, result_text))
+            artifacts.append(
+                cursor_degraded_artifact(
+                    task,
+                    worker_id,
+                    result_text,
+                    stdout_capture=stdout_capture,
+                )
+            )
         artifacts.extend(parsed_artifacts)
         return artifacts
 
@@ -447,6 +557,16 @@ class ClaudeCodeAdapter:
         except subprocess.TimeoutExpired as exc:
             stdout = exc.stdout or ""
             stderr = exc.stderr or ""
+            stdout_capture = capture_subprocess_stdout(
+                text=stdout,
+                task=task,
+                sidecar_name="claude_stdout_timeout",
+            )
+            stderr_capture = capture_subprocess_stdout(
+                text=stderr,
+                task=task,
+                sidecar_name="claude_stderr_timeout",
+            )
             return [
                 verification_artifact(
                     task=task,
@@ -459,14 +579,30 @@ class ClaudeCodeAdapter:
                     payload={
                         "failure": "timeout",
                         "returncode": None,
-                        "stdout": stdout[-8000:],
-                        "stderr": stderr[-8000:],
+                        "stdout": stdout[-_STDOUT_TAIL_CHARS:],
+                        "stderr": stderr[-_STDOUT_TAIL_CHARS:],
+                        "stdout_capture": stdout_capture,
+                        "stderr_capture": stderr_capture,
                         "timeout_seconds": timeout_seconds,
                     },
                 )
             ]
 
         after = git_snapshot(cwd)
+        # Claude Code stdout often carries long edit transcripts. Give the
+        # head/tail more room than Cursor (12k tail vs 8k) but still spool the
+        # full transcript so middle bytes survive.
+        stdout_capture = capture_subprocess_stdout(
+            text=completed.stdout,
+            task=task,
+            sidecar_name="claude_stdout",
+            tail_chars=12000,
+        )
+        stderr_capture = capture_subprocess_stdout(
+            text=completed.stderr,
+            task=task,
+            sidecar_name="claude_stderr",
+        )
         verification = verification_artifact(
             task=task,
             worker_id=worker_id,
@@ -485,7 +621,9 @@ class ClaudeCodeAdapter:
                 "failure": None if completed.returncode == 0 else classify_claude_code_failure(completed.stderr + completed.stdout),
                 "returncode": completed.returncode,
                 "stdout": completed.stdout[-12000:],
-                "stderr": completed.stderr[-8000:],
+                "stderr": completed.stderr[-_STDOUT_TAIL_CHARS:],
+                "stdout_capture": stdout_capture,
+                "stderr_capture": stderr_capture,
                 "cwd": str(cwd),
                 "permission_mode": task.payload.get("permission_mode", "acceptEdits"),
                 "base_sha": before["sha"],
@@ -768,7 +906,25 @@ def cursor_artifact_from_item(task: Task, worker_id: str, item: object) -> Optio
     )
 
 
-def cursor_degraded_artifact(task: Task, worker_id: str, result_text: str) -> Artifact:
+def cursor_degraded_artifact(
+    task: Task,
+    worker_id: str,
+    result_text: str,
+    *,
+    stdout_capture: Optional[dict[str, Any]] = None,
+) -> Artifact:
+    payload: dict[str, Any] = {
+        "risk": "Cursor SDK completed without structured Puppetmaster findings.",
+        "mitigation": "Treat this swarm as degraded; rerun with a stricter prompt or inspect the repo directly before implementation.",
+        "stdout_excerpt": result_text[:_STDOUT_HEAD_CHARS],
+    }
+    if stdout_capture is None:
+        stdout_capture = capture_subprocess_stdout(
+            text=result_text,
+            task=task,
+            sidecar_name="cursor_stdout",
+        )
+    payload["stdout_capture"] = stdout_capture
     return Artifact(
         job_id=task.job_id,
         task_id=task.id,
@@ -776,11 +932,7 @@ def cursor_degraded_artifact(task: Task, worker_id: str, result_text: str) -> Ar
         created_by=worker_id,
         confidence=0.85,
         evidence=["adapter:cursor-sdk", "cursor-result:empty-or-unstructured"],
-        payload={
-            "risk": "Cursor SDK completed without structured Puppetmaster findings.",
-            "mitigation": "Treat this swarm as degraded; rerun with a stricter prompt or inspect the repo directly before implementation.",
-            "stdout_excerpt": result_text[:1000],
-        },
+        payload=payload,
     )
 
 
@@ -1027,6 +1179,12 @@ class OpenAIAdapter:
         degraded = not parsed_artifacts and bool(result_text)
         failed = finish_reason not in (None, "stop", "length") and not parsed_artifacts
 
+        stdout_capture = capture_subprocess_stdout(
+            text=result_text,
+            task=task,
+            sidecar_name="openai_response",
+        )
+
         verification = verification_artifact(
             task=task,
             worker_id=worker_id,
@@ -1045,8 +1203,9 @@ class OpenAIAdapter:
                 "returncode": status_code,
                 "model": model,
                 "finish_reason": finish_reason,
-                "stdout": result_text[-8000:],
+                "stdout": result_text[-_STDOUT_TAIL_CHARS:],
                 "stderr": "",
+                "stdout_capture": stdout_capture,
                 "tokens_in": prompt_tokens,
                 "tokens_out": completion_tokens,
                 "tokens_total": total_tokens,
@@ -1075,7 +1234,8 @@ class OpenAIAdapter:
                             "Treat this swarm as degraded; rerun with a stricter prompt or "
                             "inspect the repo directly before implementation."
                         ),
-                        "stdout_excerpt": result_text[:1000],
+                        "stdout_excerpt": result_text[:_STDOUT_HEAD_CHARS],
+                        "stdout_capture": stdout_capture,
                     },
                 )
             )

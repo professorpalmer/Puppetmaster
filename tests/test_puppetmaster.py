@@ -2398,6 +2398,201 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertEqual(artifacts[1].type, ArtifactType.RISK)
         self.assertIn("without structured Puppetmaster findings", artifacts[1].payload["risk"])
 
+    def test_capture_subprocess_stdout_inlines_short_text_without_sidecar(self) -> None:
+        """No spool when total fits in head+tail; capture dict is still emitted."""
+        from puppetmaster.adapters import capture_subprocess_stdout
+
+        task = Task(
+            job_id="job_short",
+            role="pipeline-mapper",
+            instruction="x",
+            adapter="cursor",
+            payload={},
+        )
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"PUPPETMASTER_STATE_DIR": tmp}):
+                capture = capture_subprocess_stdout(
+                    text="hello world",
+                    task=task,
+                    sidecar_name="cursor_stdout",
+                )
+            self.assertFalse(capture["stdout_truncated"])
+            self.assertEqual(capture["stdout_total_chars"], 11)
+            self.assertEqual(capture["stdout_head_excerpt"], "hello world")
+            self.assertEqual(capture["stdout_tail_excerpt"], "")
+            self.assertNotIn("stdout_sidecar_path", capture)
+            self.assertFalse(
+                (Path(tmp) / "jobs" / "job_short" / "tasks").exists()
+            )
+
+    def test_capture_subprocess_stdout_spools_full_text_when_truncated(self) -> None:
+        """Long stdout: head + tail inline AND full text preserved at sidecar path."""
+        from puppetmaster.adapters import capture_subprocess_stdout
+
+        task = Task(
+            job_id="job_long",
+            role="pipeline-mapper",
+            instruction="x",
+            adapter="cursor",
+            payload={},
+        )
+        # 30KB > head(1k) + tail(8k); middle would have been silently dropped
+        # under the pre-fix adapter behavior.
+        long_text = "MIDDLE-MARKER-XYZ".join(["A" * 10000, "B" * 10000, "C" * 10000])
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"PUPPETMASTER_STATE_DIR": tmp}):
+                capture = capture_subprocess_stdout(
+                    text=long_text,
+                    task=task,
+                    sidecar_name="cursor_stdout",
+                )
+            self.assertTrue(capture["stdout_truncated"])
+            self.assertEqual(capture["stdout_total_chars"], len(long_text))
+            self.assertEqual(len(capture["stdout_head_excerpt"]), 1000)
+            self.assertEqual(len(capture["stdout_tail_excerpt"]), 8000)
+            sidecar = Path(capture["stdout_sidecar_path"])
+            self.assertTrue(sidecar.exists())
+            self.assertEqual(
+                sidecar,
+                Path(tmp) / "jobs" / "job_long" / "tasks" / task.id / "cursor_stdout.log",
+            )
+            # The whole payload must survive — including the middle bytes
+            # that the inline head+tail cannot fit.
+            spooled = sidecar.read_text(encoding="utf-8")
+            self.assertEqual(spooled, long_text)
+            self.assertIn("MIDDLE-MARKER-XYZ", spooled)
+
+    def test_capture_subprocess_stdout_skips_sidecar_without_state_dir(self) -> None:
+        """When PUPPETMASTER_STATE_DIR is unset (e.g. direct unit-test invocation),
+        sidecar spooling is skipped gracefully but the new truncation markers are
+        still emitted so callers can detect the drop.
+        """
+        from puppetmaster.adapters import capture_subprocess_stdout
+
+        task = Task(
+            job_id="job_nostate",
+            role="pipeline-mapper",
+            instruction="x",
+            adapter="cursor",
+            payload={},
+        )
+        # Strip the env var entirely so the helper returns None for state dir.
+        env = {k: v for k, v in os.environ.items() if k != "PUPPETMASTER_STATE_DIR"}
+        with patch.dict(os.environ, env, clear=True):
+            capture = capture_subprocess_stdout(
+                text="A" * 20000,
+                task=task,
+                sidecar_name="cursor_stdout",
+            )
+        self.assertTrue(capture["stdout_truncated"])
+        self.assertIsNone(capture["stdout_sidecar_path"])
+        self.assertEqual(capture["stdout_total_chars"], 20000)
+
+    def test_cursor_adapter_emits_stdout_capture_in_verification(self) -> None:
+        """Regression: every CursorAdapter verification artifact must carry the
+        new stdout_capture metadata so consumers can recover the full output.
+        """
+        task = Task(
+            job_id="job_cap_v",
+            role="pipeline-mapper",
+            instruction="inspect repo",
+            adapter="cursor",
+            payload={"prompt": "Inspect repo", "cwd": "."},
+        )
+        long_stdout = json.dumps(
+            {
+                "status": "finished",
+                "result": json.dumps(
+                    {
+                        "artifacts": [
+                            {
+                                "type": "finding",
+                                "claim": "noise",
+                                "evidence": ["x"],
+                                "confidence": 0.8,
+                            }
+                        ]
+                    }
+                )
+                + "\n"
+                + ("PADDING " * 2000),  # ~16KB padding
+            }
+        )
+        completed = subprocess.CompletedProcess(
+            args=["node"], returncode=0, stdout=long_stdout, stderr=""
+        )
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"PUPPETMASTER_STATE_DIR": tmp}):
+                with patch(
+                    "puppetmaster.adapters.subprocess.run", return_value=completed
+                ):
+                    artifacts = CursorAdapter().run(task, "goal", "worker-cursor")
+
+            verification = artifacts[0]
+            self.assertEqual(verification.type, ArtifactType.VERIFICATION)
+            cap = verification.payload.get("stdout_capture")
+            self.assertIsNotNone(cap, "verification payload missing stdout_capture")
+            self.assertEqual(cap["stdout_total_chars"], len(long_stdout))
+            self.assertTrue(cap["stdout_truncated"])
+            # When truncated, sidecar should exist on disk with full content
+            self.assertIsNotNone(cap["stdout_sidecar_path"])
+            self.assertTrue(Path(cap["stdout_sidecar_path"]).exists())
+
+    def test_cursor_adapter_degraded_risk_has_stdout_capture(self) -> None:
+        """Regression for the original bug: when Cursor returns no structured
+        artifacts and stdout exceeds head+tail, the middle bytes must survive
+        via the sidecar referenced from BOTH the verification AND the degraded
+        risk artifact.
+        """
+        task = Task(
+            job_id="job_cap_d",
+            role="pipeline-mapper",
+            instruction="inspect repo",
+            adapter="cursor",
+            payload={"prompt": "Inspect repo", "cwd": "."},
+        )
+        # Long markdown-y response with NO {"artifacts": []} envelope.
+        long_result = (
+            "Here is a long markdown answer.\n\n"
+            + "MIDDLE-MARKER-SHOULD-SURVIVE\n"
+            + ("PADDING line\n" * 2000)
+        )
+        completed = subprocess.CompletedProcess(
+            args=["node"],
+            returncode=0,
+            stdout=json.dumps({"status": "finished", "result": long_result}),
+            stderr="",
+        )
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"PUPPETMASTER_STATE_DIR": tmp}):
+                with patch(
+                    "puppetmaster.adapters.subprocess.run", return_value=completed
+                ):
+                    artifacts = CursorAdapter().run(task, "goal", "worker-cursor")
+
+            verification, risk = artifacts[0], artifacts[1]
+            self.assertEqual(verification.payload["result"], "degraded")
+            self.assertEqual(risk.type, ArtifactType.RISK)
+
+            v_cap = verification.payload.get("stdout_capture")
+            r_cap = risk.payload.get("stdout_capture")
+            self.assertIsNotNone(v_cap)
+            self.assertIsNotNone(r_cap)
+            # Both artifacts should reference a sidecar (path may differ if
+            # the verification used the raw stdout vs the degraded risk using
+            # the parsed result_text). What matters: the middle marker is
+            # recoverable from at least one of them.
+            recovered = ""
+            for cap in (v_cap, r_cap):
+                p = cap.get("stdout_sidecar_path")
+                if p and Path(p).exists():
+                    recovered += Path(p).read_text(encoding="utf-8")
+            self.assertIn(
+                "MIDDLE-MARKER-SHOULD-SURVIVE",
+                recovered,
+                "middle of long stdout was silently dropped — the bug is back",
+            )
+
     def test_claude_code_command_uses_full_edit_permission_mode(self) -> None:
         command = build_claude_code_command(
             prompt="Implement the change",

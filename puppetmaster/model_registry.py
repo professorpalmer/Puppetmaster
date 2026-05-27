@@ -146,68 +146,68 @@ def starter_registry() -> list[ModelSpec]:
     ``claude-code/opus-4-6``, ``claude-code/opus-4-7``) reflect a
     common mental model where the cheap tier is Cursor's house model,
     the balanced tier is GPT, and the frontier tiers are Anthropic
-    Opus. **The ``adapter_model_name`` values default to model strings
-    that work *today***; the IDs use the labels you'll eventually want
-    so you only have to edit ``adapter_model_name`` when newer
-    versions land. Each entry's ``notes`` field flags what to edit.
+    Opus. ``adapter_model_name`` values are the literal strings each
+    adapter passes through to its SDK / CLI today (verified against
+    Cursor's runtime model catalog and Anthropic's claude CLI), so
+    the starter registry is callable end-to-end without edits.
 
-    Adapter coverage is real (claude-code and cursor adapters both
-    exist and accept a ``model`` argument). Capability scores and
-    prices are user-asserted starting points — edit them to match
-    your subscriptions.
+    Capability scores and prices are user-asserted starting points —
+    edit them to match your subscriptions.
     """
     return [
         ModelSpec(
             id="cursor/composer-2-5",
             adapter="cursor",
-            adapter_model_name="composer-1",
+            adapter_model_name="composer-2.5",
             capability_score=55,
             input_per_mtok_usd=0.0,
             output_per_mtok_usd=0.0,
             context_window=0,
             tags=["cursor", "cheap", "fast", "reading", "code"],
             notes=(
-                "Fast/cheap tier. Use for high-throughput reading and "
-                "low-stakes tasks. PLACEHOLDER: edit adapter_model_name "
-                "to 'composer-2-5' (or whatever Cursor SDK accepts) when "
-                "Composer 2.5 is released."
+                "Fast/cheap tier. Cursor's house Composer model — use "
+                "for verification, exploration, formatting, and other "
+                "low-stakes work. Pricing is $0 because Composer is "
+                "bundled with your Cursor plan."
             ),
         ),
         ModelSpec(
             id="cursor/gpt-5-5",
             adapter="cursor",
-            adapter_model_name="gpt-5",
+            adapter_model_name="gpt-5.5",
             capability_score=78,
             input_per_mtok_usd=0.0,
             output_per_mtok_usd=0.0,
             context_window=0,
             tags=["cursor", "balanced", "fast", "vision"],
             notes=(
-                "Balanced tier. Medium cost, medium speed, medium "
-                "capability. PLACEHOLDER: edit adapter_model_name to "
-                "'gpt-5-5' when available. Pricing is $0 because cost "
-                "rolls into your Cursor plan."
+                "Balanced tier. GPT-5.5 via the Cursor SDK — same model "
+                "as the openai/gpt-5-5 entry but billed through your "
+                "Cursor plan (so $0 from the router's perspective). The "
+                "router prefers this over openai/gpt-5-5 under the "
+                "balanced policy whenever both qualify."
             ),
         ),
         ModelSpec(
             id="claude-code/opus-4-6",
             adapter="claude-code",
-            adapter_model_name="claude-opus-4-5",
+            adapter_model_name="claude-opus-4-6",
             capability_score=88,
             input_per_mtok_usd=15.0,
             output_per_mtok_usd=75.0,
             context_window=200_000,
             tags=["claude", "quality", "vision", "code", "reasoning"],
             notes=(
-                "High-quality tier. Medium-high cost, medium speed. "
-                "PLACEHOLDER: edit adapter_model_name to 'claude-opus-4-6' "
-                "(or the exact Anthropic id) when Opus 4.6 is released."
+                "High-quality tier. Anthropic Opus 4.6 via the Claude "
+                "Code CLI. Workhorse for implementation, refactoring, "
+                "and review when you want Anthropic-grade reasoning "
+                "without the frontier price."
             ),
         ),
         ModelSpec(
             id="claude-code/opus-4-7",
             adapter="claude-code",
-            adapter_model_name="claude-opus-4-5",
+            adapter_model_name="claude-opus-4-7",
             capability_score=98,
             input_per_mtok_usd=15.0,
             output_per_mtok_usd=75.0,
@@ -221,10 +221,9 @@ def starter_registry() -> list[ModelSpec]:
                 "code",
             ],
             notes=(
-                "Frontier tier. Slow + expensive, but best for detailed "
-                "vision, complex reasoning, audits, security review. "
-                "PLACEHOLDER: edit adapter_model_name to 'claude-opus-4-7' "
-                "(or the exact Anthropic id) when Opus 4.7 is released."
+                "Frontier tier. Anthropic Opus 4.7 via the Claude Code "
+                "CLI. Slow + expensive but best for detailed-vision, "
+                "complex reasoning, security audits, and red-team work."
             ),
         ),
         # OpenAI tier — uses the openai adapter directly with OPENAI_API_KEY,
