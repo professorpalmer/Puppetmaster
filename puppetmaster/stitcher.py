@@ -65,9 +65,14 @@ class Stitcher:
             f"# {title}",
             "",
             f"Goal: {goal}",
-            "",
-            "## Artifact Counts",
         ]
+
+        alerts = self._collect_alerts(artifacts)
+        if alerts:
+            lines.extend(["", "## Alerts (action required)"])
+            lines.extend(alerts)
+
+        lines.extend(["", "## Artifact Counts"])
         for artifact_type, count in sorted(counts.items()):
             lines.append(f"- {artifact_type}: {count}")
 
@@ -93,6 +98,52 @@ class Stitcher:
 
         lines.extend(["", "## Raw Artifact Rule", "Final synthesis used structured JSON artifacts only."])
         return "\n".join(lines) + "\n"
+
+    # Failure classes that mean the worker never really ran (auth/billing/setup)
+    # rather than "ran and found a problem". These must not hide inside a
+    # low-confidence verification line — a degraded run should be obvious at a
+    # glance, with a remediation pointer.
+    _FAILURE_REMEDIATION = {
+        "billing_or_quota": (
+            "the provider account is out of credit/quota. Top up that account, "
+            "switch to a subscription-billed login, or re-route to a funded "
+            "adapter (e.g. set required_tags=['agent-loop'] or allow only "
+            "plan-billed models)."
+        ),
+        "missing_api_key": "the adapter's API key env var is not set.",
+        "missing_cli": "the adapter's CLI is not installed / not on PATH.",
+        "sdk_not_installed": "the adapter SDK package is not installed.",
+        "model_unavailable": "the requested model is invalid or not available to this account.",
+        "permission_denied": "the adapter lacked permission to act (check permission_mode / auth).",
+        "rate_limit": "the provider rate-limited the request; retry later or re-route.",
+        "dirty_worktree": "the worktree was dirty; commit/stash or pass allow_dirty=true.",
+    }
+
+    def _collect_alerts(self, artifacts: list[Artifact]) -> list[str]:
+        alerts: list[str] = []
+        for artifact in artifacts:
+            payload = artifact.payload or {}
+            failure = payload.get("failure")
+            result = payload.get("result")
+            if not failure and result not in {"failed", "blocked"}:
+                continue
+            if not failure:
+                continue
+            adapter = payload.get("adapter") or self._adapter_from_evidence(artifact)
+            hint = self._FAILURE_REMEDIATION.get(
+                str(failure), "the worker could not complete; see the artifact for details."
+            )
+            alerts.append(
+                f"- **{failure}** on `{adapter}` worker — {hint}"
+            )
+        return alerts
+
+    @staticmethod
+    def _adapter_from_evidence(artifact: Artifact) -> str:
+        for item in artifact.evidence:
+            if item.startswith("adapter:"):
+                return item.split(":", 1)[1]
+        return "unknown"
 
     @staticmethod
     def _bullet_payloads(artifacts: list[Artifact], key: str) -> list[str]:

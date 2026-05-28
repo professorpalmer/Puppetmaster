@@ -46,6 +46,13 @@ class TaskSignals:
     required_tags: list[str] = field(default_factory=list)
     estimated_tokens_in: Optional[int] = None
     estimated_tokens_out: Optional[int] = None
+    # Cost-containment knobs (the "stay inside the plan you already pay for"
+    # default). ``prefer_plan_billed`` makes a subscription-covered model win
+    # over an out-of-pocket API model at equal-or-sufficient capability.
+    # ``allow_api_billing`` is the hard gate: when False, the router refuses
+    # to spend on api-billed models at all (plan-only).
+    prefer_plan_billed: bool = True
+    allow_api_billing: bool = True
 
 
 # ----- Classifier ----------------------------------------------------------
@@ -249,6 +256,7 @@ class RoutingDecision:
             "model_id": self.model.id,
             "adapter": self.model.adapter,
             "adapter_model_name": self.model.adapter_model_name,
+            "billing": self.model.billing,
             "policy": self.policy,
             "capability_needed": self.capability_needed,
             "capability_score": self.model.capability_score,
@@ -345,12 +353,52 @@ def route_task(
             "No model in registry fits the cost budget for this task."
         )
 
+    # Billing gate: when the caller forbids out-of-pocket API spend, drop every
+    # model that isn't covered by a subscription the user already pays for.
+    # ``unknown``-billing models are treated as not-plan here (we don't bill an
+    # account we can't confirm is contained). Runtime detection upgrades
+    # ``unknown`` -> ``plan`` before routing when it can prove a subscription.
+    if not task.allow_api_billing:
+        after_billing: list[ModelSpec] = []
+        for spec in after_cost:
+            if spec.is_plan_billed:
+                after_billing.append(spec)
+            else:
+                rejected.append(
+                    (
+                        spec,
+                        f"api billing disabled (allow_api_billing=False); "
+                        f"model is {spec.billing}-billed, not plan-covered",
+                    )
+                )
+        if not after_billing:
+            raise NoEligibleModelError(
+                "allow_api_billing=False but no plan-billed (subscription-covered) "
+                "model is eligible for this task. Enable API billing, add a "
+                "plan-billed model (e.g. run `puppetmaster models discover`), or "
+                "lower the task's capability need."
+            )
+        after_cost = after_billing
+
+    # Tie-break helper: when ``prefer_plan_billed`` is on, a subscription-covered
+    # model sorts ahead of an out-of-pocket one at equal cost/capability, so
+    # spend stays inside the user's plan whenever a plan model is good enough.
+    def _plan_rank(spec: ModelSpec) -> int:
+        if not task.prefer_plan_billed:
+            return 0
+        return 0 if spec.is_plan_billed else 1
+
     if policy == "cheap":
-        # Tie-break: lower capability_score wins (reserve big models for
-        # tasks that actually need them; "cheap" implies "small").
+        # Tie-break: plan-billed first (no marginal spend), then lower
+        # capability_score (reserve big models for tasks that need them;
+        # "cheap" implies "small").
         pick = min(
             after_cost,
-            key=lambda s: (s.estimate_cost_usd(tokens_in, tokens_out), s.capability_score),
+            key=lambda s: (
+                s.estimate_cost_usd(tokens_in, tokens_out),
+                _plan_rank(s),
+                s.capability_score,
+            ),
         )
         reason = "policy=cheap: lowest per-call estimated cost"
         for spec in after_cost:
@@ -361,7 +409,12 @@ def route_task(
         return _decision(pick, policy, need, tokens_in, tokens_out, reason, rejected)
 
     if policy == "quality":
-        pick = max(after_cost, key=lambda s: s.capability_score)
+        # Highest capability wins; plan-billed breaks ties so we don't reach
+        # for an out-of-pocket model when an equally-capable plan one exists.
+        pick = max(
+            after_cost,
+            key=lambda s: (s.capability_score, 1 if s.is_plan_billed else 0),
+        )
         reason = "policy=quality: highest capability_score"
         for spec in after_cost:
             if spec.id != pick.id:
@@ -372,7 +425,9 @@ def route_task(
         # For escalating we still return one decision (the cheapest
         # sufficient model), but ordered alternatives are listed in
         # `rejected` so the orchestrator can retry up the chain.
-        sorted_by_cap = sorted(after_cost, key=lambda s: s.capability_score)
+        sorted_by_cap = sorted(
+            after_cost, key=lambda s: (s.capability_score, _plan_rank(s))
+        )
         sufficient = [s for s in sorted_by_cap if s.capability_score >= need]
         pick = sufficient[0] if sufficient else sorted_by_cap[-1]
         reason = (
@@ -393,12 +448,20 @@ def route_task(
         # for the task. Picking the highest would waste capability.
         pick = min(
             sufficient,
-            key=lambda s: (s.estimate_cost_usd(tokens_in, tokens_out), s.capability_score),
+            key=lambda s: (
+                _plan_rank(s),
+                s.estimate_cost_usd(tokens_in, tokens_out),
+                s.capability_score,
+            ),
+        )
+        plan_note = (
+            " (plan-billed, in-subscription)" if pick.is_plan_billed else ""
         )
         reason = (
-            f"policy=balanced: cheapest model whose capability_score "
-            f"({pick.capability_score}) >= needed ({need})"
+            f"policy=balanced: cheapest sufficient model whose capability_score "
+            f"({pick.capability_score}) >= needed ({need}){plan_note}"
         )
+        pick_cost = pick.estimate_cost_usd(tokens_in, tokens_out)
         for spec in after_cost:
             if spec.id != pick.id:
                 if spec.capability_score < need:
@@ -409,12 +472,28 @@ def route_task(
                         )
                     )
                 else:
-                    rejected.append(
-                        (
-                            spec,
-                            f"sufficient capability but pricier than {pick.id}",
+                    spec_cost = spec.estimate_cost_usd(tokens_in, tokens_out)
+                    if spec_cost > pick_cost:
+                        rejected.append(
+                            (
+                                spec,
+                                f"sufficient capability but pricier than {pick.id} "
+                                f"(${spec_cost:.4f} vs ${pick_cost:.4f})",
+                            )
                         )
-                    )
+                    else:
+                        # Same estimated cost as the pick — the tie-break is
+                        # capability right-sizing: prefer the lower
+                        # capability_score so frontier models stay reserved
+                        # for tasks that actually need them.
+                        rejected.append(
+                            (
+                                spec,
+                                f"same estimated cost as {pick.id} "
+                                f"(${spec_cost:.4f}) but higher capability than "
+                                f"needed; {pick.id} is right-sized for need {need}",
+                            )
+                        )
     else:
         # Nothing meets the bar; surface the best we have rather than
         # silently failing — but the reason makes the gap obvious.
@@ -482,4 +561,6 @@ def signals_from_worker_spec(spec, *, instruction_override: Optional[str] = None
         required_tags=list(payload.get("required_tags") or []),
         estimated_tokens_in=payload.get("estimated_tokens_in"),
         estimated_tokens_out=payload.get("estimated_tokens_out"),
+        prefer_plan_billed=bool(payload.get("prefer_plan_billed", True)),
+        allow_api_billing=bool(payload.get("allow_api_billing", True)),
     )

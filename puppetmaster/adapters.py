@@ -472,6 +472,9 @@ class CursorAdapter:
         return "\n".join(lines)
 
 
+DEFAULT_CLAUDE_CODE_MODEL = "claude-opus-4-8"
+
+
 class ClaudeCodeAdapter:
     name = "claude-code"
 
@@ -512,7 +515,7 @@ class ClaudeCodeAdapter:
         command = build_claude_code_command(
             prompt=prompt,
             executable=[resolved, *command_base[1:]],
-            model=task.payload.get("model"),
+            model=task.payload.get("model") or DEFAULT_CLAUDE_CODE_MODEL,
             output_format=task.payload.get("output_format", "json"),
             permission_mode=task.payload.get("permission_mode", "acceptEdits"),
             allowed_tools=task.payload.get("allowed_tools"),

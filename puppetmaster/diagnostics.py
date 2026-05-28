@@ -48,6 +48,27 @@ def run_doctor(root: Path, state_dir: Optional[Path] = None) -> list[Check]:
         _git_clean_check(root),
         _agent_rules_check(root),
     ]
+    checks.extend(_billing_checks())
+    return checks
+
+
+def _billing_checks() -> list[Check]:
+    """Report each adapter's billing posture: plan (in-subscription) vs api
+    (out-of-pocket) vs unknown/unauthenticated. This is the at-a-glance answer
+    to "will this cost me extra, and can it even run?"."""
+    from puppetmaster.platform_billing import detect_adapter_billing
+
+    checks: list[Check] = []
+    for adapter in ("cursor", "claude-code", "codex"):
+        try:
+            status = detect_adapter_billing(adapter)
+        except Exception as exc:  # pragma: no cover - defensive
+            checks.append(Check(f"billing:{adapter}", "warn", f"probe failed: {exc}"))
+            continue
+        state = "ok" if status.healthy else "warn"
+        checks.append(
+            Check(f"billing:{adapter}", state, f"{status.billing} — {status.detail}")
+        )
     return checks
 
 

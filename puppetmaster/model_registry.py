@@ -57,6 +57,16 @@ class ModelSpec:
     tags: list[str] = field(default_factory=list)
     notes: str = ""
     enabled: bool = True
+    # Billing source for routing cost-containment. ``plan`` = covered by a
+    # subscription the user already pays for (Cursor plan, Claude Max,
+    # ChatGPT/Codex sub) so marginal spend stays inside that package;
+    # ``api`` = billed per-token to a raw provider key (out-of-pocket);
+    # ``unknown`` = depends on runtime auth and should be resolved by
+    # :mod:`puppetmaster.platform_billing` detection. The router prefers
+    # ``plan`` at sufficient capability unless the caller opts into API spend.
+    billing: str = "unknown"
+
+    _VALID_BILLING = ("plan", "api", "unknown")
 
     def __post_init__(self) -> None:
         if not 0 <= self.capability_score <= 100:
@@ -65,6 +75,15 @@ class ModelSpec:
             )
         if self.input_per_mtok_usd < 0 or self.output_per_mtok_usd < 0:
             raise ValueError(f"per-token cost for {self.id} must be non-negative")
+        if self.billing not in self._VALID_BILLING:
+            raise ValueError(
+                f"billing for {self.id} must be one of {self._VALID_BILLING}, got {self.billing!r}"
+            )
+
+    @property
+    def is_plan_billed(self) -> bool:
+        """True when this model is covered by a subscription (no marginal API spend)."""
+        return self.billing == "plan"
 
     def estimate_cost_usd(self, tokens_in: int, tokens_out: int) -> float:
         """USD cost estimate for one call. Linear; ignores caching / batching."""
@@ -132,6 +151,7 @@ def _spec_to_jsonable(spec: ModelSpec) -> dict[str, Any]:
         ("notes", ""),
         ("tags", []),
         ("context_window", 0),
+        ("billing", "unknown"),
     ]:
         if data.get(k) == default_value:
             data.pop(k)
@@ -164,6 +184,7 @@ def starter_registry() -> list[ModelSpec]:
             input_per_mtok_usd=0.0,
             output_per_mtok_usd=0.0,
             context_window=0,
+            billing="plan",
             tags=["cursor", "cheap", "fast", "reading", "code"],
             notes=(
                 "Fast/cheap tier. Cursor's house Composer model — use "
@@ -180,6 +201,7 @@ def starter_registry() -> list[ModelSpec]:
             input_per_mtok_usd=0.0,
             output_per_mtok_usd=0.0,
             context_window=0,
+            billing="plan",
             tags=["cursor", "balanced", "fast", "vision"],
             notes=(
                 "Balanced tier. GPT-5.5 via the Cursor SDK — same model "
@@ -269,6 +291,7 @@ def starter_registry() -> list[ModelSpec]:
                 "detailed-vision",
                 "reasoning",
                 "code",
+                "long-context",
             ],
             notes=(
                 "Frontier flagship (the router's top tier). Anthropic Opus "
@@ -297,6 +320,7 @@ def starter_registry() -> list[ModelSpec]:
             input_per_mtok_usd=5.0,
             output_per_mtok_usd=30.0,
             context_window=1_000_000,
+            billing="api",
             tags=[
                 "openai",
                 "frontier",
@@ -304,6 +328,7 @@ def starter_registry() -> list[ModelSpec]:
                 "detailed-vision",
                 "reasoning",
                 "code",
+                "long-context",
             ],
             notes=(
                 "OpenAI frontier coding/reasoning model. 1M context, 128K "
@@ -319,7 +344,16 @@ def starter_registry() -> list[ModelSpec]:
             input_per_mtok_usd=2.5,
             output_per_mtok_usd=15.0,
             context_window=1_000_000,
-            tags=["openai", "quality", "fast", "vision", "code", "reasoning"],
+            billing="api",
+            tags=[
+                "openai",
+                "quality",
+                "fast",
+                "vision",
+                "code",
+                "reasoning",
+                "long-context",
+            ],
             notes=(
                 "OpenAI workhorse model. Same 1M context as GPT-5.5 at half "
                 "the price. Good default for implementation tasks where you "
@@ -334,6 +368,7 @@ def starter_registry() -> list[ModelSpec]:
             input_per_mtok_usd=0.75,
             output_per_mtok_usd=4.5,
             context_window=400_000,
+            billing="api",
             tags=["openai", "balanced", "fast", "vision", "code"],
             notes=(
                 "OpenAI mini for coding, computer use, and subagents. 400K "
@@ -349,6 +384,7 @@ def starter_registry() -> list[ModelSpec]:
             input_per_mtok_usd=0.15,
             output_per_mtok_usd=0.9,
             context_window=400_000,
+            billing="api",
             tags=["openai", "cheap", "fast", "reading"],
             notes=(
                 "OpenAI nano tier. Cheapest member of the GPT-5 family for "
@@ -371,6 +407,7 @@ def starter_registry() -> list[ModelSpec]:
                 "reasoning",
                 "code",
                 "agent-loop",
+                "long-context",
             ],
             notes=(
                 "OpenAI Codex CLI (`codex exec --json`) driving gpt-5.5. "
