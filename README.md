@@ -4,47 +4,84 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](pyproject.toml)
 
-**Durable state for parallel coding-agent swarms.** Workers coordinate through typed artifacts in SQLite instead of passing transcripts around — so follow-up questions about a completed swarm cost zero model tokens.
+**Puppetmaster turns Cursor (or Claude Code, or the OpenAI API) into an orchestrator that routes each task to the cheapest model that can handle it, stores worker outputs as typed SQLite artifacts so follow-ups cost zero tokens, and coordinates workers through durable state instead of a shared parent transcript.**
 
-Puppetmaster is a local runtime that lets Cursor, Claude Code, shell checks, and future providers run as independent workers with leases, replay, and structured outputs. It works **standalone** — just `pip install` and you have an orchestrator. Pair it with optional [CodeGraph](https://github.com/colbymchenry/codegraph) integration when you want cheaper per-worker context; the two stack on different axes (CodeGraph optimizes per-call context resolution, Puppetmaster optimizes per-session coordination + state).
+> Single live OpenAI A/B with real billing tokens — same prompt, equivalent answer:  
+> Pinned `gpt-5.5`: **\$0.019530 in 14.957 s**  
+> Puppetmaster routed to `gpt-5.4-nano`: **\$0.000141 in 2.491 s**  
+> → **99.3% cheaper, 83.3% faster.** Reproduce with `OPENAI_API_KEY=... python -m bench.router_live_ab`.
+
+## Three claims, three receipts
+
+Every number in this section comes from a reproducible script in [`bench/`](bench/). What is **not** defensible today (and what we won't claim) lives in [TALKING_POINTS.md](TALKING_POINTS.md).
+
+### 1. Token cost — fixed on two axes
+
+**On new work** — Puppetmaster's v0.6.0 router classifies each task's complexity (role + instruction signal patterns + payload size) and picks the cheapest model from your user-owned registry that can handle it. Every routing decision is stored as an auditable `ROUTING` artifact: picked model, capability needed, estimated cost, and the full list of *rejected* alternatives with the reason each was rejected.
+
+- Receipt: [`bench/router_savings.py`](bench/router_savings.py) — on a 6-task fixture, the router was **35.1% cheaper** than pinning a frontier model. Two of six hard tasks (audit, architect) correctly stayed on the frontier model — the wins come from *not* using a frontier model when the task doesn't need one.
+- Receipt: [`bench/router_live_ab.py`](bench/router_live_ab.py) — live OpenAI A/B with real `usage.prompt_tokens` (not estimates): **99.3% cheaper, 83.3% faster** on a single explore task.
+
+**On follow-up work** — once a swarm completes, every artifact (finding, decision, risk, patch, verification, routing decision) lives in SQLite. Follow-up questions like *"what did the security audit worker find?"* are SQLite queries, not new agent runs.
+
+- Receipt: [`bench/followup_cost.py`](bench/followup_cost.py) — **40 follow-up queries against a real completed swarm: 0 adapter calls, 0 tokens, \$0.00, avg 0.5 ms per query.** Hypothetical "always-frontier replay" baseline for the same 40 queries: **\$4.92**.
+
+Honest scope: this is the *follow-up reads are free* claim. If your follow-up needs new reasoning the swarm didn't produce, that's a new task and it costs tokens like any other.
+
+### 2. Transcript — workers don't share one
+
+The classic multi-subagent shape stuffs everything into one parent chat. Each subagent inherits the parent's stale context, results come back as prose, and the context window bloats until the important details are buried. This is the failure mode users actually hit on long investigations.
+
+Puppetmaster does the opposite. Workers don't see each other's transcripts. They claim tasks by lease, emit **typed artifacts** with payloads + `evidence` + `confidence` + `sha256` integrity, and the final stitcher reads JSON — not raw worker stdout. The parent agent's context only sees what the stitcher publishes.
+
+- Inspect a live swarm: `puppetmaster artifacts <job_id>` returns the durable state — the actual coordination surface, not a chat scrollback.
+- Inspect a completed swarm without paying tokens: same command, milliseconds, $0 (see receipt #1 above).
+- Verify nothing is hand-waved: every artifact carries `created_by` (which worker), `created_at`, and a content `sha256`.
+
+### 3. Graphing — credit [CodeGraph](https://github.com/colbymchenry/codegraph), wire it in cleanly
+
+The "graph your directories for cheap symbol context" capability is **not** a Puppetmaster feature. It's [CodeGraph](https://github.com/colbymchenry/codegraph) — a separate project — and it deserves the credit. Puppetmaster's contribution is what happens after CodeGraph is installed:
+
+- Every Cursor / Claude / OpenAI worker auto-injects task-relevant CodeGraph context into its prompt before the model call — no MCP round-trip per worker.
+- One shared `codegraph context` query seeds N parallel workers in a swarm (vs N separate queries if each agent issues its own).
+- The resulting artifacts (which now reference symbol-level evidence from CodeGraph) land in the same durable store, so follow-ups still cost zero tokens.
+- The most-used CodeGraph CLI verbs are bundled directly into Puppetmaster's MCP — see [Bundled CodeGraph tools](#bundled-codegraph-tools-no-second-mcp) — so Cursor Agent only needs one MCP for both orchestration and symbol intelligence.
+
+Puppetmaster works fine *without* CodeGraph. Workers fall back to grep/read for context discovery, and orchestration / artifacts / durable state are unchanged. CodeGraph is opt-in via `npm install -g @colbymchenry/codegraph && codegraph init && codegraph index`.
+
+---
 
 Think **Redis/Gunicorn for agentic engineering**:
 
 ```text
-Cursor Agent / Claude Code / shell / future providers
+Cursor Agent / Claude Code / OpenAI / shell
         |
         v
-Puppetmaster supervisor
+Puppetmaster supervisor  ──>  task-aware model router
         |
         v
-independent worker processes -> SQLite state -> live artifacts -> stitched summary
+independent worker processes  ──>  SQLite (typed artifacts, events, memory)
+        |
+        v
+live artifact board  ──>  stitched summary  ──>  0-token follow-up reads
 ```
 
 Puppetmaster is not trying to beat native IDE subagents at every tiny task. It is for the work that gets messy: long repo investigations, conflicting hypotheses, repeated handoffs, flaky memory, and code changes that need evidence, replay, and approval gates.
 
-## Receipts (not vibes)
-
-The high-level marketing pitch — *"faster, cheaper, more accurate than Cursor alone"* — is exactly the kind of claim that deserves real numbers. Three reproducible benchmarks live in [`bench/`](bench/). The most recent runs are in [`bench/results/`](bench/results/). Headline numbers from the harnesses today:
-
-| Claim | Receipt | What was actually measured |
-|---|---|---|
-| **"Delegates to models based on complexity"** is real | [`bench/router_savings.py`](bench/router_savings.py) | 6-task fixture (2 easy / 2 medium / 2 hard) routed under `balanced` policy. 4/6 routed to a cheaper model than "always frontier"; 2/6 stayed on frontier (audit + architect — honest). Total estimated savings: **35.1%** at the model layer for the workload, **100%** savings on the four routable tasks (Cursor-tier models are $0 because billing rolls into the Cursor plan). |
-| **Cheaper** with real billing receipts | [`bench/router_live_ab.py`](bench/router_live_ab.py) | One live OpenAI A/B (no estimates — `tokens_in` / `tokens_out` from `usage.prompt_tokens`). Arm A pinned `gpt-5.5` (frontier), Arm B let the router pick: it picked `gpt-5.4-nano`. Result: **$0.019530 → $0.000141 (99.3% cheaper)** and **14.957 s → 2.491 s (83.3% faster)** on the same instruction. Both arms returned equivalent finding artifacts. |
-| **Faster** | Same `router_live_ab` receipt | Wall-clock measured around `OpenAIAdapter.run()`. -83.3% on this single task. Not extrapolated. |
-| **More accurate** | *Not currently measured* | Both arms above returned correct, equivalent answers — but we don't have a graded eval set yet, so "more accurate" is **not a defensible claim** today. The honest version is *"more structured"*: every worker emits typed artifacts with `evidence` and `confidence` instead of free-form prose. |
-| **"Token costs solved"** for *follow-ups* | [`bench/followup_cost.py`](bench/followup_cost.py) | After a real swarm completes, K=10 rounds × 4 different reads = **40 follow-up queries against the durable state**. Result: **0 adapter calls, 0 tokens, $0.00**, avg **0.5 ms per query**. Hypothetical "always-frontier replay" baseline for the same 40 queries: **$4.92** at the model layer. |
-| **"Context issues solved"** | Architectural, not benchmarked | Workers coordinate through SQLite artifacts, not a shared chat transcript, so the parent agent's context window doesn't bloat with worker chatter. Demonstrable via `puppetmaster artifacts <job_id>` — the durable state is the coordination surface. |
-| **"Graphs your directories"** | Credit due | That's [CodeGraph](https://github.com/colbymchenry/codegraph), a separate project Puppetmaster **optionally integrates with**. Puppetmaster's contribution is the auto-injection plus the durable state that makes follow-up reads free. |
-
-**Reproduce them locally:**
+## 90-second quickstart
 
 ```bash
-python -m bench.router_savings              # dry-run, no API key
-python -m bench.followup_cost --queries 10  # reads a recent completed job
-OPENAI_API_KEY=... python -m bench.router_live_ab  # ~$0.02 of real spend
+git clone https://github.com/professorpalmer/Puppetmaster.git
+cd Puppetmaster && python -m pip install -e . && npm install --package-lock=false --no-audit
+python -m puppetmaster doctor                    # 12 health checks, should be all green
+python -m puppetmaster models init               # writes the 8-model starter registry
+python -m puppetmaster route "Format these files" --role verify-runtime
+                                                 # dry-run routing decision: picks cursor/composer-2-5 ($0)
+OPENAI_API_KEY=... python -m bench.router_live_ab
+                                                 # ~$0.02 of real spend, prints the 99.3%-cheaper receipt
 ```
 
-For honest limitations and what is and is **not** measurable today, see [TALKING_POINTS.md](TALKING_POINTS.md).
+For deeper proof, [TALKING_POINTS.md](TALKING_POINTS.md) has the full truth-table separating "use this phrasing" from "avoid that overclaim".
 
 ## The Problem
 
@@ -133,15 +170,17 @@ The goal is not “one more chat.” The goal is a local runtime where the opera
 | --- | --- |
 | Local runtime | Daily-driver beta: subprocess workers, task DAGs, leases, recovery, failure states |
 | SQLite backend | Default backend with WAL mode, schema metadata, integrity checks, and persisted events |
-| Cursor Agent MCP | Async start tools, status polling, logs, live artifacts, partial summaries |
+| **Model router** (v0.6.0+) | Task-aware routing across the registry; every decision is an auditable `ROUTING` artifact. Receipts: [bench/router_savings.py](bench/router_savings.py), [bench/router_live_ab.py](bench/router_live_ab.py) |
+| Cursor Agent MCP | Async start tools, status polling, logs, live artifacts, partial summaries, routing tools (`puppetmaster_route_task`, `puppetmaster_list_models`, `puppetmaster_job_cost`) |
 | Cursor extension | Activity-bar control panel for running Puppetmaster inside Cursor |
 | Cursor adapter | Live adapter through `@cursor/sdk`; best for review/plan/dry-run workflows |
 | Claude Code adapter | Live full-edit adapter through Claude Code CLI; validated with real tracked diffs |
+| **OpenAI adapter** (v0.6.1-beta.1+) | Direct Chat Completions via `OPENAI_API_KEY`; captures real `tokens_in` / `tokens_out` from `usage.prompt_tokens`. The only adapter that produces billing-grade numbers today. |
 | Shell adapter | Built-in bounded command runner for verification |
 | Memory | Promoted memory retrieval into later worker context and prompts |
 | CodeGraph | Optional shared repo intelligence: workers auto-inject CodeGraph context when available |
 | Patch workflow | Patch artifacts, path locks, approval/rejection events, dirty-worktree guard |
-| Codex | Stubbed provider slot; next adapter target |
+| Reproducible benchmarks | Six harnesses in [`bench/`](bench/), each with markdown + JSON receipts under `bench/results/` |
 
 ## Install
 
@@ -256,7 +295,7 @@ If you haven't run `puppetmaster models init` yet, auto-routing is a clean no-op
 
 ### The four tiers in the starter registry
 
-`puppetmaster models init` writes four tiered model entries that map directly to the "easy / balanced / high / extra-high" mental model. **The `adapter_model_name` values default to model ids that already work today** (e.g. `composer-1`, `gpt-5`, `claude-opus-4-5`) — when newer versions land, edit `adapter_model_name` in `~/.puppetmaster/models.json` and the tier ids stay stable:
+`puppetmaster models init` writes eight tiered model entries that map directly to the "easy / balanced / high / extra-high" mental model — four Cursor/Claude tiers and four OpenAI tiers. **The `adapter_model_name` values are the literal strings each adapter passes through to its SDK / CLI today** (verified against Cursor's runtime catalog and Anthropic's `claude` CLI in v0.6.1-beta.2): `composer-2.5`, `gpt-5.5`, `claude-opus-4-6`, `claude-opus-4-7` for the Cursor/Claude tier, plus `gpt-5.5` / `gpt-5.4` / `gpt-5.4-mini` / `gpt-5.4-nano` for the OpenAI tier. When newer versions land, edit `adapter_model_name` in `~/.puppetmaster/models.json` and the tier ids stay stable:
 
 | Tier ID                  | Adapter       | Mental model                                       | Tags |
 | ------------------------ | ------------- | -------------------------------------------------- | ---- |
@@ -280,7 +319,7 @@ With the starter registry, balanced-policy routing lands roughly:
 ### Quick start
 
 ```bash
-# 1. Write a starter registry (claude-code/sonnet, /haiku, /opus + cursor/auto)
+# 1. Write the starter registry (4 Cursor/Claude tiers + 4 OpenAI tiers)
 python -m puppetmaster models init
 
 # 2. Inspect the registry
@@ -288,23 +327,28 @@ python -m puppetmaster models list
 
 # 3. Dry-run a routing decision before kicking off a swarm
 python -m puppetmaster route "Security audit across every endpoint" --role audit
-# picked: claude-code/opus  (adapter=claude-code, model_name=claude-opus-4-5)
+# picked: claude-code/opus-4-7  (adapter=claude-code, model_name=claude-opus-4-7)
 # policy: balanced
-# capability needed: 95  chosen capability: 95
+# capability needed: 98  chosen capability: 98
 # estimated tokens: in=510  out=5000  estimated cost: $0.382650
-# why: policy=balanced: cheapest model whose capability_score (95) >= needed (95)
+# why: policy=balanced: cheapest model whose capability_score (98) >= needed (98)
 # rejected:
-#   - claude-code/sonnet: capability_score 82 < needed 95
-#   - claude-code/haiku:  capability_score 58 < needed 95
-#   - cursor/auto:        capability_score 78 < needed 95
+#   - cursor/composer-2-5:  capability_score 55 < needed 98
+#   - cursor/gpt-5-5:       capability_score 78 < needed 98
+#   - claude-code/opus-4-6: capability_score 88 < needed 98
+#   - openai/gpt-5-5:       capability_score 96 < needed 98
+#   - openai/gpt-5-4:       capability_score 86 < needed 98
+#   - openai/gpt-5-4-mini:  capability_score 70 < needed 98
+#   - openai/gpt-5-4-nano:  capability_score 52 < needed 98
 
 python -m puppetmaster route "Format these files" --role verify-runtime
-# picked: cursor/auto  (adapter=cursor, model_name=auto)
-# capability needed: 20  chosen capability: 78
+# picked: cursor/composer-2-5  (adapter=cursor, model_name=composer-2.5)
+# capability needed: 20  chosen capability: 55
+# estimated cost: $0.000000  (Cursor-tier models bill through your Cursor plan)
 # rejected:
-#   - claude-code/sonnet: sufficient capability but pricier than cursor/auto
-#   - claude-code/haiku:  sufficient capability but pricier than cursor/auto
-#   - claude-code/opus:   sufficient capability but pricier than cursor/auto
+#   - cursor/gpt-5-5:        sufficient capability but pricier than cursor/composer-2-5
+#   - claude-code/opus-4-6:  sufficient capability but pricier than cursor/composer-2-5
+#   - ... (5 more, all rejected for being pricier)
 ```
 
 ### Wiring auto-routing into a swarm
@@ -338,17 +382,19 @@ After the run:
 ```bash
 python -m puppetmaster artifacts <job_id> | jq '.[] | select(.type=="routing") | .payload'
 # {
-#   "model_id": "claude-code/opus",
+#   "model_id": "claude-code/opus-4-7",
 #   "adapter": "claude-code",
+#   "adapter_model_name": "claude-opus-4-7",
 #   "policy": "balanced",
-#   "capability_needed": 95,
-#   "capability_score": 95,
+#   "capability_needed": 98,
+#   "capability_score": 98,
 #   "estimated_cost_usd": 0.382650,
-#   "reason": "policy=balanced: cheapest model whose capability_score (95) >= needed (95)",
+#   "reason": "policy=balanced: cheapest model whose capability_score (98) >= needed (98)",
 #   "rejected": [
-#     {"id": "claude-code/sonnet", "reason": "capability_score 82 < needed 95"},
-#     {"id": "claude-code/haiku",  "reason": "capability_score 58 < needed 95"},
-#     {"id": "cursor/auto",        "reason": "capability_score 78 < needed 95"}
+#     {"id": "cursor/composer-2-5",  "reason": "capability_score 55 < needed 98"},
+#     {"id": "cursor/gpt-5-5",       "reason": "capability_score 78 < needed 98"},
+#     {"id": "claude-code/opus-4-6", "reason": "capability_score 88 < needed 98"},
+#     {"id": "openai/gpt-5-5",       "reason": "capability_score 96 < needed 98"}
 #   ]
 # }
 ```
@@ -365,9 +411,9 @@ python -m puppetmaster artifacts <job_id> | jq '.[] | select(.type=="routing") |
 
 ### Scope and honesty
 
-v1 routes to adapters that already exist in Puppetmaster (`claude-code` and `cursor`). Those alone cover Sonnet / Haiku / Opus and any Cursor SDK model variant. **Raw HTTP adapters for additional providers (Gemini, DeepSeek, Kimi, OpenAI direct) are not in this release.** They slot in cleanly as new `adapter` values — the registry + router/classifier framework doesn't need to change — but actually building 5 new HTTP clients would have been scope creep without enough quality to ship.
+Three production adapters ship today: `cursor` (Cursor SDK via `@cursor/sdk`), `claude-code` (Anthropic via the `claude` CLI), and `openai` (direct Chat Completions via `OPENAI_API_KEY`, added in v0.6.1-beta.1). Together they cover the entire starter registry: `composer-2.5`, `gpt-5.5`, `claude-opus-4-6`, `claude-opus-4-7`, plus the four GPT-5 OpenAI tiers (`gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.4-nano`). **Raw HTTP adapters for additional providers (Gemini, DeepSeek, Kimi) are not yet in.** They slot in cleanly as new `adapter` values — the registry + router/classifier framework doesn't need to change — but each one needs real validation against its provider's API before it ships.
 
-Capability scores and prices stay **user-asserted**. Puppetmaster makes the **decision** transparent (full audit trail of why each task went where); it does not make the **value judgments** for you (whether Sonnet really is an 82, or whether Cursor's "auto" should be treated as $0). Edit the registry to match your reality.
+Capability scores and prices stay **user-asserted**. Puppetmaster makes the **decision** transparent (full audit trail of why each task went where); it does not make the **value judgments** for you (whether GPT-5.4 really is an 86, or whether Cursor's bundled models should be treated as $0). Edit the registry to match your reality.
 
 ### MCP
 
@@ -404,6 +450,8 @@ Fully optional and graceful. If `codegraph` is not installed, or the target repo
 Cursor Agent can also query CodeGraph directly through Puppetmaster's MCP — no second MCP server required for the daily-driver case. See [Bundled CodeGraph tools](#bundled-codegraph-tools-no-second-mcp) below.
 
 ### Cost: what changes when you switch to durable state
+
+> **Newer, more direct receipts** for the routing + durable-state claims live in [bench/router_savings.py](bench/router_savings.py), [bench/router_live_ab.py](bench/router_live_ab.py), and [bench/followup_cost.py](bench/followup_cost.py) — see the [opening section](#three-claims-three-receipts) and [TALKING_POINTS.md](TALKING_POINTS.md). The Agent / CodeGraph / Puppetmaster three-way analysis below is older and broader (it models multi-worker swarm cost vs single-agent cost); both views are valid and they answer different questions.
 
 The whole point of Puppetmaster is that durable state turns repeated questions about the same task into a database read instead of another agent run. The benchmark below shows that effect against two baselines:
 
@@ -608,6 +656,18 @@ When Claude Code edits tracked files, Puppetmaster records:
 
 - a `verification` artifact with stdout/stderr, return code, model usage, and failure classification
 - a `patch` artifact with changed files, base SHA, unified diff, and revert guidance
+
+### OpenAI
+
+Use the `openai` adapter when you want to bypass Cursor's SDK entirely and hit OpenAI's Chat Completions API directly. This is the **only adapter today that returns real billing-grade token counts** (pulled from `usage.prompt_tokens` / `usage.completion_tokens` on the API response), which is why `bench/router_live_ab.py` runs against it.
+
+```bash
+export OPENAI_API_KEY="<your-openai-api-key>"
+```
+
+Every Cursor/Claude/OpenAI worker emits the same structured artifact contract: a `VERIFICATION` artifact with `tokens_in`, `tokens_out`, `tokens_total`, plus parsed `FINDING` / `RISK` / `DECISION` artifacts from the JSON envelope. The OpenAI adapter additionally exposes those token counts on every run so `puppetmaster cost <job_id>` can sum real spend, not estimates.
+
+The starter registry includes four OpenAI tiers — `openai/gpt-5-5` ($5 / $30 per MTok, frontier), `openai/gpt-5-4` ($2.50 / $15, workhorse), `openai/gpt-5-4-mini` ($0.75 / $4.50, balanced), `openai/gpt-5-4-nano` ($0.15 / $0.90, cheap reader) — so the router can pick from the full GPT-5 family without manual configuration.
 
 ### Shell
 
