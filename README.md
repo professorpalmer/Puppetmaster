@@ -71,19 +71,29 @@ Puppetmaster is not trying to beat native IDE subagents at every tiny task. It i
 ## 90-second quickstart
 
 ```bash
-git clone https://github.com/professorpalmer/Puppetmaster.git
-cd Puppetmaster && python -m pip install -e . && npm install --package-lock=false --no-audit
+pip install puppetmaster-ai                      # PyPI release (see "Pip name" note below)
 python -m puppetmaster doctor                    # 14 health checks (python, sqlite, git, node, npm, cursor-sdk, claude-code, codex, codegraph, mcp-servers, two API keys, sqlite-state, git-status)
 python -m puppetmaster models init               # writes the 11-tier starter registry across cursor, claude-code, openai, and codex adapters
 python -m puppetmaster install-cursor-mcp        # wires Puppetmaster into Cursor (workspace .cursor/mcp.json); --global writes ~/.cursor/mcp.json
 python -m puppetmaster install-codex-mcp         # wires Puppetmaster into the Codex CLI (codex mcp add ...)
 python -m puppetmaster route "Format these files" --role verify-runtime
                                                  # dry-run routing decision: picks cursor/composer-2-5 ($0)
+```
+
+Both `install-*-mcp` commands resolve `sys.executable` (avoids the "wrong `python` on PATH" failure mode), launch a `tools/list` handshake before writing anything, are fully idempotent (re-run = `unchanged`), and preserve any existing env vars / unrelated MCP servers already in the file.
+
+**Pip name:** the package is published on PyPI as [`puppetmaster-ai`](https://pypi.org/project/puppetmaster-ai/) because PyPI's [PEP-503 name normalization](https://peps.python.org/pep-0503/#normalized-names) treats `puppetmaster` and `puppet-master` as the same name, and `puppet-master` is held by an [abandoned 2019 single-release project](https://pypi.org/project/puppet-master/) that hasn't been updated in 6+ years. The import name, CLI binary, GitHub repo, and brand all stay `puppetmaster` — only `pip install <name>` differs. A name-reassignment request for the bare name is in flight ([tracking doc](docs/PYPI_NAME_REQUEST.md)).
+
+### Developer install (run benchmarks, contribute, edit the code)
+
+```bash
+git clone https://github.com/professorpalmer/Puppetmaster.git
+cd Puppetmaster && python -m pip install -e . && npm install --package-lock=false --no-audit
 OPENAI_API_KEY=... python -m bench.router_live_ab
                                                  # ~$0.01 of real spend, prints the ~98%-cheaper receipt
 ```
 
-Both `install-*-mcp` commands resolve `sys.executable` (avoids the "wrong `python` on PATH" failure mode), launch a `tools/list` handshake before writing anything, are fully idempotent (re-run = `unchanged`), and preserve any existing env vars / unrelated MCP servers already in the file.
+The `bench/` directory is not shipped in the pip wheel (it's a development harness, not a runtime dependency), so reproducing the live A/B benchmark requires the cloned repo.
 
 For deeper proof, [TALKING_POINTS.md](TALKING_POINTS.md) has the full truth-table separating "use this phrasing" from "avoid that overclaim".
 
@@ -189,6 +199,17 @@ The goal is not “one more chat.” The goal is a local runtime where the opera
 
 ## Install
 
+The fast path (PyPI):
+
+```bash
+pip install puppetmaster-ai
+python -m puppetmaster doctor
+```
+
+That's enough for the MCP server, all CLI subcommands, the router, the model registry, and every adapter (`cursor`, `claude-code`, `openai`, `codex`). CodeGraph integration is optional and adds two more commands (`npm install -g @colbymchenry/codegraph && codegraph init && codegraph index`) — see [CodeGraph integration](#codegraph-integration-optional-but-recommended) below.
+
+The developer path (clone the repo to run benchmarks, edit the code, or contribute):
+
 ```bash
 git clone https://github.com/professorpalmer/Puppetmaster.git
 cd Puppetmaster
@@ -197,6 +218,8 @@ python -m pip install -e .
 npm install --package-lock=false --no-audit
 python -m puppetmaster doctor
 ```
+
+The `bench/` directory and the Cursor extension source ship only with the cloned repo, not the pip wheel.
 
 Run the local demo:
 
