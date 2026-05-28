@@ -117,6 +117,11 @@ class Stitcher:
         "permission_denied": "the adapter lacked permission to act (check permission_mode / auth).",
         "rate_limit": "the provider rate-limited the request; retry later or re-route.",
         "dirty_worktree": "the worktree was dirty; commit/stash or pass allow_dirty=true.",
+        "preflight_blocked": (
+            "the adapter was blocked before dispatch (auth/billing/model check). "
+            "Run `python -m puppetmaster preflight <adapter>` for the reason, fund/"
+            "re-auth the platform, or let auto_route pick a plan-billed adapter."
+        ),
     }
 
     def _collect_alerts(self, artifacts: list[Artifact]) -> list[str]:

@@ -5509,6 +5509,110 @@ class AwaitJobTests(unittest.TestCase):
             self.assertTrue(state["timed_out"])
 
 
+class PreflightDispatchGateTests(unittest.TestCase):
+    def _task(self, adapter="cursor", payload=None):
+        from puppetmaster.models import Task
+
+        return Task(
+            job_id="j",
+            role="implement",
+            instruction="do work",
+            adapter=adapter,
+            payload=payload or {},
+        )
+
+    def test_preflight_skipped_for_local_adapter(self) -> None:
+        from puppetmaster.workers import LocalWorker
+
+        worker = LocalWorker("implement")
+        self.assertIsNone(worker._preflight(self._task(adapter="local")))
+        self.assertIsNone(worker._preflight(self._task(adapter="shell")))
+
+    def test_preflight_skipped_when_opted_out(self) -> None:
+        from puppetmaster.workers import LocalWorker
+
+        worker = LocalWorker("implement")
+        task = self._task(adapter="cursor", payload={"skip_preflight": True})
+        self.assertIsNone(worker._preflight(task))
+
+    def test_preflight_blocks_unhealthy_adapter(self) -> None:
+        from unittest.mock import patch
+
+        from puppetmaster.preflight import PreflightResult
+        from puppetmaster.workers import LocalWorker
+
+        blocked = PreflightResult(
+            ok=False,
+            adapter="cursor",
+            model="default",
+            billing="unknown",
+            reason="adapter not ready: CURSOR_API_KEY is not set",
+            evidence=["cursor_api_key:missing", "preflight:unhealthy"],
+        )
+        worker = LocalWorker("implement")
+        with patch("puppetmaster.preflight.preflight_check", return_value=blocked):
+            artifact = worker._preflight(self._task(adapter="cursor"))
+        self.assertIsNotNone(artifact)
+        self.assertEqual(artifact.payload["result"], "blocked")
+        self.assertEqual(artifact.payload["failure"], "preflight_blocked")
+
+    def test_run_returns_blocked_artifact_and_failed_status(self) -> None:
+        from unittest.mock import patch
+
+        from puppetmaster.models import TaskStatus
+        from puppetmaster.preflight import PreflightResult
+        from puppetmaster.workers import LocalWorker
+
+        blocked = PreflightResult(
+            ok=False,
+            adapter="claude-code",
+            model=None,
+            billing="api",
+            reason="api billing disabled",
+            evidence=["preflight:api_blocked"],
+        )
+        worker = LocalWorker("implement")
+        with patch("puppetmaster.preflight.preflight_check", return_value=blocked):
+            run, artifacts = worker.run(self._task(adapter="claude-code"), "goal")
+        self.assertEqual(run.status, TaskStatus.FAILED)
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(artifacts[0].payload["failure"], "preflight_blocked")
+
+    def test_run_dispatches_when_preflight_passes(self) -> None:
+        from unittest.mock import patch
+
+        from puppetmaster.models import ArtifactType, TaskStatus
+        from puppetmaster.preflight import PreflightResult
+        from puppetmaster.workers import LocalWorker
+
+        ok = PreflightResult(
+            ok=True, adapter="cursor", model="default", billing="plan", reason="ready"
+        )
+        sentinel = [
+            __import__("puppetmaster.models", fromlist=["Artifact"]).Artifact(
+                job_id="j",
+                task_id="t",
+                type=ArtifactType.FINDING,
+                created_by="w",
+                payload={"claim": "did it"},
+                confidence=0.9,
+                evidence=["adapter:cursor"],
+            )
+        ]
+
+        class _FakeAdapter:
+            def run(self, task, goal, worker_id):
+                return sentinel
+
+        worker = LocalWorker("implement")
+        with patch("puppetmaster.preflight.preflight_check", return_value=ok), patch(
+            "puppetmaster.workers.get_adapter", return_value=_FakeAdapter()
+        ):
+            run, artifacts = worker.run(self._task(adapter="cursor"), "goal")
+        self.assertEqual(run.status, TaskStatus.COMPLETE)
+        self.assertIs(artifacts, sentinel)
+
+
 if __name__ == "__main__":
     unittest.main()
 
