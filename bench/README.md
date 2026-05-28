@@ -44,14 +44,14 @@ python -m bench.router_live_ab --dry-run
 OPENAI_API_KEY=sk-... python -m bench.router_live_ab
 ```
 
-Sample receipt (an actual run from the starter registry):
+Sample receipt (2026-05-28, run from the starter registry; the receipt files under `bench/results/` are timestamped so you can compare back-to-back runs):
 
 | Arm | Model | Wall (s) | tokens_in | tokens_out | $ (real) |
 |---|---|---:|---:|---:|---:|
-| A (always frontier) | `gpt-5.5` | 14.957 | 156 | 625 | $0.019530 |
-| B (Puppetmaster) | `gpt-5.4-nano` | 2.491 | 156 | 131 | $0.000141 |
+| A (always frontier) | `gpt-5.5` | 5.480 | 156 | 204 | $0.006900 |
+| B (Puppetmaster) | `gpt-5.4-nano` | 1.511 | 156 | 121 | $0.000132 |
 
-Delta: **99.3% cheaper, 83.3% faster**, equivalent finding artifacts.
+Delta: **98.1% cheaper, 72.4% faster** per this run; cost ratio held at **98.1–98.7%** across 3 back-to-back runs (wall-time variance was wider, 68–88%, because pinned-frontier latency varies more than nano latency). Equivalent finding artifacts.
 
 What it does **not** prove: output *quality* is not graded automatically (the receipt prints both replies for human inspection). For trivial definitional tasks the nano model is sufficient; for complex tasks the router would pick a stronger model and the savings would be smaller.
 

@@ -8,13 +8,13 @@ If you're about to post about Puppetmaster, lift phrasing from the **defensible*
 
 | Defensible (use this) | Avoid (overclaim) | Why / receipt |
 |---|---|---|
-| "Routes each task to the cheapest model that can handle it. On a live OpenAI A/B (real `usage.prompt_tokens` from the API), a simple task ran for **$0.000141** through the router vs **$0.019530** pinned to GPT-5.5 — **99.3% cheaper, 83.3% faster**, equivalent answer." | "Token costs? Solved." | `bench/router_live_ab.py` produces a real billing receipt. "Solved" overstates a 99% reduction on one task into a universal claim. The router does nothing about your IDE token costs; it controls per-task model selection for swarm workers. |
+| "Routes each task to the cheapest model that can handle it. On a live OpenAI A/B (real `usage.prompt_tokens` from the API), a simple task ran for **$0.000132** through the router vs **$0.006900** pinned to GPT-5.5 — **98.1% cheaper, 72.4% faster** per the 2026-05-28 receipt. Across 3 consecutive runs the cost ratio held at 98.1–98.7%, wall-time savings ranged 68–88%." | "Token costs? Solved." | `bench/router_live_ab.py` produces a real billing receipt. "Solved" overstates a 98% reduction on one task into a universal claim. The router does nothing about your IDE token costs; it controls per-task model selection for swarm workers. |
 | "Follow-up questions about a *completed* swarm cost zero model tokens — they're SQLite queries against typed artifacts. Measured at 0.5 ms per query, 40 queries = $0.00." | "Token costs? Solved." (as a general claim) | `bench/followup_cost.py` proves this for the narrow case of follow-up reads. New reasoning still needs a new task — that's a fresh model call. |
 | "Workers coordinate through durable state instead of a shared parent transcript, so the parent agent's context window doesn't bloat with worker chatter." | "Context issues? Solved." | Architectural fact. Visible in the SQLite store (`puppetmaster artifacts <job_id>`). Not a silver bullet for long-context tasks; it sidesteps one specific failure mode (transcript collapse across many subagents). |
 | "On a 6-task fixture spanning easy/medium/hard, Puppetmaster's router was 35.1% cheaper than pinning the frontier model — and on hard tasks it correctly stayed on the frontier model. The savings come from *not* using a frontier model when the task doesn't need one." | "Faster, cheaper, more accurate than Cursor alone." | `bench/router_savings.py` measures this. Note that "frontier baseline" ≠ "Cursor alone" — Cursor's bundled models are $0 because they roll into your Cursor plan. The router's wins are largest against a user who pins a paid frontier model as their default. |
 | "Routes by *task complexity* using a transparent classifier (role + payload + signal patterns) plus user-asserted capability scores per model. Every routing decision is logged as a `routing` artifact you can inspect with `puppetmaster artifacts`." | "Delegates to models based on complexity" *(no receipts)* | The classifier is in `puppetmaster/router.py`. Every routing decision is auditable; nothing is black-box. |
 | "Pairs with [CodeGraph](https://github.com/colbymchenry/codegraph) — a separate project — for symbol-level repo context that gets pre-injected into every worker prompt." | "Graphs your directories to index them for 0 token cost follow ups." | CodeGraph is not a Puppetmaster feature. Credit it. Puppetmaster's contribution is the auto-injection plus the durable state that makes follow-up reads free. |
-| "MIT licensed, runs locally, plays with Cursor SDK, Claude Code CLI, and the OpenAI API." | "Open source." | Same fact, less throwaway. |
+| "MIT licensed, runs locally, plays with Cursor SDK, Claude Code CLI, the OpenAI API, and the official OpenAI Codex CLI — four production adapters." | "Open source." | Same fact, less throwaway. v0.7.0 added the Codex CLI adapter; v0.6.1-beta.1 added the OpenAI Chat Completions adapter. |
 
 ## What is NOT currently measurable
 
@@ -48,8 +48,9 @@ If you re-run these with your own registry / your own task, please update the tr
 Puppetmaster routes each task to the cheapest model that can handle it.
 
 Receipt: on a live OpenAI A/B with real billing tokens, a simple
-explore task ran for $0.000141 through the router vs $0.019530
-pinned to GPT-5.5 — 99.3% cheaper, 83.3% faster, equivalent answer.
+explore task ran for $0.000132 through the router vs $0.006900
+pinned to GPT-5.5 — 98.1% cheaper, 72.4% faster, equivalent answer.
+Across 3 consecutive runs the cost ratio held 98.1–98.7%.
 
 Routing is transparent: every decision is logged as an auditable
 artifact. On hard tasks (audits, architecture), the router correctly
@@ -60,8 +61,9 @@ Also: follow-up questions about a completed swarm cost zero model
 tokens — they're SQLite queries against typed artifacts. 40 queries
 benchmarked at 0.5 ms each, $0.00 total.
 
-Open source (MIT), runs locally, plays with Cursor SDK, Claude Code
-CLI, and the OpenAI API. Reproducible benchmarks in bench/.
+Open source (MIT), runs locally. Four production adapters live:
+Cursor SDK, Claude Code CLI, OpenAI Chat Completions, and the
+official OpenAI Codex CLI (v0.7.0). Reproducible benchmarks in bench/.
 
 https://github.com/professorpalmer/Puppetmaster
 ```

@@ -39,6 +39,7 @@ def run_doctor(root: Path, state_dir: Optional[Path] = None) -> list[Check]:
         _command_check("npm", ["npm", "--version"]),
         _cursor_sdk_check(root),
         _claude_code_check(),
+        _codex_check(),
         _codegraph_check(root),
         _mcp_servers_check(),
         _env_check("CURSOR_API_KEY"),
@@ -47,6 +48,21 @@ def run_doctor(root: Path, state_dir: Optional[Path] = None) -> list[Check]:
         _git_clean_check(root),
     ]
     return checks
+
+
+def _codex_check() -> Check:
+    if _codex_cli_installed():
+        return Check("codex", "ok", _codex_command())
+    return Check(
+        "codex",
+        "optional",
+        (
+            "install the OpenAI Codex CLI with `npm install -g @openai/codex` "
+            "then `printenv OPENAI_API_KEY | codex login --with-api-key`, or "
+            "set CODEX_COMMAND to its path. Required only if you want to "
+            "route to codex/* tiers."
+        ),
+    )
 
 
 def _mcp_servers_check() -> Check:
@@ -151,13 +167,23 @@ def adapter_status(root: Path) -> list[dict[str, object]]:
     cursor_installed = _cursor_sdk_installed(root)
     cursor_key = bool(os.environ.get("CURSOR_API_KEY"))
     claude_installed = _claude_code_installed()
+    codex_installed = _codex_cli_installed()
+    openai_key = bool(os.environ.get("OPENAI_API_KEY"))
     rows = []
     for info in ADAPTER_INFO:
         configured = info.status == "built-in"
         if info.name == "cursor":
             configured = cursor_installed and cursor_key
-        if info.name == "claude-code":
+        elif info.name == "claude-code":
             configured = claude_installed
+        elif info.name == "openai":
+            configured = openai_key
+        elif info.name == "codex":
+            # Codex needs BOTH: the CLI installed AND OpenAI auth. We don't
+            # introspect `codex login` state from here (the auth file is
+            # outside our purview), so OPENAI_API_KEY is a decent proxy
+            # that we don't false-positive on a never-authed Codex install.
+            configured = codex_installed and openai_key
         if info.status == "stub":
             configured = False
         rows.append(
@@ -274,8 +300,12 @@ def _claude_code_check() -> Check:
         return Check("claude-code", "ok", _claude_code_command())
     return Check(
         "claude-code",
-        "missing",
-        "install Claude Code or set CLAUDE_CODE_COMMAND to the CLI executable",
+        "optional",
+        (
+            "install Claude Code (`npm install -g @anthropic-ai/claude-code` or "
+            "`npx -y @anthropic-ai/claude-code`) or set CLAUDE_CODE_COMMAND. "
+            "Required only if you want to route to claude-code/* tiers."
+        ),
     )
 
 
@@ -291,6 +321,20 @@ def _claude_code_installed() -> bool:
 
 def _claude_code_command() -> str:
     return os.environ.get("CLAUDE_CODE_COMMAND", "claude")
+
+
+def _codex_cli_installed() -> bool:
+    command = shlex.split(_codex_command())
+    if not command:
+        return False
+    first = command[0]
+    if Path(first).expanduser().exists():
+        return True
+    return shutil.which(first) is not None
+
+
+def _codex_command() -> str:
+    return os.environ.get("CODEX_COMMAND", "codex")
 
 
 def _env_check(name: str) -> Check:
