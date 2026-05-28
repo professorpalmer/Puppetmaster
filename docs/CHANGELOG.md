@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.7.3
+
+Adds **Anthropic Claude Opus 4.8** (released 2026-05-28) as the router's new frontier flagship — the "big bad" the hardest tasks route to.
+
+- **New starter-registry tier `claude-code/opus-4-8`** (`adapter_model_name: claude-opus-4-8`, `capability_score: 99`, `$5 / $25` per MTok, **1M context window**, tags `frontier, vision, detailed-vision, reasoning, code`). Opus 4.8 ships at the *same price* as 4.7 with across-the-board benchmark gains and a 4x-larger context, so it strictly dominates 4.7 for the hardest work (security audits, red-team, deep reasoning, detailed vision). `claude-code/opus-4-7` is retained (capability 98) so existing routing configs and cost history stay valid, with its `notes` updated to mark it as the previous flagship. Starter registry is now **12 tiers** (was 11). `docs/sample-models.json` aligned.
+- **Classifier ceiling raised 98 → 99** in `puppetmaster/router.py:classify_capability_needed`. The max capability-needed score tracks the current flagship's `capability_score`; with 4.7 (98) as the previous top, the hardest tasks saturated at 98 and the balanced policy's equal-cost tie-break (prefer the right-sized, lower-capability model) kept routing them to 4.7. Bumping the ceiling to 99 means the absolute-hardest tasks now *demand* 99 and route to Opus 4.8 — while merely-hard tasks (need ≤ 98) still right-size to 4.7 or below. No change to the tie-break itself, so the `$0` Cursor tier and every other pairing is unaffected.
+- **Routing impact**: `route "Security audit across every endpoint" --role audit` (and other top-tier tasks classified at 99) now pick `claude-code/opus-4-8` instead of `claude-code/opus-4-7`. Under `quality` policy the flagship is also 4.8. Detailed-vision tasks below the ceiling (e.g. `OCR every detail of the diagram`, need ~92) still right-size to `claude-code/opus-4-7` since both carry `detailed-vision` at equal cost. The new entry was appended to the developer's existing `~/.puppetmaster/models.json` (preserving all prior entries) and verified live.
+- **Tests**: updated the detailed-vision quality-policy assertion to expect `claude-code/opus-4-8`; extended `test_starter_registry_encodes_four_tiers` to assert 4.8 > 4.7, that 4.8 is the single highest-capability model, same price as 4.7, and a larger context window; added `test_starter_registry_routes_hardest_task_to_opus_4_8` locking the flagship as the destination for the hardest tier. Full router/registry subset (33 tests) green.
+
+Also in this release (the previously-deferred "last-mile" setup work):
+
+- **`python -m puppetmaster install-rules`** (new). Writes agent rule files that nudge the host (Cursor, `AGENTS.md`, Codex, Claude Code) to reach for Puppetmaster's MCP tools on the right tasks — the MCP installers give a host the *capability* to call Puppetmaster, but without a rule the agent won't reflexively use it. Auto-detects targets from cwd + tools on PATH; `--target` to pin a subset, `--global` for user-level rule files, `--force` to rewrite, `--dry-run` to preview. Uses a merge-block protocol (`<!-- puppetmaster:rules:begin/end -->`) so it inserts/updates managed content in existing files (e.g. `AGENTS.md`) without clobbering user content. New module `puppetmaster/rules.py` with `RulesInstallResult` / `TargetOutcome`.
+- **`python -m puppetmaster setup`** (new). One-shot first-run wizard: `doctor` + `models init` + `install-cursor-mcp` + `install-codex-mcp` + `install-rules`, idempotently, skipping any step whose tool isn't present. This is now the single command the README leads with after `pip install`.
+- **`doctor` gains an `agent-rules` check** that flags the half-installed state where an MCP host is registered but no agent rule file exists (returns `optional` when no MCP host is present, `ok` once a rule is found).
+- **README thinned from a wall to a scannable page** (~1100 lines removed). Deep content moved into dedicated docs: `docs/MODEL_ROUTING.md`, `docs/CODEGRAPH.md`, `docs/WHY.md`, `docs/TROUBLESHOOTING.md`, `docs/CLI_REFERENCE.md`.
+
 ## v0.7.2
 
 One-line MCP installers for Cursor and Codex, plus the previously-deferred Codex MCP documentation that sat ahead of the v0.7.1 tag.

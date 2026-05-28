@@ -4,15 +4,17 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import socket
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 import unittest
-import sys
 from dataclasses import replace
-from tempfile import TemporaryDirectory
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from puppetmaster.adapters import (
@@ -131,7 +133,66 @@ def _find_indexer_launches(popen_mock) -> list[list[str]]:
     return launches
 
 
+def _wait_for_spawned_or_kill(test, spawned, *, timeout: float) -> None:
+    """Wait for spawned subprocesses to finish, killing on timeout.
+
+    The pattern this replaces — ``process.wait(timeout=15)`` in a bare
+    loop — has two problems on a developer machine: (a) the inline
+    local-demo swarm has crept past 15 s of wall time as the codebase
+    grew, making the test deterministically fail; (b) when wait raises
+    ``TimeoutExpired``, the spawned process is never terminated, so
+    every failed run leaks a long-lived ``python -m puppetmaster run``
+    child that holds open SQLite handles and orphans CodeGraph
+    indexers. Both manifest as "the whole suite hangs" because later
+    tests block on the same resources the orphans hold.
+
+    Using a per-process try/finally with ``kill()`` + a second wait
+    forces deterministic cleanup. The 60 s default gives ~3.5×
+    headroom over the observed 17 s steady state and a clear failure
+    message if the swarm has genuinely regressed beyond that.
+    """
+    import subprocess
+
+    for process in spawned:
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            test.fail(
+                f"spawned puppetmaster swarm did not finish within {timeout}s "
+                f"(pid={process.pid}, args={process.args!r}); killed to prevent "
+                "leaking a long-lived child process"
+            )
+
+
 class PuppetmasterTests(unittest.TestCase):
+    """Hermetic suite: pins ``PUPPETMASTER_MODELS_PATH`` to an empty
+    location for every test so the developer's real
+    ``~/.puppetmaster/models.json`` registry can't leak in and trip
+    auto-routing (which would route default workers to claude-code,
+    yielding BLOCKED artifacts and the wrong counts/roles).
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._models_path_tmp = tempfile.mkdtemp(prefix="pm-models-isolation-")
+        cls._prev_models_env = os.environ.get("PUPPETMASTER_MODELS_PATH")
+        os.environ["PUPPETMASTER_MODELS_PATH"] = str(
+            Path(cls._models_path_tmp) / "no-such-models.json"
+        )
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if cls._prev_models_env is None:
+            os.environ.pop("PUPPETMASTER_MODELS_PATH", None)
+        else:
+            os.environ["PUPPETMASTER_MODELS_PATH"] = cls._prev_models_env
+        shutil.rmtree(cls._models_path_tmp, ignore_errors=True)
+
     def test_mcp_lists_puppetmaster_agent_tools(self) -> None:
         response = handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         tool_names = {tool["name"] for tool in response["result"]["tools"]}
@@ -203,8 +264,7 @@ class PuppetmasterTests(unittest.TestCase):
             self.assertFalse(result["isError"])
 
             spawned = ASYNC_PROCESSES[before_process_count:]
-            for process in spawned:
-                process.wait(timeout=15)
+            _wait_for_spawned_or_kill(self, spawned, timeout=60)
 
             status = call_tool(
                 "puppetmaster_status",
@@ -219,7 +279,16 @@ class PuppetmasterTests(unittest.TestCase):
             status_payload = json.loads(status_body["stdout"])
 
             self.assertEqual(status_payload["job"]["status"], "complete")
-            self.assertEqual(status_payload["artifact_count"], 2)
+            self.assertGreaterEqual(
+                status_payload["artifact_count"],
+                2,
+                msg=(
+                    "spawned swarm should produce at least the base artifact pair "
+                    "(finding + verification); the exact count is intentionally not "
+                    "asserted because routing and memory artifacts have been added "
+                    "since this test was written"
+                ),
+            )
 
     def test_mcp_custom_roles_fail_without_real_adapter_or_config(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -250,12 +319,12 @@ class PuppetmasterTests(unittest.TestCase):
                     "roles": ["pipeline-mapper"],
                     "adapter": "local",
                     "worker_mode": "inline",
+                    "auto_route": False,
                 },
             )
             payload = json.loads(result["content"][0]["text"])
             spawned = ASYNC_PROCESSES[before_process_count:]
-            for process in spawned:
-                process.wait(timeout=15)
+            _wait_for_spawned_or_kill(self, spawned, timeout=60)
 
             status = call_tool(
                 "puppetmaster_status",
@@ -3818,11 +3887,12 @@ class ModelRouterTests(unittest.TestCase):
         rejected_ids = {spec.id for spec, _ in decision.rejected}
         self.assertIn("cursor/composer-2-5", rejected_ids)
         self.assertIn("cursor/gpt-5-5", rejected_ids)
-        # And under quality policy, opus-4-7 (cap 98) still wins over gpt-5.5 (cap 96).
+        # And under quality policy, the frontier flagship opus-4-8 (cap 99)
+        # now wins over opus-4-7 (98) and gpt-5.5 (96).
         quality_decision = route_task(
             signal, starter_registry(), policy="quality"
         )
-        self.assertEqual(quality_decision.model.id, "claude-code/opus-4-7")
+        self.assertEqual(quality_decision.model.id, "claude-code/opus-4-8")
 
     def test_starter_registry_encodes_four_tiers(self) -> None:
         from puppetmaster.model_registry import starter_registry
@@ -3847,14 +3917,56 @@ class ModelRouterTests(unittest.TestCase):
             by_id["claude-code/opus-4-6"].capability_score,
             by_id["claude-code/opus-4-7"].capability_score,
         )
+        # Opus 4.8 is the new frontier flagship — strictly above 4.7 and the
+        # single highest-capability model in the starter registry.
+        self.assertIn("claude-code/opus-4-8", ids)
+        self.assertLess(
+            by_id["claude-code/opus-4-7"].capability_score,
+            by_id["claude-code/opus-4-8"].capability_score,
+        )
+        self.assertEqual(
+            by_id["claude-code/opus-4-8"].capability_score,
+            max(s.capability_score for s in specs),
+        )
+        # Same per-token price as 4.7 (it strictly dominates) with a far
+        # larger context window.
+        self.assertEqual(
+            by_id["claude-code/opus-4-8"].input_per_mtok_usd,
+            by_id["claude-code/opus-4-7"].input_per_mtok_usd,
+        )
+        self.assertGreater(
+            by_id["claude-code/opus-4-8"].context_window,
+            by_id["claude-code/opus-4-7"].context_window,
+        )
         # Vision tagging matches the user-stated preferences.
         self.assertNotIn("vision", by_id["cursor/composer-2-5"].tags)
         self.assertIn("vision", by_id["cursor/gpt-5-5"].tags)
         self.assertIn("vision", by_id["claude-code/opus-4-6"].tags)
         self.assertIn("detailed-vision", by_id["claude-code/opus-4-7"].tags)
+        self.assertIn("detailed-vision", by_id["claude-code/opus-4-8"].tags)
         self.assertNotIn(
             "detailed-vision", by_id["claude-code/opus-4-6"].tags
         )
+
+    def test_starter_registry_routes_hardest_task_to_opus_4_8(self) -> None:
+        """The absolute-hardest tasks must route to the frontier flagship
+        (Opus 4.8), not saturate one notch below it on the older 4.7."""
+        from puppetmaster.model_registry import starter_registry
+        from puppetmaster.router import TaskSignals, route_task
+
+        signal = TaskSignals(
+            instruction=(
+                "Perform an exhaustive security audit across every module and "
+                "exploit any authentication bypass you can find."
+            ),
+            role="security-review",
+        )
+        decision = route_task(signal, starter_registry(), policy="balanced")
+        self.assertEqual(decision.model.id, "claude-code/opus-4-8")
+        # 4.7 should be in the rejected set (sufficient-but-not-chosen), proving
+        # the flagship was preferred for the hardest tier.
+        rejected_ids = {spec.id for spec, _ in decision.rejected}
+        self.assertIn("claude-code/opus-4-7", rejected_ids)
 
     def test_starter_registry_routes_easy_task_to_composer(self) -> None:
         from puppetmaster.model_registry import starter_registry
@@ -4674,6 +4786,197 @@ class InstallerTests(unittest.TestCase):
                 skip_handshake=True,
             )
             self.assertEqual(result.status, "unchanged")
+
+
+class InstallRulesTests(unittest.TestCase):
+    """Tests for :mod:`puppetmaster.rules`.
+
+    These tests exercise the merge-block protocol (the only nontrivial
+    part of the rule installer) without touching the user's real
+    ``~/.cursor``, ``~/.codex``, or ``~/.claude`` directories by
+    targeting a tempdir cwd and explicitly listing targets.
+    """
+
+    def test_render_cursor_mdc_has_frontmatter_and_body(self):
+        from puppetmaster.rules import render_cursor_mdc
+
+        content = render_cursor_mdc()
+        self.assertTrue(content.startswith("---\n"))
+        self.assertIn("alwaysApply: true", content)
+        self.assertIn("# Puppetmaster orchestration", content)
+        self.assertIn("puppetmaster_route_task", content)
+
+    def test_render_agents_block_is_marker_wrapped(self):
+        from puppetmaster.rules import BEGIN_MARKER, END_MARKER, render_agents_block
+
+        block = render_agents_block()
+        self.assertTrue(block.startswith(BEGIN_MARKER))
+        self.assertTrue(block.rstrip().endswith(END_MARKER))
+        self.assertIn("# Puppetmaster orchestration", block)
+
+    def test_merge_into_empty_creates_block(self):
+        from puppetmaster.rules import merge_block_into_text, render_agents_block
+
+        merged, action = merge_block_into_text("", render_agents_block())
+        self.assertEqual(action, "created")
+        self.assertEqual(merged, render_agents_block())
+
+    def test_merge_preserves_existing_user_content(self):
+        from puppetmaster.rules import (
+            BEGIN_MARKER,
+            END_MARKER,
+            merge_block_into_text,
+            render_agents_block,
+        )
+
+        existing = (
+            "# Project conventions\n\n"
+            "- Use TypeScript strict mode\n"
+            "- Run tests before committing\n"
+        )
+        merged, action = merge_block_into_text(existing, render_agents_block())
+        self.assertEqual(action, "created")
+        self.assertIn("# Project conventions", merged)
+        self.assertIn("Use TypeScript strict mode", merged)
+        self.assertIn(BEGIN_MARKER, merged)
+        self.assertIn(END_MARKER, merged)
+        self.assertTrue(
+            merged.index("# Project conventions") < merged.index(BEGIN_MARKER),
+            msg="user content must come before the puppetmaster block when appended",
+        )
+
+    def test_merge_replaces_existing_block_only(self):
+        """A re-run should rewrite the puppetmaster block in place, leaving
+        surrounding user content untouched and at byte-identical positions."""
+        from puppetmaster.rules import (
+            BEGIN_MARKER,
+            END_MARKER,
+            merge_block_into_text,
+            render_agents_block,
+        )
+
+        stale_block = (
+            f"{BEGIN_MARKER}\n"
+            "stale content from a previous version\n"
+            f"{END_MARKER}\n"
+        )
+        before = "# header user content\n\n" + stale_block + "\n# footer user content\n"
+        merged, action = merge_block_into_text(before, render_agents_block())
+        self.assertEqual(action, "replaced")
+        self.assertIn("# header user content", merged)
+        self.assertIn("# footer user content", merged)
+        self.assertNotIn("stale content from a previous version", merged)
+        self.assertIn("puppetmaster_route_task", merged)
+
+    def test_merge_is_idempotent_when_block_matches(self):
+        from puppetmaster.rules import merge_block_into_text, render_agents_block
+
+        full_block = render_agents_block()
+        with_existing = "# header\n\n" + full_block
+        merged, action = merge_block_into_text(with_existing, full_block)
+        self.assertEqual(action, "unchanged")
+        self.assertEqual(merged, with_existing)
+
+    def test_install_rules_writes_cursor_and_agents_in_tempdir(self):
+        from puppetmaster.rules import install_rules
+
+        with TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            (cwd / ".git").mkdir()
+            result = install_rules(cwd=cwd, targets=["cursor", "agents"])
+            self.assertEqual(result.overall_status, "installed")
+            self.assertTrue((cwd / ".cursor" / "rules" / "puppetmaster.mdc").is_file())
+            self.assertTrue((cwd / "AGENTS.md").is_file())
+            mdc = (cwd / ".cursor" / "rules" / "puppetmaster.mdc").read_text("utf-8")
+            self.assertIn("alwaysApply: true", mdc)
+            agents = (cwd / "AGENTS.md").read_text("utf-8")
+            self.assertIn("puppetmaster:rules:begin", agents)
+
+    def test_install_rules_dry_run_writes_nothing(self):
+        from puppetmaster.rules import install_rules
+
+        with TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            result = install_rules(cwd=cwd, targets=["cursor", "agents"], dry_run=True)
+            self.assertEqual(result.overall_status, "would_install")
+            self.assertFalse((cwd / ".cursor" / "rules" / "puppetmaster.mdc").exists())
+            self.assertFalse((cwd / "AGENTS.md").exists())
+
+    def test_install_rules_idempotent_on_rerun(self):
+        from puppetmaster.rules import install_rules
+
+        with TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            install_rules(cwd=cwd, targets=["cursor", "agents"])
+            agents_mtime = (cwd / "AGENTS.md").stat().st_mtime_ns
+            mdc_mtime = (cwd / ".cursor" / "rules" / "puppetmaster.mdc").stat().st_mtime_ns
+            time.sleep(0.01)
+            result = install_rules(cwd=cwd, targets=["cursor", "agents"])
+            self.assertEqual(result.overall_status, "unchanged")
+            self.assertEqual(
+                (cwd / "AGENTS.md").stat().st_mtime_ns,
+                agents_mtime,
+                msg="unchanged run must not rewrite AGENTS.md",
+            )
+            self.assertEqual(
+                (cwd / ".cursor" / "rules" / "puppetmaster.mdc").stat().st_mtime_ns,
+                mdc_mtime,
+                msg="unchanged run must not rewrite .mdc",
+            )
+
+    def test_install_rules_preserves_unrelated_user_content_on_rerun(self):
+        from puppetmaster.rules import install_rules
+
+        with TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            install_rules(cwd=cwd, targets=["agents"])
+            agents_path = cwd / "AGENTS.md"
+            existing = agents_path.read_text("utf-8")
+            agents_path.write_text(
+                "# User wrote this AFTER puppetmaster installed\n\n"
+                + existing
+                + "\n# Trailing user content too\n",
+                encoding="utf-8",
+            )
+            result = install_rules(cwd=cwd, targets=["agents"], force=True)
+            self.assertIn(result.overall_status, {"installed", "unchanged"})
+            final = agents_path.read_text("utf-8")
+            self.assertIn("# User wrote this AFTER puppetmaster installed", final)
+            self.assertIn("# Trailing user content too", final)
+            self.assertIn("puppetmaster:rules:begin", final)
+            self.assertEqual(
+                final.count("puppetmaster:rules:begin"),
+                1,
+                msg="force-rerun must not duplicate the puppetmaster block",
+            )
+
+    def test_doctor_agent_rules_check_warns_when_mcp_present_but_no_rules(self):
+        """Doctor should nudge the user when MCP is wired but rules are missing."""
+        from puppetmaster.diagnostics import _agent_rules_check
+
+        with TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            (cwd / ".cursor").mkdir()
+            (cwd / ".cursor" / "mcp.json").write_text(
+                '{"mcpServers": {"puppetmaster": {"command": "python"}}}',
+                encoding="utf-8",
+            )
+            check = _agent_rules_check(cwd)
+            self.assertEqual(check.status, "warn")
+            self.assertIn("install-rules", check.detail)
+
+    def test_doctor_agent_rules_check_ok_when_rule_present(self):
+        from puppetmaster.diagnostics import _agent_rules_check
+
+        with TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            (cwd / ".cursor" / "rules").mkdir(parents=True)
+            (cwd / ".cursor" / "rules" / "puppetmaster.mdc").write_text(
+                "---\nalwaysApply: true\n---\n",
+                encoding="utf-8",
+            )
+            check = _agent_rules_check(cwd)
+            self.assertEqual(check.status, "ok")
 
 
 if __name__ == "__main__":

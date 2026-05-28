@@ -64,7 +64,18 @@
       "output_per_mtok_usd": 25.0,
       "context_window": 200000,
       "tags": ["claude", "frontier", "vision", "detailed-vision", "reasoning", "code"],
-      "notes": "Frontier tier. Anthropic Opus 4.7 via the Claude Code CLI. Best for detailed-vision, security audits, red-team work. Pricing per the Anthropic 4.x rate schedule ($5/$25 per MTok)."
+      "notes": "Previous frontier flagship. Anthropic Opus 4.7 via the Claude Code CLI. Superseded by claude-code/opus-4-8 (same price, better benchmarks, 1M context). Pricing per the Anthropic 4.x rate schedule ($5/$25 per MTok)."
+    },
+    {
+      "id": "claude-code/opus-4-8",
+      "adapter": "claude-code",
+      "adapter_model_name": "claude-opus-4-8",
+      "capability_score": 99,
+      "input_per_mtok_usd": 5.0,
+      "output_per_mtok_usd": 25.0,
+      "context_window": 1000000,
+      "tags": ["claude", "frontier", "vision", "detailed-vision", "reasoning", "code"],
+      "notes": "Frontier flagship (the router's top tier). Anthropic Opus 4.8 via the Claude Code CLI, released 2026-05-28. Builds on 4.7 with across-the-board benchmark gains and a 1M-token context window at the SAME $5/$25 per-MTok price, so it strictly dominates 4.7 for the hardest tasks. capability_score=99 makes it the default pick once a task needs more than Opus 4.7 (98)."
     },
     {
       "id": "openai/gpt-5-5",

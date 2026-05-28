@@ -143,10 +143,11 @@ def starter_registry() -> list[ModelSpec]:
     actually think in: fast/cheap, balanced, high-quality, frontier.
 
     Tier IDs (``cursor/composer-2-5``, ``cursor/gpt-5-5``,
-    ``claude-code/opus-4-6``, ``claude-code/opus-4-7``) reflect a
-    common mental model where the cheap tier is Cursor's house model,
-    the balanced tier is GPT, and the frontier tiers are Anthropic
-    Opus. ``adapter_model_name`` values are the literal strings each
+    ``claude-code/opus-4-6``, ``claude-code/opus-4-7``,
+    ``claude-code/opus-4-8``) reflect a common mental model where the
+    cheap tier is Cursor's house model, the balanced tier is GPT, and
+    the frontier tiers are Anthropic Opus — with Opus 4.8 as the current
+    top-of-stack flagship. ``adapter_model_name`` values are the literal strings each
     adapter passes through to its SDK / CLI today (verified against
     Cursor's runtime model catalog and Anthropic's claude CLI), so
     the starter registry is callable end-to-end without edits.
@@ -245,12 +246,44 @@ def starter_registry() -> list[ModelSpec]:
                 "code",
             ],
             notes=(
-                "Frontier tier. Anthropic Opus 4.7 via the Claude Code "
-                "CLI. Slow + expensive but best for detailed-vision, "
-                "complex reasoning, security audits, and red-team work. "
-                "Pricing reflects the Anthropic 4.x rate schedule "
-                "($5/$25 per MTok), not the older Opus 4.1 rate "
-                "($15/$75) the starter registry shipped before v0.6.3."
+                "Previous frontier flagship. Anthropic Opus 4.7 via the "
+                "Claude Code CLI. Superseded by claude-code/opus-4-8 (same "
+                "price, better benchmarks, 4x larger context) — kept in the "
+                "registry so existing routing configs and cost history stay "
+                "valid. Pricing reflects the Anthropic 4.x rate schedule "
+                "($5/$25 per MTok)."
+            ),
+        ),
+        ModelSpec(
+            id="claude-code/opus-4-8",
+            adapter="claude-code",
+            adapter_model_name="claude-opus-4-8",
+            capability_score=99,
+            input_per_mtok_usd=5.0,
+            output_per_mtok_usd=25.0,
+            context_window=1_000_000,
+            tags=[
+                "claude",
+                "frontier",
+                "vision",
+                "detailed-vision",
+                "reasoning",
+                "code",
+            ],
+            notes=(
+                "Frontier flagship (the router's top tier). Anthropic Opus "
+                "4.8 via the Claude Code CLI, released 2026-05-28. Builds on "
+                "Opus 4.7 with across-the-board benchmark gains, a 1M-token "
+                "context window, and codebase-scale parallel-subagent work — "
+                "at the SAME $5/$25 per-MTok price as 4.7, so it strictly "
+                "dominates 4.7 for the hardest tasks (detailed-vision, deep "
+                "reasoning, security audits, red-team). capability_score=99 "
+                "makes it the default pick whenever the task's required "
+                "capability exceeds Opus 4.7 (98), and the highest-capability "
+                "fallback when no model fully meets the need. A faster, "
+                "pricier 'fast mode' ($10/$50 per MTok) exists for "
+                "latency-sensitive work — add it as a separate entry if you "
+                "want the router to consider it."
             ),
         ),
         # OpenAI tier — uses the openai adapter directly with OPENAI_API_KEY,

@@ -46,8 +46,66 @@ def run_doctor(root: Path, state_dir: Optional[Path] = None) -> list[Check]:
         _env_check("OPENAI_API_KEY"),
         _sqlite_state_check(state_path / "state.sqlite3"),
         _git_clean_check(root),
+        _agent_rules_check(root),
     ]
     return checks
+
+
+def _agent_rules_check(root: Path) -> Check:
+    """Warn when MCP is wired but no agent rule file is present.
+
+    The MCP installers give Cursor / Codex / Claude Code the *capability*
+    to call Puppetmaster, but a host agent won't reflexively reach for
+    those tools without a workspace rule nudging it. This check catches
+    the common half-installed state where `install-cursor-mcp` or
+    `install-codex-mcp` was run but `install-rules` was not.
+
+    Returns ``optional`` rather than ``warn`` if no MCP integration is
+    detected either (no MCP = no point in rules), and ``ok`` once any
+    rule file is present at one of the canonical locations.
+    """
+    candidate_paths = [
+        root / ".cursor" / "rules" / "puppetmaster.mdc",
+        root / "AGENTS.md",
+        root / "CLAUDE.md",
+        Path.home() / ".codex" / "instructions.md",
+        Path.home() / ".claude" / "CLAUDE.md",
+    ]
+    rule_present_paths: list[Path] = []
+    for path in candidate_paths:
+        try:
+            if not path.is_file():
+                continue
+            if path.name == "puppetmaster.mdc":
+                rule_present_paths.append(path)
+                continue
+            text = path.read_text(encoding="utf-8")
+            if "puppetmaster:rules:begin" in text or "puppetmaster_route_task" in text:
+                rule_present_paths.append(path)
+        except OSError:
+            continue
+    if rule_present_paths:
+        rel = ", ".join(
+            str(p.relative_to(Path.home())) if str(p).startswith(str(Path.home())) else str(p)
+            for p in rule_present_paths[:2]
+        )
+        return Check("agent-rules", "ok", f"agent rule present ({rel})")
+    cursor_mcp = (root / ".cursor" / "mcp.json").is_file() or (Path.home() / ".cursor" / "mcp.json").is_file()
+    if not cursor_mcp:
+        return Check(
+            "agent-rules",
+            "optional",
+            "no agent rule files detected (run `puppetmaster install-rules` after registering an MCP host)",
+        )
+    return Check(
+        "agent-rules",
+        "warn",
+        (
+            "Puppetmaster MCP is registered but no agent rule file was found — "
+            "the host agent will not reflexively reach for Puppetmaster on multi-file tasks. "
+            "Fix: `puppetmaster install-rules` (workspace) or `puppetmaster install-rules --global` (user-level)."
+        ),
+    )
 
 
 def _codex_check() -> Check:
