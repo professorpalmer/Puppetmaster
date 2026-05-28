@@ -5613,6 +5613,73 @@ class PreflightDispatchGateTests(unittest.TestCase):
         self.assertIs(artifacts, sentinel)
 
 
+class TelemetryTests(unittest.TestCase):
+    def test_disabled_by_default(self) -> None:
+        from puppetmaster.telemetry import telemetry_enabled
+
+        self.assertFalse(telemetry_enabled({}))
+
+    def test_enable_and_override_logic(self) -> None:
+        from puppetmaster.telemetry import telemetry_enabled
+
+        self.assertTrue(telemetry_enabled({"OTEL_EXPORTER_OTLP_ENDPOINT": "http://x:4318"}))
+        self.assertTrue(telemetry_enabled({"OTEL_TRACES_EXPORTER": "console"}))
+        # explicit off wins even with an endpoint set.
+        self.assertFalse(
+            telemetry_enabled(
+                {"OTEL_EXPORTER_OTLP_ENDPOINT": "http://x:4318", "PUPPETMASTER_OTEL_ENABLED": "false"}
+            )
+        )
+        # explicit on wins with nothing else.
+        self.assertTrue(telemetry_enabled({"PUPPETMASTER_OTEL_ENABLED": "true"}))
+
+    def test_record_job_trace_noop_when_disabled(self) -> None:
+        from puppetmaster.models import Job
+        from puppetmaster.telemetry import record_job_trace
+
+        self.assertFalse(record_job_trace(Job(goal="g"), [], [], env={}))
+
+    def test_build_job_trace_shape(self) -> None:
+        from puppetmaster.models import (
+            Artifact,
+            ArtifactType,
+            Job,
+            Task,
+            TaskStatus,
+        )
+        from puppetmaster.telemetry import build_job_trace
+
+        job = Job(goal="audit the thing")
+        t_ok = Task(
+            job_id=job.id, role="explore", instruction="x", adapter="cursor",
+            status=TaskStatus.COMPLETE,
+        )
+        t_bad = Task(
+            job_id=job.id, role="implement", instruction="y", adapter="claude-code",
+            status=TaskStatus.FAILED,
+        )
+        routing = Artifact(
+            job_id=job.id, task_id=t_ok.id, type=ArtifactType.ROUTING, created_by="router",
+            payload={"model_id": "cursor/claude-opus-4-8", "adapter": "cursor",
+                     "policy": "balanced", "estimated_cost_usd": 0.0},
+            confidence=0.9, evidence=["role:explore"],
+        )
+        failed = Artifact(
+            job_id=job.id, task_id=t_bad.id, type=ArtifactType.VERIFICATION, created_by="w",
+            payload={"check": "preflight", "result": "blocked", "failure": "preflight_blocked"},
+            confidence=0.95, evidence=["adapter:claude-code"],
+        )
+        trace = build_job_trace(job, [t_ok, t_bad], [routing, failed])
+        self.assertEqual(trace.job_id, job.id)
+        self.assertEqual(len(trace.tasks), 2)
+        spans = {t.task_id: t for t in trace.tasks}
+        self.assertEqual(spans[t_ok.id].model, "cursor/claude-opus-4-8")
+        self.assertEqual(spans[t_bad.id].failure, "preflight_blocked")
+        # attributes render without the OTel SDK.
+        self.assertIn("puppetmaster.job.id", trace.attributes())
+        self.assertIn("gen_ai.system", spans[t_ok.id].attributes())
+
+
 if __name__ == "__main__":
     unittest.main()
 
