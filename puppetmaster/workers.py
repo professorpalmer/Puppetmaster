@@ -3,8 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-from puppetmaster.adapters import get_adapter
+from puppetmaster.adapters import get_adapter, verification_artifact
 from puppetmaster.models import AgentRun, Artifact, Task, TaskStatus, now_iso
+
+# Adapters that bill an LLM provider and therefore benefit from a pre-dispatch
+# auth/billing gate. ``local``/``shell`` run no model, so they're never gated.
+_PREFLIGHTABLE_ADAPTERS = {"cursor", "claude-code", "codex", "openai"}
 
 
 @dataclass(frozen=True)
@@ -67,6 +71,18 @@ class LocalWorker:
         self.worker_id = worker_id or f"local-{role}"
 
     def run(self, task: Task, goal: str) -> tuple[AgentRun, list[Artifact]]:
+        blocked = self._preflight(task)
+        if blocked is not None:
+            run = AgentRun(
+                job_id=task.job_id,
+                task_id=task.id,
+                role=task.role,
+                worker_id=self.worker_id,
+                status=TaskStatus.FAILED,
+                completed_at=now_iso(),
+            )
+            return run, [blocked]
+
         run = AgentRun(
             job_id=task.job_id,
             task_id=task.id,
@@ -80,6 +96,47 @@ class LocalWorker:
         if task.adapter == "shell":
             return run, get_adapter("shell").run(task, goal, self.worker_id)
         return run, get_adapter(task.adapter).run(task, goal, self.worker_id)
+
+    def _preflight(self, task: Task) -> Optional[Artifact]:
+        """Fast, no-network auth/billing gate before dispatching a paid worker.
+
+        Catches the cheap-to-detect failures up front — missing CLI/key,
+        unauthenticated adapter, or an api-billed adapter when the task forbids
+        out-of-pocket spend — so we emit a clear blocked artifact instead of
+        burning a dispatch. Catalog validation and live token probes are
+        deliberately skipped here to keep dispatch latency near zero; opt out
+        entirely with ``payload.skip_preflight``.
+        """
+        if task.payload.get("skip_preflight"):
+            return None
+        if task.adapter not in _PREFLIGHTABLE_ADAPTERS:
+            return None
+
+        from puppetmaster.preflight import preflight_check
+
+        model = task.payload.get("model")
+        result = preflight_check(
+            task.adapter,
+            model,
+            allow_api_billing=bool(task.payload.get("allow_api_billing", True)),
+        )
+        if result.ok:
+            return None
+        return verification_artifact(
+            task=task,
+            worker_id=self.worker_id,
+            adapter=task.adapter,
+            check=f"preflight: can {task.adapter} run this task?",
+            result="blocked",
+            confidence=0.95,
+            evidence=[f"adapter:{task.adapter}", *result.evidence],
+            payload={
+                "failure": "preflight_blocked",
+                "reason": result.reason,
+                "billing": result.billing,
+                "model": model,
+            },
+        )
 
 
 def specs_for_roles(roles: Optional[list[str]] = None) -> list[WorkerSpec]:
