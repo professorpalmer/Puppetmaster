@@ -24,7 +24,7 @@ Every number in this section comes from a reproducible script in [`bench/`](benc
 
 **On follow-up work** — once a swarm completes, every artifact (finding, decision, risk, patch, verification, routing decision) lives in SQLite. Follow-up questions like *"what did the security audit worker find?"* are SQLite queries, not new agent runs.
 
-- Receipt: [`bench/followup_cost.py`](bench/followup_cost.py) — **40 follow-up queries against a real completed swarm: 0 adapter calls, 0 tokens, \$0.00, avg 0.5 ms per query.** Hypothetical "always-frontier replay" baseline for the same 40 queries: **\$4.92**.
+- Receipt: [`bench/followup_cost.py`](bench/followup_cost.py) — **40 follow-up queries against a real completed swarm: 0 adapter calls, 0 tokens, \$0.00, avg 0.5 ms per query.** Hypothetical "always-frontier replay" baseline for the same 40 queries: **\$1.64** (using Anthropic's current Opus 4.7 rate of $5/$25 per MTok, corrected in v0.6.3 from the $15/$75 the registry shipped before).
 
 Honest scope: this is the *follow-up reads are free* claim. If your follow-up needs new reasoning the swarm didn't produce, that's a new task and it costs tokens like any other.
 
@@ -295,14 +295,15 @@ If you haven't run `puppetmaster models init` yet, auto-routing is a clean no-op
 
 ### The four tiers in the starter registry
 
-`puppetmaster models init` writes eight tiered model entries that map directly to the "easy / balanced / high / extra-high" mental model — four Cursor/Claude tiers and four OpenAI tiers. **The `adapter_model_name` values are the literal strings each adapter passes through to its SDK / CLI today** (verified against Cursor's runtime catalog and Anthropic's `claude` CLI in v0.6.1-beta.2): `composer-2.5`, `gpt-5.5`, `claude-opus-4-6`, `claude-opus-4-7` for the Cursor/Claude tier, plus `gpt-5.5` / `gpt-5.4` / `gpt-5.4-mini` / `gpt-5.4-nano` for the OpenAI tier. When newer versions land, edit `adapter_model_name` in `~/.puppetmaster/models.json` and the tier ids stay stable:
+`puppetmaster models init` writes nine tiered model entries that map directly to the "easy / balanced / high / extra-high" mental model — five Cursor/Claude tiers and four OpenAI tiers, covering every cheap → frontier pairing across all three adapters. **The `adapter_model_name` values are the literal strings each adapter passes through to its SDK / CLI today** (verified against Cursor's runtime catalog and Anthropic's `claude` CLI in v0.6.1-beta.2 / v0.6.3): `composer-2.5`, `gpt-5.5`, `claude-haiku-4-5`, `claude-opus-4-6`, `claude-opus-4-7` for the Cursor/Claude tier, plus `gpt-5.5` / `gpt-5.4` / `gpt-5.4-mini` / `gpt-5.4-nano` for the OpenAI tier. When newer versions land, edit `adapter_model_name` in `~/.puppetmaster/models.json` and the tier ids stay stable:
 
 | Tier ID                  | Adapter       | Mental model                                       | Tags |
 | ------------------------ | ------------- | -------------------------------------------------- | ---- |
-| `cursor/composer-2-5`    | `cursor`      | fast / cheap / reading                             | `cheap`, `fast`, `reading`, `code` |
-| `cursor/gpt-5-5`         | `cursor`      | balanced — medium speed, medium capability        | `balanced`, `fast`, `vision` |
-| `claude-code/opus-4-6`   | `claude-code` | high-quality — medium speed, higher cost          | `quality`, `vision`, `reasoning` |
-| `claude-code/opus-4-7`   | `claude-code` | frontier — slow, expensive, best for hard reasoning + detailed vision | `frontier`, `vision`, `detailed-vision`, `reasoning` |
+| `cursor/composer-2-5`    | `cursor`      | fast / cheap / reading (\$0 — bundled in Cursor plan) | `cheap`, `fast`, `reading`, `code` |
+| `cursor/gpt-5-5`         | `cursor`      | balanced — \$0 via Cursor plan, GPT-5.5 quality     | `balanced`, `fast`, `vision` |
+| `claude-code/haiku-4-5`  | `claude-code` | cheap on the Anthropic side (\$1 / \$5) — the cheap tier for Claude-Code-only users | `cheap`, `fast`, `vision`, `reading`, `code` |
+| `claude-code/opus-4-6`   | `claude-code` | high-quality — \$5 / \$25 per MTok                  | `quality`, `vision`, `reasoning` |
+| `claude-code/opus-4-7`   | `claude-code` | frontier — \$5 / \$25, best for hard reasoning + detailed vision | `frontier`, `vision`, `detailed-vision`, `reasoning` |
 
 With the starter registry, balanced-policy routing lands roughly:
 
@@ -330,11 +331,12 @@ python -m puppetmaster route "Security audit across every endpoint" --role audit
 # picked: claude-code/opus-4-7  (adapter=claude-code, model_name=claude-opus-4-7)
 # policy: balanced
 # capability needed: 98  chosen capability: 98
-# estimated tokens: in=510  out=5000  estimated cost: $0.382650
+# estimated tokens: in=510  out=5000  estimated cost: $0.127550
 # why: policy=balanced: cheapest model whose capability_score (98) >= needed (98)
 # rejected:
 #   - cursor/composer-2-5:  capability_score 55 < needed 98
 #   - cursor/gpt-5-5:       capability_score 78 < needed 98
+#   - claude-code/haiku-4-5:capability_score 55 < needed 98
 #   - claude-code/opus-4-6: capability_score 88 < needed 98
 #   - openai/gpt-5-5:       capability_score 96 < needed 98
 #   - openai/gpt-5-4:       capability_score 86 < needed 98
@@ -388,7 +390,7 @@ python -m puppetmaster artifacts <job_id> | jq '.[] | select(.type=="routing") |
 #   "policy": "balanced",
 #   "capability_needed": 98,
 #   "capability_score": 98,
-#   "estimated_cost_usd": 0.382650,
+#   "estimated_cost_usd": 0.127550,
 #   "reason": "policy=balanced: cheapest model whose capability_score (98) >= needed (98)",
 #   "rejected": [
 #     {"id": "cursor/composer-2-5",  "reason": "capability_score 55 < needed 98"},
