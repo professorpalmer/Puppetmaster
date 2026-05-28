@@ -588,14 +588,21 @@ def main() -> int:
 
 
 def _server_version() -> Optional[str]:
-    """Best-effort lookup of the installed puppetmaster version."""
+    """Best-effort lookup of the installed puppetmaster version.
+
+    The distribution is published as ``puppetmaster-ai`` (the bare
+    ``puppetmaster`` name is held on PyPI), so try that first and fall back to
+    the legacy name for local/editable installs registered either way.
+    """
     try:
         from importlib.metadata import PackageNotFoundError, version as _version
 
-        try:
-            return _version("puppetmaster")
-        except PackageNotFoundError:
-            return None
+        for dist_name in ("puppetmaster-ai", "puppetmaster"):
+            try:
+                return _version(dist_name)
+            except PackageNotFoundError:
+                continue
+        return None
     except Exception:
         return None
 
@@ -821,6 +828,18 @@ def tools() -> list[McpTool]:
             description="Return a live summary from current artifacts without waiting for final stitching.",
             input_schema=job_schema(required=True),
             handler=lambda args: run_cli(["show", require_string(args, "job_id"), "--partial"], args),
+        ),
+        McpTool(
+            name="puppetmaster_await_job",
+            description=(
+                "Await sugar over the long-poll: block up to timeout_seconds for a job to "
+                "reach a terminal state (complete/failed), then return its status and final "
+                "summary. If it times out first, returns timed_out=true with the current "
+                "status so you can immediately call again to keep awaiting (the MCP turn "
+                "can't block forever). Prefer this over polling status in a loop."
+            ),
+            input_schema=await_schema(),
+            handler=run_await_job,
         ),
         McpTool(
             name="puppetmaster_artifacts",
@@ -1622,6 +1641,39 @@ def run_feed_follow(args: JsonObject) -> JsonObject:
     return {"content": [{"type": "text", "text": json.dumps(body, indent=2, default=str)}], "isError": False}
 
 
+def run_await_job(args: JsonObject) -> JsonObject:
+    from puppetmaster.cli import await_job_state
+    from puppetmaster.stitcher import Stitcher
+
+    job_id = require_string(args, "job_id")
+    timeout_seconds = float(args.get("timeout_seconds") or 25.0)
+    poll_interval = float(args.get("poll_interval_seconds") or 0.25)
+    backend = str(args.get("backend") or "sqlite")
+
+    state_dir = mcp_state_dir(args)
+    store = create_store(backend, state_dir)
+
+    state = await_job_state(
+        store,
+        job_id,
+        timeout_seconds=timeout_seconds,
+        poll_interval_seconds=poll_interval,
+    )
+    summary = ""
+    if state["terminal"]:
+        summary_path = store.job_dir(job_id) / "summaries" / "stitched.md"
+        if summary_path.is_file():
+            summary = summary_path.read_text(encoding="utf-8")
+        else:
+            summary = Stitcher(store).preview(job_id)
+
+    body = {**state, "summary": summary}
+    return {
+        "content": [{"type": "text", "text": json.dumps(body, indent=2, default=str)}],
+        "isError": state["status"] == "failed",
+    }
+
+
 def start_cli(command: list[str], args: JsonObject) -> JsonObject:
     state_dir = str(mcp_state_dir(args))
     run_dir = Path(state_dir) / "mcp-runs"
@@ -1804,6 +1856,34 @@ def follow_schema() -> JsonObject:
             "limit": {
                 "type": "integer",
                 "description": "Optional cap on the number of artifacts returned in one batch.",
+            },
+            "backend": {
+                "type": "string",
+                "enum": ["file", "sqlite"],
+                "default": "sqlite",
+                "description": "Coordination backend to open. Match the one used by your jobs.",
+            },
+        }
+    )
+    return schema
+
+
+def await_schema() -> JsonObject:
+    schema = job_schema(required=True)
+    schema["properties"].update(
+        {
+            "timeout_seconds": {
+                "type": "number",
+                "default": 25,
+                "description": (
+                    "Maximum seconds to block waiting for the job to finish. Bounded so "
+                    "the MCP turn returns; if it times out, call again to keep awaiting."
+                ),
+            },
+            "poll_interval_seconds": {
+                "type": "number",
+                "default": 0.25,
+                "description": "Internal poll interval while blocked.",
             },
             "backend": {
                 "type": "string",
@@ -2095,6 +2175,14 @@ def claude_schema() -> JsonObject:
     schema = goal_schema("Implement the requested change and run focused tests.")
     schema["properties"].update(
         {
+            "model": {
+                "type": "string",
+                "description": (
+                    "Optional Claude model name. Defaults to claude-opus-4-8 "
+                    "(the frontier flagship) when omitted and no router model "
+                    "is stamped."
+                ),
+            },
             "permission_mode": {
                 "type": "string",
                 "default": "acceptEdits",

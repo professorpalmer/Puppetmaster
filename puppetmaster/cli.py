@@ -305,6 +305,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Render a live summary from current artifacts without waiting for final stitching.",
     )
 
+    await_cmd = subcommands.add_parser(
+        "await",
+        help=(
+            "Block until a job reaches a terminal state (complete/failed), then "
+            "print its final summary. True blocking await for the CLI/SDK path."
+        ),
+    )
+    await_cmd.add_argument("job_id")
+    await_cmd.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=0.0,
+        help="Give up after N seconds (0 = block until the job finishes). Default: 0.",
+    )
+    await_cmd.add_argument(
+        "--poll-interval-seconds",
+        type=float,
+        default=0.25,
+        help="How often to re-check job state while blocked. Default: 0.25.",
+    )
+    await_cmd.add_argument("--json", action="store_true", help="Emit JSON.")
+
     artifacts = subcommands.add_parser("artifacts", help="Print artifacts for a job as JSON.")
     artifacts.add_argument("job_id")
 
@@ -651,6 +673,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print the resolved model registry path.",
     )
     models_path.add_argument("--registry-path", help="Override the registry path.")
+    models_discover = models_sub.add_parser(
+        "discover",
+        help=(
+            "Enumerate the Cursor plan's model catalog and reconcile it into the "
+            "registry as plan-billed entries (requires CURSOR_API_KEY + node)."
+        ),
+    )
+    models_discover.add_argument("--registry-path", help="Override the registry path.")
+    models_discover.add_argument(
+        "--write",
+        action="store_true",
+        help="Persist the merged registry (default: dry-run, just print the diff).",
+    )
+    models_discover.add_argument("--json", action="store_true", help="Emit JSON.")
+
+    preflight_cmd = subcommands.add_parser(
+        "preflight",
+        help=(
+            "Check whether an adapter can actually run before dispatch: auth "
+            "present, plan-vs-api billing, and (Cursor) model in the live catalog."
+        ),
+    )
+    preflight_cmd.add_argument(
+        "adapter",
+        help="Adapter to check (cursor, claude-code, codex, openai).",
+    )
+    preflight_cmd.add_argument("--model", help="Model id to validate (Cursor catalog).")
+    preflight_cmd.add_argument(
+        "--no-api-billing",
+        action="store_true",
+        help="Treat api-billed adapters as blocked (plan-only).",
+    )
+    preflight_cmd.add_argument("--json", action="store_true", help="Emit JSON.")
 
     route_cmd = subcommands.add_parser(
         "route",
@@ -823,6 +878,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
 
     if args.command == "route":
         return _run_route_command(args)
+
+    if args.command == "preflight":
+        return _run_preflight_command(args)
 
     if args.command == "cost":
         return _run_cost_command(args, store)
@@ -1121,6 +1179,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
             path = store.job_dir(args.job_id) / "summaries" / "stitched.md"
             print(path.read_text(encoding="utf-8"))
         return 0
+
+    if args.command == "await":
+        return _run_await_command(args, store)
 
     if args.command == "artifacts":
         artifacts = [artifact.__dict__ for artifact in store.list_artifacts(args.job_id)]
@@ -1663,7 +1724,170 @@ def _run_models_subcommand(args) -> int:
             )
         return 0
 
+    if args.models_command == "discover":
+        return _run_models_discover(args, path)
+
     raise SystemExit(f"unknown models subcommand: {args.models_command}")
+
+
+def _run_models_discover(args, path: Path) -> int:
+    """Enumerate the Cursor plan catalog and reconcile it into the registry."""
+    import json as _json
+
+    from puppetmaster.cursor_discovery import (
+        CursorDiscoveryError,
+        fetch_cursor_catalog,
+        merge_catalog_into_registry,
+    )
+    from puppetmaster.model_registry import (
+        load_registry,
+        save_registry,
+        starter_registry,
+    )
+
+    try:
+        existing = load_registry(path)
+    except RuntimeError:
+        existing = starter_registry()
+
+    try:
+        catalog = fetch_cursor_catalog()
+    except CursorDiscoveryError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    merged, report = merge_catalog_into_registry(existing, catalog)
+
+    if args.json:
+        print(
+            _json.dumps(
+                {
+                    "report": report,
+                    "catalog": catalog,
+                    "written": bool(args.write),
+                    "registry_path": str(path),
+                },
+                indent=2,
+            )
+        )
+    else:
+        print(f"Discovered {report['discovered_count']} plan-billed Cursor model(s).")
+        if report["added"]:
+            print(f"  + new: {', '.join(report['added'])}")
+        if report["dropped_stale_cursor_models"]:
+            print(
+                f"  - dropped (no longer in plan): "
+                f"{', '.join(report['dropped_stale_cursor_models'])}"
+            )
+        print(f"  preserved {report['non_cursor_preserved']} non-cursor entr(ies).")
+
+    if args.write:
+        save_registry(merged, path)
+        if not args.json:
+            print(f"Wrote merged registry to {path}")
+    elif not args.json:
+        print("Dry run — pass --write to persist.")
+    return 0
+
+
+def await_job_state(
+    store,
+    job_id: str,
+    *,
+    timeout_seconds: float = 0.0,
+    poll_interval_seconds: float = 0.25,
+) -> dict:
+    """Block until ``job_id`` reaches a terminal state or the timeout elapses.
+
+    Returns ``{status, terminal, timed_out, completed_at}``. ``timeout_seconds``
+    of 0 blocks indefinitely (CLI/SDK path); a positive value bounds the wait
+    (so the MCP path can return and be re-called). Uses the store's
+    event-wait primitive between checks instead of busy-polling.
+    """
+    from puppetmaster.models import JobStatus
+
+    terminal = {JobStatus.COMPLETE, JobStatus.FAILED}
+    poll = max(0.05, poll_interval_seconds)
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds > 0 else None
+    cursor = 0
+    while True:
+        job = store.get_job(job_id)
+        if job.status in terminal:
+            return {
+                "job_id": job_id,
+                "status": str(job.status),
+                "terminal": True,
+                "timed_out": False,
+                "completed_at": job.completed_at,
+            }
+        if deadline is not None and time.monotonic() >= deadline:
+            return {
+                "job_id": job_id,
+                "status": str(job.status),
+                "terminal": False,
+                "timed_out": True,
+                "completed_at": job.completed_at,
+            }
+        block = poll if deadline is None else max(0.05, min(poll * 4, deadline - time.monotonic()))
+        store.wait_for_events(
+            job_id,
+            since=cursor,
+            timeout_seconds=max(0.05, block),
+            poll_interval=poll,
+        )
+
+
+def _run_await_command(args, store) -> int:
+    state = await_job_state(
+        store,
+        args.job_id,
+        timeout_seconds=args.timeout_seconds,
+        poll_interval_seconds=args.poll_interval_seconds,
+    )
+    summary = ""
+    if state["terminal"]:
+        summary_path = store.job_dir(args.job_id) / "summaries" / "stitched.md"
+        if summary_path.is_file():
+            summary = summary_path.read_text(encoding="utf-8")
+        else:
+            summary = Stitcher(store).preview(args.job_id)
+
+    if args.json:
+        print(json.dumps({**state, "summary": summary}, indent=2, default=str))
+    else:
+        if state["timed_out"]:
+            print(f"timed out after {args.timeout_seconds}s; job {args.job_id} is {state['status']}")
+        else:
+            print(summary or f"job {args.job_id} finished: {state['status']}")
+    return 0 if state["status"] != "failed" else 1
+
+
+def _run_preflight_command(args) -> int:
+    """Check an adapter's auth/billing posture (and Cursor model) before dispatch."""
+    import json as _json
+
+    from puppetmaster.preflight import preflight_check
+
+    catalog_fetcher = None
+    if args.adapter == "cursor" and args.model:
+        from puppetmaster.cursor_discovery import fetch_cursor_catalog
+
+        catalog_fetcher = fetch_cursor_catalog
+
+    result = preflight_check(
+        args.adapter,
+        args.model,
+        allow_api_billing=not args.no_api_billing,
+        catalog_fetcher=catalog_fetcher,
+    )
+
+    if args.json:
+        print(_json.dumps(result.as_dict(), indent=2))
+    else:
+        status = "READY" if result.ok else "BLOCKED"
+        print(f"{status:8} {result.adapter:12} billing={result.billing}")
+        print(f"  {result.reason}")
+    return 0 if result.ok else 1
 
 
 def _run_route_command(args) -> int:

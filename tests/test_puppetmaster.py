@@ -2703,6 +2703,68 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertEqual(classify_claude_code_failure("permission denied"), "permission_denied")
         self.assertEqual(classify_claude_code_failure("model invalid"), "model_unavailable")
 
+    def test_claude_code_adapter_defaults_to_opus_4_8(self) -> None:
+        """With no model pinned (and no router stamp), the claude-code adapter
+        must default to claude-opus-4-8 rather than the CLI's own default."""
+        from puppetmaster.adapters import DEFAULT_CLAUDE_CODE_MODEL
+
+        self.assertEqual(DEFAULT_CLAUDE_CODE_MODEL, "claude-opus-4-8")
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+
+            fake_claude = root / "fake_claude.py"
+            fake_claude.write_text(
+                """#!/usr/bin/env python3
+print('{"result":"ok"}')
+""",
+                encoding="utf-8",
+            )
+            fake_claude.chmod(0o755)
+
+            captured: dict = {}
+
+            def fake_build(**kwargs):
+                captured.update(kwargs)
+                return [str(fake_claude)]
+
+            # Default case: no model in payload.
+            task = Task(
+                job_id="job",
+                role="claude-code",
+                instruction="implement a change",
+                adapter="claude-code",
+                payload={"executable": str(fake_claude), "cwd": str(repo), "timeout_seconds": 10},
+            )
+            with patch(
+                "puppetmaster.adapters.build_claude_code_command", side_effect=fake_build
+            ):
+                ClaudeCodeAdapter().run(task, "goal", "worker")
+            self.assertEqual(captured["model"], "claude-opus-4-8")
+
+            # Explicit model still wins over the default.
+            captured.clear()
+            task_pinned = Task(
+                job_id="job",
+                role="claude-code",
+                instruction="implement a change",
+                adapter="claude-code",
+                payload={
+                    "executable": str(fake_claude),
+                    "cwd": str(repo),
+                    "timeout_seconds": 10,
+                    "model": "claude-haiku-4-5",
+                },
+            )
+            with patch(
+                "puppetmaster.adapters.build_claude_code_command", side_effect=fake_build
+            ):
+                ClaudeCodeAdapter().run(task_pinned, "goal", "worker")
+            self.assertEqual(captured["model"], "claude-haiku-4-5")
+
     def test_claude_code_adapter_injects_codegraph_context_when_available(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3684,6 +3746,41 @@ class ModelRouterTests(unittest.TestCase):
         rejected_map = {spec.id: why for spec, why in decision.rejected}
         self.assertIn("capability_score", rejected_map["cheap-model"])
         self.assertIn("pricier", rejected_map["frontier-model"])
+
+    def test_balanced_equal_cost_rejection_is_not_labeled_pricier(self) -> None:
+        """Two equal-priced models that both clear the bar must not be
+        rejected with a 'pricier' reason — the tie-break is capability
+        right-sizing, not cost. Regression for the opus-4-7 vs opus-4-8
+        (both $5/$25) case."""
+        from puppetmaster.model_registry import ModelSpec
+        from puppetmaster.router import TaskSignals, route_task
+
+        registry = [
+            ModelSpec(
+                id="tier-a",
+                adapter="claude-code",
+                adapter_model_name="a",
+                capability_score=98,
+                input_per_mtok_usd=5.0,
+                output_per_mtok_usd=25.0,
+            ),
+            ModelSpec(
+                id="tier-b",
+                adapter="claude-code",
+                adapter_model_name="b",
+                capability_score=99,
+                input_per_mtok_usd=5.0,
+                output_per_mtok_usd=25.0,
+            ),
+        ]
+        signal = TaskSignals(instruction="hard task", role="audit", explicit_min_capability=95)
+        decision = route_task(signal, registry, policy="balanced")
+        # Lower-capability equal-cost model is right-sized and wins.
+        self.assertEqual(decision.model.id, "tier-a")
+        rejected_map = {spec.id: why for spec, why in decision.rejected}
+        self.assertIn("tier-b", rejected_map)
+        self.assertNotIn("pricier", rejected_map["tier-b"])
+        self.assertIn("same estimated cost", rejected_map["tier-b"])
 
     def test_artifact_payload_carries_audit_fields(self) -> None:
         from puppetmaster.router import TaskSignals, route_task
@@ -4977,6 +5074,439 @@ class InstallRulesTests(unittest.TestCase):
             )
             check = _agent_rules_check(cwd)
             self.assertEqual(check.status, "ok")
+
+
+class ModelBillingFieldTests(unittest.TestCase):
+    def test_billing_defaults_to_unknown_and_validates(self) -> None:
+        from puppetmaster.model_registry import ModelSpec
+
+        spec = ModelSpec(id="m", adapter="cursor", adapter_model_name="x")
+        self.assertEqual(spec.billing, "unknown")
+        self.assertFalse(spec.is_plan_billed)
+
+        plan = ModelSpec(id="m", adapter="cursor", adapter_model_name="x", billing="plan")
+        self.assertTrue(plan.is_plan_billed)
+
+        with self.assertRaises(ValueError):
+            ModelSpec(id="m", adapter="cursor", adapter_model_name="x", billing="free")
+
+    def test_billing_survives_json_round_trip_and_drops_default(self) -> None:
+        from puppetmaster.model_registry import (
+            ModelSpec,
+            load_registry,
+            save_registry,
+        )
+
+        specs = [
+            ModelSpec(id="a", adapter="cursor", adapter_model_name="x", billing="plan"),
+            ModelSpec(id="b", adapter="openai", adapter_model_name="y", billing="api"),
+            ModelSpec(id="c", adapter="claude-code", adapter_model_name="z"),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "models.json"
+            save_registry(specs, path)
+            raw = path.read_text(encoding="utf-8")
+            # default "unknown" should be dropped from the serialized form.
+            self.assertNotIn('"billing": "unknown"', raw)
+            self.assertIn('"billing": "plan"', raw)
+
+            loaded = {s.id: s for s in load_registry(path)}
+            self.assertEqual(loaded["a"].billing, "plan")
+            self.assertEqual(loaded["b"].billing, "api")
+            self.assertEqual(loaded["c"].billing, "unknown")
+
+    def test_starter_registry_tags_cursor_as_plan_billed(self) -> None:
+        from puppetmaster.model_registry import starter_registry
+
+        specs = {s.id: s for s in starter_registry()}
+        cursor_specs = [s for s in specs.values() if s.adapter == "cursor"]
+        self.assertTrue(cursor_specs)
+        self.assertTrue(all(s.billing == "plan" for s in cursor_specs))
+        openai_specs = [s for s in specs.values() if s.adapter == "openai"]
+        self.assertTrue(all(s.billing == "api" for s in openai_specs))
+
+
+class BillingAwareRoutingTests(unittest.TestCase):
+    def _mixed_registry(self):
+        from puppetmaster.model_registry import ModelSpec
+
+        # A plan-billed model and an api-billed model at the SAME capability and
+        # the same cost. prefer_plan_billed should break the tie toward plan.
+        return [
+            ModelSpec(
+                id="plan-mid",
+                adapter="cursor",
+                adapter_model_name="plan-v1",
+                capability_score=80,
+                input_per_mtok_usd=0.0,
+                output_per_mtok_usd=0.0,
+                billing="plan",
+                tags=["balanced"],
+            ),
+            ModelSpec(
+                id="api-mid",
+                adapter="openai",
+                adapter_model_name="api-v1",
+                capability_score=80,
+                input_per_mtok_usd=0.0,
+                output_per_mtok_usd=0.0,
+                billing="api",
+                tags=["balanced"],
+            ),
+        ]
+
+    def test_prefer_plan_billed_breaks_ties_toward_plan(self) -> None:
+        from puppetmaster.router import TaskSignals, route_task
+
+        signal = TaskSignals(
+            instruction="implement a feature", role="implement", explicit_min_capability=78
+        )
+        decision = route_task(signal, self._mixed_registry(), policy="balanced")
+        self.assertEqual(decision.model.id, "plan-mid")
+        self.assertEqual(decision.to_artifact_payload()["billing"], "plan")
+
+    def test_prefer_plan_billed_off_falls_back_to_capability_tiebreak(self) -> None:
+        from puppetmaster.router import TaskSignals, route_task
+
+        signal = TaskSignals(
+            instruction="implement a feature",
+            role="implement",
+            explicit_min_capability=78,
+            prefer_plan_billed=False,
+        )
+        # With no plan preference and equal cost+capability, the tie falls to the
+        # first by capability ordering; both are valid, but plan must NOT be forced.
+        decision = route_task(signal, self._mixed_registry(), policy="balanced")
+        self.assertIn(decision.model.id, {"plan-mid", "api-mid"})
+
+    def test_allow_api_billing_false_blocks_api_models(self) -> None:
+        from puppetmaster.model_registry import ModelSpec
+        from puppetmaster.router import NoEligibleModelError, TaskSignals, route_task
+
+        # Registry has ONLY api-billed models; plan-only must refuse rather than
+        # silently spend out-of-pocket.
+        api_only = [
+            ModelSpec(
+                id="api-frontier",
+                adapter="openai",
+                adapter_model_name="api-v1",
+                capability_score=96,
+                input_per_mtok_usd=5.0,
+                output_per_mtok_usd=30.0,
+                billing="api",
+            )
+        ]
+        signal = TaskSignals(
+            instruction="hard audit",
+            role="audit",
+            allow_api_billing=False,
+        )
+        with self.assertRaises(NoEligibleModelError):
+            route_task(signal, api_only, policy="balanced")
+
+    def test_allow_api_billing_false_keeps_plan_models(self) -> None:
+        from puppetmaster.router import TaskSignals, route_task
+
+        signal = TaskSignals(
+            instruction="implement", role="implement", explicit_min_capability=78, allow_api_billing=False
+        )
+        decision = route_task(signal, self._mixed_registry(), policy="balanced")
+        self.assertEqual(decision.model.id, "plan-mid")
+        rejected = {spec.id: reason for spec, reason in decision.rejected}
+        self.assertIn("api-mid", rejected)
+        self.assertIn("api billing disabled", rejected["api-mid"])
+
+
+class PlatformBillingDetectionTests(unittest.TestCase):
+    def test_cursor_billing_keyed_is_plan(self) -> None:
+        from puppetmaster.platform_billing import detect_cursor_billing
+
+        s = detect_cursor_billing(env={"CURSOR_API_KEY": "k"})
+        self.assertEqual(s.billing, "plan")
+        self.assertTrue(s.healthy)
+
+        s2 = detect_cursor_billing(env={})
+        self.assertEqual(s2.billing, "unknown")
+        self.assertFalse(s2.healthy)
+
+    def test_claude_billing_api_key_vs_oauth_vs_none(self) -> None:
+        from puppetmaster.platform_billing import detect_claude_billing
+
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            # api key wins.
+            s = detect_claude_billing(env={"ANTHROPIC_API_KEY": "k"}, home=home)
+            self.assertEqual(s.billing, "api")
+            self.assertTrue(s.healthy)
+            # oauth session -> plan.
+            (home / ".claude.json").write_text("{}", encoding="utf-8")
+            s2 = detect_claude_billing(env={}, home=home)
+            self.assertEqual(s2.billing, "plan")
+            self.assertTrue(s2.healthy)
+
+        with TemporaryDirectory() as tmp2:
+            s3 = detect_claude_billing(env={}, home=Path(tmp2))
+            self.assertEqual(s3.billing, "unknown")
+            self.assertFalse(s3.healthy)
+
+    def test_codex_billing_parses_login_status(self) -> None:
+        from puppetmaster.platform_billing import detect_codex_billing
+
+        api = detect_codex_billing(run=lambda cmd: (0, "Logged in using an API key - sk-***", ""))
+        self.assertEqual(api.billing, "api")
+        chatgpt = detect_codex_billing(run=lambda cmd: (0, "Logged in using ChatGPT", ""))
+        self.assertEqual(chatgpt.billing, "plan")
+        missing = detect_codex_billing(run=lambda cmd: (127, "", "command not found"))
+        self.assertEqual(missing.billing, "unknown")
+        self.assertFalse(missing.healthy)
+        out = detect_codex_billing(run=lambda cmd: (1, "Not logged in", ""))
+        self.assertEqual(out.billing, "unknown")
+        self.assertFalse(out.healthy)
+
+    def test_detect_adapter_billing_dispatch_and_unknown(self) -> None:
+        from puppetmaster.platform_billing import detect_adapter_billing
+
+        s = detect_adapter_billing("cursor", env={"CURSOR_API_KEY": "k"})
+        self.assertEqual(s.billing, "plan")
+        # unknown adapter is benign pass-through.
+        u = detect_adapter_billing("mystery-adapter")
+        self.assertEqual(u.adapter, "mystery-adapter")
+        self.assertTrue(u.healthy)
+        self.assertEqual(u.billing, "unknown")
+
+
+class CursorDiscoveryTests(unittest.TestCase):
+    def _ok_run(self, models):
+        import json as _json
+
+        def run(command, env):
+            return (0, _json.dumps({"ok": True, "models": models}), "")
+
+        return run
+
+    def test_fetch_catalog_success(self) -> None:
+        from puppetmaster.cursor_discovery import fetch_cursor_catalog
+
+        run = self._ok_run([{"id": "gpt-5.5", "displayName": "GPT 5.5"}, {"id": "bad"}])
+        catalog = fetch_cursor_catalog(env={"CURSOR_API_KEY": "k"}, run=run)
+        ids = {m["id"] for m in catalog}
+        self.assertEqual(ids, {"gpt-5.5", "bad"})
+
+    def test_fetch_catalog_requires_key(self) -> None:
+        from puppetmaster.cursor_discovery import (
+            CursorDiscoveryError,
+            fetch_cursor_catalog,
+        )
+
+        with self.assertRaises(CursorDiscoveryError):
+            fetch_cursor_catalog(env={}, run=self._ok_run([]))
+
+    def test_fetch_catalog_handles_failures(self) -> None:
+        from puppetmaster.cursor_discovery import (
+            CursorDiscoveryError,
+            fetch_cursor_catalog,
+        )
+
+        with self.assertRaises(CursorDiscoveryError):
+            fetch_cursor_catalog(
+                env={"CURSOR_API_KEY": "k"}, run=lambda c, e: (1, "", "boom")
+            )
+        with self.assertRaises(CursorDiscoveryError):
+            fetch_cursor_catalog(
+                env={"CURSOR_API_KEY": "k"}, run=lambda c, e: (0, "not json", "")
+            )
+        with self.assertRaises(CursorDiscoveryError):
+            fetch_cursor_catalog(
+                env={"CURSOR_API_KEY": "k"}, run=lambda c, e: (0, '{"ok": false}', "")
+            )
+
+    def test_catalog_to_specs_overlays_and_seeds(self) -> None:
+        from puppetmaster.cursor_discovery import catalog_to_specs
+        from puppetmaster.model_registry import ModelSpec
+
+        existing = [
+            ModelSpec(
+                id="cursor/gpt-5-5",
+                adapter="cursor",
+                adapter_model_name="gpt-5.5",
+                capability_score=92,
+                tags=["cursor", "frontier"],
+            )
+        ]
+        catalog = [
+            {"id": "gpt-5.5", "displayName": "GPT 5.5"},
+            {"id": "new-model", "displayName": "New Model"},
+        ]
+        specs = {s.adapter_model_name: s for s in catalog_to_specs(catalog, existing)}
+        # overlay keeps capability + id, forces plan billing, adds discovered tag.
+        self.assertEqual(specs["gpt-5.5"].capability_score, 92)
+        self.assertEqual(specs["gpt-5.5"].billing, "plan")
+        self.assertIn("discovered", specs["gpt-5.5"].tags)
+        # unknown model gets a seeded plan-billed spec.
+        self.assertEqual(specs["new-model"].billing, "plan")
+        self.assertEqual(specs["new-model"].id, "cursor/new-model")
+
+    def test_catalog_inherits_capability_cross_adapter(self) -> None:
+        from puppetmaster.cursor_discovery import catalog_to_specs
+        from puppetmaster.model_registry import ModelSpec
+
+        # A native claude-code frontier entry; the same model is exposed by the
+        # Cursor plan. The discovered cursor spec should inherit cap 99.
+        existing = [
+            ModelSpec(
+                id="claude-code/opus-4-8",
+                adapter="claude-code",
+                adapter_model_name="claude-opus-4-8",
+                capability_score=99,
+                tags=["frontier", "long-context"],
+            )
+        ]
+        catalog = [{"id": "claude-opus-4-8", "displayName": "Claude Opus 4.8"}]
+        spec = catalog_to_specs(catalog, existing)[0]
+        self.assertEqual(spec.capability_score, 99)
+        self.assertEqual(spec.billing, "plan")
+        self.assertEqual(spec.adapter, "cursor")
+        self.assertIn("frontier", spec.tags)
+
+    def test_merge_drops_stale_and_preserves_non_cursor(self) -> None:
+        from puppetmaster.cursor_discovery import merge_catalog_into_registry
+        from puppetmaster.model_registry import ModelSpec
+
+        existing = [
+            ModelSpec(id="cursor/old", adapter="cursor", adapter_model_name="old-v1"),
+            ModelSpec(id="claude/x", adapter="claude-code", adapter_model_name="x"),
+        ]
+        catalog = [{"id": "fresh-v1", "displayName": "Fresh"}]
+        merged, report = merge_catalog_into_registry(existing, catalog)
+        ids = {s.id for s in merged}
+        self.assertIn("claude/x", ids)  # non-cursor preserved
+        self.assertNotIn("cursor/old", ids)  # stale cursor dropped
+        self.assertIn("old-v1", report["dropped_stale_cursor_models"])
+        self.assertIn("fresh-v1", report["added"])
+
+    def test_model_in_catalog(self) -> None:
+        from puppetmaster.cursor_discovery import model_in_catalog
+
+        catalog = [{"id": "a"}, {"id": "b"}]
+        self.assertTrue(model_in_catalog("a", catalog))
+        self.assertFalse(model_in_catalog("zzz", catalog))
+
+
+class PreflightTests(unittest.TestCase):
+    def test_ready_for_plan_billed_adapter(self) -> None:
+        from puppetmaster.preflight import preflight_check
+
+        r = preflight_check("cursor", env={"CURSOR_API_KEY": "k"})
+        self.assertTrue(r.ok)
+        self.assertEqual(r.billing, "plan")
+
+    def test_blocks_unauthenticated_adapter(self) -> None:
+        from puppetmaster.preflight import preflight_check
+
+        r = preflight_check("cursor", env={})
+        self.assertFalse(r.ok)
+        self.assertIn("not ready", r.reason)
+
+    def test_blocks_api_when_disallowed(self) -> None:
+        from puppetmaster.preflight import preflight_check
+
+        r = preflight_check(
+            "openai", allow_api_billing=False, env={"OPENAI_API_KEY": "k"}
+        )
+        self.assertFalse(r.ok)
+        self.assertIn("api billing disabled", r.reason)
+
+    def test_cursor_model_not_in_catalog_blocks(self) -> None:
+        from puppetmaster.preflight import preflight_check
+
+        r = preflight_check(
+            "cursor",
+            "ghost-model",
+            env={"CURSOR_API_KEY": "k"},
+            catalog_fetcher=lambda: [{"id": "real-model"}],
+        )
+        self.assertFalse(r.ok)
+        self.assertIn("not in the Cursor plan catalog", r.reason)
+
+    def test_cursor_catalog_unavailable_degrades_to_ok(self) -> None:
+        from puppetmaster.cursor_discovery import CursorDiscoveryError
+        from puppetmaster.preflight import preflight_check
+
+        def boom():
+            raise CursorDiscoveryError("offline")
+
+        r = preflight_check(
+            "cursor", "any", env={"CURSOR_API_KEY": "k"}, catalog_fetcher=boom
+        )
+        self.assertTrue(r.ok)
+        self.assertIn("catalog unverified", r.reason)
+
+
+class StitcherAlertTests(unittest.TestCase):
+    def _verification(self, *, failure=None, result="passed"):
+        from puppetmaster.models import Artifact, ArtifactType
+
+        payload = {"check": "did the thing", "result": result, "adapter": "claude-code"}
+        if failure:
+            payload["failure"] = failure
+        return Artifact(
+            job_id="j",
+            task_id="t",
+            type=ArtifactType.VERIFICATION,
+            created_by="w",
+            payload=payload,
+            confidence=0.55,
+            evidence=["adapter:claude-code"],
+        )
+
+    def test_billing_failure_surfaces_as_alert(self) -> None:
+        from puppetmaster.stitcher import Stitcher
+
+        summary = Stitcher(None)._render_summary(
+            "T", "goal", [self._verification(failure="billing_or_quota", result="failed")], []
+        )
+        self.assertIn("## Alerts (action required)", summary)
+        self.assertIn("billing_or_quota", summary)
+        self.assertIn("claude-code", summary)
+        # alert appears before the verification section.
+        self.assertLess(summary.index("Alerts"), summary.index("## Verification"))
+
+    def test_clean_run_has_no_alert_section(self) -> None:
+        from puppetmaster.stitcher import Stitcher
+
+        summary = Stitcher(None)._render_summary(
+            "T", "goal", [self._verification(result="passed")], []
+        )
+        self.assertNotIn("## Alerts", summary)
+
+
+class AwaitJobTests(unittest.TestCase):
+    def test_await_returns_when_already_terminal(self) -> None:
+        from puppetmaster.cli import await_job_state
+        from puppetmaster.models import JobStatus
+        from puppetmaster.store import SwarmStore
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            job = store.create_job("do work")
+            store.update_job_status(job.id, JobStatus.COMPLETE)
+            state = await_job_state(store, job.id, timeout_seconds=2.0)
+            self.assertTrue(state["terminal"])
+            self.assertFalse(state["timed_out"])
+            self.assertEqual(state["status"], "complete")
+
+    def test_await_times_out_for_running_job(self) -> None:
+        from puppetmaster.cli import await_job_state
+        from puppetmaster.store import SwarmStore
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            job = store.create_job("never finishes")
+            state = await_job_state(store, job.id, timeout_seconds=0.3, poll_interval_seconds=0.05)
+            self.assertFalse(state["terminal"])
+            self.assertTrue(state["timed_out"])
 
 
 if __name__ == "__main__":
