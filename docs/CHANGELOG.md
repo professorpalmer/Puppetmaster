@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.7.1
+
+Polish pass after v0.7.0 — diagnostics, doctor honesty, and README freshness for new readers.
+
+- **`puppetmaster doctor` now actually reflects the v0.7.0 adapter surface.** Added a `codex` check that reports `ok <command>` when the `codex` CLI is on PATH (or `CODEX_COMMAND` resolves) and `optional` with install instructions otherwise. The pre-existing `claude-code` check downgraded its severity from `missing` (which read as an alarm) to `optional` with cleaner install instructions, matching `codex`. Both adapters are genuinely optional; `missing` was misleading when only an alarm-level severity should be used for things doctor needs to function.
+- **`puppetmaster adapters` no longer false-reports `openai` and `codex` as `configured=False` despite being usable.** The `adapter_status()` diagnostics function gained explicit branches for both: `openai` is `configured` when `OPENAI_API_KEY` is set; `codex` is `configured` when the CLI is installed AND `OPENAI_API_KEY` is set (a decent proxy for "you have something usable" without introspecting the codex login file outside Puppetmaster's purview). Before this fix, four out of six adapters showed `configured=False` regardless of state — a Cursor engineer skim-reading the output would have concluded nothing worked.
+- **README headline benchmark numbers refreshed.** The opening A/B headline previously cited a specific 2026-05-08 run ($0.019530 → $0.000141, 99.3% cheaper / 83.3% faster). Re-running the same harness 3 times on 2026-05-28 against the current registry produced 98.1–98.7% cheaper / 68–88% faster. Updated to today's representative numbers ($0.006900 → $0.000132, 98.1% cheaper / 72.4% faster) and explicitly framed the cost ratio as "98.1–98.7% across 3 consecutive runs" rather than a single-point claim. Honest about variance.
+- **README copy synced to the v0.7.0 adapter surface.** Opening sentence now lists all four production adapters (`cursor`, `claude-code`, `openai`, `codex`). Architecture diagram updated to show `Codex CLI` in the inbound row. "11-tier starter registry" called out (was "8-model" / "nine"). Model registry table extended to include the four OpenAI tiers + two Codex tiers (previously only the Cursor + Claude tiers appeared). CodeGraph integration paragraph now lists Codex as a 4th adapter that auto-injects context.
+- **TALKING_POINTS.md updated** with the fresh A/B numbers and v0.7.0's four-adapter framing.
+- **bench/README.md** sample-receipt table updated to today's run.
+- Quickstart `puppetmaster doctor` comment now says "14 health checks" (was "12") and enumerates them so a new reader knows what to expect.
+- **Tests**: still 189 passing. No code-behavior changes outside diagnostics.
+
 ## v0.7.0
 
 - **Codex is no longer a stub — full Codex CLI integration shipped.** The `codex` slot has been a placeholder `UnconfiguredProviderAdapter("codex", "Codex")` since `puppetmaster/adapters.py` was first written. v0.7.0 promotes it to a real adapter, sibling to `CursorAdapter`, `ClaudeCodeAdapter`, and `OpenAIAdapter`. Puppetmaster now ships **four production adapters** instead of three.
