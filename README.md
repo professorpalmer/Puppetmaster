@@ -610,6 +610,31 @@ MCP does not patch Cursor's private model picker or force Cursor's native subage
 
 See [Cursor Agent MCP](docs/CURSOR_AGENT_MCP.md).
 
+### Codex CLI / Codex IDE MCP
+
+Codex (the official OpenAI Codex CLI / Codex desktop app, `npm install -g @openai/codex`) also speaks MCP. The wire protocol is identical to Cursor's, but the config file and registration command are different. Codex stores MCP servers in `~/.codex/config.toml` under `[mcp_servers.<name>]`.
+
+One-time registration (writes to `~/.codex/config.toml`):
+
+```bash
+codex mcp add puppetmaster -- python -m puppetmaster.mcp_server
+codex mcp list                 # confirm: puppetmaster ... enabled
+codex mcp get puppetmaster     # see the exact spec Codex will launch
+```
+
+That's it — every new Codex session sees the Puppetmaster MCP tools. No restart required for fresh sessions; existing TUI sessions need to be restarted for MCP changes to take effect.
+
+**Sandbox caveat** (important and not obvious): Codex sandboxes MCP-server subprocesses inside the agent's sandbox. Puppetmaster's MCP server reads / writes `~/.puppetmaster/` (its durable state dir) which sits **outside** any workspace. Under Codex's default `--sandbox workspace-write`, that access is denied and the tool call fails with `mcp: puppetmaster/* (failed)` followed by `user cancelled MCP tool call`. Two clean ways out:
+
+| Mode | Command | When to use |
+|---|---|---|
+| Interactive TUI | `codex` (no flags) | First-time approval prompt for `~/.puppetmaster/`; subsequent calls in the same session pass. Best for daily-driver use. |
+| Non-interactive automation | `codex exec --dangerously-bypass-approvals-and-sandbox ...` | Required for `codex exec` scripts that need to invoke Puppetmaster MCP tools. Functionally equivalent to running Puppetmaster's CLI directly. |
+
+Verified end-to-end (May 2026, against Codex 0.134.0 + Puppetmaster v0.7.1): asking Codex `"Call the puppetmaster_doctor MCP tool. Report exactly how many checks returned status='ok'."` returned `mcp: puppetmaster/puppetmaster_doctor (completed)` followed by Codex's correct summary of the actual doctor output.
+
+If you have BOTH Cursor and Codex installed and want to drive Puppetmaster from either, that's fine — Cursor and Codex use separate config files and don't interfere with each other.
+
 ### Cursor Extension
 
 The extension adds a Puppetmaster activity-bar control panel:
