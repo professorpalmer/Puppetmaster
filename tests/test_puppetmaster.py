@@ -17,12 +17,18 @@ from unittest.mock import patch
 
 from puppetmaster.adapters import (
     ClaudeCodeAdapter,
+    CodexAdapter,
     CursorAdapter,
     OpenAIAdapter,
+    UnconfiguredProviderAdapter,
     build_claude_code_command,
+    build_codex_exec_command,
     classify_claude_code_failure,
+    classify_codex_failure,
     classify_cursor_failure,
     classify_openai_failure,
+    last_codex_agent_message,
+    parse_codex_events,
 )
 from puppetmaster.codegraph import (
     codegraph_affected,
@@ -2788,22 +2794,164 @@ print('{"result":"ok"}')
             self.assertEqual(artifact.payload["result"], "blocked")
             self.assertEqual(artifact.payload["failure"], "dirty_worktree")
 
-    def test_provider_stub_returns_blocked_verification_artifact(self) -> None:
-        with TemporaryDirectory() as tmp:
-            store = SwarmStore(Path(tmp) / ".puppetmaster")
-            specs = [
-                WorkerSpec(
-                    role="codex-review",
-                    instruction="Ask Codex to review the repo.",
-                    adapter="codex",
-                )
-            ]
-            result = Orchestrator(store).run("exercise provider stub", specs=specs)
-            artifact = store.list_artifacts(result.job.id)[0]
+    def test_unconfigured_provider_adapter_returns_blocked_artifact(self) -> None:
+        """`UnconfiguredProviderAdapter` is the class operators wire in for
+        adapter slots that don't have a concrete implementation yet. It must
+        return a structured `result="blocked"` verification artifact so jobs
+        referencing the stub fail loudly but cleanly. Previously this test
+        covered the `codex` adapter slot; v0.7.0 promoted codex to a real
+        adapter, so the test now exercises the stub class directly.
+        """
+        adapter = UnconfiguredProviderAdapter("future-provider", "Future Provider")
+        task = Task(
+            id="t-stub",
+            job_id="job-stub",
+            role="future-review",
+            adapter="future-provider",
+            instruction="Try to use the unconfigured provider.",
+            payload={},
+        )
+        artifacts = adapter.run(task, "goal", "worker")
 
-            self.assertEqual(artifact.type, ArtifactType.VERIFICATION)
-            self.assertEqual(artifact.payload["adapter"], "codex")
-            self.assertEqual(artifact.payload["result"], "blocked")
+        self.assertEqual(len(artifacts), 1)
+        artifact = artifacts[0]
+        self.assertEqual(artifact.type, ArtifactType.VERIFICATION)
+        self.assertEqual(artifact.payload["adapter"], "future-provider")
+        self.assertEqual(artifact.payload["result"], "blocked")
+        self.assertIn("provider stub", artifact.payload["message"])
+
+    def test_codex_adapter_missing_cli_returns_blocked(self) -> None:
+        """When the `codex` binary isn't on PATH and no executable override
+        resolves, the adapter must return a blocked verification with a
+        failure code of `missing_cli` rather than crashing or shelling out."""
+        task = Task(
+            id="t-codex-1",
+            job_id="job-codex-1",
+            role="codex-review",
+            adapter="codex",
+            instruction="Review the repo.",
+            payload={
+                "executable": "/nonexistent/path/to/codex-cli-binary",
+                "cwd": str(Path.cwd()),
+            },
+        )
+        artifacts = CodexAdapter().run(task, "goal", "worker")
+
+        self.assertEqual(len(artifacts), 1)
+        artifact = artifacts[0]
+        self.assertEqual(artifact.type, ArtifactType.VERIFICATION)
+        self.assertEqual(artifact.payload["adapter"], "codex")
+        self.assertEqual(artifact.payload["result"], "blocked")
+        self.assertEqual(artifact.payload["failure"], "missing_cli")
+
+    def test_build_codex_exec_command_emits_expected_flags(self) -> None:
+        """The Codex command builder must produce the non-interactive
+        flag soup that v0.7.0 ships by default: `exec --json`,
+        `approval_policy="never"`, `--sandbox`, `--ephemeral`,
+        `--skip-git-repo-check`, `-C cwd`, `-m model`, and the prompt as
+        the final positional argument. Asserting on the exact command
+        shape protects against accidental regressions."""
+        cmd = build_codex_exec_command(
+            executable=["codex"],
+            prompt="hello world",
+            model="gpt-5.4-mini",
+            cwd=Path("/tmp/codex-test-cwd"),
+            sandbox="workspace-write",
+            approval_policy="never",
+            ephemeral=True,
+            skip_git_repo_check=True,
+        )
+        self.assertEqual(cmd[0], "codex")
+        self.assertEqual(cmd[1], "exec")
+        self.assertIn("--json", cmd)
+        self.assertIn("-c", cmd)
+        self.assertIn('approval_policy="never"', cmd)
+        self.assertIn("--sandbox", cmd)
+        self.assertIn("workspace-write", cmd)
+        self.assertIn("--ephemeral", cmd)
+        self.assertIn("--skip-git-repo-check", cmd)
+        self.assertIn("-C", cmd)
+        self.assertIn("/tmp/codex-test-cwd", cmd)
+        self.assertIn("-m", cmd)
+        self.assertIn("gpt-5.4-mini", cmd)
+        self.assertEqual(cmd[-1], "hello world")
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", cmd)
+
+    def test_build_codex_exec_command_with_danger_bypass(self) -> None:
+        cmd = build_codex_exec_command(
+            executable=["codex"],
+            prompt="audit",
+            model=None,
+            sandbox="workspace-write",
+            dangerously_bypass=True,
+        )
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", cmd)
+
+    def test_parse_codex_events_skips_banners_and_invalid_json(self) -> None:
+        """Codex CLI mixes a few non-JSON banner lines into its --json
+        stream when stdin isn't a TTY (e.g. "Reading additional input
+        from stdin...") and the websocket layer occasionally emits ERROR
+        lines. The parser must skip those gracefully and return only the
+        valid JSONL events."""
+        sample = "\n".join(
+            [
+                "Reading additional input from stdin...",
+                '{"type":"thread.started","thread_id":"abc"}',
+                "2026-05-28T15:04:11Z ERROR codex_api: warning text",
+                '{"type":"turn.started"}',
+                "not-json {",
+                '{"type":"item.completed","item":{"type":"agent_message","text":"hi"}}',
+                '{"type":"turn.completed","usage":{"input_tokens":42,"output_tokens":7,"cached_input_tokens":0,"reasoning_output_tokens":3}}',
+                "",
+            ]
+        )
+        events = parse_codex_events(sample)
+        types = [ev.get("type") for ev in events]
+        self.assertEqual(
+            types,
+            ["thread.started", "turn.started", "item.completed", "turn.completed"],
+        )
+        last = last_codex_agent_message(events)
+        self.assertEqual(last, "hi")
+
+    def test_last_codex_agent_message_returns_final_agent_message(self) -> None:
+        """When Codex emits multiple item.completed events (tool calls,
+        reasoning summaries, then the final reply), only the LAST
+        item.completed of type=agent_message should be returned."""
+        events = [
+            {"type": "item.completed", "item": {"type": "command_execution", "text": "ran ls"}},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "interim"}},
+            {"type": "item.completed", "item": {"type": "command_execution", "text": "ran cat"}},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "FINAL"}},
+            {"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}},
+        ]
+        self.assertEqual(last_codex_agent_message(events), "FINAL")
+
+    def test_last_codex_agent_message_returns_empty_when_none_present(self) -> None:
+        events = [
+            {"type": "thread.started", "thread_id": "x"},
+            {"type": "turn.started"},
+            {"type": "turn.failed", "error": {"message": "401"}},
+        ]
+        self.assertEqual(last_codex_agent_message(events), "")
+
+    def test_classify_codex_failure_known_signals(self) -> None:
+        self.assertEqual(
+            classify_codex_failure("401 Unauthorized: Missing bearer"),
+            "not_authenticated",
+        )
+        self.assertEqual(classify_codex_failure("Not logged in"), "not_authenticated")
+        self.assertEqual(classify_codex_failure("rate limit exceeded"), "rate_limit")
+        self.assertEqual(classify_codex_failure("credit balance is too low"), "billing_or_quota")
+        self.assertEqual(
+            classify_codex_failure("the requested model is not found"),
+            "model_unavailable",
+        )
+        self.assertEqual(classify_codex_failure("request timed out"), "timeout")
+        self.assertEqual(classify_codex_failure("DNS resolution failed"), "network_error")
+        self.assertEqual(classify_codex_failure("approval was denied by user"), "approval_denied")
+        self.assertEqual(classify_codex_failure("sandbox: write blocked"), "sandbox_denied")
+        self.assertEqual(classify_codex_failure("completely unrelated text"), "unknown")
 
     def test_diagnostics_list_provider_neutral_adapters(self) -> None:
         rows = adapter_status(Path.cwd())

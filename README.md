@@ -175,7 +175,8 @@ The goal is not “one more chat.” The goal is a local runtime where the opera
 | Cursor extension | Activity-bar control panel for running Puppetmaster inside Cursor |
 | Cursor adapter | Live adapter through `@cursor/sdk`; best for review/plan/dry-run workflows |
 | Claude Code adapter | Live full-edit adapter through Claude Code CLI; validated with real tracked diffs |
-| **OpenAI adapter** (v0.6.1-beta.1+) | Direct Chat Completions via `OPENAI_API_KEY`; captures real `tokens_in` / `tokens_out` from `usage.prompt_tokens`. The only adapter that produces billing-grade numbers today. |
+| OpenAI adapter (v0.6.1-beta.1+) | Direct Chat Completions via `OPENAI_API_KEY`; captures real `tokens_in` / `tokens_out` from `usage.prompt_tokens`. |
+| **Codex adapter** (v0.7.0+) | Live full-edit adapter through the official OpenAI Codex CLI (`codex exec --json`). Parses the structured JSONL event stream and captures `input_tokens`, `output_tokens`, `cached_input_tokens`, `reasoning_output_tokens`, and `thread_id` per turn — currently the most telemetry-rich adapter Puppetmaster ships. |
 | Shell adapter | Built-in bounded command runner for verification |
 | Memory | Promoted memory retrieval into later worker context and prompts |
 | CodeGraph | Optional shared repo intelligence: workers auto-inject CodeGraph context when available |
@@ -413,7 +414,7 @@ python -m puppetmaster artifacts <job_id> | jq '.[] | select(.type=="routing") |
 
 ### Scope and honesty
 
-Three production adapters ship today: `cursor` (Cursor SDK via `@cursor/sdk`), `claude-code` (Anthropic via the `claude` CLI), and `openai` (direct Chat Completions via `OPENAI_API_KEY`, added in v0.6.1-beta.1). Together they cover the entire starter registry: `composer-2.5`, `gpt-5.5`, `claude-opus-4-6`, `claude-opus-4-7`, plus the four GPT-5 OpenAI tiers (`gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.4-nano`). **Raw HTTP adapters for additional providers (Gemini, DeepSeek, Kimi) are not yet in.** They slot in cleanly as new `adapter` values — the registry + router/classifier framework doesn't need to change — but each one needs real validation against its provider's API before it ships.
+Four production adapters ship today: `cursor` (Cursor SDK via `@cursor/sdk`), `claude-code` (Anthropic via the `claude` CLI), `openai` (direct Chat Completions via `OPENAI_API_KEY`, added in v0.6.1-beta.1), and `codex` (official OpenAI Codex CLI via `codex exec --json`, added in v0.7.0). Together they cover the entire starter registry: `composer-2.5`, `gpt-5.5`, `claude-haiku-4-5`, `claude-opus-4-6`, `claude-opus-4-7`, the four GPT-5 OpenAI tiers (`gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.4-nano`), and the two Codex tiers (`codex/gpt-5-5`, `codex/gpt-5-4-mini`). **Raw HTTP adapters for additional providers (Gemini, DeepSeek, Kimi) are not yet in.** They slot in cleanly as new `adapter` values — the registry + router/classifier framework doesn't need to change — but each one needs real validation against its provider's API before it ships.
 
 Capability scores and prices stay **user-asserted**. Puppetmaster makes the **decision** transparent (full audit trail of why each task went where); it does not make the **value judgments** for you (whether GPT-5.4 really is an 86, or whether Cursor's bundled models should be treated as $0). Edit the registry to match your reality.
 
@@ -661,7 +662,7 @@ When Claude Code edits tracked files, Puppetmaster records:
 
 ### OpenAI
 
-Use the `openai` adapter when you want to bypass Cursor's SDK entirely and hit OpenAI's Chat Completions API directly. This is the **only adapter today that returns real billing-grade token counts** (pulled from `usage.prompt_tokens` / `usage.completion_tokens` on the API response), which is why `bench/router_live_ab.py` runs against it.
+Use the `openai` adapter when you want to bypass Cursor's SDK entirely and hit OpenAI's Chat Completions API directly. This is the adapter that returns real billing-grade token counts (pulled from `usage.prompt_tokens` / `usage.completion_tokens` on the API response), which is why `bench/router_live_ab.py` runs against it.
 
 ```bash
 export OPENAI_API_KEY="<your-openai-api-key>"
@@ -670,6 +671,23 @@ export OPENAI_API_KEY="<your-openai-api-key>"
 Every Cursor/Claude/OpenAI worker emits the same structured artifact contract: a `VERIFICATION` artifact with `tokens_in`, `tokens_out`, `tokens_total`, plus parsed `FINDING` / `RISK` / `DECISION` artifacts from the JSON envelope. The OpenAI adapter additionally exposes those token counts on every run so `puppetmaster cost <job_id>` can sum real spend, not estimates.
 
 The starter registry includes four OpenAI tiers — `openai/gpt-5-5` ($5 / $30 per MTok, frontier), `openai/gpt-5-4` ($2.50 / $15, workhorse), `openai/gpt-5-4-mini` ($0.75 / $4.50, balanced), `openai/gpt-5-4-nano` ($0.15 / $0.90, cheap reader) — so the router can pick from the full GPT-5 family without manual configuration.
+
+### Codex
+
+Use the `codex` adapter when you want OpenAI's models inside an actual coding-agent loop — the OpenAI-side equivalent of Claude Code. The `codex` CLI ships with file editing, shell, search, and tool-use built in; this adapter shells out to `codex exec --json` and captures the structured event stream, so you get real `input_tokens` / `output_tokens` / `cached_input_tokens` / `reasoning_output_tokens` / `thread_id` per turn — strictly richer telemetry than any other adapter ships.
+
+```bash
+npm install -g @openai/codex
+printenv OPENAI_API_KEY | codex login --with-api-key
+```
+
+```bash
+python -m puppetmaster codex "Implement the approved change and run focused tests"
+```
+
+The Codex adapter, like Claude Code, blocks on a dirty worktree by default (so resulting patch artifacts are attributable to the agent's run, not pre-existing churn). Pass `payload.allow_dirty=true` or downgrade to `payload.sandbox="read-only"` for review-only roles that never touch the worktree. The adapter ships two starter registry tiers — `codex/gpt-5-5` ($5 / $30, frontier with agent loop) and `codex/gpt-5-4-mini` ($0.75 / $4.50, balanced with agent loop) — so the router can fan tasks across `cursor` (subscription-billed), `claude-code` (per-token Anthropic), `openai` (per-token OpenAI chat), and `codex` (per-token OpenAI agent-loop) inside a single swarm.
+
+For one-shot reasoning where no tool use is needed, the router will usually prefer `openai/*` over `codex/*` at the same capability tier because Chat Completions has no agent-loop round-trip overhead. For multi-file refactors and audits, `codex/*` is the natural choice — its capability_score is set 1 point higher than the matching `openai/*` tier specifically to encode the agent-loop advantage.
 
 ### Shell
 

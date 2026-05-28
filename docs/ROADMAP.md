@@ -23,7 +23,7 @@
 ## Provider Integrations
 
 - Claude Code adapter.
-- Codex adapter.
+- ~~Codex adapter.~~ Shipped in v0.7.0 — `CodexAdapter` shells out to `codex exec --json` and captures billing-grade token counts from the structured event stream. See `docs/ADAPTERS.md#codex`.
 - Cursor cloud-agent mode with durable resume.
 - Generic HTTP adapter for internal agent services.
 

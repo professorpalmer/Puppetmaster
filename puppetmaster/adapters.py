@@ -656,6 +656,461 @@ class ClaudeCodeAdapter:
         return artifacts
 
 
+DEFAULT_CODEX_MODEL = "gpt-5.4-mini"
+
+
+class CodexAdapter:
+    """Shells out to the official OpenAI Codex CLI (``codex exec --json``).
+
+    Codex is the closest OpenAI-side analog to the Claude Code CLI: a
+    coding-agent loop that reads a prompt, plans, calls tools (file edits,
+    shell, search), and produces a final agent message. This adapter mirrors
+    :class:`ClaudeCodeAdapter` for subprocess + git-snapshot + sidecar-spool
+    semantics, and additionally parses Codex's structured JSONL event stream
+    to extract real ``input_tokens`` / ``output_tokens`` from
+    ``turn.completed.usage`` — telemetry the ``claude`` CLI does not surface.
+
+    Default execution mode is non-interactive: ``--ephemeral``,
+    ``--skip-git-repo-check``, ``approval_policy="never"``, sandbox
+    ``workspace-write``. The agent runs in an isolated session, can edit
+    files in ``cwd``, and never blocks on approval prompts. Callers can
+    downgrade to ``--sandbox read-only`` for review-style tasks via
+    ``payload.sandbox`` or opt in to
+    ``--dangerously-bypass-approvals-and-sandbox`` for environments that are
+    already externally sandboxed.
+    """
+
+    name = "codex"
+
+    def run(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
+        base_prompt = task.payload.get("prompt") or task.instruction
+        cwd = Path(task.payload.get("cwd") or ".").resolve()
+        prompt, codegraph_used = enrich_prompt_with_codegraph(
+            prompt_with_memory(self._structured_prompt(base_prompt), task),
+            task_description=task.payload.get("codegraph_task") or task.instruction or goal,
+            cwd=cwd,
+            disabled=bool(task.payload.get("disable_codegraph", False)),
+        )
+        timeout_seconds = int(task.payload.get("timeout_seconds", 600))
+        executable = task.payload.get("executable") or os.environ.get("CODEX_COMMAND") or "codex"
+        command_base = command_parts(executable)
+        resolved = resolve_command(command_base[0])
+        if resolved is None:
+            return [
+                verification_artifact(
+                    task=task,
+                    worker_id=worker_id,
+                    adapter="codex",
+                    check=task.instruction,
+                    result="blocked",
+                    confidence=0.45,
+                    evidence=["adapter:codex", "status:missing-cli"],
+                    payload={
+                        "failure": "missing_cli",
+                        "message": (
+                            "Codex CLI was not found. Install it with "
+                            "`npm install -g @openai/codex`, then `printenv "
+                            "OPENAI_API_KEY | codex login --with-api-key`, or "
+                            "set CODEX_COMMAND / payload.executable."
+                        ),
+                        "executable": executable,
+                    },
+                )
+            ]
+
+        model = str(task.payload.get("model") or DEFAULT_CODEX_MODEL)
+        sandbox = str(task.payload.get("sandbox") or "workspace-write")
+        approval_policy = str(task.payload.get("approval_policy") or "never")
+        bypass = bool(task.payload.get("dangerously_bypass_approvals_and_sandbox", False))
+        ephemeral = bool(task.payload.get("ephemeral", True))
+        skip_git_repo_check = bool(task.payload.get("skip_git_repo_check", True))
+
+        command = build_codex_exec_command(
+            executable=[resolved, *command_base[1:]],
+            prompt=prompt,
+            model=model,
+            cwd=cwd,
+            sandbox=sandbox,
+            approval_policy=approval_policy,
+            ephemeral=ephemeral,
+            skip_git_repo_check=skip_git_repo_check,
+            dangerously_bypass=bypass,
+            extra_args=task.payload.get("extra_args", []),
+        )
+
+        before = git_snapshot(cwd)
+        # Read-only sandbox can't mutate the worktree, so dirty-tree gating
+        # is unnecessary. For write-capable sandboxes we mirror Claude Code:
+        # refuse to run on a dirty tree by default so resulting diffs are
+        # attributable to this Puppetmaster task, not pre-existing churn.
+        if (
+            sandbox != "read-only"
+            and not task.payload.get("allow_dirty", False)
+            and (before["changed_files"] or before["untracked_files"])
+        ):
+            return [
+                verification_artifact(
+                    task=task,
+                    worker_id=worker_id,
+                    adapter="codex",
+                    check=task.instruction,
+                    result="blocked",
+                    confidence=0.8,
+                    evidence=["adapter:codex", "status:dirty-repo"],
+                    payload={
+                        "failure": "dirty_worktree",
+                        "message": (
+                            "Codex full-edit runs require a clean working tree by default "
+                            "so Puppetmaster can attribute resulting diffs correctly. Commit, "
+                            "stash, use a worktree, set payload.allow_dirty=true, or pass "
+                            "payload.sandbox='read-only' for review-only tasks."
+                        ),
+                        "changed_files": before["changed_files"],
+                        "untracked_files": before["untracked_files"],
+                    },
+                )
+            ]
+
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=cwd,
+                input="",
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout or ""
+            stderr = exc.stderr or ""
+            if isinstance(stdout, bytes):
+                stdout = stdout.decode("utf-8", errors="replace")
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode("utf-8", errors="replace")
+            stdout_capture = capture_subprocess_stdout(
+                text=stdout,
+                task=task,
+                sidecar_name="codex_stdout_timeout",
+                tail_chars=12000,
+            )
+            stderr_capture = capture_subprocess_stdout(
+                text=stderr,
+                task=task,
+                sidecar_name="codex_stderr_timeout",
+            )
+            return [
+                verification_artifact(
+                    task=task,
+                    worker_id=worker_id,
+                    adapter="codex",
+                    check=task.instruction,
+                    result="failed",
+                    confidence=0.6,
+                    evidence=["adapter:codex", "timeout"],
+                    payload={
+                        "failure": "timeout",
+                        "returncode": None,
+                        "model": model,
+                        "sandbox": sandbox,
+                        "approval_policy": approval_policy,
+                        "stdout": stdout[-_STDOUT_TAIL_CHARS:],
+                        "stderr": stderr[-_STDOUT_TAIL_CHARS:],
+                        "stdout_capture": stdout_capture,
+                        "stderr_capture": stderr_capture,
+                        "timeout_seconds": timeout_seconds,
+                    },
+                )
+            ]
+
+        after = git_snapshot(cwd)
+
+        events = parse_codex_events(completed.stdout)
+        usage = next(
+            (
+                ev.get("usage", {})
+                for ev in events
+                if ev.get("type") == "turn.completed" and isinstance(ev.get("usage"), dict)
+            ),
+            {},
+        )
+        tokens_in = int(usage.get("input_tokens") or 0)
+        tokens_out = int(usage.get("output_tokens") or 0)
+        cached_tokens = int(usage.get("cached_input_tokens") or 0)
+        reasoning_tokens = int(usage.get("reasoning_output_tokens") or 0)
+
+        last_message = last_codex_agent_message(events)
+        turn_failed = any(ev.get("type") == "turn.failed" for ev in events)
+        turn_failure_message = next(
+            (
+                str((ev.get("error") or {}).get("message") or "")
+                for ev in events
+                if ev.get("type") == "turn.failed"
+            ),
+            "",
+        )
+        thread_id = next(
+            (ev.get("thread_id") for ev in events if ev.get("type") == "thread.started"),
+            None,
+        )
+
+        stdout_capture = capture_subprocess_stdout(
+            text=completed.stdout,
+            task=task,
+            sidecar_name="codex_events",
+            tail_chars=12000,
+        )
+        stderr_capture = capture_subprocess_stdout(
+            text=completed.stderr,
+            task=task,
+            sidecar_name="codex_stderr",
+        )
+        last_message_capture = capture_subprocess_stdout(
+            text=last_message,
+            task=task,
+            sidecar_name="codex_last_message",
+        )
+
+        parsed_artifacts = cursor_result_artifacts(task, worker_id, last_message)
+        process_failed = completed.returncode != 0 or turn_failed
+        # "degraded" mirrors OpenAIAdapter / CursorAdapter: the process
+        # succeeded but didn't return parseable Puppetmaster artifacts.
+        degraded = not process_failed and not parsed_artifacts and bool(last_message.strip())
+
+        verification = verification_artifact(
+            task=task,
+            worker_id=worker_id,
+            adapter="codex",
+            check=task.instruction,
+            result=(
+                "failed"
+                if process_failed
+                else "degraded"
+                if degraded
+                else "passed"
+            ),
+            confidence=(
+                0.55 if process_failed else 0.65 if degraded else 0.9
+            ),
+            evidence=(
+                [
+                    "adapter:codex",
+                    f"model:{model}",
+                    f"sandbox:{sandbox}",
+                    f"approval_policy:{approval_policy}",
+                ]
+                + (["context:codegraph"] if codegraph_used else [])
+                + (["bypass:dangerously-bypass-approvals-and-sandbox"] if bypass else [])
+            ),
+            payload={
+                "returncode": completed.returncode,
+                "model": model,
+                "sandbox": sandbox,
+                "approval_policy": approval_policy,
+                "ephemeral": ephemeral,
+                "thread_id": thread_id,
+                "stdout": completed.stdout[-_STDOUT_TAIL_CHARS:],
+                "stderr": completed.stderr[-_STDOUT_TAIL_CHARS:],
+                "stdout_capture": stdout_capture,
+                "stderr_capture": stderr_capture,
+                "last_message": last_message[-_STDOUT_TAIL_CHARS:],
+                "last_message_capture": last_message_capture,
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
+                "tokens_total": tokens_in + tokens_out,
+                "cached_input_tokens": cached_tokens,
+                "reasoning_output_tokens": reasoning_tokens,
+                "turn_failed": turn_failed,
+                "turn_failure_message": turn_failure_message,
+                "cwd": str(cwd),
+                "base_sha": before["sha"],
+                "head_sha": after["sha"],
+                "changed_files": after["changed_files"],
+                "untracked_files": after["untracked_files"],
+                "failure": (
+                    None
+                    if not process_failed
+                    else "codex_turn_failed"
+                    if turn_failed
+                    else classify_codex_failure(
+                        completed.stderr + "\n" + completed.stdout + "\n" + turn_failure_message
+                    )
+                ),
+            },
+        )
+        artifacts: list[Artifact] = [verification]
+        if degraded:
+            artifacts.append(
+                Artifact(
+                    job_id=task.job_id,
+                    task_id=task.id,
+                    type=ArtifactType.RISK,
+                    created_by=worker_id,
+                    confidence=0.85,
+                    evidence=["adapter:codex", "result:empty-or-unstructured"],
+                    payload={
+                        "risk": "Codex call completed without structured Puppetmaster findings.",
+                        "mitigation": (
+                            "Treat this swarm as degraded; rerun with a stricter prompt or "
+                            "inspect the repo directly before implementation."
+                        ),
+                        "stdout_excerpt": last_message[:_STDOUT_HEAD_CHARS],
+                        "last_message_capture": last_message_capture,
+                    },
+                )
+            )
+        artifacts.extend(parsed_artifacts)
+        if after["diff"].strip():
+            artifacts.append(
+                Artifact(
+                    job_id=task.job_id,
+                    task_id=task.id,
+                    type=ArtifactType.PATCH,
+                    created_by=worker_id,
+                    confidence=0.8 if not process_failed else 0.5,
+                    evidence=["adapter:codex", f"base:{before['sha']}"],
+                    payload={
+                        "change": "Codex modified tracked repository files.",
+                        "files": after["changed_files"],
+                        "unified_diff": after["diff"][-20000:],
+                        "base_sha": before["sha"],
+                        "head_sha": after["sha"],
+                        "status": "applied" if not process_failed else "failed",
+                        "revert": (
+                            "Review the diff, then use git restore / git checkout or your "
+                            "VCS workflow to revert unwanted changes."
+                        ),
+                    },
+                )
+            )
+        return artifacts
+
+    @staticmethod
+    def _structured_prompt(prompt: str) -> str:
+        return "\n".join(
+            [
+                prompt,
+                "",
+                "Puppetmaster artifact contract:",
+                "When you are finished, emit ONLY a single JSON object as your final agent message "
+                "(no prose around it, no markdown fences), in this shape:",
+                '{"artifacts":[{"type":"finding","claim":"...","evidence":["path or symbol"],"confidence":0.8}]}',
+                "Allowed artifact types:",
+                '- finding: requires "claim", "evidence", "confidence".',
+                '- risk: requires "risk", "mitigation", "evidence", "confidence".',
+                '- decision: requires "decision", "why", "evidence", "confidence".',
+                "Use concrete file/function evidence. If there are no concrete findings, return a "
+                "risk artifact explaining why the run is degraded. You may still use Codex's tools "
+                "to read files and edit code along the way; just make sure the FINAL agent message "
+                "is the JSON object described above.",
+            ]
+        )
+
+
+def build_codex_exec_command(
+    *,
+    executable: Union[str, list[str]] = "codex",
+    prompt: str,
+    model: Optional[str] = None,
+    cwd: Optional[Path] = None,
+    sandbox: str = "workspace-write",
+    approval_policy: str = "never",
+    ephemeral: bool = True,
+    skip_git_repo_check: bool = True,
+    dangerously_bypass: bool = False,
+    extra_args: object = None,
+) -> list[str]:
+    command = command_parts(executable)
+    command.append("exec")
+    command.extend(["--json"])
+    command.extend(["-c", f'approval_policy="{approval_policy}"'])
+    if sandbox:
+        command.extend(["--sandbox", sandbox])
+    if dangerously_bypass:
+        command.append("--dangerously-bypass-approvals-and-sandbox")
+    if ephemeral:
+        command.append("--ephemeral")
+    if skip_git_repo_check:
+        command.append("--skip-git-repo-check")
+    if cwd is not None:
+        command.extend(["-C", str(cwd)])
+    if model:
+        command.extend(["-m", str(model)])
+    if extra_args:
+        command.extend(command_parts(extra_args))
+    command.append(prompt)
+    return command
+
+
+def parse_codex_events(stdout: str) -> list[dict[str, Any]]:
+    """Parse Codex's ``--json`` event stream from captured stdout.
+
+    Codex CLI mixes a couple of human-readable banner lines into the stream
+    on non-TTY stdin (notably "Reading additional input from stdin..." and
+    occasional ``ERROR``-tagged warnings from the websocket layer). Skip
+    anything that does not start with ``{`` and tolerate JSON decode
+    failures so a single malformed line never loses the whole turn.
+    """
+    events: list[dict[str, Any]] = []
+    for raw in (stdout or "").splitlines():
+        line = raw.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            events.append(parsed)
+    return events
+
+
+def last_codex_agent_message(events: list[dict[str, Any]]) -> str:
+    """Return the most recent ``item.completed`` of type ``agent_message``.
+
+    Codex emits multiple ``item.completed`` events per turn (tool calls,
+    reasoning summaries, the final agent message); we only want the final
+    user-visible reply.
+    """
+    for ev in reversed(events):
+        if ev.get("type") != "item.completed":
+            continue
+        item = ev.get("item") or {}
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "agent_message":
+            text = item.get("text")
+            if text is None:
+                continue
+            return str(text)
+    return ""
+
+
+def classify_codex_failure(output: str) -> str:
+    lowered = (output or "").lower()
+    if "not logged in" in lowered or "codex login" in lowered:
+        return "not_authenticated"
+    if "missing bearer" in lowered or "401" in lowered or "unauthorized" in lowered:
+        return "not_authenticated"
+    if "rate limit" in lowered or "429" in lowered:
+        return "rate_limit"
+    if "billing" in lowered or "quota" in lowered or "credit" in lowered:
+        return "billing_or_quota"
+    if "model" in lowered and ("unavailable" in lowered or "not found" in lowered or "invalid" in lowered):
+        return "model_unavailable"
+    if "command not found" in lowered:
+        return "missing_cli"
+    if "approval" in lowered and ("denied" in lowered or "rejected" in lowered):
+        return "approval_denied"
+    if "sandbox" in lowered and ("denied" in lowered or "blocked" in lowered):
+        return "sandbox_denied"
+    if "timeout" in lowered or "timed out" in lowered:
+        return "timeout"
+    if "network" in lowered or "dns" in lowered or "connect" in lowered:
+        return "network_error"
+    return "unknown"
+
+
 class UnconfiguredProviderAdapter:
     def __init__(self, name: str, description: str) -> None:
         self.name = name
@@ -1289,7 +1744,7 @@ ADAPTERS: dict[str, WorkerAdapter] = {
     "cursor": CursorAdapter(),
     "claude-code": ClaudeCodeAdapter(),
     "openai": OpenAIAdapter(),
-    "codex": UnconfiguredProviderAdapter("codex", "Codex"),
+    "codex": CodexAdapter(),
 }
 
 
@@ -1326,9 +1781,17 @@ ADAPTER_INFO = [
     ),
     AdapterInfo(
         name="codex",
-        status="stub",
-        description="Provider-neutral placeholder for a future Codex adapter.",
-        requires=["adapter implementation"],
+        status="optional",
+        description=(
+            "Runs the official OpenAI Codex CLI (`codex exec --json`) "
+            "non-interactively. Captures billing-grade token counts from the "
+            "structured event stream and emits Puppetmaster artifacts plus a "
+            "PATCH artifact when the agent edits files."
+        ),
+        requires=[
+            "codex CLI (`npm install -g @openai/codex`)",
+            "OPENAI_API_KEY or `codex login`",
+        ],
     ),
 ]
 
