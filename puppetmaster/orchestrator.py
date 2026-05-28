@@ -50,6 +50,7 @@ class Orchestrator:
             summary = Stitcher(self.store).stitch(job.id)
             completed = self.store.update_job_status(job.id, JobStatus.COMPLETE)
             summary_path = self.store.job_dir(job.id) / "summaries" / "stitched.md"
+            self._emit_telemetry(completed, artifacts)
             return RunResult(
                 job=completed,
                 artifacts=artifacts,
@@ -108,6 +109,7 @@ class Orchestrator:
             summary = Stitcher(self.store).stitch(job.id)
             completed = self.store.update_job_status(job.id, JobStatus.COMPLETE)
             summary_path = self.store.job_dir(job.id) / "summaries" / "stitched.md"
+            self._emit_telemetry(completed, artifacts)
             return RunResult(
                 job=completed,
                 artifacts=artifacts,
@@ -118,6 +120,18 @@ class Orchestrator:
         except Exception:
             self.store.update_job_status(job.id, JobStatus.FAILED)
             raise
+
+    def _emit_telemetry(self, job: Job, artifacts: list[Artifact]) -> None:
+        """Emit an OTel trace for the finished job. No-op unless tracing is on;
+        never lets a telemetry failure break the run."""
+        try:
+            from puppetmaster.telemetry import record_job_trace, telemetry_enabled
+
+            if not telemetry_enabled():
+                return
+            record_job_trace(job, self.store.list_tasks(job.id), artifacts)
+        except Exception:
+            pass
 
     def _create_tasks(self, job: Job, specs: list[WorkerSpec]) -> list[Task]:
         specs, routing_decisions = self._apply_auto_routing(job, specs)

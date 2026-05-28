@@ -21,6 +21,14 @@ classifiers = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+# Optional OpenTelemetry tracing. Without these, telemetry is a hard no-op and
+# Puppetmaster stays zero-dependency; install only if you want swarm traces.
+otel = [
+  "opentelemetry-sdk>=1.20",
+  "opentelemetry-exporter-otlp-proto-http>=1.20",
+]
+
 [project.urls]
 Homepage = "https://github.com/professorpalmer/Puppetmaster"
 Repository = "https://github.com/professorpalmer/Puppetmaster"
