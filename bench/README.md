@@ -1,15 +1,73 @@
 # Puppetmaster Benchmarks
 
-Reproducible measurements you can run on any repo to validate the Puppetmaster + CodeGraph combo. Numbers in the main README come from running these harnesses locally — they're not synthetic.
+Reproducible measurements you can run on any repo to validate Puppetmaster's marketing claims. Numbers cited in the main README and in [`TALKING_POINTS.md`](../TALKING_POINTS.md) come from running these harnesses locally — they're not synthetic.
 
-Two scripts, two different questions:
+Five scripts, five different questions:
 
-| Script | Question it answers |
-|---|---|
-| `three_way.py` | What does **Puppetmaster** add on top of CodeGraph? (compares Agent-only vs CodeGraph alone vs Puppetmaster + CodeGraph) |
-| `codegraph_ab.py` | What does **CodeGraph** add to a Cursor SDK worker? (A/B with CodeGraph on vs. off; live A/B requires `CURSOR_API_KEY`) |
+| Script | Question it answers | API key? |
+|---|---|---|
+| `router_savings.py` | Does the v0.6.0 router actually pick cheaper models per task? | No (uses router math) |
+| `router_live_ab.py` | If I pin a frontier model vs let Puppetmaster route, what's the **real** delta in `tokens_in/out` + wall-clock? | Yes (`OPENAI_API_KEY`) |
+| `followup_cost.py` | After a swarm completes, do follow-up questions really cost 0 tokens? | No (reads SQLite) |
+| `three_way.py` | What does Puppetmaster add on top of CodeGraph? (Agent-only vs CodeGraph alone vs Puppetmaster + CodeGraph) | No |
+| `codegraph_ab.py` | What does CodeGraph add to a Cursor SDK worker? | Optional (`CURSOR_API_KEY` for live A/B) |
+| `mcp_stress.py` | Does the MCP server hold up under concurrent load? | No (live MCP) |
 
-If you only run one, run `three_way.py` — it's the one that answers the cost question users actually have.
+If you only run one, run `router_live_ab.py` — it produces a real OpenAI billing receipt for under three cents of spend, and is the only one of the six that produces non-estimated dollar numbers.
+
+## `router_savings.py` — does routing actually save money?
+
+Dry-run benchmark. Runs the v0.6.0 router over a fixed 6-task fixture spanning easy / medium / hard tiers, then computes "Puppetmaster pick cost" vs "always frontier baseline cost" using the registry's pricing.
+
+```bash
+python -m bench.router_savings
+```
+
+What it proves: on a mixed-task workload, the router picks a cheaper-than-frontier model on routable tasks and correctly stays on the frontier model for hard tasks. Output is markdown + JSON under `bench/results/router_savings_<timestamp>.{md,json}`.
+
+What it does **not** prove: any individual token count. The cost numbers come from the same heuristic estimates that drive routing itself, so this benchmark is internally consistent with the ROUTING artifacts your real swarms emit — but the dollars are directional, not billing-grade.
+
+## `router_live_ab.py` — live OpenAI A/B with real token receipts
+
+The only harness that gives billing-grade numbers. Runs the **same instruction** twice through `OpenAIAdapter`:
+
+- **Arm A**: pinned to the strongest OpenAI model in your registry (`gpt-5.5` in the starter registry).
+- **Arm B**: model picked by the Puppetmaster router under `balanced` policy, candidate pool constrained to `adapter=openai` so the A/B is apples-to-apples.
+
+Both `tokens_in` and `tokens_out` are pulled from the live `usage.prompt_tokens` / `usage.completion_tokens` fields in the OpenAI API response — not estimated.
+
+```bash
+# Dry-run — show routing decision, no API call
+python -m bench.router_live_ab --dry-run
+
+# Live — real API call, ~2 cents of real spend at the default prompt
+OPENAI_API_KEY=sk-... python -m bench.router_live_ab
+```
+
+Sample receipt (an actual run from the starter registry):
+
+| Arm | Model | Wall (s) | tokens_in | tokens_out | $ (real) |
+|---|---|---:|---:|---:|---:|
+| A (always frontier) | `gpt-5.5` | 14.957 | 156 | 625 | $0.019530 |
+| B (Puppetmaster) | `gpt-5.4-nano` | 2.491 | 156 | 131 | $0.000141 |
+
+Delta: **99.3% cheaper, 83.3% faster**, equivalent finding artifacts.
+
+What it does **not** prove: output *quality* is not graded automatically (the receipt prints both replies for human inspection). For trivial definitional tasks the nano model is sufficient; for complex tasks the router would pick a stronger model and the savings would be smaller.
+
+## `followup_cost.py` — do follow-up reads really cost 0 tokens?
+
+Runs against your most recently completed Puppetmaster job (or pass `--job-id`). Performs `--queries` × 4 different reads against the SQLite store — `get_job`, `list_artifacts`, `filter by finding`, `filter by verification` — and measures wall time per query.
+
+```bash
+python -m bench.followup_cost --queries 10
+```
+
+What it proves: every follow-up answer comes out of the durable state without invoking any adapter. The receipt reports `adapter_calls=0, tokens=0, cost=$0.00`, plus a hypothetical "if every follow-up was a fresh swarm replay" baseline column for context.
+
+What it does **not** prove: that ALL follow-ups in a real workflow avoid LLM calls. If the user's follow-up needs reasoning the original swarm didn't capture, a new task has to run — and that costs tokens like any other.
+
+## `three_way.py` — Agent vs CodeGraph alone vs Puppetmaster + CodeGraph
 
 ## `three_way.py` — Agent vs CodeGraph alone vs Puppetmaster + CodeGraph
 

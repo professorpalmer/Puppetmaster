@@ -22,6 +22,30 @@ independent worker processes -> SQLite state -> live artifacts -> stitched summa
 
 Puppetmaster is not trying to beat native IDE subagents at every tiny task. It is for the work that gets messy: long repo investigations, conflicting hypotheses, repeated handoffs, flaky memory, and code changes that need evidence, replay, and approval gates.
 
+## Receipts (not vibes)
+
+The high-level marketing pitch — *"faster, cheaper, more accurate than Cursor alone"* — is exactly the kind of claim that deserves real numbers. Three reproducible benchmarks live in [`bench/`](bench/). The most recent runs are in [`bench/results/`](bench/results/). Headline numbers from the harnesses today:
+
+| Claim | Receipt | What was actually measured |
+|---|---|---|
+| **"Delegates to models based on complexity"** is real | [`bench/router_savings.py`](bench/router_savings.py) | 6-task fixture (2 easy / 2 medium / 2 hard) routed under `balanced` policy. 4/6 routed to a cheaper model than "always frontier"; 2/6 stayed on frontier (audit + architect — honest). Total estimated savings: **35.1%** at the model layer for the workload, **100%** savings on the four routable tasks (Cursor-tier models are $0 because billing rolls into the Cursor plan). |
+| **Cheaper** with real billing receipts | [`bench/router_live_ab.py`](bench/router_live_ab.py) | One live OpenAI A/B (no estimates — `tokens_in` / `tokens_out` from `usage.prompt_tokens`). Arm A pinned `gpt-5.5` (frontier), Arm B let the router pick: it picked `gpt-5.4-nano`. Result: **$0.019530 → $0.000141 (99.3% cheaper)** and **14.957 s → 2.491 s (83.3% faster)** on the same instruction. Both arms returned equivalent finding artifacts. |
+| **Faster** | Same `router_live_ab` receipt | Wall-clock measured around `OpenAIAdapter.run()`. -83.3% on this single task. Not extrapolated. |
+| **More accurate** | *Not currently measured* | Both arms above returned correct, equivalent answers — but we don't have a graded eval set yet, so "more accurate" is **not a defensible claim** today. The honest version is *"more structured"*: every worker emits typed artifacts with `evidence` and `confidence` instead of free-form prose. |
+| **"Token costs solved"** for *follow-ups* | [`bench/followup_cost.py`](bench/followup_cost.py) | After a real swarm completes, K=10 rounds × 4 different reads = **40 follow-up queries against the durable state**. Result: **0 adapter calls, 0 tokens, $0.00**, avg **0.5 ms per query**. Hypothetical "always-frontier replay" baseline for the same 40 queries: **$4.92** at the model layer. |
+| **"Context issues solved"** | Architectural, not benchmarked | Workers coordinate through SQLite artifacts, not a shared chat transcript, so the parent agent's context window doesn't bloat with worker chatter. Demonstrable via `puppetmaster artifacts <job_id>` — the durable state is the coordination surface. |
+| **"Graphs your directories"** | Credit due | That's [CodeGraph](https://github.com/colbymchenry/codegraph), a separate project Puppetmaster **optionally integrates with**. Puppetmaster's contribution is the auto-injection plus the durable state that makes follow-up reads free. |
+
+**Reproduce them locally:**
+
+```bash
+python -m bench.router_savings              # dry-run, no API key
+python -m bench.followup_cost --queries 10  # reads a recent completed job
+OPENAI_API_KEY=... python -m bench.router_live_ab  # ~$0.02 of real spend
+```
+
+For honest limitations and what is and is **not** measurable today, see [TALKING_POINTS.md](TALKING_POINTS.md).
+
 ## The Problem
 
 Most multi-agent coding workflows still use a fragile shape:
