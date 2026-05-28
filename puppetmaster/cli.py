@@ -19,6 +19,11 @@ from puppetmaster.installers import (
     install_codex_mcp,
     install_cursor_mcp,
 )
+from puppetmaster.rules import (
+    VALID_TARGETS,
+    RulesInstallResult,
+    install_rules,
+)
 from puppetmaster.mcp_registry import (
     kill_stale as registry_kill_stale,
     list_entries as registry_list_entries,
@@ -129,6 +134,66 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-handshake",
         action="store_true",
         help="Do not spawn the MCP server to verify it responds before registering.",
+    )
+
+    install_rules_parser = subcommands.add_parser(
+        "install-rules",
+        help="Write agent rule files (Cursor / AGENTS.md / Codex / Claude) that nudge hosts to reach for Puppetmaster on the right tasks.",
+    )
+    install_rules_parser.add_argument(
+        "--target",
+        default=None,
+        help=(
+            "Comma-separated subset of targets to install. "
+            f"Valid: {', '.join(sorted(VALID_TARGETS))}. "
+            "Default: auto-detect from cwd + tools on PATH."
+        ),
+    )
+    install_rules_parser.add_argument(
+        "--global",
+        dest="rules_global",
+        action="store_true",
+        help="Also write user-level rules (~/.codex/instructions.md, ~/.claude/CLAUDE.md) when those tools are detected.",
+    )
+    install_rules_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-write rule blocks even when they already match the current version.",
+    )
+    install_rules_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print what would be written without modifying any file.",
+    )
+
+    setup_parser = subcommands.add_parser(
+        "setup",
+        help="One-shot first-run: doctor + models init + install-cursor-mcp + install-codex-mcp + install-rules. Skips steps where the tool isn't present.",
+    )
+    setup_parser.add_argument(
+        "--skip-doctor",
+        action="store_true",
+        help="Skip the opening doctor pass.",
+    )
+    setup_parser.add_argument(
+        "--skip-models",
+        action="store_true",
+        help="Skip `models init` (useful if you've already customized your registry).",
+    )
+    setup_parser.add_argument(
+        "--skip-rules",
+        action="store_true",
+        help="Skip writing agent rule files.",
+    )
+    setup_parser.add_argument(
+        "--global-rules",
+        action="store_true",
+        help="Pass --global to install-rules.",
+    )
+    setup_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Pass --force through to MCP installers and rule installer.",
     )
 
     init_config = subcommands.add_parser("init-config", help="Write a starter workflow config.")
@@ -741,6 +806,12 @@ def _main(argv: Optional[list[str]] = None) -> int:
     if args.command == "install-cursor-mcp":
         return _run_install_cursor(args)
 
+    if args.command == "install-rules":
+        return _run_install_rules(args)
+
+    if args.command == "setup":
+        return _run_setup(args)
+
     if args.command == "repair-codegraph":
         return _run_repair_codegraph(args)
 
@@ -1329,6 +1400,149 @@ def _run_install_cursor(args) -> int:
         for line in CURSOR_NEXT_STEPS_GUIDANCE.splitlines():
             print(f"  {line}")
     return rc
+
+
+def _print_rules_result(result: RulesInstallResult) -> int:
+    """Pretty-print a :class:`RulesInstallResult` and return an exit code.
+
+    Exit codes mirror the MCP installers: 0 on installed / unchanged /
+    would_install / skipped, 1 on any target error.
+    """
+    print(f"[install-rules] overall: {result.overall_status}")
+    for outcome in result.outcomes:
+        print(
+            f"[install-rules] {outcome.target:<14} {outcome.status:<14} {outcome.reason}"
+        )
+        if outcome.path:
+            print(f"[install-rules] {' ' * 14} {' ' * 14} -> {outcome.path}")
+    for msg in result.messages:
+        print(f"[install-rules] note: {msg}")
+    return 1 if result.overall_status == "error" else 0
+
+
+def _run_install_rules(args) -> int:
+    """Dispatch for ``puppetmaster install-rules``."""
+    targets = None
+    raw_target = getattr(args, "target", None)
+    if raw_target:
+        targets = [t.strip() for t in raw_target.split(",") if t.strip()]
+    result = install_rules(
+        cwd=Path.cwd(),
+        targets=targets,
+        install_global=getattr(args, "rules_global", False),
+        dry_run=getattr(args, "dry_run", False),
+        force=getattr(args, "force", False),
+    )
+    return _print_rules_result(result)
+
+
+def _run_setup(args) -> int:
+    """Dispatch for ``puppetmaster setup`` — one-shot first-run wizard.
+
+    Chains the canonical install steps in dependency order:
+
+    1. ``doctor`` — fail loudly if Puppetmaster's runtime is broken.
+    2. ``models init`` — write the starter registry if missing.
+    3. ``install-cursor-mcp`` — workspace .cursor/mcp.json.
+    4. ``install-codex-mcp`` — only if ``codex`` is on PATH.
+    5. ``install-rules`` — agent nudges for whichever tools detected.
+
+    Each step is independent: a step's failure prints a clear error
+    but does not abort the rest of the chain unless ``doctor`` reports
+    that Python or sqlite is missing (in which case nothing else will
+    work). The user can re-run after fixing whatever was reported.
+    """
+    cwd = Path.cwd()
+    state_dir = resolve_state_dir(args.state_dir, cwd)
+    overall_rc = 0
+
+    if not getattr(args, "skip_doctor", False):
+        print("=== step 1/5: doctor ===")
+        checks = list(run_doctor(cwd, state_dir))
+        for check in checks:
+            print(f"  {check.status:8} {check.name:16} {check.detail}")
+        criticals = [c for c in checks if c.status == "fail" and c.name in {"python", "sqlite"}]
+        if criticals:
+            print("\nCritical dependency missing — fix the above before re-running `setup`.")
+            return 1
+        print()
+    else:
+        print("=== step 1/5: doctor SKIPPED (--skip-doctor) ===\n")
+
+    if not getattr(args, "skip_models", False):
+        print("=== step 2/5: models init ===")
+        try:
+            from puppetmaster.model_registry import (
+                default_registry_path,
+                save_registry,
+                starter_registry,
+            )
+
+            registry_path = default_registry_path()
+            if registry_path.is_file() and not getattr(args, "force", False):
+                print(f"  unchanged  registry at {registry_path} already exists (use --force to overwrite)")
+            else:
+                save_registry(starter_registry(), registry_path)
+                print(f"  installed  starter registry written to {registry_path}")
+        except Exception as exc:
+            print(f"  error  models init failed: {exc!r}")
+            overall_rc = 1
+        print()
+    else:
+        print("=== step 2/5: models init SKIPPED (--skip-models) ===\n")
+
+    print("=== step 3/5: install-cursor-mcp (workspace .cursor/mcp.json) ===")
+    cursor_result = install_cursor_mcp(
+        target_path=(cwd / ".cursor" / "mcp.json").resolve(),
+        force=getattr(args, "force", False),
+        dry_run=False,
+        skip_handshake=False,
+    )
+    for line in cursor_result.messages:
+        print(f"  {line}")
+    if cursor_result.status not in {"installed", "unchanged", "would_install"}:
+        overall_rc = 1
+    print()
+
+    print("=== step 4/5: install-codex-mcp ===")
+    import shutil as _shutil
+    if _shutil.which("codex") is None:
+        print("  skipped  `codex` CLI not on PATH — install with `npm install -g @openai/codex` and re-run `puppetmaster install-codex-mcp` later")
+    else:
+        codex_result = install_codex_mcp(
+            force=getattr(args, "force", False),
+            dry_run=False,
+            skip_handshake=False,
+        )
+        for line in codex_result.messages:
+            print(f"  {line}")
+        if codex_result.status not in {"installed", "unchanged", "would_install"}:
+            overall_rc = 1
+    print()
+
+    if not getattr(args, "skip_rules", False):
+        print("=== step 5/5: install-rules (agent nudges) ===")
+        rules_result = install_rules(
+            cwd=cwd,
+            install_global=getattr(args, "global_rules", False),
+            dry_run=False,
+            force=getattr(args, "force", False),
+        )
+        for outcome in rules_result.outcomes:
+            print(f"  {outcome.target:<14} {outcome.status:<14} {outcome.reason}")
+        for msg in rules_result.messages:
+            print(f"  note: {msg}")
+        if rules_result.overall_status == "error":
+            overall_rc = 1
+    else:
+        print("=== step 5/5: install-rules SKIPPED (--skip-rules) ===")
+    print()
+
+    if overall_rc == 0:
+        print("Setup complete. Restart Cursor (or open a new Codex / Claude session) to pick up the MCP server.")
+    else:
+        print("Setup completed with errors — see above. Individual `puppetmaster install-*` commands can be re-run after fixing.")
+    return overall_rc
 
 
 def _run_repair_codegraph(args) -> int:

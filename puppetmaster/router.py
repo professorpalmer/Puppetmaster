@@ -161,7 +161,12 @@ def classify_capability_needed(task: TaskSignals) -> int:
     elif task.payload_size_chars > 5_000:
         score += 5
 
-    return max(5, min(98, score))
+    # Ceiling tracks the capability_score of the current frontier flagship
+    # in the starter registry (Anthropic Opus 4.8 @ 99). Keeping the max
+    # need at the top model's score means the absolute-hardest tasks demand
+    # — and therefore route to — the flagship, instead of saturating one
+    # notch below it. Bump this in lockstep when a stronger model lands.
+    return max(5, min(99, score))
 
 
 def has_vision_signal(instruction: str) -> bool:

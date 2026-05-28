@@ -1,55 +1,37 @@
 # Puppetmaster
 
+[![PyPI](https://img.shields.io/pypi/v/puppetmaster-ai.svg)](https://pypi.org/project/puppetmaster-ai/)
 [![CI](https://github.com/professorpalmer/Puppetmaster/actions/workflows/ci.yml/badge.svg)](https://github.com/professorpalmer/Puppetmaster/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](pyproject.toml)
 
-**Puppetmaster turns Cursor (or Claude Code, or the OpenAI API, or the official OpenAI Codex CLI) into an orchestrator that routes each task to the cheapest model that can handle it, stores worker outputs as typed SQLite artifacts so follow-ups cost zero tokens, and coordinates workers through durable state instead of a shared parent transcript. Four production adapters live; eleven starter tiers in the model registry.**
+**Puppetmaster turns Cursor (or Claude Code, or the OpenAI API, or the OpenAI Codex CLI) into an orchestrator that routes each task to the cheapest model that can handle it, stores worker outputs as typed SQLite artifacts so follow-ups cost zero tokens, and coordinates workers through durable state instead of a shared parent transcript.**
 
-> Live OpenAI A/B with real billing tokens — same prompt, equivalent answer, one of 3 back-to-back runs:  
-> Pinned `gpt-5.5`: **\$0.006900 in 5.480 s** (156 tokens in / 204 tokens out)  
-> Puppetmaster routed to `gpt-5.4-nano`: **\$0.000132 in 1.511 s** (156 tokens in / 121 tokens out)  
-> → **98.1% cheaper, 72.4% faster.** Cost ratio was 98.1–98.7% across the 3 consecutive runs (wall-time variance was wider, 68–88%, because pinned-frontier latency varies more than nano latency). Reproduce with `OPENAI_API_KEY=... python -m bench.router_live_ab`.
+> Live OpenAI A/B with real billing tokens — same prompt, equivalent answer, one of 3 back-to-back runs:
+> Pinned `gpt-5.5`: **\$0.006900 in 5.480 s** — Puppetmaster routed to `gpt-5.4-nano`: **\$0.000132 in 1.511 s** → **98.1% cheaper, 72.4% faster.** Reproduce: `OPENAI_API_KEY=... python -m bench.router_live_ab`.
 
-## Three claims, three receipts
+## Install
 
-Every number in this section comes from a reproducible script in [`bench/`](bench/). What is **not** defensible today (and what we won't claim) lives in [TALKING_POINTS.md](TALKING_POINTS.md).
+```bash
+pip install puppetmaster-ai
+puppetmaster setup        # one-shot: doctor + models init + install-cursor-mcp + install-codex-mcp + install-rules
+```
 
-### 1. Token cost — fixed on two axes
+That's the whole install. `setup` runs every step idempotently, skips any tool that isn't present, and prints what it did at the end. Restart Cursor (or open a fresh Codex / Claude session) and the agent will see 32+ `puppetmaster_*` tools — plus an agent rule nudging it to reach for them on multi-file work.
 
-**On new work** — Puppetmaster's v0.6.0 router classifies each task's complexity (role + instruction signal patterns + payload size) and picks the cheapest model from your user-owned registry that can handle it. Every routing decision is stored as an auditable `ROUTING` artifact: picked model, capability needed, estimated cost, and the full list of *rejected* alternatives with the reason each was rejected.
+**Pip name note:** PyPI lists this as [`puppetmaster-ai`](https://pypi.org/project/puppetmaster-ai/) because [PEP-503 name normalization](https://peps.python.org/pep-0503/#normalized-names) treats `puppetmaster` and `puppet-master` as the same name, and `puppet-master` is held by an [abandoned 2019 project](https://pypi.org/project/puppet-master/). The import name, CLI binary, GitHub repo, and brand all stay `puppetmaster`. Name-reassignment request in flight ([tracking doc](docs/PYPI_NAME_REQUEST.md)).
 
-- Receipt: [`bench/router_savings.py`](bench/router_savings.py) — on a 6-task fixture, the router was **35.1% cheaper** than pinning a frontier model. Two of six hard tasks (audit, architect) correctly stayed on the frontier model — the wins come from *not* using a frontier model when the task doesn't need one.
-- Receipt: [`bench/router_live_ab.py`](bench/router_live_ab.py) — live OpenAI A/B with real `usage.prompt_tokens` (not estimates): **98.1–98.7% cheaper across 3 consecutive runs** on a single explore task; wall-time savings between 68% and 88% per run.
+To run benchmarks or contribute, clone the repo instead:
 
-**On follow-up work** — once a swarm completes, every artifact (finding, decision, risk, patch, verification, routing decision) lives in SQLite. Follow-up questions like *"what did the security audit worker find?"* are SQLite queries, not new agent runs.
+```bash
+git clone https://github.com/professorpalmer/Puppetmaster.git
+cd Puppetmaster && python -m pip install -e . && npm install --package-lock=false --no-audit
+OPENAI_API_KEY=... python -m bench.router_live_ab   # ~$0.01 of real spend, prints the ~98%-cheaper receipt
+```
 
-- Receipt: [`bench/followup_cost.py`](bench/followup_cost.py) — **40 follow-up queries against a real completed swarm: 0 adapter calls, 0 tokens, \$0.00, avg 0.5 ms per query.** Hypothetical "always-frontier replay" baseline for the same 40 queries: **\$1.64** (using Anthropic's current Opus 4.7 rate of $5/$25 per MTok, corrected in v0.6.3 from the $15/$75 the registry shipped before).
+`bench/` and the Cursor extension source ship only with the cloned repo, not the pip wheel.
 
-Honest scope: this is the *follow-up reads are free* claim. If your follow-up needs new reasoning the swarm didn't produce, that's a new task and it costs tokens like any other.
-
-### 2. Transcript — workers don't share one
-
-The classic multi-subagent shape stuffs everything into one parent chat. Each subagent inherits the parent's stale context, results come back as prose, and the context window bloats until the important details are buried. This is the failure mode users actually hit on long investigations.
-
-Puppetmaster does the opposite. Workers don't see each other's transcripts. They claim tasks by lease, emit **typed artifacts** with payloads + `evidence` + `confidence` + `sha256` integrity, and the final stitcher reads JSON — not raw worker stdout. The parent agent's context only sees what the stitcher publishes.
-
-- Inspect a live swarm: `puppetmaster artifacts <job_id>` returns the durable state — the actual coordination surface, not a chat scrollback.
-- Inspect a completed swarm without paying tokens: same command, milliseconds, $0 (see receipt #1 above).
-- Verify nothing is hand-waved: every artifact carries `created_by` (which worker), `created_at`, and a content `sha256`.
-
-### 3. Graphing — credit [CodeGraph](https://github.com/colbymchenry/codegraph), wire it in cleanly
-
-The "graph your directories for cheap symbol context" capability is **not** a Puppetmaster feature. It's [CodeGraph](https://github.com/colbymchenry/codegraph) — a separate project — and it deserves the credit. Puppetmaster's contribution is what happens after CodeGraph is installed:
-
-- Every Cursor / Claude / OpenAI / Codex worker auto-injects task-relevant CodeGraph context into its prompt before the model call — no MCP round-trip per worker.
-- One shared `codegraph context` query seeds N parallel workers in a swarm (vs N separate queries if each agent issues its own).
-- The resulting artifacts (which now reference symbol-level evidence from CodeGraph) land in the same durable store, so follow-ups still cost zero tokens.
-- The most-used CodeGraph CLI verbs are bundled directly into Puppetmaster's MCP — see [Bundled CodeGraph tools](#bundled-codegraph-tools-no-second-mcp) — so Cursor Agent only needs one MCP for both orchestration and symbol intelligence.
-
-Puppetmaster works fine *without* CodeGraph. Workers fall back to grep/read for context discovery, and orchestration / artifacts / durable state are unchanged. CodeGraph is opt-in via `npm install -g @colbymchenry/codegraph && codegraph init && codegraph index`.
-
----
+## What it does
 
 Think **Redis/Gunicorn for agentic engineering**:
 
@@ -57,7 +39,7 @@ Think **Redis/Gunicorn for agentic engineering**:
 Cursor Agent / Claude Code / OpenAI / Codex CLI / shell
         |
         v
-Puppetmaster supervisor  ──>  task-aware model router (11 starter tiers)
+Puppetmaster supervisor  ──>  task-aware model router (12 starter tiers)
         |
         v
 independent worker processes  ──>  SQLite (typed artifacts, events, memory)
@@ -66,1085 +48,121 @@ independent worker processes  ──>  SQLite (typed artifacts, events, memory)
 live artifact board  ──>  stitched summary  ──>  0-token follow-up reads
 ```
 
-Puppetmaster is not trying to beat native IDE subagents at every tiny task. It is for the work that gets messy: long repo investigations, conflicting hypotheses, repeated handoffs, flaky memory, and code changes that need evidence, replay, and approval gates.
+Puppetmaster is not trying to beat native IDE subagents at every tiny task. It is for the work that gets messy: long repo investigations, conflicting hypotheses, repeated handoffs, flaky memory, and code changes that need evidence, replay, and approval gates. The design rationale and the failure modes it fixes are in [docs/WHY.md](docs/WHY.md).
 
-## 90-second quickstart
+## Three claims, three receipts
 
-```bash
-pip install puppetmaster-ai                      # PyPI release (see "Pip name" note below)
-python -m puppetmaster doctor                    # 14 health checks (python, sqlite, git, node, npm, cursor-sdk, claude-code, codex, codegraph, mcp-servers, two API keys, sqlite-state, git-status)
-python -m puppetmaster models init               # writes the 11-tier starter registry across cursor, claude-code, openai, and codex adapters
-python -m puppetmaster install-cursor-mcp        # wires Puppetmaster into Cursor (workspace .cursor/mcp.json); --global writes ~/.cursor/mcp.json
-python -m puppetmaster install-codex-mcp         # wires Puppetmaster into the Codex CLI (codex mcp add ...)
-python -m puppetmaster route "Format these files" --role verify-runtime
-                                                 # dry-run routing decision: picks cursor/composer-2-5 ($0)
-```
+Every number in this section comes from a reproducible script in [`bench/`](bench/). What is **not** defensible (and what we won't claim) lives in [TALKING_POINTS.md](TALKING_POINTS.md).
 
-Both `install-*-mcp` commands resolve `sys.executable` (avoids the "wrong `python` on PATH" failure mode), launch a `tools/list` handshake before writing anything, are fully idempotent (re-run = `unchanged`), and preserve any existing env vars / unrelated MCP servers already in the file.
+### 1. Token cost — fixed on two axes
 
-**Pip name:** the package is published on PyPI as [`puppetmaster-ai`](https://pypi.org/project/puppetmaster-ai/) because PyPI's [PEP-503 name normalization](https://peps.python.org/pep-0503/#normalized-names) treats `puppetmaster` and `puppet-master` as the same name, and `puppet-master` is held by an [abandoned 2019 single-release project](https://pypi.org/project/puppet-master/) that hasn't been updated in 6+ years. The import name, CLI binary, GitHub repo, and brand all stay `puppetmaster` — only `pip install <name>` differs. A name-reassignment request for the bare name is in flight ([tracking doc](docs/PYPI_NAME_REQUEST.md)).
+**On new work** — the v0.6.0+ router classifies each task's complexity (role + instruction signal patterns + payload size) and picks the cheapest model from your user-owned registry that can handle it. Every routing decision is an auditable `ROUTING` artifact: picked model, capability needed, estimated cost, and the full list of *rejected* alternatives with the reason each was rejected.
 
-### Developer install (run benchmarks, contribute, edit the code)
+- [`bench/router_savings.py`](bench/router_savings.py) — on a 6-task fixture, **35.1% cheaper** than pinning a frontier model. The wins come from *not* using a frontier model when the task doesn't need one.
+- [`bench/router_live_ab.py`](bench/router_live_ab.py) — live OpenAI A/B with real `usage.prompt_tokens`: **98.1–98.7% cheaper across 3 consecutive runs** on a single explore task; wall-time savings between 68% and 88% per run.
 
-```bash
-git clone https://github.com/professorpalmer/Puppetmaster.git
-cd Puppetmaster && python -m pip install -e . && npm install --package-lock=false --no-audit
-OPENAI_API_KEY=... python -m bench.router_live_ab
-                                                 # ~$0.01 of real spend, prints the ~98%-cheaper receipt
-```
+**On follow-up work** — once a swarm completes, every artifact lives in SQLite. Follow-up questions are SQLite queries, not new agent runs.
 
-The `bench/` directory is not shipped in the pip wheel (it's a development harness, not a runtime dependency), so reproducing the live A/B benchmark requires the cloned repo.
+- [`bench/followup_cost.py`](bench/followup_cost.py) — **40 follow-up queries against a real completed swarm: 0 adapter calls, 0 tokens, \$0.00, avg 0.5 ms per query.** Hypothetical "always-frontier replay" baseline for the same 40 queries: **\$1.64** at Anthropic's current Opus 4.7 rate ($5/$25 per MTok).
 
-For deeper proof, [TALKING_POINTS.md](TALKING_POINTS.md) has the full truth-table separating "use this phrasing" from "avoid that overclaim".
+Honest scope: this is the *follow-up reads are free* claim. If your follow-up needs new reasoning the swarm didn't produce, that's a new task and it costs tokens like any other.
 
-## The Problem
+### 2. Transcript — workers don't share one
 
-Most multi-agent coding workflows still use a fragile shape:
+The classic multi-subagent shape stuffs everything into one parent chat. Each subagent inherits stale context, results come back as prose, and the context window bloats until the important details are buried.
 
-```text
-One parent chat
-  |- subagent
-  |- subagent
-  `- subagent
-```
+Puppetmaster does the opposite. Workers don't see each other's transcripts. They claim tasks by lease, emit **typed artifacts** with payloads + `evidence` + `confidence` + `sha256` integrity, and the final stitcher reads JSON — not raw worker stdout. The parent agent's context only sees what the stitcher publishes.
 
-That works for demos. It breaks down during real repo work.
+- Inspect a live swarm: `puppetmaster artifacts <job_id>` — the actual coordination surface, not a chat scrollback.
+- Inspect a completed swarm without paying tokens: same command, milliseconds, $0 (receipt #1 above).
+- Verify nothing is hand-waved: every artifact carries `created_by`, `created_at`, and a content `sha256`.
 
-- The parent context bloats until the important details are buried.
-- Subagents inherit stale assumptions from the same conversation.
-- Results come back as prose blobs instead of evidence-backed records.
-- There is no durable state, replay, lease, failure recovery, or memory promotion.
-- A crashed or confused worker often becomes a mystery instead of an inspectable event.
-- Full-edit agents can mix old local changes with new changes unless the workflow guards against it.
+### 3. Graphing — credit [CodeGraph](https://github.com/colbymchenry/codegraph), wire it in cleanly
 
-Puppetmaster is built around a different rule:
+The "graph your directories" capability is **not** a Puppetmaster feature. It's [CodeGraph](https://github.com/colbymchenry/codegraph) — a separate project — and it deserves the credit. Puppetmaster's contribution is what happens after CodeGraph is installed: every worker auto-injects task-relevant CodeGraph context into its prompt before the model call, one shared `codegraph context` query seeds N parallel workers, and the resulting artifacts land in the same durable store. Puppetmaster works fine without CodeGraph; workers fall back to grep/read. Details in [docs/CODEGRAPH.md](docs/CODEGRAPH.md).
 
-> Agents should not share transcript history. They should share durable state.
+## Quickstart
 
-## What Puppetmaster Solves
-
-### 1. Context Collapse
-
-Workers do not coordinate by stuffing every thought into one parent conversation. They claim tasks, write structured artifacts, and let the stitcher summarize durable outputs back to the operator.
-
-### 2. Subagent Resource Contention
-
-Puppetmaster does not rely on one parent agent spawning children inside the same chat surface. It runs workers as separate local subprocesses, each with its own adapter invocation and lifecycle.
-
-### 3. Vibe-Based Handoffs
-
-Workers emit typed artifacts with payloads, evidence, confidence, source files, and `sha256` integrity. The final synthesis reads artifacts, not raw worker transcripts.
-
-Artifacts are available as soon as they are emitted. The final stitch is the publishable synthesis, not the first moment the work becomes visible.
-
-### 4. Lost Work and Dead Workers
-
-Tasks are lease-based. Stale workers can be recovered. Jobs fail closed. Failures become events and verification artifacts instead of disappearing into chat history.
-
-### 5. Unsafe Code Edits
-
-Claude Code full-edit runs are blocked on dirty worktrees by default. When edits happen, Puppetmaster captures patch artifacts with changed files, base SHA, unified diff, and revert guidance.
-
-### 6. No Long-Term Recall
-
-Useful artifacts can be promoted into memory and retrieved by later workers. The next run does not need the entire old conversation to remember what mattered.
-
-## What It Is
-
-Puppetmaster is not another group-chat swarm. It is a local coordination runtime:
-
-- `Job`: one user goal
-- `Task`: role-specific work, optionally dependency-gated
-- `Worker`: separate subprocess that claims work through a lease
-- `Adapter`: Cursor SDK, Claude Code CLI, shell, or future provider
-- `Artifact`: structured finding, decision, patch, verification result, risk, or memory summary
-- `Stitcher`: final synthesis from artifacts only
-- `Memory`: promoted facts for future retrieval
-
-SQLite is the default coordination backend. WAL mode, schema metadata, integrity checks, task leases, retries, event streams, and patch artifacts are built in.
-
-## Why Not Just Use Subagents?
-
-Native IDE subagents are great for quick parallel help inside one product surface. Puppetmaster solves a different problem: making agent work durable and inspectable outside a single parent context.
-
-| Native subagents | Puppetmaster |
-| --- | --- |
-| Fast for small tasks | Better for long, stateful investigations |
-| Shared chat surface | Shared durable state |
-| Transcript-heavy handoffs | Typed artifacts with evidence |
-| Harder to replay | Jobs, events, artifacts, and summaries persist locally |
-| Usually opaque failure model | Leases, recovery, logs, and failed-task artifacts |
-| Final answer often hides process | Live artifact board while workers run |
-
-The goal is not “one more chat.” The goal is a local runtime where the operator can start a swarm, get a `job_id`, watch artifacts appear, inspect partial summaries, and only then approve edits.
-
-## What Works Today
-
-| Area | Status |
-| --- | --- |
-| Local runtime | Daily-driver beta: subprocess workers, task DAGs, leases, recovery, failure states |
-| SQLite backend | Default backend with WAL mode, schema metadata, integrity checks, and persisted events |
-| **Model router** (v0.6.0+) | Task-aware routing across the registry; every decision is an auditable `ROUTING` artifact. Receipts: [bench/router_savings.py](bench/router_savings.py), [bench/router_live_ab.py](bench/router_live_ab.py) |
-| Cursor Agent MCP | Async start tools, status polling, logs, live artifacts, partial summaries, routing tools (`puppetmaster_route_task`, `puppetmaster_list_models`, `puppetmaster_job_cost`) |
-| Cursor extension | Activity-bar control panel for running Puppetmaster inside Cursor |
-| Cursor adapter | Live adapter through `@cursor/sdk`; best for review/plan/dry-run workflows |
-| Claude Code adapter | Live full-edit adapter through Claude Code CLI; validated with real tracked diffs |
-| OpenAI adapter (v0.6.1-beta.1+) | Direct Chat Completions via `OPENAI_API_KEY`; captures real `tokens_in` / `tokens_out` from `usage.prompt_tokens`. |
-| **Codex adapter** (v0.7.0+) | Live full-edit adapter through the official OpenAI Codex CLI (`codex exec --json`). Parses the structured JSONL event stream and captures `input_tokens`, `output_tokens`, `cached_input_tokens`, `reasoning_output_tokens`, and `thread_id` per turn — currently the most telemetry-rich adapter Puppetmaster ships. |
-| Shell adapter | Built-in bounded command runner for verification |
-| Memory | Promoted memory retrieval into later worker context and prompts |
-| CodeGraph | Optional shared repo intelligence: workers auto-inject CodeGraph context when available |
-| Patch workflow | Patch artifacts, path locks, approval/rejection events, dirty-worktree guard |
-| Reproducible benchmarks | Six harnesses in [`bench/`](bench/), each with markdown + JSON receipts under `bench/results/` |
-
-## Install
-
-The fast path (PyPI):
-
-```bash
-pip install puppetmaster-ai
-python -m puppetmaster doctor
-```
-
-That's enough for the MCP server, all CLI subcommands, the router, the model registry, and every adapter (`cursor`, `claude-code`, `openai`, `codex`). CodeGraph integration is optional and adds two more commands (`npm install -g @colbymchenry/codegraph && codegraph init && codegraph index`) — see [CodeGraph integration](#codegraph-integration-optional-but-recommended) below.
-
-The developer path (clone the repo to run benchmarks, edit the code, or contribute):
-
-```bash
-git clone https://github.com/professorpalmer/Puppetmaster.git
-cd Puppetmaster
-
-python -m pip install -e .
-npm install --package-lock=false --no-audit
-python -m puppetmaster doctor
-```
-
-The `bench/` directory and the Cursor extension source ship only with the cloned repo, not the pip wheel.
-
-Run the local demo:
-
-```bash
-python -m puppetmaster run "Map this repo" --config examples/enterprise-workflow.json
-python -m puppetmaster show $(python -m puppetmaster last)
-```
-
-Prove worker recovery:
-
-```bash
-python -m puppetmaster crash-demo
-```
-
-## Daily Driver Prompts
-
-In Cursor Agent, with MCP enabled:
+After `pip install puppetmaster-ai && puppetmaster setup`, try one of these inside Cursor Agent or Codex:
 
 ```text
 Use Puppetmaster to run doctor in this repo and summarize what is missing.
 ```
 
 ```text
-Use Puppetmaster to start a swarm for this repo and return the job id immediately.
-Problem: users are getting logged out after refresh and token refresh tests are flaky.
-Constraints: keep the patch focused, preserve public API behavior, and run relevant tests.
+Use Puppetmaster to start a cursor swarm for this repo and return the job id immediately.
+Problem: users get logged out after refresh and token-refresh tests are flaky.
+Constraints: keep the patch focused, preserve public API behavior, run relevant tests.
 Do review/plan first. Poll status/logs by job id. Do not edit until you summarize findings and ask for approval.
 ```
 
-For real multi-role analysis, prefer `puppetmaster_start_cursor_swarm` through Cursor Agent. It creates real Cursor SDK-backed worker roles. Bare custom roles on the generic `puppetmaster_start_swarm` require a config or adapter so Puppetmaster does not accidentally run deterministic demo workers.
-
-While the job runs, ask Cursor Agent to inspect:
-
-```text
-Poll Puppetmaster status, live artifacts, and partial summary for <job_id>. Summarize concrete findings as they arrive.
-```
-
-After review/approval:
-
-```text
-Use Puppetmaster to start Claude Code implementation for the approved fix in a clean worktree. Return the job id immediately and poll status until complete.
-```
-
-From the CLI:
+Or from the shell:
 
 ```bash
-python -m puppetmaster doctor
-python -m puppetmaster cursor "Review this repo for release blockers" --review --dry-run
-python -m puppetmaster cursor "Plan the next safe implementation slice" --plan --dry-run
-python -m puppetmaster claude "Implement the approved change and run focused tests" --permission-mode acceptEdits
-python -m puppetmaster show $(python -m puppetmaster last)
-python -m puppetmaster logs
+puppetmaster doctor
+puppetmaster route "Security audit every endpoint" --role audit   # dry-run routing decision
+puppetmaster cursor "Review this repo for release blockers" --review --dry-run
+puppetmaster claude "Implement the approved change and run focused tests" --permission-mode acceptEdits
+puppetmaster show $(puppetmaster last)
 ```
 
-`cursor` and `claude` use inline orchestration by default to avoid an extra Python worker cold start. The provider still runs in its own process (`node` for Cursor SDK, Claude Code CLI for Claude), while Puppetmaster keeps the same job/task/artifact/lease state model. Use `--worker-mode subprocess` when you want the stricter worker-process boundary for a run.
-
-For local swarms, you can keep Puppetmaster workers warm and let jobs hand off work to them:
-
-```bash
-python -m puppetmaster daemon --roles explore architect implement redteam test
-python -m puppetmaster run "Review this repo" --worker-mode daemon
-```
-
-Daemon mode keeps the Puppetmaster worker loop alive across jobs. It preserves lease-based task claiming and artifacts, while avoiding repeated worker process startup for local-role swarms.
-
-For real edits, prefer a clean worktree:
-
-```bash
-git worktree add /tmp/puppetmaster-work -b puppetmaster-work
-python -m puppetmaster claude "Implement the approved fix" --cwd /tmp/puppetmaster-work --permission-mode acceptEdits
-```
-
-## Intelligent model orchestration (new in v0.6.0)
-
-Puppetmaster ships a task-aware **model router** that picks the right LLM for each task instead of pinning one model per adapter. Cheap models handle trivial work, capable models handle hard work, vision tasks land on a vision-capable model, and you see exactly why.
-
-The router is built around three pillars:
-
-1. **A user-owned registry.** You describe your own models, prices, and asserted capability scores in `~/.puppetmaster/models.json` (override with `$PUPPETMASTER_MODELS_PATH`). No hardcoded model names, no live price fetching — your subscriptions, your numbers.
-2. **A transparent classifier.** Pure-function heuristic that assigns a 0..100 capability-needed score from the task's role + instruction + payload (e.g. `verify-runtime` ≈ 25, `explore` ≈ 50, `implement` ≈ 75, `audit/security-review` ≈ 90+). Vision tasks auto-add a `vision` required-tag so non-vision models are filtered out cleanly. Override per-task with `payload.min_capability`.
-3. **Four policies.** `balanced` (default — cheapest sufficient, ties broken toward right-sized smaller models), `cheap`, `quality`, `escalating` (ordered chain for retries). Override per-task with `payload.routing_policy`.
-
-**Every routing decision is a durable artifact.** Picked model, classifier output, estimated USD cost, and the full list of rejected alternatives with the reason each was rejected — all stored as an `ArtifactType.ROUTING` artifact tied to the task. Run `puppetmaster artifacts <job_id>` to see why each task went where, or `puppetmaster cost <job_id>` to sum spend across the run.
-
-### Where it kicks in automatically (and where it doesn't)
-
-This is the part to be honest about:
-
-| Surface                                         | Auto-routes? |
-| ----------------------------------------------- | ------------ |
-| `puppetmaster_start_cursor_swarm` (MCP)         | **YES** — default workers ship with `auto_route: true`. |
-| `puppetmaster_start_swarm` (MCP)                | **YES** — same default workers. |
-| `puppetmaster_start_claude_implement` (MCP)     | Opt-in per call — pass a spec with `auto_route: true` or accept the default. |
-| `python -m puppetmaster run`                    | **YES** for built-in workers; opt-in per spec in a custom config. |
-| Cursor's main chat window (typing `@cursor`)    | **NO.** Cursor's own model picker chooses the chat model — Puppetmaster is not in that loop. The router applies *when Puppetmaster runs a swarm*, not when Cursor's agent is having a conversation with you. |
-| Claude Code's main session                      | **NO** — same reason. Claude Code picks its own session model. |
-
-In other words: **the router governs how Puppetmaster fans work out across its swarm workers; it does not (and cannot) hijack the model your IDE's primary chat agent uses.** If you want the cheap-tier model for trivial chat work, set that as your IDE's default in Cursor settings. The router is for *every task Puppetmaster delegates*, which on a real workflow is far more model invocations than the chat itself.
-
-If you haven't run `puppetmaster models init` yet, auto-routing is a clean no-op: the orchestrator emits one `router.registry_empty` event per run, then falls back to each spec's declared adapter. Nothing breaks.
-
-### The four tiers in the starter registry
-
-`puppetmaster models init` writes **11 tiered model entries** that map directly to the "easy / balanced / high / extra-high" mental model — 5 Cursor/Claude tiers, 4 OpenAI tiers, and 2 Codex tiers, covering every cheap → frontier pairing across all four production adapters. **The `adapter_model_name` values are the literal strings each adapter passes through to its SDK / CLI today** (verified against Cursor's runtime catalog, Anthropic's `claude` CLI, and OpenAI's `codex` CLI as of v0.7.0): `composer-2.5`, `gpt-5.5`, `claude-haiku-4-5`, `claude-opus-4-6`, `claude-opus-4-7` for the Cursor/Claude tier; `gpt-5.5` / `gpt-5.4` / `gpt-5.4-mini` / `gpt-5.4-nano` for the OpenAI tier; `gpt-5.5` / `gpt-5.4-mini` (routed through `codex exec --json`) for the Codex tier. When newer versions land, edit `adapter_model_name` in `~/.puppetmaster/models.json` and the tier ids stay stable:
-
-| Tier ID                  | Adapter       | Mental model                                       | Tags |
-| ------------------------ | ------------- | -------------------------------------------------- | ---- |
-| `cursor/composer-2-5`    | `cursor`      | fast / cheap / reading (\$0 — bundled in Cursor plan) | `cheap`, `fast`, `reading`, `code` |
-| `cursor/gpt-5-5`         | `cursor`      | balanced — \$0 via Cursor plan, GPT-5.5 quality     | `balanced`, `fast`, `vision` |
-| `claude-code/haiku-4-5`  | `claude-code` | cheap on the Anthropic side (\$1 / \$5) — the cheap tier for Claude-Code-only users | `cheap`, `fast`, `vision`, `reading`, `code` |
-| `claude-code/opus-4-6`   | `claude-code` | high-quality — \$5 / \$25 per MTok                  | `quality`, `vision`, `reasoning` |
-| `claude-code/opus-4-7`   | `claude-code` | frontier — \$5 / \$25, best for hard reasoning + detailed vision | `frontier`, `vision`, `detailed-vision`, `reasoning` |
-| `openai/gpt-5-5`         | `openai`      | frontier via Responses API — \$5 / \$30 per MTok    | `frontier`, `vision`, `detailed-vision`, `reasoning`, `code` |
-| `openai/gpt-5-4`         | `openai`      | workhorse — \$2.50 / \$15 per MTok                  | `quality`, `fast`, `vision`, `code`, `reasoning` |
-| `openai/gpt-5-4-mini`    | `openai`      | balanced — \$0.75 / \$4.50 per MTok                 | `balanced`, `fast`, `vision`, `code` |
-| `openai/gpt-5-4-nano`    | `openai`      | cheap reader — \$0.15 / \$0.90 per MTok             | `cheap`, `fast`, `reading` |
-| `codex/gpt-5-5`          | `codex`       | frontier with the **Codex agent loop** (file edits, shell, search) — \$5 / \$30 per MTok | `frontier`, `vision`, `reasoning`, `code`, `agent-loop` |
-| `codex/gpt-5-4-mini`     | `codex`       | balanced with the Codex agent loop — \$0.75 / \$4.50 per MTok | `balanced`, `vision`, `code`, `agent-loop` |
-
-With the starter registry, balanced-policy routing lands roughly:
-
-| Task                                            | Picked model |
-| ----------------------------------------------- | ------------ |
-| `format these files`                            | `cursor/composer-2-5` |
-| `map the auth module`                           | `cursor/composer-2-5` |
-| `add password reset endpoint`                   | `cursor/gpt-5-5` |
-| `decision: which caching strategy fits`         | `claude-code/opus-4-6` |
-| `security audit every endpoint`                 | `claude-code/opus-4-7` |
-| `describe what you see in the screenshot`       | `cursor/gpt-5-5` (vision-tagged) |
-| `OCR every detail of the diagram`               | `claude-code/opus-4-7` (detailed-vision) |
-| `refactor every callsite of foo() and add tests` | `openai/gpt-5-4` (workhorse — cheaper than frontier, capable enough for cross-file refactor) |
-
-### Quick start
-
-```bash
-# 1. Write the starter registry (5 Cursor/Claude tiers + 4 OpenAI tiers + 2 Codex tiers = 11)
-python -m puppetmaster models init
-
-# 2. Inspect the registry
-python -m puppetmaster models list
-
-# 3. Dry-run a routing decision before kicking off a swarm
-python -m puppetmaster route "Security audit across every endpoint" --role audit
-# picked: claude-code/opus-4-7  (adapter=claude-code, model_name=claude-opus-4-7)
-# policy: balanced
-# capability needed: 98  chosen capability: 98
-# estimated tokens: in=510  out=5000  estimated cost: $0.127550
-# why: policy=balanced: cheapest model whose capability_score (98) >= needed (98)
-# rejected:
-#   - cursor/composer-2-5:  capability_score 55 < needed 98
-#   - cursor/gpt-5-5:       capability_score 78 < needed 98
-#   - claude-code/haiku-4-5:capability_score 55 < needed 98
-#   - claude-code/opus-4-6: capability_score 88 < needed 98
-#   - openai/gpt-5-5:       capability_score 96 < needed 98
-#   - openai/gpt-5-4:       capability_score 86 < needed 98
-#   - openai/gpt-5-4-mini:  capability_score 70 < needed 98
-#   - openai/gpt-5-4-nano:  capability_score 52 < needed 98
-
-python -m puppetmaster route "Format these files" --role verify-runtime
-# picked: cursor/composer-2-5  (adapter=cursor, model_name=composer-2.5)
-# capability needed: 20  chosen capability: 55
-# estimated cost: $0.000000  (Cursor-tier models bill through your Cursor plan)
-# rejected:
-#   - cursor/gpt-5-5:        sufficient capability but pricier than cursor/composer-2-5
-#   - claude-code/opus-4-6:  sufficient capability but pricier than cursor/composer-2-5
-#   - ... (5 more, all rejected for being pricier)
-```
-
-### Wiring auto-routing into a swarm
-
-Set `payload.auto_route = true` on any worker spec. The orchestrator replaces the spec's `adapter` and stamps `payload.model` from the router's decision before the task runs, and persists a `ROUTING` artifact:
-
-```python
-from puppetmaster.workers import WorkerSpec
-
-specs = [
-    WorkerSpec(
-        role="explore",
-        instruction="Map the auth subsystem",
-        payload={"auto_route": True},
-    ),
-    WorkerSpec(
-        role="audit",
-        instruction="Find auth bypasses in every endpoint",
-        payload={"auto_route": True, "routing_policy": "quality"},
-    ),
-    WorkerSpec(
-        role="verify-runtime",
-        instruction="Run pytest and report results",
-        payload={"auto_route": True, "max_cost_usd": 0.01},
-    ),
-]
-```
-
-After the run:
-
-```bash
-python -m puppetmaster artifacts <job_id> | jq '.[] | select(.type=="routing") | .payload'
-# {
-#   "model_id": "claude-code/opus-4-7",
-#   "adapter": "claude-code",
-#   "adapter_model_name": "claude-opus-4-7",
-#   "policy": "balanced",
-#   "capability_needed": 98,
-#   "capability_score": 98,
-#   "estimated_cost_usd": 0.127550,
-#   "reason": "policy=balanced: cheapest model whose capability_score (98) >= needed (98)",
-#   "rejected": [
-#     {"id": "cursor/composer-2-5",  "reason": "capability_score 55 < needed 98"},
-#     {"id": "cursor/gpt-5-5",       "reason": "capability_score 78 < needed 98"},
-#     {"id": "claude-code/opus-4-6", "reason": "capability_score 88 < needed 98"},
-#     {"id": "openai/gpt-5-5",       "reason": "capability_score 96 < needed 98"}
-#   ]
-# }
-```
-
-### Per-task overrides
-
-| Override                       | Effect                                                                 |
-| ------------------------------ | ---------------------------------------------------------------------- |
-| `payload.min_capability` (int) | Force classifier output to this value (0..100).                        |
-| `payload.max_cost_usd` (float) | Hard cap on estimated per-call USD cost. Models over budget are excluded with a clear rejection reason. |
-| `payload.required_tags` (list) | Only consider models whose `tags` include ALL of these.                |
-| `payload.routing_policy` (str) | One of `balanced` (default), `cheap`, `quality`, `escalating`.         |
-| `payload.registry_path` (str)  | Use a different registry file for this task.                           |
-
-### Scope and honesty
-
-Four production adapters ship today: `cursor` (Cursor SDK via `@cursor/sdk`), `claude-code` (Anthropic via the `claude` CLI), `openai` (direct Chat Completions via `OPENAI_API_KEY`, added in v0.6.1-beta.1), and `codex` (official OpenAI Codex CLI via `codex exec --json`, added in v0.7.0). Together they cover the entire starter registry: `composer-2.5`, `gpt-5.5`, `claude-haiku-4-5`, `claude-opus-4-6`, `claude-opus-4-7`, the four GPT-5 OpenAI tiers (`gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.4-nano`), and the two Codex tiers (`codex/gpt-5-5`, `codex/gpt-5-4-mini`). **Raw HTTP adapters for additional providers (Gemini, DeepSeek, Kimi) are not yet in.** They slot in cleanly as new `adapter` values — the registry + router/classifier framework doesn't need to change — but each one needs real validation against its provider's API before it ships.
-
-Capability scores and prices stay **user-asserted**. Puppetmaster makes the **decision** transparent (full audit trail of why each task went where); it does not make the **value judgments** for you (whether GPT-5.4 really is an 86, or whether Cursor's bundled models should be treated as $0). Edit the registry to match your reality.
-
-### MCP
-
-Two new MCP tools for agent-side use:
-
-| MCP tool                       | What it does                                                                 |
-| ------------------------------ | ---------------------------------------------------------------------------- |
-| `puppetmaster_route_task`      | Dry-run the router on an instruction. Returns the picked model + cost + rejected alternatives. |
-| `puppetmaster_list_models`     | Print the registry as JSON (path + each model spec).                          |
-
-## Works great with CodeGraph (optional)
-
-Puppetmaster runs fine without CodeGraph — workers will fall back to grep/read for context discovery, and the orchestration / durable state / parallel-worker machinery is unchanged. When you pair it with [CodeGraph](https://github.com/colbymchenry/codegraph), every Cursor/Claude worker gets a pre-built repo map (symbols, refs, call graph) injected into its prompt instead of having to rediscover the codebase. The two tools optimize different axes and stack cleanly:
-
-- **CodeGraph** = per-call context resolution. Static facts about your *code* (symbols, refs, routes).
-- **Puppetmaster** = per-session coordination + state. Dynamic facts about the *agents' work* (tasks, leases, typed artifacts, replayable events).
-
-Install CodeGraph globally and initialize it once per target repo:
-
-```bash
-npm install -g @colbymchenry/codegraph
-cd your-target-repo
-codegraph init -i
-```
-
-After that, Puppetmaster's `doctor` will show `codegraph ok`, and every Cursor/Claude worker run against that workspace will:
-
-- query CodeGraph for task-relevant symbols, files, and routes
-- inject the result into the worker prompt as authoritative starting context
-- tag the resulting verification artifact with `context:codegraph` so the operator can confirm shared intelligence was used
-
-Fully optional and graceful. If `codegraph` is not installed, or the target repo is not initialized, workers fall back to their normal exploration path with no error. Pass `disable_codegraph: true` in a task payload to skip CodeGraph for a specific worker.
-
-Cursor Agent can also query CodeGraph directly through Puppetmaster's MCP — no second MCP server required for the daily-driver case. See [Bundled CodeGraph tools](#bundled-codegraph-tools-no-second-mcp) below.
-
-### Cost: what changes when you switch to durable state
-
-> **Newer, more direct receipts** for the routing + durable-state claims live in [bench/router_savings.py](bench/router_savings.py), [bench/router_live_ab.py](bench/router_live_ab.py), and [bench/followup_cost.py](bench/followup_cost.py) — see the [opening section](#three-claims-three-receipts) and [TALKING_POINTS.md](TALKING_POINTS.md). The Agent / CodeGraph / Puppetmaster three-way analysis below is older and broader (it models multi-worker swarm cost vs single-agent cost); both views are valid and they answer different questions.
-
-The whole point of Puppetmaster is that durable state turns repeated questions about the same task into a database read instead of another agent run. The benchmark below shows that effect against two baselines:
-
-- **A. Agent only** — one agent (Cursor or Claude Code) doing the work alone, discovering the repo with grep/read/list. No shared state across sessions.
-- **B. CodeGraph alone** — same agent, with CodeGraph's MCP installed; the agent issues `codegraph_explore` calls itself. Still no shared state across sessions.
-- **C. Puppetmaster + CodeGraph** — Puppetmaster swarm with CodeGraph context pre-injected into every worker prompt, structured artifacts in a durable SQLite store, stitcher reads JSON not transcripts. Follow-up queries read SQLite, not the model.
-
-Result, modelled from real measurements on this repo (`bench/three_way.py`, swarm of 4 workers, artifact sizes from a real past Puppetmaster run, $3/1M token input price):
-
-#### Fresh task cost (one investigation)
-
-| Config | Tokens | Cost |
-|---|---|---|
-| A. Agent only | ~30,695 | ~$0.0921 |
-| B. CodeGraph alone | ~6,250 | ~$0.0187 |
-| C. Puppetmaster + CodeGraph | ~21,231 | ~$0.0637 |
-
-**On a single fresh task, Puppetmaster does not beat CodeGraph alone in raw tokens.** Puppetmaster is doing more work — N parallel workers and a stitcher pass instead of one agent — so its token bill is higher than a single agent with CodeGraph. That's an honest, measured trade-off, and you should know it before believing any "99% reduction" copy.
-
-#### Session cost (1 swarm + K follow-up reads at $3/1M)
-
-This is where Puppetmaster actually wins. Real workflows are not one-shot: you investigate, then ask follow-up questions about the same task. In Configs A and B every follow-up is a fresh agent re-run (no persisted state). In Config C, every follow-up is just SQLite — **0 model tokens.**
-
-| Config | K=0 | K=1 | K=5 | K=10 | K=25 |
-|---|---|---|---|---|---|
-| A. Agent only | ~$0.0921 | ~$0.1842 | ~$0.5525 | ~$1.0129 | ~$2.3942 |
-| B. CodeGraph alone | ~$0.0187 | ~$0.0375 | ~$0.1125 | ~$0.2062 | ~$0.4875 |
-| **C. Puppetmaster + CodeGraph** | **~$0.0637** | **~$0.0637** | **~$0.0637** | **~$0.0637** | **~$0.0637** |
-
-At K=25 follow-ups, **Puppetmaster + CodeGraph is ~7.6× cheaper than CodeGraph alone and ~38× cheaper than agent-only.** The crossover where C catches up to B is around K=3-4 in this dataset.
-
-#### Where the savings come from
-
-1. **Durable resume (Puppetmaster)** — the headline. Every follow-up read against a completed swarm is a SQLite query, costing 0 model tokens. This is what flatlines the C column above.
-2. **Typed-artifact coordination (Puppetmaster)** — workers communicate through structured rows instead of raw transcripts; the stitcher reads JSON, not stdout.
-3. **Amortized context query (CodeGraph + Puppetmaster)** — one `codegraph context` call seeds N workers in a swarm; B issues N separate `codegraph_explore` calls.
-4. **Zero tool-call frames (CodeGraph + Puppetmaster)** — workers receive context inline in the initial prompt; no MCP round-trip envelope per worker.
-
-The first two are Puppetmaster's standalone contribution and work even without CodeGraph (you'd just lose the cheap per-call context, so worker prompts get more expensive). The last two only show up when both are installed.
-
-#### Reproduce on your own repo
-
-```bash
-npm install -g @colbymchenry/codegraph && codegraph init && codegraph index
-
-# Three-way cost-structure benchmark
-python -m bench.three_way --cwd . --workers 4 --artifacts-state /path/to/past/puppetmaster/state
-
-# Just CodeGraph's prompt enrichment (A/B, no API key required)
-python -m bench.codegraph_ab --cwd . --prompt @bench/prompts/example.txt --dry-run
-```
-
-See [`bench/README.md`](bench/README.md) for full methodology, what's measured vs. modelled, and the honest caveats (no live token billing yet — that's on the roadmap and needs SDK-side stream instrumentation).
-
-## Cursor Integration
-
-Puppetmaster ships with two Cursor integration surfaces.
-
-### Default subagent routing (no more "Utilize Puppetmaster..." prompts)
-
-This repo includes `.cursor/rules/puppetmaster-workflow.mdc` with `alwaysApply: true` and a top-level `AGENTS.md`. Together they tell Cursor Agent (and any agent that reads `AGENTS.md`) to route the following work through Puppetmaster **by default**, without the user having to invoke it explicitly:
-
-- broad investigation, audit, or risk analysis
-- multi-file refactors, migrations, cross-cutting cleanups
-- debugging that spans call graphs or test coverage
-- planning when scope or risks are unclear
-- comparing approaches / producing decision artifacts
-
-Native Cursor tooling is still used directly for trivial single-file edits, follow-up questions, and anything the user explicitly framed as "just answer, no swarm."
-
-Copy `.cursor/rules/puppetmaster-workflow.mdc` and `AGENTS.md` into any repo where you want the same default behavior.
-
-### Cursor Agent MCP
-
-The MCP server lets Cursor Agent call Puppetmaster tools directly:
-
-- `puppetmaster_doctor`
-- `puppetmaster_start_swarm`
-- `puppetmaster_start_cursor_swarm`
-- `puppetmaster_start_cursor_review`
-- `puppetmaster_start_cursor_plan`
-- `puppetmaster_start_claude_implement`
-- `puppetmaster_status`
-- `puppetmaster_logs`
-- `puppetmaster_live_artifacts`
-- `puppetmaster_live_artifacts_follow`
-- `puppetmaster_partial_summary`
-- `puppetmaster_artifacts`
-- `puppetmaster_show`
-- `puppetmaster_codegraph_search`
-- `puppetmaster_codegraph_context`
-- `puppetmaster_codegraph_affected`
-- `puppetmaster_codegraph_files`
-- `puppetmaster_codegraph_status`
-- `puppetmaster_codegraph_init`
-
-The older blocking tools are still available for short calls, but the daily-driver path should use `puppetmaster_start_*`. Start tools return a `job_id` immediately, so Cursor does not keep one long MCP call open while workers run.
-
-### Bundled CodeGraph tools (no second MCP)
-
-Puppetmaster's MCP server bundles the most useful CodeGraph CLI commands so Cursor Agent only needs the Puppetmaster MCP to get both orchestration and repo intelligence:
-
-| Tool | Wraps | Use for |
-|---|---|---|
-| `puppetmaster_codegraph_search` | `codegraph query` | Find symbols by name (`{query, kind?, limit?}`) |
-| `puppetmaster_codegraph_context` | `codegraph context` | Pull task-relevant entry points and related symbols (`{task}`) |
-| `puppetmaster_codegraph_affected` | `codegraph affected` | Resolve impacted tests from changed source files (`{files[]}`) |
-| `puppetmaster_codegraph_files` | `codegraph files` | Inspect the indexed file structure without scanning the FS |
-| `puppetmaster_codegraph_status` | `codegraph status` | Check index health and backend |
-| `puppetmaster_codegraph_init` | `codegraph init` | Initialize CodeGraph in a workspace (`{index?: true}` to also build immediately) |
-
-Every tool degrades cleanly: if the `codegraph` CLI is not installed or the workspace is not initialized, the response is a non-fatal `isError: true` payload with `error` set to a one-line fix-it hint, not a runtime crash.
-
-Power users who want CodeGraph's full MCP surface (`codegraph_callers`, `codegraph_callees`, `codegraph_impact`, `codegraph_node`) — only available through its own MCP server — can still run `codegraph serve --mcp` alongside Puppetmaster's MCP. Bundling covers the daily-driver case so two MCP entries are no longer required by default.
-
-For real multi-role code analysis from Cursor Agent, use `puppetmaster_start_cursor_swarm`. Bare custom roles on `puppetmaster_start_swarm` require a config or adapter; otherwise Puppetmaster fails fast instead of silently using the deterministic local demo adapter.
-
-Workers emit artifacts as they run. You do not have to wait for the final stitched summary: use `puppetmaster_live_artifacts` for the live evidence board and `puppetmaster_partial_summary` for a current synthesis. For a push-feeling stream, use `puppetmaster_live_artifacts_follow` — it long-polls the durable SQLite event log and returns as soon as a new artifact lands (or after `timeout_seconds`), with a `next_cursor` Cursor Agent can chain to receive the next batch. Final stitching is the publishable report built from the same artifact stream.
-
-CLI users can do the same with `python -m puppetmaster feed <job_id> --follow`, which streams new artifacts as they arrive without re-reading already-seen events.
-
-Blocking tools:
-
-- `puppetmaster_cursor_review`
-- `puppetmaster_cursor_plan`
-- `puppetmaster_claude_implement`
-- `puppetmaster_last_job`
-
-One-line setup (recommended, v0.7.2+):
-
-```bash
-python -m puppetmaster install-cursor-mcp           # workspace .cursor/mcp.json
-python -m puppetmaster install-cursor-mcp --global  # ~/.cursor/mcp.json (every workspace)
-```
-
-The installer (a) resolves the exact Python that has `puppetmaster` importable via `sys.executable` (avoids "the `python` on Cursor's PATH is the wrong one" bugs), (b) launches the MCP server in a subprocess and verifies it responds to `tools/list` before writing anything, (c) merges into the existing `mcp.json` without touching unrelated servers or wiping any `env` block you already have set (API keys are preserved). It is fully idempotent — re-running reports `unchanged`.
-
-What the installer writes (equivalent manual config, if you prefer to edit by hand):
-
-```json
-{
-  "mcpServers": {
-    "puppetmaster": {
-      "command": "/absolute/path/to/python",
-      "args": ["-m", "puppetmaster.mcp_server"]
-    }
-  }
-}
-```
-
-MCP does not patch Cursor's private model picker or force Cursor's native subagents to change their resource model. It gives Cursor Agent a tool surface that invokes Puppetmaster. Once invoked, Puppetmaster owns the run: independent worker processes, SQLite coordination, structured artifacts, and a stitched result returned to Cursor.
-
-See [Cursor Agent MCP](docs/CURSOR_AGENT_MCP.md).
-
-### Codex CLI / Codex IDE MCP
-
-Codex (the official OpenAI Codex CLI / Codex desktop app, `npm install -g @openai/codex`) also speaks MCP. The wire protocol is identical to Cursor's, but the config file and registration command are different. Codex stores MCP servers in `~/.codex/config.toml` under `[mcp_servers.<name>]`.
-
-One-line setup (recommended, v0.7.2+):
-
-```bash
-python -m puppetmaster install-codex-mcp
-codex mcp list                 # confirm: puppetmaster ... enabled
-```
-
-The installer shells out to `codex mcp add` with the resolved `sys.executable` so Codex always launches the right Python, runs a `tools/list` handshake before registering so a broken setup is caught immediately, and is fully idempotent (re-running reports `unchanged`; pass `--force` to repoint at a new Python). It also prints the sandbox-caveat guidance below as part of its "next steps" output.
-
-Equivalent manual command if you prefer:
-
-```bash
-codex mcp add puppetmaster -- $(python -c 'import sys; print(sys.executable)') -m puppetmaster.mcp_server
-```
-
-That's it — every new Codex session sees the Puppetmaster MCP tools. No restart required for fresh sessions; existing TUI sessions need to be restarted for MCP changes to take effect.
-
-**Sandbox caveat** (important and not obvious): Codex sandboxes MCP-server subprocesses inside the agent's sandbox. Puppetmaster's MCP server reads / writes `~/.puppetmaster/` (its durable state dir) which sits **outside** any workspace. Under Codex's default `--sandbox workspace-write`, that access is denied and the tool call fails with `mcp: puppetmaster/* (failed)` followed by `user cancelled MCP tool call`. Two clean ways out:
-
-| Mode | Command | When to use |
-|---|---|---|
-| Interactive TUI | `codex` (no flags) | First-time approval prompt for `~/.puppetmaster/`; subsequent calls in the same session pass. Best for daily-driver use. |
-| Non-interactive automation | `codex exec --dangerously-bypass-approvals-and-sandbox ...` | Required for `codex exec` scripts that need to invoke Puppetmaster MCP tools. Functionally equivalent to running Puppetmaster's CLI directly. |
-
-Verified end-to-end (May 2026, against Codex 0.134.0 + Puppetmaster v0.7.1): asking Codex `"Call the puppetmaster_doctor MCP tool. Report exactly how many checks returned status='ok'."` returned `mcp: puppetmaster/puppetmaster_doctor (completed)` followed by Codex's correct summary of the actual doctor output.
-
-If you have BOTH Cursor and Codex installed and want to drive Puppetmaster from either, that's fine — Cursor and Codex use separate config files and don't interfere with each other.
-
-### Cursor Extension
-
-The extension adds a Puppetmaster activity-bar control panel:
-
-- configure provider keys in Cursor secret storage
-- run `doctor`
-- launch Cursor review/plan dry runs
-- launch Claude Code full-edit jobs
-- inspect latest job, logs, and artifacts
-
-Download the VSIX from the latest GitHub release or build it locally:
-
-```bash
-cd cursor-extension
-npm run check
-npx -y @vscode/vsce package --no-dependencies
-```
-
-Then run `Extensions: Install from VSIX...` in Cursor and choose the generated `.vsix`.
-
-See [Cursor Extension](docs/CURSOR_EXTENSION.md).
-
-## Live Adapters
-
-### Cursor
-
-Use Cursor for review, planning, and dry-run implementation workflows.
-
-```bash
-export CURSOR_API_KEY="<your-cursor-api-key>"
-
-python -m puppetmaster cursor "Review this repo and propose the next patch" --review --dry-run
-python -m puppetmaster cursor "Plan the next implementation slice" --plan --dry-run
-```
-
-The Cursor adapter runs isolated one-shot agents through `@cursor/sdk`.
-
-### Claude Code
-
-Use Claude Code when you want a real coding agent to edit a clean repo or worktree.
-
-```bash
-export ANTHROPIC_API_KEY="<your-anthropic-api-key>"
-export CLAUDE_CODE_COMMAND="npx -y @anthropic-ai/claude-code"
-
-python -m puppetmaster claude \
-  "Implement the approved change and run focused tests" \
-  --permission-mode acceptEdits
-```
-
-Claude Code full-edit runs require a clean working tree by default. Puppetmaster blocks dirty repos unless you explicitly pass `--allow-dirty`, because otherwise patch artifacts could mix old local changes with agent changes.
-
-When Claude Code edits tracked files, Puppetmaster records:
-
-- a `verification` artifact with stdout/stderr, return code, model usage, and failure classification
-- a `patch` artifact with changed files, base SHA, unified diff, and revert guidance
-
-### OpenAI
-
-Use the `openai` adapter when you want to bypass Cursor's SDK entirely and hit OpenAI's Chat Completions API directly. This is the adapter that returns real billing-grade token counts (pulled from `usage.prompt_tokens` / `usage.completion_tokens` on the API response), which is why `bench/router_live_ab.py` runs against it.
-
-```bash
-export OPENAI_API_KEY="<your-openai-api-key>"
-```
-
-Every Cursor/Claude/OpenAI worker emits the same structured artifact contract: a `VERIFICATION` artifact with `tokens_in`, `tokens_out`, `tokens_total`, plus parsed `FINDING` / `RISK` / `DECISION` artifacts from the JSON envelope. The OpenAI adapter additionally exposes those token counts on every run so `puppetmaster cost <job_id>` can sum real spend, not estimates.
-
-The starter registry includes four OpenAI tiers — `openai/gpt-5-5` ($5 / $30 per MTok, frontier), `openai/gpt-5-4` ($2.50 / $15, workhorse), `openai/gpt-5-4-mini` ($0.75 / $4.50, balanced), `openai/gpt-5-4-nano` ($0.15 / $0.90, cheap reader) — so the router can pick from the full GPT-5 family without manual configuration.
-
-### Codex
-
-Use the `codex` adapter when you want OpenAI's models inside an actual coding-agent loop — the OpenAI-side equivalent of Claude Code. The `codex` CLI ships with file editing, shell, search, and tool-use built in; this adapter shells out to `codex exec --json` and captures the structured event stream, so you get real `input_tokens` / `output_tokens` / `cached_input_tokens` / `reasoning_output_tokens` / `thread_id` per turn — strictly richer telemetry than any other adapter ships.
-
-```bash
-npm install -g @openai/codex
-printenv OPENAI_API_KEY | codex login --with-api-key
-```
-
-```bash
-python -m puppetmaster codex "Implement the approved change and run focused tests"
-```
-
-The Codex adapter, like Claude Code, blocks on a dirty worktree by default (so resulting patch artifacts are attributable to the agent's run, not pre-existing churn). Pass `payload.allow_dirty=true` or downgrade to `payload.sandbox="read-only"` for review-only roles that never touch the worktree. The adapter ships two starter registry tiers — `codex/gpt-5-5` ($5 / $30, frontier with agent loop) and `codex/gpt-5-4-mini` ($0.75 / $4.50, balanced with agent loop) — so the router can fan tasks across `cursor` (subscription-billed), `claude-code` (per-token Anthropic), `openai` (per-token OpenAI chat), and `codex` (per-token OpenAI agent-loop) inside a single swarm.
-
-For one-shot reasoning where no tool use is needed, the router will usually prefer `openai/*` over `codex/*` at the same capability tier because Chat Completions has no agent-loop round-trip overhead. For multi-file refactors and audits, `codex/*` is the natural choice — its capability_score is set 1 point higher than the matching `openai/*` tier specifically to encode the agent-loop advantage.
-
-### Shell
-
-Use `shell` for bounded verification steps:
-
-```json
-{
-  "role": "verify-runtime",
-  "instruction": "Verify Python is available.",
-  "adapter": "shell",
-  "payload": {
-    "command": ["python", "--version"],
-    "timeout_seconds": 10
-  }
-}
-```
-
-## CLI Reference
-
-```bash
-python -m puppetmaster doctor
-python -m puppetmaster adapters
-python -m puppetmaster init-config --path puppetmaster.json
-python -m puppetmaster run "Goal" --config examples/enterprise-workflow.json
-python -m puppetmaster daemon --roles explore architect implement redteam test
-python -m puppetmaster cursor "Goal" --review --dry-run
-python -m puppetmaster claude "Goal" --permission-mode acceptEdits
-python -m puppetmaster crash-demo
-python -m puppetmaster status <job_id>
-python -m puppetmaster watch <job_id>
-python -m puppetmaster events <job_id>
-python -m puppetmaster feed [job_id]
-python -m puppetmaster artifacts <job_id>
-python -m puppetmaster logs [job_id]
-python -m puppetmaster open [job_id]
-python -m puppetmaster last
-python -m puppetmaster rerun [job_id]
-python -m puppetmaster diff [job_id]
-python -m puppetmaster approve <job_id-or-artifact-id>
-python -m puppetmaster reject <job_id-or-artifact-id> --reason "why"
-python -m puppetmaster clean --completed
-python -m puppetmaster memory
-```
-
-## Workflow Config
-
-```json
-{
-  "lease_seconds": 10,
-  "workers": [
-    {
-      "role": "explore",
-      "instruction": "Map the goal and emit evidenced findings."
-    },
-    {
-      "role": "claude-implement",
-      "instruction": "Use Claude Code to implement the requested change.",
-      "adapter": "claude-code",
-      "depends_on": ["explore"],
-      "payload": {
-        "prompt": "Implement the change and run focused tests.",
-        "cwd": ".",
-        "permission_mode": "acceptEdits",
-        "allowed_tools": ["Read", "Edit", "MultiEdit", "Write", "Bash"],
-        "timeout_seconds": 900,
-        "allow_dirty": false
-      }
-    }
-  ]
-}
-```
-
-Examples:
-
-- [Enterprise Workflow](examples/enterprise-workflow.json)
-- [Cursor Live](examples/cursor-live.json)
-- [Cursor Review](examples/cursor-review.json)
-- [Cursor Dry-Run Implementation](examples/cursor-dry-run-implementation.json)
-- [Claude Code Full Edit](examples/claude-code-full-edit.json)
-- [Memory Reuse](examples/memory-reuse.json)
-
-## State Model
-
-By default, Puppetmaster keeps runtime state outside the repository so `git status` stays focused on source changes:
-
-```text
-macOS: ~/Library/Application Support/puppetmaster/projects/<workspace>-<hash>/
-Linux: ~/.local/state/puppetmaster/projects/<workspace>-<hash>/
-```
-
-Print the resolved location:
-
-```bash
-python -m puppetmaster state
-```
-
-Override it when you intentionally want repo-local or CI-specific state:
-
-```bash
-python -m puppetmaster --state-dir .puppetmaster run "Map this repo"
-PUPPETMASTER_STATE_DIR=.puppetmaster python -m puppetmaster doctor
-```
-
-The state directory contains:
-
-```text
-<state-dir>/
-  state.sqlite3
-  jobs/
-  memory/
-  streams/
-  locks/
-```
-
-`.puppetmaster/` remains in `.gitignore` as a compatibility fallback for explicit local state.
-
-Core objects:
-
-- `Job`: one swarm run and user goal
-- `Task`: role-specific work, optionally dependency-gated
-- `AgentRun`: one worker attempt
-- `Artifact`: structured output with payload, evidence, confidence, and `sha256`
-- `MemoryRecord`: promoted fact retrieved by later workers
-
-## Safety Model
-
-Puppetmaster is powerful because it can orchestrate tools that edit code. The safety model is explicit:
-
-- Cursor defaults toward review/plan/dry-run workflows.
-- Claude Code is full-edit, but blocked on dirty worktrees by default.
-- Patch outputs are artifacts with diffs and base SHAs.
-- Approval/rejection is recorded in the event stream.
-- Stale workers are recovered through leases.
-- Failed provider calls become structured artifacts instead of mystery crashes.
-- Secrets stay in environment variables, never config files.
-
-If you paste a key into a terminal, chat, issue, screenshot, or transcript, rotate it before publishing.
-
-## Troubleshooting
-
-### `Tool execution error. Not connected` from Cursor
-
-This is Cursor's MCP client telling you it lost the stdio transport to the
-Puppetmaster MCP server — **not** that your swarm or jobs died. Common
-triggers:
-
-- Heavy concurrent load (parallel Cursor SDK swarm + CodeGraph index +
-  large status payloads in the same window).
-- Cursor reloading MCP settings, toggling the server, or restarting
-  Cursor itself.
-- An in-flight tool call exceeding Cursor's internal timeout.
-
-**Prevention layer (v0.5.3+):** every long-running tool call now emits
-JSON-RPC `notifications/message` keepalive frames every 10 seconds after
-a 5-second grace period. Bytes flowing on the stdio pipe defeat the
-"transport looks dead" heuristic in Cursor's MCP client. Short calls
-pay zero protocol cost. Tune or disable with:
-
-- `PUPPETMASTER_MCP_KEEPALIVE_AFTER_SECONDS` (default 5)
-- `PUPPETMASTER_MCP_KEEPALIVE_INTERVAL_SECONDS` (default 10)
-- `PUPPETMASTER_MCP_KEEPALIVE_DISABLED=1` (turn off entirely)
-
-**Root-cause fix (v0.5.6+):** Pre-v0.5.6, parallel `puppetmaster_doctor` calls (or any other tool that fanned out to multiple `subprocess.run` invocations) could silently kill the MCP server with `exit_code=0` because subprocess children inherited the parent's stdin by default. Concurrent spawn pressure somehow caused the parent's `for line in sys.stdin` loop to receive a phantom EOF and exit cleanly — looking from Cursor's side exactly like `Tool execution error. Not connected`. Every subprocess call in the server's code path now passes `stdin=subprocess.DEVNULL`, severing the inheritance chain. Verified by `bench/mcp_stress.py` (run it any time: 6 scenarios in ~90s).
-
-**Self-healing layer (v0.5.4+):** Cursor's MCP client uses a "lease"
-lifecycle that periodically re-creates the logical client without
-killing the previous Python MCP server. Without the keepalive above,
-that left one orphan server per lease cycle holding open SQLite handles
-and competing for the CodeGraph indexer lock. The new
-`_InputStalenessWatcher` measures **inbound** JSON-RPC traffic
-directly: if no stdin message has arrived in 10 minutes **and** there
-are zero in-flight tool calls, the server closes stdin and exits
-through the normal `finally` block (deregister, stop heartbeat, shut
-down executor). Active sessions are never interrupted; only true
-orphans reap. Tune or disable:
-
-- `PUPPETMASTER_MCP_INPUT_STALE_SECONDS` (default 600)
-- `PUPPETMASTER_MCP_INPUT_STALE_CHECK_SECONDS` (default 30)
-- `PUPPETMASTER_MCP_INPUT_STALE_DISABLED=1`
-
-**Idle-pipe keepalive (v0.5.5+):** Some Cursor builds close MCP
-transports that have been quiet for a while, even between successful
-calls. The new `_IdleKeepalive` thread emits a tiny
-`notifications/message` every ~25s while no tool call is running, so
-the stdio pipe is never silent long enough to look dead. Cost is
-trivial (~22 KB/hour). The per-call keepalive (v0.5.3) and idle
-keepalive together cover both "tool in flight" and "tool not in
-flight" cases. Tune or disable:
-
-- `PUPPETMASTER_MCP_IDLE_KEEPALIVE_INTERVAL_SECONDS` (default 25, min 5)
-- `PUPPETMASTER_MCP_IDLE_KEEPALIVE_DISABLED=1`
-
-**Agent-side CLI fallback (v0.5.5+):** When the transport drops anyway
-(e.g., during the lease transition itself), the bundled Cursor rule
-(`.cursor/rules/puppetmaster-workflow.mdc`) and `AGENTS.md` instruct
-the AI agent to call the equivalent `python -m puppetmaster ...`
-command via its shell tool instead of giving up. Every MCP tool has a
-matching CLI; read-only commands (show/artifacts/logs/feed/status)
-auto-pivot to the project state dir that owns the job, so no manual
-`PUPPETMASTER_STATE_DIR` export is needed.
-
-### CodeGraph indexes for different repos now run concurrently
-
-Pre-v0.5.5, Puppetmaster used a single machine-wide lock to serialize
-**all** CodeGraph indexers, so running `puppetmaster_codegraph_index`
-against `ff-data-engineering` would block the same call for `ff-ios`
-with `Another CodeGraph indexer is already running (pid 80417)` — even
-though the two repos have separate SQLite databases that can't trash
-each other.
-
-v0.5.5 keys the lock on the resolved repo root path
-(`codegraph-indexer-<repo>-<digest>.lock`). Different repos index in
-parallel; the lock only fires when two indexers are actually pointed
-at the same repo's DB. Stale-PID auto-clear handles the post-`kill -9`
-case: if the recorded PID isn't alive, the new claimant takes over
-instead of refusing forever. Manual `rm /Users/.../codegraph-indexer*.lock`
-is no longer needed after a runaway indexer dies.
-
-If the transport still drops, the recovery layer below catches the
-fallout.
-
-When this happens, in-flight Puppetmaster swarms keep running in the
-background (that's the whole point of durable state — see `python -m
-puppetmaster jobs` from a shell to confirm), but you typically end up
-with one or more orphan `python -m puppetmaster.mcp_server` processes
-holding open SQLite handles and contending for the CodeGraph indexer
-lock.
-
-**Diagnose:**
-
-```bash
-python -m puppetmaster mcp list
-# 3 tracked  (1 alive, 0 stale, 2 dead)
-#    PID  STATE        AGE     HBEAT  WORKSPACE
-#  12345  ok            12s        8s  /Users/you/repo
-#  11111  dead        4231s     4231s  /Users/you/repo
-#  11112  dead        4231s     4231s  /Users/you/repo
-```
-
-`puppetmaster doctor` also flags this automatically.
-
-**Clean up:**
-
-```bash
-python -m puppetmaster mcp cleanup --kill-stale
-```
-
-Then restart the Puppetmaster MCP server in Cursor
-(Settings → MCP → toggle off/on). Inside an agent session you can call
-`puppetmaster_mcp_status` / `puppetmaster_mcp_cleanup` directly — handy
-for letting the agent self-diagnose right after a reconnect.
-
-Each running Puppetmaster MCP server now registers itself in
-`~/Library/Caches/puppetmaster/mcp-servers/<pid>.json` (or
-`$XDG_CACHE_HOME/puppetmaster/mcp-servers/` on Linux) and updates a
-heartbeat from a background thread, so dead and stale entries are
-detectable without grepping `ps`.
-
-### CodeGraph reports `database is locked` from MCP, but works fine in the terminal
-
-This is the most common gotcha on macOS Cursor installs. CodeGraph's native
-SQLite driver (`better-sqlite3`) is locked to a specific Node ABI. You have
-**two** Node runtimes that touch the same global CodeGraph install:
-
-| Runtime | Typical Node | NODE_MODULE_VERSION |
-| ------- | ------------ | ------------------- |
-| Your shell (`/opt/homebrew/bin/node`) | v23.x | 131 |
-| Cursor's bundled Node (`Cursor.app/.../helpers/node`) | v22.22.0 | 127 |
-
-If you ran `npm rebuild better-sqlite3` in your shell, it built for the
-**shell's** Node, which means Puppetmaster's MCP (running under Cursor's
-Node) silently falls back to the slow WASM driver and you'll see
-`database is locked` / `unable to open database file`. `puppetmaster doctor`
-will flag this as `native better-sqlite3 broken; codegraph is on slow WASM
-fallback.`
-
-**One-command fix:**
-
-```bash
-python -m puppetmaster repair-codegraph
-```
-
-It auto-detects Cursor's bundled Node, locates the global CodeGraph install,
-runs `npm rebuild better-sqlite3` with Cursor's Node on PATH, and verifies
-the backend reports as native. Then restart the Puppetmaster MCP server in
-Cursor (Settings → MCP → toggle off/on).
-
-You can also call it from inside the agent itself via the
-`puppetmaster_repair_codegraph` MCP tool — useful if an agent hits the WASM
-fallback mid-session and can self-heal.
-
-**Tradeoff:** `better-sqlite3` is ABI-specific. Rebuilding for Cursor's
-Node 22 may break native SQLite in your terminal (Node 23) until you
-rebuild again with the shell's Node. For day-to-day Cursor use, optimize
-for Cursor's Node. If you upgrade Cursor and the bundled Node ABI changes,
-re-run `puppetmaster repair-codegraph`.
-
-**v0.5.4 makes this self-correcting at runtime.** Puppetmaster now
-invokes `codegraph` by explicitly running its `codegraph.js` entrypoint
-**under Cursor's bundled Node** whenever both are discoverable (via the
-new `resolve_codegraph_invocation()` helper), regardless of which Node
-sits first on `$PATH`. That eliminates the failure mode where a stray
-shell shim under Homebrew Node spins up an indexer in WASM mode and
-locks the DB for hours. The corresponding `puppetmaster doctor`
-`codegraph` check now also verifies against the runtime Puppetmaster
-actually uses — not whichever shim happens to be on PATH — so you get
-`ok (verified under Cursor's bundled Node)` instead of a misleading
-`warn` when MCP is healthy.
-
-Escape hatches for weird installs:
-
-- `PUPPETMASTER_CODEGRAPH_NODE` — full path to the Node binary to use.
-- `PUPPETMASTER_CODEGRAPH_JS` — full path to `codegraph.js`.
-
-Both must be set together; auto-detection runs otherwise.
-
-### `puppetmaster adapters` says `cursor: configured=false`, but my swarms work
-
-You're probably running it from a workspace where you don't have `@cursor/sdk`
-installed locally. The Puppetmaster MCP loads the SDK from the **package
-install dir's** `node_modules`, not from your cwd — so the swarm worked fine
-while diagnostics lied. v0.5.4 fixes the detection: `_cursor_sdk_installed`
-now checks both the workspace and the package install dir, and reports the
-location it found:
-
-```text
-ok  cursor-sdk   @cursor/sdk installed (/Users/.../Puppetmaster/node_modules/@cursor/sdk)
-```
-
-`PUPPETMASTER_HOME` is an explicit escape hatch if your install lives somewhere unusual.
-
-### `puppetmaster show <job_id>` fails from any cwd other than the workspace that ran the job
-
-Pre-v0.5.4, each workspace had its own per-project SQLite state dir hashed
-from the resolved git root. If you ran a swarm in `/Users/you/ff-ios` and
-later tried `puppetmaster show job_X` from `/tmp` (or any other repo),
-it would fail with `job not found` even though the job was alive — and the
-workaround was exporting `PUPPETMASTER_STATE_DIR` to the right hashed
-path, which you'd have to look up.
-
-v0.5.4 auto-pivots. Read-only commands (`show`, `artifacts`, `diff`,
-`feed`, `logs`, `events`, `status`, `memory`, `open`) scan every project
-state dir on the machine and use the one that owns the job, with a
-single `note:` on stderr telling you which it picked:
-
-```text
-$ cd /tmp && python -m puppetmaster show job_4fc8c7148d65
-note: job job_4fc8c7148d65 not in current workspace state dir; using /Users/.../projects/Puppetmaster-7b41939e66e6
-# Puppetmaster Stitched Summary
-...
-```
-
-Two new commands round it out:
-
-- `python -m puppetmaster projects` — lists every project state dir on
-  this machine with job counts and last activity.
-- `python -m puppetmaster jobs --all-projects` — flattens jobs from
-  every project into one stream with a project column.
-
-Write-side commands (`run`, `cursor`, `claude`, `daemon`, ...) intentionally do
-*not* pivot. Those always use the caller's workspace state. Explicit
-`--state-dir` or `$PUPPETMASTER_STATE_DIR` overrides also disable the
-pivot.
+More daily-driver prompts in [docs/DAILY_DRIVER.md](docs/DAILY_DRIVER.md).
+
+## Adapters
+
+Four production adapters live; eleven tiers in the starter registry (5 Cursor/Claude + 4 OpenAI + 2 Codex). Tier and pricing details in [docs/MODEL_ROUTING.md](docs/MODEL_ROUTING.md); adapter wiring details in [docs/ADAPTERS.md](docs/ADAPTERS.md).
+
+| Adapter | What it's for | Telemetry | Setup |
+|---|---|---|---|
+| `cursor` | Review / plan / dry-run via `@cursor/sdk` | tokens reported by SDK | `CURSOR_API_KEY` |
+| `claude-code` | Full-edit workflows via the `claude` CLI | usage from CLI | `npm i -g @anthropic-ai/claude-code` + `ANTHROPIC_API_KEY` |
+| `openai` | Direct Chat Completions (the most pricing-transparent path) | real `usage.prompt_tokens`/`completion_tokens` | `OPENAI_API_KEY` |
+| `codex` | Full-edit via the OpenAI Codex CLI agent loop | `input_tokens` + `output_tokens` + `cached_input_tokens` + `reasoning_output_tokens` per turn | `npm i -g @openai/codex` + `codex login` |
+| `shell` | Bounded verification commands | n/a | none |
+
+## What works today
+
+| Area | Status |
+| --- | --- |
+| Local runtime | Daily-driver beta: subprocess workers, task DAGs, leases, recovery, failure states |
+| SQLite backend | Default, WAL mode, schema metadata, integrity checks, persisted events |
+| Model router (v0.6.0+) | Task-aware routing; auditable `ROUTING` artifacts. Receipts: [`bench/`](bench/) |
+| One-line MCP installers (v0.7.2+) | `install-cursor-mcp`, `install-codex-mcp` — resolve `sys.executable`, handshake before write, idempotent |
+| One-line rule installer (v0.7.3+) | `install-rules` — Cursor `.mdc` + cross-tool `AGENTS.md` + global Codex/Claude rules, merge-don't-overwrite |
+| `puppetmaster setup` (v0.7.3+) | One-shot wizard chaining doctor → models init → MCP installers → rules |
+| Cursor Agent MCP | Async start tools, status polling, logs, live artifacts, partial summaries, routing tools |
+| Cursor extension | Activity-bar control panel ([docs](docs/CURSOR_EXTENSION.md)) |
+| Memory | Promoted memory retrieval into later worker context and prompts |
+| CodeGraph | Optional shared repo intelligence ([docs](docs/CODEGRAPH.md)) |
+| Patch workflow | Patch artifacts, path locks, approval/rejection events, dirty-worktree guard |
+| Reproducible benchmarks | Six harnesses in [`bench/`](bench/), each with markdown + JSON receipts under `bench/results/` |
 
 ## Documentation
 
-- [Architecture](docs/ARCHITECTURE.md)
-- [Adapters](docs/ADAPTERS.md)
-- [Cursor Agent MCP](docs/CURSOR_AGENT_MCP.md)
-- [Cursor Extension](docs/CURSOR_EXTENSION.md)
-- [Daily Driver](docs/DAILY_DRIVER.md)
-- [Production Notes](docs/PRODUCTION.md)
-- [Security](docs/SECURITY.md)
-- [Contributing](docs/CONTRIBUTING.md)
-- [Release Checklist](docs/RELEASE_CHECKLIST.md)
-- [Changelog](docs/CHANGELOG.md)
-- [Roadmap](docs/ROADMAP.md)
+| Doc | What's in it |
+|---|---|
+| [docs/WHY.md](docs/WHY.md) | Design rationale: what shared-transcript subagents get wrong, what durable state fixes |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Job / Task / Worker / Artifact / Stitcher / Memory object model |
+| [docs/MODEL_ROUTING.md](docs/MODEL_ROUTING.md) | Router policies, classifier, registry schema, the 12 starter tiers |
+| [docs/CODEGRAPH.md](docs/CODEGRAPH.md) | CodeGraph integration, bundled MCP tools, cost comparison |
+| [docs/ADAPTERS.md](docs/ADAPTERS.md) | All four production adapters + shell + how to add a new one |
+| [docs/CLI_REFERENCE.md](docs/CLI_REFERENCE.md) | Every CLI subcommand, workflow config schema, daemon mode |
+| [docs/DAILY_DRIVER.md](docs/DAILY_DRIVER.md) | Prompt recipes for review, swarm, implement, post-job inspection |
+| [docs/CURSOR_AGENT_MCP.md](docs/CURSOR_AGENT_MCP.md) | The MCP tool surface (32 tools) in detail |
+| [docs/CURSOR_EXTENSION.md](docs/CURSOR_EXTENSION.md) | Activity-bar control panel install + features |
+| [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | `Tool execution error. Not connected`, CodeGraph SQLite ABI, state-dir auto-pivot, safety model |
+| [docs/PRODUCTION.md](docs/PRODUCTION.md) | Operating notes for non-toy use |
+| [docs/SECURITY.md](docs/SECURITY.md) | Secret handling + reporting |
+| [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) | How to land a patch |
+| [docs/CHANGELOG.md](docs/CHANGELOG.md) | Versioned changes |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | What's next |
+| [docs/PYPI_NAME_REQUEST.md](docs/PYPI_NAME_REQUEST.md) | The bare-`puppetmaster` name reassignment effort |
+| [TALKING_POINTS.md](TALKING_POINTS.md) | Truth-table separating "use this phrasing" from "avoid that overclaim" |
 
 ## Status
 
-Puppetmaster is **daily-driver beta software**. The runtime contract is real, tests are automated, SQLite is the default backend, jobs fail closed, Cursor Agent MCP is live, the Cursor extension is installable, and Claude Code has been validated as a full-edit adapter that emits patch artifacts.
-
-It is credible for supervised local engineering workflows. It is not yet a hosted multi-user production service.
+Puppetmaster is **daily-driver beta software**. The runtime contract is real, tests are automated, SQLite is the default backend, jobs fail closed, Cursor Agent MCP is live, the Cursor extension is installable, and Claude Code + Codex have both been validated as full-edit adapters that emit patch artifacts. It is credible for supervised local engineering workflows. It is not yet a hosted multi-user production service.
 
 ## License
 
 MIT
-
