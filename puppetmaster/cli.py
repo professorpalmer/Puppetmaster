@@ -333,6 +333,52 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip CodeGraph context injection (e.g. for non-repo prompts).",
     )
 
+    codex = subcommands.add_parser(
+        "codex",
+        help="Run a full-featured Codex CLI worker (codex exec --json).",
+    )
+    codex.add_argument("prompt", help="Prompt for the Codex worker.")
+    codex.add_argument("--cwd", default=str(Path.cwd()), help="Workspace for Codex.")
+    codex.add_argument(
+        "--model",
+        default="gpt-5.4-mini",
+        help="Model passed to `codex exec -m` (gpt-5.5, gpt-5.4, gpt-5.4-mini, ...).",
+    )
+    codex.add_argument(
+        "--sandbox",
+        choices=["read-only", "workspace-write", "danger-full-access"],
+        default="workspace-write",
+        help="Codex sandbox mode. Defaults to workspace-write for real repo edits.",
+    )
+    codex.add_argument(
+        "--approval-policy",
+        default="never",
+        help="Codex approval policy (codex -c approval_policy=...). Defaults to 'never' for non-interactive automation.",
+    )
+    codex.add_argument(
+        "--dangerously-bypass-approvals-and-sandbox",
+        action="store_true",
+        help="Disable Codex's sandbox AND approval prompts. Only safe when the surrounding environment is externally sandboxed.",
+    )
+    codex.add_argument("--executable", help="Override the codex executable / command.")
+    codex.add_argument("--timeout-seconds", type=int, default=900)
+    codex.add_argument(
+        "--worker-mode",
+        choices=["subprocess", "inline", "daemon"],
+        default="inline",
+        help="Codex daily-driver runs default to inline orchestration while Codex remains a separate process.",
+    )
+    codex.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="Allow Codex to run in a dirty working tree.",
+    )
+    codex.add_argument(
+        "--disable-codegraph",
+        action="store_true",
+        help="Skip CodeGraph context injection (e.g. for non-repo prompts).",
+    )
+
     demo = subcommands.add_parser("demo", help="Run the Puppetmaster concept demo.")
     demo.add_argument(
         "--goal",
@@ -746,6 +792,38 @@ def _main(argv: Optional[list[str]] = None) -> int:
                     role="openai",
                     instruction=args.prompt,
                     adapter="openai",
+                    payload=payload,
+                )
+            ],
+            lease_seconds=10,
+            worker_mode=args.worker_mode,
+            on_job_created=on_job_created,
+        )
+        print_run_result(result.job.id, len(result.artifacts), result.summary_path)
+        return 0
+
+    if args.command == "codex":
+        payload: dict[str, Any] = {
+            "prompt": args.prompt,
+            "cwd": args.cwd,
+            "model": args.model,
+            "sandbox": args.sandbox,
+            "approval_policy": args.approval_policy,
+            "timeout_seconds": args.timeout_seconds,
+            "allow_dirty": args.allow_dirty,
+            "dangerously_bypass_approvals_and_sandbox": args.dangerously_bypass_approvals_and_sandbox,
+        }
+        if args.executable:
+            payload["executable"] = args.executable
+        if args.disable_codegraph:
+            payload["disable_codegraph"] = True
+        result = Orchestrator(store).run(
+            args.prompt,
+            specs=[
+                WorkerSpec(
+                    role="codex",
+                    instruction=args.prompt,
+                    adapter="codex",
                     payload=payload,
                 )
             ],

@@ -96,11 +96,63 @@ Default permission mode is `acceptEdits`, which is intentionally edit-capable. U
 
 If Claude Code edits tracked files, Puppetmaster records a `patch` artifact containing the resulting unified diff, changed files, base SHA, and revert guidance.
 
-## Provider Stubs
+### `openai`
 
-`codex` is intentionally present as a stub. It returns structured `blocked` verification artifacts until a concrete provider integration is added.
+Calls the OpenAI Chat Completions API directly with `OPENAI_API_KEY` (or `OPENAI_BASE_URL` for compatible providers). Returns the same finding / risk / decision / verification artifact shape as the other adapters, plus `tokens_in` / `tokens_out` / `tokens_total` captured from the API's `usage` payload — the only adapter besides `codex` that gives you billing-grade token telemetry.
 
-That lets configs reference future providers without breaking the runtime contract.
+Requirements:
+
+- `OPENAI_API_KEY`, or pass `payload.openai_api_key`.
+- Optional: `OPENAI_BASE_URL` / `OPENAI_ORG_ID` / `payload.openai_organization`.
+
+```json
+{
+  "role": "explore",
+  "instruction": "Summarize the auth module.",
+  "adapter": "openai",
+  "payload": {
+    "prompt": "Inspect the auth module and emit a finding per concrete risk.",
+    "model": "gpt-5.4-mini",
+    "cwd": ".",
+    "timeout_seconds": 300
+  }
+}
+```
+
+### `codex`
+
+Shells out to the official OpenAI Codex CLI (`codex exec --json`) — the OpenAI-side analog of the Claude Code CLI. The Codex CLI ships a real coding-agent loop (file edits, shell, search, tool use) on top of `gpt-5.5` / `gpt-5.4` / `gpt-5.4-mini`, so the adapter can act on the repo, not just answer.
+
+This adapter is the most telemetry-rich of the four live adapters: it parses Codex's structured JSONL event stream (`--json`) and captures real `input_tokens`, `output_tokens`, `cached_input_tokens`, `reasoning_output_tokens`, and `thread_id` from `turn.completed.usage` into the verification artifact payload. The full event stream is spooled to a sidecar log so nothing is silently dropped.
+
+Requirements:
+
+- Codex CLI installed: `npm install -g @openai/codex` (binary: `codex`), or `CODEX_COMMAND` / `payload.executable` set to a custom path.
+- Codex CLI authenticated locally. The simplest path is `printenv OPENAI_API_KEY | codex login --with-api-key` (or `codex login` for ChatGPT-account auth).
+- A reviewed workflow config, because this adapter can modify files in the configured `cwd` under the default `workspace-write` sandbox.
+
+Defaults are tuned for non-interactive automation: `approval_policy="never"`, `--sandbox workspace-write`, `--ephemeral`, `--skip-git-repo-check`. Use `payload.sandbox="read-only"` for explore / plan tasks that should never touch the worktree. Opt in to `payload.dangerously_bypass_approvals_and_sandbox=true` only when the surrounding environment is already externally sandboxed.
+
+If the adapter returns `failure=not_authenticated`, run `printenv OPENAI_API_KEY | codex login --with-api-key` once.
+If it returns `failure=dirty_worktree`, run from a clean tree, or set `payload.allow_dirty=true`, or downgrade to `payload.sandbox="read-only"`.
+If it returns `failure=missing_cli`, install the CLI with `npm install -g @openai/codex`.
+
+```json
+{
+  "role": "codex-implement",
+  "instruction": "Use Codex to implement the requested change and run tests.",
+  "adapter": "codex",
+  "payload": {
+    "prompt": "Implement the change and run the relevant tests.",
+    "model": "gpt-5.4-mini",
+    "cwd": ".",
+    "sandbox": "workspace-write",
+    "timeout_seconds": 900
+  }
+}
+```
+
+Like Claude Code, when Codex edits tracked files, Puppetmaster records a `patch` artifact alongside the verification artifact.
 
 ## Adding A Provider
 

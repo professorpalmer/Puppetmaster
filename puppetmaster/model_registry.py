@@ -323,6 +323,50 @@ def starter_registry() -> list[ModelSpec]:
                 "Pricing is an estimate; update once nano pricing is public."
             ),
         ),
+        ModelSpec(
+            id="codex/gpt-5-5",
+            adapter="codex",
+            adapter_model_name="gpt-5.5",
+            capability_score=97,
+            input_per_mtok_usd=5.0,
+            output_per_mtok_usd=30.0,
+            context_window=1_000_000,
+            tags=[
+                "codex",
+                "frontier",
+                "vision",
+                "reasoning",
+                "code",
+                "agent-loop",
+            ],
+            notes=(
+                "OpenAI Codex CLI (`codex exec --json`) driving gpt-5.5. "
+                "Same underlying model and billing as openai/gpt-5-5, but "
+                "ships an in-CLI agent loop (file edits, shell, search) so "
+                "the model can act, not just answer. Capability_score is "
+                "set 1 higher than openai/gpt-5-5 to reflect the agent-loop "
+                "advantage on multi-file refactors and codebase audits; for "
+                "pure one-shot reasoning, prefer openai/gpt-5-5 (cheaper "
+                "per-task because no tool-use round-trips)."
+            ),
+        ),
+        ModelSpec(
+            id="codex/gpt-5-4-mini",
+            adapter="codex",
+            adapter_model_name="gpt-5.4-mini",
+            capability_score=72,
+            input_per_mtok_usd=0.75,
+            output_per_mtok_usd=4.5,
+            context_window=400_000,
+            tags=["codex", "balanced", "vision", "code", "agent-loop"],
+            notes=(
+                "Codex CLI driving gpt-5.4-mini. Mini-tier coding agent "
+                "with the same per-token cost as openai/gpt-5-4-mini, but "
+                "with the Codex agent loop enabled (file edits, shell, "
+                "search). Slightly higher capability_score than its "
+                "openai/* counterpart for the same reason as codex/gpt-5-5."
+            ),
+        ),
     ]
 
 
