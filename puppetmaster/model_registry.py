@@ -189,19 +189,43 @@ def starter_registry() -> list[ModelSpec]:
             ),
         ),
         ModelSpec(
+            id="claude-code/haiku-4-5",
+            adapter="claude-code",
+            adapter_model_name="claude-haiku-4-5",
+            capability_score=55,
+            input_per_mtok_usd=1.0,
+            output_per_mtok_usd=5.0,
+            context_window=200_000,
+            tags=["claude", "cheap", "fast", "vision", "reading", "code"],
+            notes=(
+                "Cheap/fast tier. Anthropic Haiku 4.5 via the Claude Code "
+                "CLI — the Anthropic-side counterpart to Cursor's "
+                "composer-2.5, except it bills per token ($1/$5 per MTok) "
+                "instead of rolling into a subscription. The router prefers "
+                "cursor/composer-2-5 ($0) or openai/gpt-5-4-nano ($0.15/"
+                "$0.90) over this entry whenever they exist in the "
+                "registry; this entry ensures Claude-Code-only users still "
+                "get a cheap-tier routing option instead of falling "
+                "through to Opus on trivial tasks."
+            ),
+        ),
+        ModelSpec(
             id="claude-code/opus-4-6",
             adapter="claude-code",
             adapter_model_name="claude-opus-4-6",
             capability_score=88,
-            input_per_mtok_usd=15.0,
-            output_per_mtok_usd=75.0,
+            input_per_mtok_usd=5.0,
+            output_per_mtok_usd=25.0,
             context_window=200_000,
             tags=["claude", "quality", "vision", "code", "reasoning"],
             notes=(
                 "High-quality tier. Anthropic Opus 4.6 via the Claude "
                 "Code CLI. Workhorse for implementation, refactoring, "
                 "and review when you want Anthropic-grade reasoning "
-                "without the frontier price."
+                "without the frontier price. Pricing reflects the "
+                "Anthropic 4.x rate schedule ($5/$25 per MTok), not the "
+                "older Opus 4.1 rate ($15/$75) the starter registry "
+                "shipped before v0.6.3."
             ),
         ),
         ModelSpec(
@@ -209,8 +233,8 @@ def starter_registry() -> list[ModelSpec]:
             adapter="claude-code",
             adapter_model_name="claude-opus-4-7",
             capability_score=98,
-            input_per_mtok_usd=15.0,
-            output_per_mtok_usd=75.0,
+            input_per_mtok_usd=5.0,
+            output_per_mtok_usd=25.0,
             context_window=200_000,
             tags=[
                 "claude",
@@ -223,7 +247,10 @@ def starter_registry() -> list[ModelSpec]:
             notes=(
                 "Frontier tier. Anthropic Opus 4.7 via the Claude Code "
                 "CLI. Slow + expensive but best for detailed-vision, "
-                "complex reasoning, security audits, and red-team work."
+                "complex reasoning, security audits, and red-team work. "
+                "Pricing reflects the Anthropic 4.x rate schedule "
+                "($5/$25 per MTok), not the older Opus 4.1 rate "
+                "($15/$75) the starter registry shipped before v0.6.3."
             ),
         ),
         # OpenAI tier — uses the openai adapter directly with OPENAI_API_KEY,
