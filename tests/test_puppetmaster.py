@@ -4446,6 +4446,236 @@ class OpenAIAdapterTests(unittest.TestCase):
         self.assertLess(nano.capability_score, 60)
 
 
+class InstallerTests(unittest.TestCase):
+    """Tests for :mod:`puppetmaster.installers`.
+
+    These tests intentionally avoid touching the real ``~/.codex/config.toml``
+    or ``~/.cursor/mcp.json`` by either (a) writing to a tempdir and
+    pointing the Cursor installer at that file, or (b) stubbing the
+    ``codex`` CLI with a small shell script that records its argv to
+    a file. The handshake test is exercised directly against the real
+    MCP server using the in-tree Python — that's the same code path
+    real users hit, and it runs fast (sub-second).
+    """
+
+    def test_handshake_returns_tool_count_for_working_server(self):
+        from puppetmaster.installers import handshake_mcp_server
+
+        result = handshake_mcp_server(timeout_seconds=15.0)
+        self.assertTrue(result.ok, msg=f"handshake failed: {result.error}")
+        self.assertGreater(
+            result.tool_count,
+            10,
+            msg=f"expected MCP server to advertise plenty of tools, got {result.tool_count}",
+        )
+
+    def test_handshake_reports_failure_for_missing_python(self):
+        from puppetmaster.installers import handshake_mcp_server
+
+        result = handshake_mcp_server(
+            python_executable="/nonexistent/python-that-cannot-possibly-exist",
+            timeout_seconds=2.0,
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("not resolvable", result.error)
+
+    def test_install_cursor_writes_entry_into_empty_mcp_json(self):
+        from puppetmaster.installers import install_cursor_mcp
+
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "mcp.json"
+            result = install_cursor_mcp(
+                target_path=target,
+                python_executable=sys.executable,
+                skip_handshake=True,
+            )
+            self.assertEqual(result.status, "installed")
+            data = json.loads(target.read_text("utf-8"))
+            self.assertIn("puppetmaster", data["mcpServers"])
+            self.assertEqual(
+                data["mcpServers"]["puppetmaster"]["command"],
+                sys.executable,
+            )
+            self.assertEqual(
+                data["mcpServers"]["puppetmaster"]["args"],
+                ["-m", "puppetmaster.mcp_server"],
+            )
+
+    def test_install_cursor_preserves_other_servers_and_existing_env(self):
+        from puppetmaster.installers import install_cursor_mcp
+
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "mcp.json"
+            prior = {
+                "mcpServers": {
+                    "navdata": {"url": "https://example.com/sse"},
+                    "puppetmaster": {
+                        "command": "python",
+                        "args": ["-m", "puppetmaster.mcp_server"],
+                        "env": {
+                            "CURSOR_API_KEY": "secret-do-not-touch",
+                            "PYTHONPATH": "/some/where",
+                        },
+                    },
+                }
+            }
+            target.write_text(json.dumps(prior, indent=2), encoding="utf-8")
+            result = install_cursor_mcp(
+                target_path=target,
+                python_executable=sys.executable,
+                skip_handshake=True,
+            )
+            self.assertEqual(result.status, "installed")
+            data = json.loads(target.read_text("utf-8"))
+            self.assertEqual(
+                data["mcpServers"]["navdata"]["url"],
+                "https://example.com/sse",
+                msg="install must not touch unrelated MCP servers",
+            )
+            self.assertEqual(
+                data["mcpServers"]["puppetmaster"]["env"]["CURSOR_API_KEY"],
+                "secret-do-not-touch",
+                msg="install must preserve existing env keys to avoid wiping API keys",
+            )
+            self.assertEqual(
+                data["mcpServers"]["puppetmaster"]["command"], sys.executable
+            )
+
+    def test_install_cursor_idempotent_when_entry_already_matches(self):
+        from puppetmaster.installers import install_cursor_mcp
+
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "mcp.json"
+            first = install_cursor_mcp(
+                target_path=target,
+                python_executable=sys.executable,
+                skip_handshake=True,
+            )
+            self.assertEqual(first.status, "installed")
+            mtime_after_first = target.stat().st_mtime_ns
+            second = install_cursor_mcp(
+                target_path=target,
+                python_executable=sys.executable,
+                skip_handshake=True,
+            )
+            self.assertEqual(second.status, "unchanged")
+            self.assertEqual(
+                target.stat().st_mtime_ns,
+                mtime_after_first,
+                msg="unchanged install must not rewrite the file",
+            )
+
+    def test_install_cursor_force_rewrites_even_when_match(self):
+        from puppetmaster.installers import install_cursor_mcp
+
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "mcp.json"
+            install_cursor_mcp(
+                target_path=target,
+                python_executable=sys.executable,
+                skip_handshake=True,
+            )
+            time.sleep(0.01)
+            result = install_cursor_mcp(
+                target_path=target,
+                python_executable=sys.executable,
+                force=True,
+                skip_handshake=True,
+            )
+            self.assertEqual(result.status, "installed")
+
+    def test_install_cursor_dry_run_does_not_write(self):
+        from puppetmaster.installers import install_cursor_mcp
+
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "mcp.json"
+            result = install_cursor_mcp(
+                target_path=target,
+                python_executable=sys.executable,
+                dry_run=True,
+                skip_handshake=True,
+            )
+            self.assertEqual(result.status, "would_install")
+            self.assertFalse(target.exists())
+
+    def test_install_codex_reports_error_when_cli_missing(self):
+        from puppetmaster.installers import install_codex_mcp
+
+        result = install_codex_mcp(
+            codex_executable="/nonexistent/codex-that-cannot-exist",
+            skip_handshake=True,
+        )
+        self.assertEqual(result.status, "error")
+        joined = " ".join(result.messages).lower()
+        self.assertIn("not found", joined)
+
+    def test_install_codex_invokes_mcp_add_via_stub(self):
+        """Stub the `codex` CLI with a shell script and verify argv shape.
+
+        The stub records every invocation to a log file and returns
+        ``rc=1`` for ``mcp get`` (so the installer sees "no existing
+        entry") and ``rc=0`` for ``mcp add``. After install we read the
+        log and assert the installer called ``codex mcp add puppetmaster
+        -- <sys.executable> -m puppetmaster.mcp_server``.
+        """
+        from puppetmaster.installers import install_codex_mcp
+
+        with TemporaryDirectory() as tmp:
+            stub_log = Path(tmp) / "codex_calls.log"
+            stub = Path(tmp) / "codex"
+            stub.write_text(
+                "#!/usr/bin/env bash\n"
+                f'echo "$@" >> {stub_log}\n'
+                'if [ "$1" = "mcp" ] && [ "$2" = "get" ]; then\n'
+                '  echo "No MCP server named \\"puppetmaster\\" found." >&2\n'
+                "  exit 1\n"
+                "fi\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            stub.chmod(0o755)
+            result = install_codex_mcp(
+                codex_executable=str(stub),
+                skip_handshake=True,
+            )
+            self.assertEqual(
+                result.status,
+                "installed",
+                msg=f"expected install, got {result.status}: {result.messages}",
+            )
+            log = stub_log.read_text("utf-8")
+            self.assertIn("mcp get puppetmaster", log)
+            self.assertIn(
+                f"mcp add puppetmaster -- {sys.executable} -m puppetmaster.mcp_server",
+                log,
+                msg=f"unexpected codex args. full log:\n{log}",
+            )
+
+    def test_install_codex_idempotent_when_entry_already_matches(self):
+        """When `codex mcp get` reports an existing matching entry, skip."""
+        from puppetmaster.installers import install_codex_mcp
+
+        with TemporaryDirectory() as tmp:
+            stub = Path(tmp) / "codex"
+            stub.write_text(
+                "#!/usr/bin/env bash\n"
+                'if [ "$1" = "mcp" ] && [ "$2" = "get" ]; then\n'
+                '  echo "name: puppetmaster"\n'
+                f'  echo "command: {sys.executable}"\n'
+                '  echo "args: -m puppetmaster.mcp_server"\n'
+                "  exit 0\n"
+                "fi\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            stub.chmod(0o755)
+            result = install_codex_mcp(
+                codex_executable=str(stub),
+                skip_handshake=True,
+            )
+            self.assertEqual(result.status, "unchanged")
+
+
 if __name__ == "__main__":
     unittest.main()
 

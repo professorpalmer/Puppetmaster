@@ -12,6 +12,13 @@ from typing import Any, Optional
 from puppetmaster.codegraph_repair import repair_codegraph_sqlite
 from puppetmaster.config import load_config
 from puppetmaster.diagnostics import adapter_status, run_doctor, starter_config
+from puppetmaster.installers import (
+    CODEX_SANDBOX_GUIDANCE,
+    CURSOR_NEXT_STEPS_GUIDANCE,
+    InstallResult,
+    install_codex_mcp,
+    install_cursor_mcp,
+)
 from puppetmaster.mcp_registry import (
     kill_stale as registry_kill_stale,
     list_entries as registry_list_entries,
@@ -60,6 +67,69 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands.add_parser("state", help="Print the resolved Puppetmaster state directory.")
     subcommands.add_parser("doctor", help="Check local runtime dependencies.")
     subcommands.add_parser("adapters", help="List available worker adapters.")
+
+    install_codex = subcommands.add_parser(
+        "install-codex-mcp",
+        help="Register Puppetmaster as an MCP server in the OpenAI Codex CLI.",
+    )
+    install_codex.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace any existing puppetmaster MCP entry even if it already matches.",
+    )
+    install_codex.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print what would be registered without modifying any config.",
+    )
+    install_codex.add_argument(
+        "--skip-handshake",
+        action="store_true",
+        help="Do not spawn the MCP server to verify it responds before registering.",
+    )
+    install_codex.add_argument(
+        "--codex",
+        default=None,
+        help="Override the `codex` CLI path (defaults to the first `codex` on PATH).",
+    )
+
+    install_cursor = subcommands.add_parser(
+        "install-cursor-mcp",
+        help="Register Puppetmaster as an MCP server in a Cursor mcp.json file.",
+    )
+    scope_group = install_cursor.add_mutually_exclusive_group()
+    scope_group.add_argument(
+        "--global",
+        dest="install_global",
+        action="store_true",
+        help="Install into ~/.cursor/mcp.json (visible in every workspace).",
+    )
+    scope_group.add_argument(
+        "--workspace",
+        dest="install_workspace",
+        action="store_true",
+        help="Install into <cwd>/.cursor/mcp.json (workspace-local). Default.",
+    )
+    install_cursor.add_argument(
+        "--path",
+        default=None,
+        help="Explicit path to the Cursor mcp.json (overrides --global/--workspace).",
+    )
+    install_cursor.add_argument(
+        "--force",
+        action="store_true",
+        help="Rewrite the puppetmaster entry even if it already matches.",
+    )
+    install_cursor.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print what would be written without modifying any file.",
+    )
+    install_cursor.add_argument(
+        "--skip-handshake",
+        action="store_true",
+        help="Do not spawn the MCP server to verify it responds before registering.",
+    )
 
     init_config = subcommands.add_parser("init-config", help="Write a starter workflow config.")
     init_config.add_argument(
@@ -665,6 +735,12 @@ def _main(argv: Optional[list[str]] = None) -> int:
             print(f"{check.status:8} {check.name:16} {check.detail}")
         return 0
 
+    if args.command == "install-codex-mcp":
+        return _run_install_codex(args)
+
+    if args.command == "install-cursor-mcp":
+        return _run_install_cursor(args)
+
     if args.command == "repair-codegraph":
         return _run_repair_codegraph(args)
 
@@ -1174,6 +1250,85 @@ def artifact_headline(artifact: dict) -> str:
 
 def early_job_printer(job) -> None:
     print(f"job_id: {job.id}", flush=True)
+
+
+def _print_install_result(result: InstallResult, host: str) -> int:
+    """Pretty-print an :class:`InstallResult` and return the appropriate exit code.
+
+    Exit codes are deliberately compatible with shell-script automation:
+    ``0`` for installed / unchanged / would_install (a successful no-op),
+    ``1`` for any error so a CI step can fail fast on a broken install.
+    """
+    print(f"[install-{host}-mcp] status: {result.status}")
+    print(f"[install-{host}-mcp] target: {result.target}")
+    print(f"[install-{host}-mcp] python: {result.python_executable}")
+    if result.handshake is not None:
+        if result.handshake.ok:
+            print(
+                f"[install-{host}-mcp] handshake: OK ({result.handshake.tool_count} tools)"
+            )
+        else:
+            print(f"[install-{host}-mcp] handshake: FAILED — {result.handshake.error}")
+    for line in result.messages:
+        print(f"[install-{host}-mcp] {line}")
+    return 0 if result.status in {"installed", "unchanged", "would_install"} else 1
+
+
+def _run_install_codex(args) -> int:
+    """Dispatch for ``puppetmaster install-codex-mcp``.
+
+    Delegates to :func:`install_codex_mcp` and prints the sandbox
+    guidance block on success so the user knows the first MCP call
+    inside ``codex`` will surface an approval prompt.
+    """
+    result = install_codex_mcp(
+        codex_executable=getattr(args, "codex", None),
+        force=getattr(args, "force", False),
+        dry_run=getattr(args, "dry_run", False),
+        skip_handshake=getattr(args, "skip_handshake", False),
+    )
+    rc = _print_install_result(result, "codex")
+    if result.status in {"installed", "unchanged"}:
+        print()
+        print("Next steps:")
+        for line in CODEX_SANDBOX_GUIDANCE.splitlines():
+            print(f"  {line}")
+    return rc
+
+
+def _run_install_cursor(args) -> int:
+    """Dispatch for ``puppetmaster install-cursor-mcp``.
+
+    Resolves the target ``mcp.json`` path from one of three signals:
+
+    1. ``--path PATH`` overrides everything (used by tests and power users).
+    2. ``--global`` writes to ``~/.cursor/mcp.json``.
+    3. Otherwise default to ``<cwd>/.cursor/mcp.json`` (workspace-local).
+
+    The workspace-local default mirrors the convention used by most
+    Cursor projects of checking ``.cursor/mcp.json`` into the repo so
+    teammates inherit the same MCP wiring.
+    """
+    explicit = getattr(args, "path", None)
+    if explicit:
+        target = Path(explicit).expanduser().resolve()
+    elif getattr(args, "install_global", False):
+        target = (Path.home() / ".cursor" / "mcp.json").resolve()
+    else:
+        target = (Path.cwd() / ".cursor" / "mcp.json").resolve()
+    result = install_cursor_mcp(
+        target_path=target,
+        force=getattr(args, "force", False),
+        dry_run=getattr(args, "dry_run", False),
+        skip_handshake=getattr(args, "skip_handshake", False),
+    )
+    rc = _print_install_result(result, "cursor")
+    if result.status in {"installed", "unchanged"}:
+        print()
+        print("Next steps:")
+        for line in CURSOR_NEXT_STEPS_GUIDANCE.splitlines():
+            print(f"  {line}")
+    return rc
 
 
 def _run_repair_codegraph(args) -> int:

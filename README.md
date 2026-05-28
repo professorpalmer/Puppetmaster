@@ -75,11 +75,15 @@ git clone https://github.com/professorpalmer/Puppetmaster.git
 cd Puppetmaster && python -m pip install -e . && npm install --package-lock=false --no-audit
 python -m puppetmaster doctor                    # 14 health checks (python, sqlite, git, node, npm, cursor-sdk, claude-code, codex, codegraph, mcp-servers, two API keys, sqlite-state, git-status)
 python -m puppetmaster models init               # writes the 11-tier starter registry across cursor, claude-code, openai, and codex adapters
+python -m puppetmaster install-cursor-mcp        # wires Puppetmaster into Cursor (workspace .cursor/mcp.json); --global writes ~/.cursor/mcp.json
+python -m puppetmaster install-codex-mcp         # wires Puppetmaster into the Codex CLI (codex mcp add ...)
 python -m puppetmaster route "Format these files" --role verify-runtime
                                                  # dry-run routing decision: picks cursor/composer-2-5 ($0)
 OPENAI_API_KEY=... python -m bench.router_live_ab
                                                  # ~$0.01 of real spend, prints the ~98%-cheaper receipt
 ```
+
+Both `install-*-mcp` commands resolve `sys.executable` (avoids the "wrong `python` on PATH" failure mode), launch a `tools/list` handshake before writing anything, are fully idempotent (re-run = `unchanged`), and preserve any existing env vars / unrelated MCP servers already in the file.
 
 For deeper proof, [TALKING_POINTS.md](TALKING_POINTS.md) has the full truth-table separating "use this phrasing" from "avoid that overclaim".
 
@@ -590,17 +594,23 @@ Blocking tools:
 - `puppetmaster_claude_implement`
 - `puppetmaster_last_job`
 
-Example `.cursor/mcp.json`:
+One-line setup (recommended, v0.7.2+):
+
+```bash
+python -m puppetmaster install-cursor-mcp           # workspace .cursor/mcp.json
+python -m puppetmaster install-cursor-mcp --global  # ~/.cursor/mcp.json (every workspace)
+```
+
+The installer (a) resolves the exact Python that has `puppetmaster` importable via `sys.executable` (avoids "the `python` on Cursor's PATH is the wrong one" bugs), (b) launches the MCP server in a subprocess and verifies it responds to `tools/list` before writing anything, (c) merges into the existing `mcp.json` without touching unrelated servers or wiping any `env` block you already have set (API keys are preserved). It is fully idempotent — re-running reports `unchanged`.
+
+What the installer writes (equivalent manual config, if you prefer to edit by hand):
 
 ```json
 {
   "mcpServers": {
     "puppetmaster": {
-      "command": "python",
-      "args": ["-m", "puppetmaster.mcp_server"],
-      "env": {
-        "CLAUDE_CODE_COMMAND": "npx -y @anthropic-ai/claude-code"
-      }
+      "command": "/absolute/path/to/python",
+      "args": ["-m", "puppetmaster.mcp_server"]
     }
   }
 }
@@ -614,12 +624,19 @@ See [Cursor Agent MCP](docs/CURSOR_AGENT_MCP.md).
 
 Codex (the official OpenAI Codex CLI / Codex desktop app, `npm install -g @openai/codex`) also speaks MCP. The wire protocol is identical to Cursor's, but the config file and registration command are different. Codex stores MCP servers in `~/.codex/config.toml` under `[mcp_servers.<name>]`.
 
-One-time registration (writes to `~/.codex/config.toml`):
+One-line setup (recommended, v0.7.2+):
 
 ```bash
-codex mcp add puppetmaster -- python -m puppetmaster.mcp_server
+python -m puppetmaster install-codex-mcp
 codex mcp list                 # confirm: puppetmaster ... enabled
-codex mcp get puppetmaster     # see the exact spec Codex will launch
+```
+
+The installer shells out to `codex mcp add` with the resolved `sys.executable` so Codex always launches the right Python, runs a `tools/list` handshake before registering so a broken setup is caught immediately, and is fully idempotent (re-running reports `unchanged`; pass `--force` to repoint at a new Python). It also prints the sandbox-caveat guidance below as part of its "next steps" output.
+
+Equivalent manual command if you prefer:
+
+```bash
+codex mcp add puppetmaster -- $(python -c 'import sys; print(sys.executable)') -m puppetmaster.mcp_server
 ```
 
 That's it — every new Codex session sees the Puppetmaster MCP tools. No restart required for fresh sessions; existing TUI sessions need to be restarted for MCP changes to take effect.
