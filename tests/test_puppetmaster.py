@@ -2739,7 +2739,7 @@ print('{"result":"ok"}')
 
             def fake_build(**kwargs):
                 captured.update(kwargs)
-                return [str(fake_claude)]
+                return [sys.executable, str(fake_claude)]
 
             # Default case: no model in payload.
             task = Task(
@@ -2747,7 +2747,7 @@ print('{"result":"ok"}')
                 role="claude-code",
                 instruction="implement a change",
                 adapter="claude-code",
-                payload={"executable": str(fake_claude), "cwd": str(repo), "timeout_seconds": 10},
+                payload={"executable": [sys.executable, str(fake_claude)], "cwd": str(repo), "timeout_seconds": 10},
             )
             with patch(
                 "puppetmaster.adapters.build_claude_code_command", side_effect=fake_build
@@ -2763,7 +2763,7 @@ print('{"result":"ok"}')
                 instruction="implement a change",
                 adapter="claude-code",
                 payload={
-                    "executable": str(fake_claude),
+                    "executable": [sys.executable, str(fake_claude)],
                     "cwd": str(repo),
                     "timeout_seconds": 10,
                     "model": "claude-haiku-4-5",
@@ -2797,7 +2797,7 @@ print('{"result":"ok"}')
                 instruction="map the auth flow",
                 adapter="claude-code",
                 payload={
-                    "executable": str(fake_claude),
+                    "executable": [sys.executable, str(fake_claude)],
                     "cwd": str(repo),
                     "timeout_seconds": 10,
                     "prompt": "Inspect the repo and propose a small fix.",
@@ -2839,7 +2839,7 @@ print('{"result":"ok"}')
                 instruction="ship a tiny change",
                 adapter="claude-code",
                 payload={
-                    "executable": str(fake_claude),
+                    "executable": [sys.executable, str(fake_claude)],
                     "cwd": str(repo),
                     "timeout_seconds": 10,
                     "prompt": "Make the change.",
@@ -2879,7 +2879,7 @@ print('{"result":"ok"}')
                 instruction="edit the file",
                 adapter="claude-code",
                 payload={
-                    "executable": str(fake_claude),
+                    "executable": [sys.executable, str(fake_claude)],
                     "cwd": str(repo),
                     "timeout_seconds": 10,
                 },
@@ -3012,7 +3012,9 @@ print('{"result":"ok"}')
         self.assertIn("--ephemeral", cmd)
         self.assertIn("--skip-git-repo-check", cmd)
         self.assertIn("-C", cmd)
-        self.assertIn("/tmp/codex-test-cwd", cmd)
+        # The builder normalizes the cwd via Path; compare against the same
+        # normalization so the assertion holds on Windows (\tmp\...) too.
+        self.assertIn(str(Path("/tmp/codex-test-cwd")), cmd)
         self.assertIn("-m", cmd)
         self.assertIn("gpt-5.4-mini", cmd)
         self.assertEqual(cmd[-1], "hello world")
@@ -4828,6 +4830,11 @@ class InstallerTests(unittest.TestCase):
         joined = " ".join(result.messages).lower()
         self.assertIn("not found", joined)
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "bash CLI stub is POSIX-only scaffolding; installer logic is OS-agnostic "
+        "and covered on Linux + macOS",
+    )
     def test_install_codex_invokes_mcp_add_via_stub(self):
         """Stub the `codex` CLI with a shell script and verify argv shape.
 
@@ -4870,6 +4877,11 @@ class InstallerTests(unittest.TestCase):
                 msg=f"unexpected codex args. full log:\n{log}",
             )
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "bash CLI stub is POSIX-only scaffolding; installer logic is OS-agnostic "
+        "and covered on Linux + macOS",
+    )
     def test_install_codex_idempotent_when_entry_already_matches(self):
         """When `codex mcp get` reports an existing matching entry, skip."""
         from puppetmaster.installers import install_codex_mcp

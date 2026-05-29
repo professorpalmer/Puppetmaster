@@ -8,7 +8,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from puppetmaster.adapters import ADAPTER_INFO, AdapterInfo
 from puppetmaster.codegraph import (
@@ -29,27 +29,48 @@ class Check:
     detail: str
 
 
+def _guard(name: str, fn: "Callable[[], Check]") -> Check:
+    """Run a check, converting any exception into an ``error`` Check.
+
+    A probe that shells out to a CLI can raise on some platforms (e.g. a
+    Windows node-shim that isn't a valid executable raises ``OSError`` /
+    ``FileNotFoundError``). Doctor must always return a full report rather
+    than crashing because one optional probe blew up.
+    """
+    try:
+        return fn()
+    except Exception as exc:  # never let one probe abort the whole report
+        return Check(name, "error", f"check raised: {type(exc).__name__}: {exc}")
+
+
+def _guard_many(fn: "Callable[[], list[Check]]") -> list[Check]:
+    try:
+        return list(fn())
+    except Exception as exc:
+        return [Check("billing", "error", f"billing checks raised: {type(exc).__name__}: {exc}")]
+
+
 def run_doctor(root: Path, state_dir: Optional[Path] = None) -> list[Check]:
     state_path = state_dir or resolve_state_dir(cwd=root)
     checks = [
         Check("python", "ok", sys.version.split()[0]),
         Check("sqlite", "ok", sqlite3.sqlite_version),
-        _command_check("git", ["git", "--version"]),
-        _command_check("node", ["node", "--version"]),
-        _command_check("npm", ["npm", "--version"]),
-        _cursor_sdk_check(root),
-        _claude_code_check(),
-        _codex_check(),
-        _codegraph_check(root),
-        _mcp_servers_check(),
-        _env_check("CURSOR_API_KEY"),
-        _env_check("OPENAI_API_KEY"),
-        _sqlite_state_check(state_path / "state.sqlite3"),
-        _git_clean_check(root),
-        _agent_rules_check(root),
+        _guard("git", lambda: _command_check("git", ["git", "--version"])),
+        _guard("node", lambda: _command_check("node", ["node", "--version"])),
+        _guard("npm", lambda: _command_check("npm", ["npm", "--version"])),
+        _guard("cursor-sdk", lambda: _cursor_sdk_check(root)),
+        _guard("claude-code", _claude_code_check),
+        _guard("codex", _codex_check),
+        _guard("codegraph", lambda: _codegraph_check(root)),
+        _guard("mcp-servers", _mcp_servers_check),
+        _guard("CURSOR_API_KEY", lambda: _env_check("CURSOR_API_KEY")),
+        _guard("OPENAI_API_KEY", lambda: _env_check("OPENAI_API_KEY")),
+        _guard("sqlite-state", lambda: _sqlite_state_check(state_path / "state.sqlite3")),
+        _guard("git-status", lambda: _git_clean_check(root)),
+        _guard("agent-rules", lambda: _agent_rules_check(root)),
     ]
-    checks.extend(_billing_checks())
-    checks.append(_catalog_freshness_check())
+    checks.extend(_guard_many(_billing_checks))
+    checks.append(_guard("catalog-freshness", _catalog_freshness_check))
     return checks
 
 

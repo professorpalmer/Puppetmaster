@@ -1186,7 +1186,10 @@ def command_parts(command: object) -> list[str]:
     if isinstance(command, list) and all(isinstance(part, str) for part in command):
         return command
     if isinstance(command, str):
-        return shlex.split(command)
+        # POSIX-mode shlex treats backslashes as escapes, which mangles Windows
+        # paths like ``C:\Users\me\claude.exe`` into an unresolvable token. Split
+        # in non-POSIX mode on Windows so native paths survive intact.
+        return shlex.split(command, posix=(os.name != "nt"))
     raise ValueError("provider executable must be a string or list of strings")
 
 

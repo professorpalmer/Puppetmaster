@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Iterator, Optional, Union
 
 from puppetmaster.models import (
     AgentRun,
@@ -40,7 +41,7 @@ class SQLiteSwarmStore(SwarmStore):
             self.locks_dir,
         ]:
             directory.mkdir(parents=True, exist_ok=True)
-        with self.connect() as connection:
+        with self._session() as connection:
             connection.executescript(
                 """
                 PRAGMA journal_mode = WAL;
@@ -106,11 +107,29 @@ class SQLiteSwarmStore(SwarmStore):
         connection.row_factory = sqlite3.Row
         return connection
 
+    @contextmanager
+    def _session(self) -> "Iterator[sqlite3.Connection]":
+        """Open a connection, run a transaction, and ALWAYS close it.
+
+        ``with sqlite3.connect(...) as conn`` is a *transaction* context manager —
+        it commits/rolls back but leaves the connection (and its OS file handle)
+        open. On POSIX a lingering handle is harmless, but Windows holds a
+        mandatory lock on the open database file, so a later unlink / temp-dir
+        cleanup fails with ``WinError 32``. Closing the handle here keeps the
+        store correct and leak-free on every platform.
+        """
+        connection = self.connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
     def create_job(self, goal: str) -> Job:
         self.init()
         job = Job(goal=goal)
         self._ensure_job_dirs(job.id)
-        with self.connect() as connection:
+        with self._session() as connection:
             connection.execute(
                 "INSERT INTO jobs(id, data) VALUES(?, ?)",
                 (job.id, self._dumps(job)),
@@ -129,7 +148,7 @@ class SQLiteSwarmStore(SwarmStore):
             if status in {JobStatus.COMPLETE, JobStatus.FAILED}
             else job.completed_at,
         )
-        with self.connect() as connection:
+        with self._session() as connection:
             connection.execute(
                 "UPDATE jobs SET data = ? WHERE id = ?",
                 (self._dumps(updated), job_id),
@@ -139,7 +158,7 @@ class SQLiteSwarmStore(SwarmStore):
 
     def save_task(self, task: Task) -> None:
         self.init()
-        with self.connect() as connection:
+        with self._session() as connection:
             connection.execute(
                 """
                 INSERT INTO tasks(id, job_id, role, status, data)
@@ -165,7 +184,7 @@ class SQLiteSwarmStore(SwarmStore):
 
     def save_run(self, run: AgentRun) -> None:
         self.init()
-        with self.connect() as connection:
+        with self._session() as connection:
             connection.execute(
                 """
                 INSERT INTO runs(id, job_id, task_id, data)
@@ -186,7 +205,7 @@ class SQLiteSwarmStore(SwarmStore):
 
             artifact = replace(artifact, sha256=self.artifact_hash(artifact))
         self.init()
-        with self.connect() as connection:
+        with self._session() as connection:
             connection.execute(
                 """
                 INSERT INTO artifacts(id, job_id, task_id, type, data)
@@ -219,7 +238,7 @@ class SQLiteSwarmStore(SwarmStore):
 
     def promote_memory(self, memory: MemoryRecord) -> None:
         self.init()
-        with self.connect() as connection:
+        with self._session() as connection:
             connection.execute(
                 """
                 INSERT INTO memory(id, data)
@@ -309,7 +328,7 @@ class SQLiteSwarmStore(SwarmStore):
 
     def delete_job(self, job_id: str) -> None:
         self.init()
-        with self.connect() as connection:
+        with self._session() as connection:
             for table in ["events", "artifacts", "runs", "tasks"]:
                 connection.execute(f"DELETE FROM {table} WHERE job_id = ?", (job_id,))
             connection.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
@@ -334,7 +353,7 @@ class SQLiteSwarmStore(SwarmStore):
 
     def emit(self, job_id: str, event: str, payload: dict[str, Any]) -> None:
         self.init()
-        with self.connect() as connection:
+        with self._session() as connection:
             connection.execute(
                 "INSERT INTO events(job_id, at, event, payload) VALUES(?, ?, ?, ?)",
                 (job_id, now_iso(), event, json.dumps(payload, sort_keys=True)),
@@ -370,11 +389,11 @@ class SQLiteSwarmStore(SwarmStore):
         return int(row["cursor"]) if row is not None else 0
 
     def _one(self, query: str, params: tuple[Any, ...] = ()) -> Optional[sqlite3.Row]:
-        with self.connect() as connection:
+        with self._session() as connection:
             return connection.execute(query, params).fetchone()
 
     def _all(self, query: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
-        with self.connect() as connection:
+        with self._session() as connection:
             return list(connection.execute(query, params).fetchall())
 
     def _ensure_job_dirs(self, job_id: str) -> None:

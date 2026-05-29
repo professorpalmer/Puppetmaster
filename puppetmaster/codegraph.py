@@ -563,35 +563,24 @@ class CodegraphLock:
         self._fd: Optional[int] = None
 
     def acquire(self) -> "CodegraphLock":
-        # We avoid fcntl on platforms that don't have it (Windows). On POSIX
-        # we use a non-blocking flock so the call fails fast when another
-        # indexer is running.
-        try:
-            import fcntl  # type: ignore[import-not-found]
-        except ImportError:  # pragma: no cover - non-POSIX fallback
-            fcntl = None
+        # POSIX uses a non-blocking flock; Windows (no fcntl) uses msvcrt's
+        # mandatory byte-range lock. Either way the second acquirer fails fast.
+        fcntl = _import_fcntl()
+        msvcrt = _import_msvcrt() if fcntl is None else None
         flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
         self._fd = os.open(self.path, flags, 0o644)
-        if fcntl is not None:
-            try:
-                fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except (OSError, BlockingIOError):
-                # Stale-PID auto-clear: if the lock file records a PID
-                # that isn't alive anymore, the previous indexer died
-                # ungracefully and its kernel-level flock has already
-                # been released — what we just observed is a different
-                # holder, *or* macOS keeping the file flag a moment
-                # longer than expected. Re-check the PID; if dead,
-                # truncate and retry once. If alive, surface the busy
-                # error so the caller can decide whether to wait.
+        if fcntl is not None or msvcrt is not None:
+            if not self._try_lock(fcntl, msvcrt):
+                # Stale-PID auto-clear: if the lock file records a PID that
+                # isn't alive anymore, the previous indexer died ungracefully
+                # and its kernel-level lock has been released — what we
+                # observed is a different holder (or macOS keeping the flag a
+                # moment longer). Re-check the PID; if dead, truncate and retry
+                # once. If alive, surface busy so the caller can decide to wait.
                 holder_pid = _read_holder_pid(self.path)
                 if holder_pid is not None and not _pid_is_alive(holder_pid):
-                    try:
-                        os.ftruncate(self._fd, 0)
-                        fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    except (OSError, BlockingIOError):
-                        # Someone else grabbed it between the staleness
-                        # check and the retry. Treat as busy.
+                    os.ftruncate(self._fd, 0)
+                    if not self._try_lock(fcntl, msvcrt):
                         os.close(self._fd)
                         self._fd = None
                         raise CodegraphLockBusy(
@@ -605,17 +594,30 @@ class CodegraphLock:
         os.write(self._fd, f"{os.getpid()}\n".encode("utf-8"))
         return self
 
+    def _try_lock(self, fcntl, msvcrt) -> bool:
+        """Attempt a non-blocking exclusive lock. True on success."""
+        try:
+            if fcntl is not None:
+                fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            else:  # Windows: lock a 1-byte region at offset 0.
+                os.lseek(self._fd, 0, os.SEEK_SET)
+                msvcrt.locking(self._fd, msvcrt.LK_NBLCK, 1)
+            return True
+        except (OSError, BlockingIOError):
+            return False
+
     def release(self) -> None:
         if self._fd is None:
             return
+        fcntl = _import_fcntl()
+        msvcrt = _import_msvcrt() if fcntl is None else None
         try:
-            import fcntl  # type: ignore[import-not-found]
-
-            try:
+            if fcntl is not None:
                 fcntl.flock(self._fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-        except ImportError:  # pragma: no cover - non-POSIX
+            elif msvcrt is not None:
+                os.lseek(self._fd, 0, os.SEEK_SET)
+                msvcrt.locking(self._fd, msvcrt.LK_UNLCK, 1)
+        except OSError:
             pass
         try:
             os.close(self._fd)
@@ -637,6 +639,24 @@ def _read_holder_pid(path: Path) -> Optional[int]:
     if not contents.isdigit():
         return None
     return int(contents)
+
+
+def _import_fcntl():
+    try:
+        import fcntl  # type: ignore[import-not-found]
+
+        return fcntl
+    except ImportError:  # Windows
+        return None
+
+
+def _import_msvcrt():
+    try:
+        import msvcrt  # type: ignore[import-not-found]
+
+        return msvcrt
+    except ImportError:  # non-Windows
+        return None
 
 
 def _pid_is_alive(pid: int) -> bool:
