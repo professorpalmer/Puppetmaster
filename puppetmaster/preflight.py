@@ -77,6 +77,18 @@ _LIVE_BILLING_MARKERS = (
     "payment required",
     "quota",
     "not_enough_credits",
+    # Subscription/plan-side exhaustion (Cursor/ChatGPT/Max): a plan can be
+    # authenticated and carry the model yet be out of monthly allowance or
+    # rate-limited right now — a catalog ping can't see that, only a real call.
+    "rate limit",
+    "rate_limit",
+    "usage limit",
+    "usage_limit",
+    "too many requests",
+    "monthly limit",
+    "limit reached",
+    "out of credits",
+    "429",
 )
 _LIVE_AUTH_MARKERS = (
     "unauthorized",
@@ -161,6 +173,98 @@ def _default_prober(adapter: str, model: Optional[str]) -> "tuple[int, str, str]
         return (124, "", "live probe timed out")
     except Exception as exc:  # pragma: no cover - defensive
         return (1, "", str(exc))
+
+
+def _probe_cursor(
+    model: Optional[str],
+    env: Mapping[str, str],
+    *,
+    runner: Optional[Path] = None,
+) -> "tuple[int, str, str]":
+    """Minimal real generation through the Cursor SDK runner.
+
+    A catalog ping proves the plan is authenticated and exposes the model, but
+    NOT that the plan can serve a token *right now* — a Cursor subscription can
+    be over its monthly allowance, rate-limited, or suspended and still
+    enumerate models. This drives the same runner the adapter uses with a
+    1-token prompt so that exhaustion surfaces here instead of mid-job."""
+    import json
+    import subprocess
+
+    from puppetmaster.cursor_discovery import CURSOR_RUNNER
+
+    base_env = dict(env)
+    if not base_env.get("CURSOR_API_KEY"):
+        return (1, "", "CURSOR_API_KEY not set")
+    base_env["PUPPETMASTER_CURSOR_INPUT"] = json.dumps(
+        {
+            "prompt": "Reply with: ok",
+            "model": model or "default",
+            "cwd": base_env.get("PWD") or os.getcwd(),
+        }
+    )
+    node = base_env.get("PUPPETMASTER_NODE", "node")
+    runner_path = runner or CURSOR_RUNNER
+    try:
+        completed = subprocess.run(
+            [node, str(runner_path)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=base_env,
+        )
+        return (completed.returncode, completed.stdout or "", completed.stderr or "")
+    except FileNotFoundError:
+        return (127, "", "node not found")
+    except subprocess.TimeoutExpired:
+        return (124, "", "cursor live probe timed out")
+    except Exception as exc:  # pragma: no cover - defensive
+        return (1, "", str(exc))
+
+
+def _verdict_from_probe(
+    adapter: str,
+    model: Optional[str],
+    billing: str,
+    returncode: int,
+    stdout: str,
+    stderr: str,
+    *,
+    ok_reason: str,
+) -> PreflightResult:
+    """Shared classification of a live-probe round-trip into a verdict.
+
+    Blocks ONLY on a definitive provider rejection (``billing_or_quota`` /
+    ``auth``). A probe that couldn't reach a verdict (missing optional CLI/node,
+    timeout, network blip, non-billing error) degrades to an "unverified" pass
+    so ``--live`` never false-blocks an account the static checks already
+    cleared."""
+    failure = classify_live_probe(adapter, returncode, f"{stdout}\n{stderr}")
+    if failure is None:
+        return PreflightResult(
+            ok=True, adapter=adapter, model=model, billing=billing,
+            reason=ok_reason,
+            evidence=["live_probe:ok"],
+        )
+    if failure not in _BLOCKING_FAILURES:
+        return PreflightResult(
+            ok=True, adapter=adapter, model=model, billing=billing,
+            reason=(
+                f"live probe could not reach a verdict ({failure}, rc={returncode}); "
+                "leaving static result in place (unverified)"
+            ),
+            evidence=["live_probe:skipped_unverified"],
+        )
+    return PreflightResult(
+        ok=False, adapter=adapter, model=model, billing=billing,
+        reason=f"live probe failed ({failure}); account cannot serve this model",
+        evidence=[f"live_probe:{failure}"],
+    )
+
+
+# A probe only blocks on a definitive provider rejection; everything else
+# degrades to an unverified pass (see _verdict_from_probe).
+_BLOCKING_FAILURES = {"billing_or_quota", "auth"}
 
 
 def _probe_openai(model: Optional[str], env: Mapping[str, str]) -> "tuple[int, str, str]":
@@ -267,10 +371,17 @@ def live_probe(
                 reason=f"live probe: model {model!r} not in Cursor plan catalog",
                 evidence=["live_probe:model_not_in_catalog"],
             )
-        return PreflightResult(
-            ok=True, adapter=adapter, model=model, billing=billing,
-            reason="live probe ok (Cursor plan catalog reachable)",
-            evidence=["live_probe:ok"],
+        # Catalog cleared auth + model availability; now do a real 1-token
+        # generation so a plan that's out of monthly allowance / rate-limited /
+        # suspended is caught here, not mid-job (the plan-path equivalent of the
+        # OAuth-balance-$0 case that motivated all this).
+        if prober is not None:
+            returncode, stdout, stderr = prober(adapter, model)
+        else:
+            returncode, stdout, stderr = _probe_cursor(model, env)
+        return _verdict_from_probe(
+            adapter, model, billing, returncode, stdout, stderr,
+            ok_reason="live probe ok (Cursor plan served a token)",
         )
 
     if prober is not None:
@@ -280,33 +391,9 @@ def live_probe(
     else:
         returncode, stdout, stderr = _default_prober(adapter, model)
 
-    failure = classify_live_probe(adapter, returncode, f"{stdout}\n{stderr}")
-    if failure is None:
-        return PreflightResult(
-            ok=True, adapter=adapter, model=model, billing=billing,
-            reason="live probe ok (1-token call succeeded)",
-            evidence=["live_probe:ok"],
-        )
-    # Only a definitive provider *rejection* blocks. A probe that couldn't
-    # actually reach a verdict — missing optional CLI, timeout, network blip,
-    # malformed-but-non-billing error — must NOT block a dispatch the static
-    # checks already cleared; otherwise `--live` would wrongly fail working
-    # accounts whenever the probe path is imperfect (the CLIs vary). We degrade
-    # those to a pass with an "unverified" note instead.
-    _BLOCKING = {"billing_or_quota", "auth"}
-    if failure not in _BLOCKING:
-        return PreflightResult(
-            ok=True, adapter=adapter, model=model, billing=billing,
-            reason=(
-                f"live probe could not reach a verdict ({failure}, rc={returncode}); "
-                "leaving static result in place (unverified)"
-            ),
-            evidence=["live_probe:skipped_unverified"],
-        )
-    return PreflightResult(
-        ok=False, adapter=adapter, model=model, billing=billing,
-        reason=f"live probe failed ({failure}); account cannot serve this model",
-        evidence=[f"live_probe:{failure}"],
+    return _verdict_from_probe(
+        adapter, model, billing, returncode, stdout, stderr,
+        ok_reason="live probe ok (1-token call succeeded)",
     )
 
 

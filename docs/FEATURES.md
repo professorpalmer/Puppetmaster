@@ -22,8 +22,9 @@ Four production adapters live; eleven tiers in the starter registry (5 Cursor/Cl
 | SQLite backend | Default, WAL mode, schema metadata, integrity checks, persisted events |
 | Model router (v0.6.0+) | Task-aware routing; auditable `ROUTING` artifacts. Receipts: [`bench/`](../bench/) |
 | Billing-aware routing + auto-fallback (v0.9.0+) | Prefers plan-billed models; reroutes billing/quota/auth/missing-CLI failures to the next funded adapter. Validated live ([claim #4](CLAIMS.md)) |
-| Preflight gate (v0.9.0+) | Static checks (key/CLI/billing-mode) + optional live 1-token probe (`preflight --live`) catch zero-balance accounts before dispatch |
+| Preflight gate (v0.9.0+) | Static checks (key/CLI/billing-mode) + optional live 1-token probe (`preflight --live`) — real round-trips for **every** adapter incl. plan/subscription (Cursor generation, Claude/Codex CLI) catch a funded-looking-but-exhausted account before dispatch |
 | Catalog discovery (v0.9.0+) | `models discover` enumerates Cursor / OpenAI / Anthropic catalogs; `doctor` nudges when a catalog goes stale |
+| Plan-first auto-discovery (v0.9.0+) | First `auto_route` job auto-merges the authenticated subscription's frontier so hard tasks stay in-plan (`$0`). Cursor self-enumerates; Claude Code / Codex use curated catalogs (`models discover --source claude\|codex`) since their CLIs can't list models |
 | OpenTelemetry (optional, v0.9.0+) | Zero-cost unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set: per-task spans, job metrics, cross-process trace context. `pip install puppetmaster-ai[otel]` |
 | Async await (v0.9.0+) | `puppetmaster await <job_id>` (CLI), `puppetmaster_await_job` (MCP), and a TypeScript blocking client in [`clients/typescript`](../clients/typescript) |
 | One-line MCP installers (v0.7.2+) | `install-cursor-mcp`, `install-codex-mcp` — resolve `sys.executable`, handshake before write, idempotent |

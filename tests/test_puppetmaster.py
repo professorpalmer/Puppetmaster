@@ -5259,36 +5259,113 @@ class PlatformBillingDetectionTests(unittest.TestCase):
     def test_claude_billing_api_key_vs_oauth_vs_none(self) -> None:
         from puppetmaster.platform_billing import detect_claude_billing
 
+        import json as _json
+
         with TemporaryDirectory() as tmp:
             home = Path(tmp)
             # api key wins.
             s = detect_claude_billing(env={"ANTHROPIC_API_KEY": "k"}, home=home)
             self.assertEqual(s.billing, "api")
             self.assertTrue(s.healthy)
-            # oauth session -> plan.
-            (home / ".claude.json").write_text("{}", encoding="utf-8")
+            # A real oauthAccount (uuid/email) -> plan, with seat/org in detail.
+            (home / ".claude.json").write_text(
+                _json.dumps(
+                    {
+                        "oauthAccount": {
+                            "accountUuid": "abc-123",
+                            "emailAddress": "me@example.com",
+                            "seatTier": "max",
+                            "organizationName": "Acme",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
             s2 = detect_claude_billing(env={}, home=home)
             self.assertEqual(s2.billing, "plan")
             self.assertTrue(s2.healthy)
+            self.assertIn("seat_tier:max", s2.evidence)
+            self.assertIn("Acme", s2.detail)
+
+        # A config-only ~/.claude.json (no oauthAccount) is NOT proof of auth —
+        # it survives a logout, so it must read as unauthenticated.
+        with TemporaryDirectory() as tmp_cfg:
+            home = Path(tmp_cfg)
+            (home / ".claude.json").write_text("{}", encoding="utf-8")
+            s_cfg = detect_claude_billing(env={}, home=home)
+            self.assertEqual(s_cfg.billing, "unknown")
+            self.assertFalse(s_cfg.healthy)
+
+        # Credentials-file fallback -> plan.
+        with TemporaryDirectory() as tmp_cred:
+            home = Path(tmp_cred)
+            (home / ".claude").mkdir()
+            (home / ".claude" / ".credentials.json").write_text(
+                '{"claudeAiOauth": {"accessToken": "x"}}', encoding="utf-8"
+            )
+            s_cred = detect_claude_billing(env={}, home=home)
+            self.assertEqual(s_cred.billing, "plan")
 
         with TemporaryDirectory() as tmp2:
             s3 = detect_claude_billing(env={}, home=Path(tmp2))
             self.assertEqual(s3.billing, "unknown")
             self.assertFalse(s3.healthy)
 
-    def test_codex_billing_parses_login_status(self) -> None:
+    def test_codex_billing_reads_auth_file_first(self) -> None:
+        import json as _json
+
         from puppetmaster.platform_billing import detect_codex_billing
 
-        api = detect_codex_billing(run=lambda cmd: (0, "Logged in using an API key - sk-***", ""))
-        self.assertEqual(api.billing, "api")
-        chatgpt = detect_codex_billing(run=lambda cmd: (0, "Logged in using ChatGPT", ""))
-        self.assertEqual(chatgpt.billing, "plan")
-        missing = detect_codex_billing(run=lambda cmd: (127, "", "command not found"))
-        self.assertEqual(missing.billing, "unknown")
-        self.assertFalse(missing.healthy)
-        out = detect_codex_billing(run=lambda cmd: (1, "Not logged in", ""))
-        self.assertEqual(out.billing, "unknown")
-        self.assertFalse(out.healthy)
+        # auth_mode=apikey -> api, no subprocess.
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / ".codex").mkdir()
+            (home / ".codex" / "auth.json").write_text(
+                _json.dumps({"OPENAI_API_KEY": "sk-x", "auth_mode": "apikey"}),
+                encoding="utf-8",
+            )
+
+            def _boom(cmd):
+                raise AssertionError("subprocess must not run when auth.json present")
+
+            s = detect_codex_billing(run=_boom, home=home)
+            self.assertEqual(s.billing, "api")
+            self.assertIn("codex_auth:apikey", s.evidence)
+
+        # auth_mode=chatgpt (or tokens block) -> plan.
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / ".codex").mkdir()
+            (home / ".codex" / "auth.json").write_text(
+                _json.dumps({"auth_mode": "chatgpt", "tokens": {"access": "x"}}),
+                encoding="utf-8",
+            )
+            s = detect_codex_billing(run=lambda cmd: (1, "", ""), home=home)
+            self.assertEqual(s.billing, "plan")
+            self.assertIn("codex_auth:chatgpt", s.evidence)
+
+    def test_codex_billing_falls_back_to_login_status(self) -> None:
+        from puppetmaster.platform_billing import detect_codex_billing
+
+        # No auth.json -> fall back to parsing `codex login status`.
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)  # empty: no ~/.codex/auth.json
+            api = detect_codex_billing(
+                run=lambda cmd: (0, "Logged in using an API key - sk-***", ""), home=home
+            )
+            self.assertEqual(api.billing, "api")
+            chatgpt = detect_codex_billing(
+                run=lambda cmd: (0, "Logged in using ChatGPT", ""), home=home
+            )
+            self.assertEqual(chatgpt.billing, "plan")
+            missing = detect_codex_billing(
+                run=lambda cmd: (127, "", "command not found"), home=home
+            )
+            self.assertEqual(missing.billing, "unknown")
+            self.assertFalse(missing.healthy)
+            out = detect_codex_billing(run=lambda cmd: (1, "Not logged in", ""), home=home)
+            self.assertEqual(out.billing, "unknown")
+            self.assertFalse(out.healthy)
 
     def test_detect_adapter_billing_dispatch_and_unknown(self) -> None:
         from puppetmaster.platform_billing import detect_adapter_billing
@@ -6208,10 +6285,51 @@ class LiveProbeTests(unittest.TestCase):
         from puppetmaster.preflight import live_probe
 
         catalog = [{"id": "gpt-5.5"}]
-        ok = live_probe("cursor", "gpt-5.5", catalog_fetcher=lambda: catalog)
+        # Catalog ok + a real generation that succeeds -> ok (inject the
+        # generation prober so the test stays hermetic / never shells to node).
+        ok = live_probe(
+            "cursor", "gpt-5.5",
+            catalog_fetcher=lambda: catalog,
+            prober=lambda a, m: (0, "ok", ""),
+        )
         self.assertTrue(ok.ok)
-        missing = live_probe("cursor", "nope", catalog_fetcher=lambda: catalog)
+        # Model not in the plan catalog -> blocks before any generation.
+        missing = live_probe(
+            "cursor", "nope",
+            catalog_fetcher=lambda: catalog,
+            prober=lambda a, m: (0, "ok", ""),
+        )
         self.assertFalse(missing.ok)
+        self.assertIn("live_probe:model_not_in_catalog", missing.evidence)
+
+    def test_live_probe_cursor_blocks_on_plan_exhaustion(self) -> None:
+        """A Cursor plan can enumerate the catalog yet be rate-limited / out of
+        monthly allowance — the generation probe must catch that the static
+        catalog ping can't."""
+        from puppetmaster.preflight import live_probe
+
+        catalog = [{"id": "gpt-5.5"}]
+        rate_limited = live_probe(
+            "cursor", "gpt-5.5",
+            catalog_fetcher=lambda: catalog,
+            prober=lambda a, m: (1, "", "rate limit exceeded; usage limit reached"),
+        )
+        self.assertFalse(rate_limited.ok)
+        self.assertIn("live_probe:billing_or_quota", rate_limited.evidence)
+
+    def test_live_probe_cursor_generation_unrunnable_does_not_block(self) -> None:
+        """If the generation probe itself can't run (node missing), don't block a
+        plan the catalog already validated — degrade to unverified."""
+        from puppetmaster.preflight import live_probe
+
+        catalog = [{"id": "gpt-5.5"}]
+        result = live_probe(
+            "cursor", "gpt-5.5",
+            catalog_fetcher=lambda: catalog,
+            prober=lambda a, m: (127, "", "node not found"),
+        )
+        self.assertTrue(result.ok)
+        self.assertIn("live_probe:skipped_unverified", result.evidence)
 
     def test_preflight_check_live_blocks_on_billing(self) -> None:
         from puppetmaster.platform_billing import BillingStatus
@@ -6302,6 +6420,140 @@ class LiveProbeTests(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         self.assertEqual(sent_params, ["max_completion_tokens", "max_tokens"])
+
+
+class SubscriptionPlanCatalogTests(unittest.TestCase):
+    """Curated catalogs + first-run auto-merge for the CLI agent loops
+    (Claude Code OAuth, Codex/ChatGPT) that can't self-enumerate models."""
+
+    def _status(self, adapter, healthy=True, billing="plan"):
+        from puppetmaster.platform_billing import BillingStatus
+
+        return BillingStatus(
+            adapter=adapter, billing=billing, healthy=healthy, detail="t", evidence=[]
+        )
+
+    def _registry_path(self, tmp):
+        from puppetmaster.model_registry import save_registry, starter_registry
+
+        path = Path(tmp) / "models.json"
+        save_registry(starter_registry(), path)
+        return path
+
+    def test_plan_merge_zeroes_price_preserves_id_and_capability(self) -> None:
+        from puppetmaster.model_registry import starter_registry
+        from puppetmaster.static_catalog import merge_curated_into_registry
+
+        merged, report = merge_curated_into_registry(
+            "claude-code", "plan", starter_registry()
+        )
+        self.assertEqual(report["source"], "claude")
+        opus = next(s for s in merged if s.adapter_model_name == "claude-opus-4-8")
+        self.assertEqual(opus.billing, "plan")
+        self.assertEqual(opus.input_per_mtok_usd, 0.0)
+        self.assertEqual(opus.output_per_mtok_usd, 0.0)
+        # Existing id + (possibly user-tuned) capability are preserved.
+        self.assertEqual(opus.id, "claude-code/opus-4-8")
+        self.assertEqual(opus.capability_score, 99)
+        self.assertIn("plan-billed", opus.tags)
+        # A curated model not yet in the starter registry is added.
+        self.assertIn("claude-sonnet-4-5", report["added"])
+
+    def test_api_merge_keeps_reference_prices(self) -> None:
+        from puppetmaster.model_registry import starter_registry
+        from puppetmaster.static_catalog import merge_curated_into_registry
+
+        merged, _ = merge_curated_into_registry(
+            "claude-code", "api", starter_registry()
+        )
+        opus = next(s for s in merged if s.adapter_model_name == "claude-opus-4-8")
+        self.assertEqual(opus.billing, "api")
+        self.assertEqual(opus.input_per_mtok_usd, 5.0)
+        self.assertEqual(opus.output_per_mtok_usd, 25.0)
+        self.assertNotIn("plan-billed", opus.tags)
+
+    def test_discovers_when_claude_subscription_and_no_frontier(self) -> None:
+        from puppetmaster.cursor_discovery import has_plan_frontier
+        from puppetmaster.model_registry import load_registry, read_discovery_meta
+        from puppetmaster.static_catalog import ensure_subscription_plan_catalog
+
+        with TemporaryDirectory() as tmp:
+            path = self._registry_path(tmp)
+            self.assertFalse(has_plan_frontier(load_registry(path)))
+
+            def detector(adapter):
+                return self._status(adapter, healthy=(adapter == "claude-code"),
+                                    billing="plan" if adapter == "claude-code" else "unknown")
+
+            report = ensure_subscription_plan_catalog(path, billing_detector=detector)
+            self.assertEqual(report["action"], "discovered")
+            self.assertEqual(report["adapter"], "claude-code")
+            merged = load_registry(path)
+            self.assertTrue(has_plan_frontier(merged))
+            self.assertTrue(read_discovery_meta(path).get("claude"))
+
+    def test_skips_when_plan_frontier_present(self) -> None:
+        from puppetmaster.model_registry import ModelSpec, save_registry
+        from puppetmaster.static_catalog import ensure_subscription_plan_catalog
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "models.json"
+            save_registry(
+                [ModelSpec(id="cursor/x", adapter="cursor", adapter_model_name="x",
+                           capability_score=90, billing="plan")],
+                path,
+            )
+            called = {"n": 0}
+
+            def detector(adapter):
+                called["n"] += 1
+                return self._status(adapter)
+
+            report = ensure_subscription_plan_catalog(path, billing_detector=detector)
+            self.assertEqual(report["action"], "skip")
+            self.assertEqual(report["reason"], "plan_frontier_present")
+            self.assertEqual(called["n"], 0)  # no billing probe when frontier exists
+
+    def test_skips_when_no_subscription_adapter(self) -> None:
+        from puppetmaster.static_catalog import ensure_subscription_plan_catalog
+
+        with TemporaryDirectory() as tmp:
+            path = self._registry_path(tmp)
+            report = ensure_subscription_plan_catalog(
+                path,
+                billing_detector=lambda a: self._status(a, healthy=True, billing="api"),
+            )
+            self.assertEqual(report["action"], "skip")
+            self.assertEqual(report["reason"], "no_subscription_adapter")
+
+    def test_idempotent_when_source_already_discovered(self) -> None:
+        from puppetmaster.model_registry import write_discovery_meta
+        from puppetmaster.static_catalog import ensure_subscription_plan_catalog
+
+        with TemporaryDirectory() as tmp:
+            path = self._registry_path(tmp)
+            write_discovery_meta("claude", 5, path)
+            # claude already discovered -> skipped; codex not authed -> overall skip.
+            report = ensure_subscription_plan_catalog(
+                path,
+                billing_detector=lambda a: self._status(
+                    a, healthy=(a == "claude-code"),
+                    billing="plan" if a == "claude-code" else "unknown",
+                ),
+            )
+            self.assertEqual(report["action"], "skip")
+
+    def test_unavailable_on_detector_exception(self) -> None:
+        from puppetmaster.static_catalog import ensure_subscription_plan_catalog
+
+        def boom(adapter):
+            raise RuntimeError("billing probe crashed")
+
+        with TemporaryDirectory() as tmp:
+            path = self._registry_path(tmp)
+            report = ensure_subscription_plan_catalog(path, billing_detector=boom)
+            self.assertEqual(report["action"], "unavailable")
+            self.assertIn("billing probe crashed", report["error"])
 
 
 class ApiDiscoveryTests(unittest.TestCase):

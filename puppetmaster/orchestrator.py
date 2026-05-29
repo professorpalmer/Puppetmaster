@@ -173,15 +173,40 @@ class Orchestrator:
         except Exception as exc:
             report = {"action": "unavailable", "error": str(exc)}
 
+        self._emit_plan_catalog_event(job, report, "Cursor plan", "cursor")
+
+        # If Cursor didn't supply a plan frontier (no Cursor plan, or it's not
+        # authenticated), fall back to the curated subscription catalogs so
+        # Claude Code (OAuth) / Codex (ChatGPT) users still get plan-first
+        # routing. This self-skips if Cursor already produced a frontier.
+        if report.get("action") != "discovered":
+            try:
+                from puppetmaster.static_catalog import (
+                    ensure_subscription_plan_catalog,
+                )
+
+                sub_report = ensure_subscription_plan_catalog(registry_path)
+            except Exception as exc:
+                sub_report = {"action": "unavailable", "error": str(exc)}
+            label = sub_report.get("adapter") or "subscription"
+            self._emit_plan_catalog_event(
+                job, sub_report, f"{label} subscription", sub_report.get("source")
+            )
+
+    def _emit_plan_catalog_event(
+        self, job: Job, report: dict, label: str, source: Optional[str]
+    ) -> None:
+        """Emit a loud event describing a plan-catalog auto-merge outcome."""
         action = report.get("action")
         if action == "discovered":
             self.store.emit(
                 job.id,
                 "router.plan_catalog_discovered",
                 {
+                    "source": source,
                     "discovered_count": report.get("discovered_count"),
                     "detail": (
-                        "Auto-discovered the Cursor plan catalog so frontier work "
+                        f"Auto-discovered the {label} catalog so frontier work "
                         "routes through your subscription (plan-billed, $0 marginal)."
                     ),
                 },
@@ -191,12 +216,13 @@ class Orchestrator:
                 job.id,
                 "router.plan_catalog_unavailable",
                 {
+                    "source": source,
                     "error": report.get("error"),
                     "hint": (
-                        "Could not enumerate the Cursor plan catalog; routing falls "
+                        f"Could not enumerate the {label} catalog; routing falls "
                         "back to the existing registry. Run `python -m puppetmaster "
-                        "models discover --source cursor --write` once Cursor is "
-                        "authenticated to keep frontier work on your plan."
+                        "models discover --write` once the platform is authenticated "
+                        "to keep frontier work on your plan."
                     ),
                 },
             )

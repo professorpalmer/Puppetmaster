@@ -8,11 +8,13 @@ authenticated on this machine right now:
 
 * **Cursor** always bills through the Cursor plan when a ``CURSOR_API_KEY``
   is present — the SDK only exposes the account's own catalog.
-* **Claude Code** bills the subscription when authenticated via OAuth
-  (``~/.claude.json`` with no ``ANTHROPIC_API_KEY``), or per-token to the
+* **Claude Code** bills the subscription when signed in via OAuth — detected
+  by reading the real ``oauthAccount`` (seat tier / org) from ``~/.claude.json``
+  (not mere file existence, which survives a logout) — or per-token to the
   console account when ``ANTHROPIC_API_KEY`` is set.
-* **Codex** reports its mode via ``codex login status`` — an API key is
-  out-of-pocket; a ChatGPT login is subscription-covered.
+* **Codex** reads ``~/.codex/auth.json`` (``auth_mode``/``tokens``) directly —
+  an API key is out-of-pocket; a ChatGPT login is subscription-covered —
+  falling back to ``codex login status`` only when that file is absent.
 
 Every probe is a pure function with injectable ``env`` / ``home`` / ``run``
 dependencies so the test suite can exercise each branch without real
@@ -85,11 +87,40 @@ def detect_cursor_billing(
     )
 
 
+def _read_claude_oauth(home: Path) -> "Optional[dict]":
+    """Return the ``oauthAccount`` block from ``~/.claude.json`` if a real OAuth
+    session is present, else None.
+
+    ``~/.claude.json`` also stores onboarding/config state and survives a
+    logout, so "the file exists" is NOT proof of authentication — we require an
+    ``oauthAccount`` carrying an ``accountUuid`` or ``emailAddress``.
+    """
+    import json
+
+    path = home / ".claude.json"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    oauth = data.get("oauthAccount") if isinstance(data, dict) else None
+    if isinstance(oauth, dict) and (oauth.get("accountUuid") or oauth.get("emailAddress")):
+        return oauth
+    return None
+
+
 def detect_claude_billing(
     env: Optional[Mapping[str, str]] = None,
     home: Optional[Path] = None,
 ) -> BillingStatus:
-    """Claude Code: OAuth subscription (plan) vs ANTHROPIC_API_KEY (api)."""
+    """Claude Code: OAuth subscription (plan) vs ANTHROPIC_API_KEY (api).
+
+    Plan detection reads the real ``oauthAccount`` from ``~/.claude.json`` (and
+    falls back to ``~/.claude/.credentials.json``) rather than trusting that the
+    file merely exists — most users are on a Pro/Max/Team subscription, so this
+    is the common path and it must not false-positive on a logged-out config.
+    """
     env = env if env is not None else os.environ
     home = home if home is not None else Path.home()
     if env.get("ANTHROPIC_API_KEY"):
@@ -103,34 +134,114 @@ def detect_claude_billing(
             ),
             evidence=["anthropic_api_key:set"],
         )
-    if (home / ".claude.json").is_file() or (home / ".claude").is_dir():
+    oauth = _read_claude_oauth(home)
+    if oauth is not None:
+        seat = oauth.get("seatTier") or oauth.get("subscriptionType")
+        org = oauth.get("organizationName")
+        evidence = ["claude_oauth:account"]
+        who = []
+        if seat:
+            evidence.append(f"seat_tier:{seat}")
+            who.append(f"{seat} seat")
+        if org:
+            who.append(f"org '{org}'")
+        suffix = f" ({', '.join(who)})" if who else ""
         return BillingStatus(
             adapter="claude-code",
             billing="plan",
             healthy=True,
             detail=(
-                "Claude Code is authenticated via OAuth (~/.claude) — work bills "
-                "against the logged-in Anthropic subscription."
+                "Claude Code is signed in via OAuth" + suffix + " — work bills "
+                "against the logged-in Anthropic subscription (no marginal API spend)."
             ),
-            evidence=["claude_oauth:present"],
+            evidence=evidence,
+        )
+    # Fallback: some installs keep tokens only in ~/.claude/.credentials.json.
+    creds = home / ".claude" / ".credentials.json"
+    if creds.is_file() and creds.stat().st_size > 2:
+        return BillingStatus(
+            adapter="claude-code",
+            billing="plan",
+            healthy=True,
+            detail=(
+                "Claude Code OAuth credentials present (~/.claude/.credentials.json)"
+                " — work bills against the logged-in Anthropic subscription."
+            ),
+            evidence=["claude_oauth:credentials"],
         )
     return BillingStatus(
         adapter="claude-code",
         billing="unknown",
         healthy=False,
         detail=(
-            "No ANTHROPIC_API_KEY and no ~/.claude OAuth session — Claude Code is "
-            "not authenticated."
+            "No ANTHROPIC_API_KEY and no active ~/.claude OAuth session "
+            "(run `claude` and sign in) — Claude Code is not authenticated."
         ),
         evidence=["claude_auth:missing"],
     )
 
 
+def _read_codex_auth(home: Path) -> "Optional[BillingStatus]":
+    """Detect Codex billing from ``~/.codex/auth.json`` without a subprocess.
+
+    The file is authoritative and fast: ``auth_mode == "apikey"`` (or a present
+    ``OPENAI_API_KEY``) is out-of-pocket; ``auth_mode == "chatgpt"`` (or a
+    ``tokens`` block) is subscription-covered. Returns None when the file is
+    absent/unreadable so the caller can fall back to ``codex login status``.
+    """
+    import json
+
+    path = home / ".codex" / "auth.json"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    mode = str(data.get("auth_mode") or "").lower()
+    has_key = bool(data.get("OPENAI_API_KEY"))
+    has_tokens = bool(data.get("tokens"))
+    if mode == "apikey" or (has_key and not has_tokens):
+        return BillingStatus(
+            adapter="codex",
+            billing="api",
+            healthy=True,
+            detail=(
+                "Codex is authenticated with an OpenAI API key (~/.codex/auth.json) "
+                "— work bills per-token to that account (out-of-pocket)."
+            ),
+            evidence=["codex_auth:apikey"],
+        )
+    if mode == "chatgpt" or has_tokens:
+        return BillingStatus(
+            adapter="codex",
+            billing="plan",
+            healthy=True,
+            detail=(
+                "Codex is signed in via a ChatGPT subscription (~/.codex/auth.json) "
+                "— work is covered by that plan (no marginal API spend)."
+            ),
+            evidence=["codex_auth:chatgpt"],
+        )
+    return None
+
+
 def detect_codex_billing(
     run: Optional[CommandRunner] = None,
     codex_command: str = "codex",
+    home: Optional[Path] = None,
 ) -> BillingStatus:
-    """Codex: parse ``codex login status`` — API key (api) vs ChatGPT (plan)."""
+    """Codex: API key (api) vs ChatGPT subscription (plan).
+
+    Reads ``~/.codex/auth.json`` first (fast, deterministic, no subprocess) and
+    only falls back to parsing ``codex login status`` when the file is missing.
+    """
+    home = home if home is not None else Path.home()
+    from_file = _read_codex_auth(home)
+    if from_file is not None:
+        return from_file
     run = run or _default_runner
     returncode, stdout, stderr = run([codex_command, "login", "status"])
     text = f"{stdout}\n{stderr}".lower()
@@ -205,7 +316,7 @@ _DETECTORS: dict[str, Callable[..., BillingStatus]] = {
     "claude-code": lambda **kw: detect_claude_billing(
         env=kw.get("env"), home=kw.get("home")
     ),
-    "codex": lambda **kw: detect_codex_billing(run=kw.get("run")),
+    "codex": lambda **kw: detect_codex_billing(run=kw.get("run"), home=kw.get("home")),
     "openai": lambda **kw: detect_openai_billing(env=kw.get("env")),
 }
 

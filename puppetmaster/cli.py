@@ -703,12 +703,14 @@ def build_parser() -> argparse.ArgumentParser:
     models_discover.add_argument("--registry-path", help="Override the registry path.")
     models_discover.add_argument(
         "--source",
-        choices=["cursor", "openai", "anthropic", "all"],
+        choices=["cursor", "openai", "anthropic", "claude", "codex", "all"],
         default="cursor",
         help=(
             "Which platform catalog to enumerate. cursor (plan, default), "
             "openai (GET /v1/models, needs OPENAI_API_KEY), anthropic "
-            "(needs ANTHROPIC_API_KEY for discovery), or all."
+            "(needs ANTHROPIC_API_KEY for discovery), claude / codex (curated "
+            "catalogs for the CLI agent loops that can't self-enumerate; billed "
+            "as your detected subscription/API posture), or all."
         ),
     )
     models_discover.add_argument(
@@ -1878,6 +1880,30 @@ def _discover_one_source(source: str, registry: list):
             raise _DiscoverSourceError(str(exc)) from exc
         merged, report = merge_catalog_into_registry(registry, catalog)
         report["source"] = "cursor"
+        return merged, report, catalog
+
+    if source in ("claude", "codex"):
+        from puppetmaster.platform_billing import detect_adapter_billing
+        from puppetmaster.static_catalog import (
+            SOURCE_TO_ADAPTER,
+            curated_catalog,
+            merge_curated_into_registry,
+        )
+
+        adapter = SOURCE_TO_ADAPTER[source]
+        status = detect_adapter_billing(adapter)
+        # Use the detected posture so prices/billing are truthful; fall back to
+        # API-billed reference pricing when auth can't be determined, so the
+        # curated entries are still usable rather than silently $0.
+        billing = (
+            status.billing
+            if getattr(status, "healthy", False)
+            and getattr(status, "billing", "unknown") in ("plan", "api")
+            else "api"
+        )
+        merged, report = merge_curated_into_registry(adapter, billing, registry)
+        catalog = [{"id": item["model"]} for item in curated_catalog(adapter)]
+        report["source"] = source
         return merged, report, catalog
 
     from puppetmaster.api_discovery import (
