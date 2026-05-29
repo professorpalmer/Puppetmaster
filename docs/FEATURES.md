@@ -1,0 +1,43 @@
+# Features & adapters
+
+A full map of what ships today, plus the adapter matrix. For the design rationale behind these, see [docs/WHY.md](WHY.md); for the proof behind the headline claims, see [docs/CLAIMS.md](CLAIMS.md).
+
+## Adapters
+
+Four production adapters live; eleven tiers in the starter registry (5 Cursor/Claude + 4 OpenAI + 2 Codex). Tier and pricing details in [docs/MODEL_ROUTING.md](MODEL_ROUTING.md); adapter wiring details in [docs/ADAPTERS.md](ADAPTERS.md).
+
+| Adapter | What it's for | Telemetry | Setup |
+|---|---|---|---|
+| `cursor` | Review / plan / dry-run via `@cursor/sdk` | tokens reported by SDK | `CURSOR_API_KEY` |
+| `claude-code` | Full-edit workflows via the `claude` CLI | usage from CLI | `npm i -g @anthropic-ai/claude-code` + `ANTHROPIC_API_KEY` |
+| `openai` | Direct Chat Completions (the most pricing-transparent path) | real `usage.prompt_tokens`/`completion_tokens` | `OPENAI_API_KEY` |
+| `codex` | Full-edit via the OpenAI Codex CLI agent loop | `input_tokens` + `output_tokens` + `cached_input_tokens` + `reasoning_output_tokens` per turn | `npm i -g @openai/codex` + `codex login` |
+| `shell` | Bounded verification commands | n/a | none |
+
+## What works today
+
+| Area | Status |
+| --- | --- |
+| Local runtime | Daily-driver beta: subprocess workers, task DAGs, leases, recovery, failure states |
+| SQLite backend | Default, WAL mode, schema metadata, integrity checks, persisted events |
+| Model router (v0.6.0+) | Task-aware routing; auditable `ROUTING` artifacts. Receipts: [`bench/`](../bench/) |
+| Billing-aware routing + auto-fallback (v0.9.0+) | Prefers plan-billed models; reroutes billing/quota/auth/missing-CLI failures to the next funded adapter. Validated live ([claim #4](CLAIMS.md)) |
+| Preflight gate (v0.9.0+) | Static checks (key/CLI/billing-mode) + optional live 1-token probe (`preflight --live`) catch zero-balance accounts before dispatch |
+| Catalog discovery (v0.9.0+) | `models discover` enumerates Cursor / OpenAI / Anthropic catalogs; `doctor` nudges when a catalog goes stale |
+| OpenTelemetry (optional, v0.9.0+) | Zero-cost unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set: per-task spans, job metrics, cross-process trace context. `pip install puppetmaster-ai[otel]` |
+| Async await (v0.9.0+) | `puppetmaster await <job_id>` (CLI), `puppetmaster_await_job` (MCP), and a TypeScript blocking client in [`clients/typescript`](../clients/typescript) |
+| One-line MCP installers (v0.7.2+) | `install-cursor-mcp`, `install-codex-mcp` — resolve `sys.executable`, handshake before write, idempotent |
+| One-line rule installer (v0.7.3+) | `install-rules` — Cursor `.mdc` + cross-tool `AGENTS.md` + global Codex/Claude rules, merge-don't-overwrite |
+| `puppetmaster setup` (v0.7.3+) | One-shot wizard chaining doctor → models init → MCP installers → rules |
+| Cursor Agent MCP | Async start tools, status polling, logs, live artifacts, partial summaries, routing tools |
+| Cursor extension | Activity-bar control panel ([docs](CURSOR_EXTENSION.md)) |
+| Memory | Promoted memory retrieval into later worker context and prompts |
+| CodeGraph | Optional shared repo intelligence ([docs](CODEGRAPH.md)) |
+| Patch workflow | Patch artifacts, path locks, approval/rejection events, dirty-worktree guard |
+| Reproducible benchmarks | Six harnesses in [`bench/`](../bench/), each with markdown + JSON receipts under `bench/results/` |
+| Local dashboard (v0.9.0+) | `puppetmaster dashboard [<job_id>]` — zero-dependency live web board (task graph, typed artifacts, cost, auto-fallback reroutes, alerts) served from durable state; no OTLP collector required |
+| Cross-platform CI | GitHub Actions matrix runs the full suite on Linux / macOS / Windows (Python 3.9 + 3.12), **all three required and green.** Getting Windows there fixed real defects: a leaked sqlite handle (Windows mandatory locks), POSIX-mode path splitting that mangled `C:\…` executables, a `fcntl`-only CodeGraph lock that was a no-op on Windows (now `msvcrt`), and a `doctor` that could crash on a bad CLI shim |
+
+## Status
+
+Puppetmaster is **daily-driver beta software**. The runtime contract is real, tests are automated, SQLite is the default backend, jobs fail closed, Cursor Agent MCP is live, the Cursor extension is installable, and Claude Code + Codex have both been validated as full-edit adapters that emit patch artifacts. It is credible for supervised local engineering workflows. It is not yet a hosted multi-user production service.

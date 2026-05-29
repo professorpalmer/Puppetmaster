@@ -82,7 +82,7 @@ longer required by default.
 > claims live in [`bench/router_savings.py`](../bench/router_savings.py),
 > [`bench/router_live_ab.py`](../bench/router_live_ab.py), and
 > [`bench/followup_cost.py`](../bench/followup_cost.py) — see the
-> [README opening section](../README.md#three-claims-three-receipts)
+> [docs/CLAIMS.md](CLAIMS.md)
 > and [TALKING_POINTS.md](../TALKING_POINTS.md). The Agent /
 > CodeGraph / Puppetmaster three-way analysis below is older and
 > broader (it models multi-worker swarm cost vs single-agent cost);
