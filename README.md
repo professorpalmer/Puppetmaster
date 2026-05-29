@@ -32,6 +32,7 @@ To run benchmarks or hack on it, clone instead — see [Contributing](docs/CONTR
 |---|---|
 | Understand the design & what it fixes | [docs/WHY.md](docs/WHY.md) |
 | Know how it differs from LangGraph / CrewAI / subagents | [docs/COMPARISON.md](docs/COMPARISON.md) |
+| Know if it's safe to hand it your repo & plan | [docs/SECURITY.md](docs/SECURITY.md) |
 | See the proof behind the claims | [docs/CLAIMS.md](docs/CLAIMS.md) · receipts in [`bench/`](bench/) |
 | See everything that ships + adapters | [docs/FEATURES.md](docs/FEATURES.md) |
 | Copy/paste prompts & shell recipes | [Quickstart](#quickstart) · [docs/DAILY_DRIVER.md](docs/DAILY_DRIVER.md) |
