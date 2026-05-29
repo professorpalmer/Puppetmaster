@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Launch packaging: positioning + a self-healing hero.** Added [docs/COMPARISON.md](COMPARISON.md) — an honest, calibrated side-by-side answering "why this over LangGraph / CrewAI / Claude Agent SDK / native subagents," with an explicit "pick X instead if…" section (Puppetmaster orchestrates the agent CLIs you already pay for; it isn't a framework for authoring an agent from primitives). Rebuilt the README hero around **two receipts** — 💸 cheaper (98.8% live OpenAI A/B) and 🔁 self-healing (the live `job_d82715bebc5d` auto-fallback: a `$0` Claude balance → rerouted to `cursor/gpt-5.5` → completed) — so the differentiated, shareable moment is above the fold. Docs index updated; all internal links verified.
+
 ## v0.9.1
 
 **Plan-first for everyone, and a probe that proves it.** Closes the gap where only Cursor users got subscription-contained routing and where the live probe only covered API keys — so the "frontier work always rides the subscription you already pay for, and we verify it can actually serve before spending" promise now holds for Claude Code and Codex users too.
