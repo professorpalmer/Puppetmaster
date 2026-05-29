@@ -53,6 +53,7 @@ class Orchestrator:
         self._begin_trace()
         try:
             specs = self._with_retrieved_memory(specs or specs_for_roles(roles), goal)
+            self._ensure_plan_catalog(job, specs)
             self.store.update_job_status(job.id, JobStatus.RUNNING)
             tasks = self._create_tasks(job, specs)
             self._run_workers(job, tasks, lease_seconds=lease_seconds, worker_mode=worker_mode)
@@ -137,6 +138,68 @@ class Orchestrator:
         except Exception:
             self.store.update_job_status(job.id, JobStatus.FAILED)
             raise
+
+    def _ensure_plan_catalog(self, job: Job, specs: list[WorkerSpec]) -> None:
+        """First-run guarantee that auto-routed work can land on the user's
+        subscription. If any spec opts into ``auto_route`` and the registry has
+        no plan-billed frontier yet, discover the Cursor plan catalog once so
+        frontier work routes through the plan instead of falling off to a
+        per-token / depleted account. Never raises; loud (event) when it can't.
+
+        Opt out with ``PUPPETMASTER_AUTODISCOVER=0``.
+        """
+        import os
+
+        if os.environ.get("PUPPETMASTER_AUTODISCOVER", "1") in ("0", "false", "no"):
+            return
+        if not any((s.payload or {}).get("auto_route") for s in specs):
+            return
+        try:
+            from puppetmaster.cursor_discovery import ensure_cursor_plan_catalog
+            from puppetmaster.model_registry import default_registry_path
+
+            override = next(
+                (
+                    (s.payload or {}).get("registry_path")
+                    for s in specs
+                    if (s.payload or {}).get("registry_path")
+                ),
+                None,
+            )
+            registry_path = (
+                Path(str(override)).expanduser() if override else default_registry_path()
+            )
+            report = ensure_cursor_plan_catalog(registry_path)
+        except Exception as exc:
+            report = {"action": "unavailable", "error": str(exc)}
+
+        action = report.get("action")
+        if action == "discovered":
+            self.store.emit(
+                job.id,
+                "router.plan_catalog_discovered",
+                {
+                    "discovered_count": report.get("discovered_count"),
+                    "detail": (
+                        "Auto-discovered the Cursor plan catalog so frontier work "
+                        "routes through your subscription (plan-billed, $0 marginal)."
+                    ),
+                },
+            )
+        elif action == "unavailable":
+            self.store.emit(
+                job.id,
+                "router.plan_catalog_unavailable",
+                {
+                    "error": report.get("error"),
+                    "hint": (
+                        "Could not enumerate the Cursor plan catalog; routing falls "
+                        "back to the existing registry. Run `python -m puppetmaster "
+                        "models discover --source cursor --write` once Cursor is "
+                        "authenticated to keep frontier work on your plan."
+                    ),
+                },
+            )
 
     def _begin_trace(self) -> None:
         """Mint a W3C traceparent for this job when telemetry is enabled.
