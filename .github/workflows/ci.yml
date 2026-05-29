@@ -7,11 +7,9 @@ on:
 jobs:
   test:
     runs-on: ${{ matrix.os }}
-    # Linux and macOS are required and must stay green. Windows runs as a
-    # best-effort signal while platform-specific test assumptions (CLI shims,
-    # POSIX paths, file-handle/sqlite teardown) are hardened, so it reports
-    # without failing the whole workflow. Flip this off once Windows is green.
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
+    # All three OSes are required and must stay green. Windows was hardened
+    # (sqlite handle close, non-POSIX path splitting, msvcrt advisory lock,
+    # crash-proof doctor) and now passes as a blocking leg.
     strategy:
       fail-fast: false
       matrix:
