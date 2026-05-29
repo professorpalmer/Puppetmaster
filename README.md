@@ -171,7 +171,7 @@ Four production adapters live; eleven tiers in the starter registry (5 Cursor/Cl
 | Patch workflow | Patch artifacts, path locks, approval/rejection events, dirty-worktree guard |
 | Reproducible benchmarks | Six harnesses in [`bench/`](bench/), each with markdown + JSON receipts under `bench/results/` |
 | Local dashboard (v0.9.0+) | `puppetmaster dashboard [<job_id>]` — zero-dependency live web board (task graph, typed artifacts, cost, auto-fallback reroutes, alerts) served from durable state; no OTLP collector required |
-| Cross-platform CI | GitHub Actions matrix runs the suite on Linux / macOS / Windows (Python 3.9 + 3.12). **Linux + macOS are required and green; Windows runs best-effort (non-blocking) while platform-specific test assumptions — CLI shims, POSIX paths, sqlite file-handle teardown — are hardened.** See the CI badge for current status |
+| Cross-platform CI | GitHub Actions matrix runs the full suite on Linux / macOS / Windows (Python 3.9 + 3.12), **all three required and green.** Getting Windows there fixed real defects: a leaked sqlite handle (Windows mandatory locks), POSIX-mode path splitting that mangled `C:\…` executables, a `fcntl`-only CodeGraph lock that was a no-op on Windows (now `msvcrt`), and a `doctor` that could crash on a bad CLI shim. See the CI badge for current status |
 
 ## Documentation
 
