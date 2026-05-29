@@ -490,12 +490,18 @@ def _sqlite_state_check(path: Path) -> Check:
     if not path.exists():
         return Check("sqlite-state", "optional", "no local sqlite state yet")
     try:
-        with sqlite3.connect(path) as connection:
+        # ``with sqlite3.connect(...)`` only commits — it does not close the
+        # handle. On Windows a lingering handle locks the file and breaks a
+        # later unlink (WinError 32), so close it explicitly.
+        connection = sqlite3.connect(path)
+        try:
             row = connection.execute(
                 "SELECT value FROM metadata WHERE key = 'schema_version'"
             ).fetchone()
             integrity = connection.execute("PRAGMA integrity_check").fetchone()
             journal = connection.execute("PRAGMA journal_mode").fetchone()
+        finally:
+            connection.close()
     except sqlite3.Error as exc:
         return Check("sqlite-state", "warn", str(exc))
     version = row[0] if row else "unknown"
