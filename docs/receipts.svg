@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="330" viewBox="0 0 1024 330" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Roboto, sans-serif" role="img" aria-label="The receipts: Scenario A best case 98.8 percent cheaper, 88 percent faster (live OpenAI A/B); Scenario B everyday mixed workload 35.1 percent cheaper overall.">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0a0e1a"/>
+      <stop offset="1" stop-color="#11172c"/>
+    </linearGradient>
+    <linearGradient id="green" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#34d399"/>
+      <stop offset="1" stop-color="#38bdf8"/>
+    </linearGradient>
+    <linearGradient id="cyan" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#38bdf8"/>
+      <stop offset="1" stop-color="#a78bfa"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="1024" height="330" rx="20" fill="url(#bg)"/>
+
+  <text x="512" y="34" text-anchor="middle" fill="#93a0c4" font-size="12" font-weight="700" letter-spacing="3.5">REAL NUMBERS &#183; REPRODUCIBLE IN BENCH/</text>
+  <text x="512" y="88" text-anchor="middle" font-size="44" font-weight="900" letter-spacing="-1">
+    <tspan fill="#e8edff">The </tspan><tspan fill="url(#green)">receipts</tspan>
+  </text>
+
+  <rect x="24" y="118" width="476" height="188" rx="16" fill="#ffffff" fill-opacity="0.04" stroke="#ffffff" stroke-opacity="0.10"/>
+  <text x="48" y="150" fill="#93a0c4" font-size="11" font-weight="700" letter-spacing="2">SCENARIO A &#183; ONE TASK THAT DOESN'T NEED A BIG MODEL</text>
+  <text x="48" y="180" font-size="21" font-weight="900" fill="#e8edff">Best case <tspan fill="#93a0c4" font-size="13" font-weight="700">(live OpenAI A/B, real receipts)</tspan></text>
+
+  <text x="48" y="244" fill="url(#green)" font-size="52" font-weight="900">98.8%</text>
+  <text x="48" y="268" fill="#e8edff" font-size="15" font-weight="700">cheaper</text>
+  <text x="48" y="289" fill="#93a0c4" font-size="12">98.1&#8211;98.8% across runs</text>
+
+  <text x="248" y="244" fill="url(#cyan)" font-size="52" font-weight="900">88%</text>
+  <text x="248" y="268" fill="#e8edff" font-size="15" font-weight="700">faster</text>
+  <text x="248" y="289" fill="#93a0c4" font-size="12">68&#8211;88% per run</text>
+
+  <rect x="524" y="118" width="476" height="188" rx="16" fill="#ffffff" fill-opacity="0.04" stroke="#ffffff" stroke-opacity="0.10"/>
+  <text x="548" y="150" fill="#93a0c4" font-size="11" font-weight="700" letter-spacing="2">SCENARIO B &#183; A REALISTIC MIXED WORKLOAD</text>
+  <text x="548" y="180" font-size="21" font-weight="900" fill="#e8edff">Everyday case <tspan fill="#93a0c4" font-size="13" font-weight="700">(6 tasks: easy&#8594;hard, dry-run)</tspan></text>
+
+  <text x="548" y="244" fill="url(#green)" font-size="52" font-weight="900">35.1%</text>
+  <text x="548" y="268" fill="#e8edff" font-size="15" font-weight="700">cheaper overall</text>
+
+  <text x="724" y="226" fill="#93a0c4" font-size="13" font-weight="700">2 of the 6 tasks <tspan fill="#e8edff">correctly</tspan></text>
+  <text x="724" y="245" fill="#e8edff" font-size="13" font-weight="700">kept the frontier model.</text>
+  <text x="724" y="266" fill="#93a0c4" font-size="13">That's the router refusing to</text>
+  <text x="724" y="284" fill="#93a0c4" font-size="13">cheap out on hard work, not a miss.</text>
+</svg>
