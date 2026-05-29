@@ -599,9 +599,15 @@ class CodegraphLock:
         try:
             if fcntl is not None:
                 fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            else:  # Windows: lock a 1-byte region at offset 0.
-                os.lseek(self._fd, 0, os.SEEK_SET)
+            else:
+                # Windows msvcrt locks are *mandatory*: a locked byte range
+                # can't even be read by other handles. We must keep the PID
+                # text readable for the busy-check, so lock a single sentinel
+                # byte far past any content rather than byte 0. Locking beyond
+                # EOF is allowed on Windows.
+                os.lseek(self._fd, _WIN_LOCK_OFFSET, os.SEEK_SET)
                 msvcrt.locking(self._fd, msvcrt.LK_NBLCK, 1)
+                os.lseek(self._fd, 0, os.SEEK_SET)
             return True
         except (OSError, BlockingIOError):
             return False
@@ -615,8 +621,9 @@ class CodegraphLock:
             if fcntl is not None:
                 fcntl.flock(self._fd, fcntl.LOCK_UN)
             elif msvcrt is not None:
-                os.lseek(self._fd, 0, os.SEEK_SET)
+                os.lseek(self._fd, _WIN_LOCK_OFFSET, os.SEEK_SET)
                 msvcrt.locking(self._fd, msvcrt.LK_UNLCK, 1)
+                os.lseek(self._fd, 0, os.SEEK_SET)
         except OSError:
             pass
         try:
@@ -639,6 +646,12 @@ def _read_holder_pid(path: Path) -> Optional[int]:
     if not contents.isdigit():
         return None
     return int(contents)
+
+
+# A sentinel byte offset (1 GiB) used only on Windows for the msvcrt advisory
+# lock. It sits far past the tiny PID text so the mandatory lock never blocks
+# readers of the holder PID, while still serializing acquirers on one byte.
+_WIN_LOCK_OFFSET = 1 << 30
 
 
 def _import_fcntl():
