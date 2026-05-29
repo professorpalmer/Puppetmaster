@@ -6,10 +6,25 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.9", "3.12"]
+        exclude:
+          # Keep the matrix lean: exercise the full OS spread on the current
+          # Python, and the version spread on Linux. (3.9 + macOS/Windows is
+          # covered transitively by 3.12 on those OSes and 3.9 on Linux.)
+          - os: macos-latest
+            python-version: "3.9"
+          - os: windows-latest
+            python-version: "3.9"
+    defaults:
+      run:
+        # GitHub provides bash on every runner (Git Bash on Windows), so the
+        # heredoc-based steps below run identically across all three OSes.
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -64,4 +79,3 @@ jobs:
               sys.exit(1)
           print("README local links ok")
           PY
-

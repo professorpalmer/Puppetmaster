@@ -272,8 +272,11 @@ def kill_stale(
             if entry.path:
                 deregister(Path(entry.path))
             continue
+        # Windows has no SIGKILL; os.kill(pid, SIGTERM) there maps to
+        # TerminateProcess, which is the equivalent hard kill.
+        hard_kill = getattr(signal, "SIGKILL", signal.SIGTERM)
         try:
-            os.kill(entry.pid, signal.SIGKILL)
+            os.kill(entry.pid, hard_kill)
         except OSError:
             pass
         if entry.path:
