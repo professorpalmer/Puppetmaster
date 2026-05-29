@@ -3312,7 +3312,12 @@ print('{"result":"ok"}')
         )
         keepalive.start()
         try:
-            time.sleep(0.25)
+            # Poll up to a generous deadline instead of a fixed sleep: at a
+            # 0.05s interval two emissions take ~0.1s, but a loaded CI runner
+            # can starve the timer thread, so wait (don't assume) for >= 2.
+            deadline = time.time() + 5.0
+            while len(emitted) < 2 and time.time() < deadline:
+                time.sleep(0.02)
         finally:
             keepalive.stop()
         self.assertGreaterEqual(len(emitted), 2)
