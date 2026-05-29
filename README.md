@@ -9,7 +9,9 @@
 
 <img src="docs/demo.gif" alt="Puppetmaster 60-second demo: cost routing, swarm fan-out, stitched summary, $0 follow-ups" width="100%" />
 
-> **Live OpenAI A/B, real billing tokens, same prompt, equivalent answer:** pinned `gpt-5.5` cost **\$0.0132**; Puppetmaster routed the same task to `gpt-5.4-nano` for **\$0.00016** — **98.8% cheaper and 81% faster.** Reproduce in ~$0.01 of spend: `OPENAI_API_KEY=... python -m bench.router_live_ab`.
+> **💸 Cheaper — live OpenAI A/B, real billing tokens, same prompt, equivalent answer:** pinned `gpt-5.5` cost **\$0.0132**; Puppetmaster routed the same task to `gpt-5.4-nano` for **\$0.00016** — **98.8% cheaper and 81% faster.** Reproduce in ~$0.01 of spend: `OPENAI_API_KEY=... python -m bench.router_live_ab`.
+
+> **🔁 Self-healing — a dead provider doesn't kill the swarm (proven live, job `job_d82715bebc5d`):** a `claude-code` worker hit a real **\$0 Anthropic balance** → classified `billing_or_quota` → marked **FAILED** → **auto-rerouted to `cursor/gpt-5.5`** (plan-billed, `$0`) → the funded adapter **completed the task.** No silent degraded run.
 
 ## Install
 
@@ -29,6 +31,7 @@ To run benchmarks or hack on it, clone instead — see [Contributing](docs/CONTR
 | Want to… | Go to |
 |---|---|
 | Understand the design & what it fixes | [docs/WHY.md](docs/WHY.md) |
+| Know how it differs from LangGraph / CrewAI / subagents | [docs/COMPARISON.md](docs/COMPARISON.md) |
 | See the proof behind the claims | [docs/CLAIMS.md](docs/CLAIMS.md) · receipts in [`bench/`](bench/) |
 | See everything that ships + adapters | [docs/FEATURES.md](docs/FEATURES.md) |
 | Copy/paste prompts & shell recipes | [Quickstart](#quickstart) · [docs/DAILY_DRIVER.md](docs/DAILY_DRIVER.md) |
@@ -54,6 +57,8 @@ live artifact board  ──>  stitched summary  ──>  0-token follow-up reads
 ```
 
 Puppetmaster isn't trying to beat native IDE subagents at every tiny task. It's for the work that gets messy: long repo investigations, conflicting hypotheses, repeated handoffs, flaky memory, and code changes that need evidence, replay, and approval gates. The rationale and failure modes it fixes are in [docs/WHY.md](docs/WHY.md).
+
+**How it's different:** LangGraph, CrewAI, and the Claude Agent SDK are libraries you write code against to *build* an agent. Puppetmaster sits one layer up — it **orchestrates the agent CLIs you already pay for** (Cursor, Claude Code, Codex, OpenAI), routes each task to the cheapest sufficient model, keeps the spend inside your subscription, and self-heals when a provider is down. Full side-by-side + "pick X instead if…" in [docs/COMPARISON.md](docs/COMPARISON.md).
 
 ### The demo (no API keys)
 

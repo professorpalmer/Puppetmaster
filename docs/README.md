@@ -9,6 +9,7 @@ The full documentation set. Start at the [project README](../README.md) for the 
 | [WHY.md](WHY.md) | Design rationale: what shared-transcript subagents get wrong, what durable state fixes |
 | [CLAIMS.md](CLAIMS.md) | The four headline claims with reproducible receipts from [`bench/`](../bench/) |
 | [FEATURES.md](FEATURES.md) | Full feature matrix + the adapter table |
+| [COMPARISON.md](COMPARISON.md) | How it differs from LangGraph / CrewAI / Claude Agent SDK / native subagents + "pick X instead if…" |
 | [DAILY_DRIVER.md](DAILY_DRIVER.md) | Prompt recipes for review, swarm, implement, post-job inspection |
 
 ## Concepts & reference
