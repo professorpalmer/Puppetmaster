@@ -216,6 +216,96 @@ def merge_catalog_into_registry(
     return merged, report
 
 
+# A registry is considered to already carry the Cursor plan's frontier when it
+# has at least one plan-billed model at or above this capability. Below it, hard
+# tasks (audit/redteam/implement, classifier ~85-95) would route off the plan to
+# a per-token account — the exact failure mode auto-discovery exists to prevent.
+PLAN_FRONTIER_MIN_CAPABILITY = 85
+
+
+def has_plan_frontier(registry: list[ModelSpec], *, min_capability: int = PLAN_FRONTIER_MIN_CAPABILITY) -> bool:
+    """True when the registry already has a plan-billed model strong enough for
+    frontier work, so auto-discovery can be skipped."""
+    for spec in registry:
+        if (
+            getattr(spec, "billing", "unknown") == "plan"
+            and int(getattr(spec, "capability_score", 0)) >= min_capability
+            and getattr(spec, "enabled", True)
+        ):
+            return True
+    return False
+
+
+def ensure_cursor_plan_catalog(
+    registry_path: "Path",
+    *,
+    billing_detector: Optional[Callable[[], object]] = None,
+    catalog_fetcher: Optional[Callable[[], list[dict]]] = None,
+    min_capability: int = PLAN_FRONTIER_MIN_CAPABILITY,
+) -> dict:
+    """First-run guarantee that the registry carries the Cursor plan's frontier.
+
+    The promise is "frontier work always routes through the subscription, never
+    falls off to a per-token / depleted account." That only holds if the
+    plan-billed frontier models are actually *in* the registry — but a fresh
+    install ships a thin starter registry and discovery was historically manual.
+    This closes that gap automatically and idempotently:
+
+    * If the registry already has a plan-billed frontier model
+      (``capability_score >= min_capability``) → no-op (steady state, no cost).
+    * Else if a Cursor catalog was already discovered once (sidecar meta has a
+      ``cursor`` entry) → no-op (don't re-enumerate every run; ``doctor`` nudges
+      on staleness, and a plan genuinely without a frontier shouldn't loop).
+    * Else if the Cursor adapter is authenticated (plan-billed) → enumerate the
+      plan catalog, merge it in (plan-billed), persist the registry + meta.
+    * Else → no-op (Cursor not signed in; nothing to discover).
+
+    Returns a small report ``{"action": ..., ...}``. Never raises — a discovery
+    failure degrades to ``{"action": "unavailable", "error": ...}`` so a swarm
+    is never blocked by catalog enumeration.
+    """
+    from puppetmaster.model_registry import (
+        load_registry,
+        read_discovery_meta,
+        save_registry,
+        write_discovery_meta,
+    )
+
+    try:
+        registry = load_registry(registry_path)
+        if has_plan_frontier(registry, min_capability=min_capability):
+            return {"action": "skip", "reason": "plan_frontier_present"}
+
+        meta = read_discovery_meta(registry_path)
+        if isinstance(meta, dict) and meta.get("cursor"):
+            return {"action": "skip", "reason": "already_discovered"}
+
+        detect = billing_detector
+        if detect is None:
+            from puppetmaster.platform_billing import detect_cursor_billing
+
+            detect = detect_cursor_billing
+        status = detect()
+        if not (
+            getattr(status, "healthy", False)
+            and getattr(status, "billing", "unknown") == "plan"
+        ):
+            return {"action": "skip", "reason": "cursor_unauthenticated"}
+
+        fetch = catalog_fetcher or fetch_cursor_catalog
+        catalog = fetch()
+        merged, report = merge_catalog_into_registry(registry, catalog)
+        save_registry(merged, registry_path)
+        write_discovery_meta("cursor", report.get("discovered_count", 0), registry_path)
+        return {
+            "action": "discovered",
+            "discovered_count": report.get("discovered_count", 0),
+            "added": report.get("added", []),
+        }
+    except Exception as exc:  # never block a run on catalog enumeration
+        return {"action": "unavailable", "error": str(exc)}
+
+
 def model_in_catalog(model_name: str, catalog: list[dict]) -> bool:
     """True if ``model_name`` (an adapter model id) is in the live catalog.
 

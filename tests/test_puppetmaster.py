@@ -17,6 +17,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+# Hermetic tests: the orchestrator's first-run plan-catalog auto-discovery
+# shells out to the Cursor SDK (node) when CURSOR_API_KEY is set. The suite
+# must never make that network/subprocess call implicitly — tests that
+# exercise the discovery helper inject their own catalog fetcher instead.
+os.environ.setdefault("PUPPETMASTER_AUTODISCOVER", "0")
+
 from puppetmaster.adapters import (
     ClaudeCodeAdapter,
     CodexAdapter,
@@ -5644,6 +5650,126 @@ class DashboardTests(unittest.TestCase):
             )
             snap = build_job_snapshot(store, job.id)
             self.assertEqual(snap["cost"]["total_estimated_cost_usd"], 0.0)
+
+
+class EnsurePlanCatalogTests(unittest.TestCase):
+    """First-run guarantee: auto-routed work always has a plan-billed frontier
+    to land on, so it never falls off to a per-token / depleted account."""
+
+    def _status(self, healthy=True, billing="plan"):
+        from puppetmaster.platform_billing import BillingStatus
+
+        return BillingStatus(
+            adapter="cursor", billing=billing, healthy=healthy, detail="t", evidence=[]
+        )
+
+    def _registry_path(self, tmp):
+        from puppetmaster.model_registry import save_registry, starter_registry
+
+        path = Path(tmp) / "models.json"
+        save_registry(starter_registry(), path)
+        return path
+
+    def test_skips_when_plan_frontier_already_present(self) -> None:
+        from puppetmaster.cursor_discovery import ensure_cursor_plan_catalog
+        from puppetmaster.model_registry import ModelSpec, save_registry
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "models.json"
+            save_registry(
+                [ModelSpec(id="cursor/claude-opus-4-8", adapter="cursor",
+                           adapter_model_name="claude-opus-4-8", capability_score=99,
+                           input_per_mtok_usd=0.0, output_per_mtok_usd=0.0,
+                           context_window=200000, billing="plan")],
+                path,
+            )
+            called = {"fetch": False}
+
+            def fetch():
+                called["fetch"] = True
+                return []
+
+            report = ensure_cursor_plan_catalog(
+                path, billing_detector=lambda: self._status(), catalog_fetcher=fetch
+            )
+            self.assertEqual(report["action"], "skip")
+            self.assertEqual(report["reason"], "plan_frontier_present")
+            self.assertFalse(called["fetch"])  # no network when frontier exists
+
+    def test_skips_when_cursor_unauthenticated(self) -> None:
+        from puppetmaster.cursor_discovery import ensure_cursor_plan_catalog
+
+        with TemporaryDirectory() as tmp:
+            path = self._registry_path(tmp)
+            report = ensure_cursor_plan_catalog(
+                path,
+                billing_detector=lambda: self._status(healthy=False, billing="unknown"),
+                catalog_fetcher=lambda: [{"id": "claude-opus-4-8"}],
+            )
+            self.assertEqual(report["action"], "skip")
+            self.assertEqual(report["reason"], "cursor_unauthenticated")
+
+    def test_discovers_when_authenticated_and_no_frontier(self) -> None:
+        from puppetmaster.cursor_discovery import (
+            ensure_cursor_plan_catalog,
+            has_plan_frontier,
+        )
+        from puppetmaster.model_registry import load_registry, read_discovery_meta
+
+        with TemporaryDirectory() as tmp:
+            path = self._registry_path(tmp)
+            self.assertFalse(has_plan_frontier(load_registry(path)))  # starter is thin
+            report = ensure_cursor_plan_catalog(
+                path,
+                billing_detector=lambda: self._status(),
+                catalog_fetcher=lambda: [
+                    {"id": "claude-opus-4-8", "displayName": "Opus 4.8"},
+                    {"id": "gpt-5.5", "displayName": "GPT-5.5"},
+                ],
+            )
+            self.assertEqual(report["action"], "discovered")
+            merged = load_registry(path)
+            # The plan now carries a frontier model (cap inherited from claude-code/opus-4-8).
+            self.assertTrue(has_plan_frontier(merged))
+            self.assertTrue(
+                any(s.adapter == "cursor" and s.adapter_model_name == "claude-opus-4-8"
+                    and s.billing == "plan" for s in merged)
+            )
+            self.assertTrue(read_discovery_meta(path).get("cursor"))
+
+    def test_does_not_reenumerate_after_prior_discovery(self) -> None:
+        from puppetmaster.cursor_discovery import ensure_cursor_plan_catalog
+        from puppetmaster.model_registry import write_discovery_meta
+
+        with TemporaryDirectory() as tmp:
+            path = self._registry_path(tmp)
+            write_discovery_meta("cursor", 3, path)  # we've tried before
+            called = {"fetch": False}
+
+            def fetch():
+                called["fetch"] = True
+                return [{"id": "claude-opus-4-8"}]
+
+            report = ensure_cursor_plan_catalog(
+                path, billing_detector=lambda: self._status(), catalog_fetcher=fetch
+            )
+            self.assertEqual(report["action"], "skip")
+            self.assertEqual(report["reason"], "already_discovered")
+            self.assertFalse(called["fetch"])
+
+    def test_discovery_failure_degrades_to_unavailable(self) -> None:
+        from puppetmaster.cursor_discovery import ensure_cursor_plan_catalog
+
+        def boom():
+            raise RuntimeError("cursor sdk offline")
+
+        with TemporaryDirectory() as tmp:
+            path = self._registry_path(tmp)
+            report = ensure_cursor_plan_catalog(
+                path, billing_detector=lambda: self._status(), catalog_fetcher=boom
+            )
+            self.assertEqual(report["action"], "unavailable")
+            self.assertIn("offline", report["error"])
 
 
 class AwaitJobTests(unittest.TestCase):
