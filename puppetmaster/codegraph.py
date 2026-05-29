@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Optional, Union
 
@@ -641,13 +642,21 @@ def _read_holder_pid(path: Path) -> Optional[int]:
 def _pid_is_alive(pid: int) -> bool:
     """Return True if a process with ``pid`` exists for this user.
 
-    ``os.kill(pid, 0)`` sends no signal but errors out when the pid
-    doesn't exist or we lack permission. We treat "no such process"
-    (ESRCH) as dead and "permission denied" (EPERM) as alive — if a
-    different user owns the pid, we shouldn't blow away their lock.
+    POSIX: ``os.kill(pid, 0)`` sends no signal but errors out when the pid
+    doesn't exist or we lack permission. We treat "no such process" (ESRCH)
+    as dead and "permission denied" (EPERM) as alive — if a different user
+    owns the pid, we shouldn't blow away their lock.
+
+    Windows: ``os.kill(pid, 0)`` does NOT raise for a missing pid (it maps to
+    ``TerminateProcess`` and surfaces a generic ``OSError``), so the POSIX path
+    would wrongly report every dead pid as alive — leaving a stale lock held by
+    a long-gone process unbreakable. Query the OS directly via ``OpenProcess``
+    and distinguish "missing pid" from "access denied" by the Win32 error code.
     """
     if pid <= 0:
         return False
+    if sys.platform == "win32":
+        return _pid_is_alive_windows(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -657,6 +666,36 @@ def _pid_is_alive(pid: int) -> bool:
     except OSError:
         return True
     return True
+
+
+def _pid_is_alive_windows(pid: int) -> bool:
+    """Windows liveness probe via the Win32 API (no psutil dependency)."""
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    ERROR_ACCESS_DENIED = 5
+    ERROR_INVALID_PARAMETER = 87
+
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        err = ctypes.get_last_error() or kernel32.GetLastError()
+        # No such process -> dead. Access denied -> someone else's live process
+        # (mirror POSIX EPERM -> alive so we don't break another user's lock).
+        if err == ERROR_INVALID_PARAMETER:
+            return False
+        if err == ERROR_ACCESS_DENIED:
+            return True
+        return False
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return True
+        return exit_code.value == STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 # --- Native SQLite health check ---------------------------------------------
