@@ -50,7 +50,7 @@ live artifact board  ──>  stitched summary  ──>  0-token follow-up reads
 
 Puppetmaster is not trying to beat native IDE subagents at every tiny task. It is for the work that gets messy: long repo investigations, conflicting hypotheses, repeated handoffs, flaky memory, and code changes that need evidence, replay, and approval gates. The design rationale and the failure modes it fixes are in [docs/WHY.md](docs/WHY.md).
 
-## Three claims, three receipts
+## Four claims, four receipts
 
 Every number in this section comes from a reproducible script in [`bench/`](bench/). What is **not** defensible (and what we won't claim) lives in [TALKING_POINTS.md](TALKING_POINTS.md).
 
@@ -80,6 +80,21 @@ Puppetmaster does the opposite. Workers don't see each other's transcripts. They
 ### 3. Graphing — credit [CodeGraph](https://github.com/colbymchenry/codegraph), wire it in cleanly
 
 The "graph your directories" capability is **not** a Puppetmaster feature. It's [CodeGraph](https://github.com/colbymchenry/codegraph) — a separate project — and it deserves the credit. Puppetmaster's contribution is what happens after CodeGraph is installed: every worker auto-injects task-relevant CodeGraph context into its prompt before the model call, one shared `codegraph context` query seeds N parallel workers, and the resulting artifacts land in the same durable store. Puppetmaster works fine without CodeGraph; workers fall back to grep/read. Details in [docs/CODEGRAPH.md](docs/CODEGRAPH.md).
+
+### 4. Resilience — a dead provider doesn't kill the swarm (v0.9.0+)
+
+The original failure that motivated this feature: a Claude Code worker hit a `$0` Anthropic balance and the job came back "degraded" with no useful output. Puppetmaster now treats that as a **recoverable** failure. The orchestrator classifies billing / quota / auth / missing-CLI failures, marks the task `FAILED` (not a silent `COMPLETE`), and **auto-re-routes it to the next funded adapter** under the same routing policy — preferring plan-billed models so the retry stays inside a subscription you already pay for.
+
+Validated live end-to-end against real adapters (job `job_d82715bebc5d`):
+
+```text
+worker-implement (claude-code)  →  verification failure=billing_or_quota   [FAILED]
+router-fallback                 →  reason="policy=balanced: cheapest sufficient
+                                    model whose capability_score (78) >= needed (75)"
+worker-implement (cursor/gpt-5.5)  →  verification result=passed  + finding @0.95  [COMPLETE]
+```
+
+The billing failure is also surfaced loudly in the stitched summary's **Alerts (action required)** section with concrete remediation, instead of being buried in a low-confidence verification line. Failure-classification, the `FAILED`-status propagation, and the reroute loop are covered by automated tests (`AutoFallbackTests`, `WorkerRuntimeFailureStatusTests`). A static + live `preflight` gate (`puppetmaster preflight --live`) catches missing keys, wrong billing mode, and even funded-looking-but-`$0` accounts *before* dispatch.
 
 ## Quickstart
 
@@ -127,6 +142,11 @@ Four production adapters live; eleven tiers in the starter registry (5 Cursor/Cl
 | Local runtime | Daily-driver beta: subprocess workers, task DAGs, leases, recovery, failure states |
 | SQLite backend | Default, WAL mode, schema metadata, integrity checks, persisted events |
 | Model router (v0.6.0+) | Task-aware routing; auditable `ROUTING` artifacts. Receipts: [`bench/`](bench/) |
+| Billing-aware routing + auto-fallback (v0.9.0+) | Prefers plan-billed models; reroutes billing/quota/auth/missing-CLI failures to the next funded adapter. Validated live (claim #4) |
+| Preflight gate (v0.9.0+) | Static checks (key/CLI/billing-mode) + optional live 1-token probe (`preflight --live`) catch zero-balance accounts before dispatch |
+| Catalog discovery (v0.9.0+) | `models discover` enumerates Cursor / OpenAI / Anthropic catalogs; `doctor` nudges when a catalog goes stale |
+| OpenTelemetry (optional, v0.9.0+) | Zero-cost unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set: per-task spans, job metrics, cross-process trace context. `pip install puppetmaster-ai[otel]` |
+| Async await (v0.9.0+) | `puppetmaster await <job_id>` (CLI), `puppetmaster_await_job` (MCP), and a TypeScript blocking client in [`clients/typescript`](clients/typescript) |
 | One-line MCP installers (v0.7.2+) | `install-cursor-mcp`, `install-codex-mcp` — resolve `sys.executable`, handshake before write, idempotent |
 | One-line rule installer (v0.7.3+) | `install-rules` — Cursor `.mdc` + cross-tool `AGENTS.md` + global Codex/Claude rules, merge-don't-overwrite |
 | `puppetmaster setup` (v0.7.3+) | One-shot wizard chaining doctor → models init → MCP installers → rules |

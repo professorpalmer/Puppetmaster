@@ -1,0 +1,18 @@
+{
+  "name": "@puppetmaster/client",
+  "version": "0.9.0",
+  "description": "TypeScript client for Puppetmaster: true blocking await over the durable CLI state, free of the MCP stdio constraint.",
+  "type": "module",
+  "main": "puppetmaster.ts",
+  "types": "puppetmaster.ts",
+  "files": ["puppetmaster.ts", "README.md"],
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "typescript": "^5"
+  },
+  "keywords": ["puppetmaster", "llm", "orchestration", "await", "cursor"],
+  "license": "MIT"
+}

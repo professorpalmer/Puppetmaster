@@ -440,6 +440,67 @@ def starter_registry() -> list[ModelSpec]:
     ]
 
 
+def discovery_meta_path(registry_path: Optional[Path] = None) -> Path:
+    """Sidecar file that records when each catalog source was last discovered.
+
+    Kept separate from ``models.json`` so discovery bookkeeping never perturbs
+    the hand-editable registry (or its round-trip tests)."""
+    resolved = registry_path or default_registry_path()
+    return resolved.with_name(resolved.stem + ".discovery.json")
+
+
+def read_discovery_meta(registry_path: Optional[Path] = None) -> dict[str, Any]:
+    """Return ``{source: {refreshed_at, count}}`` recorded by ``models discover``."""
+    path = discovery_meta_path(registry_path)
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_discovery_meta(
+    source: str,
+    count: int,
+    registry_path: Optional[Path] = None,
+    *,
+    now_iso: Optional[str] = None,
+) -> Path:
+    """Record that ``source`` (e.g. ``cursor``/``openai``/``anthropic``) was
+    just discovered, with how many models it returned and when."""
+    from datetime import datetime, timezone
+
+    path = discovery_meta_path(registry_path)
+    meta = read_discovery_meta(registry_path)
+    stamp = now_iso or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    meta[source] = {"refreshed_at": stamp, "count": count}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def catalog_staleness_days(
+    meta: dict[str, Any], source: str, *, now: Optional["object"] = None
+) -> Optional[float]:
+    """Age in days since ``source`` was last discovered, or None if never."""
+    from datetime import datetime, timezone
+
+    entry = meta.get(source) or {}
+    refreshed = entry.get("refreshed_at")
+    if not refreshed:
+        return None
+    try:
+        when = datetime.strptime(refreshed, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except (ValueError, TypeError):
+        return None
+    current = now or datetime.now(timezone.utc)
+    return max(0.0, (current - when).total_seconds() / 86400.0)
+
+
 def find(specs: Iterable[ModelSpec], model_id: str) -> Optional[ModelSpec]:
     for spec in specs:
         if spec.id == model_id:

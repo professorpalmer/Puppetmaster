@@ -7,11 +7,18 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Optional
 
-from puppetmaster.models import Artifact, ArtifactType, Job, JobStatus, Task, TaskStatus
+from puppetmaster.models import Artifact, ArtifactType, Job, JobStatus, Task, TaskStatus, now_iso
 from puppetmaster.stitcher import Stitcher
 from puppetmaster.store import SwarmStore
 from puppetmaster.worker_runtime import WorkerRuntime
-from puppetmaster.workers import WorkerSpec, specs_for_roles
+from puppetmaster.workers import RECOVERABLE_FAILURES, WorkerSpec, specs_for_roles
+
+# How many times the orchestrator will re-route a single task to a different
+# funded adapter after an auth/billing/quota rejection before giving up, and
+# how many whole-job fallback sweeps it will run. Bounded so a systematically
+# broken environment (every adapter unfunded) can't loop forever.
+_MAX_FALLBACK_ATTEMPTS = 2
+_MAX_FALLBACK_ROUNDS = 3
 
 
 @dataclass(frozen=True)
@@ -21,11 +28,15 @@ class RunResult:
     summary: str
     summary_path: Path
     recovered_tasks: int = 0
+    rerouted_tasks: int = 0
 
 
 class Orchestrator:
     def __init__(self, store: SwarmStore) -> None:
         self.store = store
+        # W3C traceparent for the active job, propagated to worker subprocesses
+        # so live per-task spans correlate into one trace (telemetry, opt-in).
+        self._traceparent: Optional[str] = None
 
     def run(
         self,
@@ -39,11 +50,13 @@ class Orchestrator:
         job = self.store.create_job(goal)
         if on_job_created is not None:
             on_job_created(job)
+        self._begin_trace()
         try:
             specs = self._with_retrieved_memory(specs or specs_for_roles(roles), goal)
             self.store.update_job_status(job.id, JobStatus.RUNNING)
             tasks = self._create_tasks(job, specs)
             self._run_workers(job, tasks, lease_seconds=lease_seconds, worker_mode=worker_mode)
+            rerouted = self._auto_fallback(job, lease_seconds=lease_seconds, worker_mode=worker_mode)
             artifacts = self.store.list_artifacts(job.id)
 
             self.store.update_job_status(job.id, JobStatus.STITCHING)
@@ -56,10 +69,13 @@ class Orchestrator:
                 artifacts=artifacts,
                 summary=summary,
                 summary_path=summary_path,
+                rerouted_tasks=rerouted,
             )
         except Exception:
             self.store.update_job_status(job.id, JobStatus.FAILED)
             raise
+        finally:
+            self._traceparent = None
 
     def run_crash_recovery_demo(
         self,
@@ -68,6 +84,7 @@ class Orchestrator:
         roles: Optional[list[str]] = None,
     ) -> RunResult:
         job = self.store.create_job(goal)
+        self._begin_trace()
         try:
             specs = self._with_retrieved_memory(specs_for_roles(roles), goal)
             self.store.update_job_status(job.id, JobStatus.RUNNING)
@@ -121,17 +138,274 @@ class Orchestrator:
             self.store.update_job_status(job.id, JobStatus.FAILED)
             raise
 
-    def _emit_telemetry(self, job: Job, artifacts: list[Artifact]) -> None:
-        """Emit an OTel trace for the finished job. No-op unless tracing is on;
-        never lets a telemetry failure break the run."""
+    def _begin_trace(self) -> None:
+        """Mint a W3C traceparent for this job when telemetry is enabled.
+
+        Stored on the orchestrator so ``_spawn_worker`` can hand it to worker
+        subprocesses (live per-task spans) and ``_emit_telemetry`` can anchor
+        the assembled end-of-job trace to the same trace id."""
+        self._traceparent = None
         try:
-            from puppetmaster.telemetry import record_job_trace, telemetry_enabled
+            from puppetmaster.telemetry import new_traceparent, telemetry_enabled
+
+            if telemetry_enabled():
+                self._traceparent = new_traceparent()
+        except Exception:
+            self._traceparent = None
+
+    def _emit_telemetry(self, job: Job, artifacts: list[Artifact]) -> None:
+        """Emit an OTel trace + metrics for the finished job. No-op unless
+        tracing is on; never lets a telemetry failure break the run."""
+        try:
+            from puppetmaster.telemetry import (
+                record_job_metrics,
+                record_job_trace,
+                telemetry_enabled,
+            )
 
             if not telemetry_enabled():
                 return
-            record_job_trace(job, self.store.list_tasks(job.id), artifacts)
+            tasks = self.store.list_tasks(job.id)
+            record_job_trace(job, tasks, artifacts, traceparent=self._traceparent)
+            record_job_metrics(job, tasks, artifacts)
         except Exception:
             pass
+
+    def _auto_fallback(
+        self, job: Job, *, lease_seconds: int, worker_mode: str
+    ) -> int:
+        """Re-route tasks that hit an auth/billing/quota rejection.
+
+        After the main worker pass, any task left FAILED because *its adapter's
+        account* was unfunded/unauthenticated (not because the task itself was
+        bad) is re-routed to the cheapest sufficient model on a different,
+        verified-funded adapter and re-run. Bounded by
+        :data:`_MAX_FALLBACK_ROUNDS` and per-task :data:`_MAX_FALLBACK_ATTEMPTS`
+        so a fully-broken environment surfaces loudly (via the stitched Alerts
+        section) instead of looping. Returns the number of re-routes performed.
+        """
+        total = 0
+        for _ in range(_MAX_FALLBACK_ROUNDS):
+            rerouted = self._reroute_recoverable_failures(job)
+            if not rerouted:
+                break
+            total += rerouted
+            self.store.emit(job.id, "job.auto_fallback_round", {"rerouted": rerouted})
+            self._run_workers(
+                job,
+                self.store.list_tasks(job.id),
+                lease_seconds=lease_seconds,
+                worker_mode=worker_mode,
+            )
+        return total
+
+    def _reroute_recoverable_failures(self, job: Job) -> int:
+        """Re-queue each FAILED task with a recoverable failure onto a funded
+        adapter. Returns the count re-queued (0 when nothing is re-routable)."""
+        from puppetmaster.model_registry import default_registry_path, load_registry
+        from puppetmaster.platform_billing import detect_adapter_billing
+        from puppetmaster.router import (
+            NoEligibleModelError,
+            route_task,
+            signals_from_worker_spec,
+        )
+
+        failed = [
+            task
+            for task in self.store.list_tasks(job.id)
+            if task.status == TaskStatus.FAILED
+            and int((task.payload or {}).get("fallback_attempts", 0)) < _MAX_FALLBACK_ATTEMPTS
+        ]
+        if not failed:
+            return 0
+
+        failure_by_task = self._recoverable_failure_by_task(job)
+        failed = [t for t in failed if t.id in failure_by_task]
+        if not failed:
+            return 0
+
+        registry_path = default_registry_path()
+        registry = [s for s in load_registry(registry_path) if s.enabled]
+        if not registry:
+            return 0
+
+        billing_cache: dict[str, object] = {}
+
+        def _funded(adapter: str) -> object:
+            if adapter not in billing_cache:
+                try:
+                    billing_cache[adapter] = detect_adapter_billing(adapter)
+                except Exception:
+                    billing_cache[adapter] = None
+            return billing_cache[adapter]
+
+        rerouted = 0
+        for task in failed:
+            failed_adapter = task.adapter
+            allow_api = bool((task.payload or {}).get("allow_api_billing", True))
+            candidates = []
+            for spec in registry:
+                if spec.adapter == failed_adapter:
+                    continue
+                status = _funded(spec.adapter)
+                if status is None or not getattr(status, "healthy", False):
+                    continue
+                if getattr(status, "billing", "unknown") == "api" and not allow_api:
+                    continue
+                candidates.append(spec)
+            if not candidates:
+                continue
+            policy = (task.payload or {}).get("router_policy") or "balanced"
+            try:
+                decision = route_task(
+                    signals_from_worker_spec(task), candidates, policy=policy
+                )
+            except NoEligibleModelError:
+                continue
+
+            attempts = int((task.payload or {}).get("fallback_attempts", 0)) + 1
+            new_payload = {
+                **(task.payload or {}),
+                "model": decision.model.adapter_model_name,
+                "router_model_id": decision.model.id,
+                "router_policy": decision.policy,
+                "router_capability_needed": decision.capability_needed,
+                "router_estimated_cost_usd": decision.estimated_cost_usd,
+                "fallback_attempts": attempts,
+                "fallback_from_adapter": failed_adapter,
+            }
+            requeued = replace(
+                task,
+                adapter=decision.model.adapter,
+                payload=new_payload,
+                status=TaskStatus.QUEUED,
+                attempts=0,
+                lease_owner=None,
+                lease_expires_at=None,
+                completed_at=None,
+                updated_at=now_iso(),
+            )
+            self.store.save_task(requeued)
+
+            artifact_payload = decision.to_artifact_payload()
+            artifact_payload["role"] = task.role
+            artifact_payload["fallback_from_adapter"] = failed_adapter
+            artifact_payload["fallback_reason"] = failure_by_task[task.id]
+            artifact_payload["fallback_attempt"] = attempts
+            self.store.save_artifact(
+                Artifact(
+                    job_id=job.id,
+                    task_id=task.id,
+                    type=ArtifactType.ROUTING,
+                    created_by="router-fallback",
+                    payload=artifact_payload,
+                    confidence=0.9,
+                    evidence=[
+                        f"fallback_from:{failed_adapter}",
+                        f"reason:{failure_by_task[task.id]}",
+                        f"to:{decision.model.id}",
+                    ],
+                )
+            )
+            self.store.emit(
+                job.id,
+                "router.auto_fallback",
+                {
+                    "task_id": task.id,
+                    "role": task.role,
+                    "from_adapter": failed_adapter,
+                    "to_adapter": decision.model.adapter,
+                    "to_model": decision.model.adapter_model_name,
+                    "reason": failure_by_task[task.id],
+                    "attempt": attempts,
+                },
+            )
+            rerouted += 1
+        return rerouted
+
+    def _recoverable_failure_by_task(self, job: Job) -> dict[str, str]:
+        """Map task_id -> recoverable failure class from blocked/failed artifacts."""
+        out: dict[str, str] = {}
+        for artifact in self.store.list_artifacts(job.id):
+            failure = (artifact.payload or {}).get("failure")
+            if failure in RECOVERABLE_FAILURES and artifact.task_id not in out:
+                out[artifact.task_id] = str(failure)
+        return out
+
+    def _has_hard_failure(self, job: Job, allowed_task_ids: set[str]) -> bool:
+        """True when a task FAILED for a non-recoverable reason (a real error
+        like a bad adapter or an exception) — i.e. nothing auto-fallback can fix.
+
+        Deliberately does NOT flag QUEUED/RUNNING tasks: those are normal
+        mid-flight states while daemon/external workers are still going. Use
+        :meth:`_should_fail_closed` at a terminal point (workers exited) to also
+        catch a genuinely stuck swarm."""
+        recoverable = set(self._recoverable_failure_by_task(job))
+        for task in self.store.list_tasks(job.id):
+            if task.id not in allowed_task_ids:
+                continue
+            if task.status == TaskStatus.FAILED and task.id not in recoverable:
+                return True
+        return False
+
+    def _should_fail_closed(self, job: Job, allowed_task_ids: set[str]) -> bool:
+        """Terminal-point verdict: should the orchestrator raise (fail the job)?
+
+        Called after workers have exited and no recovery/unblock/next-task
+        progress is possible. Raise when any incomplete task is *not* explained
+        by a recoverable adapter-billing failure: a hard error, a genuinely
+        stuck QUEUED/RUNNING task, or a task blocked on a hard-failed upstream.
+        Recoverable-failed tasks and the tasks blocked behind them are left for
+        the auto-fallback sweep (or surfaced in the stitched Alerts section)."""
+        recoverable = set(self._recoverable_failure_by_task(job))
+        by_id = {t.id: t for t in self.store.list_tasks(job.id)}
+
+        def _blocked_on_recoverable(task: Task, seen: set[str]) -> bool:
+            if task.id in seen:
+                return False
+            seen.add(task.id)
+            for dep_id in task.depends_on:
+                dep = by_id.get(dep_id)
+                if dep is None:
+                    continue
+                if dep.id in recoverable:
+                    return True
+                if dep.status == TaskStatus.BLOCKED and _blocked_on_recoverable(dep, seen):
+                    return True
+            return False
+
+        for task in by_id.values():
+            if task.id not in allowed_task_ids or task.status == TaskStatus.COMPLETE:
+                continue
+            if task.id in recoverable:
+                continue
+            if task.status == TaskStatus.BLOCKED and _blocked_on_recoverable(task, set()):
+                continue
+            return True
+        return False
+
+    def _daemon_settled(self, job: Job, allowed_task_ids: set[str]) -> bool:
+        """True when no daemon/external worker can make further progress.
+
+        Returns False while any task is QUEUED/RUNNING (work remains) or any
+        BLOCKED task still has an upstream that could complete and unblock it —
+        so the wait loop keeps polling. Returns True once everything is COMPLETE
+        or terminally stuck (FAILED, or BLOCKED behind a terminal dep), letting
+        the caller hand off to the auto-fallback sweep."""
+        by_id = {t.id: t for t in self.store.list_tasks(job.id)}
+        for task in by_id.values():
+            if task.id not in allowed_task_ids:
+                continue
+            if task.status in {TaskStatus.QUEUED, TaskStatus.RUNNING}:
+                return False
+            if task.status == TaskStatus.BLOCKED:
+                deps = [by_id[d] for d in task.depends_on if d in by_id]
+                if any(
+                    d.status in {TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.BLOCKED}
+                    for d in deps
+                ):
+                    return False
+        return True
 
     def _create_tasks(self, job: Job, specs: list[WorkerSpec]) -> list[Task]:
         specs, routing_decisions = self._apply_auto_routing(job, specs)
@@ -400,11 +674,7 @@ class Orchestrator:
                 and task.status in {TaskStatus.QUEUED, TaskStatus.RUNNING}
             ]
         if not tasks:
-            if any(
-                task.status != TaskStatus.COMPLETE
-                for task in self.store.list_tasks(job.id)
-                if task.id in allowed_task_ids
-            ):
+            if self._should_fail_closed(job, allowed_task_ids):
                 raise RuntimeError("swarm exited with incomplete tasks")
             return
 
@@ -449,11 +719,7 @@ class Orchestrator:
                     allowed_task_ids=allowed_task_ids,
                     worker_mode=worker_mode,
                 )
-            elif any(
-                task.status != TaskStatus.COMPLETE
-                for task in self.store.list_tasks(job.id)
-                if task.id in allowed_task_ids
-            ):
+            elif self._should_fail_closed(job, allowed_task_ids):
                 raise RuntimeError("swarm exited with incomplete tasks")
 
     def _run_inline_workers(
@@ -474,13 +740,10 @@ class Orchestrator:
                 and task.status in {TaskStatus.QUEUED, TaskStatus.RUNNING}
             ]
             if not ready_tasks:
-                incomplete = [
-                    task
-                    for task in self.store.list_tasks(job.id)
-                    if task.id in allowed_task_ids and task.status != TaskStatus.COMPLETE
-                ]
-                if incomplete:
+                if self._should_fail_closed(job, allowed_task_ids):
                     raise RuntimeError("swarm exited with incomplete tasks")
+                # Either fully complete, or only recoverable adapter-billing
+                # failures remain — hand back to the auto-fallback sweep.
                 return
 
             completed = 0
@@ -493,12 +756,12 @@ class Orchestrator:
                     lease_seconds=lease_seconds,
                 )
                 completed += runtime.run_until_idle()
-            if completed == 0 and any(
-                task.status != TaskStatus.COMPLETE
-                for task in self.store.list_tasks(job.id)
-                if task.id in allowed_task_ids
-            ):
-                raise RuntimeError("swarm exited with incomplete tasks")
+            if completed == 0:
+                if self._should_fail_closed(job, allowed_task_ids):
+                    raise RuntimeError("swarm exited with incomplete tasks")
+                # No progress and only recoverable failures left — stop spinning
+                # and let auto_fallback re-route on a funded adapter.
+                return
 
     def _wait_for_daemon_workers(
         self,
@@ -522,9 +785,9 @@ class Orchestrator:
                 for task in self.store.list_tasks(job.id)
                 if task.id in allowed_task_ids
             ]
-            if any(task.status == TaskStatus.FAILED for task in current_tasks):
+            if self._has_hard_failure(job, allowed_task_ids):
                 raise RuntimeError("daemon worker failed a task")
-            if current_tasks and all(task.status == TaskStatus.COMPLETE for task in current_tasks):
+            if current_tasks and self._daemon_settled(job, allowed_task_ids):
                 return
             time.sleep(0.2)
         raise RuntimeError("timed out waiting for daemon workers")
@@ -591,7 +854,16 @@ class Orchestrator:
         ]
         if crash_after_claim:
             command.append("--crash-after-claim")
-        return subprocess.Popen(command)
+        env = None
+        if self._traceparent:
+            import os
+
+            env = {
+                **os.environ,
+                "TRACEPARENT": self._traceparent,
+                "PUPPETMASTER_TRACEPARENT": self._traceparent,
+            }
+        return subprocess.Popen(command, env=env)
 
     @staticmethod
     def _worker_wait_timeout(tasks: list[Task]) -> int:
