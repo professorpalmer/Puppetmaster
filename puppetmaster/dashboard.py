@@ -20,9 +20,27 @@ socket:
 from __future__ import annotations
 
 import json
+import re
 import threading
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
+
+# Job ids are minted as ``job_<hex>``; constrain to that alphabet so a request
+# id can never escape the state tree via ``..`` / absolute paths (defense in
+# depth — the server binds to loopback by default, but a local user or a careless
+# ``--host`` should still not be able to read arbitrary files).
+_JOB_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _valid_job_id(job_id: str) -> bool:
+    return bool(job_id) and bool(_JOB_ID_RE.match(job_id)) and len(job_id) <= 128
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 from puppetmaster.models import Artifact, ArtifactType, Task
 from puppetmaster.store import SwarmStore
@@ -74,7 +92,7 @@ def cost_rollup(artifacts: list[Artifact]) -> dict[str, Any]:
             continue
         payload = artifact.payload or {}
         model_id = str(payload.get("model_id") or payload.get("selected_model") or "<unknown>")
-        cost = float(payload.get("estimated_cost_usd") or 0.0)
+        cost = _safe_float(payload.get("estimated_cost_usd"))
         total += cost
         bucket = by_model.setdefault(model_id, {"calls": 0.0, "cost": 0.0})
         bucket["calls"] += 1
@@ -340,14 +358,21 @@ def make_handler(store_factory: Callable[[], SwarmStore]):
                     if not job_id:
                         self._json(400, {"error": "missing id"})
                         return
+                    if not _valid_job_id(job_id):
+                        # Reject anything that isn't a plain job id before it can
+                        # reach the store path join (no traversal / absolute paths).
+                        self._json(400, {"error": "invalid id"})
+                        return
                     try:
                         self._json(200, build_job_snapshot(store_factory(), job_id))
                     except (FileNotFoundError, KeyError):
                         self._json(404, {"error": "job not found", "id": job_id})
                     return
                 self._json(404, {"error": "not found"})
-            except Exception as exc:  # never crash the server on one bad request
-                self._json(500, {"error": str(exc)})
+            except Exception:
+                # Never leak internals (paths, backend details) to the client;
+                # a request that trips an unexpected error gets a generic 500.
+                self._json(500, {"error": "internal error"})
 
     return _Handler
 

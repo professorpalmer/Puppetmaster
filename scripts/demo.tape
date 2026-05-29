@@ -10,21 +10,22 @@
 Output docs/demo.gif
 
 Set Shell bash
-Set FontSize 16
-Set Width 1280
-Set Height 760
-Set Padding 16
+Set FontSize 15
+Set Width 1200
+Set Height 720
+Set Padding 14
+Set Framerate 24
 Set Theme "Catppuccin Mocha"
-Set TypingSpeed 35ms
+Set TypingSpeed 30ms
 Set PlaybackSpeed 1.0
 
 Hide
 Type "clear" Enter
 Show
 
-Type "./scripts/demo.sh"
+Type "DEMO_PAUSE=1.4 ./scripts/demo.sh"
 Sleep 600ms
 Enter
 
 # The script self-paces with DEMO_PAUSE between sections; give it room to finish.
-Sleep 40s
+Sleep 22s

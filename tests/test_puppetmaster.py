@@ -5592,6 +5592,59 @@ class DashboardTests(unittest.TestCase):
             finally:
                 httpd.shutdown()
 
+    def test_dashboard_rejects_traversal_job_id(self) -> None:
+        """/api/job must reject ids that aren't plain job ids before they reach
+        the store path join (no `..` / absolute-path traversal)."""
+        import threading
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+
+        from puppetmaster.dashboard import serve
+
+        with TemporaryDirectory() as tmp:
+            self._seed_store(tmp)
+            httpd = serve(
+                Path(tmp) / ".puppetmaster", backend="file", host="127.0.0.1",
+                port=0, open_browser=False, serve_forever=False,
+            )
+            port = httpd.server_address[1]
+            t = threading.Thread(target=httpd.serve_forever, daemon=True)
+            t.start()
+            try:
+                evil = urllib.parse.quote("../../../../etc/passwd", safe="")
+                try:
+                    urllib.request.urlopen(f"http://127.0.0.1:{port}/api/job?id={evil}")
+                    self.fail("expected HTTP 400 for traversal id")
+                except urllib.error.HTTPError as exc:
+                    self.assertEqual(exc.code, 400)
+                    self.assertIn(b"invalid id", exc.read())
+            finally:
+                httpd.shutdown()
+
+    def test_cost_rollup_tolerates_non_numeric_cost(self) -> None:
+        """A ROUTING artifact with a non-numeric estimated_cost_usd must not
+        500 the snapshot (validate only requires model_id/adapter/policy)."""
+        from puppetmaster.dashboard import build_job_snapshot
+        from puppetmaster.models import Artifact, ArtifactType
+        from puppetmaster.store import SwarmStore
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            job = store.create_job("cost robustness")
+            store.save_artifact(
+                Artifact(
+                    job_id=job.id, task_id="t", type=ArtifactType.ROUTING,
+                    created_by="router",
+                    payload={"model_id": "m", "adapter": "cursor", "policy": "balanced",
+                             "estimated_cost_usd": "not-a-number"},
+                    confidence=0.9, evidence=["x"],
+                )
+            )
+            snap = build_job_snapshot(store, job.id)
+            self.assertEqual(snap["cost"]["total_estimated_cost_usd"], 0.0)
+
 
 class AwaitJobTests(unittest.TestCase):
     def test_await_returns_when_already_terminal(self) -> None:
