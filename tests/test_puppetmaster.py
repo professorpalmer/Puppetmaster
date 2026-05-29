@@ -408,6 +408,30 @@ class PuppetmasterTests(unittest.TestCase):
 
                 self.assertEqual(store.read_events_since("job-x", since=3), [])
 
+    def test_file_reader_skips_torn_concurrent_append_line(self) -> None:
+        """A malformed/torn line (Windows non-atomic append) is skipped, not fatal.
+
+        POSIX O_APPEND is atomic; Windows appends are not, so two workers
+        writing at once can interleave a partial or null-padded line into the
+        JSONL stream. The reader must survive it and still return the
+        well-formed events around it.
+        """
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            store.emit("job-x", "first", {"n": 1})
+            store.emit("job-x", "second", {"n": 2})
+
+            stream = store.stream_dir / "job-x.jsonl"
+            with stream.open("a", encoding="utf-8") as handle:
+                handle.write('{"event": "torn", "payl\x00\x00')  # truncated + null pad
+                handle.write("\n")
+                handle.write("\n")  # stray blank line
+            store.emit("job-x", "third", {"n": 3})
+
+            events = [e["event"] for e in store.read_events("job-x")]
+            self.assertEqual(events, ["first", "second", "third"])
+
     def test_wait_for_events_returns_immediately_when_events_present(self) -> None:
         for backend in ("file", "sqlite"):
             with self.subTest(backend=backend), TemporaryDirectory() as tmp:
