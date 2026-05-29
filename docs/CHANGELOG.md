@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Removed `TALKING_POINTS.md`** — it was an internal positioning/messaging cheat-sheet not meant to ship publicly. Dropped the file and the references to it in `README.md`, `bench/README.md`, `docs/CLAIMS.md`, and `docs/CODEGRAPH.md`. The defensible-numbers source of truth remains [docs/CLAIMS.md](CLAIMS.md) + the harnesses in [`bench/`](../bench/).
+
 ## v0.9.2
 
 **Platform lock + launch packaging.** Lock Puppetmaster to the platforms you actually pay for (so a stray Claude Code / Codex login can never be picked behind your back), plus the security doc, positioning comparison, and self-healing README hero that make it launch-ready.

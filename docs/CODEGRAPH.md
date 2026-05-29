@@ -81,9 +81,8 @@ longer required by default.
 > **Newer, more direct receipts** for the routing + durable-state
 > claims live in [`bench/router_savings.py`](../bench/router_savings.py),
 > [`bench/router_live_ab.py`](../bench/router_live_ab.py), and
-> [`bench/followup_cost.py`](../bench/followup_cost.py) — see the
-> [docs/CLAIMS.md](CLAIMS.md)
-> and [TALKING_POINTS.md](../TALKING_POINTS.md). The Agent /
+> [`bench/followup_cost.py`](../bench/followup_cost.py) — see
+> [docs/CLAIMS.md](CLAIMS.md). The Agent /
 > CodeGraph / Puppetmaster three-way analysis below is older and
 > broader (it models multi-worker swarm cost vs single-agent cost);
 > both views are valid and they answer different questions.
