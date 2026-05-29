@@ -2238,8 +2238,12 @@ class PuppetmasterTests(unittest.TestCase):
                 check_interval_seconds=0.02,
                 on_shutdown=triggered.set,
             )
+            # Simulate Cursor sending us something, resetting the (otherwise stale)
+            # timestamp BEFORE the watcher starts so its first check can never race
+            # the mark and observe the stale value. The guarantee under test — a
+            # fresh inbound message keeps the watcher from firing — is unchanged.
+            mcp_server._mark_inbound_message()
             watcher.start()
-            mcp_server._mark_inbound_message()  # simulate Cursor sending us something
             # Heartbeat refresh should keep us alive for at least one check cycle.
             self.assertFalse(triggered.wait(timeout=0.1))
         finally:
