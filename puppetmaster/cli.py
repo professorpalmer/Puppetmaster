@@ -682,6 +682,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     models_discover.add_argument("--registry-path", help="Override the registry path.")
     models_discover.add_argument(
+        "--source",
+        choices=["cursor", "openai", "anthropic", "all"],
+        default="cursor",
+        help=(
+            "Which platform catalog to enumerate. cursor (plan, default), "
+            "openai (GET /v1/models, needs OPENAI_API_KEY), anthropic "
+            "(needs ANTHROPIC_API_KEY for discovery), or all."
+        ),
+    )
+    models_discover.add_argument(
         "--write",
         action="store_true",
         help="Persist the merged registry (default: dry-run, just print the diff).",
@@ -704,6 +714,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-api-billing",
         action="store_true",
         help="Treat api-billed adapters as blocked (plan-only).",
+    )
+    preflight_cmd.add_argument(
+        "--live",
+        action="store_true",
+        help=(
+            "Run a real 1-token probe to catch a funded-looking account whose "
+            "balance is actually exhausted (adds a real call + latency)."
+        ),
     )
     preflight_cmd.add_argument("--json", action="store_true", help="Emit JSON.")
 
@@ -1731,39 +1749,50 @@ def _run_models_subcommand(args) -> int:
 
 
 def _run_models_discover(args, path: Path) -> int:
-    """Enumerate the Cursor plan catalog and reconcile it into the registry."""
+    """Enumerate platform model catalogs and reconcile them into the registry.
+
+    Cursor (plan, default) uses the SDK; OpenAI and Anthropic use their
+    ``/v1/models`` endpoints. ``--source all`` runs every reachable source."""
     import json as _json
 
-    from puppetmaster.cursor_discovery import (
-        CursorDiscoveryError,
-        fetch_cursor_catalog,
-        merge_catalog_into_registry,
-    )
     from puppetmaster.model_registry import (
         load_registry,
         save_registry,
         starter_registry,
+        write_discovery_meta,
     )
 
     try:
-        existing = load_registry(path)
+        registry = load_registry(path)
     except RuntimeError:
-        existing = starter_registry()
+        registry = starter_registry()
 
-    try:
-        catalog = fetch_cursor_catalog()
-    except CursorDiscoveryError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
+    sources = (
+        ["cursor", "openai", "anthropic"] if args.source == "all" else [args.source]
+    )
+    reports: list[dict] = []
+    catalogs: dict[str, list] = {}
+    errors: dict[str, str] = {}
 
-    merged, report = merge_catalog_into_registry(existing, catalog)
+    for source in sources:
+        try:
+            registry, report, catalog = _discover_one_source(source, registry)
+        except _DiscoverSourceError as exc:
+            errors[source] = str(exc)
+            if args.source != "all":
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
+            continue
+        reports.append(report)
+        catalogs[source] = catalog
 
     if args.json:
         print(
             _json.dumps(
                 {
-                    "report": report,
-                    "catalog": catalog,
+                    "reports": reports,
+                    "errors": errors,
+                    "catalogs": catalogs,
                     "written": bool(args.write),
                     "registry_path": str(path),
                 },
@@ -1771,23 +1800,76 @@ def _run_models_discover(args, path: Path) -> int:
             )
         )
     else:
-        print(f"Discovered {report['discovered_count']} plan-billed Cursor model(s).")
-        if report["added"]:
-            print(f"  + new: {', '.join(report['added'])}")
-        if report["dropped_stale_cursor_models"]:
-            print(
-                f"  - dropped (no longer in plan): "
-                f"{', '.join(report['dropped_stale_cursor_models'])}"
-            )
-        print(f"  preserved {report['non_cursor_preserved']} non-cursor entr(ies).")
+        for report in reports:
+            src = report.get("source") or report.get("adapter") or "cursor"
+            print(f"[{src}] discovered {report['discovered_count']} model(s).")
+            if report.get("added"):
+                print(f"  + new: {', '.join(report['added'])}")
+            if report.get("dropped_stale_cursor_models"):
+                print(
+                    f"  - dropped (no longer in plan): "
+                    f"{', '.join(report['dropped_stale_cursor_models'])}"
+                )
+        for src, err in errors.items():
+            print(f"[{src}] skipped: {err}")
 
-    if args.write:
-        save_registry(merged, path)
+    if args.write and reports:
+        save_registry(registry, path)
+        for report in reports:
+            src = report.get("source") or report.get("adapter")
+            write_discovery_meta(src, report["discovered_count"], path)
         if not args.json:
             print(f"Wrote merged registry to {path}")
-    elif not args.json:
+    elif not args.json and reports:
         print("Dry run — pass --write to persist.")
-    return 0
+    return 0 if reports or not errors else 1
+
+
+class _DiscoverSourceError(RuntimeError):
+    pass
+
+
+def _discover_one_source(source: str, registry: list):
+    """Fetch + merge one catalog source; returns (registry, report, catalog)."""
+    if source == "cursor":
+        from puppetmaster.cursor_discovery import (
+            CursorDiscoveryError,
+            fetch_cursor_catalog,
+            merge_catalog_into_registry,
+        )
+
+        try:
+            catalog = fetch_cursor_catalog()
+        except CursorDiscoveryError as exc:
+            raise _DiscoverSourceError(str(exc)) from exc
+        merged, report = merge_catalog_into_registry(registry, catalog)
+        report["source"] = "cursor"
+        return merged, report, catalog
+
+    from puppetmaster.api_discovery import (
+        ApiDiscoveryError,
+        fetch_anthropic_models,
+        fetch_openai_models,
+        merge_api_catalog_into_registry,
+    )
+
+    try:
+        if source == "openai":
+            catalog = fetch_openai_models()
+            merged, report = merge_api_catalog_into_registry(
+                "openai", "api", registry, catalog
+            )
+        elif source == "anthropic":
+            catalog = fetch_anthropic_models()
+            merged, report = merge_api_catalog_into_registry(
+                "claude-code", "unknown", registry, catalog
+            )
+        else:
+            raise _DiscoverSourceError(f"unknown source: {source}")
+    except ApiDiscoveryError as exc:
+        raise _DiscoverSourceError(str(exc)) from exc
+    report["source"] = source
+    return merged, report, catalog
 
 
 def await_job_state(
@@ -1878,6 +1960,7 @@ def _run_preflight_command(args) -> int:
         args.adapter,
         args.model,
         allow_api_billing=not args.no_api_billing,
+        live=getattr(args, "live", False),
         catalog_fetcher=catalog_fetcher,
     )
 

@@ -10,6 +10,25 @@ from puppetmaster.models import AgentRun, Artifact, Task, TaskStatus, now_iso
 # auth/billing gate. ``local``/``shell`` run no model, so they're never gated.
 _PREFLIGHTABLE_ADAPTERS = {"cursor", "claude-code", "codex", "openai"}
 
+# Failure classes that are about *this adapter's account* (auth, billing,
+# quota, missing CLI/key, or a preflight block) rather than the task itself.
+# When a worker hits one of these, the right move is to fail the task
+# truthfully and re-route it to a different funded adapter — not to bury a
+# COMPLETE status over a doomed run, and not to nuke the whole job. The
+# orchestrator's auto-fallback loop keys off this set; the worker runtime
+# uses it to convert an adapter-detected billing/auth rejection into a
+# truthful FAILED task status.
+RECOVERABLE_FAILURES = frozenset(
+    {
+        "billing_or_quota",
+        "preflight_blocked",
+        "missing_api_key",
+        "missing_cli",
+        "auth",
+        "authentication",
+    }
+)
+
 
 @dataclass(frozen=True)
 class WorkerSpec:
@@ -115,10 +134,19 @@ class LocalWorker:
         from puppetmaster.preflight import preflight_check
 
         model = task.payload.get("model")
+        catalog_fetcher = None
+        if task.adapter == "cursor" and (
+            model or task.payload.get("live_preflight")
+        ):
+            from puppetmaster.cursor_discovery import fetch_cursor_catalog
+
+            catalog_fetcher = fetch_cursor_catalog
         result = preflight_check(
             task.adapter,
             model,
             allow_api_billing=bool(task.payload.get("allow_api_billing", True)),
+            live=bool(task.payload.get("live_preflight")),
+            catalog_fetcher=catalog_fetcher,
         )
         if result.ok:
             return None

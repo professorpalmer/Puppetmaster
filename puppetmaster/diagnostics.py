@@ -49,7 +49,50 @@ def run_doctor(root: Path, state_dir: Optional[Path] = None) -> list[Check]:
         _agent_rules_check(root),
     ]
     checks.extend(_billing_checks())
+    checks.append(_catalog_freshness_check())
     return checks
+
+
+def _catalog_freshness_check() -> Check:
+    """Nudge when a discovered model catalog is stale (or never refreshed).
+
+    Model catalogs drift — platforms add/retire models. ``models discover``
+    records when each source was last enumerated; this surfaces a gentle
+    reminder so routing doesn't quietly run against an out-of-date view."""
+    from puppetmaster.model_registry import (
+        catalog_staleness_days,
+        read_discovery_meta,
+    )
+
+    meta = read_discovery_meta()
+    if not meta:
+        return Check(
+            "catalog-freshness",
+            "optional",
+            "no catalog discovery recorded yet — run `puppetmaster models discover --write` "
+            "to enumerate plan-billed models and keep routing current.",
+        )
+    stale_threshold = 30.0
+    stale: list[str] = []
+    fresh: list[str] = []
+    for source in meta:
+        age = catalog_staleness_days(meta, source)
+        if age is None:
+            continue
+        label = f"{source} {age:.0f}d"
+        (stale if age > stale_threshold else fresh).append(label)
+    if stale:
+        return Check(
+            "catalog-freshness",
+            "warn",
+            f"catalog stale (>{stale_threshold:.0f}d): {', '.join(stale)}. "
+            "Re-run `puppetmaster models discover --write` to refresh.",
+        )
+    return Check(
+        "catalog-freshness",
+        "ok",
+        f"catalog fresh ({', '.join(fresh) or 'recently discovered'})",
+    )
 
 
 def _billing_checks() -> list[Check]:

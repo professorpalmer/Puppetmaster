@@ -78,7 +78,7 @@ class WorkerRuntime:
         )
         heartbeat.start()
         try:
-            _, artifacts = LocalWorker(task.role, worker_id=self.worker_id).run(
+            worker_run, artifacts = LocalWorker(task.role, worker_id=self.worker_id).run(
                 task,
                 self.store.get_job(self.job_id).goal,
             )
@@ -108,6 +108,35 @@ class WorkerRuntime:
             stop_heartbeats.set()
             heartbeat.join(timeout=1)
 
+        # Honor a FAILED verdict from the worker (e.g. a preflight block), and
+        # also convert an adapter-detected auth/billing/quota rejection that
+        # came back as a verification artifact into a truthful FAILED status.
+        # Without this the task would be recorded COMPLETE over a run that
+        # never produced real output — telemetry would lie, await would report
+        # success, and the orchestrator's auto-fallback could never re-route.
+        recoverable = self._recoverable_failure(artifacts)
+        if worker_run.status == TaskStatus.FAILED or recoverable is not None:
+            failed_run = replace(
+                run,
+                status=TaskStatus.FAILED,
+                heartbeat_at=now_iso(),
+                completed_at=now_iso(),
+            )
+            self.store.save_run(failed_run)
+            updated = self.store.update_task_status(task, TaskStatus.FAILED)
+            self.store.emit(
+                self.job_id,
+                "worker.failed_task",
+                {
+                    "worker_id": self.worker_id,
+                    "task_id": task.id,
+                    "role": self.role,
+                    "failure": recoverable,
+                },
+            )
+            self._emit_live_task_span(updated, artifacts)
+            return True
+
         completed_run = replace(
             run,
             status=TaskStatus.COMPLETE,
@@ -115,13 +144,54 @@ class WorkerRuntime:
             completed_at=now_iso(),
         )
         self.store.save_run(completed_run)
-        self.store.update_task_status(task, TaskStatus.COMPLETE)
+        updated = self.store.update_task_status(task, TaskStatus.COMPLETE)
         self.store.emit(
             self.job_id,
             "worker.completed_task",
             {"worker_id": self.worker_id, "task_id": task.id, "role": self.role},
         )
+        self._emit_live_task_span(updated, artifacts)
         return True
+
+    def _emit_live_task_span(self, task, artifacts: list) -> None:
+        """Emit a live OTel span for this finished task. No-op unless live
+        telemetry is enabled; never lets a telemetry failure break the run.
+
+        The parent trace context is read from the ``TRACEPARENT`` env var the
+        orchestrator exported to this subprocess, so the span correlates into
+        the job's trace across the process boundary."""
+        try:
+            from puppetmaster.telemetry import live_telemetry_enabled, record_task_span
+
+            if not live_telemetry_enabled():
+                return
+            traceparent = os.environ.get("PUPPETMASTER_TRACEPARENT") or os.environ.get(
+                "TRACEPARENT"
+            )
+            record_task_span(
+                self.store.get_job(self.job_id).goal,
+                task,
+                artifacts,
+                traceparent=traceparent,
+            )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _recoverable_failure(artifacts: list) -> Optional[str]:
+        """Return the first recoverable failure class found in ``artifacts``.
+
+        Recoverable = an auth/billing/quota/missing-tool rejection (see
+        :data:`puppetmaster.workers.RECOVERABLE_FAILURES`) that the
+        orchestrator can re-route to a different funded adapter.
+        """
+        from puppetmaster.workers import RECOVERABLE_FAILURES
+
+        for artifact in artifacts:
+            failure = (getattr(artifact, "payload", None) or {}).get("failure")
+            if failure in RECOVERABLE_FAILURES:
+                return str(failure)
+        return None
 
     def _heartbeat_until_stopped(
         self,

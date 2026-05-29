@@ -5680,6 +5680,445 @@ class TelemetryTests(unittest.TestCase):
         self.assertIn("gen_ai.system", spans[t_ok.id].attributes())
 
 
+class WorkerRuntimeFailureStatusTests(unittest.TestCase):
+    """The fix for the defect: a recoverable adapter failure (or a preflight
+    block) must record the task FAILED, not COMPLETE."""
+
+    def _store_job_task(self, tmp, adapter="claude-code"):
+        from puppetmaster.models import Task, TaskStatus
+        from puppetmaster.store import SwarmStore
+
+        store = SwarmStore(Path(tmp) / ".puppetmaster")
+        job = store.create_job("ship it")
+        store.update_job_status(job.id, __import__("puppetmaster.models", fromlist=["JobStatus"]).JobStatus.RUNNING)
+        task = Task(job_id=job.id, role="implement", instruction="do", adapter=adapter, status=TaskStatus.QUEUED)
+        store.save_task(task)
+        return store, job, task
+
+    def test_recoverable_artifact_marks_task_failed(self) -> None:
+        from unittest.mock import patch
+
+        from puppetmaster.models import AgentRun, Artifact, ArtifactType, TaskStatus
+        from puppetmaster.worker_runtime import WorkerRuntime
+
+        with TemporaryDirectory() as tmp:
+            store, job, task = self._store_job_task(tmp)
+
+            class _FakeWorker:
+                def __init__(self, role, worker_id=None):
+                    self.role = role
+
+                def run(self, t, goal):
+                    run = AgentRun(job_id=t.job_id, task_id=t.id, role=t.role, worker_id="w", status=TaskStatus.COMPLETE)
+                    art = Artifact(
+                        job_id=t.job_id, task_id=t.id, type=ArtifactType.VERIFICATION,
+                        created_by="w", payload={"check": "x", "result": "blocked", "failure": "billing_or_quota"},
+                        confidence=0.5, evidence=["adapter:claude-code"],
+                    )
+                    return run, [art]
+
+            runtime = WorkerRuntime(store=store, job_id=job.id, role="implement", worker_id="w")
+            with patch("puppetmaster.worker_runtime.LocalWorker", _FakeWorker):
+                runtime.run_once()
+            self.assertEqual(store.get_task_by_id(task.id).status, TaskStatus.FAILED)
+
+    def test_clean_run_marks_task_complete(self) -> None:
+        from unittest.mock import patch
+
+        from puppetmaster.models import AgentRun, Artifact, ArtifactType, TaskStatus
+        from puppetmaster.worker_runtime import WorkerRuntime
+
+        with TemporaryDirectory() as tmp:
+            store, job, task = self._store_job_task(tmp, adapter="local")
+
+            class _FakeWorker:
+                def __init__(self, role, worker_id=None):
+                    self.role = role
+
+                def run(self, t, goal):
+                    run = AgentRun(job_id=t.job_id, task_id=t.id, role=t.role, worker_id="w", status=TaskStatus.COMPLETE)
+                    art = Artifact(
+                        job_id=t.job_id, task_id=t.id, type=ArtifactType.FINDING,
+                        created_by="w", payload={"claim": "did it"}, confidence=0.9, evidence=["adapter:local"],
+                    )
+                    return run, [art]
+
+            runtime = WorkerRuntime(store=store, job_id=job.id, role="implement", worker_id="w")
+            with patch("puppetmaster.worker_runtime.LocalWorker", _FakeWorker):
+                runtime.run_once()
+            self.assertEqual(store.get_task_by_id(task.id).status, TaskStatus.COMPLETE)
+
+
+class AutoFallbackTests(unittest.TestCase):
+    def _setup(self, tmp):
+        from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
+        from puppetmaster.store import SwarmStore
+
+        store = SwarmStore(Path(tmp) / ".puppetmaster")
+        job = store.create_job("fix the bug")
+        task = Task(
+            job_id=job.id, role="implement", instruction="implement the fix",
+            adapter="claude-code", status=TaskStatus.FAILED,
+            payload={"auto_route": True, "model": "claude-opus-4-8"},
+        )
+        store.save_task(task)
+        store.save_artifact(Artifact(
+            job_id=job.id, task_id=task.id, type=ArtifactType.VERIFICATION, created_by="w",
+            payload={"check": "x", "result": "blocked", "failure": "billing_or_quota"},
+            confidence=0.5, evidence=["adapter:claude-code"],
+        ))
+        return store, job, task
+
+    def test_reroutes_to_funded_alternate_adapter(self) -> None:
+        from unittest.mock import patch
+
+        from puppetmaster.model_registry import ModelSpec
+        from puppetmaster.models import TaskStatus
+        from puppetmaster.orchestrator import Orchestrator
+        from puppetmaster.platform_billing import BillingStatus
+
+        registry = [
+            ModelSpec(id="claude-code/opus-4-8", adapter="claude-code", adapter_model_name="claude-opus-4-8", capability_score=99, input_per_mtok_usd=5, output_per_mtok_usd=25, billing="unknown"),
+            ModelSpec(id="cursor/gpt-5-5", adapter="cursor", adapter_model_name="gpt-5.5", capability_score=90, billing="plan", tags=["cursor"]),
+        ]
+
+        def _billing(adapter, **kw):
+            if adapter == "cursor":
+                return BillingStatus(adapter="cursor", billing="plan", healthy=True, detail="ok", evidence=[])
+            return BillingStatus(adapter=adapter, billing="unknown", healthy=False, detail="no", evidence=[])
+
+        with TemporaryDirectory() as tmp:
+            store, job, task = self._setup(tmp)
+            orch = Orchestrator(store)
+            with patch("puppetmaster.model_registry.load_registry", return_value=registry), \
+                 patch("puppetmaster.platform_billing.detect_adapter_billing", side_effect=_billing):
+                rerouted = orch._reroute_recoverable_failures(job)
+            self.assertEqual(rerouted, 1)
+            updated = store.get_task_by_id(task.id)
+            self.assertEqual(updated.status, TaskStatus.QUEUED)
+            self.assertEqual(updated.adapter, "cursor")
+            self.assertEqual(updated.payload["fallback_attempts"], 1)
+            self.assertEqual(updated.payload["fallback_from_adapter"], "claude-code")
+
+    def test_no_funded_alternate_means_no_reroute(self) -> None:
+        from unittest.mock import patch
+
+        from puppetmaster.model_registry import ModelSpec
+        from puppetmaster.orchestrator import Orchestrator
+        from puppetmaster.platform_billing import BillingStatus
+
+        registry = [
+            ModelSpec(id="claude-code/opus-4-8", adapter="claude-code", adapter_model_name="claude-opus-4-8", capability_score=99, billing="unknown"),
+        ]
+
+        def _billing(adapter, **kw):
+            return BillingStatus(adapter=adapter, billing="unknown", healthy=False, detail="no", evidence=[])
+
+        with TemporaryDirectory() as tmp:
+            store, job, task = self._setup(tmp)
+            orch = Orchestrator(store)
+            with patch("puppetmaster.model_registry.load_registry", return_value=registry), \
+                 patch("puppetmaster.platform_billing.detect_adapter_billing", side_effect=_billing):
+                rerouted = orch._reroute_recoverable_failures(job)
+            self.assertEqual(rerouted, 0)
+
+    def test_hard_failure_vs_recoverable_classification(self) -> None:
+        from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
+        from puppetmaster.orchestrator import Orchestrator
+        from puppetmaster.store import SwarmStore
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("g")
+            hard = Task(job_id=job.id, role="a", instruction="x", adapter="missing", status=TaskStatus.FAILED)
+            soft = Task(job_id=job.id, role="b", instruction="y", adapter="claude-code", status=TaskStatus.FAILED)
+            store.save_task(hard)
+            store.save_task(soft)
+            store.save_artifact(Artifact(
+                job_id=job.id, task_id=soft.id, type=ArtifactType.VERIFICATION, created_by="w",
+                payload={"check": "x", "result": "blocked", "failure": "billing_or_quota"},
+                confidence=0.5, evidence=["a"],
+            ))
+            orch = Orchestrator(store)
+            allowed = {hard.id, soft.id}
+            self.assertTrue(orch._has_hard_failure(job, allowed))  # hard task is non-recoverable
+            self.assertTrue(orch._should_fail_closed(job, allowed))
+
+            # With only the soft (recoverable) task, neither should fail closed.
+            store.update_task_status(hard, TaskStatus.COMPLETE)
+            self.assertFalse(orch._has_hard_failure(job, allowed))
+            self.assertFalse(orch._should_fail_closed(job, allowed))
+
+
+class LiveProbeTests(unittest.TestCase):
+    def test_classify_billing_and_auth_and_ok(self) -> None:
+        from puppetmaster.preflight import classify_live_probe
+
+        self.assertEqual(classify_live_probe("claude-code", 1, "Credit balance is too low"), "billing_or_quota")
+        # Codex's own classifier returns a richer auth class; just confirm a
+        # failure is detected (not a clean pass) for a not-logged-in probe.
+        self.assertIsNotNone(classify_live_probe("codex", 0, "You are not logged in"))
+        # An adapter with no specific classifier falls back to the auth marker.
+        self.assertEqual(classify_live_probe("cursor", 0, "unauthorized"), "auth")
+        self.assertIsNone(classify_live_probe("openai", 0, "ok"))
+
+    def test_live_probe_with_injected_prober(self) -> None:
+        from puppetmaster.preflight import live_probe
+
+        bad = live_probe("claude-code", "claude-opus-4-8", prober=lambda a, m: (1, "", "credit balance is too low"))
+        self.assertFalse(bad.ok)
+        self.assertIn("live_probe:billing_or_quota", bad.evidence)
+
+        good = live_probe("claude-code", "claude-opus-4-8", prober=lambda a, m: (0, "ok", ""))
+        self.assertTrue(good.ok)
+
+    def test_live_probe_unrunnable_does_not_block(self) -> None:
+        """A probe that can't reach a verdict (missing CLI / timeout) must not
+        block a dispatch the static checks already cleared."""
+        from puppetmaster.preflight import live_probe
+
+        missing_cli = live_probe(
+            "claude-code", "claude-opus-4-8",
+            prober=lambda a, m: (127, "", "command not found"),
+        )
+        self.assertTrue(missing_cli.ok)
+        self.assertIn("live_probe:skipped_unverified", missing_cli.evidence)
+
+        timed_out = live_probe(
+            "codex", "gpt-5.5",
+            prober=lambda a, m: (124, "", "live probe timed out"),
+        )
+        self.assertTrue(timed_out.ok)
+        self.assertIn("live_probe:skipped_unverified", timed_out.evidence)
+
+    def test_live_probe_cursor_uses_catalog(self) -> None:
+        from puppetmaster.preflight import live_probe
+
+        catalog = [{"id": "gpt-5.5"}]
+        ok = live_probe("cursor", "gpt-5.5", catalog_fetcher=lambda: catalog)
+        self.assertTrue(ok.ok)
+        missing = live_probe("cursor", "nope", catalog_fetcher=lambda: catalog)
+        self.assertFalse(missing.ok)
+
+    def test_preflight_check_live_blocks_on_billing(self) -> None:
+        from puppetmaster.platform_billing import BillingStatus
+        from puppetmaster.preflight import preflight_check
+
+        healthy = BillingStatus(adapter="claude-code", billing="plan", healthy=True, detail="oauth", evidence=["claude_oauth:present"])
+        result = preflight_check(
+            "claude-code", "claude-opus-4-8",
+            live=True,
+            prober=lambda a, m: (1, "", "credit balance is too low"),
+            billing_status=healthy,
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("live_probe:billing_or_quota", result.evidence)
+
+    def test_probe_openai_uses_max_completion_tokens(self) -> None:
+        """Regression: GPT-5+ rejects the legacy ``max_tokens`` parameter with a
+        400 on a *funded* account; the probe must send ``max_completion_tokens``
+        so it doesn't falsely block a working key."""
+        import io
+        import json as _json
+        import urllib.request
+        from puppetmaster import preflight
+
+        sent_bodies = []
+
+        class _Resp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(request, timeout=None):
+            sent_bodies.append(_json.loads(request.data.decode("utf-8")))
+            return _Resp(b'{"choices":[{"message":{"content":"ok"}}]}')
+
+        original = urllib.request.urlopen
+        urllib.request.urlopen = fake_urlopen
+        try:
+            rc, out, err = preflight._probe_openai(None, {"OPENAI_API_KEY": "k"})
+        finally:
+            urllib.request.urlopen = original
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(sent_bodies), 1)
+        self.assertIn("max_completion_tokens", sent_bodies[0])
+        self.assertNotIn("max_tokens", sent_bodies[0])
+
+    def test_probe_openai_falls_back_to_legacy_max_tokens(self) -> None:
+        """OpenAI-compatible endpoints that predate the rename reject
+        ``max_completion_tokens``; the probe then retries with ``max_tokens``."""
+        import io
+        import json as _json
+        import urllib.error
+        import urllib.request
+        from puppetmaster import preflight
+
+        sent_params = []
+
+        class _Resp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(request, timeout=None):
+            body = _json.loads(request.data.decode("utf-8"))
+            if "max_completion_tokens" in body:
+                sent_params.append("max_completion_tokens")
+                err_body = io.BytesIO(
+                    b'{"error":{"code":"unsupported_parameter",'
+                    b'"message":"max_completion_tokens not supported"}}'
+                )
+                raise urllib.error.HTTPError(
+                    "url", 400, "Bad Request", {}, err_body
+                )
+            sent_params.append("max_tokens")
+            return _Resp(b'{"choices":[]}')
+
+        original = urllib.request.urlopen
+        urllib.request.urlopen = fake_urlopen
+        try:
+            rc, out, err = preflight._probe_openai(None, {"OPENAI_API_KEY": "k"})
+        finally:
+            urllib.request.urlopen = original
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(sent_params, ["max_completion_tokens", "max_tokens"])
+
+
+class ApiDiscoveryTests(unittest.TestCase):
+    def test_fetch_openai_models_parses_data(self) -> None:
+        import json as _json
+
+        from puppetmaster.api_discovery import fetch_openai_models
+
+        body = _json.dumps({"data": [{"id": "gpt-5.5"}, {"id": "gpt-5.4-mini"}, {"bad": 1}]})
+        catalog = fetch_openai_models(env={"OPENAI_API_KEY": "k"}, getter=lambda u, h: (200, body))
+        self.assertEqual([m["id"] for m in catalog], ["gpt-5.5", "gpt-5.4-mini"])
+
+    def test_fetch_requires_key(self) -> None:
+        from puppetmaster.api_discovery import ApiDiscoveryError, fetch_anthropic_models
+
+        with self.assertRaises(ApiDiscoveryError):
+            fetch_anthropic_models(env={})
+
+    def test_catalog_to_specs_inherits_and_seeds(self) -> None:
+        from puppetmaster.api_discovery import catalog_to_specs
+        from puppetmaster.model_registry import ModelSpec
+
+        existing = [
+            ModelSpec(id="openai/gpt-5-5", adapter="openai", adapter_model_name="gpt-5.5", capability_score=96, input_per_mtok_usd=5, output_per_mtok_usd=30, billing="api"),
+        ]
+        catalog = [{"id": "gpt-5.5"}, {"id": "gpt-7-future"}]
+        specs = catalog_to_specs("openai", "api", catalog, existing)
+        by_name = {s.adapter_model_name: s for s in specs}
+        self.assertEqual(by_name["gpt-5.5"].capability_score, 96)  # overlay
+        self.assertEqual(by_name["gpt-7-future"].capability_score, 60)  # seed
+        self.assertEqual(by_name["gpt-7-future"].billing, "api")
+        self.assertIn("discovered", by_name["gpt-5.5"].tags)
+
+    def test_merge_adds_without_dropping(self) -> None:
+        from puppetmaster.api_discovery import merge_api_catalog_into_registry
+        from puppetmaster.model_registry import ModelSpec
+
+        existing = [
+            ModelSpec(id="openai/legacy", adapter="openai", adapter_model_name="gpt-old", capability_score=40, billing="api"),
+            ModelSpec(id="cursor/x", adapter="cursor", adapter_model_name="composer-2.5", capability_score=55, billing="plan"),
+        ]
+        merged, report = merge_api_catalog_into_registry("openai", "api", existing, [{"id": "gpt-5.5"}])
+        names = {(s.adapter, s.adapter_model_name) for s in merged}
+        self.assertIn(("openai", "gpt-old"), names)  # not dropped
+        self.assertIn(("openai", "gpt-5.5"), names)  # added
+        self.assertIn(("cursor", "composer-2.5"), names)  # preserved
+        self.assertIn("gpt-5.5", report["added"])
+
+
+class CatalogStalenessTests(unittest.TestCase):
+    def test_write_read_and_staleness(self) -> None:
+        from datetime import datetime, timezone
+
+        from puppetmaster.model_registry import (
+            catalog_staleness_days,
+            read_discovery_meta,
+            write_discovery_meta,
+        )
+
+        with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "models.json"
+            write_discovery_meta("cursor", 7, registry_path, now_iso="2026-05-01T00:00:00Z")
+            meta = read_discovery_meta(registry_path)
+            self.assertEqual(meta["cursor"]["count"], 7)
+            now = datetime(2026, 6, 10, tzinfo=timezone.utc)  # ~40 days later
+            age = catalog_staleness_days(meta, "cursor", now=now)
+            self.assertGreater(age, 30)
+            self.assertIsNone(catalog_staleness_days(meta, "openai"))
+
+
+class TelemetryContextAndMetricsTests(unittest.TestCase):
+    def test_traceparent_roundtrip(self) -> None:
+        import re
+
+        from puppetmaster.telemetry import new_traceparent, parse_traceparent
+
+        tp = new_traceparent()
+        self.assertRegex(tp, r"^00-[0-9a-f]{32}-[0-9a-f]{16}-01$")
+        parsed = parse_traceparent(tp)
+        self.assertIsNotNone(parsed)
+        self.assertIsNone(parse_traceparent("garbage"))
+        self.assertIsNone(parse_traceparent(None))
+
+    def test_live_telemetry_enabled_logic(self) -> None:
+        from puppetmaster.telemetry import live_telemetry_enabled
+
+        self.assertFalse(live_telemetry_enabled({"PUPPETMASTER_OTEL_LIVE": "true"}))  # tracing off
+        self.assertTrue(
+            live_telemetry_enabled(
+                {"PUPPETMASTER_OTEL_ENABLED": "true", "PUPPETMASTER_OTEL_LIVE": "true"}
+            )
+        )
+        self.assertFalse(live_telemetry_enabled({"PUPPETMASTER_OTEL_ENABLED": "true"}))
+
+    def test_build_job_metrics(self) -> None:
+        from puppetmaster.models import Job, Task, TaskStatus
+        from puppetmaster.telemetry import build_job_metrics, build_job_trace
+
+        job = Job(goal="g")
+        tasks = [
+            Task(job_id=job.id, role="a", instruction="x", adapter="cursor", status=TaskStatus.COMPLETE),
+            Task(job_id=job.id, role="b", instruction="y", adapter="claude-code", status=TaskStatus.FAILED),
+        ]
+        metrics = build_job_metrics(build_job_trace(job, tasks, []))
+        self.assertEqual(metrics["jobs"], 1)
+        self.assertEqual(metrics["tasks"], 2)
+        self.assertIn(str(TaskStatus.COMPLETE), metrics["tasks_by_status"])
+
+    def test_build_task_span(self) -> None:
+        from puppetmaster.models import Job, Task, TaskStatus
+        from puppetmaster.telemetry import build_task_span
+
+        job = Job(goal="g")
+        task = Task(
+            job_id=job.id, role="implement", instruction="x", adapter="cursor",
+            status=TaskStatus.COMPLETE, payload={"router_model_id": "cursor/gpt-5-5"},
+        )
+        span = build_task_span(task, [])
+        self.assertEqual(span.model, "cursor/gpt-5-5")
+        self.assertEqual(span.role, "implement")
+
+    def test_record_job_trace_with_traceparent_noop_when_disabled(self) -> None:
+        from puppetmaster.models import Job
+        from puppetmaster.telemetry import record_job_trace
+
+        self.assertFalse(
+            record_job_trace(Job(goal="g"), [], [], env={}, traceparent="00-" + "a" * 32 + "-" + "b" * 16 + "-01")
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
 
