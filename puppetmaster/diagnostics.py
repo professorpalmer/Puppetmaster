@@ -71,7 +71,29 @@ def run_doctor(root: Path, state_dir: Optional[Path] = None) -> list[Check]:
     ]
     checks.extend(_guard_many(_billing_checks))
     checks.append(_guard("catalog-freshness", _catalog_freshness_check))
+    checks.append(_guard("platform-lock", _platform_lock_check))
     return checks
+
+
+def _platform_lock_check() -> Check:
+    """Report whether a platform lock is narrowing the adapter set.
+
+    When active, only the listed platforms can be routed to, auto-discovered,
+    or used for fallback — a disabled platform can never run, even if its CLI
+    is installed and funded. Off by default (every platform enabled)."""
+    from puppetmaster import platform_lock as pl
+
+    enabled = pl.enabled_adapters()
+    if not pl.is_restricted():
+        return Check("platform-lock", "ok", "off — all platforms enabled")
+    disabled = sorted(set(pl.KNOWN_ADAPTERS) - enabled)
+    detail = (
+        f"active — only {', '.join(sorted(enabled)) or '(none)'} "
+        f"(disabled: {', '.join(disabled) or 'none'})"
+    )
+    if (os.environ.get(pl.ONLY_ENV) or "").strip():
+        detail += f"; via ${pl.ONLY_ENV}"
+    return Check("platform-lock", "ok", detail)
 
 
 def _catalog_freshness_check() -> Check:

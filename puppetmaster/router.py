@@ -53,6 +53,11 @@ class TaskSignals:
     # to spend on api-billed models at all (plan-only).
     prefer_plan_billed: bool = True
     allow_api_billing: bool = True
+    # Platform lock: when set, only models whose adapter is in this set are
+    # eligible. ``None`` means "no restriction" (every adapter allowed), which
+    # is the default for unlocked users. Populated from ``platform_lock`` by
+    # the signal builders so the restriction applies everywhere routing runs.
+    allowed_adapters: Optional[frozenset[str]] = None
 
 
 # ----- Classifier ----------------------------------------------------------
@@ -313,6 +318,29 @@ def route_task(
 
     rejected: list[tuple[ModelSpec, str]] = []
 
+    # Platform lock first: a disabled platform must never be selected, so drop
+    # its models before any other consideration with a clear reason.
+    if task.allowed_adapters is not None:
+        after_platform: list[ModelSpec] = []
+        for spec in candidates:
+            if spec.adapter in task.allowed_adapters:
+                after_platform.append(spec)
+            else:
+                rejected.append(
+                    (
+                        spec,
+                        f"adapter {spec.adapter!r} not in platform lock "
+                        f"{sorted(task.allowed_adapters)}",
+                    )
+                )
+        if not after_platform:
+            raise NoEligibleModelError(
+                "No model in registry uses an enabled platform "
+                f"{sorted(task.allowed_adapters)}. Adjust with "
+                "`puppetmaster platform enable <adapter>`."
+            )
+        candidates = after_platform
+
     # Tag filter first — cheap to evaluate, gives a clean reason on rejection.
     after_tags: list[ModelSpec] = []
     for spec in candidates:
@@ -552,6 +580,16 @@ def signals_from_worker_spec(spec, *, instruction_override: Optional[str] = None
     for value in payload.values():
         if isinstance(value, str):
             payload_str += value
+
+    # A per-task override wins; otherwise inherit the user's platform lock.
+    allowed = payload.get("allowed_adapters")
+    if allowed is not None:
+        allowed_adapters: Optional[frozenset[str]] = frozenset(allowed)
+    else:
+        from puppetmaster.platform_lock import active_allowlist
+
+        allowed_adapters = active_allowlist()
+
     return TaskSignals(
         instruction=instruction,
         role=getattr(spec, "role", "explore") or "explore",
@@ -563,4 +601,5 @@ def signals_from_worker_spec(spec, *, instruction_override: Optional[str] = None
         estimated_tokens_out=payload.get("estimated_tokens_out"),
         prefer_plan_billed=bool(payload.get("prefer_plan_billed", True)),
         allow_api_billing=bool(payload.get("allow_api_billing", True)),
+        allowed_adapters=allowed_adapters,
     )

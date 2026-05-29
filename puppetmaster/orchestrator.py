@@ -154,32 +154,44 @@ class Orchestrator:
             return
         if not any((s.payload or {}).get("auto_route") for s in specs):
             return
-        try:
-            from puppetmaster.cursor_discovery import ensure_cursor_plan_catalog
-            from puppetmaster.model_registry import default_registry_path
 
-            override = next(
-                (
-                    (s.payload or {}).get("registry_path")
-                    for s in specs
-                    if (s.payload or {}).get("registry_path")
-                ),
-                None,
-            )
-            registry_path = (
-                Path(str(override)).expanduser() if override else default_registry_path()
-            )
-            report = ensure_cursor_plan_catalog(registry_path)
-        except Exception as exc:
-            report = {"action": "unavailable", "error": str(exc)}
+        from puppetmaster.model_registry import default_registry_path
+        from puppetmaster.platform_lock import is_adapter_enabled
 
-        self._emit_plan_catalog_event(job, report, "Cursor plan", "cursor")
+        override = next(
+            (
+                (s.payload or {}).get("registry_path")
+                for s in specs
+                if (s.payload or {}).get("registry_path")
+            ),
+            None,
+        )
+        registry_path = (
+            Path(str(override)).expanduser() if override else default_registry_path()
+        )
 
-        # If Cursor didn't supply a plan frontier (no Cursor plan, or it's not
-        # authenticated), fall back to the curated subscription catalogs so
-        # Claude Code (OAuth) / Codex (ChatGPT) users still get plan-first
-        # routing. This self-skips if Cursor already produced a frontier.
-        if report.get("action") != "discovered":
+        # Respect the platform lock: only discover catalogs for enabled
+        # platforms so a disabled adapter is never auto-added behind the
+        # user's back. The lock is a global per-user setting, so it is read
+        # from its canonical location regardless of any per-job registry
+        # override (keeping it consistent with routing + fallback).
+        report: dict = {"action": "skipped"}
+        if is_adapter_enabled("cursor"):
+            try:
+                from puppetmaster.cursor_discovery import ensure_cursor_plan_catalog
+
+                report = ensure_cursor_plan_catalog(registry_path)
+            except Exception as exc:
+                report = {"action": "unavailable", "error": str(exc)}
+            self._emit_plan_catalog_event(job, report, "Cursor plan", "cursor")
+
+        # If Cursor didn't supply a plan frontier (no Cursor plan, it's not
+        # authenticated, or it's disabled), fall back to the curated
+        # subscription catalogs so Claude Code (OAuth) / Codex (ChatGPT) users
+        # still get plan-first routing — but only for enabled platforms.
+        if report.get("action") != "discovered" and (
+            is_adapter_enabled("claude-code") or is_adapter_enabled("codex")
+        ):
             try:
                 from puppetmaster.static_catalog import (
                     ensure_subscription_plan_catalog,
@@ -328,6 +340,8 @@ class Orchestrator:
                     billing_cache[adapter] = None
             return billing_cache[adapter]
 
+        from puppetmaster.platform_lock import is_adapter_enabled
+
         rerouted = 0
         for task in failed:
             failed_adapter = task.adapter
@@ -335,6 +349,9 @@ class Orchestrator:
             candidates = []
             for spec in registry:
                 if spec.adapter == failed_adapter:
+                    continue
+                if not is_adapter_enabled(spec.adapter):
+                    # Platform lock: never fall back onto a disabled platform.
                     continue
                 status = _funded(spec.adapter)
                 if status is None or not getattr(status, "healthy", False):
