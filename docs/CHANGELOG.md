@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Security & threat model doc** ([docs/SECURITY.md](SECURITY.md)). The "is it safe to hand it my repo and my plan?" answer a skeptical first user looks for before installing: what Puppetmaster can do (spawn agent subprocesses, edit files, run shell, read local auth), how credentials are handled (uses existing auth; keys never inlined/stored — evidence records presence like `cursor_api_key:set`, never values), the exact edit-permission/sandbox model per adapter with dirty-tree guards, the complete network-egress list (only the providers your workers use; telemetry off by default; no phone-home/analytics), data-at-rest (local SQLite only), hardening recommendations, and honest limitations (it orchestrates autonomous agents — auditable and reversible, not risk-free; no independent audit yet). Linked from both indexes.
 - **Launch packaging: positioning + a self-healing hero.** Added [docs/COMPARISON.md](COMPARISON.md) — an honest, calibrated side-by-side answering "why this over LangGraph / CrewAI / Claude Agent SDK / native subagents," with an explicit "pick X instead if…" section (Puppetmaster orchestrates the agent CLIs you already pay for; it isn't a framework for authoring an agent from primitives). Rebuilt the README hero around **two receipts** — 💸 cheaper (98.8% live OpenAI A/B) and 🔁 self-healing (the live `job_d82715bebc5d` auto-fallback: a `$0` Claude balance → rerouted to `cursor/gpt-5.5` → completed) — so the differentiated, shareable moment is above the fold. Docs index updated; all internal links verified.
 
 ## v0.9.1
