@@ -442,9 +442,20 @@ class SwarmStore:
         results: list[dict[str, Any]] = []
         with stream.open("r", encoding="utf-8") as handle:
             for index, line in enumerate(handle, start=1):
-                if index <= since or not line.strip():
+                if index <= since:
                     continue
-                record = json.loads(line)
+                cleaned = line.strip().strip("\x00")
+                if not cleaned:
+                    continue
+                try:
+                    record = json.loads(cleaned)
+                except json.JSONDecodeError:
+                    # Torn/partial line from a concurrent append. POSIX
+                    # O_APPEND writes are atomic, but Windows appends are
+                    # not, so two workers writing at once can interleave a
+                    # malformed line. Skip it rather than crash the reader;
+                    # the well-formed events around it are still returned.
+                    continue
                 record["id"] = index
                 results.append(record)
         return results
