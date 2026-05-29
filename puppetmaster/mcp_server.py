@@ -1519,6 +1519,8 @@ def run_route_task(args: JsonObject) -> JsonObject:
         )
         return {"content": [{"type": "text", "text": msg}], "isError": True}
 
+    from puppetmaster.platform_lock import active_allowlist
+
     signals = TaskSignals(
         instruction=instruction,
         role=role,
@@ -1529,6 +1531,7 @@ def run_route_task(args: JsonObject) -> JsonObject:
             float(args["max_cost_usd"]) if "max_cost_usd" in args and args["max_cost_usd"] is not None else None
         ),
         required_tags=list(args.get("required_tags") or []),
+        allowed_adapters=active_allowlist(),
     )
 
     try:

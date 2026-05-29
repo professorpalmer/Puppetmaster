@@ -51,6 +51,20 @@ python -m puppetmaster models list                            # show registered 
 python -m puppetmaster models path                            # print resolved registry path
 ```
 
+## Platform lock (restrict which platforms get used)
+
+```bash
+python -m puppetmaster platform status                        # show each platform on/off
+python -m puppetmaster platform only cursor                   # lock to Cursor only (single-platform mode)
+python -m puppetmaster platform enable claude-code codex      # turn platforms back on
+python -m puppetmaster platform disable openai                # turn a platform off
+python -m puppetmaster platform reset                         # clear the lock (all platforms on)
+# ephemeral / CI override (wins over saved config):
+PUPPETMASTER_ONLY_ADAPTERS=cursor python -m puppetmaster route "audit" --role audit
+```
+
+A disabled platform is never routed to, auto-discovered, or used for fallback. Default is everything-on. Lock state persists in `~/.puppetmaster/platform.json`.
+
 ## Inspection (read-only, auto-pivots across workspaces v0.5.4+)
 
 ```bash

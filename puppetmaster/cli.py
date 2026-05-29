@@ -720,6 +720,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     models_discover.add_argument("--json", action="store_true", help="Emit JSON.")
 
+    platform_cmd = subcommands.add_parser(
+        "platform",
+        help=(
+            "Restrict which platforms (adapters) Puppetmaster may use. Lock to "
+            "the one plan you pay for, or toggle several on to bounce tiers."
+        ),
+    )
+    platform_sub = platform_cmd.add_subparsers(dest="platform_command", required=True)
+    platform_status = platform_sub.add_parser(
+        "status", help="Show which platforms are enabled or disabled."
+    )
+    platform_status.add_argument("--registry-path", help="Override the registry path.")
+    platform_status.add_argument("--json", action="store_true", help="Emit JSON.")
+    platform_only = platform_sub.add_parser(
+        "only", help="Enable exactly these platforms; disable all others."
+    )
+    platform_only.add_argument("adapters", nargs="+", help="cursor, claude-code, codex, openai")
+    platform_only.add_argument("--registry-path", help="Override the registry path.")
+    platform_enable = platform_sub.add_parser(
+        "enable", help="Turn these platforms back on."
+    )
+    platform_enable.add_argument("adapters", nargs="+", help="cursor, claude-code, codex, openai")
+    platform_enable.add_argument("--registry-path", help="Override the registry path.")
+    platform_disable = platform_sub.add_parser(
+        "disable", help="Turn these platforms off (never routed or discovered)."
+    )
+    platform_disable.add_argument("adapters", nargs="+", help="cursor, claude-code, codex, openai")
+    platform_disable.add_argument("--registry-path", help="Override the registry path.")
+    platform_reset = platform_sub.add_parser(
+        "reset", help="Clear the lock; enable every platform again."
+    )
+    platform_reset.add_argument("--registry-path", help="Override the registry path.")
+
     preflight_cmd = subcommands.add_parser(
         "preflight",
         help=(
@@ -916,6 +949,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
 
     if args.command == "models":
         return _run_models_subcommand(args)
+
+    if args.command == "platform":
+        return _run_platform_subcommand(args)
 
     if args.command == "route":
         return _run_route_command(args)
@@ -1713,6 +1749,81 @@ def _registry_path_from_args(args) -> Optional[Path]:
     return Path(raw).expanduser() if raw else None
 
 
+def _run_platform_subcommand(args) -> int:
+    """Dispatch `python -m puppetmaster platform ...`.
+
+    The platform lock decides which adapters (cursor, claude-code, codex,
+    openai) Puppetmaster may route to, auto-discover, or fall back onto. It is
+    persisted next to the model registry; an empty lock means everything is on.
+    """
+    import json as _json
+
+    from puppetmaster import platform_lock as pl
+
+    path = _registry_path_from_args(args)
+    sub = args.platform_command
+
+    def _normalize(raw_adapters) -> tuple[set[str], list[str]]:
+        wanted = {a.strip() for a in raw_adapters if a.strip()}
+        unknown = sorted(a for a in wanted if a not in pl.KNOWN_ADAPTERS)
+        return {a for a in wanted if a in pl.KNOWN_ADAPTERS}, unknown
+
+    if sub in ("only", "enable", "disable"):
+        valid, unknown = _normalize(args.adapters)
+        if unknown:
+            print(
+                f"error: unknown platform(s): {', '.join(unknown)}. "
+                f"Known: {', '.join(pl.KNOWN_ADAPTERS)}.",
+                file=sys.stderr,
+            )
+            return 1
+        if not valid:
+            print("error: name at least one known platform.", file=sys.stderr)
+            return 1
+        if sub == "only":
+            pl.set_enabled(valid, path)
+        elif sub == "enable":
+            pl.enable(valid, path)
+        else:
+            pl.disable(valid, path)
+        # Fall through to status so the user always sees the resulting state.
+    elif sub == "reset":
+        pl.reset(path)
+
+    enabled = pl.enabled_adapters(path)
+    restricted = pl.is_restricted(path)
+    env_override = bool((os.environ.get(pl.ONLY_ENV) or "").strip())
+
+    if getattr(args, "json", False):
+        print(
+            _json.dumps(
+                {
+                    "enabled": sorted(enabled),
+                    "disabled": sorted(set(pl.KNOWN_ADAPTERS) - enabled),
+                    "restricted": restricted,
+                    "env_override": env_override,
+                    "config_path": str(pl.platform_config_path(path)),
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    if restricted:
+        print(f"Platform lock ACTIVE — only: {', '.join(sorted(enabled)) or '(none)'}")
+    else:
+        print("Platform lock: off (all platforms enabled)")
+    for adapter in pl.KNOWN_ADAPTERS:
+        mark = "on " if adapter in enabled else "off"
+        print(f"  [{mark}] {adapter}")
+    if env_override:
+        print(
+            f"note: ${pl.ONLY_ENV} is set and overrides the saved config "
+            "for this shell."
+        )
+    return 0
+
+
 def _run_models_subcommand(args) -> int:
     """Dispatch `python -m puppetmaster models ...`.
 
@@ -2061,12 +2172,15 @@ def _run_route_command(args) -> int:
         )
         return 1
 
+    from puppetmaster.platform_lock import active_allowlist
+
     signals = TaskSignals(
         instruction=args.instruction,
         role=args.role,
         explicit_min_capability=args.min_capability,
         explicit_max_cost_usd=args.max_cost_usd,
         required_tags=list(args.required_tag),
+        allowed_adapters=active_allowlist(),
     )
     try:
         decision = route_task(signals, specs, policy=args.policy)

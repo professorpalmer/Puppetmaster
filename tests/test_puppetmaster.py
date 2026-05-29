@@ -6708,6 +6708,152 @@ class TelemetryContextAndMetricsTests(unittest.TestCase):
         )
 
 
+class PlatformLockTests(unittest.TestCase):
+    """The platform lock restricts which adapters Puppetmaster may use,
+    enforced at routing, auto-discovery, and auto-fallback."""
+
+    def _path(self, tmp: str) -> Path:
+        return Path(tmp) / "models.json"
+
+    def test_default_is_unrestricted(self) -> None:
+        from puppetmaster import platform_lock as pl
+
+        with TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(pl.ONLY_ENV, None)
+            p = self._path(tmp)
+            self.assertEqual(pl.enabled_adapters(p), set(pl.KNOWN_ADAPTERS))
+            self.assertFalse(pl.is_restricted(p))
+            self.assertIsNone(pl.active_allowlist(p))
+
+    def test_only_enable_disable_reset_roundtrip(self) -> None:
+        from puppetmaster import platform_lock as pl
+
+        with TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(pl.ONLY_ENV, None)
+            p = self._path(tmp)
+            pl.set_enabled({"cursor"}, p)
+            self.assertEqual(pl.enabled_adapters(p), {"cursor"})
+            self.assertTrue(pl.is_restricted(p))
+            self.assertEqual(pl.active_allowlist(p), frozenset({"cursor"}))
+
+            pl.enable({"codex"}, p)
+            self.assertEqual(pl.enabled_adapters(p), {"cursor", "codex"})
+
+            pl.disable({"cursor"}, p)
+            self.assertEqual(pl.enabled_adapters(p), {"codex"})
+
+            pl.reset(p)
+            self.assertEqual(pl.enabled_adapters(p), set(pl.KNOWN_ADAPTERS))
+            self.assertFalse(pl.is_restricted(p))
+
+    def test_env_override_wins_over_file(self) -> None:
+        from puppetmaster import platform_lock as pl
+
+        with TemporaryDirectory() as tmp:
+            p = self._path(tmp)
+            pl.set_enabled({"codex"}, p)  # file says codex only
+            with patch.dict(os.environ, {pl.ONLY_ENV: "cursor,openai"}):
+                self.assertEqual(pl.enabled_adapters(p), {"cursor", "openai"})
+                self.assertEqual(pl.active_allowlist(p), frozenset({"cursor", "openai"}))
+
+    def test_unknown_adapter_never_blocked(self) -> None:
+        from puppetmaster import platform_lock as pl
+
+        with TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(pl.ONLY_ENV, None)
+            p = self._path(tmp)
+            pl.set_enabled({"cursor"}, p)
+            # shell / internal adapters are not platform-billed → always allowed.
+            self.assertTrue(pl.is_adapter_enabled("shell", p))
+            self.assertFalse(pl.is_adapter_enabled("codex", p))
+            self.assertTrue(pl.is_adapter_enabled("cursor", p))
+
+    def test_route_task_rejects_disabled_adapter(self) -> None:
+        from puppetmaster.model_registry import starter_registry
+        from puppetmaster.router import TaskSignals, route_task
+
+        reg = starter_registry()
+        sig = TaskSignals(
+            instruction="security audit of auth",
+            role="audit",
+            allowed_adapters=frozenset({"cursor"}),
+        )
+        decision = route_task(sig, reg, policy="balanced")
+        self.assertEqual(decision.model.adapter, "cursor")
+
+    def test_route_task_raises_when_no_enabled_adapter_in_registry(self) -> None:
+        from puppetmaster.model_registry import starter_registry
+        from puppetmaster.router import NoEligibleModelError, TaskSignals, route_task
+
+        reg = starter_registry()
+        sig = TaskSignals(instruction="x", allowed_adapters=frozenset({"nonexistent"}))
+        with self.assertRaises(NoEligibleModelError):
+            route_task(sig, reg)
+
+    def test_signals_from_worker_spec_inherits_lock(self) -> None:
+        from puppetmaster import platform_lock as pl
+        from puppetmaster.router import signals_from_worker_spec
+        from puppetmaster.workers import WorkerSpec
+
+        with patch.dict(os.environ, {pl.ONLY_ENV: "cursor"}):
+            spec = WorkerSpec(role="audit", instruction="audit", payload={"auto_route": True})
+            sig = signals_from_worker_spec(spec)
+            self.assertEqual(sig.allowed_adapters, frozenset({"cursor"}))
+
+    def test_signals_payload_override_wins(self) -> None:
+        from puppetmaster import platform_lock as pl
+        from puppetmaster.router import signals_from_worker_spec
+        from puppetmaster.workers import WorkerSpec
+
+        with patch.dict(os.environ, {pl.ONLY_ENV: "cursor"}):
+            spec = WorkerSpec(
+                role="audit",
+                instruction="audit",
+                payload={"allowed_adapters": ["codex", "openai"]},
+            )
+            sig = signals_from_worker_spec(spec)
+            self.assertEqual(sig.allowed_adapters, frozenset({"codex", "openai"}))
+
+    def test_cli_platform_only_and_status_json(self) -> None:
+        from puppetmaster import platform_lock as pl
+
+        with TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(pl.ONLY_ENV, None)
+            p = self._path(tmp)
+            rc = cli_main(["platform", "only", "cursor", "--registry-path", str(p)])
+            self.assertEqual(rc, 0)
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli_main(
+                    ["platform", "status", "--registry-path", str(p), "--json"]
+                )
+            self.assertEqual(rc, 0)
+            data = json.loads(buf.getvalue())
+            self.assertEqual(data["enabled"], ["cursor"])
+            self.assertTrue(data["restricted"])
+            self.assertIn("claude-code", data["disabled"])
+
+    def test_cli_platform_rejects_unknown_adapter(self) -> None:
+        with TemporaryDirectory() as tmp:
+            p = self._path(tmp)
+            rc = cli_main(["platform", "only", "bogus", "--registry-path", str(p)])
+            self.assertEqual(rc, 1)
+
+    def test_fallback_skips_disabled_adapter(self) -> None:
+        from puppetmaster import platform_lock as pl
+
+        with TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(pl.ONLY_ENV, None)
+            p = self._path(tmp)
+            pl.set_enabled({"cursor"}, p)
+            # When everything but cursor is disabled, a cursor failure has no
+            # enabled platform to fall back onto.
+            self.assertFalse(pl.is_adapter_enabled("codex", p))
+            self.assertFalse(pl.is_adapter_enabled("openai", p))
+            self.assertTrue(pl.is_adapter_enabled("cursor", p))
+
+
 if __name__ == "__main__":
     unittest.main()
 
