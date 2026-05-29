@@ -40,7 +40,6 @@ To run benchmarks or hack on it, clone instead — see [Contributing](docs/CONTR
 | Copy/paste prompts & shell recipes | [Quickstart](#quickstart) · [docs/DAILY_DRIVER.md](docs/DAILY_DRIVER.md) |
 | Read the full docs set | [docs/README.md](docs/README.md) |
 | Browse by directory | [`puppetmaster/`](puppetmaster/README.md) · [`bench/`](bench/README.md) · [`examples/`](examples/README.md) · [`scripts/`](scripts/README.md) · [`clients/typescript/`](clients/typescript/README.md) · [`cursor-extension/`](cursor-extension/README.md) |
-| Know what's honest vs. overclaim | [TALKING_POINTS.md](TALKING_POINTS.md) |
 
 ## What it does
 

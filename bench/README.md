@@ -1,6 +1,6 @@
 # Puppetmaster Benchmarks
 
-Reproducible measurements you can run on any repo to validate Puppetmaster's marketing claims. Numbers cited in the main README and in [`TALKING_POINTS.md`](../TALKING_POINTS.md) come from running these harnesses locally — they're not synthetic.
+Reproducible measurements you can run on any repo to validate Puppetmaster's marketing claims. Numbers cited in the main README come from running these harnesses locally — they're not synthetic.
 
 Five scripts, five different questions:
 

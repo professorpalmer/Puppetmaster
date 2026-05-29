@@ -1,6 +1,6 @@
 # Four claims, four receipts
 
-Every number here comes from a reproducible script in [`bench/`](../bench/). What is **not** defensible (and what we won't claim) lives in [TALKING_POINTS.md](../TALKING_POINTS.md).
+Every number here comes from a reproducible script in [`bench/`](../bench/).
 
 ## 1. Token cost — fixed on two axes
 
