@@ -10,6 +10,20 @@
 > Live OpenAI A/B with real billing tokens — same prompt, equivalent answer, one of 3 back-to-back runs:
 > Pinned `gpt-5.5`: **\$0.006900 in 5.480 s** — Puppetmaster routed to `gpt-5.4-nano`: **\$0.000132 in 1.511 s** → **98.1% cheaper, 72.4% faster.** Reproduce: `OPENAI_API_KEY=... python -m bench.router_live_ab`.
 
+## Demo
+
+The whole story in one command — **no API keys required** (local + shell adapters): route a task mix by cost, fan out a 6-role swarm as independent processes, read the stitched summary, then prove follow-up reads cost **\$0.00**.
+
+<img src="docs/demo.gif" alt="Puppetmaster 60-second demo: cost routing, swarm fan-out, stitched summary, $0 follow-ups" width="100%" />
+
+```bash
+./scripts/demo.sh                  # the 60-second tour (clean machine, no keys)
+vhs scripts/demo.tape              # regenerate docs/demo.gif (GIF-as-code)
+python -m puppetmaster dashboard   # live, zero-dependency web board for any job
+```
+
+The demo script is [`scripts/demo.sh`](scripts/demo.sh); the GIF is reproducible from [`scripts/demo.tape`](scripts/demo.tape).
+
 ## Install
 
 ```bash
@@ -156,6 +170,8 @@ Four production adapters live; eleven tiers in the starter registry (5 Cursor/Cl
 | CodeGraph | Optional shared repo intelligence ([docs](docs/CODEGRAPH.md)) |
 | Patch workflow | Patch artifacts, path locks, approval/rejection events, dirty-worktree guard |
 | Reproducible benchmarks | Six harnesses in [`bench/`](bench/), each with markdown + JSON receipts under `bench/results/` |
+| Local dashboard (v0.9.0+) | `puppetmaster dashboard [<job_id>]` — zero-dependency live web board (task graph, typed artifacts, cost, auto-fallback reroutes, alerts) served from durable state; no OTLP collector required |
+| Cross-platform CI | GitHub Actions matrix runs the suite on Linux / macOS / Windows (Python 3.9 + 3.12); see the CI badge for current status |
 
 ## Documentation
 

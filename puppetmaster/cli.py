@@ -305,6 +305,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="Render a live summary from current artifacts without waiting for final stitching.",
     )
 
+    dashboard_cmd = subcommands.add_parser(
+        "dashboard",
+        help=(
+            "Serve a live, zero-dependency local web board for a job (or the "
+            "job list) from durable state. No OTLP collector required."
+        ),
+    )
+    dashboard_cmd.add_argument(
+        "job_id",
+        nargs="?",
+        help="Job to open. Omit to land on the job list.",
+    )
+    dashboard_cmd.add_argument("--port", type=int, default=8787, help="Port (default 8787).")
+    dashboard_cmd.add_argument("--host", default="127.0.0.1", help="Bind host (default 127.0.0.1).")
+    dashboard_cmd.add_argument(
+        "--no-open",
+        action="store_true",
+        help="Do not auto-open a browser tab.",
+    )
+
     await_cmd = subcommands.add_parser(
         "await",
         help=(
@@ -849,6 +869,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
         "status",
         "open",
         "cost",
+        "dashboard",
     }:
         candidate_job_id = getattr(args, "job_id", None)
         state_dir, store = _resolve_store_for_job(
@@ -1196,6 +1217,19 @@ def _main(argv: Optional[list[str]] = None) -> int:
         else:
             path = store.job_dir(args.job_id) / "summaries" / "stitched.md"
             print(path.read_text(encoding="utf-8"))
+        return 0
+
+    if args.command == "dashboard":
+        from puppetmaster.dashboard import serve
+
+        serve(
+            state_dir,
+            backend=args.backend,
+            job_id=args.job_id,
+            host=args.host,
+            port=args.port,
+            open_browser=not args.no_open,
+        )
         return 0
 
     if args.command == "await":

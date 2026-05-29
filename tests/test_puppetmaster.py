@@ -5480,6 +5480,119 @@ class StitcherAlertTests(unittest.TestCase):
         self.assertNotIn("## Alerts", summary)
 
 
+class DashboardTests(unittest.TestCase):
+    def _seed_store(self, tmp):
+        from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
+        from puppetmaster.store import SwarmStore
+
+        store = SwarmStore(Path(tmp) / ".puppetmaster")
+        store.init()
+        job = store.create_job("dashboard demo goal")
+        task = Task(
+            job_id=job.id,
+            role="implement",
+            instruction="do the thing",
+            adapter="cursor",
+            status=TaskStatus.COMPLETE,
+            payload={"model": "gpt-5.5"},
+            attempts=2,
+        )
+        store.save_task(task)
+        store.save_artifact(
+            Artifact(
+                job_id=job.id, task_id=task.id, type=ArtifactType.FINDING,
+                created_by="worker-implement", payload={"claim": "found the bug"},
+                confidence=0.95, evidence=["foo.py"],
+            )
+        )
+        store.save_artifact(
+            Artifact(
+                job_id=job.id, task_id=task.id, type=ArtifactType.ROUTING,
+                created_by="router",
+                payload={
+                    "model_id": "cursor/gpt-5-5", "adapter": "cursor", "policy": "balanced",
+                    "estimated_cost_usd": 0.0,
+                },
+                confidence=1.0, evidence=["policy:balanced"],
+            )
+        )
+        store.save_artifact(
+            Artifact(
+                job_id=job.id, task_id=task.id, type=ArtifactType.ROUTING,
+                created_by="router-fallback",
+                payload={
+                    "model_id": "cursor/gpt-5-5", "adapter": "cursor", "policy": "balanced",
+                    "reason": "policy=balanced: cheapest sufficient model", "estimated_cost_usd": 0.0,
+                },
+                confidence=0.9, evidence=["fallback:from=claude-code"],
+            )
+        )
+        store.save_artifact(
+            Artifact(
+                job_id=job.id, task_id=task.id, type=ArtifactType.VERIFICATION,
+                created_by="worker-implement-old",
+                payload={"check": "x", "result": "failed", "failure": "billing_or_quota", "adapter": "claude-code"},
+                confidence=0.55, evidence=["adapter:claude-code"],
+            )
+        )
+        return store, job
+
+    def test_build_job_snapshot(self) -> None:
+        from puppetmaster.dashboard import build_job_snapshot
+
+        with TemporaryDirectory() as tmp:
+            store, job = self._seed_store(tmp)
+            snap = build_job_snapshot(store, job.id)
+
+            self.assertEqual(snap["job"]["id"], job.id)
+            self.assertEqual(snap["job"]["goal"], "dashboard demo goal")
+            self.assertEqual(len(snap["tasks"]), 1)
+            self.assertEqual(snap["tasks"][0]["model"], "gpt-5.5")
+            self.assertEqual(snap["tasks"][0]["attempts"], 2)
+            self.assertEqual(snap["counts"]["finding"], 1)
+            self.assertEqual(snap["artifacts"]["finding"][0]["statement"], "found the bug")
+            # the router-fallback routing artifact is surfaced as a reroute
+            self.assertEqual(len(snap["reroutes"]), 1)
+            self.assertIn("balanced", snap["reroutes"][0]["reason"])
+            # the billing failure surfaces as an alert
+            self.assertTrue(any("billing_or_quota" in a for a in snap["alerts"]))
+
+    def test_dashboard_http_serves_index_and_job(self) -> None:
+        import threading
+        import urllib.request
+
+        from puppetmaster.dashboard import serve
+
+        with TemporaryDirectory() as tmp:
+            store, job = self._seed_store(tmp)
+            httpd = serve(
+                Path(tmp) / ".puppetmaster",
+                backend="file",
+                host="127.0.0.1",
+                port=0,
+                open_browser=False,
+                serve_forever=False,
+            )
+            port = httpd.server_address[1]
+            t = threading.Thread(target=httpd.serve_forever, daemon=True)
+            t.start()
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/") as r:
+                    self.assertEqual(r.status, 200)
+                    self.assertIn(b"Puppetmaster", r.read())
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/api/job?id={job.id}"
+                ) as r:
+                    data = json.loads(r.read())
+                    self.assertEqual(data["job"]["id"], job.id)
+                    self.assertEqual(len(data["tasks"]), 1)
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/jobs") as r:
+                    jobs = json.loads(r.read())
+                    self.assertTrue(any(j["id"] == job.id for j in jobs))
+            finally:
+                httpd.shutdown()
+
+
 class AwaitJobTests(unittest.TestCase):
     def test_await_returns_when_already_terminal(self) -> None:
         from puppetmaster.cli import await_job_state
