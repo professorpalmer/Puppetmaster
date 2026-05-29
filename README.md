@@ -9,7 +9,9 @@
 
 <img src="docs/demo.gif" alt="Puppetmaster 60-second demo: cost routing, swarm fan-out, stitched summary, $0 follow-ups" width="100%" />
 
-> **💸 Cheaper — live OpenAI A/B, real billing tokens, same prompt, equivalent answer:** pinned `gpt-5.5` cost **\$0.0132**; Puppetmaster routed the same task to `gpt-5.4-nano` for **\$0.00016** — **98.8% cheaper and 81% faster.** Reproduce in ~$0.01 of spend: `OPENAI_API_KEY=... python -m bench.router_live_ab`.
+<img src="docs/receipts.svg" alt="The receipts — Scenario A (best case, live OpenAI A/B): 98.8% cheaper, 88% faster. Scenario B (everyday mixed workload, dry-run): 35.1% cheaper overall." width="100%" />
+
+> **💸 Reproduce the live A/B in ~$0.01 of spend** — `OPENAI_API_KEY=... python -m bench.router_live_ab`. Pinned `gpt-5.5` cost **\$0.0132**; Puppetmaster routed the same task to `gpt-5.4-nano` for **\$0.00016** (same prompt, equivalent answer). The 35.1% figure is a 6-task mixed-workload dry-run where the router *correctly* kept the frontier model on the 2 hard tasks — full method in [docs/CLAIMS.md](docs/CLAIMS.md).
 
 > **🔁 Self-healing — a dead provider doesn't kill the swarm (proven live, job `job_d82715bebc5d`):** a `claude-code` worker hit a real **\$0 Anthropic balance** → classified `billing_or_quota` → marked **FAILED** → **auto-rerouted to `cursor/gpt-5.5`** (plan-billed, `$0`) → the funded adapter **completed the task.** No silent degraded run.
 
