@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Confidence-based mid-run escalation** (opt-in). Static upfront routing can under-provision — a task that *looks* simple can turn out hard once a worker is in it, and the cheap model it was routed to says so via a low-confidence `VERIFICATION` artifact. When a confidence floor is configured (`$PUPPETMASTER_ESCALATE_CONFIDENCE=0.7` globally, or per-task `payload.min_confidence`), the orchestrator now re-dispatches a COMPLETE-but-low-confidence task to the cheapest **strictly stronger** funded + platform-enabled model and re-runs it *before* the result is accepted. **Off by default** so the cost-saving promise holds unless you opt in; bounded by `_MAX_ESCALATION_ATTEMPTS` (a task already on the top tier is left as-is); only escalates router-placed tasks (never a hand-pinned model); respects the platform lock and billing posture exactly like auto-fallback. Each escalation writes a `router-escalation` ROUTING artifact (with `escalated_from_model`, `escalated_from_confidence`, `confidence_threshold`) and emits a `router.auto_escalate` event; the local dashboard's reroute panel now surfaces both fallback and escalation. +8 tests; full suite **311** green.
 - **Removed `TALKING_POINTS.md`** — it was an internal positioning/messaging cheat-sheet not meant to ship publicly. Dropped the file and the references to it in `README.md`, `bench/README.md`, `docs/CLAIMS.md`, and `docs/CODEGRAPH.md`. The defensible-numbers source of truth remains [docs/CLAIMS.md](CLAIMS.md) + the harnesses in [`bench/`](../bench/).
 
 ## v0.9.2
