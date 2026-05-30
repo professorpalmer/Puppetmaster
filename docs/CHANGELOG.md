@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## v0.9.4
+
+**Routing self-audit + docs polish.** Closes the routing loop: a read-only recommender that reads back the artifacts you already store and tells you whether your capability scores still match reality — proposing conservative `models.json` changes you apply by hand. Also adds the "a layer above your agents" diagram to the README.
+
 - **Routing self-audit (`puppetmaster audit`).** A read-only recommender that aggregates the routing/escalation/verification artifacts you already store and reports how each model *actually* behaved (picks, mean confidence, escalation rate, spend). It proposes conservative `models.json` score changes only for the defensible case — an under-delivering model that keeps getting escalated away from or finishing with low confidence — and lowers its score so harder work routes elsewhere. "Over-used" (a strong model on trivial work) is flagged but never auto-adjusted, since proving a cheaper model would've sufficed needs a counterfactual this audit doesn't run. Dry-run by default; `--apply` writes the diff. `--window DAYS` scopes it to recent jobs. Human stays in the loop — the registry is your assertion, not the audit's.
 
 ## v0.9.3
