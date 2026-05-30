@@ -51,6 +51,17 @@ python -m puppetmaster models list                            # show registered 
 python -m puppetmaster models path                            # print resolved registry path
 ```
 
+## Routing self-audit (recommend score changes from real history)
+
+```bash
+python -m puppetmaster audit                                 # per-model report + suggested score diff (dry-run)
+python -m puppetmaster audit --window 7                       # only jobs from the last 7 days
+python -m puppetmaster audit --json                           # machine-readable report + suggestions
+python -m puppetmaster audit --apply                          # write the suggested score changes to models.json
+```
+
+Read-only by default. It aggregates the routing/escalation/verification artifacts already in your store and proposes a lower `capability_score` only for an **under-delivering** model (keeps getting escalated away from / finishing with low confidence) so harder work routes to a stronger model. A strong model doing trivial work is flagged `possibly-over-used` but never auto-adjusted — proving a cheaper model would've sufficed needs a counterfactual the audit doesn't run. The registry stays your assertion; nothing is written without `--apply`.
+
 ## Platform lock (restrict which platforms get used)
 
 ```bash
