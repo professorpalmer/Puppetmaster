@@ -20,6 +20,12 @@ from puppetmaster.workers import RECOVERABLE_FAILURES, WorkerSpec, specs_for_rol
 _MAX_FALLBACK_ATTEMPTS = 2
 _MAX_FALLBACK_ROUNDS = 3
 
+# How many times a single COMPLETE-but-low-confidence task will be re-dispatched
+# one capability tier up before its result is accepted as-is. Bounded so a
+# genuinely-hard task that no available model is confident about can't loop
+# forever (and can't quietly run up a frontier-model bill).
+_MAX_ESCALATION_ATTEMPTS = 2
+
 
 @dataclass(frozen=True)
 class RunResult:
@@ -58,6 +64,7 @@ class Orchestrator:
             tasks = self._create_tasks(job, specs)
             self._run_workers(job, tasks, lease_seconds=lease_seconds, worker_mode=worker_mode)
             rerouted = self._auto_fallback(job, lease_seconds=lease_seconds, worker_mode=worker_mode)
+            rerouted += self._auto_escalate(job, lease_seconds=lease_seconds, worker_mode=worker_mode)
             artifacts = self.store.list_artifacts(job.id)
 
             self.store.update_job_status(job.id, JobStatus.STITCHING)
@@ -428,6 +435,217 @@ class Orchestrator:
             )
             rerouted += 1
         return rerouted
+
+    def _auto_escalate(
+        self, job: Job, *, lease_seconds: int, worker_mode: str
+    ) -> int:
+        """Re-dispatch COMPLETE-but-low-confidence tasks one capability tier up.
+
+        Static upfront routing can under-provision: a task that *looked* simple
+        can turn out hard once a worker is in it, and the cheap model it was
+        routed to will say so via a low-confidence VERIFICATION artifact. When a
+        confidence threshold is configured (per-task ``payload.min_confidence``
+        or ``$PUPPETMASTER_ESCALATE_CONFIDENCE``; **off by default** so the
+        cost-saving promise holds unless the user opts in), this re-routes such a
+        task to the cheapest *strictly stronger* funded + platform-enabled model
+        and re-runs it before its result is accepted. Bounded by
+        :data:`_MAX_ESCALATION_ATTEMPTS`; a task already on the top tier (no
+        stronger model exists) is left as-is. Returns the number of re-routes.
+        """
+        total = 0
+        for _ in range(_MAX_ESCALATION_ATTEMPTS):
+            rerouted = self._reroute_low_confidence(job)
+            if not rerouted:
+                break
+            total += rerouted
+            self.store.emit(job.id, "job.auto_escalate_round", {"rerouted": rerouted})
+            self._run_workers(
+                job,
+                self.store.list_tasks(job.id),
+                lease_seconds=lease_seconds,
+                worker_mode=worker_mode,
+            )
+        return total
+
+    def _reroute_low_confidence(self, job: Job) -> int:
+        """Re-queue each COMPLETE task whose verification confidence is below its
+        configured threshold onto the cheapest strictly-stronger funded model.
+        Returns the count re-queued (0 when nothing qualifies)."""
+        from puppetmaster.model_registry import default_registry_path, load_registry
+        from puppetmaster.platform_billing import detect_adapter_billing
+        from puppetmaster.platform_lock import is_adapter_enabled
+        from puppetmaster.router import (
+            NoEligibleModelError,
+            route_task,
+            signals_from_worker_spec,
+        )
+
+        registry = [s for s in load_registry(default_registry_path()) if s.enabled]
+        if not registry:
+            return 0
+        by_model_id = {s.id: s for s in registry}
+
+        billing_cache: dict[str, object] = {}
+
+        def _funded(adapter: str) -> object:
+            if adapter not in billing_cache:
+                try:
+                    billing_cache[adapter] = detect_adapter_billing(adapter)
+                except Exception:
+                    billing_cache[adapter] = None
+            return billing_cache[adapter]
+
+        rerouted = 0
+        for task in self.store.list_tasks(job.id):
+            if task.status != TaskStatus.COMPLETE:
+                continue
+            payload = task.payload or {}
+            threshold = self._escalation_threshold(task)
+            if threshold is None:
+                continue  # feature not enabled for this task
+            if int(payload.get("escalation_attempts", 0)) >= _MAX_ESCALATION_ATTEMPTS:
+                continue
+            # Only escalate work the router placed — don't override a model the
+            # user pinned by hand.
+            current_model_id = payload.get("router_model_id")
+            current_spec = by_model_id.get(current_model_id) if current_model_id else None
+            if current_spec is None:
+                continue
+            confidence = self._latest_verification_confidence(job, task.id)
+            if confidence is None or confidence >= threshold:
+                continue
+
+            allow_api = bool(payload.get("allow_api_billing", True))
+            candidates = []
+            for spec in registry:
+                if not is_adapter_enabled(spec.adapter):
+                    continue
+                status = _funded(spec.adapter)
+                if status is None or not getattr(status, "healthy", False):
+                    continue
+                if getattr(status, "billing", "unknown") == "api" and not allow_api:
+                    continue
+                candidates.append(spec)
+            if not candidates:
+                continue
+
+            # Demand strictly more capability than the current model by lifting
+            # the floor one point above its score, then route normally.
+            signals = replace(
+                signals_from_worker_spec(task),
+                explicit_min_capability=current_spec.capability_score + 1,
+            )
+            policy = payload.get("router_policy") or "balanced"
+            try:
+                decision = route_task(signals, candidates, policy=policy)
+            except NoEligibleModelError:
+                continue
+            # `balanced` degrades to the highest-available model when nothing
+            # meets the floor — guard so we only act on a genuine upgrade.
+            if (
+                decision.model.id == current_model_id
+                or decision.model.capability_score <= current_spec.capability_score
+            ):
+                continue
+
+            attempts = int(payload.get("escalation_attempts", 0)) + 1
+            new_payload = {
+                **payload,
+                "model": decision.model.adapter_model_name,
+                "router_model_id": decision.model.id,
+                "router_policy": decision.policy,
+                "router_capability_needed": decision.capability_needed,
+                "router_estimated_cost_usd": decision.estimated_cost_usd,
+                "escalation_attempts": attempts,
+                "escalated_from_model": current_model_id,
+                "escalated_from_confidence": confidence,
+            }
+            requeued = replace(
+                task,
+                adapter=decision.model.adapter,
+                payload=new_payload,
+                status=TaskStatus.QUEUED,
+                attempts=0,
+                lease_owner=None,
+                lease_expires_at=None,
+                completed_at=None,
+                updated_at=now_iso(),
+            )
+            self.store.save_task(requeued)
+
+            artifact_payload = decision.to_artifact_payload()
+            artifact_payload["role"] = task.role
+            artifact_payload["escalated_from_model"] = current_model_id
+            artifact_payload["escalated_from_confidence"] = round(confidence, 3)
+            artifact_payload["confidence_threshold"] = threshold
+            artifact_payload["escalation_attempt"] = attempts
+            self.store.save_artifact(
+                Artifact(
+                    job_id=job.id,
+                    task_id=task.id,
+                    type=ArtifactType.ROUTING,
+                    created_by="router-escalation",
+                    payload=artifact_payload,
+                    confidence=0.9,
+                    evidence=[
+                        f"escalated_from:{current_model_id}",
+                        f"confidence:{confidence:.2f}<{threshold:.2f}",
+                        f"to:{decision.model.id}",
+                    ],
+                )
+            )
+            self.store.emit(
+                job.id,
+                "router.auto_escalate",
+                {
+                    "task_id": task.id,
+                    "role": task.role,
+                    "from_model": current_model_id,
+                    "to_model": decision.model.id,
+                    "confidence": round(confidence, 3),
+                    "threshold": threshold,
+                    "attempt": attempts,
+                },
+            )
+            rerouted += 1
+        return rerouted
+
+    @staticmethod
+    def _escalation_threshold(task: Task) -> Optional[float]:
+        """The confidence floor below which ``task`` should escalate, or ``None``
+        when escalation is disabled (the default).
+
+        Per-task ``payload.min_confidence`` wins; otherwise
+        ``$PUPPETMASTER_ESCALATE_CONFIDENCE`` enables it globally. Both must be a
+        float in ``(0, 1]`` to take effect."""
+        import os
+
+        payload = task.payload or {}
+        raw = payload.get("min_confidence")
+        if raw is None:
+            raw = os.environ.get("PUPPETMASTER_ESCALATE_CONFIDENCE")
+        if raw is None or raw == "":
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if 0 < value <= 1 else None
+
+    def _latest_verification_confidence(
+        self, job: Job, task_id: str
+    ) -> Optional[float]:
+        """Confidence of the task's most recent VERIFICATION artifact (the run's
+        own self-assessment), or ``None`` if it never emitted one."""
+        verifications = [
+            a
+            for a in self.store.list_artifacts(job.id)
+            if a.task_id == task_id and a.type == ArtifactType.VERIFICATION
+        ]
+        if not verifications:
+            return None
+        latest = max(verifications, key=lambda a: a.created_at)
+        return latest.confidence
 
     def _recoverable_failure_by_task(self, job: Job) -> dict[str, str]:
         """Map task_id -> recoverable failure class from blocked/failed artifacts."""

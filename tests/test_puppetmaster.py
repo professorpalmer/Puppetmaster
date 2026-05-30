@@ -6854,6 +6854,157 @@ class PlatformLockTests(unittest.TestCase):
             self.assertTrue(pl.is_adapter_enabled("cursor", p))
 
 
+class AutoEscalationTests(unittest.TestCase):
+    """Confidence-based mid-run escalation: a COMPLETE task whose verification
+    confidence is below threshold gets re-dispatched one capability tier up."""
+
+    def _setup(self, tmp, *, confidence, model_id, payload_extra=None):
+        from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
+        from puppetmaster.store import SwarmStore
+
+        store = SwarmStore(Path(tmp) / ".puppetmaster")
+        job = store.create_job("do the work")
+        payload = {"auto_route": True, "router_model_id": model_id, "model": "x"}
+        payload.update(payload_extra or {})
+        task = Task(
+            job_id=job.id, role="implement", instruction="implement the thing",
+            adapter="cursor", status=TaskStatus.COMPLETE, payload=payload,
+        )
+        store.save_task(task)
+        store.save_artifact(Artifact(
+            job_id=job.id, task_id=task.id, type=ArtifactType.VERIFICATION,
+            created_by="w", payload={"check": "self", "result": "done"},
+            confidence=confidence, evidence=["adapter:cursor"],
+        ))
+        return store, job, task
+
+    def _registry(self):
+        from puppetmaster.model_registry import ModelSpec
+
+        return [
+            ModelSpec(id="cursor/composer-2-5", adapter="cursor", adapter_model_name="composer-2.5", capability_score=55, billing="plan", tags=["cursor"]),
+            ModelSpec(id="cursor/gpt-5-5", adapter="cursor", adapter_model_name="gpt-5.5", capability_score=90, billing="plan", tags=["cursor"]),
+        ]
+
+    def _plan_billing(self, adapter, **kw):
+        from puppetmaster.platform_billing import BillingStatus
+
+        return BillingStatus(adapter=adapter, billing="plan", healthy=True, detail="ok", evidence=[])
+
+    def _run_reroute(self, store, job):
+        from unittest.mock import patch
+
+        from puppetmaster.orchestrator import Orchestrator
+
+        orch = Orchestrator(store)
+        with patch("puppetmaster.model_registry.load_registry", return_value=self._registry()), \
+             patch("puppetmaster.platform_billing.detect_adapter_billing", side_effect=self._plan_billing), \
+             patch("puppetmaster.platform_lock.is_adapter_enabled", return_value=True):
+            return orch._reroute_low_confidence(job)
+
+    def test_escalates_low_confidence_to_stronger_model(self) -> None:
+        from puppetmaster.models import TaskStatus
+
+        with TemporaryDirectory() as tmp:
+            store, job, task = self._setup(
+                tmp, confidence=0.5, model_id="cursor/composer-2-5",
+                payload_extra={"min_confidence": 0.8},
+            )
+            rerouted = self._run_reroute(store, job)
+            self.assertEqual(rerouted, 1)
+            updated = store.get_task_by_id(task.id)
+            self.assertEqual(updated.status, TaskStatus.QUEUED)
+            self.assertEqual(updated.payload["router_model_id"], "cursor/gpt-5-5")
+            self.assertEqual(updated.payload["escalation_attempts"], 1)
+            self.assertEqual(updated.payload["escalated_from_model"], "cursor/composer-2-5")
+            # A router-escalation ROUTING artifact records the why.
+            arts = [a for a in store.list_artifacts(job.id) if a.created_by == "router-escalation"]
+            self.assertEqual(len(arts), 1)
+            self.assertEqual(arts[0].payload["escalated_from_model"], "cursor/composer-2-5")
+
+    def test_no_escalation_when_confidence_meets_threshold(self) -> None:
+        from puppetmaster.models import TaskStatus
+
+        with TemporaryDirectory() as tmp:
+            store, job, task = self._setup(
+                tmp, confidence=0.9, model_id="cursor/composer-2-5",
+                payload_extra={"min_confidence": 0.8},
+            )
+            self.assertEqual(self._run_reroute(store, job), 0)
+            self.assertEqual(store.get_task_by_id(task.id).status, TaskStatus.COMPLETE)
+
+    def test_no_escalation_when_already_top_tier(self) -> None:
+        with TemporaryDirectory() as tmp:
+            # Current model is already the strongest in the registry.
+            store, job, task = self._setup(
+                tmp, confidence=0.4, model_id="cursor/gpt-5-5",
+                payload_extra={"min_confidence": 0.9},
+            )
+            self.assertEqual(self._run_reroute(store, job), 0)
+
+    def test_disabled_by_default(self) -> None:
+        with TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PUPPETMASTER_ESCALATE_CONFIDENCE", None)
+            # Low confidence but no threshold configured anywhere -> no-op.
+            store, job, task = self._setup(
+                tmp, confidence=0.2, model_id="cursor/composer-2-5",
+            )
+            self.assertEqual(self._run_reroute(store, job), 0)
+
+    def test_env_threshold_enables_escalation(self) -> None:
+        with TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"PUPPETMASTER_ESCALATE_CONFIDENCE": "0.7"}
+        ):
+            store, job, task = self._setup(
+                tmp, confidence=0.5, model_id="cursor/composer-2-5",
+            )
+            self.assertEqual(self._run_reroute(store, job), 1)
+
+    def test_bounded_by_max_attempts(self) -> None:
+        from puppetmaster.orchestrator import _MAX_ESCALATION_ATTEMPTS
+
+        with TemporaryDirectory() as tmp:
+            store, job, task = self._setup(
+                tmp, confidence=0.3, model_id="cursor/composer-2-5",
+                payload_extra={"min_confidence": 0.9, "escalation_attempts": _MAX_ESCALATION_ATTEMPTS},
+            )
+            self.assertEqual(self._run_reroute(store, job), 0)
+
+    def test_escalation_threshold_parsing(self) -> None:
+        from puppetmaster.models import Task
+        from puppetmaster.orchestrator import Orchestrator
+
+        mk = lambda p: Task(job_id="j", role="implement", instruction="i", payload=p)
+        self.assertEqual(Orchestrator._escalation_threshold(mk({"min_confidence": 0.6})), 0.6)
+        self.assertIsNone(Orchestrator._escalation_threshold(mk({})))
+        self.assertIsNone(Orchestrator._escalation_threshold(mk({"min_confidence": "nope"})))
+        self.assertIsNone(Orchestrator._escalation_threshold(mk({"min_confidence": 1.5})))
+        with patch.dict(os.environ, {"PUPPETMASTER_ESCALATE_CONFIDENCE": "0.55"}):
+            self.assertEqual(Orchestrator._escalation_threshold(mk({})), 0.55)
+
+    def test_latest_verification_confidence(self) -> None:
+        from puppetmaster.models import Artifact, ArtifactType
+        from puppetmaster.orchestrator import Orchestrator
+        from puppetmaster.store import SwarmStore
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("g")
+            orch = Orchestrator(store)
+            self.assertIsNone(orch._latest_verification_confidence(job, "task_x"))
+            store.save_artifact(Artifact(
+                job_id=job.id, task_id="task_x", type=ArtifactType.VERIFICATION,
+                created_by="w", payload={"check": "a", "result": "r"}, confidence=0.4,
+                evidence=["e"], created_at="2026-01-01T00:00:00Z",
+            ))
+            store.save_artifact(Artifact(
+                job_id=job.id, task_id="task_x", type=ArtifactType.VERIFICATION,
+                created_by="w", payload={"check": "b", "result": "r"}, confidence=0.85,
+                evidence=["e"], created_at="2026-01-02T00:00:00Z",
+            ))
+            self.assertEqual(orch._latest_verification_confidence(job, "task_x"), 0.85)
+
+
 if __name__ == "__main__":
     unittest.main()
 

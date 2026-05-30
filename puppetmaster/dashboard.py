@@ -136,12 +136,21 @@ def build_job_snapshot(store: SwarmStore, job_id: str) -> dict[str, Any]:
         if kind in grouped:
             grouped[kind].append(row)
         if artifact.type == ArtifactType.ROUTING and str(artifact.created_by).startswith(
-            "router-fallback"
+            ("router-fallback", "router-escalation")
         ):
+            payload = artifact.payload or {}
+            if str(artifact.created_by).startswith("router-escalation"):
+                reason = (
+                    f"low confidence {payload.get('escalated_from_confidence')} "
+                    f"< {payload.get('confidence_threshold')} → escalated "
+                    f"{payload.get('escalated_from_model')} to {payload.get('model_id')}"
+                )
+            else:
+                reason = payload.get("reason")
             reroutes.append(
                 {
                     "task_id": artifact.task_id,
-                    "reason": (artifact.payload or {}).get("reason"),
+                    "reason": reason,
                     "created_by": artifact.created_by,
                 }
             )
@@ -284,7 +293,7 @@ async function loadJob(){
       d.alerts.map(a => '<div class="alert">'+esc(a.replace(/^- /,''))+'</div>').join('') + '</div>';
   }
   if(d.reroutes && d.reroutes.length){
-    html += '<div class="card"><h2>Auto-fallback reroutes</h2>' +
+    html += '<div class="card"><h2>Reroutes (fallback &amp; escalation)</h2>' +
       d.reroutes.map(x => '<div class="reroute"><b>'+esc(x.task_id)+'</b> → '+esc(x.reason||'')+'</div>').join('') + '</div>';
   }
 

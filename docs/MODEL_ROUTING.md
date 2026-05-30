@@ -192,6 +192,41 @@ python -m puppetmaster artifacts <job_id> | jq '.[] | select(.type=="routing") |
 | `payload.required_tags` (list) | Only consider models whose `tags` include ALL of these.                |
 | `payload.routing_policy` (str) | One of `balanced` (default), `cheap`, `quality`, `escalating`.         |
 | `payload.registry_path` (str)  | Use a different registry file for this task.                           |
+| `payload.min_confidence` (float) | Confidence floor for mid-run escalation (0..1). Below it, the task is re-run one capability tier up. Off unless set (or `$PUPPETMASTER_ESCALATE_CONFIDENCE`). |
+
+## Confidence-based mid-run escalation (opt-in)
+
+Upfront routing is a *prediction*: the classifier scores complexity from
+the role + instruction *before* any work happens. Sometimes a task that
+looks simple turns out hard once a worker is in it — and the cheap model
+it was routed to will tell you, via a low-confidence `VERIFICATION`
+artifact (its own self-assessment of the run).
+
+When you set a confidence floor, the orchestrator acts on that signal: a
+task that finished COMPLETE but below the floor is **re-dispatched to the
+cheapest strictly-stronger funded model and re-run, before its result is
+accepted**.
+
+- **Enable globally:** `export PUPPETMASTER_ESCALATE_CONFIDENCE=0.7`
+- **Enable per task:** `payload.min_confidence = 0.7`
+- **Off by default** — escalation costs more, so it never fires unless you
+  opt in. The default behavior (cheapest sufficient, accept the result) is
+  unchanged.
+- **Bounded** by `_MAX_ESCALATION_ATTEMPTS`; a task already on the top tier
+  (no stronger model in the registry) is left as-is rather than looping.
+- **Safe by construction:** only escalates router-placed tasks (never a
+  model you pinned by hand), and respects the platform lock + billing
+  posture exactly like auto-fallback (never reroutes onto a disabled or
+  unfunded platform).
+- **Auditable:** each escalation writes a `router-escalation` ROUTING
+  artifact (`escalated_from_model`, `escalated_from_confidence`,
+  `confidence_threshold`) and emits a `router.auto_escalate` event. The
+  local dashboard's reroute panel shows it alongside fallbacks.
+
+This is the counterpart to **auto-fallback**: fallback re-routes on
+*failure* (a dead/unfunded provider), escalation re-routes on *low
+confidence* (the cheap model ran but wasn't sure). Both reuse the same
+bounded re-queue loop.
 
 ## Scope and honesty
 
