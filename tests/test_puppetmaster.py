@@ -7005,6 +7005,205 @@ class AutoEscalationTests(unittest.TestCase):
             self.assertEqual(orch._latest_verification_confidence(job, "task_x"), 0.85)
 
 
+class RoutingAuditTests(unittest.TestCase):
+    """The read-only self-audit recommender: aggregation + conservative
+    suggestions + the store collector."""
+
+    def _rec(self, model_id, *, conf=None, needed=40, cost=0.001,
+             escalated=False, escalated_from=None, fell_back=False,
+             adapter="cursor"):
+        from puppetmaster.audit import TaskAuditRecord
+
+        return TaskAuditRecord(
+            model_id=model_id, adapter=adapter, capability_needed=needed,
+            est_cost_usd=cost, confidence=conf, escalated=escalated,
+            escalated_from=escalated_from, fell_back=fell_back,
+        )
+
+    def test_under_delivering_model_gets_lower_score_suggested(self) -> None:
+        from puppetmaster.audit import build_audit_report
+
+        # weak/55 is the initial pick on 6 tasks; 4 escalate away to strong/80.
+        records = []
+        for _ in range(4):
+            records.append(self._rec("strong/80", conf=0.95, escalated=True,
+                                      escalated_from="weak/55"))
+        for _ in range(2):
+            records.append(self._rec("weak/55", conf=0.5))
+        report = build_audit_report(
+            records, {"weak/55": 55, "strong/80": 80}, min_sample=5
+        )
+        weak = next(m for m in report.models if m.model_id == "weak/55")
+        self.assertEqual(weak.selections, 6)  # 2 retained + 4 escalated away
+        self.assertAlmostEqual(weak.escalated_away_rate, 4 / 6, places=2)
+        self.assertIn("under-provisioned", weak.flags)
+        self.assertIsNotNone(weak.suggested_score)
+        self.assertLess(weak.suggested_score, 55)
+        sug = report.suggestions
+        self.assertEqual(len(sug), 1)
+        self.assertEqual(sug[0]["model_id"], "weak/55")
+
+    def test_well_calibrated_model_gets_no_suggestion(self) -> None:
+        from puppetmaster.audit import build_audit_report
+
+        records = [self._rec("ok/60", conf=0.8, needed=55) for _ in range(8)]
+        report = build_audit_report(records, {"ok/60": 60})
+        ok = next(m for m in report.models if m.model_id == "ok/60")
+        self.assertEqual(ok.flags, [])
+        self.assertIsNone(ok.suggested_score)
+        self.assertEqual(report.suggestions, [])
+
+    def test_small_sample_is_not_acted_on(self) -> None:
+        from puppetmaster.audit import build_audit_report
+
+        # 100% escalated away, but only 2 picks — below MIN_SAMPLE.
+        records = [
+            self._rec("strong/80", conf=0.9, escalated=True, escalated_from="weak/55")
+            for _ in range(2)
+        ]
+        report = build_audit_report(records, {"weak/55": 55, "strong/80": 80})
+        weak = next(m for m in report.models if m.model_id == "weak/55")
+        self.assertEqual(weak.escalated_away, 2)
+        self.assertIsNone(weak.suggested_score)
+        self.assertEqual(report.suggestions, [])
+
+    def test_over_used_is_flagged_but_not_auto_adjusted(self) -> None:
+        from puppetmaster.audit import build_audit_report
+
+        # strong/90 confidently doing low-need (need 20) work.
+        records = [self._rec("strong/90", conf=0.95, needed=20) for _ in range(8)]
+        report = build_audit_report(records, {"strong/90": 90})
+        strong = next(m for m in report.models if m.model_id == "strong/90")
+        self.assertIn("possibly-over-used", strong.flags)
+        self.assertIsNone(strong.suggested_score)  # no counterfactual -> no number
+        self.assertEqual(report.suggestions, [])
+
+    def test_collect_records_from_store(self) -> None:
+        from puppetmaster.audit import build_audit_report, collect_records
+        from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
+        from puppetmaster.store import SwarmStore
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            job = store.create_job("audit goal")
+            task = Task(
+                job_id=job.id, role="implement", instruction="do it",
+                adapter="cursor", status=TaskStatus.COMPLETE,
+                payload={
+                    "router_model_id": "strong/80",
+                    "router_capability_needed": 70,
+                    "router_estimated_cost_usd": 0.01,
+                },
+            )
+            store.save_task(task)
+            # initial pick of weak/55, escalation to strong/80, final verification.
+            store.save_artifact(Artifact(
+                job_id=job.id, task_id=task.id, type=ArtifactType.ROUTING,
+                created_by="router",
+                payload={"model_id": "weak/55", "adapter": "cursor",
+                         "policy": "balanced", "capability_needed": 50,
+                         "estimated_cost_usd": 0.002},
+                confidence=0.9, evidence=["role:implement"],
+            ))
+            store.save_artifact(Artifact(
+                job_id=job.id, task_id=task.id, type=ArtifactType.ROUTING,
+                created_by="router-escalation",
+                payload={"model_id": "strong/80", "adapter": "cursor",
+                         "policy": "escalating", "escalated_from_model": "weak/55",
+                         "escalated_from_confidence": 0.4, "confidence_threshold": 0.7},
+                confidence=0.9, evidence=["escalate"],
+            ))
+            store.save_artifact(Artifact(
+                job_id=job.id, task_id=task.id, type=ArtifactType.VERIFICATION,
+                created_by="w", payload={"check": "x", "result": "passed"},
+                confidence=0.92, evidence=["e"],
+            ))
+
+            records, jobs = collect_records(store)
+            self.assertEqual(jobs, 1)
+            self.assertEqual(len(records), 1)
+            r = records[0]
+            self.assertEqual(r.model_id, "strong/80")  # final model
+            self.assertTrue(r.escalated)
+            self.assertEqual(r.escalated_from, "weak/55")
+            self.assertEqual(r.confidence, 0.92)
+
+            report = build_audit_report(records, {"weak/55": 55, "strong/80": 80})
+            weak = next(m for m in report.models if m.model_id == "weak/55")
+            self.assertEqual(weak.escalated_away, 1)
+
+    def test_cli_apply_writes_lowered_score(self) -> None:
+        import argparse
+
+        from puppetmaster.cli import _run_audit_command
+        from puppetmaster.model_registry import (
+            ModelSpec,
+            load_registry,
+            save_registry,
+        )
+        from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
+        from puppetmaster.store import SwarmStore
+
+        with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "models.json"
+            save_registry(
+                [
+                    ModelSpec(id="weak/55", adapter="cursor",
+                              adapter_model_name="weak", capability_score=55),
+                    ModelSpec(id="strong/80", adapter="cursor",
+                              adapter_model_name="strong", capability_score=80),
+                ],
+                registry_path,
+            )
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            job = store.create_job("g")
+            # 6 tasks initially picked weak/55; 4 escalate to strong/80.
+            for i in range(6):
+                escalated = i < 4
+                final = "strong/80" if escalated else "weak/55"
+                task = Task(
+                    job_id=job.id, role="implement", instruction="x",
+                    adapter="cursor", status=TaskStatus.COMPLETE,
+                    payload={"router_model_id": final,
+                             "router_capability_needed": 50,
+                             "router_estimated_cost_usd": 0.001},
+                )
+                store.save_task(task)
+                store.save_artifact(Artifact(
+                    job_id=job.id, task_id=task.id, type=ArtifactType.ROUTING,
+                    created_by="router",
+                    payload={"model_id": "weak/55", "adapter": "cursor",
+                             "policy": "balanced", "capability_needed": 50},
+                    confidence=0.9, evidence=["r"],
+                ))
+                if escalated:
+                    store.save_artifact(Artifact(
+                        job_id=job.id, task_id=task.id, type=ArtifactType.ROUTING,
+                        created_by="router-escalation",
+                        payload={"model_id": "strong/80", "adapter": "cursor",
+                                 "policy": "escalating",
+                                 "escalated_from_model": "weak/55"},
+                        confidence=0.9, evidence=["e"],
+                    ))
+                store.save_artifact(Artifact(
+                    job_id=job.id, task_id=task.id, type=ArtifactType.VERIFICATION,
+                    created_by="w", payload={"check": "c", "result": "passed"},
+                    confidence=0.5 if not escalated else 0.95, evidence=["v"],
+                ))
+
+            args = argparse.Namespace(
+                registry_path=str(registry_path), window=None,
+                apply=True, json=False,
+            )
+            rc = _run_audit_command(args, store)
+            self.assertEqual(rc, 0)
+            after = {s.id: s.capability_score for s in load_registry(registry_path)}
+            self.assertLess(after["weak/55"], 55)  # lowered
+            self.assertEqual(after["strong/80"], 80)  # untouched
+
+
 if __name__ == "__main__":
     unittest.main()
 

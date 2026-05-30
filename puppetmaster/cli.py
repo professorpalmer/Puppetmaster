@@ -780,6 +780,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     preflight_cmd.add_argument("--json", action="store_true", help="Emit JSON.")
 
+    audit_cmd = subcommands.add_parser(
+        "audit",
+        help=(
+            "Analyze how routing actually behaved across past jobs and propose "
+            "(never auto-apply) conservative capability-score adjustments."
+        ),
+    )
+    audit_cmd.add_argument(
+        "--window",
+        type=float,
+        default=None,
+        metavar="DAYS",
+        help="Only consider jobs created within this many days (default: all).",
+    )
+    audit_cmd.add_argument("--registry-path", help="Override the registry path.")
+    audit_cmd.add_argument(
+        "--apply",
+        action="store_true",
+        help="Write the suggested score changes to models.json (default: dry-run).",
+    )
+    audit_cmd.add_argument("--json", action="store_true", help="Emit JSON.")
+
     route_cmd = subcommands.add_parser(
         "route",
         help=(
@@ -955,6 +977,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
 
     if args.command == "route":
         return _run_route_command(args)
+
+    if args.command == "audit":
+        return _run_audit_command(args, store)
 
     if args.command == "preflight":
         return _run_preflight_command(args)
@@ -2142,6 +2167,97 @@ def _run_preflight_command(args) -> int:
         print(f"{status:8} {result.adapter:12} billing={result.billing}")
         print(f"  {result.reason}")
     return 0 if result.ok else 1
+
+
+def _run_audit_command(args, store) -> int:
+    """Analyze past routing behavior and propose conservative score changes.
+
+    Read-only by default: prints a per-model report (picks, mean confidence,
+    escalation rate, spend) plus a suggested models.json diff. ``--apply``
+    writes the suggested score changes; nothing is mutated otherwise.
+    """
+    import json as _json
+    from dataclasses import asdict, replace
+
+    from puppetmaster.audit import build_audit_report, collect_records
+    from puppetmaster.model_registry import (
+        default_registry_path,
+        load_registry,
+        save_registry,
+    )
+
+    registry_path = _registry_path_from_args(args) or default_registry_path()
+    registry = load_registry(registry_path)
+    scores = {s.id: s.capability_score for s in registry}
+
+    records, jobs_considered = collect_records(store, window_days=args.window)
+    report = build_audit_report(
+        records, scores, window_days=args.window, jobs_considered=jobs_considered
+    )
+
+    if args.json:
+        print(
+            _json.dumps(
+                {
+                    "jobs_considered": report.jobs_considered,
+                    "tasks_considered": report.tasks_considered,
+                    "window_days": report.window_days,
+                    "total_est_spend_usd": report.total_est_spend_usd,
+                    "models": [asdict(m) for m in report.models],
+                    "suggestions": report.suggestions,
+                },
+                indent=2,
+            )
+        )
+    else:
+        window = f"{args.window:g}d" if args.window else "all time"
+        print(
+            f"Routing audit — {report.jobs_considered} jobs, "
+            f"{report.tasks_considered} tasks ({window}); "
+            f"est spend ${report.total_est_spend_usd:.4f}"
+        )
+        if report.tasks_considered == 0:
+            print(
+                "  No router-placed tasks found. Run some auto_route work first "
+                "(routing decisions are recorded as durable artifacts)."
+            )
+        else:
+            print(
+                f"  {'model':<26}{'picks':>6}{'conf':>7}{'esc%':>7}  flags"
+            )
+            for m in report.models:
+                if m.selections == 0 and m.runs_with_confidence == 0:
+                    continue
+                conf = f"{m.mean_confidence:.2f}" if m.mean_confidence is not None else "  -"
+                esc = f"{m.escalated_away_rate:.0%}"
+                print(
+                    f"  {m.model_id:<26}{m.selections:>6}{conf:>7}{esc:>7}  "
+                    f"{', '.join(m.flags)}"
+                )
+        if report.suggestions:
+            print("\nSuggested score changes (your assertion stays the source of truth):")
+            for s in report.suggestions:
+                print(f"  {s['model_id']}: {s['from_score']} -> {s['to_score']}")
+                print(f"      {s['rationale']}")
+        elif report.tasks_considered:
+            print("\nNo score changes suggested — routing looks well-calibrated.")
+
+    if args.apply:
+        if not report.suggestions:
+            print("\nNothing to apply.")
+            return 0
+        by_id = {s.id: s for s in registry}
+        changed = 0
+        for sug in report.suggestions:
+            spec = by_id.get(sug["model_id"])
+            if spec is None:
+                continue
+            by_id[sug["model_id"]] = replace(spec, capability_score=sug["to_score"])
+            changed += 1
+        if changed:
+            save_registry(list(by_id.values()), registry_path)
+            print(f"\nApplied {changed} score change(s) to {registry_path}.")
+    return 0
 
 
 def _run_route_command(args) -> int:

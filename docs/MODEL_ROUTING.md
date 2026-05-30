@@ -228,6 +228,43 @@ This is the counterpart to **auto-fallback**: fallback re-routes on
 confidence* (the cheap model ran but wasn't sure). Both reuse the same
 bounded re-queue loop.
 
+## Closing the loop: routing self-audit (`puppetmaster audit`)
+
+Routing decisions, escalations, and verifications all land as durable
+artifacts. `puppetmaster audit` reads them back and tells you whether your
+capability scores still match reality — so the registry doesn't silently
+"overcook" work as your model lineup or task mix drifts over weeks.
+
+```bash
+python -m puppetmaster audit                # dry-run report + suggested diff
+python -m puppetmaster audit --window 7      # last 7 days only
+python -m puppetmaster audit --apply         # write the suggested score changes
+```
+
+It prints, per model: how often it was the **initial pick**, mean/min
+self-reported confidence, the rate it got **escalated away from**, and
+estimated spend. Then it proposes score changes — but only for the one
+case that's actually defensible:
+
+- **`under-provisioned`** → a model that keeps getting picked and then
+  escalated away from (or finishing below the confidence bar). The audit
+  suggests **lowering its score** so the harder work routes to a stronger
+  model instead, killing the cheap-then-expensive double-run. Bounded step
+  (−5, or −10 when severe), floored so the model stays reachable for
+  trivial work, and only after `MIN_SAMPLE` observations.
+- **`possibly-over-used`** → a strong model confidently doing work that
+  needed far less capability. This is **flagged, never auto-adjusted**:
+  high confidence on a strong model doesn't prove a cheaper one would have
+  succeeded — that needs a shadow run the audit deliberately doesn't
+  perform. You get the signal; you decide.
+
+**Recommend, don't autopilot.** Confidence and escalation rate are noisy,
+self-reported, and gameable; a closed feedback loop on them risks a
+ratchet that only ever raises cost. So `audit` is dry-run by default,
+mutates `models.json` only with `--apply`, and the registry stays *your*
+assertion. If you'd rather never touch scores automatically, just read the
+report and ignore the diff — that's a supported mode, not a degraded one.
+
 ## Scope and honesty
 
 Four production adapters ship today: `cursor` (Cursor SDK via
