@@ -62,6 +62,10 @@ Puppetmaster isn't trying to beat native IDE subagents at every tiny task. It's 
 
 **How it's different:** LangGraph, CrewAI, and the Claude Agent SDK are libraries you write code against to *build* an agent. Puppetmaster sits one layer up — it **orchestrates the agent CLIs you already pay for** (Cursor, Claude Code, Codex, OpenAI), routes each task to the cheapest sufficient model, keeps the spend inside your subscription, and self-heals when a provider is down. Full side-by-side + "pick X instead if…" in [docs/COMPARISON.md](docs/COMPARISON.md).
 
+<p align="center">
+<img src="docs/layer-above.jpg" alt="A layer above your agents, not another framework. Cursor / Claude Code / Codex / OpenAI feed into Puppetmaster (cost-aware router + supervisor), which fans out to independent worker processes, SQLite typed artifacts, and $0 follow-up reads. LangGraph / CrewAI are libraries you write code against to build an agent; Puppetmaster drives the agent CLIs you already use." width="100%" />
+</p>
+
 ### The demo (no API keys)
 
 The whole story in one command — local + shell adapters, nothing to configure:
