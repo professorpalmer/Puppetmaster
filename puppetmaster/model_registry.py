@@ -501,12 +501,5 @@ def catalog_staleness_days(
     return max(0.0, (current - when).total_seconds() / 86400.0)
 
 
-def find(specs: Iterable[ModelSpec], model_id: str) -> Optional[ModelSpec]:
-    for spec in specs:
-        if spec.id == model_id:
-            return spec
-    return None
-
-
 def enabled_specs(specs: Iterable[ModelSpec]) -> list[ModelSpec]:
     return [s for s in specs if s.enabled]

@@ -648,12 +648,22 @@ class Orchestrator:
         return latest.confidence
 
     def _recoverable_failure_by_task(self, job: Job) -> dict[str, str]:
-        """Map task_id -> recoverable failure class from blocked/failed artifacts."""
+        """Map task_id -> recoverable failure class from the task's *latest*
+        failed artifact.
+
+        Keeping the first artifact seen meant a stale failure reason could win
+        after a retry produced a newer one; compare created_at so the most
+        recent recoverable failure per task is the one reported."""
         out: dict[str, str] = {}
+        latest_at: dict[str, str] = {}
         for artifact in self.store.list_artifacts(job.id):
             failure = (artifact.payload or {}).get("failure")
-            if failure in RECOVERABLE_FAILURES and artifact.task_id not in out:
-                out[artifact.task_id] = str(failure)
+            if failure not in RECOVERABLE_FAILURES:
+                continue
+            task_id = artifact.task_id
+            if task_id not in latest_at or artifact.created_at > latest_at[task_id]:
+                latest_at[task_id] = artifact.created_at
+                out[task_id] = str(failure)
         return out
 
     def _has_hard_failure(self, job: Job, allowed_task_ids: set[str]) -> bool:
@@ -1132,12 +1142,24 @@ class Orchestrator:
             self._spawn_worker(job.id, role, lease_seconds=lease_seconds)
             for role in roles
         ]
-        for process in processes:
-            process.wait(timeout=self._worker_wait_timeout(dependencies))
-            if process.returncode != 0:
-                raise RuntimeError(
-                    f"prerequisite worker failed with exit code {process.returncode}"
-                )
+        try:
+            for process in processes:
+                process.wait(timeout=self._worker_wait_timeout(dependencies))
+                if process.returncode != 0:
+                    raise RuntimeError(
+                        f"prerequisite worker failed with exit code {process.returncode}"
+                    )
+        finally:
+            # If a wait timed out or a prerequisite failed mid-batch, don't
+            # leave the remaining workers running as orphans — terminate (then
+            # kill) any that are still alive so they don't outlive the job.
+            for process in processes:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
 
     @staticmethod
     def _dependency_closure(tasks: list[Task], task_id: str) -> list[Task]:

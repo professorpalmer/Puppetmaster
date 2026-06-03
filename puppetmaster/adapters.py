@@ -310,11 +310,178 @@ class CursorAdapter:
     name = "cursor"
 
     def run(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
+        # Two execution modes share the same Cursor SDK runner. ``analyze`` (the
+        # default) steers the agent to return findings/risks and never touches
+        # the tree; ``implement`` lets it edit files and captures the resulting
+        # diff as a PATCH artifact — the same full-edit contract Claude Code and
+        # Codex already honour, so a cursor-only platform lock can still ship code.
+        if task.payload.get("mode") == "implement" or task.payload.get("implement"):
+            return self._run_implement(task, goal, worker_id)
+        return self._run_analyze(task, goal, worker_id)
+
+    def _run_implement(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
+        base_prompt = task.payload.get("prompt") or task.instruction
+        cwd = Path(task.payload.get("cwd") or ".").resolve()
+        model = task.payload.get("model", "default")
+
+        # Fail fast on a dirty tree before spending any work (codegraph, agent).
+        before = git_snapshot(cwd)
+        if not task.payload.get("allow_dirty", False) and (
+            before["changed_files"] or before["untracked_files"]
+        ):
+            return [
+                verification_artifact(
+                    task=task,
+                    worker_id=worker_id,
+                    adapter="cursor",
+                    check=task.instruction,
+                    result="blocked",
+                    confidence=0.8,
+                    evidence=["adapter:cursor-sdk", "status:dirty-repo"],
+                    payload={
+                        "failure": "dirty_worktree",
+                        "message": (
+                            "Cursor implement runs require a clean working tree by default "
+                            "so Puppetmaster can attribute the resulting diff correctly. Commit, "
+                            "stash, use a worktree, or set payload.allow_dirty=true."
+                        ),
+                        "changed_files": before["changed_files"],
+                        "untracked_files": before["untracked_files"],
+                    },
+                )
+            ]
+
+        prompt, codegraph_used = enrich_prompt_with_codegraph(
+            prompt_with_memory(self._implement_prompt(base_prompt), task),
+            task_description=task.payload.get("codegraph_task") or task.instruction or goal,
+            cwd=cwd,
+            disabled=bool(task.payload.get("disable_codegraph", False)),
+        )
+
+        runner = Path(__file__).with_name("cursor_sdk_runner.mjs")
+        environment = os.environ.copy()
+        environment["PUPPETMASTER_CURSOR_INPUT"] = json.dumps(
+            {"prompt": prompt, "cwd": str(cwd), "model": model},
+            sort_keys=True,
+        )
+        timeout_seconds = int(task.payload.get("timeout_seconds", 900))
+        try:
+            completed = subprocess.run(
+                ["node", str(runner)],
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                check=False,
+                env=environment,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout or ""
+            stderr = exc.stderr or ""
+            after = git_snapshot(cwd)
+            artifacts: list[Artifact] = [
+                verification_artifact(
+                    task=task,
+                    worker_id=worker_id,
+                    adapter="cursor",
+                    check=task.instruction,
+                    result="failed",
+                    confidence=0.55,
+                    evidence=["adapter:cursor-sdk", "mode:implement", "timeout"],
+                    payload={
+                        "failure": "timeout",
+                        "returncode": None,
+                        "stdout": stdout[-_STDOUT_TAIL_CHARS:],
+                        "stderr": stderr[-_STDOUT_TAIL_CHARS:],
+                        "timeout_seconds": timeout_seconds,
+                        "base_sha": before["sha"],
+                        "head_sha": after["sha"],
+                        "changed_files": after["changed_files"],
+                        "untracked_files": after["untracked_files"],
+                    },
+                )
+            ]
+            # A timed-out implement run may still have edited files; surface the
+            # partial diff so the work isn't silently lost.
+            if after["diff"].strip():
+                artifacts.append(
+                    self._patch_artifact(task, worker_id, before, after, status="failed")
+                )
+            return artifacts
+
+        after = git_snapshot(cwd)
+        failure = classify_cursor_failure(completed.stderr + completed.stdout)
+        stdout_capture = capture_subprocess_stdout(
+            text=completed.stdout, task=task, sidecar_name="cursor_implement_stdout", tail_chars=12000
+        )
+        stderr_capture = capture_subprocess_stdout(
+            text=completed.stderr, task=task, sidecar_name="cursor_implement_stderr"
+        )
+        artifacts = [
+            verification_artifact(
+                task=task,
+                worker_id=worker_id,
+                adapter="cursor",
+                check=task.instruction,
+                result="passed" if completed.returncode == 0 else "failed",
+                confidence=0.9 if completed.returncode == 0 else 0.55,
+                evidence=(
+                    ["adapter:cursor-sdk", "mode:implement", f"node:{sys.platform}"]
+                    + (["context:codegraph"] if codegraph_used else [])
+                ),
+                payload={
+                    "failure": None if completed.returncode == 0 else failure,
+                    "returncode": completed.returncode,
+                    "stdout": completed.stdout[-12000:],
+                    "stderr": completed.stderr[-_STDOUT_TAIL_CHARS:],
+                    "stdout_capture": stdout_capture,
+                    "stderr_capture": stderr_capture,
+                    "model": model,
+                    "cwd": str(cwd),
+                    "base_sha": before["sha"],
+                    "head_sha": after["sha"],
+                    "changed_files": after["changed_files"],
+                    "untracked_files": after["untracked_files"],
+                },
+            )
+        ]
+        if after["diff"].strip():
+            artifacts.append(
+                self._patch_artifact(
+                    task,
+                    worker_id,
+                    before,
+                    after,
+                    status="applied" if completed.returncode == 0 else "failed",
+                )
+            )
+        return artifacts
+
+    @staticmethod
+    def _patch_artifact(task: Task, worker_id: str, before, after, *, status: str) -> Artifact:
+        return Artifact(
+            job_id=task.job_id,
+            task_id=task.id,
+            type=ArtifactType.PATCH,
+            created_by=worker_id,
+            confidence=0.8 if status == "applied" else 0.5,
+            evidence=["adapter:cursor-sdk", f"base:{before['sha']}"],
+            payload={
+                "change": "Cursor agent modified tracked repository files.",
+                "files": after["changed_files"],
+                "unified_diff": after["diff"][-20000:],
+                "base_sha": before["sha"],
+                "head_sha": after["sha"],
+                "status": status,
+                "revert": "Review the diff, then use git restore / git checkout or your VCS workflow to revert unwanted changes.",
+            },
+        )
+
+    def _run_analyze(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
         base_prompt = task.payload.get("prompt") or task.instruction
         cwd = task.payload.get("cwd")
         model = task.payload.get("model", "default")
         prompt, codegraph_used = enrich_prompt_with_codegraph(
-            self._prompt_with_memory(
+            prompt_with_memory(
                 self._structured_prompt(base_prompt),
                 task,
             ),
@@ -437,6 +604,22 @@ class CursorAdapter:
         return artifacts
 
     @staticmethod
+    def _implement_prompt(prompt: str) -> str:
+        return "\n".join(
+            [
+                prompt,
+                "",
+                "Implement mode: you are running as a full-edit Puppetmaster worker "
+                "inside the user's repository. Actually make the code changes — create, "
+                "edit, and delete files as needed to complete the task end to end. Do not "
+                "just describe a plan or return findings.",
+                "Keep the change focused on the task; run any obvious local checks you can. "
+                "Puppetmaster captures the resulting git diff as a PATCH artifact, so leave "
+                "the working tree containing your final intended changes.",
+            ]
+        )
+
+    @staticmethod
     def _structured_prompt(prompt: str) -> str:
         return "\n".join(
             [
@@ -452,24 +635,6 @@ class CursorAdapter:
                 "Use concrete file/function evidence. If there are no concrete findings, return a risk artifact explaining why the run is degraded.",
             ]
         )
-
-    @staticmethod
-    def _prompt_with_memory(prompt: str, task: Task) -> str:
-        retrieved = task.payload.get("retrieved_memory") or []
-        if not retrieved:
-            return prompt
-        lines = [
-            prompt,
-            "",
-            "Relevant promoted Puppetmaster memory:",
-        ]
-        for memory in retrieved[:5]:
-            lines.append(
-                f"- [{memory.get('scope', 'memory')}] {memory.get('statement', '')}"
-            )
-        lines.append("")
-        lines.append("Use this as retrieved context, but verify claims before relying on them.")
-        return "\n".join(lines)
 
 
 DEFAULT_CLAUDE_CODE_MODEL = "claude-opus-4-8"
@@ -1440,6 +1605,52 @@ def _confidence(value: object) -> float:
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"
 
+# Hosts the OpenAI adapter may send the OPENAI_API_KEY to. A caller-supplied
+# openai_base_url pointing elsewhere would exfiltrate the bearer token to an
+# arbitrary "OpenAI-compatible" endpoint, so we refuse it unless explicitly
+# trusted (allowlist env or per-task opt-in).
+_OPENAI_DEFAULT_ALLOWED_HOSTS = frozenset({"api.openai.com"})
+_OPENAI_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _openai_allowed_hosts() -> set[str]:
+    hosts = set(_OPENAI_DEFAULT_ALLOWED_HOSTS)
+    extra = os.environ.get("PUPPETMASTER_OPENAI_ALLOWED_HOSTS", "")
+    for host in extra.replace(",", " ").split():
+        cleaned = host.strip().lower()
+        if cleaned:
+            hosts.add(cleaned)
+    return hosts
+
+
+def validate_openai_base_url(base_url: str, task: Task) -> Optional[str]:
+    """Return an error string when sending the API key to ``base_url`` is unsafe.
+
+    Returns ``None`` when the URL is allowed. By default the key is only sent
+    over HTTPS to an allowlisted host (``api.openai.com``; extend via
+    ``PUPPETMASTER_OPENAI_ALLOWED_HOSTS``). A loopback host is permitted for
+    local proxies/tests, and ``payload.openai_allow_untrusted_base_url=true``
+    is an explicit per-task override.
+    """
+    if task.payload.get("openai_allow_untrusted_base_url"):
+        return None
+    from urllib.parse import urlparse
+
+    parsed = urlparse(base_url)
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return f"could not parse a host from openai_base_url {base_url!r}"
+    is_loopback = host in _OPENAI_LOOPBACK_HOSTS
+    if parsed.scheme != "https" and not is_loopback:
+        return f"refusing to send OPENAI_API_KEY to non-HTTPS base_url {base_url!r}"
+    if is_loopback or host in _openai_allowed_hosts():
+        return None
+    return (
+        f"refusing to send OPENAI_API_KEY to untrusted host {host!r}. Add it to "
+        "PUPPETMASTER_OPENAI_ALLOWED_HOSTS or set "
+        "payload.openai_allow_untrusted_base_url=true to override."
+    )
+
 
 class OpenAIAdapter:
     """Calls the OpenAI Chat Completions API directly via OPENAI_API_KEY.
@@ -1495,6 +1706,26 @@ class OpenAIAdapter:
                             "OPENAI_API_KEY is not set. Export it or pass openai_api_key "
                             "in the task payload."
                         ),
+                    },
+                )
+            ]
+
+        base_url_error = validate_openai_base_url(base_url, task)
+        if base_url_error is not None:
+            return [
+                verification_artifact(
+                    task=task,
+                    worker_id=worker_id,
+                    adapter="openai",
+                    check=task.instruction,
+                    result="failed",
+                    confidence=0.5,
+                    evidence=evidence_base + ["untrusted_base_url"],
+                    payload={
+                        "returncode": None,
+                        "model": model,
+                        "failure": "untrusted_base_url",
+                        "stderr": base_url_error,
                     },
                 )
             ]

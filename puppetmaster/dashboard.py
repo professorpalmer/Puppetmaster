@@ -20,6 +20,7 @@ socket:
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 from pathlib import Path
@@ -386,6 +387,9 @@ def make_handler(store_factory: Callable[[], SwarmStore]):
     return _Handler
 
 
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", ""})
+
+
 def serve(
     state_dir: Union[Path, str],
     *,
@@ -395,15 +399,33 @@ def serve(
     port: int = 8787,
     open_browser: bool = True,
     serve_forever: bool = True,
+    allow_external: bool = False,
 ):
     """Start the dashboard HTTP server. Returns the server (already bound).
 
     ``serve_forever=False`` binds and returns without blocking — used by tests
     to drive a single request, then ``server.shutdown()``.
+
+    The dashboard serves durable job state with no authentication, so binding
+    to a non-loopback interface would expose it to the local network. That is
+    refused unless ``allow_external`` (or
+    ``PUPPETMASTER_DASHBOARD_ALLOW_EXTERNAL=1``) is set, making the exposure an
+    explicit, deliberate choice.
     """
     from http.server import ThreadingHTTPServer
 
     from puppetmaster.store_factory import create_store
+
+    allow_external = allow_external or os.environ.get(
+        "PUPPETMASTER_DASHBOARD_ALLOW_EXTERNAL", ""
+    ).strip() not in ("", "0", "false", "False")
+    if host.strip().lower() not in _LOOPBACK_HOSTS and not allow_external:
+        raise ValueError(
+            f"refusing to bind the unauthenticated dashboard to non-loopback host "
+            f"{host!r}; it would expose job state to the network. Pass "
+            f"allow_external=True (CLI: --allow-external) or set "
+            f"PUPPETMASTER_DASHBOARD_ALLOW_EXTERNAL=1 to override."
+        )
 
     resolved = Path(state_dir)
 

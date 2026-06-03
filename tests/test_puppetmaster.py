@@ -918,6 +918,52 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertIn("Plan mode", prompt)
         self.assertIn("Dry-run constraint", prompt)
 
+    def test_start_implement_uses_locked_platform(self) -> None:
+        from puppetmaster import mcp_server
+
+        captured = {}
+
+        def fake_start_cli(command, args):
+            captured["command"] = command
+            return {"ok": True, "job_id": "j1"}
+
+        with patch(
+            "puppetmaster.platform_lock.enabled_adapters", return_value={"cursor"}
+        ), patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
+            result = mcp_server.start_implement({"goal": "ship the audit", "cwd": "."})
+
+        self.assertIn("--implement", captured["command"])
+        self.assertEqual(captured["command"][0], "cursor")
+        self.assertEqual(result["implement_adapter"], "cursor")
+
+    def test_start_implement_falls_back_to_claude_when_cursor_disabled(self) -> None:
+        from puppetmaster import mcp_server
+
+        captured = {}
+
+        def fake_start_cli(command, args):
+            captured["command"] = command
+            return {"ok": True}
+
+        with patch(
+            "puppetmaster.platform_lock.enabled_adapters", return_value={"claude-code"}
+        ), patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
+            result = mcp_server.start_implement({"goal": "ship it", "cwd": "."})
+
+        self.assertEqual(captured["command"][0], "claude")
+        self.assertEqual(result["implement_adapter"], "claude-code")
+
+    def test_start_implement_rejects_disabled_requested_adapter(self) -> None:
+        from puppetmaster import mcp_server
+
+        with patch(
+            "puppetmaster.platform_lock.enabled_adapters", return_value={"cursor"}
+        ):
+            result = mcp_server.start_implement(
+                {"goal": "ship it", "cwd": ".", "adapter": "claude-code"}
+            )
+        self.assertTrue(result.get("isError"))
+
     def test_cursor_failure_classification_is_actionable(self) -> None:
         self.assertEqual(classify_cursor_failure("CURSOR_API_KEY is required"), "missing_api_key")
         self.assertEqual(classify_cursor_failure("model invalid"), "model_unavailable")
@@ -970,6 +1016,98 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertIn(ArtifactType.RISK, artifact_types)
         self.assertEqual(artifacts[0].payload["result"], "passed")
         self.assertIn("Puppetmaster artifact contract", cursor_input["prompt"])
+
+    def test_cursor_implement_emits_patch_when_tree_changes(self) -> None:
+        task = Task(
+            job_id="job",
+            role="cursor",
+            instruction="add a helper",
+            adapter="cursor",
+            payload={
+                "prompt": "Add a helper",
+                "cwd": ".",
+                "mode": "implement",
+                "disable_codegraph": True,
+            },
+        )
+        completed = subprocess.CompletedProcess(
+            args=["node"],
+            returncode=0,
+            stdout=json.dumps({"status": "finished", "result": "done"}),
+            stderr="",
+        )
+        before = {"sha": "base123", "changed_files": [], "untracked_files": [], "diff": ""}
+        after = {
+            "sha": "base123",
+            "changed_files": ["helper.py"],
+            "untracked_files": [],
+            "diff": "diff --git a/helper.py b/helper.py\n+def helper():\n+    return 1\n",
+        }
+        with patch("puppetmaster.adapters.git_snapshot", side_effect=[before, after]), patch(
+            "puppetmaster.adapters.subprocess.run", return_value=completed
+        ) as run:
+            artifacts = CursorAdapter().run(task, "goal", "worker-cursor")
+
+        cursor_input = json.loads(run.call_args.kwargs["env"]["PUPPETMASTER_CURSOR_INPUT"])
+        self.assertIn("Implement mode", cursor_input["prompt"])
+        types = [a.type for a in artifacts]
+        self.assertIn(ArtifactType.VERIFICATION, types)
+        self.assertIn(ArtifactType.PATCH, types)
+        patch_artifact = next(a for a in artifacts if a.type == ArtifactType.PATCH)
+        self.assertEqual(patch_artifact.payload["status"], "applied")
+        self.assertIn("helper.py", patch_artifact.payload["files"])
+        self.assertIn("diff --git", patch_artifact.payload["unified_diff"])
+        self.assertEqual(artifacts[0].payload["result"], "passed")
+
+    def test_cursor_implement_blocks_on_dirty_tree(self) -> None:
+        task = Task(
+            job_id="job",
+            role="cursor",
+            instruction="add a helper",
+            adapter="cursor",
+            payload={"prompt": "Add a helper", "cwd": ".", "mode": "implement"},
+        )
+        dirty = {
+            "sha": "base123",
+            "changed_files": ["already_dirty.py"],
+            "untracked_files": [],
+            "diff": "x",
+        }
+        with patch("puppetmaster.adapters.git_snapshot", return_value=dirty), patch(
+            "puppetmaster.adapters.subprocess.run"
+        ) as run:
+            artifacts = CursorAdapter().run(task, "goal", "worker-cursor")
+
+        run.assert_not_called()  # never spawns the agent on a dirty tree
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(artifacts[0].payload["result"], "blocked")
+        self.assertEqual(artifacts[0].payload["failure"], "dirty_worktree")
+
+    def test_cursor_implement_allow_dirty_runs_agent(self) -> None:
+        task = Task(
+            job_id="job",
+            role="cursor",
+            instruction="add a helper",
+            adapter="cursor",
+            payload={
+                "prompt": "Add a helper",
+                "cwd": ".",
+                "mode": "implement",
+                "allow_dirty": True,
+                "disable_codegraph": True,
+            },
+        )
+        completed = subprocess.CompletedProcess(
+            args=["node"], returncode=0, stdout=json.dumps({"status": "finished", "result": "ok"}), stderr=""
+        )
+        dirty = {"sha": "s", "changed_files": ["pre.py"], "untracked_files": [], "diff": ""}
+        with patch("puppetmaster.adapters.git_snapshot", side_effect=[dirty, dirty]), patch(
+            "puppetmaster.adapters.subprocess.run", return_value=completed
+        ) as run:
+            artifacts = CursorAdapter().run(task, "goal", "worker-cursor")
+
+        run.assert_called_once()  # dirty guard bypassed
+        self.assertEqual(artifacts[0].payload["result"], "passed")
 
     def test_codegraph_helper_returns_none_when_cli_missing(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -4580,6 +4718,9 @@ class OpenAIAdapterTests(unittest.TestCase):
                     openai_organization="org-puppetmaster",
                     max_output_tokens=2048,
                     temperature=0.4,
+                    # Custom (untrusted) host requires the explicit opt-in so the
+                    # adapter is willing to send the API key there.
+                    openai_allow_untrusted_base_url=True,
                 ),
                 "goal",
                 "worker-openai",
@@ -4597,6 +4738,47 @@ class OpenAIAdapterTests(unittest.TestCase):
         self.assertEqual(body["max_completion_tokens"], 2048)
         self.assertNotIn("max_tokens", body)
         self.assertEqual(body["temperature"], 0.4)
+
+    def test_openai_adapter_refuses_untrusted_base_url(self) -> None:
+        """The adapter must not send OPENAI_API_KEY to an arbitrary host.
+
+        Without the explicit opt-in, a caller-supplied non-allowlisted
+        base_url is refused before any network call (no key exfiltration).
+        """
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "sk"}, clear=False), patch(
+            "puppetmaster.adapters.urllib.request.urlopen"
+        ) as urlopen:
+            artifacts = OpenAIAdapter().run(
+                self._task(openai_base_url="https://evil.example.com/v1"),
+                "goal",
+                "worker-openai",
+            )
+
+        urlopen.assert_not_called()
+        self.assertEqual(artifacts[0].payload["failure"], "untrusted_base_url")
+        self.assertEqual(artifacts[0].payload["result"], "failed")
+
+    def test_openai_adapter_allows_allowlisted_host_via_env(self) -> None:
+        """PUPPETMASTER_OPENAI_ALLOWED_HOSTS extends the trusted host set."""
+        fake_response = _FakeUrlopenResponse(
+            json.dumps({"choices": [{"message": {"content": "{}"}}], "usage": {}})
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "OPENAI_API_KEY": "sk",
+                "PUPPETMASTER_OPENAI_ALLOWED_HOSTS": "proxy.internal",
+            },
+            clear=False,
+        ), patch(
+            "puppetmaster.adapters.urllib.request.urlopen", return_value=fake_response
+        ) as urlopen:
+            OpenAIAdapter().run(
+                self._task(openai_base_url="https://proxy.internal/v1"),
+                "goal",
+                "worker-openai",
+            )
+        urlopen.assert_called_once()
 
     def test_openai_adapter_legacy_max_tokens_opt_in(self) -> None:
         """Some OpenAI-compatible providers still want the old `max_tokens` key.

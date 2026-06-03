@@ -299,8 +299,16 @@ def route_task(
 ) -> RoutingDecision:
     """Pick a model for ``task`` from ``registry`` using ``policy``.
 
-    Raises :class:`NoEligibleModelError` if nothing in the registry
-    satisfies the constraints — never silently downgrade.
+    Raises :class:`NoEligibleModelError` for *hard* constraint failures: an
+    empty/all-disabled registry, a platform lock that excludes every model, or
+    a ``max_cost_usd`` cap nothing can satisfy.
+
+    Capability is treated as a *soft* preference, not a hard gate: when no model
+    meets the needed capability score, ``balanced`` deliberately falls back to
+    the highest-capability model available (with a reason that makes the gap
+    explicit) rather than raising — so a task still runs on the best option on
+    hand instead of failing closed. Use ``payload.min_capability`` /
+    ``payload.required_tags`` if you need a hard floor.
     """
     if policy not in VALID_POLICIES:
         raise ValueError(f"unknown policy {policy!r}; expected one of {VALID_POLICIES}")
@@ -475,7 +483,12 @@ def route_task(
         # sufficient model), but ordered alternatives are listed in
         # `rejected` so the orchestrator can retry up the chain.
         sorted_by_cap = sorted(
-            after_cost, key=lambda s: (s.capability_score, _plan_rank(s))
+            after_cost,
+            key=lambda s: (
+                s.capability_score,
+                _plan_rank(s),
+                s.estimate_cost_usd(tokens_in, tokens_out),
+            ),
         )
         sufficient = [s for s in sorted_by_cap if s.capability_score >= need]
         pick = sufficient[0] if sufficient else sorted_by_cap[-1]

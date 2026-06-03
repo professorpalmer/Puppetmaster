@@ -338,6 +338,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not auto-open a browser tab.",
     )
+    dashboard_cmd.add_argument(
+        "--allow-external",
+        action="store_true",
+        help=(
+            "Allow binding to a non-loopback host. The dashboard is "
+            "unauthenticated, so this exposes job state to the network — only "
+            "use on a trusted network."
+        ),
+    )
 
     await_cmd = subcommands.add_parser(
         "await",
@@ -438,6 +447,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--plan",
         action="store_true",
         help="Ask Cursor for decisions and a task graph without implementation.",
+    )
+    cursor.add_argument(
+        "--implement",
+        action="store_true",
+        help="Full-edit mode: let the Cursor agent modify files and capture the diff as a PATCH artifact.",
+    )
+    cursor.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="Allow an --implement run to start in a dirty working tree.",
     )
 
     claude = subcommands.add_parser("claude", help="Run a full-featured Claude Code worker.")
@@ -1058,7 +1077,23 @@ def _main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     if args.command == "cursor":
-        prompt = cursor_prompt(args.prompt, review=args.review, plan=args.plan, dry_run=args.dry_run)
+        implement = getattr(args, "implement", False)
+        prompt = cursor_prompt(
+            args.prompt,
+            review=args.review,
+            plan=args.plan,
+            dry_run=args.dry_run,
+            implement=implement,
+        )
+        payload = {
+            "prompt": prompt,
+            "cwd": args.cwd,
+            "model": args.model,
+            "timeout_seconds": args.timeout_seconds,
+        }
+        if implement:
+            payload["mode"] = "implement"
+            payload["allow_dirty"] = getattr(args, "allow_dirty", False)
         result = Orchestrator(store).run(
             args.prompt,
             specs=[
@@ -1066,12 +1101,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
                     role="cursor",
                     instruction=args.prompt,
                     adapter="cursor",
-                    payload={
-                        "prompt": prompt,
-                        "cwd": args.cwd,
-                        "model": args.model,
-                        "timeout_seconds": args.timeout_seconds,
-                    },
+                    payload=payload,
                 )
             ],
             lease_seconds=10,
@@ -1337,6 +1367,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
             host=args.host,
             port=args.port,
             open_browser=not args.no_open,
+            allow_external=getattr(args, "allow_external", False),
         )
         return 0
 
@@ -1442,18 +1473,33 @@ def artifact_feed_since(
     fresh read). ``next_cursor`` is the highest event id observed, regardless
     of whether it was an artifact event, so callers can resume reliably.
     """
-    artifacts = {artifact.id: artifact.__dict__ for artifact in store.list_artifacts(job_id)}
-    items: list[dict] = []
-    seen: set = set()
+    # Read events FIRST, then fetch only the artifacts those events reference.
+    # The previous order (snapshot all artifacts, then read events) had a race:
+    # an artifact saved between the two reads was missing from the snapshot, so
+    # its event was skipped while the cursor still advanced past it — dropping
+    # the artifact from the feed forever. save_artifact persists the row before
+    # emitting its event, so an artifact named by an event we just read is
+    # guaranteed to exist when we fetch it afterward.
+    events = store.read_events_since(job_id, since=since)
+    artifact_events: list[dict] = []
     cursor = since
-    for event in store.read_events_since(job_id, since=since):
+    for event in events:
         event_id = event.get("id")
         if isinstance(event_id, int) and event_id > cursor:
             cursor = event_id
-        if event.get("event") != "artifact.saved":
-            continue
+        if event.get("event") == "artifact.saved":
+            artifact_events.append(event)
+
+    needed_ids = [
+        event.get("payload", {}).get("artifact_id") for event in artifact_events
+    ]
+    fetched = store.get_artifacts_by_ids(job_id, needed_ids)
+
+    items: list[dict] = []
+    seen: set = set()
+    for event in artifact_events:
         artifact_id = event.get("payload", {}).get("artifact_id")
-        artifact = artifacts.get(artifact_id)
+        artifact = fetched.get(artifact_id)
         if artifact is None or artifact_id in seen:
             continue
         seen.add(artifact_id)
@@ -1461,8 +1507,8 @@ def artifact_feed_since(
             {
                 "at": event["at"],
                 "event": event["event"],
-                "id": event_id,
-                "artifact": artifact,
+                "id": event.get("id"),
+                "artifact": artifact.__dict__,
             }
         )
     if limit is not None:
@@ -2262,12 +2308,20 @@ def await_job_state(
                 "completed_at": job.completed_at,
             }
         block = poll if deadline is None else max(0.05, min(poll * 4, deadline - time.monotonic()))
-        store.wait_for_events(
+        events = store.wait_for_events(
             job_id,
             since=cursor,
             timeout_seconds=max(0.05, block),
             poll_interval=poll,
         )
+        # Advance the cursor past the events we just observed. Without this the
+        # cursor stayed at 0, so once any event existed wait_for_events returned
+        # immediately every iteration and the loop hot-spun (re-reading the
+        # whole event stream) until the job reached a terminal state.
+        for event in events:
+            event_id = event.get("id")
+            if isinstance(event_id, int) and event_id > cursor:
+                cursor = event_id
 
 
 def _run_await_command(args, store) -> int:
@@ -2651,7 +2705,21 @@ def _run_cost_command(args, store) -> int:
 
     job_id = args.job_id
     artifacts = store.list_artifacts(job_id)
-    routing = [a for a in artifacts if a.type == ArtifactType.ROUTING]
+    # Only count the router's initial decision per task. Fallback/escalation
+    # reroutes (created_by 'router-fallback' / 'router-escalation') emit their
+    # own ROUTING artifacts; summing all of them double-counts a rerouted task.
+    # Dedup by task_id mirrors savings.collect_routing_records.
+    routing = []
+    seen_router_tasks: set = set()
+    for artifact in artifacts:
+        if artifact.type != ArtifactType.ROUTING or artifact.created_by != "router":
+            continue
+        task_id = artifact.task_id
+        if task_id:
+            if task_id in seen_router_tasks:
+                continue
+            seen_router_tasks.add(task_id)
+        routing.append(artifact)
 
     if not routing:
         msg = (
@@ -2914,8 +2982,25 @@ def apply_patch_diff(diff: str, cwd: Path) -> None:
         raise RuntimeError(f"patch apply failed: {applied.stderr.strip()}")
 
 
-def cursor_prompt(prompt: str, *, review: bool = False, plan: bool = False, dry_run: bool = False) -> str:
+def cursor_prompt(
+    prompt: str,
+    *,
+    review: bool = False,
+    plan: bool = False,
+    dry_run: bool = False,
+    implement: bool = False,
+) -> str:
     lines = [prompt]
+    if implement:
+        lines.extend(
+            [
+                "",
+                "Implement mode: you are a full-edit worker inside the user's repository. "
+                "Actually make the code changes to complete the task end to end — create, "
+                "edit, and delete files as needed. Do not just return a plan or findings; "
+                "leave the working tree containing your final intended changes.",
+            ]
+        )
     if review:
         lines.extend(
             [

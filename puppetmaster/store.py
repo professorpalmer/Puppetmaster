@@ -194,10 +194,15 @@ class SwarmStore:
         lease_seconds: int = 60,
     ) -> Optional[Task]:
         self.refresh_blocked_tasks(job_id)
-        for task in self.list_tasks(job_id):
+        # Load the job's tasks once and resolve dependency status from the
+        # in-memory map instead of re-fetching each dependency by id (which is
+        # a per-edge file glob / SQLite SELECT on every claim sweep).
+        tasks = self.list_tasks(job_id)
+        task_map = {task.id: task for task in tasks}
+        for task in tasks:
             if task.status != TaskStatus.QUEUED:
                 continue
-            if not self.dependencies_complete(task):
+            if not self.dependencies_complete(task, task_map=task_map):
                 self.save_task(replace(task, status=TaskStatus.BLOCKED, updated_at=now_iso()))
                 continue
             if role is not None and task.role != role:
@@ -208,7 +213,7 @@ class SwarmStore:
             try:
                 return self.claim_task(task.id, worker_id, lease_seconds=lease_seconds)
             finally:
-                self.release_lock(lock_name)
+                self.release_lock(lock_name, owner=worker_id)
         return None
 
     def recover_stale_tasks(self, job_id: str) -> list[Task]:
@@ -245,12 +250,22 @@ class SwarmStore:
             ready.append(queued)
         return ready
 
-    def dependencies_complete(self, task: Task) -> bool:
+    def dependencies_complete(
+        self,
+        task: Task,
+        task_map: Optional[dict[str, Task]] = None,
+    ) -> bool:
         for dependency_id in task.depends_on:
-            try:
-                dependency = self.get_task_by_id(dependency_id)
-            except FileNotFoundError:
-                return False
+            dependency: Optional[Task]
+            if task_map is not None:
+                dependency = task_map.get(dependency_id)
+                if dependency is None:
+                    return False
+            else:
+                try:
+                    dependency = self.get_task_by_id(dependency_id)
+                except FileNotFoundError:
+                    return False
             if dependency.status != TaskStatus.COMPLETE:
                 return False
         return True
@@ -330,10 +345,50 @@ class SwarmStore:
             for path in sorted((self.job_dir(job_id) / "artifacts").glob("*.json"))
         ]
 
+    def count_artifacts(self, job_id: str) -> int:
+        """Cheap artifact count that avoids deserializing every payload."""
+        artifacts_dir = self.job_dir(job_id) / "artifacts"
+        if not artifacts_dir.exists():
+            return 0
+        return sum(1 for _ in artifacts_dir.glob("*.json"))
+
+    def get_artifacts_by_ids(
+        self, job_id: str, artifact_ids: Iterable[str]
+    ) -> dict[str, Artifact]:
+        """Load only the requested artifacts (by id) for a job.
+
+        Lets pollers (e.g. the artifact feed) fetch just the artifacts a new
+        batch of events references instead of snapshotting the whole job.
+        """
+        artifacts_dir = self.job_dir(job_id) / "artifacts"
+        out: dict[str, Artifact] = {}
+        for artifact_id in artifact_ids:
+            if not artifact_id or artifact_id in out:
+                continue
+            path = artifacts_dir / f"{artifact_id}.json"
+            if path.exists():
+                out[artifact_id] = artifact_from_dict(self.read_json(path))
+        return out
+
+    def list_artifacts_by_type(self, artifact_type: str) -> list[Artifact]:
+        """Return every artifact of ``artifact_type`` across all jobs.
+
+        The file backend still walks each job; SQLite overrides this with a
+        single indexed query. Used by the savings ledger so it doesn't have to
+        deserialize every artifact of every job just to find routing records.
+        """
+        out: list[Artifact] = []
+        for job in self.list_jobs():
+            out.extend(
+                artifact
+                for artifact in self.list_artifacts(job.id)
+                if str(artifact.type) == artifact_type
+            )
+        return out
+
     def status_snapshot(self, job_id: str) -> dict[str, Any]:
         self.refresh_blocked_tasks(job_id)
         tasks = self.list_tasks(job_id)
-        artifacts = self.list_artifacts(job_id)
         status_counts: dict[str, int] = {}
         for task in tasks:
             status_counts[str(task.status)] = status_counts.get(str(task.status), 0) + 1
@@ -341,7 +396,7 @@ class SwarmStore:
             "job": to_jsonable(self.get_job(job_id)),
             "tasks": [to_jsonable(task) for task in tasks],
             "task_counts": status_counts,
-            "artifact_count": len(artifacts),
+            "artifact_count": self.count_artifacts(job_id),
             "stale_task_ids": [task.id for task in tasks if self.is_task_stale(task)],
         }
 
@@ -371,7 +426,7 @@ class SwarmStore:
                 for key in ["scope", "statement", "evidence", "adapter", "role", "topic"]
             ).lower()
             score = sum(1 for term in terms if term in haystack)
-            confidence = float(memory.get("confidence", 0))
+            confidence = _coerce_confidence(memory.get("confidence"))
             scored.append((score, confidence, memory))
         scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
         return [memory for score, _, memory in scored[:limit] if score > 0 or not terms]
@@ -413,10 +468,24 @@ class SwarmStore:
         except FileExistsError:
             return False
 
-    def release_lock(self, name: str) -> None:
+    def release_lock(self, name: str, owner: Optional[str] = None) -> None:
         path = self.locks_dir / f"{self._safe_key(name)}.lock"
-        if path.exists():
+        if not path.exists():
+            return
+        # When an owner is supplied, only release a lock we actually hold.
+        # This prevents a stale/late caller from unlinking another worker's
+        # lock and letting a second worker double-claim the same task.
+        if owner is not None:
+            try:
+                held_by = path.read_text(encoding="utf-8").strip()
+            except OSError:
+                held_by = ""
+            if held_by and held_by != owner:
+                return
+        try:
             path.unlink()
+        except FileNotFoundError:
+            pass
 
     def emit(self, job_id: str, event: str, payload: dict[str, Any]) -> None:
         self.init()
@@ -524,6 +593,19 @@ class SwarmStore:
     @staticmethod
     def _safe_key(value: str) -> str:
         return "".join(char if char.isalnum() or char in "-_" else "_" for char in value)
+
+
+def _coerce_confidence(value: Any) -> float:
+    """Best-effort float for a persisted confidence value.
+
+    Malformed JSON (a string, None, or garbage written by an older/buggy
+    producer) must not crash memory retrieval — treat anything uncoercible
+    as 0.0 so the record sorts last instead of raising.
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def group_by_type(artifacts: Iterable[Artifact]) -> dict[str, list[Artifact]]:
