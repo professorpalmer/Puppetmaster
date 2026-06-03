@@ -1,7 +1,5 @@
 # Cursor Agent MCP Integration
 
-The Cursor extension gives Puppetmaster a visual control panel.
-
 The MCP server gives Cursor's Agent chat access to Puppetmaster tools.
 
 That is the integration path for using Puppetmaster from the Agent surface instead of manually typing terminal commands.
@@ -166,4 +164,4 @@ Use Puppetmaster to start Claude Code implementation for the approved fix in a c
 
 ## Current Boundary
 
-Cursor does not expose the internal Agent model picker or composer controls as a public extension API. MCP is the supported tool surface for Agent-chat integration, while the extension is the supported UI surface for a native control panel.
+Cursor does not expose the internal Agent model picker or composer controls as a public extension API. MCP is the supported tool surface for Agent-chat integration.

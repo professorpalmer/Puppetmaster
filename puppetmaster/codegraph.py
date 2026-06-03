@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -65,8 +66,15 @@ CODEGRAPH_NATIVE_SQLITE_HINT = (
 
 
 def codegraph_available() -> bool:
-    """Return True when the codegraph CLI is on PATH."""
-    return shutil.which(CODEGRAPH_COMMAND) is not None
+    """Return True when CodeGraph can be invoked.
+
+    Either the ``codegraph`` shim is on PATH, or we can run it directly under
+    Cursor's bundled Node (the ABI-safe path), so a machine whose shell lacks
+    the global shim still works as long as Cursor + the install are present.
+    """
+    if shutil.which(CODEGRAPH_COMMAND) is not None:
+        return True
+    return _cursor_codegraph_invocation() is not None
 
 
 def resolve_codegraph_invocation() -> list[str]:
@@ -101,7 +109,31 @@ def resolve_codegraph_invocation() -> list[str]:
     return [CODEGRAPH_COMMAND]
 
 
+# Resolving the Cursor-Node invocation shells out (`npm root -g`, filesystem
+# probes) and is hit on every codegraph_available() check. The install location
+# is stable for the life of the process, so memoize it. _UNSET distinguishes
+# "not computed yet" from a cached negative (None) result.
+_UNSET = object()
+_CURSOR_INVOCATION_CACHE: Any = _UNSET
+
+
+def reset_cursor_codegraph_invocation_cache() -> None:
+    """Clear the memoized Cursor-Node invocation (used by tests)."""
+    global _CURSOR_INVOCATION_CACHE
+    _CURSOR_INVOCATION_CACHE = _UNSET
+
+
 def _cursor_codegraph_invocation() -> Optional[list[str]]:
+    """Return ``[cursor_node, codegraph.js]`` when both are discoverable (memoized)."""
+    global _CURSOR_INVOCATION_CACHE
+    if _CURSOR_INVOCATION_CACHE is not _UNSET:
+        return _CURSOR_INVOCATION_CACHE
+    result = _compute_cursor_codegraph_invocation()
+    _CURSOR_INVOCATION_CACHE = result
+    return result
+
+
+def _compute_cursor_codegraph_invocation() -> Optional[list[str]]:
     """Return ``[cursor_node, codegraph.js]`` when both are discoverable."""
     # Imports deferred to avoid module-import-time cost in code paths
     # that never actually invoke codegraph (e.g. pure Puppetmaster swarm runs).
@@ -254,7 +286,7 @@ def run_codegraph_cli(
     cwd: Union[Path, str, None],
     *,
     require_initialized: bool = True,
-    timeout_seconds: int = DEFAULT_CONTEXT_TIMEOUT_SECONDS,
+    timeout_seconds: Optional[int] = DEFAULT_CONTEXT_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """Run a codegraph CLI subcommand and return a JSON-serializable result.
 
@@ -280,6 +312,33 @@ def run_codegraph_cli(
             "error": CODEGRAPH_NOT_INITIALIZED_HINT,
         }
 
+    result = _run_codegraph_once(
+        cli_args, cwd_str, rendered_command, timeout_seconds
+    )
+
+    # Auto-heal: a non-zero exit whose output matches the better-sqlite3 Node
+    # ABI failure means the native binding was built for a different Node than
+    # the one invoking it. Rebuild it against Cursor's Node once, then retry —
+    # but only if the rebuild actually succeeded (a failed rebuild means a
+    # blind retry would just reproduce the same ABI error).
+    if _codegraph_should_autoheal(result):
+        repair = _attempt_codegraph_autoheal()
+        if repair is not None:
+            if repair.get("ok"):
+                result = _run_codegraph_once(
+                    cli_args, cwd_str, rendered_command, timeout_seconds
+                )
+            result["autoheal"] = repair
+    return result
+
+
+def _run_codegraph_once(
+    cli_args: list[str],
+    cwd_str: str,
+    rendered_command: str,
+    timeout_seconds: Optional[int],
+) -> dict[str, Any]:
+    """Invoke codegraph once via the resolved (Cursor-Node) invocation."""
     started = time.monotonic()
     try:
         completed = subprocess.run(
@@ -326,6 +385,124 @@ def run_codegraph_cli(
         "stdout": completed.stdout or "",
         "stderr": completed.stderr or "",
     }
+
+
+# Auto-heal coordination. A rebuild is expensive (npm) and concurrent callers
+# (the MCP server runs codegraph queries on worker threads) must not each spawn
+# their own `npm rebuild`. The lock makes the decision-to-rebuild atomic; the
+# cooldown keeps a *failed* rebuild from wedging the process forever while still
+# preventing a tight retry storm. A *successful* rebuild latches `succeeded` so
+# we never rebuild again for the life of the process.
+_AUTOHEAL_LOCK = threading.Lock()
+_AUTOHEAL_COOLDOWN_SECONDS = 300.0
+_AUTOHEAL_STATE: dict[str, Any] = {
+    "succeeded": False,
+    "in_progress": False,
+    "last_attempt_at": 0.0,
+}
+
+# Backwards-compatible alias: some callers/tests reset the legacy one-shot flag.
+_CODEGRAPH_AUTOHEAL_STATE = _AUTOHEAL_STATE
+
+
+def reset_codegraph_autoheal_state() -> None:
+    """Reset auto-heal bookkeeping (used by tests and after a manual repair)."""
+    with _AUTOHEAL_LOCK:
+        _AUTOHEAL_STATE["succeeded"] = False
+        _AUTOHEAL_STATE["in_progress"] = False
+        _AUTOHEAL_STATE["last_attempt_at"] = 0.0
+
+
+def codegraph_autoheal_enabled() -> bool:
+    """Auto-heal is on by default; opt out with PUPPETMASTER_CODEGRAPH_AUTOHEAL=0."""
+    return os.environ.get("PUPPETMASTER_CODEGRAPH_AUTOHEAL", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _codegraph_env_install_pinned() -> bool:
+    """True when the user pinned a custom Node+JS install via env overrides.
+
+    In that case ``repair_codegraph_sqlite`` (which rebuilds the *global* npm
+    install) can't safely target their install, so we must not auto-heal.
+    """
+    node = os.environ.get("PUPPETMASTER_CODEGRAPH_NODE")
+    js = os.environ.get("PUPPETMASTER_CODEGRAPH_JS")
+    return bool(node and js and Path(node).is_file() and Path(js).is_file())
+
+
+# Unambiguous strings emitted only by a better-sqlite3 native ABI load failure.
+# Kept deliberately strict (vs. the broader `codegraph_native_sqlite_broken`
+# backend detector) so a transient/unrelated non-zero exit never triggers an
+# expensive npm rebuild.
+_ABI_LOAD_FAILURE_PHRASES = (
+    "node_module_version",
+    "was compiled against a different node",
+    "different node.js version",
+)
+
+
+def _codegraph_abi_load_failure(text: str) -> bool:
+    """True only for the hard better-sqlite3 Node ABI native-load signature."""
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(phrase in lowered for phrase in _ABI_LOAD_FAILURE_PHRASES)
+
+
+def _codegraph_should_autoheal(result: dict[str, Any]) -> bool:
+    """True when a result looks like a better-sqlite3 Node ABI failure we can fix."""
+    if result.get("ok"):
+        return False
+    if not codegraph_autoheal_enabled():
+        return False
+    if _codegraph_env_install_pinned():
+        return False
+    combined = (result.get("stderr") or "") + "\n" + (result.get("stdout") or "")
+    return _codegraph_abi_load_failure(combined)
+
+
+def _claim_codegraph_autoheal() -> bool:
+    """Atomically decide whether *this* caller should run the rebuild.
+
+    Returns True for exactly one caller at a time, never after a success, and
+    never within the cooldown window of a prior (failed) attempt.
+    """
+    with _AUTOHEAL_LOCK:
+        if _AUTOHEAL_STATE["succeeded"] or _AUTOHEAL_STATE["in_progress"]:
+            return False
+        now = time.monotonic()
+        last = _AUTOHEAL_STATE["last_attempt_at"]
+        if last and now - last < _AUTOHEAL_COOLDOWN_SECONDS:
+            return False
+        _AUTOHEAL_STATE["in_progress"] = True
+        _AUTOHEAL_STATE["last_attempt_at"] = now
+        return True
+
+
+def _attempt_codegraph_autoheal() -> Optional[dict[str, Any]]:
+    """Rebuild better-sqlite3 against Cursor's Node. Returns a summary dict, or
+    None when another thread already owns the (one-at-a-time) attempt or the
+    cooldown/success latch forbids a new one."""
+    if not _claim_codegraph_autoheal():
+        return None
+    summary: dict[str, Any] = {"ok": False, "message": "auto-heal failed: unknown"}
+    try:
+        from puppetmaster.codegraph_repair import repair_codegraph_sqlite
+
+        result = repair_codegraph_sqlite(verify=False)
+        summary = {"ok": bool(result.ok), "message": result.message}
+    except Exception as exc:  # pragma: no cover - defensive
+        summary = {"ok": False, "message": f"auto-heal failed: {exc}"}
+    finally:
+        with _AUTOHEAL_LOCK:
+            _AUTOHEAL_STATE["in_progress"] = False
+            if summary.get("ok"):
+                _AUTOHEAL_STATE["succeeded"] = True
+    return summary
 
 
 def _record_codegraph_usage(
@@ -802,5 +979,12 @@ def codegraph_native_sqlite_broken(status_output: str) -> bool:
         "better-sqlite3",
         "backend: fallback",
         "backend: wasm",
+        # Hard native-load failure surface (command exits non-zero before it
+        # can fall back to WASM). This is the exact error a shell-Node
+        # invocation throws when better-sqlite3 was built for a different ABI.
+        "node_module_version",
+        "better_sqlite3",
+        "was compiled against a different node",
+        "different node.js version",
     )
     return any(marker in lowered for marker in fallback_markers)

@@ -109,9 +109,11 @@ If any `puppetmaster_*` MCP tool returns `Tool execution error. Not connected`, 
 | `puppetmaster_mcp_status` | `python -m puppetmaster mcp list` |
 | `puppetmaster_mcp_cleanup` | `python -m puppetmaster mcp cleanup --kill-stale` |
 | `puppetmaster_repair_codegraph` | `python -m puppetmaster repair-codegraph` |
-| `puppetmaster_codegraph_status` | `codegraph status` |
-| `puppetmaster_codegraph_search` | `codegraph search '<query>'` |
-| `puppetmaster_codegraph_context` | `codegraph context '<task>' --max-nodes 15 --format markdown` |
-| `puppetmaster_codegraph_init` | `codegraph init --index` |
+| `puppetmaster_codegraph_status` | `python -m puppetmaster codegraph status` |
+| `puppetmaster_codegraph_search` | `python -m puppetmaster codegraph search '<query>'` |
+| `puppetmaster_codegraph_context` | `python -m puppetmaster codegraph context '<task>' --max-nodes 15 --format markdown` |
+| `puppetmaster_codegraph_init` | `python -m puppetmaster codegraph init --index` |
 
 Read-only commands (`show`/`artifacts`/`logs`/`feed`/`status`) auto-pivot to whichever project state dir owns the job — no need to export `PUPPETMASTER_STATE_DIR`. Only ask the user to restart MCP in Cursor Settings when `python -m puppetmaster mcp list` shows zero alive servers.
+
+**Always invoke CodeGraph through `python -m puppetmaster codegraph …`, never a bare `codegraph …` from the shell.** A bare shell call runs under your shell's Node, whose ABI usually differs from Cursor's bundled Node that compiled better-sqlite3 — so it dies with a `NODE_MODULE_VERSION` / native-load error. The `python -m puppetmaster codegraph` passthrough runs it under Cursor's Node and auto-rebuilds the binding on a mismatch (the MCP `puppetmaster_codegraph_*` tools already do this internally).

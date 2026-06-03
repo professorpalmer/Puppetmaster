@@ -31,7 +31,6 @@ Four production adapters live; eleven tiers in the starter registry (5 Cursor/Cl
 | One-line rule installer (v0.7.3+) | `install-rules` — Cursor `.mdc` + cross-tool `AGENTS.md` + global Codex/Claude rules, merge-don't-overwrite |
 | `puppetmaster setup` (v0.7.3+) | One-shot wizard chaining doctor → models init → MCP installers → rules |
 | Cursor Agent MCP | Async start tools, status polling, logs, live artifacts, partial summaries, routing tools |
-| Cursor extension | Activity-bar control panel ([docs](CURSOR_EXTENSION.md)) |
 | Memory | Promoted memory retrieval into later worker context and prompts |
 | CodeGraph | Optional shared repo intelligence ([docs](CODEGRAPH.md)) |
 | Patch workflow | Patch artifacts, path locks, approval/rejection events, dirty-worktree guard |
@@ -41,4 +40,4 @@ Four production adapters live; eleven tiers in the starter registry (5 Cursor/Cl
 
 ## Status
 
-Puppetmaster is **daily-driver beta software**. The runtime contract is real, tests are automated, SQLite is the default backend, jobs fail closed, Cursor Agent MCP is live, the Cursor extension is installable, and Claude Code + Codex have both been validated as full-edit adapters that emit patch artifacts. It is credible for supervised local engineering workflows. It is not yet a hosted multi-user production service.
+Puppetmaster is **daily-driver beta software**. The runtime contract is real, tests are automated, SQLite is the default backend, jobs fail closed, Cursor Agent MCP is live, and Claude Code + Codex have both been validated as full-edit adapters that emit patch artifacts. It is credible for supervised local engineering workflows. It is not yet a hosted multi-user production service.

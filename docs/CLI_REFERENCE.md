@@ -121,6 +121,32 @@ python -m puppetmaster recover                # recover stale-leased tasks
 python -m puppetmaster repair-codegraph       # rebuild CodeGraph's native SQLite binding for Cursor's bundled Node
 ```
 
+## CodeGraph passthrough (ABI-safe)
+
+```bash
+python -m puppetmaster codegraph status                 # backend + index state
+python -m puppetmaster codegraph search 'router'        # find symbols
+python -m puppetmaster codegraph context 'add caching' --max-nodes 15 --format markdown
+python -m puppetmaster codegraph init --index           # init + background index
+python -m puppetmaster codegraph --cwd /path/to/repo files
+python -m puppetmaster codegraph --timeout 60 search 'x' # cap the call at 60s
+python -m puppetmaster codegraph -- --version            # pass codegraph's own flags after `--`
+```
+
+`--timeout SECONDS` caps the call; the default is **no timeout** so long ops
+(`index`, `affected`) aren't cut off. Anything after a literal `--` is forwarded
+verbatim to the CodeGraph CLI.
+
+Use this instead of a bare `codegraph …` call from your shell. The passthrough
+runs CodeGraph under **Cursor's bundled Node** (resolved via
+`resolve_codegraph_invocation()`), not your shell's Node, so the native
+`better-sqlite3` binding loads. If it still hits a Node-ABI mismatch
+(`NODE_MODULE_VERSION` / "compiled against a different Node.js version"), it
+**auto-rebuilds the binding against Cursor's Node once and retries** — the same
+self-heal the `puppetmaster_codegraph_*` MCP tools now perform internally.
+Disable the auto-rebuild with `PUPPETMASTER_CODEGRAPH_AUTOHEAL=0`. Everything
+after the subcommand is forwarded verbatim to the codegraph CLI.
+
 ## MCP server management
 
 ```bash
