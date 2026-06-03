@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Optional, Union
 
@@ -146,6 +147,7 @@ def codegraph_context(
     """Return task-relevant CodeGraph context for the workspace, or None."""
     if not codegraph_ready(cwd):
         return None
+    started = time.monotonic()
     try:
         completed = subprocess.run(
             resolve_codegraph_invocation()
@@ -171,7 +173,16 @@ def codegraph_context(
     output = (completed.stdout or "").strip()
     if not output:
         return None
-    return output[:MAX_CONTEXT_CHARS]
+    output = output[:MAX_CONTEXT_CHARS]
+    _record_codegraph_usage(
+        cli_args=["context", task],
+        cwd=str(cwd or ""),
+        stdout=output,
+        latency_ms=(time.monotonic() - started) * 1000.0,
+        ok=True,
+        caller="swarm",
+    )
+    return output
 
 
 def codegraph_status_line(
@@ -269,6 +280,7 @@ def run_codegraph_cli(
             "error": CODEGRAPH_NOT_INITIALIZED_HINT,
         }
 
+    started = time.monotonic()
     try:
         completed = subprocess.run(
             resolve_codegraph_invocation() + cli_args,
@@ -298,6 +310,14 @@ def run_codegraph_cli(
             "error": f"failed to invoke codegraph: {exc}",
         }
 
+    _record_codegraph_usage(
+        cli_args=cli_args,
+        cwd=cwd_str,
+        stdout=completed.stdout or "",
+        latency_ms=(time.monotonic() - started) * 1000.0,
+        ok=completed.returncode == 0,
+        caller="mcp",
+    )
     return {
         "ok": completed.returncode == 0,
         "command": rendered_command,
@@ -306,6 +326,36 @@ def run_codegraph_cli(
         "stdout": completed.stdout or "",
         "stderr": completed.stderr or "",
     }
+
+
+def _record_codegraph_usage(
+    *,
+    cli_args: list[str],
+    cwd: str,
+    stdout: str,
+    latency_ms: float,
+    ok: bool,
+    caller: str,
+) -> None:
+    """Best-effort: log this query to the global codegraph usage log. The
+    command is the first CLI arg (``context``/``search``/``affected``/``files``);
+    the query argument's length is recorded as a size signal, never its text."""
+    try:
+        from puppetmaster import codegraph_usage
+
+        command = cli_args[0] if cli_args else ""
+        query_chars = len(cli_args[1]) if len(cli_args) > 1 else 0
+        codegraph_usage.record_query(
+            command=command,
+            cwd=cwd,
+            result_chars=len(stdout or ""),
+            latency_ms=latency_ms,
+            ok=ok,
+            caller=caller,
+            query_chars=query_chars,
+        )
+    except Exception:
+        pass
 
 
 def codegraph_query(

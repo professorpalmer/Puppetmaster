@@ -7204,6 +7204,212 @@ class RoutingAuditTests(unittest.TestCase):
             self.assertEqual(after["strong/80"], 80)  # untouched
 
 
+class CodegraphUsageTests(unittest.TestCase):
+    """The local, numbers-only codegraph usage log + its aggregation."""
+
+    def _with_log(self, tmp):
+        import os
+        os.environ["PUPPETMASTER_CODEGRAPH_USAGE_LOG"] = str(Path(tmp) / "usage.jsonl")
+        os.environ.pop("PUPPETMASTER_CODEGRAPH_USAGE", None)
+
+    def tearDown(self) -> None:
+        import os
+        os.environ.pop("PUPPETMASTER_CODEGRAPH_USAGE_LOG", None)
+        os.environ.pop("PUPPETMASTER_CODEGRAPH_USAGE", None)
+
+    def test_record_is_numbers_only_and_aggregates(self) -> None:
+        from puppetmaster import codegraph_usage as cu
+
+        with TemporaryDirectory() as tmp:
+            self._with_log(tmp)
+            cu.record_query(command="context", cwd="/repo", result_chars=4000,
+                            latency_ms=120.0, ok=True, caller="mcp", query_chars=30)
+            cu.record_query(command="search", cwd="/repo", result_chars=800,
+                            latency_ms=40.0, ok=True, caller="swarm", query_chars=12)
+            recs = cu.load_usage()
+            self.assertEqual(len(recs), 2)
+            # numbers-only: never stores the query text itself.
+            self.assertNotIn("query", recs[0])
+            self.assertEqual(recs[0]["context_tokens"], 1000)  # 4000 // 4
+            agg = cu.aggregate(recs, exploration_baseline_tokens=8000,
+                               input_price_per_mtok=1.0)
+            self.assertEqual(agg["queries"], 2)
+            self.assertEqual(agg["context_tokens_fed"], 1200)  # 1000 + 200
+            self.assertEqual(agg["avoided_exploration_tokens_est"], 16000)
+            self.assertEqual(agg["net_tokens_saved_est"], 14800)
+
+    def test_non_exploration_commands_are_ignored(self) -> None:
+        from puppetmaster import codegraph_usage as cu
+
+        with TemporaryDirectory() as tmp:
+            self._with_log(tmp)
+            cu.record_query(command="status", cwd="/r", result_chars=10,
+                            latency_ms=5.0, ok=True)
+            cu.record_query(command="init", cwd="/r", result_chars=10,
+                            latency_ms=5.0, ok=True)
+            self.assertEqual(cu.load_usage(), [])
+
+    def test_disabled_writes_nothing(self) -> None:
+        import os
+        from puppetmaster import codegraph_usage as cu
+
+        with TemporaryDirectory() as tmp:
+            self._with_log(tmp)
+            os.environ["PUPPETMASTER_CODEGRAPH_USAGE"] = "0"
+            cu.record_query(command="context", cwd="/r", result_chars=4000,
+                            latency_ms=1.0, ok=True)
+            self.assertEqual(cu.load_usage(), [])
+
+
+class ReadsLogTests(unittest.TestCase):
+    """The $0 follow-up reads counter — user-facing result reads only."""
+
+    def _with_log(self, tmp):
+        import os
+        os.environ["PUPPETMASTER_READS_LOG"] = str(Path(tmp) / "reads.jsonl")
+        os.environ.pop("PUPPETMASTER_READS_USAGE", None)
+
+    def tearDown(self) -> None:
+        import os
+        os.environ.pop("PUPPETMASTER_READS_LOG", None)
+        os.environ.pop("PUPPETMASTER_READS_USAGE", None)
+
+    def test_records_result_reads_and_aggregates(self) -> None:
+        from puppetmaster import reads_log as rl
+
+        with TemporaryDirectory() as tmp:
+            self._with_log(tmp)
+            rl.record_read("show", caller="cli")
+            rl.record_read("artifacts", caller="mcp")
+            rl.record_read("partial_summary", caller="cli")
+            agg = rl.aggregate(rl.load_reads())
+            self.assertEqual(agg["reads"], 3)
+            self.assertEqual(agg["by_kind"]["show"], 1)
+            # numbers-only: no job content stored.
+            self.assertNotIn("job_id", rl.load_reads()[0])
+
+    def test_operational_reads_are_ignored(self) -> None:
+        from puppetmaster import reads_log as rl
+
+        with TemporaryDirectory() as tmp:
+            self._with_log(tmp)
+            rl.record_read("status", caller="cli")   # operational, not a result read
+            rl.record_read("savings", caller="cli")  # must never self-count
+            self.assertEqual(rl.load_reads(), [])
+
+    def test_disabled_writes_nothing(self) -> None:
+        import os
+        from puppetmaster import reads_log as rl
+
+        with TemporaryDirectory() as tmp:
+            self._with_log(tmp)
+            os.environ["PUPPETMASTER_READS_USAGE"] = "0"
+            rl.record_read("show", caller="cli")
+            self.assertEqual(rl.load_reads(), [])
+
+
+class RoutingBaselineSnapshotTests(unittest.TestCase):
+    """The router stamps a decision-time savings baseline onto every decision."""
+
+    def _registry(self):
+        from puppetmaster.model_registry import ModelSpec
+        return [
+            ModelSpec(id="cheap/40", adapter="cursor", adapter_model_name="c",
+                      capability_score=40, input_per_mtok_usd=0.1, output_per_mtok_usd=0.2),
+            ModelSpec(id="frontier/95", adapter="cursor", adapter_model_name="f",
+                      capability_score=95, input_per_mtok_usd=5.0, output_per_mtok_usd=25.0),
+        ]
+
+    def test_decision_records_frontier_baseline(self) -> None:
+        from puppetmaster.router import route_task, TaskSignals
+
+        d = route_task(
+            TaskSignals(role="explore", instruction="tiny lookup"),
+            self._registry(), policy="balanced",
+        )
+        p = d.to_artifact_payload()
+        self.assertEqual(p["baseline_model_id"], "frontier/95")
+        self.assertGreater(p["baseline_cost_usd"], 0.0)
+        # cheap pick should cost no more than the frontier baseline.
+        self.assertLessEqual(p["estimated_cost_usd"], p["baseline_cost_usd"])
+
+
+class SavingsLedgerTests(unittest.TestCase):
+    """Policy-aware savings aggregation with the two honesty rules."""
+
+    def _rec(self, policy, chosen, baseline, has_baseline=True):
+        from puppetmaster.savings import RoutingRecord
+        return RoutingRecord(policy=policy, chosen_cost_usd=chosen,
+                             baseline_cost_usd=baseline, has_baseline=has_baseline)
+
+    def test_only_cost_optimizing_policies_count_as_savings(self) -> None:
+        from puppetmaster.savings import summarize_routing
+
+        recs = [
+            self._rec("balanced", 0.0, 0.04),       # plan win
+            self._rec("balanced", 0.01, 0.04),      # cheaper API
+            self._rec("quality", 0.16, 0.16),       # deliberate spend, NOT savings
+        ]
+        s = summarize_routing(recs)
+        self.assertEqual(s.cost_optimizing_tasks, 2)
+        self.assertAlmostEqual(s.saved_usd, 0.07, places=4)   # 0.04 + 0.03
+        self.assertEqual(s.deliberate_tasks, 1)
+        self.assertAlmostEqual(s.deliberate_spend_usd, 0.16, places=4)
+        self.assertEqual(s.plan_routed_tasks, 1)
+
+    def test_tasks_without_baseline_are_excluded_from_dollars(self) -> None:
+        from puppetmaster.savings import summarize_routing
+
+        recs = [
+            self._rec("balanced", 0.01, 0.0, has_baseline=False),  # pre-snapshot
+            self._rec("balanced", 0.0, 0.04, has_baseline=True),
+        ]
+        s = summarize_routing(recs)
+        self.assertEqual(s.tasks_without_baseline, 1)
+        self.assertEqual(s.cost_optimizing_tasks, 1)
+        self.assertAlmostEqual(s.saved_usd, 0.04, places=4)
+
+    def test_collect_counts_routing_and_self_heal(self) -> None:
+        from puppetmaster.savings import collect_routing_records
+        from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
+        from puppetmaster.store import SwarmStore
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            job = store.create_job("g")
+            task = Task(job_id=job.id, role="implement", instruction="x",
+                        adapter="cursor", status=TaskStatus.COMPLETE,
+                        payload={"router_model_id": "cheap/40"})
+            store.save_task(task)
+            store.save_artifact(Artifact(
+                job_id=job.id, task_id=task.id, type=ArtifactType.ROUTING,
+                created_by="router",
+                payload={"model_id": "cheap/40", "adapter": "cursor",
+                         "policy": "balanced", "estimated_cost_usd": 0.0,
+                         "baseline_cost_usd": 0.05},
+                confidence=0.9, evidence=["r"]))
+            store.save_artifact(Artifact(
+                job_id=job.id, task_id=task.id, type=ArtifactType.ROUTING,
+                created_by="router-fallback",
+                payload={"model_id": "cheap/40", "adapter": "cursor",
+                         "policy": "balanced"},
+                confidence=0.9, evidence=["f"]))
+            store.save_artifact(Artifact(
+                job_id=job.id, task_id=task.id, type=ArtifactType.ROUTING,
+                created_by="router-escalation",
+                payload={"model_id": "frontier/95", "adapter": "cursor",
+                         "policy": "escalating"},
+                confidence=0.9, evidence=["e"]))
+
+            records, jobs, heal = collect_routing_records([store])
+            self.assertEqual(jobs, 1)
+            self.assertEqual(len(records), 1)  # only the 'router' artifact
+            self.assertTrue(records[0].has_baseline)
+            self.assertEqual(heal.fallbacks, 1)
+            self.assertEqual(heal.escalations, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
 

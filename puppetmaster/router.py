@@ -255,6 +255,13 @@ class RoutingDecision:
     estimated_cost_usd: float
     reason: str
     rejected: list[tuple[ModelSpec, str]] = field(default_factory=list)
+    # Savings accounting (Rule 1: snapshot the baseline at decision time so the
+    # ledger never compares a stored cost against a recomputed/drifted one).
+    # ``baseline`` = what this task would have cost on the strongest model the
+    # user could have used (highest-capability enabled + platform-allowed),
+    # at the same token estimate.
+    baseline_cost_usd: float = 0.0
+    baseline_model_id: str = ""
 
     def to_artifact_payload(self) -> dict:
         return {
@@ -268,6 +275,8 @@ class RoutingDecision:
             "estimated_tokens_in": self.estimated_tokens_in,
             "estimated_tokens_out": self.estimated_tokens_out,
             "estimated_cost_usd": round(self.estimated_cost_usd, 6),
+            "baseline_cost_usd": round(self.baseline_cost_usd, 6),
+            "baseline_model_id": self.baseline_model_id,
             "reason": self.reason,
             "rejected": [
                 {"id": spec.id, "reason": why} for spec, why in self.rejected
@@ -340,6 +349,14 @@ def route_task(
                 "`puppetmaster platform enable <adapter>`."
             )
         candidates = after_platform
+
+    # Snapshot the savings baseline now, from the strongest model the user could
+    # have used (highest-capability, enabled + platform-allowed), at this task's
+    # token estimate. Stored on the decision so the ledger compares like-for-like
+    # later instead of recomputing against a possibly-changed registry.
+    _baseline_model = max(candidates, key=lambda s: s.capability_score)
+    _baseline_cost = _baseline_model.estimate_cost_usd(tokens_in, tokens_out)
+    _baseline_id = _baseline_model.id
 
     # Tag filter first — cheap to evaluate, gives a clean reason on rejection.
     after_tags: list[ModelSpec] = []
@@ -434,7 +451,7 @@ def route_task(
                 rejected.append(
                     (spec, f"cheaper alternative {pick.id} chosen"),
                 )
-        return _decision(pick, policy, need, tokens_in, tokens_out, reason, rejected)
+        return _decision(pick, policy, need, tokens_in, tokens_out, reason, rejected, _baseline_cost, _baseline_id)
 
     if policy == "quality":
         # Highest capability wins; plan-billed breaks ties so we don't reach
@@ -447,7 +464,7 @@ def route_task(
         for spec in after_cost:
             if spec.id != pick.id:
                 rejected.append((spec, f"higher-capability {pick.id} chosen"))
-        return _decision(pick, policy, need, tokens_in, tokens_out, reason, rejected)
+        return _decision(pick, policy, need, tokens_in, tokens_out, reason, rejected, _baseline_cost, _baseline_id)
 
     if policy == "escalating":
         # For escalating we still return one decision (the cheapest
@@ -465,7 +482,7 @@ def route_task(
         for spec in sorted_by_cap:
             if spec.id != pick.id:
                 rejected.append((spec, "escalation candidate"))
-        return _decision(pick, policy, need, tokens_in, tokens_out, reason, rejected)
+        return _decision(pick, policy, need, tokens_in, tokens_out, reason, rejected, _baseline_cost, _baseline_id)
 
     # balanced (default)
     sufficient = [s for s in after_cost if s.capability_score >= need]
@@ -537,7 +554,7 @@ def route_task(
                 rejected.append(
                     (spec, f"lower capability_score {spec.capability_score}")
                 )
-    return _decision(pick, policy, need, tokens_in, tokens_out, reason, rejected)
+    return _decision(pick, policy, need, tokens_in, tokens_out, reason, rejected, _baseline_cost, _baseline_id)
 
 
 def _decision(
@@ -548,6 +565,8 @@ def _decision(
     tokens_out: int,
     reason: str,
     rejected: list[tuple[ModelSpec, str]],
+    baseline_cost_usd: float = 0.0,
+    baseline_model_id: str = "",
 ) -> RoutingDecision:
     return RoutingDecision(
         model=pick,
@@ -558,6 +577,8 @@ def _decision(
         estimated_cost_usd=pick.estimate_cost_usd(tokens_in, tokens_out),
         reason=reason,
         rejected=rejected,
+        baseline_cost_usd=baseline_cost_usd,
+        baseline_model_id=baseline_model_id,
     )
 
 
