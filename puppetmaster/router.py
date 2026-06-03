@@ -88,25 +88,25 @@ _ROLE_BASE_SCORE = {
 }
 
 _HARD_SIGNAL_PATTERNS = [
-    (r"\baudit\b", 10),
-    (r"\bsecurity\b", 15),
-    (r"\bperformance\b", 10),
-    (r"\bperf\b", 10),
-    (r"\bcross[-\s]?repo\b", 10),
-    (r"\bevery (file|function|module|repo)\b", 10),
-    (r"\bdesign\b", 8),
-    (r"\barchitect", 8),
-    (r"\brefactor\b", 5),
-    (r"\bcomplex\b", 5),
-    (r"\bnon[-\s]?trivial\b", 5),
+    (re.compile(r"\baudit\b"), 10),
+    (re.compile(r"\bsecurity\b"), 15),
+    (re.compile(r"\bperformance\b"), 10),
+    (re.compile(r"\bperf\b"), 10),
+    (re.compile(r"\bcross[-\s]?repo\b"), 10),
+    (re.compile(r"\bevery (file|function|module|repo)\b"), 10),
+    (re.compile(r"\bdesign\b"), 8),
+    (re.compile(r"\barchitect"), 8),
+    (re.compile(r"\brefactor\b"), 5),
+    (re.compile(r"\bcomplex\b"), 5),
+    (re.compile(r"\bnon[-\s]?trivial\b"), 5),
 ]
 
 _EASY_SIGNAL_PATTERNS = [
-    (r"\btypo\b", -15),
-    (r"\bcomment\b(?!.*delete)", -5),
-    (r"\brename\b", -5),
-    (r"\bformat\b", -5),
-    (r"\blint\b", -5),
+    (re.compile(r"\btypo\b"), -15),
+    (re.compile(r"\bcomment\b(?!.*delete)"), -5),
+    (re.compile(r"\brename\b"), -5),
+    (re.compile(r"\bformat\b"), -5),
+    (re.compile(r"\blint\b"), -5),
 ]
 
 # Vision signals. When ANY of these match the instruction, the router
@@ -115,25 +115,29 @@ _EASY_SIGNAL_PATTERNS = [
 # model must declare vision support in its tags. ``detailed-vision``
 # tasks (screenshots, diagrams, OCR) get an extra bump on top.
 _VISION_SIGNAL_PATTERNS = [
-    (r"\bimage\b", 8),
-    (r"\bimages\b", 8),
-    (r"\bphoto\b", 8),
-    (r"\bvisual(ly)?\b", 8),
-    (r"\bvision\b", 10),
-    (r"\bscreenshot\b", 10),
-    (r"\bdiagram\b", 10),
-    (r"\bui mock(up)?\b", 10),
-    (r"\bocr\b", 12),
-    (r"\bchart\b", 6),
+    (re.compile(r"\bimage\b"), 8),
+    (re.compile(r"\bimages\b"), 8),
+    (re.compile(r"\bphoto\b"), 8),
+    (re.compile(r"\bvisual(ly)?\b"), 8),
+    (re.compile(r"\bvision\b"), 10),
+    (re.compile(r"\bscreenshot\b"), 10),
+    (re.compile(r"\bdiagram\b"), 10),
+    (re.compile(r"\bui mock(up)?\b"), 10),
+    (re.compile(r"\bocr\b"), 12),
+    (re.compile(r"\bchart\b"), 6),
 ]
 
 _DETAILED_VISION_PATTERNS = [
-    r"\bdetailed (image|visual|vision|diagram|chart|screenshot)\b",
-    r"\bocr\b",
-    r"\bread (the|this) (screenshot|image|diagram|chart|ui mock(up)?)\b",
-    r"\b(extract|describe) (every|all) (element|detail)s? in (the|this) (image|screenshot|diagram)\b",
-    r"\b(every|all) (element|detail)s? (in|of) (the|this) (image|screenshot|diagram)\b",
-    r"\bocr every (detail|element)\b",
+    re.compile(r"\bdetailed (image|visual|vision|diagram|chart|screenshot)\b"),
+    re.compile(r"\bocr\b"),
+    re.compile(r"\bread (the|this) (screenshot|image|diagram|chart|ui mock(up)?)\b"),
+    re.compile(
+        r"\b(extract|describe) (every|all) (element|detail)s? in (the|this) (image|screenshot|diagram)\b"
+    ),
+    re.compile(
+        r"\b(every|all) (element|detail)s? (in|of) (the|this) (image|screenshot|diagram)\b"
+    ),
+    re.compile(r"\bocr every (detail|element)\b"),
 ]
 
 

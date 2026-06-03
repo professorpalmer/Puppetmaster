@@ -235,12 +235,25 @@ def collect_records(store, *, window_days: Optional[float] = None) -> tuple[list
 
     records: list[TaskAuditRecord] = []
     jobs_considered = 0
+    eligible_jobs = []
     for job in store.list_jobs():
         if cutoff is not None and not _within(job.created_at, cutoff):
             continue
+        eligible_jobs.append(job)
+    job_ids = [job.id for job in eligible_jobs]
+    all_artifacts = store.list_artifacts_for_jobs(job_ids)
+    all_tasks = store.list_tasks_for_jobs(job_ids)
+    artifacts_by_job: dict[str, list] = {}
+    for artifact in all_artifacts:
+        artifacts_by_job.setdefault(artifact.job_id, []).append(artifact)
+    tasks_by_job: dict[str, dict] = {}
+    for task in all_tasks:
+        tasks_by_job.setdefault(task.job_id, {})[task.id] = task
+
+    for job in eligible_jobs:
         jobs_considered += 1
-        artifacts = store.list_artifacts(job.id)
-        tasks = {t.id: t for t in store.list_tasks(job.id)}
+        artifacts = artifacts_by_job.get(job.id, [])
+        tasks = tasks_by_job.get(job.id, {})
 
         # Initial routing picks and escalation/fallback events, per task.
         initial_by_task: dict[str, dict] = {}

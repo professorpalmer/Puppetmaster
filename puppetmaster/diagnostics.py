@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from puppetmaster.adapters import ADAPTER_INFO, AdapterInfo
+from puppetmaster.adapters import ADAPTER_INFO
 from puppetmaster.codegraph import (
     codegraph_available,
     codegraph_initialized,

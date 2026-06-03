@@ -18,7 +18,7 @@ Honesty rules baked in (learned the hard way from a probe that "lost money"):
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 

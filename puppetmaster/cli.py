@@ -2993,10 +2993,10 @@ def require_latest_job_id(store) -> str:
 
 
 def artifact_job_id(store, artifact_id: str) -> str:
-    for job in store.list_jobs():
-        if any(artifact.id == artifact_id for artifact in store.list_artifacts(job.id)):
-            return job.id
-    raise FileNotFoundError(f"artifact not found: {artifact_id}")
+    job_id = store.get_artifact_job_id(artifact_id)
+    if job_id is None:
+        raise FileNotFoundError(f"artifact not found: {artifact_id}")
+    return job_id
 
 
 def patch_artifacts_for_target(store, target: str):

@@ -75,22 +75,22 @@ def load_reads(since: Optional[datetime] = None) -> list[dict]:
         return []
     out: list[dict] = []
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        with path.open(encoding="utf-8") as fh:
+            for raw_line in fh:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if since is not None:
+                    ts = _parse_ts(rec.get("ts"))
+                    if ts is not None and ts < since:
+                        continue
+                out.append(rec)
     except OSError:
         return []
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rec = json.loads(line)
-        except ValueError:
-            continue
-        if since is not None:
-            ts = _parse_ts(rec.get("ts"))
-            if ts is not None and ts < since:
-                continue
-        out.append(rec)
     return out
 
 

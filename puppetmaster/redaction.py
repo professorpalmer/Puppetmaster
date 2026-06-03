@@ -44,5 +44,4 @@ def redact_secrets(text: Optional[str]) -> Optional[str]:
             redacted = redacted.replace(value, f"<{var}:redacted>")
     redacted = _SECRET_SK.sub("sk-<redacted>", redacted)
     redacted = _SECRET_BEARER.sub(lambda m: f"{m.group(1)}<redacted>", redacted)
-    redacted = _SECRET_APIKEY.sub(lambda m: f"{m.group(1)}<redacted>", redacted)
-    return redacted
+    return _SECRET_APIKEY.sub(lambda m: f"{m.group(1)}<redacted>", redacted)
