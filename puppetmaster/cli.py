@@ -2321,6 +2321,7 @@ def _run_savings_command(args, state_dir) -> int:
     cg = report["codegraph"]
     heal = report["self_heal"]
     reads = report["reads"]
+    metrics = report["metrics"]
 
     if args.json:
         from dataclasses import asdict
@@ -2335,6 +2336,7 @@ def _run_savings_command(args, state_dir) -> int:
                     "self_heal": asdict(heal),
                     "codegraph": cg,
                     "reads": reads,
+                    "metrics": metrics,
                 },
                 indent=2,
             )
@@ -2379,6 +2381,28 @@ def _run_savings_command(args, state_dir) -> int:
     print(
         f"  Avoided exploration: ~{cg['net_tokens_saved_est']:,} tokens "
         f"-> ~${cg['dollars_saved_est']:.4f} saved"
+    )
+    print()
+
+    def _pct(value):
+        return "n/a" if value is None else f"{value * 100:.0f}%"
+
+    sample = metrics["sample"]
+    print("RATES (no $, for org dashboards — trend these over a --window)")
+    print(
+        f"  Capability-match rate: {_pct(metrics['capability_match_rate'])} "
+        f"(ran a cheaper-but-sufficient model; n={sample['cost_optimizing_with_baseline']})"
+    )
+    print(
+        f"  Escalation rate: {_pct(metrics['escalation_rate'])} | "
+        f"Fallback rate: {_pct(metrics['fallback_rate'])} (n={sample['routed_tasks']} routed tasks)"
+    )
+    reuse = metrics["reuse_reads_per_job"]
+    ctx = metrics["context_tokens_per_job"]
+    print(
+        f"  Reuse: {('n/a' if reuse is None else f'{reuse:g}')} result reads/job | "
+        f"Context: {('n/a' if ctx is None else f'~{ctx:,.0f}')} focused tokens/job "
+        f"(n={sample['jobs']} jobs)"
     )
     print()
     print("Notes")

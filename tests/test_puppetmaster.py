@@ -7369,6 +7369,35 @@ class SavingsLedgerTests(unittest.TestCase):
         self.assertEqual(s.cost_optimizing_tasks, 1)
         self.assertAlmostEqual(s.saved_usd, 0.04, places=4)
 
+    def test_build_metrics_rates_and_none_for_empty_denominator(self) -> None:
+        from puppetmaster.savings import build_metrics, SelfHeal
+
+        recs = [
+            self._rec("balanced", 0.0, 0.05, has_baseline=True),   # downshifted
+            self._rec("balanced", 0.05, 0.05, has_baseline=True),  # not downshifted
+            self._rec("quality", 0.10, 0.10, has_baseline=True),   # excluded (policy)
+        ]
+        heal = SelfHeal(fallbacks=1, escalations=2)
+        m = build_metrics(
+            recs, heal,
+            codegraph={"context_tokens_fed": 8000},
+            reads={"reads": 6},
+            jobs=2,
+        )
+        # 1 of 2 cost-optimizing-with-baseline downshifted.
+        self.assertAlmostEqual(m["capability_match_rate"], 0.5, places=3)
+        self.assertAlmostEqual(m["escalation_rate"], 2 / 3, places=3)
+        self.assertAlmostEqual(m["fallback_rate"], 1 / 3, places=3)
+        self.assertAlmostEqual(m["reuse_reads_per_job"], 3.0, places=3)
+        self.assertAlmostEqual(m["context_tokens_per_job"], 4000.0, places=1)
+        self.assertEqual(m["sample"]["cost_optimizing_with_baseline"], 2)
+
+        empty = build_metrics([], SelfHeal(), {"context_tokens_fed": 0}, {"reads": 0}, 0)
+        self.assertIsNone(empty["capability_match_rate"])
+        self.assertIsNone(empty["escalation_rate"])
+        self.assertIsNone(empty["reuse_reads_per_job"])
+        self.assertIsNone(empty["context_tokens_per_job"])
+
     def test_collect_counts_routing_and_self_heal(self) -> None:
         from puppetmaster.savings import collect_routing_records
         from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
