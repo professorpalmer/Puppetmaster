@@ -5,12 +5,15 @@ import os
 import threading
 import time
 from dataclasses import replace
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from puppetmaster.models import AgentRun, JobStatus, TaskStatus, now_iso
 from puppetmaster.state import resolve_state_dir
 from puppetmaster.store_factory import create_store
 from puppetmaster.workers import LocalWorker
+
+if TYPE_CHECKING:
+    from puppetmaster.store import SwarmStore
 
 
 def worker_id_for(role: Optional[str]) -> str:
