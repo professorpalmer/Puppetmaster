@@ -141,13 +141,58 @@ def _job_within(job, since: datetime) -> bool:
         return True
 
 
+def build_metrics(
+    routing_records: list[RoutingRecord],
+    self_heal: SelfHeal,
+    codegraph: dict,
+    reads: dict,
+    jobs: int,
+) -> dict:
+    """Derived **rates and ratios** — the $-free org-success view. Every rate is
+    over an explicit denominator, surfaced in ``sample`` so small samples are
+    visible and nothing reads like a vanity total. A rate is ``None`` (JSON
+    null) when its denominator is zero, never a misleading 0.0."""
+    total_routed = len(routing_records)
+    cost_opt = [
+        r
+        for r in routing_records
+        if r.policy in COST_OPTIMIZING_POLICIES and r.has_baseline
+    ]
+    downshifted = [r for r in cost_opt if r.chosen_cost_usd < r.baseline_cost_usd]
+
+    def rate(numerator: int, denominator: int) -> Optional[float]:
+        return round(numerator / denominator, 3) if denominator else None
+
+    return {
+        # Discipline: of the cost-optimizing tasks we *could* judge, how often did
+        # we run something cheaper than the strongest eligible model?
+        "capability_match_rate": rate(len(downshifted), len(cost_opt)),
+        # Calibration: how often did a task need a bump up a tier?
+        "escalation_rate": rate(self_heal.escalations, total_routed),
+        # Reliability: how often did a task fail over off a dead provider?
+        "fallback_rate": rate(self_heal.fallbacks, total_routed),
+        # Leverage: result reads served per job (work produced once, reused).
+        "reuse_reads_per_job": rate(reads.get("reads", 0), jobs),
+        # Efficiency: focused-context tokens fed per job.
+        "context_tokens_per_job": (
+            round(codegraph.get("context_tokens_fed", 0) / jobs, 1) if jobs else None
+        ),
+        "sample": {
+            "routed_tasks": total_routed,
+            "cost_optimizing_with_baseline": len(cost_opt),
+            "jobs": jobs,
+        },
+    }
+
+
 def build_report(
     stores: list,
     *,
     window_days: Optional[float] = None,
 ) -> dict:
     """Top-level: routing savings (measured) + CodeGraph usage (measured +
-    estimated). Pure aggregation over local data; emits nothing."""
+    estimated) + reliability/reuse counts + derived rates. Pure aggregation
+    over local data; emits nothing."""
     from puppetmaster import codegraph_usage, reads_log
 
     since: Optional[datetime] = None
@@ -158,6 +203,7 @@ def build_report(
     routing = summarize_routing(routing_records)
     codegraph = codegraph_usage.aggregate(codegraph_usage.load_usage(since=since))
     reads = reads_log.aggregate(reads_log.load_reads(since=since))
+    metrics = build_metrics(routing_records, self_heal, codegraph, reads, jobs)
 
     return {
         "window_days": window_days,
@@ -166,4 +212,5 @@ def build_report(
         "self_heal": self_heal,
         "codegraph": codegraph,
         "reads": reads,
+        "metrics": metrics,
     }
