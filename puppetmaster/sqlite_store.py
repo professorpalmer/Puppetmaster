@@ -21,6 +21,13 @@ from puppetmaster.models import (
 )
 from puppetmaster.store import SwarmStore, _coerce_confidence
 
+_SQLITE_IN_CHUNK = 900
+
+
+def _chunked(values: Iterable[str], size: int = _SQLITE_IN_CHUNK) -> list[list[str]]:
+    unique = list(dict.fromkeys(values))
+    return [unique[index : index + size] for index in range(0, len(unique), size)]
+
 
 class SQLiteSwarmStore(SwarmStore):
     """SQLite-backed coordination store for multi-process worker coordination."""
@@ -204,6 +211,44 @@ class SQLiteSwarmStore(SwarmStore):
                 (task.job_id, now_iso(), "task.saved", json.dumps(payload, sort_keys=True)),
             )
 
+    def save_tasks(self, tasks: Iterable[Task]) -> None:
+        task_list = list(tasks)
+        if not task_list:
+            return
+        self.init()
+        rows: list[tuple[Any, ...]] = []
+        event_rows: list[tuple[Any, ...]] = []
+        for task in task_list:
+            payload = {
+                "task_id": task.id,
+                "role": task.role,
+                "status": str(task.status),
+                "adapter": task.adapter,
+            }
+            rows.append(
+                (task.id, task.job_id, task.role, str(task.status), self._dumps(task))
+            )
+            event_rows.append(
+                (task.job_id, now_iso(), "task.saved", json.dumps(payload, sort_keys=True))
+            )
+        with self._session() as connection:
+            connection.executemany(
+                """
+                INSERT INTO tasks(id, job_id, role, status, data)
+                VALUES(?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  job_id = excluded.job_id,
+                  role = excluded.role,
+                  status = excluded.status,
+                  data = excluded.data
+                """,
+                rows,
+            )
+            connection.executemany(
+                "INSERT INTO events(job_id, at, event, payload) VALUES(?, ?, ?, ?)",
+                event_rows,
+            )
+
     def save_run(self, run: AgentRun) -> None:
         self.init()
         with self._session() as connection:
@@ -258,6 +303,55 @@ class SQLiteSwarmStore(SwarmStore):
             },
         )
 
+    def save_artifacts(self, artifacts: Iterable[Artifact]) -> None:
+        from dataclasses import replace
+
+        artifact_list = list(artifacts)
+        if not artifact_list:
+            return
+        prepared: list[Artifact] = []
+        for artifact in artifact_list:
+            artifact.validate()
+            if artifact.sha256 is None:
+                artifact = replace(artifact, sha256=self.artifact_hash(artifact))
+            prepared.append(artifact)
+        self.init()
+        rows = [
+            (
+                artifact.id,
+                artifact.job_id,
+                artifact.task_id,
+                str(artifact.type),
+                self._dumps(artifact),
+            )
+            for artifact in prepared
+        ]
+        with self._session() as connection:
+            connection.executemany(
+                """
+                INSERT INTO artifacts(id, job_id, task_id, type, data)
+                VALUES(?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  job_id = excluded.job_id,
+                  task_id = excluded.task_id,
+                  type = excluded.type,
+                  data = excluded.data
+                """,
+                rows,
+            )
+        for artifact in prepared:
+            self.emit(
+                artifact.job_id,
+                "artifact.saved",
+                {
+                    "artifact_id": artifact.id,
+                    "task_id": artifact.task_id,
+                    "type": str(artifact.type),
+                    "confidence": artifact.confidence,
+                    "sha256": artifact.sha256,
+                },
+            )
+
     def promote_memory(self, memory: MemoryRecord) -> None:
         self.init()
         with self._session() as connection:
@@ -268,6 +362,22 @@ class SQLiteSwarmStore(SwarmStore):
                 ON CONFLICT(id) DO UPDATE SET data = excluded.data
                 """,
                 (memory.id, self._dumps(memory)),
+            )
+
+    def promote_memories(self, records: Iterable[MemoryRecord]) -> None:
+        memory_list = list(records)
+        if not memory_list:
+            return
+        self.init()
+        rows = [(memory.id, self._dumps(memory)) for memory in memory_list]
+        with self._session() as connection:
+            connection.executemany(
+                """
+                INSERT INTO memory(id, data)
+                VALUES(?, ?)
+                ON CONFLICT(id) DO UPDATE SET data = excluded.data
+                """,
+                rows,
             )
 
     def get_job(self, job_id: str) -> Job:
@@ -315,6 +425,21 @@ class SQLiteSwarmStore(SwarmStore):
             )
         ]
 
+    def list_tasks_for_jobs(self, job_ids: Iterable[str]) -> list[Task]:
+        ids = list(dict.fromkeys(job_ids))
+        if not ids:
+            return []
+        self.init()
+        tasks: list[Task] = []
+        for chunk in _chunked(ids):
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self._all(
+                f"SELECT data FROM tasks WHERE job_id IN ({placeholders}) ORDER BY job_id, id",
+                tuple(chunk),
+            )
+            tasks.extend(task_from_dict(json.loads(row["data"])) for row in rows)
+        return tasks
+
     def list_artifacts(self, job_id: str) -> list[Artifact]:
         self.init()
         return [
@@ -324,6 +449,28 @@ class SQLiteSwarmStore(SwarmStore):
                 (job_id,),
             )
         ]
+
+    def list_artifacts_for_jobs(self, job_ids: Iterable[str]) -> list[Artifact]:
+        ids = list(dict.fromkeys(job_ids))
+        if not ids:
+            return []
+        self.init()
+        artifacts: list[Artifact] = []
+        for chunk in _chunked(ids):
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self._all(
+                f"SELECT data FROM artifacts WHERE job_id IN ({placeholders}) ORDER BY job_id, id",
+                tuple(chunk),
+            )
+            artifacts.extend(artifact_from_dict(json.loads(row["data"])) for row in rows)
+        return artifacts
+
+    def get_artifact_job_id(self, artifact_id: str) -> Optional[str]:
+        self.init()
+        row = self._one("SELECT job_id FROM artifacts WHERE id = ?", (artifact_id,))
+        if row is None:
+            return None
+        return str(row["job_id"])
 
     def count_artifacts(self, job_id: str) -> int:
         self.init()
@@ -403,6 +550,10 @@ class SQLiteSwarmStore(SwarmStore):
             if value is not None:
                 clauses.append(f"json_extract(data, '$.{column}') = ?")
                 params.append(value)
+        if terms:
+            for term in terms:
+                clauses.append("instr(lower(data), ?) > 0")
+                params.append(term)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         rows = self._all(
             f"SELECT data FROM memory{where} ORDER BY id", tuple(params)

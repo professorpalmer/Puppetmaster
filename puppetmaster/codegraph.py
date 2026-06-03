@@ -217,31 +217,6 @@ def codegraph_context(
     return output
 
 
-def codegraph_status_line(
-    cwd: Union[Path, str, None],
-    *,
-    timeout_seconds: int = DEFAULT_STATUS_TIMEOUT_SECONDS,
-) -> Optional[str]:
-    """Return a short codegraph status string for diagnostics, or None."""
-    if not codegraph_ready(cwd):
-        return None
-    try:
-        completed = subprocess.run(
-            resolve_codegraph_invocation() + ["status"],
-            cwd=str(cwd),
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if completed.returncode != 0:
-        return None
-    return (completed.stdout or "").strip() or None
-
-
 def codegraph_prompt_section(context: str) -> str:
     """Format a CodeGraph context string for prompt injection."""
     return "\n".join(
@@ -400,9 +375,6 @@ _AUTOHEAL_STATE: dict[str, Any] = {
     "in_progress": False,
     "last_attempt_at": 0.0,
 }
-
-# Backwards-compatible alias: some callers/tests reset the legacy one-shot flag.
-_CODEGRAPH_AUTOHEAL_STATE = _AUTOHEAL_STATE
 
 
 def reset_codegraph_autoheal_state() -> None:

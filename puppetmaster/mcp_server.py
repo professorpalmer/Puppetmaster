@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from puppetmaster.codegraph import (
-    CODEGRAPH_COMMAND,
     CODEGRAPH_MISSING_HINT,
     CODEGRAPH_NATIVE_SQLITE_HINT,
     CodegraphLockBusy,

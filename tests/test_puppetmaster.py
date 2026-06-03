@@ -408,6 +408,68 @@ class PuppetmasterTests(unittest.TestCase):
 
                 self.assertEqual(store.read_events_since("job-x", since=3), [])
 
+    def test_batch_store_methods_across_backends(self) -> None:
+        from puppetmaster.models import (
+            Artifact,
+            ArtifactType,
+            MemoryRecord,
+            Task,
+            TaskStatus,
+        )
+
+        for backend in ("file", "sqlite"):
+            with self.subTest(backend=backend), TemporaryDirectory() as tmp:
+                store = self._store_for_backend(backend, Path(tmp) / ".puppetmaster")
+                store.init()
+
+                job_a = store.create_job("job a")
+                job_b = store.create_job("job b")
+                task_a = Task(
+                    job_id=job_a.id,
+                    role="implement",
+                    instruction="a",
+                    adapter="cursor",
+                    status=TaskStatus.QUEUED,
+                )
+                task_b = Task(
+                    job_id=job_b.id,
+                    role="review",
+                    instruction="b",
+                    adapter="cursor",
+                    status=TaskStatus.QUEUED,
+                )
+                store.save_tasks([task_a, task_b])
+                self.assertEqual(len(store.list_tasks(job_a.id)), 1)
+                self.assertEqual(len(store.list_tasks(job_b.id)), 1)
+
+                artifact = Artifact(
+                    job_id=job_a.id,
+                    task_id=task_a.id,
+                    type=ArtifactType.FINDING,
+                    created_by="w",
+                    payload={"claim": "x"},
+                    confidence=0.9,
+                    evidence=["e"],
+                )
+                store.save_artifacts([artifact])
+                self.assertEqual(store.get_artifact_job_id(artifact.id), job_a.id)
+                self.assertIsNone(store.get_artifact_job_id("missing"))
+
+                batch_tasks = store.list_tasks_for_jobs([job_a.id, job_b.id])
+                self.assertEqual({task.id for task in batch_tasks}, {task_a.id, task_b.id})
+                batch_artifacts = store.list_artifacts_for_jobs([job_a.id, job_b.id])
+                self.assertEqual(len(batch_artifacts), 1)
+
+                memory = MemoryRecord(
+                    scope="swarm.findings",
+                    statement="found it",
+                    evidence=["e"],
+                    source_artifacts=[artifact.id],
+                    confidence=0.85,
+                )
+                store.promote_memories([memory])
+                self.assertEqual(len(store.list_memory()), 1)
+
     def test_file_reader_skips_torn_concurrent_append_line(self) -> None:
         """A malformed/torn line (Windows non-atomic append) is skipped, not fatal.
 

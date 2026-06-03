@@ -99,6 +99,10 @@ class SwarmStore:
             },
         )
 
+    def save_tasks(self, tasks: Iterable[Task]) -> None:
+        for task in tasks:
+            self.save_task(task)
+
     def update_task_status(self, task: Task, status: TaskStatus) -> Task:
         terminal = status in {TaskStatus.COMPLETE, TaskStatus.FAILED}
         updated = replace(
@@ -312,9 +316,17 @@ class SwarmStore:
             },
         )
 
+    def save_artifacts(self, artifacts: Iterable[Artifact]) -> None:
+        for artifact in artifacts:
+            self.save_artifact(artifact)
+
     def promote_memory(self, memory: MemoryRecord) -> None:
         path = self.memory_dir / f"{memory.id}.json"
         self.write_json(path, memory)
+
+    def promote_memories(self, records: Iterable[MemoryRecord]) -> None:
+        for memory in records:
+            self.promote_memory(memory)
 
     def write_summary(self, job_id: str, name: str, body: str) -> Path:
         path = self.job_dir(job_id) / "summaries" / name
@@ -349,11 +361,29 @@ class SwarmStore:
             for path in sorted((self.job_dir(job_id) / "tasks").glob("*.json"))
         ]
 
+    def list_tasks_for_jobs(self, job_ids: Iterable[str]) -> list[Task]:
+        tasks: list[Task] = []
+        for job_id in job_ids:
+            tasks.extend(self.list_tasks(job_id))
+        return tasks
+
     def list_artifacts(self, job_id: str) -> list[Artifact]:
         return [
             artifact_from_dict(self.read_json(path))
             for path in sorted((self.job_dir(job_id) / "artifacts").glob("*.json"))
         ]
+
+    def list_artifacts_for_jobs(self, job_ids: Iterable[str]) -> list[Artifact]:
+        artifacts: list[Artifact] = []
+        for job_id in job_ids:
+            artifacts.extend(self.list_artifacts(job_id))
+        return artifacts
+
+    def get_artifact_job_id(self, artifact_id: str) -> Optional[str]:
+        for job in self.list_jobs():
+            if (self.job_dir(job.id) / "artifacts" / f"{artifact_id}.json").exists():
+                return job.id
+        return None
 
     def count_artifacts(self, job_id: str) -> int:
         """Cheap artifact count that avoids deserializing every payload."""

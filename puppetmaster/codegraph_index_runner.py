@@ -28,7 +28,6 @@ from pathlib import Path
 from typing import Optional
 
 from puppetmaster.codegraph import (
-    CODEGRAPH_COMMAND,
     CodegraphLock,
     CodegraphLockBusy,
     resolve_codegraph_invocation,

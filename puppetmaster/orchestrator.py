@@ -496,6 +496,8 @@ class Orchestrator:
             return billing_cache[adapter]
 
         rerouted = 0
+        artifacts = self.store.list_artifacts(job.id)
+        confidence_by_task = self._verification_confidence_by_task(artifacts)
         for task in self.store.list_tasks(job.id):
             if task.status != TaskStatus.COMPLETE:
                 continue
@@ -511,7 +513,7 @@ class Orchestrator:
             current_spec = by_model_id.get(current_model_id) if current_model_id else None
             if current_spec is None:
                 continue
-            confidence = self._latest_verification_confidence(job, task.id)
+            confidence = confidence_by_task.get(task.id)
             if confidence is None or confidence >= threshold:
                 continue
 
@@ -632,22 +634,36 @@ class Orchestrator:
             return None
         return value if 0 < value <= 1 else None
 
+    @staticmethod
+    def _verification_confidence_by_task(
+        artifacts: list[Artifact],
+    ) -> dict[str, float]:
+        latest: dict[str, tuple[str, float]] = {}
+        for artifact in artifacts:
+            if artifact.type != ArtifactType.VERIFICATION:
+                continue
+            previous = latest.get(artifact.task_id)
+            if previous is None or artifact.created_at > previous[0]:
+                latest[artifact.task_id] = (artifact.created_at, artifact.confidence)
+        return {task_id: confidence for task_id, (_, confidence) in latest.items()}
+
     def _latest_verification_confidence(
-        self, job: Job, task_id: str
+        self,
+        job: Job,
+        task_id: str,
+        artifacts: Optional[list[Artifact]] = None,
     ) -> Optional[float]:
         """Confidence of the task's most recent VERIFICATION artifact (the run's
         own self-assessment), or ``None`` if it never emitted one."""
-        verifications = [
-            a
-            for a in self.store.list_artifacts(job.id)
-            if a.task_id == task_id and a.type == ArtifactType.VERIFICATION
-        ]
-        if not verifications:
-            return None
-        latest = max(verifications, key=lambda a: a.created_at)
-        return latest.confidence
+        if artifacts is None:
+            artifacts = self.store.list_artifacts(job.id)
+        return self._verification_confidence_by_task(artifacts).get(task_id)
 
-    def _recoverable_failure_by_task(self, job: Job) -> dict[str, str]:
+    def _recoverable_failure_by_task(
+        self,
+        job: Job,
+        artifacts: Optional[list[Artifact]] = None,
+    ) -> dict[str, str]:
         """Map task_id -> recoverable failure class from the task's *latest*
         failed artifact.
 
@@ -656,7 +672,9 @@ class Orchestrator:
         recent recoverable failure per task is the one reported."""
         out: dict[str, str] = {}
         latest_at: dict[str, str] = {}
-        for artifact in self.store.list_artifacts(job.id):
+        if artifacts is None:
+            artifacts = self.store.list_artifacts(job.id)
+        for artifact in artifacts:
             failure = (artifact.payload or {}).get("failure")
             if failure not in RECOVERABLE_FAILURES:
                 continue
@@ -666,7 +684,13 @@ class Orchestrator:
                 out[task_id] = str(failure)
         return out
 
-    def _has_hard_failure(self, job: Job, allowed_task_ids: set[str]) -> bool:
+    def _has_hard_failure(
+        self,
+        job: Job,
+        allowed_task_ids: set[str],
+        tasks: Optional[list[Task]] = None,
+        artifacts: Optional[list[Artifact]] = None,
+    ) -> bool:
         """True when a task FAILED for a non-recoverable reason (a real error
         like a bad adapter or an exception) — i.e. nothing auto-fallback can fix.
 
@@ -674,8 +698,10 @@ class Orchestrator:
         mid-flight states while daemon/external workers are still going. Use
         :meth:`_should_fail_closed` at a terminal point (workers exited) to also
         catch a genuinely stuck swarm."""
-        recoverable = set(self._recoverable_failure_by_task(job))
-        for task in self.store.list_tasks(job.id):
+        recoverable = set(self._recoverable_failure_by_task(job, artifacts=artifacts))
+        if tasks is None:
+            tasks = self.store.list_tasks(job.id)
+        for task in tasks:
             if task.id not in allowed_task_ids:
                 continue
             if task.status == TaskStatus.FAILED and task.id not in recoverable:
@@ -718,7 +744,12 @@ class Orchestrator:
             return True
         return False
 
-    def _daemon_settled(self, job: Job, allowed_task_ids: set[str]) -> bool:
+    def _daemon_settled(
+        self,
+        job: Job,
+        allowed_task_ids: set[str],
+        tasks: Optional[list[Task]] = None,
+    ) -> bool:
         """True when no daemon/external worker can make further progress.
 
         Returns False while any task is QUEUED/RUNNING (work remains) or any
@@ -726,7 +757,9 @@ class Orchestrator:
         so the wait loop keeps polling. Returns True once everything is COMPLETE
         or terminally stuck (FAILED, or BLOCKED behind a terminal dep), letting
         the caller hand off to the auto-fallback sweep."""
-        by_id = {t.id: t for t in self.store.list_tasks(job.id)}
+        if tasks is None:
+            tasks = self.store.list_tasks(job.id)
+        by_id = {t.id: t for t in tasks}
         for task in by_id.values():
             if task.id not in allowed_task_ids:
                 continue
@@ -778,8 +811,7 @@ class Orchestrator:
                 )
             )
         self._validate_task_graph(tasks)
-        for task in tasks:
-            self.store.save_task(task)
+        self.store.save_tasks(tasks)
         self._emit_routing_artifacts(job, tasks_by_role, routing_decisions)
         return tasks
 
@@ -795,11 +827,12 @@ class Orchestrator:
         ``task_id`` (rather than a placeholder), keeping the audit
         story consistent with the rest of the store.
         """
+        routing_artifacts: list[Artifact] = []
         for role, artifact_payload in routing_decisions:
             task = tasks_by_role.get(role)
             if task is None:
                 continue
-            self.store.save_artifact(
+            routing_artifacts.append(
                 Artifact(
                     job_id=job.id,
                     task_id=task.id,
@@ -814,6 +847,8 @@ class Orchestrator:
                     ],
                 )
             )
+        if routing_artifacts:
+            self.store.save_artifacts(routing_artifacts)
 
     def _apply_auto_routing(
         self, job: Job, specs: list[WorkerSpec]
@@ -1114,14 +1149,18 @@ class Orchestrator:
         while time.monotonic() < deadline:
             self.store.recover_stale_tasks(job.id)
             self.store.refresh_blocked_tasks(job.id)
+            all_tasks = self.store.list_tasks(job.id)
+            all_artifacts = self.store.list_artifacts(job.id)
             current_tasks = [
-                task
-                for task in self.store.list_tasks(job.id)
-                if task.id in allowed_task_ids
+                task for task in all_tasks if task.id in allowed_task_ids
             ]
-            if self._has_hard_failure(job, allowed_task_ids):
+            if self._has_hard_failure(
+                job, allowed_task_ids, tasks=all_tasks, artifacts=all_artifacts
+            ):
                 raise RuntimeError("daemon worker failed a task")
-            if current_tasks and self._daemon_settled(job, allowed_task_ids):
+            if current_tasks and self._daemon_settled(
+                job, allowed_task_ids, tasks=all_tasks
+            ):
                 return
             time.sleep(0.2)
         raise RuntimeError("timed out waiting for daemon workers")

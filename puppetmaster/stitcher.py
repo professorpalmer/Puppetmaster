@@ -18,8 +18,7 @@ class Stitcher:
         job = self.store.get_job(job_id)
         artifacts = self.store.list_artifacts(job_id)
         memories = self._promote_memories(artifacts)
-        for memory in memories:
-            self.store.promote_memory(memory)
+        self.store.promote_memories(memories)
 
         summary = self._render_summary("Puppetmaster Stitched Summary", job.goal, artifacts, memories)
         self.store.write_summary(job_id, "stitched.md", summary)
