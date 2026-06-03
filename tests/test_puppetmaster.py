@@ -7308,6 +7308,54 @@ class ReadsLogTests(unittest.TestCase):
             self.assertEqual(rl.load_reads(), [])
 
 
+class SetupPlatformStepTests(unittest.TestCase):
+    """The `setup` wizard's platform-lock step (non-interactive paths)."""
+
+    def _args(self, **kw):
+        from types import SimpleNamespace
+        base = {"platforms": None, "skip_platforms": False}
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    def _isolated(self, tmp):
+        import os
+        from puppetmaster import platform_lock as pl
+        os.environ["PUPPETMASTER_MODELS_PATH"] = str(Path(tmp) / "models.json")
+        os.environ.pop(pl.ONLY_ENV, None)
+
+    def tearDown(self) -> None:
+        import os
+        os.environ.pop("PUPPETMASTER_MODELS_PATH", None)
+
+    def test_explicit_platforms_sets_lock(self) -> None:
+        from puppetmaster.cli import _setup_platform_step
+        from puppetmaster import platform_lock as pl
+        with TemporaryDirectory() as tmp:
+            self._isolated(tmp)
+            rc = _setup_platform_step(self._args(platforms="cursor"))
+            self.assertEqual(rc, 0)
+            self.assertEqual(pl.enabled_adapters(), {"cursor"})
+            self.assertTrue(pl.is_restricted())
+
+    def test_unknown_platform_returns_error_and_writes_nothing(self) -> None:
+        from puppetmaster.cli import _setup_platform_step
+        from puppetmaster import platform_lock as pl
+        with TemporaryDirectory() as tmp:
+            self._isolated(tmp)
+            rc = _setup_platform_step(self._args(platforms="banana"))
+            self.assertEqual(rc, 1)
+            self.assertFalse(pl.is_restricted())
+
+    def test_skip_leaves_lock_unchanged(self) -> None:
+        from puppetmaster.cli import _setup_platform_step
+        from puppetmaster import platform_lock as pl
+        with TemporaryDirectory() as tmp:
+            self._isolated(tmp)
+            rc = _setup_platform_step(self._args(skip_platforms=True))
+            self.assertEqual(rc, 0)
+            self.assertFalse(pl.is_restricted())
+
+
 class RoutingBaselineSnapshotTests(unittest.TestCase):
     """The router stamps a decision-time savings baseline onto every decision."""
 
@@ -7333,14 +7381,69 @@ class RoutingBaselineSnapshotTests(unittest.TestCase):
         # cheap pick should cost no more than the frontier baseline.
         self.assertLessEqual(p["estimated_cost_usd"], p["baseline_cost_usd"])
 
+    def test_baseline_respects_required_tags(self) -> None:
+        # Regression: the baseline must come from the SAME eligible set the pick
+        # is drawn from. A required-tag constraint that excludes the strongest
+        # model must also exclude it from the baseline, or savings are bogus.
+        from puppetmaster.model_registry import ModelSpec
+        from puppetmaster.router import route_task, TaskSignals
+
+        registry = [
+            ModelSpec(id="api/cheap", adapter="openai", adapter_model_name="c",
+                      capability_score=50, input_per_mtok_usd=0.15,
+                      output_per_mtok_usd=0.9, billing="api", tags=["openai", "cheap"]),
+            ModelSpec(id="api/frontier", adapter="openai", adapter_model_name="f",
+                      capability_score=90, input_per_mtok_usd=5.0,
+                      output_per_mtok_usd=30.0, billing="api", tags=["openai"]),
+            # Strongest overall, but a DIFFERENT platform/tag — must not leak in.
+            ModelSpec(id="plan/top", adapter="claude-code", adapter_model_name="t",
+                      capability_score=99, input_per_mtok_usd=0.0,
+                      output_per_mtok_usd=0.0, billing="plan", tags=["plan"]),
+        ]
+        d = route_task(
+            TaskSignals(role="explore", instruction="tiny lookup",
+                        required_tags=["openai"]),
+            registry, policy="balanced",
+        )
+        p = d.to_artifact_payload()
+        # baseline is the strongest *openai* model, NOT the plan/top giant.
+        self.assertEqual(p["baseline_model_id"], "api/frontier")
+        self.assertGreater(p["baseline_cost_usd"], 0.0)
+
+    def test_baseline_respects_billing_gate_no_overclaim(self) -> None:
+        # Regression: with API billing forbidden, the baseline can't be an
+        # API model the run could never have used — that would overclaim savings.
+        from puppetmaster.model_registry import ModelSpec
+        from puppetmaster.router import route_task, TaskSignals
+
+        registry = [
+            ModelSpec(id="plan/only", adapter="claude-code", adapter_model_name="p",
+                      capability_score=60, input_per_mtok_usd=0.0,
+                      output_per_mtok_usd=0.0, billing="plan", tags=["plan"]),
+            ModelSpec(id="api/giant", adapter="openai", adapter_model_name="g",
+                      capability_score=99, input_per_mtok_usd=5.0,
+                      output_per_mtok_usd=30.0, billing="api", tags=["openai"]),
+        ]
+        d = route_task(
+            TaskSignals(role="explore", instruction="tiny lookup",
+                        allow_api_billing=False),
+            registry, policy="balanced",
+        )
+        p = d.to_artifact_payload()
+        # baseline must be the plan model, and savings must be zero (no overclaim).
+        self.assertEqual(p["baseline_model_id"], "plan/only")
+        self.assertEqual(p["baseline_cost_usd"], 0.0)
+
 
 class SavingsLedgerTests(unittest.TestCase):
     """Policy-aware savings aggregation with the two honesty rules."""
 
-    def _rec(self, policy, chosen, baseline, has_baseline=True):
+    def _rec(self, policy, chosen, baseline, has_baseline=True,
+             picked="cheap/40", baseline_id="frontier/95"):
         from puppetmaster.savings import RoutingRecord
         return RoutingRecord(policy=policy, chosen_cost_usd=chosen,
-                             baseline_cost_usd=baseline, has_baseline=has_baseline)
+                             baseline_cost_usd=baseline, has_baseline=has_baseline,
+                             picked_model_id=picked, baseline_model_id=baseline_id)
 
     def test_only_cost_optimizing_policies_count_as_savings(self) -> None:
         from puppetmaster.savings import summarize_routing
@@ -7373,8 +7476,12 @@ class SavingsLedgerTests(unittest.TestCase):
         from puppetmaster.savings import build_metrics, SelfHeal
 
         recs = [
-            self._rec("balanced", 0.0, 0.05, has_baseline=True),   # downshifted
-            self._rec("balanced", 0.05, 0.05, has_baseline=True),  # not downshifted
+            # right-sized: ran something other than the strongest (even at $0).
+            self._rec("balanced", 0.0, 0.0, has_baseline=False,
+                      picked="cheap/40", baseline_id="frontier/95"),
+            # not right-sized: ran the strongest model itself.
+            self._rec("balanced", 0.05, 0.05, has_baseline=True,
+                      picked="frontier/95", baseline_id="frontier/95"),
             self._rec("quality", 0.10, 0.10, has_baseline=True),   # excluded (policy)
         ]
         heal = SelfHeal(fallbacks=1, escalations=2)
@@ -7384,13 +7491,14 @@ class SavingsLedgerTests(unittest.TestCase):
             reads={"reads": 6},
             jobs=2,
         )
-        # 1 of 2 cost-optimizing-with-baseline downshifted.
+        # 1 of 2 cost-optimizing tasks ran below the strongest model (by identity,
+        # independent of dollars — works for plan-billed $0 models).
         self.assertAlmostEqual(m["capability_match_rate"], 0.5, places=3)
         self.assertAlmostEqual(m["escalation_rate"], 2 / 3, places=3)
         self.assertAlmostEqual(m["fallback_rate"], 1 / 3, places=3)
         self.assertAlmostEqual(m["reuse_reads_per_job"], 3.0, places=3)
         self.assertAlmostEqual(m["context_tokens_per_job"], 4000.0, places=1)
-        self.assertEqual(m["sample"]["cost_optimizing_with_baseline"], 2)
+        self.assertEqual(m["sample"]["cost_optimizing_judgeable"], 2)
 
         empty = build_metrics([], SelfHeal(), {"context_tokens_fed": 0}, {"reads": 0}, 0)
         self.assertIsNone(empty["capability_match_rate"])
@@ -7437,6 +7545,99 @@ class SavingsLedgerTests(unittest.TestCase):
             self.assertTrue(records[0].has_baseline)
             self.assertEqual(heal.fallbacks, 1)
             self.assertEqual(heal.escalations, 1)
+
+    def test_counterfactual_prices_tokens_against_reference(self) -> None:
+        from puppetmaster.savings import (
+            RoutingRecord,
+            compute_counterfactual,
+            resolve_counterfactual_model,
+        )
+        from puppetmaster.model_registry import ModelSpec
+
+        registry = [
+            ModelSpec(id="plan/top", adapter="cursor", adapter_model_name="t",
+                      capability_score=90, input_per_mtok_usd=0.0,
+                      output_per_mtok_usd=0.0, billing="plan"),
+            ModelSpec(id="api/frontier", adapter="openai", adapter_model_name="f",
+                      capability_score=88, input_per_mtok_usd=5.0,
+                      output_per_mtok_usd=30.0, billing="api"),
+        ]
+        # Default reference = highest-capability *priced* model, not the $0 giant.
+        ref = resolve_counterfactual_model(registry)
+        self.assertEqual(ref.id, "api/frontier")
+
+        recs = [
+            RoutingRecord(policy="balanced", chosen_cost_usd=0.0,
+                          baseline_cost_usd=0.0, has_baseline=False,
+                          tokens_in=1_000_000, tokens_out=1_000_000),
+        ]
+        cf = compute_counterfactual(recs, ref)
+        self.assertTrue(cf.reference_priced)
+        # 1M in @ $5 + 1M out @ $30 = $35 naive; actual $0 (plan) -> avoided $35.
+        self.assertAlmostEqual(cf.naive_cost_usd, 35.0, places=4)
+        self.assertAlmostEqual(cf.actual_cost_usd, 0.0, places=4)
+        self.assertAlmostEqual(cf.avoided_usd, 35.0, places=4)
+        self.assertEqual(cf.tasks, 1)
+
+    def test_counterfactual_unpriced_reference_is_zero(self) -> None:
+        from puppetmaster.savings import RoutingRecord, compute_counterfactual
+        from puppetmaster.model_registry import ModelSpec
+
+        plan_only = ModelSpec(id="plan/only", adapter="cursor", adapter_model_name="p",
+                              capability_score=80, input_per_mtok_usd=0.0,
+                              output_per_mtok_usd=0.0, billing="plan")
+        recs = [RoutingRecord(policy="balanced", chosen_cost_usd=0.0,
+                              baseline_cost_usd=0.0, has_baseline=False,
+                              tokens_in=500, tokens_out=500)]
+        cf = compute_counterfactual(recs, plan_only)
+        self.assertFalse(cf.reference_priced)
+        self.assertEqual(cf.naive_cost_usd, 0.0)
+        self.assertEqual(cf.avoided_usd, 0.0)
+
+    def test_counterfactual_env_override_selects_model(self) -> None:
+        import os
+        from puppetmaster.savings import resolve_counterfactual_model, COUNTERFACTUAL_MODEL_ENV
+        from puppetmaster.model_registry import ModelSpec
+
+        registry = [
+            ModelSpec(id="api/cheap", adapter="openai", adapter_model_name="c",
+                      capability_score=50, input_per_mtok_usd=0.1,
+                      output_per_mtok_usd=0.2, billing="api"),
+            ModelSpec(id="api/frontier", adapter="openai", adapter_model_name="f",
+                      capability_score=99, input_per_mtok_usd=5.0,
+                      output_per_mtok_usd=30.0, billing="api"),
+        ]
+        os.environ[COUNTERFACTUAL_MODEL_ENV] = "api/cheap"
+        try:
+            ref = resolve_counterfactual_model(registry)
+            self.assertEqual(ref.id, "api/cheap")
+        finally:
+            os.environ.pop(COUNTERFACTUAL_MODEL_ENV, None)
+
+    def test_collect_dedups_router_artifacts_by_task_id(self) -> None:
+        from puppetmaster.savings import collect_routing_records
+        from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
+        from puppetmaster.store import SwarmStore
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            job = store.create_job("g")
+            task = Task(job_id=job.id, role="implement", instruction="x",
+                        adapter="cursor", status=TaskStatus.COMPLETE)
+            store.save_task(task)
+            # Two 'router' artifacts for the SAME task (e.g. a re-dispatch) must
+            # be counted once, not twice — no inflated savings.
+            for _ in range(2):
+                store.save_artifact(Artifact(
+                    job_id=job.id, task_id=task.id, type=ArtifactType.ROUTING,
+                    created_by="router",
+                    payload={"model_id": "cheap/40", "adapter": "cursor",
+                             "policy": "balanced", "estimated_cost_usd": 0.0,
+                             "baseline_cost_usd": 0.05},
+                    confidence=0.9, evidence=["r"]))
+            records, _, _ = collect_routing_records([store])
+            self.assertEqual(len(records), 1)
 
 
 if __name__ == "__main__":
