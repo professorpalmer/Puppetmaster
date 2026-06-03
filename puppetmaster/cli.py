@@ -653,6 +653,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print the full repair payload as JSON instead of a human-readable summary.",
     )
 
+    codegraph_cmd = subcommands.add_parser(
+        "codegraph",
+        help=(
+            "ABI-safe passthrough to the codegraph CLI. Runs under Cursor's "
+            "bundled Node (not your shell's Node) so better-sqlite3 loads, and "
+            "auto-rebuilds it on a Node ABI mismatch. Use this instead of a bare "
+            "`codegraph ...` call from your shell."
+        ),
+    )
+    codegraph_cmd.add_argument(
+        "--cwd",
+        help="Target repo to run codegraph in (default: current directory).",
+    )
+    codegraph_cmd.add_argument(
+        "--timeout",
+        type=int,
+        default=0,
+        help=(
+            "Seconds before the codegraph call is killed. 0 (default) means no "
+            "limit, so long operations like `index` / `affected` aren't cut off."
+        ),
+    )
+    codegraph_cmd.add_argument(
+        "cg_args",
+        nargs=argparse.REMAINDER,
+        help=(
+            "codegraph subcommand and arguments, e.g. `search foo`, `status`, "
+            "`context 'task'`. Prefix with `--` to pass codegraph's own flags, "
+            "e.g. `codegraph -- --version`."
+        ),
+    )
+
     mcp = subcommands.add_parser(
         "mcp",
         help=(
@@ -1019,6 +1051,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
 
     if args.command == "repair-codegraph":
         return _run_repair_codegraph(args)
+
+    if args.command == "codegraph":
+        return _run_codegraph_passthrough(args)
 
     if args.command == "mcp":
         return _run_mcp_subcommand(args)
@@ -1959,6 +1994,67 @@ def _run_repair_codegraph(args) -> int:
         for line in result.rebuild_stderr.strip().splitlines()[-20:]:
             print(f"    {line}")
     return 0 if result.ok else 1
+
+
+def _run_codegraph_passthrough(args) -> int:
+    """CLI entrypoint for `python -m puppetmaster codegraph <args>`.
+
+    The whole point: invoke CodeGraph under Cursor's bundled Node via
+    ``run_codegraph_cli`` (which resolves that Node and auto-rebuilds the
+    native better-sqlite3 binding on an ABI mismatch) instead of a bare
+    ``codegraph`` shell call that picks up the wrong Node and dies with a
+    ``NODE_MODULE_VERSION`` native-load error. This is the durable fallback
+    when the MCP transport is unavailable.
+    """
+    from puppetmaster.codegraph import run_codegraph_cli
+
+    cli_args = list(args.cg_args or [])
+    if cli_args and cli_args[0] == "--":
+        cli_args = cli_args[1:]
+    if not cli_args:
+        print("usage: python -m puppetmaster codegraph <subcommand> [args...]", file=sys.stderr)
+        print("examples: codegraph status | codegraph search 'router' | codegraph context 'task'", file=sys.stderr)
+        return 2
+
+    target = args.cwd or os.getcwd()
+    # `status`, `init`, and `help` work before/while a workspace is indexed;
+    # everything else needs an initialized `.codegraph/`. (codegraph's own
+    # flags like `--version` arrive after a literal `--`, already stripped
+    # above, so they pass through to the CLI rather than being gated here.)
+    sub = cli_args[0]
+    require_initialized = sub not in {"status", "init", "help"}
+
+    timeout_seconds = args.timeout if getattr(args, "timeout", 0) else None
+    result = run_codegraph_cli(
+        cli_args,
+        target,
+        require_initialized=require_initialized,
+        timeout_seconds=timeout_seconds,
+    )
+
+    autoheal = result.get("autoheal")
+    if isinstance(autoheal, dict):
+        verdict = "ok" if autoheal.get("ok") else "failed"
+        print(
+            f"[puppetmaster] codegraph native binding rebuilt against Cursor's Node ({verdict}).",
+            file=sys.stderr,
+        )
+
+    if not result.get("ok"):
+        error = result.get("error")
+        if error:
+            print(error, file=sys.stderr)
+        if result.get("stdout"):
+            sys.stdout.write(result["stdout"])
+        if result.get("stderr"):
+            sys.stderr.write(result["stderr"])
+        return int(result.get("returncode") or 1)
+
+    if result.get("stdout"):
+        sys.stdout.write(result["stdout"])
+    if result.get("stderr"):
+        sys.stderr.write(result["stderr"])
+    return 0
 
 
 def _run_mcp_subcommand(args) -> int:

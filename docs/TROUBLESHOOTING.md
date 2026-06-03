@@ -166,6 +166,21 @@ You can also call it from inside the agent itself via the
 `puppetmaster_repair_codegraph` MCP tool — useful if an agent hits
 the WASM fallback mid-session and can self-heal.
 
+**v0.9.7 makes this fully automatic and kills the bare-shell footgun.**
+Two changes: (1) every CodeGraph call routed through Puppetmaster
+(`run_codegraph_cli`, used by the `puppetmaster_codegraph_*` MCP tools
+and the CLI passthrough) now detects the `NODE_MODULE_VERSION` /
+"compiled against a different Node.js version" native-load error,
+rebuilds `better-sqlite3` against Cursor's Node **once per process**,
+and retries — so you no longer have to run `repair-codegraph` by hand.
+(2) A new `python -m puppetmaster codegraph <args>` passthrough runs the
+CLI under Cursor's bundled Node. **Stop calling a bare `codegraph …`
+from your shell** — that picks up your shell's Node (wrong ABI) and dies
+with the native-load error. Use `python -m puppetmaster codegraph status`
+/ `search` / `context` / `init --index` instead, which is also the
+correct MCP-down fallback. Disable the auto-rebuild with
+`PUPPETMASTER_CODEGRAPH_AUTOHEAL=0`.
+
 **Tradeoff:** `better-sqlite3` is ABI-specific. Rebuilding for
 Cursor's Node 22 may break native SQLite in your terminal (Node 23)
 until you rebuild again with the shell's Node. For day-to-day Cursor

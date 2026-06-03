@@ -22,7 +22,6 @@ The full documentation set. Start at the [project README](../README.md) for the 
 | [ADAPTERS.md](ADAPTERS.md) | All four production adapters + shell + how to add a new one |
 | [CLI_REFERENCE.md](CLI_REFERENCE.md) | Every CLI subcommand, workflow config schema, daemon mode |
 | [CURSOR_AGENT_MCP.md](CURSOR_AGENT_MCP.md) | The MCP tool surface in detail |
-| [CURSOR_EXTENSION.md](CURSOR_EXTENSION.md) | Activity-bar control panel install + features |
 | [CODEGRAPH.md](CODEGRAPH.md) | CodeGraph integration, bundled MCP tools, cost comparison |
 
 ## Operate & contribute
@@ -47,4 +46,3 @@ The full documentation set. Start at the [project README](../README.md) for the 
 | Example workflow configs | [`examples/`](../examples/README.md) |
 | Demo + GIF scripts | [`scripts/`](../scripts/README.md) |
 | TypeScript await client | [`clients/typescript/`](../clients/typescript/README.md) |
-| Cursor extension | [`cursor-extension/`](../cursor-extension/README.md) |

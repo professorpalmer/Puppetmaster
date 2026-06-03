@@ -15,7 +15,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 # Hermetic tests: the orchestrator's first-run plan-catalog auto-discovery
 # shells out to the Cursor SDK (node) when CURSOR_API_KEY is set. The suite
@@ -1157,9 +1157,13 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertFalse(used)
 
     def test_run_codegraph_cli_reports_missing_cli(self) -> None:
+        from puppetmaster import codegraph as codegraph_module
+
         with TemporaryDirectory() as tmp:
             (Path(tmp) / ".codegraph").mkdir()
-            with patch("puppetmaster.codegraph.shutil.which", return_value=None):
+            with patch("puppetmaster.codegraph.shutil.which", return_value=None), patch.object(
+                codegraph_module, "_cursor_codegraph_invocation", return_value=None
+            ):
                 payload = run_codegraph_cli(["status"], tmp)
 
             self.assertFalse(payload["ok"])
@@ -1928,6 +1932,282 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(repair.call_count, 1)
 
+    def _reset_codegraph_autoheal(self) -> None:
+        from puppetmaster import codegraph as codegraph_module
+
+        codegraph_module.reset_codegraph_autoheal_state()
+
+    def test_codegraph_native_broken_detects_hard_module_load_failure(self) -> None:
+        """The hard `NODE_MODULE_VERSION` load error is detected, not just WASM."""
+        from puppetmaster.codegraph import codegraph_native_sqlite_broken
+
+        stderr = (
+            "Error: The module '/x/better_sqlite3.node' was compiled against a "
+            "different Node.js version using NODE_MODULE_VERSION 127. This version "
+            "of Node.js requires NODE_MODULE_VERSION 131."
+        )
+        self.assertTrue(codegraph_native_sqlite_broken(stderr))
+
+    def test_run_codegraph_cli_autoheals_and_retries_on_abi_error(self) -> None:
+        """A better-sqlite3 ABI failure triggers a one-shot rebuild + retry."""
+        from puppetmaster import codegraph as codegraph_module
+        from puppetmaster.codegraph_repair import RepairResult
+
+        self.addCleanup(self._reset_codegraph_autoheal)
+        self._reset_codegraph_autoheal()
+
+        broken = {
+            "ok": False,
+            "command": "codegraph status",
+            "cwd": "/repo",
+            "returncode": 1,
+            "stdout": "",
+            "stderr": "better_sqlite3.node was compiled against a different Node.js version",
+        }
+        healed = {
+            "ok": True,
+            "command": "codegraph status",
+            "cwd": "/repo",
+            "returncode": 0,
+            "stdout": "Backend: native; nodes: 42",
+            "stderr": "",
+        }
+        once = MagicMock(side_effect=[broken, healed])
+        repair = MagicMock(return_value=RepairResult(ok=True, message="rebuilt"))
+
+        with patch.object(codegraph_module, "codegraph_available", return_value=True), \
+            patch.object(codegraph_module, "codegraph_initialized", return_value=True), \
+            patch.object(codegraph_module, "_run_codegraph_once", once), \
+            patch("puppetmaster.codegraph_repair.repair_codegraph_sqlite", repair):
+            result = codegraph_module.run_codegraph_cli(["status"], "/repo")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(once.call_count, 2)
+        self.assertEqual(repair.call_count, 1)
+        self.assertEqual(result["autoheal"], {"ok": True, "message": "rebuilt"})
+
+    def test_run_codegraph_cli_no_autoheal_on_clean_failure(self) -> None:
+        """A normal non-ABI failure must NOT trigger an expensive rebuild."""
+        from puppetmaster import codegraph as codegraph_module
+
+        self.addCleanup(self._reset_codegraph_autoheal)
+        self._reset_codegraph_autoheal()
+
+        failure = {
+            "ok": False,
+            "command": "codegraph search foo",
+            "cwd": "/repo",
+            "returncode": 2,
+            "stdout": "",
+            "stderr": "no results found",
+        }
+        once = MagicMock(return_value=failure)
+        repair = MagicMock()
+
+        with patch.object(codegraph_module, "codegraph_available", return_value=True), \
+            patch.object(codegraph_module, "codegraph_initialized", return_value=True), \
+            patch.object(codegraph_module, "_run_codegraph_once", once), \
+            patch("puppetmaster.codegraph_repair.repair_codegraph_sqlite", repair):
+            result = codegraph_module.run_codegraph_cli(["search", "foo"], "/repo")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(once.call_count, 1)
+        repair.assert_not_called()
+        self.assertNotIn("autoheal", result)
+
+    def test_run_codegraph_cli_autoheal_disabled_by_env(self) -> None:
+        """PUPPETMASTER_CODEGRAPH_AUTOHEAL=0 disables the rebuild entirely."""
+        from puppetmaster import codegraph as codegraph_module
+
+        self.addCleanup(self._reset_codegraph_autoheal)
+        self._reset_codegraph_autoheal()
+
+        broken = {
+            "ok": False,
+            "command": "codegraph status",
+            "cwd": "/repo",
+            "returncode": 1,
+            "stdout": "",
+            "stderr": "better_sqlite3 NODE_MODULE_VERSION mismatch",
+        }
+        once = MagicMock(return_value=broken)
+        repair = MagicMock()
+
+        with patch.dict(os.environ, {"PUPPETMASTER_CODEGRAPH_AUTOHEAL": "0"}), \
+            patch.object(codegraph_module, "codegraph_available", return_value=True), \
+            patch.object(codegraph_module, "codegraph_initialized", return_value=True), \
+            patch.object(codegraph_module, "_run_codegraph_once", once), \
+            patch("puppetmaster.codegraph_repair.repair_codegraph_sqlite", repair):
+            result = codegraph_module.run_codegraph_cli(["status"], "/repo")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(once.call_count, 1)
+        repair.assert_not_called()
+
+    def test_run_codegraph_cli_no_retry_when_repair_fails(self) -> None:
+        """A failed rebuild must NOT trigger a blind retry of the command."""
+        from puppetmaster import codegraph as codegraph_module
+        from puppetmaster.codegraph_repair import RepairResult
+
+        self.addCleanup(self._reset_codegraph_autoheal)
+        self._reset_codegraph_autoheal()
+
+        broken = {
+            "ok": False,
+            "command": "codegraph status",
+            "cwd": "/repo",
+            "returncode": 1,
+            "stdout": "",
+            "stderr": "better_sqlite3.node was compiled against a different Node.js version",
+        }
+        once = MagicMock(return_value=broken)
+        repair = MagicMock(return_value=RepairResult(ok=False, message="rebuild failed"))
+
+        with patch.object(codegraph_module, "codegraph_available", return_value=True), \
+            patch.object(codegraph_module, "codegraph_initialized", return_value=True), \
+            patch.object(codegraph_module, "_run_codegraph_once", once), \
+            patch("puppetmaster.codegraph_repair.repair_codegraph_sqlite", repair):
+            result = codegraph_module.run_codegraph_cli(["status"], "/repo")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(once.call_count, 1)
+        self.assertEqual(repair.call_count, 1)
+        self.assertEqual(result["autoheal"], {"ok": False, "message": "rebuild failed"})
+
+    def test_codegraph_should_autoheal_uses_strict_abi_predicate(self) -> None:
+        """Only the hard Node-ABI load signature should trip auto-heal."""
+        from puppetmaster import codegraph as codegraph_module
+
+        self.addCleanup(self._reset_codegraph_autoheal)
+        self._reset_codegraph_autoheal()
+
+        # A package-name mention alone is not enough (avoids false rebuilds).
+        self.assertFalse(
+            codegraph_module._codegraph_should_autoheal(
+                {"ok": False, "stderr": "could not load better-sqlite3 plugin"}
+            )
+        )
+        self.assertFalse(
+            codegraph_module._codegraph_should_autoheal(
+                {"ok": False, "stderr": "no results found"}
+            )
+        )
+        self.assertTrue(
+            codegraph_module._codegraph_should_autoheal(
+                {"ok": False, "stderr": "Error: ... NODE_MODULE_VERSION 127 ..."}
+            )
+        )
+
+    def test_codegraph_autoheal_skipped_when_env_install_pinned(self) -> None:
+        """A user-pinned custom install must not be auto-rebuilt globally."""
+        from puppetmaster import codegraph as codegraph_module
+
+        self.addCleanup(self._reset_codegraph_autoheal)
+        self._reset_codegraph_autoheal()
+
+        with TemporaryDirectory() as tmp:
+            node = Path(tmp) / "node"
+            js = Path(tmp) / "codegraph.js"
+            node.write_text("#!/bin/sh\n")
+            js.write_text("// codegraph\n")
+            with patch.dict(
+                os.environ,
+                {
+                    "PUPPETMASTER_CODEGRAPH_NODE": str(node),
+                    "PUPPETMASTER_CODEGRAPH_JS": str(js),
+                },
+            ):
+                self.assertFalse(
+                    codegraph_module._codegraph_should_autoheal(
+                        {"ok": False, "stderr": "NODE_MODULE_VERSION mismatch"}
+                    )
+                )
+
+    def test_codegraph_autoheal_claim_is_one_at_a_time_with_cooldown(self) -> None:
+        """Only one caller claims an attempt; a failed attempt is gated by cooldown."""
+        from puppetmaster import codegraph as codegraph_module
+
+        self.addCleanup(self._reset_codegraph_autoheal)
+        self._reset_codegraph_autoheal()
+
+        self.assertTrue(codegraph_module._claim_codegraph_autoheal())
+        # Still in-progress -> nobody else can claim.
+        self.assertFalse(codegraph_module._claim_codegraph_autoheal())
+        # Mark the attempt done-but-failed; cooldown should still block reclaim.
+        with codegraph_module._AUTOHEAL_LOCK:
+            codegraph_module._AUTOHEAL_STATE["in_progress"] = False
+        self.assertFalse(codegraph_module._claim_codegraph_autoheal())
+        # After cooldown elapses, a fresh attempt is allowed (not wedged forever).
+        with codegraph_module._AUTOHEAL_LOCK:
+            codegraph_module._AUTOHEAL_STATE["last_attempt_at"] = (
+                time.monotonic() - codegraph_module._AUTOHEAL_COOLDOWN_SECONDS - 1
+            )
+        self.assertTrue(codegraph_module._claim_codegraph_autoheal())
+
+    def test_cli_codegraph_passthrough_defaults_to_no_timeout(self) -> None:
+        """Passthrough must not impose the short context timeout on long ops."""
+        from puppetmaster import cli as cli_module
+
+        captured = {}
+
+        def fake_run(cli_args, cwd, *, require_initialized=True, timeout_seconds=None, **kwargs):
+            captured["timeout_seconds"] = timeout_seconds
+            return {"ok": True, "stdout": "", "stderr": "", "returncode": 0}
+
+        with patch("puppetmaster.codegraph.run_codegraph_cli", side_effect=fake_run):
+            rc = cli_module.main(["codegraph", "index"])
+
+        self.assertEqual(rc, 0)
+        self.assertIsNone(captured["timeout_seconds"])
+
+    def test_codegraph_available_via_cursor_node_without_shim(self) -> None:
+        """Available when Cursor-Node invocation resolves even if shim is off PATH."""
+        from puppetmaster import codegraph as codegraph_module
+
+        with patch.object(codegraph_module.shutil, "which", return_value=None), \
+            patch.object(
+                codegraph_module,
+                "_cursor_codegraph_invocation",
+                return_value=["/cursor/node", "/install/codegraph.js"],
+            ):
+            self.assertTrue(codegraph_module.codegraph_available())
+
+    def test_cli_codegraph_passthrough_routes_through_run_codegraph_cli(self) -> None:
+        """`puppetmaster codegraph <args>` delegates to the ABI-safe runner."""
+        from puppetmaster import cli as cli_module
+
+        captured = {}
+
+        def fake_run(cli_args, cwd, *, require_initialized=True, **kwargs):
+            captured["cli_args"] = cli_args
+            captured["cwd"] = cwd
+            captured["require_initialized"] = require_initialized
+            return {"ok": True, "stdout": "ok\n", "stderr": "", "returncode": 0}
+
+        with patch("puppetmaster.codegraph.run_codegraph_cli", side_effect=fake_run):
+            rc = cli_module.main(["codegraph", "--cwd", "/repo", "search", "router"])
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(captured["cli_args"], ["search", "router"])
+        self.assertEqual(captured["cwd"], "/repo")
+        self.assertTrue(captured["require_initialized"])
+
+    def test_cli_codegraph_passthrough_status_skips_init_requirement(self) -> None:
+        """`status` runs even before the workspace is initialized."""
+        from puppetmaster import cli as cli_module
+
+        captured = {}
+
+        def fake_run(cli_args, cwd, *, require_initialized=True, **kwargs):
+            captured["require_initialized"] = require_initialized
+            return {"ok": True, "stdout": "Backend: native\n", "stderr": "", "returncode": 0}
+
+        with patch("puppetmaster.codegraph.run_codegraph_cli", side_effect=fake_run):
+            rc = cli_module.main(["codegraph", "status"])
+
+        self.assertEqual(rc, 0)
+        self.assertFalse(captured["require_initialized"])
+
     def test_mcp_registry_round_trip(self) -> None:
         """register -> list -> heartbeat -> deregister flows correctly."""
         from puppetmaster import mcp_registry
@@ -2292,6 +2572,9 @@ class PuppetmasterTests(unittest.TestCase):
         from puppetmaster import codegraph as codegraph_mod
         from puppetmaster import codegraph_repair
 
+        codegraph_mod.reset_cursor_codegraph_invocation_cache()
+        self.addCleanup(codegraph_mod.reset_cursor_codegraph_invocation_cache)
+
         with TemporaryDirectory() as tmp:
             node = Path(tmp) / "Cursor.app/Contents/Resources/app/resources/helpers/node"
             node.parent.mkdir(parents=True)
@@ -2312,6 +2595,9 @@ class PuppetmasterTests(unittest.TestCase):
         """Without a Cursor install, we fall back to the codegraph shim on PATH."""
         from puppetmaster import codegraph as codegraph_mod
         from puppetmaster import codegraph_repair
+
+        codegraph_mod.reset_cursor_codegraph_invocation_cache()
+        self.addCleanup(codegraph_mod.reset_cursor_codegraph_invocation_cache)
 
         with patch.object(codegraph_repair, "find_cursor_node", return_value=None), patch.object(
             codegraph_repair, "find_codegraph_install", return_value=None

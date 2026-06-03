@@ -39,7 +39,7 @@ To run benchmarks or hack on it, clone instead — see [Contributing](docs/CONTR
 | See everything that ships + adapters | [docs/FEATURES.md](docs/FEATURES.md) |
 | Copy/paste prompts & shell recipes | [Quickstart](#quickstart) · [docs/DAILY_DRIVER.md](docs/DAILY_DRIVER.md) |
 | Read the full docs set | [docs/README.md](docs/README.md) |
-| Browse by directory | [`puppetmaster/`](puppetmaster/README.md) · [`bench/`](bench/README.md) · [`examples/`](examples/README.md) · [`scripts/`](scripts/README.md) · [`clients/typescript/`](clients/typescript/README.md) · [`cursor-extension/`](cursor-extension/README.md) |
+| Browse by directory | [`puppetmaster/`](puppetmaster/README.md) · [`bench/`](bench/README.md) · [`examples/`](examples/README.md) · [`scripts/`](scripts/README.md) · [`clients/typescript/`](clients/typescript/README.md) |
 
 ## What it does
 
@@ -115,7 +115,7 @@ More recipes in [docs/DAILY_DRIVER.md](docs/DAILY_DRIVER.md).
 
 ## Status
 
-**Daily-driver beta.** Real runtime contract, automated tests, SQLite default backend, fail-closed jobs, live Cursor Agent MCP, installable Cursor extension, validated full-edit adapters. Credible for supervised local engineering; not yet a hosted multi-user service. Full feature matrix: [docs/FEATURES.md](docs/FEATURES.md).
+**Daily-driver beta.** Real runtime contract, automated tests, SQLite default backend, fail-closed jobs, live Cursor Agent MCP, validated full-edit adapters. Credible for supervised local engineering; not yet a hosted multi-user service. Full feature matrix: [docs/FEATURES.md](docs/FEATURES.md).
 
 **Pip name:** PyPI lists this as [`puppetmaster-ai`](https://pypi.org/project/puppetmaster-ai/) because [PEP-503 normalization](https://peps.python.org/pep-0503/#normalized-names) collides `puppetmaster` with an [abandoned 2019 `puppet-master`](https://pypi.org/project/puppet-master/). The import name, CLI, repo, and brand stay `puppetmaster`. ([tracking](docs/PYPI_NAME_REQUEST.md))
 
