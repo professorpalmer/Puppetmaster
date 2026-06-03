@@ -17,6 +17,7 @@ Honesty rules baked in (learned the hard way from a probe that "lost money"):
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -30,6 +31,10 @@ class RoutingRecord:
     chosen_cost_usd: float
     baseline_cost_usd: float
     has_baseline: bool
+    picked_model_id: str = ""
+    baseline_model_id: str = ""
+    tokens_in: int = 0
+    tokens_out: int = 0
 
 
 @dataclass
@@ -94,6 +99,10 @@ def collect_routing_records(
     records: list[RoutingRecord] = []
     self_heal = SelfHeal()
     jobs = 0
+    # A task contributes exactly one *initial* routing decision. Dedup by task_id
+    # guards against a re-dispatched task emitting multiple created_by=="router"
+    # artifacts, which would otherwise inflate the savings dollars and counts.
+    seen_router_tasks: set = set()
     for store in stores:
         try:
             job_list = store.list_jobs()
@@ -118,6 +127,11 @@ def collect_routing_records(
                     continue
                 if a.created_by != "router":
                     continue
+                tid = getattr(a, "task_id", None)
+                if tid:
+                    if tid in seen_router_tasks:
+                        continue
+                    seen_router_tasks.add(tid)
                 p = a.payload or {}
                 baseline = float(p.get("baseline_cost_usd") or 0.0)
                 records.append(
@@ -126,6 +140,10 @@ def collect_routing_records(
                         chosen_cost_usd=float(p.get("estimated_cost_usd") or 0.0),
                         baseline_cost_usd=baseline,
                         has_baseline="baseline_cost_usd" in p and baseline > 0.0,
+                        picked_model_id=p.get("model_id") or "",
+                        baseline_model_id=p.get("baseline_model_id") or "",
+                        tokens_in=int(p.get("estimated_tokens_in") or 0),
+                        tokens_out=int(p.get("estimated_tokens_out") or 0),
                     )
                 )
     return records, jobs, self_heal
@@ -153,20 +171,24 @@ def build_metrics(
     visible and nothing reads like a vanity total. A rate is ``None`` (JSON
     null) when its denominator is zero, never a misleading 0.0."""
     total_routed = len(routing_records)
-    cost_opt = [
+    cost_opt = [r for r in routing_records if r.policy in COST_OPTIMIZING_POLICIES]
+    # Capability-match is by model *identity*, not dollars, so it stays meaningful
+    # for plan-billed shops where every model costs $0: did we run something other
+    # than the strongest eligible model because the task didn't need it?
+    judgeable = [r for r in cost_opt if r.baseline_model_id]
+    right_sized = [
         r
-        for r in routing_records
-        if r.policy in COST_OPTIMIZING_POLICIES and r.has_baseline
+        for r in judgeable
+        if r.picked_model_id and r.picked_model_id != r.baseline_model_id
     ]
-    downshifted = [r for r in cost_opt if r.chosen_cost_usd < r.baseline_cost_usd]
 
     def rate(numerator: int, denominator: int) -> Optional[float]:
         return round(numerator / denominator, 3) if denominator else None
 
     return {
-        # Discipline: of the cost-optimizing tasks we *could* judge, how often did
-        # we run something cheaper than the strongest eligible model?
-        "capability_match_rate": rate(len(downshifted), len(cost_opt)),
+        # Discipline: of the cost-optimizing tasks we can judge, how often did we
+        # run a model other than the strongest available (i.e. right-size down)?
+        "capability_match_rate": rate(len(right_sized), len(judgeable)),
         # Calibration: how often did a task need a bump up a tier?
         "escalation_rate": rate(self_heal.escalations, total_routed),
         # Reliability: how often did a task fail over off a dead provider?
@@ -179,10 +201,87 @@ def build_metrics(
         ),
         "sample": {
             "routed_tasks": total_routed,
-            "cost_optimizing_with_baseline": len(cost_opt),
+            "cost_optimizing_judgeable": len(judgeable),
             "jobs": jobs,
         },
     }
+
+
+COUNTERFACTUAL_MODEL_ENV = "PUPPETMASTER_COUNTERFACTUAL_MODEL"
+
+
+@dataclass
+class Counterfactual:
+    """The 'avoided spend vs the naive approach' number — explicitly a
+    *counterfactual*, not measured cash. It prices the exact token volume we
+    actually routed against a single reference model at its API rates, and
+    subtracts what the routed work actually cost. On a plan-billed setup the
+    actual cost is ~$0, so ``avoided_usd`` ≈ ``naive_cost_usd``.
+
+    Only as honest as ``reference_model_id``: it answers "what would this have
+    cost if every task had run on <reference> at metered rates?" — so the
+    reference must be a model leadership agrees you'd otherwise have used.
+    ``reference_priced`` is False when the chosen reference has no per-token
+    price (then the number is $0 and we say so, rather than implying savings).
+    """
+
+    reference_model_id: str
+    reference_priced: bool
+    naive_cost_usd: float
+    actual_cost_usd: float
+    avoided_usd: float
+    tasks: int
+
+
+def resolve_counterfactual_model(registry: list):
+    """Pick the reference model for the counterfactual.
+
+    1. ``$PUPPETMASTER_COUNTERFACTUAL_MODEL`` (a registry model id) wins.
+    2. Otherwise the highest-capability model that has a real per-token price
+       (so the counterfactual reflects metered-API spend, not a $0 plan model).
+    3. Falls back to the highest-capability model overall if nothing is priced.
+
+    Returns ``None`` only for an empty registry.
+    """
+    if not registry:
+        return None
+    env = os.environ.get(COUNTERFACTUAL_MODEL_ENV)
+    if env and env.strip():
+        for m in registry:
+            if getattr(m, "id", None) == env.strip():
+                return m
+    priced = [
+        m
+        for m in registry
+        if (getattr(m, "input_per_mtok_usd", 0) or 0) > 0
+        or (getattr(m, "output_per_mtok_usd", 0) or 0) > 0
+    ]
+    pool = priced or registry
+    return max(pool, key=lambda m: getattr(m, "capability_score", 0))
+
+
+def compute_counterfactual(
+    records: list[RoutingRecord], reference
+) -> Optional[Counterfactual]:
+    """Price every routed task's token volume against ``reference`` and compare
+    to what the work actually cost. ``None`` when there's no reference."""
+    if reference is None:
+        return None
+    naive = 0.0
+    actual = 0.0
+    for r in records:
+        naive += reference.estimate_cost_usd(r.tokens_in, r.tokens_out)
+        actual += r.chosen_cost_usd
+    in_price = getattr(reference, "input_per_mtok_usd", 0) or 0
+    out_price = getattr(reference, "output_per_mtok_usd", 0) or 0
+    return Counterfactual(
+        reference_model_id=getattr(reference, "id", "?"),
+        reference_priced=(in_price > 0 or out_price > 0),
+        naive_cost_usd=round(naive, 6),
+        actual_cost_usd=round(actual, 6),
+        avoided_usd=round(naive - actual, 6),
+        tasks=len(records),
+    )
 
 
 def build_report(
@@ -205,6 +304,15 @@ def build_report(
     reads = reads_log.aggregate(reads_log.load_reads(since=since))
     metrics = build_metrics(routing_records, self_heal, codegraph, reads, jobs)
 
+    counterfactual: Optional[Counterfactual] = None
+    try:
+        from puppetmaster.model_registry import load_registry
+
+        reference = resolve_counterfactual_model(load_registry())
+        counterfactual = compute_counterfactual(routing_records, reference)
+    except Exception:
+        counterfactual = None
+
     return {
         "window_days": window_days,
         "jobs_considered": jobs,
@@ -213,4 +321,5 @@ def build_report(
         "codegraph": codegraph,
         "reads": reads,
         "metrics": metrics,
+        "counterfactual": counterfactual,
     }

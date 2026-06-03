@@ -350,14 +350,6 @@ def route_task(
             )
         candidates = after_platform
 
-    # Snapshot the savings baseline now, from the strongest model the user could
-    # have used (highest-capability, enabled + platform-allowed), at this task's
-    # token estimate. Stored on the decision so the ledger compares like-for-like
-    # later instead of recomputing against a possibly-changed registry.
-    _baseline_model = max(candidates, key=lambda s: s.capability_score)
-    _baseline_cost = _baseline_model.estimate_cost_usd(tokens_in, tokens_out)
-    _baseline_id = _baseline_model.id
-
     # Tag filter first — cheap to evaluate, gives a clean reason on rejection.
     after_tags: list[ModelSpec] = []
     for spec in candidates:
@@ -424,6 +416,18 @@ def route_task(
                 "lower the task's capability need."
             )
         after_cost = after_billing
+
+    # Snapshot the savings baseline from the strongest model that was *actually
+    # eligible for this task* — i.e. the final candidate set the pick is drawn
+    # from, after every hard constraint (platform lock, required tags, cost cap,
+    # billing gate). Computing it from the same set the pick comes from is what
+    # keeps the ledger honest: a constrained run can't be credited against (or
+    # penalised by) a model it could never have run. Stored on the decision so
+    # the ledger compares like-for-like later instead of recomputing against a
+    # possibly-changed registry.
+    _baseline_model = max(after_cost, key=lambda s: s.capability_score)
+    _baseline_cost = _baseline_model.estimate_cost_usd(tokens_in, tokens_out)
+    _baseline_id = _baseline_model.id
 
     # Tie-break helper: when ``prefer_plan_billed`` is on, a subscription-covered
     # model sorts ahead of an out-of-pocket one at equal cost/capability, so

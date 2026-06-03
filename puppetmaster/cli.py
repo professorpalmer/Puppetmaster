@@ -195,6 +195,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Pass --force through to MCP installers and rule installer.",
     )
+    setup_parser.add_argument(
+        "--platforms",
+        default=None,
+        help=(
+            "Comma-separated platforms to enable out of the gate "
+            "(e.g. 'cursor' or 'cursor,claude-code'); every other platform is "
+            "disabled. Non-interactive — skips the platform prompt."
+        ),
+    )
+    setup_parser.add_argument(
+        "--skip-platforms",
+        action="store_true",
+        help="Skip the platform-lock selection step (leave the lock unchanged).",
+    )
 
     init_config = subcommands.add_parser("init-config", help="Write a starter workflow config.")
     init_config.add_argument(
@@ -1646,16 +1660,115 @@ def _run_install_rules(args) -> int:
     return _print_rules_result(result)
 
 
+def _setup_platform_step(args) -> int:
+    """The `setup` wizard's platform-lock step.
+
+    Lets the user pick which platforms Puppetmaster may route to right out of
+    the gate — a single Cursor plan, Cursor + Claude Code, etc. Three modes:
+
+    * ``--platforms cursor,claude-code`` — explicit, non-interactive.
+    * a TTY with no flag — interactive toggle prompt.
+    * non-interactive shell with no flag — left unchanged, with a hint.
+
+    Returns non-zero only for an invalid *explicit* ``--platforms`` value; the
+    interactive and skipped paths never fail the wizard on a typo.
+    """
+    from puppetmaster import platform_lock as pl
+
+    known = pl.KNOWN_ADAPTERS
+
+    def _show_state() -> None:
+        enabled = pl.enabled_adapters()
+        for adapter in known:
+            mark = "on " if adapter in enabled else "off"
+            print(f"  [{mark}] {adapter}")
+
+    raw = getattr(args, "platforms", None)
+    if raw is not None:
+        wanted = {a.strip() for a in raw.split(",") if a.strip()}
+        unknown = sorted(a for a in wanted if a not in known)
+        if unknown:
+            print(
+                f"  error  unknown platform(s): {', '.join(unknown)}. "
+                f"Known: {', '.join(known)}."
+            )
+            return 1
+        valid = {a for a in wanted if a in known}
+        if not valid:
+            print("  error  --platforms named no known platform.")
+            return 1
+        pl.set_enabled(valid)
+        print(f"  locked  routing restricted to: {', '.join(sorted(valid))}")
+        _show_state()
+        return 0
+
+    if getattr(args, "skip_platforms", False):
+        print("  skipped  (--skip-platforms) — platform lock left unchanged")
+        _show_state()
+        return 0
+
+    if not sys.stdin.isatty():
+        print(
+            "  skipped  non-interactive shell and no --platforms flag — "
+            "platform lock left unchanged"
+        )
+        print(
+            "  note: set later with `puppetmaster platform only cursor` "
+            "(or enable/disable/reset)"
+        )
+        _show_state()
+        return 0
+
+    print("Puppetmaster routes work across these platforms:")
+    _show_state()
+    print(
+        "Enter a comma-separated list of platforms to ENABLE (all others off),\n"
+        "'all' to keep every platform on, or press Enter to leave unchanged."
+    )
+    try:
+        answer = input("  platforms> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\n  skipped  no input — platform lock left unchanged")
+        return 0
+
+    if not answer:
+        print("  unchanged  platform lock left as-is")
+        _show_state()
+        return 0
+    if answer.lower() == "all":
+        pl.reset()
+        print("  reset  all platforms enabled")
+        _show_state()
+        return 0
+    wanted = {a.strip() for a in answer.split(",") if a.strip()}
+    unknown = sorted(a for a in wanted if a not in known)
+    if unknown:
+        print(
+            f"  error  unknown platform(s): {', '.join(unknown)} — leaving "
+            f"unchanged. Known: {', '.join(known)}."
+        )
+        return 0  # a typo shouldn't fail the whole wizard
+    valid = {a for a in wanted if a in known}
+    if not valid:
+        print("  unchanged  no known platform named — left as-is")
+        return 0
+    pl.set_enabled(valid)
+    print(f"  locked  routing restricted to: {', '.join(sorted(valid))}")
+    _show_state()
+    return 0
+
+
 def _run_setup(args) -> int:
     """Dispatch for ``puppetmaster setup`` — one-shot first-run wizard.
 
     Chains the canonical install steps in dependency order:
 
     1. ``doctor`` — fail loudly if Puppetmaster's runtime is broken.
-    2. ``models init`` — write the starter registry if missing.
-    3. ``install-cursor-mcp`` — workspace .cursor/mcp.json.
-    4. ``install-codex-mcp`` — only if ``codex`` is on PATH.
-    5. ``install-rules`` — agent nudges for whichever tools detected.
+    2. ``platform lock`` — choose which platforms to route to out of the gate.
+    3. ``models init`` — write the starter registry if missing.
+    4. ``install-cursor-mcp`` — workspace .cursor/mcp.json.
+    5. ``install-codex-mcp`` — only if ``codex`` is enabled *and* on PATH.
+    6. ``install-rules`` — agent nudges for whichever tools detected.
 
     Each step is independent: a step's failure prints a clear error
     but does not abort the rest of the chain unless ``doctor`` reports
@@ -1667,7 +1780,7 @@ def _run_setup(args) -> int:
     overall_rc = 0
 
     if not getattr(args, "skip_doctor", False):
-        print("=== step 1/5: doctor ===")
+        print("=== step 1/6: doctor ===")
         checks = list(run_doctor(cwd, state_dir))
         for check in checks:
             print(f"  {check.status:8} {check.name:16} {check.detail}")
@@ -1677,10 +1790,15 @@ def _run_setup(args) -> int:
             return 1
         print()
     else:
-        print("=== step 1/5: doctor SKIPPED (--skip-doctor) ===\n")
+        print("=== step 1/6: doctor SKIPPED (--skip-doctor) ===\n")
+
+    print("=== step 2/6: platform lock ===")
+    if _setup_platform_step(args) != 0:
+        overall_rc = 1
+    print()
 
     if not getattr(args, "skip_models", False):
-        print("=== step 2/5: models init ===")
+        print("=== step 3/6: models init ===")
         try:
             from puppetmaster.model_registry import (
                 default_registry_path,
@@ -1699,9 +1817,9 @@ def _run_setup(args) -> int:
             overall_rc = 1
         print()
     else:
-        print("=== step 2/5: models init SKIPPED (--skip-models) ===\n")
+        print("=== step 3/6: models init SKIPPED (--skip-models) ===\n")
 
-    print("=== step 3/5: install-cursor-mcp (workspace .cursor/mcp.json) ===")
+    print("=== step 4/6: install-cursor-mcp (workspace .cursor/mcp.json) ===")
     cursor_result = install_cursor_mcp(
         target_path=(cwd / ".cursor" / "mcp.json").resolve(),
         force=getattr(args, "force", False),
@@ -1714,9 +1832,12 @@ def _run_setup(args) -> int:
         overall_rc = 1
     print()
 
-    print("=== step 4/5: install-codex-mcp ===")
+    print("=== step 5/6: install-codex-mcp ===")
     import shutil as _shutil
-    if _shutil.which("codex") is None:
+    from puppetmaster import platform_lock as _pl
+    if "codex" not in _pl.enabled_adapters():
+        print("  skipped  codex platform disabled by the platform lock — not installing its MCP client")
+    elif _shutil.which("codex") is None:
         print("  skipped  `codex` CLI not on PATH — install with `npm install -g @openai/codex` and re-run `puppetmaster install-codex-mcp` later")
     else:
         codex_result = install_codex_mcp(
@@ -1731,7 +1852,7 @@ def _run_setup(args) -> int:
     print()
 
     if not getattr(args, "skip_rules", False):
-        print("=== step 5/5: install-rules (agent nudges) ===")
+        print("=== step 6/6: install-rules (agent nudges) ===")
         rules_result = install_rules(
             cwd=cwd,
             install_global=getattr(args, "global_rules", False),
@@ -1745,7 +1866,7 @@ def _run_setup(args) -> int:
         if rules_result.overall_status == "error":
             overall_rc = 1
     else:
-        print("=== step 5/5: install-rules SKIPPED (--skip-rules) ===")
+        print("=== step 6/6: install-rules SKIPPED (--skip-rules) ===")
     print()
 
     if overall_rc == 0:
@@ -2298,7 +2419,7 @@ def _run_savings_command(args, state_dir) -> int:
     """Print the cumulative savings receipt. Read-only; local; emits nothing."""
     import json as _json
 
-    from puppetmaster.savings import build_report
+    from puppetmaster.savings import COUNTERFACTUAL_MODEL_ENV, build_report
     from puppetmaster.state import list_project_state_dirs
     from puppetmaster.store_factory import create_store
 
@@ -2322,6 +2443,7 @@ def _run_savings_command(args, state_dir) -> int:
     heal = report["self_heal"]
     reads = report["reads"]
     metrics = report["metrics"]
+    cf = report["counterfactual"]
 
     if args.json:
         from dataclasses import asdict
@@ -2337,6 +2459,7 @@ def _run_savings_command(args, state_dir) -> int:
                     "codegraph": cg,
                     "reads": reads,
                     "metrics": metrics,
+                    "counterfactual": asdict(cf) if cf is not None else None,
                 },
                 indent=2,
             )
@@ -2384,6 +2507,29 @@ def _run_savings_command(args, state_dir) -> int:
     )
     print()
 
+    if cf is not None:
+        print(
+            f"COUNTERFACTUAL (vs running every routed task on {cf.reference_model_id} "
+            f"at metered API rates)"
+        )
+        if cf.reference_priced:
+            print(
+                f"  Avoided spend: ${cf.avoided_usd:,.2f} "
+                f"(naive ${cf.naive_cost_usd:,.2f} - actual ${cf.actual_cost_usd:,.2f}) "
+                f"across {cf.tasks} routed task(s)"
+            )
+            print(
+                "  This is a counterfactual, not cash off your bill — only as honest "
+                f"as the assumption that you'd otherwise have run {cf.reference_model_id}."
+            )
+        else:
+            print(
+                f"  Reference {cf.reference_model_id} has no per-token price, so there is "
+                "no metered counterfactual to compute ($0). Point "
+                f"${COUNTERFACTUAL_MODEL_ENV} at a priced model to get this number."
+            )
+        print()
+
     def _pct(value):
         return "n/a" if value is None else f"{value * 100:.0f}%"
 
@@ -2391,7 +2537,7 @@ def _run_savings_command(args, state_dir) -> int:
     print("RATES (no $, for org dashboards — trend these over a --window)")
     print(
         f"  Capability-match rate: {_pct(metrics['capability_match_rate'])} "
-        f"(ran a cheaper-but-sufficient model; n={sample['cost_optimizing_with_baseline']})"
+        f"(right-sized below the strongest model; n={sample['cost_optimizing_judgeable']})"
     )
     print(
         f"  Escalation rate: {_pct(metrics['escalation_rate'])} | "
