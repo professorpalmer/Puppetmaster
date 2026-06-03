@@ -362,8 +362,9 @@ class SwarmStore:
         ]
 
     def list_tasks_for_jobs(self, job_ids: Iterable[str]) -> list[Task]:
+        """job_ids are de-duplicated; returns all matching rows; callers should not rely on per-job ordering."""
         tasks: list[Task] = []
-        for job_id in job_ids:
+        for job_id in dict.fromkeys(job_ids):
             tasks.extend(self.list_tasks(job_id))
         return tasks
 
@@ -374,8 +375,9 @@ class SwarmStore:
         ]
 
     def list_artifacts_for_jobs(self, job_ids: Iterable[str]) -> list[Artifact]:
+        """job_ids are de-duplicated; returns all matching rows; callers should not rely on per-job ordering."""
         artifacts: list[Artifact] = []
-        for job_id in job_ids:
+        for job_id in dict.fromkeys(job_ids):
             artifacts.extend(self.list_artifacts(job_id))
         return artifacts
 

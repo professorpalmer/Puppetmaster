@@ -470,6 +470,154 @@ class PuppetmasterTests(unittest.TestCase):
                 store.promote_memories([memory])
                 self.assertEqual(len(store.list_memory()), 1)
 
+    def test_retrieve_memory_multi_term_parity_across_backends(self) -> None:
+        from puppetmaster.models import MemoryRecord
+
+        memory = MemoryRecord(
+            scope="swarm.findings",
+            statement="independent workers coordinate via the store",
+            evidence=["e"],
+            source_artifacts=[],
+            confidence=0.9,
+        )
+        results: dict[str, set[str]] = {}
+        for backend in ("file", "sqlite"):
+            with self.subTest(backend=backend), TemporaryDirectory() as tmp:
+                store = self._store_for_backend(backend, Path(tmp) / ".puppetmaster")
+                store.init()
+                store.promote_memories([memory])
+
+                partial = store.retrieve_memory("workers nonexistent", limit=10)
+                partial_ids = {item["id"] for item in partial}
+                self.assertTrue(partial_ids)
+                self.assertEqual(partial_ids, {memory.id})
+                results[backend] = partial_ids
+
+                none_match = store.retrieve_memory("nonexistent zzzqqq", limit=10)
+                self.assertEqual(none_match, [])
+
+        self.assertEqual(results["file"], results["sqlite"])
+
+    def test_save_artifacts_emits_events_in_same_transaction(self) -> None:
+        from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
+
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            job = store.create_job("artifact events")
+            task = Task(
+                job_id=job.id,
+                role="implement",
+                instruction="x",
+                adapter="cursor",
+                status=TaskStatus.QUEUED,
+            )
+            store.save_task(task)
+            artifacts = [
+                Artifact(
+                    job_id=job.id,
+                    task_id=task.id,
+                    type=ArtifactType.FINDING,
+                    created_by="w",
+                    payload={"claim": f"c{i}"},
+                    confidence=0.8 + i * 0.05,
+                    evidence=["e"],
+                )
+                for i in range(3)
+            ]
+            store.save_artifacts(artifacts)
+
+            events = store.read_events_since(job.id, since=0)
+            saved = [e for e in events if e["event"] == "artifact.saved"]
+            self.assertEqual(len(saved), len(artifacts))
+            saved_by_id = {e["payload"]["artifact_id"]: e for e in saved}
+            self.assertEqual(set(saved_by_id.keys()), {artifact.id for artifact in artifacts})
+            for artifact in artifacts:
+                event = saved_by_id[artifact.id]
+                stored = store.get_artifacts_by_ids(job.id, [artifact.id])[artifact.id]
+                self.assertEqual(event["payload"]["task_id"], artifact.task_id)
+                self.assertEqual(event["payload"]["type"], str(artifact.type))
+                self.assertEqual(event["payload"]["confidence"], artifact.confidence)
+                self.assertEqual(event["payload"]["sha256"], stored.sha256)
+
+    def test_batch_list_methods_dedupe_duplicate_job_ids(self) -> None:
+        from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
+
+        for backend in ("file", "sqlite"):
+            with self.subTest(backend=backend), TemporaryDirectory() as tmp:
+                store = self._store_for_backend(backend, Path(tmp) / ".puppetmaster")
+                store.init()
+                job = store.create_job("dedupe jobs")
+                task = Task(
+                    job_id=job.id,
+                    role="implement",
+                    instruction="x",
+                    adapter="cursor",
+                    status=TaskStatus.QUEUED,
+                )
+                store.save_task(task)
+                artifact = Artifact(
+                    job_id=job.id,
+                    task_id=task.id,
+                    type=ArtifactType.FINDING,
+                    created_by="w",
+                    payload={"claim": "x"},
+                    confidence=0.9,
+                    evidence=["e"],
+                )
+                store.save_artifact(artifact)
+
+                dup_tasks = store.list_tasks_for_jobs([job.id, job.id])
+                dup_artifacts = store.list_artifacts_for_jobs([job.id, job.id])
+                self.assertEqual(len(dup_tasks), 1)
+                self.assertEqual(len(dup_artifacts), 1)
+                self.assertEqual({t.id for t in dup_tasks}, {task.id})
+                self.assertEqual({a.id for a in dup_artifacts}, {artifact.id})
+
+    def test_sqlite_chunked_in_lists_for_artifacts(self) -> None:
+        from unittest.mock import patch
+
+        from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
+        from puppetmaster import sqlite_store
+
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            job = store.create_job("chunked in")
+            task = Task(
+                job_id=job.id,
+                role="implement",
+                instruction="x",
+                adapter="cursor",
+                status=TaskStatus.QUEUED,
+            )
+            store.save_task(task)
+            artifacts = [
+                Artifact(
+                    job_id=job.id,
+                    task_id=task.id,
+                    type=ArtifactType.FINDING,
+                    created_by="w",
+                    payload={"claim": f"c{i}"},
+                    confidence=0.9,
+                    evidence=["e"],
+                )
+                for i in range(5)
+            ]
+            store.save_artifacts(artifacts)
+            artifact_ids = [artifact.id for artifact in artifacts]
+            extra_ids = ["missing-a", "missing-b"]
+            query_ids = artifact_ids + extra_ids
+
+            with patch.object(sqlite_store, "_SQLITE_IN_CHUNK", 2):
+                by_id = store.get_artifacts_by_ids(job.id, query_ids)
+            self.assertEqual(set(by_id.keys()), set(artifact_ids))
+
+            jobs = [job.id, job.id, "missing-job"]
+            with patch.object(sqlite_store, "_SQLITE_IN_CHUNK", 2):
+                by_type = store.list_artifacts_by_type("finding", job_ids=jobs)
+            self.assertEqual({a.id for a in by_type}, set(artifact_ids))
+
     def test_file_reader_skips_torn_concurrent_append_line(self) -> None:
         """A malformed/torn line (Windows non-atomic append) is skipped, not fatal.
 
