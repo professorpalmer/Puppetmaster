@@ -113,6 +113,31 @@ puppetmaster show $(puppetmaster last)
 
 More recipes in [docs/DAILY_DRIVER.md](docs/DAILY_DRIVER.md).
 
+## Recommended setup: a cheap chat model that delegates to Puppetmaster
+
+The pattern that works best — and the one `puppetmaster setup` nudges your agent toward — is to **keep a cheap conversational model in your IDE chat window and let it hand the technical work to Puppetmaster.** You talk to the fast/cheap model for everything conversational; the moment a request is real engineering (multi-file investigation, a refactor, a review, an implementation), it starts a Puppetmaster job and drives it.
+
+```text
+You ── chat ──> cheap conversational model (fast, $-light)
+                      │
+                      │  "this is real work" → delegate
+                      v
+              Puppetmaster (routes to the cheapest sufficient model,
+              runs durable workers, stores typed artifacts)
+```
+
+Why this is the shape to aim for:
+
+- **Conversational asks stay instant and cheap.** "What does this do?", "summarize that", "thanks" never pay orchestration cost.
+- **Technical work gets the full machine** — cost routing, independent workers, durable artifacts, replay, $0 follow-up reads — only when it's warranted.
+- **Context compounds where it belongs.** Each delegated job leaves typed artifacts and promoted memory that later jobs reuse, instead of living in a chat scrollback that evaporates.
+
+The agent rules installed by `puppetmaster setup` (Cursor `.mdc` + `AGENTS.md`) already encode this: *start a swarm for non-trivial work; use native tooling for trivial edits and conversational follow-ups.*
+
+### Puppetmaster is not a chat layer — on purpose
+
+Don't try to route **every** chat message through Puppetmaster "to capture context." It's a deliberate boundary, not a missing feature: spinning a durable worker for "hi" or "what's this function" inverts the entire value proposition (you'd add orchestration cost and latency to the cheapest turns), and it fights the IDE, which doesn't expose a clean intercept-every-message hook. Let the cheap model triage; let Puppetmaster do the work that deserves a job. The router-at-the-top decides what crosses that line.
+
 ## Status
 
 **Daily-driver beta.** Real runtime contract, automated tests, SQLite default backend, fail-closed jobs, live Cursor Agent MCP, validated full-edit adapters. Credible for supervised local engineering; not yet a hosted multi-user service. Full feature matrix: [docs/FEATURES.md](docs/FEATURES.md).
