@@ -802,8 +802,9 @@ def _build_tools() -> list[McpTool]:
             name="puppetmaster_start_implement",
             description=(
                 "Start a full-edit implement worker on whichever platform you're locked to "
-                "(cursor or claude-code), so implement isn't Claude-Code-only. Returns job_id "
-                "immediately. Pass adapter to force one; otherwise the enabled platform is used."
+                "(cursor, claude-code, or codex), so implement isn't Claude-Code-only. Returns "
+                "job_id immediately. Pass adapter to force one; otherwise the enabled platform "
+                "is used."
             ),
             input_schema=implement_schema(),
             handler=start_implement,
@@ -1331,8 +1332,10 @@ def cursor_command(
 
 
 # Adapters that can run a full-edit "implement" worker, in the order the generic
-# `puppetmaster_start_implement` verb prefers when several are enabled.
-_IMPLEMENT_ADAPTER_PRIORITY = ("cursor", "claude-code")
+# `puppetmaster_start_implement` verb prefers when several are enabled. Codex is
+# last (cursor/claude are the daily drivers) but is a full-edit, PATCH-producing
+# adapter, so a codex-only platform lock can still use the generic verb.
+_IMPLEMENT_ADAPTER_PRIORITY = ("cursor", "claude-code", "codex")
 
 
 def _implement_command(args: JsonObject, adapter: str) -> list[str]:
@@ -1340,7 +1343,23 @@ def _implement_command(args: JsonObject, adapter: str) -> list[str]:
         return cursor_command(args, implement=True)
     if adapter == "claude-code":
         return claude_command(args)
+    if adapter == "codex":
+        return codex_command(args)
     raise ValueError(f"adapter {adapter!r} has no implement command")
+
+
+def codex_command(args: JsonObject) -> list[str]:
+    goal = require_string(args, "goal")
+    command = ["codex", goal, "--cwd", cwd(args)]
+    if args.get("model"):
+        command.extend(["--model", str(args["model"])])
+    if args.get("sandbox"):
+        command.extend(["--sandbox", str(args["sandbox"])])
+    if args.get("timeout_seconds"):
+        command.extend(["--timeout-seconds", str(args["timeout_seconds"])])
+    if args.get("allow_dirty"):
+        command.append("--allow-dirty")
+    return command
 
 
 def start_implement(args: JsonObject) -> JsonObject:
@@ -1698,46 +1717,52 @@ def run_list_models(args: JsonObject) -> JsonObject:
     }
 
 
-_SECRET_ENV_VARS = (
-    "OPENAI_API_KEY",
-    "ANTHROPIC_API_KEY",
-    "CURSOR_API_KEY",
-    "OPENAI_ORG_ID",
-)
-_SECRET_SK = re.compile(r"sk-[A-Za-z0-9_\-]{8,}")
-_SECRET_BEARER = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-]{8,}")
-_SECRET_APIKEY = re.compile(r"(?i)(api[_-]?key\"?\s*[:=]\s*\"?)[A-Za-z0-9._\-]{8,}")
+# Secret redaction lives in puppetmaster.redaction so adapters and the MCP
+# server share one implementation. Re-exported here under the original name
+# for backward compatibility with any caller importing it from mcp_server.
+from puppetmaster.redaction import redact_secrets  # noqa: E402
 
 
-def redact_secrets(text: Optional[str]) -> Optional[str]:
-    """Scrub likely secrets from child-process output before returning it over
-    MCP. Replaces the live values of known credential env vars plus common
-    token shapes (``sk-...``, ``Bearer ...``, ``api_key=...``) so a command
-    that echoes a key doesn't leak it into the agent transcript."""
-    if not text:
-        return text
-    redacted = text
-    for var in _SECRET_ENV_VARS:
-        value = os.environ.get(var)
-        if value and len(value) >= 6:
-            redacted = redacted.replace(value, f"<{var}:redacted>")
-    redacted = _SECRET_SK.sub("sk-<redacted>", redacted)
-    redacted = _SECRET_BEARER.sub(lambda m: f"{m.group(1)}<redacted>", redacted)
-    redacted = _SECRET_APIKEY.sub(lambda m: f"{m.group(1)}<redacted>", redacted)
-    return redacted
+def _coerce_subprocess_text(value: object) -> str:
+    """Normalize subprocess stdout/stderr to str. ``TimeoutExpired`` may carry
+    bytes (or None) depending on how the child was captured."""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
 
 
 def run_cli(command: list[str], args: JsonObject) -> JsonObject:
     state_dir = str(mcp_state_dir(args))
-    process = subprocess.run(
-        [sys.executable, "-m", "puppetmaster", "--state-dir", state_dir] + command,
-        cwd=cwd(args),
-        env=launcher_environment(args),
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        timeout=int(args.get("runner_timeout_seconds") or 1800),
-    )
+    timeout_seconds = int(args.get("runner_timeout_seconds") or 1800)
+    try:
+        process = subprocess.run(
+            [sys.executable, "-m", "puppetmaster", "--state-dir", state_dir] + command,
+            cwd=cwd(args),
+            env=launcher_environment(args),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # Surface a structured, redacted error instead of letting the
+        # TimeoutExpired bubble up as an unstructured tool crash. Synchronous
+        # implement/review calls can legitimately exceed the runner budget.
+        body = {
+            "command": "python -m puppetmaster " + " ".join(command),
+            "cwd": cwd(args),
+            "returncode": None,
+            "failure": "timeout",
+            "timeout_seconds": timeout_seconds,
+            "stdout": redact_secrets(_coerce_subprocess_text(exc.stdout)),
+            "stderr": redact_secrets(_coerce_subprocess_text(exc.stderr)),
+        }
+        return {
+            "content": [{"type": "text", "text": json.dumps(body, indent=2)}],
+            "isError": True,
+        }
     body = {
         "command": "python -m puppetmaster " + " ".join(command),
         "cwd": cwd(args),
@@ -1842,21 +1867,44 @@ def start_cli(command: list[str], args: JsonObject) -> JsonObject:
         "--emit-job-id-early",
     ] + command
     stdout_handle = stdout_path.open("w", encoding="utf-8")
-    stderr_handle = stderr_path.open("w", encoding="utf-8")
-    process = subprocess.Popen(
-        full_command,
-        cwd=cwd(args),
-        env=launcher_environment(args),
-        stdin=subprocess.DEVNULL,
-        stdout=stdout_handle,
-        stderr=stderr_handle,
-        text=True,
-        start_new_session=True,
-    )
+    try:
+        stderr_handle = stderr_path.open("w", encoding="utf-8")
+    except OSError:
+        stdout_handle.close()
+        raise
+    try:
+        process = subprocess.Popen(
+            full_command,
+            cwd=cwd(args),
+            env=launcher_environment(args),
+            stdin=subprocess.DEVNULL,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+            text=True,
+            start_new_session=True,
+        )
+    except OSError:
+        # Popen failed before owning the fds; don't leak the open log handles.
+        stdout_handle.close()
+        stderr_handle.close()
+        raise
     ASYNC_PROCESSES.append(process)
     stdout_handle.close()
     stderr_handle.close()
-    job_id = wait_for_job_id(stdout_path, stderr_path, process, timeout_seconds=5)
+    try:
+        job_id = wait_for_job_id(stdout_path, stderr_path, process, timeout_seconds=5)
+    except BaseException:
+        # The child was spawned but never reported a job id (startup crash or
+        # parse timeout). Don't leave a detached full-edit agent running.
+        try:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        except Exception:
+            pass
+        raise
     body = {
         "run_id": run_id,
         "job_id": job_id,
@@ -2388,11 +2436,16 @@ def implement_schema() -> JsonObject:
         {
             "adapter": {
                 "type": "string",
-                "enum": ["cursor", "claude-code"],
+                "enum": ["cursor", "claude-code", "codex"],
                 "description": (
                     "Force a specific implement-capable platform. Omit to use whichever "
-                    "platform the lock has enabled (cursor preferred, then claude-code)."
+                    "platform the lock has enabled (cursor preferred, then claude-code, "
+                    "then codex)."
                 ),
+            },
+            "sandbox": {
+                "type": "string",
+                "description": "Codex sandbox mode (only used when the codex adapter runs).",
             },
             "permission_mode": {
                 "type": "string",

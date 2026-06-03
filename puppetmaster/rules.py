@@ -78,7 +78,8 @@ RULE_BODY = textwrap.dedent(
        returns the chosen model, estimated cost, and reasoning. Use
        whenever spend matters or the task is ambiguous.
     2. `puppetmaster_start_cursor_plan` / `puppetmaster_start_claude_implement`
-       / `puppetmaster_start_codex_implement` — start a swarm.
+       / `puppetmaster_start_implement` (platform-agnostic full-edit verb) —
+       start a swarm.
     3. `puppetmaster_artifacts <job_id>` — read structured outputs at zero
        token cost (results persist in SQLite).
     4. `puppetmaster_doctor` — sanity-check Puppetmaster's runtime

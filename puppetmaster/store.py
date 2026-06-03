@@ -40,6 +40,10 @@ class SwarmStore:
         self.memory_dir = self.root / "memory"
         self.stream_dir = self.root / "streams"
         self.locks_dir = self.root / "locks"
+        # job_id -> (last seen file size, line count). Streams are append-only
+        # JSONL, so an unchanged size means an unchanged line count; this lets
+        # event_cursor skip re-counting the whole file on every poll.
+        self._event_cursor_cache: dict[str, tuple[int, int]] = {}
 
     def init(self) -> None:
         for directory in [
@@ -239,10 +243,16 @@ class SwarmStore:
 
     def refresh_blocked_tasks(self, job_id: str) -> list[Task]:
         ready: list[Task] = []
-        for task in self.list_tasks(job_id):
+        # Build the dependency lookup once and thread it through
+        # dependencies_complete, mirroring claim_next_task — otherwise each
+        # blocked task triggers one get_task_by_id() per dependency on every
+        # claim sweep (an N+1 file glob / SQLite SELECT).
+        tasks = self.list_tasks(job_id)
+        task_map = {task.id: task for task in tasks}
+        for task in tasks:
             if task.status != TaskStatus.BLOCKED:
                 continue
-            if not self.dependencies_complete(task):
+            if not self.dependencies_complete(task, task_map=task_map):
                 continue
             queued = replace(task, status=TaskStatus.QUEUED, updated_at=now_iso())
             self.save_task(queued)
@@ -370,15 +380,22 @@ class SwarmStore:
                 out[artifact_id] = artifact_from_dict(self.read_json(path))
         return out
 
-    def list_artifacts_by_type(self, artifact_type: str) -> list[Artifact]:
-        """Return every artifact of ``artifact_type`` across all jobs.
+    def list_artifacts_by_type(
+        self, artifact_type: str, job_ids: Optional[Iterable[str]] = None
+    ) -> list[Artifact]:
+        """Return every artifact of ``artifact_type``, optionally scoped to
+        ``job_ids``.
 
         The file backend still walks each job; SQLite overrides this with a
         single indexed query. Used by the savings ledger so it doesn't have to
-        deserialize every artifact of every job just to find routing records.
+        deserialize every artifact of every job just to find routing records —
+        and, when a time window is set, only scans the in-window jobs.
         """
+        job_filter = set(job_ids) if job_ids is not None else None
         out: list[Artifact] = []
         for job in self.list_jobs():
+            if job_filter is not None and job.id not in job_filter:
+                continue
             out.extend(
                 artifact
                 for artifact in self.list_artifacts(job.id)
@@ -530,12 +547,24 @@ class SwarmStore:
         return results
 
     def event_cursor(self, job_id: str) -> int:
-        """Return the highest event id currently stored for `job_id`."""
+        """Return the highest event id currently stored for `job_id`.
+
+        Uses a size-keyed cache so a hot poll loop (wait_for_events) doesn't
+        re-scan the entire append-only stream every iteration: if the file size
+        is unchanged since the last count, the line count is unchanged too."""
         stream = self.stream_dir / f"{job_id}.jsonl"
-        if not stream.exists():
+        try:
+            size = stream.stat().st_size
+        except (FileNotFoundError, NotADirectoryError):
+            self._event_cursor_cache.pop(job_id, None)
             return 0
+        cached = self._event_cursor_cache.get(job_id)
+        if cached is not None and cached[0] == size:
+            return cached[1]
         with stream.open("rb") as handle:
-            return sum(1 for _ in handle)
+            count = sum(1 for _ in handle)
+        self._event_cursor_cache[job_id] = (size, count)
+        return count
 
     def wait_for_events(
         self,

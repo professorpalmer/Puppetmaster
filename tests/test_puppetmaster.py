@@ -3025,6 +3025,24 @@ print('{"result":"ok"}')
             target = repo / "sample.txt"
             target.write_text("before\n", encoding="utf-8")
             subprocess.run(["git", "add", "sample.txt"], cwd=repo, check=True, capture_output=True)
+            # Commit so the tree is clean (HEAD exists); the agent's edit is then
+            # the only change. Staged-but-uncommitted content now counts as dirty
+            # (it's captured by `git diff HEAD`), which is the corrected gating.
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.email=test@example.com",
+                    "-c",
+                    "user.name=Test",
+                    "commit",
+                    "-m",
+                    "seed",
+                ],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
             fake_claude = root / "fake_claude.py"
             fake_claude.write_text(
                 """#!/usr/bin/env python3
@@ -3096,6 +3114,108 @@ print('{"result":"ok"}')
 
             self.assertEqual(artifact.payload["result"], "blocked")
             self.assertEqual(artifact.payload["failure"], "dirty_worktree")
+
+    def test_git_snapshot_captures_staged_and_untracked_changes(self) -> None:
+        from puppetmaster.adapters import git_snapshot
+
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-c", "user.name=T", "-c", "user.email=t@e.com", "commit", "-m", "seed"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+            # Stage an edit to a tracked file (plain `git diff` would miss this).
+            (repo / "tracked.txt").write_text("two\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True, capture_output=True)
+            # Create a brand-new untracked file (plain `git diff` never shows it).
+            (repo / "new_file.txt").write_text("hello\n", encoding="utf-8")
+
+            snap = git_snapshot(repo)
+
+            self.assertTrue(snap["is_worktree"])
+            self.assertIn("tracked.txt", snap["changed_files"])  # staged change caught
+            self.assertIn("new_file.txt", snap["untracked_files"])
+            # Both the staged edit and the untracked file appear in the diff.
+            self.assertIn("two", snap["diff"])
+            self.assertIn("new_file.txt", snap["diff"])
+            self.assertIn("+hello", snap["diff"])
+
+    def test_git_snapshot_flags_non_worktree(self) -> None:
+        from puppetmaster.adapters import git_snapshot
+
+        with TemporaryDirectory() as tmp:
+            snap = git_snapshot(Path(tmp))
+            self.assertFalse(snap["is_worktree"])
+
+    def test_implement_blocks_outside_worktree(self) -> None:
+        with TemporaryDirectory() as tmp:
+            task = Task(
+                job_id="job",
+                role="cursor",
+                instruction="add a helper",
+                adapter="cursor",
+                payload={
+                    "prompt": "Add a helper",
+                    "cwd": tmp,  # not a git work tree
+                    "mode": "implement",
+                    "disable_codegraph": True,
+                },
+            )
+            # git_snapshot runs real git and reports not-a-worktree, so the
+            # guard returns a blocked artifact before the agent is ever spawned.
+            artifacts = CursorAdapter().run(task, "goal", "worker-cursor")
+
+            self.assertEqual(len(artifacts), 1)
+            self.assertEqual(artifacts[0].payload["result"], "blocked")
+            self.assertEqual(artifacts[0].payload["failure"], "not_a_worktree")
+
+    def test_build_patch_payload_redacts_and_marks_truncation(self) -> None:
+        from puppetmaster.adapters import build_patch_payload
+
+        secret = "sk-" + "a" * 40
+        # Secret near the tail so it survives truncation (the inline excerpt
+        # keeps the last 20k chars) — proving redaction runs on the full diff.
+        big_diff = "diff --git a/f b/f\n" + ("+x\n" * 30000) + "+" + secret + "\n"
+        before = {"sha": "base", "changed_files": ["f"], "untracked_files": [], "diff": ""}
+        after = {"sha": "uncommitted", "changed_files": ["f"], "untracked_files": [], "diff": big_diff}
+        task = Task(job_id="job", role="cursor", instruction="x", adapter="cursor", payload={})
+
+        payload = build_patch_payload(
+            task=task,
+            before=before,
+            after=after,
+            status="applied",
+            change="changed",
+            sidecar_name="t",
+        )
+
+        self.assertNotIn(secret, payload["unified_diff"])
+        self.assertIn("sk-<redacted>", payload["unified_diff"])
+        self.assertTrue(payload["diff_truncated"])
+        self.assertLessEqual(len(payload["unified_diff"]), 20000)
+        self.assertGreater(payload["diff_total_chars"], 20000)
+
+    def test_start_implement_supports_codex_adapter(self) -> None:
+        from puppetmaster import mcp_server
+
+        captured = {}
+
+        def fake_start_cli(command, args):
+            captured["command"] = command
+            return {"ok": True}
+
+        with patch(
+            "puppetmaster.platform_lock.enabled_adapters", return_value={"codex"}
+        ), patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
+            result = mcp_server.start_implement({"goal": "ship it", "cwd": "."})
+
+        self.assertEqual(captured["command"][0], "codex")
+        self.assertEqual(result["implement_adapter"], "codex")
 
     def test_unconfigured_provider_adapter_returns_blocked_artifact(self) -> None:
         """`UnconfiguredProviderAdapter` is the class operators wire in for
