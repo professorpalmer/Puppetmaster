@@ -26,6 +26,13 @@ import threading
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
+from puppetmaster.models import Artifact, ArtifactType, Task
+from puppetmaster.store import SwarmStore
+
+# Reuse the stitcher's failure→remediation map so the dashboard Alerts match the
+# stitched summary verbatim (one source of truth for "what went wrong + fix").
+from puppetmaster.stitcher import Stitcher
+
 # Job ids are minted as ``job_<hex>``; constrain to that alphabet so a request
 # id can never escape the state tree via ``..`` / absolute paths (defense in
 # depth — the server binds to loopback by default, but a local user or a careless
@@ -43,12 +50,6 @@ def _safe_float(value: Any) -> float:
     except (TypeError, ValueError):
         return 0.0
 
-from puppetmaster.models import Artifact, ArtifactType, Task
-from puppetmaster.store import SwarmStore
-
-# Reuse the stitcher's failure→remediation map so the dashboard Alerts match the
-# stitched summary verbatim (one source of truth for "what went wrong + fix").
-from puppetmaster.stitcher import Stitcher
 
 _ARTIFACT_STATEMENT_KEYS = {
     ArtifactType.FINDING: "claim",
