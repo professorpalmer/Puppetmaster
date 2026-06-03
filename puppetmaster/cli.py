@@ -802,6 +802,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     audit_cmd.add_argument("--json", action="store_true", help="Emit JSON.")
 
+    savings_cmd = subcommands.add_parser(
+        "savings",
+        help=(
+            "Cumulative savings receipt: routing dollars saved (measured, "
+            "policy-aware) + CodeGraph exploration savings. Read-only, local."
+        ),
+    )
+    savings_cmd.add_argument(
+        "--window",
+        type=float,
+        default=None,
+        metavar="DAYS",
+        help="Only count jobs/queries from the last N days (default: all time).",
+    )
+    savings_cmd.add_argument(
+        "--all-projects",
+        action="store_true",
+        help="Aggregate across every workspace's state dir (default: just this one).",
+    )
+    savings_cmd.add_argument("--json", action="store_true", help="Emit JSON.")
+
     route_cmd = subcommands.add_parser(
         "route",
         help=(
@@ -980,6 +1001,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
 
     if args.command == "audit":
         return _run_audit_command(args, store)
+
+    if args.command == "savings":
+        return _run_savings_command(args, state_dir)
 
     if args.command == "preflight":
         return _run_preflight_command(args)
@@ -1241,6 +1265,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     if args.command == "feed":
+        from puppetmaster import reads_log
+
+        reads_log.record_read("feed", caller="cli")
         job_id = args.job_id or require_latest_job_id(store)
         if args.follow:
             return run_feed_follow(
@@ -1275,9 +1302,13 @@ def _main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     if args.command == "show":
+        from puppetmaster import reads_log
+
         if args.partial:
+            reads_log.record_read("partial_summary", caller="cli")
             print(Stitcher(store).preview(args.job_id))
         else:
+            reads_log.record_read("show", caller="cli")
             path = store.job_dir(args.job_id) / "summaries" / "stitched.md"
             print(path.read_text(encoding="utf-8"))
         return 0
@@ -1299,6 +1330,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
         return _run_await_command(args, store)
 
     if args.command == "artifacts":
+        from puppetmaster import reads_log
+
+        reads_log.record_read("artifacts", caller="cli")
         artifacts = [artifact.__dict__ for artifact in store.list_artifacts(args.job_id)]
         print(json.dumps(artifacts, indent=2, default=str))
         return 0
@@ -2257,6 +2291,107 @@ def _run_audit_command(args, store) -> int:
         if changed:
             save_registry(list(by_id.values()), registry_path)
             print(f"\nApplied {changed} score change(s) to {registry_path}.")
+    return 0
+
+
+def _run_savings_command(args, state_dir) -> int:
+    """Print the cumulative savings receipt. Read-only; local; emits nothing."""
+    import json as _json
+
+    from puppetmaster.savings import build_report
+    from puppetmaster.state import list_project_state_dirs
+    from puppetmaster.store_factory import create_store
+
+    dirs = [state_dir]
+    if getattr(args, "all_projects", False):
+        seen = {state_dir.resolve()}
+        for d in list_project_state_dirs():
+            if d.resolve() not in seen and d.exists():
+                seen.add(d.resolve())
+                dirs.append(d)
+    stores = []
+    for d in dirs:
+        try:
+            stores.append(create_store(args.backend, d))
+        except Exception:
+            continue
+
+    report = build_report(stores, window_days=args.window)
+    routing = report["routing"]
+    cg = report["codegraph"]
+    heal = report["self_heal"]
+    reads = report["reads"]
+
+    if args.json:
+        from dataclasses import asdict
+
+        print(
+            _json.dumps(
+                {
+                    "window_days": report["window_days"],
+                    "jobs_considered": report["jobs_considered"],
+                    "routing": asdict(routing),
+                    "routing_pct_cheaper": round(routing.pct_cheaper, 1),
+                    "self_heal": asdict(heal),
+                    "codegraph": cg,
+                    "reads": reads,
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    window = f"last {args.window:g}d" if args.window else "all time"
+    scope = "all projects" if getattr(args, "all_projects", False) else "this project"
+    print(f"Puppetmaster savings — {window}, {scope} ({report['jobs_considered']} jobs)")
+    print()
+    print("MEASURED")
+    print(
+        f"  Routing (cost-optimizing tasks): saved ${routing.saved_usd:.4f} "
+        f"of ${routing.baseline_usd:.4f} baseline ({routing.pct_cheaper:.0f}% cheaper) "
+        f"across {routing.cost_optimizing_tasks} tasks"
+    )
+    print(
+        f"    tasks routed to a $0-marginal (plan) model: {routing.plan_routed_tasks}"
+    )
+    if routing.deliberate_tasks:
+        print(
+            f"  Deliberate quality spend (by request): ${routing.deliberate_spend_usd:.4f} "
+            f"over {routing.deliberate_tasks} tasks (not counted as savings)"
+        )
+    print(
+        f"  CodeGraph: {cg['queries']} exploration queries served, "
+        f"~{cg['context_tokens_fed']:,} focused-context tokens fed to agents"
+    )
+    print(
+        f"  Reliability: {heal.fallbacks} task(s) auto-recovered off a dead/unfunded "
+        f"provider, {heal.escalations} re-run for confidence (counts, not dollars)"
+    )
+    print(
+        f"  $0 follow-up reads: {reads['reads']} result read(s) served from durable "
+        f"state at zero model cost"
+    )
+    print()
+    print(
+        f"ESTIMATE (baseline: {cg['exploration_baseline_tokens']:,} tokens/query "
+        f"a graph-less crawl would read, ${cg['input_price_per_mtok']:g}/Mtok input)"
+    )
+    print(
+        f"  Avoided exploration: ~{cg['net_tokens_saved_est']:,} tokens "
+        f"-> ~${cg['dollars_saved_est']:.4f} saved"
+    )
+    print()
+    print("Notes")
+    print("  - Routing $ is vs the strongest model you could have used, snapshotted at")
+    print("    decision time (no recompute drift). Quality/escalating picks are spend you")
+    print("    asked for, shown separately, never as a loss.")
+    if routing.tasks_without_baseline:
+        print(
+            f"  - {routing.tasks_without_baseline} cost-optimizing tasks predate baseline "
+            "tracking and are excluded from the $ figure."
+        )
+    print("  - 'Avoided exploration' is an estimate; tune with "
+          "PUPPETMASTER_EXPLORATION_BASELINE_TOKENS / _PRICE_PER_MTOK.")
     return 0
 
 

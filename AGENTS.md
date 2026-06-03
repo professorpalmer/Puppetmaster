@@ -47,6 +47,8 @@ If a swarm completes with empty findings, only verification artifacts, or a degr
 
 Puppetmaster ships a task-aware **model router** that picks the right LLM per task. Use it instead of hardcoding `model` in every spec.
 
+**Auto-routing is the unconditional default for non-trivial work.** Do not wait to be handed a task list — proactively set `payload.auto_route = true` on every worker you dispatch for substantive work, so each task lands on the cheapest sufficient model automatically. Hardcode a `model` only when the user explicitly pins one. The trivial-task carve-out above still holds (don't spin up a routed worker for a rename or a one-line answer — that adds cost, not saves it), but for anything that warrants a worker, routing is on by default, every time.
+
 - The user keeps a registry at `~/.puppetmaster/models.json`. List it with `puppetmaster_list_models`. If empty, tell the user to run `python -m puppetmaster models init` once.
 - To opt a worker into routing, set `payload.auto_route = true`. The orchestrator picks the cheapest model whose capability_score >= the classifier output for the task's role + instruction, stamps `adapter` + `payload.model`, and persists a `ROUTING` artifact with the decision.
 - Use `puppetmaster_route_task` to dry-run a routing decision before kicking off a swarm — surfaces the model that would run, the estimated USD cost, and why the cheaper alternatives were rejected. Useful when the user asks "how much will this cost?" or "what model would this use?"
@@ -62,6 +64,15 @@ Puppetmaster ships a task-aware **model router** that picks the right LLM per ta
 Puppetmaster auto-injects CodeGraph context into every Cursor and Claude Code worker prompt when `.codegraph/` exists in the target repo. The verification artifact's `evidence` array will include `context:codegraph` when this happened.
 
 For quick, direct repo lookups without spinning up a swarm, prefer the bundled tools: `puppetmaster_codegraph_search`, `puppetmaster_codegraph_context`, `puppetmaster_codegraph_affected`, `puppetmaster_codegraph_files`, `puppetmaster_codegraph_status`. If CodeGraph isn't initialized, call `puppetmaster_codegraph_init` once first.
+
+## Savings receipts (`puppetmaster savings`)
+
+Puppetmaster keeps a **read-only, local, numbers-only** ledger of what it saved, so the value is auditable instead of asserted. Two measured pillars plus labeled estimates:
+
+- **Routing dollars saved** — each routing decision snapshots a `baseline_cost_usd` (the strongest model you could've used, same tokens) at decision time, so savings compare like-for-like with no recompute drift. Only cost-optimizing policies (`balanced`/`cheap`) count; `quality`/`escalating` are shown as deliberate spend, never as a loss.
+- **CodeGraph exploration** — every query through the `puppetmaster_codegraph_*` tools (from any platform's agent) is logged numbers-only: context tokens fed (measured) + avoided directory-crawl tokens (estimate, stated baseline).
+
+`python -m puppetmaster savings [--window DAYS] [--all-projects] [--json]`. It emits nothing over the network; it only reads local state. Tune the exploration estimate with `PUPPETMASTER_EXPLORATION_BASELINE_TOKENS` / `_PRICE_PER_MTOK`; disable the usage log with `PUPPETMASTER_CODEGRAPH_USAGE=0`.
 
 ## Coding conventions in this repo
 

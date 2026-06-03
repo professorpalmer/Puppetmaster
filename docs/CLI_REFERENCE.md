@@ -62,6 +62,17 @@ python -m puppetmaster audit --apply                          # write the sugges
 
 Read-only by default. It aggregates the routing/escalation/verification artifacts already in your store and proposes a lower `capability_score` only for an **under-delivering** model (keeps getting escalated away from / finishing with low confidence) so harder work routes to a stronger model. A strong model doing trivial work is flagged `possibly-over-used` but never auto-adjusted — proving a cheaper model would've sufficed needs a counterfactual the audit doesn't run. The registry stays your assertion; nothing is written without `--apply`.
 
+## Savings receipt (what Puppetmaster actually saved)
+
+```bash
+python -m puppetmaster savings                                # routing $ saved + CodeGraph savings (this project)
+python -m puppetmaster savings --all-projects                 # aggregate across every workspace
+python -m puppetmaster savings --window 30                    # last 30 days only
+python -m puppetmaster savings --json                         # machine-readable
+```
+
+Read-only, local, **numbers-only** — emits nothing over the network. Two measured cost pillars: **routing dollars saved** (each decision snapshots a frontier `baseline_cost_usd` at decision time; only `balanced`/`cheap` count, `quality`/`escalating` are shown as deliberate spend) and **CodeGraph exploration** (context tokens fed, measured; avoided directory-crawl tokens, a clearly-labeled estimate). Plus two real-count lines that are never dollarized: **reliability** (tasks auto-recovered off a dead provider + tasks re-run for confidence, from existing fallback/escalation artifacts) and **$0 follow-up reads** (user-facing `show`/`artifacts`/`partial_summary`/`feed` reads served from durable state at zero model cost; recorded once per invocation at the command entry, never the store's internal reads, and the `feed --follow` long-poll is excluded so it can't inflate). Tune the codegraph estimate with `PUPPETMASTER_EXPLORATION_BASELINE_TOKENS` / `PUPPETMASTER_EXPLORATION_PRICE_PER_MTOK`; disable the codegraph usage log with `PUPPETMASTER_CODEGRAPH_USAGE=0` and the reads log with `PUPPETMASTER_READS_USAGE=0`.
+
 ## Platform lock (restrict which platforms get used)
 
 ```bash
