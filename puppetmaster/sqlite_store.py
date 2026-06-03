@@ -316,16 +316,35 @@ class SQLiteSwarmStore(SwarmStore):
                 artifact = replace(artifact, sha256=self.artifact_hash(artifact))
             prepared.append(artifact)
         self.init()
-        rows = [
-            (
-                artifact.id,
-                artifact.job_id,
-                artifact.task_id,
-                str(artifact.type),
-                self._dumps(artifact),
+        rows: list[tuple[Any, ...]] = []
+        event_rows: list[tuple[Any, ...]] = []
+        for artifact in prepared:
+            rows.append(
+                (
+                    artifact.id,
+                    artifact.job_id,
+                    artifact.task_id,
+                    str(artifact.type),
+                    self._dumps(artifact),
+                )
             )
-            for artifact in prepared
-        ]
+            event_rows.append(
+                (
+                    artifact.job_id,
+                    now_iso(),
+                    "artifact.saved",
+                    json.dumps(
+                        {
+                            "artifact_id": artifact.id,
+                            "task_id": artifact.task_id,
+                            "type": str(artifact.type),
+                            "confidence": artifact.confidence,
+                            "sha256": artifact.sha256,
+                        },
+                        sort_keys=True,
+                    ),
+                )
+            )
         with self._session() as connection:
             connection.executemany(
                 """
@@ -339,17 +358,9 @@ class SQLiteSwarmStore(SwarmStore):
                 """,
                 rows,
             )
-        for artifact in prepared:
-            self.emit(
-                artifact.job_id,
-                "artifact.saved",
-                {
-                    "artifact_id": artifact.id,
-                    "task_id": artifact.task_id,
-                    "type": str(artifact.type),
-                    "confidence": artifact.confidence,
-                    "sha256": artifact.sha256,
-                },
+            connection.executemany(
+                "INSERT INTO events(job_id, at, event, payload) VALUES(?, ?, ?, ?)",
+                event_rows,
             )
 
     def promote_memory(self, memory: MemoryRecord) -> None:
@@ -487,15 +498,16 @@ class SQLiteSwarmStore(SwarmStore):
         if not unique_ids:
             return {}
         self.init()
-        placeholders = ",".join("?" for _ in unique_ids)
-        rows = self._all(
-            f"SELECT data FROM artifacts WHERE job_id = ? AND id IN ({placeholders})",
-            (job_id, *unique_ids),
-        )
         out: dict[str, Artifact] = {}
-        for row in rows:
-            artifact = artifact_from_dict(json.loads(row["data"]))
-            out[artifact.id] = artifact
+        for chunk in _chunked(unique_ids):
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self._all(
+                f"SELECT data FROM artifacts WHERE job_id = ? AND id IN ({placeholders})",
+                (job_id, *chunk),
+            )
+            for row in rows:
+                artifact = artifact_from_dict(json.loads(row["data"]))
+                out[artifact.id] = artifact
         return out
 
     def list_artifacts_by_type(
@@ -506,11 +518,17 @@ class SQLiteSwarmStore(SwarmStore):
             ids = list(dict.fromkeys(job_ids))
             if not ids:
                 return []
-            placeholders = ",".join("?" for _ in ids)
-            rows = self._all(
-                f"SELECT data FROM artifacts WHERE type = ? AND job_id IN ({placeholders}) ORDER BY id",
-                (artifact_type, *ids),
-            )
+            artifacts: list[Artifact] = []
+            for chunk in _chunked(ids):
+                placeholders = ",".join("?" for _ in chunk)
+                rows = self._all(
+                    f"SELECT data FROM artifacts WHERE type = ? AND job_id IN ({placeholders}) ORDER BY id",
+                    (artifact_type, *chunk),
+                )
+                artifacts.extend(
+                    artifact_from_dict(json.loads(row["data"])) for row in rows
+                )
+            return artifacts
         else:
             rows = self._all(
                 "SELECT data FROM artifacts WHERE type = ? ORDER BY id",
@@ -536,10 +554,8 @@ class SQLiteSwarmStore(SwarmStore):
     ) -> list[dict[str, Any]]:
         self.init()
         terms = {term.lower() for term in query.split() if len(term) > 2}
-        # Push the exact-match filters into SQL via json_extract so we only
-        # deserialize candidate rows instead of every promoted memory record
-        # (which grows unbounded over a session).
-        clauses: list[str] = []
+        filter_clauses: list[str] = []
+        term_clauses: list[str] = []
         params: list[Any] = []
         for column, value in (
             ("scope", scope),
@@ -548,12 +564,15 @@ class SQLiteSwarmStore(SwarmStore):
             ("topic", topic),
         ):
             if value is not None:
-                clauses.append(f"json_extract(data, '$.{column}') = ?")
+                filter_clauses.append(f"json_extract(data, '$.{column}') = ?")
                 params.append(value)
         if terms:
             for term in terms:
-                clauses.append("instr(lower(data), ?) > 0")
+                term_clauses.append("instr(lower(data), ?) > 0")
                 params.append(term)
+        clauses = list(filter_clauses)
+        if term_clauses:
+            clauses.append("(" + " OR ".join(term_clauses) + ")")
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         rows = self._all(
             f"SELECT data FROM memory{where} ORDER BY id", tuple(params)

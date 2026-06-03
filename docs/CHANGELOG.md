@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.9.9
+
+**Fifth-pass audit: fixes two store regressions the v0.9.8 optimization pass introduced, plus parity hardening.** A follow-up CodeGraph + review swarm against this repo caught that two of the v0.9.8 store changes diverged the SQLite backend from the file backend. This patch restores exact cross-backend parity (with one verified repro fixed) and tightens the new batch APIs. No public API changes.
+
+- **REGRESSION fix — SQLite `retrieve_memory` multi-term queries silently dropped results.** v0.9.8 pushed each query term into SQL as a separate **ANDed** `instr(lower(data), ?)` clause, so a record had to contain *every* term to be fetched — while the file backend keeps any record matching *any* term (score > 0). A two-term query like `"workers nonexistent"` returned matches on the file store but **0 rows** on SQLite. The term clauses are now combined into a single **OR** group, AND'd with the exact-match filters, so SQL is a pure superset prefilter and the existing Python scoring stays authoritative — results now match the file backend exactly.
+- **REGRESSION fix — `save_artifacts` event atomicity.** v0.9.8's batch `save_artifacts` wrote all artifact rows in one transaction, then emitted `artifact.saved` events afterward in separate transactions; a crash in between could leave artifacts durable with missing events (unlike `save_tasks`, which writes rows + events atomically). `save_artifacts` now inserts the event rows via `executemany` in the **same** transaction as the artifact upserts.
+- **Parity — batch list methods.** The `SwarmStore` base defaults for `list_tasks_for_jobs` / `list_artifacts_for_jobs` now de-duplicate `job_ids` (first-seen order) to match the SQLite overrides; the contract (dedup, no per-job ordering guarantee) is documented on the base methods.
+- **Scale — chunked `IN` lists.** `get_artifacts_by_ids` and `list_artifacts_by_type(job_ids=...)` now use the `_chunked` (900) helper so very large id/job windows can't exceed SQLite's bound-variable limit.
+- Added four focused parity/edge tests (multi-term memory parity across backends, batch `artifact.saved` event emission, duplicate-`job_id` dedup, chunked `IN` queries); full suite **367** green.
+
 ## v0.9.8
 
 **CodeGraph-driven performance audit pass: N+1 query elimination, hot-path optimization, and dead-code cleanup.** A fourth-pass audit (run through Puppetmaster's own CodeGraph + review swarm against this repo) surfaced a batch of read-amplification and recompute issues; this release fixes the high-confidence ones with batched store APIs and per-tick snapshots, plus the usual lint/dead-code sweep. No behavior changes — store contract preserved across both backends.
