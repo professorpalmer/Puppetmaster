@@ -116,9 +116,21 @@ def collect_routing_records(
         ]
         jobs += len(in_window)
         window_job_ids = {job.id for job in in_window}
+        # When a window is set, scope the indexed query to the in-window jobs so
+        # the backend doesn't deserialize the full historical routing ledger.
+        scope = window_job_ids if since is not None else None
+        routing_artifacts = None
         try:
-            routing_artifacts = store.list_artifacts_by_type("routing")
+            routing_artifacts = store.list_artifacts_by_type("routing", job_ids=scope)
+        except TypeError:
+            # Store predates the job_ids kwarg; fall back to the unscoped query.
+            try:
+                routing_artifacts = store.list_artifacts_by_type("routing")
+            except Exception:
+                routing_artifacts = None
         except Exception:
+            routing_artifacts = None
+        if routing_artifacts is None:
             # Fallback for stores without the indexed helper: per-job scan.
             routing_artifacts = []
             for job in in_window:

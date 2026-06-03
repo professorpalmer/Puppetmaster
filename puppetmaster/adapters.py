@@ -15,6 +15,7 @@ from typing import Any, Optional, Protocol, Union
 
 from puppetmaster.codegraph import enrich_prompt_with_codegraph
 from puppetmaster.models import Artifact, ArtifactType, Task
+from puppetmaster.redaction import redact_secrets
 
 
 # Default truncation budgets. Match what the codebase used pre-spool so existing
@@ -22,6 +23,28 @@ from puppetmaster.models import Artifact, ArtifactType, Task
 # preserves whatever falls in the middle so nothing is silently dropped.
 _STDOUT_HEAD_CHARS = 1000
 _STDOUT_TAIL_CHARS = 8000
+
+# Inline budget for a PATCH artifact's unified diff. Larger diffs are spooled to
+# a sidecar (full, redacted) and only an excerpt is kept inline so the JSON
+# payload stays bounded but the patch is never silently lost.
+_PATCH_INLINE_CHARS = 20000
+
+
+def _coerce_text(value: object) -> str:
+    """Normalize subprocess output to ``str``. ``TimeoutExpired.stdout`` may be
+    bytes (or None) depending on how the child was captured, while a normal
+    ``CompletedProcess`` yields str under ``text=True``."""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _redacted_tail(value: object, limit: int) -> str:
+    """Redact secrets, then keep the last ``limit`` chars for an inline excerpt."""
+    text = redact_secrets(_coerce_text(value)) or ""
+    return text[-limit:]
 
 
 def _resolve_sidecar_state_dir() -> Optional[Path]:
@@ -68,7 +91,11 @@ def capture_subprocess_stdout(
       sidecar file when truncated and the spool succeeded, else None.
     - ``stdout_sidecar_error`` (str, optional): only set when spooling was
       attempted but failed (filesystem error).
+
+    The text is secret-redacted before any excerpt or sidecar is produced, so
+    an agent transcript that echoes an API key never lands in persisted state.
     """
+    text = redact_secrets(text) or ""
     total = len(text)
     truncated = total > (head_chars + tail_chars)
     result: dict[str, Any] = {
@@ -94,6 +121,72 @@ def capture_subprocess_stdout(
         result["stdout_sidecar_path"] = None
         result["stdout_sidecar_error"] = repr(exc)
     return result
+
+
+def build_patch_payload(
+    *,
+    task: Task,
+    before: dict,
+    after: dict,
+    status: str,
+    change: str,
+    sidecar_name: str,
+) -> dict[str, Any]:
+    """Build a PATCH artifact payload from before/after git snapshots.
+
+    Centralizes three previously-missing safeguards for full-edit runs:
+
+    - **Redaction**: the unified diff is scrubbed for secrets before it is
+      persisted (a diff that adds a key to a ``.env`` would otherwise leak it).
+    - **No silent truncation**: large diffs are spooled in full to a sidecar
+      and only an excerpt is kept inline, with explicit ``diff_truncated`` /
+      ``diff_total_chars`` metadata, instead of slicing to the last 20k chars
+      and producing an unapplyable patch.
+    - **Untracked visibility**: untracked files are surfaced alongside changed
+      files so a run that only creates new files is still attributable.
+    """
+    raw_diff = str(after.get("diff") or "")
+    redacted = redact_secrets(raw_diff) or ""
+    total = len(redacted)
+    truncated = total > _PATCH_INLINE_CHARS
+    inline = redacted[-_PATCH_INLINE_CHARS:] if truncated else redacted
+    payload: dict[str, Any] = {
+        "change": change,
+        "files": after.get("changed_files", []),
+        "untracked_files": after.get("untracked_files", []),
+        "unified_diff": inline,
+        "diff_total_chars": total,
+        "diff_truncated": truncated,
+        "base_sha": before.get("sha"),
+        "head_sha": after.get("sha"),
+        "status": status,
+        "revert": (
+            "Review the diff, then use git restore / git checkout or your VCS "
+            "workflow to revert unwanted changes."
+        ),
+    }
+    if truncated:
+        payload["unified_diff_sidecar_path"] = _spool_patch_sidecar(
+            task=task, sidecar_name=sidecar_name, diff=redacted
+        )
+    return payload
+
+
+def _spool_patch_sidecar(*, task: Task, sidecar_name: str, diff: str) -> Optional[str]:
+    """Write the full (already-redacted) diff to a sidecar file next to the
+    task's other spooled output. Returns the path, or ``None`` if no state dir
+    is in scope or the write fails."""
+    state_dir = _resolve_sidecar_state_dir()
+    if state_dir is None:
+        return None
+    try:
+        sidecar_dir = state_dir / "jobs" / task.job_id / "tasks" / task.id
+        sidecar_dir.mkdir(parents=True, exist_ok=True)
+        sidecar_path = sidecar_dir / f"{sidecar_name}.patch"
+        sidecar_path.write_text(diff, encoding="utf-8", errors="replace")
+        return str(sidecar_path)
+    except OSError:
+        return None
 
 
 @dataclass(frozen=True)
@@ -326,6 +419,9 @@ class CursorAdapter:
 
         # Fail fast on a dirty tree before spending any work (codegraph, agent).
         before = git_snapshot(cwd)
+        blocked = worktree_guard(task, worker_id, "cursor", cwd, before)
+        if blocked is not None:
+            return blocked
         if not task.payload.get("allow_dirty", False) and (
             before["changed_files"] or before["untracked_files"]
         ):
@@ -375,8 +471,6 @@ class CursorAdapter:
                 env=environment,
             )
         except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout or ""
-            stderr = exc.stderr or ""
             after = git_snapshot(cwd)
             artifacts: list[Artifact] = [
                 verification_artifact(
@@ -390,8 +484,8 @@ class CursorAdapter:
                     payload={
                         "failure": "timeout",
                         "returncode": None,
-                        "stdout": stdout[-_STDOUT_TAIL_CHARS:],
-                        "stderr": stderr[-_STDOUT_TAIL_CHARS:],
+                        "stdout": _redacted_tail(exc.stdout, _STDOUT_TAIL_CHARS),
+                        "stderr": _redacted_tail(exc.stderr, _STDOUT_TAIL_CHARS),
                         "timeout_seconds": timeout_seconds,
                         "base_sha": before["sha"],
                         "head_sha": after["sha"],
@@ -431,8 +525,8 @@ class CursorAdapter:
                 payload={
                     "failure": None if completed.returncode == 0 else failure,
                     "returncode": completed.returncode,
-                    "stdout": completed.stdout[-12000:],
-                    "stderr": completed.stderr[-_STDOUT_TAIL_CHARS:],
+                    "stdout": _redacted_tail(completed.stdout, 12000),
+                    "stderr": _redacted_tail(completed.stderr, _STDOUT_TAIL_CHARS),
                     "stdout_capture": stdout_capture,
                     "stderr_capture": stderr_capture,
                     "model": model,
@@ -465,15 +559,14 @@ class CursorAdapter:
             created_by=worker_id,
             confidence=0.8 if status == "applied" else 0.5,
             evidence=["adapter:cursor-sdk", f"base:{before['sha']}"],
-            payload={
-                "change": "Cursor agent modified tracked repository files.",
-                "files": after["changed_files"],
-                "unified_diff": after["diff"][-20000:],
-                "base_sha": before["sha"],
-                "head_sha": after["sha"],
-                "status": status,
-                "revert": "Review the diff, then use git restore / git checkout or your VCS workflow to revert unwanted changes.",
-            },
+            payload=build_patch_payload(
+                task=task,
+                before=before,
+                after=after,
+                status=status,
+                change="Cursor agent modified repository files.",
+                sidecar_name="cursor_implement",
+            ),
         )
 
     def _run_analyze(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
@@ -688,6 +781,9 @@ class ClaudeCodeAdapter:
             extra_args=task.payload.get("extra_args", []),
         )
         before = git_snapshot(cwd)
+        blocked = worktree_guard(task, worker_id, "claude-code", cwd, before)
+        if blocked is not None:
+            return blocked
         if not task.payload.get("allow_dirty", False) and (
             before["changed_files"] or before["untracked_files"]
         ):
@@ -723,8 +819,9 @@ class ClaudeCodeAdapter:
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout or ""
-            stderr = exc.stderr or ""
+            stdout = _coerce_text(exc.stdout)
+            stderr = _coerce_text(exc.stderr)
+            after = git_snapshot(cwd)
             stdout_capture = capture_subprocess_stdout(
                 text=stdout,
                 task=task,
@@ -735,7 +832,7 @@ class ClaudeCodeAdapter:
                 task=task,
                 sidecar_name="claude_stderr_timeout",
             )
-            return [
+            artifacts: list[Artifact] = [
                 verification_artifact(
                     task=task,
                     worker_id=worker_id,
@@ -747,14 +844,40 @@ class ClaudeCodeAdapter:
                     payload={
                         "failure": "timeout",
                         "returncode": None,
-                        "stdout": stdout[-_STDOUT_TAIL_CHARS:],
-                        "stderr": stderr[-_STDOUT_TAIL_CHARS:],
+                        "stdout": _redacted_tail(stdout, _STDOUT_TAIL_CHARS),
+                        "stderr": _redacted_tail(stderr, _STDOUT_TAIL_CHARS),
                         "stdout_capture": stdout_capture,
                         "stderr_capture": stderr_capture,
                         "timeout_seconds": timeout_seconds,
+                        "base_sha": before["sha"],
+                        "head_sha": after["sha"],
+                        "changed_files": after["changed_files"],
+                        "untracked_files": after["untracked_files"],
                     },
                 )
             ]
+            # A timed-out run may have already edited files; surface the partial
+            # diff so the work isn't silently stranded in the tree.
+            if str(after.get("diff") or "").strip():
+                artifacts.append(
+                    Artifact(
+                        job_id=task.job_id,
+                        task_id=task.id,
+                        type=ArtifactType.PATCH,
+                        created_by=worker_id,
+                        confidence=0.5,
+                        evidence=["adapter:claude-code", f"base:{before['sha']}", "timeout"],
+                        payload=build_patch_payload(
+                            task=task,
+                            before=before,
+                            after=after,
+                            status="failed",
+                            change="Claude Code modified repository files before timing out.",
+                            sidecar_name="claude_implement_timeout",
+                        ),
+                    )
+                )
+            return artifacts
 
         after = git_snapshot(cwd)
         # Claude Code stdout often carries long edit transcripts. Give the
@@ -788,8 +911,8 @@ class ClaudeCodeAdapter:
             payload={
                 "failure": None if completed.returncode == 0 else classify_claude_code_failure(completed.stderr + completed.stdout),
                 "returncode": completed.returncode,
-                "stdout": completed.stdout[-12000:],
-                "stderr": completed.stderr[-_STDOUT_TAIL_CHARS:],
+                "stdout": _redacted_tail(completed.stdout, 12000),
+                "stderr": _redacted_tail(completed.stderr, _STDOUT_TAIL_CHARS),
                 "stdout_capture": stdout_capture,
                 "stderr_capture": stderr_capture,
                 "cwd": str(cwd),
@@ -801,7 +924,7 @@ class ClaudeCodeAdapter:
             },
         )
         artifacts = [verification]
-        if after["diff"].strip():
+        if str(after.get("diff") or "").strip():
             artifacts.append(
                 Artifact(
                     job_id=task.job_id,
@@ -810,15 +933,14 @@ class ClaudeCodeAdapter:
                     created_by=worker_id,
                     confidence=0.8 if completed.returncode == 0 else 0.5,
                     evidence=["adapter:claude-code", f"base:{before['sha']}"],
-                    payload={
-                        "change": "Claude Code modified tracked repository files.",
-                        "files": after["changed_files"],
-                        "unified_diff": after["diff"][-20000:],
-                        "base_sha": before["sha"],
-                        "head_sha": after["sha"],
-                        "status": "applied" if completed.returncode == 0 else "failed",
-                        "revert": "Review the diff, then use git restore / git checkout or your VCS workflow to revert unwanted changes.",
-                    },
+                    payload=build_patch_payload(
+                        task=task,
+                        before=before,
+                        after=after,
+                        status="applied" if completed.returncode == 0 else "failed",
+                        change="Claude Code modified repository files.",
+                        sidecar_name="claude_implement",
+                    ),
                 )
             )
         return artifacts
@@ -908,9 +1030,13 @@ class CodexAdapter:
 
         before = git_snapshot(cwd)
         # Read-only sandbox can't mutate the worktree, so dirty-tree gating
-        # is unnecessary. For write-capable sandboxes we mirror Claude Code:
-        # refuse to run on a dirty tree by default so resulting diffs are
-        # attributable to this Puppetmaster task, not pre-existing churn.
+        # and worktree-boundary checks are unnecessary. For write-capable
+        # sandboxes we mirror Claude Code: require a git work tree and a clean
+        # tree by default so resulting diffs are attributable to this task.
+        if sandbox != "read-only":
+            blocked = worktree_guard(task, worker_id, "codex", cwd, before)
+            if blocked is not None:
+                return blocked
         if (
             sandbox != "read-only"
             and not task.payload.get("allow_dirty", False)
@@ -950,12 +1076,9 @@ class CodexAdapter:
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout or ""
-            stderr = exc.stderr or ""
-            if isinstance(stdout, bytes):
-                stdout = stdout.decode("utf-8", errors="replace")
-            if isinstance(stderr, bytes):
-                stderr = stderr.decode("utf-8", errors="replace")
+            stdout = _coerce_text(exc.stdout)
+            stderr = _coerce_text(exc.stderr)
+            after = git_snapshot(cwd)
             stdout_capture = capture_subprocess_stdout(
                 text=stdout,
                 task=task,
@@ -967,7 +1090,7 @@ class CodexAdapter:
                 task=task,
                 sidecar_name="codex_stderr_timeout",
             )
-            return [
+            artifacts: list[Artifact] = [
                 verification_artifact(
                     task=task,
                     worker_id=worker_id,
@@ -982,14 +1105,38 @@ class CodexAdapter:
                         "model": model,
                         "sandbox": sandbox,
                         "approval_policy": approval_policy,
-                        "stdout": stdout[-_STDOUT_TAIL_CHARS:],
-                        "stderr": stderr[-_STDOUT_TAIL_CHARS:],
+                        "stdout": _redacted_tail(stdout, _STDOUT_TAIL_CHARS),
+                        "stderr": _redacted_tail(stderr, _STDOUT_TAIL_CHARS),
                         "stdout_capture": stdout_capture,
                         "stderr_capture": stderr_capture,
                         "timeout_seconds": timeout_seconds,
+                        "base_sha": before["sha"],
+                        "head_sha": after["sha"],
+                        "changed_files": after["changed_files"],
+                        "untracked_files": after["untracked_files"],
                     },
                 )
             ]
+            if str(after.get("diff") or "").strip():
+                artifacts.append(
+                    Artifact(
+                        job_id=task.job_id,
+                        task_id=task.id,
+                        type=ArtifactType.PATCH,
+                        created_by=worker_id,
+                        confidence=0.5,
+                        evidence=["adapter:codex", f"base:{before['sha']}", "timeout"],
+                        payload=build_patch_payload(
+                            task=task,
+                            before=before,
+                            after=after,
+                            status="failed",
+                            change="Codex modified repository files before timing out.",
+                            sidecar_name="codex_implement_timeout",
+                        ),
+                    )
+                )
+            return artifacts
 
         after = git_snapshot(cwd)
 
@@ -1077,11 +1224,11 @@ class CodexAdapter:
                 "approval_policy": approval_policy,
                 "ephemeral": ephemeral,
                 "thread_id": thread_id,
-                "stdout": completed.stdout[-_STDOUT_TAIL_CHARS:],
-                "stderr": completed.stderr[-_STDOUT_TAIL_CHARS:],
+                "stdout": _redacted_tail(completed.stdout, _STDOUT_TAIL_CHARS),
+                "stderr": _redacted_tail(completed.stderr, _STDOUT_TAIL_CHARS),
                 "stdout_capture": stdout_capture,
                 "stderr_capture": stderr_capture,
-                "last_message": last_message[-_STDOUT_TAIL_CHARS:],
+                "last_message": _redacted_tail(last_message, _STDOUT_TAIL_CHARS),
                 "last_message_capture": last_message_capture,
                 "tokens_in": tokens_in,
                 "tokens_out": tokens_out,
@@ -1122,13 +1269,13 @@ class CodexAdapter:
                             "Treat this swarm as degraded; rerun with a stricter prompt or "
                             "inspect the repo directly before implementation."
                         ),
-                        "stdout_excerpt": last_message[:_STDOUT_HEAD_CHARS],
+                        "stdout_excerpt": (redact_secrets(last_message) or "")[:_STDOUT_HEAD_CHARS],
                         "last_message_capture": last_message_capture,
                     },
                 )
             )
         artifacts.extend(parsed_artifacts)
-        if after["diff"].strip():
+        if str(after.get("diff") or "").strip():
             artifacts.append(
                 Artifact(
                     job_id=task.job_id,
@@ -1137,18 +1284,14 @@ class CodexAdapter:
                     created_by=worker_id,
                     confidence=0.8 if not process_failed else 0.5,
                     evidence=["adapter:codex", f"base:{before['sha']}"],
-                    payload={
-                        "change": "Codex modified tracked repository files.",
-                        "files": after["changed_files"],
-                        "unified_diff": after["diff"][-20000:],
-                        "base_sha": before["sha"],
-                        "head_sha": after["sha"],
-                        "status": "applied" if not process_failed else "failed",
-                        "revert": (
-                            "Review the diff, then use git restore / git checkout or your "
-                            "VCS workflow to revert unwanted changes."
-                        ),
-                    },
+                    payload=build_patch_payload(
+                        task=task,
+                        before=before,
+                        after=after,
+                        status="applied" if not process_failed else "failed",
+                        change="Codex modified repository files.",
+                        sidecar_name="codex_implement",
+                    ),
                 )
             )
         return artifacts
@@ -1398,11 +1541,41 @@ def tool_list(value: object) -> str:
 
 
 def git_snapshot(cwd: Path) -> dict[str, object]:
+    """Capture a diff-attributable snapshot of the working tree.
+
+    Captures changes **against HEAD** (not just working-tree-vs-index) so that
+    *staged* edits are seen by dirty-tree gating and included in PATCH diffs,
+    and synthesizes no-index patches for *untracked* files so a run that only
+    creates new files still produces an applyable diff. Also reports whether
+    ``cwd`` is inside a git work tree so full-edit adapters can refuse to run
+    outside a repo (where diffs are unattributable)."""
+    inside = git_output(cwd, ["rev-parse", "--is-inside-work-tree"]) == "true"
+    sha = git_output(cwd, ["rev-parse", "HEAD"])
+    untracked = git_untracked_files(cwd)
+    if sha:
+        # HEAD exists: `git diff HEAD` covers both staged and unstaged tracked
+        # changes; plain `git diff` would silently drop staged edits.
+        changed = git_lines(cwd, ["diff", "HEAD", "--name-only"])
+        diff = git_diff_output(cwd, ["diff", "HEAD", "--binary"])
+    else:
+        # No commit yet (or detached/empty): union the staged and unstaged
+        # diffs so nothing tracked is missed.
+        changed = sorted(
+            set(git_lines(cwd, ["diff", "--name-only"]))
+            | set(git_lines(cwd, ["diff", "--cached", "--name-only"]))
+        )
+        diff = git_diff_output(cwd, ["diff", "--binary"]) + git_diff_output(
+            cwd, ["diff", "--cached", "--binary"]
+        )
+    untracked_diff = git_untracked_diff(cwd, untracked)
+    if untracked_diff:
+        diff = (diff.rstrip("\n") + "\n" + untracked_diff) if diff.strip() else untracked_diff
     return {
-        "sha": git_output(cwd, ["rev-parse", "HEAD"]) or "uncommitted",
-        "changed_files": git_lines(cwd, ["diff", "--name-only"]),
-        "untracked_files": git_untracked_files(cwd),
-        "diff": git_output(cwd, ["diff", "--binary"]) or "",
+        "sha": sha or "uncommitted",
+        "is_worktree": inside,
+        "changed_files": changed,
+        "untracked_files": untracked,
+        "diff": diff,
     }
 
 
@@ -1417,9 +1590,49 @@ def git_output(cwd: Path, args: list[str]) -> str:
     return completed.stdout.strip() if completed.returncode == 0 else ""
 
 
+def git_diff_output(cwd: Path, args: list[str]) -> str:
+    """Like :func:`git_output` but does not strip — diff bytes are significant
+    and a trailing context newline can matter for patch application."""
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return completed.stdout if completed.returncode == 0 else ""
+
+
 def git_lines(cwd: Path, args: list[str]) -> list[str]:
     output = git_output(cwd, args)
     return [line for line in output.splitlines() if line.strip()]
+
+
+def git_untracked_diff(cwd: Path, untracked: list[str]) -> str:
+    """Synthesize unified diffs for untracked files via ``git diff --no-index``.
+
+    ``git diff`` never reports untracked files, so a run that only *creates*
+    new files would otherwise produce an empty PATCH. ``--no-index`` exits 1
+    when the files differ (the normal case here), so we can't reuse
+    :func:`git_output`, which discards non-zero output."""
+    chunks: list[str] = []
+    for rel in untracked:
+        try:
+            if not (cwd / rel).is_file():
+                continue  # skip directories / submodules / special files
+        except OSError:
+            continue
+        completed = subprocess.run(
+            ["git", "diff", "--binary", "--no-index", "--", os.devnull, rel],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        # 0 == identical (no output), 1 == differs (the diff we want), >1 == error.
+        if completed.returncode in (0, 1) and completed.stdout.strip():
+            chunks.append(completed.stdout)
+    return "".join(chunks)
 
 
 def git_untracked_files(cwd: Path) -> list[str]:
@@ -1429,6 +1642,44 @@ def git_untracked_files(cwd: Path) -> list[str]:
         if line.startswith("?? "):
             files.append(line[3:])
     return files
+
+
+def worktree_guard(
+    task: Task, worker_id: str, adapter: str, cwd: Path, before: dict
+) -> Optional[list[Artifact]]:
+    """Return a blocked-artifact list when a full-edit run is pointed outside a
+    git work tree, else ``None``.
+
+    Outside a repo, :func:`git_snapshot` reports ``sha='uncommitted'`` with no
+    dirty state, so an editing agent would run with no dirty-tree gating and no
+    reliable diff attribution — and could modify files anywhere. Callers can
+    opt out with ``payload.allow_non_worktree=true`` for deliberately
+    sandboxed/non-repo runs."""
+    if before.get("is_worktree", True):
+        return None
+    if task.payload.get("allow_non_worktree", False):
+        return None
+    return [
+        verification_artifact(
+            task=task,
+            worker_id=worker_id,
+            adapter=adapter,
+            check=task.instruction,
+            result="blocked",
+            confidence=0.85,
+            evidence=[f"adapter:{adapter}", "status:not-a-worktree"],
+            payload={
+                "failure": "not_a_worktree",
+                "message": (
+                    f"{adapter} full-edit runs require cwd to be inside a git work tree "
+                    "so Puppetmaster can gate on a clean tree and attribute the resulting "
+                    "diff. Point cwd at a repo/worktree, or set "
+                    "payload.allow_non_worktree=true to run unsandboxed anyway."
+                ),
+                "cwd": str(cwd),
+            },
+        )
+    ]
 
 
 def cursor_result_text(stdout: str) -> tuple[Optional[str], str]:

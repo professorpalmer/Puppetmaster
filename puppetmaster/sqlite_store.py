@@ -351,15 +351,25 @@ class SQLiteSwarmStore(SwarmStore):
             out[artifact.id] = artifact
         return out
 
-    def list_artifacts_by_type(self, artifact_type: str) -> list[Artifact]:
+    def list_artifacts_by_type(
+        self, artifact_type: str, job_ids: Optional[Iterable[str]] = None
+    ) -> list[Artifact]:
         self.init()
-        return [
-            artifact_from_dict(json.loads(row["data"]))
-            for row in self._all(
+        if job_ids is not None:
+            ids = list(dict.fromkeys(job_ids))
+            if not ids:
+                return []
+            placeholders = ",".join("?" for _ in ids)
+            rows = self._all(
+                f"SELECT data FROM artifacts WHERE type = ? AND job_id IN ({placeholders}) ORDER BY id",
+                (artifact_type, *ids),
+            )
+        else:
+            rows = self._all(
                 "SELECT data FROM artifacts WHERE type = ? ORDER BY id",
                 (artifact_type,),
             )
-        ]
+        return [artifact_from_dict(json.loads(row["data"])) for row in rows]
 
     def list_memory(self) -> list[dict[str, Any]]:
         self.init()
@@ -377,11 +387,29 @@ class SQLiteSwarmStore(SwarmStore):
         role: Optional[str] = None,
         topic: Optional[str] = None,
     ) -> list[dict[str, Any]]:
+        self.init()
         terms = {term.lower() for term in query.split() if len(term) > 2}
+        # Push the exact-match filters into SQL via json_extract so we only
+        # deserialize candidate rows instead of every promoted memory record
+        # (which grows unbounded over a session).
+        clauses: list[str] = []
+        params: list[Any] = []
+        for column, value in (
+            ("scope", scope),
+            ("adapter", adapter),
+            ("role", role),
+            ("topic", topic),
+        ):
+            if value is not None:
+                clauses.append(f"json_extract(data, '$.{column}') = ?")
+                params.append(value)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        rows = self._all(
+            f"SELECT data FROM memory{where} ORDER BY id", tuple(params)
+        )
         scored = []
-        for memory in self.list_memory():
-            if not self._memory_matches_filters(memory, scope, adapter, role, topic):
-                continue
+        for row in rows:
+            memory = json.loads(row["data"])
             haystack = " ".join(
                 str(memory.get(key, ""))
                 for key in ["scope", "statement", "evidence", "adapter", "role", "topic"]
