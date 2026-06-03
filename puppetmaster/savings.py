@@ -108,44 +108,57 @@ def collect_routing_records(
             job_list = store.list_jobs()
         except Exception:
             continue
-        for job in job_list:
-            if since is not None and not _job_within(job, since):
-                continue
-            jobs += 1
-            try:
-                artifacts = store.list_artifacts(job.id)
-            except Exception:
-                continue
-            for a in artifacts:
-                if a.type.value != "routing":
-                    continue
-                if a.created_by == "router-fallback":
-                    self_heal.fallbacks += 1
-                    continue
-                if a.created_by == "router-escalation":
-                    self_heal.escalations += 1
-                    continue
-                if a.created_by != "router":
-                    continue
-                tid = getattr(a, "task_id", None)
-                if tid:
-                    if tid in seen_router_tasks:
-                        continue
-                    seen_router_tasks.add(tid)
-                p = a.payload or {}
-                baseline = float(p.get("baseline_cost_usd") or 0.0)
-                records.append(
-                    RoutingRecord(
-                        policy=p.get("policy") or "?",
-                        chosen_cost_usd=float(p.get("estimated_cost_usd") or 0.0),
-                        baseline_cost_usd=baseline,
-                        has_baseline="baseline_cost_usd" in p and baseline > 0.0,
-                        picked_model_id=p.get("model_id") or "",
-                        baseline_model_id=p.get("baseline_model_id") or "",
-                        tokens_in=int(p.get("estimated_tokens_in") or 0),
-                        tokens_out=int(p.get("estimated_tokens_out") or 0),
+        # Determine the in-window jobs once, then pull routing artifacts with a
+        # single indexed query (SQLite: WHERE type='routing') instead of loading
+        # and deserializing every artifact of every job just to find them.
+        in_window = [
+            job for job in job_list if since is None or _job_within(job, since)
+        ]
+        jobs += len(in_window)
+        window_job_ids = {job.id for job in in_window}
+        try:
+            routing_artifacts = store.list_artifacts_by_type("routing")
+        except Exception:
+            # Fallback for stores without the indexed helper: per-job scan.
+            routing_artifacts = []
+            for job in in_window:
+                try:
+                    routing_artifacts.extend(
+                        a for a in store.list_artifacts(job.id)
+                        if a.type.value == "routing"
                     )
+                except Exception:
+                    continue
+        for a in routing_artifacts:
+            if getattr(a, "job_id", None) not in window_job_ids:
+                continue
+            if a.created_by == "router-fallback":
+                self_heal.fallbacks += 1
+                continue
+            if a.created_by == "router-escalation":
+                self_heal.escalations += 1
+                continue
+            if a.created_by != "router":
+                continue
+            tid = getattr(a, "task_id", None)
+            if tid:
+                if tid in seen_router_tasks:
+                    continue
+                seen_router_tasks.add(tid)
+            p = a.payload or {}
+            baseline = float(p.get("baseline_cost_usd") or 0.0)
+            records.append(
+                RoutingRecord(
+                    policy=p.get("policy") or "?",
+                    chosen_cost_usd=float(p.get("estimated_cost_usd") or 0.0),
+                    baseline_cost_usd=baseline,
+                    has_baseline="baseline_cost_usd" in p and baseline > 0.0,
+                    picked_model_id=p.get("model_id") or "",
+                    baseline_model_id=p.get("baseline_model_id") or "",
+                    tokens_in=int(p.get("estimated_tokens_in") or 0),
+                    tokens_out=int(p.get("estimated_tokens_out") or 0),
                 )
+            )
     return records, jobs, self_heal
 
 
@@ -156,7 +169,11 @@ def _job_within(job, since: datetime) -> bool:
             ts = ts.replace(tzinfo=timezone.utc)
         return ts >= since
     except (ValueError, AttributeError, TypeError):
-        return True
+        # A job whose created_at can't be parsed has no place in a *windowed*
+        # report — including it would silently pad windowed savings with
+        # undatable jobs. Exclude it (the caller only invokes this when a
+        # window is set; unwindowed reports never reach here).
+        return False
 
 
 def build_metrics(

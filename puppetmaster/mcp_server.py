@@ -655,7 +655,10 @@ def handle_message(message: JsonObject) -> Optional[JsonObject]:
             result = {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "puppetmaster", "version": "0.2.0-beta.1"},
+                "serverInfo": {
+                    "name": "puppetmaster",
+                    "version": _server_version() or "0.2.0-beta.1",
+                },
             }
         elif method == "tools/list":
             result = {"tools": [tool_to_json(tool) for tool in tools()]}
@@ -671,14 +674,35 @@ def handle_message(message: JsonObject) -> Optional[JsonObject]:
 
 
 def call_tool(name: str, arguments: JsonObject) -> JsonObject:
-    registry = {tool.name: tool for tool in tools()}
-    tool = registry.get(name)
+    tool = _tool_registry().get(name)
     if tool is None:
         raise ValueError(f"Unknown Puppetmaster tool: {name}")
     return tool.handler(arguments)
 
 
+# The tool list and name->tool map are static for the life of the process, but
+# `tools/list` and every `tools/call` used to rebuild them (allocating the full
+# list plus a fresh dict and all the lambdas) on each hot-path MCP request.
+# Build once and cache.
+_TOOLS_CACHE: Optional[list[McpTool]] = None
+_TOOL_REGISTRY_CACHE: Optional[dict[str, McpTool]] = None
+
+
 def tools() -> list[McpTool]:
+    global _TOOLS_CACHE
+    if _TOOLS_CACHE is None:
+        _TOOLS_CACHE = _build_tools()
+    return _TOOLS_CACHE
+
+
+def _tool_registry() -> dict[str, McpTool]:
+    global _TOOL_REGISTRY_CACHE
+    if _TOOL_REGISTRY_CACHE is None:
+        _TOOL_REGISTRY_CACHE = {tool.name: tool for tool in tools()}
+    return _TOOL_REGISTRY_CACHE
+
+
+def _build_tools() -> list[McpTool]:
     return [
         McpTool(
             name="puppetmaster_doctor",
@@ -761,6 +785,28 @@ def tools() -> list[McpTool]:
             description="Start Claude Code as a full-edit worker asynchronously and return job_id immediately.",
             input_schema=claude_schema(),
             handler=start_claude,
+        ),
+        McpTool(
+            name="puppetmaster_cursor_implement",
+            description="Run Cursor as a full-edit Puppetmaster worker (edits files, captures a PATCH) and wait for completion.",
+            input_schema=cursor_implement_schema(),
+            handler=lambda args: run_cursor(args, implement=True),
+        ),
+        McpTool(
+            name="puppetmaster_start_cursor_implement",
+            description="Start Cursor as a full-edit worker asynchronously (edits files, captures a PATCH) and return job_id immediately.",
+            input_schema=cursor_implement_schema(),
+            handler=lambda args: start_cursor(args, implement=True),
+        ),
+        McpTool(
+            name="puppetmaster_start_implement",
+            description=(
+                "Start a full-edit implement worker on whichever platform you're locked to "
+                "(cursor or claude-code), so implement isn't Claude-Code-only. Returns job_id "
+                "immediately. Pass adapter to force one; otherwise the enabled platform is used."
+            ),
+            input_schema=implement_schema(),
+            handler=start_implement,
         ),
         McpTool(
             name="puppetmaster_openai",
@@ -1199,17 +1245,27 @@ def _spawn_codegraph_indexer(args: JsonObject, target_cwd: str) -> JsonObject:
         str(lock_path),
     ]
     stdout_handle = stdout_path.open("w", encoding="utf-8")
-    stderr_handle = stderr_path.open("w", encoding="utf-8")
-    process = subprocess.Popen(
-        launcher,
-        cwd=target_cwd,
-        env=launcher_environment(args),
-        stdin=subprocess.DEVNULL,
-        stdout=stdout_handle,
-        stderr=stderr_handle,
-        text=True,
-        start_new_session=True,
-    )
+    try:
+        stderr_handle = stderr_path.open("w", encoding="utf-8")
+    except OSError:
+        stdout_handle.close()
+        raise
+    try:
+        process = subprocess.Popen(
+            launcher,
+            cwd=target_cwd,
+            env=launcher_environment(args),
+            stdin=subprocess.DEVNULL,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+            text=True,
+            start_new_session=True,
+        )
+    except OSError:
+        # Popen failed (e.g. bad executable); don't leak the open log handles.
+        stdout_handle.close()
+        stderr_handle.close()
+        raise
     ASYNC_PROCESSES.append(process)
     stdout_handle.close()
     stderr_handle.close()
@@ -1236,21 +1292,35 @@ def codegraph_response(payload: JsonObject) -> JsonObject:
     }
 
 
-def run_cursor(args: JsonObject, review: bool = False, plan: bool = False) -> JsonObject:
-    return run_cli(cursor_command(args, review=review, plan=plan), args)
+def run_cursor(
+    args: JsonObject, review: bool = False, plan: bool = False, implement: bool = False
+) -> JsonObject:
+    return run_cli(cursor_command(args, review=review, plan=plan, implement=implement), args)
 
 
-def start_cursor(args: JsonObject, review: bool = False, plan: bool = False) -> JsonObject:
-    return start_cli(cursor_command(args, review=review, plan=plan), args)
+def start_cursor(
+    args: JsonObject, review: bool = False, plan: bool = False, implement: bool = False
+) -> JsonObject:
+    return start_cli(cursor_command(args, review=review, plan=plan, implement=implement), args)
 
 
-def cursor_command(args: JsonObject, review: bool = False, plan: bool = False) -> list[str]:
+def cursor_command(
+    args: JsonObject, review: bool = False, plan: bool = False, implement: bool = False
+) -> list[str]:
     goal = require_string(args, "goal")
-    command = ["cursor", goal, "--cwd", cwd(args), "--dry-run"]
-    if review:
-        command.append("--review")
-    if plan:
-        command.append("--plan")
+    command = ["cursor", goal, "--cwd", cwd(args)]
+    if implement:
+        # Full-edit run: no --dry-run, let the agent modify the tree and capture
+        # the diff as a PATCH artifact.
+        command.append("--implement")
+        if args.get("allow_dirty"):
+            command.append("--allow-dirty")
+    else:
+        command.append("--dry-run")
+        if review:
+            command.append("--review")
+        if plan:
+            command.append("--plan")
     model = args.get("model")
     if model:
         command.extend(["--model", str(model)])
@@ -1258,6 +1328,56 @@ def cursor_command(args: JsonObject, review: bool = False, plan: bool = False) -
     if timeout_seconds:
         command.extend(["--timeout-seconds", str(timeout_seconds)])
     return command
+
+
+# Adapters that can run a full-edit "implement" worker, in the order the generic
+# `puppetmaster_start_implement` verb prefers when several are enabled.
+_IMPLEMENT_ADAPTER_PRIORITY = ("cursor", "claude-code")
+
+
+def _implement_command(args: JsonObject, adapter: str) -> list[str]:
+    if adapter == "cursor":
+        return cursor_command(args, implement=True)
+    if adapter == "claude-code":
+        return claude_command(args)
+    raise ValueError(f"adapter {adapter!r} has no implement command")
+
+
+def start_implement(args: JsonObject) -> JsonObject:
+    """Platform-agnostic implement: pick the full-edit adapter for whichever
+    platform the user is locked to, so `implement` works no matter which single
+    platform is enabled (not Claude-Code-only)."""
+    from puppetmaster import platform_lock
+
+    enabled = platform_lock.enabled_adapters()
+    requested = args.get("adapter")
+    if requested:
+        adapter = str(requested)
+        if adapter not in _IMPLEMENT_ADAPTER_PRIORITY:
+            return tool_error(
+                f"adapter {adapter!r} cannot implement. Implement-capable: "
+                f"{', '.join(_IMPLEMENT_ADAPTER_PRIORITY)}.",
+                {"requested": adapter},
+            )
+        if adapter not in enabled:
+            return tool_error(
+                f"adapter {adapter!r} is disabled by the platform lock.",
+                {"enabled": sorted(enabled), "fix": "puppetmaster platform enable " + adapter},
+            )
+    else:
+        adapter = next(
+            (a for a in _IMPLEMENT_ADAPTER_PRIORITY if a in enabled), None
+        )
+        if adapter is None:
+            return tool_error(
+                "No implement-capable platform is enabled. Enable one of "
+                f"{', '.join(_IMPLEMENT_ADAPTER_PRIORITY)} via the platform lock.",
+                {"enabled": sorted(enabled)},
+            )
+    result = start_cli(_implement_command(args, adapter), args)
+    if isinstance(result, dict):
+        result.setdefault("implement_adapter", adapter)
+    return result
 
 
 def run_claude(args: JsonObject) -> JsonObject:
@@ -1578,6 +1698,35 @@ def run_list_models(args: JsonObject) -> JsonObject:
     }
 
 
+_SECRET_ENV_VARS = (
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "CURSOR_API_KEY",
+    "OPENAI_ORG_ID",
+)
+_SECRET_SK = re.compile(r"sk-[A-Za-z0-9_\-]{8,}")
+_SECRET_BEARER = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-]{8,}")
+_SECRET_APIKEY = re.compile(r"(?i)(api[_-]?key\"?\s*[:=]\s*\"?)[A-Za-z0-9._\-]{8,}")
+
+
+def redact_secrets(text: Optional[str]) -> Optional[str]:
+    """Scrub likely secrets from child-process output before returning it over
+    MCP. Replaces the live values of known credential env vars plus common
+    token shapes (``sk-...``, ``Bearer ...``, ``api_key=...``) so a command
+    that echoes a key doesn't leak it into the agent transcript."""
+    if not text:
+        return text
+    redacted = text
+    for var in _SECRET_ENV_VARS:
+        value = os.environ.get(var)
+        if value and len(value) >= 6:
+            redacted = redacted.replace(value, f"<{var}:redacted>")
+    redacted = _SECRET_SK.sub("sk-<redacted>", redacted)
+    redacted = _SECRET_BEARER.sub(lambda m: f"{m.group(1)}<redacted>", redacted)
+    redacted = _SECRET_APIKEY.sub(lambda m: f"{m.group(1)}<redacted>", redacted)
+    return redacted
+
+
 def run_cli(command: list[str], args: JsonObject) -> JsonObject:
     state_dir = str(mcp_state_dir(args))
     process = subprocess.run(
@@ -1593,8 +1742,8 @@ def run_cli(command: list[str], args: JsonObject) -> JsonObject:
         "command": "python -m puppetmaster " + " ".join(command),
         "cwd": cwd(args),
         "returncode": process.returncode,
-        "stdout": process.stdout,
-        "stderr": process.stderr,
+        "stdout": redact_secrets(process.stdout),
+        "stderr": redact_secrets(process.stderr),
     }
     return {
         "content": [{"type": "text", "text": json.dumps(body, indent=2)}],
@@ -1733,14 +1882,24 @@ def wait_for_job_id(
 ) -> str:
     deadline = time.monotonic() + timeout_seconds
     pattern = re.compile(r"job_id:\s*(job_[A-Za-z0-9]+)")
+    # Read the log incrementally from a tracked byte offset instead of
+    # re-reading the entire file every 50ms. Re-reading was O(n) per poll
+    # (O(n^2) overall) once startup wrote a lot of output before the job id.
+    offset = 0
+    buffer = ""
     while time.monotonic() < deadline:
         if process.poll() is not None and not stdout_path.exists():
             break
         if stdout_path.exists():
-            text = stdout_path.read_text(encoding="utf-8")
-            match = pattern.search(text)
-            if match:
-                return match.group(1)
+            with stdout_path.open("r", encoding="utf-8") as handle:
+                handle.seek(offset)
+                chunk = handle.read()
+                offset = handle.tell()
+            if chunk:
+                buffer += chunk
+                match = pattern.search(buffer)
+                if match:
+                    return match.group(1)
             if process.poll() is not None:
                 break
         time.sleep(0.05)
@@ -2209,6 +2368,42 @@ def claude_schema() -> JsonObject:
     return schema
 
 
+def cursor_implement_schema() -> JsonObject:
+    schema = goal_schema("Implement the requested change end to end and leave the diff in the tree.")
+    schema["properties"].update(
+        {
+            "allow_dirty": {
+                "type": "boolean",
+                "default": False,
+                "description": "Allow the implement run to start in a dirty working tree.",
+            },
+        }
+    )
+    return schema
+
+
+def implement_schema() -> JsonObject:
+    schema = cursor_implement_schema()
+    schema["properties"].update(
+        {
+            "adapter": {
+                "type": "string",
+                "enum": ["cursor", "claude-code"],
+                "description": (
+                    "Force a specific implement-capable platform. Omit to use whichever "
+                    "platform the lock has enabled (cursor preferred, then claude-code)."
+                ),
+            },
+            "permission_mode": {
+                "type": "string",
+                "default": "acceptEdits",
+                "description": "Claude Code permission mode (only used when the claude-code adapter runs).",
+            },
+        }
+    )
+    return schema
+
+
 def openai_schema() -> JsonObject:
     schema = goal_schema("Produce structured findings/risks/decisions for the requested task.")
     schema["properties"].update(
@@ -2250,12 +2445,6 @@ def openai_schema() -> JsonObject:
                 "type": "boolean",
                 "default": False,
                 "description": "Skip CodeGraph context injection (e.g. for non-repo prompts).",
-            },
-            "worker_mode": {
-                "type": "string",
-                "enum": ["subprocess", "inline", "daemon"],
-                "default": "inline",
-                "description": "Worker execution mode.",
             },
         }
     )

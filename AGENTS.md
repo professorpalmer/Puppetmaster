@@ -19,8 +19,10 @@ For any request that involves more than a single trivial change, start a Puppetm
 Default routing:
 
 1. `puppetmaster_start_cursor_swarm` — multi-role read-only analysis (the daily-driver entry point).
-2. `puppetmaster_start_claude_implement` — durable, patch-producing implementation in a clean worktree.
+2. `puppetmaster_start_implement` — durable, patch-producing implementation that runs on whatever platform the lock enables (cursor preferred, then claude-code). Use this as the default implement verb so it works regardless of platform lock. `puppetmaster_start_cursor_implement` / `puppetmaster_start_claude_implement` force a specific platform.
 3. `puppetmaster_start_cursor_review` / `puppetmaster_start_cursor_plan` — lightweight single-pass review or plan.
+
+Every implement verb runs full-edit in a clean worktree (clean-tree guard; set `allow_dirty` to override) and captures the resulting diff as a `PATCH` artifact.
 
 Start tools return a `job_id` immediately. Do **not** wait inside one long MCP call.
 

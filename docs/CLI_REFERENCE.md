@@ -35,6 +35,7 @@ handshake before writing anything, are idempotent (re-run =
 python -m puppetmaster run "Goal" --config examples/enterprise-workflow.json
 python -m puppetmaster daemon --roles explore architect implement redteam test
 python -m puppetmaster cursor "Goal" --review --dry-run
+python -m puppetmaster cursor "Goal" --implement           # full-edit: Cursor edits files, captures a PATCH (add --allow-dirty to skip the clean-tree guard)
 python -m puppetmaster claude "Goal" --permission-mode acceptEdits
 python -m puppetmaster codex "Goal"
 python -m puppetmaster openai "Goal"

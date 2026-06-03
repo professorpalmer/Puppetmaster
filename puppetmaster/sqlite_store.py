@@ -4,7 +4,7 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Optional, Union
+from typing import Any, Iterable, Iterator, Optional, Union
 
 from puppetmaster.models import (
     AgentRun,
@@ -19,7 +19,7 @@ from puppetmaster.models import (
     task_from_dict,
     to_jsonable,
 )
-from puppetmaster.store import SwarmStore
+from puppetmaster.store import SwarmStore, _coerce_confidence
 
 
 class SQLiteSwarmStore(SwarmStore):
@@ -31,8 +31,15 @@ class SQLiteSwarmStore(SwarmStore):
     def __init__(self, root: Optional[Union[Path, str]] = None) -> None:
         super().__init__(root)
         self.db_path = self.root / "state.sqlite3"
+        # Schema/PRAGMA/DDL setup is idempotent but not free: re-running it from
+        # every public method (each opens a connection and replays the whole
+        # script) is pure overhead once the DB exists. Run it once per store
+        # instance and short-circuit afterward.
+        self._initialized = False
 
     def init(self) -> None:
+        if self._initialized:
+            return
         for directory in [
             self.root,
             self.jobs_dir,
@@ -59,6 +66,8 @@ class SQLiteSwarmStore(SwarmStore):
                 );
                 CREATE INDEX IF NOT EXISTS idx_tasks_job_status
                   ON tasks(job_id, status);
+                CREATE INDEX IF NOT EXISTS idx_tasks_job_id
+                  ON tasks(job_id, id);
                 CREATE TABLE IF NOT EXISTS runs (
                   id TEXT PRIMARY KEY,
                   job_id TEXT NOT NULL,
@@ -73,7 +82,9 @@ class SQLiteSwarmStore(SwarmStore):
                   data TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_artifacts_job
-                  ON artifacts(job_id);
+                  ON artifacts(job_id, id);
+                CREATE INDEX IF NOT EXISTS idx_artifacts_type
+                  ON artifacts(type, job_id);
                 CREATE TABLE IF NOT EXISTS memory (
                   id TEXT PRIMARY KEY,
                   data TEXT NOT NULL
@@ -93,14 +104,20 @@ class SQLiteSwarmStore(SwarmStore):
                 );
                 """
             )
+            # Record the schema version only when absent. Blindly overwriting it
+            # on every init would mask a database written by a newer (or
+            # incompatible) Puppetmaster: the metadata would silently claim our
+            # version even though the on-disk schema is something else. Leaving
+            # an existing value intact lets schema_status() surface the mismatch.
             connection.execute(
                 """
                 INSERT INTO metadata(key, value)
                 VALUES('schema_version', ?)
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                ON CONFLICT(key) DO NOTHING
                 """,
                 (str(self.schema_version),),
             )
+        self._initialized = True
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path, timeout=5)
@@ -158,6 +175,17 @@ class SQLiteSwarmStore(SwarmStore):
 
     def save_task(self, task: Task) -> None:
         self.init()
+        # Persist the task row and its task.saved event in a single
+        # transaction. Splitting them across two connections left a window
+        # where a crash after the task write but before the event write would
+        # produce state with no corresponding event (a torn write that breaks
+        # event-cursor consumers).
+        payload = {
+            "task_id": task.id,
+            "role": task.role,
+            "status": str(task.status),
+            "adapter": task.adapter,
+        }
         with self._session() as connection:
             connection.execute(
                 """
@@ -171,16 +199,10 @@ class SQLiteSwarmStore(SwarmStore):
                 """,
                 (task.id, task.job_id, task.role, str(task.status), self._dumps(task)),
             )
-        self.emit(
-            task.job_id,
-            "task.saved",
-            {
-                "task_id": task.id,
-                "role": task.role,
-                "status": str(task.status),
-                "adapter": task.adapter,
-            },
-        )
+            connection.execute(
+                "INSERT INTO events(job_id, at, event, payload) VALUES(?, ?, ?, ?)",
+                (task.job_id, now_iso(), "task.saved", json.dumps(payload, sort_keys=True)),
+            )
 
     def save_run(self, run: AgentRun) -> None:
         self.init()
@@ -270,10 +292,18 @@ class SQLiteSwarmStore(SwarmStore):
         ]
 
     def latest_job(self) -> Optional[Job]:
-        jobs = self.list_jobs()
-        if not jobs:
+        self.init()
+        # Sort by the embedded created_at on the SQLite side and only
+        # deserialize the single newest row, instead of loading and decoding
+        # every job just to take a max().
+        row = self._one(
+            "SELECT data FROM jobs "
+            "ORDER BY json_extract(data, '$.created_at') DESC, id DESC "
+            "LIMIT 1"
+        )
+        if row is None:
             return None
-        return max(jobs, key=lambda job: job.created_at)
+        return job_from_dict(json.loads(row["data"]))
 
     def list_tasks(self, job_id: str) -> list[Task]:
         self.init()
@@ -292,6 +322,42 @@ class SQLiteSwarmStore(SwarmStore):
             for row in self._all(
                 "SELECT data FROM artifacts WHERE job_id = ? ORDER BY id",
                 (job_id,),
+            )
+        ]
+
+    def count_artifacts(self, job_id: str) -> int:
+        self.init()
+        row = self._one(
+            "SELECT COUNT(*) AS n FROM artifacts WHERE job_id = ?",
+            (job_id,),
+        )
+        return int(row["n"]) if row is not None else 0
+
+    def get_artifacts_by_ids(
+        self, job_id: str, artifact_ids: "Iterable[str]"
+    ) -> dict[str, Artifact]:
+        unique_ids = [aid for aid in dict.fromkeys(artifact_ids) if aid]
+        if not unique_ids:
+            return {}
+        self.init()
+        placeholders = ",".join("?" for _ in unique_ids)
+        rows = self._all(
+            f"SELECT data FROM artifacts WHERE job_id = ? AND id IN ({placeholders})",
+            (job_id, *unique_ids),
+        )
+        out: dict[str, Artifact] = {}
+        for row in rows:
+            artifact = artifact_from_dict(json.loads(row["data"]))
+            out[artifact.id] = artifact
+        return out
+
+    def list_artifacts_by_type(self, artifact_type: str) -> list[Artifact]:
+        self.init()
+        return [
+            artifact_from_dict(json.loads(row["data"]))
+            for row in self._all(
+                "SELECT data FROM artifacts WHERE type = ? ORDER BY id",
+                (artifact_type,),
             )
         ]
 
@@ -321,7 +387,7 @@ class SQLiteSwarmStore(SwarmStore):
                 for key in ["scope", "statement", "evidence", "adapter", "role", "topic"]
             ).lower()
             score = sum(1 for term in terms if term in haystack)
-            confidence = float(memory.get("confidence", 0))
+            confidence = _coerce_confidence(memory.get("confidence"))
             scored.append((score, confidence, memory))
         scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
         return [memory for score, _, memory in scored[:limit] if score > 0 or not terms]
