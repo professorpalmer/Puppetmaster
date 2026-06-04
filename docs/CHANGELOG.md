@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.9.10
+
+**Workers can now self-serve CodeGraph mid-task; plus the deferred lint cleanup.** Puppetmaster runs each worker in a hermetic SDK sandbox, so CodeGraph reaches workers as an injected one-time context snapshot rather than as live tools — which meant reverse-dependency / blast-radius checks fell back to ripgrep/git once the snapshot went stale. This release tells workers they can refresh that view themselves. No sandbox or behavior change to the orchestrator.
+
+- **Workers told they can refresh their own CodeGraph view.** Every adapter (cursor/claude/codex) injects CodeGraph through one helper, `codegraph_prompt_section`. It now instructs workers that the snapshot is a one-time view and that they can refresh or expand it on demand — to trace callers, reverse dependencies, or a change's blast radius — via the ABI-safe `python -m puppetmaster codegraph search/context/affected` CLI they can already shell to, with a graceful ripgrep/git fallback when the CLI isn't importable in the worker's environment. This is prompt-level guidance only: no change to the `settingSources: []` sandbox and no per-worker MCP boot.
+- **Lint cleanup (carried over from the v0.9.9 cycle).** Cleared the pre-existing ruff errors that predated the audit work: hoisted `dashboard.py`'s models/store/stitcher imports to the top of the module (E402) and moved `worker_runtime.py`'s `SwarmStore` import under `TYPE_CHECKING` (F821, zero runtime cost with `from __future__ import annotations`). `ruff check puppetmaster/` is now clean.
+- Added `test_codegraph_prompt_section_advertises_self_serve_cli`; full suite **368** green.
+
 ## v0.9.9
 
 **Fifth-pass audit: fixes two store regressions the v0.9.8 optimization pass introduced, plus parity hardening.** A follow-up CodeGraph + review swarm against this repo caught that two of the v0.9.8 store changes diverged the SQLite backend from the file backend. This patch restores exact cross-backend parity (with one verified repro fixed) and tightens the new batch APIs. No public API changes.

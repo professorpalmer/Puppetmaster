@@ -1366,6 +1366,17 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertEqual(prompt, "Inspect repo")
         self.assertFalse(used)
 
+    def test_codegraph_prompt_section_advertises_self_serve_cli(self) -> None:
+        from puppetmaster.codegraph import codegraph_prompt_section
+
+        section = codegraph_prompt_section("auth.py:42 -> login()")
+        self.assertIn("auth.py:42", section)
+        # Workers run sandboxed (no live MCP tools), so the injected snapshot
+        # must tell them they can refresh the graph view themselves via the
+        # ABI-safe CLI instead of only relying on the frozen context.
+        self.assertIn("python -m puppetmaster codegraph", section)
+        self.assertIn("affected", section)
+
     def test_run_codegraph_cli_reports_missing_cli(self) -> None:
         from puppetmaster import codegraph as codegraph_module
 

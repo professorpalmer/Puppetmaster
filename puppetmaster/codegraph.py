@@ -231,6 +231,17 @@ def codegraph_prompt_section(context: str) -> str:
             "re-scan the whole codebase if CodeGraph already located the "
             "relevant area.",
             "",
+            "This snapshot is a one-time view captured before you started. To "
+            "refresh or expand it on demand -- e.g. to trace callers, reverse "
+            "dependencies, or the blast radius of a change -- run the ABI-safe "
+            "CodeGraph CLI from the repo root instead of falling back to a "
+            "whole-repo grep:",
+            "  python -m puppetmaster codegraph search '<symbol or keyword>'",
+            "  python -m puppetmaster codegraph context '<task>' --max-nodes 15",
+            "  python -m puppetmaster codegraph affected <path>",
+            "If that command is unavailable in this environment it will simply "
+            "error; fall back to ripgrep/git as usual.",
+            "",
         ]
     )
 
