@@ -26,6 +26,34 @@ _MAX_FALLBACK_ROUNDS = 3
 # forever (and can't quietly run up a frontier-model bill).
 _MAX_ESCALATION_ATTEMPTS = 2
 
+# Roles that judge or verify the system should not inherit prior promoted
+# conclusions — that would circularly feed audits their own past claims.
+_FRESH_JUDGMENT_ROLES = frozenset(
+    {
+        "audit",
+        "conflict-auditor",
+        "cursor-plan",
+        "cursor-review",
+        "decision-explainer",
+        "plan",
+        "redteam",
+        "review",
+        "reviewer",
+        "security-review",
+        "test",
+        "test-coverage-reviewer",
+    }
+)
+
+
+def _memory_injection_enabled(spec: WorkerSpec) -> bool:
+    override = spec.payload.get("disable_memory")
+    if override is True:
+        return False
+    if override is False:
+        return True
+    return spec.role not in _FRESH_JUDGMENT_ROLES
+
 
 @dataclass(frozen=True)
 class RunResult:
@@ -962,16 +990,21 @@ class Orchestrator:
         memory = self.store.retrieve_memory(goal)
         if not memory:
             return specs
-        return [
-            replace(
-                spec,
-                payload={
-                    **spec.payload,
-                    "retrieved_memory": memory,
-                },
+        result: list[WorkerSpec] = []
+        for spec in specs:
+            if not _memory_injection_enabled(spec):
+                result.append(spec)
+                continue
+            result.append(
+                replace(
+                    spec,
+                    payload={
+                        **spec.payload,
+                        "retrieved_memory": memory,
+                    },
+                )
             )
-            for spec in specs
-        ]
+        return result
 
     @staticmethod
     def _initial_task_status(depends_on: list[str]) -> TaskStatus:

@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.9.11
+
+**User-feedback pass: fresh-perspective audits, delegate-first agent rules, and first-class Codex verbs.** Driven by field reports that PM audits were inheriting their own prior conclusions (circular self-evaluation) and that IDE chat agents (e.g. JetBrains AI Chat + Codex) kept solving multi-step tasks inline instead of delegating. This release makes evaluative and swarm runs judge fresh by default, hardens the rules `install-rules` writes from a soft nudge into a delegate-first directive, and promotes the existing Codex CLI adapter to first-class MCP verbs. No breaking API changes.
+
+- **Audits/reviews now run with a fresh perspective by default** — evaluative roles (`audit`, `redteam`, `review`, `conflict-auditor`, `test-coverage-reviewer`, …) no longer inherit prior promoted conclusions, which previously let an audit anchor on the very claims it was meant to test. Added a `disable_memory` payload override (`True` → always fresh, `False` → always inject, absent → role-based). Implement runs still receive memory for continuity.
+- **Swarm runs default to a fresh perspective** — `puppetmaster_start_swarm` / `puppetmaster_start_cursor_swarm` (the read-only analysis entry points) stamp `disable_memory: true` on every worker unless the caller passes `disable_memory: false`; the CLI `run` verb gains `--disable-memory` / `--enable-memory`.
+- **Hardened delegate-first agent rules** — `puppetmaster install-rules` now writes a trigger convention (`Use Puppetmaster to …` / `PM this …`) and a delegate-first gate for multi-file/audit/refactor work, with a tight inline carve-out for trivial edits and a native-tooling fallback. One change updates the Cursor `.mdc`, `AGENTS.md`, Codex instructions, and `CLAUDE.md` alike.
+- **First-class Codex MCP verbs** — `puppetmaster_codex` and `puppetmaster_start_codex` mirror the Claude/OpenAI worker verbs, driving the existing `codex exec --json` CLI adapter directly instead of only via `start_implement --adapter codex`.
+- Full suite **377** green; `ruff check puppetmaster/` clean.
+
 ## v0.9.10
 
 **Workers can now self-serve CodeGraph mid-task; plus the deferred lint cleanup.** Puppetmaster runs each worker in a hermetic SDK sandbox, so CodeGraph reaches workers as an injected one-time context snapshot rather than as live tools — which meant reverse-dependency / blast-radius checks fell back to ripgrep/git once the snapshot went stale. This release tells workers they can refresh that view themselves. No sandbox or behavior change to the orchestrator.

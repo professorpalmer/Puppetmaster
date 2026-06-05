@@ -51,35 +51,54 @@ RULE_BODY = textwrap.dedent(
 
     Puppetmaster is an MCP-based agent orchestrator with structured worker
     swarms, durable SQLite state, tiered model routing, and zero-token
-    follow-ups via stored artifacts. The `puppetmaster_*` MCP tools are
-    available in this environment when Puppetmaster's MCP server is
-    registered (run `puppetmaster install-cursor-mcp` or
-    `puppetmaster install-codex-mcp` once if it isn't).
+    follow-ups via stored artifacts. When Puppetmaster's MCP server is
+    registered (`puppetmaster install-cursor-mcp` or
+    `puppetmaster install-codex-mcp`), the `puppetmaster_*` MCP tools are
+    available in this environment.
 
-    ## When to prefer Puppetmaster over a single-agent loop
+    ## Trigger convention (must obey)
 
-    - Multi-file refactors spanning 3+ files
-    - Audits ("review every endpoint", "find all places where X happens")
-    - Tasks where the result will be referenced again later in this session
-      or next session — call `puppetmaster_artifacts <job_id>` for
-      zero-token recall instead of re-running the work
-    - Anything that benefits from N workers in parallel rather than one
-      serial loop, or that would otherwise blow the context window
+    When the user says **"Use Puppetmaster to …"**, **"PM this …"**, or
+    otherwise names Puppetmaster for a task, route that work through the
+    `puppetmaster_*` MCP tools — do not answer inline.
 
-    ## When NOT to use Puppetmaster
+    ## Delegate-first gate (default path)
 
-    - Single-line fixes, comment additions, simple typos
-    - Tasks completable in under 30 seconds directly
-    - Interactive scaffolding where the user is iterating fast
+    Before attempting multi-step work inline, start a Puppetmaster verb
+    (`puppetmaster_start_cursor_swarm`, `puppetmaster_start_swarm`,
+    `puppetmaster_start_implement`, or the matching sync verbs) when the
+    task is any of:
+
+    - Multi-file (3+ files) or cross-cutting refactor/migration
+    - An audit, review, or "find all X" search
+    - Work whose result will be reused later in this or a future session
+
+    Swarms and reviews run read-only analysis; building goes through
+    implement. Recall prior results with `puppetmaster_artifacts <job_id>`
+    at zero token cost.
+
+    ## When NOT to use Puppetmaster (stay inline)
+
+    - Trivial single-file edits, typos, one-line fixes
+    - Quick factual questions
+    - Fast interactive iteration where the user is steering turn-by-turn
+
+    Routing those through Puppetmaster wastes tokens and latency.
+
+    ## Fallback
+
+    If `puppetmaster_*` tools are not connected, fall back to native
+    tooling — do not pretend the tools exist.
 
     ## Usage
 
     1. `puppetmaster_route_task <prompt> --role <role>` — dry-run that
        returns the chosen model, estimated cost, and reasoning. Use
        whenever spend matters or the task is ambiguous.
-    2. `puppetmaster_start_cursor_plan` / `puppetmaster_start_claude_implement`
-       / `puppetmaster_start_implement` (platform-agnostic full-edit verb) —
-       start a swarm.
+    2. `puppetmaster_start_cursor_swarm` / `puppetmaster_start_swarm` for
+       read-only analysis; `puppetmaster_start_implement` /
+       `puppetmaster_start_claude_implement` / `puppetmaster_start_codex`
+       for full-edit builds.
     3. `puppetmaster_artifacts <job_id>` — read structured outputs at zero
        token cost (results persist in SQLite).
     4. `puppetmaster_doctor` — sanity-check Puppetmaster's runtime
@@ -142,8 +161,8 @@ def render_cursor_mdc() -> str:
     user message, not just when a glob matches.
     """
     description = (
-        "Prefer Puppetmaster MCP for multi-file refactors, audits, and "
-        "any task that benefits from worker swarms with durable artifacts."
+        "Delegate multi-file refactors, audits, and reusable work to "
+        "Puppetmaster MCP swarms; obey 'Use Puppetmaster to …' triggers."
     )
     frontmatter = (
         "---\n"

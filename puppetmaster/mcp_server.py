@@ -786,6 +786,18 @@ def _build_tools() -> list[McpTool]:
             handler=start_claude,
         ),
         McpTool(
+            name="puppetmaster_codex",
+            description="Run a full-featured Codex CLI worker through Puppetmaster and wait for completion.",
+            input_schema=codex_schema(),
+            handler=run_codex,
+        ),
+        McpTool(
+            name="puppetmaster_start_codex",
+            description="Start a Codex CLI worker asynchronously and return job_id immediately.",
+            input_schema=codex_schema(),
+            handler=start_codex,
+        ),
+        McpTool(
             name="puppetmaster_cursor_implement",
             description="Run Cursor as a full-edit Puppetmaster worker (edits files, captures a PATCH) and wait for completion.",
             input_schema=cursor_implement_schema(),
@@ -1327,6 +1339,9 @@ def cursor_command(
     timeout_seconds = args.get("timeout_seconds")
     if timeout_seconds:
         command.extend(["--timeout-seconds", str(timeout_seconds)])
+    disable_memory = args.get("disable_memory")
+    if disable_memory is True or (disable_memory is None and (review or plan)):
+        command.append("--disable-memory")
     return command
 
 
@@ -1354,10 +1369,18 @@ def codex_command(args: JsonObject) -> list[str]:
         command.extend(["--model", str(args["model"])])
     if args.get("sandbox"):
         command.extend(["--sandbox", str(args["sandbox"])])
+    if args.get("approval_policy"):
+        command.extend(["--approval-policy", str(args["approval_policy"])])
     if args.get("timeout_seconds"):
         command.extend(["--timeout-seconds", str(args["timeout_seconds"])])
     if args.get("allow_dirty"):
         command.append("--allow-dirty")
+    if args.get("executable"):
+        command.extend(["--executable", str(args["executable"])])
+    if args.get("dangerously_bypass_approvals_and_sandbox"):
+        command.append("--dangerously-bypass-approvals-and-sandbox")
+    if args.get("disable_codegraph"):
+        command.append("--disable-codegraph")
     return command
 
 
@@ -1404,6 +1427,14 @@ def run_claude(args: JsonObject) -> JsonObject:
 
 def start_claude(args: JsonObject) -> JsonObject:
     return start_cli(claude_command(args), args)
+
+
+def run_codex(args: JsonObject) -> JsonObject:
+    return run_cli(codex_command(args), args)
+
+
+def start_codex(args: JsonObject) -> JsonObject:
+    return start_cli(codex_command(args), args)
 
 
 def claude_command(args: JsonObject) -> list[str]:
@@ -1482,6 +1513,7 @@ def start_swarm(args: JsonObject) -> JsonObject:
     worker_mode = args.get("worker_mode")
     if worker_mode:
         command.extend(["--worker-mode", str(worker_mode)])
+    _append_swarm_memory_flags(command, args)
     return start_cli(command, args)
 
 
@@ -1498,6 +1530,13 @@ def start_cursor_swarm(args: JsonObject) -> JsonObject:
     if worker_mode:
         command.extend(["--worker-mode", str(worker_mode)])
     return start_cli(command, args)
+
+
+def _append_swarm_memory_flags(command: list[str], args: JsonObject) -> None:
+    if args.get("disable_memory") is False:
+        command.append("--enable-memory")
+    elif args.get("disable_memory", True):
+        command.append("--disable-memory")
 
 
 def normalized_roles(args: JsonObject) -> list[str]:
@@ -1552,6 +1591,10 @@ def write_generated_swarm_config(args: JsonObject, roles: list[str], adapter: st
                 payload["min_capability"] = int(min_capability)
             if isinstance(required_tags, list) and required_tags:
                 payload["required_tags"] = [str(tag) for tag in required_tags if str(tag).strip()]
+        if args.get("disable_memory") is False:
+            payload["disable_memory"] = False
+        else:
+            payload["disable_memory"] = True
         workers.append(
             {
                 "role": role,
@@ -1982,6 +2025,8 @@ def environment(args: JsonObject) -> dict[str, str]:
         env["OPENAI_BASE_URL"] = str(args["openai_base_url"])
     if args.get("openai_organization"):
         env["OPENAI_ORG_ID"] = str(args["openai_organization"])
+    if args.get("codex_command"):
+        env["CODEX_COMMAND"] = str(args["codex_command"])
     return env
 
 
@@ -2122,6 +2167,13 @@ def goal_schema(default_goal: str) -> JsonObject:
             "cursor_api_key": {
                 "type": "string",
                 "description": "Optional Cursor API key. Prefer MCP env config instead.",
+            },
+            "disable_memory": {
+                "type": "boolean",
+                "description": (
+                    "Skip promoted shared-memory injection for a fresh perspective. "
+                    "Evaluative worker roles skip memory by default."
+                ),
             },
         }
     )
@@ -2374,6 +2426,56 @@ def repair_codegraph_schema() -> JsonObject:
                     "Workspace to run the verification `codegraph status` in. "
                     "Defaults to the cwd argument or process cwd."
                 ),
+            },
+        }
+    )
+    return schema
+
+
+def codex_schema() -> JsonObject:
+    schema = goal_schema("Implement the requested change and run focused tests.")
+    schema["properties"].update(
+        {
+            "model": {
+                "type": "string",
+                "description": (
+                    "Optional Codex model name. Defaults to gpt-5.4-mini when omitted."
+                ),
+            },
+            "sandbox": {
+                "type": "string",
+                "enum": ["read-only", "workspace-write", "danger-full-access"],
+                "description": "Codex sandbox mode. Defaults to workspace-write.",
+            },
+            "approval_policy": {
+                "type": "string",
+                "default": "never",
+                "description": "Codex approval policy for non-interactive automation.",
+            },
+            "allow_dirty": {
+                "type": "boolean",
+                "default": False,
+                "description": "Allow Codex to run in a dirty working tree.",
+            },
+            "executable": {
+                "type": "string",
+                "description": "Optional Codex CLI executable or command override.",
+            },
+            "dangerously_bypass_approvals_and_sandbox": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "Disable Codex sandbox and approval prompts. Only when externally sandboxed."
+                ),
+            },
+            "disable_codegraph": {
+                "type": "boolean",
+                "default": False,
+                "description": "Skip CodeGraph context injection.",
+            },
+            "codex_command": {
+                "type": "string",
+                "description": "Optional Codex CLI command override (e.g. path to codex binary).",
             },
         }
     )
