@@ -208,6 +208,8 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertIn("puppetmaster_start_cursor_review", tool_names)
         self.assertIn("puppetmaster_claude_implement", tool_names)
         self.assertIn("puppetmaster_start_claude_implement", tool_names)
+        self.assertIn("puppetmaster_codex", tool_names)
+        self.assertIn("puppetmaster_start_codex", tool_names)
         self.assertIn("puppetmaster_start_swarm", tool_names)
         self.assertIn("puppetmaster_start_cursor_swarm", tool_names)
         self.assertIn("puppetmaster_status", tool_names)
@@ -906,6 +908,63 @@ class PuppetmasterTests(unittest.TestCase):
 
             self.assertTrue(scoped)
             self.assertFalse(any(memory["scope"] == "swarm.findings" for memory in missing))
+
+    def test_fresh_by_default_skips_memory_for_evaluative_roles(self) -> None:
+        from puppetmaster.models import MemoryRecord
+
+        goal = "audit fresh memory injection"
+        memory = MemoryRecord(
+            scope="swarm.verification",
+            statement="prior audit claimed everything is clean",
+            evidence=["e"],
+            source_artifacts=["artifact_x"],
+            confidence=0.9,
+        )
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            store.promote_memory(memory)
+            orch = Orchestrator(store)
+
+            eval_spec = WorkerSpec(role="audit", instruction="verify the delta")
+            explore_spec = WorkerSpec(role="explore", instruction="map the repo")
+            routed = orch._with_retrieved_memory([eval_spec, explore_spec], goal)
+
+            self.assertNotIn("retrieved_memory", routed[0].payload)
+            self.assertIn("retrieved_memory", routed[1].payload)
+            self.assertTrue(routed[1].payload["retrieved_memory"])
+
+    def test_disable_memory_payload_overrides_role_defaults(self) -> None:
+        from puppetmaster.models import MemoryRecord
+
+        goal = "shared context for workers"
+        memory = MemoryRecord(
+            scope="swarm.findings",
+            statement="shared context for workers",
+            evidence=["e"],
+            source_artifacts=["artifact_y"],
+            confidence=0.85,
+        )
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            store.promote_memory(memory)
+            orch = Orchestrator(store)
+
+            forced_fresh = WorkerSpec(
+                role="explore",
+                instruction="explore without memory",
+                payload={"disable_memory": True},
+            )
+            forced_memory = WorkerSpec(
+                role="audit",
+                instruction="audit with inherited memory",
+                payload={"disable_memory": False},
+            )
+            routed = orch._with_retrieved_memory([forced_fresh, forced_memory], goal)
+
+            self.assertNotIn("retrieved_memory", routed[0].payload)
+            self.assertIn("retrieved_memory", routed[1].payload)
 
     def test_subprocess_swarm_emits_worker_process_events(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -5121,6 +5180,175 @@ class ModelRouterTests(unittest.TestCase):
             payload = cfg["workers"][0]["payload"]
             self.assertNotIn("auto_route", payload)
 
+    def test_mcp_swarm_config_defaults_to_fresh_memory(self) -> None:
+        from puppetmaster.mcp_server import write_generated_swarm_config
+        from puppetmaster.models import MemoryRecord
+        from puppetmaster.orchestrator import Orchestrator
+        from puppetmaster.config import load_config
+
+        goal = "swarm fresh memory default"
+        memory = MemoryRecord(
+            scope="swarm.findings",
+            statement="prior swarm conclusion",
+            evidence=["e"],
+            source_artifacts=["artifact_z"],
+            confidence=0.9,
+        )
+        with TemporaryDirectory() as tmp:
+            args = {"goal": goal, "cwd": tmp, "state_dir": str(Path(tmp) / "state")}
+            config_path = write_generated_swarm_config(args, ["explore", "audit"], "cursor")
+            cfg = json.loads(Path(config_path).read_text())
+            for worker in cfg["workers"]:
+                self.assertTrue(worker["payload"].get("disable_memory"))
+
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            store.promote_memory(memory)
+            specs = load_config(config_path).workers
+            routed = Orchestrator(store)._with_retrieved_memory(specs, goal)
+            for spec in routed:
+                self.assertNotIn(
+                    "retrieved_memory",
+                    spec.payload,
+                    f"swarm role={spec.role} should be fresh by default",
+                )
+
+    def test_mcp_swarm_config_disable_memory_false_restores_injection(self) -> None:
+        from puppetmaster.mcp_server import write_generated_swarm_config
+        from puppetmaster.models import MemoryRecord
+        from puppetmaster.orchestrator import Orchestrator
+        from puppetmaster.config import load_config
+
+        goal = "swarm memory opt-in"
+        memory = MemoryRecord(
+            scope="swarm.findings",
+            statement="shared swarm context",
+            evidence=["e"],
+            source_artifacts=["artifact_w"],
+            confidence=0.85,
+        )
+        with TemporaryDirectory() as tmp:
+            args = {
+                "goal": goal,
+                "cwd": tmp,
+                "state_dir": str(Path(tmp) / "state"),
+                "disable_memory": False,
+            }
+            config_path = write_generated_swarm_config(args, ["explore"], "cursor")
+            cfg = json.loads(Path(config_path).read_text())
+            self.assertFalse(cfg["workers"][0]["payload"]["disable_memory"])
+
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            store.promote_memory(memory)
+            specs = load_config(config_path).workers
+            routed = Orchestrator(store)._with_retrieved_memory(specs, goal)
+            self.assertIn("retrieved_memory", routed[0].payload)
+
+    def test_start_swarm_passes_disable_memory_flag_by_default(self) -> None:
+        from puppetmaster import mcp_server
+
+        captured = {}
+
+        def fake_start_cli(command, args):
+            captured["command"] = command
+            return {"ok": True}
+
+        with patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
+            mcp_server.start_swarm(
+                {
+                    "goal": "fresh swarm",
+                    "cwd": ".",
+                    "roles": ["explore"],
+                    "allow_local_demo": True,
+                }
+            )
+
+        self.assertIn("--disable-memory", captured["command"])
+
+    def test_start_swarm_disable_memory_false_passes_enable_memory(self) -> None:
+        from puppetmaster import mcp_server
+
+        captured = {}
+
+        def fake_start_cli(command, args):
+            captured["command"] = command
+            return {"ok": True}
+
+        with patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
+            mcp_server.start_swarm(
+                {
+                    "goal": "memory swarm",
+                    "cwd": ".",
+                    "roles": ["explore"],
+                    "allow_local_demo": True,
+                    "disable_memory": False,
+                }
+            )
+
+        self.assertIn("--enable-memory", captured["command"])
+        self.assertNotIn("--disable-memory", captured["command"])
+
+    def test_codex_schema_requires_goal(self) -> None:
+        from puppetmaster.mcp_server import codex_schema
+
+        schema = codex_schema()
+        self.assertIn("goal", schema["required"])
+        self.assertIn("sandbox", schema["properties"])
+        self.assertIn("executable", schema["properties"])
+
+    def test_run_codex_builds_codex_cli_command(self) -> None:
+        from puppetmaster import mcp_server
+
+        captured = {}
+
+        def fake_run_cli(command, args):
+            captured["command"] = command
+            return {"ok": True}
+
+        with patch.object(mcp_server, "run_cli", side_effect=fake_run_cli):
+            mcp_server.run_codex(
+                {
+                    "goal": "ship codex worker",
+                    "cwd": "/tmp/repo",
+                    "model": "gpt-5.4-mini",
+                    "sandbox": "read-only",
+                    "timeout_seconds": 120,
+                    "allow_dirty": True,
+                    "executable": "/opt/codex",
+                }
+            )
+
+        command = captured["command"]
+        self.assertEqual(command[0], "codex")
+        self.assertIn("ship codex worker", command)
+        self.assertIn("--cwd", command)
+        self.assertIn("/tmp/repo", command)
+        self.assertIn("--model", command)
+        self.assertIn("gpt-5.4-mini", command)
+        self.assertIn("--sandbox", command)
+        self.assertIn("read-only", command)
+        self.assertIn("--timeout-seconds", command)
+        self.assertIn("120", command)
+        self.assertIn("--allow-dirty", command)
+        self.assertIn("--executable", command)
+        self.assertIn("/opt/codex", command)
+
+    def test_start_codex_builds_codex_cli_command(self) -> None:
+        from puppetmaster import mcp_server
+
+        captured = {}
+
+        def fake_start_cli(command, args):
+            captured["command"] = command
+            return {"ok": True}
+
+        with patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
+            mcp_server.start_codex({"goal": "async codex", "cwd": "."})
+
+        self.assertEqual(captured["command"][0], "codex")
+        self.assertIn("async codex", captured["command"])
+
 
 class _FakeUrlopenResponse:
     """Stand-in for a urlopen() context manager returning a fixed body + status."""
@@ -5762,6 +5990,8 @@ class InstallRulesTests(unittest.TestCase):
         self.assertIn("alwaysApply: true", content)
         self.assertIn("# Puppetmaster orchestration", content)
         self.assertIn("puppetmaster_route_task", content)
+        self.assertIn("Use Puppetmaster to", content)
+        self.assertIn("PM this", content)
 
     def test_render_agents_block_is_marker_wrapped(self):
         from puppetmaster.rules import BEGIN_MARKER, END_MARKER, render_agents_block
@@ -5770,6 +6000,7 @@ class InstallRulesTests(unittest.TestCase):
         self.assertTrue(block.startswith(BEGIN_MARKER))
         self.assertTrue(block.rstrip().endswith(END_MARKER))
         self.assertIn("# Puppetmaster orchestration", block)
+        self.assertIn("Delegate-first gate", block)
 
     def test_merge_into_empty_creates_block(self):
         from puppetmaster.rules import merge_block_into_text, render_agents_block

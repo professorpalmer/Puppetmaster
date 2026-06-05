@@ -236,6 +236,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="subprocess",
         help="Use subprocess workers, inline workers, or wait for warm daemon workers.",
     )
+    run.add_argument(
+        "--disable-memory",
+        action="store_true",
+        help="Skip promoted shared-memory injection on all workers (fresh swarm perspective).",
+    )
+    run.add_argument(
+        "--enable-memory",
+        action="store_true",
+        help="Force promoted shared-memory injection on all workers.",
+    )
 
     jobs_parser = subcommands.add_parser("jobs", help="List known jobs.")
     jobs_parser.add_argument(
@@ -457,6 +467,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-dirty",
         action="store_true",
         help="Allow an --implement run to start in a dirty working tree.",
+    )
+    cursor.add_argument(
+        "--disable-memory",
+        action="store_true",
+        help="Skip promoted shared-memory injection for a fresh perspective.",
     )
 
     claude = subcommands.add_parser("claude", help="Run a full-featured Claude Code worker.")
@@ -1092,22 +1107,34 @@ def _main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     if args.command == "run":
+        from dataclasses import replace
+
+        from puppetmaster.workers import specs_for_roles
+
         if args.config:
             config = load_config(args.config)
-            result = Orchestrator(store).run(
-                args.goal,
-                specs=config.workers,
-                lease_seconds=config.lease_seconds,
-                worker_mode=args.worker_mode,
-                on_job_created=on_job_created,
-            )
+            specs = config.workers
+            lease_seconds = config.lease_seconds
         else:
-            result = Orchestrator(store).run(
-                args.goal,
-                roles=args.workers,
-                worker_mode=args.worker_mode,
-                on_job_created=on_job_created,
-            )
+            specs = specs_for_roles(args.workers)
+            lease_seconds = 5
+        if args.enable_memory:
+            specs = [
+                replace(spec, payload={**spec.payload, "disable_memory": False})
+                for spec in specs
+            ]
+        elif args.disable_memory:
+            specs = [
+                replace(spec, payload={**spec.payload, "disable_memory": True})
+                for spec in specs
+            ]
+        result = Orchestrator(store).run(
+            args.goal,
+            specs=specs,
+            lease_seconds=lease_seconds,
+            worker_mode=args.worker_mode,
+            on_job_created=on_job_created,
+        )
         print_run_result(result.job.id, len(result.artifacts), result.summary_path)
         return 0
 
@@ -1129,6 +1156,8 @@ def _main(argv: Optional[list[str]] = None) -> int:
         if implement:
             payload["mode"] = "implement"
             payload["allow_dirty"] = getattr(args, "allow_dirty", False)
+        if args.disable_memory or args.review or args.plan:
+            payload["disable_memory"] = True
         result = Orchestrator(store).run(
             args.prompt,
             specs=[
