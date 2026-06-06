@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.9.12
+
+**Field-report fix pass: a dead orchestrator can no longer masquerade as a running job, and the run/CLI surface stops hiding read-only swarms and silent worker output.** Driven by a real JAD UI migration session where a backgrounded orchestrator got reaped and left its job wedged in `running` forever, `show` crashed with a raw `Errno 2`, and an analysis swarm's `implement` role wrote nothing while looking like it should. Eleven grounded fixes; no breaking API changes.
+
+- **Stalled-job liveness + reaper (new `puppetmaster/liveness.py`).** The orchestrator now stamps a heartbeat sidecar (`orchestrator.json`: pid/host/time) and refreshes it across worker batches. A new reaper transitions a dead-orchestrator job `running -> stalled` (new `JobStatus.STALLED`) when its pid is provably gone — or when no task holds a live lease and nothing has progressed past `PUPPETMASTER_STALL_AFTER_SECONDS` (default 180) — and **auto-requeues lease-expired tasks** so no manual `recover` is needed. Wired into `status`/`jobs`, plus a new `reap` command. A dead job is never reported as live again.
+- **`finalize` / `wait` / graceful `show`.** `show` now degrades to a live preview with a friendly "job not finalized — run `finalize`" note instead of a raw `[Errno 2] … stitched.md`. New `puppetmaster finalize <job>` force-stitches and completes a job whose orchestrator died before stitching. New `puppetmaster wait <job> --timeout` blocks until `complete`/`failed`/`stalled` and exits non-zero on the bad states; `await` now treats `stalled` as terminal.
+- **Honest swarm mode banner.** A read-only analysis run no longer looks like it edits code: a mode classifier + one-line banner (`mode=analysis (read-only)` vs `mode=edit`) prints on `run`/`cursor`/`claude`/`codex`/`openai` and emits a `job.mode` event; the analysis-swarm `implement` role is documented as plan-only.
+- **`cursor --implement` streams progress.** Implement runs tee stdout/stderr to a live sidecar log line-by-line with a `still working` heartbeat every 30s — no more 0-byte-log-looks-hung. Worker startup failures now leave a trace (`startup_error-*.log` + `worker.startup_failed` event) instead of vanishing.
+- **Router on direct adapters.** `cursor`/`claude`/`codex`/`openai` gain `--auto-route` (+ `--routing-policy` / `--max-cost-usd` / `--min-capability`), pinned to the invoked adapter, so a direct run emits a ROUTING artifact + cost stamp like a swarm does.
+- **Quality-of-life.** `codegraph` passthrough accepts `--cwd`/`--timeout` after the subcommand (e.g. `codegraph init --cwd …`) and disables child pagers when stdout isn't a TTY. New `mcp doctor` distinguishes a dropped stdio pipe (daemon healthy → restart MCP in Cursor) from a genuinely dead server.
+- Added 11 focused friction-fix tests; full suite **388** green.
+
 ## v0.9.11
 
 **User-feedback pass: fresh-perspective audits, delegate-first agent rules, and first-class Codex verbs.** Driven by field reports that PM audits were inheriting their own prior conclusions (circular self-evaluation) and that IDE chat agents (e.g. JetBrains AI Chat + Codex) kept solving multi-step tasks inline instead of delegating. This release makes evaluative and swarm runs judge fresh by default, hardens the rules `install-rules` writes from a soft nudge into a delegate-first directive, and promotes the existing Codex CLI adapter to first-class MCP verbs. No breaking API changes.
