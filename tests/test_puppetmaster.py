@@ -28,6 +28,7 @@ from puppetmaster.adapters import (
     CodexAdapter,
     CursorAdapter,
     OpenAIAdapter,
+    StreamedProcess,
     UnconfiguredProviderAdapter,
     build_claude_code_command,
     build_codex_exec_command,
@@ -1299,11 +1300,12 @@ class PuppetmasterTests(unittest.TestCase):
                 "disable_codegraph": True,
             },
         )
-        completed = subprocess.CompletedProcess(
-            args=["node"],
+        completed = StreamedProcess(
             returncode=0,
             stdout=json.dumps({"status": "finished", "result": "done"}),
             stderr="",
+            timed_out=False,
+            live_log_path=None,
         )
         before = {"sha": "base123", "changed_files": [], "untracked_files": [], "diff": ""}
         after = {
@@ -1313,7 +1315,7 @@ class PuppetmasterTests(unittest.TestCase):
             "diff": "diff --git a/helper.py b/helper.py\n+def helper():\n+    return 1\n",
         }
         with patch("puppetmaster.adapters.git_snapshot", side_effect=[before, after]), patch(
-            "puppetmaster.adapters.subprocess.run", return_value=completed
+            "puppetmaster.adapters.run_streamed_subprocess", return_value=completed
         ) as run:
             artifacts = CursorAdapter().run(task, "goal", "worker-cursor")
 
@@ -1366,12 +1368,16 @@ class PuppetmasterTests(unittest.TestCase):
                 "disable_codegraph": True,
             },
         )
-        completed = subprocess.CompletedProcess(
-            args=["node"], returncode=0, stdout=json.dumps({"status": "finished", "result": "ok"}), stderr=""
+        completed = StreamedProcess(
+            returncode=0,
+            stdout=json.dumps({"status": "finished", "result": "ok"}),
+            stderr="",
+            timed_out=False,
+            live_log_path=None,
         )
         dirty = {"sha": "s", "changed_files": ["pre.py"], "untracked_files": [], "diff": ""}
         with patch("puppetmaster.adapters.git_snapshot", side_effect=[dirty, dirty]), patch(
-            "puppetmaster.adapters.subprocess.run", return_value=completed
+            "puppetmaster.adapters.run_streamed_subprocess", return_value=completed
         ) as run:
             artifacts = CursorAdapter().run(task, "goal", "worker-cursor")
 
@@ -8678,6 +8684,203 @@ class SavingsLedgerTests(unittest.TestCase):
                     confidence=0.9, evidence=["r"]))
             records, _, _ = collect_routing_records([store])
             self.assertEqual(len(records), 1)
+
+
+class PuppetmasterFrictionFixTests(unittest.TestCase):
+    """Coverage for the JAD-migration friction-log fixes (stalled reaper, mode
+    banner, show fallback, finalize, wait, codegraph flag hoist, routing flags)."""
+
+    def _store(self, tmp: str):
+        store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+        store.init()
+        return store
+
+    # --- #1: swarm mode classification ---------------------------------
+    def test_swarm_mode_analysis_vs_edit(self) -> None:
+        from puppetmaster.workers import DEFAULT_WORKERS, spec_edits_files, swarm_mode
+
+        # The default analysis swarm (all local) is read-only despite the
+        # "implement" role name.
+        self.assertEqual(swarm_mode(DEFAULT_WORKERS), "analysis")
+        self.assertFalse(any(spec_edits_files(s) for s in DEFAULT_WORKERS))
+
+        edit_spec = WorkerSpec(
+            role="cursor", instruction="x", adapter="cursor",
+            payload={"mode": "implement"},
+        )
+        self.assertTrue(spec_edits_files(edit_spec))
+        self.assertEqual(swarm_mode([edit_spec]), "edit")
+        self.assertTrue(
+            spec_edits_files(WorkerSpec(role="c", instruction="x", adapter="claude-code"))
+        )
+
+    # --- #2 / #4: stalled-job reaper -----------------------------------
+    def test_reaper_marks_dead_orchestrator_job_stalled(self) -> None:
+        from puppetmaster.liveness import reap_stalled_jobs
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            job = store.create_job("goal")
+            store.update_job_status(job.id, JobStatus.RUNNING)
+            # Record a heartbeat for a pid that is certainly not alive.
+            store.write_json(
+                store.job_dir(job.id) / "orchestrator.json",
+                {
+                    "pid": 999999999,
+                    "host": __import__("socket").gethostname(),
+                    "started_at": seconds_from_now(-30),
+                    "heartbeat_at": seconds_from_now(-30),
+                },
+            )
+            reaped = reap_stalled_jobs(store)
+            self.assertEqual(len(reaped), 1)
+            self.assertEqual(reaped[0]["reason"], "orchestrator_pid_gone")
+            self.assertEqual(store.get_job(job.id).status, JobStatus.STALLED)
+
+    def test_reaper_leaves_live_lease_job_running(self) -> None:
+        from puppetmaster.liveness import reap_stalled_jobs
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            job = store.create_job("goal")
+            store.update_job_status(job.id, JobStatus.RUNNING)
+            task = Task(
+                job_id=job.id, role="r", instruction="i",
+                status=TaskStatus.RUNNING,
+                lease_owner="w",
+                lease_expires_at=seconds_from_now(120),
+            )
+            store.save_task(task)
+            reaped = reap_stalled_jobs(store)
+            self.assertEqual(reaped, [])
+            self.assertEqual(store.get_job(job.id).status, JobStatus.RUNNING)
+
+    def test_reaper_requeues_stale_tasks(self) -> None:
+        from puppetmaster.liveness import reap_stalled_jobs
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            job = store.create_job("goal")
+            store.update_job_status(job.id, JobStatus.RUNNING)
+            # Fresh heartbeat from THIS process => orchestrator looks alive, so
+            # the job is not stalled, but the dead worker's task is requeued.
+            store.write_json(
+                store.job_dir(job.id) / "orchestrator.json",
+                {
+                    "pid": os.getpid(),
+                    "host": __import__("socket").gethostname(),
+                    "started_at": seconds_from_now(-5),
+                    "heartbeat_at": seconds_from_now(-1),
+                },
+            )
+            stale = Task(
+                job_id=job.id, role="r", instruction="i",
+                status=TaskStatus.RUNNING,
+                lease_owner="dead-worker",
+                lease_expires_at=seconds_from_now(-30),
+            )
+            store.save_task(stale)
+            reap_stalled_jobs(store)
+            self.assertEqual(store.get_job(job.id).status, JobStatus.RUNNING)
+            self.assertEqual(
+                store.get_task_by_id(stale.id).status, TaskStatus.QUEUED
+            )
+
+    # --- #3: show fallback + finalize ----------------------------------
+    def test_show_falls_back_to_preview_when_not_finalized(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            job = store.create_job("goal")
+            store.update_job_status(job.id, JobStatus.RUNNING)
+            rc = cli_main(
+                ["--state-dir", str(store.root), "--backend", "sqlite", "show", job.id]
+            )
+            self.assertEqual(rc, 0)  # no crash, even with no stitched.md
+
+    def test_finalize_stitches_and_completes(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            job = store.create_job("goal")
+            store.update_job_status(job.id, JobStatus.RUNNING)
+            rc = cli_main(
+                ["--state-dir", str(store.root), "--backend", "sqlite", "finalize", job.id]
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual(store.get_job(job.id).status, JobStatus.COMPLETE)
+            self.assertTrue(
+                (store.job_dir(job.id) / "summaries" / "stitched.md").is_file()
+            )
+
+    # --- #6: codegraph global-flag hoisting ----------------------------
+    def test_hoist_global_codegraph_flags(self) -> None:
+        from puppetmaster.cli import _hoist_global_codegraph_flags
+
+        cwd, timeout, remaining = _hoist_global_codegraph_flags(
+            ["init", "--cwd", "/repo", "--timeout", "30"]
+        )
+        self.assertEqual(cwd, "/repo")
+        self.assertEqual(timeout, 30)
+        self.assertEqual(remaining, ["init"])
+
+        cwd, _, remaining = _hoist_global_codegraph_flags(["search", "--cwd=/r", "foo"])
+        self.assertEqual(cwd, "/r")
+        self.assertEqual(remaining, ["search", "foo"])
+
+        # Flags after a literal `--` are forwarded to codegraph untouched.
+        cwd, _, remaining = _hoist_global_codegraph_flags(["--", "--cwd", "x"])
+        self.assertIsNone(cwd)
+        self.assertEqual(remaining, ["--", "--cwd", "x"])
+
+    # --- #7: direct-adapter routing flags ------------------------------
+    def test_routing_payload_from_args(self) -> None:
+        from argparse import Namespace
+
+        from puppetmaster.cli import routing_payload_from_args
+
+        off = Namespace(auto_route=False)
+        self.assertEqual(routing_payload_from_args(off, adapter="cursor"), {})
+
+        on = Namespace(
+            auto_route=True, routing_policy="cheap", max_cost_usd=0.5, min_capability=70
+        )
+        payload = routing_payload_from_args(on, adapter="cursor")
+        self.assertTrue(payload["auto_route"])
+        self.assertEqual(payload["allowed_adapters"], ["cursor"])
+        self.assertEqual(payload["routing_policy"], "cheap")
+        self.assertEqual(payload["max_cost_usd"], 0.5)
+        self.assertEqual(payload["min_capability"], 70)
+
+    # --- #10: wait exit codes ------------------------------------------
+    def test_wait_returns_nonzero_for_stalled(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            job = store.create_job("goal")
+            store.update_job_status(job.id, JobStatus.STALLED)
+            rc = cli_main(
+                ["--state-dir", str(store.root), "--backend", "sqlite", "wait", job.id]
+            )
+            self.assertEqual(rc, 1)
+
+    def test_wait_returns_zero_for_complete(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            job = store.create_job("goal")
+            store.update_job_status(job.id, JobStatus.COMPLETE)
+            rc = cli_main(
+                ["--state-dir", str(store.root), "--backend", "sqlite", "wait", job.id]
+            )
+            self.assertEqual(rc, 0)
+
+    def test_await_treats_stalled_as_terminal(self) -> None:
+        from puppetmaster.cli import await_job_state
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            job = store.create_job("goal")
+            store.update_job_status(job.id, JobStatus.STALLED)
+            state = await_job_state(store, job.id, timeout_seconds=1.0)
+            self.assertTrue(state["terminal"])
+            self.assertEqual(state["status"], "stalled")
 
 
 if __name__ == "__main__":

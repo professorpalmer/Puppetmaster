@@ -79,7 +79,7 @@ class SwarmStore:
             status=status,
             created_at=job.created_at,
             completed_at=now_iso()
-            if status in {JobStatus.COMPLETE, JobStatus.FAILED}
+            if status in {JobStatus.COMPLETE, JobStatus.FAILED, JobStatus.STALLED}
             else job.completed_at,
         )
         self.write_json(self.job_dir(job_id) / "job.json", updated)

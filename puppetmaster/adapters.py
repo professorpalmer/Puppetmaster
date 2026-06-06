@@ -123,6 +123,146 @@ def capture_subprocess_stdout(
     return result
 
 
+@dataclass
+class StreamedProcess:
+    """Result of a streamed subprocess run (mirrors the subset of
+    ``CompletedProcess`` the adapters use, plus liveness metadata)."""
+
+    returncode: Optional[int]
+    stdout: str
+    stderr: str
+    timed_out: bool = False
+    live_log_path: Optional[str] = None
+    elapsed_seconds: float = 0.0
+
+
+def run_streamed_subprocess(
+    *,
+    command: list[str],
+    env: Optional[dict],
+    task: Task,
+    sidecar_name: str,
+    timeout_seconds: int,
+    cwd: Optional[str] = None,
+    heartbeat_seconds: float = 30.0,
+) -> StreamedProcess:
+    """Run ``command`` while teeing its output to a live sidecar log.
+
+    A long agent run (e.g. ``cursor --implement``) used to produce a 0-byte log
+    for minutes and then flush everything at exit, making "working" and "hung"
+    indistinguishable without external ``pgrep``/``find -mmin`` heuristics. This
+    streams stdout/stderr line-by-line to ``<task>/<sidecar_name>_live.log`` as
+    they arrive and writes a ``still working`` heartbeat every
+    ``heartbeat_seconds`` of the run, so the log visibly grows. Returns separate
+    stdout/stderr buffers so existing artifact payloads are unchanged.
+    """
+    import threading
+    import time as _time
+
+    state_dir = _resolve_sidecar_state_dir()
+    live_handle = None
+    live_path: Optional[Path] = None
+    if state_dir is not None:
+        try:
+            sidecar_dir = state_dir / "jobs" / task.job_id / "tasks" / task.id
+            sidecar_dir.mkdir(parents=True, exist_ok=True)
+            live_path = sidecar_dir / f"{sidecar_name}_live.log"
+            live_handle = live_path.open("w", encoding="utf-8", errors="replace")
+        except OSError:
+            live_handle = None
+
+    write_lock = threading.Lock()
+
+    def _write_live(line: str) -> None:
+        if live_handle is None:
+            return
+        try:
+            with write_lock:
+                live_handle.write(line)
+                live_handle.flush()
+        except Exception:
+            pass
+
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+
+    def _reader(stream, buffer: list[str], tag: str) -> None:
+        try:
+            for line in iter(stream.readline, ""):
+                buffer.append(line)
+                _write_live(line if line.endswith("\n") else line + "\n")
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    threads = [
+        threading.Thread(target=_reader, args=(process.stdout, stdout_lines, "out"), daemon=True),
+        threading.Thread(target=_reader, args=(process.stderr, stderr_lines, "err"), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+
+    stop_heartbeat = threading.Event()
+    started = _time.monotonic()
+
+    def _heartbeat() -> None:
+        while not stop_heartbeat.wait(heartbeat_seconds):
+            elapsed = int(_time.monotonic() - started)
+            _write_live(
+                f"[puppetmaster] still working: {elapsed}s elapsed, "
+                f"{len(stdout_lines)} stdout / {len(stderr_lines)} stderr lines so far\n"
+            )
+
+    heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
+    heartbeat_thread.start()
+
+    timed_out = False
+    try:
+        process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        process.kill()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+    finally:
+        stop_heartbeat.set()
+        for thread in threads:
+            thread.join(timeout=2)
+        elapsed = _time.monotonic() - started
+        if live_handle is not None:
+            _write_live(
+                f"[puppetmaster] process exited rc={process.returncode} "
+                f"timed_out={timed_out} after {int(elapsed)}s\n"
+            )
+            try:
+                live_handle.close()
+            except Exception:
+                pass
+
+    return StreamedProcess(
+        returncode=process.returncode,
+        stdout="".join(stdout_lines),
+        stderr="".join(stderr_lines),
+        timed_out=timed_out,
+        live_log_path=str(live_path) if live_path is not None else None,
+        elapsed_seconds=_time.monotonic() - started,
+    )
+
+
 def build_patch_payload(
     *,
     task: Task,
@@ -461,16 +601,16 @@ class CursorAdapter:
             sort_keys=True,
         )
         timeout_seconds = int(task.payload.get("timeout_seconds", 900))
-        try:
-            completed = subprocess.run(
-                ["node", str(runner)],
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds,
-                check=False,
-                env=environment,
-            )
-        except subprocess.TimeoutExpired as exc:
+        # Stream output to a live sidecar log so a multi-minute agent run is
+        # visibly making progress (no more 0-byte-log-then-flush ambiguity).
+        completed = run_streamed_subprocess(
+            command=["node", str(runner)],
+            env=environment,
+            task=task,
+            sidecar_name="cursor_implement",
+            timeout_seconds=timeout_seconds,
+        )
+        if completed.timed_out:
             after = git_snapshot(cwd)
             artifacts: list[Artifact] = [
                 verification_artifact(
@@ -484,9 +624,10 @@ class CursorAdapter:
                     payload={
                         "failure": "timeout",
                         "returncode": None,
-                        "stdout": _redacted_tail(exc.stdout, _STDOUT_TAIL_CHARS),
-                        "stderr": _redacted_tail(exc.stderr, _STDOUT_TAIL_CHARS),
+                        "stdout": _redacted_tail(completed.stdout, _STDOUT_TAIL_CHARS),
+                        "stderr": _redacted_tail(completed.stderr, _STDOUT_TAIL_CHARS),
                         "timeout_seconds": timeout_seconds,
+                        "live_log": completed.live_log_path,
                         "base_sha": before["sha"],
                         "head_sha": after["sha"],
                         "changed_files": after["changed_files"],
@@ -529,6 +670,7 @@ class CursorAdapter:
                     "stderr": _redacted_tail(completed.stderr, _STDOUT_TAIL_CHARS),
                     "stdout_capture": stdout_capture,
                     "stderr_capture": stderr_capture,
+                    "live_log": completed.live_log_path,
                     "model": model,
                     "cwd": str(cwd),
                     "base_sha": before["sha"],

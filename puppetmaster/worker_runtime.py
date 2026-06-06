@@ -303,6 +303,40 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _write_startup_error(state_dir, job_id: str, worker_id: str, exc: BaseException) -> None:
+    """Record a worker that died before/while starting so the failure isn't a
+    silent 0-byte log.
+
+    A worker that fails to start (bad env, import error, store init failure)
+    used to vanish with no trace — indistinguishable from "never launched". We
+    drop a startup-error file next to the job's task logs and, if the store is
+    usable, emit a ``worker.startup_failed`` event so it shows up in the feed.
+    """
+    import traceback
+
+    detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    try:
+        from pathlib import Path
+
+        crash_dir = Path(state_dir) / "jobs" / job_id / "tasks"
+        crash_dir.mkdir(parents=True, exist_ok=True)
+        (crash_dir / f"startup_error-{worker_id}.log").write_text(
+            f"worker {worker_id} for job {job_id} failed to start:\n\n{detail}",
+            encoding="utf-8",
+            errors="replace",
+        )
+    except Exception:
+        pass
+    try:
+        create_store("sqlite", state_dir).emit(
+            job_id,
+            "worker.startup_failed",
+            {"worker_id": worker_id, "error": str(exc)},
+        )
+    except Exception:
+        pass
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     state_dir = resolve_state_dir(args.state_dir)
@@ -312,17 +346,26 @@ def main(argv: Optional[list[str]] = None) -> int:
     # Without this the adapter would fall back to the workspace-hashed default,
     # which can land logs in a project state dir that doesn't own the job.
     os.environ["PUPPETMASTER_STATE_DIR"] = str(state_dir)
-    runtime = WorkerRuntime(
-        store=create_store(args.backend, state_dir),
-        job_id=args.job_id,
-        role=args.role,
-        worker_id=args.worker_id or worker_id_for(args.role),
-        lease_seconds=args.lease_seconds,
-        poll_seconds=args.poll_seconds,
-        simulate_seconds=args.simulate_seconds,
-        crash_after_claim=args.crash_after_claim,
-    )
-    return 0 if runtime.run_until_idle() >= 0 else 1
+    worker_id = args.worker_id or worker_id_for(args.role)
+    try:
+        runtime = WorkerRuntime(
+            store=create_store(args.backend, state_dir),
+            job_id=args.job_id,
+            role=args.role,
+            worker_id=worker_id,
+            lease_seconds=args.lease_seconds,
+            poll_seconds=args.poll_seconds,
+            simulate_seconds=args.simulate_seconds,
+            crash_after_claim=args.crash_after_claim,
+        )
+        return 0 if runtime.run_until_idle() >= 0 else 1
+    except SystemExit:
+        # An intentional exit (e.g. the crash-after-claim demo) is not a
+        # startup failure — let it propagate untouched.
+        raise
+    except BaseException as exc:  # noqa: BLE001 — last-resort trace before dying
+        _write_startup_error(state_dir, args.job_id, worker_id, exc)
+        raise
 
 
 if __name__ == "__main__":

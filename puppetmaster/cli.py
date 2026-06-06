@@ -68,6 +68,37 @@ def build_parser() -> argparse.ArgumentParser:
 
     subcommands = parser.add_subparsers(dest="command", required=True)
 
+    def _add_routing_flags(adapter_parser: argparse.ArgumentParser) -> None:
+        """Expose the model router on a direct adapter subcommand.
+
+        Without these, a direct ``cursor``/``claude``/``codex``/``openai`` run
+        bypassed routing entirely — no auto_route, no ROUTING artifact, no cost
+        stamp — so "why this model / what did it cost" was unanswerable for
+        anything but a swarm. ``--auto-route`` opts the single worker into the
+        same router the swarms use, which stamps a ROUTING artifact.
+        """
+        group = adapter_parser.add_argument_group("routing")
+        group.add_argument(
+            "--auto-route",
+            action="store_true",
+            help="Let the router pick the model (emits a ROUTING artifact + cost stamp).",
+        )
+        group.add_argument(
+            "--routing-policy",
+            choices=["balanced", "cheap", "quality", "escalating"],
+            help="Routing policy when --auto-route is set. Default: balanced.",
+        )
+        group.add_argument(
+            "--max-cost-usd",
+            type=float,
+            help="Hard cap on the routed model's estimated USD/call.",
+        )
+        group.add_argument(
+            "--min-capability",
+            type=int,
+            help="Force the routing capability floor (0..100).",
+        )
+
     subcommands.add_parser("init", help="Create the local Puppetmaster state store.")
     subcommands.add_parser("state", help="Print the resolved Puppetmaster state directory.")
     subcommands.add_parser("doctor", help="Check local runtime dependencies.")
@@ -329,6 +360,67 @@ def build_parser() -> argparse.ArgumentParser:
         help="Render a live summary from current artifacts without waiting for final stitching.",
     )
 
+    finalize = subcommands.add_parser(
+        "finalize",
+        help=(
+            "Force-stitch a job's artifacts into its summary and mark it "
+            "complete. Use to recover a job whose orchestrator died before it "
+            "could finalize (e.g. a wedged/stalled run)."
+        ),
+    )
+    finalize.add_argument("job_id")
+
+    reap = subcommands.add_parser(
+        "reap",
+        help=(
+            "Scan running jobs and transition any whose orchestrator is dead "
+            "(or wedged with no live lease) to 'stalled', requeuing their "
+            "lease-expired tasks. Don't represent a dead job as running."
+        ),
+    )
+    reap.add_argument(
+        "--stall-after-seconds",
+        type=int,
+        default=None,
+        help="No-progress window before a leaseless job is called stalled.",
+    )
+    reap.add_argument("--json", action="store_true", help="Emit JSON.")
+
+    wait = subcommands.add_parser(
+        "wait",
+        help=(
+            "Block until a job reaches a terminal state (complete/failed/"
+            "stalled), then exit. Exit code is non-zero when the job did not "
+            "complete cleanly. Runs the stalled-job reaper while waiting."
+        ),
+    )
+    wait.add_argument("job_id")
+    wait.add_argument(
+        "--timeout",
+        dest="timeout_seconds",
+        type=float,
+        default=0.0,
+        help="Give up after N seconds (0 = block until terminal). Default: 0.",
+    )
+    wait.add_argument(
+        "--poll-interval-seconds",
+        type=float,
+        default=0.5,
+        help="How often to re-check job state / run the reaper. Default: 0.5.",
+    )
+    wait.add_argument(
+        "--stall-after-seconds",
+        type=int,
+        default=None,
+        help="No-progress window before a leaseless job is called stalled.",
+    )
+    wait.add_argument("--json", action="store_true", help="Emit JSON.")
+    wait.add_argument(
+        "--summary",
+        action="store_true",
+        help="Also print the job summary when it finishes.",
+    )
+
     dashboard_cmd = subcommands.add_parser(
         "dashboard",
         help=(
@@ -473,6 +565,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip promoted shared-memory injection for a fresh perspective.",
     )
+    _add_routing_flags(cursor)
 
     claude = subcommands.add_parser("claude", help="Run a full-featured Claude Code worker.")
     claude.add_argument("prompt", help="Prompt for the Claude Code worker.")
@@ -498,6 +591,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Allow Claude Code to run in a dirty working tree.",
     )
+    _add_routing_flags(claude)
 
     openai = subcommands.add_parser(
         "openai",
@@ -557,6 +651,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip CodeGraph context injection (e.g. for non-repo prompts).",
     )
+    _add_routing_flags(openai)
 
     codex = subcommands.add_parser(
         "codex",
@@ -603,6 +698,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip CodeGraph context injection (e.g. for non-repo prompts).",
     )
+    _add_routing_flags(codex)
 
     demo = subcommands.add_parser("demo", help="Run the Puppetmaster concept demo.")
     demo.add_argument(
@@ -718,6 +814,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print the full registry payload as JSON.",
     )
+
+    mcp_doctor = mcp_sub.add_parser(
+        "doctor",
+        help=(
+            "Diagnose a `Tool execution error. Not connected`: distinguish "
+            "'daemon healthy, stdio pipe dropped (restart MCP in Cursor)' from "
+            "'no MCP server alive'."
+        ),
+    )
+    mcp_doctor.add_argument("--json", action="store_true", help="Emit JSON.")
 
     mcp_cleanup = mcp_sub.add_parser(
         "cleanup",
@@ -1028,6 +1134,8 @@ def _main(argv: Optional[list[str]] = None) -> int:
         "open",
         "cost",
         "dashboard",
+        "finalize",
+        "wait",
     }:
         candidate_job_id = getattr(args, "job_id", None)
         state_dir, store = _resolve_store_for_job(
@@ -1135,6 +1243,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
             worker_mode=args.worker_mode,
             on_job_created=on_job_created,
         )
+        print_mode_banner(result.mode)
         print_run_result(result.job.id, len(result.artifacts), result.summary_path)
         return 0
 
@@ -1158,6 +1267,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
             payload["allow_dirty"] = getattr(args, "allow_dirty", False)
         if args.disable_memory or args.review or args.plan:
             payload["disable_memory"] = True
+        payload.update(routing_payload_from_args(args, adapter="cursor"))
         result = Orchestrator(store).run(
             args.prompt,
             specs=[
@@ -1172,10 +1282,23 @@ def _main(argv: Optional[list[str]] = None) -> int:
             worker_mode=args.worker_mode,
             on_job_created=on_job_created,
         )
+        print_mode_banner(result.mode)
         print_run_result(result.job.id, len(result.artifacts), result.summary_path)
         return 0
 
     if args.command == "claude":
+        payload = {
+            "prompt": args.prompt,
+            "cwd": args.cwd,
+            "model": args.model,
+            "permission_mode": args.permission_mode,
+            "allowed_tools": args.allowed_tools,
+            "disallowed_tools": args.disallowed_tools,
+            "executable": args.executable,
+            "timeout_seconds": args.timeout_seconds,
+            "allow_dirty": args.allow_dirty,
+        }
+        payload.update(routing_payload_from_args(args, adapter="claude-code"))
         result = Orchestrator(store).run(
             args.prompt,
             specs=[
@@ -1183,23 +1306,14 @@ def _main(argv: Optional[list[str]] = None) -> int:
                     role="claude-code",
                     instruction=args.prompt,
                     adapter="claude-code",
-                    payload={
-                        "prompt": args.prompt,
-                        "cwd": args.cwd,
-                        "model": args.model,
-                        "permission_mode": args.permission_mode,
-                        "allowed_tools": args.allowed_tools,
-                        "disallowed_tools": args.disallowed_tools,
-                        "executable": args.executable,
-                        "timeout_seconds": args.timeout_seconds,
-                        "allow_dirty": args.allow_dirty,
-                    },
+                    payload=payload,
                 )
             ],
             lease_seconds=10,
             worker_mode=args.worker_mode,
             on_job_created=on_job_created,
         )
+        print_mode_banner(result.mode)
         print_run_result(result.job.id, len(result.artifacts), result.summary_path)
         return 0
 
@@ -1224,6 +1338,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
             payload["reasoning_effort"] = args.reasoning_effort
         if args.disable_codegraph:
             payload["disable_codegraph"] = True
+        payload.update(routing_payload_from_args(args, adapter="openai"))
         result = Orchestrator(store).run(
             args.prompt,
             specs=[
@@ -1238,6 +1353,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
             worker_mode=args.worker_mode,
             on_job_created=on_job_created,
         )
+        print_mode_banner(result.mode)
         print_run_result(result.job.id, len(result.artifacts), result.summary_path)
         return 0
 
@@ -1256,6 +1372,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
             payload["executable"] = args.executable
         if args.disable_codegraph:
             payload["disable_codegraph"] = True
+        payload.update(routing_payload_from_args(args, adapter="codex"))
         result = Orchestrator(store).run(
             args.prompt,
             specs=[
@@ -1270,6 +1387,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
             worker_mode=args.worker_mode,
             on_job_created=on_job_created,
         )
+        print_mode_banner(result.mode)
         print_run_result(result.job.id, len(result.artifacts), result.summary_path)
         return 0
 
@@ -1290,6 +1408,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     if args.command == "jobs":
+        _reap_quietly(store)
         if getattr(args, "all_projects", False):
             for project in list_project_state_dirs():
                 project_store = create_store(args.backend, project)
@@ -1343,6 +1462,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     if args.command == "status":
+        # Surface a dead-but-"running" job as stalled before snapshotting, so
+        # status never reports a wedged job as live.
+        _reap_quietly(store)
         print(json.dumps(store.status_snapshot(args.job_id), indent=2))
         return 0
 
@@ -1415,11 +1537,33 @@ def _main(argv: Optional[list[str]] = None) -> int:
         if args.partial:
             reads_log.record_read("partial_summary", caller="cli")
             print(Stitcher(store).preview(args.job_id))
-        else:
-            reads_log.record_read("show", caller="cli")
-            path = store.job_dir(args.job_id) / "summaries" / "stitched.md"
+            return 0
+        reads_log.record_read("show", caller="cli")
+        path = store.job_dir(args.job_id) / "summaries" / "stitched.md"
+        if path.is_file():
             print(path.read_text(encoding="utf-8"))
+            return 0
+        # No stitched summary yet: degrade gracefully instead of crashing with a
+        # raw "[Errno 2] No such file or directory" stack. Synthesize a live
+        # summary from whatever artifacts exist and tell the user the job hasn't
+        # finalized (and how to force it).
+        job = store.get_job(args.job_id)
+        sys.stderr.write(
+            f"note: job {args.job_id} not finalized (state={job.status}); "
+            "showing a live summary from current artifacts. "
+            f"Run `puppetmaster finalize {args.job_id}` to force stitching.\n"
+        )
+        print(Stitcher(store).preview(args.job_id))
         return 0
+
+    if args.command == "finalize":
+        return _run_finalize_command(args, store)
+
+    if args.command == "reap":
+        return _run_reap_command(args, store)
+
+    if args.command == "wait":
+        return _run_wait_command(args, store)
 
     if args.command == "dashboard":
         from puppetmaster.dashboard import serve
@@ -1518,6 +1662,42 @@ def print_run_result(job_id: str, artifact_count: int, summary_path: Path) -> No
     print(f"job_id: {job_id}")
     print(f"artifacts: {artifact_count}")
     print(f"summary: {summary_path}")
+
+
+def print_mode_banner(mode: str) -> None:
+    """Print a one-line read-only / edit banner to stderr so the user is never
+    surprised that an 'analysis' swarm wrote no files."""
+    if mode == "edit":
+        print(
+            "puppetmaster: mode=edit — workers may modify files in the working tree.",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "puppetmaster: mode=analysis (read-only) — no files will be edited; "
+            "this run only emits artifacts.",
+            file=sys.stderr,
+        )
+
+
+def routing_payload_from_args(args, *, adapter: str) -> dict:
+    """Translate the shared ``--auto-route`` routing flags into payload keys the
+    orchestrator's router understands. Empty unless ``--auto-route`` is set, so
+    a direct adapter run is unchanged by default.
+
+    Pins ``allowed_adapters`` to the invoked adapter so routing only picks a
+    *model* within that platform — a direct ``cursor`` run never silently hops
+    to claude-code."""
+    if not getattr(args, "auto_route", False):
+        return {}
+    payload: dict[str, Any] = {"auto_route": True, "allowed_adapters": [adapter]}
+    if getattr(args, "routing_policy", None):
+        payload["routing_policy"] = args.routing_policy
+    if getattr(args, "max_cost_usd", None) is not None:
+        payload["max_cost_usd"] = args.max_cost_usd
+    if getattr(args, "min_capability", None) is not None:
+        payload["min_capability"] = args.min_capability
+    return payload
 
 
 def artifact_feed(store, job_id: str, limit: Optional[int] = None) -> list[dict]:
@@ -2025,6 +2205,61 @@ def _run_repair_codegraph(args) -> int:
     return 0 if result.ok else 1
 
 
+def _hoist_global_codegraph_flags(
+    cli_args: list[str],
+) -> tuple[Optional[str], Optional[int], list[str]]:
+    """Pull misplaced ``--cwd``/``--timeout`` out of codegraph passthrough args.
+
+    Returns ``(cwd, timeout, remaining_args)``. Scanning stops at a literal
+    ``--`` so codegraph's own flags (forwarded after ``--``) are never touched.
+    Supports both ``--cwd X`` and ``--cwd=X`` spellings.
+    """
+    cwd: Optional[str] = None
+    timeout: Optional[int] = None
+    remaining: list[str] = []
+    index = 0
+    forwarding = False
+    while index < len(cli_args):
+        token = cli_args[index]
+        if forwarding:
+            remaining.append(token)
+            index += 1
+            continue
+        if token == "--":
+            forwarding = True
+            remaining.append(token)
+            index += 1
+            continue
+        if token in ("--cwd", "--timeout"):
+            if index + 1 < len(cli_args):
+                value = cli_args[index + 1]
+                if token == "--cwd":
+                    cwd = value
+                else:
+                    try:
+                        timeout = int(value)
+                    except (TypeError, ValueError):
+                        timeout = None
+                index += 2
+                continue
+            index += 1
+            continue
+        if token.startswith("--cwd="):
+            cwd = token.split("=", 1)[1]
+            index += 1
+            continue
+        if token.startswith("--timeout="):
+            try:
+                timeout = int(token.split("=", 1)[1])
+            except (TypeError, ValueError):
+                timeout = None
+            index += 1
+            continue
+        remaining.append(token)
+        index += 1
+    return cwd, timeout, remaining
+
+
 def _run_codegraph_passthrough(args) -> int:
     """CLI entrypoint for `python -m puppetmaster codegraph <args>`.
 
@@ -2038,6 +2273,16 @@ def _run_codegraph_passthrough(args) -> int:
     from puppetmaster.codegraph import run_codegraph_cli
 
     cli_args = list(args.cg_args or [])
+    # Accept the global flags after the subcommand too: `codegraph init --cwd X`
+    # is natural to type, but argparse REMAINDER captures `--cwd X` into cg_args,
+    # so codegraph saw an unknown option. Hoist any misplaced --cwd/--timeout
+    # (up to a literal `--`, which forwards the rest verbatim) onto the global
+    # flags when they weren't already supplied before the subcommand.
+    hoisted_cwd, hoisted_timeout, cli_args = _hoist_global_codegraph_flags(cli_args)
+    if getattr(args, "cwd", None) is None and hoisted_cwd is not None:
+        args.cwd = hoisted_cwd
+    if not getattr(args, "timeout", 0) and hoisted_timeout is not None:
+        args.timeout = hoisted_timeout
     if cli_args and cli_args[0] == "--":
         cli_args = cli_args[1:]
     if not cli_args:
@@ -2090,9 +2335,68 @@ def _run_mcp_subcommand(args) -> int:
     """Dispatch the `python -m puppetmaster mcp ...` family of commands."""
     if args.mcp_command == "list":
         return _run_mcp_list(args)
+    if args.mcp_command == "doctor":
+        return _run_mcp_doctor(args)
     if args.mcp_command == "cleanup":
         return _run_mcp_cleanup(args)
     raise SystemExit(f"unknown mcp subcommand: {args.mcp_command}")
+
+
+def _run_mcp_doctor(args) -> int:
+    """Diagnose a `Tool execution error. Not connected`.
+
+    The actual failure mode the rules document: the Puppetmaster daemon/MCP
+    server is fine, but Cursor's stdio pipe for *this chat* dropped. This
+    separates that (restart MCP in Cursor) from a genuinely dead server (no
+    process tracked) so the user knows whether to restart or to fall back to
+    the CLI and keep working."""
+    snapshot = registry_summarize(registry_list_entries())
+    alive = snapshot["alive"]
+    stale = snapshot["stale"]
+    dead = snapshot["dead"]
+    tracked = snapshot["count"]
+
+    if alive > 0:
+        verdict = "stdio_pipe_dropped"
+        headline = (
+            f"{alive} MCP server(s) alive. The Puppetmaster daemon is healthy."
+        )
+        remedy = (
+            "If Cursor reports 'Tool execution error. Not connected', the stdio "
+            "pipe for THIS chat dropped — restart the Puppetmaster MCP in Cursor "
+            "Settings (or just keep using the `python -m puppetmaster` CLI; "
+            "durable state is unaffected)."
+        )
+    elif tracked > 0:
+        verdict = "servers_stale_or_dead"
+        headline = (
+            f"No alive MCP server (tracked={tracked}, stale={stale}, dead={dead})."
+        )
+        remedy = (
+            "Run `python -m puppetmaster mcp cleanup --kill-stale` to clear "
+            "orphans, then restart the Puppetmaster MCP in Cursor Settings."
+        )
+    else:
+        verdict = "no_server"
+        headline = "No Puppetmaster MCP server is tracked on this machine."
+        remedy = (
+            "The server isn't running. Restart the Puppetmaster MCP in Cursor "
+            "Settings, or re-run `python -m puppetmaster install-cursor-mcp`."
+        )
+
+    if args.json:
+        print(
+            json.dumps(
+                {"verdict": verdict, "headline": headline, "remedy": remedy, **snapshot},
+                indent=2,
+            )
+        )
+        return 0
+    print(f"verdict: {verdict}")
+    print(headline)
+    print(f"  -> {remedy}")
+    # Non-zero only when there's no usable server at all.
+    return 0 if alive > 0 else 1
 
 
 def _registry_path_from_args(args) -> Optional[Path]:
@@ -2410,7 +2714,7 @@ def await_job_state(
     """
     from puppetmaster.models import JobStatus
 
-    terminal = {JobStatus.COMPLETE, JobStatus.FAILED}
+    terminal = {JobStatus.COMPLETE, JobStatus.FAILED, JobStatus.STALLED}
     poll = max(0.05, poll_interval_seconds)
     deadline = time.monotonic() + timeout_seconds if timeout_seconds > 0 else None
     cursor = 0
@@ -2447,6 +2751,119 @@ def await_job_state(
             event_id = event.get("id")
             if isinstance(event_id, int) and event_id > cursor:
                 cursor = event_id
+
+
+def _reap_quietly(store) -> list[dict]:
+    """Run the stalled-job reaper, swallowing any failure.
+
+    Wired into read-side commands (status/jobs/wait) so a dead-but-"running"
+    job is transitioned to stalled the next time anyone looks, without the user
+    having to remember a separate command. Never raises into the caller."""
+    try:
+        from puppetmaster.liveness import reap_stalled_jobs
+
+        return reap_stalled_jobs(store)
+    except Exception:
+        return []
+
+
+def _run_finalize_command(args, store) -> int:
+    """Force-stitch a job and mark it complete.
+
+    Recovery path for a job whose orchestrator died after the workers finished
+    but before it could stitch — exactly the run-swarm finalize gap. Stitching
+    is idempotent (it just rewrites summaries/stitched.md from artifacts)."""
+    from puppetmaster.models import JobStatus
+
+    job = store.get_job(args.job_id)
+    summary = Stitcher(store).stitch(args.job_id)
+    summary_path = store.job_dir(args.job_id) / "summaries" / "stitched.md"
+    # Only advance a non-terminal job to complete; never override an explicit
+    # FAILED verdict.
+    if job.status not in {JobStatus.COMPLETE, JobStatus.FAILED}:
+        store.update_job_status(args.job_id, JobStatus.COMPLETE)
+    print(f"finalized: {args.job_id}")
+    print(f"summary: {summary_path}")
+    return 0
+
+
+def _run_reap_command(args, store) -> int:
+    from puppetmaster.liveness import reap_stalled_jobs
+
+    reaped = reap_stalled_jobs(store, stall_after_seconds=args.stall_after_seconds)
+    if args.json:
+        print(json.dumps(reaped, indent=2))
+        return 0
+    if not reaped:
+        print("no stalled jobs found")
+        return 0
+    print(f"stalled: {len(reaped)}")
+    for row in reaped:
+        print(
+            f"  {row['job_id']}\treason={row['reason']}\t"
+            f"requeued_tasks={row['requeued_tasks']}"
+        )
+    return 0
+
+
+def _run_wait_command(args, store) -> int:
+    """Block until a job reaches a terminal state, running the reaper between
+    checks so a stalled job is detected (not waited on forever). Exits non-zero
+    when the job did not complete cleanly."""
+    poll = max(0.05, args.poll_interval_seconds)
+    deadline = (
+        time.monotonic() + args.timeout_seconds if args.timeout_seconds > 0 else None
+    )
+    terminal = {"complete", "failed", "stalled"}
+    while True:
+        try:
+            from puppetmaster.liveness import reap_stalled_jobs
+
+            reap_stalled_jobs(store, stall_after_seconds=args.stall_after_seconds)
+        except Exception:
+            pass
+        job = store.get_job(args.job_id)
+        status = str(job.status)
+        if status in terminal:
+            timed_out = False
+            break
+        if deadline is not None and time.monotonic() >= deadline:
+            timed_out = True
+            break
+        time.sleep(poll)
+
+    summary = ""
+    if args.summary and status in {"complete", "stalled"}:
+        summary_path = store.job_dir(args.job_id) / "summaries" / "stitched.md"
+        if summary_path.is_file():
+            summary = summary_path.read_text(encoding="utf-8")
+        else:
+            summary = Stitcher(store).preview(args.job_id)
+
+    payload = {
+        "job_id": args.job_id,
+        "status": status,
+        "terminal": status in terminal,
+        "timed_out": timed_out,
+        "completed_at": job.completed_at,
+    }
+    if args.json:
+        print(json.dumps({**payload, "summary": summary}, indent=2, default=str))
+    elif timed_out:
+        print(
+            f"timed out after {args.timeout_seconds}s; job {args.job_id} is {status}",
+            file=sys.stderr,
+        )
+    else:
+        print(f"job {args.job_id} reached terminal state: {status}")
+        if summary:
+            print()
+            print(summary)
+    # Exit non-zero on the bad terminal states (and on timeout) so scripts can
+    # branch on it without parsing output.
+    if timed_out or status in {"failed", "stalled"}:
+        return 1
+    return 0
 
 
 def _run_await_command(args, store) -> int:

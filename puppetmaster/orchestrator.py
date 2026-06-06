@@ -7,11 +7,17 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Optional
 
+from puppetmaster.liveness import record_orchestrator_heartbeat
 from puppetmaster.models import Artifact, ArtifactType, Job, JobStatus, Task, TaskStatus, now_iso
 from puppetmaster.stitcher import Stitcher
 from puppetmaster.store import SwarmStore
 from puppetmaster.worker_runtime import WorkerRuntime
-from puppetmaster.workers import RECOVERABLE_FAILURES, WorkerSpec, specs_for_roles
+from puppetmaster.workers import (
+    RECOVERABLE_FAILURES,
+    WorkerSpec,
+    specs_for_roles,
+    swarm_mode,
+)
 
 # How many times the orchestrator will re-route a single task to a different
 # funded adapter after an auth/billing/quota rejection before giving up, and
@@ -63,6 +69,9 @@ class RunResult:
     summary_path: Path
     recovered_tasks: int = 0
     rerouted_tasks: int = 0
+    # "edit" when a worker could change files, "analysis" when the swarm is
+    # read-only (emits artifacts only). Lets the CLI print an honest banner.
+    mode: str = "analysis"
 
 
 class Orchestrator:
@@ -84,9 +93,11 @@ class Orchestrator:
         job = self.store.create_job(goal)
         if on_job_created is not None:
             on_job_created(job)
+        record_orchestrator_heartbeat(self.store, job.id, started=True)
         self._begin_trace()
         try:
             specs = self._with_retrieved_memory(specs or specs_for_roles(roles), goal)
+            self._announce_mode(job, specs)
             self._ensure_plan_catalog(job, specs)
             self.store.update_job_status(job.id, JobStatus.RUNNING)
             tasks = self._create_tasks(job, specs)
@@ -106,12 +117,30 @@ class Orchestrator:
                 summary=summary,
                 summary_path=summary_path,
                 rerouted_tasks=rerouted,
+                mode=swarm_mode(specs),
             )
         except Exception:
             self.store.update_job_status(job.id, JobStatus.FAILED)
             raise
         finally:
             self._traceparent = None
+
+    def _announce_mode(self, job: Job, specs: list[WorkerSpec]) -> str:
+        """Emit a one-line banner classifying the swarm as edit vs analysis so a
+        read-only run is never mistaken for one that writes code.
+
+        Returns the mode (``"edit"`` / ``"analysis"``)."""
+        mode = swarm_mode(specs)
+        if mode == "edit":
+            detail = "mode=edit — workers may modify files in the working tree."
+        else:
+            detail = (
+                "mode=analysis (read-only) — no files will be edited; this swarm "
+                "only emits artifacts. Use an implement verb or an edit-capable "
+                "adapter to land code."
+            )
+        self.store.emit(job.id, "job.mode", {"mode": mode, "detail": detail})
+        return mode
 
     def run_crash_recovery_demo(
         self,
@@ -1081,6 +1110,7 @@ class Orchestrator:
             return
 
         roles = sorted({task.role for task in tasks})
+        record_orchestrator_heartbeat(self.store, job.id)
         processes = [
             self._spawn_worker(job.id, role, lease_seconds=lease_seconds)
             for role in roles
@@ -1133,6 +1163,7 @@ class Orchestrator:
     ) -> None:
         allowed_task_ids = allowed_task_ids or {task.id for task in tasks}
         while True:
+            record_orchestrator_heartbeat(self.store, job.id)
             self.store.recover_stale_tasks(job.id)
             self.store.refresh_blocked_tasks(job.id)
             ready_tasks = [
@@ -1180,6 +1211,7 @@ class Orchestrator:
             {"timeout_seconds": timeout_seconds},
         )
         while time.monotonic() < deadline:
+            record_orchestrator_heartbeat(self.store, job.id)
             self.store.recover_stale_tasks(job.id)
             self.store.refresh_blocked_tasks(job.id)
             all_tasks = self.store.list_tasks(job.id)
