@@ -318,6 +318,27 @@ def run_codegraph_cli(
     return result
 
 
+def _nonpaging_env() -> dict[str, str]:
+    """Environment for child CLIs that disables interactive pagers when our own
+    stdout isn't a TTY (or the user set ``PUPPETMASTER_NO_PAGER``).
+
+    A pager (git/codegraph spawning ``less``) blocks forever in a
+    non-interactive shell waiting for a keypress that never comes. Forcing
+    ``PAGER``/``GIT_PAGER`` to ``cat`` keeps output flowing. A TTY caller is left
+    alone so interactive use still pages."""
+    env = dict(os.environ)
+    forced = os.environ.get("PUPPETMASTER_NO_PAGER", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if forced or not sys.stdout.isatty():
+        env.setdefault("PAGER", "cat")
+        env["GIT_PAGER"] = "cat"
+        env["PAGER"] = "cat"
+    return env
+
+
 def _run_codegraph_once(
     cli_args: list[str],
     cwd_str: str,
@@ -335,6 +356,7 @@ def _run_codegraph_once(
             text=True,
             timeout=timeout_seconds,
             check=False,
+            env=_nonpaging_env(),
         )
     except subprocess.TimeoutExpired as exc:
         stdout = _decode_stream(exc.stdout)

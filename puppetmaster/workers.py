@@ -62,8 +62,16 @@ DEFAULT_WORKERS = [
         depends_on_roles=["explore"],
     ),
     WorkerSpec(
+        # NB: this analysis-swarm role produces an implementation *plan*
+        # (decision + patch-plan artifacts), not edits. The swarm runs
+        # read-only; use an implement verb / an edit-capable adapter to land
+        # real code. The startup mode banner makes this explicit at runtime.
         role="implement",
-        instruction="Produce implementation artifacts and patch plans, not prose blobs.",
+        instruction=(
+            "Produce an implementation plan as artifacts (decisions + patch "
+            "plan), not prose blobs. This is an analysis role: do not expect "
+            "files to be edited."
+        ),
         payload=dict(_DEFAULT_AUTO_ROUTE_PAYLOAD),
         depends_on_roles=["architect"],
     ),
@@ -165,6 +173,28 @@ class LocalWorker:
                 "model": model,
             },
         )
+
+
+# Adapters that can actually modify the working tree. ``local``/``shell`` and
+# the analyze-only paths (cursor without implement mode, openai) only ever emit
+# artifacts, so a swarm built solely from those is read-only no matter how its
+# roles are named — including the analysis swarm's "implement" role, which
+# writes an implementation *plan*, not code.
+_EDIT_CAPABLE_ADAPTERS = frozenset({"claude-code", "codex"})
+
+
+def spec_edits_files(spec: WorkerSpec) -> bool:
+    """True when ``spec`` can leave file changes behind (vs. emit-only)."""
+    payload = spec.payload or {}
+    if payload.get("mode") == "implement" or payload.get("implement"):
+        return True
+    return spec.adapter in _EDIT_CAPABLE_ADAPTERS
+
+
+def swarm_mode(specs: list[WorkerSpec]) -> str:
+    """Classify a swarm as ``"edit"`` (some worker can change files) or
+    ``"analysis"`` (read-only — emits artifacts only)."""
+    return "edit" if any(spec_edits_files(spec) for spec in specs) else "analysis"
 
 
 def specs_for_roles(roles: Optional[list[str]] = None) -> list[WorkerSpec]:

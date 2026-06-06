@@ -37,6 +37,10 @@ class JobStatus(StringEnum):
     STITCHING = "stitching"
     COMPLETE = "complete"
     FAILED = "failed"
+    # A job whose orchestrator died (or whose work wedged) with no live worker
+    # leasing tasks. Distinct from RUNNING so a dead job is never represented
+    # as live, and distinct from FAILED so it stays recoverable.
+    STALLED = "stalled"
 
 
 class TaskStatus(StringEnum):
