@@ -9120,6 +9120,17 @@ class PuppetmasterSalvageAndLivenessTests(unittest.TestCase):
         claims = [a.payload.get("claim") for a in artifacts if str(a.type) == "finding"]
         self.assertIn("recovered finding", claims)
 
+    def test_worker_cli_env_prepends_source_root(self) -> None:
+        from puppetmaster.codegraph import inject_worker_cli_env, puppetmaster_source_root
+
+        root = puppetmaster_source_root()
+        env = inject_worker_cli_env({})
+        self.assertTrue(env["PYTHONPATH"].startswith(root))
+        # An existing PYTHONPATH is preserved after the injected root.
+        env2 = inject_worker_cli_env({"PYTHONPATH": "/existing"})
+        self.assertTrue(env2["PYTHONPATH"].startswith(root))
+        self.assertIn("/existing", env2["PYTHONPATH"])
+
     def test_liveness_summary_flags_dead_pid(self) -> None:
         from puppetmaster.liveness import liveness_summary
 

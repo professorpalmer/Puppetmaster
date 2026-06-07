@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Protocol, Union
 
-from puppetmaster.codegraph import enrich_prompt_with_codegraph
+from puppetmaster.codegraph import enrich_prompt_with_codegraph, inject_worker_cli_env
 from puppetmaster.models import Artifact, ArtifactType, Task
 from puppetmaster.redaction import redact_secrets
 from puppetmaster.usage import token_usage
@@ -596,7 +596,7 @@ class CursorAdapter:
         )
 
         runner = Path(__file__).with_name("cursor_sdk_runner.mjs")
-        environment = os.environ.copy()
+        environment = inject_worker_cli_env(os.environ.copy())
         environment["PUPPETMASTER_CURSOR_INPUT"] = json.dumps(
             {"prompt": prompt, "cwd": str(cwd), "model": model},
             sort_keys=True,
@@ -732,7 +732,7 @@ class CursorAdapter:
             disabled=bool(task.payload.get("disable_codegraph", False)),
         )
         runner = Path(__file__).with_name("cursor_sdk_runner.mjs")
-        environment = os.environ.copy()
+        environment = inject_worker_cli_env(os.environ.copy())
         environment["PUPPETMASTER_CURSOR_INPUT"] = json.dumps(
             {"prompt": prompt, "cwd": cwd, "model": model},
             sort_keys=True,
