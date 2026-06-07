@@ -118,7 +118,8 @@ class WorkerRuntime:
         # never produced real output — telemetry would lie, await would report
         # success, and the orchestrator's auto-fallback could never re-route.
         recoverable = self._recoverable_failure(artifacts)
-        if worker_run.status == TaskStatus.FAILED or recoverable is not None:
+        blocked = self._blocked_verdict(artifacts)
+        if worker_run.status == TaskStatus.FAILED or recoverable is not None or blocked is not None:
             failed_run = replace(
                 run,
                 status=TaskStatus.FAILED,
@@ -134,7 +135,8 @@ class WorkerRuntime:
                     "worker_id": self.worker_id,
                     "task_id": task.id,
                     "role": self.role,
-                    "failure": recoverable,
+                    "failure": recoverable or blocked,
+                    "blocked": blocked,
                 },
             )
             self._emit_live_task_span(updated, artifacts)
@@ -194,6 +196,22 @@ class WorkerRuntime:
             failure = (getattr(artifact, "payload", None) or {}).get("failure")
             if failure in RECOVERABLE_FAILURES:
                 return str(failure)
+        return None
+
+    @staticmethod
+    def _blocked_verdict(artifacts: list) -> Optional[str]:
+        """Return the failure reason when a worker *refused to run*.
+
+        A verification artifact with ``result == "blocked"`` means the adapter
+        declined to do the work — a dirty tree, a non-worktree target, a
+        preflight gate. That is never a COMPLETE: a "completed" task that did
+        zero work is the worst failure mode because it looks like success. Mark
+        it FAILED loudly so the diff/commit is never silently empty.
+        """
+        for artifact in artifacts:
+            payload = getattr(artifact, "payload", None) or {}
+            if payload.get("result") == "blocked":
+                return str(payload.get("failure") or "blocked")
         return None
 
     def _heartbeat_until_stopped(

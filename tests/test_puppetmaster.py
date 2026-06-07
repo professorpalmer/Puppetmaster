@@ -8883,6 +8883,82 @@ class PuppetmasterFrictionFixTests(unittest.TestCase):
             self.assertEqual(state["status"], "stalled")
 
 
+class PuppetmasterLoudFailureTests(unittest.TestCase):
+    """Tier-1 reliability: a run that did zero work must never look like success.
+
+    Covers the blocked->FAILED veto (#1) and the built-in run-quality verdict
+    (#10) that lets the parent stop eyeballing artifact composition.
+    """
+
+    def _blocked_artifact(self):
+        from puppetmaster.adapters import verification_artifact
+        from puppetmaster.models import Task
+
+        task = Task(job_id="job_x", role="cursor", instruction="do the thing")
+        return verification_artifact(
+            task=task,
+            worker_id="w1",
+            adapter="cursor",
+            check=task.instruction,
+            result="blocked",
+            confidence=0.8,
+            evidence=["status:dirty-repo"],
+            payload={"failure": "dirty_worktree"},
+        )
+
+    def _finding_artifact(self):
+        from puppetmaster.models import Artifact, ArtifactType
+
+        return Artifact(
+            job_id="job_x",
+            task_id="task_x",
+            type=ArtifactType.FINDING,
+            created_by="w1",
+            confidence=0.9,
+            evidence=["e"],
+            payload={"finding": "something real", "detail": "x"},
+        )
+
+    def test_blocked_verdict_vetoes_complete(self) -> None:
+        from puppetmaster.worker_runtime import WorkerRuntime
+
+        blocked = self._blocked_artifact()
+        self.assertEqual(WorkerRuntime._blocked_verdict([blocked]), "dirty_worktree")
+        self.assertIsNone(WorkerRuntime._blocked_verdict([self._finding_artifact()]))
+
+    def test_quality_blocked_is_untrustworthy(self) -> None:
+        from puppetmaster.quality import assess_run_quality
+
+        verdict = assess_run_quality([self._blocked_artifact()])
+        self.assertEqual(verdict["quality"], "blocked")
+        self.assertFalse(verdict["trustworthy"])
+        self.assertIn("dirty_worktree", verdict["blocking_failures"])
+
+    def test_quality_empty_when_no_artifacts(self) -> None:
+        from puppetmaster.quality import assess_run_quality
+
+        self.assertEqual(assess_run_quality([])["quality"], "empty")
+
+    def test_quality_degraded_when_only_verification(self) -> None:
+        from puppetmaster.adapters import verification_artifact
+        from puppetmaster.models import Task
+        from puppetmaster.quality import assess_run_quality
+
+        task = Task(job_id="job_x", role="cursor", instruction="x")
+        passed = verification_artifact(
+            task=task, worker_id="w1", adapter="cursor", check="x",
+            result="passed", confidence=0.9, evidence=["e"], payload={},
+        )
+        self.assertEqual(assess_run_quality([passed])["quality"], "degraded")
+
+    def test_quality_ok_with_substantive_artifact(self) -> None:
+        from puppetmaster.quality import assess_run_quality
+
+        verdict = assess_run_quality([self._finding_artifact()])
+        self.assertEqual(verdict["quality"], "ok")
+        self.assertTrue(verdict["trustworthy"])
+
+
 if __name__ == "__main__":
     unittest.main()
 
