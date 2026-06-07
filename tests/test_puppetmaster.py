@@ -3645,6 +3645,49 @@ print('{"result":"ok"}')
             self.assertIn("-before", patch_artifacts[0].payload["unified_diff"])
             self.assertIn("+after", patch_artifacts[0].payload["unified_diff"])
 
+    def test_claude_code_adapter_records_measured_tokens(self) -> None:
+        # Token metering must be universal, not Cursor-only: when Claude Code's
+        # JSON stdout carries a usage object, the verification artifact records
+        # it as *measured* (tokens_estimated=False) so rollup/cost tell the truth.
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-c", "user.email=t@e.co", "-c", "user.name=T", "commit", "-m", "seed"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+            fake_claude = root / "fake_claude.py"
+            fake_claude.write_text(
+                """#!/usr/bin/env python3
+import json
+print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens": 77}}))
+""",
+                encoding="utf-8",
+            )
+            fake_claude.chmod(0o755)
+            task = Task(
+                job_id="job",
+                role="claude-code",
+                instruction="noop",
+                adapter="claude-code",
+                payload={
+                    "executable": [sys.executable, str(fake_claude)],
+                    "cwd": str(repo),
+                    "timeout_seconds": 10,
+                },
+            )
+            artifacts = ClaudeCodeAdapter().run(task, "goal", "worker")
+            verification = artifacts[0].payload
+            self.assertEqual(verification["tokens_in"], 321)
+            self.assertEqual(verification["tokens_out"], 77)
+            self.assertFalse(verification["tokens_estimated"])
+
     def test_claude_code_blocks_dirty_worktree_by_default(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -9241,12 +9284,12 @@ class PuppetmasterUsageTests(unittest.TestCase):
         self.assertEqual(estimated["tokens_in"], 10)
         self.assertEqual(estimated["tokens_out"], 5)
 
-    def test_cursor_result_usage_extraction(self) -> None:
-        from puppetmaster.adapters import cursor_result_usage
+    def test_sdk_usage_from_stdout_extraction(self) -> None:
+        from puppetmaster.adapters import sdk_usage_from_stdout
 
         stdout = json.dumps({"status": "finished", "result": "x", "usage": {"inputTokens": 9}})
-        self.assertEqual(cursor_result_usage(stdout), {"inputTokens": 9})
-        self.assertIsNone(cursor_result_usage("not json"))
+        self.assertEqual(sdk_usage_from_stdout(stdout), {"inputTokens": 9})
+        self.assertIsNone(sdk_usage_from_stdout("not json"))
 
     def test_aggregate_splits_measured_and_estimated(self) -> None:
         from puppetmaster.models import Artifact, ArtifactType
@@ -9271,6 +9314,141 @@ class PuppetmasterUsageTests(unittest.TestCase):
         self.assertEqual(roll["estimated_runs"], 1)
         self.assertEqual(roll["estimated_tokens_in"], 20)
         self.assertEqual(roll["total_tokens"], 100 + 40 + 20 + 10)
+
+
+class PuppetmasterGateReplayCliTests(unittest.TestCase):
+    """`puppetmaster gate` replays the runtime's completion gates outside a
+    worker run, so a parent agent or CI can enforce the same post-conditions."""
+
+    def _store(self, tmp: str):
+        store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+        store.init()
+        return store
+
+    def _git_repo(self, root: Path) -> Path:
+        repo = root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-c", "user.email=t@e.co", "-c", "user.name=T", "commit", "-m", "seed"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+        return repo
+
+    def _args(self, store, repo: Path, **overrides):
+        from types import SimpleNamespace
+
+        defaults = dict(
+            cwd=str(repo),
+            require_diff=False,
+            gate_command=None,
+            ratchet_command=None,
+            metric=None,
+            committed=False,
+            gates_json=None,
+            json=True,
+        )
+        defaults.update(overrides)
+        return SimpleNamespace(**defaults)
+
+    def test_require_diff_fails_on_clean_tree_but_committed_passes(self) -> None:
+        from puppetmaster.cli import _run_gate_command
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            repo = self._git_repo(Path(tmp))
+            # Clean tree: require_diff must fail (exit 1)...
+            self.assertEqual(
+                _run_gate_command(self._args(store, repo, require_diff=True), store), 1
+            )
+            # ...while committed passes (nothing uncommitted) (exit 0).
+            self.assertEqual(
+                _run_gate_command(self._args(store, repo, committed=True), store), 0
+            )
+
+    def test_ratchet_establishes_then_enforces_monotonic(self) -> None:
+        from puppetmaster.cli import _run_gate_command
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            repo = self._git_repo(Path(tmp))
+            metric_file = repo / "metric.txt"
+            metric_file.write_text("5", encoding="utf-8")
+            # A tiny oracle that prints {"metrics": {"violations": N}} from a file.
+            oracle = (
+                f'{sys.executable} -c "import json,pathlib;'
+                f"print(json.dumps({{'metrics': {{'violations': "
+                f"int(pathlib.Path('metric.txt').read_text())}}}}))\""
+            )
+            args = self._args(store, repo, ratchet_command=oracle, metric="violations")
+            # First run establishes baseline=5 → pass.
+            self.assertEqual(_run_gate_command(args, store), 0)
+            # Regress to 9 → ratchet loosened → fail.
+            metric_file.write_text("9", encoding="utf-8")
+            self.assertEqual(_run_gate_command(args, store), 1)
+            # Tighten to 2 → pass and move baseline down.
+            metric_file.write_text("2", encoding="utf-8")
+            self.assertEqual(_run_gate_command(args, store), 0)
+
+    def test_no_gates_specified_is_a_usage_error(self) -> None:
+        from puppetmaster.cli import _run_gate_command
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            repo = self._git_repo(Path(tmp))
+            self.assertEqual(_run_gate_command(self._args(store, repo), store), 2)
+
+
+class PuppetmasterMcpVerbTests(unittest.TestCase):
+    """gc / rollup / gate are first-class MCP verbs that shell to the CLI."""
+
+    def test_gc_rollup_gate_build_expected_cli_commands(self) -> None:
+        from unittest.mock import patch
+
+        import puppetmaster.mcp_server as mcp
+
+        captured: list = []
+
+        def fake_run_cli(command, args):
+            captured.append(command)
+            return {"content": [], "isError": False}
+
+        with patch.object(mcp, "run_cli", side_effect=fake_run_cli):
+            mcp.run_gc({"older_than_days": 3, "all_projects": True, "force": True})
+            mcp.run_rollup({"effort_id": "mig-1", "all_projects": True})
+            mcp.run_gate(
+                {
+                    "gate_cwd": "/tmp/x",
+                    "require_diff": True,
+                    "command": "pytest -q",
+                    "committed": True,
+                    "gates": [{"kind": "ratchet", "command": "c", "metric": "m"}],
+                }
+            )
+
+        gc_cmd, rollup_cmd, gate_cmd = captured
+        self.assertEqual(
+            gc_cmd, ["gc", "--json", "--older-than-days", "3", "--all-projects", "--force"]
+        )
+        self.assertEqual(rollup_cmd, ["rollup", "--json", "--effort", "mig-1", "--all-projects"])
+        self.assertEqual(gate_cmd[:2], ["gate", "--json"])
+        self.assertIn("--require-diff", gate_cmd)
+        self.assertIn("--committed", gate_cmd)
+        self.assertIn("--cwd", gate_cmd)
+        self.assertIn("--command", gate_cmd)
+        self.assertIn("--gates-json", gate_cmd)
+
+    def test_gc_rollup_gate_registered_as_tools(self) -> None:
+        import puppetmaster.mcp_server as mcp
+
+        names = {tool.name for tool in mcp.tools()}
+        self.assertIn("puppetmaster_gc", names)
+        self.assertIn("puppetmaster_rollup", names)
+        self.assertIn("puppetmaster_gate", names)
 
 
 if __name__ == "__main__":
