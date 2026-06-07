@@ -39,7 +39,12 @@ def _payload(artifact: Artifact) -> dict[str, Any]:
 
 
 def _is_blocked(artifact: Artifact) -> bool:
-    return _payload(artifact).get("result") == "blocked"
+    payload = _payload(artifact)
+    if payload.get("result") == "blocked":
+        return True
+    # A failed completion gate (drift ratchet, required diff, commit) means the
+    # run did not satisfy its post-conditions — never trustworthy.
+    return artifact.type == ArtifactType.GATE and payload.get("passed") is False
 
 
 def _is_degraded_marker(artifact: Artifact) -> bool:
@@ -58,8 +63,17 @@ def assess_run_quality(artifacts: Iterable[Artifact]) -> dict[str, Any]:
 
     blocked = [a for a in artifacts if _is_blocked(a)]
     if blocked:
-        failures = sorted({str(_payload(a).get("failure") or "blocked") for a in blocked})
-        reasons.append(f"worker refused to run: {', '.join(failures)}")
+        failures = sorted(
+            {
+                str(
+                    _payload(a).get("failure")
+                    or (f"gate:{_payload(a).get('gate')}" if a.type == ArtifactType.GATE else None)
+                    or "blocked"
+                )
+                for a in blocked
+            }
+        )
+        reasons.append(f"blocked / failed post-conditions: {', '.join(failures)}")
         return {
             "quality": "blocked",
             "reasons": reasons,

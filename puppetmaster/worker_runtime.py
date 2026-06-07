@@ -142,6 +142,34 @@ class WorkerRuntime:
             self._emit_live_task_span(updated, artifacts)
             return True
 
+        # Non-bypassable completion gates: an agent may not reach COMPLETE just
+        # because it thinks it finished. Post-conditions (drift ratchet, required
+        # diff, commit) are evaluated by the runtime; a failed gate is FAILED.
+        gate_eval = self._evaluate_gates(task, artifacts)
+        for gate_artifact in gate_eval.artifacts:
+            self.store.save_artifact(gate_artifact)
+        if not gate_eval.passed:
+            failed_run = replace(
+                run,
+                status=TaskStatus.FAILED,
+                heartbeat_at=now_iso(),
+                completed_at=now_iso(),
+            )
+            self.store.save_run(failed_run)
+            updated = self.store.update_task_status(task, TaskStatus.FAILED)
+            self.store.emit(
+                self.job_id,
+                "worker.gate_failed",
+                {
+                    "worker_id": self.worker_id,
+                    "task_id": task.id,
+                    "role": self.role,
+                    "reason": gate_eval.failed_reason,
+                },
+            )
+            self._emit_live_task_span(updated, artifacts + gate_eval.artifacts)
+            return True
+
         completed_run = replace(
             run,
             status=TaskStatus.COMPLETE,
@@ -155,8 +183,26 @@ class WorkerRuntime:
             "worker.completed_task",
             {"worker_id": self.worker_id, "task_id": task.id, "role": self.role},
         )
-        self._emit_live_task_span(updated, artifacts)
+        self._emit_live_task_span(updated, artifacts + gate_eval.artifacts)
         return True
+
+    def _evaluate_gates(self, task, artifacts: list):
+        """Evaluate this task's completion gates. Never let a gate-engine error
+        crash the run — on an internal failure, pass (gates are opt-in and must
+        not break ungated tasks)."""
+        from puppetmaster.gates import GateEvaluation, evaluate_task_gates
+
+        try:
+            return evaluate_task_gates(
+                task, artifacts, self.store, worker_id=self.worker_id
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            self.store.emit(
+                self.job_id,
+                "worker.gate_error",
+                {"worker_id": self.worker_id, "task_id": task.id, "error": str(exc)},
+            )
+            return GateEvaluation(passed=True, results=[], artifacts=[])
 
     def _emit_live_task_span(self, task, artifacts: list) -> None:
         """Emit a live OTel span for this finished task. No-op unless live

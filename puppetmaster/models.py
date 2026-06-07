@@ -59,6 +59,11 @@ class ArtifactType(StringEnum):
     RISK = "risk"
     MEMORY_SUMMARY = "memory_summary"
     ROUTING = "routing"
+    # The verdict of a non-bypassable completion gate (post-condition / drift
+    # ratchet / commit check). A failed GATE forces the task to FAILED, so the
+    # agent can never report COMPLETE over work that regressed a baseline or
+    # left its output uncommitted.
+    GATE = "gate"
 
 
 @dataclass(frozen=True)
@@ -129,6 +134,7 @@ class Artifact:
             ArtifactType.RISK: ["risk", "mitigation"],
             ArtifactType.MEMORY_SUMMARY: ["summary"],
             ArtifactType.ROUTING: ["model_id", "adapter", "policy"],
+            ArtifactType.GATE: ["gate", "passed"],
         }
         for key in required_keys.get(self.type, []):
             if key not in self.payload:
