@@ -3353,10 +3353,13 @@ def _run_cost_command(args, store) -> int:
         bucket["cost"] += cost
 
     if args.json:
+        from puppetmaster.usage import aggregate_token_usage
+
         print(
             json.dumps(
                 {
                     "job_id": job_id,
+                    "cost_basis": "preflight_routing_estimate",
                     "total_estimated_cost_usd": round(total, 6),
                     "by_model": {
                         mid: {
@@ -3365,6 +3368,7 @@ def _run_cost_command(args, store) -> int:
                         }
                         for mid, v in by_model.items()
                     },
+                    "token_usage": aggregate_token_usage(artifacts),
                     "tasks": rows,
                 },
                 indent=2,
@@ -3387,7 +3391,40 @@ def _run_cost_command(args, store) -> int:
             f"  {task_id:<14}  {role:<14}  {model_id:<28}  "
             f"${row['estimated_cost_usd']:>10.6f}"
         )
+    print()
+    print(
+        "  note: the figures above are PRE-FLIGHT ROUTING ESTIMATES (relative "
+        "model cost), not measured consumption — do not read them as token volume."
+    )
+    _print_token_usage(artifacts)
     return 0
+
+
+def _print_token_usage(artifacts) -> None:
+    """Print measured-vs-estimated token consumption for a job's runs.
+
+    Plan-billed runtimes (Cursor SDK) have $0 marginal cost, so a dollars-only
+    ledger says nothing. Token counts are the honest measure of consumption;
+    surface them, clearly split into measured vs char/4-estimated.
+    """
+    from puppetmaster.usage import aggregate_token_usage
+
+    usage = aggregate_token_usage(artifacts)
+    if usage["measured_runs"] == 0 and usage["estimated_runs"] == 0:
+        return
+    print()
+    print("  token consumption (measured where the SDK reports usage):")
+    if usage["measured_runs"]:
+        print(
+            f"    measured:  {usage['measured_tokens_in']:,} in / "
+            f"{usage['measured_tokens_out']:,} out over {usage['measured_runs']} run(s)"
+        )
+    if usage["estimated_runs"]:
+        print(
+            f"    estimated: ~{usage['estimated_tokens_in']:,} in / "
+            f"~{usage['estimated_tokens_out']:,} out over {usage['estimated_runs']} run(s) "
+            "(char/4 approximation — SDK reported no usage)"
+        )
 
 
 def _run_mcp_list(args) -> int:

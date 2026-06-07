@@ -9092,6 +9092,67 @@ class PuppetmasterGateTests(unittest.TestCase):
             self.assertFalse(verdict["trustworthy"])
 
 
+class PuppetmasterUsageTests(unittest.TestCase):
+    """Token-consumption capture & rollup (#5 metering, #6 estimate labeling)."""
+
+    def test_usage_from_sdk_accepts_key_spellings(self) -> None:
+        from puppetmaster.usage import usage_from_sdk
+
+        self.assertEqual(
+            usage_from_sdk({"inputTokens": 10, "outputTokens": 5}),
+            {"tokens_in": 10, "tokens_out": 5},
+        )
+        self.assertEqual(
+            usage_from_sdk({"prompt_tokens": 7, "completion_tokens": 3}),
+            {"tokens_in": 7, "tokens_out": 3},
+        )
+        self.assertIsNone(usage_from_sdk(None))
+        self.assertIsNone(usage_from_sdk({"unrelated": 1}))
+
+    def test_token_usage_measured_vs_estimated(self) -> None:
+        from puppetmaster.usage import token_usage
+
+        measured = token_usage(sdk_usage={"inputTokens": 100, "outputTokens": 40})
+        self.assertFalse(measured["tokens_estimated"])
+        self.assertEqual(measured["tokens_in"], 100)
+
+        estimated = token_usage(prompt_text="a" * 40, output_text="b" * 20)
+        self.assertTrue(estimated["tokens_estimated"])
+        self.assertEqual(estimated["tokens_in"], 10)
+        self.assertEqual(estimated["tokens_out"], 5)
+
+    def test_cursor_result_usage_extraction(self) -> None:
+        from puppetmaster.adapters import cursor_result_usage
+
+        stdout = json.dumps({"status": "finished", "result": "x", "usage": {"inputTokens": 9}})
+        self.assertEqual(cursor_result_usage(stdout), {"inputTokens": 9})
+        self.assertIsNone(cursor_result_usage("not json"))
+
+    def test_aggregate_splits_measured_and_estimated(self) -> None:
+        from puppetmaster.models import Artifact, ArtifactType
+        from puppetmaster.usage import aggregate_token_usage
+
+        def va(task_id, tin, tout, estimated):
+            return Artifact(
+                job_id="j", task_id=task_id, type=ArtifactType.VERIFICATION,
+                created_by="w", confidence=0.9, evidence=["e"],
+                payload={
+                    "check": "c", "result": "passed",
+                    "tokens_in": tin, "tokens_out": tout, "tokens_estimated": estimated,
+                },
+            )
+
+        roll = aggregate_token_usage(
+            [va("t1", 100, 40, False), va("t2", 20, 10, True), va("t1", 999, 999, False)]
+        )
+        # t1 counted once (dedup), measured; t2 estimated.
+        self.assertEqual(roll["measured_runs"], 1)
+        self.assertEqual(roll["measured_tokens_in"], 100)
+        self.assertEqual(roll["estimated_runs"], 1)
+        self.assertEqual(roll["estimated_tokens_in"], 20)
+        self.assertEqual(roll["total_tokens"], 100 + 40 + 20 + 10)
+
+
 if __name__ == "__main__":
     unittest.main()
 
