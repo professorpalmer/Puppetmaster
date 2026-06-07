@@ -74,6 +74,17 @@ class RunResult:
     mode: str = "analysis"
 
 
+def _tag_job_effort(store: SwarmStore, job_id: str) -> None:
+    """Stamp a new job with the ambient effort id (if any) so jobs spread across
+    many worktrees can later be rolled up as one effort. Best-effort."""
+    try:
+        from puppetmaster.lifecycle import current_effort_id, tag_job_effort
+
+        tag_job_effort(store, job_id, current_effort_id())
+    except Exception:
+        pass
+
+
 class Orchestrator:
     def __init__(self, store: SwarmStore) -> None:
         self.store = store
@@ -91,6 +102,7 @@ class Orchestrator:
         on_job_created: Optional[Callable[[Job], None]] = None,
     ) -> RunResult:
         job = self.store.create_job(goal)
+        _tag_job_effort(self.store, job.id)
         if on_job_created is not None:
             on_job_created(job)
         record_orchestrator_heartbeat(self.store, job.id, started=True)
@@ -149,6 +161,7 @@ class Orchestrator:
         roles: Optional[list[str]] = None,
     ) -> RunResult:
         job = self.store.create_job(goal)
+        _tag_job_effort(self.store, job.id)
         self._begin_trace()
         try:
             specs = self._with_retrieved_memory(specs_for_roles(roles), goal)

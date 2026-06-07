@@ -9152,6 +9152,66 @@ class PuppetmasterSalvageAndLivenessTests(unittest.TestCase):
             self.assertIn("dead", summary["verdict"])
 
 
+class PuppetmasterLifecycleTests(unittest.TestCase):
+    """Durable-state GC (#8) and effort rollup (#7)."""
+
+    def _store(self, tmp: str):
+        store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+        store.init()
+        return store
+
+    def test_effort_tag_roundtrip(self) -> None:
+        from puppetmaster.lifecycle import job_effort_id, tag_job_effort
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            job = store.create_job("goal")
+            self.assertIsNone(job_effort_id(store, job.id))
+            tag_job_effort(store, job.id, "migration-x")
+            self.assertEqual(job_effort_id(store, job.id), "migration-x")
+
+    def test_gc_only_reaps_old_terminal_jobs(self) -> None:
+        from puppetmaster.lifecycle import gc_terminal_jobs
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            running = store.create_job("running")
+            store.update_job_status(running.id, JobStatus.RUNNING)
+            done = store.create_job("done")
+            store.update_job_status(done.id, JobStatus.COMPLETE)
+
+            # Dry-run with a 0-day window reaps the terminal job, not the running one.
+            reaped = gc_terminal_jobs(store, older_than_days=0, force=False)
+            ids = {r["job_id"] for r in reaped}
+            self.assertIn(done.id, ids)
+            self.assertNotIn(running.id, ids)
+            self.assertFalse(reaped[0]["deleted"])
+            self.assertIsNotNone(store.get_job(done.id))  # dry-run didn't delete
+
+            # A 7-day window leaves the just-created terminal job alone.
+            self.assertEqual(gc_terminal_jobs(store, older_than_days=7, force=False), [])
+
+            # Force actually deletes.
+            gc_terminal_jobs(store, older_than_days=0, force=True)
+            self.assertNotIn(done.id, {j.id for j in store.list_jobs()})
+
+    def test_rollup_filters_by_effort(self) -> None:
+        from puppetmaster.lifecycle import rollup_stores, tag_job_effort
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            a = store.create_job("a")
+            tag_job_effort(store, a.id, "EFF")
+            b = store.create_job("b")  # untagged
+
+            scoped = rollup_stores([store], effort_id="EFF")
+            self.assertEqual(scoped["jobs"], 1)
+
+            everything = rollup_stores([store], effort_id=None)
+            self.assertEqual(everything["jobs"], 2)
+            self.assertIn("EFF", everything["efforts_seen"])
+
+
 class PuppetmasterUsageTests(unittest.TestCase):
     """Token-consumption capture & rollup (#5 metering, #6 estimate labeling)."""
 
