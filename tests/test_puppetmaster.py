@@ -8959,6 +8959,139 @@ class PuppetmasterLoudFailureTests(unittest.TestCase):
         self.assertTrue(verdict["trustworthy"])
 
 
+class PuppetmasterGateTests(unittest.TestCase):
+    """Non-bypassable completion gates (#2 commit, #11 drift ratchet)."""
+
+    def _store(self, tmp: str):
+        store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+        store.init()
+        return store
+
+    def _git_repo(self, path: Path) -> None:
+        path.mkdir(parents=True, exist_ok=True)
+        for args in (
+            ["git", "init", "-q"],
+            ["git", "config", "user.email", "t@t.t"],
+            ["git", "config", "user.name", "t"],
+        ):
+            subprocess.run(args, cwd=str(path), check=True, capture_output=True)
+        (path / "seed.txt").write_text("seed\n")
+        subprocess.run(["git", "add", "-A"], cwd=str(path), check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "seed"], cwd=str(path), check=True, capture_output=True
+        )
+
+    def _task(self, **payload):
+        from puppetmaster.models import Task
+
+        return Task(job_id="job_g", role="cursor", instruction="x", payload=payload)
+
+    def test_gate_specs_resolved_from_convenience_flags(self) -> None:
+        from puppetmaster.gates import task_gate_specs
+
+        task = self._task(require_diff=True, commit={"author": "a <a@a>"})
+        kinds = {s["kind"] for s in task_gate_specs(task)}
+        self.assertEqual(kinds, {"require_diff", "committed"})
+        self.assertEqual(task_gate_specs(self._task()), [])
+
+    def test_require_diff_fails_on_empty_tree(self) -> None:
+        from puppetmaster.gates import evaluate_task_gates
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            repo = Path(tmp) / "repo"
+            self._git_repo(repo)
+            task = self._task(require_diff=True, cwd=str(repo))
+            result = evaluate_task_gates(task, [], store, worker_id="w1", cwd=repo)
+            self.assertFalse(result.passed)
+            self.assertIn("no diff", result.failed_reason)
+
+    def test_require_diff_passes_with_changes(self) -> None:
+        from puppetmaster.gates import evaluate_task_gates
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            repo = Path(tmp) / "repo"
+            self._git_repo(repo)
+            (repo / "new.txt").write_text("change\n")
+            task = self._task(require_diff=True, cwd=str(repo))
+            result = evaluate_task_gates(task, [], store, worker_id="w1", cwd=repo)
+            self.assertTrue(result.passed)
+
+    def test_ratchet_establishes_then_enforces(self) -> None:
+        from puppetmaster.gates import evaluate_task_gates
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            repo = Path(tmp) / "repo"
+            self._git_repo(repo)
+            spec = {"kind": "ratchet", "command": "echo '{\"metrics\": {\"m\": 5}}'", "metric": "m"}
+            task = self._task(gates=[spec], cwd=str(repo))
+            # First run establishes baseline 5 and passes.
+            self.assertTrue(evaluate_task_gates(task, [], store, worker_id="w1", cwd=repo).passed)
+
+            # A regression to 7 fails.
+            worse = {"kind": "ratchet", "command": "echo '{\"metrics\": {\"m\": 7}}'", "metric": "m"}
+            bad = self._task(gates=[worse], cwd=str(repo))
+            evald = evaluate_task_gates(bad, [], store, worker_id="w1", cwd=repo)
+            self.assertFalse(evald.passed)
+            self.assertIn("regressed", evald.failed_reason)
+
+            # Shrinking to 3 passes and tightens the baseline.
+            better = {"kind": "ratchet", "command": "echo '{\"metrics\": {\"m\": 3}}'", "metric": "m"}
+            good = self._task(gates=[better], cwd=str(repo))
+            self.assertTrue(evaluate_task_gates(good, [], store, worker_id="w1", cwd=repo).passed)
+            # Baseline now 3: returning to 5 must fail.
+            again = self._task(
+                gates=[{"kind": "ratchet", "command": "echo '{\"metrics\": {\"m\": 5}}'", "metric": "m"}],
+                cwd=str(repo),
+            )
+            self.assertFalse(evaluate_task_gates(again, [], store, worker_id="w1", cwd=repo).passed)
+
+    def test_command_gate_exit_code(self) -> None:
+        from puppetmaster.gates import evaluate_task_gates
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            repo = Path(tmp) / "repo"
+            self._git_repo(repo)
+            ok = self._task(gates=[{"kind": "command", "command": "true"}], cwd=str(repo))
+            self.assertTrue(evaluate_task_gates(ok, [], store, worker_id="w1", cwd=repo).passed)
+            bad = self._task(gates=[{"kind": "command", "command": "false"}], cwd=str(repo))
+            self.assertFalse(evaluate_task_gates(bad, [], store, worker_id="w1", cwd=repo).passed)
+
+    def test_committed_gate_fails_when_dirty_then_autocommits(self) -> None:
+        from puppetmaster.gates import evaluate_task_gates
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            repo = Path(tmp) / "repo"
+            self._git_repo(repo)
+            (repo / "work.txt").write_text("uncommitted\n")
+            # Without auto, a dirty tree fails the commit post-condition.
+            strict = self._task(gates=[{"kind": "committed"}], cwd=str(repo))
+            self.assertFalse(evaluate_task_gates(strict, [], store, worker_id="w1", cwd=repo).passed)
+            # With auto, the runtime commits the work and the gate passes.
+            auto = self._task(
+                gates=[{"kind": "committed", "auto": True, "message": "feat: x"}], cwd=str(repo)
+            )
+            self.assertTrue(evaluate_task_gates(auto, [], store, worker_id="w1", cwd=repo).passed)
+
+    def test_gate_failure_marks_run_untrustworthy(self) -> None:
+        from puppetmaster.gates import evaluate_task_gates
+        from puppetmaster.quality import assess_run_quality
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            repo = Path(tmp) / "repo"
+            self._git_repo(repo)
+            task = self._task(require_diff=True, cwd=str(repo))
+            evald = evaluate_task_gates(task, [], store, worker_id="w1", cwd=repo)
+            verdict = assess_run_quality(evald.artifacts)
+            self.assertEqual(verdict["quality"], "blocked")
+            self.assertFalse(verdict["trustworthy"])
+
+
 if __name__ == "__main__":
     unittest.main()
 
