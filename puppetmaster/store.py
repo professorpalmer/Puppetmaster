@@ -27,6 +27,28 @@ from puppetmaster.models import (
 )
 from puppetmaster.state import resolve_state_dir
 
+_WINDOWS_LOCK_RETRIES = 10
+_WINDOWS_LOCK_BACKOFF_SECONDS = 0.02
+
+
+def _retry_on_windows_lock(operation):
+    """Run a filesystem op, retrying briefly on a Windows sharing-violation.
+
+    Windows raises ``PermissionError`` (errno 13) when one process holds a file
+    open while another tries to ``os.replace``/read it. The JSON store is touched
+    by the orchestrator and worker subprocesses concurrently, so a task file can
+    be read mid-rewrite. On POSIX these ops are atomic and the loop succeeds on
+    the first try, so this is a Windows-only safety net with no POSIX cost.
+    """
+    last_error: Optional[PermissionError] = None
+    for attempt in range(_WINDOWS_LOCK_RETRIES):
+        try:
+            return operation()
+        except PermissionError as error:
+            last_error = error
+            time.sleep(_WINDOWS_LOCK_BACKOFF_SECONDS * (attempt + 1))
+    raise last_error  # type: ignore[misc]
+
 
 class SwarmStore:
     """File-backed coordination store with Redis-like key spaces."""
@@ -639,11 +661,17 @@ class SwarmStore:
             json.dumps(to_jsonable(value), indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
-        os.replace(temp_path, path)
+        # On Windows os.replace raises PermissionError when a concurrent reader
+        # holds the destination open; on POSIX the rename is atomic and this
+        # retry never triggers. Keeps cross-process task writes from flaking.
+        _retry_on_windows_lock(lambda: os.replace(temp_path, path))
 
     @staticmethod
     def read_json(path: Path) -> dict[str, Any]:
-        return json.loads(path.read_text(encoding="utf-8"))
+        # Mirror of write_json: a read that lands mid-replace can hit a transient
+        # PermissionError on Windows. Retry briefly instead of crashing the run.
+        text = _retry_on_windows_lock(lambda: path.read_text(encoding="utf-8"))
+        return json.loads(text)
 
     @staticmethod
     def artifact_hash(artifact: Artifact) -> str:
