@@ -16,6 +16,7 @@ from typing import Any, Optional, Protocol, Union
 from puppetmaster.codegraph import enrich_prompt_with_codegraph
 from puppetmaster.models import Artifact, ArtifactType, Task
 from puppetmaster.redaction import redact_secrets
+from puppetmaster.usage import token_usage
 
 
 # Default truncation budgets. Match what the codebase used pre-spool so existing
@@ -645,6 +646,11 @@ class CursorAdapter:
 
         after = git_snapshot(cwd)
         failure = classify_cursor_failure(completed.stderr + completed.stdout)
+        usage = token_usage(
+            sdk_usage=cursor_result_usage(completed.stdout),
+            prompt_text=prompt,
+            output_text=completed.stdout,
+        )
         stdout_capture = capture_subprocess_stdout(
             text=completed.stdout, task=task, sidecar_name="cursor_implement_stdout", tail_chars=12000
         )
@@ -677,6 +683,7 @@ class CursorAdapter:
                     "head_sha": after["sha"],
                     "changed_files": after["changed_files"],
                     "untracked_files": after["untracked_files"],
+                    **usage,
                 },
             )
         ]
@@ -774,6 +781,11 @@ class CursorAdapter:
             ]
         failure = classify_cursor_failure(completed.stderr + completed.stdout)
         status, result_text = cursor_result_text(completed.stdout)
+        usage = token_usage(
+            sdk_usage=cursor_result_usage(completed.stdout),
+            prompt_text=prompt,
+            output_text=result_text or completed.stdout,
+        )
         parsed_artifacts = (
             cursor_result_artifacts(task, worker_id, result_text)
             if completed.returncode == 0
@@ -823,6 +835,7 @@ class CursorAdapter:
                         if completed.returncode != 0
                         else None
                     ),
+                    **usage,
                 },
             )
         ]
@@ -1822,6 +1835,17 @@ def worktree_guard(
             },
         )
     ]
+
+
+def cursor_result_usage(stdout: str) -> Any:
+    """Pull the SDK ``usage`` object out of the runner's JSON stdout, if any."""
+    try:
+        payload = json.loads(stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if isinstance(payload, dict):
+        return payload.get("usage")
+    return None
 
 
 def cursor_result_text(stdout: str) -> tuple[Optional[str], str]:

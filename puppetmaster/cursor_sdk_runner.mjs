@@ -41,10 +41,16 @@ try {
     local: { cwd: input.cwd || process.cwd(), settingSources: [] },
   });
 
+  // Surface token usage when the SDK provides it. Cursor plans are
+  // plan-billed (marginal $0), but the *token counts* are still the only
+  // honest measure of consumption — capture them even though cost is zero.
+  // Shape varies across SDK versions, so pass through defensively.
+  const usage = result.usage ?? result.tokenUsage ?? null;
   process.stdout.write(
     JSON.stringify({
       status: result.status,
       result: result.result || "",
+      usage: usage,
     }),
   );
   process.exit(result.status === "finished" ? 0 : 2);
