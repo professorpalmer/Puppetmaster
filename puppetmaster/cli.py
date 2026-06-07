@@ -1243,9 +1243,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
             worker_mode=args.worker_mode,
             on_job_created=on_job_created,
         )
-        print_mode_banner(result.mode)
-        print_run_result(result.job.id, len(result.artifacts), result.summary_path)
-        return 0
+        return finalize_cli_run(result)
 
     if args.command == "cursor":
         implement = getattr(args, "implement", False)
@@ -1282,9 +1280,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
             worker_mode=args.worker_mode,
             on_job_created=on_job_created,
         )
-        print_mode_banner(result.mode)
-        print_run_result(result.job.id, len(result.artifacts), result.summary_path)
-        return 0
+        return finalize_cli_run(result)
 
     if args.command == "claude":
         payload = {
@@ -1313,9 +1309,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
             worker_mode=args.worker_mode,
             on_job_created=on_job_created,
         )
-        print_mode_banner(result.mode)
-        print_run_result(result.job.id, len(result.artifacts), result.summary_path)
-        return 0
+        return finalize_cli_run(result)
 
     if args.command == "openai":
         payload: dict[str, Any] = {
@@ -1353,9 +1347,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
             worker_mode=args.worker_mode,
             on_job_created=on_job_created,
         )
-        print_mode_banner(result.mode)
-        print_run_result(result.job.id, len(result.artifacts), result.summary_path)
-        return 0
+        return finalize_cli_run(result)
 
     if args.command == "codex":
         payload: dict[str, Any] = {
@@ -1387,9 +1379,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
             worker_mode=args.worker_mode,
             on_job_created=on_job_created,
         )
-        print_mode_banner(result.mode)
-        print_run_result(result.job.id, len(result.artifacts), result.summary_path)
-        return 0
+        return finalize_cli_run(result)
 
     if args.command == "demo":
         result = Orchestrator(store).run(args.goal)
@@ -1534,6 +1524,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
     if args.command == "show":
         from puppetmaster import reads_log
 
+        _warn_run_quality(store, args.job_id)
         if args.partial:
             reads_log.record_read("partial_summary", caller="cli")
             print(Stitcher(store).preview(args.job_id))
@@ -1662,6 +1653,60 @@ def print_run_result(job_id: str, artifact_count: int, summary_path: Path) -> No
     print(f"job_id: {job_id}")
     print(f"artifacts: {artifact_count}")
     print(f"summary: {summary_path}")
+
+
+def _warn_run_quality(store: Any, job_id: str) -> None:
+    """Print a one-line quality verdict to stderr when a job's artifacts look
+    blocked/empty/degraded, so a reader of ``show`` is never silently handed an
+    untrustworthy summary."""
+    from puppetmaster.quality import assess_run_quality
+
+    try:
+        verdict = assess_run_quality(store.list_artifacts(job_id))
+    except Exception:
+        return
+    if verdict["quality"] == "ok":
+        return
+    reason = "; ".join(verdict.get("reasons") or [])
+    sys.stderr.write(
+        f"quality: {verdict['quality']} — {reason}. "
+        "This run is low-confidence; verify before trusting it.\n"
+    )
+
+
+def finalize_cli_run(result: Any) -> int:
+    """Print a run's mode banner, summary, and a built-in quality verdict, then
+    return a shell exit code.
+
+    A ``blocked`` run (a worker refused to run — e.g. dirty tree) or an
+    ``empty`` run exits non-zero and prints a loud reason, so a "completed" job
+    that did zero work can never masquerade as success. ``degraded`` is loud but
+    non-fatal (exit 0) — the artifacts exist but shouldn't be trusted blindly.
+    """
+    from puppetmaster.quality import assess_run_quality
+
+    print_mode_banner(result.mode)
+    print_run_result(result.job.id, len(result.artifacts), result.summary_path)
+
+    verdict = assess_run_quality(result.artifacts)
+    quality = verdict["quality"]
+    if quality == "ok":
+        return 0
+
+    reason = "; ".join(verdict.get("reasons") or [])
+    if quality in {"blocked", "empty"}:
+        print(
+            f"puppetmaster: run {quality} — {reason}. "
+            "Nothing was accomplished; not reporting success.",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        f"puppetmaster: run quality=degraded — {reason}. "
+        "Artifacts exist but treat this run as low-confidence.",
+        file=sys.stderr,
+    )
+    return 0
 
 
 def print_mode_banner(mode: str) -> None:
