@@ -647,7 +647,7 @@ class CursorAdapter:
         after = git_snapshot(cwd)
         failure = classify_cursor_failure(completed.stderr + completed.stdout)
         usage = token_usage(
-            sdk_usage=cursor_result_usage(completed.stdout),
+            sdk_usage=sdk_usage_from_stdout(completed.stdout),
             prompt_text=prompt,
             output_text=completed.stdout,
         )
@@ -782,7 +782,7 @@ class CursorAdapter:
         failure = classify_cursor_failure(completed.stderr + completed.stdout)
         status, result_text = cursor_result_text(completed.stdout)
         usage = token_usage(
-            sdk_usage=cursor_result_usage(completed.stdout),
+            sdk_usage=sdk_usage_from_stdout(completed.stdout),
             prompt_text=prompt,
             output_text=result_text or completed.stdout,
         )
@@ -1058,6 +1058,11 @@ class ClaudeCodeAdapter:
             task=task,
             sidecar_name="claude_stderr",
         )
+        usage = token_usage(
+            sdk_usage=sdk_usage_from_stdout(completed.stdout),
+            prompt_text=prompt,
+            output_text=completed.stdout,
+        )
         verification = verification_artifact(
             task=task,
             worker_id=worker_id,
@@ -1085,6 +1090,7 @@ class ClaudeCodeAdapter:
                 "head_sha": after["sha"],
                 "changed_files": after["changed_files"],
                 "untracked_files": after["untracked_files"],
+                **usage,
             },
         )
         artifacts = [verification]
@@ -1846,8 +1852,12 @@ def worktree_guard(
     ]
 
 
-def cursor_result_usage(stdout: str) -> Any:
-    """Pull the SDK ``usage`` object out of the runner's JSON stdout, if any."""
+def sdk_usage_from_stdout(stdout: str) -> Any:
+    """Pull a top-level SDK ``usage`` object out of JSON stdout, if any.
+
+    Shared by the Cursor and Claude Code adapters, whose runners both emit a
+    single JSON result object carrying ``usage``. Returns ``None`` when stdout
+    isn't JSON or has no usage, so the caller falls back to an approximation."""
     try:
         payload = json.loads(stdout)
     except (json.JSONDecodeError, TypeError):

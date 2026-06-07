@@ -1007,6 +1007,42 @@ def _build_tools() -> list[McpTool]:
             input_schema=mcp_cleanup_schema(),
             handler=run_mcp_cleanup,
         ),
+        McpTool(
+            name="puppetmaster_gc",
+            description=(
+                "Reap durable state for old terminal jobs (complete/failed/stalled) so "
+                "per-project / per-worktree state dirs stop piling up. Dry-run by default "
+                "— pass force=true to actually delete. Use all_projects=true to sweep "
+                "every Puppetmaster state dir on the machine. Platform-agnostic: works "
+                "across cursor, claude-code, codex, and openai jobs alike."
+            ),
+            input_schema=gc_schema(),
+            handler=run_gc,
+        ),
+        McpTool(
+            name="puppetmaster_rollup",
+            description=(
+                "Aggregate jobs/artifacts/cost/tokens across many worktree state dirs for "
+                "one logical effort. Tag jobs via PUPPETMASTER_EFFORT_ID or `run --effort`, "
+                "then roll them up here to get one ledger for an effort that spanned many "
+                "worktrees. Pass effort_id to filter; all_projects=true is the usual case."
+            ),
+            input_schema=rollup_schema(),
+            handler=run_rollup,
+        ),
+        McpTool(
+            name="puppetmaster_gate",
+            description=(
+                "Replay the non-bypassable completion gates against a working tree, outside "
+                "a worker run — the same engine the runtime enforces at task completion: "
+                "require_diff / command oracle / monotonic ratchet (baseline only shrinks) / "
+                "committed. Lets a parent agent or CI enforce drift/parity/commit "
+                "post-conditions on demand. isError=true when any gate fails. Universal "
+                "across every adapter."
+            ),
+            input_schema=gate_schema(),
+            handler=run_gate,
+        ),
     ]
 
 
@@ -1818,6 +1854,46 @@ def run_cli(command: list[str], args: JsonObject) -> JsonObject:
     }
 
 
+def run_gc(args: JsonObject) -> JsonObject:
+    command = ["gc", "--json"]
+    if args.get("older_than_days") is not None:
+        command.extend(["--older-than-days", str(args["older_than_days"])])
+    if args.get("all_projects"):
+        command.append("--all-projects")
+    if args.get("force"):
+        command.append("--force")
+    return run_cli(command, args)
+
+
+def run_rollup(args: JsonObject) -> JsonObject:
+    command = ["rollup", "--json"]
+    if isinstance(args.get("effort_id"), str) and args["effort_id"].strip():
+        command.extend(["--effort", args["effort_id"]])
+    if args.get("all_projects"):
+        command.append("--all-projects")
+    return run_cli(command, args)
+
+
+def run_gate(args: JsonObject) -> JsonObject:
+    command = ["gate", "--json"]
+    if isinstance(args.get("gate_cwd"), str) and args["gate_cwd"].strip():
+        command.extend(["--cwd", args["gate_cwd"]])
+    if args.get("require_diff"):
+        command.append("--require-diff")
+    if isinstance(args.get("command"), str) and args["command"].strip():
+        command.extend(["--command", args["command"]])
+    if isinstance(args.get("ratchet_command"), str) and args["ratchet_command"].strip():
+        command.extend(["--ratchet-command", args["ratchet_command"]])
+    if isinstance(args.get("metric"), str) and args["metric"].strip():
+        command.extend(["--metric", args["metric"]])
+    if args.get("committed"):
+        command.append("--committed")
+    gates = args.get("gates")
+    if gates is not None:
+        command.extend(["--gates-json", json.dumps(gates)])
+    return run_cli(command, args)
+
+
 def run_feed(args: JsonObject) -> JsonObject:
     command = ["feed", require_string(args, "job_id"), "--json"]
     if args.get("limit"):
@@ -2076,6 +2152,83 @@ def job_schema(required: bool = False) -> JsonObject:
     schema["properties"]["job_id"] = {"type": "string", "description": "Puppetmaster job id."}
     if required:
         schema["required"] = ["job_id"]
+    return schema
+
+
+def gc_schema() -> JsonObject:
+    schema = base_schema()
+    schema["properties"].update(
+        {
+            "older_than_days": {
+                "type": "number",
+                "default": 7.0,
+                "description": "Only reap terminal jobs finished more than N days ago.",
+            },
+            "all_projects": {
+                "type": "boolean",
+                "description": "Sweep every Puppetmaster project state dir on this machine.",
+            },
+            "force": {
+                "type": "boolean",
+                "description": "Actually delete. Omit for a dry-run that only reports.",
+            },
+        }
+    )
+    return schema
+
+
+def rollup_schema() -> JsonObject:
+    schema = base_schema()
+    schema["properties"].update(
+        {
+            "effort_id": {
+                "type": "string",
+                "description": "Only include jobs tagged with this effort id. Omit for all.",
+            },
+            "all_projects": {
+                "type": "boolean",
+                "description": "Aggregate across every project state dir (usual for an effort).",
+            },
+        }
+    )
+    return schema
+
+
+def gate_schema() -> JsonObject:
+    schema = base_schema()
+    schema["properties"].update(
+        {
+            "gate_cwd": {
+                "type": "string",
+                "description": "Working tree to evaluate gates against. Defaults to cwd.",
+            },
+            "require_diff": {
+                "type": "boolean",
+                "description": "Fail unless the tree has a non-empty diff (an edit happened).",
+            },
+            "command": {
+                "type": "string",
+                "description": "Oracle command; must exit 0 (e.g. the test/parity suite).",
+            },
+            "ratchet_command": {
+                "type": "string",
+                "description": "Command printing JSON metrics on stdout for the ratchet gate.",
+            },
+            "metric": {
+                "type": "string",
+                "description": "Metric key the ratchet enforces (monotonic; may only shrink).",
+            },
+            "committed": {
+                "type": "boolean",
+                "description": "Fail if the tree has uncommitted changes after the run.",
+            },
+            "gates": {
+                "type": "array",
+                "items": {"type": "object"},
+                "description": "Full gate specs ([{kind,...}]) for gates the flags don't cover.",
+            },
+        }
+    )
     return schema
 
 

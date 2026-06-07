@@ -464,6 +464,53 @@ def build_parser() -> argparse.ArgumentParser:
         "effort that spanned multiple worktrees).",
     )
     rollup.add_argument("--json", action="store_true", help="Emit JSON.")
+
+    gate = subcommands.add_parser(
+        "gate",
+        help=(
+            "Replay the non-bypassable completion gates against a working tree, "
+            "outside a worker run. Same engine the runtime enforces at task "
+            "completion: require_diff / command oracle / monotonic ratchet / "
+            "committed. Exits non-zero if any gate fails."
+        ),
+    )
+    gate.add_argument(
+        "--cwd",
+        default=".",
+        help="Working tree to evaluate gates against. Default: current dir.",
+    )
+    gate.add_argument(
+        "--require-diff",
+        action="store_true",
+        help="Fail unless the tree has a non-empty diff (an edit happened).",
+    )
+    gate.add_argument(
+        "--command",
+        dest="gate_command",
+        help="Oracle command; must exit 0 (e.g. the test/parity suite).",
+    )
+    gate.add_argument(
+        "--ratchet-command",
+        help="Command printing JSON metrics on stdout for the ratchet gate.",
+    )
+    gate.add_argument(
+        "--metric",
+        help="Metric key the ratchet enforces (monotonic; may only shrink).",
+    )
+    gate.add_argument(
+        "--committed",
+        action="store_true",
+        help="Fail if the tree has uncommitted changes after the run.",
+    )
+    gate.add_argument(
+        "--gates-json",
+        help=(
+            "Full gate spec as a JSON array of {kind,...} objects, for gates the "
+            "convenience flags don't cover. Merged with any flags above."
+        ),
+    )
+    gate.add_argument("--json", action="store_true", help="Emit JSON.")
+
     wait.add_argument("--json", action="store_true", help="Emit JSON.")
     wait.add_argument(
         "--summary",
@@ -1608,6 +1655,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
 
     if args.command == "rollup":
         return _run_rollup_command(args, store)
+
+    if args.command == "gate":
+        return _run_gate_command(args, store)
 
     if args.command == "reap":
         return _run_reap_command(args, store)
@@ -2903,7 +2953,7 @@ def _run_finalize_command(args, store) -> int:
     from puppetmaster.models import JobStatus
 
     job = store.get_job(args.job_id)
-    summary = Stitcher(store).stitch(args.job_id)
+    Stitcher(store).stitch(args.job_id)  # side effect: (re)writes summaries/stitched.md
     summary_path = store.job_dir(args.job_id) / "summaries" / "stitched.md"
     # Only advance a non-terminal job to complete; never override an explicit
     # FAILED verdict.
@@ -2992,6 +3042,79 @@ def _run_rollup_command(args, store) -> int:
     if not args.effort and rollup["efforts_seen"]:
         print(f"  efforts seen: {', '.join(rollup['efforts_seen'])}")
     return 0
+
+
+def _gate_specs_from_args(args) -> list[dict]:
+    """Translate the gate flags + --gates-json into the same spec list the
+    runtime resolves from ``task.payload['gates']``."""
+    specs: list[dict] = []
+    if args.gates_json:
+        parsed = json.loads(args.gates_json)
+        if not isinstance(parsed, list):
+            raise ValueError("--gates-json must be a JSON array of gate objects")
+        specs.extend(s for s in parsed if isinstance(s, dict) and s.get("kind"))
+    if args.require_diff:
+        specs.append({"kind": "require_diff"})
+    if args.gate_command:
+        specs.append({"kind": "command", "command": args.gate_command})
+    if args.ratchet_command or args.metric:
+        if not (args.ratchet_command and args.metric):
+            raise ValueError("--ratchet-command and --metric must be given together")
+        specs.append(
+            {"kind": "ratchet", "command": args.ratchet_command, "metric": args.metric}
+        )
+    if args.committed:
+        specs.append({"kind": "committed"})
+    return specs
+
+
+def _run_gate_command(args, store) -> int:
+    """Replay completion gates against a working tree outside a worker run, so
+    a parent agent or CI can enforce the very same post-conditions the runtime
+    applies at task completion. Exits non-zero when any gate fails."""
+    from puppetmaster.gates import evaluate_task_gates
+    from puppetmaster.models import Task
+
+    try:
+        specs = _gate_specs_from_args(args)
+    except ValueError as exc:
+        print(f"gate: {exc}")
+        return 2
+    if not specs:
+        print(
+            "gate: no gates specified. Pass --require-diff / --command / "
+            "--ratchet-command+--metric / --committed / --gates-json."
+        )
+        return 2
+
+    cwd = Path(args.cwd).resolve()
+    task = Task(
+        job_id="gate-replay",
+        role="gate",
+        instruction="gate replay",
+        payload={"gates": specs, "cwd": str(cwd)},
+    )
+    evaluation = evaluate_task_gates(
+        task, artifacts=[], store=store, worker_id="gate-replay", cwd=cwd
+    )
+
+    rows = [
+        {
+            "gate": result.name,
+            "kind": result.kind,
+            "passed": result.passed,
+            "reason": result.reason,
+        }
+        for result in evaluation.results
+    ]
+    if args.json:
+        print(json.dumps({"passed": evaluation.passed, "gates": rows}, indent=2))
+    else:
+        for row in rows:
+            mark = "PASS" if row["passed"] else "FAIL"
+            print(f"  [{mark}] {row['gate']} ({row['kind']}): {row['reason']}")
+        print(f"\ngate: {'all gates passed' if evaluation.passed else 'GATE FAILED'}")
+    return 0 if evaluation.passed else 1
 
 
 def _run_wait_command(args, store) -> int:
