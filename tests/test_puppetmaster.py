@@ -9064,31 +9064,35 @@ class PuppetmasterGateTests(unittest.TestCase):
     def test_ratchet_establishes_then_enforces(self) -> None:
         from puppetmaster.gates import evaluate_task_gates
 
+        # Emit the metric JSON via an argv list (shell=False) so the oracle is
+        # cross-platform — a shell `echo '...'` leaves the quotes intact under
+        # cmd.exe and breaks the JSON parse on Windows.
+        def oracle(value: int) -> list:
+            return [
+                sys.executable,
+                "-c",
+                f"import json;print(json.dumps({{'metrics': {{'m': {value}}}}}))",
+            ]
+
         with TemporaryDirectory() as tmp:
             store = self._store(tmp)
             repo = Path(tmp) / "repo"
             self._git_repo(repo)
-            spec = {"kind": "ratchet", "command": "echo '{\"metrics\": {\"m\": 5}}'", "metric": "m"}
-            task = self._task(gates=[spec], cwd=str(repo))
+            task = self._task(gates=[{"kind": "ratchet", "command": oracle(5), "metric": "m"}], cwd=str(repo))
             # First run establishes baseline 5 and passes.
             self.assertTrue(evaluate_task_gates(task, [], store, worker_id="w1", cwd=repo).passed)
 
             # A regression to 7 fails.
-            worse = {"kind": "ratchet", "command": "echo '{\"metrics\": {\"m\": 7}}'", "metric": "m"}
-            bad = self._task(gates=[worse], cwd=str(repo))
+            bad = self._task(gates=[{"kind": "ratchet", "command": oracle(7), "metric": "m"}], cwd=str(repo))
             evald = evaluate_task_gates(bad, [], store, worker_id="w1", cwd=repo)
             self.assertFalse(evald.passed)
             self.assertIn("regressed", evald.failed_reason)
 
             # Shrinking to 3 passes and tightens the baseline.
-            better = {"kind": "ratchet", "command": "echo '{\"metrics\": {\"m\": 3}}'", "metric": "m"}
-            good = self._task(gates=[better], cwd=str(repo))
+            good = self._task(gates=[{"kind": "ratchet", "command": oracle(3), "metric": "m"}], cwd=str(repo))
             self.assertTrue(evaluate_task_gates(good, [], store, worker_id="w1", cwd=repo).passed)
             # Baseline now 3: returning to 5 must fail.
-            again = self._task(
-                gates=[{"kind": "ratchet", "command": "echo '{\"metrics\": {\"m\": 5}}'", "metric": "m"}],
-                cwd=str(repo),
-            )
+            again = self._task(gates=[{"kind": "ratchet", "command": oracle(5), "metric": "m"}], cwd=str(repo))
             self.assertFalse(evaluate_task_gates(again, [], store, worker_id="w1", cwd=repo).passed)
 
     def test_command_gate_exit_code(self) -> None:
