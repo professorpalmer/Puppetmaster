@@ -256,6 +256,11 @@ def build_parser() -> argparse.ArgumentParser:
     run = subcommands.add_parser("run", help="Run a local swarm against a goal.")
     run.add_argument("goal", help="The swarm goal.")
     run.add_argument(
+        "--effort",
+        help="Tag this job with an effort id so it can be rolled up across "
+        "worktrees later (sets PUPPETMASTER_EFFORT_ID for this run).",
+    )
+    run.add_argument(
         "--workers",
         nargs="+",
         help="Worker roles to run. Defaults to explore architect implement redteam test.",
@@ -414,6 +419,51 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="No-progress window before a leaseless job is called stalled.",
     )
+
+    gc = subcommands.add_parser(
+        "gc",
+        help=(
+            "Reap durable state for old terminal jobs (complete/failed/stalled) "
+            "so per-project state dirs stop piling up. Dry-run by default."
+        ),
+    )
+    gc.add_argument(
+        "--older-than-days",
+        type=float,
+        default=7.0,
+        help="Only reap terminal jobs finished more than N days ago. Default: 7.",
+    )
+    gc.add_argument(
+        "--all-projects",
+        action="store_true",
+        help="Sweep every Puppetmaster project state dir on this machine.",
+    )
+    gc.add_argument(
+        "--force",
+        action="store_true",
+        help="Actually delete. Without this, gc only reports what it would reap.",
+    )
+    gc.add_argument("--json", action="store_true", help="Emit JSON.")
+
+    rollup = subcommands.add_parser(
+        "rollup",
+        help=(
+            "Aggregate jobs/artifacts/cost/tokens across many worktree state "
+            "dirs for one logical effort. Tag jobs via PUPPETMASTER_EFFORT_ID "
+            "or `run --effort`, then roll them up here."
+        ),
+    )
+    rollup.add_argument(
+        "--effort",
+        help="Only include jobs tagged with this effort id. Omit to include all.",
+    )
+    rollup.add_argument(
+        "--all-projects",
+        action="store_true",
+        help="Aggregate across every project state dir (the usual case for an "
+        "effort that spanned multiple worktrees).",
+    )
+    rollup.add_argument("--json", action="store_true", help="Emit JSON.")
     wait.add_argument("--json", action="store_true", help="Emit JSON.")
     wait.add_argument(
         "--summary",
@@ -1219,6 +1269,8 @@ def _main(argv: Optional[list[str]] = None) -> int:
 
         from puppetmaster.workers import specs_for_roles
 
+        if getattr(args, "effort", None):
+            os.environ["PUPPETMASTER_EFFORT_ID"] = args.effort
         if args.config:
             config = load_config(args.config)
             specs = config.workers
@@ -1550,6 +1602,12 @@ def _main(argv: Optional[list[str]] = None) -> int:
 
     if args.command == "finalize":
         return _run_finalize_command(args, store)
+
+    if args.command == "gc":
+        return _run_gc_command(args, store)
+
+    if args.command == "rollup":
+        return _run_rollup_command(args, store)
 
     if args.command == "reap":
         return _run_reap_command(args, store)
@@ -2872,6 +2930,67 @@ def _run_reap_command(args, store) -> int:
             f"  {row['job_id']}\treason={row['reason']}\t"
             f"requeued_tasks={row['requeued_tasks']}"
         )
+    return 0
+
+
+def _gc_target_stores(args, store) -> list:
+    """The stores `gc`/`rollup` should sweep: just this project, or every one."""
+    if not getattr(args, "all_projects", False):
+        return [store]
+    stores = []
+    for project in list_project_state_dirs():
+        try:
+            stores.append(create_store(args.backend, project))
+        except Exception:
+            continue
+    return stores or [store]
+
+
+def _run_gc_command(args, store) -> int:
+    from puppetmaster.lifecycle import gc_terminal_jobs
+
+    reaped: list[dict] = []
+    for target in _gc_target_stores(args, store):
+        reaped.extend(
+            gc_terminal_jobs(
+                target, older_than_days=args.older_than_days, force=args.force
+            )
+        )
+    if args.json:
+        print(json.dumps({"reaped": reaped, "deleted": args.force}, indent=2))
+        return 0
+    if not reaped:
+        print(f"gc: no terminal jobs older than {args.older_than_days}d to reap")
+        return 0
+    verb = "reaped" if args.force else "would reap (dry-run; pass --force)"
+    print(f"gc: {verb} {len(reaped)} job(s):")
+    for row in reaped:
+        print(f"  {row['job_id']}\t{row['status']}\t{row['age_days']}d\t{row['goal'][:60]}")
+    if not args.force:
+        print("\n  Re-run with --force to delete this state.")
+    return 0
+
+
+def _run_rollup_command(args, store) -> int:
+    from puppetmaster.lifecycle import rollup_stores
+
+    rollup = rollup_stores(_gc_target_stores(args, store), effort_id=args.effort)
+    if args.json:
+        print(json.dumps(rollup, indent=2))
+        return 0
+    scope = f"effort '{args.effort}'" if args.effort else "all jobs"
+    print(f"rollup ({scope}):")
+    print(f"  jobs:      {rollup['jobs']}  {rollup['jobs_by_status']}")
+    print(f"  artifacts: {rollup['artifacts']}")
+    print(f"  est. cost: ${rollup['estimated_cost_usd']:.6f} (pre-flight routing estimate)")
+    usage = rollup["token_usage"]
+    if usage["measured_runs"] or usage["estimated_runs"]:
+        print(
+            f"  tokens:    {usage['measured_tokens_in'] + usage['measured_tokens_out']:,} measured / "
+            f"~{usage['estimated_tokens_in'] + usage['estimated_tokens_out']:,} estimated"
+        )
+    if not args.effort and rollup["efforts_seen"]:
+        print(f"  efforts seen: {', '.join(rollup['efforts_seen'])}")
     return 0
 
 
