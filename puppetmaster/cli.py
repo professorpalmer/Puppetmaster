@@ -1455,6 +1455,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
         # Surface a dead-but-"running" job as stalled before snapshotting, so
         # status never reports a wedged job as live.
         _reap_quietly(store)
+        _warn_job_liveness(store, args.job_id)
         print(json.dumps(store.status_snapshot(args.job_id), indent=2))
         return 0
 
@@ -1653,6 +1654,29 @@ def print_run_result(job_id: str, artifact_count: int, summary_path: Path) -> No
     print(f"job_id: {job_id}")
     print(f"artifacts: {artifact_count}")
     print(f"summary: {summary_path}")
+
+
+def _warn_job_liveness(store: Any, job_id: str) -> None:
+    """For a still-"running" job, print a loud liveness verdict to stderr so a
+    wedged/dead orchestrator is obvious at a glance instead of hiding behind a
+    quiet ``running`` status (#9)."""
+    from puppetmaster.liveness import liveness_summary
+
+    try:
+        job = store.get_job(job_id)
+        if job is None or str(job.status) not in {"running", "stitching"}:
+            return
+        summary = liveness_summary(store, job)
+    except Exception:
+        return
+    if summary["verdict"] == "alive":
+        return
+    pid = summary.get("pid")
+    sys.stderr.write(
+        f"liveness: {summary['verdict']} — orchestrator pid={pid} "
+        f"idle={summary['idle_seconds']}s, live_lease={summary['live_lease']}. "
+        "Run `puppetmaster reap` to stall+requeue, or `recover` to retry tasks.\n"
+    )
 
 
 def _warn_run_quality(store: Any, job_id: str) -> None:

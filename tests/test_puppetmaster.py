@@ -9092,6 +9092,55 @@ class PuppetmasterGateTests(unittest.TestCase):
             self.assertFalse(verdict["trustworthy"])
 
 
+class PuppetmasterSalvageAndLivenessTests(unittest.TestCase):
+    """#3 salvage structured content from raw stdout; #9 loud liveness."""
+
+    def _store(self, tmp: str):
+        store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+        store.init()
+        return store
+
+    def test_analyze_salvages_findings_from_stdout_on_failure(self) -> None:
+        from puppetmaster.models import Task
+
+        task = Task(
+            job_id="job", role="reviewer", instruction="review",
+            adapter="cursor", payload={"prompt": "review", "cwd": "."},
+        )
+        # A non-zero run whose structured findings nonetheless sit in stdout —
+        # previously lost; now salvaged before declaring degraded/failed.
+        completed = subprocess.CompletedProcess(
+            args=["node"],
+            returncode=2,
+            stdout=json.dumps([{"type": "finding", "claim": "recovered finding", "evidence": ["e"]}]),
+            stderr="",
+        )
+        with patch("puppetmaster.adapters.subprocess.run", return_value=completed):
+            artifacts = CursorAdapter().run(task, "goal", "worker-cursor")
+        claims = [a.payload.get("claim") for a in artifacts if str(a.type) == "finding"]
+        self.assertIn("recovered finding", claims)
+
+    def test_liveness_summary_flags_dead_pid(self) -> None:
+        from puppetmaster.liveness import liveness_summary
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            job = store.create_job("goal")
+            store.update_job_status(job.id, JobStatus.RUNNING)
+            store.write_json(
+                store.job_dir(job.id) / "orchestrator.json",
+                {
+                    "pid": 999999999,
+                    "host": socket.gethostname(),
+                    "started_at": seconds_from_now(-30),
+                    "heartbeat_at": seconds_from_now(-30),
+                },
+            )
+            summary = liveness_summary(store, store.get_job(job.id))
+            self.assertFalse(summary["pid_alive"])
+            self.assertIn("dead", summary["verdict"])
+
+
 class PuppetmasterUsageTests(unittest.TestCase):
     """Token-consumption capture & rollup (#5 metering, #6 estimate labeling)."""
 
