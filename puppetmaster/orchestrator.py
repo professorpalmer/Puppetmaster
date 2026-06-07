@@ -1304,15 +1304,17 @@ class Orchestrator:
         ]
         if crash_after_claim:
             command.append("--crash-after-claim")
-        env = None
-        if self._traceparent:
-            import os
+        # Always hand the worker (and any agent it spawns) a PYTHONPATH that puts
+        # this install first, so a self-served `python -m puppetmaster codegraph`
+        # can't resolve a stale pip build that lacks the subcommand (#4).
+        import os
 
-            env = {
-                **os.environ,
-                "TRACEPARENT": self._traceparent,
-                "PUPPETMASTER_TRACEPARENT": self._traceparent,
-            }
+        from puppetmaster.codegraph import inject_worker_cli_env
+
+        env = inject_worker_cli_env(dict(os.environ))
+        if self._traceparent:
+            env["TRACEPARENT"] = self._traceparent
+            env["PUPPETMASTER_TRACEPARENT"] = self._traceparent
         return subprocess.Popen(command, env=env)
 
     @staticmethod

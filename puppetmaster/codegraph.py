@@ -217,6 +217,27 @@ def codegraph_context(
     return output
 
 
+def puppetmaster_source_root() -> str:
+    """Absolute path to the directory containing the ``puppetmaster`` package."""
+    return str(Path(__file__).resolve().parents[1])
+
+
+def inject_worker_cli_env(env: dict[str, str]) -> dict[str, str]:
+    """Ensure a worker subprocess can self-serve the CodeGraph CLI (#4).
+
+    A spawned agent that runs ``python -m puppetmaster codegraph ...`` may pick
+    up a *stale pip install* that predates the codegraph subcommand and fail
+    with "unknown command". Prepending this install's source root to PYTHONPATH
+    makes the current tree shadow any older one, so the worker's CLI matches the
+    parent's. Mutates and returns ``env``."""
+    source_root = puppetmaster_source_root()
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        f"{source_root}{os.pathsep}{existing}" if existing else source_root
+    )
+    return env
+
+
 def codegraph_prompt_section(context: str) -> str:
     """Format a CodeGraph context string for prompt injection."""
     return "\n".join(
