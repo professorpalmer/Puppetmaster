@@ -791,6 +791,15 @@ class CursorAdapter:
             if completed.returncode == 0
             else []
         )
+        # Salvage (#3): structured content can sit in raw stdout even when the
+        # SDK's `result` field was empty (a dry-run that printed but never
+        # "finished") or the run exited non-zero. Parse raw stdout before
+        # declaring the run degraded, so a real review isn't lost to a manual
+        # log read.
+        if not parsed_artifacts:
+            salvaged = cursor_result_artifacts(task, worker_id, completed.stdout)
+            if salvaged:
+                parsed_artifacts = salvaged
         degraded = completed.returncode == 0 and not parsed_artifacts
         stdout_capture = capture_subprocess_stdout(
             text=completed.stdout,

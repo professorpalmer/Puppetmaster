@@ -183,6 +183,46 @@ def assess_job_liveness(
     return LivenessVerdict(dead=False, reason="recent_activity")
 
 
+def liveness_summary(
+    store: SwarmStore,
+    job: Job,
+    *,
+    stall_after_seconds: Optional[int] = None,
+    now: Optional[datetime] = None,
+) -> dict:
+    """A glanceable liveness report for a job: pid, whether it's alive, the
+    heartbeat/idle age, and a human verdict. Lets ``status`` scream "this is
+    dead" instead of quietly showing ``running`` for a wedged job (#9)."""
+    stall_after = stall_after_seconds or stall_after_seconds_default()
+    now = now or datetime.now(timezone.utc)
+    record = _read_record(store, job.id) or {}
+    tasks = store.list_tasks(job.id)
+    pid = record.get("pid") if isinstance(record.get("pid"), int) else None
+    same_host = record.get("host") == socket.gethostname()
+    pid_alive = bool(pid and same_host and _pid_alive(pid))
+    idle_seconds = int((now - _latest_activity(store, job, record)).total_seconds())
+    live_lease = _has_live_lease(tasks, now)
+
+    if pid and same_host and not pid_alive:
+        verdict = "dead (orchestrator pid gone)"
+    elif not live_lease and idle_seconds > stall_after:
+        verdict = f"dead (no progress for {idle_seconds}s)"
+    elif not live_lease and idle_seconds > stall_after // 2:
+        verdict = f"stale (no progress for {idle_seconds}s; reaped at {stall_after}s)"
+    else:
+        verdict = "alive"
+
+    return {
+        "pid": pid,
+        "host": record.get("host"),
+        "pid_alive": pid_alive,
+        "idle_seconds": idle_seconds,
+        "live_lease": live_lease,
+        "stall_after_seconds": stall_after,
+        "verdict": verdict,
+    }
+
+
 def reap_stalled_jobs(
     store: SwarmStore,
     *,
