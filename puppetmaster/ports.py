@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import socket
+import sys
 from pathlib import Path
 from typing import Optional, Union
 
@@ -85,7 +86,15 @@ def _port_is_free(port: int, host: str = "127.0.0.1") -> bool:
     if port < 1 or port > 65535:
         return False
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # SO_REUSEADDR has inverted semantics on Windows: it lets bind() succeed
+        # *over* an actively-listening socket, which would make this liveness probe
+        # report a busy port as free and defeat collision avoidance. Only set it on
+        # POSIX, where it correctly distinguishes a live listener (bind still fails)
+        # from a reclaimable TIME_WAIT socket (bind succeeds). On Windows the default
+        # (no SO_REUSEADDR) already fails to bind an occupied port — which is what we
+        # want here.
+        if not sys.platform.startswith("win"):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             sock.bind((host, port))
             return True
