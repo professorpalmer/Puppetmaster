@@ -270,6 +270,10 @@ class PuppetmasterTests(unittest.TestCase):
 
             self.assertIn("job_", payload["job_id"])
             self.assertIn("pid", payload)
+            # The launcher pid is now labeled honestly and monitoring is pointed
+            # at job_id rather than the misleading supervisor pid (C2).
+            self.assertEqual(payload["launcher_pid"], payload["pid"])
+            self.assertEqual(payload["monitor_with"]["job_id"], payload["job_id"])
             self.assertFalse(result["isError"])
 
             spawned = ASYNC_PROCESSES[before_process_count:]
@@ -898,6 +902,34 @@ class PuppetmasterTests(unittest.TestCase):
 
             self.assertEqual(store.latest_job().id, result.job.id)
             self.assertTrue(matches)
+
+    def test_prompt_with_memory_dedupes_and_caps_statements(self) -> None:
+        """Injected promoted memory is deduped and each statement size-capped."""
+        from puppetmaster.adapters import prompt_with_memory, _MEMORY_STATEMENT_MAX_CHARS
+        from puppetmaster.models import Task
+
+        long_statement = "decided to " + ("x" * 600)
+        retrieved = [
+            {"scope": "swarm.decisions", "statement": "use sqlite store"},
+            {"scope": "swarm.decisions", "statement": "use sqlite store"},  # dup
+            {"scope": "swarm.decisions", "statement": long_statement},
+        ]
+        task = Task(job_id="j", role="explore", instruction="x", payload={"retrieved_memory": retrieved})
+        result = prompt_with_memory("base prompt", task)
+
+        self.assertEqual(result.count("use sqlite store"), 1)  # deduped
+        self.assertIn("…", result)  # long statement truncated
+        for line in result.splitlines():
+            if line.startswith("- ["):
+                # bullet body never exceeds the cap (plus the scope prefix/ellipsis).
+                self.assertLessEqual(len(line), _MEMORY_STATEMENT_MAX_CHARS + 40)
+
+    def test_prompt_with_memory_noop_without_memory(self) -> None:
+        from puppetmaster.adapters import prompt_with_memory
+        from puppetmaster.models import Task
+
+        task = Task(job_id="j", role="explore", instruction="x", payload={})
+        self.assertEqual(prompt_with_memory("base prompt", task), "base prompt")
 
     def test_memory_retrieval_supports_scope_filters(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -2987,6 +3019,85 @@ class PuppetmasterTests(unittest.TestCase):
                 mcp_server._ACTIVE_TOOL_CALLS = 0
             mcp_server._SHUTDOWN_REQUESTED.clear()
 
+    def test_reaper_drops_exited_launchers_keeps_running(self) -> None:
+        """`_reap_async_processes` waitpid-reaps exited launchers and keeps live ones."""
+        from puppetmaster import mcp_server
+
+        class _FakeLauncher:
+            def __init__(self, exited: bool) -> None:
+                self._exited = exited
+                self.poll_calls = 0
+
+            def poll(self):
+                self.poll_calls += 1
+                return 0 if self._exited else None
+
+        done_a, done_b, running = _FakeLauncher(True), _FakeLauncher(True), _FakeLauncher(False)
+        with mcp_server._ASYNC_PROCESSES_LOCK:
+            saved = list(mcp_server.ASYNC_PROCESSES)
+            mcp_server.ASYNC_PROCESSES[:] = [done_a, running, done_b]
+        try:
+            reaped = mcp_server._reap_async_processes()
+            self.assertEqual(reaped, 2)
+            self.assertEqual(mcp_server.ASYNC_PROCESSES, [running])
+            self.assertGreaterEqual(running.poll_calls, 1)
+        finally:
+            with mcp_server._ASYNC_PROCESSES_LOCK:
+                mcp_server.ASYNC_PROCESSES[:] = saved
+
+    def test_track_async_process_sweeps_in_same_critical_section(self) -> None:
+        """Appending a launcher also reaps already-exited ones, so bursts can't pile up."""
+        from puppetmaster import mcp_server
+
+        class _FakeLauncher:
+            def __init__(self, exited: bool) -> None:
+                self._exited = exited
+
+            def poll(self):
+                return 0 if self._exited else None
+
+        stale, fresh = _FakeLauncher(True), _FakeLauncher(False)
+        with mcp_server._ASYNC_PROCESSES_LOCK:
+            saved = list(mcp_server.ASYNC_PROCESSES)
+            mcp_server.ASYNC_PROCESSES[:] = [stale]
+        try:
+            mcp_server._track_async_process(fresh)
+            self.assertEqual(mcp_server.ASYNC_PROCESSES, [fresh])
+        finally:
+            with mcp_server._ASYNC_PROCESSES_LOCK:
+                mcp_server.ASYNC_PROCESSES[:] = saved
+
+    def test_reaper_thread_reaps_on_interval_and_final_sweep(self) -> None:
+        """The daemon reaper clears exited launchers on its tick and on stop()."""
+        from puppetmaster import mcp_server
+
+        class _FakeLauncher:
+            def __init__(self) -> None:
+                self.alive = True
+
+            def poll(self):
+                return None if self.alive else 0
+
+        launcher = _FakeLauncher()
+        with mcp_server._ASYNC_PROCESSES_LOCK:
+            saved = list(mcp_server.ASYNC_PROCESSES)
+            mcp_server.ASYNC_PROCESSES[:] = [launcher]
+        reaper = mcp_server._AsyncProcessReaper(interval_seconds=0.02)
+        try:
+            reaper.start()
+            time.sleep(0.1)
+            # Still running -> not reaped yet.
+            self.assertIn(launcher, mcp_server.ASYNC_PROCESSES)
+            launcher.alive = False
+            deadline = time.time() + 1.0
+            while launcher in mcp_server.ASYNC_PROCESSES and time.time() < deadline:
+                time.sleep(0.02)
+            self.assertNotIn(launcher, mcp_server.ASYNC_PROCESSES)
+        finally:
+            reaper.stop()
+            with mcp_server._ASYNC_PROCESSES_LOCK:
+                mcp_server.ASYNC_PROCESSES[:] = saved
+
     def test_input_staleness_can_be_disabled_via_env(self) -> None:
         from puppetmaster.mcp_server import _input_staleness_disabled
 
@@ -4465,6 +4576,39 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
 
             self.assertEqual(run_code, 0)
             self.assertEqual(clean_code, 0)
+
+    def test_cli_logs_collapses_heartbeats_by_default(self) -> None:
+        with TemporaryDirectory() as tmp:
+            state_dir = str(Path(tmp) / ".puppetmaster")
+            store = SwarmStore(Path(state_dir))
+            job = store.create_job("heartbeat collapse check")
+            for _ in range(5):
+                store.emit(job.id, "run.heartbeat", {"run_id": "r1"})
+            store.emit(job.id, "task.lease_renewed", {"task_id": "t1"})
+            store.emit(job.id, "verification.recorded", {"confidence": 0.9})
+
+            def _run_logs(extra: list[str]) -> tuple[str, str]:
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    code = cli_main(
+                        ["--state-dir", state_dir, "--backend", "file", "logs", job.id] + extra
+                    )
+                self.assertEqual(code, 0)
+                return out.getvalue(), err.getvalue()
+
+            default_out, default_err = _run_logs([])
+            self.assertIn("verification.recorded", default_out)
+            self.assertNotIn("run.heartbeat", default_out)
+            self.assertIn("collapsed 6 heartbeat event(s)", default_err)
+            self.assertIn("run.heartbeat=5", default_err)
+
+            all_out, _ = _run_logs(["--all"])
+            self.assertIn("run.heartbeat", all_out)
+            self.assertIn("task.lease_renewed", all_out)
+
+            filtered_out, _ = _run_logs(["--event-type", "heartbeat"])
+            self.assertIn("run.heartbeat", filtered_out)
+            self.assertNotIn("verification.recorded", filtered_out)
 
     def test_cli_approve_and_reject_accept_job_targets(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -9001,6 +9145,128 @@ class PuppetmasterLoudFailureTests(unittest.TestCase):
         self.assertEqual(verdict["quality"], "ok")
         self.assertTrue(verdict["trustworthy"])
 
+    def test_warn_run_quality_treats_running_empty_job_as_in_progress(self) -> None:
+        """A still-running job with no artifacts yet must not be warned as low-confidence."""
+        from puppetmaster.cli import _warn_run_quality
+        from puppetmaster.models import JobStatus
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("implement in flight")
+            store.update_job_status(job.id, JobStatus.RUNNING)
+
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                _warn_run_quality(store, job.id)
+            message = err.getvalue()
+            self.assertIn("in progress", message)
+            self.assertNotIn("low-confidence", message)
+
+    def test_warn_run_quality_warns_when_finished_job_is_empty(self) -> None:
+        """A terminal job that produced nothing still gets the low-confidence warning."""
+        from puppetmaster.cli import _warn_run_quality
+        from puppetmaster.models import JobStatus
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("finished but empty")
+            store.update_job_status(job.id, JobStatus.COMPLETE)
+
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                _warn_run_quality(store, job.id)
+            message = err.getvalue()
+            self.assertIn("low-confidence", message)
+            self.assertIn("empty", message)
+
+    def test_worker_timeout_emits_blocked_artifact(self) -> None:
+        """A killed-on-timeout worker records a blocked artifact so the run can't look done."""
+        from puppetmaster.models import Task
+        from puppetmaster.quality import assess_run_quality
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("long playwright run")
+            task = Task(job_id=job.id, role="implement", instruction="e2e")
+            store.save_task(task)
+
+            Orchestrator(store)._emit_timeout_artifact(job, [task], timeout_seconds=600)
+
+            artifacts = store.list_artifacts(job.id)
+            self.assertTrue(artifacts)
+            verdict = assess_run_quality(artifacts)
+            self.assertEqual(verdict["quality"], "blocked")
+            self.assertIn("worker_timeout", verdict["blocking_failures"])
+
+    def test_worker_wait_extends_while_progressing(self) -> None:
+        """A4: a worker still emitting events past base timeout is extended, not killed."""
+        import subprocess as sp
+        from puppetmaster.models import Task
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("long verify")
+            task = Task(job_id=job.id, role="cursor", instruction="e2e")
+
+            class ProgressingProc:
+                """Times out a few times while emitting events, then exits clean."""
+                def __init__(self) -> None:
+                    self.calls = 0
+                    self.returncode = 0
+
+                def wait(self, timeout=None):
+                    self.calls += 1
+                    store.emit(job.id, "run.heartbeat", {"n": self.calls})
+                    if self.calls <= 3:
+                        raise sp.TimeoutExpired(cmd="x", timeout=timeout)
+                    return 0
+
+                def terminate(self):
+                    raise AssertionError("must not kill a progressing worker")
+
+            orch = Orchestrator(store)
+            with patch.object(Orchestrator, "_worker_wait_timeout", staticmethod(lambda tasks: 0)), \
+                 patch.object(Orchestrator, "_worker_hard_cap", staticmethod(lambda tasks, base: 9999)):
+                orch._wait_for_worker(ProgressingProc(), job, [task])
+            events = [e["event"] for e in store.read_events(job.id)]
+            self.assertIn("worker.timeout_extended", events)
+            self.assertNotIn("worker.timed_out", events)
+
+    def test_worker_wait_kills_when_no_progress(self) -> None:
+        """A4: a quiet (wedged) worker past base timeout is still killed loudly."""
+        import subprocess as sp
+        from puppetmaster.models import Task
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("wedged")
+            task = Task(job_id=job.id, role="cursor", instruction="e2e")
+
+            class WedgedProc:
+                """Always times out and emits nothing — no demonstrable progress."""
+                def __init__(self) -> None:
+                    self.returncode = -15
+                    self.killed = False
+
+                def wait(self, timeout=None):
+                    if self.killed:
+                        return -15
+                    raise sp.TimeoutExpired(cmd="x", timeout=timeout)
+
+                def terminate(self):
+                    self.killed = True
+
+                def kill(self):
+                    self.killed = True
+
+            orch = Orchestrator(store)
+            with patch.object(Orchestrator, "_worker_wait_timeout", staticmethod(lambda tasks: 0)), \
+                 patch.object(Orchestrator, "_worker_hard_cap", staticmethod(lambda tasks, base: 0)):
+                with self.assertRaises(RuntimeError):
+                    orch._wait_for_worker(WedgedProc(), job, [task])
+            events = [e["event"] for e in store.read_events(job.id)]
+            self.assertIn("worker.timed_out", events)
+
 
 class PuppetmasterGateTests(unittest.TestCase):
     """Non-bypassable completion gates (#2 commit, #11 drift ratchet)."""
@@ -9036,6 +9302,31 @@ class PuppetmasterGateTests(unittest.TestCase):
         kinds = {s["kind"] for s in task_gate_specs(task)}
         self.assertEqual(kinds, {"require_diff", "committed"})
         self.assertEqual(task_gate_specs(self._task()), [])
+
+    def test_implement_mode_defaults_require_diff_invariant(self) -> None:
+        """A3: implement tasks auto-require a diff so a no-op 'complete' fails loudly."""
+        from puppetmaster.gates import task_gate_specs
+
+        implement_kinds = {s["kind"] for s in task_gate_specs(self._task(mode="implement"))}
+        self.assertIn("require_diff", implement_kinds)
+        # Explicit opt-outs disable the auto-invariant for legitimate no-op tasks.
+        self.assertEqual(task_gate_specs(self._task(mode="implement", require_diff=False)), [])
+        self.assertEqual(task_gate_specs(self._task(mode="implement", allow_empty_diff=True)), [])
+        # Non-implement tasks remain ungated by default.
+        self.assertEqual(task_gate_specs(self._task(mode="review")), [])
+
+    def test_implement_no_diff_fails_loudly(self) -> None:
+        """A3 end-to-end: an implement task that changed nothing FAILS its gate."""
+        from puppetmaster.gates import evaluate_task_gates
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            repo = Path(tmp) / "repo"
+            self._git_repo(repo)
+            task = self._task(mode="implement", cwd=str(repo))
+            result = evaluate_task_gates(task, [], store, worker_id="w1", cwd=repo)
+            self.assertFalse(result.passed)
+            self.assertIn("require_diff", result.failed_reason)
 
     def test_require_diff_fails_on_empty_tree(self) -> None:
         from puppetmaster.gates import evaluate_task_gates
@@ -9123,6 +9414,159 @@ class PuppetmasterGateTests(unittest.TestCase):
                 gates=[{"kind": "committed", "auto": True, "message": "feat: x"}], cwd=str(repo)
             )
             self.assertTrue(evaluate_task_gates(auto, [], store, worker_id="w1", cwd=repo).passed)
+
+    def test_write_scope_gate_blocks_out_of_scope_writes(self) -> None:
+        """B3/C1: a task that writes outside its declared scope FAILS the gate."""
+        from puppetmaster.gates import evaluate_task_gates
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            repo = Path(tmp) / "repo"
+            self._git_repo(repo)
+            (repo / "src").mkdir()
+            (repo / "src" / "in_scope.py").write_text("ok\n")
+            (repo / "stray.py").write_text("oops\n")
+
+            task = self._task(write_scope=["src/**"], cwd=str(repo))
+            result = evaluate_task_gates(task, [], store, worker_id="w1", cwd=repo)
+            self.assertFalse(result.passed)
+            self.assertIn("outside declared scope", result.failed_reason)
+
+            # Remove the stray write -> the gate passes.
+            (repo / "stray.py").unlink()
+            ok = evaluate_task_gates(task, [], store, worker_id="w1", cwd=repo)
+            self.assertTrue(ok.passed)
+
+    def test_predict_write_conflicts_flags_overlapping_scopes(self) -> None:
+        """B3/C1: overlapping declared scopes are predicted before dispatch."""
+        from puppetmaster.conflicts import predict_write_conflicts, scopes_overlap
+
+        self.assertTrue(scopes_overlap(["src/api/**"], ["src/api/routes.py"]))
+        self.assertFalse(scopes_overlap(["src/api/**"], ["src/ui/**"]))
+
+        conflicts = predict_write_conflicts([
+            ("t1", ["src/api/**"]),
+            ("t2", ["src/api/routes.py"]),
+            ("t3", ["docs/**"]),
+            ("t4", []),  # undeclared -> skipped
+        ])
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0]["tasks"], ["t1", "t2"])
+
+    def test_affected_specs_rules_template_and_command(self) -> None:
+        """B2: changed files map to specs via declarative rules and via a command."""
+        from puppetmaster.affected import affected_specs
+
+        mapping = {"rules": [
+            {"match": "src/*", "specs": ["tests/{stem}_test.py"]},
+            {"match": "src/api/*", "specs": ["tests/api_smoke.py"]},
+        ]}
+        specs = affected_specs(["src/foo.py", "src/api/routes.py"], mapping)
+        self.assertIn("tests/foo_test.py", specs)
+        self.assertIn("tests/routes_test.py", specs)
+        self.assertIn("tests/api_smoke.py", specs)
+        # Stable + de-duplicated, and an empty changed set yields nothing.
+        self.assertEqual(len(specs), len(set(specs)))
+        self.assertEqual(affected_specs([], mapping), [])
+        # Command strategy: receives changed files on stdin, prints specs.
+        self.assertEqual(affected_specs(["a.py", "b.py"], {"command": "cat"}), ["a.py", "b.py"])
+        # A mapping with neither rules nor command is a usage error.
+        with self.assertRaises(ValueError):
+            affected_specs(["a.py"], {})
+
+    def test_affected_cli_inline_rule(self) -> None:
+        """B2 CLI: inline --rule shorthand resolves affected specs."""
+        from puppetmaster.cli import _run_affected_command
+        from types import SimpleNamespace
+
+        args = SimpleNamespace(
+            config=None, rule=["src/*=>tests/{stem}_test.py"],
+            changed=["src/foo.py"], git_range=None, cwd=".", json=True,
+        )
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = _run_affected_command(args)
+        self.assertEqual(rc, 0)
+        out = json.loads(buf.getvalue())
+        self.assertIn("tests/foo_test.py", out["affected_specs"])
+
+    def test_worktree_ports_are_deterministic_and_distinct(self) -> None:
+        """B1: each worktree gets a stable, non-colliding port block."""
+        from puppetmaster.ports import worktree_port_base, worktree_port_env, apply_worktree_ports
+
+        with TemporaryDirectory() as a, TemporaryDirectory() as b:
+            base_a = worktree_port_base(a)
+            base_b = worktree_port_base(b)
+            # Deterministic: same path -> same base.
+            self.assertEqual(base_a, worktree_port_base(a))
+            # Distinct worktrees almost surely get distinct blocks.
+            self.assertNotEqual(base_a, base_b)
+            # Range stays below Linux's ephemeral floor (32768) for cross-OS safety.
+            self.assertTrue(10000 <= base_a < 32768)
+
+            env = worktree_port_env(a)
+            self.assertEqual(env["PORT"], str(base_a))
+            self.assertEqual(env["PUPPETMASTER_PORT_BASE"], str(base_a))
+            self.assertEqual(env["PUPPETMASTER_PORT_0"], str(base_a))
+
+            # apply_worktree_ports respects an already-pinned PORT unless overridden.
+            pinned = {"PORT": "3000"}
+            apply_worktree_ports(pinned, a)
+            self.assertEqual(pinned["PORT"], "3000")
+            self.assertEqual(pinned["PUPPETMASTER_PORT_BASE"], str(base_a))
+            apply_worktree_ports(pinned, a, override_port=True)
+            self.assertEqual(pinned["PORT"], str(base_a))
+
+    def test_reserve_port_skips_busy_ports(self) -> None:
+        """B1 bulletproof path: reserve_port bumps past a live listener (EADDRINUSE)."""
+        import socket
+        from puppetmaster.ports import reserve_port, worktree_port_base, _port_is_free
+
+        with TemporaryDirectory() as wt:
+            hint = worktree_port_base(wt)
+            # Occupy the hinted port with a real listener.
+            busy = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            busy.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                busy.bind(("127.0.0.1", hint))
+                busy.listen(1)
+                reserved = reserve_port(wt)
+                # Must not hand back the occupied port, and must be bindable.
+                self.assertNotEqual(reserved, hint)
+                self.assertTrue(_port_is_free(reserved))
+            except OSError:
+                self.skipTest("could not bind the hinted port in this environment")
+            finally:
+                busy.close()
+
+    def test_committed_gate_excludes_generated_artifacts(self) -> None:
+        """C2: configured generated artifacts are kept out of the auto-commit."""
+        from puppetmaster.gates import evaluate_task_gates
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            repo = Path(tmp) / "repo"
+            self._git_repo(repo)
+            (repo / "real.txt").write_text("real change\n")
+            (repo / "parity-scoreboard.json").write_text("{\"generated\": true}\n")
+            task = self._task(
+                gates=[{
+                    "kind": "committed", "auto": True, "message": "feat: real",
+                    "exclude": ["parity-scoreboard.json"],
+                }],
+                cwd=str(repo),
+            )
+            evald = evaluate_task_gates(task, [], store, worker_id="w1", cwd=repo)
+            self.assertTrue(evald.passed)
+
+            committed = subprocess.run(
+                ["git", "show", "--name-only", "--pretty=format:", "HEAD"],
+                cwd=str(repo), capture_output=True, text=True, check=True,
+            ).stdout
+            self.assertIn("real.txt", committed)
+            self.assertNotIn("parity-scoreboard.json", committed)
+            # And it's gitignored so it won't resurface in future diffs.
+            self.assertIn("parity-scoreboard.json", (repo / ".gitignore").read_text())
 
     def test_gate_failure_marks_run_untrustworthy(self) -> None:
         from puppetmaster.gates import evaluate_task_gates
@@ -9241,6 +9685,72 @@ class PuppetmasterLifecycleTests(unittest.TestCase):
             # Force actually deletes.
             gc_terminal_jobs(store, older_than_days=0, force=True)
             self.assertNotIn(done.id, {j.id for j in store.list_jobs()})
+
+    def test_delete_job_refuses_unsafe_ids(self) -> None:
+        """delete_job must never rglob outside its own jobs tree (D1 data-loss guard)."""
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            job = store.create_job("real job")
+            sentinel = store.jobs_dir / "DO_NOT_DELETE.txt"
+            sentinel.write_text("keep me", encoding="utf-8")
+
+            for unsafe in ["", "   ", ".", "..", "../..", "/", "../../etc"]:
+                with self.assertRaises(ValueError):
+                    store.delete_job(unsafe)
+            # The jobs tree and the real job survive every refusal.
+            self.assertTrue(sentinel.exists())
+            self.assertIsNotNone(store.get_job(job.id))
+            # A legitimate id still deletes.
+            store.delete_job(job.id)
+            self.assertNotIn(job.id, {j.id for j in store.list_jobs()})
+
+    def test_status_snapshot_surfaces_outcome_signals(self) -> None:
+        """A2+F2: status carries a quality verdict + diff/commit presence."""
+        from puppetmaster.models import Artifact, ArtifactType
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            job = store.create_job("implement something")
+            # No artifacts yet -> empty/untrustworthy, no diff, no commit.
+            snap = store.status_snapshot(job.id)
+            self.assertIn("outcome", snap)
+            self.assertEqual(snap["outcome"]["quality"], "empty")
+            self.assertFalse(snap["outcome"]["diff_present"])
+            self.assertFalse(snap["outcome"]["commit_present"])
+
+            store.save_artifact(Artifact(
+                job_id=job.id, task_id="t1", type=ArtifactType.PATCH, created_by="w1",
+                confidence=0.9, evidence=["e"], payload={"change": "edit", "files": ["a.py"]},
+            ))
+            store.save_artifact(Artifact(
+                job_id=job.id, task_id="t1", type=ArtifactType.GATE, created_by="w1",
+                confidence=0.95, evidence=["gate:committed", "passed"],
+                payload={"gate": "committed", "kind": "committed", "passed": True},
+            ))
+            snap = store.status_snapshot(job.id)
+            self.assertTrue(snap["outcome"]["diff_present"])
+            self.assertTrue(snap["outcome"]["commit_present"])
+            self.assertEqual(snap["outcome"]["artifact_count"], 2)
+
+    def test_gc_all_projects_force_skips_active_worktree(self) -> None:
+        """`gc --force --all-projects` must not delete the active project's state (D1)."""
+        from puppetmaster.cli import _run_gc_command
+        from types import SimpleNamespace
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            done = store.create_job("active worktree run")
+            store.update_job_status(done.id, JobStatus.COMPLETE)
+
+            args = SimpleNamespace(
+                all_projects=True, force=True, older_than_days=0, json=True, backend="file"
+            )
+            with patch("puppetmaster.cli._gc_target_stores", return_value=[store]):
+                err = io.StringIO()
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                    _run_gc_command(args, store)
+            # The active project's terminal job is preserved, not deleted.
+            self.assertIsNotNone(store.get_job(done.id))
 
     def test_rollup_filters_by_effort(self) -> None:
         from puppetmaster.lifecycle import rollup_stores, tag_job_effort

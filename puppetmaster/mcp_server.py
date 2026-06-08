@@ -42,7 +42,17 @@ from puppetmaster.store_factory import create_store
 
 
 JsonObject = dict[str, Any]
+
+# Detached job/index launchers spawned with ``start_new_session=True``. The
+# request path returns the moment a launcher reports its job id, so nothing
+# inline ever waits on these children. Without an out-of-band reaper, each one
+# becomes a ``<defunct>`` zombie parented to this server the instant it exits —
+# an unbounded leak that, over a long Cursor session, can exhaust the PID table.
+# ``_ASYNC_PROCESSES_LOCK`` guards the list because tool handlers append from
+# pool threads while the reaper thread sweeps it.
 ASYNC_PROCESSES: list[subprocess.Popen] = []
+_ASYNC_PROCESSES_LOCK = threading.Lock()
+_DEFAULT_REAP_INTERVAL_SECONDS = 15.0
 
 # Concurrency primitives for the stdio loop.
 #
@@ -102,6 +112,87 @@ _INPUT_STATE_LOCK = threading.Lock()
 _LAST_INBOUND_MESSAGE_AT = time.time()
 _ACTIVE_TOOL_CALLS = 0
 _SHUTDOWN_REQUESTED = threading.Event()
+
+
+def _reap_async_processes_locked() -> int:
+    """Poll every tracked launcher and drop the ones that have exited.
+
+    ``Popen.poll()`` waitpid-reaps an exited child, clearing its zombie slot.
+    The caller must hold ``_ASYNC_PROCESSES_LOCK``. Returns the count reaped.
+    """
+    survivors: list[subprocess.Popen] = []
+    reaped = 0
+    for process in ASYNC_PROCESSES:
+        try:
+            exited = process.poll() is not None
+        except Exception:
+            # A process we can no longer query is not worth tracking; treat it
+            # as gone rather than holding a reference that never clears.
+            exited = True
+        if exited:
+            reaped += 1
+        else:
+            survivors.append(process)
+    ASYNC_PROCESSES[:] = survivors
+    return reaped
+
+
+def _reap_async_processes() -> int:
+    with _ASYNC_PROCESSES_LOCK:
+        return _reap_async_processes_locked()
+
+
+def _track_async_process(process: subprocess.Popen) -> None:
+    """Register a detached launcher for reaping.
+
+    Sweeps already-exited launchers in the same critical section so a burst of
+    short jobs can't pile up zombies between reaper ticks.
+    """
+    with _ASYNC_PROCESSES_LOCK:
+        ASYNC_PROCESSES.append(process)
+        _reap_async_processes_locked()
+
+
+def _resolve_reap_interval() -> float:
+    raw = os.environ.get("PUPPETMASTER_MCP_REAP_INTERVAL_SECONDS")
+    if not raw:
+        return _DEFAULT_REAP_INTERVAL_SECONDS
+    try:
+        return max(1.0, float(raw))
+    except ValueError:
+        return _DEFAULT_REAP_INTERVAL_SECONDS
+
+
+class _AsyncProcessReaper(threading.Thread):
+    """Daemon thread that waitpid-reaps detached job/index launchers.
+
+    Each async job and codegraph index is spawned as a detached child and the
+    request path returns immediately, so nothing inline waits on them. On exit
+    they become ``<defunct>`` zombies parented to this server. This thread
+    sweeps the tracked set on a fixed interval (and once more on shutdown) so
+    exited launchers are reaped instead of accumulating.
+    """
+
+    def __init__(self, interval_seconds: float = _DEFAULT_REAP_INTERVAL_SECONDS) -> None:
+        super().__init__(daemon=True, name="puppetmaster-mcp-process-reaper")
+        self._interval = max(1.0, interval_seconds)
+        self._stop = threading.Event()
+
+    def stop(self) -> None:
+        self._stop.set()
+        # A final sweep so a launcher that finished during shutdown doesn't
+        # outlive us as a zombie handed back to init.
+        try:
+            _reap_async_processes()
+        except Exception:
+            pass
+
+    def run(self) -> None:  # pragma: no cover - timing covered via direct tests
+        while not self._stop.wait(self._interval):
+            try:
+                _reap_async_processes()
+            except Exception:
+                pass
 
 
 def _resolve_worker_count() -> int:
@@ -534,6 +625,9 @@ def main() -> int:
         )
         idle_keepalive.start()
 
+    reaper = _AsyncProcessReaper(interval_seconds=_resolve_reap_interval())
+    reaper.start()
+
     executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=_resolve_worker_count(),
         thread_name_prefix="pm-mcp",
@@ -572,6 +666,7 @@ def main() -> int:
             sys.stderr.write(f"[pm-mcp] main exiting; reason={exit_reason}\n")
             sys.stderr.flush()
         executor.shutdown(wait=False)
+        reaper.stop()
         if input_watcher is not None:
             input_watcher.stop()
         if idle_keepalive is not None:
@@ -1314,7 +1409,7 @@ def _spawn_codegraph_indexer(args: JsonObject, target_cwd: str) -> JsonObject:
         stdout_handle.close()
         stderr_handle.close()
         raise
-    ASYNC_PROCESSES.append(process)
+    _track_async_process(process)
     stdout_handle.close()
     stderr_handle.close()
     return {
@@ -2006,7 +2101,7 @@ def start_cli(command: list[str], args: JsonObject) -> JsonObject:
         stdout_handle.close()
         stderr_handle.close()
         raise
-    ASYNC_PROCESSES.append(process)
+    _track_async_process(process)
     stdout_handle.close()
     stderr_handle.close()
     try:
@@ -2026,7 +2121,17 @@ def start_cli(command: list[str], args: JsonObject) -> JsonObject:
     body = {
         "run_id": run_id,
         "job_id": job_id,
+        # `launcher_pid` is the detached launcher/orchestrator process, NOT the
+        # durable worker doing the edits — that worker is a downstream child with
+        # its own (shorter) lifetime and pid. Don't monitor progress by this pid;
+        # use `job_id` with status/logs/feed. `pid` is kept as a back-compat alias.
+        "launcher_pid": process.pid,
         "pid": process.pid,
+        "pid_note": (
+            "launcher_pid is the orchestrator launcher, not the worker; "
+            "track progress via job_id (status/logs/feed), not this pid"
+        ),
+        "monitor_with": {"job_id": job_id, "use": "status/logs/feed"},
         "command": "python -m puppetmaster " + " ".join(command),
         "cwd": cwd(args),
         "stdout_path": str(stdout_path),

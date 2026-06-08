@@ -592,11 +592,13 @@ class SQLiteSwarmStore(SwarmStore):
 
     def delete_job(self, job_id: str) -> None:
         self.init()
+        # Validate the path BEFORE touching SQL so an unsafe id (blank/relative/
+        # absolute) can neither wipe rows nor rglob-unlink outside the jobs tree.
+        job_dir = self._assert_safe_job_dir(job_id)
         with self._session() as connection:
             for table in ["events", "artifacts", "runs", "tasks"]:
                 connection.execute(f"DELETE FROM {table} WHERE job_id = ?", (job_id,))
             connection.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
-        job_dir = self.job_dir(job_id)
         if job_dir.exists():
             for path in sorted(job_dir.rglob("*"), reverse=True):
                 if path.is_file():

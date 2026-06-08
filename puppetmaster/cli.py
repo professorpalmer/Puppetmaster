@@ -41,6 +41,11 @@ from puppetmaster.stitcher import Stitcher
 from puppetmaster.worker_runtime import WorkerDaemon
 from puppetmaster.workers import WorkerSpec
 
+# High-frequency lifecycle events that fire ~once/second per task/run and bury
+# the real events in `logs` output. Collapsed to a one-line summary by default;
+# `logs --all` (or an `--event-type` match) restores them.
+_NOISY_LOG_EVENTS = {"task.lease_renewed", "run.heartbeat", "task.saved"}
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -319,6 +324,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     logs = subcommands.add_parser("logs", help="Print event logs for a job, defaulting to the latest.")
     logs.add_argument("job_id", nargs="?")
+    logs.add_argument(
+        "-a",
+        "--all",
+        action="store_true",
+        help="Include high-frequency heartbeat events (lease_renewed/run.heartbeat/"
+        "task.saved). They are collapsed to a one-line summary by default.",
+    )
+    logs.add_argument(
+        "--event-type",
+        action="append",
+        metavar="EVENT",
+        help="Only show events whose name contains this substring. Repeatable; "
+        "implies --all so a heartbeat type can be matched.",
+    )
 
     feed = subcommands.add_parser("feed", help="Print live artifact feed for a job, defaulting to latest.")
     feed.add_argument("job_id", nargs="?")
@@ -444,6 +463,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Actually delete. Without this, gc only reports what it would reap.",
     )
     gc.add_argument("--json", action="store_true", help="Emit JSON.")
+
+    affected = subcommands.add_parser(
+        "affected",
+        help=(
+            "Resolve which spec/test paths a set of changed files affects, using "
+            "your own changed-file->spec mapping (declarative rules or a command). "
+            "Puppetmaster supplies the blast radius; you supply the layout."
+        ),
+    )
+    affected.add_argument(
+        "--config",
+        help="Path to a JSON mapping with 'rules' and/or 'command'.",
+    )
+    affected.add_argument(
+        "--changed",
+        nargs="*",
+        help="Changed file paths. If omitted, read newline-separated paths from stdin.",
+    )
+    affected.add_argument(
+        "--git-range",
+        help="Derive changed files from `git diff --name-only <range>` (e.g. HEAD~1..HEAD).",
+    )
+    affected.add_argument(
+        "--rule",
+        action="append",
+        default=[],
+        help="Inline rule shorthand 'match=>spec1,spec2' (repeatable; merged with --config).",
+    )
+    affected.add_argument("--cwd", default=".", help="Repo root for globbing/command/git.")
+    affected.add_argument("--json", action="store_true", help="Emit JSON instead of newline-separated paths.")
 
     rollup = subcommands.add_parser(
         "rollup",
@@ -633,9 +682,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Cursor daily-driver runs default to inline orchestration to avoid an extra Python worker cold start.",
     )
     cursor.add_argument(
+        "--no-edit",
         "--dry-run",
+        dest="dry_run",
         action="store_true",
-        help="Instruct the agent to inspect and propose artifacts without editing files.",
+        help="Analysis-only: produce findings/plan/review artifacts but don't modify "
+        "the working tree. The deliverable is still produced — '--dry-run' is the "
+        "legacy alias and is a misnomer for plan/review, whose output IS the point.",
     )
     cursor.add_argument(
         "--review",
@@ -1580,8 +1633,24 @@ def _main(argv: Optional[list[str]] = None) -> int:
 
     if args.command == "logs":
         job_id = args.job_id or require_latest_job_id(store)
+        event_filters = [needle for needle in (args.event_type or []) if needle]
+        show_all = args.all or bool(event_filters)
+        suppressed: dict[str, int] = {}
         for event in store.read_events(job_id):
-            print(f"{event['at']}\t{event['event']}\t{json.dumps(event['payload'], sort_keys=True)}")
+            name = event["event"]
+            if event_filters and not any(needle in name for needle in event_filters):
+                continue
+            if not show_all and name in _NOISY_LOG_EVENTS:
+                suppressed[name] = suppressed.get(name, 0) + 1
+                continue
+            print(f"{event['at']}\t{name}\t{json.dumps(event['payload'], sort_keys=True)}")
+        if suppressed:
+            collapsed = ", ".join(f"{name}={count}" for name, count in sorted(suppressed.items()))
+            total = sum(suppressed.values())
+            print(
+                f"… collapsed {total} heartbeat event(s) [{collapsed}] — pass --all to show them",
+                file=sys.stderr,
+            )
         return 0
 
     if args.command == "feed":
@@ -1652,6 +1721,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
 
     if args.command == "gc":
         return _run_gc_command(args, store)
+
+    if args.command == "affected":
+        return _run_affected_command(args)
 
     if args.command == "rollup":
         return _run_rollup_command(args, store)
@@ -1790,18 +1862,42 @@ def _warn_job_liveness(store: Any, job_id: str) -> None:
 def _warn_run_quality(store: Any, job_id: str) -> None:
     """Print a one-line quality verdict to stderr when a job's artifacts look
     blocked/empty/degraded, so a reader of ``show`` is never silently handed an
-    untrustworthy summary."""
+    untrustworthy summary.
+
+    A still-running job is exempt from the empty/degraded warning: implement
+    workers stream no incremental artifacts, so a perfectly healthy in-flight
+    job legitimately has no substantive artifacts yet. Calling that
+    "low-confidence; verify before trusting" cries wolf. We instead emit a
+    neutral in-progress note. A ``blocked`` verdict (a worker refused to run)
+    is a real failure even mid-flight, so it still warns.
+    """
     from puppetmaster.quality import assess_run_quality
+    from puppetmaster.models import JobStatus
 
     try:
         verdict = assess_run_quality(store.list_artifacts(job_id))
     except Exception:
         return
-    if verdict["quality"] == "ok":
+    quality = verdict["quality"]
+    if quality == "ok":
         return
+
+    in_progress = {JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.STITCHING}
+    try:
+        status = store.get_job(job_id).status
+    except Exception:
+        status = None
+    if quality in {"empty", "degraded"} and status in in_progress:
+        sys.stderr.write(
+            f"quality: in progress (state={status}) — no substantive artifacts yet. "
+            "This is expected for a running implement job (artifacts land at the end); "
+            "not a failure signal.\n"
+        )
+        return
+
     reason = "; ".join(verdict.get("reasons") or [])
     sys.stderr.write(
-        f"quality: {verdict['quality']} — {reason}. "
+        f"quality: {quality} — {reason}. "
         "This run is low-confidence; verify before trusting it.\n"
     )
 
@@ -1819,6 +1915,22 @@ def finalize_cli_run(result: Any) -> int:
 
     print_mode_banner(result.mode)
     print_run_result(result.job.id, len(result.artifacts), result.summary_path)
+
+    if result.mode == "edit":
+        from puppetmaster.models import ArtifactType
+
+        diff_present = any(a.type == ArtifactType.PATCH for a in result.artifacts)
+        commit_present = any(
+            a.type == ArtifactType.GATE
+            and (a.payload or {}).get("kind") == "committed"
+            and (a.payload or {}).get("passed") is True
+            for a in result.artifacts
+        )
+        print(
+            f"outcome: diff_present={diff_present} commit_present={commit_present} "
+            f"artifacts={len(result.artifacts)}",
+            file=sys.stderr,
+        )
 
     verdict = assess_run_quality(result.artifacts)
     quality = verdict["quality"]
@@ -2999,15 +3111,29 @@ def _gc_target_stores(args, store) -> list:
 def _run_gc_command(args, store) -> int:
     from puppetmaster.lifecycle import gc_terminal_jobs
 
+    all_projects = getattr(args, "all_projects", False)
+    active_root = _resolved_store_root(store)
     reaped: list[dict] = []
+    protected_active = False
     for target in _gc_target_stores(args, store):
+        # D1 (P0): a `gc --force --all-projects` sweep must never destroy the
+        # active worktree's state out from under live work. Reap the active
+        # project only when the user targets it explicitly (plain `gc --force`,
+        # no --all-projects); under --all-projects we report it dry-run only.
+        is_active_under_sweep = all_projects and _resolved_store_root(target) == active_root
+        effective_force = args.force and not is_active_under_sweep
+        if args.force and is_active_under_sweep:
+            protected_active = True
         reaped.extend(
             gc_terminal_jobs(
-                target, older_than_days=args.older_than_days, force=args.force
+                target, older_than_days=args.older_than_days, force=effective_force
             )
         )
     if args.json:
-        print(json.dumps({"reaped": reaped, "deleted": args.force}, indent=2))
+        print(json.dumps(
+            {"reaped": reaped, "deleted": args.force, "protected_active_worktree": protected_active},
+            indent=2,
+        ))
         return 0
     if not reaped:
         print(f"gc: no terminal jobs older than {args.older_than_days}d to reap")
@@ -3018,6 +3144,66 @@ def _run_gc_command(args, store) -> int:
         print(f"  {row['job_id']}\t{row['status']}\t{row['age_days']}d\t{row['goal'][:60]}")
     if not args.force:
         print("\n  Re-run with --force to delete this state.")
+    if protected_active:
+        print(
+            "\n  note: skipped the active worktree's state under --all-projects "
+            "(reported dry-run above). Run plain `gc --force` here to reap it.",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def _resolved_store_root(store) -> Optional[str]:
+    """Best-effort resolved filesystem root for a store, for active-worktree
+    comparison. Returns None when it can't be determined."""
+    try:
+        return str(Path(store.root).resolve())
+    except Exception:
+        return None
+
+
+def _parse_inline_rules(rule_args: list[str]) -> list[dict]:
+    """Turn 'src/**/*.py=>tests/{stem}_test.py,tests/smoke.py' shorthand into
+    mapping rules."""
+    rules: list[dict] = []
+    for raw in rule_args or []:
+        if "=>" not in raw:
+            raise SystemExit(f"affected: bad --rule (missing '=>'): {raw!r}")
+        match, specs = raw.split("=>", 1)
+        rules.append({
+            "match": match.strip(),
+            "specs": [s.strip() for s in specs.split(",") if s.strip()],
+        })
+    return rules
+
+
+def _run_affected_command(args) -> int:
+    from puppetmaster.affected import affected_specs, changed_files_from_git, load_mapping
+
+    cwd = Path(args.cwd)
+    mapping: dict[str, Any] = {}
+    if args.config:
+        mapping = load_mapping(args.config)
+    inline_rules = _parse_inline_rules(args.rule)
+    if inline_rules:
+        mapping = dict(mapping)
+        mapping["rules"] = list(mapping.get("rules") or []) + inline_rules
+    if not mapping.get("rules") and not mapping.get("command"):
+        raise SystemExit("affected: provide --config and/or --rule defining a mapping")
+
+    if args.git_range:
+        changed = changed_files_from_git(cwd, args.git_range)
+    elif args.changed:
+        changed = list(args.changed)
+    else:
+        changed = [line.strip() for line in sys.stdin.read().splitlines() if line.strip()]
+
+    specs = affected_specs(changed, mapping, cwd=cwd)
+    if args.json:
+        print(json.dumps({"changed": changed, "affected_specs": specs}, indent=2))
+    else:
+        for spec in specs:
+            print(spec)
     return 0
 
 
