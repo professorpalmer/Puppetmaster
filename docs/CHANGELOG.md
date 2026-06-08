@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.9.15
+
+**Windows hotfix for v0.9.14's per-worktree port isolation.** The B1 `reserve_port` probe set `SO_REUSEADDR`, which has inverted semantics on Windows — it lets `bind()` succeed *over* an actively-listening socket, so the liveness check reported a busy port as free and `reserve_port` handed back occupied ports. On Windows, collision avoidance was effectively a no-op. The probe now only sets `SO_REUSEADDR` on POSIX (where it correctly distinguishes a live listener from a reclaimable `TIME_WAIT` socket); Windows uses the default exclusive bind, which already fails on an occupied port. Verified green on the `windows-latest` CI matrix. POSIX behavior is unchanged. No API changes.
+
 ## v0.9.14
 
 **Data-loss guards, parallel-worktree isolation, and progress-aware lifecycle — the safety pass on top of v0.9.13's loud-failure work.** A real multi-worktree migration session surfaced the next tier of sharp edges: state GC that could in principle reach the active worktree, fixed ports that collided when many worktrees ran at once, "implement" tasks that could complete without a diff, generated artifacts polluting worker commits, and long-but-healthy workers killed by a flat timeout. This release hardens the destructive paths, isolates per-worktree runtime, makes completion honest about whether work actually landed, and adds a generic seam for "validate only affected specs." No breaking API changes; full suite **439** green + a 10-scenario end-to-end stress harness (`bench/stress_new_features.py`).
