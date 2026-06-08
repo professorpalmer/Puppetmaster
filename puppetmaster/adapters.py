@@ -15,6 +15,7 @@ from typing import Any, Optional, Protocol, Union
 
 from puppetmaster.codegraph import enrich_prompt_with_codegraph, inject_worker_cli_env
 from puppetmaster.models import Artifact, ArtifactType, Task
+from puppetmaster.ports import apply_worktree_ports
 from puppetmaster.redaction import redact_secrets
 from puppetmaster.usage import token_usage
 
@@ -597,6 +598,7 @@ class CursorAdapter:
 
         runner = Path(__file__).with_name("cursor_sdk_runner.mjs")
         environment = inject_worker_cli_env(os.environ.copy())
+        apply_worktree_ports(environment, cwd)
         environment["PUPPETMASTER_CURSOR_INPUT"] = json.dumps(
             {"prompt": prompt, "cwd": str(cwd), "model": model},
             sort_keys=True,
@@ -733,6 +735,7 @@ class CursorAdapter:
         )
         runner = Path(__file__).with_name("cursor_sdk_runner.mjs")
         environment = inject_worker_cli_env(os.environ.copy())
+        apply_worktree_ports(environment, cwd)
         environment["PUPPETMASTER_CURSOR_INPUT"] = json.dumps(
             {"prompt": prompt, "cwd": cwd, "model": model},
             sort_keys=True,
@@ -981,6 +984,7 @@ class ClaudeCodeAdapter:
                 text=True,
                 timeout=timeout_seconds,
                 check=False,
+                env=apply_worktree_ports(os.environ.copy(), cwd),
             )
         except subprocess.TimeoutExpired as exc:
             stdout = _coerce_text(exc.stdout)
@@ -1244,6 +1248,7 @@ class CodexAdapter:
                 text=True,
                 timeout=timeout_seconds,
                 check=False,
+                env=apply_worktree_ports(os.environ.copy(), cwd),
             )
         except subprocess.TimeoutExpired as exc:
             stdout = _coerce_text(exc.stdout)
@@ -1644,17 +1649,56 @@ def verification_artifact(
     )
 
 
+# Promoted memory is injected into every worker prompt, so verbose or duplicated
+# statements (e.g. a prior task's full instruction promoted as a "decision") are
+# a per-worker token tax paid on every dispatch. Distill at the injection
+# boundary: dedupe identical statements and cap each to a fact-sized snippet.
+_MEMORY_MAX_ITEMS = 5
+_MEMORY_STATEMENT_MAX_CHARS = 280
+
+
+def _truncate_statement(statement: str) -> str:
+    collapsed = " ".join(statement.split())
+    if len(collapsed) <= _MEMORY_STATEMENT_MAX_CHARS:
+        return collapsed
+    return collapsed[: _MEMORY_STATEMENT_MAX_CHARS - 1].rstrip() + "…"
+
+
+def _distill_memory_lines(retrieved: list) -> list[str]:
+    """Dedupe promoted memory and cap each statement so a handful of verbose
+    prior decisions can't balloon every worker prompt with thousands of tokens
+    of duplicated instructions. Full statements remain in the memory store; only
+    the injected copy is trimmed."""
+    lines: list[str] = []
+    seen: set[str] = set()
+    for memory in retrieved:
+        statement = str(memory.get("statement", "")).strip()
+        if not statement:
+            continue
+        key = " ".join(statement.lower().split())
+        if key in seen:
+            continue
+        seen.add(key)
+        scope = memory.get("scope", "memory")
+        lines.append(f"- [{scope}] {_truncate_statement(statement)}")
+        if len(lines) >= _MEMORY_MAX_ITEMS:
+            break
+    return lines
+
+
 def prompt_with_memory(prompt: str, task: Task) -> str:
     retrieved = task.payload.get("retrieved_memory") or []
     if not retrieved:
         return prompt
+    distilled = _distill_memory_lines(retrieved)
+    if not distilled:
+        return prompt
     lines = [
         prompt,
         "",
-        "Relevant promoted Puppetmaster memory:",
+        "Relevant promoted Puppetmaster memory (distilled facts/decisions):",
     ]
-    for memory in retrieved[:5]:
-        lines.append(f"- [{memory.get('scope', 'memory')}] {memory.get('statement', '')}")
+    lines.extend(distilled)
     lines.append("")
     lines.append("Use this as retrieved context, but verify claims before relying on them.")
     return "\n".join(lines)

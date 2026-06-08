@@ -76,7 +76,20 @@ def task_gate_specs(task: Task) -> list[dict[str, Any]]:
         if isinstance(raw, dict) and raw.get("kind"):
             specs.append(dict(raw))
 
-    if task.payload.get("require_diff") and not any(s["kind"] == "require_diff" for s in specs):
+    # An implement (full-edit) task must produce a diff to reach COMPLETE — a
+    # "completed" implement run with zero changes is the A3 silent-no-op failure
+    # (looks done, committed nothing, changed nothing). Default the require_diff
+    # invariant ON for implement mode unless explicitly opted out
+    # (require_diff=false or allow_empty_diff=true for a legitimate no-op task).
+    require_diff = task.payload.get("require_diff")
+    implement_requires_diff = (
+        task.payload.get("mode") == "implement"
+        and require_diff is not False
+        and not task.payload.get("allow_empty_diff", False)
+    )
+    if (require_diff or implement_requires_diff) and not any(
+        s["kind"] == "require_diff" for s in specs
+    ):
         specs.append({"kind": "require_diff"})
 
     commit = task.payload.get("commit")
@@ -85,6 +98,12 @@ def task_gate_specs(task: Task) -> list[dict[str, Any]]:
         if isinstance(commit, dict):
             spec.update(commit)
         specs.append(spec)
+
+    # B3/C1: a declared write-scope is enforced — the task may only change files
+    # matching its globs. Catches a worker straying into another wave's hot files.
+    write_scope = task.payload.get("write_scope")
+    if write_scope and not any(s["kind"] == "write_scope" for s in specs):
+        specs.append({"kind": "write_scope", "scope": list(write_scope)})
 
     return specs
 
@@ -135,6 +154,8 @@ def _evaluate_one(
             return _gate_ratchet(name, spec, store, cwd)
         if kind == "committed":
             return _gate_committed(name, spec, cwd)
+        if kind == "write_scope":
+            return _gate_write_scope(name, spec, artifacts, cwd)
         return GateResult(name, str(kind), False, f"unknown gate kind: {kind!r}")
     except Exception as exc:  # a gate that crashes must FAIL closed, never pass
         return GateResult(name, str(kind), False, f"gate raised: {exc}")
@@ -154,6 +175,44 @@ def _gate_require_diff(name: str, artifacts: list[Artifact], cwd: Path) -> GateR
         False,
         "edit task produced no diff (no files changed) — refusing to call this complete",
         {"changed_files": snapshot.get("changed_files", [])},
+    )
+
+
+def _gate_write_scope(
+    name: str, spec: dict[str, Any], artifacts: list[Artifact], cwd: Path
+) -> GateResult:
+    """Enforce a task's declared write-scope (B3/C1).
+
+    Every file the run changed must match one of the declared globs. A write
+    outside scope means the worker strayed into territory another task owns —
+    the root cause of cross-wave regressions and hand-merged hot files — so the
+    task FAILS loudly instead of silently colliding.
+    """
+    import fnmatch
+    from puppetmaster.adapters import git_snapshot
+
+    scope = [str(g) for g in (spec.get("scope") or spec.get("globs") or []) if str(g).strip()]
+    if not scope:
+        return GateResult(name, "write_scope", False, "write_scope gate needs 'scope' globs")
+
+    snapshot = git_snapshot(cwd)
+    changed = set(snapshot.get("changed_files") or []) | set(snapshot.get("untracked_files") or [])
+    for artifact in artifacts:
+        if artifact.type == ArtifactType.PATCH:
+            changed.update((artifact.payload or {}).get("files") or [])
+
+    out_of_scope = sorted(
+        path for path in changed if not any(fnmatch.fnmatch(path, glob) for glob in scope)
+    )
+    if out_of_scope:
+        return GateResult(
+            name, "write_scope", False,
+            f"wrote {len(out_of_scope)} file(s) outside declared scope",
+            {"out_of_scope": out_of_scope, "scope": scope},
+        )
+    return GateResult(
+        name, "write_scope", True, "all writes within declared scope",
+        {"scope": scope, "changed_files": sorted(changed)},
     )
 
 
@@ -241,6 +300,10 @@ def _gate_committed(name: str, spec: dict[str, Any], cwd: Path) -> GateResult:
     add = _run("git add -A", cwd, 120)
     if add.returncode != 0:
         return GateResult(name, "committed", False, "git add failed", {"stderr_tail": add.stderr[-2000:]})
+    # C2: keep generated artifacts (parity scoreboards, coverage, build output)
+    # out of the worker's commit. Unstage every excluded pathspec and record it
+    # in .gitignore so it stays out of future diffs too.
+    excluded = _strip_excluded_paths(spec.get("exclude"), cwd)
     args = ["git", "commit", "-m", message]
     if author:
         args += ["--author", str(author)]
@@ -249,8 +312,42 @@ def _gate_committed(name: str, spec: dict[str, Any], cwd: Path) -> GateResult:
     return GateResult(
         name, "committed", ok,
         "auto-committed work" if ok else "auto-commit failed",
-        {"message": message, "author": author, "stderr_tail": (committed.stderr or "")[-2000:]},
+        {
+            "message": message,
+            "author": author,
+            "excluded": excluded,
+            "stderr_tail": (committed.stderr or "")[-2000:],
+        },
     )
+
+
+def _strip_excluded_paths(exclude: Any, cwd: Path) -> list[str]:
+    """Unstage every excluded pathspec so generated artifacts never enter an
+    auto-commit, and append them to ``.gitignore`` so they stay out of future
+    diffs. Returns the normalized exclude list (empty when nothing configured).
+    Best-effort: a failure here must not block the commit."""
+    if not exclude:
+        return []
+    patterns = [str(p).strip() for p in (exclude if isinstance(exclude, (list, tuple)) else [exclude])]
+    patterns = [p for p in patterns if p]
+    if not patterns:
+        return []
+    _run(["git", "reset", "-q", "--", *patterns], cwd, 60)
+    try:
+        gitignore = cwd / ".gitignore"
+        existing = gitignore.read_text(encoding="utf-8") if gitignore.is_file() else ""
+        present = {line.strip() for line in existing.splitlines()}
+        additions = [p for p in patterns if p not in present]
+        if additions:
+            prefix = "" if existing.endswith("\n") or not existing else "\n"
+            with gitignore.open("a", encoding="utf-8") as handle:
+                handle.write(prefix + "# Puppetmaster: generated artifacts excluded from worker commits\n")
+                handle.write("\n".join(additions) + "\n")
+            # Re-stage .gitignore so the exclusion persists in the worker's commit.
+            _run(["git", "add", "--", ".gitignore"], cwd, 30)
+    except OSError:
+        pass
+    return patterns
 
 
 def _run(command: Any, cwd: Path, timeout: int) -> subprocess.CompletedProcess:

@@ -883,7 +883,25 @@ class Orchestrator:
         self._validate_task_graph(tasks)
         self.store.save_tasks(tasks)
         self._emit_routing_artifacts(job, tasks_by_role, routing_decisions)
+        self._emit_predicted_conflicts(job, tasks)
         return tasks
+
+    def _emit_predicted_conflicts(self, job: Job, tasks: list[Task]) -> None:
+        """Warn at planning time when two tasks declare overlapping write-scopes
+        (B3/C1) — overlapping hot files are the source of the hand-merge tax and
+        cross-wave regressions. Best-effort; never blocks planning."""
+        try:
+            from puppetmaster.conflicts import predict_write_conflicts
+
+            scoped = [
+                (task.id, task.payload.get("write_scope") or [])
+                for task in tasks
+                if task.payload.get("write_scope")
+            ]
+            for conflict in predict_write_conflicts(scoped):
+                self.store.emit(job.id, "conflict.predicted", conflict)
+        except Exception:
+            pass
 
     def _emit_routing_artifacts(
         self,
@@ -1129,21 +1147,7 @@ class Orchestrator:
             for role in roles
         ]
         for process in processes:
-            try:
-                process.wait(timeout=self._worker_wait_timeout(tasks))
-            except subprocess.TimeoutExpired as exc:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=5)
-                self.store.emit(
-                    job.id,
-                    "worker.timed_out",
-                    {"returncode": process.returncode, "timeout_seconds": self._worker_wait_timeout(tasks)},
-                )
-                raise RuntimeError("worker process timed out") from exc
+            self._wait_for_worker(process, job, tasks)
             if process.returncode != 0:
                 raise RuntimeError(f"worker process failed with exit code {process.returncode}")
 
@@ -1338,4 +1342,136 @@ class Orchestrator:
             if isinstance(task.payload.get("timeout_seconds", 30), int)
         ]
         return max([60, *task_timeouts]) + 30
+
+    @staticmethod
+    def _worker_hard_cap(tasks: list[Task], base_timeout: int) -> int:
+        """The absolute ceiling a worker may run to even while showing progress.
+
+        A4: a worker actively making progress past its base timeout (e.g. a long
+        but legitimate e2e verify phase) is extended rather than SIGKILL'd, but
+        only up to this cap so a wedged-yet-heartbeating worker can't run forever.
+        Honors an explicit ``payload.max_timeout_seconds``; otherwise 3× base.
+        """
+        explicit = [
+            int(task.payload.get("max_timeout_seconds", 0))
+            for task in tasks
+            if isinstance(task.payload.get("max_timeout_seconds", 0), int)
+        ]
+        return max([base_timeout * 3, *explicit])
+
+    def _job_event_count(self, job_id: str) -> int:
+        """Total event count for a job — the cheap, backend-agnostic progress
+        signal. A growing count between polls means the worker is still doing
+        work (heartbeats, lease renewals, saved tasks/artifacts)."""
+        try:
+            return len(self.store.read_events(job_id))
+        except Exception:
+            return 0
+
+    def _wait_for_worker(self, process: subprocess.Popen, job: Job, tasks: list[Task]) -> None:
+        """Wait for a worker, extending past its base timeout only while it shows
+        demonstrable progress, up to a hard cap (A4).
+
+        The historical behavior — SIGKILL exactly at ``base_timeout`` — silently
+        murdered long-but-legitimate verify phases mid-run, leaving partial edits
+        and no rollback. Here a worker that keeps emitting events past the base
+        timeout is granted extensions (with a ``worker.timeout_extended`` event)
+        instead, while a genuinely wedged worker that goes quiet is still killed.
+        """
+        base_timeout = self._worker_wait_timeout(tasks)
+        hard_cap = self._worker_hard_cap(tasks, base_timeout)
+        poll = max(5, min(30, base_timeout // 4 or 5))
+        start = time.monotonic()
+        last_event_count = self._job_event_count(job.id)
+        extended = False
+        while True:
+            elapsed = time.monotonic() - start
+            wait_for = poll if elapsed < base_timeout else min(poll, max(1.0, hard_cap - elapsed))
+            try:
+                process.wait(timeout=wait_for)
+                return
+            except subprocess.TimeoutExpired:
+                elapsed = time.monotonic() - start
+                if elapsed < base_timeout:
+                    continue
+                event_count = self._job_event_count(job.id)
+                progressed = event_count > last_event_count
+                last_event_count = event_count
+                if progressed and elapsed < hard_cap:
+                    if not extended:
+                        self.store.emit(
+                            job.id,
+                            "worker.timeout_extended",
+                            {
+                                "base_timeout_seconds": base_timeout,
+                                "hard_cap_seconds": hard_cap,
+                                "elapsed_seconds": int(elapsed),
+                                "reason": "worker still emitting progress events",
+                            },
+                        )
+                        extended = True
+                    continue
+                raise self._kill_and_report_timeout(process, job, tasks, base_timeout)
+
+    def _kill_and_report_timeout(
+        self, process: subprocess.Popen, job: Job, tasks: list[Task], timeout_seconds: int
+    ) -> RuntimeError:
+        """Terminate a timed-out worker, emit the timeout event + blocked
+        artifact, and return the error for the caller to raise."""
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+        self.store.emit(
+            job.id,
+            "worker.timed_out",
+            {"returncode": process.returncode, "timeout_seconds": timeout_seconds},
+        )
+        self._emit_timeout_artifact(job, tasks, timeout_seconds)
+        return RuntimeError("worker process timed out")
+
+    def _emit_timeout_artifact(
+        self, job: Job, tasks: list[Task], timeout_seconds: int
+    ) -> None:
+        """Record an explicit *blocked* VERIFICATION artifact when a worker is
+        killed on timeout.
+
+        Without it a timed-out run leaves only a ``worker.timed_out`` event,
+        which the quality assessment never reads — so a SIGKILL'd run (partial
+        edits, no rollback) could masquerade as done if a stray artifact landed.
+        A blocked verification forces ``assess_run_quality`` to classify the run
+        untrustworthy and gives ``show`` a clear "I timed out" line. Best-effort:
+        a failure to persist must not mask the original timeout error.
+        """
+        representative = tasks[0] if tasks else None
+        if representative is None:
+            return
+        roles = sorted({task.role for task in tasks})
+        artifact = Artifact(
+            job_id=job.id,
+            task_id=representative.id,
+            type=ArtifactType.VERIFICATION,
+            created_by="orchestrator",
+            confidence=0.9,
+            evidence=["orchestrator:worker-timeout", f"timeout_seconds:{timeout_seconds}"],
+            payload={
+                "adapter": "orchestrator",
+                "check": "worker.timeout",
+                "result": "blocked",
+                "failure": "worker_timeout",
+                "roles": roles,
+                "timeout_seconds": timeout_seconds,
+                "message": (
+                    f"Worker for roles {roles} was killed after {timeout_seconds}s. "
+                    "Results are partial and must not be trusted; re-run with a longer "
+                    "timeout (raise the task's timeout_seconds) or split the work."
+                ),
+            },
+        )
+        try:
+            self.store.save_artifact(artifact)
+        except Exception:
+            pass
 

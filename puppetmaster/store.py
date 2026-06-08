@@ -463,12 +463,41 @@ class SwarmStore:
         status_counts: dict[str, int] = {}
         for task in tasks:
             status_counts[str(task.status)] = status_counts.get(str(task.status), 0) + 1
+        artifacts = self.list_artifacts(job_id)
         return {
             "job": to_jsonable(self.get_job(job_id)),
             "tasks": [to_jsonable(task) for task in tasks],
             "task_counts": status_counts,
-            "artifact_count": self.count_artifacts(job_id),
+            "artifact_count": len(artifacts),
             "stale_task_ids": [task.id for task in tasks if self.is_task_stale(task)],
+            # A2+F2: a real terminal-quality signal so a "complete" job that did
+            # nothing (no diff/commit, only verification, or refused outright) is
+            # legible in status/completion instead of looking like success.
+            "outcome": self._outcome_signals(artifacts),
+        }
+
+    @staticmethod
+    def _outcome_signals(artifacts: list[Any]) -> dict[str, Any]:
+        """Artifact-derived outcome signals (no git shell-out): quality verdict
+        plus whether the run produced a diff and a verified commit."""
+        from puppetmaster.quality import assess_run_quality
+        from puppetmaster.models import ArtifactType
+
+        verdict = assess_run_quality(artifacts)
+        diff_present = any(getattr(a, "type", None) == ArtifactType.PATCH for a in artifacts)
+        commit_present = any(
+            getattr(a, "type", None) == ArtifactType.GATE
+            and (getattr(a, "payload", None) or {}).get("kind") == "committed"
+            and (getattr(a, "payload", None) or {}).get("passed") is True
+            for a in artifacts
+        )
+        return {
+            "quality": verdict["quality"],
+            "trustworthy": verdict["trustworthy"],
+            "reasons": verdict.get("reasons", []),
+            "artifact_count": len(artifacts),
+            "diff_present": diff_present,
+            "commit_present": commit_present,
         }
 
     def has_incomplete_tasks(self, job_id: str) -> bool:
@@ -518,8 +547,32 @@ class SwarmStore:
         }
         return all(value is None or memory.get(key) == value for key, value in filters.items())
 
+    def _assert_safe_job_dir(self, job_id: str) -> Path:
+        """Resolve and validate ``job_id``'s directory before any destructive
+        delete, returning the safe path.
+
+        Refuses to act unless the resolved directory is *strictly inside* this
+        store's jobs tree. A blank, relative, or absolute ``job_id`` (``""``,
+        ``..``, ``/``) would otherwise make ``delete_job`` rglob-unlink the whole
+        jobs tree — or escape the state dir entirely into the user's active
+        worktree. This is the guard that stops a ``gc --force`` from ever
+        nuking the primary/active worktree (D1, P0 data-loss).
+        """
+        if not job_id or not isinstance(job_id, str) or job_id.strip() in {"", ".", ".."}:
+            raise ValueError(f"refusing to delete job with unsafe id: {job_id!r}")
+        jobs_root = self.jobs_dir.resolve()
+        try:
+            resolved = self.job_dir(job_id).resolve()
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(f"refusing to delete job with unresolvable path: {job_id!r}") from exc
+        if resolved == jobs_root or jobs_root not in resolved.parents:
+            raise ValueError(
+                f"refusing to delete a path outside the jobs tree: {job_id!r} -> {resolved}"
+            )
+        return resolved
+
     def delete_job(self, job_id: str) -> None:
-        job_dir = self.job_dir(job_id)
+        job_dir = self._assert_safe_job_dir(job_id)
         if job_dir.exists():
             for path in sorted(job_dir.rglob("*"), reverse=True):
                 if path.is_file():
