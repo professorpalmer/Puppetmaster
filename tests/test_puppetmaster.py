@@ -2885,6 +2885,194 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertEqual(notifications[0]["method"], "notifications/message")
         self.assertEqual(responses[0]["id"], 1)
 
+    def test_max_block_seconds_default_and_disable(self) -> None:
+        """The block cap defaults on, honors override, and disables at 0."""
+        from puppetmaster import mcp_server
+
+        os.environ.pop("PUPPETMASTER_MCP_MAX_BLOCK_SECONDS", None)
+        self.assertEqual(
+            mcp_server._resolve_max_block_seconds(),
+            mcp_server._DEFAULT_MAX_BLOCK_SECONDS,
+        )
+        try:
+            os.environ["PUPPETMASTER_MCP_MAX_BLOCK_SECONDS"] = "12.5"
+            self.assertEqual(mcp_server._resolve_max_block_seconds(), 12.5)
+            os.environ["PUPPETMASTER_MCP_MAX_BLOCK_SECONDS"] = "0"
+            self.assertEqual(mcp_server._resolve_max_block_seconds(), 0.0)
+            os.environ["PUPPETMASTER_MCP_MAX_BLOCK_SECONDS"] = "garbage"
+            self.assertEqual(
+                mcp_server._resolve_max_block_seconds(),
+                mcp_server._DEFAULT_MAX_BLOCK_SECONDS,
+            )
+        finally:
+            os.environ.pop("PUPPETMASTER_MCP_MAX_BLOCK_SECONDS", None)
+
+    def test_capped_block_seconds_clamps_only_when_exceeded(self) -> None:
+        """A requested block over the ceiling is clamped and flagged; under it passes through."""
+        from puppetmaster import mcp_server
+
+        try:
+            os.environ["PUPPETMASTER_MCP_MAX_BLOCK_SECONDS"] = "45"
+            self.assertEqual(mcp_server._capped_block_seconds(300.0), (45.0, True))
+            self.assertEqual(mcp_server._capped_block_seconds(10.0), (10.0, False))
+            self.assertEqual(mcp_server._capped_block_seconds(45.0), (45.0, False))
+            os.environ["PUPPETMASTER_MCP_MAX_BLOCK_SECONDS"] = "0"
+            self.assertEqual(mcp_server._capped_block_seconds(99999.0), (99999.0, False))
+        finally:
+            os.environ.pop("PUPPETMASTER_MCP_MAX_BLOCK_SECONDS", None)
+
+    def test_feed_follow_caps_block_and_stamps_capped(self) -> None:
+        """run_feed_follow clamps an oversized timeout under the Codex ceiling."""
+        from puppetmaster import mcp_server
+
+        observed: dict = {}
+
+        class _FakeStore:
+            def wait_for_events(self, job_id, since, timeout_seconds, poll_interval):
+                observed["timeout_seconds"] = timeout_seconds
+                return None
+
+        with patch.dict(os.environ, {"PUPPETMASTER_MCP_MAX_BLOCK_SECONDS": "45"}), patch.object(
+            mcp_server, "create_store", return_value=_FakeStore()
+        ), patch.object(
+            mcp_server, "mcp_state_dir", return_value=Path("/tmp/pm-state")
+        ), patch(
+            "puppetmaster.cli.artifact_feed_since", return_value=([], 0)
+        ):
+            result = mcp_server.run_feed_follow(
+                {"job_id": "job_abc", "timeout_seconds": 300}
+            )
+
+        # The blocking wait must never see the oversized request.
+        self.assertEqual(observed["timeout_seconds"], 45.0)
+        body = json.loads(result["content"][0]["text"])
+        self.assertTrue(body["capped"])
+        self.assertEqual(body["requested_timeout_seconds"], 300.0)
+        self.assertEqual(body["effective_timeout_seconds"], 45.0)
+        self.assertTrue(body["timed_out"])
+
+    def test_extract_progress_token(self) -> None:
+        """progressToken is pulled from params._meta only when present."""
+        from puppetmaster.mcp_server import _extract_progress_token
+
+        self.assertEqual(
+            _extract_progress_token({"name": "t", "_meta": {"progressToken": "tok-1"}}),
+            "tok-1",
+        )
+        self.assertEqual(
+            _extract_progress_token({"name": "t", "_meta": {"progressToken": 7}}), 7
+        )
+        self.assertIsNone(_extract_progress_token({"name": "t"}))
+        self.assertIsNone(_extract_progress_token({"name": "t", "_meta": {}}))
+        self.assertIsNone(_extract_progress_token("not-a-dict"))
+
+    def test_keepalive_emits_progress_only_with_token(self) -> None:
+        """A progressToken yields notifications/progress frames; absent it, only logs."""
+        from puppetmaster.mcp_server import _ToolCallKeepalive
+
+        with_token: list[dict] = []
+        keepalive = _ToolCallKeepalive(
+            tool_name="puppetmaster_await_job",
+            request_id="req-1",
+            progress_token="tok-9",
+            start_after_seconds=0.02,
+            interval_seconds=0.02,
+            emitter=lambda payload: (with_token.append(payload) or True),
+        )
+        keepalive.start()
+        time.sleep(0.12)
+        keepalive.stop(wait=True)
+
+        methods = {frame["method"] for frame in with_token}
+        self.assertIn("notifications/message", methods)
+        self.assertIn("notifications/progress", methods)
+        progress_frames = [
+            f for f in with_token if f["method"] == "notifications/progress"
+        ]
+        first = progress_frames[0]
+        self.assertNotIn("id", first)
+        self.assertEqual(first["params"]["progressToken"], "tok-9")
+        # Per MCP, the progress value must strictly increase across frames.
+        values = [f["params"]["progress"] for f in progress_frames]
+        self.assertEqual(values, sorted(values))
+        if len(values) >= 2:
+            self.assertLess(values[0], values[-1])
+
+        without_token: list[dict] = []
+        bare = _ToolCallKeepalive(
+            tool_name="puppetmaster_await_job",
+            request_id="req-2",
+            start_after_seconds=0.02,
+            interval_seconds=0.02,
+            emitter=lambda payload: (without_token.append(payload) or True),
+        )
+        bare.start()
+        time.sleep(0.12)
+        bare.stop(wait=True)
+        self.assertTrue(without_token)
+        self.assertTrue(
+            all(f["method"] == "notifications/message" for f in without_token)
+        )
+
+    def test_ensure_codex_timeouts_inserts_when_absent(self) -> None:
+        """Timeout keys are added under the puppetmaster table when missing."""
+        from puppetmaster import installers
+
+        with TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.toml"
+            config.write_text(
+                "[mcp_servers.puppetmaster]\n"
+                'command = "python"\n'
+                'args = ["-m", "puppetmaster.mcp_server"]\n',
+                encoding="utf-8",
+            )
+            messages = installers._ensure_codex_timeouts(config)
+            text = config.read_text(encoding="utf-8")
+
+        self.assertIn(
+            f"tool_timeout_sec = {installers.CODEX_TOOL_TIMEOUT_SEC}", text
+        )
+        self.assertIn(
+            f"startup_timeout_sec = {installers.CODEX_STARTUP_TIMEOUT_SEC}", text
+        )
+        # The original keys must survive the insert.
+        self.assertIn('command = "python"', text)
+        self.assertTrue(any("set Codex timeouts" in m for m in messages))
+
+    def test_ensure_codex_timeouts_preserves_user_values(self) -> None:
+        """An existing tool_timeout_sec is never clobbered."""
+        from puppetmaster import installers
+
+        with TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.toml"
+            config.write_text(
+                "[mcp_servers.puppetmaster]\n"
+                'command = "python"\n'
+                "tool_timeout_sec = 999\n",
+                encoding="utf-8",
+            )
+            installers._ensure_codex_timeouts(config)
+            text = config.read_text(encoding="utf-8")
+
+        self.assertIn("tool_timeout_sec = 999", text)
+        self.assertNotIn(f"tool_timeout_sec = {installers.CODEX_TOOL_TIMEOUT_SEC}", text)
+        # startup was absent, so it should have been added.
+        self.assertIn(
+            f"startup_timeout_sec = {installers.CODEX_STARTUP_TIMEOUT_SEC}", text
+        )
+
+    def test_ensure_codex_timeouts_skips_when_table_missing(self) -> None:
+        """No puppetmaster table => leave the file untouched, warn cleanly."""
+        from puppetmaster import installers
+
+        with TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.toml"
+            original = "[mcp_servers.other]\ncommand = \"x\"\n"
+            config.write_text(original, encoding="utf-8")
+            messages = installers._ensure_codex_timeouts(config)
+            self.assertEqual(config.read_text(encoding="utf-8"), original)
+        self.assertTrue(any("skipped Codex timeout tuning" in m for m in messages))
+
     def test_resolve_codegraph_invocation_prefers_cursor_node(self) -> None:
         """When Cursor Node + codegraph.js are both discoverable, prefer that pair."""
         from puppetmaster import codegraph as codegraph_mod

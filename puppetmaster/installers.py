@@ -27,12 +27,27 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+
+# Codex's MCP client enforces a hard per-tool timeout (`tool_timeout_sec`,
+# default 60s) and a startup timeout (`startup_timeout_sec`, default 10s).
+# The 60s tool cap guillotines any long call — long-poll follows, the first
+# cold codegraph index, sync verbs — which is what made Codex read healthy
+# swarms as a dead tool. The server now caps blocking handlers under 60s on
+# its own (PUPPETMASTER_MCP_MAX_BLOCK_SECONDS), but we also raise Codex's
+# ceilings at install time so a genuinely-long single call survives and a
+# cold Python import doesn't trip the 10s startup window. These are
+# documented, stable Codex config keys; we only set them when absent so a
+# user override is never clobbered.
+CODEX_STARTUP_TIMEOUT_SEC = 30
+CODEX_TOOL_TIMEOUT_SEC = 300
 
 
 @dataclass(frozen=True)
@@ -291,6 +306,64 @@ def install_cursor_mcp(
     )
 
 
+def _ensure_codex_timeouts(config_path: Path) -> list[str]:
+    """Set Codex tool/startup timeouts on the puppetmaster MCP entry if absent.
+
+    ``codex mcp add`` writes a ``[mcp_servers.puppetmaster]`` table but never
+    sets timeout keys, leaving the server exposed to Codex's 60s tool cap and
+    10s startup cap. We insert ``tool_timeout_sec`` / ``startup_timeout_sec``
+    directly after the table header when they aren't already present, so an
+    explicit user value is preserved. Best-effort: any failure returns a
+    warning message and never raises — the MCP entry is still functional.
+    """
+    messages: list[str] = []
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return [f"could not read {config_path} to set Codex timeouts: {exc!r}"]
+
+    lines = text.splitlines()
+    header = re.compile(r"^\s*\[\s*mcp_servers\.puppetmaster\s*\]\s*$")
+    next_table = re.compile(r"^\s*\[")
+    header_idx = next((i for i, line in enumerate(lines) if header.match(line)), None)
+    if header_idx is None:
+        # Don't risk creating a duplicate table; leave config untouched.
+        return [
+            "skipped Codex timeout tuning: no [mcp_servers.puppetmaster] table "
+            f"found in {config_path}. The server still works on Codex via the "
+            "server-side block cap; set tool_timeout_sec manually for long sync calls."
+        ]
+
+    # Scan only this table's body (until the next table header or EOF).
+    body_end = len(lines)
+    for i in range(header_idx + 1, len(lines)):
+        if next_table.match(lines[i]):
+            body_end = i
+            break
+    body = lines[header_idx + 1 : body_end]
+    has_tool = any(re.match(r"^\s*tool_timeout_sec\s*=", line) for line in body)
+    has_startup = any(re.match(r"^\s*startup_timeout_sec\s*=", line) for line in body)
+
+    inserts: list[str] = []
+    if not has_startup:
+        inserts.append(f"startup_timeout_sec = {CODEX_STARTUP_TIMEOUT_SEC}")
+    if not has_tool:
+        inserts.append(f"tool_timeout_sec = {CODEX_TOOL_TIMEOUT_SEC}")
+    if not inserts:
+        messages.append("Codex timeouts already set on puppetmaster entry; left as-is")
+        return messages
+
+    lines[header_idx + 1 : header_idx + 1] = inserts
+    try:
+        config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError as exc:
+        return [f"could not write Codex timeouts to {config_path}: {exc!r}"]
+    messages.append(
+        f"set Codex timeouts on puppetmaster entry ({', '.join(inserts)})"
+    )
+    return messages
+
+
 def install_codex_mcp(
     *,
     python_executable: Optional[str] = None,
@@ -304,7 +377,11 @@ def install_codex_mcp(
     Shells out to ``codex mcp add`` / ``codex mcp remove`` rather than
     hand-editing ``~/.codex/config.toml``: Codex owns the TOML schema
     and may change it across versions, so going through its CLI is the
-    forward-compatible path.
+    forward-compatible path. The one exception is a minimal, absence-only
+    insert of ``startup_timeout_sec`` / ``tool_timeout_sec`` after the
+    server table (:func:`_ensure_codex_timeouts`), since ``codex mcp add``
+    exposes no flag for them and Codex's 60s tool cap is what strangled
+    long Puppetmaster calls.
 
     Idempotency: if ``codex mcp get puppetmaster`` already exists and
     its command + args match what we would register, the function
@@ -402,6 +479,8 @@ def install_codex_mcp(
         messages.append(
             f"DRY RUN — would run: "
             f"`{resolved_codex} mcp add puppetmaster -- {desired_command} {' '.join(desired_args)}`"
+            f", then set startup_timeout_sec={CODEX_STARTUP_TIMEOUT_SEC}/"
+            f"tool_timeout_sec={CODEX_TOOL_TIMEOUT_SEC} on the entry if unset"
         )
         return InstallResult(
             status="would_install",
@@ -464,6 +543,7 @@ def install_codex_mcp(
     messages.append(
         f"registered puppetmaster MCP entry with Codex via `{resolved_codex} mcp add`"
     )
+    messages.extend(_ensure_codex_timeouts(Path("~/.codex/config.toml").expanduser()))
     return InstallResult(
         status="installed",
         target="~/.codex/config.toml",
@@ -484,7 +564,14 @@ CODEX_SANDBOX_GUIDANCE = (
     "daily-driver use.\n"
     "  2. Non-interactive `codex exec`: pass "
     "`--dangerously-bypass-approvals-and-sandbox`. Functionally equivalent "
-    "to running Puppetmaster's CLI directly."
+    "to running Puppetmaster's CLI directly.\n"
+    "\n"
+    "Long jobs: Codex caps each tool call at tool_timeout_sec (default 60s); "
+    "this installer raises it on the puppetmaster entry and the server now "
+    "caps its own blocking calls under that ceiling. Still prefer the async "
+    "pattern — fire a `start_*` verb, then re-poll with bounded "
+    "`live_artifacts_follow` / `await_job` — instead of asking for one "
+    "multi-minute block."
 )
 
 
