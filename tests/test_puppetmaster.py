@@ -9583,6 +9583,403 @@ class PuppetmasterGateTests(unittest.TestCase):
             self.assertFalse(verdict["trustworthy"])
 
 
+class ReviewGateTests(unittest.TestCase):
+    """The ``review`` gate: a strictly-stronger model judges the diff before a
+    task may COMPLETE. The live judge call is injected so the suite never hits a
+    model, and the env flag is controlled so default behavior stays unchanged."""
+
+    def _store(self, tmp):
+        store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+        store.init()
+        return store
+
+    def _git_repo(self, path, *, with_change):
+        path.mkdir(parents=True, exist_ok=True)
+        for args in (
+            ["git", "init", "-q"],
+            ["git", "config", "user.email", "t@t.t"],
+            ["git", "config", "user.name", "t"],
+        ):
+            subprocess.run(args, cwd=str(path), check=True, capture_output=True)
+        (path / "seed.txt").write_text("seed\n")
+        subprocess.run(["git", "add", "-A"], cwd=str(path), check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "seed"], cwd=str(path), check=True, capture_output=True
+        )
+        if with_change:
+            (path / "feature.py").write_text("def f():\n    return 1\n")
+
+    def _task(self, **payload):
+        from puppetmaster.models import Task
+
+        return Task(job_id="job_r", role="cursor", instruction="add feature f", payload=payload)
+
+    def _registry(self):
+        from puppetmaster.model_registry import ModelSpec
+
+        return [
+            ModelSpec(id="cursor/composer-2-5", adapter="cursor", adapter_model_name="composer-2.5", capability_score=55, billing="plan", tags=["cursor"]),
+            ModelSpec(id="cursor/gpt-5-5", adapter="cursor", adapter_model_name="gpt-5.5", capability_score=90, billing="plan", tags=["cursor"]),
+        ]
+
+    # ----- pure helpers -----
+
+    def test_build_review_prompt_contains_intent_diff_and_contract(self) -> None:
+        from puppetmaster.gates import _REVIEW_VERDICT_MARKER, build_review_prompt
+
+        prompt = build_review_prompt(self._task(), "THE_DIFF_BODY", "THE_RUBRIC")
+        self.assertIn("add feature f", prompt)
+        self.assertIn("THE_DIFF_BODY", prompt)
+        self.assertIn("THE_RUBRIC", prompt)
+        self.assertIn(_REVIEW_VERDICT_MARKER, prompt)
+
+    def test_parse_review_verdict_extracts_last_marker(self) -> None:
+        from puppetmaster.gates import _REVIEW_VERDICT_MARKER, parse_review_verdict
+
+        text = (
+            f"first {_REVIEW_VERDICT_MARKER} {{\"pass\": true, \"severity\": \"none\"}}\n"
+            f"final {_REVIEW_VERDICT_MARKER} "
+            '{"pass": false, "severity": "major", "reasons": ["broken"]}'
+        )
+        verdict = parse_review_verdict(text)
+        self.assertEqual(verdict["pass"], False)
+        self.assertEqual(verdict["reasons"], ["broken"])
+
+    def test_parse_review_verdict_none_on_missing_or_malformed(self) -> None:
+        from puppetmaster.gates import _REVIEW_VERDICT_MARKER, parse_review_verdict
+
+        self.assertIsNone(parse_review_verdict("no marker here"))
+        self.assertIsNone(parse_review_verdict(f"{_REVIEW_VERDICT_MARKER} {{not json"))
+
+    def test_resolve_judge_picks_cheapest_strictly_stronger(self) -> None:
+        from puppetmaster.gates import resolve_judge_model
+
+        with patch("puppetmaster.model_registry.load_registry", return_value=self._registry()), \
+             patch("puppetmaster.platform_lock.is_adapter_enabled", return_value=True):
+            judge = resolve_judge_model(
+                self._task(router_model_id="cursor/composer-2-5"), {}
+            )
+        self.assertEqual(judge.id, "cursor/gpt-5-5")
+
+    def test_resolve_judge_peer_when_implementer_top_tier(self) -> None:
+        from puppetmaster.gates import resolve_judge_model
+
+        with patch("puppetmaster.model_registry.load_registry", return_value=self._registry()), \
+             patch("puppetmaster.platform_lock.is_adapter_enabled", return_value=True):
+            judge = resolve_judge_model(
+                self._task(router_model_id="cursor/gpt-5-5"), {}
+            )
+        # No strictly-stronger model exists; the strongest available (the peer
+        # top tier) is used rather than skipping review entirely.
+        self.assertEqual(judge.id, "cursor/gpt-5-5")
+
+    def test_resolve_judge_none_without_registry(self) -> None:
+        from puppetmaster.gates import resolve_judge_model
+
+        with patch("puppetmaster.model_registry.load_registry", return_value=[]):
+            self.assertIsNone(resolve_judge_model(self._task(), {}))
+
+    def test_default_judge_disabled_without_env(self) -> None:
+        from unittest.mock import Mock
+
+        from puppetmaster.gates import default_judge_review
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PUPPETMASTER_REVIEW_GATE", None)
+            verdict = default_judge_review(
+                prompt="p", judge=Mock(id="cursor/gpt-5-5", adapter="cursor"),
+                cwd=Path("."), timeout=10, task=self._task(),
+            )
+        self.assertFalse(verdict.available)
+        self.assertTrue(verdict.passed)  # unavailable judge is a no-op, not a block
+
+    def test_default_judge_fail_closed_on_unparseable(self) -> None:
+        from unittest.mock import Mock
+
+        from puppetmaster.gates import default_judge_review
+        from puppetmaster.models import Artifact, ArtifactType
+
+        judge = Mock(id="cursor/gpt-5-5", adapter="cursor", adapter_model_name="gpt-5.5")
+        noise = Artifact(
+            job_id="job_r", task_id="t", type=ArtifactType.VERIFICATION,
+            created_by="judge", payload={"check": "c", "result": "passed", "stdout": "no verdict here"},
+            confidence=0.9, evidence=["adapter:cursor"],
+        )
+        fake_adapter = Mock()
+        fake_adapter.run.return_value = [noise]
+        with patch.dict(os.environ, {"PUPPETMASTER_REVIEW_GATE": "1"}), \
+             patch("puppetmaster.adapters.get_adapter", return_value=fake_adapter):
+            verdict = default_judge_review(
+                prompt="p", judge=judge, cwd=Path("."), timeout=10, task=self._task(),
+            )
+        self.assertTrue(verdict.available)
+        self.assertFalse(verdict.passed)  # a judge that ran but gave no verdict → reject
+
+    def test_default_judge_reads_verdict_from_stdout(self) -> None:
+        from unittest.mock import Mock
+
+        from puppetmaster.gates import _REVIEW_VERDICT_MARKER, default_judge_review
+        from puppetmaster.models import Artifact, ArtifactType
+
+        judge = Mock(id="cursor/gpt-5-5", adapter="cursor", adapter_model_name="gpt-5.5")
+        out = Artifact(
+            job_id="job_r", task_id="t", type=ArtifactType.VERIFICATION,
+            created_by="judge",
+            payload={"check": "c", "result": "passed", "stdout": f"{_REVIEW_VERDICT_MARKER} {{\"pass\": true, \"severity\": \"none\"}}"},
+            confidence=0.9, evidence=["adapter:cursor"],
+        )
+        fake_adapter = Mock()
+        fake_adapter.run.return_value = [out]
+        with patch.dict(os.environ, {"PUPPETMASTER_REVIEW_GATE": "1"}), \
+             patch("puppetmaster.adapters.get_adapter", return_value=fake_adapter):
+            verdict = default_judge_review(
+                prompt="p", judge=judge, cwd=Path("."), timeout=10, task=self._task(),
+            )
+        self.assertTrue(verdict.available)
+        self.assertTrue(verdict.passed)
+
+    # ----- gate behavior (injected judge) -----
+
+    def _eval_review(self, tmp, *, with_change, judge_verdict, spec_extra=None):
+        from unittest.mock import Mock
+
+        import puppetmaster.gates as gates
+        from puppetmaster.gates import ReviewVerdict, evaluate_task_gates
+
+        store = self._store(tmp)
+        repo = Path(tmp) / "repo"
+        self._git_repo(repo, with_change=with_change)
+        payload = {"review": True, "cwd": str(repo)}
+        payload.update(spec_extra or {})
+        task = self._task(**payload)
+        fake_model = Mock(id="cursor/gpt-5-5")
+        with patch.object(gates, "resolve_judge_model", return_value=fake_model), \
+             patch.object(gates, "_REVIEW_JUDGE", return_value=judge_verdict):
+            return evaluate_task_gates(task, [], store, worker_id="w1", cwd=repo)
+
+    def test_gate_passes_when_judge_approves(self) -> None:
+        from puppetmaster.gates import ReviewVerdict
+
+        with TemporaryDirectory() as tmp:
+            evald = self._eval_review(
+                tmp, with_change=True,
+                judge_verdict=ReviewVerdict(available=True, passed=True, severity="none"),
+            )
+            self.assertTrue(evald.passed)
+
+    def test_gate_fails_when_judge_rejects(self) -> None:
+        from puppetmaster.gates import ReviewVerdict
+
+        with TemporaryDirectory() as tmp:
+            evald = self._eval_review(
+                tmp, with_change=True,
+                judge_verdict=ReviewVerdict(
+                    available=True, passed=False, severity="major", reasons=["incorrect logic"]
+                ),
+            )
+            self.assertFalse(evald.passed)
+            self.assertIn("rejected", evald.failed_reason)
+            gate_art = [a for a in evald.artifacts if (a.payload or {}).get("kind") == "review"]
+            self.assertEqual(len(gate_art), 1)
+            self.assertFalse(gate_art[0].payload["passed"])
+
+    def test_gate_failure_is_blocked_verdict(self) -> None:
+        from puppetmaster.gates import ReviewVerdict
+        from puppetmaster.quality import assess_run_quality
+
+        with TemporaryDirectory() as tmp:
+            evald = self._eval_review(
+                tmp, with_change=True,
+                judge_verdict=ReviewVerdict(available=True, passed=False, reasons=["bad"]),
+            )
+            verdict = assess_run_quality(evald.artifacts)
+            self.assertEqual(verdict["quality"], "blocked")
+            self.assertFalse(verdict["trustworthy"])
+
+    def test_gate_skips_when_no_diff(self) -> None:
+        from puppetmaster.gates import ReviewVerdict
+
+        with TemporaryDirectory() as tmp:
+            # Judge would reject, but there's no diff so the gate never consults it.
+            evald = self._eval_review(
+                tmp, with_change=False,
+                judge_verdict=ReviewVerdict(available=True, passed=False),
+            )
+            self.assertTrue(evald.passed)
+
+    def test_gate_skips_when_judge_unavailable(self) -> None:
+        from puppetmaster.gates import ReviewVerdict
+
+        with TemporaryDirectory() as tmp:
+            evald = self._eval_review(
+                tmp, with_change=True,
+                judge_verdict=ReviewVerdict(available=False, passed=True),
+            )
+            self.assertTrue(evald.passed)
+
+    def test_deterministic_sampling(self) -> None:
+        from puppetmaster.gates import _review_sampled
+
+        self.assertTrue(_review_sampled("any-task", 1.0))
+        self.assertFalse(_review_sampled("any-task", 0.0))
+        # Stable across calls for the same id.
+        self.assertEqual(_review_sampled("t-123", 0.5), _review_sampled("t-123", 0.5))
+
+    # ----- auto-attach wiring -----
+
+    def test_review_auto_attached_for_implement_when_env_set(self) -> None:
+        from puppetmaster.gates import task_gate_specs
+
+        with patch.dict(os.environ, {"PUPPETMASTER_REVIEW_GATE": "1"}):
+            kinds = [s["kind"] for s in task_gate_specs(self._task(mode="implement"))]
+            self.assertIn("review", kinds)
+            # Ordered last so the cheap gates run before the expensive judge.
+            self.assertEqual(kinds[-1], "review")
+            # A single task opts out even with the global flag on.
+            self.assertNotIn(
+                "review",
+                [s["kind"] for s in task_gate_specs(self._task(mode="implement", review=False))],
+            )
+
+    def test_review_not_attached_by_default(self) -> None:
+        from puppetmaster.gates import task_gate_specs
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PUPPETMASTER_REVIEW_GATE", None)
+            kinds = [s["kind"] for s in task_gate_specs(self._task(mode="implement"))]
+            self.assertNotIn("review", kinds)
+            # Explicit per-task opt-in still works without the global flag.
+            self.assertIn(
+                "review",
+                [s["kind"] for s in task_gate_specs(self._task(mode="implement", review=True))],
+            )
+
+
+class ReviewEscalationTests(unittest.TestCase):
+    """Objective escalation: a task a review gate rejected is re-routed one
+    capability tier up (vs. the self-reported-confidence escalation)."""
+
+    def _registry(self):
+        from puppetmaster.model_registry import ModelSpec
+
+        return [
+            ModelSpec(id="cursor/composer-2-5", adapter="cursor", adapter_model_name="composer-2.5", capability_score=55, billing="plan", tags=["cursor"]),
+            ModelSpec(id="cursor/gpt-5-5", adapter="cursor", adapter_model_name="gpt-5.5", capability_score=90, billing="plan", tags=["cursor"]),
+        ]
+
+    def _plan_billing(self, adapter, **kw):
+        from puppetmaster.platform_billing import BillingStatus
+
+        return BillingStatus(adapter=adapter, billing="plan", healthy=True, detail="ok", evidence=[])
+
+    def _setup(self, tmp, *, model_id, passed=False, payload_extra=None):
+        from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
+        from puppetmaster.store import SwarmStore
+
+        store = SwarmStore(Path(tmp) / ".puppetmaster")
+        job = store.create_job("do the work")
+        payload = {"auto_route": True, "router_model_id": model_id, "model": "x", "mode": "implement"}
+        payload.update(payload_extra or {})
+        task = Task(
+            job_id=job.id, role="implement", instruction="implement the thing",
+            adapter="cursor", status=TaskStatus.FAILED, payload=payload,
+        )
+        store.save_task(task)
+        store.save_artifact(Artifact(
+            job_id=job.id, task_id=task.id, type=ArtifactType.GATE,
+            created_by="w", payload={"gate": "review", "kind": "review", "passed": passed, "reason": "judge rejected"},
+            confidence=0.9, evidence=["gate:review", "failed" if not passed else "passed"],
+        ))
+        return store, job, task
+
+    def _run_reroute(self, store, job):
+        from puppetmaster.orchestrator import Orchestrator
+
+        orch = Orchestrator(store)
+        with patch("puppetmaster.model_registry.load_registry", return_value=self._registry()), \
+             patch("puppetmaster.platform_billing.detect_adapter_billing", side_effect=self._plan_billing), \
+             patch("puppetmaster.platform_lock.is_adapter_enabled", return_value=True):
+            return orch._reroute_failed_review(job)
+
+    def test_failed_review_task_ids(self) -> None:
+        from puppetmaster.models import Artifact, ArtifactType
+        from puppetmaster.orchestrator import Orchestrator
+
+        def gate(task_id, passed, at):
+            return Artifact(
+                job_id="j", task_id=task_id, type=ArtifactType.GATE, created_by="w",
+                payload={"kind": "review", "passed": passed}, confidence=0.9,
+                evidence=["gate:review"], created_at=at,
+            )
+
+        arts = [
+            gate("A", False, "2026-01-01T00:00:00Z"),
+            gate("B", True, "2026-01-01T00:00:00Z"),
+            # C: an older rejection superseded by a newer pass → not failed.
+            gate("C", False, "2026-01-01T00:00:00Z"),
+            gate("C", True, "2026-01-02T00:00:00Z"),
+        ]
+        self.assertEqual(Orchestrator._failed_review_task_ids(arts), {"A"})
+
+    def test_reroute_escalates_rejected_diff(self) -> None:
+        from puppetmaster.models import TaskStatus
+
+        with TemporaryDirectory() as tmp:
+            store, job, task = self._setup(tmp, model_id="cursor/composer-2-5")
+            self.assertEqual(self._run_reroute(store, job), 1)
+            updated = store.get_task_by_id(task.id)
+            self.assertEqual(updated.status, TaskStatus.QUEUED)
+            self.assertEqual(updated.payload["router_model_id"], "cursor/gpt-5-5")
+            self.assertEqual(updated.payload["review_escalation_attempts"], 1)
+            arts = [a for a in store.list_artifacts(job.id) if a.created_by == "router-review-escalation"]
+            self.assertEqual(len(arts), 1)
+
+    def test_no_reroute_when_review_passed(self) -> None:
+        from puppetmaster.models import TaskStatus
+
+        with TemporaryDirectory() as tmp:
+            store, job, task = self._setup(tmp, model_id="cursor/composer-2-5", passed=True)
+            # A passed review (and a FAILED status for some other reason) is not a
+            # review-escalation trigger.
+            self.assertEqual(self._run_reroute(store, job), 0)
+
+    def test_no_reroute_when_already_top_tier(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store, job, task = self._setup(tmp, model_id="cursor/gpt-5-5")
+            self.assertEqual(self._run_reroute(store, job), 0)
+
+    def test_reroute_bounded_by_max_attempts(self) -> None:
+        from puppetmaster.orchestrator import _MAX_ESCALATION_ATTEMPTS
+
+        with TemporaryDirectory() as tmp:
+            store, job, task = self._setup(
+                tmp, model_id="cursor/composer-2-5",
+                payload_extra={"review_escalation_attempts": _MAX_ESCALATION_ATTEMPTS},
+            )
+            self.assertEqual(self._run_reroute(store, job), 0)
+
+    def test_review_rejection_is_reachable_not_fail_closed(self) -> None:
+        """Regression guard (redteam): a review rejection must NOT make
+        _run_workers raise before the escalation sweep runs — it's pending
+        re-route, like a recoverable failure — but a task with no budget left
+        is terminal and the job must fail closed."""
+        from dataclasses import replace
+
+        from puppetmaster.orchestrator import Orchestrator, _MAX_ESCALATION_ATTEMPTS
+
+        with TemporaryDirectory() as tmp:
+            store, job, task = self._setup(tmp, model_id="cursor/composer-2-5")
+            orch = Orchestrator(store)
+            self.assertFalse(orch._should_fail_closed(job, {task.id}))
+            store.save_task(
+                replace(
+                    task,
+                    payload={**task.payload, "review_escalation_attempts": _MAX_ESCALATION_ATTEMPTS},
+                )
+            )
+            self.assertTrue(orch._should_fail_closed(job, {task.id}))
+
+
 class PuppetmasterSalvageAndLivenessTests(unittest.TestCase):
     """#3 salvage structured content from raw stdout; #9 loud liveness."""
 

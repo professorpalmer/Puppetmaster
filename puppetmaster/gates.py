@@ -22,26 +22,57 @@ Gate kinds (all opt-in via ``task.payload["gates"]`` or convenience flags):
 - ``committed``     — after the run the tree must have no uncommitted changes
                       (the worker committed its work). Optionally the runtime
                       performs the commit itself with a fixed author/message.
+- ``review``        — a *strictly stronger* model judges the run's diff before
+                      it is allowed to COMPLETE. This is the semantic
+                      quality bar that ``require_diff`` (only "files changed")
+                      and ``command`` (only "the tests you wrote pass") can't
+                      provide: an LLM-as-judge reading the actual patch for
+                      correctness, scope, regressions, and readability. It is
+                      the answer to "a cheap routed model wrote this — who
+                      checks the work?": the judge is always at least one
+                      capability tier above the implementer, so mass
+                      auto-routed swarms can't land code no stronger model
+                      would sign off on. The live judge call is opt-in behind
+                      ``$PUPPETMASTER_REVIEW_GATE`` (it makes an extra model
+                      call, so it's a deliberate, flagged spend); when the flag
+                      is off, or no adequate judge exists, the gate is a no-op
+                      rather than bricking every implement run.
 
-The cheap ``ratchet`` and the expensive ``command`` oracle cover each other's
-blind spot: gaming the scalar metric gets caught by the semantic command, and
-the command only has to run when the metric gate passes.
+Layering, cheap-to-expensive: ``require_diff`` (free) → ``ratchet`` (one
+command) → ``command`` (your test suite) → ``review`` (one judge call). Each
+covers the one below's blind spot — gaming a scalar metric gets caught by the
+semantic command; a green suite over thin tests gets caught by the judge — and
+the expensive gates only run when the cheap ones already passed, so a no-op or
+test-failing task never pays for a judge.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from puppetmaster.models import Artifact, ArtifactType, Task, now_iso
 
 if TYPE_CHECKING:
+    from puppetmaster.model_registry import ModelSpec
     from puppetmaster.store import SwarmStore
 
 _GATE_COMMAND_TIMEOUT = 1800
+
+# Review-gate tunables. The judge sees a bounded slice of the diff (a judge
+# doesn't need the whole 50k-line refactor to spot that a function is wrong),
+# and gets its own timeout so a slow judge can't wedge a worker.
+_REVIEW_TIMEOUT = 300
+_REVIEW_MAX_DIFF_CHARS = 60_000
+_REVIEW_ENABLE_ENV = "PUPPETMASTER_REVIEW_GATE"
+# The marker the judge model must emit so its verdict is machine-extractable
+# from free-form model output, regardless of which adapter ran it.
+_REVIEW_VERDICT_MARKER = "PUPPETMASTER_REVIEW_VERDICT"
 
 
 @dataclass
@@ -105,6 +136,26 @@ def task_gate_specs(task: Task) -> list[dict[str, Any]]:
     if write_scope and not any(s["kind"] == "write_scope" for s in specs):
         specs.append({"kind": "write_scope", "scope": list(write_scope)})
 
+    # Semantic review is the implement safety net: a strictly-stronger model
+    # must approve the diff before COMPLETE. Attached last so the cheap gates
+    # (require_diff/ratchet/command) run first and a no-op or test-failing task
+    # never pays for a judge call. Default-on for implement when the feature is
+    # enabled (``review=true`` on the task, or ``$PUPPETMASTER_REVIEW_GATE``
+    # globally); opt a single task out with ``review=false`` / ``allow_unreviewed``.
+    review = task.payload.get("review")
+    review_globally_on = bool(os.environ.get(_REVIEW_ENABLE_ENV))
+    implement_wants_review = (
+        task.payload.get("mode") == "implement"
+        and review is not False
+        and not task.payload.get("allow_unreviewed", False)
+        and (review or review_globally_on)
+    )
+    if (review or implement_wants_review) and not any(s["kind"] == "review" for s in specs):
+        spec: dict[str, Any] = {"kind": "review"}
+        if isinstance(review, dict):
+            spec.update(review)
+        specs.append(spec)
+
     return specs
 
 
@@ -156,6 +207,8 @@ def _evaluate_one(
             return _gate_committed(name, spec, cwd)
         if kind == "write_scope":
             return _gate_write_scope(name, spec, artifacts, cwd)
+        if kind == "review":
+            return _gate_review(name, spec, task, artifacts, cwd)
         return GateResult(name, str(kind), False, f"unknown gate kind: {kind!r}")
     except Exception as exc:  # a gate that crashes must FAIL closed, never pass
         return GateResult(name, str(kind), False, f"gate raised: {exc}")
@@ -348,6 +401,298 @@ def _strip_excluded_paths(exclude: Any, cwd: Path) -> list[str]:
     except OSError:
         pass
     return patterns
+
+
+# --------------------------------------------------------------------------
+# review gate — a strictly-stronger model judges the diff before COMPLETE
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class ReviewVerdict:
+    """Outcome of an LLM-as-judge review of a task's diff.
+
+    ``available`` distinguishes "a judge ran and reached a verdict" from "no
+    judge ran" (feature off, no eligible model, judge unreachable). Only an
+    *available* failing verdict fails the gate; an unavailable judge is a no-op
+    so an unconfigured environment is never bricked. A judge that ran but whose
+    answer couldn't be parsed is ``available=True, passed=False`` — fail-closed,
+    because a quality gate that can't read its oracle must not wave work through.
+    """
+
+    available: bool
+    passed: bool
+    severity: str = "none"
+    reasons: list[str] = field(default_factory=list)
+    detail: dict[str, Any] = field(default_factory=dict)
+
+
+_DEFAULT_REVIEW_RUBRIC = (
+    "Judge whether this diff is production-quality work for the stated task. "
+    "Reject (pass=false) if it is incorrect, only partially implements the task, "
+    "introduces a regression or security issue, ignores the task's scope, leaves "
+    "debugging cruft / dead code, or is so unclear a maintainer couldn't safely "
+    "own it. A diff that merely changes files without doing the task well must be "
+    "rejected. Approve (pass=true) only if you would let it merge as-is."
+)
+
+
+def build_review_prompt(task: Task, diff: str, rubric: str) -> str:
+    """Compose the judge prompt: task intent + rubric + diff + a strict,
+    machine-extractable output contract. Pure (no I/O) so it's unit-testable."""
+    instruction = (task.payload.get("prompt") or task.instruction or "").strip()
+    return (
+        "You are a senior staff engineer doing a blocking code review of a change "
+        "another agent produced. Be exacting; your approval is the only thing "
+        "standing between this diff and the main branch.\n\n"
+        f"## Task the change was supposed to accomplish\n{instruction}\n\n"
+        f"## Review rubric\n{rubric}\n\n"
+        f"## Diff under review\n```diff\n{diff}\n```\n\n"
+        "## Required output\n"
+        "Reason briefly, then emit your verdict on its own line as the marker "
+        f"`{_REVIEW_VERDICT_MARKER}` immediately followed by a single-line JSON "
+        'object: {"pass": <true|false>, "severity": '
+        '"none"|"minor"|"major"|"critical", "reasons": ["..."]}. '
+        "Emit the marker and JSON exactly once."
+    )
+
+
+def _implementer_capability(task: Task, spec: dict[str, Any], registry: list) -> int:
+    """The capability floor the judge must clear. ``min_judge_capability`` on
+    the gate spec wins; otherwise the judge must be strictly stronger than the
+    model that wrote the code (router-stamped ``router_model_id``)."""
+    explicit = spec.get("min_judge_capability")
+    if isinstance(explicit, (int, float)):
+        return int(explicit)
+    model_id = (task.payload or {}).get("router_model_id")
+    if model_id:
+        for model_spec in registry:
+            if model_spec.id == model_id:
+                return model_spec.capability_score + 1
+    return 0
+
+
+def resolve_judge_model(task: Task, spec: dict[str, Any]) -> Optional["ModelSpec"]:
+    """Pick the cheapest model that clears the capability floor (the smallest
+    sufficient upgrade over the implementer). Falls back to the single strongest
+    available model as a peer reviewer when nothing strictly clears the floor —
+    but only if it is at least as capable as the implementer, otherwise there is
+    no point and we return ``None`` (review becomes a no-op)."""
+    from puppetmaster.model_registry import default_registry_path, load_registry
+    from puppetmaster.platform_lock import is_adapter_enabled
+
+    registry = [
+        s
+        for s in load_registry(default_registry_path())
+        if s.enabled and is_adapter_enabled(s.adapter)
+    ]
+    if not registry:
+        return None
+
+    floor = _implementer_capability(task, spec, registry)
+    eligible = [s for s in registry if s.capability_score >= floor]
+    if eligible:
+        return min(eligible, key=lambda s: (s.capability_score, s.id))
+
+    strongest = max(registry, key=lambda s: s.capability_score)
+    implementer_floor = floor - 1 if not spec.get("min_judge_capability") else floor
+    if strongest.capability_score >= implementer_floor:
+        return strongest
+    return None
+
+
+def parse_review_verdict(text: str) -> Optional[dict[str, Any]]:
+    """Extract the judge's ``{pass, severity, reasons}`` object from free-form
+    model output by locating the marker and brace-matching the JSON that follows.
+    Returns ``None`` when no well-formed verdict is present (→ fail-closed)."""
+    marker_at = text.rfind(_REVIEW_VERDICT_MARKER)
+    if marker_at == -1:
+        return None
+    tail = text[marker_at + len(_REVIEW_VERDICT_MARKER):]
+    brace = tail.find("{")
+    if brace == -1:
+        return None
+    depth = 0
+    for offset, char in enumerate(tail[brace:]):
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                blob = tail[brace : brace + offset + 1]
+                try:
+                    parsed = json.loads(blob)
+                except json.JSONDecodeError:
+                    return None
+                return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _verdict_from_artifacts(artifacts: list[Artifact]) -> Optional[dict[str, Any]]:
+    """Scan a judge run's artifacts for the verdict marker. The marker may land
+    in a parsed FINDING/VERIFICATION payload or in the raw captured stdout the
+    adapter stashes on its verification artifact — search all of it."""
+    for artifact in artifacts:
+        for value in (artifact.payload or {}).values():
+            if isinstance(value, str) and _REVIEW_VERDICT_MARKER in value:
+                verdict = parse_review_verdict(value)
+                if verdict is not None:
+                    return verdict
+    return None
+
+
+def default_judge_review(
+    *, prompt: str, judge: "ModelSpec", cwd: Path, timeout: int, task: Task
+) -> ReviewVerdict:
+    """Run the judge model read-only over the diff and read back its verdict.
+
+    Gated behind ``$PUPPETMASTER_REVIEW_GATE`` because it makes an extra model
+    call (a deliberate, flagged spend). Fail-closed: any error, timeout, or
+    unparseable answer from a judge that *did* run rejects the diff — a review
+    oracle that can't be read is treated as a failed review, never a pass."""
+    if not os.environ.get(_REVIEW_ENABLE_ENV):
+        return ReviewVerdict(
+            available=False,
+            passed=True,
+            reasons=[f"{_REVIEW_ENABLE_ENV} not set; live review disabled"],
+            detail={"enabled": False},
+        )
+    try:
+        from dataclasses import replace as _replace
+
+        from puppetmaster.adapters import get_adapter
+
+        judge_task = _replace(
+            task,
+            adapter=judge.adapter,
+            payload={
+                **(task.payload or {}),
+                "prompt": prompt,
+                "model": judge.adapter_model_name,
+                "cwd": str(cwd),
+                "mode": "analyze",
+                "implement": False,
+                "disable_memory": True,
+                "disable_codegraph": True,
+                "auto_route": False,
+                "timeout_seconds": timeout,
+            },
+        )
+        artifacts = get_adapter(judge.adapter).run(
+            judge_task, prompt, f"review-judge-{judge.id}"
+        )
+    except Exception as exc:  # judge crashed → fail-closed
+        return ReviewVerdict(
+            available=True,
+            passed=False,
+            severity="critical",
+            reasons=[f"judge invocation failed: {exc}"],
+            detail={"error": str(exc)},
+        )
+
+    verdict = _verdict_from_artifacts(artifacts)
+    if verdict is None:
+        return ReviewVerdict(
+            available=True,
+            passed=False,
+            severity="critical",
+            reasons=["judge produced no parseable verdict"],
+            detail={"judge_artifacts": len(artifacts)},
+        )
+    reasons = verdict.get("reasons")
+    return ReviewVerdict(
+        available=True,
+        passed=bool(verdict.get("pass")),
+        severity=str(verdict.get("severity", "none")),
+        reasons=[str(r) for r in reasons] if isinstance(reasons, list) else [],
+        detail={"raw_verdict": verdict},
+    )
+
+
+# Module-level seam so tests inject a fake judge and the live adapter call is
+# never made in the unit suite. Production wiring uses ``default_judge_review``.
+ReviewJudge = Callable[..., ReviewVerdict]
+_REVIEW_JUDGE: ReviewJudge = default_judge_review
+
+
+def _review_sampled(task_id: str, sample: float) -> bool:
+    """Deterministic per-task sampling: the same task always lands on the same
+    side of the cut, so a re-run isn't randomly (un)reviewed. ``sample`` is the
+    fraction of tasks reviewed (1.0 → all, 0.0 → none)."""
+    if sample >= 1.0:
+        return True
+    if sample <= 0.0:
+        return False
+    digest = hashlib.sha256(task_id.encode("utf-8")).hexdigest()
+    bucket = int(digest[:8], 16) / 0xFFFFFFFF
+    return bucket < sample
+
+
+def _collect_diff(artifacts: list[Artifact], cwd: Path) -> str:
+    """The change to review: the live working-tree diff, plus any PATCH-artifact
+    diffs (covers a committed implement run whose tree is already clean)."""
+    from puppetmaster.adapters import git_snapshot
+
+    diff = str(git_snapshot(cwd).get("diff") or "")
+    if not diff.strip():
+        chunks = [
+            str((a.payload or {}).get("diff") or "")
+            for a in artifacts
+            if a.type == ArtifactType.PATCH
+        ]
+        diff = "\n".join(c for c in chunks if c.strip())
+    return diff
+
+
+def _gate_review(
+    name: str, spec: dict[str, Any], task: Task, artifacts: list[Artifact], cwd: Path
+) -> GateResult:
+    diff = _collect_diff(artifacts, cwd)
+    if not diff.strip():
+        # Nothing to review. ``require_diff`` owns the "implement did nothing"
+        # failure; an empty diff here is not the review gate's problem.
+        return GateResult(name, "review", True, "no diff to review")
+
+    sample = spec.get("sample")
+    if isinstance(sample, (int, float)) and not _review_sampled(task.id, float(sample)):
+        return GateResult(
+            name, "review", True, f"not sampled (sample={sample})", {"sampled": False}
+        )
+
+    judge = resolve_judge_model(task, spec)
+    if judge is None:
+        return GateResult(
+            name, "review", True, "review skipped: no adequate judge model available",
+            {"judge": None},
+        )
+
+    max_chars = int(spec.get("max_diff_chars", _REVIEW_MAX_DIFF_CHARS))
+    diff_for_judge = (
+        diff
+        if len(diff) <= max_chars
+        else diff[:max_chars] + "\n... (diff truncated for review) ..."
+    )
+    rubric = str(spec.get("rubric") or _DEFAULT_REVIEW_RUBRIC)
+    prompt = build_review_prompt(task, diff_for_judge, rubric)
+    timeout = int(spec.get("timeout_seconds", _REVIEW_TIMEOUT))
+
+    verdict = _REVIEW_JUDGE(prompt=prompt, judge=judge, cwd=cwd, timeout=timeout, task=task)
+    if not verdict.available:
+        return GateResult(
+            name, "review", True, "review skipped: judge unavailable",
+            {"judge": judge.id, **verdict.detail},
+        )
+
+    detail = {
+        "judge_model": judge.id,
+        "severity": verdict.severity,
+        "reasons": verdict.reasons,
+        "diff_chars": len(diff),
+    }
+    if verdict.passed:
+        return GateResult(name, "review", True, f"{judge.id} approved the diff", detail)
+    summary = "; ".join(verdict.reasons) or verdict.severity or "rejected"
+    return GateResult(name, "review", False, f"{judge.id} rejected the diff: {summary}", detail)
 
 
 def _run(command: Any, cwd: Path, timeout: int) -> subprocess.CompletedProcess:
