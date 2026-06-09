@@ -233,6 +233,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Pass --global to install-rules.",
     )
     setup_parser.add_argument(
+        "--global-hooks",
+        action="store_true",
+        help=(
+            "Install user-level auto-invocation hooks (~/.cursor/hooks.json, "
+            "~/.claude/settings.json) that cover every repo, instead of just this "
+            "workspace."
+        ),
+    )
+    setup_parser.add_argument(
         "--force",
         action="store_true",
         help="Pass --force through to MCP installers and rule installer.",
@@ -1249,13 +1258,23 @@ def build_parser() -> argparse.ArgumentParser:
             "Install deterministic auto-invocation hooks into Cursor "
             "(.cursor/hooks.json) and Claude Code (.claude/settings.json). These "
             "inject a delegate directive on prompt submit and deny-redirect broad "
-            "native Grep/Glob/Task to Puppetmaster equivalents."
+            "native Grep/Glob/Task to Puppetmaster equivalents. Default scope is "
+            "this workspace; pass --global for user-level hooks covering every repo."
         ),
     )
     install_hooks_parser.add_argument(
         "--target",
         default=None,
         help=f"Comma-separated subset. Valid: {', '.join(sorted(VALID_HOOK_TARGETS))}. Default: both.",
+    )
+    install_hooks_parser.add_argument(
+        "--global",
+        dest="global_scope",
+        action="store_true",
+        help=(
+            "Install user-level hooks (~/.cursor/hooks.json, ~/.claude/settings.json) "
+            "that cover every repo you open, instead of just this workspace."
+        ),
     )
     install_hooks_parser.add_argument("--force", action="store_true", help="Rewrite even if current.")
     install_hooks_parser.add_argument("--dry-run", action="store_true", help="Print without writing.")
@@ -2534,11 +2553,13 @@ def _run_setup(args) -> int:
     print()
 
     if not getattr(args, "skip_hooks", False):
-        print("=== step 7/7: install-hooks (deterministic auto-invocation) ===")
+        hooks_scope = "global" if getattr(args, "global_hooks", False) else "project"
+        print(f"=== step 7/7: install-hooks (deterministic auto-invocation, scope={hooks_scope}) ===")
         hooks_result = install_hooks(
             cwd=cwd,
             dry_run=False,
             force=getattr(args, "force", False),
+            scope=hooks_scope,
         )
         for outcome in hooks_result.outcomes:
             print(f"  {outcome.target:<14} {outcome.status:<14} {outcome.reason}")
@@ -2546,6 +2567,12 @@ def _run_setup(args) -> int:
             print(f"  note: {msg}")
         if hooks_result.overall_status == "error":
             overall_rc = 1
+        scope_note = (
+            "user-level (~/.cursor, ~/.claude) — covers every repo you open"
+            if hooks_scope == "global"
+            else "this workspace only — re-run with --global-hooks to cover every repo"
+        )
+        print(f"  note: scope is {scope_note}.")
         print(
             "  note: hooks inject a delegate directive on prompt-submit and "
             "deny-redirect broad native Grep/Glob/Task. Disable anytime with "
@@ -3867,13 +3894,15 @@ def _run_install_hooks(args) -> int:
     raw = getattr(args, "target", None)
     if raw:
         targets = [t.strip() for t in raw.split(",") if t.strip()]
+    scope = "global" if getattr(args, "global_scope", False) else "project"
     result = install_hooks(
         cwd=Path.cwd(),
         targets=targets,
         dry_run=getattr(args, "dry_run", False),
         force=getattr(args, "force", False),
+        scope=scope,
     )
-    print(f"[install-hooks] overall: {result.overall_status}")
+    print(f"[install-hooks] overall: {result.overall_status} (scope={scope})")
     for outcome in result.outcomes:
         print(f"[install-hooks] {outcome.target:<8} {outcome.status:<14} {outcome.reason}")
         if outcome.path:

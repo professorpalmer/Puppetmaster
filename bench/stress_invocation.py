@@ -215,6 +215,16 @@ def run_installer_roundtrip() -> None:
         again = install_hooks(cwd=cwd, python=PY)
         check("re-install is unchanged (idempotent)", again.overall_status == "unchanged", again.overall_status)
 
+        # Global scope lands under ~ (fake home), never under the workspace.
+        with TemporaryDirectory() as home_tmp:
+            home = Path(home_tmp)
+            g = install_hooks(cwd=cwd, scope="global", home=home, python=PY)
+            check("global install reports installed", g.overall_status == "installed", g.overall_status)
+            check("global writes ~/.cursor + ~/.claude",
+                  (home / ".cursor" / "hooks.json").exists() and (home / ".claude" / "settings.json").exists())
+            g2 = install_hooks(cwd=cwd, scope="global", home=home, python=PY)
+            check("global re-install idempotent", g2.overall_status == "unchanged", g2.overall_status)
+
 
 # ---------------------------------------------------------------------------
 # 5. Kill switch
