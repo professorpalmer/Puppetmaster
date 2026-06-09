@@ -19,10 +19,10 @@
 
 ```bash
 pipx install puppetmaster-ai     # or: pip install puppetmaster-ai
-puppetmaster setup               # doctor + models init + MCP installers + agent rules, idempotent
+puppetmaster setup               # doctor + models init + MCP installers + rules + auto-invocation hooks, idempotent
 ```
 
-That's the whole install. `setup` runs every step idempotently, skips any tool that isn't present, and prints what it did. Restart Cursor (or open a fresh Codex / Claude session) and the agent sees 32+ `puppetmaster_*` tools plus a rule nudging it to reach for them on multi-file work.
+That's the whole install. `setup` runs every step idempotently, skips any tool that isn't present, and prints what it did. Restart Cursor (or open a fresh Codex / Claude session) and the agent sees 32+ `puppetmaster_*` tools, a rule nudging it to reach for them, **and deterministic auto-invocation hooks** that inject a "delegate now" directive on prompt submit and redirect broad native Grep/Glob/Task to Puppetmaster on multi-file work — so you stop having to remind it. It's classifier-gated (trivial edits stay inline) and fully kill-switchable with `PUPPETMASTER_AUTO_INVOKE_DISABLED=1`. See [Auto-invocation](#auto-invocation).
 
 To run benchmarks or hack on it, clone instead — see [Contributing](docs/CONTRIBUTING.md). (`pipx` keeps the CLI in its own isolated environment, which is the recommended way to install a command-line app.)
 
@@ -137,6 +137,16 @@ The agent rules installed by `puppetmaster setup` (Cursor `.mdc` + `AGENTS.md`) 
 ### Puppetmaster is not a chat layer — on purpose
 
 Don't try to route **every** chat message through Puppetmaster "to capture context." It's a deliberate boundary, not a missing feature: spinning a durable worker for "hi" or "what's this function" inverts the entire value proposition (you'd add orchestration cost and latency to the cheapest turns), and it fights the IDE, which doesn't expose a clean intercept-every-message hook. Let the cheap model triage; let Puppetmaster do the work that deserves a job. The router-at-the-top decides what crosses that line.
+
+## Auto-invocation
+
+The hardest part of that pattern is getting the host agent to *actually* delegate without you reminding it every few turns. Rules help but decay with context distance. So `puppetmaster setup` also installs a layered, classifier-gated enforcement system — designed to fire automatically exactly when a task warrants a job, and stay out of the way otherwise.
+
+- **The gate** (`puppetmaster should-delegate "<prompt>"`) reuses the router's existing pure-function classifier to answer delegate-vs-inline in microseconds — no LLM, no network. A trivial-task carve-out keeps typos/renames/one-liners/quick questions inline; a conservative threshold and a broad-scope override (audit/refactor/migrate/trace) catch real multi-file work.
+- **Deterministic hooks** (`puppetmaster install-hooks`, run automatically by `setup`) write idempotent, non-destructive entries into Cursor's `.cursor/hooks.json` and Claude Code's `.claude/settings.json`: they inject a "delegate now" directive on prompt submit and **deny-redirect** broad native `Grep`/`Glob`/`Task` to the Puppetmaster/CodeGraph equivalent. They fail open — a hook can never wedge your session.
+- **Optional proxy** (`puppetmaster proxy`) extends the same gate to OpenAI-compatible API-key/SDK clients that closed harnesses can't hook.
+
+**Honest about the ceiling:** there is no universal *deterministic* invocation. Closed harnesses won't let anything sit on their LLM provider wire or force an MCP call, so the system is explicitly tiered — soft rules everywhere, hard hooks where the host exposes them (Cursor, Claude Code), proxy only for clients routed through it — and fully kill-switchable with `PUPPETMASTER_AUTO_INVOKE_DISABLED=1`. It enforces the "let the cheap model triage, let Puppetmaster do the real work" boundary above; it does not try to make Puppetmaster a chat layer.
 
 ## Status
 
