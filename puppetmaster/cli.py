@@ -1257,8 +1257,9 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Install deterministic auto-invocation hooks into Cursor "
             "(.cursor/hooks.json) and Claude Code (.claude/settings.json). These "
-            "inject a delegate directive on prompt submit and deny-redirect broad "
-            "native Grep/Glob/Task to Puppetmaster equivalents. Default scope is "
+            "inject a delegate directive on prompt submit and deny-redirect "
+            "recursive shell searches + Task fan-out to Puppetmaster equivalents "
+            "(read-only inspection and native Grep/Glob pass through). Default scope is "
             "this workspace; pass --global for user-level hooks covering every repo."
         ),
     )
@@ -2575,7 +2576,8 @@ def _run_setup(args) -> int:
         print(f"  note: scope is {scope_note}.")
         print(
             "  note: hooks inject a delegate directive on prompt-submit and "
-            "deny-redirect broad native Grep/Glob/Task. Disable anytime with "
+            "deny-redirect recursive shell searches + Task fan-out (read-only "
+            "inspection passes through). Disable anytime with "
             "PUPPETMASTER_AUTO_INVOKE_DISABLED=1."
         )
     else:

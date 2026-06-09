@@ -44,22 +44,44 @@ _PRE_TOOL_ALIASES = {
     "beforemcpexecution", "pre_tool", "tool",
 }
 
-# Native host tools that mean "broad exploration" — redirect these to
-# Puppetmaster. Matched case-insensitively against the host's tool name.
-_NATIVE_BROAD_TOOLS = {
-    "grep", "glob", "task", "codebase_search", "search", "ripgrep",
-}
-_BROAD_TOOL_REDIRECT = {
-    "grep": "puppetmaster_codegraph_search",
-    "glob": "puppetmaster_codegraph_files",
-    "codebase_search": "puppetmaster_codegraph_context",
-    "search": "puppetmaster_codegraph_search",
-    "ripgrep": "puppetmaster_codegraph_search",
+# Built-in agent fan-out — the one native tool we still deny-redirect, because a
+# subagent fan-out is unambiguously "this should be a Puppetmaster swarm" and
+# carries no read-only-inspection use. (Caught by the Claude PreToolUse matcher.)
+_BROAD_AGENT_TOOLS = {"task", "agent"}
+_TOOL_REDIRECT = {
     "task": "puppetmaster_start_cursor_swarm",
+    "agent": "puppetmaster_start_cursor_swarm",
 }
-# Shell commands that are really a repo-wide search in disguise.
+
+# NOTE on native search/glob tools (Grep/Glob/codebase_search): we deliberately
+# do NOT hard-deny these. Field testing showed Cursor's hook payload for them
+# doesn't reliably carry the call's *scope*, so we can't tell "grep one file" /
+# "list one config dir" (read-only inspection) from a repo-wide sweep — and
+# hard-denying *every* one obstructs legitimate work, violating the "never wedge
+# the session" contract. Steering toward Puppetmaster for broad search is left to
+# the non-blocking prompt-submit directive; only genuinely recursive *shell*
+# searches (where the command string is visible) are redirected below.
+
+# Read-only shell inspection that must NEVER be redirected — git history, listing
+# a directory, viewing a file. Matched at the start of a command or after a
+# pipe/sep, so `git log`, `ls ~/.cursor`, `cat foo.py | head` all pass.
+_READONLY_SHELL_RE = re.compile(
+    r"(?:^|[\n;&|]\s*)\s*(?:sudo\s+)?(?:"
+    r"git\s+(?:log|show|diff|status|blame|reflog|describe|rev-parse|branch|tag|"
+    r"remote|stash|config|cat-file|shortlog|whatchanged|ls-files)"
+    r"|ls|ll|cat|bat|head|tail|less|more|pwd|echo|printf|which|type|file|stat|"
+    r"wc|tree|env|date|whoami|basename|dirname|realpath|cd"
+    r")\b",
+    re.IGNORECASE,
+)
+# A *genuinely broad* shell search: a search tool used recursively / repo-wide.
+# Requires an explicit broad signal (recursive flag, ** glob, or find -name/-path),
+# so a narrow `grep pattern file.py` or `rg pattern src/app.ts` is NOT flagged.
 _BROAD_SHELL_RE = re.compile(
-    r"\b(rg|grep|ag|ack|find)\b.*(-r|--recursive|-R|\*\*|/)", re.IGNORECASE
+    r"\b(?:rg|ripgrep|grep|egrep|fgrep|ag|ack)\b[^\n|;&]*?"
+    r"(?:\s-{1,2}(?:r|R|recursive)\b|\*\*)"
+    r"|\bfind\b[^\n|;&]*?\s-(?:i?name|i?path|regex)\b",
+    re.IGNORECASE,
 )
 
 
@@ -164,10 +186,18 @@ def extract_tool(payload: Mapping[str, Any]) -> tuple[str, Any]:
 def classify_tool(tool_name: str, tool_input: Any) -> tuple[bool, str]:
     """Decide whether a native tool call should be redirected to Puppetmaster.
 
-    Returns ``(should_redirect, suggested_verb)``. Conservative on purpose:
-    only *broad* exploration is redirected. Anything namespaced ``puppetmaster``
-    / ``mcp`` is always allowed (never block our own tools), and focused reads /
-    single commands pass through.
+    Returns ``(should_redirect, suggested_verb)``. Deliberately conservative —
+    a false deny obstructs legitimate read-only work (the field-reported failure
+    mode), which is worse than a false allow. So we only redirect:
+
+    * a shell command that is a genuinely recursive/repo-wide search, with an
+      explicit read-only carve-out (``git log/show/diff``, ``ls``, ``cat`` …);
+    * built-in agent fan-out (``Task``) — unambiguously "should be a swarm."
+
+    Native search/glob tools (Grep/Glob/codebase_search) are NOT denied — their
+    scope isn't visible in the hook payload, so blocking them all wedges benign
+    inspection. Anything namespaced ``puppetmaster`` / ``mcp`` is always allowed,
+    and plain file reads (``Read``) are never touched.
     """
     name = (tool_name or "").strip().lower()
     if not name:
@@ -176,13 +206,19 @@ def classify_tool(tool_name: str, tool_input: Any) -> tuple[bool, str]:
         return False, ""
 
     base = name.split("__")[-1]  # strip any "mcp__server__tool" prefixing
-    if base in _NATIVE_BROAD_TOOLS:
-        return True, _BROAD_TOOL_REDIRECT.get(base, "puppetmaster_start_cursor_swarm")
 
-    if base == "shell" or base in {"bash", "run_terminal_cmd", "execute"}:
+    if base in {"shell", "bash", "sh", "zsh", "run_terminal_cmd", "execute"}:
         command = tool_input if isinstance(tool_input, str) else json.dumps(tool_input)
-        if _BROAD_SHELL_RE.search(command or ""):
+        command = command or ""
+        if _READONLY_SHELL_RE.search(command):
+            return False, ""
+        if _BROAD_SHELL_RE.search(command):
             return True, "puppetmaster_codegraph_search"
+        return False, ""
+
+    if base in _BROAD_AGENT_TOOLS:
+        return True, _TOOL_REDIRECT.get(base, "puppetmaster_start_cursor_swarm")
+
     return False, ""
 
 

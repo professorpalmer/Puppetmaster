@@ -10,7 +10,8 @@ Targets:
 
 * ``.cursor/hooks.json`` — Cursor hooks. We register ``beforeSubmitPrompt``
   (inject a delegate directive) plus ``beforeShellExecution`` /
-  ``beforeReadFile`` (deny-redirect broad native exploration).
+  ``beforeReadFile`` (deny-redirect genuinely recursive shell searches + Task
+  fan-out; read-only inspection passes through).
 * ``.claude/settings.json`` — Claude Code hooks: ``UserPromptSubmit`` (inject)
   and ``PreToolUse`` matched on ``Grep|Glob|Task`` (deny-redirect).
 
