@@ -189,6 +189,10 @@ def run_streamed_subprocess(
         command,
         cwd=cwd,
         env=env,
+        # Close stdin: an agent CLI launched in a non-interactive worker must
+        # never block forever waiting on terminal input (a silent "stall").
+        # Callers that previously passed input="" rely on this EOF behavior.
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -975,20 +979,21 @@ class ClaudeCodeAdapter:
                     },
                 )
             ]
-        try:
-            completed = subprocess.run(
-                command,
-                cwd=cwd,
-                input="",
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds,
-                check=False,
-                env=apply_worktree_ports(os.environ.copy(), cwd),
-            )
-        except subprocess.TimeoutExpired as exc:
-            stdout = _coerce_text(exc.stdout)
-            stderr = _coerce_text(exc.stderr)
+        # Stream output to a live sidecar log + heartbeat so a long Claude Code
+        # run is visibly alive instead of looking hung behind a flat, silent
+        # blocking wait. The streamed runner closes stdin, so the CLI can never
+        # wedge waiting on terminal input.
+        completed = run_streamed_subprocess(
+            command=command,
+            env=apply_worktree_ports(os.environ.copy(), cwd),
+            task=task,
+            sidecar_name="claude_implement",
+            timeout_seconds=timeout_seconds,
+            cwd=str(cwd),
+        )
+        if completed.timed_out:
+            stdout = completed.stdout
+            stderr = completed.stderr
             after = git_snapshot(cwd)
             stdout_capture = capture_subprocess_stdout(
                 text=stdout,
@@ -1016,6 +1021,7 @@ class ClaudeCodeAdapter:
                         "stderr": _redacted_tail(stderr, _STDOUT_TAIL_CHARS),
                         "stdout_capture": stdout_capture,
                         "stderr_capture": stderr_capture,
+                        "live_log": completed.live_log_path,
                         "timeout_seconds": timeout_seconds,
                         "base_sha": before["sha"],
                         "head_sha": after["sha"],
@@ -1088,6 +1094,7 @@ class ClaudeCodeAdapter:
                 "stderr": _redacted_tail(completed.stderr, _STDOUT_TAIL_CHARS),
                 "stdout_capture": stdout_capture,
                 "stderr_capture": stderr_capture,
+                "live_log": completed.live_log_path,
                 "cwd": str(cwd),
                 "permission_mode": task.payload.get("permission_mode", "acceptEdits"),
                 "base_sha": before["sha"],
@@ -1239,20 +1246,21 @@ class CodexAdapter:
                 )
             ]
 
-        try:
-            completed = subprocess.run(
-                command,
-                cwd=cwd,
-                input="",
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds,
-                check=False,
-                env=apply_worktree_ports(os.environ.copy(), cwd),
-            )
-        except subprocess.TimeoutExpired as exc:
-            stdout = _coerce_text(exc.stdout)
-            stderr = _coerce_text(exc.stderr)
+        # Stream output to a live sidecar log + heartbeat so a long `codex exec`
+        # run is visibly alive instead of looking hung behind a flat, silent
+        # blocking wait — the symptom that made Codex runs read as "stalled".
+        # The streamed runner closes stdin, so codex can never wedge on input.
+        completed = run_streamed_subprocess(
+            command=command,
+            env=apply_worktree_ports(os.environ.copy(), cwd),
+            task=task,
+            sidecar_name="codex_exec",
+            timeout_seconds=timeout_seconds,
+            cwd=str(cwd),
+        )
+        if completed.timed_out:
+            stdout = completed.stdout
+            stderr = completed.stderr
             after = git_snapshot(cwd)
             stdout_capture = capture_subprocess_stdout(
                 text=stdout,
@@ -1284,6 +1292,7 @@ class CodexAdapter:
                         "stderr": _redacted_tail(stderr, _STDOUT_TAIL_CHARS),
                         "stdout_capture": stdout_capture,
                         "stderr_capture": stderr_capture,
+                        "live_log": completed.live_log_path,
                         "timeout_seconds": timeout_seconds,
                         "base_sha": before["sha"],
                         "head_sha": after["sha"],
@@ -1403,6 +1412,7 @@ class CodexAdapter:
                 "stderr": _redacted_tail(completed.stderr, _STDOUT_TAIL_CHARS),
                 "stdout_capture": stdout_capture,
                 "stderr_capture": stderr_capture,
+                "live_log": completed.live_log_path,
                 "last_message": _redacted_tail(last_message, _STDOUT_TAIL_CHARS),
                 "last_message_capture": last_message_capture,
                 "tokens_in": tokens_in,
