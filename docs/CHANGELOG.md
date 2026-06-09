@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.9.19
+
+**Fix: auto-invocation hooks were over-aggressive on read-only inspection (field report).** v0.9.16/0.9.17's pre-tool deny-redirect hard-denied *every* native `Grep`/`Glob`, and any shell command where a search tool was followed by a `/` anywhere — so benign read-only work (a plain `git log`, listing a config dir, grepping a single file, even reading this changelog) got blocked, contradicting the "never wedge the session" contract the hooks promise. The classifier is now scoped to redirect only genuinely broad operations, with an explicit read-only carve-out. No breaking API changes; full suite **498** green + the E2E stress harness (`bench/stress_invocation.py`) extended with carve-out checks.
+
+- **Native search tools (`Grep` / `Glob` / `codebase_search`) are no longer hard-denied.** Their per-call scope isn't visible in the host hook payload, so there's no reliable way to tell "grep one file" / "list one config dir" from a repo-wide sweep — and blocking them all obstructs legitimate inspection. Steering toward Puppetmaster for broad search now rides entirely on the **non-blocking** prompt-submit directive. The built-in `Task` fan-out (unambiguously "should be a swarm") is still redirected.
+- **Read-only shell inspection is explicitly carved out** — `git log` / `show` / `diff` / `status` / `blame`, `ls`, `cat`, `head` / `tail`, `tree`, etc. always pass through.
+- **Broad-shell detection tightened.** Only a search tool with an explicit recursive signal (`-r` / `-R` / `--recursive`, `**`, or `find -name/-path`) is redirected; `rg pattern src/app.ts` and `grep TODO file.py` are not. The old rule matched any `/` in the command, so a single-file path tripped it.
+- Also made a non-hermetic doctor test hermetic — it read the real `~/.codex` / `~/.claude`, which started failing once v0.9.17's `--global-rules` made global rule installs a normal thing. The check itself was correct; the test now pins a clean home.
+
 ## v0.9.18
 
 **Semantic review gate — a strictly-stronger model must approve an implement diff before it can COMPLETE.** The hole this closes: when Puppetmaster fans out implement work across many auto-routed (often cheap) workers, the only objective acceptance check was `require_diff` — "files changed", not "the code is good". A worker that exited 0 got a hardcoded `confidence=0.9` regardless of quality (`adapters.py`: `confidence=0.9 if returncode == 0`), and the confidence-based auto-escalation keyed off exactly that self-report, so a confidently-mediocre cheap model sailed through. This adds the missing semantic acceptance control as a non-bypassable, fail-closed completion gate, riding the existing gate chokepoint with no new lifecycle machinery. Off by default (one extra model call is a deliberate, flagged spend); flip `PUPPETMASTER_REVIEW_GATE=1` to enforce. No breaking API changes; full suite **495** green (+23 focused tests).
