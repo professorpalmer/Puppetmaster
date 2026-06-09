@@ -9965,6 +9965,314 @@ class PuppetmasterMcpVerbTests(unittest.TestCase):
         self.assertIn("puppetmaster_gate", names)
 
 
+class InvocationGateTests(unittest.TestCase):
+    """Tests for the classifier-gated auto-invocation decision."""
+
+    def test_should_delegate_audit_suggests_review_verb(self):
+        from puppetmaster.invocation_gate import should_delegate
+
+        d = should_delegate("audit the auth module for security issues across the repo")
+        self.assertTrue(d.should_delegate)
+        self.assertEqual(d.suggested_verb, "puppetmaster_start_cursor_review")
+        self.assertGreaterEqual(d.capability_score, 60)
+
+    def test_should_not_delegate_trivial_typo(self):
+        from puppetmaster.invocation_gate import should_delegate
+
+        d = should_delegate("fix a typo in the README")
+        self.assertFalse(d.should_delegate)
+        self.assertIn("trivial", d.matched_signals)
+
+    def test_explicit_trigger_forces_delegation(self):
+        from puppetmaster.invocation_gate import should_delegate
+
+        d = should_delegate("use puppetmaster to add a comment")
+        self.assertTrue(d.should_delegate)
+        self.assertIn("explicit-trigger", d.matched_signals)
+
+    def test_explicit_inline_opt_out_wins(self):
+        from puppetmaster.invocation_gate import should_delegate
+
+        d = should_delegate("refactor everything across the repo, but do it inline")
+        self.assertFalse(d.should_delegate)
+        self.assertIn("explicit-inline", d.matched_signals)
+
+    def test_kill_switch_disables_delegation(self):
+        from puppetmaster.invocation_gate import should_delegate
+
+        d = should_delegate("audit everything", env={"PUPPETMASTER_AUTO_INVOKE_DISABLED": "1"})
+        self.assertFalse(d.should_delegate)
+        self.assertIn("kill-switch", d.matched_signals)
+
+    def test_hard_scope_overrides_just_under_threshold(self):
+        from puppetmaster.invocation_gate import should_delegate
+
+        # A high threshold forces the score under the bar; broad scope still wins.
+        d = should_delegate("rename every usage of getCwd across the codebase", threshold=98)
+        self.assertTrue(d.should_delegate)
+        self.assertIn("hard-scope", d.matched_signals)
+
+    def test_role_inference_maps_to_verbs(self):
+        from puppetmaster.invocation_gate import infer_role_and_verb
+
+        self.assertEqual(infer_role_and_verb("design the caching layer")[1], "puppetmaster_start_cursor_plan")
+        self.assertEqual(infer_role_and_verb("where is ClientError defined")[1], "puppetmaster_codegraph_search")
+
+
+class HookRunnerTests(unittest.TestCase):
+    """Tests for host hook payload → response translation."""
+
+    def test_user_prompt_injects_directive_when_delegating(self):
+        from puppetmaster.hook_runner import handle_hook
+
+        r = handle_hook(
+            {"prompt": "refactor the auth module across all files"},
+            host="cursor", event="beforeSubmitPrompt",
+        )
+        self.assertEqual(r.action, "allow")
+        self.assertIn("Puppetmaster", r.context)
+        out = r.to_host_json("cursor")
+        self.assertEqual(out["permission"], "allow")
+        self.assertIn("additionalContext", out)
+
+    def test_pre_tool_denies_native_grep(self):
+        from puppetmaster.hook_runner import handle_hook
+
+        r = handle_hook({"tool_name": "Grep"}, host="claude", event="PreToolUse")
+        self.assertEqual(r.action, "deny")
+        out = r.to_host_json("claude")
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_pre_tool_allows_puppetmaster_tools(self):
+        from puppetmaster.hook_runner import handle_hook
+
+        r = handle_hook(
+            {"tool_name": "mcp__puppetmaster__codegraph_search"},
+            host="cursor", event="pre-tool",
+        )
+        self.assertEqual(r.action, "allow")
+
+    def test_pre_tool_redirects_broad_shell_search(self):
+        from puppetmaster.hook_runner import classify_tool
+
+        redirect, verb = classify_tool("shell", "rg -r 'TODO' ./src")
+        self.assertTrue(redirect)
+        self.assertTrue(verb.startswith("puppetmaster_"))
+
+    def test_kill_switch_allows_everything(self):
+        from puppetmaster.hook_runner import handle_hook
+
+        r = handle_hook(
+            {"tool_name": "Grep"}, host="cursor", event="pre-tool",
+            env={"PUPPETMASTER_AUTO_INVOKE_DISABLED": "1"},
+        )
+        self.assertEqual(r.action, "allow")
+
+    def test_run_reads_stdin_and_emits_json(self):
+        from puppetmaster.hook_runner import run
+
+        stdin = io.StringIO(json.dumps({"prompt": "audit the whole repo for races"}))
+        stdout = io.StringIO()
+        rc = run(["--host", "cursor", "--event", "user-prompt"], stdin=stdin, stdout=stdout)
+        self.assertEqual(rc, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertIn("additionalContext", payload)
+
+    def test_run_fails_open_on_garbage_stdin(self):
+        from puppetmaster.hook_runner import run
+
+        stdout = io.StringIO()
+        rc = run(["--host", "cursor", "--event", "user-prompt"], stdin=io.StringIO("not json"), stdout=stdout)
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(stdout.getvalue())["permission"], "allow")
+
+
+class ProviderProxyTests(unittest.TestCase):
+    """Tests for the OpenAI-compatible enforcement proxy (pure logic)."""
+
+    def test_extract_user_prompt_from_messages(self):
+        from puppetmaster.provider_proxy import extract_user_prompt
+
+        body = {"messages": [{"role": "system", "content": "x"}, {"role": "user", "content": "audit the repo"}]}
+        self.assertEqual(extract_user_prompt(body), "audit the repo")
+
+    def test_extract_user_prompt_structured_content(self):
+        from puppetmaster.provider_proxy import extract_user_prompt
+
+        body = {"messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}, {"type": "text", "text": "there"}]}]}
+        self.assertEqual(extract_user_prompt(body), "hi\nthere")
+
+    def test_transform_injects_directive_when_delegating(self):
+        from puppetmaster.provider_proxy import transform_chat_request
+
+        body = {"messages": [{"role": "user", "content": "refactor the database layer across all modules"}]}
+        new_body, decision = transform_chat_request(body)
+        self.assertTrue(decision.should_delegate)
+        self.assertEqual(new_body["messages"][0]["role"], "system")
+        self.assertIn("Puppetmaster", new_body["messages"][0]["content"])
+
+    def test_transform_passthrough_when_inline(self):
+        from puppetmaster.provider_proxy import transform_chat_request
+
+        body = {"messages": [{"role": "user", "content": "fix a typo"}]}
+        new_body, decision = transform_chat_request(body)
+        self.assertFalse(decision.should_delegate)
+        self.assertEqual(new_body["messages"], body["messages"])
+
+    def test_upstream_allowlist(self):
+        from puppetmaster.provider_proxy import is_upstream_allowed
+
+        self.assertTrue(is_upstream_allowed("https://api.openai.com/v1"))
+        self.assertTrue(is_upstream_allowed("http://127.0.0.1:9999"))
+        self.assertFalse(is_upstream_allowed("https://evil.example.com"))
+        self.assertFalse(is_upstream_allowed("http://api.openai.com"))  # not https
+
+    def test_advice_response_shape(self):
+        from puppetmaster.invocation_gate import should_delegate
+        from puppetmaster.provider_proxy import build_advice_response
+
+        decision = should_delegate("audit the repo")
+        resp = build_advice_response(decision)
+        self.assertEqual(resp["object"], "chat.completion")
+        self.assertIn("Puppetmaster", resp["choices"][0]["message"]["content"])
+
+
+class HookInstallerTests(unittest.TestCase):
+    """Tests for the deterministic hook installer (idempotent + non-destructive)."""
+
+    def test_install_writes_cursor_and_claude(self):
+        from puppetmaster.hook_installers import install_hooks
+
+        with TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            result = install_hooks(cwd=cwd)
+            self.assertEqual(result.overall_status, "installed")
+            cursor = json.loads((cwd / ".cursor" / "hooks.json").read_text())
+            self.assertIn("beforeSubmitPrompt", cursor["hooks"])
+            self.assertIn("invocation-gate", json.dumps(cursor))
+            claude = json.loads((cwd / ".claude" / "settings.json").read_text())
+            self.assertIn("UserPromptSubmit", claude["hooks"])
+            self.assertIn("PreToolUse", claude["hooks"])
+
+    def test_install_is_idempotent(self):
+        from puppetmaster.hook_installers import install_hooks
+
+        with TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            install_hooks(cwd=cwd)
+            again = install_hooks(cwd=cwd)
+            self.assertEqual(again.overall_status, "unchanged")
+
+    def test_install_preserves_user_hooks(self):
+        from puppetmaster.hook_installers import install_hooks
+
+        with TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            cursor_path = cwd / ".cursor" / "hooks.json"
+            cursor_path.parent.mkdir(parents=True)
+            cursor_path.write_text(json.dumps({
+                "version": 1,
+                "hooks": {"beforeSubmitPrompt": [{"command": "my-own-hook"}]},
+            }))
+            install_hooks(cwd=cwd, targets=["cursor"])
+            data = json.loads(cursor_path.read_text())
+            commands = json.dumps(data["hooks"]["beforeSubmitPrompt"])
+            self.assertIn("my-own-hook", commands)
+            self.assertIn("invocation-gate", commands)
+
+    def test_dry_run_writes_nothing(self):
+        from puppetmaster.hook_installers import install_hooks
+
+        with TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            result = install_hooks(cwd=cwd, dry_run=True)
+            self.assertEqual(result.overall_status, "would_install")
+            self.assertFalse((cwd / ".cursor" / "hooks.json").exists())
+
+
+class InvocationGateCliTests(unittest.TestCase):
+    """The should-delegate / install-hooks CLI surface."""
+
+    def test_should_delegate_cli_json(self):
+        from puppetmaster.cli import main as cli_main
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli_main(["should-delegate", "audit the whole repo for security holes", "--json"])
+        self.assertEqual(rc, 0)
+        payload = json.loads(buf.getvalue())
+        self.assertTrue(payload["should_delegate"])
+
+    def test_install_hooks_cli(self):
+        from puppetmaster.cli import main as cli_main
+
+        with TemporaryDirectory() as tmp:
+            cwd = Path.cwd()
+            try:
+                os.chdir(tmp)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli_main(["install-hooks", "--target", "cursor"])
+                self.assertEqual(rc, 0)
+                self.assertTrue((Path(tmp) / ".cursor" / "hooks.json").exists())
+            finally:
+                os.chdir(cwd)
+
+
+class SetupHooksStepTests(unittest.TestCase):
+    """The `setup` wizard installs auto-invocation hooks as step 7."""
+
+    def _args(self, **over):
+        base = dict(
+            skip_doctor=True, skip_models=True, skip_platforms=True,
+            skip_rules=True, skip_hooks=False, global_rules=False,
+            force=False, state_dir=None, platforms=None,
+        )
+        base.update(over)
+        return MagicMock(**base)
+
+    def test_setup_installs_hooks(self):
+        import puppetmaster.cli as cli
+
+        class _Res:
+            status = "installed"
+            messages: list = []
+
+        with TemporaryDirectory() as tmp:
+            cwd0 = Path.cwd()
+            try:
+                os.chdir(tmp)
+                with patch.object(cli, "install_cursor_mcp", return_value=_Res()), \
+                        patch.object(cli, "install_codex_mcp", return_value=_Res()), \
+                        patch("puppetmaster.platform_lock.enabled_adapters", return_value={"cursor"}):
+                    rc = cli._run_setup(self._args())
+                self.assertEqual(rc, 0)
+                self.assertTrue((Path(tmp) / ".cursor" / "hooks.json").exists())
+                self.assertTrue((Path(tmp) / ".claude" / "settings.json").exists())
+            finally:
+                os.chdir(cwd0)
+
+    def test_setup_skip_hooks_writes_no_hooks(self):
+        import puppetmaster.cli as cli
+
+        class _Res:
+            status = "installed"
+            messages: list = []
+
+        with TemporaryDirectory() as tmp:
+            cwd0 = Path.cwd()
+            try:
+                os.chdir(tmp)
+                with patch.object(cli, "install_cursor_mcp", return_value=_Res()), \
+                        patch.object(cli, "install_codex_mcp", return_value=_Res()), \
+                        patch("puppetmaster.platform_lock.enabled_adapters", return_value={"cursor"}):
+                    rc = cli._run_setup(self._args(skip_hooks=True))
+                self.assertEqual(rc, 0)
+                self.assertFalse((Path(tmp) / ".cursor" / "hooks.json").exists())
+            finally:
+                os.chdir(cwd0)
+
+
 if __name__ == "__main__":
     unittest.main()
 
