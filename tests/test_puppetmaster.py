@@ -1416,14 +1416,107 @@ class PuppetmasterTests(unittest.TestCase):
             timed_out=False,
             live_log_path=None,
         )
-        dirty = {"sha": "s", "changed_files": ["pre.py"], "untracked_files": [], "diff": ""}
-        with patch("puppetmaster.adapters.git_snapshot", side_effect=[dirty, dirty]), patch(
+        before_dirty = {
+            "sha": "s",
+            "changed_files": ["pre.py"],
+            "untracked_files": [],
+            "diff": "diff --git a/pre.py b/pre.py\n+already dirty\n",
+        }
+        after_dirty = {
+            "sha": "s",
+            "changed_files": ["pre.py", "helper.py"],
+            "untracked_files": [],
+            "worker_changed_files": ["helper.py"],
+            "worker_untracked_files": [],
+            "worker_diff": "diff --git a/helper.py b/helper.py\n+def helper():\n+    return 1\n",
+            "diff": (
+                "diff --git a/pre.py b/pre.py\n+already dirty\n"
+                "diff --git a/helper.py b/helper.py\n+def helper():\n+    return 1\n"
+            ),
+        }
+        with patch("puppetmaster.adapters.git_snapshot", side_effect=[before_dirty, after_dirty]), patch(
             "puppetmaster.adapters.run_streamed_subprocess", return_value=completed
         ) as run:
             artifacts = CursorAdapter().run(task, "goal", "worker-cursor")
 
         run.assert_called_once()  # dirty guard bypassed
         self.assertEqual(artifacts[0].payload["result"], "passed")
+        patch_artifact = next(a for a in artifacts if a.type == ArtifactType.PATCH)
+        self.assertEqual(patch_artifact.payload["files"], ["helper.py"])
+        self.assertIn("helper.py", patch_artifact.payload["unified_diff"])
+        self.assertNotIn("pre.py", patch_artifact.payload["unified_diff"])
+
+    def test_dirty_baseline_without_worker_diff_emits_no_patch(self) -> None:
+        from puppetmaster.adapters import _should_emit_patch_artifact
+
+        before_dirty = {
+            "sha": "s",
+            "changed_files": ["pre.py"],
+            "untracked_files": [],
+            "diff": "diff --git a/pre.py b/pre.py\n+already dirty\n",
+        }
+        after_unattributed = {
+            "sha": "s",
+            "changed_files": ["pre.py", "helper.py"],
+            "untracked_files": [],
+            "worker_diff": "",
+            "diff": (
+                "diff --git a/pre.py b/pre.py\n+already dirty\n"
+                "diff --git a/helper.py b/helper.py\n+def helper():\n+    return 1\n"
+            ),
+        }
+
+        self.assertFalse(_should_emit_patch_artifact(before_dirty, after_unattributed))
+
+    def test_cursor_implement_dirty_tree_snapshot_failure_emits_no_patch(self) -> None:
+        from puppetmaster import adapters
+
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            (repo / "pre.py").write_text("clean\n", encoding="utf-8")
+            subprocess.run(["git", "add", "pre.py"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-c", "user.name=T", "-c", "user.email=t@e.com", "commit", "-m", "seed"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+            (repo / "pre.py").write_text("user dirty\n", encoding="utf-8")
+            before_tree = adapters.git_worktree_tree(repo)
+            task = Task(
+                job_id="job",
+                role="cursor",
+                instruction="add a helper",
+                adapter="cursor",
+                payload={
+                    "prompt": "Add a helper",
+                    "cwd": str(repo),
+                    "mode": "implement",
+                    "allow_dirty": True,
+                    "disable_codegraph": True,
+                },
+            )
+            completed = StreamedProcess(
+                returncode=0,
+                stdout=json.dumps({"status": "finished", "result": "ok"}),
+                stderr="",
+                timed_out=False,
+                live_log_path=None,
+            )
+
+            def fake_run(*args: object, **kwargs: object) -> StreamedProcess:
+                (repo / "helper.py").write_text("pm change\n", encoding="utf-8")
+                return completed
+
+            with patch(
+                "puppetmaster.adapters.git_worktree_tree",
+                side_effect=[before_tree, ""],
+            ), patch("puppetmaster.adapters.run_streamed_subprocess", side_effect=fake_run):
+                artifacts = CursorAdapter().run(task, "goal", "worker-cursor")
+
+            self.assertEqual(artifacts[0].payload["result"], "passed")
+            self.assertNotIn(ArtifactType.PATCH, [artifact.type for artifact in artifacts])
 
     def test_codegraph_helper_returns_none_when_cli_missing(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -4114,6 +4207,140 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
             self.assertIn("two", snap["diff"])
             self.assertIn("new_file.txt", snap["diff"])
             self.assertIn("+hello", snap["diff"])
+
+    def test_git_snapshot_worker_diff_excludes_preexisting_dirty_files(self) -> None:
+        from puppetmaster.adapters import git_snapshot
+
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            (repo / "pre.py").write_text("clean\n", encoding="utf-8")
+            subprocess.run(["git", "add", "pre.py"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-c", "user.name=T", "-c", "user.email=t@e.com", "commit", "-m", "seed"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+
+            (repo / "pre.py").write_text("user dirty\n", encoding="utf-8")
+            before = git_snapshot(repo)
+            (repo / "helper.py").write_text("pm change\n", encoding="utf-8")
+
+            after = git_snapshot(repo, base_tree=before["tree"])
+
+            self.assertIn("pre.py", after["diff"])
+            self.assertIn("helper.py", after["worker_changed_files"])
+            self.assertIn("helper.py", after["worker_untracked_files"])
+            self.assertIn("helper.py", after["worker_diff"])
+            self.assertNotIn("pre.py", after["worker_diff"])
+
+    def test_git_snapshot_worker_diff_fails_closed_without_after_tree(self) -> None:
+        from puppetmaster.adapters import _should_emit_patch_artifact, git_snapshot
+
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            (repo / "pre.py").write_text("clean\n", encoding="utf-8")
+            subprocess.run(["git", "add", "pre.py"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-c", "user.name=T", "-c", "user.email=t@e.com", "commit", "-m", "seed"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+
+            (repo / "pre.py").write_text("user dirty\n", encoding="utf-8")
+            before = git_snapshot(repo)
+            (repo / "helper.py").write_text("pm change\n", encoding="utf-8")
+
+            with patch("puppetmaster.adapters.git_worktree_tree", return_value=""):
+                after = git_snapshot(repo, base_tree=before["tree"])
+
+            self.assertEqual(after["worker_changed_files"], [])
+            self.assertEqual(after["worker_diff"], "")
+            self.assertFalse(_should_emit_patch_artifact(before, after))
+
+    def test_git_snapshot_worker_tree_preserves_real_index(self) -> None:
+        from puppetmaster.adapters import git_snapshot
+
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            target = repo / "tracked.py"
+            target.write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.py"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-c", "user.name=T", "-c", "user.email=t@e.com", "commit", "-m", "seed"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+
+            target.write_text("staged\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.py"], cwd=repo, check=True, capture_output=True)
+            target.write_text("worktree\n", encoding="utf-8")
+            (repo / "new.py").write_text("untracked\n", encoding="utf-8")
+
+            cached_before = subprocess.run(
+                ["git", "diff", "--cached", "--binary"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            worktree_before = subprocess.run(
+                ["git", "diff", "--binary"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+
+            git_snapshot(repo)
+
+            cached_after = subprocess.run(
+                ["git", "diff", "--cached", "--binary"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            worktree_after = subprocess.run(
+                ["git", "diff", "--binary"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            self.assertEqual(cached_after, cached_before)
+            self.assertEqual(worktree_after, worktree_before)
+
+    def test_git_snapshot_worker_diff_covers_whole_repo_from_subdir(self) -> None:
+        from puppetmaster.adapters import git_snapshot
+
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            (repo / "pkg").mkdir()
+            (repo / "pkg" / "seed.py").write_text("seed\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-c", "user.name=T", "-c", "user.email=t@e.com", "commit", "-m", "seed"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+
+            subdir = repo / "pkg"
+            before = git_snapshot(subdir)
+            (repo / "outside.py").write_text("pm change\n", encoding="utf-8")
+
+            after = git_snapshot(subdir, base_tree=before["tree"])
+
+            self.assertIn("outside.py", after["worker_changed_files"])
+            self.assertIn("outside.py", after["worker_untracked_files"])
+            self.assertIn("outside.py", after["worker_diff"])
 
     def test_git_snapshot_flags_non_worktree(self) -> None:
         from puppetmaster.adapters import git_snapshot
@@ -11845,4 +12072,3 @@ class UninstallTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
