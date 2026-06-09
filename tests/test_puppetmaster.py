@@ -6333,16 +6333,21 @@ class InstallRulesTests(unittest.TestCase):
 
     def test_doctor_agent_rules_check_warns_when_mcp_present_but_no_rules(self):
         """Doctor should nudge the user when MCP is wired but rules are missing."""
+        from puppetmaster import diagnostics
         from puppetmaster.diagnostics import _agent_rules_check
 
-        with TemporaryDirectory() as tmp:
+        # Pin a clean home: the check also inspects ~/.codex / ~/.claude, so a
+        # real global-rules install (now a first-class option) must not make this
+        # non-hermetic.
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as home_tmp:
             cwd = Path(tmp)
             (cwd / ".cursor").mkdir()
             (cwd / ".cursor" / "mcp.json").write_text(
                 '{"mcpServers": {"puppetmaster": {"command": "python"}}}',
                 encoding="utf-8",
             )
-            check = _agent_rules_check(cwd)
+            with patch.object(diagnostics.Path, "home", return_value=Path(home_tmp)):
+                check = _agent_rules_check(cwd)
             self.assertEqual(check.status, "warn")
             self.assertIn("install-rules", check.detail)
 
@@ -10432,13 +10437,40 @@ class HookRunnerTests(unittest.TestCase):
         self.assertEqual(out["permission"], "allow")
         self.assertIn("additionalContext", out)
 
-    def test_pre_tool_denies_native_grep(self):
+    def test_pre_tool_denies_native_task_fanout(self):
         from puppetmaster.hook_runner import handle_hook
 
-        r = handle_hook({"tool_name": "Grep"}, host="claude", event="PreToolUse")
+        r = handle_hook({"tool_name": "Task"}, host="claude", event="PreToolUse")
         self.assertEqual(r.action, "deny")
         out = r.to_host_json("claude")
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_pre_tool_allows_native_grep_glob(self):
+        # Field fix: native search tools are read-only inspection in disguise as
+        # often as not, and their scope isn't visible in the hook payload — so we
+        # never hard-deny them (that wedged legitimate work).
+        from puppetmaster.hook_runner import handle_hook
+
+        for tool in ("Grep", "Glob", "codebase_search"):
+            r = handle_hook({"tool_name": tool}, host="cursor", event="pre-tool")
+            self.assertEqual(r.action, "allow", tool)
+
+    def test_pre_tool_allows_readonly_shell_inspection(self):
+        from puppetmaster.hook_runner import classify_tool
+
+        for cmd in ("git log", "git log --oneline -20", "git show HEAD",
+                    "git diff HEAD~1", "ls ~/.cursor", "cat foo.py | head -40",
+                    "grep TODO app.py", "rg pattern src/app.ts"):
+            redirect, _ = classify_tool("shell", cmd)
+            self.assertFalse(redirect, cmd)
+
+    def test_pre_tool_still_redirects_recursive_shell_search(self):
+        from puppetmaster.hook_runner import classify_tool
+
+        for cmd in ("rg -r TODO ./src", "grep -R foo .", "find . -name '*.py'"):
+            redirect, verb = classify_tool("shell", cmd)
+            self.assertTrue(redirect, cmd)
+            self.assertTrue(verb.startswith("puppetmaster_"))
 
     def test_pre_tool_allows_puppetmaster_tools(self):
         from puppetmaster.hook_runner import handle_hook

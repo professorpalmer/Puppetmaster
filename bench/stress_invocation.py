@@ -120,10 +120,17 @@ def run_hook_subprocess() -> None:
     check("claude prompt-submit injects directive", "Puppetmaster" in ctx)
 
     out = _hook("cursor", "beforeShellExecution", {"command": "rg -r 'TODO' ./src"})
-    check("cursor deny-redirects broad shell search", out.get("permission") == "deny")
+    check("cursor deny-redirects recursive shell search", out.get("permission") == "deny")
 
-    out = _hook("claude", "PreToolUse", {"tool_name": "Grep"})
-    check("claude deny-redirects native Grep", out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny")
+    out = _hook("claude", "PreToolUse", {"tool_name": "Task"})
+    check("claude deny-redirects native Task fan-out", out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny")
+
+    # Read-only inspection must pass — the field-reported over-aggression fix.
+    out = _hook("cursor", "beforeShellExecution", {"command": "git log --oneline -20"})
+    check("read-only git log is allowed", out.get("permission") == "allow")
+
+    out = _hook("cursor", "beforeReadFile", {"tool_name": "Grep", "tool_input": {"pattern": "x", "path": "app.py"}})
+    check("native Grep is no longer hard-denied", out.get("permission") == "allow")
 
     out = _hook("cursor", "beforeReadFile", {"tool_name": "mcp__puppetmaster__codegraph_search"})
     check("puppetmaster tools never denied", out.get("permission") == "allow")
