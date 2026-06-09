@@ -106,6 +106,28 @@ _DEFAULT_INPUT_STALE_CHECK_SECONDS = 30.0
 # bandwidth per hour ≈ 22 KB. Disabled with PUPPETMASTER_MCP_IDLE_KEEPALIVE_DISABLED.
 _DEFAULT_IDLE_KEEPALIVE_INTERVAL_SECONDS = 25.0
 
+# Maximum seconds any single tool handler may *block* the MCP turn.
+#
+# Cursor's MCP client tolerates arbitrarily long tool calls as long as
+# bytes keep flowing (the keepalive above). OpenAI Codex does NOT: its
+# MCP client enforces a hard per-tool `tool_timeout_sec` (default 60s)
+# that cancels the request regardless of progress/log notifications. A
+# long-poll handler (`live_artifacts_follow`, `await_job`) that the
+# caller asked to block for, say, 300s therefore reads as a dead tool on
+# Codex even though the swarm is healthy — the exact "can't keep
+# puppetmaster alive" symptom.
+#
+# We make long-poll handlers Codex-safe by capping their effective block
+# to this budget, which sits comfortably under Codex's 60s default with
+# margin for import/serialization overhead. The follow/await tools are
+# *designed* to be re-called (they return `next_cursor` / `timed_out`),
+# so capping just turns one 300s block into a sequence of short polls —
+# the push-feeling stream still works, and it now works everywhere. The
+# response is stamped `capped: true` whenever the requested block was
+# shortened so callers (and tests) can see it happened. Tune or disable
+# with PUPPETMASTER_MCP_MAX_BLOCK_SECONDS (0 = no cap).
+_DEFAULT_MAX_BLOCK_SECONDS = 45.0
+
 # Module-level state for stdin-liveness tracking. Initialized at startup
 # by ``main()`` and mutated by the stdin reader + tool-call dispatcher.
 _INPUT_STATE_LOCK = threading.Lock()
@@ -224,6 +246,22 @@ def _keepalive_disabled() -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _extract_progress_token(params: Any) -> Any:
+    """Pull ``params._meta.progressToken`` from a ``tools/call`` request.
+
+    Per the MCP spec a client opts into progress notifications by sending a
+    ``progressToken`` (string or integer) inside ``params._meta``. When the
+    client omits it we return ``None`` and the keepalive sends no progress
+    frames — only clients that asked for progress receive it.
+    """
+    if not isinstance(params, dict):
+        return None
+    meta = params.get("_meta")
+    if not isinstance(meta, dict):
+        return None
+    return meta.get("progressToken")
+
+
 def _emit_notification(notification: JsonObject) -> bool:
     """Serialize and write a JSON-RPC notification under the stdout lock.
 
@@ -252,9 +290,19 @@ class _ToolCallKeepalive:
     traffic — then emits one notification per ``interval_seconds`` until
     stop is signalled or the pipe is closed.
 
-    The notifications use the MCP-spec ``notifications/message`` method
-    with a ``debug`` level, which clients are free to log or ignore. They
-    intentionally carry no ``id`` field so Cursor doesn't try to match
+    Two complementary signals are emitted each tick:
+
+    * ``notifications/message`` (debug level) — a transport-liveness ping
+      that Cursor's client treats as "the pipe is alive". Always sent.
+    * ``notifications/progress`` — the MCP-spec mechanism for telling a
+      client a specific in-flight request is still making progress. Only
+      sent when the originating ``tools/call`` supplied a
+      ``params._meta.progressToken``. Spec-compliant clients (OpenAI
+      Codex/rmcp among them) use this to keep a long call from tripping
+      their hard per-tool timeout — the gap that made Codex read healthy
+      swarms as a dead tool. Cursor ignores it; Codex needs it.
+
+    Both intentionally carry no ``id`` field so clients don't try to match
     them against an outstanding request.
     """
 
@@ -263,12 +311,14 @@ class _ToolCallKeepalive:
         *,
         tool_name: str,
         request_id: Any,
+        progress_token: Any = None,
         interval_seconds: Optional[float] = None,
         start_after_seconds: Optional[float] = None,
         emitter: Callable[[JsonObject], bool] = _emit_notification,
     ) -> None:
         self._tool_name = tool_name or "unknown"
         self._request_id = request_id
+        self._progress_token = progress_token
         self._interval = (
             interval_seconds
             if interval_seconds is not None
@@ -319,7 +369,9 @@ class _ToolCallKeepalive:
             elapsed += self._interval
 
     def _safe_emit(self, elapsed: float) -> bool:
-        notification = {
+        if self._stop.is_set():
+            return False
+        message = {
             "jsonrpc": "2.0",
             "method": "notifications/message",
             "params": {
@@ -337,12 +389,31 @@ class _ToolCallKeepalive:
                 },
             },
         }
-        if self._stop.is_set():
+        ok = self._emit(message)
+        if not ok:
             return False
-        ok = self._emit(notification)
-        if ok:
-            self._emitted += 1
-        return ok
+        self._emitted += 1
+        # Spec-compliant progress for clients (Codex) that reset their
+        # per-tool timeout on it. `progress` must strictly increase; we use
+        # elapsed seconds and omit `total` because the duration is unknown.
+        if self._progress_token is not None and not self._stop.is_set():
+            progress = {
+                "jsonrpc": "2.0",
+                "method": "notifications/progress",
+                "params": {
+                    "progressToken": self._progress_token,
+                    # MCP requires `progress` to strictly increase per token.
+                    # `elapsed` grows by `interval` each tick; round only enough
+                    # to drop float noise while preserving monotonicity.
+                    "progress": round(elapsed, 3),
+                    "message": (
+                        f"Puppetmaster '{self._tool_name}' running "
+                        f"({elapsed:.0f}s)"
+                    ),
+                },
+            }
+            self._emit(progress)
+        return True
 
 
 def _input_staleness_disabled() -> bool:
@@ -467,6 +538,38 @@ def _resolve_idle_keepalive_interval() -> float:
         return _DEFAULT_IDLE_KEEPALIVE_INTERVAL_SECONDS
     # Refuse intervals shorter than 5s to avoid log spam.
     return max(5.0, value)
+
+
+def _resolve_max_block_seconds() -> float:
+    """The hard ceiling on how long a tool handler may block the MCP turn.
+
+    Returns 0.0 when the cap is disabled (``PUPPETMASTER_MCP_MAX_BLOCK_SECONDS=0``),
+    in which case :func:`_capped_block_seconds` is a passthrough. A malformed
+    value falls back to the default rather than removing the protection.
+    """
+    raw = os.environ.get("PUPPETMASTER_MCP_MAX_BLOCK_SECONDS")
+    if raw is None:
+        return _DEFAULT_MAX_BLOCK_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return _DEFAULT_MAX_BLOCK_SECONDS
+    if value <= 0:
+        return 0.0  # explicitly disabled
+    return value
+
+
+def _capped_block_seconds(requested: float) -> tuple[float, bool]:
+    """Clamp a requested block duration to the Codex-safe ceiling.
+
+    Returns ``(effective_seconds, was_capped)``. ``was_capped`` is True only
+    when the cap is active *and* strictly shortened the requested value, so a
+    caller asking for less than the ceiling never gets flagged.
+    """
+    cap = _resolve_max_block_seconds()
+    if cap <= 0 or requested <= cap:
+        return requested, False
+    return cap, True
 
 
 class _IdleKeepalive(threading.Thread):
@@ -711,11 +814,12 @@ def _process_message_safely(message: JsonObject) -> None:
     is_tool_call = message.get("method") == "tools/call"
     keepalive: Optional[_ToolCallKeepalive] = None
     if is_tool_call and not _keepalive_disabled():
-        params = message.get("params") or {}
-        tool_name = params.get("name") if isinstance(params, dict) else None
+        params = message.get("params") if isinstance(message.get("params"), dict) else {}
+        tool_name = params.get("name")
         keepalive = _ToolCallKeepalive(
             tool_name=str(tool_name or ""),
             request_id=message.get("id"),
+            progress_token=_extract_progress_token(params),
         )
         keepalive.start()
     if is_tool_call:
@@ -748,7 +852,10 @@ def handle_message(message: JsonObject) -> Optional[JsonObject]:
         if method == "initialize":
             result = {
                 "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}},
+                # `logging` advertises that we emit `notifications/message`
+                # (the keepalive + idle pings); declaring it keeps those
+                # frames spec-legal for strict clients like Codex.
+                "capabilities": {"tools": {}, "logging": {}},
                 "serverInfo": {
                     "name": "puppetmaster",
                     "version": _server_version() or "0.2.0-beta.1",
@@ -2014,7 +2121,8 @@ def run_feed_follow(args: JsonObject) -> JsonObject:
 
     job_id = require_string(args, "job_id")
     since = int(args.get("since_cursor") or args.get("since") or 0)
-    timeout_seconds = float(args.get("timeout_seconds") or 10.0)
+    requested_timeout = float(args.get("timeout_seconds") or 10.0)
+    timeout_seconds, was_capped = _capped_block_seconds(requested_timeout)
     poll_interval = float(args.get("poll_interval_seconds") or 0.1)
     limit_value = args.get("limit")
     limit = int(limit_value) if limit_value is not None else None
@@ -2041,6 +2149,12 @@ def run_feed_follow(args: JsonObject) -> JsonObject:
         "items": items,
         "timed_out": len(items) == 0,
     }
+    if was_capped:
+        # Tell the caller the block was shortened so it knows to re-poll
+        # rather than assuming the job produced nothing for `requested_timeout`.
+        body["capped"] = True
+        body["requested_timeout_seconds"] = requested_timeout
+        body["effective_timeout_seconds"] = timeout_seconds
     return {"content": [{"type": "text", "text": json.dumps(body, indent=2, default=str)}], "isError": False}
 
 
@@ -2049,7 +2163,8 @@ def run_await_job(args: JsonObject) -> JsonObject:
     from puppetmaster.stitcher import Stitcher
 
     job_id = require_string(args, "job_id")
-    timeout_seconds = float(args.get("timeout_seconds") or 25.0)
+    requested_timeout = float(args.get("timeout_seconds") or 25.0)
+    timeout_seconds, was_capped = _capped_block_seconds(requested_timeout)
     poll_interval = float(args.get("poll_interval_seconds") or 0.25)
     backend = str(args.get("backend") or "sqlite")
 
@@ -2071,6 +2186,12 @@ def run_await_job(args: JsonObject) -> JsonObject:
             summary = Stitcher(store).preview(job_id)
 
     body = {**state, "summary": summary}
+    if was_capped and not state["terminal"]:
+        # Block shortened to stay under the client tool-timeout. The job is
+        # still running; the caller should immediately await again.
+        body["capped"] = True
+        body["requested_timeout_seconds"] = requested_timeout
+        body["effective_timeout_seconds"] = timeout_seconds
     return {
         "content": [{"type": "text", "text": json.dumps(body, indent=2, default=str)}],
         "isError": state["status"] == "failed",
