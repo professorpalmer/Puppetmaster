@@ -77,6 +77,19 @@ RULE_BODY = textwrap.dedent(
     implement. Recall prior results with `puppetmaster_artifacts <job_id>`
     at zero token cost.
 
+    Reach for a Puppetmaster verb **before** native broad search/exploration:
+    prefer `puppetmaster_codegraph_search` / `_context` over a repo-wide
+    `Grep`/`Glob`/`find`, and a swarm over the built-in `Task` tool, for any
+    multi-file investigation. When unsure whether a task qualifies, run the
+    classifier-backed gate — `puppetmaster_route_task` (or
+    `puppetmaster should-delegate "<prompt>"`) — which returns a delegate /
+    inline verdict and a suggested verb with zero LLM cost.
+
+    For deterministic enforcement, the user can install host hooks
+    (`puppetmaster install-hooks`) that inject this directive on prompt submit
+    and deny-redirect broad native exploration automatically. The kill switch
+    is `PUPPETMASTER_AUTO_INVOKE_DISABLED=1`.
+
     ## When NOT to use Puppetmaster (stay inline)
 
     - Trivial single-file edits, typos, one-line fixes

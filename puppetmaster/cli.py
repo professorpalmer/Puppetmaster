@@ -24,6 +24,7 @@ from puppetmaster.rules import (
     RulesInstallResult,
     install_rules,
 )
+from puppetmaster.hook_installers import VALID_HOOK_TARGETS, install_hooks
 from puppetmaster.mcp_registry import (
     kill_stale as registry_kill_stale,
     list_entries as registry_list_entries,
@@ -220,6 +221,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-rules",
         action="store_true",
         help="Skip writing agent rule files.",
+    )
+    setup_parser.add_argument(
+        "--skip-hooks",
+        action="store_true",
+        help="Skip installing deterministic auto-invocation hooks (.cursor/hooks.json, .claude/settings.json).",
     )
     setup_parser.add_argument(
         "--global-rules",
@@ -1211,6 +1217,71 @@ def build_parser() -> argparse.ArgumentParser:
     cost_cmd.add_argument("job_id", help="Puppetmaster job id.")
     cost_cmd.add_argument("--json", action="store_true", help="Emit JSON.")
 
+    delegate_cmd = subcommands.add_parser(
+        "should-delegate",
+        help=(
+            "Run the classifier-backed invocation gate on a prompt: should the "
+            "host agent delegate this to a Puppetmaster verb, or stay inline? "
+            "Pure, local, no LLM. Pairs with the install-hooks deterministic hooks."
+        ),
+    )
+    delegate_cmd.add_argument("prompt", help="The user prompt / task text.")
+    delegate_cmd.add_argument("--role", default=None, help="Override the inferred task role.")
+    delegate_cmd.add_argument(
+        "--threshold", type=int, default=None, help="Delegate at/above this capability score."
+    )
+    delegate_cmd.add_argument("--json", action="store_true", help="Emit JSON.")
+
+    gate_hook = subcommands.add_parser(
+        "invocation-gate",
+        help=(
+            "Host-hook entry point: read a Cursor/Claude hook payload as JSON on "
+            "stdin and print the host-specific verdict. Wired up by install-hooks; "
+            "rarely run by hand."
+        ),
+    )
+    gate_hook.add_argument("--host", default="cursor", help="cursor | claude")
+    gate_hook.add_argument("--event", default="user-prompt", help="Host event name.")
+
+    install_hooks_parser = subcommands.add_parser(
+        "install-hooks",
+        help=(
+            "Install deterministic auto-invocation hooks into Cursor "
+            "(.cursor/hooks.json) and Claude Code (.claude/settings.json). These "
+            "inject a delegate directive on prompt submit and deny-redirect broad "
+            "native Grep/Glob/Task to Puppetmaster equivalents."
+        ),
+    )
+    install_hooks_parser.add_argument(
+        "--target",
+        default=None,
+        help=f"Comma-separated subset. Valid: {', '.join(sorted(VALID_HOOK_TARGETS))}. Default: both.",
+    )
+    install_hooks_parser.add_argument("--force", action="store_true", help="Rewrite even if current.")
+    install_hooks_parser.add_argument("--dry-run", action="store_true", help="Print without writing.")
+
+    proxy_cmd = subcommands.add_parser(
+        "proxy",
+        help=(
+            "Run a local OpenAI-compatible proxy that runs the invocation gate on "
+            "inbound prompts — the deterministic enforcement path for API-key/SDK "
+            "clients that closed harnesses can't offer."
+        ),
+    )
+    proxy_cmd.add_argument("--host", default="127.0.0.1", help="Bind host.")
+    proxy_cmd.add_argument("--port", type=int, default=8788, help="Bind port.")
+    proxy_cmd.add_argument(
+        "--mode",
+        choices=["advise", "inject"],
+        default="advise",
+        help="advise: synthetic local delegate reply (no upstream). inject: forward to a vetted upstream.",
+    )
+    proxy_cmd.add_argument(
+        "--upstream-base-url",
+        default="",
+        help="Required for inject mode; must be loopback or an allowlisted HTTPS host.",
+    )
+
     return parser
 
 
@@ -1339,6 +1410,18 @@ def _main(argv: Optional[list[str]] = None) -> int:
 
     if args.command == "route":
         return _run_route_command(args)
+
+    if args.command == "should-delegate":
+        return _run_should_delegate_command(args)
+
+    if args.command == "invocation-gate":
+        return _run_invocation_gate_command(args)
+
+    if args.command == "install-hooks":
+        return _run_install_hooks(args)
+
+    if args.command == "proxy":
+        return _run_proxy_command(args)
 
     if args.command == "audit":
         return _run_audit_command(args, store)
@@ -2347,7 +2430,9 @@ def _run_setup(args) -> int:
     3. ``models init`` — write the starter registry if missing.
     4. ``install-cursor-mcp`` — workspace .cursor/mcp.json.
     5. ``install-codex-mcp`` — only if ``codex`` is enabled *and* on PATH.
-    6. ``install-rules`` — agent nudges for whichever tools detected.
+    6. ``install-rules`` — soft agent nudges for whichever tools detected.
+    7. ``install-hooks`` — deterministic auto-invocation hooks for Cursor +
+       Claude Code (prompt-inject + native-tool deny-redirect).
 
     Each step is independent: a step's failure prints a clear error
     but does not abort the rest of the chain unless ``doctor`` reports
@@ -2359,7 +2444,7 @@ def _run_setup(args) -> int:
     overall_rc = 0
 
     if not getattr(args, "skip_doctor", False):
-        print("=== step 1/6: doctor ===")
+        print("=== step 1/7: doctor ===")
         checks = list(run_doctor(cwd, state_dir))
         for check in checks:
             print(f"  {check.status:8} {check.name:16} {check.detail}")
@@ -2369,15 +2454,15 @@ def _run_setup(args) -> int:
             return 1
         print()
     else:
-        print("=== step 1/6: doctor SKIPPED (--skip-doctor) ===\n")
+        print("=== step 1/7: doctor SKIPPED (--skip-doctor) ===\n")
 
-    print("=== step 2/6: platform lock ===")
+    print("=== step 2/7: platform lock ===")
     if _setup_platform_step(args) != 0:
         overall_rc = 1
     print()
 
     if not getattr(args, "skip_models", False):
-        print("=== step 3/6: models init ===")
+        print("=== step 3/7: models init ===")
         try:
             from puppetmaster.model_registry import (
                 default_registry_path,
@@ -2396,9 +2481,9 @@ def _run_setup(args) -> int:
             overall_rc = 1
         print()
     else:
-        print("=== step 3/6: models init SKIPPED (--skip-models) ===\n")
+        print("=== step 3/7: models init SKIPPED (--skip-models) ===\n")
 
-    print("=== step 4/6: install-cursor-mcp (workspace .cursor/mcp.json) ===")
+    print("=== step 4/7: install-cursor-mcp (workspace .cursor/mcp.json) ===")
     cursor_result = install_cursor_mcp(
         target_path=(cwd / ".cursor" / "mcp.json").resolve(),
         force=getattr(args, "force", False),
@@ -2411,7 +2496,7 @@ def _run_setup(args) -> int:
         overall_rc = 1
     print()
 
-    print("=== step 5/6: install-codex-mcp ===")
+    print("=== step 5/7: install-codex-mcp ===")
     import shutil as _shutil
     from puppetmaster import platform_lock as _pl
     if "codex" not in _pl.enabled_adapters():
@@ -2431,7 +2516,7 @@ def _run_setup(args) -> int:
     print()
 
     if not getattr(args, "skip_rules", False):
-        print("=== step 6/6: install-rules (agent nudges) ===")
+        print("=== step 6/7: install-rules (soft agent nudges) ===")
         rules_result = install_rules(
             cwd=cwd,
             install_global=getattr(args, "global_rules", False),
@@ -2445,7 +2530,29 @@ def _run_setup(args) -> int:
         if rules_result.overall_status == "error":
             overall_rc = 1
     else:
-        print("=== step 6/6: install-rules SKIPPED (--skip-rules) ===")
+        print("=== step 6/7: install-rules SKIPPED (--skip-rules) ===")
+    print()
+
+    if not getattr(args, "skip_hooks", False):
+        print("=== step 7/7: install-hooks (deterministic auto-invocation) ===")
+        hooks_result = install_hooks(
+            cwd=cwd,
+            dry_run=False,
+            force=getattr(args, "force", False),
+        )
+        for outcome in hooks_result.outcomes:
+            print(f"  {outcome.target:<14} {outcome.status:<14} {outcome.reason}")
+        for msg in hooks_result.messages:
+            print(f"  note: {msg}")
+        if hooks_result.overall_status == "error":
+            overall_rc = 1
+        print(
+            "  note: hooks inject a delegate directive on prompt-submit and "
+            "deny-redirect broad native Grep/Glob/Task. Disable anytime with "
+            "PUPPETMASTER_AUTO_INVOKE_DISABLED=1."
+        )
+    else:
+        print("=== step 7/7: install-hooks SKIPPED (--skip-hooks) ===")
     print()
 
     if overall_rc == 0:
@@ -3725,6 +3832,71 @@ def _run_route_command(args) -> int:
         print("rejected:")
         for spec, why in decision.rejected:
             print(f"  - {spec.id}: {why}")
+    return 0
+
+
+def _run_should_delegate_command(args) -> int:
+    """Dry-run the invocation gate against a prompt."""
+    from puppetmaster.invocation_gate import should_delegate
+
+    decision = should_delegate(
+        args.prompt, role=args.role, threshold=args.threshold
+    )
+    if args.json:
+        print(json.dumps(decision.to_dict(), indent=2))
+        return 0
+    verdict = "DELEGATE" if decision.should_delegate else "inline"
+    print(f"{verdict}  (capability {decision.capability_score}, role={decision.role})")
+    print(f"verb:   {decision.suggested_verb}")
+    print(f"why:    {decision.reason}")
+    if decision.matched_signals:
+        print(f"signals: {', '.join(decision.matched_signals)}")
+    return 0
+
+
+def _run_invocation_gate_command(args) -> int:
+    """Host-hook entry point. Reads stdin JSON, prints host verdict, exits 0."""
+    from puppetmaster.hook_runner import run as run_hook
+
+    return run_hook(["--host", args.host, "--event", args.event])
+
+
+def _run_install_hooks(args) -> int:
+    """Dispatch for ``puppetmaster install-hooks``."""
+    targets = None
+    raw = getattr(args, "target", None)
+    if raw:
+        targets = [t.strip() for t in raw.split(",") if t.strip()]
+    result = install_hooks(
+        cwd=Path.cwd(),
+        targets=targets,
+        dry_run=getattr(args, "dry_run", False),
+        force=getattr(args, "force", False),
+    )
+    print(f"[install-hooks] overall: {result.overall_status}")
+    for outcome in result.outcomes:
+        print(f"[install-hooks] {outcome.target:<8} {outcome.status:<14} {outcome.reason}")
+        if outcome.path:
+            print(f"[install-hooks] {' ' * 8} {' ' * 14} -> {outcome.path}")
+    for msg in result.messages:
+        print(f"[install-hooks] note: {msg}")
+    return 1 if result.overall_status == "error" else 0
+
+
+def _run_proxy_command(args) -> int:
+    """Run the local OpenAI-compatible enforcement proxy."""
+    from puppetmaster.provider_proxy import serve_proxy
+
+    try:
+        serve_proxy(
+            host=args.host,
+            port=args.port,
+            mode=args.mode,
+            upstream_base_url=args.upstream_base_url,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 

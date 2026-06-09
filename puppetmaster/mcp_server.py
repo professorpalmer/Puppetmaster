@@ -810,8 +810,10 @@ def _build_tools() -> list[McpTool]:
                 "Show which model the Puppetmaster router would pick for a task, "
                 "including estimated cost in USD and a list of rejected alternatives "
                 "with the reason each was rejected. Pure decision tool — does not "
-                "run the model. Use this to estimate spend before kicking off a swarm "
-                "or to debug 'why did this go to model X?' artifacts."
+                "run the model. Use this to estimate spend before kicking off a swarm, "
+                "to debug 'why did this go to model X?' artifacts, or as a cheap "
+                "delegate/inline gate: if a task scores as non-trivial here, prefer a "
+                "Puppetmaster swarm over grinding through it inline."
             ),
             input_schema=route_task_schema(),
             handler=run_route_task,
@@ -907,10 +909,12 @@ def _build_tools() -> list[McpTool]:
         McpTool(
             name="puppetmaster_start_implement",
             description=(
-                "Start a full-edit implement worker on whichever platform you're locked to "
-                "(cursor, claude-code, or codex), so implement isn't Claude-Code-only. Returns "
-                "job_id immediately. Pass adapter to force one; otherwise the enabled platform "
-                "is used."
+                "PREFER over the built-in Task tool or an inline multi-file edit loop for "
+                "any cross-cutting change. Start a full-edit implement worker on whichever "
+                "platform you're locked to (cursor, claude-code, or codex), so implement "
+                "isn't Claude-Code-only. Runs in a clean worktree and captures a PATCH "
+                "artifact. Returns job_id immediately. Pass adapter to force one; otherwise "
+                "the enabled platform is used."
             ),
             input_schema=implement_schema(),
             handler=start_implement,
@@ -932,13 +936,22 @@ def _build_tools() -> list[McpTool]:
         ),
         McpTool(
             name="puppetmaster_start_swarm",
-            description="Start a local Puppetmaster swarm asynchronously and return job_id immediately.",
+            description=(
+                "PREFER over the built-in Task tool or your own grep/read exploration "
+                "loop for broad investigation. Start a local Puppetmaster swarm "
+                "asynchronously and return job_id immediately."
+            ),
             input_schema=swarm_schema(),
             handler=start_swarm,
         ),
         McpTool(
             name="puppetmaster_start_cursor_swarm",
-            description="Start a multi-role Cursor SDK analysis swarm asynchronously and return job_id immediately.",
+            description=(
+                "PREFER over the built-in Task tool or an inline grep/read loop for any "
+                "multi-file audit, review, or 'find all X' investigation. Start a "
+                "multi-role Cursor SDK analysis swarm asynchronously and return job_id "
+                "immediately."
+            ),
             input_schema=cursor_swarm_schema(),
             handler=start_cursor_swarm,
         ),
