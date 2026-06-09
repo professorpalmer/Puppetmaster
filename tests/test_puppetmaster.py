@@ -3552,6 +3552,39 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertEqual(artifact.payload["result"], "blocked")
         self.assertEqual(artifact.payload["failure"], "missing_cli")
 
+    def test_claude_code_adapter_streams_and_surfaces_live_log_on_timeout(self) -> None:
+        """Claude Code runs through the streamed runner (live log + heartbeat),
+        and a timeout reports ``failed`` + ``timeout`` while still exposing the
+        live log path. The flat blocking ``subprocess.run`` path is gone."""
+        streamed = StreamedProcess(
+            returncode=None,
+            stdout="partial",
+            stderr="",
+            timed_out=True,
+            live_log_path="/tmp/claude_implement_live.log",
+        )
+        task = Task(
+            job_id="job-claude-timeout",
+            role="claude-code",
+            instruction="ship a tiny change",
+            adapter="claude-code",
+            payload={"cwd": str(Path.cwd()), "allow_dirty": True, "disable_codegraph": True},
+        )
+        clean = {"sha": "s", "changed_files": [], "untracked_files": [], "diff": ""}
+        with patch("puppetmaster.adapters.resolve_command", return_value="/usr/bin/claude"), patch(
+            "puppetmaster.adapters.worktree_guard", return_value=None
+        ), patch("puppetmaster.adapters.git_snapshot", side_effect=[clean, clean]), patch(
+            "puppetmaster.adapters.run_streamed_subprocess", return_value=streamed
+        ) as streamed_run, patch("puppetmaster.adapters.subprocess.run") as blocking_run:
+            artifacts = ClaudeCodeAdapter().run(task, "goal", "worker")
+
+        streamed_run.assert_called_once()
+        blocking_run.assert_not_called()
+        verification = artifacts[0]
+        self.assertEqual(verification.payload["result"], "failed")
+        self.assertEqual(verification.payload["failure"], "timeout")
+        self.assertEqual(verification.payload["live_log"], "/tmp/claude_implement_live.log")
+
     def test_claude_code_failure_classification_is_actionable(self) -> None:
         self.assertEqual(classify_claude_code_failure("please login first"), "not_authenticated")
         self.assertEqual(classify_claude_code_failure("Credit balance is too low"), "billing_or_quota")
@@ -3992,6 +4025,127 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
         self.assertEqual(artifact.payload["adapter"], "codex")
         self.assertEqual(artifact.payload["result"], "blocked")
         self.assertEqual(artifact.payload["failure"], "missing_cli")
+
+    def test_codex_adapter_streams_and_surfaces_live_log(self) -> None:
+        """Codex must run through the streamed runner (live sidecar log +
+        heartbeat) — not a flat, silent blocking ``subprocess.run`` — so a long
+        run is visibly alive instead of looking stalled. The verification
+        payload exposes the live log path, and the legacy blocking path is
+        never used."""
+        agent_text = json.dumps(
+            {"artifacts": [{"type": "finding", "claim": "ok", "evidence": ["a.py:1"], "confidence": 0.9}]}
+        )
+        events_stdout = "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "th_test"}),
+                json.dumps({"type": "turn.started"}),
+                json.dumps(
+                    {"type": "item.completed", "item": {"type": "agent_message", "text": agent_text}}
+                ),
+                json.dumps(
+                    {
+                        "type": "turn.completed",
+                        "usage": {
+                            "input_tokens": 10,
+                            "output_tokens": 5,
+                            "cached_input_tokens": 0,
+                            "reasoning_output_tokens": 0,
+                        },
+                    }
+                ),
+            ]
+        )
+        streamed = StreamedProcess(
+            returncode=0,
+            stdout=events_stdout,
+            stderr="",
+            timed_out=False,
+            live_log_path="/tmp/codex_exec_live.log",
+        )
+        task = Task(
+            id="t-codex-stream",
+            job_id="job-codex-stream",
+            role="codex-review",
+            adapter="codex",
+            instruction="Review the repo.",
+            payload={"cwd": str(Path.cwd()), "sandbox": "read-only", "disable_codegraph": True},
+        )
+        clean = {"sha": "s", "changed_files": [], "untracked_files": [], "diff": ""}
+        with patch("puppetmaster.adapters.resolve_command", return_value="/usr/bin/codex"), patch(
+            "puppetmaster.adapters.git_snapshot", side_effect=[clean, clean]
+        ), patch(
+            "puppetmaster.adapters.run_streamed_subprocess", return_value=streamed
+        ) as streamed_run, patch(
+            "puppetmaster.adapters.subprocess.run"
+        ) as blocking_run:
+            artifacts = CodexAdapter().run(task, "goal", "worker")
+
+        streamed_run.assert_called_once()
+        self.assertEqual(streamed_run.call_args.kwargs["sidecar_name"], "codex_exec")
+        blocking_run.assert_not_called()
+        verification = artifacts[0]
+        self.assertEqual(verification.payload["adapter"], "codex")
+        self.assertEqual(verification.payload["result"], "passed")
+        self.assertEqual(verification.payload["live_log"], "/tmp/codex_exec_live.log")
+
+    def test_codex_adapter_timeout_surfaces_failed_with_live_log(self) -> None:
+        """A timed-out Codex run reports ``failed`` + ``timeout`` and still
+        carries the live log path so the operator can see how far it got."""
+        streamed = StreamedProcess(
+            returncode=None,
+            stdout="partial output",
+            stderr="",
+            timed_out=True,
+            live_log_path="/tmp/codex_exec_live.log",
+        )
+        task = Task(
+            id="t-codex-timeout",
+            job_id="job-codex-timeout",
+            role="codex-review",
+            adapter="codex",
+            instruction="Review the repo.",
+            payload={"cwd": str(Path.cwd()), "sandbox": "read-only", "disable_codegraph": True},
+        )
+        clean = {"sha": "s", "changed_files": [], "untracked_files": [], "diff": ""}
+        with patch("puppetmaster.adapters.resolve_command", return_value="/usr/bin/codex"), patch(
+            "puppetmaster.adapters.git_snapshot", side_effect=[clean, clean]
+        ), patch("puppetmaster.adapters.run_streamed_subprocess", return_value=streamed):
+            artifacts = CodexAdapter().run(task, "goal", "worker")
+
+        verification = artifacts[0]
+        self.assertEqual(verification.payload["result"], "failed")
+        self.assertEqual(verification.payload["failure"], "timeout")
+        self.assertEqual(verification.payload["live_log"], "/tmp/codex_exec_live.log")
+
+    def test_run_streamed_subprocess_closes_stdin_so_readers_see_eof(self) -> None:
+        """The streamed runner must close the child's stdin (DEVNULL). A CLI
+        that reads stdin would otherwise block forever on a non-interactive
+        worker — the silent "stall" we are eliminating. With stdin closed, a
+        reader sees EOF immediately and exits cleanly within the timeout."""
+        from puppetmaster.adapters import run_streamed_subprocess
+
+        task = Task(
+            id="t-stdin",
+            job_id="job-stdin",
+            role="codex-review",
+            adapter="codex",
+            instruction="x",
+            payload={},
+        )
+        result = run_streamed_subprocess(
+            command=[
+                sys.executable,
+                "-c",
+                "import sys; data = sys.stdin.read(); sys.stdout.write('EOF' if data == '' else 'BLOCKED')",
+            ],
+            env=None,
+            task=task,
+            sidecar_name="stdin_probe",
+            timeout_seconds=10,
+        )
+        self.assertFalse(result.timed_out)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("EOF", result.stdout)
 
     def test_build_codex_exec_command_emits_expected_flags(self) -> None:
         """The Codex command builder must produce the non-interactive
