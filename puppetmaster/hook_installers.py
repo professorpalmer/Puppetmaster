@@ -8,12 +8,22 @@ which reads the host payload on stdin and prints a host-specific verdict.
 
 Targets:
 
-* ``.cursor/hooks.json`` — Cursor workspace hooks. We register
-  ``beforeSubmitPrompt`` (inject a delegate directive) plus
-  ``beforeShellExecution`` / ``beforeReadFile`` (deny-redirect broad native
-  exploration).
+* ``.cursor/hooks.json`` — Cursor hooks. We register ``beforeSubmitPrompt``
+  (inject a delegate directive) plus ``beforeShellExecution`` /
+  ``beforeReadFile`` (deny-redirect broad native exploration).
 * ``.claude/settings.json`` — Claude Code hooks: ``UserPromptSubmit`` (inject)
   and ``PreToolUse`` matched on ``Grep|Glob|Task`` (deny-redirect).
+
+Each target has two **scopes**, differing only in the base directory the same
+subpath hangs off:
+
+* ``project`` (default) — ``<cwd>/.cursor/hooks.json`` and
+  ``<cwd>/.claude/settings.json``. Covers this repo only; can be checked in.
+* ``global`` — ``~/.cursor/hooks.json`` and ``~/.claude/settings.json``. Covers
+  every repo the user opens, so they don't re-run setup per project. Our hook
+  command is an absolute ``python -m puppetmaster invocation-gate`` (no relative
+  script path), so it resolves identically regardless of the host's cwd — which
+  is what makes a user-level Cursor hook (run from ``~/.cursor/``) work.
 
 Both writers are **idempotent and non-destructive**: they merge our entries in,
 identified by the ``puppetmaster invocation-gate`` command string, and leave any
@@ -32,6 +42,7 @@ from typing import Iterable, Optional
 _GATE_MARKER = "puppetmaster invocation-gate"
 
 VALID_HOOK_TARGETS = {"cursor", "claude"}
+VALID_HOOK_SCOPES = {"project", "global"}
 
 
 @dataclass
@@ -130,30 +141,37 @@ def _write_atomic(path: Path, content: str) -> None:
     tmp.replace(path)
 
 
-def _install_cursor(cwd: Path, *, dry_run: bool, force: bool, python: Optional[str]) -> HookOutcome:
-    path = cwd / ".cursor" / "hooks.json"
+def _scoped_label(scope: str, relpath: str) -> str:
+    """Human label for a hook file, e.g. ``~/.cursor/hooks.json`` (global)."""
+    return f"~/{relpath}" if scope == "global" else relpath
+
+
+def _install_cursor(base_dir: Path, *, scope: str, dry_run: bool, force: bool, python: Optional[str]) -> HookOutcome:
+    path = base_dir / ".cursor" / "hooks.json"
+    label = _scoped_label(scope, ".cursor/hooks.json")
     existing = _read_json(path)
     if "version" not in existing:
         existing = {"version": 1, **existing}
     merged, changed = merge_hook_maps(existing, render_cursor_hooks(python))
     if not changed and not force:
-        return HookOutcome("cursor", str(path), "unchanged", ".cursor/hooks.json already current")
+        return HookOutcome("cursor", str(path), "unchanged", f"{label} already current")
     if dry_run:
-        return HookOutcome("cursor", str(path), "would_install", "would register Cursor beforeSubmitPrompt + deny-redirect hooks")
+        return HookOutcome("cursor", str(path), "would_install", f"would register Cursor {scope} beforeSubmitPrompt + deny-redirect hooks")
     _write_atomic(path, json.dumps(merged, indent=2) + "\n")
-    return HookOutcome("cursor", str(path), "installed", "wrote Cursor prompt-inject + native-tool deny-redirect hooks")
+    return HookOutcome("cursor", str(path), "installed", f"wrote Cursor {scope} prompt-inject + native-tool deny-redirect hooks")
 
 
-def _install_claude(cwd: Path, *, dry_run: bool, force: bool, python: Optional[str]) -> HookOutcome:
-    path = cwd / ".claude" / "settings.json"
+def _install_claude(base_dir: Path, *, scope: str, dry_run: bool, force: bool, python: Optional[str]) -> HookOutcome:
+    path = base_dir / ".claude" / "settings.json"
+    label = _scoped_label(scope, ".claude/settings.json")
     existing = _read_json(path)
     merged, changed = merge_hook_maps(existing, render_claude_hooks(python))
     if not changed and not force:
-        return HookOutcome("claude", str(path), "unchanged", ".claude/settings.json already current")
+        return HookOutcome("claude", str(path), "unchanged", f"{label} already current")
     if dry_run:
-        return HookOutcome("claude", str(path), "would_install", "would register Claude UserPromptSubmit + PreToolUse deny-redirect hooks")
+        return HookOutcome("claude", str(path), "would_install", f"would register Claude {scope} UserPromptSubmit + PreToolUse deny-redirect hooks")
     _write_atomic(path, json.dumps(merged, indent=2) + "\n")
-    return HookOutcome("claude", str(path), "installed", "wrote Claude UserPromptSubmit + PreToolUse(Grep|Glob|Task) hooks")
+    return HookOutcome("claude", str(path), "installed", f"wrote Claude {scope} UserPromptSubmit + PreToolUse(Grep|Glob|Task) hooks")
 
 
 def install_hooks(
@@ -163,19 +181,33 @@ def install_hooks(
     dry_run: bool = False,
     force: bool = False,
     python: Optional[str] = None,
+    scope: str = "project",
+    home: Optional[Path] = None,
 ) -> HooksInstallResult:
     """Install Puppetmaster auto-invocation hooks for ``targets``.
 
-    Defaults to both Cursor and Claude Code. Pass ``targets`` to restrict.
+    ``scope`` selects where the hooks land:
+
+    * ``"project"`` (default) — workspace-local under ``cwd``; covers this repo
+      only and can be checked in.
+    * ``"global"`` — user-level under ``home`` (``~`` by default); covers every
+      repo the user opens without re-running setup per project.
+
+    Only the base directory differs between scopes — the ``.cursor`` / ``.claude``
+    subpaths are identical. Defaults to both Cursor and Claude Code; pass
+    ``targets`` to restrict. ``home`` is an injectable override of ``~`` for tests.
     """
-    cwd = cwd or Path.cwd()
     result = HooksInstallResult()
+    if scope not in VALID_HOOK_SCOPES:
+        result.outcomes.append(HookOutcome("", "", "error", f"unknown hook scope: {scope!r}"))
+        return result
+    base = (home or Path.home()) if scope == "global" else (cwd or Path.cwd())
     selected = list(targets) if targets else ["cursor", "claude"]
     for target in selected:
         if target == "cursor":
-            result.outcomes.append(_install_cursor(cwd, dry_run=dry_run, force=force, python=python))
+            result.outcomes.append(_install_cursor(base, scope=scope, dry_run=dry_run, force=force, python=python))
         elif target == "claude":
-            result.outcomes.append(_install_claude(cwd, dry_run=dry_run, force=force, python=python))
+            result.outcomes.append(_install_claude(base, scope=scope, dry_run=dry_run, force=force, python=python))
         else:
             result.outcomes.append(HookOutcome(target, "", "error", f"unknown hook target: {target!r}"))
     return result

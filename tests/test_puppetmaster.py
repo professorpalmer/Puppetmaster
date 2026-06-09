@@ -10189,6 +10189,34 @@ class HookInstallerTests(unittest.TestCase):
             self.assertEqual(result.overall_status, "would_install")
             self.assertFalse((cwd / ".cursor" / "hooks.json").exists())
 
+    def test_global_scope_writes_under_home_not_cwd(self):
+        from puppetmaster.hook_installers import install_hooks
+
+        with TemporaryDirectory() as proj, TemporaryDirectory() as home_tmp:
+            cwd, home = Path(proj), Path(home_tmp)
+            result = install_hooks(cwd=cwd, scope="global", home=home)
+            self.assertEqual(result.overall_status, "installed")
+            # global lands under ~ , never under the workspace
+            self.assertTrue((home / ".cursor" / "hooks.json").exists())
+            self.assertTrue((home / ".claude" / "settings.json").exists())
+            self.assertFalse((cwd / ".cursor" / "hooks.json").exists())
+
+    def test_global_scope_is_idempotent_and_labeled(self):
+        from puppetmaster.hook_installers import install_hooks
+
+        with TemporaryDirectory() as home_tmp:
+            home = Path(home_tmp)
+            install_hooks(scope="global", home=home)
+            again = install_hooks(scope="global", home=home)
+            self.assertEqual(again.overall_status, "unchanged")
+            self.assertTrue(any("~/.cursor/hooks.json" in o.reason for o in again.outcomes))
+
+    def test_unknown_scope_is_an_error(self):
+        from puppetmaster.hook_installers import install_hooks
+
+        result = install_hooks(scope="bogus")
+        self.assertEqual(result.overall_status, "error")
+
 
 class InvocationGateCliTests(unittest.TestCase):
     """The should-delegate / install-hooks CLI surface."""
@@ -10218,6 +10246,26 @@ class InvocationGateCliTests(unittest.TestCase):
             finally:
                 os.chdir(cwd)
 
+    def test_install_hooks_cli_global_targets_home(self):
+        from puppetmaster.cli import main as cli_main
+        from puppetmaster import hook_installers
+
+        with TemporaryDirectory() as proj, TemporaryDirectory() as home_tmp:
+            home = Path(home_tmp)
+            cwd = Path.cwd()
+            try:
+                os.chdir(proj)
+                buf = io.StringIO()
+                with patch.object(hook_installers.Path, "home", return_value=home), \
+                        contextlib.redirect_stdout(buf):
+                    rc = cli_main(["install-hooks", "--global", "--target", "claude"])
+                self.assertEqual(rc, 0)
+                self.assertIn("scope=global", buf.getvalue())
+                self.assertTrue((home / ".claude" / "settings.json").exists())
+                self.assertFalse((Path(proj) / ".claude" / "settings.json").exists())
+            finally:
+                os.chdir(cwd)
+
 
 class SetupHooksStepTests(unittest.TestCase):
     """The `setup` wizard installs auto-invocation hooks as step 7."""
@@ -10226,7 +10274,7 @@ class SetupHooksStepTests(unittest.TestCase):
         base = dict(
             skip_doctor=True, skip_models=True, skip_platforms=True,
             skip_rules=True, skip_hooks=False, global_rules=False,
-            force=False, state_dir=None, platforms=None,
+            global_hooks=False, force=False, state_dir=None, platforms=None,
         )
         base.update(over)
         return MagicMock(**base)
@@ -10268,6 +10316,30 @@ class SetupHooksStepTests(unittest.TestCase):
                         patch("puppetmaster.platform_lock.enabled_adapters", return_value={"cursor"}):
                     rc = cli._run_setup(self._args(skip_hooks=True))
                 self.assertEqual(rc, 0)
+                self.assertFalse((Path(tmp) / ".cursor" / "hooks.json").exists())
+            finally:
+                os.chdir(cwd0)
+
+    def test_setup_global_hooks_writes_under_home(self):
+        import puppetmaster.cli as cli
+        from puppetmaster import hook_installers
+
+        class _Res:
+            status = "installed"
+            messages: list = []
+
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as home_tmp:
+            cwd0 = Path.cwd()
+            home = Path(home_tmp)
+            try:
+                os.chdir(tmp)
+                with patch.object(cli, "install_cursor_mcp", return_value=_Res()), \
+                        patch.object(cli, "install_codex_mcp", return_value=_Res()), \
+                        patch("puppetmaster.platform_lock.enabled_adapters", return_value={"cursor"}), \
+                        patch.object(hook_installers.Path, "home", return_value=home):
+                    rc = cli._run_setup(self._args(global_hooks=True))
+                self.assertEqual(rc, 0)
+                self.assertTrue((home / ".cursor" / "hooks.json").exists())
                 self.assertFalse((Path(tmp) / ".cursor" / "hooks.json").exists())
             finally:
                 os.chdir(cwd0)
