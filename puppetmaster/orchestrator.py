@@ -116,6 +116,9 @@ class Orchestrator:
             self._run_workers(job, tasks, lease_seconds=lease_seconds, worker_mode=worker_mode)
             rerouted = self._auto_fallback(job, lease_seconds=lease_seconds, worker_mode=worker_mode)
             rerouted += self._auto_escalate(job, lease_seconds=lease_seconds, worker_mode=worker_mode)
+            rerouted += self._auto_review_escalate(
+                job, lease_seconds=lease_seconds, worker_mode=worker_mode
+            )
             artifacts = self.store.list_artifacts(job.id)
 
             self.store.update_job_status(job.id, JobStatus.STITCHING)
@@ -682,6 +685,210 @@ class Orchestrator:
             rerouted += 1
         return rerouted
 
+    def _auto_review_escalate(
+        self, job: Job, *, lease_seconds: int, worker_mode: str
+    ) -> int:
+        """Re-dispatch tasks a *review gate* rejected onto a stronger model.
+
+        This is the objective counterpart to ``_auto_escalate``: where that
+        keys off the worker's *self-reported* confidence (and is off by
+        default), this keys off a binding judgment from a strictly-stronger
+        model — the ``review`` GATE artifact's ``passed=False``. A rejected diff
+        already FAILED the task at the gate; rather than leave the lackluster
+        work dead, re-route it one capability tier up and let the better model
+        redo it. On by default precisely because the trigger is objective, not a
+        cheap model grading its own homework. Bounded by
+        :data:`_MAX_ESCALATION_ATTEMPTS`."""
+        total = 0
+        for _ in range(_MAX_ESCALATION_ATTEMPTS):
+            rerouted = self._reroute_failed_review(job)
+            if not rerouted:
+                break
+            total += rerouted
+            self.store.emit(job.id, "job.auto_review_escalate_round", {"rerouted": rerouted})
+            self._run_workers(
+                job,
+                self.store.list_tasks(job.id),
+                lease_seconds=lease_seconds,
+                worker_mode=worker_mode,
+            )
+        return total
+
+    def _review_pending_reroute_ids(
+        self, job: Job, *, artifacts: Optional[list[Artifact]] = None
+    ) -> set[str]:
+        """FAILED tasks a review gate rejected that still have escalation budget.
+
+        These are *not* terminal failures — the post-worker review-escalation
+        sweep will re-route them one tier up — so they must be excluded from the
+        fail-closed verdict exactly like recoverable adapter-billing failures.
+        Without this a review rejection would make ``_run_workers`` raise before
+        :meth:`_auto_review_escalate` ever runs, and the better model would never
+        get its turn. A task that has exhausted its attempts is omitted, so the
+        job still fails loudly when even the strongest model can't pass review."""
+        if artifacts is None:
+            artifacts = self.store.list_artifacts(job.id)
+        rejected = self._failed_review_task_ids(artifacts)
+        if not rejected:
+            return set()
+        pending: set[str] = set()
+        for task in self.store.list_tasks(job.id):
+            if (
+                task.id in rejected
+                and task.status == TaskStatus.FAILED
+                and (task.payload or {}).get("router_model_id")
+                and int((task.payload or {}).get("review_escalation_attempts", 0))
+                < _MAX_ESCALATION_ATTEMPTS
+            ):
+                pending.add(task.id)
+        return pending
+
+    @staticmethod
+    def _failed_review_task_ids(artifacts: list[Artifact]) -> set[str]:
+        """Task ids whose latest ``review`` GATE artifact rejected the diff."""
+        latest: dict[str, tuple[str, bool]] = {}
+        for artifact in artifacts:
+            if artifact.type != ArtifactType.GATE:
+                continue
+            payload = artifact.payload or {}
+            if payload.get("kind") != "review":
+                continue
+            previous = latest.get(artifact.task_id)
+            if previous is None or artifact.created_at > previous[0]:
+                latest[artifact.task_id] = (artifact.created_at, bool(payload.get("passed")))
+        return {task_id for task_id, (_, passed) in latest.items() if not passed}
+
+    def _reroute_failed_review(self, job: Job) -> int:
+        """Re-queue each review-rejected task onto the cheapest strictly-stronger
+        funded model. Returns the count re-queued (0 when nothing qualifies)."""
+        from puppetmaster.model_registry import default_registry_path, load_registry
+        from puppetmaster.platform_billing import detect_adapter_billing
+        from puppetmaster.platform_lock import is_adapter_enabled
+        from puppetmaster.router import (
+            NoEligibleModelError,
+            route_task,
+            signals_from_worker_spec,
+        )
+
+        registry = [s for s in load_registry(default_registry_path()) if s.enabled]
+        if not registry:
+            return 0
+        by_model_id = {s.id: s for s in registry}
+
+        artifacts = self.store.list_artifacts(job.id)
+        failed_review = self._failed_review_task_ids(artifacts)
+        if not failed_review:
+            return 0
+
+        billing_cache: dict[str, object] = {}
+
+        def _funded(adapter: str) -> object:
+            if adapter not in billing_cache:
+                try:
+                    billing_cache[adapter] = detect_adapter_billing(adapter)
+                except Exception:
+                    billing_cache[adapter] = None
+            return billing_cache[adapter]
+
+        rerouted = 0
+        for task in self.store.list_tasks(job.id):
+            if task.status != TaskStatus.FAILED or task.id not in failed_review:
+                continue
+            payload = task.payload or {}
+            if int(payload.get("review_escalation_attempts", 0)) >= _MAX_ESCALATION_ATTEMPTS:
+                continue
+            # Only re-route work the router placed — never override a hand-pinned
+            # model (the user chose it deliberately).
+            current_model_id = payload.get("router_model_id")
+            current_spec = by_model_id.get(current_model_id) if current_model_id else None
+            if current_spec is None:
+                continue
+
+            allow_api = bool(payload.get("allow_api_billing", True))
+            candidates = []
+            for spec in registry:
+                if not is_adapter_enabled(spec.adapter):
+                    continue
+                status = _funded(spec.adapter)
+                if status is None or not getattr(status, "healthy", False):
+                    continue
+                if getattr(status, "billing", "unknown") == "api" and not allow_api:
+                    continue
+                candidates.append(spec)
+            if not candidates:
+                continue
+
+            signals = replace(
+                signals_from_worker_spec(task),
+                explicit_min_capability=current_spec.capability_score + 1,
+            )
+            policy = payload.get("router_policy") or "balanced"
+            try:
+                decision = route_task(signals, candidates, policy=policy)
+            except NoEligibleModelError:
+                continue
+            if (
+                decision.model.id == current_model_id
+                or decision.model.capability_score <= current_spec.capability_score
+            ):
+                continue  # no genuine upgrade available — leave it FAILED
+
+            attempts = int(payload.get("review_escalation_attempts", 0)) + 1
+            new_payload = {
+                **payload,
+                "model": decision.model.adapter_model_name,
+                "router_model_id": decision.model.id,
+                "router_policy": decision.policy,
+                "router_capability_needed": decision.capability_needed,
+                "router_estimated_cost_usd": decision.estimated_cost_usd,
+                "review_escalation_attempts": attempts,
+                "review_escalated_from_model": current_model_id,
+            }
+            requeued = replace(
+                task,
+                adapter=decision.model.adapter,
+                payload=new_payload,
+                status=TaskStatus.QUEUED,
+                attempts=0,
+                lease_owner=None,
+                lease_expires_at=None,
+                completed_at=None,
+                updated_at=now_iso(),
+            )
+            self.store.save_task(requeued)
+
+            artifact_payload = decision.to_artifact_payload()
+            artifact_payload["role"] = task.role
+            artifact_payload["review_escalated_from_model"] = current_model_id
+            artifact_payload["review_escalation_attempt"] = attempts
+            self.store.save_artifact(
+                Artifact(
+                    job_id=job.id,
+                    task_id=task.id,
+                    type=ArtifactType.ROUTING,
+                    created_by="router-review-escalation",
+                    payload=artifact_payload,
+                    confidence=0.9,
+                    evidence=[
+                        f"review_rejected_on:{current_model_id}",
+                        f"to:{decision.model.id}",
+                    ],
+                )
+            )
+            self.store.emit(
+                job.id,
+                "router.auto_review_escalate",
+                {
+                    "task_id": task.id,
+                    "role": task.role,
+                    "from_model": current_model_id,
+                    "to_model": decision.model.id,
+                    "attempt": attempts,
+                },
+            )
+            rerouted += 1
+        return rerouted
+
     @staticmethod
     def _escalation_threshold(task: Task) -> Optional[float]:
         """The confidence floor below which ``task`` should escalate, or ``None``
@@ -768,7 +975,9 @@ class Orchestrator:
         mid-flight states while daemon/external workers are still going. Use
         :meth:`_should_fail_closed` at a terminal point (workers exited) to also
         catch a genuinely stuck swarm."""
-        recoverable = set(self._recoverable_failure_by_task(job, artifacts=artifacts))
+        recoverable = set(
+            self._recoverable_failure_by_task(job, artifacts=artifacts)
+        ) | self._review_pending_reroute_ids(job, artifacts=artifacts)
         if tasks is None:
             tasks = self.store.list_tasks(job.id)
         for task in tasks:
@@ -787,7 +996,7 @@ class Orchestrator:
         stuck QUEUED/RUNNING task, or a task blocked on a hard-failed upstream.
         Recoverable-failed tasks and the tasks blocked behind them are left for
         the auto-fallback sweep (or surfaced in the stitched Alerts section)."""
-        recoverable = set(self._recoverable_failure_by_task(job))
+        recoverable = set(self._recoverable_failure_by_task(job)) | self._review_pending_reroute_ids(job)
         by_id = {t.id: t for t in self.store.list_tasks(job.id)}
 
         def _blocked_on_recoverable(task: Task, seen: set[str]) -> bool:
