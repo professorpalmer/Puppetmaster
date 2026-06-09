@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.9.17
+
+**Global (user-level) auto-invocation hooks — cover every repo without re-running setup per project.** v0.9.16 installed hooks per-workspace (`.cursor/hooks.json` / `.claude/settings.json`), which only protects the repo you ran `setup` in. This adds a `global` scope that writes user-level hooks to `~/.cursor/hooks.json` and `~/.claude/settings.json`, so a single install makes the host agent delegate-aware in *every* repo the user opens. No breaking API changes; full suite **472** green + the E2E stress harness (`bench/stress_invocation.py`) extended with global-scope checks.
+
+- **`puppetmaster install-hooks --global`** and **`puppetmaster setup --global-hooks`** install at user scope instead of the workspace. Only the base directory differs between scopes — the `.cursor` / `.claude` subpaths are identical — and the hook command is an absolute `python -m puppetmaster invocation-gate` (no relative script path), so a user-level Cursor hook (which Cursor runs from `~/.cursor/`) resolves the same as a project one. Idempotent and non-destructive at both scopes; an unknown scope is a loud error rather than a silent no-op.
+- **`setup` reports the scope it used** and nudges toward `--global-hooks` when it installed per-repo, so the broader option is discoverable.
+- Added 5 focused tests (global writes under `~` not cwd, idempotent + labeled, unknown-scope error, `install-hooks --global`, `setup --global-hooks`) plus a global round-trip in the stress harness.
+
 ## v0.9.16
 
 **Auto-invocation: make host agents reach for Puppetmaster on their own, with as little user prompting as possible.** The #1 field complaint was that Cursor / Claude Code / Codex grind multi-file work inline unless the user manually reminds them to delegate — the soft rule text Puppetmaster writes decays with context distance and task momentum. This release adds a layered, classifier-gated enforcement system on top of the rules: a pure delegation gate, deterministic host hooks, and an optional provider proxy — wired into `setup` so a fresh install gets it all. Honest about the ceiling: universal *deterministic* invocation is impossible on closed harnesses (you can't sit on Cursor's provider wire or force an MCP call), so the design is explicitly tiered — soft everywhere, hard where hooks/proxy exist — and fully kill-switchable. No breaking API changes; full suite **467** green + a 6-stage end-to-end stress harness (`bench/stress_invocation.py`).
