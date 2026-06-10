@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import contextlib
 import io
 import json
@@ -11692,6 +11693,154 @@ class SetupHooksStepTests(unittest.TestCase):
                 self.assertFalse((Path(tmp) / ".cursor" / "hooks.json").exists())
             finally:
                 os.chdir(cwd0)
+
+
+class UninstallTests(unittest.TestCase):
+    """Tests for ``puppetmaster uninstall`` and its removal helpers."""
+
+    def test_strip_block_preserves_surrounding_agents_content(self):
+        from puppetmaster.rules import (
+            BEGIN_MARKER,
+            END_MARKER,
+            render_agents_block,
+            strip_block_from_text,
+        )
+
+        user_header = "# Project conventions\n\n- Keep tests green\n\n"
+        user_footer = "\n# Trailing notes\n"
+        existing = user_header + render_agents_block() + user_footer
+        stripped, action = strip_block_from_text(existing)
+        self.assertEqual(action, "removed")
+        self.assertEqual(stripped, user_header + user_footer)
+        self.assertNotIn(BEGIN_MARKER, stripped)
+        self.assertNotIn(END_MARKER, stripped)
+
+    def test_uninstall_cursor_mcp_preserves_other_servers(self):
+        from puppetmaster.installers import install_cursor_mcp, uninstall_cursor_mcp
+
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "mcp.json"
+            target.write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "navdata": {"url": "https://example.com/sse"},
+                            "puppetmaster": {
+                                "command": sys.executable,
+                                "args": ["-m", "puppetmaster.mcp_server"],
+                            },
+                        }
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            result = uninstall_cursor_mcp(target_path=target)
+            self.assertEqual(result.status, "removed")
+            data = json.loads(target.read_text("utf-8"))
+            self.assertNotIn("puppetmaster", data["mcpServers"])
+            self.assertEqual(data["mcpServers"]["navdata"]["url"], "https://example.com/sse")
+
+    def test_remove_codex_puppetmaster_table(self):
+        from puppetmaster.installers import _remove_codex_puppetmaster_table
+
+        with TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.toml"
+            config.write_text(
+                "[mcp_servers.other]\ncommand = \"echo\"\n\n"
+                "[mcp_servers.puppetmaster]\n"
+                "command = \"python\"\n"
+                "args = [\"-m\", \"puppetmaster.mcp_server\"]\n"
+                "tool_timeout_sec = 300\n\n"
+                "[features]\nenabled = true\n",
+                encoding="utf-8",
+            )
+            removed, messages = _remove_codex_puppetmaster_table(config)
+            self.assertTrue(removed)
+            text = config.read_text("utf-8")
+            self.assertNotIn("[mcp_servers.puppetmaster]", text)
+            self.assertIn("[mcp_servers.other]", text)
+            self.assertIn("[features]", text)
+            again, _ = _remove_codex_puppetmaster_table(config)
+            self.assertFalse(again)
+
+    def test_uninstall_hooks_preserves_foreign_hooks(self):
+        from puppetmaster.hook_installers import install_hooks, uninstall_hooks
+
+        with TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            foreign = {
+                "version": 1,
+                "hooks": {
+                    "beforeSubmitPrompt": [{"command": "echo user-hook"}],
+                },
+            }
+            hooks_path = cwd / ".cursor" / "hooks.json"
+            hooks_path.parent.mkdir(parents=True)
+            hooks_path.write_text(json.dumps(foreign, indent=2) + "\n", encoding="utf-8")
+            install_hooks(cwd=cwd, targets=["cursor"], scope="project")
+            result = uninstall_hooks(cwd=cwd, targets=["cursor"], scopes=["project"])
+            self.assertIn(result.overall_status, {"removed", "unchanged"})
+            data = json.loads(hooks_path.read_text("utf-8"))
+            self.assertEqual(data["hooks"]["beforeSubmitPrompt"], [{"command": "echo user-hook"}])
+
+    def test_uninstall_is_idempotent(self):
+        from puppetmaster.installers import install_cursor_mcp, uninstall_cursor_mcp
+        from puppetmaster.rules import install_rules, uninstall_rules
+
+        with TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            (cwd / ".git").mkdir()
+            target = cwd / ".cursor" / "mcp.json"
+            install_rules(cwd=cwd, targets=["cursor", "agents"])
+            install_cursor_mcp(
+                target_path=target,
+                python_executable=sys.executable,
+                skip_handshake=True,
+            )
+            uninstall_rules(cwd=cwd)
+            uninstall_cursor_mcp(target_path=target)
+            rules_again = uninstall_rules(cwd=cwd)
+            mcp_again = uninstall_cursor_mcp(target_path=target)
+            self.assertEqual(rules_again.overall_status, "unchanged")
+            self.assertEqual(mcp_again.status, "unchanged")
+
+    def test_uninstall_dry_run_writes_nothing(self):
+        from puppetmaster import cli
+        from puppetmaster.installers import install_cursor_mcp
+        from puppetmaster.rules import install_rules
+
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as home_tmp:
+            cwd = Path(tmp)
+            (cwd / ".git").mkdir()
+            target = cwd / ".cursor" / "mcp.json"
+            install_rules(cwd=cwd, targets=["cursor", "agents"])
+            install_cursor_mcp(
+                target_path=target,
+                python_executable=sys.executable,
+                skip_handshake=True,
+            )
+            agents_before = (cwd / "AGENTS.md").read_text("utf-8")
+            mcp_before = target.read_text("utf-8")
+            cwd0 = os.getcwd()
+            try:
+                os.chdir(cwd)
+                with patch.object(cli.Path, "home", return_value=Path(home_tmp)):
+                    rc = cli._run_uninstall(
+                        argparse.Namespace(
+                            cwd=str(cwd),
+                            dry_run=True,
+                            purge_state=False,
+                            yes=True,
+                        )
+                    )
+                self.assertEqual(rc, 0)
+            finally:
+                os.chdir(cwd0)
+            self.assertEqual((cwd / "AGENTS.md").read_text("utf-8"), agents_before)
+            self.assertEqual(target.read_text("utf-8"), mcp_before)
+            self.assertTrue((cwd / ".cursor" / "rules" / "puppetmaster.mdc").is_file())
 
 
 if __name__ == "__main__":

@@ -161,6 +161,10 @@ class RulesInstallResult:
             return "unchanged"
         if any(s == "would_install" for s in statuses):
             return "would_install"
+        if any(s == "would_remove" for s in statuses):
+            return "would_remove"
+        if any(s == "removed" for s in statuses):
+            return "removed"
         return "installed"
 
 
@@ -234,6 +238,46 @@ def merge_block_into_text(existing: str, new_block: str) -> tuple[str, str]:
     if candidate == existing:
         return existing, "unchanged"
     return candidate, "replaced"
+
+
+def strip_block_from_text(existing: str) -> tuple[str, str]:
+    """Remove the Puppetmaster block from ``existing`` if present.
+
+    Returns ``(stripped_text, action)`` where ``action`` is ``"removed"``
+    when the block was stripped, or ``"unchanged"`` when no markers were
+    found. Surrounding content outside the markers is preserved byte-for-byte.
+    """
+    begin_idx = existing.find(BEGIN_MARKER)
+    end_idx = existing.find(END_MARKER)
+    if begin_idx == -1 or end_idx == -1 or end_idx < begin_idx:
+        return existing, "unchanged"
+    end_line_end = existing.find("\n", end_idx)
+    if end_line_end == -1:
+        end_line_end = len(existing)
+    else:
+        end_line_end += 1
+    stripped = existing[:begin_idx] + existing[end_line_end:]
+    if stripped == existing:
+        return existing, "unchanged"
+    return stripped, "removed"
+
+
+def _text_is_empty(content: str) -> bool:
+    return not content or not content.strip()
+
+
+def _write_or_delete_markdown(path: Path, content: str, *, dry_run: bool) -> str:
+    """Write ``content`` to ``path``, deleting the file when whitespace-only."""
+    if _text_is_empty(content):
+        if dry_run:
+            return "would_delete"
+        if path.is_file():
+            path.unlink()
+        return "deleted"
+    if dry_run:
+        return "would_write"
+    _write_atomic(path, content)
+    return "written"
 
 
 def _detect_cursor(cwd: Path) -> bool:
@@ -473,3 +517,156 @@ def install_rules(
 
 
 VALID_TARGETS = {"cursor", "agents", "codex_global", "claude_global"}
+VALID_UNINSTALL_TARGETS = VALID_TARGETS | {"claude_workspace"}
+
+
+def _uninstall_cursor_workspace(
+    cwd: Path, *, dry_run: bool
+) -> TargetOutcome:
+    target_path = cwd / ".cursor" / "rules" / "puppetmaster.mdc"
+    if not target_path.is_file():
+        return TargetOutcome(
+            target="cursor",
+            path=str(target_path),
+            status="unchanged",
+            reason="no .cursor/rules/puppetmaster.mdc",
+        )
+    if dry_run:
+        return TargetOutcome(
+            target="cursor",
+            path=str(target_path),
+            status="would_remove",
+            reason="would delete .cursor/rules/puppetmaster.mdc",
+        )
+    target_path.unlink()
+    return TargetOutcome(
+        target="cursor",
+        path=str(target_path),
+        status="removed",
+        reason="deleted .cursor/rules/puppetmaster.mdc",
+    )
+
+
+def _uninstall_markdown_block_file(
+    target_path: Path,
+    *,
+    target: str,
+    dry_run: bool,
+    label: str,
+) -> TargetOutcome:
+    if not target_path.is_file():
+        existing = ""
+    else:
+        existing = target_path.read_text(encoding="utf-8")
+    stripped, action = strip_block_from_text(existing)
+    if action == "unchanged":
+        if not target_path.is_file():
+            return TargetOutcome(
+                target=target,
+                path=str(target_path),
+                status="unchanged",
+                reason=f"no {label}",
+            )
+        return TargetOutcome(
+            target=target,
+            path=str(target_path),
+            status="unchanged",
+            reason=f"{label} has no Puppetmaster block",
+        )
+    if dry_run:
+        if _text_is_empty(stripped):
+            return TargetOutcome(
+                target=target,
+                path=str(target_path),
+                status="would_remove",
+                reason=f"would strip Puppetmaster block and delete {label}",
+            )
+        return TargetOutcome(
+            target=target,
+            path=str(target_path),
+            status="would_remove",
+            reason=f"would strip Puppetmaster block from {label}",
+        )
+    write_action = _write_or_delete_markdown(target_path, stripped, dry_run=False)
+    if write_action == "deleted":
+        return TargetOutcome(
+            target=target,
+            path=str(target_path),
+            status="removed",
+            reason=f"stripped Puppetmaster block and deleted {label}",
+        )
+    return TargetOutcome(
+        target=target,
+        path=str(target_path),
+        status="removed",
+        reason=f"stripped Puppetmaster block from {label}",
+    )
+
+
+def uninstall_rules(
+    *,
+    cwd: Optional[Path] = None,
+    targets: Optional[Iterable[str]] = None,
+    dry_run: bool = False,
+) -> RulesInstallResult:
+    """Remove Puppetmaster rule files and marked blocks installed by :func:`install_rules`."""
+    cwd = cwd or Path.cwd()
+    result = RulesInstallResult()
+    selected = list(targets) if targets is not None else [
+        "cursor",
+        "agents",
+        "claude_workspace",
+        "claude_global",
+        "codex_global",
+    ]
+
+    for target in selected:
+        if target == "cursor":
+            result.outcomes.append(_uninstall_cursor_workspace(cwd, dry_run=dry_run))
+        elif target == "agents":
+            result.outcomes.append(
+                _uninstall_markdown_block_file(
+                    cwd / "AGENTS.md",
+                    target="agents",
+                    dry_run=dry_run,
+                    label="AGENTS.md",
+                )
+            )
+        elif target == "claude_workspace":
+            result.outcomes.append(
+                _uninstall_markdown_block_file(
+                    cwd / "CLAUDE.md",
+                    target="claude_workspace",
+                    dry_run=dry_run,
+                    label="CLAUDE.md",
+                )
+            )
+        elif target == "claude_global":
+            result.outcomes.append(
+                _uninstall_markdown_block_file(
+                    Path.home() / ".claude" / "CLAUDE.md",
+                    target="claude_global",
+                    dry_run=dry_run,
+                    label="~/.claude/CLAUDE.md",
+                )
+            )
+        elif target == "codex_global":
+            result.outcomes.append(
+                _uninstall_markdown_block_file(
+                    Path.home() / ".codex" / "instructions.md",
+                    target="codex_global",
+                    dry_run=dry_run,
+                    label="~/.codex/instructions.md",
+                )
+            )
+        else:
+            result.outcomes.append(
+                TargetOutcome(
+                    target=target,
+                    path="",
+                    status="error",
+                    reason=f"unknown rule target: {target!r}",
+                )
+            )
+
+    return result
