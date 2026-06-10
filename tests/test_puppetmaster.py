@@ -12098,6 +12098,61 @@ class PuppetmasterMcpVerbTests(unittest.TestCase):
         self.assertIn("puppetmaster_rollup", names)
         self.assertIn("puppetmaster_gate", names)
 
+    def test_dashboard_tool_reuses_running_server(self) -> None:
+        import puppetmaster.mcp_server as mcp
+
+        self.assertIn("puppetmaster_dashboard", {tool.name for tool in mcp.tools()})
+        with patch.object(mcp, "_dashboard_alive", return_value=True), patch.object(
+            mcp, "_spawn_dashboard_server"
+        ) as popen:
+            result = mcp.call_tool(
+                "puppetmaster_dashboard", {"cwd": "/tmp", "job_id": "job_abc"}
+            )
+        body = json.loads(result["content"][0]["text"])
+        popen.assert_not_called()
+        self.assertTrue(body["already_running"])
+        self.assertFalse(body["started"])
+        self.assertEqual(body["url"], "http://127.0.0.1:8787/?job=job_abc")
+
+    def test_dashboard_tool_starts_server_when_absent(self) -> None:
+        import puppetmaster.mcp_server as mcp
+
+        spawned = MagicMock()
+        spawned.pid = 4321
+        spawned.poll.return_value = None
+        # alive checks: initial probe (absent), readiness loop, post-loop verify
+        with patch.object(
+            mcp, "_dashboard_alive", side_effect=[False, True, True]
+        ), patch.object(mcp, "_spawn_dashboard_server", return_value=spawned) as popen:
+            result = mcp.call_tool("puppetmaster_dashboard", {"cwd": "/tmp", "port": 9000})
+        body = json.loads(result["content"][0]["text"])
+        command = popen.call_args.args[0]
+        self.assertIn("dashboard", command)
+        self.assertIn("--no-open", command)
+        self.assertIn("9000", command)
+        self.assertTrue(body["started"])
+        self.assertEqual(body["pid"], 4321)
+        self.assertEqual(body["url"], "http://127.0.0.1:9000/")
+
+    def test_dashboard_tool_reports_failed_start(self) -> None:
+        import puppetmaster.mcp_server as mcp
+
+        dead = MagicMock()
+        dead.pid = 4321
+        dead.poll.return_value = 1
+        with patch.object(mcp, "_dashboard_alive", return_value=False), patch.object(
+            mcp, "_spawn_dashboard_server", return_value=dead
+        ):
+            result = mcp.call_tool("puppetmaster_dashboard", {"cwd": "/tmp"})
+        self.assertTrue(result["isError"])
+        body = json.loads(result["content"][0]["text"])
+        self.assertEqual(body["error"], "dashboard failed to start")
+
+    def test_installed_rules_teach_the_dashboard_verb(self) -> None:
+        from puppetmaster.rules import RULE_BODY
+
+        self.assertIn("puppetmaster_dashboard", RULE_BODY)
+
 
 class InvocationGateTests(unittest.TestCase):
     """Tests for the classifier-gated auto-invocation decision."""

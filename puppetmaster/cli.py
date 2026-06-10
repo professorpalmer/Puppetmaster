@@ -2436,7 +2436,7 @@ def _run_uninstall(args) -> int:
     else:
         killed_entries = registry_kill_stale()
         if killed_entries:
-            print(f"[uninstall-mcp-processes] status: removed")
+            print("[uninstall-mcp-processes] status: removed")
             for entry in killed_entries:
                 print(
                     f"[uninstall-mcp-processes] killed stale PID {entry.pid} "
