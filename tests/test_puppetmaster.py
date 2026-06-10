@@ -8390,6 +8390,39 @@ class DashboardTests(unittest.TestCase):
             snap = build_job_snapshot(store, job.id)
             self.assertEqual(snap["cost"]["total_estimated_cost_usd"], 0.0)
 
+    def test_extract_metadata_falls_back_to_payload_token_counts(self) -> None:
+        """Adapters without a Claude-style JSON stdout envelope (cursor/codex/
+        openai) still stamp token_usage() counts top-level on the payload —
+        the chips must surface those, flagged when estimated."""
+        from puppetmaster.dashboard import _extract_metadata
+
+        meta = _extract_metadata(
+            {
+                "model": "composer-2.5",
+                "tokens_in": 2646,
+                "tokens_out": 8866,
+                "tokens_estimated": True,
+                "stdout_capture": {"stdout_head_excerpt": "not json {"},
+            }
+        )
+        self.assertEqual(meta["tokens_in"], 2646)
+        self.assertEqual(meta["tokens_out"], 8866)
+        self.assertTrue(meta["tokens_estimated"])
+
+        envelope = json.dumps(
+            {"usage": {"input_tokens": 10, "output_tokens": 20}, "num_turns": 3}
+        )
+        measured = _extract_metadata(
+            {
+                "tokens_in": 999,
+                "tokens_estimated": True,
+                "stdout_capture": {"stdout_head_excerpt": envelope},
+            }
+        )
+        self.assertEqual(measured["tokens_in"], 10)
+        self.assertEqual(measured["tokens_out"], 20)
+        self.assertNotIn("tokens_estimated", measured)
+
     def test_build_job_snapshot_includes_task_activity_and_progress(self) -> None:
         """Each task row carries its instruction plus an artifact-backed
         activity timeline, and PATCH diffs attach to exactly the task that

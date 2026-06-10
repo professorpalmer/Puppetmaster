@@ -142,6 +142,15 @@ def _extract_metadata(payload: dict[str, Any]) -> dict[str, Any]:
         if "duration_ms" in envelope:
             meta["duration_ms"] = envelope["duration_ms"]
         break
+    # Claude Code is the only adapter whose stdout is a single JSON envelope.
+    # Every adapter stamps token_usage() counts top-level on the payload, so
+    # fall back to those (flagging estimates) — otherwise cursor/codex/openai
+    # tasks never show token chips at all.
+    if "tokens_in" not in meta and payload.get("tokens_in") is not None:
+        meta["tokens_in"] = payload["tokens_in"]
+        if payload.get("tokens_out") is not None:
+            meta["tokens_out"] = payload["tokens_out"]
+        meta["tokens_estimated"] = bool(payload.get("tokens_estimated"))
     if "returncode" in payload:
         meta["returncode"] = payload["returncode"]
     if "failure" in payload:
@@ -1160,8 +1169,9 @@ function renderTask(task) {
         html += '<div class="meta-chips">';
         if (act.meta.model) html += `<span class="meta-chip">${esc(act.meta.model)}</span>`;
         if (act.meta.cost_usd != null) html += `<span class="meta-chip">$${act.meta.cost_usd.toFixed(6)}</span>`;
-        if (act.meta.tokens_in != null) html += `<span class="meta-chip">↑ ${act.meta.tokens_in}</span>`;
-        if (act.meta.tokens_out != null) html += `<span class="meta-chip">↓ ${act.meta.tokens_out}</span>`;
+        const approx = act.meta.tokens_estimated ? "~" : "";
+        if (act.meta.tokens_in != null) html += `<span class="meta-chip">↑ ${approx}${act.meta.tokens_in}</span>`;
+        if (act.meta.tokens_out != null) html += `<span class="meta-chip">↓ ${approx}${act.meta.tokens_out}</span>`;
         if (act.meta.num_turns != null) html += `<span class="meta-chip">${act.meta.num_turns} turns</span>`;
         if (act.meta.duration_ms != null) html += `<span class="meta-chip">${(act.meta.duration_ms / 1000).toFixed(1)}s</span>`;
         html += '</div>';
