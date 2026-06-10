@@ -37,6 +37,13 @@ CatalogRunner = Callable[[list[str], Mapping[str, str]], "tuple[int, str, str]"]
 # frontier or get starved as trivial in the meantime.
 _DEFAULT_DISCOVERED_CAPABILITY = 60
 
+# Cursor catalog ids that differ from their native-adapter model names but share
+# a frontier kin entry in the registry overlay. Matched before the conservative
+# seed so plan-discovered frontier models rank at their true capability.
+_CURSOR_FRONTIER_KIN_ALIASES: dict[str, str] = {
+    "fable-5": "claude-fable-5",
+}
+
 
 class CursorDiscoveryError(RuntimeError):
     """Raised when the Cursor catalog cannot be enumerated."""
@@ -149,6 +156,10 @@ def catalog_to_specs(
         else:
             display = item.get("displayName") or model_id
             kin = cap_by_name.get(model_id)
+            if kin is None:
+                alias = _CURSOR_FRONTIER_KIN_ALIASES.get(model_id)
+                if alias is not None:
+                    kin = cap_by_name.get(alias)
             if kin is not None:
                 capability = kin.capability_score
                 context_window = kin.context_window
