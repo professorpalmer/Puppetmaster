@@ -2639,6 +2639,8 @@ class PuppetmasterTests(unittest.TestCase):
                     pid=os.getpid(),
                     workspace="/tmp/test-workspace",
                     version="0.5.2-test",
+                    parent_pid=12345,
+                    parent_process="datagrip",
                 )
                 self.assertTrue(path.exists())
 
@@ -2646,8 +2648,14 @@ class PuppetmasterTests(unittest.TestCase):
                 self.assertEqual(len(entries), 1)
                 self.assertEqual(entries[0].pid, os.getpid())
                 self.assertEqual(entries[0].workspace, "/tmp/test-workspace")
+                self.assertEqual(entries[0].parent_pid, 12345)
+                self.assertEqual(entries[0].parent_process, "datagrip")
                 self.assertTrue(entries[0].is_alive())
                 self.assertFalse(entries[0].is_stale())
+
+                payload = mcp_registry.summarize(entries)["servers"][0]
+                self.assertEqual(payload["parent_pid"], 12345)
+                self.assertEqual(payload["parent_process"], "datagrip")
 
                 before = entries[0].last_heartbeat
                 time.sleep(0.01)
@@ -2658,6 +2666,86 @@ class PuppetmasterTests(unittest.TestCase):
                 mcp_registry.deregister(path)
                 self.assertFalse(path.exists())
                 self.assertEqual(mcp_registry.list_entries(), [])
+            finally:
+                del os.environ["PUPPETMASTER_MCP_REGISTRY_DIR"]
+
+    def test_mcp_registry_detects_parent_process_identity(self) -> None:
+        from puppetmaster import mcp_registry
+
+        completed = subprocess.CompletedProcess(
+            ["ps", "-p", "4242", "-o", "comm="],
+            0,
+            "/Applications/DataGrip.app/Contents/MacOS/datagrip\n",
+            "",
+        )
+        with TemporaryDirectory() as tmp:
+            os.environ["PUPPETMASTER_MCP_REGISTRY_DIR"] = tmp
+            try:
+                with patch.object(mcp_registry.os, "getppid", return_value=4242), patch.object(
+                    mcp_registry.subprocess, "run", return_value=completed
+                ) as run:
+                    mcp_registry.register(pid=os.getpid(), workspace="/auto-parent")
+
+                entry = mcp_registry.list_entries()[0]
+                self.assertEqual(entry.parent_pid, 4242)
+                self.assertEqual(entry.parent_process, "datagrip")
+                run.assert_called_once()
+            finally:
+                del os.environ["PUPPETMASTER_MCP_REGISTRY_DIR"]
+
+    def test_mcp_registry_keeps_old_entries_without_parent_identity(self) -> None:
+        from puppetmaster import mcp_registry
+
+        with TemporaryDirectory() as tmp:
+            os.environ["PUPPETMASTER_MCP_REGISTRY_DIR"] = tmp
+            try:
+                path = Path(tmp) / f"{os.getpid()}.json"
+                path.write_text(
+                    json.dumps(
+                        {
+                            "pid": os.getpid(),
+                            "workspace": "/old",
+                            "started_at": time.time(),
+                            "last_heartbeat": time.time(),
+                            "transport": "stdio",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                entry = mcp_registry.list_entries()[0]
+                self.assertIsNone(entry.parent_pid)
+                self.assertIsNone(entry.parent_process)
+                payload = mcp_registry.summarize([entry])["servers"][0]
+                self.assertIsNone(payload["parent_pid"])
+                self.assertIsNone(payload["parent_process"])
+            finally:
+                del os.environ["PUPPETMASTER_MCP_REGISTRY_DIR"]
+
+    def test_mcp_registry_heartbeat_reregister_preserves_parent_identity(self) -> None:
+        from puppetmaster import mcp_registry
+
+        with TemporaryDirectory() as tmp:
+            os.environ["PUPPETMASTER_MCP_REGISTRY_DIR"] = tmp
+            try:
+                path = mcp_registry.register(
+                    pid=os.getpid(),
+                    workspace="/self-heal",
+                    version="test-version",
+                    parent_pid=12345,
+                    parent_process="datagrip",
+                )
+                thread = mcp_registry.HeartbeatThread(path, interval_seconds=0.5)
+                path.unlink()
+
+                with patch.object(mcp_registry.os, "getppid", return_value=99999):
+                    thread._reregister()
+
+                entry = mcp_registry.list_entries()[0]
+                self.assertEqual(entry.workspace, "/self-heal")
+                self.assertEqual(entry.version, "test-version")
+                self.assertEqual(entry.parent_pid, 12345)
+                self.assertEqual(entry.parent_process, "datagrip")
             finally:
                 del os.environ["PUPPETMASTER_MCP_REGISTRY_DIR"]
 
@@ -2824,7 +2912,12 @@ class PuppetmasterTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             os.environ["PUPPETMASTER_MCP_REGISTRY_DIR"] = tmp
             try:
-                mcp_registry.register(pid=os.getpid(), workspace="/listed")
+                mcp_registry.register(
+                    pid=os.getpid(),
+                    workspace="/listed",
+                    parent_pid=12345,
+                    parent_process="datagrip",
+                )
                 buf = io.StringIO()
                 with patch("sys.stdout", buf):
                     rc = cli_module.main(["mcp", "list", "--json"])
@@ -2834,6 +2927,36 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         snapshot = json.loads(buf.getvalue())
         self.assertGreaterEqual(snapshot["count"], 1)
+        server = next(row for row in snapshot["servers"] if row["pid"] == os.getpid())
+        self.assertEqual(server["parent_pid"], 12345)
+        self.assertEqual(server["parent_process"], "datagrip")
+
+    def test_cli_mcp_list_outputs_parent_process_columns(self) -> None:
+        import io
+        from puppetmaster import cli as cli_module
+        from puppetmaster import mcp_registry
+
+        with TemporaryDirectory() as tmp:
+            os.environ["PUPPETMASTER_MCP_REGISTRY_DIR"] = tmp
+            try:
+                mcp_registry.register(
+                    pid=os.getpid(),
+                    workspace="/listed",
+                    parent_pid=12345,
+                    parent_process="datagrip",
+                )
+                buf = io.StringIO()
+                with patch("sys.stdout", buf):
+                    rc = cli_module.main(["mcp", "list"])
+            finally:
+                del os.environ["PUPPETMASTER_MCP_REGISTRY_DIR"]
+
+        self.assertEqual(rc, 0)
+        output = buf.getvalue()
+        self.assertIn("PPID", output)
+        self.assertIn("PARENT", output)
+        self.assertIn("12345", output)
+        self.assertIn("datagrip", output)
 
     def test_tool_call_keepalive_skips_fast_handlers(self) -> None:
         """Handlers that finish before the start_after grace period emit no notifications.

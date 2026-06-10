@@ -38,6 +38,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -66,6 +67,8 @@ class McpServerEntry:
     last_heartbeat: float
     transport: str = "stdio"
     version: Optional[str] = None
+    parent_pid: Optional[int] = None
+    parent_process: Optional[str] = None
     path: Optional[str] = None  # absolute path to the tracking file
 
     def is_alive(self) -> bool:
@@ -84,6 +87,8 @@ class McpServerEntry:
             "last_heartbeat": self.last_heartbeat,
             "age_seconds": round(current - self.started_at, 3),
             "heartbeat_age_seconds": round(current - self.last_heartbeat, 3),
+            "parent_pid": self.parent_pid,
+            "parent_process": self.parent_process,
             "transport": self.transport,
             "version": self.version,
             "alive": self.is_alive(),
@@ -125,6 +130,8 @@ def register(
     workspace: Optional[str] = None,
     version: Optional[str] = None,
     transport: str = "stdio",
+    parent_pid: Optional[int] = None,
+    parent_process: Optional[str] = None,
 ) -> Path:
     """Write this server's tracking file and return its path.
 
@@ -132,6 +139,12 @@ def register(
     re-registration after a heartbeat thread restart) we overwrite it.
     """
     actual_pid = pid if pid is not None else os.getpid()
+    actual_parent_pid = parent_pid if parent_pid is not None else _parent_pid()
+    actual_parent_process = (
+        parent_process
+        if parent_process is not None
+        else _process_name(actual_parent_pid)
+    )
     now = time.time()
     payload = {
         "pid": actual_pid,
@@ -140,6 +153,8 @@ def register(
         "last_heartbeat": now,
         "transport": transport,
         "version": version,
+        "parent_pid": actual_parent_pid,
+        "parent_process": actual_parent_process,
     }
     path = registry_dir() / f"{actual_pid}.json"
     _atomic_write(path, payload)
@@ -207,6 +222,8 @@ def list_entries(*, include_stale: bool = True) -> list[McpServerEntry]:
                 last_heartbeat=float(data.get("last_heartbeat") or now),
                 transport=str(data.get("transport") or "stdio"),
                 version=data.get("version"),
+                parent_pid=_coerce_optional_int(data.get("parent_pid")),
+                parent_process=_coerce_optional_str(data.get("parent_process")),
                 path=str(child),
             )
         except (KeyError, TypeError, ValueError):
@@ -304,6 +321,7 @@ class HeartbeatThread(threading.Thread):
         self._path = registration_path
         self._interval = max(0.5, float(interval_seconds))
         self._stop_event = threading.Event()
+        self._registration_payload = self._registration_payload_from_path(registration_path)
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -314,9 +332,27 @@ class HeartbeatThread(threading.Thread):
                 # File got cleaned up under us — write a fresh one so we
                 # remain visible. This is unusual but cheap to handle.
                 try:
-                    register(pid=os.getpid(), workspace=_workspace_hint())
+                    self._reregister()
                 except OSError:
                     return
+
+    def _reregister(self) -> None:
+        self._path = register(
+            pid=os.getpid(),
+            workspace=self._registration_payload.get("workspace") or _workspace_hint(),
+            version=_coerce_optional_str(self._registration_payload.get("version")),
+            transport=str(self._registration_payload.get("transport") or "stdio"),
+            parent_pid=_coerce_optional_int(self._registration_payload.get("parent_pid")),
+            parent_process=_coerce_optional_str(self._registration_payload.get("parent_process")),
+        )
+
+    @staticmethod
+    def _registration_payload_from_path(path: Path) -> dict:
+        try:
+            data = _read_entry(path)
+        except (OSError, ValueError):
+            return {}
+        return data or {}
 
 
 def _workspace_hint() -> Optional[str]:
@@ -325,6 +361,56 @@ def _workspace_hint() -> Optional[str]:
         return str(Path.cwd())
     except OSError:
         return None
+
+
+def _parent_pid() -> Optional[int]:
+    """Best-effort parent PID for the current process."""
+    try:
+        value = os.getppid()
+    except (AttributeError, OSError):
+        return None
+    return value if value > 0 else None
+
+
+def _process_name(pid: Optional[int]) -> Optional[str]:
+    """Best-effort short process label for ``pid``.
+
+    Used only for diagnostics, so failures intentionally collapse to ``None``.
+    """
+    if pid is None or pid <= 0 or os.name == "nt":
+        return None
+    try:
+        completed = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "comm="],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=1.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    raw = completed.stdout.strip()
+    if not raw:
+        return None
+    return Path(raw).name or raw
+
+
+def _coerce_optional_int(value: object) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_optional_str(value: object) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _pid_alive(pid: int) -> bool:
