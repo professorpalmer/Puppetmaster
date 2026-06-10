@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.9.29
+
+**Feature: `puppetmaster_dashboard` MCP verb — "show me the job dashboard" is now a first-class ask in any IDE with the MCP registered.** Until now the dashboard only launched via the CLI, and nothing told agents that; an agent fielding "open the dashboard" had to already know the fallback. Full suite **580** green (+4 focused tests); verified live — real server spawn, HTTP probe, idempotent reuse, deep link.
+
+- **The verb.** `puppetmaster_dashboard [job_id] [port]` checks whether a dashboard already answers on the port (reused if so — no duplicate servers), otherwise spawns the CLI server detached (`start_new_session`, loopback-only as always) and waits for it to come up before returning. The response carries the URL (deep-linked via `?job=` when `job_id` is given), pid, state dir, and an explicit `started` / `already_running` so the agent can tell the user what happened. A server that dies on startup returns a structured error with the CLI command to reproduce.
+- **Agents are taught the trigger.** The managed rules block (`install-rules`) now includes: when the user asks to see/open the job dashboard, call `puppetmaster_dashboard` and open the returned URL in a browser tab — CLI fallback `python -m puppetmaster dashboard [job_id]`. Docs updated (`CURSOR_AGENT_MCP.md`, `AGENTS.md`).
+- **Rode along:** the two pre-existing ruff errors (F541 f-string, F401 unused import) are cleared; `ruff check puppetmaster/` is clean again.
+- **Known limits.** Port reuse is honest but blind: an already-listening dashboard may be serving a *different* project's state dir — the response says so rather than pretending. `--allow-external` is deliberately not exposed over MCP; exposing the unauthenticated board beyond loopback stays a manual CLI decision.
+
 ## v0.9.28
 
 **Hardening + dashboard release: concurrency/security audit fixes, privacy-by-default state, and a real ops-console dashboard.** Rolls up two audit-driven fix waves (jobs `job_50c71c87c5ff` → `job_21250fad1985` and `job_20c605263497` → `job_2caeeb332399`), three community PRs (#4 parent-process visibility, #5 no-edit classification, #6 hermetic test env), and the dashboard overhaul. Full suite **576** green on all platforms (Windows CI fixed in-release); dedicated end-to-end stress harness ALL GREEN (33 checks: subprocess swarms on both backends, 12-thread claim races, lease fencing, lock TTL, redaction, permissions, live dashboard HTTP + security probes).
