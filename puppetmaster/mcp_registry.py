@@ -46,6 +46,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
+from puppetmaster.fs_permissions import mkdir_private, write_private_text
+
 
 # How often a running server bumps its heartbeat.
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 10.0
@@ -110,7 +112,7 @@ def registry_dir() -> Path:
         directory = Path(override)
     else:
         directory = _default_cache_root() / "puppetmaster" / "mcp-servers"
-    directory.mkdir(parents=True, exist_ok=True)
+    mkdir_private(directory)
     return directory
 
 
@@ -435,9 +437,8 @@ def _pid_alive(pid: int) -> bool:
 
 def _atomic_write(path: Path, payload: dict) -> None:
     """Write JSON to ``path`` via a temp file + rename so readers never see a half-write."""
-    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
-    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    write_private_text(tmp, json.dumps(payload))
     os.replace(tmp, path)
 
 

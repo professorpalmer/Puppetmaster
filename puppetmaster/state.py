@@ -8,8 +8,17 @@ import sys
 from pathlib import Path
 from typing import Optional, Union
 
+from puppetmaster.fs_permissions import mkdir_private
+
 
 STATE_DIR_ENV = "PUPPETMASTER_STATE_DIR"
+
+
+def ensure_state_dir(path: Union[Path, str]) -> Path:
+    """Create ``path`` (and parents) with owner-only directory permissions."""
+    resolved = Path(path)
+    mkdir_private(resolved)
+    return resolved
 
 
 def resolve_state_dir(value: Optional[Union[Path, str]] = None, cwd: Optional[Path] = None) -> Path:

@@ -27,6 +27,7 @@ import urllib.request
 from typing import Callable, Mapping, Optional
 
 from puppetmaster.model_registry import ModelSpec
+from puppetmaster.openai_security import DEFAULT_OPENAI_BASE_URL, validate_openai_base_url
 
 # Injectable HTTP getter: (url, headers) -> (status, body_text). Defaults to a
 # real urllib GET; tests pass a stub.
@@ -66,7 +67,10 @@ def fetch_openai_models(
     api_key = env.get("OPENAI_API_KEY")
     if not api_key:
         raise ApiDiscoveryError("OPENAI_API_KEY is not set — cannot enumerate OpenAI models.")
-    base = env.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    base = env.get("OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL).rstrip("/")
+    base_url_error = validate_openai_base_url(base)
+    if base_url_error is not None:
+        raise ApiDiscoveryError(base_url_error)
     get = getter or _default_getter
     status, body = get(f"{base}/models", {"Authorization": f"Bearer {api_key}"})
     return _parse_models_response("openai", status, body)

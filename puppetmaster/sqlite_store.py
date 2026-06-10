@@ -22,6 +22,7 @@ from puppetmaster.models import (
     task_from_dict,
     to_jsonable,
 )
+from puppetmaster.fs_permissions import chmod_private_file, mkdir_private
 from puppetmaster.store import SwarmStore, _coerce_confidence
 
 _SQLITE_IN_CHUNK = 900
@@ -57,7 +58,7 @@ class SQLiteSwarmStore(SwarmStore):
             self.stream_dir,
             self.locks_dir,
         ]:
-            directory.mkdir(parents=True, exist_ok=True)
+            mkdir_private(directory)
         with self._session() as connection:
             connection.executescript(
                 """
@@ -127,11 +128,13 @@ class SQLiteSwarmStore(SwarmStore):
                 """,
                 (str(self.schema_version),),
             )
+        chmod_private_file(self.db_path)
         self._initialized = True
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path, timeout=5)
         connection.row_factory = sqlite3.Row
+        chmod_private_file(self.db_path)
         return connection
 
     @contextmanager
@@ -868,9 +871,11 @@ class SQLiteSwarmStore(SwarmStore):
             self.job_dir(job_id),
             self.job_dir(job_id) / "summaries",
         ]:
-            directory.mkdir(parents=True, exist_ok=True)
+            mkdir_private(directory)
 
     @staticmethod
     def _dumps(value: Any) -> str:
-        return json.dumps(to_jsonable(value), indent=2, sort_keys=True)
+        from puppetmaster.store import _prepare_for_persistence
+
+        return json.dumps(to_jsonable(_prepare_for_persistence(value)), indent=2, sort_keys=True)
 
