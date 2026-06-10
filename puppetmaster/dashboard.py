@@ -625,30 +625,50 @@ _PAGE_HEAD = r"""<!doctype html>
     color: #8b949e;
     font-size: 13px;
   }
-  #jobs li {
-    margin: 6px 0;
-    display: flex;
+  .job-list {
+    border: 1px solid #21262d;
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .job-row {
+    display: grid;
+    grid-template-columns: 110px max-content minmax(0, 1fr) max-content;
+    gap: 16px;
     align-items: center;
-    gap: 10px;
+    padding: 11px 16px;
+    border-bottom: 1px solid #161b22;
+    text-decoration: none;
+    color: inherit;
+    background: #0f141b;
+    transition: background 0.12s ease;
+  }
+  .job-row:last-child { border-bottom: none; }
+  .job-row:hover {
+    background: #161b22;
+    text-decoration: none;
+  }
+  .job-row .pill { justify-self: start; }
+  .job-id {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    color: #58a6ff;
+    white-space: nowrap;
   }
   .job-goal {
-    flex: 1;
     min-width: 0;
+    color: #8b949e;
+    font-size: 13px;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  .dot {
-    display: inline-block;
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
+  .job-row:hover .job-goal { color: #c9d1d9; }
+  .job-time {
+    color: #6e7681;
+    font-size: 12px;
+    white-space: nowrap;
+    text-align: right;
   }
-  .dot.s-complete { background: #1f6f3f; }
-  .dot.s-running, .dot.s-stitching { background: #9e6a03; }
-  .dot.s-failed { background: #8b2c2c; }
-  .dot.s-queued, .dot.s-blocked { background: #30363d; }
-  .dot.s-stalled { background: #6e4a9e; }
   .task-card {
     border: 1px solid #21262d;
     border-radius: 8px;
@@ -987,6 +1007,22 @@ function truncateGoal(goal, maxChars = 120) {
   return esc(firstLine.substring(0, maxChars)) + "...";
 }
 
+function fmtAgo(iso) {
+  const t = Date.parse(iso || "");
+  if (Number.isNaN(t)) return "";
+  const s = Math.max(0, (Date.now() - t) / 1000);
+  if (s < 60) return "just now";
+  if (s < 3600) return Math.floor(s / 60) + "m ago";
+  if (s < 86400) return Math.floor(s / 3600) + "h ago";
+  return Math.floor(s / 86400) + "d ago";
+}
+
+let jobFilter = "all";
+window.setJobFilter = function(filter) {
+  jobFilter = filter;
+  loadIndex();
+};
+
 async function loadIndex() {
   const r = await fetch("/api/jobs");
   const jobs = await r.json();
@@ -994,13 +1030,41 @@ async function loadIndex() {
   const _home = document.getElementById("home"); if (_home) _home.style.display = "none";
   const _jid = document.getElementById("jobid"); if (_jid) _jid.textContent = "";
   document.getElementById("status").outerHTML = '<span id="status" class="pill s-queued">jobs</span>';
-  let html = '<div class="card"><h2>Jobs</h2><ul id="jobs">';
-  if (!jobs.length) html += '<li class="muted">No jobs in this workspace state dir yet.</li>';
-  for (const j of jobs) {
-    html += `<li><span class="dot s-${esc(j.status)}"></span><a href="?job=${encodeURIComponent(j.id)}">${esc(j.id)}</a> ${pill(j.status)} <span class="muted job-goal" title="${esc(j.goal)}">${truncateGoal(j.goal, 140)}</span></li>`;
+
+  const counts = {};
+  for (const j of jobs) counts[j.status] = (counts[j.status] || 0) + 1;
+  const shown = jobFilter === "all" ? jobs : jobs.filter(j => j.status === jobFilter);
+
+  let html = '<div class="card"><h2>Jobs</h2>';
+  html += '<div class="filter-bar">';
+  html += `<div class="filter-btn ${jobFilter === "all" ? "active" : ""}" onclick="setJobFilter('all')">All (${jobs.length})</div>`;
+  for (const status of Object.keys(counts).sort()) {
+    html += `<div class="filter-btn ${jobFilter === status ? "active" : ""}" onclick="setJobFilter('${esc(status)}')">${esc(status)} (${counts[status]})</div>`;
   }
-  html += "</ul></div>";
-  document.getElementById("content").innerHTML = html;
+  html += '</div>';
+
+  if (!shown.length) {
+    html += '<p class="muted">No jobs in this workspace state dir yet.</p>';
+  } else {
+    html += '<div class="job-list">';
+    for (const j of shown) {
+      html += `<a class="job-row" href="?job=${encodeURIComponent(j.id)}">
+        ${pill(j.status)}
+        <span class="job-id">${esc(j.id)}</span>
+        <span class="job-goal" title="${esc(j.goal)}">${truncateGoal(j.goal, 160)}</span>
+        <span class="job-time">${fmtAgo(j.created_at)}</span>
+      </a>`;
+    }
+    html += '</div>';
+  }
+  html += '</div>';
+
+  // Same no-op guard as the job view: skip DOM writes (and the hover/scroll
+  // disruption they cause) when nothing changed between polls.
+  if (html !== lastContent) {
+    document.getElementById("content").innerHTML = html;
+    lastContent = html;
+  }
 }
 
 function rows(items, cols) {
