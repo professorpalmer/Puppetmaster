@@ -10,8 +10,9 @@ authenticated on this machine right now:
   is present — the SDK only exposes the account's own catalog.
 * **Claude Code** bills the subscription when signed in via OAuth — detected
   by reading the real ``oauthAccount`` (seat tier / org) from ``~/.claude.json``
-  (not mere file existence, which survives a logout) — or per-token to the
-  console account when ``ANTHROPIC_API_KEY`` is set.
+  (not mere file existence, which survives a logout) — per-token to the console
+  account when ``ANTHROPIC_API_KEY`` is set — or per-token to the AWS account
+  when ``CLAUDE_CODE_USE_BEDROCK`` is enabled with usable AWS credentials.
 * **Codex** reads ``~/.codex/auth.json`` (``auth_mode``/``tokens``) directly —
   an API key is out-of-pocket; a ChatGPT login is subscription-covered —
   falling back to ``codex login status`` only when that file is absent.
@@ -113,19 +114,111 @@ def _read_claude_oauth(home: Path) -> "Optional[dict]":
     return None
 
 
+def _is_truthy_env_value(value: Optional[str]) -> bool:
+    """Return True for common truthy env strings ("1", "true"); False for off/empty."""
+    if not value:
+        return False
+    normalized = value.strip().lower()
+    if normalized in ("0", "false", ""):
+        return False
+    return normalized in ("1", "true")
+
+
+def _claude_bedrock_enabled(env: Mapping[str, str], home: Path) -> bool:
+    if _is_truthy_env_value(env.get("CLAUDE_CODE_USE_BEDROCK")):
+        return True
+    import json
+
+    path = home / ".claude" / "settings.json"
+    if not path.is_file():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    env_block = data.get("env")
+    if not isinstance(env_block, dict):
+        return False
+    return _is_truthy_env_value(env_block.get("CLAUDE_CODE_USE_BEDROCK"))
+
+
+def _detect_aws_credentials(env: Mapping[str, str], home: Path) -> "tuple[Optional[str], list[str]]":
+    """Return (credential_kind, evidence) when AWS creds appear usable, else (None, [])."""
+    if env.get("AWS_BEARER_TOKEN_BEDROCK"):
+        return ("bearer_token", ["aws_credentials:bearer_token"])
+    if env.get("AWS_ACCESS_KEY_ID") and env.get("AWS_SECRET_ACCESS_KEY"):
+        return ("env_keys", ["aws_credentials:env_keys"])
+    if env.get("AWS_PROFILE"):
+        return ("profile", ["aws_credentials:profile"])
+    aws_dir = home / ".aws"
+    for name in ("credentials", "config"):
+        path = aws_dir / name
+        if path.is_file() and path.stat().st_size > 0:
+            return ("config_file", ["aws_credentials:config_file"])
+    return (None, [])
+
+
+def _detect_claude_bedrock(
+    env: Mapping[str, str],
+    home: Path,
+) -> "Optional[BillingStatus]":
+    """Return Bedrock billing posture when CLAUDE_CODE_USE_BEDROCK is on, else None."""
+    if not _claude_bedrock_enabled(env, home):
+        return None
+
+    evidence = ["claude_bedrock:enabled"]
+    region = env.get("AWS_REGION") or env.get("AWS_DEFAULT_REGION")
+    region_suffix = f" (region {region})" if region else ""
+
+    cred_kind, cred_evidence = _detect_aws_credentials(env, home)
+    if cred_kind is not None:
+        evidence.extend(cred_evidence)
+        detail = (
+            "CLAUDE_CODE_USE_BEDROCK is enabled — Claude Code bills per-token to "
+            f"the AWS account via Bedrock{region_suffix} (out-of-pocket)."
+        )
+        return BillingStatus(
+            adapter="claude-code",
+            billing="api",
+            healthy=True,
+            detail=detail,
+            evidence=evidence,
+        )
+
+    evidence.append("aws_credentials:missing")
+    return BillingStatus(
+        adapter="claude-code",
+        billing="api",
+        healthy=False,
+        detail=(
+            "CLAUDE_CODE_USE_BEDROCK is set but no AWS credentials were detected — "
+            "run `aws configure`, set AWS_PROFILE, or set AWS_ACCESS_KEY_ID."
+        ),
+        evidence=evidence,
+    )
+
+
 def detect_claude_billing(
     env: Optional[Mapping[str, str]] = None,
     home: Optional[Path] = None,
 ) -> BillingStatus:
-    """Claude Code: OAuth subscription (plan) vs ANTHROPIC_API_KEY (api).
+    """Claude Code: OAuth subscription (plan) vs ANTHROPIC_API_KEY (api) vs Bedrock (api).
 
     Plan detection reads the real ``oauthAccount`` from ``~/.claude.json`` (and
     falls back to ``~/.claude/.credentials.json``) rather than trusting that the
     file merely exists — most users are on a Pro/Max/Team subscription, so this
     is the common path and it must not false-positive on a logged-out config.
+
+    When ``CLAUDE_CODE_USE_BEDROCK`` is enabled (env or ``~/.claude/settings.json``),
+    Bedrock wins over ``ANTHROPIC_API_KEY`` and bills per-token to the AWS account.
     """
     env = env if env is not None else os.environ
     home = home if home is not None else Path.home()
+    bedrock = _detect_claude_bedrock(env, home)
+    if bedrock is not None:
+        return bedrock
     if env.get("ANTHROPIC_API_KEY"):
         return BillingStatus(
             adapter="claude-code",

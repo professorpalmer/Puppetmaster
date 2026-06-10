@@ -7376,6 +7376,127 @@ class PlatformBillingDetectionTests(unittest.TestCase):
             self.assertEqual(s3.billing, "unknown")
             self.assertFalse(s3.healthy)
 
+    def test_claude_billing_bedrock_env_profile(self) -> None:
+        from puppetmaster.platform_billing import detect_claude_billing
+
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            s = detect_claude_billing(
+                env={"CLAUDE_CODE_USE_BEDROCK": "1", "AWS_PROFILE": "myprofile"},
+                home=home,
+            )
+            self.assertEqual(s.billing, "api")
+            self.assertTrue(s.healthy)
+            self.assertIn("claude_bedrock:enabled", s.evidence)
+            self.assertIn("aws_credentials:profile", s.evidence)
+
+    def test_claude_billing_bedrock_env_bearer_token(self) -> None:
+        from puppetmaster.platform_billing import detect_claude_billing
+
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            s = detect_claude_billing(
+                env={
+                    "CLAUDE_CODE_USE_BEDROCK": "true",
+                    "AWS_BEARER_TOKEN_BEDROCK": "tok",
+                },
+                home=home,
+            )
+            self.assertTrue(s.healthy)
+            self.assertIn("claude_bedrock:enabled", s.evidence)
+            self.assertIn("aws_credentials:bearer_token", s.evidence)
+
+    def test_claude_billing_bedrock_settings_json_aws_file(self) -> None:
+        import json as _json
+
+        from puppetmaster.platform_billing import detect_claude_billing
+
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / ".claude").mkdir()
+            (home / ".claude" / "settings.json").write_text(
+                _json.dumps({"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}}),
+                encoding="utf-8",
+            )
+            (home / ".aws").mkdir()
+            (home / ".aws" / "credentials").write_text(
+                "[default]\naws_access_key_id = x\n", encoding="utf-8"
+            )
+            s = detect_claude_billing(env={}, home=home)
+            self.assertTrue(s.healthy)
+            self.assertIn("claude_bedrock:enabled", s.evidence)
+            self.assertIn("aws_credentials:config_file", s.evidence)
+
+    def test_claude_billing_bedrock_no_credentials(self) -> None:
+        from puppetmaster.platform_billing import detect_claude_billing
+
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            s = detect_claude_billing(
+                env={"CLAUDE_CODE_USE_BEDROCK": "1"},
+                home=home,
+            )
+            self.assertEqual(s.billing, "api")
+            self.assertFalse(s.healthy)
+            self.assertIn("claude_bedrock:enabled", s.evidence)
+            self.assertIn("aws_credentials:missing", s.evidence)
+
+    def test_claude_billing_bedrock_disabled_regression(self) -> None:
+        import json as _json
+
+        from puppetmaster.platform_billing import detect_claude_billing
+
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            # unset -> existing oauth/api-key behavior.
+            (home / ".claude.json").write_text(
+                _json.dumps(
+                    {
+                        "oauthAccount": {
+                            "accountUuid": "abc",
+                            "seatTier": "pro",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            s_unset = detect_claude_billing(env={}, home=home)
+            self.assertEqual(s_unset.billing, "plan")
+            self.assertTrue(s_unset.healthy)
+
+            s_zero = detect_claude_billing(
+                env={"CLAUDE_CODE_USE_BEDROCK": "0"},
+                home=home,
+            )
+            self.assertEqual(s_zero.billing, "plan")
+            self.assertTrue(s_zero.healthy)
+
+            s_api = detect_claude_billing(
+                env={"ANTHROPIC_API_KEY": "k"},
+                home=Path(tmp),
+            )
+            self.assertEqual(s_api.billing, "api")
+            self.assertTrue(s_api.healthy)
+
+    def test_claude_billing_bedrock_wins_over_api_key(self) -> None:
+        from puppetmaster.platform_billing import detect_claude_billing
+
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            s = detect_claude_billing(
+                env={
+                    "CLAUDE_CODE_USE_BEDROCK": "1",
+                    "ANTHROPIC_API_KEY": "k",
+                    "AWS_PROFILE": "bedrock",
+                },
+                home=home,
+            )
+            self.assertEqual(s.billing, "api")
+            self.assertTrue(s.healthy)
+            self.assertIn("claude_bedrock:enabled", s.evidence)
+            self.assertIn("aws_credentials:profile", s.evidence)
+            self.assertNotIn("anthropic_api_key:set", s.evidence)
+
     def test_codex_billing_reads_auth_file_first(self) -> None:
         import json as _json
 
