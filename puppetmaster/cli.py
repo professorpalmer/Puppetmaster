@@ -2081,7 +2081,14 @@ def finalize_cli_run(result: Any) -> int:
     if result.mode == "edit":
         from puppetmaster.models import ArtifactType
 
-        diff_present = any(a.type == ArtifactType.PATCH for a in result.artifacts)
+        patch_artifacts = [a for a in result.artifacts if a.type == ArtifactType.PATCH]
+        baseline_diff_present = any(
+            bool((a.payload or {}).get("baseline_diff_present")) for a in result.artifacts
+        )
+        worker_diff_present = any(
+            bool((a.payload or {}).get("worker_diff_present")) for a in result.artifacts
+        )
+        patch_artifact_emitted = bool(patch_artifacts)
         commit_present = any(
             a.type == ArtifactType.GATE
             and (a.payload or {}).get("kind") == "committed"
@@ -2089,7 +2096,10 @@ def finalize_cli_run(result: Any) -> int:
             for a in result.artifacts
         )
         print(
-            f"outcome: diff_present={diff_present} commit_present={commit_present} "
+            f"outcome: baseline_diff_present={baseline_diff_present} "
+            f"worker_diff_present={worker_diff_present} "
+            f"patch_artifact_emitted={patch_artifact_emitted} "
+            f"commit_present={commit_present} "
             f"artifacts={len(result.artifacts)}",
             file=sys.stderr,
         )
