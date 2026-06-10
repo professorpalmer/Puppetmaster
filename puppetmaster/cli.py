@@ -1034,7 +1034,7 @@ def build_parser() -> argparse.ArgumentParser:
         "doctor",
         help=(
             "Diagnose a `Tool execution error. Not connected`: distinguish "
-            "'daemon healthy, stdio pipe dropped (restart MCP in Cursor)' from "
+            "'daemon healthy, stdio pipe dropped (restart the MCP client)' from "
             "'no MCP server alive'."
         ),
     )
@@ -1044,7 +1044,7 @@ def build_parser() -> argparse.ArgumentParser:
         "cleanup",
         help=(
             "Prune dead tracking files; with --kill-stale, terminate stale-but-alive "
-            "MCP servers whose Cursor parent is gone."
+            "MCP servers whose parent client is gone."
         ),
     )
     mcp_cleanup.add_argument(
@@ -2985,10 +2985,10 @@ def _run_mcp_doctor(args) -> int:
     """Diagnose a `Tool execution error. Not connected`.
 
     The actual failure mode the rules document: the Puppetmaster daemon/MCP
-    server is fine, but Cursor's stdio pipe for *this chat* dropped. This
-    separates that (restart MCP in Cursor) from a genuinely dead server (no
-    process tracked) so the user knows whether to restart or to fall back to
-    the CLI and keep working."""
+    server is fine, but this chat's stdio pipe dropped. This separates that
+    (restart the MCP client) from a genuinely dead server (no process tracked)
+    so the user knows whether to restart or to fall back to the CLI and keep
+    working."""
     snapshot = registry_summarize(registry_list_entries())
     alive = snapshot["alive"]
     stale = snapshot["stale"]
@@ -3001,9 +3001,9 @@ def _run_mcp_doctor(args) -> int:
             f"{alive} MCP server(s) alive. The Puppetmaster daemon is healthy."
         )
         remedy = (
-            "If Cursor reports 'Tool execution error. Not connected', the stdio "
-            "pipe for THIS chat dropped — restart the Puppetmaster MCP in Cursor "
-            "Settings (or just keep using the `python -m puppetmaster` CLI; "
+            "If your MCP client reports 'Tool execution error. Not connected', "
+            "the stdio pipe for THIS chat dropped — reconnect Puppetmaster in "
+            "your MCP client settings (or just keep using the `python -m puppetmaster` CLI; "
             "durable state is unaffected)."
         )
     elif tracked > 0:
@@ -3013,14 +3013,16 @@ def _run_mcp_doctor(args) -> int:
         )
         remedy = (
             "Run `python -m puppetmaster mcp cleanup --kill-stale` to clear "
-            "orphans, then restart the Puppetmaster MCP in Cursor Settings."
+            "orphans, then reconnect Puppetmaster in your MCP client settings."
         )
     else:
         verdict = "no_server"
         headline = "No Puppetmaster MCP server is tracked on this machine."
         remedy = (
-            "The server isn't running. Restart the Puppetmaster MCP in Cursor "
-            "Settings, or re-run `python -m puppetmaster install-cursor-mcp`."
+            "Run the MCP installer for your host "
+            "(`python -m puppetmaster install-codex-mcp` or "
+            "`python -m puppetmaster install-cursor-mcp`), then reconnect "
+            "Puppetmaster in your MCP client settings."
         )
 
     if args.json:
