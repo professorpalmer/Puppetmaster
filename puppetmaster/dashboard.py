@@ -430,9 +430,20 @@ function md(text){
   s=s.replace(/\[([^\]]+)\]\(([^)]+)\)/g,(m,x,u)=>/^(https?:|\/|#)/.test(u)?'<a href="'+u+'">'+x+'</a>':x);
   const lines=s.split("\n"); const out=[]; let i=0;
   const ol=/^\d+\.\s+(.+)$/, ul=/^[*-]\s+(.+)$/;
+  // Blank lines between items of the same list ("loose" lists) stay in one
+  // <ol>/<ul>, otherwise every numbered item would restart at 1.
+  const collect=(re,tag)=>{
+    const it=[];
+    while(i<lines.length){
+      if(re.test(lines[i])){it.push("<li>"+lines[i].replace(re,"$1")+"</li>");i++;}
+      else if(lines[i].trim()===""&&i+1<lines.length&&re.test(lines[i+1])){i++;}
+      else break;
+    }
+    out.push("<"+tag+">"+it.join("")+"</"+tag+">");
+  };
   while(i<lines.length){
-    if(ol.test(lines[i])){const it=[];while(i<lines.length&&ol.test(lines[i])){it.push("<li>"+lines[i].replace(ol,"$1")+"</li>");i++;}out.push("<ol>"+it.join("")+"</ol>");}
-    else if(ul.test(lines[i])){const it=[];while(i<lines.length&&ul.test(lines[i])){it.push("<li>"+lines[i].replace(ul,"$1")+"</li>");i++;}out.push("<ul>"+it.join("")+"</ul>");}
+    if(ol.test(lines[i])) collect(ol,"ol");
+    else if(ul.test(lines[i])) collect(ul,"ul");
     else {out.push(lines[i]);i++;}
   }
   s=out.join("\n");
@@ -619,6 +630,13 @@ _PAGE_HEAD = r"""<!doctype html>
     display: flex;
     align-items: center;
     gap: 10px;
+  }
+  .job-goal {
+    flex: 1;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .dot {
     display: inline-block;
@@ -979,7 +997,7 @@ async function loadIndex() {
   let html = '<div class="card"><h2>Jobs</h2><ul id="jobs">';
   if (!jobs.length) html += '<li class="muted">No jobs in this workspace state dir yet.</li>';
   for (const j of jobs) {
-    html += `<li><span class="dot s-${esc(j.status)}"></span><a href="?job=${encodeURIComponent(j.id)}">${esc(j.id)}</a> ${pill(j.status)} <span class="muted">${esc(j.goal)}</span></li>`;
+    html += `<li><span class="dot s-${esc(j.status)}"></span><a href="?job=${encodeURIComponent(j.id)}">${esc(j.id)}</a> ${pill(j.status)} <span class="muted job-goal" title="${esc(j.goal)}">${truncateGoal(j.goal, 140)}</span></li>`;
   }
   html += "</ul></div>";
   document.getElementById("content").innerHTML = html;
@@ -1069,7 +1087,7 @@ function renderTask(task) {
         html += `<span class="conf">confidence: ${act.confidence}</span>`;
       }
 
-      if (act.message && act.message.length > 20) {
+      if (act.message && act.message.length > 20 && act.message !== act.text) {
         html += `<div class="message-block">${md(act.message)}</div>`;
       }
 
