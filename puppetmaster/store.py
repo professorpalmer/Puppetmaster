@@ -512,10 +512,9 @@ class SwarmStore:
         from puppetmaster.models import ArtifactType
 
         verdict = assess_run_quality(artifacts)
-        patch_artifacts = [
-            a for a in artifacts if getattr(a, "type", None) == ArtifactType.PATCH
-        ]
-        diff_present = bool(patch_artifacts)
+        patch_artifact_emitted = any(
+            getattr(a, "type", None) == ArtifactType.PATCH for a in artifacts
+        )
         baseline_diff_present = any(
             bool((getattr(a, "payload", None) or {}).get("baseline_diff_present"))
             for a in artifacts
@@ -524,7 +523,6 @@ class SwarmStore:
             bool((getattr(a, "payload", None) or {}).get("worker_diff_present"))
             for a in artifacts
         )
-        patch_artifact_emitted = bool(patch_artifacts)
         commit_present = any(
             getattr(a, "type", None) == ArtifactType.GATE
             and (getattr(a, "payload", None) or {}).get("kind") == "committed"
@@ -536,7 +534,8 @@ class SwarmStore:
             "trustworthy": verdict["trustworthy"],
             "reasons": verdict.get("reasons", []),
             "artifact_count": len(artifacts),
-            "diff_present": diff_present,
+            # Legacy alias for patch_artifact_emitted; older consumers key on it.
+            "diff_present": patch_artifact_emitted,
             "baseline_diff_present": baseline_diff_present,
             "worker_diff_present": worker_diff_present,
             "patch_artifact_emitted": patch_artifact_emitted,
