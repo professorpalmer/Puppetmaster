@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.9.27
+
+**Feature: AWS Bedrock account support for Claude Code (field report: a Bedrock-authenticated VSCode-extension user read as "not authenticated" and lost every claude-code model).** `detect_claude_billing` only knew OAuth and `ANTHROPIC_API_KEY`, so a `CLAUDE_CODE_USE_BEDROCK` setup had no recognizable credentials: the probe returned unhealthy, `reconcile_registry` dropped all claude-code models, and `doctor` told a working Bedrock user to sign in. Full suite **537** green (+6 focused tests); verified live end to end — aws-vault STS credentials → probe reports `api`/healthy with region → `doctor` flips to ok → real Claude Code completion through Bedrock (`us.anthropic.claude-3-5-haiku`).
+
+- **Bedrock posture detection.** Bedrock mode is recognized from a truthy `CLAUDE_CODE_USE_BEDROCK` in the process env *or* the `env` block of `~/.claude/settings.json` (how the CLI and VSCode extension persist it), parsed defensively like the OAuth probe. The branch is evaluated before `ANTHROPIC_API_KEY`, matching Claude Code's own routing precedence when both are set.
+- **Honest billing classification.** Bedrock bills per-token to the AWS account, so the posture is `api` (out-of-pocket) — never misreported as subscription-covered. Detail includes the AWS region when `AWS_REGION`/`AWS_DEFAULT_REGION` is set.
+- **Presence-based credential health.** `healthy=True` when AWS credentials look usable, checked in order with distinct evidence: `AWS_BEARER_TOKEN_BEDROCK` → `AWS_ACCESS_KEY_ID`+`AWS_SECRET_ACCESS_KEY` → `AWS_PROFILE` → non-empty `~/.aws/credentials`/`config`. Bedrock on with no credentials is honestly unhealthy, with an actionable detail (`aws configure` / `AWS_PROFILE` / `AWS_ACCESS_KEY_ID`).
+- **Known limits.** Credential checks are presence-only by design (no boto3, no network, matching the pure-probe philosophy) — expired STS/SSO sessions still read healthy and fail at dispatch time instead of preflight. Bedrock enabled solely in the VSCode extension's internal settings (not env or `settings.json`) is invisible to subprocess probes. Vertex AI (`CLAUDE_CODE_USE_VERTEX`) is not yet detected.
+
 ## v0.9.26
 
 **Feature: `puppetmaster uninstall` — the exact inverse of `setup` (field report: "How do I uninstall?" had no good answer).** Until now `pip uninstall puppetmaster-ai` removed the code but stranded every host-side integration: dead MCP entries in Cursor/Codex config, `beforeSubmitPrompt` hooks firing a missing module on every prompt submit, and orphaned rules instructing agents to use tools that no longer exist. The new command removes all of it, then tells you to run `pip uninstall puppetmaster-ai` as the final step. Full suite **531** green (+6 focused tests); dry-run verified live against a real install.
