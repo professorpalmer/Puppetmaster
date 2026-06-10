@@ -24,6 +24,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional, Union
 
+from puppetmaster.fs_permissions import mkdir_private, open_private
+
 
 CODEGRAPH_COMMAND = "codegraph"
 MAX_CONTEXT_CHARS = 4000
@@ -745,7 +747,7 @@ def codegraph_lock_path(repo_root: Optional[Union[Path, str]] = None) -> Path:
         directory = Path(base)
     else:
         directory = _default_cache_root() / "puppetmaster"
-    directory.mkdir(parents=True, exist_ok=True)
+    mkdir_private(directory)
     if repo_root is None:
         return directory / "codegraph-indexer.lock"
     resolved = Path(repo_root).expanduser().resolve()
@@ -821,7 +823,7 @@ class CodegraphLock:
         fcntl = _import_fcntl()
         msvcrt = _import_msvcrt() if fcntl is None else None
         flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
-        self._fd = os.open(self.path, flags, 0o644)
+        self._fd = open_private(self.path, flags)
         if fcntl is not None or msvcrt is not None:
             if not self._try_lock(fcntl, msvcrt):
                 # Stale-PID auto-clear: if the lock file records a PID that

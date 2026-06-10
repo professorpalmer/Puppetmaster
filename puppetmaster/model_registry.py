@@ -33,6 +33,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from puppetmaster.fs_permissions import write_private_text
+
 
 REGISTRY_ENV = "PUPPETMASTER_MODELS_PATH"
 
@@ -139,13 +141,10 @@ def save_registry(
 ) -> Path:
     """Persist the registry. Creates parent dirs. Returns the written path."""
     resolved = path or default_registry_path()
-    resolved.parent.mkdir(parents=True, exist_ok=True)
     payload: dict[str, Any] = {
         "models": [_spec_to_jsonable(spec) for spec in specs],
     }
-    resolved.write_text(
-        json.dumps(payload, indent=2, sort_keys=False) + "\n", encoding="utf-8"
-    )
+    write_private_text(resolved, json.dumps(payload, indent=2, sort_keys=False) + "\n")
     return resolved
 
 
@@ -537,8 +536,7 @@ def write_discovery_meta(
     meta = read_discovery_meta(registry_path)
     stamp = now_iso or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     meta[source] = {"refreshed_at": stamp, "count": count}
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    write_private_text(path, json.dumps(meta, indent=2) + "\n")
     return path
 
 

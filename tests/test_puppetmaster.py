@@ -2689,6 +2689,7 @@ class PuppetmasterTests(unittest.TestCase):
             finally:
                 del os.environ["PUPPETMASTER_MCP_REGISTRY_DIR"]
 
+    @unittest.skipIf(os.name == "nt", "parent-process detection uses POSIX ps")
     def test_mcp_registry_detects_parent_process_identity(self) -> None:
         from puppetmaster import mcp_registry
 
@@ -4697,6 +4698,48 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
         self.assertEqual(verification.payload["result"], "failed")
         self.assertEqual(verification.payload["failure"], "timeout")
         self.assertEqual(verification.payload["live_log"], "/tmp/codex_exec_live.log")
+
+    def test_codex_adapter_bypassed_read_only_uses_worktree_guard(self) -> None:
+        from puppetmaster.adapters import verification_artifact
+
+        task = Task(
+            id="t-codex-bypass",
+            job_id="job-codex-bypass",
+            role="codex-review",
+            adapter="codex",
+            instruction="Review the repo.",
+            payload={
+                "cwd": str(Path.cwd()),
+                "sandbox": "read-only",
+                "dangerously_bypass_approvals_and_sandbox": True,
+                "disable_codegraph": True,
+            },
+        )
+        clean = {"sha": "s", "changed_files": [], "untracked_files": [], "diff": ""}
+        blocked = [
+            verification_artifact(
+                task=task,
+                worker_id="worker",
+                adapter="codex",
+                check="guard",
+                result="blocked",
+                confidence=0.9,
+                evidence=["guarded"],
+                payload={"failure": "guarded"},
+            )
+        ]
+        with patch("puppetmaster.adapters.resolve_command", return_value="/usr/bin/codex"), patch(
+            "puppetmaster.adapters.git_snapshot", return_value=clean
+        ), patch(
+            "puppetmaster.adapters.worktree_guard", return_value=blocked
+        ) as guard, patch(
+            "puppetmaster.adapters.run_streamed_subprocess"
+        ) as streamed:
+            artifacts = CodexAdapter().run(task, "goal", "worker")
+
+        guard.assert_called_once()
+        streamed.assert_not_called()
+        self.assertIs(artifacts, blocked)
 
     def test_run_streamed_subprocess_closes_stdin_so_readers_see_eof(self) -> None:
         """The streamed runner must close the child's stdin (DEVNULL). A CLI
@@ -8368,6 +8411,39 @@ class DashboardTests(unittest.TestCase):
             snap = build_job_snapshot(store, job.id)
             self.assertEqual(snap["cost"]["total_estimated_cost_usd"], 0.0)
 
+    def test_extract_metadata_falls_back_to_payload_token_counts(self) -> None:
+        """Adapters without a Claude-style JSON stdout envelope (cursor/codex/
+        openai) still stamp token_usage() counts top-level on the payload —
+        the chips must surface those, flagged when estimated."""
+        from puppetmaster.dashboard import _extract_metadata
+
+        meta = _extract_metadata(
+            {
+                "model": "composer-2.5",
+                "tokens_in": 2646,
+                "tokens_out": 8866,
+                "tokens_estimated": True,
+                "stdout_capture": {"stdout_head_excerpt": "not json {"},
+            }
+        )
+        self.assertEqual(meta["tokens_in"], 2646)
+        self.assertEqual(meta["tokens_out"], 8866)
+        self.assertTrue(meta["tokens_estimated"])
+
+        envelope = json.dumps(
+            {"usage": {"input_tokens": 10, "output_tokens": 20}, "num_turns": 3}
+        )
+        measured = _extract_metadata(
+            {
+                "tokens_in": 999,
+                "tokens_estimated": True,
+                "stdout_capture": {"stdout_head_excerpt": envelope},
+            }
+        )
+        self.assertEqual(measured["tokens_in"], 10)
+        self.assertEqual(measured["tokens_out"], 20)
+        self.assertNotIn("tokens_estimated", measured)
+
     def test_build_job_snapshot_includes_task_activity_and_progress(self) -> None:
         """Each task row carries its instruction plus an artifact-backed
         activity timeline, and PATCH diffs attach to exactly the task that
@@ -8441,6 +8517,9 @@ assert.ok(!xss.includes("javascript:"));
 assert.ok(xss.includes("&lt;script&gt;"));
 // A forged sentinel in artifact text must not dereference the stash.
 assert.ok(!md("\uE000 0 \uE000").includes("undefined"));
+// Loose lists (blank lines between items) stay one list, so numbering
+// continues instead of every item restarting at 1.
+assert.ok(md("1. first\n\n2. second").includes("<ol><li>first</li><li>second</li></ol>"));
 console.log("renderer-ok");
 """
         completed = subprocess.run(
@@ -10001,6 +10080,10 @@ class CodegraphUsageTests(unittest.TestCase):
                             latency_ms=40.0, ok=True, caller="swarm", query_chars=12)
             recs = cu.load_usage()
             self.assertEqual(len(recs), 2)
+            # cwd is a privacy-preserving hash, not the raw path.
+            import hashlib
+            expected = hashlib.sha256(str(Path("/repo").resolve()).encode("utf-8")).hexdigest()[:12]
+            self.assertEqual(recs[0]["cwd"], expected)
             # numbers-only: never stores the query text itself.
             self.assertNotIn("query", recs[0])
             self.assertEqual(recs[0]["context_tokens"], 1000)  # 4000 // 4
@@ -10084,6 +10167,15 @@ class ReadsLogTests(unittest.TestCase):
 class SetupPlatformStepTests(unittest.TestCase):
     """The `setup` wizard's platform-lock step (non-interactive paths)."""
 
+    def setUp(self) -> None:
+        import os
+        from puppetmaster import platform_lock as pl
+
+        self._env_before = {
+            "PUPPETMASTER_MODELS_PATH": os.environ.get("PUPPETMASTER_MODELS_PATH"),
+            pl.ONLY_ENV: os.environ.get(pl.ONLY_ENV),
+        }
+
     def _args(self, **kw):
         from types import SimpleNamespace
         base = {"platforms": None, "skip_platforms": False}
@@ -10098,7 +10190,12 @@ class SetupPlatformStepTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         import os
-        os.environ.pop("PUPPETMASTER_MODELS_PATH", None)
+
+        for key, value in self._env_before.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
     def test_explicit_platforms_sets_lock(self) -> None:
         from puppetmaster.cli import _setup_platform_step
@@ -10440,6 +10537,56 @@ class PuppetmasterFrictionFixTests(unittest.TestCase):
         self.assertTrue(
             spec_edits_files(WorkerSpec(role="c", instruction="x", adapter="claude-code"))
         )
+        self.assertFalse(
+            spec_edits_files(
+                WorkerSpec(
+                    role="audit",
+                    instruction="x",
+                    adapter="claude-code",
+                    payload={"read_only": True},
+                )
+            )
+        )
+        self.assertFalse(
+            spec_edits_files(
+                WorkerSpec(
+                    role="audit",
+                    instruction="x",
+                    adapter="codex",
+                    payload={"no_edit": True},
+                )
+            )
+        )
+        self.assertFalse(
+            spec_edits_files(
+                WorkerSpec(
+                    role="dry-run",
+                    instruction="x",
+                    adapter="codex",
+                    payload={"dry_run": True},
+                )
+            )
+        )
+        self.assertFalse(
+            spec_edits_files(
+                WorkerSpec(
+                    role="dry-run-implement",
+                    instruction="x",
+                    adapter="codex",
+                    payload={"mode": "implement", "dry_run": True},
+                )
+            )
+        )
+        self.assertTrue(
+            spec_edits_files(
+                WorkerSpec(
+                    role="impl",
+                    instruction="x",
+                    adapter="cursor",
+                    payload={"mode": "implement", "review": True},
+                )
+            )
+        )
 
     # --- #2 / #4: stalled-job reaper -----------------------------------
     def test_reaper_marks_dead_orchestrator_job_stalled(self) -> None:
@@ -10648,6 +10795,43 @@ class PuppetmasterFrictionFixTests(unittest.TestCase):
             [specs[0].payload.get("disable_memory") for _, specs in captured],
             [True, True, True],
         )
+
+    def test_direct_codex_read_only_sandbox_sets_generic_no_edit_payload(self) -> None:
+        captured = []
+
+        def fake_run(self, goal, **kwargs):  # noqa: ANN001
+            captured.append((goal, kwargs["specs"]))
+            return object()
+
+        with TemporaryDirectory() as tmp, patch(
+            "puppetmaster.cli.Orchestrator.run", autospec=True, side_effect=fake_run
+        ), patch("puppetmaster.cli.finalize_cli_run", return_value=0):
+            cases = [
+                ("read-only", False, True),
+                ("workspace-write", False, False),
+                ("read-only", True, False),
+            ]
+            for sandbox, bypass, expected_read_only in cases:
+                with self.subTest(sandbox=sandbox, bypass=bypass):
+                    command = [
+                        "--state-dir",
+                        str(Path(tmp) / "state"),
+                        "codex",
+                        f"{sandbox} review",
+                        "--cwd",
+                        tmp,
+                        "--disable-codegraph",
+                        "--sandbox",
+                        sandbox,
+                    ]
+                    if bypass:
+                        command.append("--dangerously-bypass-approvals-and-sandbox")
+                    rc = cli_main(command)
+                    self.assertEqual(rc, 0)
+
+        for (_, specs), (_, _, expected_read_only) in zip(captured, cases):
+            payload = specs[0].payload
+            self.assertEqual(payload.get("read_only", False), expected_read_only)
 
     # --- #10: wait exit codes ------------------------------------------
     def test_wait_returns_nonzero_for_stalled(self) -> None:
@@ -12002,6 +12186,61 @@ class PuppetmasterMcpVerbTests(unittest.TestCase):
         self.assertIn("puppetmaster_rollup", names)
         self.assertIn("puppetmaster_gate", names)
 
+    def test_dashboard_tool_reuses_running_server(self) -> None:
+        import puppetmaster.mcp_server as mcp
+
+        self.assertIn("puppetmaster_dashboard", {tool.name for tool in mcp.tools()})
+        with patch.object(mcp, "_dashboard_alive", return_value=True), patch.object(
+            mcp, "_spawn_dashboard_server"
+        ) as popen:
+            result = mcp.call_tool(
+                "puppetmaster_dashboard", {"cwd": "/tmp", "job_id": "job_abc"}
+            )
+        body = json.loads(result["content"][0]["text"])
+        popen.assert_not_called()
+        self.assertTrue(body["already_running"])
+        self.assertFalse(body["started"])
+        self.assertEqual(body["url"], "http://127.0.0.1:8787/?job=job_abc")
+
+    def test_dashboard_tool_starts_server_when_absent(self) -> None:
+        import puppetmaster.mcp_server as mcp
+
+        spawned = MagicMock()
+        spawned.pid = 4321
+        spawned.poll.return_value = None
+        # alive checks: initial probe (absent), readiness loop, post-loop verify
+        with patch.object(
+            mcp, "_dashboard_alive", side_effect=[False, True, True]
+        ), patch.object(mcp, "_spawn_dashboard_server", return_value=spawned) as popen:
+            result = mcp.call_tool("puppetmaster_dashboard", {"cwd": "/tmp", "port": 9000})
+        body = json.loads(result["content"][0]["text"])
+        command = popen.call_args.args[0]
+        self.assertIn("dashboard", command)
+        self.assertIn("--no-open", command)
+        self.assertIn("9000", command)
+        self.assertTrue(body["started"])
+        self.assertEqual(body["pid"], 4321)
+        self.assertEqual(body["url"], "http://127.0.0.1:9000/")
+
+    def test_dashboard_tool_reports_failed_start(self) -> None:
+        import puppetmaster.mcp_server as mcp
+
+        dead = MagicMock()
+        dead.pid = 4321
+        dead.poll.return_value = 1
+        with patch.object(mcp, "_dashboard_alive", return_value=False), patch.object(
+            mcp, "_spawn_dashboard_server", return_value=dead
+        ):
+            result = mcp.call_tool("puppetmaster_dashboard", {"cwd": "/tmp"})
+        self.assertTrue(result["isError"])
+        body = json.loads(result["content"][0]["text"])
+        self.assertEqual(body["error"], "dashboard failed to start")
+
+    def test_installed_rules_teach_the_dashboard_verb(self) -> None:
+        from puppetmaster.rules import RULE_BODY
+
+        self.assertIn("puppetmaster_dashboard", RULE_BODY)
+
 
 class InvocationGateTests(unittest.TestCase):
     """Tests for the classifier-gated auto-invocation decision."""
@@ -12556,6 +12795,382 @@ class UninstallTests(unittest.TestCase):
             self.assertEqual((cwd / "AGENTS.md").read_text("utf-8"), agents_before)
             self.assertEqual(target.read_text("utf-8"), mcp_before)
             self.assertTrue((cwd / ".cursor" / "rules" / "puppetmaster.mdc").is_file())
+
+
+class AuditFixTests(unittest.TestCase):
+    def test_sqlite_concurrent_claim_has_exactly_one_winner(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("race claim")
+            task = Task(job_id=job.id, role="coder", instruction="work")
+            store.save_task(task)
+
+            barrier = threading.Barrier(2)
+            results: list[Optional[Task]] = []
+            lock = threading.Lock()
+
+            def claim(worker_id: str) -> None:
+                barrier.wait()
+                claimed = store.claim_task(task.id, worker_id, lease_seconds=60)
+                with lock:
+                    results.append(claimed)
+
+            threads = [
+                threading.Thread(target=claim, args=("worker-a",)),
+                threading.Thread(target=claim, args=("worker-b",)),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+
+            winners = [claimed for claimed in results if claimed is not None]
+            self.assertEqual(len(winners), 1)
+            self.assertEqual(store.get_task_by_id(task.id).lease_owner, winners[0].lease_owner)
+
+    def test_lease_fenced_terminal_write_conflict(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("fence terminal writes")
+            task = Task(job_id=job.id, role="coder", instruction="work")
+            store.save_task(task)
+            claimed = store.claim_task(task.id, "worker-a", lease_seconds=60)
+            self.assertIsNotNone(claimed)
+
+            conflict = store.update_task_status(
+                claimed, TaskStatus.COMPLETE, worker_id="worker-b"
+            )
+            self.assertEqual(conflict.status, TaskStatus.RUNNING)
+            self.assertEqual(conflict.lease_owner, "worker-a")
+
+            completed = store.update_task_status(
+                claimed, TaskStatus.COMPLETE, worker_id="worker-a"
+            )
+            self.assertEqual(completed.status, TaskStatus.COMPLETE)
+
+    def test_sqlite_lease_fenced_terminal_write_conflict(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("sqlite fence")
+            task = Task(job_id=job.id, role="coder", instruction="work")
+            store.save_task(task)
+            claimed = store.claim_task(task.id, "worker-a", lease_seconds=60)
+            self.assertIsNotNone(claimed)
+
+            conflict = store.update_task_status(
+                claimed, TaskStatus.COMPLETE, worker_id="worker-b"
+            )
+            self.assertEqual(conflict.status, TaskStatus.RUNNING)
+
+    def test_acquire_lock_breaks_stale_task_lock(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            lock_path = store.locks_dir / "task_task123.lock"
+            lock_path.write_text(
+                json.dumps({"owner": "dead-worker", "at": time.time() - 120}),
+                encoding="utf-8",
+            )
+            self.assertTrue(store.acquire_lock("task:task123", "worker-b", ttl_seconds=30))
+
+    def test_gate_command_parses_string_without_shell(self) -> None:
+        from puppetmaster import gates
+
+        command = "touch gate-marker.txt"
+        with patch("puppetmaster.gates.subprocess.run") as run_mock:
+            run_mock.return_value = subprocess.CompletedProcess(
+                ["touch", "gate-marker.txt"], 0, "", ""
+            )
+            gates._run(command, Path(tempfile.gettempdir()), timeout=5)
+        argv = run_mock.call_args.args[0]
+        if os.name == "nt":
+            # Windows: raw string handed to CreateProcess (shlex would eat
+            # C:\path backslashes); still no cmd.exe involved.
+            self.assertEqual(argv, command)
+        else:
+            self.assertEqual(argv, ["touch", "gate-marker.txt"])
+        self.assertFalse(run_mock.call_args.kwargs.get("shell"))
+
+    def test_gate_engine_error_fails_closed_for_gated_tasks(self) -> None:
+        from puppetmaster.gates import GateEvaluation
+        from puppetmaster.worker_runtime import WorkerRuntime
+
+        store = MagicMock()
+        runtime = WorkerRuntime(
+            store=store,
+            job_id="job_x",
+            role="coder",
+            worker_id="worker-a",
+        )
+        task = Task(
+            job_id="job_x",
+            role="coder",
+            instruction="do work",
+            payload={"gates": [{"kind": "require_diff"}]},
+        )
+        with patch(
+            "puppetmaster.gates.evaluate_task_gates",
+            side_effect=RuntimeError("boom"),
+        ):
+            evaluation = runtime._evaluate_gates(task, [])
+        self.assertIsInstance(evaluation, GateEvaluation)
+        self.assertFalse(evaluation.passed)
+        self.assertIn("gate_engine_error", evaluation.failed_reason or "")
+
+    def test_gate_engine_error_passes_through_ungated_tasks(self) -> None:
+        from puppetmaster.gates import GateEvaluation
+        from puppetmaster.worker_runtime import WorkerRuntime
+
+        store = MagicMock()
+        runtime = WorkerRuntime(
+            store=store,
+            job_id="job_x",
+            role="coder",
+            worker_id="worker-a",
+        )
+        task = Task(job_id="job_x", role="coder", instruction="do work")
+        with patch(
+            "puppetmaster.gates.evaluate_task_gates",
+            side_effect=RuntimeError("boom"),
+        ):
+            evaluation = runtime._evaluate_gates(task, [])
+        self.assertTrue(evaluation.passed)
+
+    def test_heartbeat_lease_loss_sets_abort_signal(self) -> None:
+        from puppetmaster.worker_runtime import WorkerRuntime
+
+        store = MagicMock()
+        store.heartbeat_run.side_effect = lambda run: run
+        store.renew_task_lease.return_value = None
+        runtime = WorkerRuntime(
+            store=store,
+            job_id="job_x",
+            role="coder",
+            worker_id="worker-a",
+            poll_seconds=0.01,
+        )
+        stop = threading.Event()
+        run = MagicMock()
+        runtime._heartbeat_until_stopped(run, "task_x", stop)
+        self.assertTrue(stop.is_set())
+        self.assertTrue(runtime._lease_lost.is_set())
+
+    def test_redact_secrets_scrubs_argument_supplied_keys(self) -> None:
+        from puppetmaster.redaction import (
+            clear_registered_secrets,
+            redact_secrets,
+            register_secret_value,
+        )
+
+        clear_registered_secrets()
+        secret = "sk-argument-supplied-test-key-1234567890"
+        register_secret_value(secret)
+        redacted = redact_secrets(f"Authorization: Bearer {secret}") or ""
+        self.assertNotIn(secret, redacted)
+        self.assertIn("<secret:redacted>", redacted)
+        clear_registered_secrets()
+
+    def test_redact_secrets_catches_common_token_shapes(self) -> None:
+        from puppetmaster.redaction import redact_secrets
+
+        # Fake fixtures assembled at runtime so secret scanners (e.g. GitHub
+        # push protection) don't flag the literal source as a leaked token.
+        fake_slack = "xoxb-" + "1234567890-1234567890-" + "abcdefghijklmnopqrst"
+        fake_github = "ghp_" + "1234567890abcdefghijklmnopqrstuvwxyz"
+        samples = {
+            fake_github: "ghp_<redacted>",
+            "AKIAIOSFODNN7EXAMPLE": "AKIA<redacted>",
+            fake_slack: "xoxb-<redacted>",
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature": "eyJ<redacted>",
+        }
+        for raw, needle in samples.items():
+            redacted = redact_secrets(raw) or ""
+            self.assertIn(needle, redacted, msg=raw)
+            self.assertNotIn(raw, redacted, msg=raw)
+
+    def test_sqlite_stalled_job_sets_completed_at(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("stall")
+            updated = store.update_job_status(job.id, JobStatus.STALLED)
+            self.assertIsNotNone(updated.completed_at)
+
+    def test_sqlite_save_run_emits_event_in_same_transaction(self) -> None:
+        from puppetmaster.models import AgentRun
+
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("atomic run event")
+            task = Task(job_id=job.id, role="coder", instruction="work")
+            store.save_task(task)
+            run = AgentRun(job_id=job.id, task_id=task.id, role="coder", worker_id="w")
+            store.save_run(run)
+            events = store.read_events(job.id)
+            self.assertTrue(any(event["event"] == "run.saved" for event in events))
+
+    def test_file_claim_compare_and_swap_blocks_double_winner(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("file cas")
+            task = Task(job_id=job.id, role="coder", instruction="work")
+            store.save_task(task)
+
+            first = store.claim_task(task.id, "worker-a", lease_seconds=60)
+            second = store.claim_task(task.id, "worker-b", lease_seconds=60)
+            self.assertIsNotNone(first)
+            self.assertIsNone(second)
+            self.assertEqual(store.get_task_by_id(task.id).lease_owner, "worker-a")
+
+
+class SecurityHardeningTests(unittest.TestCase):
+    """Privacy/security defaults from the cross-cutting hardening pass."""
+
+    def test_run_streamed_subprocess_redacts_live_log_not_stdout(self) -> None:
+        from puppetmaster.adapters import run_streamed_subprocess
+
+        secret = "super-secret-openai-key-xyz123456"
+        with TemporaryDirectory() as tmp:
+            os.environ["PUPPETMASTER_STATE_DIR"] = tmp
+            with patch.dict(os.environ, {"OPENAI_API_KEY": secret}, clear=False):
+                task = Task(
+                    id="t-redact-live",
+                    job_id="job-redact-live",
+                    role="codex-review",
+                    adapter="codex",
+                    instruction="x",
+                    payload={},
+                )
+                result = run_streamed_subprocess(
+                    command=[
+                        sys.executable,
+                        "-c",
+                        "import os; print(os.environ.get('OPENAI_API_KEY', ''))",
+                    ],
+                    env=os.environ.copy(),
+                    task=task,
+                    sidecar_name="secret_probe",
+                    timeout_seconds=10,
+                )
+                self.assertIn(secret, result.stdout)
+                self.assertIsNotNone(result.live_log_path)
+                live_text = Path(result.live_log_path).read_text(encoding="utf-8")
+                self.assertNotIn(secret, live_text)
+                self.assertIn("redacted", live_text.lower())
+            os.environ.pop("PUPPETMASTER_STATE_DIR", None)
+
+    def test_shell_adapter_redacts_verification_stdout_stderr(self) -> None:
+        from puppetmaster.adapters import ShellAdapter
+
+        secret = "sk-leaked-shell-secret-key-abc12345"
+        with patch.dict(os.environ, {"OPENAI_API_KEY": secret}, clear=False), patch(
+            "puppetmaster.adapters.subprocess.run",
+            return_value=MagicMock(
+                returncode=0,
+                stdout=f"before {secret} after",
+                stderr=f"err {secret}",
+            ),
+        ):
+            artifacts = ShellAdapter().run(
+                Task(
+                    id="t-shell",
+                    job_id="job-shell",
+                    role="verify",
+                    adapter="shell",
+                    instruction="run",
+                    payload={"command": ["echo", "hi"]},
+                ),
+                "goal",
+                "worker-shell",
+            )
+
+        payload = artifacts[0].payload
+        self.assertNotIn(secret, payload["stdout"])
+        self.assertNotIn(secret, payload["stderr"])
+
+    def test_task_payload_api_keys_scrubbed_on_persist(self) -> None:
+        for backend in ("file", "sqlite"):
+            with self.subTest(backend=backend), TemporaryDirectory() as tmp:
+                root = Path(tmp) / ".puppetmaster"
+                store = SwarmStore(root) if backend == "file" else SQLiteSwarmStore(root)
+                store.init()
+                job = store.create_job("scrub secrets")
+                task = Task(
+                    id="task-secret",
+                    job_id=job.id,
+                    role="openai-review",
+                    adapter="openai",
+                    instruction="review",
+                    payload={
+                        "openai_api_key": "sk-live-in-memory",
+                        "custom_token": "tok-live",
+                        "model": "gpt-5.4-mini",
+                    },
+                )
+                store.save_task(task)
+                loaded = store.get_task_by_id(task.id)
+                self.assertEqual(loaded.payload["openai_api_key"], "<redacted>")
+                self.assertEqual(loaded.payload["custom_token"], "<redacted>")
+                self.assertEqual(loaded.payload["model"], "gpt-5.4-mini")
+                self.assertEqual(task.payload["openai_api_key"], "sk-live-in-memory")
+
+    def test_codegraph_usage_stores_hashed_cwd_not_raw_path(self) -> None:
+        import hashlib
+
+        from puppetmaster import codegraph_usage as cu
+
+        raw = "/secret/acme/proprietary-repo"
+        expected = hashlib.sha256(str(Path(raw).resolve()).encode("utf-8")).hexdigest()[:12]
+        with TemporaryDirectory() as tmp:
+            os.environ["PUPPETMASTER_CODEGRAPH_USAGE_LOG"] = str(Path(tmp) / "usage.jsonl")
+            cu.record_query(
+                command="search",
+                cwd=raw,
+                result_chars=100,
+                latency_ms=1.0,
+                ok=True,
+            )
+            rec = cu.load_usage()[0]
+            self.assertEqual(rec["cwd"], expected)
+            self.assertNotIn("proprietary", rec["cwd"])
+        os.environ.pop("PUPPETMASTER_CODEGRAPH_USAGE_LOG", None)
+
+    def test_fetch_openai_models_refuses_untrusted_base_url(self) -> None:
+        from puppetmaster.api_discovery import ApiDiscoveryError, fetch_openai_models
+
+        with self.assertRaises(ApiDiscoveryError) as ctx:
+            fetch_openai_models(
+                env={
+                    "OPENAI_API_KEY": "sk-test",
+                    "OPENAI_BASE_URL": "https://evil.example.com/v1",
+                },
+                getter=lambda u, h: (200, '{"data":[]}'),
+            )
+        self.assertIn("untrusted host", str(ctx.exception).lower())
+
+    def test_probe_openai_refuses_untrusted_base_url(self) -> None:
+        from puppetmaster.preflight import _probe_openai
+
+        rc, _out, err = _probe_openai(
+            "gpt-5.4-mini",
+            {
+                "OPENAI_API_KEY": "sk-test",
+                "OPENAI_BASE_URL": "https://evil.example.com/v1",
+            },
+        )
+        self.assertEqual(rc, 1)
+        self.assertIn("untrusted host", err.lower())
+
+    @unittest.skipUnless(os.name != "nt", "POSIX-only permission check")
+    def test_sensitive_state_dirs_created_owner_only(self) -> None:
+        from puppetmaster.fs_permissions import supports_posix_modes
+        from puppetmaster.state import ensure_state_dir
+
+        if not supports_posix_modes():
+            self.skipTest("POSIX modes unavailable")
+        with TemporaryDirectory() as tmp:
+            state_dir = ensure_state_dir(Path(tmp) / "nested" / "state")
+            mode = state_dir.stat().st_mode & 0o777
+            self.assertEqual(mode, 0o700)
 
 
 if __name__ == "__main__":

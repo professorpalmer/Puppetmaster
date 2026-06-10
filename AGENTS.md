@@ -86,7 +86,7 @@ Puppetmaster keeps a **read-only, local, numbers-only** ledger of what it saved,
 
 ## MCP surface (quick reference)
 
-Orchestration: `puppetmaster_doctor`, `puppetmaster_start_swarm`, `puppetmaster_start_cursor_swarm`, `puppetmaster_start_cursor_review`, `puppetmaster_start_cursor_plan`, `puppetmaster_start_claude_implement`, `puppetmaster_status`, `puppetmaster_logs`, `puppetmaster_live_artifacts`, `puppetmaster_live_artifacts_follow`, `puppetmaster_partial_summary`, `puppetmaster_artifacts`, `puppetmaster_show`, `puppetmaster_last_job`.
+Orchestration: `puppetmaster_doctor`, `puppetmaster_start_swarm`, `puppetmaster_start_cursor_swarm`, `puppetmaster_start_cursor_review`, `puppetmaster_start_cursor_plan`, `puppetmaster_start_claude_implement`, `puppetmaster_status`, `puppetmaster_logs`, `puppetmaster_live_artifacts`, `puppetmaster_live_artifacts_follow`, `puppetmaster_partial_summary`, `puppetmaster_artifacts`, `puppetmaster_show`, `puppetmaster_last_job`, `puppetmaster_dashboard`.
 
 Bundled CodeGraph: `puppetmaster_codegraph_search`, `puppetmaster_codegraph_context`, `puppetmaster_codegraph_affected`, `puppetmaster_codegraph_files`, `puppetmaster_codegraph_status`, `puppetmaster_codegraph_init`.
 
@@ -188,7 +188,11 @@ tooling — do not pretend the tools exist.
    for full-edit builds.
 3. `puppetmaster_artifacts <job_id>` — read structured outputs at zero
    token cost (results persist in SQLite).
-4. `puppetmaster_doctor` — sanity-check Puppetmaster's runtime
+4. `puppetmaster_dashboard [job_id]` — when the user asks to see/open
+   the job dashboard, call this (it starts the local server if needed)
+   and open the returned URL in a browser tab for them. CLI fallback:
+   `python -m puppetmaster dashboard [job_id]`.
+5. `puppetmaster_doctor` — sanity-check Puppetmaster's runtime
    dependencies once per session.
 
 If `puppetmaster_doctor` reports critical failures, surface them to

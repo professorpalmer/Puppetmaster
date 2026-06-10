@@ -24,6 +24,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
+from puppetmaster.fs_permissions import write_private_text
 from puppetmaster.model_registry import default_registry_path
 
 # The user-billable adapters the lock governs. ``shell`` and any future
@@ -58,11 +59,8 @@ def _read_disabled(registry_path: Optional[Path] = None) -> set[str]:
 
 def _write_disabled(disabled: set[str], registry_path: Optional[Path] = None) -> Path:
     path = platform_config_path(registry_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Persist a stable, known-only, sorted list so the file stays readable
-    # and forward entries we don't recognise don't accumulate.
     payload = {"disabled": sorted(a for a in disabled if a in KNOWN_ADAPTERS)}
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    write_private_text(path, json.dumps(payload, indent=2) + "\n")
     return path
 
 

@@ -40,6 +40,7 @@ class WorkerRuntime:
         self.poll_seconds = poll_seconds
         self.simulate_seconds = simulate_seconds
         self.crash_after_claim = crash_after_claim
+        self._lease_lost = threading.Event()
 
     def run_once(self) -> bool:
         task = self.store.claim_next_task(
@@ -85,6 +86,13 @@ class WorkerRuntime:
                 task,
                 self.store.get_job(self.job_id).goal,
             )
+            if self._lease_lost.is_set():
+                self.store.emit(
+                    self.job_id,
+                    "worker.lease_lost",
+                    {"worker_id": self.worker_id, "task_id": task.id, "role": self.role},
+                )
+                return True
             for artifact in artifacts:
                 self.store.save_artifact(artifact)
         except Exception as exc:
@@ -95,7 +103,7 @@ class WorkerRuntime:
                 completed_at=now_iso(),
             )
             self.store.save_run(failed_run)
-            self.store.update_task_status(task, TaskStatus.FAILED)
+            self.store.update_task_status(task, TaskStatus.FAILED, worker_id=self.worker_id)
             self.store.emit(
                 self.job_id,
                 "worker.failed_task",
@@ -127,7 +135,9 @@ class WorkerRuntime:
                 completed_at=now_iso(),
             )
             self.store.save_run(failed_run)
-            updated = self.store.update_task_status(task, TaskStatus.FAILED)
+            updated = self.store.update_task_status(
+                task, TaskStatus.FAILED, worker_id=self.worker_id
+            )
             self.store.emit(
                 self.job_id,
                 "worker.failed_task",
@@ -156,7 +166,9 @@ class WorkerRuntime:
                 completed_at=now_iso(),
             )
             self.store.save_run(failed_run)
-            updated = self.store.update_task_status(task, TaskStatus.FAILED)
+            updated = self.store.update_task_status(
+                task, TaskStatus.FAILED, worker_id=self.worker_id
+            )
             self.store.emit(
                 self.job_id,
                 "worker.gate_failed",
@@ -177,7 +189,9 @@ class WorkerRuntime:
             completed_at=now_iso(),
         )
         self.store.save_run(completed_run)
-        updated = self.store.update_task_status(task, TaskStatus.COMPLETE)
+        updated = self.store.update_task_status(
+            task, TaskStatus.COMPLETE, worker_id=self.worker_id
+        )
         self.store.emit(
             self.job_id,
             "worker.completed_task",
@@ -187,11 +201,16 @@ class WorkerRuntime:
         return True
 
     def _evaluate_gates(self, task, artifacts: list):
-        """Evaluate this task's completion gates. Never let a gate-engine error
-        crash the run — on an internal failure, pass (gates are opt-in and must
-        not break ungated tasks)."""
-        from puppetmaster.gates import GateEvaluation, evaluate_task_gates
+        """Evaluate this task's completion gates. Ungated tasks pass through;
+        gated tasks fail closed when the gate engine raises."""
+        from puppetmaster.gates import (
+            GateEvaluation,
+            GateResult,
+            evaluate_task_gates,
+            task_gate_specs,
+        )
 
+        has_gates = bool(task_gate_specs(task))
         try:
             return evaluate_task_gates(
                 task, artifacts, self.store, worker_id=self.worker_id
@@ -202,7 +221,20 @@ class WorkerRuntime:
                 "worker.gate_error",
                 {"worker_id": self.worker_id, "task_id": task.id, "error": str(exc)},
             )
-            return GateEvaluation(passed=True, results=[], artifacts=[])
+            if not has_gates:
+                return GateEvaluation(passed=True, results=[], artifacts=[])
+            return GateEvaluation(
+                passed=False,
+                results=[
+                    GateResult(
+                        name="gate_engine",
+                        kind="internal",
+                        passed=False,
+                        reason="gate_engine_error",
+                    )
+                ],
+                artifacts=[],
+            )
 
     def _emit_live_task_span(self, task, artifacts: list) -> None:
         """Emit a live OTel span for this finished task. No-op unless live
@@ -268,7 +300,13 @@ class WorkerRuntime:
     ) -> None:
         while not stop.wait(self.poll_seconds):
             run = self.store.heartbeat_run(run)
-            self.store.renew_task_lease(task_id, self.worker_id, self.lease_seconds)
+            renewed = self.store.renew_task_lease(
+                task_id, self.worker_id, self.lease_seconds
+            )
+            if renewed is None:
+                self._lease_lost.set()
+                stop.set()
+                return
 
     def run_until_idle(self) -> int:
         completed = 0
