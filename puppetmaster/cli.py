@@ -4284,7 +4284,8 @@ def _run_mcp_list(args) -> int:
         f"{snapshot['dead']} dead)"
     )
     print(
-        f"  {'PID':>7}  {'STATE':<6}  {'AGE':>8}  {'HBEAT':>8}  WORKSPACE"
+        f"  {'PID':>7}  {'STATE':<6}  {'AGE':>8}  {'HBEAT':>8}  "
+        f"{'PPID':>7}  {'PARENT':<12}  WORKSPACE"
     )
     for row in snapshot["servers"]:
         if not row["alive"]:
@@ -4294,10 +4295,14 @@ def _run_mcp_list(args) -> int:
         else:
             state = "ok"
         workspace = row.get("workspace") or "-"
+        parent_pid = row.get("parent_pid") or "-"
+        parent_process = row.get("parent_process") or "-"
         print(
             f"  {row['pid']:>7}  {state:<6}  "
             f"{row['age_seconds']:>8.0f}s  "
             f"{row['heartbeat_age_seconds']:>8.0f}s  "
+            f"{parent_pid:>7}  "
+            f"{parent_process:<12}  "
             f"{workspace}"
         )
     return 0
@@ -4494,4 +4499,3 @@ def cursor_prompt(
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
