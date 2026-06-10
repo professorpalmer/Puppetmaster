@@ -1592,6 +1592,8 @@ def classify_codex_failure(output: str) -> str:
         return "rate_limit"
     if "billing" in lowered or "quota" in lowered or "credit" in lowered:
         return "billing_or_quota"
+    if "model_not_found" in lowered:
+        return "model_unavailable"
     if "model" in lowered and ("unavailable" in lowered or "not found" in lowered or "invalid" in lowered):
         return "model_unavailable"
     if "command not found" in lowered:
@@ -2458,6 +2460,8 @@ def classify_openai_failure(body: str, http_status: Optional[int] = None) -> str
         return "missing_api_key"
     if "rate limit" in lowered:
         return "rate_limit"
+    if "model_not_found" in lowered:
+        return "model_unavailable"
     if "model" in lowered and ("not found" in lowered or "unavailable" in lowered):
         return "model_unavailable"
     if "context length" in lowered or "maximum context" in lowered:
@@ -2535,7 +2539,15 @@ def classify_cursor_failure(output: str) -> str:
         return "missing_api_key"
     if "cannot find package" in lowered or "@cursor/sdk" in lowered and "not found" in lowered:
         return "sdk_not_installed"
-    if "model" in lowered and ("unavailable" in lowered or "not found" in lowered or "invalid" in lowered):
+    if (
+        "forbidden-model" in lowered
+        or ("forbidden" in lowered and "model" in lowered)
+        or ("unknown" in lowered and "model" in lowered)
+        or (
+            "model" in lowered
+            and ("unavailable" in lowered or "not found" in lowered or "invalid" in lowered)
+        )
+    ):
         return "model_unavailable"
     if "timeout" in lowered or "timed out" in lowered:
         return "timeout"
@@ -2548,14 +2560,24 @@ def classify_claude_code_failure(output: str) -> str:
     lowered = output.lower()
     if "credit balance" in lowered or "billing" in lowered or "quota" in lowered:
         return "billing_or_quota"
-    if "command not found" in lowered or "not found" in lowered:
+    if (
+        "not_found_error" in lowered
+        or "permission_error" in lowered
+        or (
+            "model" in lowered
+            and ("unavailable" in lowered or "invalid" in lowered or "not found" in lowered)
+        )
+        or ("permission" in lowered and "model" in lowered)
+        or ("not allowed" in lowered and "model" in lowered)
+        or ("denied" in lowered and "model" in lowered)
+    ):
+        return "model_unavailable"
+    if "command not found" in lowered:
         return "missing_cli"
     if "auth" in lowered or "login" in lowered or "api key" in lowered:
         return "not_authenticated"
     if "permission" in lowered or "not allowed" in lowered or "denied" in lowered:
         return "permission_denied"
-    if "model" in lowered and ("unavailable" in lowered or "invalid" in lowered or "not found" in lowered):
-        return "model_unavailable"
     if "timeout" in lowered or "timed out" in lowered:
         return "timeout"
     return "unknown"

@@ -164,10 +164,11 @@ def starter_registry() -> list[ModelSpec]:
 
     Tier IDs (``cursor/composer-2-5``, ``cursor/gpt-5-5``,
     ``claude-code/opus-4-6``, ``claude-code/opus-4-7``,
-    ``claude-code/opus-4-8``) reflect a common mental model where the
-    cheap tier is Cursor's house model, the balanced tier is GPT, and
-    the frontier tiers are Anthropic Opus — with Opus 4.8 as the current
-    top-of-stack flagship. ``adapter_model_name`` values are the literal strings each
+    ``claude-code/opus-4-8``, ``cursor/fable-5``, ``claude-code/fable-5``)
+    reflect a common mental model where the cheap tier is Cursor's house
+    model, the balanced tier is GPT, and the frontier tiers are Anthropic
+    Opus — with Claude Fable 5 as the current top-of-stack flagship above
+    Opus 4.8. ``adapter_model_name`` values are the literal strings each
     adapter passes through to its SDK / CLI today (verified against
     Cursor's runtime model catalog and Anthropic's claude CLI), so
     the starter registry is callable end-to-end without edits.
@@ -294,19 +295,73 @@ def starter_registry() -> list[ModelSpec]:
                 "long-context",
             ],
             notes=(
-                "Frontier flagship (the router's top tier). Anthropic Opus "
-                "4.8 via the Claude Code CLI, released 2026-05-28. Builds on "
-                "Opus 4.7 with across-the-board benchmark gains, a 1M-token "
-                "context window, and codebase-scale parallel-subagent work — "
-                "at the SAME $5/$25 per-MTok price as 4.7, so it strictly "
-                "dominates 4.7 for the hardest tasks (detailed-vision, deep "
-                "reasoning, security audits, red-team). capability_score=99 "
-                "makes it the default pick whenever the task's required "
-                "capability exceeds Opus 4.7 (98), and the highest-capability "
-                "fallback when no model fully meets the need. A faster, "
-                "pricier 'fast mode' ($10/$50 per MTok) exists for "
-                "latency-sensitive work — add it as a separate entry if you "
-                "want the router to consider it."
+                "Previous frontier flagship. Anthropic Opus 4.8 via the "
+                "Claude Code CLI, released 2026-05-28. Builds on Opus 4.7 with "
+                "across-the-board benchmark gains, a 1M-token context window, "
+                "and codebase-scale parallel-subagent work — at the SAME $5/$25 "
+                "per-MTok price as 4.7. Superseded by claude-code/fable-5 "
+                "(capability_score=100) for the absolute-hardest tasks; kept so "
+                "existing routing configs and cost history stay valid and it "
+                "remains the best fallback when Fable 5 is unavailable on an "
+                "account. A faster, pricier 'fast mode' ($10/$50 per MTok) "
+                "exists for latency-sensitive work — add it as a separate "
+                "entry if you want the router to consider it."
+            ),
+        ),
+        ModelSpec(
+            id="cursor/fable-5",
+            adapter="cursor",
+            adapter_model_name="fable-5",
+            capability_score=100,
+            input_per_mtok_usd=0.0,
+            output_per_mtok_usd=0.0,
+            context_window=0,
+            billing="plan",
+            tags=[
+                "cursor",
+                "frontier",
+                "mythos-class",
+                "reasoning",
+                "code",
+                "long-context",
+                "vision",
+                "detailed-vision",
+            ],
+            notes=(
+                "Frontier flagship on Cursor. Anthropic Claude Fable 5 via the "
+                "Cursor SDK (released 2026-06-09). Billed through your Cursor "
+                "plan ($0 marginal from the router's perspective). SOTA on "
+                "CursorBench; capability_score=100 makes it the default pick "
+                "for the hardest tasks when your plan exposes fable-5."
+            ),
+        ),
+        ModelSpec(
+            id="claude-code/fable-5",
+            adapter="claude-code",
+            adapter_model_name="claude-fable-5",
+            capability_score=100,
+            input_per_mtok_usd=10.0,
+            output_per_mtok_usd=50.0,
+            context_window=1_000_000,
+            billing="unknown",
+            tags=[
+                "claude",
+                "frontier",
+                "mythos-class",
+                "vision",
+                "detailed-vision",
+                "reasoning",
+                "code",
+                "long-context",
+            ],
+            notes=(
+                "Frontier flagship. Anthropic Claude Fable 5 via the Claude "
+                "Code CLI (API id claude-fable-5, released 2026-06-09). "
+                "Subscription access is staged and ends 2026-06-22; many "
+                "enterprise plans do not include it yet — expect "
+                "model_unavailable and auto-fallback to claude-code/opus-4-8 "
+                "or a plan-billed cursor/* alternate when absent. Pricing "
+                "reflects the public fast-mode rate ($10/$50 per MTok)."
             ),
         ),
         # OpenAI tier — uses the openai adapter directly with OPENAI_API_KEY,

@@ -26,6 +26,7 @@ RECOVERABLE_FAILURES = frozenset(
         "missing_cli",
         "auth",
         "authentication",
+        "model_unavailable",
     }
 )
 

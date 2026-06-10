@@ -1269,6 +1269,14 @@ class PuppetmasterTests(unittest.TestCase):
     def test_cursor_failure_classification_is_actionable(self) -> None:
         self.assertEqual(classify_cursor_failure("CURSOR_API_KEY is required"), "missing_api_key")
         self.assertEqual(classify_cursor_failure("model invalid"), "model_unavailable")
+        self.assertEqual(
+            classify_cursor_failure("forbidden-model: fable-5 is not on your plan"),
+            "model_unavailable",
+        )
+        self.assertEqual(
+            classify_cursor_failure("unknown model fable-5 rejected by Cursor SDK"),
+            "model_unavailable",
+        )
         self.assertEqual(classify_cursor_failure("operation timed out"), "timeout")
 
     def test_cursor_adapter_parses_sdk_result_into_artifacts(self) -> None:
@@ -3778,6 +3786,20 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertEqual(classify_claude_code_failure("Credit balance is too low"), "billing_or_quota")
         self.assertEqual(classify_claude_code_failure("permission denied"), "permission_denied")
         self.assertEqual(classify_claude_code_failure("model invalid"), "model_unavailable")
+        self.assertEqual(
+            classify_claude_code_failure(
+                '{"type":"error","error":{"type":"not_found_error",'
+                '"message":"model: claude-fable-5"}}'
+            ),
+            "model_unavailable",
+        )
+        self.assertEqual(
+            classify_claude_code_failure(
+                '{"type":"error","error":{"type":"permission_error",'
+                '"message":"model claude-fable-5 is not permitted"}}'
+            ),
+            "model_unavailable",
+        )
 
     def test_claude_code_adapter_defaults_to_opus_4_8(self) -> None:
         """With no model pinned (and no router stamp), the claude-code adapter
@@ -4440,6 +4462,10 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
             classify_codex_failure("the requested model is not found"),
             "model_unavailable",
         )
+        self.assertEqual(
+            classify_codex_failure('{"error":{"code":"model_not_found"}}'),
+            "model_unavailable",
+        )
         self.assertEqual(classify_codex_failure("request timed out"), "timeout")
         self.assertEqual(classify_codex_failure("DNS resolution failed"), "network_error")
         self.assertEqual(classify_codex_failure("approval was denied by user"), "approval_denied")
@@ -5068,6 +5094,45 @@ class ModelRouterTests(unittest.TestCase):
         )
         self.assertEqual(classify_capability_needed(signal), 80)
 
+    def test_classifier_ceiling_tracks_fable_5_frontier(self) -> None:
+        from puppetmaster.router import TaskSignals, classify_capability_needed
+
+        signal = TaskSignals(
+            instruction=(
+                "security audit across every module with detailed vision on "
+                "every screenshot and cross-repo architecture review"
+            ),
+            role="security-review",
+            payload_size_chars=25_000,
+            explicit_min_capability=100,
+        )
+        self.assertEqual(classify_capability_needed(signal), 100)
+
+    def test_starter_registry_includes_fable_5_entries(self) -> None:
+        from puppetmaster.model_registry import starter_registry
+
+        registry = {spec.id: spec for spec in starter_registry()}
+        self.assertIn("cursor/fable-5", registry)
+        self.assertIn("claude-code/fable-5", registry)
+
+        cursor_fable = registry["cursor/fable-5"]
+        self.assertEqual(cursor_fable.adapter, "cursor")
+        self.assertEqual(cursor_fable.adapter_model_name, "fable-5")
+        self.assertEqual(cursor_fable.capability_score, 100)
+        self.assertEqual(cursor_fable.billing, "plan")
+        self.assertEqual(cursor_fable.input_per_mtok_usd, 0.0)
+        self.assertIn("mythos-class", cursor_fable.tags)
+
+        claude_fable = registry["claude-code/fable-5"]
+        self.assertEqual(claude_fable.adapter, "claude-code")
+        self.assertEqual(claude_fable.adapter_model_name, "claude-fable-5")
+        self.assertEqual(claude_fable.capability_score, 100)
+        self.assertEqual(claude_fable.input_per_mtok_usd, 10.0)
+        self.assertEqual(claude_fable.output_per_mtok_usd, 50.0)
+        self.assertEqual(claude_fable.context_window, 1_000_000)
+        self.assertEqual(claude_fable.billing, "unknown")
+        self.assertIn("2026-06-22", claude_fable.notes)
+
     def test_balanced_policy_picks_cheapest_sufficient_model(self) -> None:
         from puppetmaster.router import TaskSignals, route_task
 
@@ -5384,12 +5449,12 @@ class ModelRouterTests(unittest.TestCase):
         rejected_ids = {spec.id for spec, _ in decision.rejected}
         self.assertIn("cursor/composer-2-5", rejected_ids)
         self.assertIn("cursor/gpt-5-5", rejected_ids)
-        # And under quality policy, the frontier flagship opus-4-8 (cap 99)
-        # now wins over opus-4-7 (98) and gpt-5.5 (96).
+        # And under quality policy, the plan-billed cursor/fable-5 (cap 100)
+        # wins over claude-code/fable-5, opus-4-8 (99), and gpt-5.5 (96).
         quality_decision = route_task(
             signal, starter_registry(), policy="quality"
         )
-        self.assertEqual(quality_decision.model.id, "claude-code/opus-4-8")
+        self.assertEqual(quality_decision.model.id, "cursor/fable-5")
 
     def test_starter_registry_encodes_four_tiers(self) -> None:
         from puppetmaster.model_registry import starter_registry
@@ -5414,15 +5479,21 @@ class ModelRouterTests(unittest.TestCase):
             by_id["claude-code/opus-4-6"].capability_score,
             by_id["claude-code/opus-4-7"].capability_score,
         )
-        # Opus 4.8 is the new frontier flagship — strictly above 4.7 and the
+        # Fable 5 is the frontier flagship — strictly above Opus 4.8 and the
         # single highest-capability model in the starter registry.
         self.assertIn("claude-code/opus-4-8", ids)
+        self.assertIn("cursor/fable-5", ids)
+        self.assertIn("claude-code/fable-5", ids)
         self.assertLess(
             by_id["claude-code/opus-4-7"].capability_score,
             by_id["claude-code/opus-4-8"].capability_score,
         )
-        self.assertEqual(
+        self.assertLess(
             by_id["claude-code/opus-4-8"].capability_score,
+            by_id["claude-code/fable-5"].capability_score,
+        )
+        self.assertEqual(
+            by_id["claude-code/fable-5"].capability_score,
             max(s.capability_score for s in specs),
         )
         # Same per-token price as 4.7 (it strictly dominates) with a far
@@ -5445,9 +5516,9 @@ class ModelRouterTests(unittest.TestCase):
             "detailed-vision", by_id["claude-code/opus-4-6"].tags
         )
 
-    def test_starter_registry_routes_hardest_task_to_opus_4_8(self) -> None:
+    def test_starter_registry_routes_hardest_task_to_fable_5(self) -> None:
         """The absolute-hardest tasks must route to the frontier flagship
-        (Opus 4.8), not saturate one notch below it on the older 4.7."""
+        (Fable 5), not saturate one notch below it on Opus 4.8."""
         from puppetmaster.model_registry import starter_registry
         from puppetmaster.router import TaskSignals, route_task
 
@@ -5459,11 +5530,11 @@ class ModelRouterTests(unittest.TestCase):
             role="security-review",
         )
         decision = route_task(signal, starter_registry(), policy="balanced")
-        self.assertEqual(decision.model.id, "claude-code/opus-4-8")
-        # 4.7 should be in the rejected set (sufficient-but-not-chosen), proving
-        # the flagship was preferred for the hardest tier.
+        self.assertEqual(decision.model.id, "cursor/fable-5")
+        # Opus 4.8 should be in the rejected set (sufficient-but-not-chosen),
+        # proving the flagship was preferred for the hardest tier.
         rejected_ids = {spec.id for spec, _ in decision.rejected}
-        self.assertIn("claude-code/opus-4-7", rejected_ids)
+        self.assertIn("claude-code/opus-4-8", rejected_ids)
 
     def test_starter_registry_routes_easy_task_to_composer(self) -> None:
         from puppetmaster.model_registry import starter_registry
@@ -6235,6 +6306,10 @@ class OpenAIAdapterTests(unittest.TestCase):
         )
         self.assertEqual(
             classify_openai_failure("model not found", None), "model_unavailable"
+        )
+        self.assertEqual(
+            classify_openai_failure('{"error":{"code":"model_not_found"}}', None),
+            "model_unavailable",
         )
         self.assertEqual(
             classify_openai_failure("maximum context length", None),
@@ -7076,6 +7151,27 @@ class CursorDiscoveryTests(unittest.TestCase):
         self.assertEqual(spec.adapter, "cursor")
         self.assertIn("frontier", spec.tags)
 
+    def test_catalog_inherits_fable_5_frontier_kin(self) -> None:
+        from puppetmaster.cursor_discovery import catalog_to_specs
+        from puppetmaster.model_registry import ModelSpec
+
+        existing = [
+            ModelSpec(
+                id="claude-code/fable-5",
+                adapter="claude-code",
+                adapter_model_name="claude-fable-5",
+                capability_score=100,
+                context_window=1_000_000,
+                tags=["frontier", "mythos-class", "long-context"],
+            )
+        ]
+        catalog = [{"id": "fable-5", "displayName": "Claude Fable 5"}]
+        spec = catalog_to_specs(catalog, existing)[0]
+        self.assertEqual(spec.capability_score, 100)
+        self.assertEqual(spec.adapter_model_name, "fable-5")
+        self.assertEqual(spec.billing, "plan")
+        self.assertIn("mythos-class", spec.tags)
+
     def test_merge_drops_stale_and_preserves_non_cursor(self) -> None:
         from puppetmaster.cursor_discovery import merge_catalog_into_registry
         from puppetmaster.model_registry import ModelSpec
@@ -7369,7 +7465,10 @@ class EnsurePlanCatalogTests(unittest.TestCase):
         from puppetmaster.model_registry import save_registry, starter_registry
 
         path = Path(tmp) / "models.json"
-        save_registry(starter_registry(), path)
+        # Thin starter: drop the seeded plan-billed frontier so discovery tests
+        # still exercise the no-frontier first-run path.
+        thin = [s for s in starter_registry() if s.id != "cursor/fable-5"]
+        save_registry(thin, path)
         return path
 
     def test_skips_when_plan_frontier_already_present(self) -> None:
@@ -7794,6 +7893,99 @@ class AutoFallbackTests(unittest.TestCase):
             self.assertEqual(updated.payload["fallback_attempts"], 1)
             self.assertEqual(updated.payload["fallback_from_adapter"], "claude-code")
 
+    def test_model_unavailable_on_fable_5_reroutes_to_opus_4_8(self) -> None:
+        from unittest.mock import patch
+
+        from puppetmaster.model_registry import ModelSpec
+        from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
+        from puppetmaster.orchestrator import Orchestrator
+        from puppetmaster.platform_billing import BillingStatus
+        from puppetmaster.store import SwarmStore
+
+        registry = [
+            ModelSpec(
+                id="claude-code/fable-5",
+                adapter="claude-code",
+                adapter_model_name="claude-fable-5",
+                capability_score=100,
+                input_per_mtok_usd=10.0,
+                output_per_mtok_usd=50.0,
+                billing="unknown",
+            ),
+            ModelSpec(
+                id="claude-code/opus-4-8",
+                adapter="claude-code",
+                adapter_model_name="claude-opus-4-8",
+                capability_score=99,
+                input_per_mtok_usd=5.0,
+                output_per_mtok_usd=25.0,
+                billing="unknown",
+            ),
+            ModelSpec(
+                id="cursor/opus-4-8",
+                adapter="cursor",
+                adapter_model_name="claude-opus-4-8",
+                capability_score=99,
+                billing="plan",
+                tags=["cursor"],
+            ),
+        ]
+
+        def _billing(adapter, **kw):
+            if adapter == "cursor":
+                return BillingStatus(adapter="cursor", billing="plan", healthy=True, detail="ok", evidence=[])
+            return BillingStatus(adapter=adapter, billing="unknown", healthy=False, detail="no", evidence=[])
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("frontier task")
+            task = Task(
+                job_id=job.id,
+                role="audit",
+                instruction="security audit across every module",
+                adapter="claude-code",
+                status=TaskStatus.FAILED,
+                payload={
+                    "auto_route": True,
+                    "model": "claude-fable-5",
+                    "router_model_id": "claude-code/fable-5",
+                },
+            )
+            store.save_task(task)
+            store.save_artifact(
+                Artifact(
+                    job_id=job.id,
+                    task_id=task.id,
+                    type=ArtifactType.VERIFICATION,
+                    created_by="w",
+                    payload={
+                        "check": "x",
+                        "result": "blocked",
+                        "failure": "model_unavailable",
+                        "adapter": "claude-code",
+                    },
+                    confidence=0.5,
+                    evidence=["adapter:claude-code"],
+                )
+            )
+            orch = Orchestrator(store)
+            with patch("puppetmaster.model_registry.load_registry", return_value=registry), \
+                 patch("puppetmaster.platform_billing.detect_adapter_billing", side_effect=_billing):
+                rerouted = orch._reroute_recoverable_failures(job)
+            self.assertEqual(rerouted, 1)
+            updated = store.get_task_by_id(task.id)
+            self.assertEqual(updated.status, TaskStatus.QUEUED)
+            self.assertEqual(updated.adapter, "cursor")
+            self.assertEqual(updated.payload["model"], "claude-opus-4-8")
+            self.assertEqual(updated.payload["fallback_from_adapter"], "claude-code")
+            routing = [
+                a for a in store.list_artifacts(job.id)
+                if a.type == ArtifactType.ROUTING and a.created_by == "router-fallback"
+            ]
+            self.assertEqual(len(routing), 1)
+            self.assertEqual(routing[0].payload["fallback_reason"], "model_unavailable")
+            self.assertEqual(routing[0].payload["model_id"], "cursor/opus-4-8")
+
     def test_no_funded_alternate_means_no_reroute(self) -> None:
         from unittest.mock import patch
 
@@ -8041,7 +8233,8 @@ class SubscriptionPlanCatalogTests(unittest.TestCase):
         from puppetmaster.model_registry import save_registry, starter_registry
 
         path = Path(tmp) / "models.json"
-        save_registry(starter_registry(), path)
+        thin = [s for s in starter_registry() if s.id != "cursor/fable-5"]
+        save_registry(thin, path)
         return path
 
     def test_plan_merge_zeroes_price_preserves_id_and_capability(self) -> None:
