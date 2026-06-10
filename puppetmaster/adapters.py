@@ -181,7 +181,7 @@ def run_streamed_subprocess(
             return
         try:
             with write_lock:
-                live_handle.write(line)
+                live_handle.write(redact_secrets(line) or "")
                 live_handle.flush()
         except Exception:
             pass
@@ -528,8 +528,8 @@ class ShellAdapter:
                     evidence=[f"command:{' '.join(command)}", "timeout"],
                     payload={
                         "returncode": None,
-                        "stdout": (exc.stdout or "")[-4000:],
-                        "stderr": (exc.stderr or "")[-4000:],
+                        "stdout": _redacted_tail(exc.stdout, 4000),
+                        "stderr": _redacted_tail(exc.stderr, 4000),
                         "timeout_seconds": timeout_seconds,
                     },
                 )
@@ -545,8 +545,8 @@ class ShellAdapter:
                 evidence=[f"command:{' '.join(command)}"],
                 payload={
                     "returncode": completed.returncode,
-                    "stdout": completed.stdout[-4000:],
-                    "stderr": completed.stderr[-4000:],
+                    "stdout": _redacted_tail(completed.stdout, 4000),
+                    "stderr": _redacted_tail(completed.stderr, 4000),
                 },
             )
         ]
@@ -2382,7 +2382,7 @@ class OpenAIAdapter:
                         "returncode": exc.code,
                         "model": model,
                         "failure": classify_openai_failure(err_body, exc.code),
-                        "stderr": err_body[-8000:],
+                        "stderr": _redacted_tail(err_body, 8000),
                     },
                 )
             ]
