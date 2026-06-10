@@ -117,3 +117,81 @@ If any `puppetmaster_*` MCP tool returns `Tool execution error. Not connected`, 
 Read-only commands (`show`/`artifacts`/`logs`/`feed`/`status`) auto-pivot to whichever project state dir owns the job — no need to export `PUPPETMASTER_STATE_DIR`. Only ask the user to restart MCP in Cursor Settings when `python -m puppetmaster mcp list` shows zero alive servers.
 
 **Always invoke CodeGraph through `python -m puppetmaster codegraph …`, never a bare `codegraph …` from the shell.** A bare shell call runs under your shell's Node, whose ABI usually differs from Cursor's bundled Node that compiled better-sqlite3 — so it dies with a `NODE_MODULE_VERSION` / native-load error. The `python -m puppetmaster codegraph` passthrough runs it under Cursor's Node and auto-rebuilds the binding on a mismatch (the MCP `puppetmaster_codegraph_*` tools already do this internally).
+
+<!-- puppetmaster:rules:begin -->
+<!-- managed by `puppetmaster install-rules`; delete this whole block to disable -->
+
+# Puppetmaster orchestration
+
+Puppetmaster is an MCP-based agent orchestrator with structured worker
+swarms, durable SQLite state, tiered model routing, and zero-token
+follow-ups via stored artifacts. When Puppetmaster's MCP server is
+registered (`puppetmaster install-cursor-mcp` or
+`puppetmaster install-codex-mcp`), the `puppetmaster_*` MCP tools are
+available in this environment.
+
+## Trigger convention (must obey)
+
+When the user says **"Use Puppetmaster to …"**, **"PM this …"**, or
+otherwise names Puppetmaster for a task, route that work through the
+`puppetmaster_*` MCP tools — do not answer inline.
+
+## Delegate-first gate (default path)
+
+Before attempting multi-step work inline, start a Puppetmaster verb
+(`puppetmaster_start_cursor_swarm`, `puppetmaster_start_swarm`,
+`puppetmaster_start_implement`, or the matching sync verbs) when the
+task is any of:
+
+- Multi-file (3+ files) or cross-cutting refactor/migration
+- An audit, review, or "find all X" search
+- Work whose result will be reused later in this or a future session
+
+Swarms and reviews run read-only analysis; building goes through
+implement. Recall prior results with `puppetmaster_artifacts <job_id>`
+at zero token cost.
+
+Reach for a Puppetmaster verb **before** native broad search/exploration:
+prefer `puppetmaster_codegraph_search` / `_context` over a repo-wide
+`Grep`/`Glob`/`find`, and a swarm over the built-in `Task` tool, for any
+multi-file investigation. When unsure whether a task qualifies, run the
+classifier-backed gate — `puppetmaster_route_task` (or
+`puppetmaster should-delegate "<prompt>"`) — which returns a delegate /
+inline verdict and a suggested verb with zero LLM cost.
+
+For deterministic enforcement, the user can install host hooks
+(`puppetmaster install-hooks`) that inject this directive on prompt submit
+and deny-redirect broad native exploration automatically. The kill switch
+is `PUPPETMASTER_AUTO_INVOKE_DISABLED=1`.
+
+## When NOT to use Puppetmaster (stay inline)
+
+- Trivial single-file edits, typos, one-line fixes
+- Quick factual questions
+- Fast interactive iteration where the user is steering turn-by-turn
+
+Routing those through Puppetmaster wastes tokens and latency.
+
+## Fallback
+
+If `puppetmaster_*` tools are not connected, fall back to native
+tooling — do not pretend the tools exist.
+
+## Usage
+
+1. `puppetmaster_route_task <prompt> --role <role>` — dry-run that
+   returns the chosen model, estimated cost, and reasoning. Use
+   whenever spend matters or the task is ambiguous.
+2. `puppetmaster_start_cursor_swarm` / `puppetmaster_start_swarm` for
+   read-only analysis; `puppetmaster_start_implement` /
+   `puppetmaster_start_claude_implement` / `puppetmaster_start_codex`
+   for full-edit builds.
+3. `puppetmaster_artifacts <job_id>` — read structured outputs at zero
+   token cost (results persist in SQLite).
+4. `puppetmaster_doctor` — sanity-check Puppetmaster's runtime
+   dependencies once per session.
+
+If `puppetmaster_doctor` reports critical failures, surface them to
+the user before continuing.
+
+<!-- puppetmaster:rules:end -->
