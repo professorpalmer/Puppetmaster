@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.9.25
+
+**Fix: every relative link in the README 404'd on PyPI (field report from Slack — `pypi.org/project/puppetmaster-ai/docs/WHY.md`).** GitHub rewrites relative markdown links into the repo; PyPI's renderer does no such rewriting, so all `docs/*.md` links, directory links, and the three `<img src="docs/...">` tags were broken on the project page. All 27 relative refs are now absolute (`github.com/...` for links, `raw.githubusercontent.com/...` for images). Docs-only; no code changes. (v0.9.24 shipped the absolute-link rewrite; v0.9.25 follows up because PyPI *also* strips heading `id`s — verified against `readme_renderer`, PyPI's own pipeline — so the in-page anchor links `#what-it-does` / `#quickstart` / `#auto-invocation` pointed at nothing and now target the GitHub README's anchors.)
+
+- **Known limits.** Anchor links on the PyPI page now bounce readers to GitHub instead of jumping in-page — the only behavior PyPI supports. PyPI never re-renders a published version's description, hence the two version bumps for a README fix.
+
 ## v0.9.23
 
 **Fix: a Claude-Code-plan user's swarms never routed to Claude Code (field report, reproduced with diagnostics).** Three coordinated defects, all fixed: the router costed every model at its *nominal* registry price (so a plan-billed Claude model with real $5/$25 prices lost every cost comparison to a $0 plan peer and got costed out of budgets on dollars the user would never spend); the main routing path (`_apply_auto_routing`) never reconciled detected billing/health onto the registry (OAuth-plan Claude stayed `unknown`-billed, credential-less adapters stayed candidates and could only fail preflight); and even when a plan model was picked, the ROUTING artifact reported the fictional nominal cost, poisoning the savings ledger. Full suite **525** green; cross-platform stress harness ALL GREEN.
