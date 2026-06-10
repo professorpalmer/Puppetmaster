@@ -13,7 +13,13 @@ from __future__ import annotations
 import os
 import re
 import threading
-from typing import Optional
+from typing import Any, Optional
+
+_REDACTED_PLACEHOLDER = "<redacted>"
+_SECRET_KEY_SUFFIXES = ("_api_key", "_token", "_secret")
+_EXPLICIT_SECRET_KEYS = frozenset(
+    {"openai_api_key", "anthropic_api_key", "cursor_api_key"}
+)
 
 # Live values of these env vars are replaced wherever they appear verbatim.
 _SECRET_ENV_VARS = (
@@ -81,3 +87,24 @@ def redact_secrets(text: Optional[str]) -> Optional[str]:
     redacted = _SECRET_AWS.sub("AKIA<redacted>", redacted)
     redacted = _SECRET_SLACK.sub("xoxb-<redacted>", redacted)
     return _SECRET_JWT.sub("eyJ<redacted>", redacted)
+
+
+def _is_secret_payload_key(key: str) -> bool:
+    lower = key.lower()
+    if lower in _EXPLICIT_SECRET_KEYS:
+        return True
+    return any(lower.endswith(suffix) for suffix in _SECRET_KEY_SUFFIXES)
+
+
+def redact_payload_for_storage(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of ``payload`` with secret-bearing keys replaced for persistence."""
+    if not payload:
+        return payload
+    return {
+        key: (
+            _REDACTED_PLACEHOLDER
+            if _is_secret_payload_key(key) and value not in (None, "")
+            else value
+        )
+        for key, value in payload.items()
+    }

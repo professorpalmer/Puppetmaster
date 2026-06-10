@@ -10026,6 +10026,10 @@ class CodegraphUsageTests(unittest.TestCase):
                             latency_ms=40.0, ok=True, caller="swarm", query_chars=12)
             recs = cu.load_usage()
             self.assertEqual(len(recs), 2)
+            # cwd is a privacy-preserving hash, not the raw path.
+            import hashlib
+            expected = hashlib.sha256(str(Path("/repo").resolve()).encode("utf-8")).hexdigest()[:12]
+            self.assertEqual(recs[0]["cwd"], expected)
             # numbers-only: never stores the query text itself.
             self.assertNotIn("query", recs[0])
             self.assertEqual(recs[0]["context_tokens"], 1000)  # 4000 // 4
@@ -12840,6 +12844,157 @@ class AuditFixTests(unittest.TestCase):
             self.assertIsNotNone(first)
             self.assertIsNone(second)
             self.assertEqual(store.get_task_by_id(task.id).lease_owner, "worker-a")
+
+
+class SecurityHardeningTests(unittest.TestCase):
+    """Privacy/security defaults from the cross-cutting hardening pass."""
+
+    def test_run_streamed_subprocess_redacts_live_log_not_stdout(self) -> None:
+        from puppetmaster.adapters import run_streamed_subprocess
+
+        secret = "super-secret-openai-key-xyz123456"
+        with TemporaryDirectory() as tmp:
+            os.environ["PUPPETMASTER_STATE_DIR"] = tmp
+            with patch.dict(os.environ, {"OPENAI_API_KEY": secret}, clear=False):
+                task = Task(
+                    id="t-redact-live",
+                    job_id="job-redact-live",
+                    role="codex-review",
+                    adapter="codex",
+                    instruction="x",
+                    payload={},
+                )
+                result = run_streamed_subprocess(
+                    command=[
+                        sys.executable,
+                        "-c",
+                        "import os; print(os.environ.get('OPENAI_API_KEY', ''))",
+                    ],
+                    env=os.environ.copy(),
+                    task=task,
+                    sidecar_name="secret_probe",
+                    timeout_seconds=10,
+                )
+                self.assertIn(secret, result.stdout)
+                self.assertIsNotNone(result.live_log_path)
+                live_text = Path(result.live_log_path).read_text(encoding="utf-8")
+                self.assertNotIn(secret, live_text)
+                self.assertIn("redacted", live_text.lower())
+            os.environ.pop("PUPPETMASTER_STATE_DIR", None)
+
+    def test_shell_adapter_redacts_verification_stdout_stderr(self) -> None:
+        from puppetmaster.adapters import ShellAdapter
+
+        secret = "sk-leaked-shell-secret-key-abc12345"
+        with patch.dict(os.environ, {"OPENAI_API_KEY": secret}, clear=False), patch(
+            "puppetmaster.adapters.subprocess.run",
+            return_value=MagicMock(
+                returncode=0,
+                stdout=f"before {secret} after",
+                stderr=f"err {secret}",
+            ),
+        ):
+            artifacts = ShellAdapter().run(
+                Task(
+                    id="t-shell",
+                    job_id="job-shell",
+                    role="verify",
+                    adapter="shell",
+                    instruction="run",
+                    payload={"command": ["echo", "hi"]},
+                ),
+                "goal",
+                "worker-shell",
+            )
+
+        payload = artifacts[0].payload
+        self.assertNotIn(secret, payload["stdout"])
+        self.assertNotIn(secret, payload["stderr"])
+
+    def test_task_payload_api_keys_scrubbed_on_persist(self) -> None:
+        for backend in ("file", "sqlite"):
+            with self.subTest(backend=backend), TemporaryDirectory() as tmp:
+                root = Path(tmp) / ".puppetmaster"
+                store = SwarmStore(root) if backend == "file" else SQLiteSwarmStore(root)
+                store.init()
+                job = store.create_job("scrub secrets")
+                task = Task(
+                    id="task-secret",
+                    job_id=job.id,
+                    role="openai-review",
+                    adapter="openai",
+                    instruction="review",
+                    payload={
+                        "openai_api_key": "sk-live-in-memory",
+                        "custom_token": "tok-live",
+                        "model": "gpt-5.4-mini",
+                    },
+                )
+                store.save_task(task)
+                loaded = store.get_task_by_id(task.id)
+                self.assertEqual(loaded.payload["openai_api_key"], "<redacted>")
+                self.assertEqual(loaded.payload["custom_token"], "<redacted>")
+                self.assertEqual(loaded.payload["model"], "gpt-5.4-mini")
+                self.assertEqual(task.payload["openai_api_key"], "sk-live-in-memory")
+
+    def test_codegraph_usage_stores_hashed_cwd_not_raw_path(self) -> None:
+        import hashlib
+
+        from puppetmaster import codegraph_usage as cu
+
+        raw = "/secret/acme/proprietary-repo"
+        expected = hashlib.sha256(str(Path(raw).resolve()).encode("utf-8")).hexdigest()[:12]
+        with TemporaryDirectory() as tmp:
+            os.environ["PUPPETMASTER_CODEGRAPH_USAGE_LOG"] = str(Path(tmp) / "usage.jsonl")
+            cu.record_query(
+                command="search",
+                cwd=raw,
+                result_chars=100,
+                latency_ms=1.0,
+                ok=True,
+            )
+            rec = cu.load_usage()[0]
+            self.assertEqual(rec["cwd"], expected)
+            self.assertNotIn("proprietary", rec["cwd"])
+        os.environ.pop("PUPPETMASTER_CODEGRAPH_USAGE_LOG", None)
+
+    def test_fetch_openai_models_refuses_untrusted_base_url(self) -> None:
+        from puppetmaster.api_discovery import ApiDiscoveryError, fetch_openai_models
+
+        with self.assertRaises(ApiDiscoveryError) as ctx:
+            fetch_openai_models(
+                env={
+                    "OPENAI_API_KEY": "sk-test",
+                    "OPENAI_BASE_URL": "https://evil.example.com/v1",
+                },
+                getter=lambda u, h: (200, '{"data":[]}'),
+            )
+        self.assertIn("untrusted host", str(ctx.exception).lower())
+
+    def test_probe_openai_refuses_untrusted_base_url(self) -> None:
+        from puppetmaster.preflight import _probe_openai
+
+        rc, _out, err = _probe_openai(
+            "gpt-5.4-mini",
+            {
+                "OPENAI_API_KEY": "sk-test",
+                "OPENAI_BASE_URL": "https://evil.example.com/v1",
+            },
+        )
+        self.assertEqual(rc, 1)
+        self.assertIn("untrusted host", err.lower())
+
+    @unittest.skipUnless(os.name != "nt", "POSIX-only permission check")
+    def test_sensitive_state_dirs_created_owner_only(self) -> None:
+        from puppetmaster.fs_permissions import supports_posix_modes
+        from puppetmaster.state import ensure_state_dir
+
+        if not supports_posix_modes():
+            self.skipTest("POSIX modes unavailable")
+        with TemporaryDirectory() as tmp:
+            state_dir = ensure_state_dir(Path(tmp) / "nested" / "state")
+            mode = state_dir.stat().st_mode & 0o777
+            self.assertEqual(mode, 0o700)
 
 
 if __name__ == "__main__":

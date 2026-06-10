@@ -25,7 +25,9 @@ from puppetmaster.models import (
     task_from_dict,
     to_jsonable,
 )
-from puppetmaster.state import resolve_state_dir
+from puppetmaster.redaction import redact_payload_for_storage
+from puppetmaster.fs_permissions import chmod_private_file, mkdir_private
+from puppetmaster.state import ensure_state_dir, resolve_state_dir
 
 _WINDOWS_LOCK_RETRIES = 10
 _WINDOWS_LOCK_BACKOFF_SECONDS = 0.02
@@ -50,6 +52,15 @@ def _retry_on_windows_lock(operation):
     raise last_error  # type: ignore[misc]
 
 
+def _prepare_for_persistence(value: Any) -> Any:
+    if isinstance(value, Task):
+        return replace(
+            value,
+            payload=redact_payload_for_storage(value.payload),
+        )
+    return value
+
+
 class SwarmStore:
     """File-backed coordination store with Redis-like key spaces."""
 
@@ -58,6 +69,7 @@ class SwarmStore:
 
     def __init__(self, root: Optional[Union[Path, str]] = None) -> None:
         self.root = resolve_state_dir(root)
+        ensure_state_dir(self.root)
         self.jobs_dir = self.root / "jobs"
         self.memory_dir = self.root / "memory"
         self.stream_dir = self.root / "streams"
@@ -75,7 +87,7 @@ class SwarmStore:
             self.stream_dir,
             self.locks_dir,
         ]:
-            directory.mkdir(parents=True, exist_ok=True)
+            mkdir_private(directory)
 
     def create_job(self, goal: str) -> Job:
         self.init()
@@ -88,7 +100,7 @@ class SwarmStore:
             job_dir / "artifacts",
             job_dir / "summaries",
         ]:
-            directory.mkdir(parents=True, exist_ok=True)
+            mkdir_private(directory)
         self.write_json(job_dir / "job.json", job)
         self.emit(job.id, "job.created", {"goal": goal})
         return job
@@ -784,16 +796,23 @@ class SwarmStore:
 
     @staticmethod
     def write_json(path: Path, value: Any) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        mkdir_private(path.parent)
         temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         temp_path.write_text(
-            json.dumps(to_jsonable(value), indent=2, sort_keys=True) + "\n",
+            json.dumps(
+                to_jsonable(_prepare_for_persistence(value)),
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
             encoding="utf-8",
         )
+        chmod_private_file(temp_path)
         # On Windows os.replace raises PermissionError when a concurrent reader
         # holds the destination open; on POSIX the rename is atomic and this
         # retry never triggers. Keeps cross-process task writes from flaking.
         _retry_on_windows_lock(lambda: os.replace(temp_path, path))
+        chmod_private_file(path)
 
     @staticmethod
     def read_json(path: Path) -> dict[str, Any]:

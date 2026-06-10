@@ -282,6 +282,8 @@ def _probe_openai(model: Optional[str], env: Mapping[str, str]) -> "tuple[int, s
     import urllib.error
     import urllib.request
 
+    from puppetmaster.openai_security import DEFAULT_OPENAI_BASE_URL, validate_openai_base_url
+
     api_key = env.get("OPENAI_API_KEY")
     if not api_key:
         return (1, "", "OPENAI_API_KEY not set")
@@ -289,7 +291,10 @@ def _probe_openai(model: Optional[str], env: Mapping[str, str]) -> "tuple[int, s
         from puppetmaster.adapters import DEFAULT_OPENAI_MODEL as _default_model
     except Exception:  # pragma: no cover - defensive
         _default_model = "gpt-5.4-mini"
-    base = env.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    base = env.get("OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL).rstrip("/")
+    base_url_error = validate_openai_base_url(base)
+    if base_url_error is not None:
+        return (1, "", base_url_error)
     resolved_model = model or _default_model
 
     def _post(token_param: str) -> "tuple[int, str, str]":
