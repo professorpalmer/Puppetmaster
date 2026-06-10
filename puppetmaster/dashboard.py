@@ -953,6 +953,7 @@ _PAGE_HEAD = r"""<!doctype html>
     padding: 6px 12px;
     cursor: pointer;
     font-size: 12px;
+    font-family: inherit;
     color: #c9d1d9;
     user-select: none;
   }
@@ -1037,9 +1038,9 @@ async function loadIndex() {
 
   let html = '<div class="card"><h2>Jobs</h2>';
   html += '<div class="filter-bar">';
-  html += `<div class="filter-btn ${jobFilter === "all" ? "active" : ""}" onclick="setJobFilter('all')">All (${jobs.length})</div>`;
+  html += `<button class="filter-btn ${jobFilter === "all" ? "active" : ""}" onclick="setJobFilter('all')">All (${jobs.length})</button>`;
   for (const status of Object.keys(counts).sort()) {
-    html += `<div class="filter-btn ${jobFilter === status ? "active" : ""}" onclick="setJobFilter('${esc(status)}')">${esc(status)} (${counts[status]})</div>`;
+    html += `<button class="filter-btn ${jobFilter === status ? "active" : ""}" onclick="setJobFilter('${esc(status)}')">${esc(status)} (${counts[status]})</button>`;
   }
   html += '</div>';
 
@@ -1308,11 +1309,11 @@ async function loadJob() {
 
     html += '<div class="card"><h2>Tasks</h2>';
     html += '<div class="filter-bar">';
-    html += `<div class="filter-btn ${taskFilter === "all" ? "active" : ""}" onclick="setTaskFilter('all')">All (${d.tasks.length})</div>`;
+    html += `<button class="filter-btn ${taskFilter === "all" ? "active" : ""}" onclick="setTaskFilter('all')">All (${d.tasks.length})</button>`;
     const failedCount = d.tasks.filter(t => t.status === "failed").length;
     const runningCount = d.tasks.filter(t => t.status === "running" || t.status === "queued").length;
-    if (failedCount > 0) html += `<div class="filter-btn ${taskFilter === "failed" ? "active" : ""}" onclick="setTaskFilter('failed')">Failed (${failedCount})</div>`;
-    if (runningCount > 0) html += `<div class="filter-btn ${taskFilter === "running" ? "active" : ""}" onclick="setTaskFilter('running')">Active (${runningCount})</div>`;
+    if (failedCount > 0) html += `<button class="filter-btn ${taskFilter === "failed" ? "active" : ""}" onclick="setTaskFilter('failed')">Failed (${failedCount})</button>`;
+    if (runningCount > 0) html += `<button class="filter-btn ${taskFilter === "running" ? "active" : ""}" onclick="setTaskFilter('running')">Active (${runningCount})</button>`;
     html += '</div>';
     for (const task of filteredTasks) {
       html += renderTask(task);
