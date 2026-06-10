@@ -512,7 +512,19 @@ class SwarmStore:
         from puppetmaster.models import ArtifactType
 
         verdict = assess_run_quality(artifacts)
-        diff_present = any(getattr(a, "type", None) == ArtifactType.PATCH for a in artifacts)
+        patch_artifacts = [
+            a for a in artifacts if getattr(a, "type", None) == ArtifactType.PATCH
+        ]
+        diff_present = bool(patch_artifacts)
+        baseline_diff_present = any(
+            bool((getattr(a, "payload", None) or {}).get("baseline_diff_present"))
+            for a in artifacts
+        )
+        worker_diff_present = any(
+            bool((getattr(a, "payload", None) or {}).get("worker_diff_present"))
+            for a in artifacts
+        )
+        patch_artifact_emitted = bool(patch_artifacts)
         commit_present = any(
             getattr(a, "type", None) == ArtifactType.GATE
             and (getattr(a, "payload", None) or {}).get("kind") == "committed"
@@ -525,6 +537,9 @@ class SwarmStore:
             "reasons": verdict.get("reasons", []),
             "artifact_count": len(artifacts),
             "diff_present": diff_present,
+            "baseline_diff_present": baseline_diff_present,
+            "worker_diff_present": worker_diff_present,
+            "patch_artifact_emitted": patch_artifact_emitted,
             "commit_present": commit_present,
         }
 
@@ -850,4 +865,3 @@ def group_by_type(artifacts: Iterable[Artifact]) -> dict[str, list[Artifact]]:
     for artifact in artifacts:
         grouped.setdefault(str(artifact.type), []).append(artifact)
     return grouped
-
