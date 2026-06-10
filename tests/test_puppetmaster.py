@@ -8463,6 +8463,9 @@ assert.ok(!xss.includes("javascript:"));
 assert.ok(xss.includes("&lt;script&gt;"));
 // A forged sentinel in artifact text must not dereference the stash.
 assert.ok(!md("\uE000 0 \uE000").includes("undefined"));
+// Loose lists (blank lines between items) stay one list, so numbering
+// continues instead of every item restarting at 1.
+assert.ok(md("1. first\n\n2. second").includes("<ol><li>first</li><li>second</li></ol>"));
 console.log("renderer-ok");
 """
         completed = subprocess.run(
