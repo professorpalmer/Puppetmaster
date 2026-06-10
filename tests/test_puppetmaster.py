@@ -2669,6 +2669,7 @@ class PuppetmasterTests(unittest.TestCase):
             finally:
                 del os.environ["PUPPETMASTER_MCP_REGISTRY_DIR"]
 
+    @unittest.skipIf(os.name == "nt", "parent-process detection uses POSIX ps")
     def test_mcp_registry_detects_parent_process_identity(self) -> None:
         from puppetmaster import mcp_registry
 
@@ -12732,21 +12733,20 @@ class AuditFixTests(unittest.TestCase):
     def test_gate_command_parses_string_without_shell(self) -> None:
         from puppetmaster import gates
 
-        fd, marker = tempfile.mkstemp(suffix=".gate-marker")
-        os.close(fd)
-        marker_path = Path(marker)
-        try:
-            command = f"touch {marker_path}"
-            with patch("puppetmaster.gates.subprocess.run") as run_mock:
-                run_mock.return_value = subprocess.CompletedProcess(
-                    ["touch", str(marker_path)], 0, "", ""
-                )
-                gates._run(command, Path(tempfile.gettempdir()), timeout=5)
-            argv = run_mock.call_args.args[0]
-            self.assertEqual(argv, ["touch", str(marker_path)])
-            self.assertFalse(run_mock.call_args.kwargs.get("shell"))
-        finally:
-            marker_path.unlink(missing_ok=True)
+        command = "touch gate-marker.txt"
+        with patch("puppetmaster.gates.subprocess.run") as run_mock:
+            run_mock.return_value = subprocess.CompletedProcess(
+                ["touch", "gate-marker.txt"], 0, "", ""
+            )
+            gates._run(command, Path(tempfile.gettempdir()), timeout=5)
+        argv = run_mock.call_args.args[0]
+        if os.name == "nt":
+            # Windows: raw string handed to CreateProcess (shlex would eat
+            # C:\path backslashes); still no cmd.exe involved.
+            self.assertEqual(argv, command)
+        else:
+            self.assertEqual(argv, ["touch", "gate-marker.txt"])
+        self.assertFalse(run_mock.call_args.kwargs.get("shell"))
 
     def test_gate_engine_error_fails_closed_for_gated_tasks(self) -> None:
         from puppetmaster.gates import GateEvaluation

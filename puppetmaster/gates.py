@@ -697,8 +697,14 @@ def _gate_review(
 
 
 def _run(command: Any, cwd: Path, timeout: int) -> subprocess.CompletedProcess:
-    """Run a gate command. Strings are parsed into argv; lists run as argv."""
-    argv = shlex.split(command) if isinstance(command, str) else command
+    """Run a gate command without a shell. Lists run as argv. Strings are
+    shlex-parsed on POSIX; on Windows the raw string goes straight to
+    CreateProcess (POSIX shlex would eat ``C:\\path`` backslashes), which
+    still never involves cmd.exe."""
+    if isinstance(command, str) and os.name != "nt":
+        argv: Any = shlex.split(command)
+    else:
+        argv = command
     try:
         return subprocess.run(
             argv,
