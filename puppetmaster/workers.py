@@ -184,9 +184,21 @@ class LocalWorker:
 _EDIT_CAPABLE_ADAPTERS = frozenset({"claude-code", "codex"})
 
 
+def spec_explicitly_no_edit(spec: WorkerSpec) -> bool:
+    """True when a worker payload declares an adapter-independent no-edit run."""
+    payload = spec.payload or {}
+    return bool(
+        payload.get("read_only")
+        or payload.get("no_edit")
+        or payload.get("dry_run")
+    )
+
+
 def spec_edits_files(spec: WorkerSpec) -> bool:
     """True when ``spec`` can leave file changes behind (vs. emit-only)."""
     payload = spec.payload or {}
+    if spec_explicitly_no_edit(spec):
+        return False
     if payload.get("mode") == "implement" or payload.get("implement"):
         return True
     return spec.adapter in _EDIT_CAPABLE_ADAPTERS
