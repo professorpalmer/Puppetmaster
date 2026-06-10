@@ -51,6 +51,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -696,13 +697,12 @@ def _gate_review(
 
 
 def _run(command: Any, cwd: Path, timeout: int) -> subprocess.CompletedProcess:
-    """Run a gate command. A string runs through the shell; a list runs argv."""
-    shell = isinstance(command, str)
+    """Run a gate command. Strings are parsed into argv; lists run as argv."""
+    argv = shlex.split(command) if isinstance(command, str) else command
     try:
         return subprocess.run(
-            command,
+            argv,
             cwd=str(cwd),
-            shell=shell,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -710,7 +710,7 @@ def _run(command: Any, cwd: Path, timeout: int) -> subprocess.CompletedProcess:
         )
     except subprocess.TimeoutExpired as exc:
         return subprocess.CompletedProcess(
-            command, returncode=124, stdout=exc.stdout or "", stderr=f"timeout after {timeout}s"
+            argv, returncode=124, stdout=exc.stdout or "", stderr=f"timeout after {timeout}s"
         )
 
 

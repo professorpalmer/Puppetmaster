@@ -2019,7 +2019,7 @@ def run_list_models(args: JsonObject) -> JsonObject:
 # Secret redaction lives in puppetmaster.redaction so adapters and the MCP
 # server share one implementation. Re-exported here under the original name
 # for backward compatibility with any caller importing it from mcp_server.
-from puppetmaster.redaction import redact_secrets  # noqa: E402
+from puppetmaster.redaction import register_secret_values, redact_secrets  # noqa: E402
 
 
 def _coerce_subprocess_text(value: object) -> str:
@@ -2334,20 +2334,28 @@ def launcher_environment(args: JsonObject) -> dict[str, str]:
 
 def environment(args: JsonObject) -> dict[str, str]:
     env = os.environ.copy()
+    argument_secrets: list[str] = []
     if args.get("cursor_api_key"):
-        env["CURSOR_API_KEY"] = str(args["cursor_api_key"])
+        value = str(args["cursor_api_key"])
+        env["CURSOR_API_KEY"] = value
+        argument_secrets.append(value)
     if args.get("anthropic_api_key"):
-        env["ANTHROPIC_API_KEY"] = str(args["anthropic_api_key"])
+        value = str(args["anthropic_api_key"])
+        env["ANTHROPIC_API_KEY"] = value
+        argument_secrets.append(value)
     if args.get("claude_code_command"):
         env["CLAUDE_CODE_COMMAND"] = str(args["claude_code_command"])
     if args.get("openai_api_key"):
-        env["OPENAI_API_KEY"] = str(args["openai_api_key"])
+        value = str(args["openai_api_key"])
+        env["OPENAI_API_KEY"] = value
+        argument_secrets.append(value)
     if args.get("openai_base_url"):
         env["OPENAI_BASE_URL"] = str(args["openai_base_url"])
     if args.get("openai_organization"):
         env["OPENAI_ORG_ID"] = str(args["openai_organization"])
     if args.get("codex_command"):
         env["CODEX_COMMAND"] = str(args["codex_command"])
+    register_secret_values(argument_secrets)
     return env
 
 

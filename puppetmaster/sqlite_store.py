@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional, Union
 
@@ -13,9 +14,11 @@ from puppetmaster.models import (
     JobStatus,
     MemoryRecord,
     Task,
+    TaskStatus,
     artifact_from_dict,
     job_from_dict,
     now_iso,
+    seconds_from_now,
     task_from_dict,
     to_jsonable,
 )
@@ -169,15 +172,19 @@ class SQLiteSwarmStore(SwarmStore):
             status=status,
             created_at=job.created_at,
             completed_at=now_iso()
-            if status in {JobStatus.COMPLETE, JobStatus.FAILED}
+            if status in {JobStatus.COMPLETE, JobStatus.FAILED, JobStatus.STALLED}
             else job.completed_at,
         )
+        payload = {"status": str(status)}
         with self._session() as connection:
             connection.execute(
                 "UPDATE jobs SET data = ? WHERE id = ?",
                 (self._dumps(updated), job_id),
             )
-        self.emit(job_id, "job.status", {"status": str(status)})
+            connection.execute(
+                "INSERT INTO events(job_id, at, event, payload) VALUES(?, ?, ?, ?)",
+                (job_id, now_iso(), "job.status", json.dumps(payload, sort_keys=True)),
+            )
         return updated
 
     def save_task(self, task: Task) -> None:
@@ -249,8 +256,194 @@ class SQLiteSwarmStore(SwarmStore):
                 event_rows,
             )
 
+    def update_task_status(
+        self,
+        task: Task,
+        status: TaskStatus,
+        worker_id: Optional[str] = None,
+    ) -> Task:
+        terminal = status in {TaskStatus.COMPLETE, TaskStatus.FAILED}
+        stored = self.get_task_by_id(task.id)
+        if terminal and worker_id is not None and stored.lease_owner != worker_id:
+            return stored
+        updated = replace(
+            stored,
+            status=status,
+            lease_owner=None if terminal else stored.lease_owner,
+            lease_expires_at=None if terminal else stored.lease_expires_at,
+            updated_at=now_iso(),
+            completed_at=now_iso() if status == TaskStatus.COMPLETE else stored.completed_at,
+        )
+        payload = {
+            "task_id": updated.id,
+            "role": updated.role,
+            "status": str(updated.status),
+            "adapter": updated.adapter,
+        }
+        with self._session() as connection:
+            if terminal and worker_id is not None:
+                cursor = connection.execute(
+                    """
+                    UPDATE tasks SET status = ?, data = ?
+                    WHERE id = ? AND json_extract(data, '$.lease_owner') = ?
+                    """,
+                    (str(status), self._dumps(updated), task.id, worker_id),
+                )
+                if cursor.rowcount != 1:
+                    return self.get_task_by_id(task.id)
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO tasks(id, job_id, role, status, data)
+                    VALUES(?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                      job_id = excluded.job_id,
+                      role = excluded.role,
+                      status = excluded.status,
+                      data = excluded.data
+                    """,
+                    (
+                        updated.id,
+                        updated.job_id,
+                        updated.role,
+                        str(updated.status),
+                        self._dumps(updated),
+                    ),
+                )
+            connection.execute(
+                "INSERT INTO events(job_id, at, event, payload) VALUES(?, ?, ?, ?)",
+                (updated.job_id, now_iso(), "task.saved", json.dumps(payload, sort_keys=True)),
+            )
+        return updated
+
+    def claim_task(
+        self,
+        task_id: str,
+        worker_id: str,
+        lease_seconds: int = 60,
+    ) -> Optional[Task]:
+        self.init()
+        task = self.get_task_by_id(task_id)
+        if not self.dependencies_complete(task):
+            blocked = replace(task, status=TaskStatus.BLOCKED, updated_at=now_iso())
+            self.save_task(blocked)
+            return None
+        if task.status == TaskStatus.COMPLETE:
+            return None
+        if task.attempts >= self.max_task_attempts:
+            failed = replace(
+                task,
+                status=TaskStatus.FAILED,
+                lease_owner=None,
+                lease_expires_at=None,
+                updated_at=now_iso(),
+            )
+            self.save_task(failed)
+            self.emit(
+                task.job_id,
+                "task.max_attempts_exceeded",
+                {"task_id": task.id, "attempts": task.attempts},
+            )
+            return None
+        if task.status == TaskStatus.RUNNING and not self.is_task_stale(task):
+            return None
+
+        now = now_iso()
+        claimed = replace(
+            task,
+            status=TaskStatus.RUNNING,
+            attempts=task.attempts + 1,
+            lease_owner=worker_id,
+            lease_expires_at=seconds_from_now(lease_seconds),
+            updated_at=now,
+        )
+        claim_payload = {
+            "task_id": task.id,
+            "worker_id": worker_id,
+            "lease_expires_at": claimed.lease_expires_at,
+            "attempts": claimed.attempts,
+        }
+        with self._session() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE tasks SET status = ?, data = ?
+                WHERE id = ? AND (
+                  status = ?
+                  OR (status = ? AND json_extract(data, '$.lease_expires_at') <= ?)
+                )
+                """,
+                (
+                    str(TaskStatus.RUNNING),
+                    self._dumps(claimed),
+                    task_id,
+                    str(TaskStatus.QUEUED),
+                    str(TaskStatus.RUNNING),
+                    now,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            connection.execute(
+                "INSERT INTO events(job_id, at, event, payload) VALUES(?, ?, ?, ?)",
+                (
+                    task.job_id,
+                    now,
+                    "task.claimed",
+                    json.dumps(claim_payload, sort_keys=True),
+                ),
+            )
+        return claimed
+
+    def recover_stale_tasks(self, job_id: str) -> list[Task]:
+        self.init()
+        now = now_iso()
+        recovered: list[Task] = []
+        for task in self.list_tasks(job_id):
+            if not self.is_task_stale(task):
+                continue
+            queued = replace(
+                task,
+                status=TaskStatus.QUEUED,
+                lease_owner=None,
+                lease_expires_at=None,
+                updated_at=now,
+            )
+            recover_payload = {
+                "task_id": task.id,
+                "previous_owner": task.lease_owner,
+            }
+            with self._session() as connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE tasks SET status = ?, data = ?
+                    WHERE id = ? AND status = ? AND json_extract(data, '$.lease_expires_at') <= ?
+                    """,
+                    (
+                        str(TaskStatus.QUEUED),
+                        self._dumps(queued),
+                        task.id,
+                        str(TaskStatus.RUNNING),
+                        now,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    continue
+                connection.execute(
+                    "INSERT INTO events(job_id, at, event, payload) VALUES(?, ?, ?, ?)",
+                    (
+                        job_id,
+                        now,
+                        "task.recovered",
+                        json.dumps(recover_payload, sort_keys=True),
+                    ),
+                )
+            self.release_lock(f"task:{task.id}")
+            recovered.append(queued)
+        return recovered
+
     def save_run(self, run: AgentRun) -> None:
         self.init()
+        payload = {"run_id": run.id, "role": run.role}
         with self._session() as connection:
             connection.execute(
                 """
@@ -263,7 +456,10 @@ class SQLiteSwarmStore(SwarmStore):
                 """,
                 (run.id, run.job_id, run.task_id, self._dumps(run)),
             )
-        self.emit(run.job_id, "run.saved", {"run_id": run.id, "role": run.role})
+            connection.execute(
+                "INSERT INTO events(job_id, at, event, payload) VALUES(?, ?, ?, ?)",
+                (run.job_id, now_iso(), "run.saved", json.dumps(payload, sort_keys=True)),
+            )
 
     def save_artifact(self, artifact: Artifact) -> None:
         artifact.validate()
@@ -272,6 +468,13 @@ class SQLiteSwarmStore(SwarmStore):
 
             artifact = replace(artifact, sha256=self.artifact_hash(artifact))
         self.init()
+        event_payload = {
+            "artifact_id": artifact.id,
+            "task_id": artifact.task_id,
+            "type": str(artifact.type),
+            "confidence": artifact.confidence,
+            "sha256": artifact.sha256,
+        }
         with self._session() as connection:
             connection.execute(
                 """
@@ -291,17 +494,15 @@ class SQLiteSwarmStore(SwarmStore):
                     self._dumps(artifact),
                 ),
             )
-        self.emit(
-            artifact.job_id,
-            "artifact.saved",
-            {
-                "artifact_id": artifact.id,
-                "task_id": artifact.task_id,
-                "type": str(artifact.type),
-                "confidence": artifact.confidence,
-                "sha256": artifact.sha256,
-            },
-        )
+            connection.execute(
+                "INSERT INTO events(job_id, at, event, payload) VALUES(?, ?, ?, ?)",
+                (
+                    artifact.job_id,
+                    now_iso(),
+                    "artifact.saved",
+                    json.dumps(event_payload, sort_keys=True),
+                ),
+            )
 
     def save_artifacts(self, artifacts: Iterable[Artifact]) -> None:
         from dataclasses import replace

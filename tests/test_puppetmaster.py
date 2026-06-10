@@ -12616,5 +12616,231 @@ class UninstallTests(unittest.TestCase):
             self.assertTrue((cwd / ".cursor" / "rules" / "puppetmaster.mdc").is_file())
 
 
+class AuditFixTests(unittest.TestCase):
+    def test_sqlite_concurrent_claim_has_exactly_one_winner(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("race claim")
+            task = Task(job_id=job.id, role="coder", instruction="work")
+            store.save_task(task)
+
+            barrier = threading.Barrier(2)
+            results: list[Optional[Task]] = []
+            lock = threading.Lock()
+
+            def claim(worker_id: str) -> None:
+                barrier.wait()
+                claimed = store.claim_task(task.id, worker_id, lease_seconds=60)
+                with lock:
+                    results.append(claimed)
+
+            threads = [
+                threading.Thread(target=claim, args=("worker-a",)),
+                threading.Thread(target=claim, args=("worker-b",)),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+
+            winners = [claimed for claimed in results if claimed is not None]
+            self.assertEqual(len(winners), 1)
+            self.assertEqual(store.get_task_by_id(task.id).lease_owner, winners[0].lease_owner)
+
+    def test_lease_fenced_terminal_write_conflict(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("fence terminal writes")
+            task = Task(job_id=job.id, role="coder", instruction="work")
+            store.save_task(task)
+            claimed = store.claim_task(task.id, "worker-a", lease_seconds=60)
+            self.assertIsNotNone(claimed)
+
+            conflict = store.update_task_status(
+                claimed, TaskStatus.COMPLETE, worker_id="worker-b"
+            )
+            self.assertEqual(conflict.status, TaskStatus.RUNNING)
+            self.assertEqual(conflict.lease_owner, "worker-a")
+
+            completed = store.update_task_status(
+                claimed, TaskStatus.COMPLETE, worker_id="worker-a"
+            )
+            self.assertEqual(completed.status, TaskStatus.COMPLETE)
+
+    def test_sqlite_lease_fenced_terminal_write_conflict(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("sqlite fence")
+            task = Task(job_id=job.id, role="coder", instruction="work")
+            store.save_task(task)
+            claimed = store.claim_task(task.id, "worker-a", lease_seconds=60)
+            self.assertIsNotNone(claimed)
+
+            conflict = store.update_task_status(
+                claimed, TaskStatus.COMPLETE, worker_id="worker-b"
+            )
+            self.assertEqual(conflict.status, TaskStatus.RUNNING)
+
+    def test_acquire_lock_breaks_stale_task_lock(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            lock_path = store.locks_dir / "task_task123.lock"
+            lock_path.write_text(
+                json.dumps({"owner": "dead-worker", "at": time.time() - 120}),
+                encoding="utf-8",
+            )
+            self.assertTrue(store.acquire_lock("task:task123", "worker-b", ttl_seconds=30))
+
+    def test_gate_command_parses_string_without_shell(self) -> None:
+        from puppetmaster import gates
+
+        fd, marker = tempfile.mkstemp(suffix=".gate-marker")
+        os.close(fd)
+        marker_path = Path(marker)
+        try:
+            command = f"touch {marker_path}"
+            with patch("puppetmaster.gates.subprocess.run") as run_mock:
+                run_mock.return_value = subprocess.CompletedProcess(
+                    ["touch", str(marker_path)], 0, "", ""
+                )
+                gates._run(command, Path(tempfile.gettempdir()), timeout=5)
+            argv = run_mock.call_args.args[0]
+            self.assertEqual(argv, ["touch", str(marker_path)])
+            self.assertFalse(run_mock.call_args.kwargs.get("shell"))
+        finally:
+            marker_path.unlink(missing_ok=True)
+
+    def test_gate_engine_error_fails_closed_for_gated_tasks(self) -> None:
+        from puppetmaster.gates import GateEvaluation
+        from puppetmaster.worker_runtime import WorkerRuntime
+
+        store = MagicMock()
+        runtime = WorkerRuntime(
+            store=store,
+            job_id="job_x",
+            role="coder",
+            worker_id="worker-a",
+        )
+        task = Task(
+            job_id="job_x",
+            role="coder",
+            instruction="do work",
+            payload={"gates": [{"kind": "require_diff"}]},
+        )
+        with patch(
+            "puppetmaster.gates.evaluate_task_gates",
+            side_effect=RuntimeError("boom"),
+        ):
+            evaluation = runtime._evaluate_gates(task, [])
+        self.assertIsInstance(evaluation, GateEvaluation)
+        self.assertFalse(evaluation.passed)
+        self.assertIn("gate_engine_error", evaluation.failed_reason or "")
+
+    def test_gate_engine_error_passes_through_ungated_tasks(self) -> None:
+        from puppetmaster.gates import GateEvaluation
+        from puppetmaster.worker_runtime import WorkerRuntime
+
+        store = MagicMock()
+        runtime = WorkerRuntime(
+            store=store,
+            job_id="job_x",
+            role="coder",
+            worker_id="worker-a",
+        )
+        task = Task(job_id="job_x", role="coder", instruction="do work")
+        with patch(
+            "puppetmaster.gates.evaluate_task_gates",
+            side_effect=RuntimeError("boom"),
+        ):
+            evaluation = runtime._evaluate_gates(task, [])
+        self.assertTrue(evaluation.passed)
+
+    def test_heartbeat_lease_loss_sets_abort_signal(self) -> None:
+        from puppetmaster.worker_runtime import WorkerRuntime
+
+        store = MagicMock()
+        store.heartbeat_run.side_effect = lambda run: run
+        store.renew_task_lease.return_value = None
+        runtime = WorkerRuntime(
+            store=store,
+            job_id="job_x",
+            role="coder",
+            worker_id="worker-a",
+            poll_seconds=0.01,
+        )
+        stop = threading.Event()
+        run = MagicMock()
+        runtime._heartbeat_until_stopped(run, "task_x", stop)
+        self.assertTrue(stop.is_set())
+        self.assertTrue(runtime._lease_lost.is_set())
+
+    def test_redact_secrets_scrubs_argument_supplied_keys(self) -> None:
+        from puppetmaster.redaction import (
+            clear_registered_secrets,
+            redact_secrets,
+            register_secret_value,
+        )
+
+        clear_registered_secrets()
+        secret = "sk-argument-supplied-test-key-1234567890"
+        register_secret_value(secret)
+        redacted = redact_secrets(f"Authorization: Bearer {secret}") or ""
+        self.assertNotIn(secret, redacted)
+        self.assertIn("<secret:redacted>", redacted)
+        clear_registered_secrets()
+
+    def test_redact_secrets_catches_common_token_shapes(self) -> None:
+        from puppetmaster.redaction import redact_secrets
+
+        # Fake fixtures assembled at runtime so secret scanners (e.g. GitHub
+        # push protection) don't flag the literal source as a leaked token.
+        fake_slack = "xoxb-" + "1234567890-1234567890-" + "abcdefghijklmnopqrst"
+        fake_github = "ghp_" + "1234567890abcdefghijklmnopqrstuvwxyz"
+        samples = {
+            fake_github: "ghp_<redacted>",
+            "AKIAIOSFODNN7EXAMPLE": "AKIA<redacted>",
+            fake_slack: "xoxb-<redacted>",
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature": "eyJ<redacted>",
+        }
+        for raw, needle in samples.items():
+            redacted = redact_secrets(raw) or ""
+            self.assertIn(needle, redacted, msg=raw)
+            self.assertNotIn(raw, redacted, msg=raw)
+
+    def test_sqlite_stalled_job_sets_completed_at(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("stall")
+            updated = store.update_job_status(job.id, JobStatus.STALLED)
+            self.assertIsNotNone(updated.completed_at)
+
+    def test_sqlite_save_run_emits_event_in_same_transaction(self) -> None:
+        from puppetmaster.models import AgentRun
+
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("atomic run event")
+            task = Task(job_id=job.id, role="coder", instruction="work")
+            store.save_task(task)
+            run = AgentRun(job_id=job.id, task_id=task.id, role="coder", worker_id="w")
+            store.save_run(run)
+            events = store.read_events(job.id)
+            self.assertTrue(any(event["event"] == "run.saved" for event in events))
+
+    def test_file_claim_compare_and_swap_blocks_double_winner(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("file cas")
+            task = Task(job_id=job.id, role="coder", instruction="work")
+            store.save_task(task)
+
+            first = store.claim_task(task.id, "worker-a", lease_seconds=60)
+            second = store.claim_task(task.id, "worker-b", lease_seconds=60)
+            self.assertIsNotNone(first)
+            self.assertIsNone(second)
+            self.assertEqual(store.get_task_by_id(task.id).lease_owner, "worker-a")
+
+
 if __name__ == "__main__":
     unittest.main()
