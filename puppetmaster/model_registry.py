@@ -92,6 +92,12 @@ class ModelSpec:
             + (tokens_out / 1_000_000.0) * self.output_per_mtok_usd
         )
 
+    def marginal_cost_usd(self, tokens_in: int, tokens_out: int) -> float:
+        """Marginal USD this call adds to the user's bill; subscription-covered models add nothing."""
+        if self.is_plan_billed:
+            return 0.0
+        return self.estimate_cost_usd(tokens_in, tokens_out)
+
 
 def default_registry_path() -> Path:
     """Where the registry lives by default.

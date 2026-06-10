@@ -259,12 +259,14 @@ class RoutingDecision:
     estimated_cost_usd: float
     reason: str
     rejected: list[tuple[ModelSpec, str]] = field(default_factory=list)
+    nominal_cost_usd: float = 0.0
     # Savings accounting (Rule 1: snapshot the baseline at decision time so the
     # ledger never compares a stored cost against a recomputed/drifted one).
     # ``baseline`` = what this task would have cost on the strongest model the
     # user could have used (highest-capability enabled + platform-allowed),
     # at the same token estimate.
     baseline_cost_usd: float = 0.0
+    baseline_nominal_cost_usd: float = 0.0
     baseline_model_id: str = ""
 
     def to_artifact_payload(self) -> dict:
@@ -279,7 +281,9 @@ class RoutingDecision:
             "estimated_tokens_in": self.estimated_tokens_in,
             "estimated_tokens_out": self.estimated_tokens_out,
             "estimated_cost_usd": round(self.estimated_cost_usd, 6),
+            "nominal_cost_usd": round(self.nominal_cost_usd, 6),
             "baseline_cost_usd": round(self.baseline_cost_usd, 6),
+            "baseline_nominal_cost_usd": round(self.baseline_nominal_cost_usd, 6),
             "baseline_model_id": self.baseline_model_id,
             "reason": self.reason,
             "rejected": [
@@ -383,7 +387,7 @@ def route_task(
     # Cost budget filter.
     after_cost: list[ModelSpec] = []
     for spec in after_tags:
-        est = spec.estimate_cost_usd(tokens_in, tokens_out)
+        est = spec.marginal_cost_usd(tokens_in, tokens_out)
         if (
             task.explicit_max_cost_usd is not None
             and est > task.explicit_max_cost_usd
@@ -438,7 +442,8 @@ def route_task(
     # the ledger compares like-for-like later instead of recomputing against a
     # possibly-changed registry.
     _baseline_model = max(after_cost, key=lambda s: s.capability_score)
-    _baseline_cost = _baseline_model.estimate_cost_usd(tokens_in, tokens_out)
+    _baseline_cost = _baseline_model.marginal_cost_usd(tokens_in, tokens_out)
+    _baseline_nominal = _baseline_model.estimate_cost_usd(tokens_in, tokens_out)
     _baseline_id = _baseline_model.id
 
     # Tie-break helper: when ``prefer_plan_billed`` is on, a subscription-covered
@@ -456,7 +461,7 @@ def route_task(
         pick = min(
             after_cost,
             key=lambda s: (
-                s.estimate_cost_usd(tokens_in, tokens_out),
+                s.marginal_cost_usd(tokens_in, tokens_out),
                 _plan_rank(s),
                 s.capability_score,
             ),
@@ -467,7 +472,10 @@ def route_task(
                 rejected.append(
                     (spec, f"cheaper alternative {pick.id} chosen"),
                 )
-        return _decision(pick, policy, need, tokens_in, tokens_out, reason, rejected, _baseline_cost, _baseline_id)
+        return _decision(
+            pick, policy, need, tokens_in, tokens_out, reason, rejected,
+            _baseline_cost, _baseline_id, _baseline_nominal,
+        )
 
     if policy == "quality":
         # Highest capability wins; plan-billed breaks ties so we don't reach
@@ -480,7 +488,10 @@ def route_task(
         for spec in after_cost:
             if spec.id != pick.id:
                 rejected.append((spec, f"higher-capability {pick.id} chosen"))
-        return _decision(pick, policy, need, tokens_in, tokens_out, reason, rejected, _baseline_cost, _baseline_id)
+        return _decision(
+            pick, policy, need, tokens_in, tokens_out, reason, rejected,
+            _baseline_cost, _baseline_id, _baseline_nominal,
+        )
 
     if policy == "escalating":
         # For escalating we still return one decision (the cheapest
@@ -491,7 +502,7 @@ def route_task(
             key=lambda s: (
                 s.capability_score,
                 _plan_rank(s),
-                s.estimate_cost_usd(tokens_in, tokens_out),
+                s.marginal_cost_usd(tokens_in, tokens_out),
             ),
         )
         sufficient = [s for s in sorted_by_cap if s.capability_score >= need]
@@ -503,7 +514,10 @@ def route_task(
         for spec in sorted_by_cap:
             if spec.id != pick.id:
                 rejected.append((spec, "escalation candidate"))
-        return _decision(pick, policy, need, tokens_in, tokens_out, reason, rejected, _baseline_cost, _baseline_id)
+        return _decision(
+            pick, policy, need, tokens_in, tokens_out, reason, rejected,
+            _baseline_cost, _baseline_id, _baseline_nominal,
+        )
 
     # balanced (default)
     sufficient = [s for s in after_cost if s.capability_score >= need]
@@ -516,7 +530,7 @@ def route_task(
             sufficient,
             key=lambda s: (
                 _plan_rank(s),
-                s.estimate_cost_usd(tokens_in, tokens_out),
+                s.marginal_cost_usd(tokens_in, tokens_out),
                 s.capability_score,
             ),
         )
@@ -527,7 +541,7 @@ def route_task(
             f"policy=balanced: cheapest sufficient model whose capability_score "
             f"({pick.capability_score}) >= needed ({need}){plan_note}"
         )
-        pick_cost = pick.estimate_cost_usd(tokens_in, tokens_out)
+        pick_cost = pick.marginal_cost_usd(tokens_in, tokens_out)
         for spec in after_cost:
             if spec.id != pick.id:
                 if spec.capability_score < need:
@@ -538,7 +552,7 @@ def route_task(
                         )
                     )
                 else:
-                    spec_cost = spec.estimate_cost_usd(tokens_in, tokens_out)
+                    spec_cost = spec.marginal_cost_usd(tokens_in, tokens_out)
                     if spec_cost > pick_cost:
                         rejected.append(
                             (
@@ -575,7 +589,10 @@ def route_task(
                 rejected.append(
                     (spec, f"lower capability_score {spec.capability_score}")
                 )
-    return _decision(pick, policy, need, tokens_in, tokens_out, reason, rejected, _baseline_cost, _baseline_id)
+    return _decision(
+        pick, policy, need, tokens_in, tokens_out, reason, rejected,
+        _baseline_cost, _baseline_id, _baseline_nominal,
+    )
 
 
 def _decision(
@@ -588,6 +605,7 @@ def _decision(
     rejected: list[tuple[ModelSpec, str]],
     baseline_cost_usd: float = 0.0,
     baseline_model_id: str = "",
+    baseline_nominal_cost_usd: float = 0.0,
 ) -> RoutingDecision:
     return RoutingDecision(
         model=pick,
@@ -595,10 +613,12 @@ def _decision(
         capability_needed=need,
         estimated_tokens_in=tokens_in,
         estimated_tokens_out=tokens_out,
-        estimated_cost_usd=pick.estimate_cost_usd(tokens_in, tokens_out),
+        estimated_cost_usd=pick.marginal_cost_usd(tokens_in, tokens_out),
+        nominal_cost_usd=pick.estimate_cost_usd(tokens_in, tokens_out),
         reason=reason,
         rejected=rejected,
         baseline_cost_usd=baseline_cost_usd,
+        baseline_nominal_cost_usd=baseline_nominal_cost_usd,
         baseline_model_id=baseline_model_id,
     )
 
