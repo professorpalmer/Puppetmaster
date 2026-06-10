@@ -2200,7 +2200,7 @@ def run_await_job(args: JsonObject) -> JsonObject:
         body["effective_timeout_seconds"] = timeout_seconds
     return {
         "content": [{"type": "text", "text": json.dumps(body, indent=2, default=str)}],
-        "isError": state["status"] == "failed",
+        "isError": state["status"] in {"failed", "stalled"},
     }
 
 
