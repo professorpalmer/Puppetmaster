@@ -15,7 +15,12 @@ from pathlib import Path
 from typing import Any, Optional, Protocol, Union
 
 from puppetmaster.codegraph import enrich_prompt_with_codegraph, inject_worker_cli_env
+from puppetmaster.fs_permissions import mkdir_private, open_private, write_private_text
 from puppetmaster.models import Artifact, ArtifactType, Task
+from puppetmaster.openai_security import (
+    DEFAULT_OPENAI_BASE_URL,
+    validate_openai_base_url_for_task,
+)
 from puppetmaster.ports import apply_worktree_ports
 from puppetmaster.redaction import redact_secrets
 from puppetmaster.usage import token_usage
@@ -116,9 +121,9 @@ def capture_subprocess_stdout(
         return result
     try:
         sidecar_dir = state_dir / "jobs" / task.job_id / "tasks" / task.id
-        sidecar_dir.mkdir(parents=True, exist_ok=True)
+        mkdir_private(sidecar_dir)
         sidecar_path = sidecar_dir / f"{sidecar_name}.log"
-        sidecar_path.write_text(text, encoding="utf-8", errors="replace")
+        write_private_text(sidecar_path, text)
         result["stdout_sidecar_path"] = str(sidecar_path)
     except OSError as exc:
         result["stdout_sidecar_path"] = None
@@ -168,9 +173,15 @@ def run_streamed_subprocess(
     if state_dir is not None:
         try:
             sidecar_dir = state_dir / "jobs" / task.job_id / "tasks" / task.id
-            sidecar_dir.mkdir(parents=True, exist_ok=True)
+            mkdir_private(sidecar_dir)
             live_path = sidecar_dir / f"{sidecar_name}_live.log"
-            live_handle = live_path.open("w", encoding="utf-8", errors="replace")
+            live_handle = open(
+                open_private(live_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC),
+                "w",
+                encoding="utf-8",
+                errors="replace",
+                closefd=True,
+            )
         except OSError:
             live_handle = None
 
@@ -180,8 +191,9 @@ def run_streamed_subprocess(
         if live_handle is None:
             return
         try:
+            redacted = redact_secrets(line) or line
             with write_lock:
-                live_handle.write(line)
+                live_handle.write(redacted)
                 live_handle.flush()
         except Exception:
             pass
@@ -360,9 +372,9 @@ def _spool_patch_sidecar(*, task: Task, sidecar_name: str, diff: str) -> Optiona
         return None
     try:
         sidecar_dir = state_dir / "jobs" / task.job_id / "tasks" / task.id
-        sidecar_dir.mkdir(parents=True, exist_ok=True)
+        mkdir_private(sidecar_dir)
         sidecar_path = sidecar_dir / f"{sidecar_name}.patch"
-        sidecar_path.write_text(diff, encoding="utf-8", errors="replace")
+        write_private_text(sidecar_path, diff)
         return str(sidecar_path)
     except OSError:
         return None
@@ -554,8 +566,8 @@ class ShellAdapter:
                     evidence=[f"command:{' '.join(command)}", "timeout"],
                     payload={
                         "returncode": None,
-                        "stdout": (exc.stdout or "")[-4000:],
-                        "stderr": (exc.stderr or "")[-4000:],
+                        "stdout": _redacted_tail(exc.stdout, 4000),
+                        "stderr": _redacted_tail(exc.stderr, 4000),
                         "timeout_seconds": timeout_seconds,
                     },
                 )
@@ -571,8 +583,8 @@ class ShellAdapter:
                 evidence=[f"command:{' '.join(command)}"],
                 payload={
                     "returncode": completed.returncode,
-                    "stdout": completed.stdout[-4000:],
-                    "stderr": completed.stderr[-4000:],
+                    "stdout": _redacted_tail(completed.stdout, 4000),
+                    "stderr": _redacted_tail(completed.stderr, 4000),
                 },
             )
         ]
@@ -1263,12 +1275,13 @@ class CodexAdapter:
         # and worktree-boundary checks are unnecessary. For write-capable
         # sandboxes we mirror Claude Code: require a git work tree and a clean
         # tree by default so resulting diffs are attributable to this task.
-        if sandbox != "read-only":
+        write_capable = sandbox != "read-only" or bypass
+        if write_capable:
             blocked = worktree_guard(task, worker_id, "codex", cwd, before)
             if blocked is not None:
                 return blocked
         if (
-            sandbox != "read-only"
+            write_capable
             and not task.payload.get("allow_dirty", False)
             and (before["changed_files"] or before["untracked_files"])
         ):
@@ -2225,54 +2238,7 @@ def _confidence(value: object) -> float:
     return min(1.0, max(0.0, parsed))
 
 
-DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"
-
-# Hosts the OpenAI adapter may send the OPENAI_API_KEY to. A caller-supplied
-# openai_base_url pointing elsewhere would exfiltrate the bearer token to an
-# arbitrary "OpenAI-compatible" endpoint, so we refuse it unless explicitly
-# trusted (allowlist env or per-task opt-in).
-_OPENAI_DEFAULT_ALLOWED_HOSTS = frozenset({"api.openai.com"})
-_OPENAI_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
-
-
-def _openai_allowed_hosts() -> set[str]:
-    hosts = set(_OPENAI_DEFAULT_ALLOWED_HOSTS)
-    extra = os.environ.get("PUPPETMASTER_OPENAI_ALLOWED_HOSTS", "")
-    for host in extra.replace(",", " ").split():
-        cleaned = host.strip().lower()
-        if cleaned:
-            hosts.add(cleaned)
-    return hosts
-
-
-def validate_openai_base_url(base_url: str, task: Task) -> Optional[str]:
-    """Return an error string when sending the API key to ``base_url`` is unsafe.
-
-    Returns ``None`` when the URL is allowed. By default the key is only sent
-    over HTTPS to an allowlisted host (``api.openai.com``; extend via
-    ``PUPPETMASTER_OPENAI_ALLOWED_HOSTS``). A loopback host is permitted for
-    local proxies/tests, and ``payload.openai_allow_untrusted_base_url=true``
-    is an explicit per-task override.
-    """
-    if task.payload.get("openai_allow_untrusted_base_url"):
-        return None
-    from urllib.parse import urlparse
-
-    parsed = urlparse(base_url)
-    host = (parsed.hostname or "").lower()
-    if not host:
-        return f"could not parse a host from openai_base_url {base_url!r}"
-    is_loopback = host in _OPENAI_LOOPBACK_HOSTS
-    if parsed.scheme != "https" and not is_loopback:
-        return f"refusing to send OPENAI_API_KEY to non-HTTPS base_url {base_url!r}"
-    if is_loopback or host in _openai_allowed_hosts():
-        return None
-    return (
-        f"refusing to send OPENAI_API_KEY to untrusted host {host!r}. Add it to "
-        "PUPPETMASTER_OPENAI_ALLOWED_HOSTS or set "
-        "payload.openai_allow_untrusted_base_url=true to override."
-    )
 
 
 class OpenAIAdapter:
@@ -2333,7 +2299,7 @@ class OpenAIAdapter:
                 )
             ]
 
-        base_url_error = validate_openai_base_url(base_url, task)
+        base_url_error = validate_openai_base_url_for_task(base_url, task)
         if base_url_error is not None:
             return [
                 verification_artifact(
@@ -2415,7 +2381,7 @@ class OpenAIAdapter:
                         "returncode": exc.code,
                         "model": model,
                         "failure": classify_openai_failure(err_body, exc.code),
-                        "stderr": err_body[-8000:],
+                        "stderr": _redacted_tail(err_body, 8000),
                     },
                 )
             ]
@@ -2472,7 +2438,7 @@ class OpenAIAdapter:
                         "returncode": status_code,
                         "model": model,
                         "failure": "malformed_response",
-                        "stderr": raw_body[-8000:],
+                        "stderr": _redacted_tail(raw_body, 8000),
                     },
                 )
             ]

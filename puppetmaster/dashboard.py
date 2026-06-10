@@ -142,6 +142,15 @@ def _extract_metadata(payload: dict[str, Any]) -> dict[str, Any]:
         if "duration_ms" in envelope:
             meta["duration_ms"] = envelope["duration_ms"]
         break
+    # Claude Code is the only adapter whose stdout is a single JSON envelope.
+    # Every adapter stamps token_usage() counts top-level on the payload, so
+    # fall back to those (flagging estimates) — otherwise cursor/codex/openai
+    # tasks never show token chips at all.
+    if "tokens_in" not in meta and payload.get("tokens_in") is not None:
+        meta["tokens_in"] = payload["tokens_in"]
+        if payload.get("tokens_out") is not None:
+            meta["tokens_out"] = payload["tokens_out"]
+        meta["tokens_estimated"] = bool(payload.get("tokens_estimated"))
     if "returncode" in payload:
         meta["returncode"] = payload["returncode"]
     if "failure" in payload:
@@ -430,9 +439,20 @@ function md(text){
   s=s.replace(/\[([^\]]+)\]\(([^)]+)\)/g,(m,x,u)=>/^(https?:|\/|#)/.test(u)?'<a href="'+u+'">'+x+'</a>':x);
   const lines=s.split("\n"); const out=[]; let i=0;
   const ol=/^\d+\.\s+(.+)$/, ul=/^[*-]\s+(.+)$/;
+  // Blank lines between items of the same list ("loose" lists) stay in one
+  // <ol>/<ul>, otherwise every numbered item would restart at 1.
+  const collect=(re,tag)=>{
+    const it=[];
+    while(i<lines.length){
+      if(re.test(lines[i])){it.push("<li>"+lines[i].replace(re,"$1")+"</li>");i++;}
+      else if(lines[i].trim()===""&&i+1<lines.length&&re.test(lines[i+1])){i++;}
+      else break;
+    }
+    out.push("<"+tag+">"+it.join("")+"</"+tag+">");
+  };
   while(i<lines.length){
-    if(ol.test(lines[i])){const it=[];while(i<lines.length&&ol.test(lines[i])){it.push("<li>"+lines[i].replace(ol,"$1")+"</li>");i++;}out.push("<ol>"+it.join("")+"</ol>");}
-    else if(ul.test(lines[i])){const it=[];while(i<lines.length&&ul.test(lines[i])){it.push("<li>"+lines[i].replace(ul,"$1")+"</li>");i++;}out.push("<ul>"+it.join("")+"</ul>");}
+    if(ol.test(lines[i])) collect(ol,"ol");
+    else if(ul.test(lines[i])) collect(ul,"ul");
     else {out.push(lines[i]);i++;}
   }
   s=out.join("\n");
@@ -614,23 +634,50 @@ _PAGE_HEAD = r"""<!doctype html>
     color: #8b949e;
     font-size: 13px;
   }
-  #jobs li {
-    margin: 6px 0;
-    display: flex;
+  .job-list {
+    border: 1px solid #21262d;
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .job-row {
+    display: grid;
+    grid-template-columns: 110px max-content minmax(0, 1fr) max-content;
+    gap: 16px;
     align-items: center;
-    gap: 10px;
+    padding: 11px 16px;
+    border-bottom: 1px solid #161b22;
+    text-decoration: none;
+    color: inherit;
+    background: #0f141b;
+    transition: background 0.12s ease;
   }
-  .dot {
-    display: inline-block;
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
+  .job-row:last-child { border-bottom: none; }
+  .job-row:hover {
+    background: #161b22;
+    text-decoration: none;
   }
-  .dot.s-complete { background: #1f6f3f; }
-  .dot.s-running, .dot.s-stitching { background: #9e6a03; }
-  .dot.s-failed { background: #8b2c2c; }
-  .dot.s-queued, .dot.s-blocked { background: #30363d; }
-  .dot.s-stalled { background: #6e4a9e; }
+  .job-row .pill { justify-self: start; }
+  .job-id {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    color: #58a6ff;
+    white-space: nowrap;
+  }
+  .job-goal {
+    min-width: 0;
+    color: #8b949e;
+    font-size: 13px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .job-row:hover .job-goal { color: #c9d1d9; }
+  .job-time {
+    color: #6e7681;
+    font-size: 12px;
+    white-space: nowrap;
+    text-align: right;
+  }
   .task-card {
     border: 1px solid #21262d;
     border-radius: 8px;
@@ -915,6 +962,7 @@ _PAGE_HEAD = r"""<!doctype html>
     padding: 6px 12px;
     cursor: pointer;
     font-size: 12px;
+    font-family: inherit;
     color: #c9d1d9;
     user-select: none;
   }
@@ -969,6 +1017,22 @@ function truncateGoal(goal, maxChars = 120) {
   return esc(firstLine.substring(0, maxChars)) + "...";
 }
 
+function fmtAgo(iso) {
+  const t = Date.parse(iso || "");
+  if (Number.isNaN(t)) return "";
+  const s = Math.max(0, (Date.now() - t) / 1000);
+  if (s < 60) return "just now";
+  if (s < 3600) return Math.floor(s / 60) + "m ago";
+  if (s < 86400) return Math.floor(s / 3600) + "h ago";
+  return Math.floor(s / 86400) + "d ago";
+}
+
+let jobFilter = "all";
+window.setJobFilter = function(filter) {
+  jobFilter = filter;
+  loadIndex();
+};
+
 async function loadIndex() {
   const r = await fetch("/api/jobs");
   const jobs = await r.json();
@@ -976,13 +1040,41 @@ async function loadIndex() {
   const _home = document.getElementById("home"); if (_home) _home.style.display = "none";
   const _jid = document.getElementById("jobid"); if (_jid) _jid.textContent = "";
   document.getElementById("status").outerHTML = '<span id="status" class="pill s-queued">jobs</span>';
-  let html = '<div class="card"><h2>Jobs</h2><ul id="jobs">';
-  if (!jobs.length) html += '<li class="muted">No jobs in this workspace state dir yet.</li>';
-  for (const j of jobs) {
-    html += `<li><span class="dot s-${esc(j.status)}"></span><a href="?job=${encodeURIComponent(j.id)}">${esc(j.id)}</a> ${pill(j.status)} <span class="muted">${esc(j.goal)}</span></li>`;
+
+  const counts = {};
+  for (const j of jobs) counts[j.status] = (counts[j.status] || 0) + 1;
+  const shown = jobFilter === "all" ? jobs : jobs.filter(j => j.status === jobFilter);
+
+  let html = '<div class="card"><h2>Jobs</h2>';
+  html += '<div class="filter-bar">';
+  html += `<button class="filter-btn ${jobFilter === "all" ? "active" : ""}" onclick="setJobFilter('all')">All (${jobs.length})</button>`;
+  for (const status of Object.keys(counts).sort()) {
+    html += `<button class="filter-btn ${jobFilter === status ? "active" : ""}" onclick="setJobFilter('${esc(status)}')">${esc(status)} (${counts[status]})</button>`;
   }
-  html += "</ul></div>";
-  document.getElementById("content").innerHTML = html;
+  html += '</div>';
+
+  if (!shown.length) {
+    html += '<p class="muted">No jobs in this workspace state dir yet.</p>';
+  } else {
+    html += '<div class="job-list">';
+    for (const j of shown) {
+      html += `<a class="job-row" href="?job=${encodeURIComponent(j.id)}">
+        ${pill(j.status)}
+        <span class="job-id">${esc(j.id)}</span>
+        <span class="job-goal" title="${esc(j.goal)}">${truncateGoal(j.goal, 160)}</span>
+        <span class="job-time">${fmtAgo(j.created_at)}</span>
+      </a>`;
+    }
+    html += '</div>';
+  }
+  html += '</div>';
+
+  // Same no-op guard as the job view: skip DOM writes (and the hover/scroll
+  // disruption they cause) when nothing changed between polls.
+  if (html !== lastContent) {
+    document.getElementById("content").innerHTML = html;
+    lastContent = html;
+  }
 }
 
 function rows(items, cols) {
@@ -1069,7 +1161,7 @@ function renderTask(task) {
         html += `<span class="conf">confidence: ${act.confidence}</span>`;
       }
 
-      if (act.message && act.message.length > 20) {
+      if (act.message && act.message.length > 20 && act.message !== act.text) {
         html += `<div class="message-block">${md(act.message)}</div>`;
       }
 
@@ -1077,8 +1169,9 @@ function renderTask(task) {
         html += '<div class="meta-chips">';
         if (act.meta.model) html += `<span class="meta-chip">${esc(act.meta.model)}</span>`;
         if (act.meta.cost_usd != null) html += `<span class="meta-chip">$${act.meta.cost_usd.toFixed(6)}</span>`;
-        if (act.meta.tokens_in != null) html += `<span class="meta-chip">↑ ${act.meta.tokens_in}</span>`;
-        if (act.meta.tokens_out != null) html += `<span class="meta-chip">↓ ${act.meta.tokens_out}</span>`;
+        const approx = act.meta.tokens_estimated ? "~" : "";
+        if (act.meta.tokens_in != null) html += `<span class="meta-chip">↑ ${approx}${act.meta.tokens_in}</span>`;
+        if (act.meta.tokens_out != null) html += `<span class="meta-chip">↓ ${approx}${act.meta.tokens_out}</span>`;
         if (act.meta.num_turns != null) html += `<span class="meta-chip">${act.meta.num_turns} turns</span>`;
         if (act.meta.duration_ms != null) html += `<span class="meta-chip">${(act.meta.duration_ms / 1000).toFixed(1)}s</span>`;
         html += '</div>';
@@ -1226,11 +1319,11 @@ async function loadJob() {
 
     html += '<div class="card"><h2>Tasks</h2>';
     html += '<div class="filter-bar">';
-    html += `<div class="filter-btn ${taskFilter === "all" ? "active" : ""}" onclick="setTaskFilter('all')">All (${d.tasks.length})</div>`;
+    html += `<button class="filter-btn ${taskFilter === "all" ? "active" : ""}" onclick="setTaskFilter('all')">All (${d.tasks.length})</button>`;
     const failedCount = d.tasks.filter(t => t.status === "failed").length;
     const runningCount = d.tasks.filter(t => t.status === "running" || t.status === "queued").length;
-    if (failedCount > 0) html += `<div class="filter-btn ${taskFilter === "failed" ? "active" : ""}" onclick="setTaskFilter('failed')">Failed (${failedCount})</div>`;
-    if (runningCount > 0) html += `<div class="filter-btn ${taskFilter === "running" ? "active" : ""}" onclick="setTaskFilter('running')">Active (${runningCount})</div>`;
+    if (failedCount > 0) html += `<button class="filter-btn ${taskFilter === "failed" ? "active" : ""}" onclick="setTaskFilter('failed')">Failed (${failedCount})</button>`;
+    if (runningCount > 0) html += `<button class="filter-btn ${taskFilter === "running" ? "active" : ""}" onclick="setTaskFilter('running')">Active (${runningCount})</button>`;
     html += '</div>';
     for (const task of filteredTasks) {
       html += renderTask(task);

@@ -1678,6 +1678,11 @@ def _main(argv: Optional[list[str]] = None) -> int:
             payload["disable_codegraph"] = True
         if args.disable_memory:
             payload["disable_memory"] = True
+        if (
+            args.sandbox == "read-only"
+            and not args.dangerously_bypass_approvals_and_sandbox
+        ):
+            payload["read_only"] = True
         payload.update(routing_payload_from_args(args, adapter="codex"))
         result = Orchestrator(store).run(
             args.prompt,
@@ -2441,7 +2446,7 @@ def _run_uninstall(args) -> int:
     else:
         killed_entries = registry_kill_stale()
         if killed_entries:
-            print(f"[uninstall-mcp-processes] status: removed")
+            print("[uninstall-mcp-processes] status: removed")
             for entry in killed_entries:
                 print(
                     f"[uninstall-mcp-processes] killed stale PID {entry.pid} "

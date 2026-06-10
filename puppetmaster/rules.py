@@ -114,7 +114,11 @@ RULE_BODY = textwrap.dedent(
        for full-edit builds.
     3. `puppetmaster_artifacts <job_id>` — read structured outputs at zero
        token cost (results persist in SQLite).
-    4. `puppetmaster_doctor` — sanity-check Puppetmaster's runtime
+    4. `puppetmaster_dashboard [job_id]` — when the user asks to see/open
+       the job dashboard, call this (it starts the local server if needed)
+       and open the returned URL in a browser tab for them. CLI fallback:
+       `python -m puppetmaster dashboard [job_id]`.
+    5. `puppetmaster_doctor` — sanity-check Puppetmaster's runtime
        dependencies once per session.
 
     If `puppetmaster_doctor` reports critical failures, surface them to

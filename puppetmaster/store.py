@@ -25,7 +25,9 @@ from puppetmaster.models import (
     task_from_dict,
     to_jsonable,
 )
-from puppetmaster.state import resolve_state_dir
+from puppetmaster.redaction import redact_payload_for_storage
+from puppetmaster.fs_permissions import chmod_private_file, mkdir_private
+from puppetmaster.state import ensure_state_dir, resolve_state_dir
 
 _WINDOWS_LOCK_RETRIES = 10
 _WINDOWS_LOCK_BACKOFF_SECONDS = 0.02
@@ -50,6 +52,15 @@ def _retry_on_windows_lock(operation):
     raise last_error  # type: ignore[misc]
 
 
+def _prepare_for_persistence(value: Any) -> Any:
+    if isinstance(value, Task):
+        return replace(
+            value,
+            payload=redact_payload_for_storage(value.payload),
+        )
+    return value
+
+
 class SwarmStore:
     """File-backed coordination store with Redis-like key spaces."""
 
@@ -58,6 +69,7 @@ class SwarmStore:
 
     def __init__(self, root: Optional[Union[Path, str]] = None) -> None:
         self.root = resolve_state_dir(root)
+        ensure_state_dir(self.root)
         self.jobs_dir = self.root / "jobs"
         self.memory_dir = self.root / "memory"
         self.stream_dir = self.root / "streams"
@@ -75,7 +87,7 @@ class SwarmStore:
             self.stream_dir,
             self.locks_dir,
         ]:
-            directory.mkdir(parents=True, exist_ok=True)
+            mkdir_private(directory)
 
     def create_job(self, goal: str) -> Job:
         self.init()
@@ -88,7 +100,7 @@ class SwarmStore:
             job_dir / "artifacts",
             job_dir / "summaries",
         ]:
-            directory.mkdir(parents=True, exist_ok=True)
+            mkdir_private(directory)
         self.write_json(job_dir / "job.json", job)
         self.emit(job.id, "job.created", {"goal": goal})
         return job
@@ -125,16 +137,28 @@ class SwarmStore:
         for task in tasks:
             self.save_task(task)
 
-    def update_task_status(self, task: Task, status: TaskStatus) -> Task:
+    def update_task_status(
+        self,
+        task: Task,
+        status: TaskStatus,
+        worker_id: Optional[str] = None,
+    ) -> Task:
         terminal = status in {TaskStatus.COMPLETE, TaskStatus.FAILED}
+        stored = self.get_task_by_id(task.id)
+        if terminal and worker_id is not None and stored.lease_owner != worker_id:
+            return stored
         updated = replace(
-            task,
+            stored,
             status=status,
-            lease_owner=None if terminal else task.lease_owner,
-            lease_expires_at=None if terminal else task.lease_expires_at,
+            lease_owner=None if terminal else stored.lease_owner,
+            lease_expires_at=None if terminal else stored.lease_expires_at,
             updated_at=now_iso(),
-            completed_at=now_iso() if status == TaskStatus.COMPLETE else task.completed_at,
+            completed_at=now_iso() if status == TaskStatus.COMPLETE else stored.completed_at,
         )
+        if terminal and worker_id is not None:
+            current = self.get_task_by_id(task.id)
+            if current.lease_owner != worker_id:
+                return current
         self.save_task(updated)
         return updated
 
@@ -169,6 +193,7 @@ class SwarmStore:
         if task.status == TaskStatus.RUNNING and not self.is_task_stale(task):
             return None
 
+        claim_snapshot = self._task_claim_snapshot(task)
         claimed = replace(
             task,
             status=TaskStatus.RUNNING,
@@ -177,7 +202,8 @@ class SwarmStore:
             lease_expires_at=seconds_from_now(lease_seconds),
             updated_at=now_iso(),
         )
-        self.save_task(claimed)
+        if not self._save_task_if_matches(task.id, claim_snapshot, claimed):
+            return None
         self.emit(
             task.job_id,
             "task.claimed",
@@ -238,7 +264,8 @@ class SwarmStore:
             if role is not None and task.role != role:
                 continue
             lock_name = f"task:{task.id}"
-            if not self.acquire_lock(lock_name, worker_id):
+            lock_ttl = max(lease_seconds * 3, lease_seconds + 1)
+            if not self.acquire_lock(lock_name, worker_id, ttl_seconds=lock_ttl):
                 continue
             try:
                 return self.claim_task(task.id, worker_id, lease_seconds=lease_seconds)
@@ -259,6 +286,7 @@ class SwarmStore:
                 updated_at=now_iso(),
             )
             self.save_task(queued)
+            self.release_lock(f"task:{task.id}")
             self.emit(
                 job_id,
                 "task.recovered",
@@ -596,15 +624,27 @@ class SwarmStore:
                     path.rmdir()
             job_dir.rmdir()
 
-    def acquire_lock(self, name: str, owner: str) -> bool:
+    def acquire_lock(
+        self,
+        name: str,
+        owner: str,
+        ttl_seconds: Optional[int] = None,
+    ) -> bool:
         self.init()
         path = self.locks_dir / f"{self._safe_key(name)}.lock"
+        payload = json.dumps({"owner": owner, "at": time.time()}, sort_keys=True)
         try:
             descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                handle.write(owner)
+                handle.write(payload)
             return True
         except FileExistsError:
+            if ttl_seconds is not None and self._lock_is_stale(path, ttl_seconds):
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                return self.acquire_lock(name, owner, ttl_seconds=ttl_seconds)
             return False
 
     def release_lock(self, name: str, owner: Optional[str] = None) -> None:
@@ -615,16 +655,64 @@ class SwarmStore:
         # This prevents a stale/late caller from unlinking another worker's
         # lock and letting a second worker double-claim the same task.
         if owner is not None:
-            try:
-                held_by = path.read_text(encoding="utf-8").strip()
-            except OSError:
-                held_by = ""
+            held_by = self._lock_owner(path)
             if held_by and held_by != owner:
                 return
         try:
             path.unlink()
         except FileNotFoundError:
             pass
+
+    @staticmethod
+    def _task_claim_snapshot(task: Task) -> tuple[Any, ...]:
+        return (task.status, task.lease_owner, task.updated_at, task.attempts)
+
+    def _save_task_if_matches(
+        self,
+        task_id: str,
+        expected: tuple[Any, ...],
+        updated: Task,
+    ) -> bool:
+        current = self.get_task_by_id(task_id)
+        if self._task_claim_snapshot(current) != expected:
+            return False
+        self.save_task(updated)
+        return True
+
+    @staticmethod
+    def _lock_owner(path: Path) -> str:
+        try:
+            raw = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+        if not raw:
+            return ""
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return raw
+        if isinstance(payload, dict):
+            return str(payload.get("owner") or "")
+        return raw
+
+    @staticmethod
+    def _lock_is_stale(path: Path, ttl_seconds: int) -> bool:
+        try:
+            raw = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return True
+        if not raw:
+            return True
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(payload, dict):
+            return False
+        created_at = payload.get("at")
+        if not isinstance(created_at, (int, float)):
+            return False
+        return (time.time() - float(created_at)) >= ttl_seconds
 
     def emit(self, job_id: str, event: str, payload: dict[str, Any]) -> None:
         self.init()
@@ -723,16 +811,23 @@ class SwarmStore:
 
     @staticmethod
     def write_json(path: Path, value: Any) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        mkdir_private(path.parent)
         temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         temp_path.write_text(
-            json.dumps(to_jsonable(value), indent=2, sort_keys=True) + "\n",
+            json.dumps(
+                to_jsonable(_prepare_for_persistence(value)),
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
             encoding="utf-8",
         )
+        chmod_private_file(temp_path)
         # On Windows os.replace raises PermissionError when a concurrent reader
         # holds the destination open; on POSIX the rename is atomic and this
         # retry never triggers. Keeps cross-process task writes from flaking.
         _retry_on_windows_lock(lambda: os.replace(temp_path, path))
+        chmod_private_file(path)
 
     @staticmethod
     def read_json(path: Path) -> dict[str, Any]:

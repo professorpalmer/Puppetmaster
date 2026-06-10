@@ -19,11 +19,14 @@ Opt out with ``PUPPETMASTER_CODEGRAPH_USAGE=0``.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+from puppetmaster.fs_permissions import append_private_text
 
 # Commands whose results displace an agent reading/grepping files. Only these
 # count toward exploration savings; status/init/repair are housekeeping.
@@ -41,6 +44,18 @@ DEFAULT_EXPLORATION_BASELINE_TOKENS = 8000
 # ESTIMATE knob: input price used to turn avoided tokens into dollars. Defaults
 # to a mid-tier model input price; override with PUPPETMASTER_EXPLORATION_PRICE_PER_MTOK.
 DEFAULT_INPUT_PRICE_PER_MTOK = 1.0
+
+
+def _privacy_preserving_cwd(cwd: Optional[object]) -> str:
+    if not cwd:
+        return ""
+    try:
+        resolved = str(Path(cwd).expanduser().resolve())
+    except (OSError, RuntimeError, ValueError):
+        resolved = str(cwd)
+    if not resolved:
+        return ""
+    return hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:12]
 
 
 def usage_log_path() -> Path:
@@ -84,7 +99,7 @@ def record_query(
         "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "command": command,
         "caller": caller,
-        "cwd": str(cwd or ""),
+        "cwd": _privacy_preserving_cwd(cwd),
         "query_chars": int(query_chars),  # size of the ask, not its content
         "result_chars": int(result_chars),
         "context_tokens": estimate_tokens(result_chars),
@@ -93,9 +108,7 @@ def record_query(
     }
     try:
         path = usage_log_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(rec) + "\n")
+        append_private_text(path, json.dumps(rec) + "\n")
     except OSError:
         pass  # measurement must never break a real query
 

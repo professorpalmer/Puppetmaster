@@ -4,6 +4,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -1378,30 +1379,64 @@ class Orchestrator:
             self._spawn_worker(job.id, role, lease_seconds=lease_seconds)
             for role in roles
         ]
-        for process in processes:
-            self._wait_for_worker(process, job, tasks)
-            if process.returncode != 0:
-                raise RuntimeError(f"worker process failed with exit code {process.returncode}")
+        try:
+            for process in processes:
+                self._wait_for_worker(process, job, tasks)
+                if process.returncode != 0:
+                    raise RuntimeError(
+                        f"worker process failed with exit code {process.returncode}"
+                    )
 
-        if self.store.has_incomplete_tasks(job.id):
-            recovered = self.store.recover_stale_tasks(job.id)
-            unblocked = self.store.refresh_blocked_tasks(job.id)
-            next_tasks = [
-                task
-                for task in self.store.list_tasks(job.id)
-                if task.id in allowed_task_ids
-                and task.status in {TaskStatus.QUEUED, TaskStatus.RUNNING}
-            ]
-            if recovered or unblocked or next_tasks:
-                self._run_workers(
-                    job,
-                    next_tasks,
-                    lease_seconds=lease_seconds,
-                    allowed_task_ids=allowed_task_ids,
-                    worker_mode=worker_mode,
+            if self.store.has_incomplete_tasks(job.id):
+                recovered = self.store.recover_stale_tasks(job.id)
+                unblocked = self.store.refresh_blocked_tasks(job.id)
+                next_tasks = [
+                    task
+                    for task in self.store.list_tasks(job.id)
+                    if task.id in allowed_task_ids
+                    and task.status in {TaskStatus.QUEUED, TaskStatus.RUNNING}
+                ]
+                claimable = any(
+                    task.status == TaskStatus.QUEUED for task in next_tasks
                 )
-            elif self._should_fail_closed(job, allowed_task_ids):
-                raise RuntimeError("swarm exited with incomplete tasks")
+                if recovered or unblocked or claimable:
+                    self._run_workers(
+                        job,
+                        next_tasks,
+                        lease_seconds=lease_seconds,
+                        allowed_task_ids=allowed_task_ids,
+                        worker_mode=worker_mode,
+                    )
+                elif next_tasks:
+                    poll_interval = 0.2
+                    remaining_lease = float(lease_seconds)
+                    for task in next_tasks:
+                        if task.lease_expires_at:
+                            from puppetmaster.models import parse_iso
+
+                            delta = (
+                                parse_iso(task.lease_expires_at)
+                                - datetime.now(timezone.utc)
+                            ).total_seconds()
+                            remaining_lease = min(remaining_lease, max(0.0, delta))
+                    time.sleep(min(remaining_lease, poll_interval))
+                    self._run_workers(
+                        job,
+                        next_tasks,
+                        lease_seconds=lease_seconds,
+                        allowed_task_ids=allowed_task_ids,
+                        worker_mode=worker_mode,
+                    )
+                elif self._should_fail_closed(job, allowed_task_ids):
+                    raise RuntimeError("swarm exited with incomplete tasks")
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
 
     def _run_inline_workers(
         self,
