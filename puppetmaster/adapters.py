@@ -297,6 +297,7 @@ def build_patch_payload(
         if after.get("worker_diff") is not None
         else after.get("diff") or ""
     )
+    diff_source = diff_source_payload(before, after)
     redacted = redact_secrets(raw_diff) or ""
     total = len(redacted)
     truncated = total > _PATCH_INLINE_CHARS
@@ -306,6 +307,7 @@ def build_patch_payload(
         "files": after.get("worker_changed_files", after.get("changed_files", [])),
         "untracked_files": after.get("worker_untracked_files", after.get("untracked_files", [])),
         "unified_diff": inline,
+        **diff_source,
         "diff_total_chars": total,
         "diff_truncated": truncated,
         "base_sha": before.get("sha"),
@@ -323,6 +325,30 @@ def build_patch_payload(
             task=task, sidecar_name=sidecar_name, diff=redacted
         )
     return payload
+
+
+def snapshot_has_diff(snapshot: dict) -> bool:
+    """True when a git snapshot reports any tracked or untracked diff."""
+    return bool(
+        str(snapshot.get("diff") or "").strip()
+        or snapshot.get("changed_files")
+        or snapshot.get("untracked_files")
+    )
+
+
+def diff_source_payload(before: dict, after: dict) -> dict[str, bool]:
+    """Label whether a diff existed before the worker and whether it changed."""
+    worker_diff = after.get("worker_diff")
+    if worker_diff is not None:
+        worker_diff_present = bool(str(worker_diff).strip())
+    elif snapshot_has_diff(before):
+        worker_diff_present = False
+    else:
+        worker_diff_present = snapshot_has_diff(after)
+    return {
+        "baseline_diff_present": snapshot_has_diff(before),
+        "worker_diff_present": worker_diff_present,
+    }
 
 
 def _spool_patch_sidecar(*, task: Task, sidecar_name: str, diff: str) -> Optional[str]:
@@ -596,6 +622,7 @@ class CursorAdapter:
                         ),
                         "changed_files": before["changed_files"],
                         "untracked_files": before["untracked_files"],
+                        **diff_source_payload(before, {}),
                     },
                 )
             ]
@@ -646,6 +673,7 @@ class CursorAdapter:
                         "head_sha": after["sha"],
                         "changed_files": after["changed_files"],
                         "untracked_files": after["untracked_files"],
+                        **diff_source_payload(before, after),
                     },
                 )
             ]
@@ -696,6 +724,7 @@ class CursorAdapter:
                     "head_sha": after["sha"],
                     "changed_files": after["changed_files"],
                     "untracked_files": after["untracked_files"],
+                    **diff_source_payload(before, after),
                     **usage,
                 },
             )
@@ -983,6 +1012,7 @@ class ClaudeCodeAdapter:
                         ),
                         "changed_files": before["changed_files"],
                         "untracked_files": before["untracked_files"],
+                        **diff_source_payload(before, {}),
                     },
                 )
             ]
@@ -1034,6 +1064,7 @@ class ClaudeCodeAdapter:
                         "head_sha": after["sha"],
                         "changed_files": after["changed_files"],
                         "untracked_files": after["untracked_files"],
+                        **diff_source_payload(before, after),
                     },
                 )
             ]
@@ -1108,6 +1139,7 @@ class ClaudeCodeAdapter:
                 "head_sha": after["sha"],
                 "changed_files": after["changed_files"],
                 "untracked_files": after["untracked_files"],
+                **diff_source_payload(before, after),
                 **usage,
             },
         )
@@ -1139,8 +1171,7 @@ def _should_emit_patch_artifact(before: dict, after: dict) -> bool:
     worker_diff = after.get("worker_diff")
     if worker_diff is not None:
         return bool(str(worker_diff).strip())
-    before_diff = str(before.get("diff") or "")
-    if before_diff.strip() or before.get("changed_files") or before.get("untracked_files"):
+    if snapshot_has_diff(before):
         return False
     return bool(str(after.get("diff") or "").strip())
 
@@ -1260,6 +1291,7 @@ class CodexAdapter:
                         ),
                         "changed_files": before["changed_files"],
                         "untracked_files": before["untracked_files"],
+                        **diff_source_payload(before, {}),
                     },
                 )
             ]
@@ -1316,6 +1348,7 @@ class CodexAdapter:
                         "head_sha": after["sha"],
                         "changed_files": after["changed_files"],
                         "untracked_files": after["untracked_files"],
+                        **diff_source_payload(before, after),
                     },
                 )
             ]
@@ -1445,6 +1478,7 @@ class CodexAdapter:
                 "head_sha": after["sha"],
                 "changed_files": after["changed_files"],
                 "untracked_files": after["untracked_files"],
+                **diff_source_payload(before, after),
                 "failure": (
                     None
                     if not process_failed

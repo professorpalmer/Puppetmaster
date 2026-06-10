@@ -1441,8 +1441,13 @@ class PuppetmasterTests(unittest.TestCase):
 
         run.assert_called_once()  # dirty guard bypassed
         self.assertEqual(artifacts[0].payload["result"], "passed")
+        self.assertTrue(artifacts[0].payload["baseline_diff_present"])
+        self.assertTrue(artifacts[0].payload["worker_diff_present"])
         patch_artifact = next(a for a in artifacts if a.type == ArtifactType.PATCH)
         self.assertEqual(patch_artifact.payload["files"], ["helper.py"])
+        self.assertTrue(patch_artifact.payload["baseline_diff_present"])
+        self.assertTrue(patch_artifact.payload["worker_diff_present"])
+        self.assertNotIn("patch_artifact_emitted", patch_artifact.payload)
         self.assertIn("helper.py", patch_artifact.payload["unified_diff"])
         self.assertNotIn("pre.py", patch_artifact.payload["unified_diff"])
 
@@ -1467,6 +1472,21 @@ class PuppetmasterTests(unittest.TestCase):
         }
 
         self.assertFalse(_should_emit_patch_artifact(before_dirty, after_unattributed))
+
+    def test_patch_gate_requires_diff_text_without_worker_diff(self) -> None:
+        from puppetmaster.adapters import _should_emit_patch_artifact
+
+        clean_before = {"sha": "s", "changed_files": [], "untracked_files": [], "diff": ""}
+        after_without_diff_text = {
+            "sha": "s",
+            "changed_files": ["helper.py"],
+            "untracked_files": [],
+            "diff": "",
+        }
+
+        self.assertFalse(
+            _should_emit_patch_artifact(clean_before, after_without_diff_text)
+        )
 
     def test_cursor_implement_dirty_tree_snapshot_failure_emits_no_patch(self) -> None:
         from puppetmaster import adapters
@@ -10518,6 +10538,45 @@ class PuppetmasterFrictionFixTests(unittest.TestCase):
                 (store.job_dir(job.id) / "summaries" / "stitched.md").is_file()
             )
 
+    def test_finalize_cli_run_reports_diff_source(self) -> None:
+        from puppetmaster.cli import finalize_cli_run
+        from puppetmaster.orchestrator import RunResult
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            job = store.create_job("goal")
+            artifact = Artifact(
+                job_id=job.id,
+                task_id="t1",
+                type=ArtifactType.VERIFICATION,
+                created_by="w1",
+                confidence=0.9,
+                evidence=["adapter:cursor"],
+                payload={
+                    "check": "run",
+                    "result": "passed",
+                    "baseline_diff_present": True,
+                    "worker_diff_present": False,
+                },
+            )
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+                finalize_cli_run(
+                    RunResult(
+                        job=job,
+                        artifacts=[artifact],
+                        summary="",
+                        summary_path=Path(tmp) / "summary.md",
+                        mode="edit",
+                    )
+                )
+
+        outcome = stderr.getvalue()
+        self.assertIn("baseline_diff_present=True", outcome)
+        self.assertIn("worker_diff_present=False", outcome)
+        self.assertIn("patch_artifact_emitted=False", outcome)
+        self.assertIn("commit_present=False", outcome)
+
     # --- #6: codegraph global-flag hoisting ----------------------------
     def test_hoist_global_codegraph_flags(self) -> None:
         from puppetmaster.cli import _hoist_global_codegraph_flags
@@ -11666,11 +11725,37 @@ class PuppetmasterLifecycleTests(unittest.TestCase):
             self.assertIn("outcome", snap)
             self.assertEqual(snap["outcome"]["quality"], "empty")
             self.assertFalse(snap["outcome"]["diff_present"])
+            self.assertFalse(snap["outcome"]["baseline_diff_present"])
+            self.assertFalse(snap["outcome"]["worker_diff_present"])
+            self.assertFalse(snap["outcome"]["patch_artifact_emitted"])
             self.assertFalse(snap["outcome"]["commit_present"])
 
             store.save_artifact(Artifact(
+                job_id=job.id, task_id="t1", type=ArtifactType.VERIFICATION, created_by="w1",
+                confidence=0.9, evidence=["e"],
+                payload={
+                    "check": "run",
+                    "result": "passed",
+                    "baseline_diff_present": True,
+                    "worker_diff_present": False,
+                },
+            ))
+            snap = store.status_snapshot(job.id)
+            self.assertFalse(snap["outcome"]["diff_present"])
+            self.assertTrue(snap["outcome"]["baseline_diff_present"])
+            self.assertFalse(snap["outcome"]["worker_diff_present"])
+            self.assertFalse(snap["outcome"]["patch_artifact_emitted"])
+
+            store.save_artifact(Artifact(
                 job_id=job.id, task_id="t1", type=ArtifactType.PATCH, created_by="w1",
-                confidence=0.9, evidence=["e"], payload={"change": "edit", "files": ["a.py"]},
+                confidence=0.9, evidence=["e"],
+                payload={
+                    "change": "edit",
+                    "files": ["a.py"],
+                    "baseline_diff_present": True,
+                    "worker_diff_present": True,
+                    "patch_artifact_emitted": True,
+                },
             ))
             store.save_artifact(Artifact(
                 job_id=job.id, task_id="t1", type=ArtifactType.GATE, created_by="w1",
@@ -11679,8 +11764,11 @@ class PuppetmasterLifecycleTests(unittest.TestCase):
             ))
             snap = store.status_snapshot(job.id)
             self.assertTrue(snap["outcome"]["diff_present"])
+            self.assertTrue(snap["outcome"]["baseline_diff_present"])
+            self.assertTrue(snap["outcome"]["worker_diff_present"])
+            self.assertTrue(snap["outcome"]["patch_artifact_emitted"])
             self.assertTrue(snap["outcome"]["commit_present"])
-            self.assertEqual(snap["outcome"]["artifact_count"], 2)
+            self.assertEqual(snap["outcome"]["artifact_count"], 3)
 
     def test_gc_all_projects_force_skips_active_worktree(self) -> None:
         """`gc --force --all-projects` must not delete the active project's state (D1)."""
