@@ -1230,7 +1230,7 @@ def _build_tools() -> list[McpTool]:
             description=(
                 "Prune dead tracking files for MCP servers that exited without cleanup, "
                 "and (with kill_stale=true) SIGTERM/SIGKILL stale-but-alive Puppetmaster "
-                "MCP servers whose Cursor parent appears to be gone. Never signals the "
+                "MCP servers whose parent client appears to be gone. Never signals the "
                 "current process. Returns the before/after registry snapshot."
             ),
             input_schema=mcp_cleanup_schema(),
