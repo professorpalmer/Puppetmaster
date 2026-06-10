@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.9.30
+
+**Community fix wave: stalled jobs can't masquerade as success, diff outcomes are attributable, and MCP diagnostics stop assuming Cursor.** Three contributor PRs (#7, #8, #9 — a community contributor), merged with one post-merge tidy. Full suite **584** green (+4 focused tests); `ruff check puppetmaster/` clean.
+
+- **Stalled `await` is an error (#8).** `stalled` was already a terminal state, but CLI `await` exited 0 and MCP `puppetmaster_await_job` returned `isError: false` for it — automation gating on await would sail past a degraded run. Both entry points now match `wait`'s existing behavior: non-zero exit / `isError: true`, with regression coverage for each.
+- **Diff-source outcome reporting (#7).** The ambiguous `diff_present=True` is unpacked into three honest signals on full-edit verification and PATCH payloads, edit-run CLI outcome lines, and status outcome snapshots: `baseline_diff_present` (tree was dirty before the worker), `worker_diff_present` (the worker made an attributable change), `patch_artifact_emitted` (a PATCH artifact actually exists). The patch-emission gate and the new labels share one `snapshot_has_diff` predicate, so they can't drift. `diff_present` is kept as a legacy alias of `patch_artifact_emitted` for existing consumers.
+- **Client-neutral MCP diagnostics (#9).** `mcp doctor` / `mcp cleanup` no longer tell every user to "restart MCP in Cursor Settings" — Puppetmaster runs from Codex and Claude Code hosts too. Same failure-mode explanations, host-neutral wording; the no-server remedy now names both installers.
+- **Known limits.** `worker_diff_present` is `False` for unattributable changes in a pre-dirty tree without a worker-scoped diff — by design, matching the patch-emission gate. Outcome lines on stderr changed format (`diff_present=` → the three new keys); anything scraping that human-facing line needs updating, while the structured `outcome` snapshot keeps `diff_present`.
+
 ## v0.9.29
 
 **Feature: `puppetmaster_dashboard` MCP verb — "show me the job dashboard" is now a first-class ask in any IDE with the MCP registered.** Until now the dashboard only launched via the CLI, and nothing told agents that; an agent fielding "open the dashboard" had to already know the fallback. Full suite **580** green (+4 focused tests); verified live — real server spawn, HTTP probe, idempotent reuse, deep link.
