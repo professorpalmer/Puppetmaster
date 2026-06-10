@@ -10806,6 +10806,35 @@ class PuppetmasterFrictionFixTests(unittest.TestCase):
             self.assertTrue(state["terminal"])
             self.assertEqual(state["status"], "stalled")
 
+    def test_await_returns_nonzero_for_stalled(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            job = store.create_job("goal")
+            store.update_job_status(job.id, JobStatus.STALLED)
+            rc = cli_main(
+                ["--state-dir", str(store.root), "--backend", "sqlite", "await", job.id]
+            )
+            self.assertEqual(rc, 1)
+
+    def test_mcp_await_marks_stalled_as_error(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            job = store.create_job("goal")
+            store.update_job_status(job.id, JobStatus.STALLED)
+            result = call_tool(
+                "puppetmaster_await_job",
+                {
+                    "cwd": tmp,
+                    "state_dir": str(store.root),
+                    "backend": "sqlite",
+                    "job_id": job.id,
+                    "timeout_seconds": 1,
+                },
+            )
+            payload = json.loads(result["content"][0]["text"])
+            self.assertTrue(result["isError"])
+            self.assertEqual(payload["status"], "stalled")
+
 
 class PuppetmasterLoudFailureTests(unittest.TestCase):
     """Tier-1 reliability: a run that did zero work must never look like success.

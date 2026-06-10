@@ -3735,7 +3735,7 @@ def _run_await_command(args, store) -> int:
             print(f"timed out after {args.timeout_seconds}s; job {args.job_id} is {state['status']}")
         else:
             print(summary or f"job {args.job_id} finished: {state['status']}")
-    return 0 if state["status"] != "failed" else 1
+    return 0 if state["status"] not in {"failed", "stalled"} else 1
 
 
 def _run_preflight_command(args) -> int:
