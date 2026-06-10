@@ -8348,6 +8348,87 @@ class DashboardTests(unittest.TestCase):
             snap = build_job_snapshot(store, job.id)
             self.assertEqual(snap["cost"]["total_estimated_cost_usd"], 0.0)
 
+    def test_build_job_snapshot_includes_task_activity_and_progress(self) -> None:
+        """Each task row carries its instruction plus an artifact-backed
+        activity timeline, and PATCH diffs attach to exactly the task that
+        produced them (never repeated across cards)."""
+        from puppetmaster.dashboard import build_job_snapshot
+        from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
+
+        with TemporaryDirectory() as tmp:
+            store, job = self._seed_store(tmp)
+            patched_task = store.list_tasks(job.id)[0]
+            other_task = Task(
+                job_id=job.id, role="review", instruction="look it over",
+                adapter="cursor", status=TaskStatus.RUNNING, payload={}, attempts=1,
+            )
+            store.save_task(other_task)
+            store.save_artifact(
+                Artifact(
+                    job_id=job.id, task_id=patched_task.id, type=ArtifactType.PATCH,
+                    created_by="worker-implement",
+                    payload={
+                        "change": "add helper",
+                        "files": ["helper.py"],
+                        "unified_diff": "diff --git a/helper.py b/helper.py\n+x\n",
+                        "diff_truncated": False,
+                        "diff_total_chars": 40,
+                    },
+                    confidence=1.0, evidence=["worktree"],
+                )
+            )
+
+            snap = build_job_snapshot(store, job.id)
+
+            self.assertEqual(snap["progress"], {"complete": 1, "running": 1})
+            by_id = {row["id"]: row for row in snap["tasks"]}
+            patched_row = by_id[patched_task.id]
+            self.assertEqual(patched_row["instruction"], "do the thing")
+            activity_types = [item["type"] for item in patched_row["activity"]]
+            self.assertIn("routing", activity_types)
+            self.assertIn("patch", activity_types)
+            patch_item = next(
+                item for item in patched_row["activity"] if item["type"] == "patch"
+            )
+            self.assertEqual(patch_item["diff"]["files"], ["helper.py"])
+            routing_item = next(
+                item for item in patched_row["activity"] if item["type"] == "routing"
+            )
+            self.assertIn("Routed to", routing_item["text"])
+            other_types = [item["type"] for item in by_id[other_task.id]["activity"]]
+            self.assertNotIn("patch", other_types)
+
+    def test_renderer_js_neutralizes_xss_and_preserves_digits(self) -> None:
+        """Execute the actual client-side renderer under node: script tags and
+        javascript: links must come out inert, and ordinary digits must survive
+        the code-span stash (regression: bare numeric placeholders once turned
+        every number in prose into `undefined`)."""
+        import shutil
+
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not available")
+        from puppetmaster.dashboard import RENDERER_JS
+
+        harness = RENDERER_JS + r"""
+const assert = require("assert");
+assert.ok(md("We found 3 issues across 12 files").includes("3 issues across 12 files"));
+assert.ok(md("Run `pytest` — 537 passed").includes("537 passed"));
+assert.ok(md("Run `pytest` — 537 passed").includes("<code>pytest</code>"));
+const xss = md("<script>alert(1)</script> [x](javascript:alert(2))");
+assert.ok(!xss.includes("<script>"));
+assert.ok(!xss.includes("javascript:"));
+assert.ok(xss.includes("&lt;script&gt;"));
+// A forged sentinel in artifact text must not dereference the stash.
+assert.ok(!md("\uE000 0 \uE000").includes("undefined"));
+console.log("renderer-ok");
+"""
+        completed = subprocess.run(
+            [node, "-e", harness], capture_output=True, text=True, timeout=30
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("renderer-ok", completed.stdout)
+
 
 class EnsurePlanCatalogTests(unittest.TestCase):
     """First-run guarantee: auto-routed work always has a plan-billed frontier
