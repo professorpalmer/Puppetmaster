@@ -9591,6 +9591,15 @@ class ReadsLogTests(unittest.TestCase):
 class SetupPlatformStepTests(unittest.TestCase):
     """The `setup` wizard's platform-lock step (non-interactive paths)."""
 
+    def setUp(self) -> None:
+        import os
+        from puppetmaster import platform_lock as pl
+
+        self._env_before = {
+            "PUPPETMASTER_MODELS_PATH": os.environ.get("PUPPETMASTER_MODELS_PATH"),
+            pl.ONLY_ENV: os.environ.get(pl.ONLY_ENV),
+        }
+
     def _args(self, **kw):
         from types import SimpleNamespace
         base = {"platforms": None, "skip_platforms": False}
@@ -9605,7 +9614,12 @@ class SetupPlatformStepTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         import os
-        os.environ.pop("PUPPETMASTER_MODELS_PATH", None)
+
+        for key, value in self._env_before.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
     def test_explicit_platforms_sets_lock(self) -> None:
         from puppetmaster.cli import _setup_platform_step
