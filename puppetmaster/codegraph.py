@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional, Union
 
-from puppetmaster.fs_permissions import chmod_private_file, mkdir_private, open_private
+from puppetmaster.fs_permissions import mkdir_private, open_private
 
 
 CODEGRAPH_COMMAND = "codegraph"

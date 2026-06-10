@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -1127,6 +1128,19 @@ def _build_tools() -> list[McpTool]:
             handler=lambda args: run_cli(["show", require_string(args, "job_id")], args),
         ),
         McpTool(
+            name="puppetmaster_dashboard",
+            description=(
+                "Open the live Puppetmaster web dashboard. Starts the "
+                "zero-dependency local server (loopback-only) if one isn't "
+                "already listening on the port and returns the URL to open — "
+                "pass job_id to deep-link straight to one job. Use whenever the "
+                "user asks to see/open/show the job dashboard, then open the "
+                "returned URL in a browser tab for them."
+            ),
+            input_schema=dashboard_schema(),
+            handler=run_dashboard,
+        ),
+        McpTool(
             name="puppetmaster_codegraph_search",
             description=(
                 "Find symbols by name using the local CodeGraph index. "
@@ -2075,6 +2089,95 @@ def run_cli(command: list[str], args: JsonObject) -> JsonObject:
     }
 
 
+def _dashboard_alive(port: int) -> bool:
+    """True when a dashboard already answers on the loopback port."""
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/api/jobs", timeout=1.0
+        ) as response:
+            return response.status == 200
+    except OSError:
+        return False
+
+
+def _spawn_dashboard_server(command: list[str], args: JsonObject) -> subprocess.Popen:
+    """Launch the dashboard CLI detached from this MCP process."""
+    return subprocess.Popen(
+        command,
+        cwd=cwd(args),
+        env=launcher_environment(args),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def run_dashboard(args: JsonObject) -> JsonObject:
+    """Ensure a dashboard server is running and return its URL.
+
+    Idempotent: an already-listening dashboard on the port is reused rather
+    than spawning a duplicate. The server binds loopback-only — exposing it
+    further requires the CLI's explicit --allow-external."""
+    state_dir = str(mcp_state_dir(args))
+    port = int(args.get("port") or 8787)
+    job_id = args.get("job_id")
+    job = job_id.strip() if isinstance(job_id, str) and job_id.strip() else None
+    url = f"http://127.0.0.1:{port}/" + (f"?job={job}" if job else "")
+
+    already_running = _dashboard_alive(port)
+    pid: Optional[int] = None
+    if not already_running:
+        command = [
+            sys.executable,
+            "-m",
+            "puppetmaster",
+            "--state-dir",
+            state_dir,
+            "dashboard",
+            "--port",
+            str(port),
+            "--no-open",
+        ]
+        if job:
+            command.append(job)
+        process = _spawn_dashboard_server(command, args)
+        pid = process.pid
+        deadline = time.time() + 10
+        while time.time() < deadline and not _dashboard_alive(port):
+            if process.poll() is not None:
+                break
+            time.sleep(0.2)
+        if not _dashboard_alive(port):
+            body = {
+                "error": "dashboard failed to start",
+                "port": port,
+                "state_dir": state_dir,
+                "returncode": process.poll(),
+                "hint": f"Try `python -m puppetmaster dashboard --port {port}` for the full error.",
+            }
+            return {
+                "content": [{"type": "text", "text": json.dumps(body, indent=2)}],
+                "isError": True,
+            }
+
+    body = {
+        "url": url,
+        "port": port,
+        "state_dir": state_dir,
+        "already_running": already_running,
+        "started": not already_running,
+        "pid": pid,
+        "note": (
+            "Reused the dashboard already listening on this port — it may be "
+            "serving a different project's state dir."
+            if already_running
+            else "Open the URL in a browser tab for the user."
+        ),
+    }
+    return {"content": [{"type": "text", "text": json.dumps(body, indent=2)}]}
+
+
 def run_gc(args: JsonObject) -> JsonObject:
     command = ["gc", "--json"]
     if args.get("older_than_days") is not None:
@@ -2405,6 +2508,19 @@ def job_schema(required: bool = False) -> JsonObject:
     schema["properties"]["job_id"] = {"type": "string", "description": "Puppetmaster job id."}
     if required:
         schema["required"] = ["job_id"]
+    return schema
+
+
+def dashboard_schema() -> JsonObject:
+    schema = job_schema()
+    schema["properties"]["job_id"]["description"] = (
+        "Optional job to deep-link; omit to land on the jobs index."
+    )
+    schema["properties"]["port"] = {
+        "type": "integer",
+        "default": 8787,
+        "description": "Dashboard port (default 8787).",
+    }
     return schema
 
 

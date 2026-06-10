@@ -25,6 +25,7 @@ Puppetmaster exposes these MCP tools:
 - `puppetmaster_partial_summary`
 - `puppetmaster_artifacts`
 - `puppetmaster_show`
+- `puppetmaster_dashboard`
 - `puppetmaster_codegraph_search`
 - `puppetmaster_codegraph_context`
 - `puppetmaster_codegraph_affected`
@@ -64,6 +65,7 @@ Puppetmaster is not meant to hide all useful work until the end. Workers write a
 - `puppetmaster_live_artifacts_follow`: long-poll for new artifacts since a cursor (push-style stream over MCP)
 - `puppetmaster_partial_summary`: current synthesis from artifacts already emitted
 - `puppetmaster_show`: final stitched summary after completion
+- `puppetmaster_dashboard`: ensure the local web dashboard is serving (idempotent, loopback-only) and get its URL — ask the Agent to "open the Puppetmaster dashboard" and it opens the returned URL in a browser tab, optionally deep-linked to one job via `job_id`
 
 Final stitching is the publishable report. The live artifact board is the shared coordination surface.
 
