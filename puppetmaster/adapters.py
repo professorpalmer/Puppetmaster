@@ -7,6 +7,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -291,20 +292,26 @@ def build_patch_payload(
     - **Untracked visibility**: untracked files are surfaced alongside changed
       files so a run that only creates new files is still attributable.
     """
-    raw_diff = str(after.get("diff") or "")
+    raw_diff = str(
+        after.get("worker_diff")
+        if after.get("worker_diff") is not None
+        else after.get("diff") or ""
+    )
     redacted = redact_secrets(raw_diff) or ""
     total = len(redacted)
     truncated = total > _PATCH_INLINE_CHARS
     inline = redacted[-_PATCH_INLINE_CHARS:] if truncated else redacted
     payload: dict[str, Any] = {
         "change": change,
-        "files": after.get("changed_files", []),
-        "untracked_files": after.get("untracked_files", []),
+        "files": after.get("worker_changed_files", after.get("changed_files", [])),
+        "untracked_files": after.get("worker_untracked_files", after.get("untracked_files", [])),
         "unified_diff": inline,
         "diff_total_chars": total,
         "diff_truncated": truncated,
         "base_sha": before.get("sha"),
         "head_sha": after.get("sha"),
+        "base_tree": before.get("tree"),
+        "head_tree": after.get("tree"),
         "status": status,
         "revert": (
             "Review the diff, then use git restore / git checkout or your VCS "
@@ -618,7 +625,7 @@ class CursorAdapter:
             timeout_seconds=timeout_seconds,
         )
         if completed.timed_out:
-            after = git_snapshot(cwd)
+            after = git_snapshot(cwd, base_tree=str(before.get("tree") or "") or None)
             artifacts: list[Artifact] = [
                 verification_artifact(
                     task=task,
@@ -644,13 +651,13 @@ class CursorAdapter:
             ]
             # A timed-out implement run may still have edited files; surface the
             # partial diff so the work isn't silently lost.
-            if after["diff"].strip():
+            if _should_emit_patch_artifact(before, after):
                 artifacts.append(
                     self._patch_artifact(task, worker_id, before, after, status="failed")
                 )
             return artifacts
 
-        after = git_snapshot(cwd)
+        after = git_snapshot(cwd, base_tree=str(before.get("tree") or "") or None)
         failure = classify_cursor_failure(completed.stderr + completed.stdout)
         usage = token_usage(
             sdk_usage=sdk_usage_from_stdout(completed.stdout),
@@ -693,7 +700,7 @@ class CursorAdapter:
                 },
             )
         ]
-        if after["diff"].strip():
+        if _should_emit_patch_artifact(before, after):
             artifacts.append(
                 self._patch_artifact(
                     task,
@@ -994,7 +1001,7 @@ class ClaudeCodeAdapter:
         if completed.timed_out:
             stdout = completed.stdout
             stderr = completed.stderr
-            after = git_snapshot(cwd)
+            after = git_snapshot(cwd, base_tree=str(before.get("tree") or "") or None)
             stdout_capture = capture_subprocess_stdout(
                 text=stdout,
                 task=task,
@@ -1032,7 +1039,7 @@ class ClaudeCodeAdapter:
             ]
             # A timed-out run may have already edited files; surface the partial
             # diff so the work isn't silently stranded in the tree.
-            if str(after.get("diff") or "").strip():
+            if _should_emit_patch_artifact(before, after):
                 artifacts.append(
                     Artifact(
                         job_id=task.job_id,
@@ -1053,7 +1060,7 @@ class ClaudeCodeAdapter:
                 )
             return artifacts
 
-        after = git_snapshot(cwd)
+        after = git_snapshot(cwd, base_tree=str(before.get("tree") or "") or None)
         # Claude Code stdout often carries long edit transcripts. Give the
         # head/tail more room than Cursor (12k tail vs 8k) but still spool the
         # full transcript so middle bytes survive.
@@ -1105,7 +1112,7 @@ class ClaudeCodeAdapter:
             },
         )
         artifacts = [verification]
-        if str(after.get("diff") or "").strip():
+        if _should_emit_patch_artifact(before, after):
             artifacts.append(
                 Artifact(
                     job_id=task.job_id,
@@ -1125,6 +1132,17 @@ class ClaudeCodeAdapter:
                 )
             )
         return artifacts
+
+
+def _should_emit_patch_artifact(before: dict, after: dict) -> bool:
+    """True when a PATCH can be attributed to the worker run."""
+    worker_diff = after.get("worker_diff")
+    if worker_diff is not None:
+        return bool(str(worker_diff).strip())
+    before_diff = str(before.get("diff") or "")
+    if before_diff.strip() or before.get("changed_files") or before.get("untracked_files"):
+        return False
+    return bool(str(after.get("diff") or "").strip())
 
 
 DEFAULT_CODEX_MODEL = "gpt-5.4-mini"
@@ -1261,7 +1279,7 @@ class CodexAdapter:
         if completed.timed_out:
             stdout = completed.stdout
             stderr = completed.stderr
-            after = git_snapshot(cwd)
+            after = git_snapshot(cwd, base_tree=str(before.get("tree") or "") or None)
             stdout_capture = capture_subprocess_stdout(
                 text=stdout,
                 task=task,
@@ -1301,7 +1319,7 @@ class CodexAdapter:
                     },
                 )
             ]
-            if str(after.get("diff") or "").strip():
+            if _should_emit_patch_artifact(before, after):
                 artifacts.append(
                     Artifact(
                         job_id=task.job_id,
@@ -1322,7 +1340,7 @@ class CodexAdapter:
                 )
             return artifacts
 
-        after = git_snapshot(cwd)
+        after = git_snapshot(cwd, base_tree=str(before.get("tree") or "") or None)
 
         events = parse_codex_events(completed.stdout)
         usage = next(
@@ -1460,7 +1478,7 @@ class CodexAdapter:
                 )
             )
         artifacts.extend(parsed_artifacts)
-        if str(after.get("diff") or "").strip():
+        if _should_emit_patch_artifact(before, after):
             artifacts.append(
                 Artifact(
                     job_id=task.job_id,
@@ -1766,43 +1784,122 @@ def tool_list(value: object) -> str:
     return str(value)
 
 
-def git_snapshot(cwd: Path) -> dict[str, object]:
+def git_snapshot(cwd: Path, *, base_tree: Optional[str] = None) -> dict[str, object]:
     """Capture a diff-attributable snapshot of the working tree.
 
     Captures changes **against HEAD** (not just working-tree-vs-index) so that
-    *staged* edits are seen by dirty-tree gating and included in PATCH diffs,
-    and synthesizes no-index patches for *untracked* files so a run that only
-    creates new files still produces an applyable diff. Also reports whether
-    ``cwd`` is inside a git work tree so full-edit adapters can refuse to run
-    outside a repo (where diffs are unattributable)."""
+    *staged* edits are seen by dirty-tree gating and included in dirty-state
+    checks, and synthesizes no-index patches for *untracked* files. When
+    ``base_tree`` is provided, also records a PM-attributable diff from that
+    pre-worker tree to the current worktree. Also reports whether ``cwd`` is
+    inside a git work tree so full-edit adapters can refuse to run outside a
+    repo (where diffs are unattributable)."""
     inside = git_output(cwd, ["rev-parse", "--is-inside-work-tree"]) == "true"
-    sha = git_output(cwd, ["rev-parse", "HEAD"])
-    untracked = git_untracked_files(cwd)
+    root = git_worktree_root(cwd) if inside else cwd
+    sha = git_output(root, ["rev-parse", "HEAD"])
+    untracked = git_untracked_files(root)
     if sha:
         # HEAD exists: `git diff HEAD` covers both staged and unstaged tracked
         # changes; plain `git diff` would silently drop staged edits.
-        changed = git_lines(cwd, ["diff", "HEAD", "--name-only"])
-        diff = git_diff_output(cwd, ["diff", "HEAD", "--binary"])
+        changed = git_lines(root, ["diff", "HEAD", "--name-only"])
+        diff = git_diff_output(root, ["diff", "HEAD", "--binary"])
     else:
         # No commit yet (or detached/empty): union the staged and unstaged
         # diffs so nothing tracked is missed.
         changed = sorted(
-            set(git_lines(cwd, ["diff", "--name-only"]))
-            | set(git_lines(cwd, ["diff", "--cached", "--name-only"]))
+            set(git_lines(root, ["diff", "--name-only"]))
+            | set(git_lines(root, ["diff", "--cached", "--name-only"]))
         )
-        diff = git_diff_output(cwd, ["diff", "--binary"]) + git_diff_output(
-            cwd, ["diff", "--cached", "--binary"]
+        diff = git_diff_output(root, ["diff", "--binary"]) + git_diff_output(
+            root, ["diff", "--cached", "--binary"]
         )
-    untracked_diff = git_untracked_diff(cwd, untracked)
+    untracked_diff = git_untracked_diff(root, untracked)
     if untracked_diff:
         diff = (diff.rstrip("\n") + "\n" + untracked_diff) if diff.strip() else untracked_diff
-    return {
+    tree = git_worktree_tree(root) if inside else ""
+    worker_diff = ""
+    worker_changed: list[str] = []
+    if base_tree and tree:
+        worker_changed = git_lines(root, ["diff", "--name-only", base_tree, tree, "--"])
+        worker_diff = git_diff_output(root, ["diff", "--binary", base_tree, tree, "--"])
+    snapshot = {
         "sha": sha or "uncommitted",
         "is_worktree": inside,
         "changed_files": changed,
         "untracked_files": untracked,
         "diff": diff,
     }
+    if tree:
+        snapshot["tree"] = tree
+    if base_tree:
+        worker_changed_set = set(worker_changed)
+        snapshot["worker_changed_files"] = worker_changed
+        snapshot["worker_untracked_files"] = [path for path in untracked if path in worker_changed_set]
+        snapshot["worker_diff"] = worker_diff
+    return snapshot
+
+
+def git_worktree_root(cwd: Path) -> Path:
+    root = git_output(cwd, ["rev-parse", "--show-toplevel"])
+    return Path(root) if root else cwd
+
+
+def git_worktree_tree(cwd: Path) -> str:
+    """Write the current worktree state to a temporary Git tree.
+
+    Uses a throwaway index so staged/user index state is never modified. The tree
+    includes tracked changes and untracked, non-ignored files, matching the files
+    Puppetmaster can later report in a PATCH artifact.
+    """
+    sha = git_output(cwd, ["rev-parse", "HEAD"])
+    fd, index_path = tempfile.mkstemp(prefix="puppetmaster-index-")
+    os.close(fd)
+    env = {**os.environ, "GIT_INDEX_FILE": index_path}
+    try:
+        if sha:
+            read = subprocess.run(
+                ["git", "read-tree", sha],
+                cwd=cwd,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        else:
+            read = subprocess.run(
+                ["git", "read-tree", "--empty"],
+                cwd=cwd,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        if read.returncode != 0:
+            return ""
+        add = subprocess.run(
+            ["git", "add", "-A", "--", "."],
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if add.returncode != 0:
+            return ""
+        written = subprocess.run(
+            ["git", "write-tree"],
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return written.stdout.strip() if written.returncode == 0 else ""
+    finally:
+        try:
+            os.unlink(index_path)
+        except OSError:
+            pass
 
 
 def git_output(cwd: Path, args: list[str]) -> str:
@@ -2581,4 +2678,3 @@ def classify_claude_code_failure(output: str) -> str:
     if "timeout" in lowered or "timed out" in lowered:
         return "timeout"
     return "unknown"
-
