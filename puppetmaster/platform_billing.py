@@ -27,9 +27,12 @@ from __future__ import annotations
 
 import os
 import subprocess
-from dataclasses import dataclass, field
+import time
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Mapping, Optional
+
+from puppetmaster.model_registry import ModelSpec
 
 # A command runner returns (returncode, stdout, stderr). Injectable for tests.
 CommandRunner = Callable[[list[str]], "tuple[int, str, str]"]
@@ -344,3 +347,103 @@ def detect_adapter_billing(
             evidence=[f"adapter:{adapter}", "detector:none"],
         )
     return detector(env=env, home=home, run=run)
+
+
+_BILLING_CACHE: dict[str, tuple[BillingStatus, float]] = {}
+
+
+def _default_billing_ttl_seconds() -> int:
+    raw = os.environ.get("PUPPETMASTER_BILLING_TTL_SECONDS")
+    if raw is not None:
+        return int(raw)
+    return 300
+
+
+def clear_billing_cache() -> None:
+    """Clear the module-level billing detection cache (for tests)."""
+    _BILLING_CACHE.clear()
+
+
+def detect_adapter_billing_cached(
+    adapter: str,
+    *,
+    ttl_seconds: Optional[int] = None,
+    env: Optional[Mapping[str, str]] = None,
+    home: Optional[Path] = None,
+    run: Optional[CommandRunner] = None,
+) -> BillingStatus:
+    """Like :func:`detect_adapter_billing`, with a TTL cache per adapter."""
+    if ttl_seconds is None:
+        ttl_seconds = _default_billing_ttl_seconds()
+    if ttl_seconds == 0:
+        return detect_adapter_billing(adapter, env=env, home=home, run=run)
+
+    now = time.monotonic()
+    cached = _BILLING_CACHE.get(adapter)
+    if cached is not None:
+        status, stamped = cached
+        if now - stamped < ttl_seconds:
+            return status
+
+    status = detect_adapter_billing(adapter, env=env, home=home, run=run)
+    _BILLING_CACHE[adapter] = (status, now)
+    return status
+
+
+@dataclass(frozen=True)
+class RegistryReconciliation:
+    """Result of upgrading registry billing hints and filtering unhealthy adapters."""
+
+    specs: list[ModelSpec]
+    upgraded: list[dict[str, str]]
+    dropped: list[dict[str, str]]
+
+
+def reconcile_registry(
+    specs: list[ModelSpec],
+    *,
+    detect: Optional[Callable[..., BillingStatus]] = None,
+) -> RegistryReconciliation:
+    """Upgrade ``unknown`` billing from runtime detection and drop unhealthy adapters."""
+    if not specs:
+        return RegistryReconciliation(specs=[], upgraded=[], dropped=[])
+
+    detect_fn = detect or detect_adapter_billing_cached
+    upgraded: list[dict[str, str]] = []
+    dropped: list[dict[str, str]] = []
+    upgraded_specs: list[ModelSpec] = []
+    surviving: list[ModelSpec] = []
+
+    for spec in specs:
+        working = spec
+        try:
+            status = detect_fn(spec.adapter)
+        except Exception:
+            upgraded_specs.append(spec)
+            surviving.append(spec)
+            continue
+
+        if status.billing in ("plan", "api") and spec.billing == "unknown":
+            working = replace(spec, billing=status.billing)
+            upgraded.append(
+                {"model_id": spec.id, "from": spec.billing, "to": status.billing}
+            )
+
+        upgraded_specs.append(working)
+
+        if not status.healthy:
+            reason = (
+                f"adapter {spec.adapter!r} has no usable credentials: {status.detail}"
+            )
+            dropped.append(
+                {"model_id": spec.id, "adapter": spec.adapter, "reason": reason}
+            )
+        else:
+            surviving.append(working)
+
+    if not surviving:
+        return RegistryReconciliation(
+            specs=upgraded_specs, upgraded=upgraded, dropped=dropped
+        )
+
+    return RegistryReconciliation(specs=surviving, upgraded=upgraded, dropped=dropped)

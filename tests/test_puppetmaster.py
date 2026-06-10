@@ -5665,7 +5665,19 @@ class ModelRouterTests(unittest.TestCase):
             self.assertEqual(code, 0)
             data = json.loads(stdout.getvalue())
             self.assertEqual(data["job_id"], job.id)
-            self.assertGreater(data["total_estimated_cost_usd"], 0.0)
+            from puppetmaster.models import ArtifactType
+
+            routing = [
+                a
+                for a in store.list_artifacts(job.id)
+                if a.type == ArtifactType.ROUTING
+            ]
+            self.assertEqual(len(routing), 1)
+            self.assertGreater(routing[0].payload["nominal_cost_usd"], 0.0)
+            self.assertEqual(
+                data["total_estimated_cost_usd"],
+                routing[0].payload["estimated_cost_usd"],
+            )
             self.assertEqual(len(data["tasks"]), 1)
             self.assertEqual(data["tasks"][0]["role"], "audit")
 
@@ -6921,6 +6933,379 @@ class BillingAwareRoutingTests(unittest.TestCase):
         rejected = {spec.id: reason for spec, reason in decision.rejected}
         self.assertIn("api-mid", rejected)
         self.assertIn("api billing disabled", rejected["api-mid"])
+
+
+class MarginalCostRoutingTests(unittest.TestCase):
+    def _plan_priced_registry(self):
+        from puppetmaster.model_registry import ModelSpec
+
+        return [
+            ModelSpec(
+                id="claude-code/opus",
+                adapter="claude-code",
+                adapter_model_name="opus",
+                capability_score=82,
+                input_per_mtok_usd=5.0,
+                output_per_mtok_usd=25.0,
+                billing="plan",
+            ),
+            ModelSpec(
+                id="cursor/composer",
+                adapter="cursor",
+                adapter_model_name="composer",
+                capability_score=82,
+                input_per_mtok_usd=0.0,
+                output_per_mtok_usd=0.0,
+                billing="plan",
+            ),
+        ]
+
+    def test_plan_billed_priced_model_competes_as_zero_peer(self) -> None:
+        from puppetmaster.router import TaskSignals, route_task
+
+        signal = TaskSignals(instruction="implement a feature", role="implement")
+        decision = route_task(signal, self._plan_priced_registry(), policy="balanced")
+        self.assertEqual(decision.model.id, "claude-code/opus")
+        for _, reason in decision.rejected:
+            self.assertNotIn("pricier", reason)
+
+    def test_explicit_max_cost_allows_plan_billed_priced_model(self) -> None:
+        from puppetmaster.router import TaskSignals, route_task
+
+        signal = TaskSignals(
+            instruction="implement a feature",
+            role="implement",
+            explicit_max_cost_usd=0.0005,
+        )
+        decision = route_task(signal, self._plan_priced_registry(), policy="balanced")
+        self.assertEqual(decision.model.id, "claude-code/opus")
+
+    def test_routing_decision_records_marginal_and_nominal_costs(self) -> None:
+        from puppetmaster.router import TaskSignals, route_task
+
+        signal = TaskSignals(instruction="implement a feature", role="implement")
+        decision = route_task(signal, self._plan_priced_registry(), policy="balanced")
+        self.assertEqual(decision.estimated_cost_usd, 0.0)
+        self.assertGreater(decision.nominal_cost_usd, 0.0)
+        payload = decision.to_artifact_payload()
+        self.assertEqual(payload["estimated_cost_usd"], 0.0)
+        self.assertGreater(payload["nominal_cost_usd"], 0.0)
+        self.assertIn("baseline_nominal_cost_usd", payload)
+
+
+class RegistryReconciliationTests(unittest.TestCase):
+    def test_reconcile_upgrades_unknown_billing(self) -> None:
+        from puppetmaster.model_registry import ModelSpec
+        from puppetmaster.platform_billing import BillingStatus, reconcile_registry
+
+        specs = [
+            ModelSpec(
+                id="claude-code/opus",
+                adapter="claude-code",
+                adapter_model_name="opus",
+                billing="unknown",
+            )
+        ]
+
+        def detect(adapter: str) -> BillingStatus:
+            return BillingStatus(
+                adapter=adapter,
+                billing="plan",
+                healthy=True,
+                detail="oauth",
+                evidence=[],
+            )
+
+        result = reconcile_registry(specs, detect=detect)
+        self.assertEqual(result.specs[0].billing, "plan")
+        self.assertEqual(
+            result.upgraded,
+            [{"model_id": "claude-code/opus", "from": "unknown", "to": "plan"}],
+        )
+        self.assertEqual(result.dropped, [])
+
+    def test_reconcile_filters_unhealthy_when_healthy_survivors_exist(self) -> None:
+        from puppetmaster.model_registry import ModelSpec
+        from puppetmaster.platform_billing import BillingStatus, reconcile_registry
+
+        specs = [
+            ModelSpec(
+                id="cursor/composer",
+                adapter="cursor",
+                adapter_model_name="composer",
+                billing="plan",
+            ),
+            ModelSpec(
+                id="claude-code/opus",
+                adapter="claude-code",
+                adapter_model_name="opus",
+                billing="unknown",
+            ),
+        ]
+
+        def detect(adapter: str) -> BillingStatus:
+            if adapter == "cursor":
+                return BillingStatus(
+                    adapter=adapter,
+                    billing="unknown",
+                    healthy=False,
+                    detail="CURSOR_API_KEY is not set",
+                    evidence=[],
+                )
+            return BillingStatus(
+                adapter=adapter,
+                billing="plan",
+                healthy=True,
+                detail="oauth",
+                evidence=[],
+            )
+
+        result = reconcile_registry(specs, detect=detect)
+        self.assertEqual([s.id for s in result.specs], ["claude-code/opus"])
+        self.assertEqual(result.specs[0].billing, "plan")
+        self.assertEqual(len(result.dropped), 1)
+
+    def test_reconcile_drops_unhealthy_adapter(self) -> None:
+        from puppetmaster.model_registry import ModelSpec
+        from puppetmaster.platform_billing import BillingStatus, reconcile_registry
+
+        specs = [
+            ModelSpec(
+                id="cursor/composer",
+                adapter="cursor",
+                adapter_model_name="composer",
+                billing="plan",
+            )
+        ]
+
+        def detect(adapter: str) -> BillingStatus:
+            return BillingStatus(
+                adapter=adapter,
+                billing="unknown",
+                healthy=False,
+                detail="CURSOR_API_KEY is not set",
+                evidence=[],
+            )
+
+        result = reconcile_registry(specs, detect=detect)
+        self.assertEqual(len(result.specs), 1)
+        self.assertEqual(result.specs[0].id, "cursor/composer")
+        self.assertEqual(len(result.dropped), 1)
+        self.assertIn("no usable credentials", result.dropped[0]["reason"])
+
+    def test_reconcile_detection_exception_keeps_spec(self) -> None:
+        from puppetmaster.model_registry import ModelSpec
+        from puppetmaster.platform_billing import reconcile_registry
+
+        specs = [
+            ModelSpec(
+                id="cursor/composer",
+                adapter="cursor",
+                adapter_model_name="composer",
+                billing="plan",
+            )
+        ]
+
+        def detect(adapter: str):
+            raise RuntimeError("probe failed")
+
+        result = reconcile_registry(specs, detect=detect)
+        self.assertEqual(len(result.specs), 1)
+        self.assertEqual(result.specs[0].id, "cursor/composer")
+        self.assertEqual(result.dropped, [])
+
+    def test_reconcile_all_dropped_returns_upgraded_unfiltered(self) -> None:
+        from puppetmaster.model_registry import ModelSpec
+        from puppetmaster.platform_billing import BillingStatus, reconcile_registry
+
+        specs = [
+            ModelSpec(
+                id="cursor/a",
+                adapter="cursor",
+                adapter_model_name="a",
+                billing="unknown",
+            ),
+            ModelSpec(
+                id="cursor/b",
+                adapter="cursor",
+                adapter_model_name="b",
+                billing="unknown",
+            ),
+        ]
+
+        def detect(adapter: str) -> BillingStatus:
+            return BillingStatus(
+                adapter=adapter,
+                billing="plan",
+                healthy=False,
+                detail="no key",
+                evidence=[],
+            )
+
+        result = reconcile_registry(specs, detect=detect)
+        self.assertEqual(len(result.specs), 2)
+        self.assertTrue(all(s.billing == "plan" for s in result.specs))
+        self.assertEqual(len(result.dropped), 2)
+
+
+class BillingCacheTests(unittest.TestCase):
+    def test_detect_adapter_billing_cached_respects_ttl(self) -> None:
+        from puppetmaster.platform_billing import (
+            BillingStatus,
+            clear_billing_cache,
+            detect_adapter_billing_cached,
+        )
+
+        calls = []
+
+        def fake_detect(adapter: str, **kwargs) -> BillingStatus:
+            calls.append(adapter)
+            return BillingStatus(
+                adapter=adapter,
+                billing="plan",
+                healthy=True,
+                detail="ok",
+                evidence=[],
+            )
+
+        clear_billing_cache()
+        with patch(
+            "puppetmaster.platform_billing.detect_adapter_billing",
+            side_effect=fake_detect,
+        ):
+            detect_adapter_billing_cached("cursor", ttl_seconds=60)
+            detect_adapter_billing_cached("cursor", ttl_seconds=60)
+        self.assertEqual(calls, ["cursor"])
+
+        clear_billing_cache()
+        with patch(
+            "puppetmaster.platform_billing.detect_adapter_billing",
+            side_effect=fake_detect,
+        ):
+            detect_adapter_billing_cached("cursor", ttl_seconds=60)
+        self.assertEqual(calls, ["cursor", "cursor"])
+
+    def test_detect_adapter_billing_cached_ttl_zero_bypasses(self) -> None:
+        from puppetmaster.platform_billing import (
+            BillingStatus,
+            clear_billing_cache,
+            detect_adapter_billing_cached,
+        )
+
+        calls = []
+
+        def fake_detect(adapter: str, **kwargs) -> BillingStatus:
+            calls.append(adapter)
+            return BillingStatus(
+                adapter=adapter,
+                billing="plan",
+                healthy=True,
+                detail="ok",
+                evidence=[],
+            )
+
+        clear_billing_cache()
+        with patch(
+            "puppetmaster.platform_billing.detect_adapter_billing",
+            side_effect=fake_detect,
+        ):
+            detect_adapter_billing_cached("cursor", ttl_seconds=0)
+            detect_adapter_billing_cached("cursor", ttl_seconds=0)
+        self.assertEqual(calls, ["cursor", "cursor"])
+
+
+class AutoRoutingReconciliationTests(unittest.TestCase):
+    def test_apply_auto_routing_reconciles_registry_and_audits_drops(self) -> None:
+        from puppetmaster.model_registry import ModelSpec, save_registry
+        from puppetmaster.models import ArtifactType
+        from puppetmaster.orchestrator import Orchestrator
+        from puppetmaster.platform_billing import BillingStatus
+        from puppetmaster.store_factory import create_store
+        from puppetmaster.workers import WorkerSpec
+
+        with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "models.json"
+            save_registry(
+                [
+                    ModelSpec(
+                        id="cursor/composer",
+                        adapter="cursor",
+                        adapter_model_name="composer",
+                        capability_score=82,
+                        billing="plan",
+                    ),
+                    ModelSpec(
+                        id="claude-code/opus",
+                        adapter="claude-code",
+                        adapter_model_name="opus",
+                        capability_score=82,
+                        input_per_mtok_usd=5.0,
+                        output_per_mtok_usd=25.0,
+                        billing="unknown",
+                    ),
+                ],
+                registry_path,
+            )
+            state_dir = Path(tmp) / ".puppetmaster"
+            store = create_store("file", state_dir)
+            store.init()
+            orchestrator = Orchestrator(store)
+            job = store.create_job("reconcile routing")
+
+            def detect(adapter: str) -> BillingStatus:
+                if adapter == "cursor":
+                    return BillingStatus(
+                        adapter=adapter,
+                        billing="unknown",
+                        healthy=False,
+                        detail="CURSOR_API_KEY is not set",
+                        evidence=[],
+                    )
+                return BillingStatus(
+                    adapter=adapter,
+                    billing="plan",
+                    healthy=True,
+                    detail="oauth",
+                    evidence=[],
+                )
+
+            spec = WorkerSpec(
+                role="implement",
+                instruction="implement a feature",
+                adapter="local",
+                payload={
+                    "auto_route": True,
+                    "registry_path": str(registry_path),
+                    "routing_policy": "balanced",
+                },
+                depends_on_roles=[],
+            )
+
+            with patch(
+                "puppetmaster.platform_billing.detect_adapter_billing_cached",
+                side_effect=detect,
+            ):
+                tasks = orchestrator._create_tasks(job, [spec])
+
+            self.assertEqual(len(tasks), 1)
+            self.assertEqual(tasks[0].adapter, "claude-code")
+            self.assertEqual(tasks[0].payload.get("router_model_id"), "claude-code/opus")
+
+            events = store.read_events(job.id)
+            reconciled = [
+                e for e in events if e.get("event") == "router.registry_reconciled"
+            ]
+            self.assertEqual(len(reconciled), 1)
+            self.assertEqual(len(reconciled[0]["payload"]["dropped"]), 1)
+
+            routing = [
+                a
+                for a in store.list_artifacts(job.id)
+                if a.type == ArtifactType.ROUTING
+            ]
+            self.assertEqual(len(routing), 1)
+            rejected_ids = {entry["id"] for entry in routing[0].payload["rejected"]}
+            self.assertIn("cursor/composer", rejected_ids)
 
 
 class PlatformBillingDetectionTests(unittest.TestCase):

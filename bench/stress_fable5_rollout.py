@@ -364,6 +364,12 @@ def stress_auto_fallback_matrix() -> None:
     ]
 
     for failing_adapter, healthy, expected_adapter in matrix:
+        # Each matrix case simulates a different machine; drop the TTL'd
+        # billing probes so one case's posture never bleeds into the next.
+        from puppetmaster.platform_billing import clear_billing_cache
+
+        clear_billing_cache()
+
         def _billing(adapter, **kw):
             if adapter in healthy:
                 return BillingStatus(adapter=adapter, billing=healthy[adapter],

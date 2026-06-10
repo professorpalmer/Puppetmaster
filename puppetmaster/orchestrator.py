@@ -384,7 +384,7 @@ class Orchestrator:
         """Re-queue each FAILED task with a recoverable failure onto a funded
         adapter. Returns the count re-queued (0 when nothing is re-routable)."""
         from puppetmaster.model_registry import default_registry_path, load_registry
-        from puppetmaster.platform_billing import detect_adapter_billing
+        from puppetmaster.platform_billing import detect_adapter_billing_cached
         from puppetmaster.router import (
             NoEligibleModelError,
             route_task,
@@ -415,7 +415,7 @@ class Orchestrator:
         def _funded(adapter: str) -> object:
             if adapter not in billing_cache:
                 try:
-                    billing_cache[adapter] = detect_adapter_billing(adapter)
+                    billing_cache[adapter] = detect_adapter_billing_cached(adapter)
                 except Exception:
                     billing_cache[adapter] = None
             return billing_cache[adapter]
@@ -1169,6 +1169,7 @@ class Orchestrator:
         only.
         """
         from puppetmaster.model_registry import default_registry_path, load_registry
+        from puppetmaster.platform_billing import RegistryReconciliation, reconcile_registry
         from puppetmaster.router import (
             NoEligibleModelError,
             route_task,
@@ -1179,6 +1180,7 @@ class Orchestrator:
         decisions: list[tuple[str, dict]] = []
         registry_cache: Optional[list] = None
         registry_path: Optional[Path] = None
+        registry_reconciliation: Optional[RegistryReconciliation] = None
         empty_registry_announced = False
         for spec in specs:
             payload = spec.payload or {}
@@ -1193,6 +1195,21 @@ class Orchestrator:
                     else default_registry_path()
                 )
                 registry_cache = load_registry(registry_path)
+                if registry_cache:
+                    registry_reconciliation = reconcile_registry(registry_cache)
+                    registry_cache = registry_reconciliation.specs
+                    if (
+                        registry_reconciliation.upgraded
+                        or registry_reconciliation.dropped
+                    ):
+                        self.store.emit(
+                            job.id,
+                            "router.registry_reconciled",
+                            {
+                                "upgraded": registry_reconciliation.upgraded,
+                                "dropped": registry_reconciliation.dropped,
+                            },
+                        )
             if not registry_cache:
                 # No registry on disk yet (user hasn't run `models init`).
                 # Don't fail the run — pass the spec through unmodified.
@@ -1249,6 +1266,12 @@ class Orchestrator:
             result.append(routed_spec)
 
             artifact_payload = decision.to_artifact_payload()
+            if registry_reconciliation and registry_reconciliation.dropped:
+                artifact_payload["rejected"] = list(artifact_payload.get("rejected") or [])
+                for entry in registry_reconciliation.dropped:
+                    artifact_payload["rejected"].append(
+                        {"id": entry["model_id"], "reason": entry["reason"]}
+                    )
             artifact_payload["role"] = spec.role
             artifact_payload["registry_path"] = str(registry_path) if registry_path else None
             decisions.append((spec.role, artifact_payload))
