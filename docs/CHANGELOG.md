@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.9.26
+
+**Feature: `puppetmaster uninstall` — the exact inverse of `setup` (field report: "How do I uninstall?" had no good answer).** Until now `pip uninstall puppetmaster-ai` removed the code but stranded every host-side integration: dead MCP entries in Cursor/Codex config, `beforeSubmitPrompt` hooks firing a missing module on every prompt submit, and orphaned rules instructing agents to use tools that no longer exist. The new command removes all of it, then tells you to run `pip uninstall puppetmaster-ai` as the final step. Full suite **531** green (+6 focused tests); dry-run verified live against a real install.
+
+- **MCP registrations.** Removes only the `puppetmaster` entry from workspace and global `.cursor/mcp.json` (other servers untouched) and the `[mcp_servers.puppetmaster]` table from `~/.codex/config.toml` — prefers `codex mcp remove`, with a TOML-strip fallback so a missing CLI can't strand the table.
+- **Rules.** Deletes `.cursor/rules/puppetmaster.mdc` (owned wholesale) and strips the managed marker block from `AGENTS.md`, `CLAUDE.md`, `~/.claude/CLAUDE.md`, and `~/.codex/instructions.md`, leaving surrounding content byte-identical; files left whitespace-only are deleted.
+- **Hooks.** Removes Puppetmaster hooks from `.cursor/hooks.json` / `.claude/settings.json` at both project and global scopes; foreign hooks are preserved.
+- **Processes & state.** Kills stale MCP daemons (same logic as `mcp cleanup --kill-stale`). State dirs (`~/.puppetmaster/`, `<cwd>/.puppetmaster/`, `.codegraph/`) are kept unless `--purge-state`.
+- **UX.** `--dry-run` previews every action without writing; `--yes` skips confirmation; per-target status lines (`removed` / `unchanged` / `would_remove` / `error`); idempotent — a second run reports `unchanged`; exit 1 if any target errored.
+- **Known limits.** Project-scoped artifacts are removed only for the `--cwd` workspace — other repos where `install-rules` / `install-hooks` ran at project scope must run `uninstall` from each of those directories (global-scope artifacts are removed once, for all). The pip package itself is step 2: `pip uninstall puppetmaster-ai`.
+
 ## v0.9.25
 
 **Fix: every relative link in the README 404'd on PyPI (field report from Slack — `pypi.org/project/puppetmaster-ai/docs/WHY.md`).** GitHub rewrites relative markdown links into the repo; PyPI's renderer does no such rewriting, so all `docs/*.md` links, directory links, and the three `<img src="docs/...">` tags were broken on the project page. All 27 relative refs are now absolute (`github.com/...` for links, `raw.githubusercontent.com/...` for images). Docs-only; no code changes. (v0.9.24 shipped the absolute-link rewrite; v0.9.25 follows up because PyPI *also* strips heading `id`s — verified against `readme_renderer`, PyPI's own pipeline — so the in-page anchor links `#what-it-does` / `#quickstart` / `#auto-invocation` pointed at nothing and now target the GitHub README's anchors.)
