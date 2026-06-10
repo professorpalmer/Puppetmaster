@@ -1632,6 +1632,8 @@ def codex_command(args: JsonObject) -> list[str]:
         command.append("--dangerously-bypass-approvals-and-sandbox")
     if args.get("disable_codegraph"):
         command.append("--disable-codegraph")
+    if args.get("disable_memory"):
+        command.append("--disable-memory")
     return command
 
 
@@ -1704,6 +1706,8 @@ def claude_command(args: JsonObject) -> list[str]:
         command.extend(["--timeout-seconds", str(args["timeout_seconds"])])
     if args.get("allow_dirty"):
         command.append("--allow-dirty")
+    if args.get("disable_memory"):
+        command.append("--disable-memory")
     return command
 
 
@@ -1736,6 +1740,8 @@ def openai_command(args: JsonObject) -> list[str]:
         command.extend(["--reasoning-effort", str(args["reasoning_effort"])])
     if args.get("disable_codegraph"):
         command.append("--disable-codegraph")
+    if args.get("disable_memory"):
+        command.append("--disable-memory")
     return command
 
 

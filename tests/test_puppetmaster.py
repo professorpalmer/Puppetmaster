@@ -6162,6 +6162,7 @@ class ModelRouterTests(unittest.TestCase):
                     "timeout_seconds": 120,
                     "allow_dirty": True,
                     "executable": "/opt/codex",
+                    "disable_memory": True,
                 }
             )
 
@@ -6179,6 +6180,47 @@ class ModelRouterTests(unittest.TestCase):
         self.assertIn("--allow-dirty", command)
         self.assertIn("--executable", command)
         self.assertIn("/opt/codex", command)
+        self.assertIn("--disable-memory", command)
+
+    def test_single_adapter_mcp_commands_forward_disable_memory(self) -> None:
+        from puppetmaster import mcp_server
+
+        claude = mcp_server.claude_command({"goal": "fresh claude", "cwd": ".", "disable_memory": True})
+        openai = mcp_server.openai_command({"goal": "fresh openai", "cwd": ".", "disable_memory": True})
+        codex = mcp_server.codex_command({"goal": "fresh codex", "cwd": ".", "disable_memory": True})
+
+        self.assertIn("--disable-memory", claude)
+        self.assertIn("--disable-memory", openai)
+        self.assertIn("--disable-memory", codex)
+
+    def test_single_adapter_mcp_commands_do_not_disable_memory_by_default(self) -> None:
+        from puppetmaster import mcp_server
+
+        claude = mcp_server.claude_command({"goal": "default claude", "cwd": "."})
+        openai = mcp_server.openai_command({"goal": "default openai", "cwd": "."})
+        codex = mcp_server.codex_command({"goal": "default codex", "cwd": "."})
+
+        self.assertNotIn("--disable-memory", claude)
+        self.assertNotIn("--disable-memory", openai)
+        self.assertNotIn("--disable-memory", codex)
+
+    def test_single_adapter_mcp_run_functions_forward_disable_memory(self) -> None:
+        from puppetmaster import mcp_server
+
+        captured = []
+
+        def fake_run_cli(command, args):
+            captured.append(command)
+            return {"ok": True}
+
+        with patch.object(mcp_server, "run_cli", side_effect=fake_run_cli):
+            mcp_server.run_claude({"goal": "fresh claude", "cwd": ".", "disable_memory": True})
+            mcp_server.run_openai({"goal": "fresh openai", "cwd": ".", "disable_memory": True})
+            mcp_server.run_codex({"goal": "fresh codex", "cwd": ".", "disable_memory": True})
+
+        self.assertEqual([command[0] for command in captured], ["claude", "openai", "codex"])
+        for command in captured:
+            self.assertIn("--disable-memory", command)
 
     def test_start_codex_builds_codex_cli_command(self) -> None:
         from puppetmaster import mcp_server
@@ -10310,6 +10352,39 @@ class PuppetmasterFrictionFixTests(unittest.TestCase):
         self.assertEqual(payload["routing_policy"], "cheap")
         self.assertEqual(payload["max_cost_usd"], 0.5)
         self.assertEqual(payload["min_capability"], 70)
+
+    def test_direct_single_adapter_cli_sets_disable_memory_payload(self) -> None:
+        captured = []
+
+        def fake_run(self, goal, **kwargs):  # noqa: ANN001
+            captured.append((goal, kwargs["specs"]))
+            return object()
+
+        with TemporaryDirectory() as tmp, patch(
+            "puppetmaster.cli.Orchestrator.run", autospec=True, side_effect=fake_run
+        ), patch("puppetmaster.cli.finalize_cli_run", return_value=0):
+            state_dir = str(Path(tmp) / "state")
+            cases = [
+                ("claude-code", ["claude", "fresh claude", "--cwd", tmp, "--disable-memory"]),
+                (
+                    "openai",
+                    ["openai", "fresh openai", "--cwd", tmp, "--disable-codegraph", "--disable-memory"],
+                ),
+                (
+                    "codex",
+                    ["codex", "fresh codex", "--cwd", tmp, "--disable-codegraph", "--disable-memory"],
+                ),
+            ]
+            for adapter, command in cases:
+                with self.subTest(adapter=adapter):
+                    rc = cli_main(["--state-dir", state_dir, *command])
+                    self.assertEqual(rc, 0)
+
+        self.assertEqual([specs[0].adapter for _, specs in captured], ["claude-code", "openai", "codex"])
+        self.assertEqual(
+            [specs[0].payload.get("disable_memory") for _, specs in captured],
+            [True, True, True],
+        )
 
     # --- #10: wait exit codes ------------------------------------------
     def test_wait_returns_nonzero_for_stalled(self) -> None:

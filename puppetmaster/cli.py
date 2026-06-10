@@ -791,6 +791,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Allow Claude Code to run in a dirty working tree.",
     )
+    claude.add_argument(
+        "--disable-memory",
+        action="store_true",
+        help="Skip promoted shared-memory injection for a fresh perspective.",
+    )
     _add_routing_flags(claude)
 
     openai = subcommands.add_parser(
@@ -851,6 +856,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip CodeGraph context injection (e.g. for non-repo prompts).",
     )
+    openai.add_argument(
+        "--disable-memory",
+        action="store_true",
+        help="Skip promoted shared-memory injection for a fresh perspective.",
+    )
     _add_routing_flags(openai)
 
     codex = subcommands.add_parser(
@@ -897,6 +907,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--disable-codegraph",
         action="store_true",
         help="Skip CodeGraph context injection (e.g. for non-repo prompts).",
+    )
+    codex.add_argument(
+        "--disable-memory",
+        action="store_true",
+        help="Skip promoted shared-memory injection for a fresh perspective.",
     )
     _add_routing_flags(codex)
 
@@ -1587,6 +1602,8 @@ def _main(argv: Optional[list[str]] = None) -> int:
             "timeout_seconds": args.timeout_seconds,
             "allow_dirty": args.allow_dirty,
         }
+        if args.disable_memory:
+            payload["disable_memory"] = True
         payload.update(routing_payload_from_args(args, adapter="claude-code"))
         result = Orchestrator(store).run(
             args.prompt,
@@ -1625,6 +1642,8 @@ def _main(argv: Optional[list[str]] = None) -> int:
             payload["reasoning_effort"] = args.reasoning_effort
         if args.disable_codegraph:
             payload["disable_codegraph"] = True
+        if args.disable_memory:
+            payload["disable_memory"] = True
         payload.update(routing_payload_from_args(args, adapter="openai"))
         result = Orchestrator(store).run(
             args.prompt,
@@ -1657,6 +1676,8 @@ def _main(argv: Optional[list[str]] = None) -> int:
             payload["executable"] = args.executable
         if args.disable_codegraph:
             payload["disable_codegraph"] = True
+        if args.disable_memory:
+            payload["disable_memory"] = True
         payload.update(routing_payload_from_args(args, adapter="codex"))
         result = Orchestrator(store).run(
             args.prompt,
