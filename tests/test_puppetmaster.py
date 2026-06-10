@@ -4678,6 +4678,48 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
         self.assertEqual(verification.payload["failure"], "timeout")
         self.assertEqual(verification.payload["live_log"], "/tmp/codex_exec_live.log")
 
+    def test_codex_adapter_bypassed_read_only_uses_worktree_guard(self) -> None:
+        from puppetmaster.adapters import verification_artifact
+
+        task = Task(
+            id="t-codex-bypass",
+            job_id="job-codex-bypass",
+            role="codex-review",
+            adapter="codex",
+            instruction="Review the repo.",
+            payload={
+                "cwd": str(Path.cwd()),
+                "sandbox": "read-only",
+                "dangerously_bypass_approvals_and_sandbox": True,
+                "disable_codegraph": True,
+            },
+        )
+        clean = {"sha": "s", "changed_files": [], "untracked_files": [], "diff": ""}
+        blocked = [
+            verification_artifact(
+                task=task,
+                worker_id="worker",
+                adapter="codex",
+                check="guard",
+                result="blocked",
+                confidence=0.9,
+                evidence=["guarded"],
+                payload={"failure": "guarded"},
+            )
+        ]
+        with patch("puppetmaster.adapters.resolve_command", return_value="/usr/bin/codex"), patch(
+            "puppetmaster.adapters.git_snapshot", return_value=clean
+        ), patch(
+            "puppetmaster.adapters.worktree_guard", return_value=blocked
+        ) as guard, patch(
+            "puppetmaster.adapters.run_streamed_subprocess"
+        ) as streamed:
+            artifacts = CodexAdapter().run(task, "goal", "worker")
+
+        guard.assert_called_once()
+        streamed.assert_not_called()
+        self.assertIs(artifacts, blocked)
+
     def test_run_streamed_subprocess_closes_stdin_so_readers_see_eof(self) -> None:
         """The streamed runner must close the child's stdin (DEVNULL). A CLI
         that reads stdin would otherwise block forever on a non-interactive
@@ -10420,6 +10462,56 @@ class PuppetmasterFrictionFixTests(unittest.TestCase):
         self.assertTrue(
             spec_edits_files(WorkerSpec(role="c", instruction="x", adapter="claude-code"))
         )
+        self.assertFalse(
+            spec_edits_files(
+                WorkerSpec(
+                    role="audit",
+                    instruction="x",
+                    adapter="claude-code",
+                    payload={"read_only": True},
+                )
+            )
+        )
+        self.assertFalse(
+            spec_edits_files(
+                WorkerSpec(
+                    role="audit",
+                    instruction="x",
+                    adapter="codex",
+                    payload={"no_edit": True},
+                )
+            )
+        )
+        self.assertFalse(
+            spec_edits_files(
+                WorkerSpec(
+                    role="dry-run",
+                    instruction="x",
+                    adapter="codex",
+                    payload={"dry_run": True},
+                )
+            )
+        )
+        self.assertFalse(
+            spec_edits_files(
+                WorkerSpec(
+                    role="dry-run-implement",
+                    instruction="x",
+                    adapter="codex",
+                    payload={"mode": "implement", "dry_run": True},
+                )
+            )
+        )
+        self.assertTrue(
+            spec_edits_files(
+                WorkerSpec(
+                    role="impl",
+                    instruction="x",
+                    adapter="cursor",
+                    payload={"mode": "implement", "review": True},
+                )
+            )
+        )
 
     # --- #2 / #4: stalled-job reaper -----------------------------------
     def test_reaper_marks_dead_orchestrator_job_stalled(self) -> None:
@@ -10589,6 +10681,43 @@ class PuppetmasterFrictionFixTests(unittest.TestCase):
             [specs[0].payload.get("disable_memory") for _, specs in captured],
             [True, True, True],
         )
+
+    def test_direct_codex_read_only_sandbox_sets_generic_no_edit_payload(self) -> None:
+        captured = []
+
+        def fake_run(self, goal, **kwargs):  # noqa: ANN001
+            captured.append((goal, kwargs["specs"]))
+            return object()
+
+        with TemporaryDirectory() as tmp, patch(
+            "puppetmaster.cli.Orchestrator.run", autospec=True, side_effect=fake_run
+        ), patch("puppetmaster.cli.finalize_cli_run", return_value=0):
+            cases = [
+                ("read-only", False, True),
+                ("workspace-write", False, False),
+                ("read-only", True, False),
+            ]
+            for sandbox, bypass, expected_read_only in cases:
+                with self.subTest(sandbox=sandbox, bypass=bypass):
+                    command = [
+                        "--state-dir",
+                        str(Path(tmp) / "state"),
+                        "codex",
+                        f"{sandbox} review",
+                        "--cwd",
+                        tmp,
+                        "--disable-codegraph",
+                        "--sandbox",
+                        sandbox,
+                    ]
+                    if bypass:
+                        command.append("--dangerously-bypass-approvals-and-sandbox")
+                    rc = cli_main(command)
+                    self.assertEqual(rc, 0)
+
+        for (_, specs), (_, _, expected_read_only) in zip(captured, cases):
+            payload = specs[0].payload
+            self.assertEqual(payload.get("read_only", False), expected_read_only)
 
     # --- #10: wait exit codes ------------------------------------------
     def test_wait_returns_nonzero_for_stalled(self) -> None:

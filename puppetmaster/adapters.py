@@ -1232,12 +1232,13 @@ class CodexAdapter:
         # and worktree-boundary checks are unnecessary. For write-capable
         # sandboxes we mirror Claude Code: require a git work tree and a clean
         # tree by default so resulting diffs are attributable to this task.
-        if sandbox != "read-only":
+        write_capable = sandbox != "read-only" or bypass
+        if write_capable:
             blocked = worktree_guard(task, worker_id, "codex", cwd, before)
             if blocked is not None:
                 return blocked
         if (
-            sandbox != "read-only"
+            write_capable
             and not task.payload.get("allow_dirty", False)
             and (before["changed_files"] or before["untracked_files"])
         ):
