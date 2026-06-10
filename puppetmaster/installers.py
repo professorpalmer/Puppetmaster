@@ -67,6 +67,20 @@ class HandshakeResult:
 
 
 @dataclass
+class UninstallResult:
+    """Structured outcome of one uninstall run.
+
+    ``status`` is one of ``"removed"`` (artifact deleted or entry stripped),
+    ``"unchanged"`` (nothing Puppetmaster-owned was present),
+    ``"would_remove"`` (dry-run preview), or ``"error"``.
+    """
+
+    status: str
+    target: str
+    messages: list[str] = field(default_factory=list)
+
+
+@dataclass
 class InstallResult:
     """Structured outcome of one install run.
 
@@ -580,3 +594,176 @@ CURSOR_NEXT_STEPS_GUIDANCE = (
     "Cursor Agent should now see 32+ puppetmaster_* tools alongside its native tools.\n"
     "Verify by asking the agent to call `puppetmaster_doctor` and report the results."
 )
+
+
+def _remove_codex_puppetmaster_table(config_path: Path) -> tuple[bool, list[str]]:
+    """Remove the ``[mcp_servers.puppetmaster]`` table from Codex config TOML.
+
+    Uses the same line-oriented, regex-scoped editing as
+    :func:`_ensure_codex_timeouts` so we never parse or rewrite unrelated
+    tables. Returns ``(removed, messages)``.
+    """
+    messages: list[str] = []
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return False, [f"could not read {config_path}: {exc!r}"]
+
+    lines = text.splitlines()
+    header = re.compile(r"^\s*\[\s*mcp_servers\.puppetmaster\s*\]\s*$")
+    next_table = re.compile(r"^\s*\[")
+    header_idx = next((i for i, line in enumerate(lines) if header.match(line)), None)
+    if header_idx is None:
+        return False, []
+
+    body_end = len(lines)
+    for i in range(header_idx + 1, len(lines)):
+        if next_table.match(lines[i]):
+            body_end = i
+            break
+    new_lines = lines[:header_idx] + lines[body_end:]
+    new_text = "\n".join(new_lines)
+    if new_text and not new_text.endswith("\n"):
+        new_text += "\n"
+    if new_text == text:
+        return False, []
+    try:
+        config_path.write_text(new_text, encoding="utf-8")
+    except OSError as exc:
+        return False, [f"could not write {config_path}: {exc!r}"]
+    messages.append(f"removed [mcp_servers.puppetmaster] table from {config_path}")
+    return True, messages
+
+
+def uninstall_cursor_mcp(
+    *,
+    target_path: Path,
+    dry_run: bool = False,
+) -> UninstallResult:
+    """Remove Puppetmaster's MCP entry from a Cursor ``mcp.json``.
+
+    Other ``mcpServers`` entries are never touched. Idempotent: reports
+    ``unchanged`` when no puppetmaster entry exists.
+    """
+    messages: list[str] = []
+    if not target_path.is_file():
+        messages.append(f"no config at {target_path}; nothing to remove")
+        return UninstallResult(status="unchanged", target=str(target_path), messages=messages)
+
+    try:
+        existing = json.loads(target_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        messages.append(f"existing config at {target_path} is not valid JSON: {exc!r}")
+        return UninstallResult(status="error", target=str(target_path), messages=messages)
+
+    if not isinstance(existing, dict):
+        messages.append(f"config at {target_path} is not a JSON object")
+        return UninstallResult(status="error", target=str(target_path), messages=messages)
+
+    mcp_servers = existing.get("mcpServers")
+    if not isinstance(mcp_servers, dict) or "puppetmaster" not in mcp_servers:
+        messages.append(f"no puppetmaster entry in {target_path}")
+        return UninstallResult(status="unchanged", target=str(target_path), messages=messages)
+
+    if dry_run:
+        messages.append(f"DRY RUN — would remove puppetmaster entry from {target_path}")
+        return UninstallResult(status="would_remove", target=str(target_path), messages=messages)
+
+    del mcp_servers["puppetmaster"]
+    tmp_path = target_path.with_suffix(target_path.suffix + ".tmp")
+    tmp_path.write_text(
+        json.dumps(existing, indent=2, sort_keys=False) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(tmp_path, target_path)
+    messages.append(f"removed puppetmaster MCP entry from {target_path}")
+    return UninstallResult(status="removed", target=str(target_path), messages=messages)
+
+
+def uninstall_codex_mcp(
+    *,
+    codex_executable: Optional[str] = None,
+    dry_run: bool = False,
+) -> UninstallResult:
+    """Remove Puppetmaster's MCP entry from the OpenAI Codex CLI config.
+
+    Prefers ``codex mcp remove puppetmaster`` when the CLI is available,
+    then verifies with :func:`_remove_codex_puppetmaster_table` so a stale
+    table cannot survive a missing CLI.
+    """
+    codex = codex_executable or "codex"
+    config_path = Path("~/.codex/config.toml").expanduser()
+    target_label = str(config_path)
+    messages: list[str] = []
+    resolved_codex = shutil.which(codex) or (codex if Path(codex).expanduser().exists() else None)
+
+    has_entry = False
+    if resolved_codex is not None:
+        try:
+            get_result = subprocess.run(
+                [resolved_codex, "mcp", "get", "puppetmaster"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            messages.append(f"`codex mcp get puppetmaster` failed: {exc!r}")
+            get_result = None
+        if get_result is not None and get_result.returncode == 0:
+            has_entry = True
+
+    table_present = False
+    if config_path.is_file():
+        header = re.compile(r"^\s*\[\s*mcp_servers\.puppetmaster\s*\]\s*$")
+        table_present = any(header.match(line) for line in config_path.read_text(encoding="utf-8").splitlines())
+
+    if not has_entry and not table_present:
+        messages.append("no puppetmaster MCP entry in Codex config")
+        return UninstallResult(status="unchanged", target=target_label, messages=messages)
+
+    if dry_run:
+        if has_entry and resolved_codex is not None:
+            messages.append(
+                f"DRY RUN — would run: `{resolved_codex} mcp remove puppetmaster`"
+            )
+        if table_present:
+            messages.append(
+                f"DRY RUN — would remove [mcp_servers.puppetmaster] from {config_path}"
+            )
+        return UninstallResult(status="would_remove", target=target_label, messages=messages)
+
+    removed_any = False
+    if has_entry and resolved_codex is not None:
+        try:
+            remove_result = subprocess.run(
+                [resolved_codex, "mcp", "remove", "puppetmaster"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            messages.append(f"`codex mcp remove puppetmaster` failed: {exc!r}")
+            remove_result = None
+        if remove_result is not None and remove_result.returncode == 0:
+            removed_any = True
+            messages.append(
+                f"removed puppetmaster MCP entry from Codex via `{resolved_codex} mcp remove`"
+            )
+        elif remove_result is not None and remove_result.returncode != 0:
+            messages.append(
+                f"`codex mcp remove` exited rc={remove_result.returncode}: "
+                f"stderr={(remove_result.stderr or '')[-300:]!r}"
+            )
+
+    removed_table, table_messages = _remove_codex_puppetmaster_table(config_path)
+    messages.extend(table_messages)
+    removed_any = removed_any or removed_table
+
+    if not removed_any:
+        if messages:
+            return UninstallResult(status="error", target=target_label, messages=messages)
+        return UninstallResult(status="unchanged", target=target_label, messages=messages)
+
+    return UninstallResult(status="removed", target=target_label, messages=messages)

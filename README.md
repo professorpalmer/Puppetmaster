@@ -26,6 +26,17 @@ That's the whole install. `setup` runs every step idempotently, skips any tool t
 
 To run benchmarks or hack on it, clone instead — see [Contributing](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/CONTRIBUTING.md). (`pipx` keeps the CLI in its own isolated environment, which is the recommended way to install a command-line app.)
 
+## Uninstall
+
+Remove host-side integrations first, then drop the Python package:
+
+```bash
+puppetmaster uninstall          # MCP registrations, hooks, rules — idempotent
+pip uninstall puppetmaster-ai   # or: pipx uninstall puppetmaster-ai
+```
+
+`uninstall` removes only Puppetmaster-owned artifacts: the `puppetmaster` entry from workspace and global Cursor `mcp.json` (other MCP servers stay), the Codex `[mcp_servers.puppetmaster]` table, auto-invocation hooks in `.cursor/hooks.json` and `.claude/settings.json` (project and global scopes), and rule files/blocks (`.cursor/rules/puppetmaster.mdc`, marked blocks in `AGENTS.md` / `CLAUDE.md`). It also kills stale Puppetmaster MCP daemon processes. Swarm state under `~/.puppetmaster/` and workspace `.codegraph/` are **left intact** unless you pass `--purge-state`. Use `--dry-run` to preview, `--yes` to skip confirmation, and `--cwd` to target a different workspace.
+
 ## Index
 
 **New here?** Watch the GIF above, run `pipx install puppetmaster-ai && puppetmaster setup`, then skim [What it does](https://github.com/professorpalmer/Puppetmaster#what-it-does).

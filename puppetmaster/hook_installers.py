@@ -68,6 +68,10 @@ class HooksInstallResult:
             return "unchanged"
         if any(s == "would_install" for s in statuses):
             return "would_install"
+        if any(s == "would_remove" for s in statuses):
+            return "would_remove"
+        if any(s == "removed" for s in statuses):
+            return "removed"
         if statuses and all(s == "skipped" for s in statuses):
             return "skipped"
         return "installed"
@@ -123,6 +127,43 @@ def merge_hook_maps(existing: dict, ours: dict) -> tuple[dict, bool]:
     merged["hooks"] = hooks
     changed = json.dumps(existing or {}, sort_keys=True) != json.dumps(merged, sort_keys=True)
     return merged, changed
+
+
+def strip_hook_maps(existing: dict) -> tuple[dict, bool]:
+    """Remove Puppetmaster hook entries from ``existing['hooks']``.
+
+    Returns ``(stripped, changed)``. User-authored hooks are preserved.
+    """
+    merged = dict(existing) if isinstance(existing, dict) else {}
+    hooks = dict(merged.get("hooks") or {})
+    changed = False
+    for event, entries in list(hooks.items()):
+        prior = [e for e in (entries or []) if not _is_ours(e)]
+        if len(prior) != len(entries or []):
+            changed = True
+        if prior:
+            hooks[event] = prior
+        elif event in hooks:
+            del hooks[event]
+    if hooks:
+        merged["hooks"] = hooks
+    elif "hooks" in merged:
+        del merged["hooks"]
+        changed = True
+    if json.dumps(existing or {}, sort_keys=True) != json.dumps(merged, sort_keys=True):
+        changed = True
+    return merged, changed
+
+
+def _hooks_file_is_empty(data: dict) -> bool:
+    """True when a hooks/settings file has no meaningful content left."""
+    if not data:
+        return True
+    hooks = data.get("hooks") or {}
+    if hooks:
+        return False
+    other_keys = set(data.keys()) - {"version", "hooks"}
+    return len(other_keys) == 0
 
 
 def _read_json(path: Path) -> dict:
@@ -211,4 +252,114 @@ def install_hooks(
             result.outcomes.append(_install_claude(base, scope=scope, dry_run=dry_run, force=force, python=python))
         else:
             result.outcomes.append(HookOutcome(target, "", "error", f"unknown hook target: {target!r}"))
+    return result
+
+
+def _uninstall_cursor(
+    base_dir: Path,
+    *,
+    scope: str,
+    dry_run: bool,
+    python: Optional[str],
+) -> HookOutcome:
+    path = base_dir / ".cursor" / "hooks.json"
+    label = _scoped_label(scope, ".cursor/hooks.json")
+    if not path.is_file():
+        return HookOutcome("cursor", str(path), "unchanged", f"no {label}")
+    existing = _read_json(path)
+    stripped, changed = strip_hook_maps(existing)
+    if not changed:
+        return HookOutcome("cursor", str(path), "unchanged", f"{label} has no Puppetmaster hooks")
+    if dry_run:
+        if _hooks_file_is_empty(stripped):
+            return HookOutcome(
+                "cursor",
+                str(path),
+                "would_remove",
+                f"would remove Puppetmaster hooks and delete {label}",
+            )
+        return HookOutcome(
+            "cursor",
+            str(path),
+            "would_remove",
+            f"would remove Puppetmaster hooks from {label}",
+        )
+    if _hooks_file_is_empty(stripped):
+        path.unlink(missing_ok=True)
+        return HookOutcome("cursor", str(path), "removed", f"removed Puppetmaster hooks and deleted {label}")
+    _write_atomic(path, json.dumps(stripped, indent=2) + "\n")
+    return HookOutcome("cursor", str(path), "removed", f"removed Puppetmaster hooks from {label}")
+
+
+def _uninstall_claude(
+    base_dir: Path,
+    *,
+    scope: str,
+    dry_run: bool,
+    python: Optional[str],
+) -> HookOutcome:
+    path = base_dir / ".claude" / "settings.json"
+    label = _scoped_label(scope, ".claude/settings.json")
+    if not path.is_file():
+        return HookOutcome("claude", str(path), "unchanged", f"no {label}")
+    existing = _read_json(path)
+    stripped, changed = strip_hook_maps(existing)
+    if not changed:
+        return HookOutcome("claude", str(path), "unchanged", f"{label} has no Puppetmaster hooks")
+    if dry_run:
+        if _hooks_file_is_empty(stripped):
+            return HookOutcome(
+                "claude",
+                str(path),
+                "would_remove",
+                f"would remove Puppetmaster hooks and delete {label}",
+            )
+        return HookOutcome(
+            "claude",
+            str(path),
+            "would_remove",
+            f"would remove Puppetmaster hooks from {label}",
+        )
+    if _hooks_file_is_empty(stripped):
+        path.unlink(missing_ok=True)
+        return HookOutcome("claude", str(path), "removed", f"removed Puppetmaster hooks and deleted {label}")
+    _write_atomic(path, json.dumps(stripped, indent=2) + "\n")
+    return HookOutcome("claude", str(path), "removed", f"removed Puppetmaster hooks from {label}")
+
+
+def uninstall_hooks(
+    *,
+    cwd: Optional[Path] = None,
+    targets: Optional[Iterable[str]] = None,
+    dry_run: bool = False,
+    python: Optional[str] = None,
+    scopes: Optional[Iterable[str]] = None,
+    home: Optional[Path] = None,
+) -> HooksInstallResult:
+    """Remove Puppetmaster auto-invocation hooks for ``targets``.
+
+    By default removes hooks at both ``project`` and ``global`` scopes so
+    a prior ``setup`` or ``install-hooks --global`` is fully reversed.
+    """
+    result = HooksInstallResult()
+    selected_scopes = list(scopes) if scopes is not None else ["project", "global"]
+    selected = list(targets) if targets else ["cursor", "claude"]
+    for scope in selected_scopes:
+        if scope not in VALID_HOOK_SCOPES:
+            result.outcomes.append(HookOutcome("", "", "error", f"unknown hook scope: {scope!r}"))
+            continue
+        base = (home or Path.home()) if scope == "global" else (cwd or Path.cwd())
+        for target in selected:
+            if target == "cursor":
+                result.outcomes.append(
+                    _uninstall_cursor(base, scope=scope, dry_run=dry_run, python=python)
+                )
+            elif target == "claude":
+                result.outcomes.append(
+                    _uninstall_claude(base, scope=scope, dry_run=dry_run, python=python)
+                )
+            else:
+                result.outcomes.append(
+                    HookOutcome(target, "", "error", f"unknown hook target: {target!r}")
+                )
     return result

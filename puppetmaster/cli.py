@@ -16,15 +16,19 @@ from puppetmaster.installers import (
     CODEX_SANDBOX_GUIDANCE,
     CURSOR_NEXT_STEPS_GUIDANCE,
     InstallResult,
+    UninstallResult,
     install_codex_mcp,
     install_cursor_mcp,
+    uninstall_codex_mcp,
+    uninstall_cursor_mcp,
 )
 from puppetmaster.rules import (
     VALID_TARGETS,
     RulesInstallResult,
     install_rules,
+    uninstall_rules,
 )
-from puppetmaster.hook_installers import VALID_HOOK_TARGETS, install_hooks
+from puppetmaster.hook_installers import VALID_HOOK_TARGETS, install_hooks, uninstall_hooks
 from puppetmaster.mcp_registry import (
     kill_stale as registry_kill_stale,
     list_entries as registry_list_entries,
@@ -259,6 +263,37 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-platforms",
         action="store_true",
         help="Skip the platform-lock selection step (leave the lock unchanged).",
+    )
+
+    uninstall_parser = subcommands.add_parser(
+        "uninstall",
+        help=(
+            "Remove Puppetmaster host integrations (MCP registrations, hooks, rules) "
+            "before `pip uninstall puppetmaster-ai`. Idempotent."
+        ),
+    )
+    uninstall_parser.add_argument(
+        "--cwd",
+        default=".",
+        help="Workspace root for project-scoped artifacts. Default: current dir.",
+    )
+    uninstall_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print every action without writing or deleting anything.",
+    )
+    uninstall_parser.add_argument(
+        "--purge-state",
+        action="store_true",
+        help=(
+            "Also remove ~/.puppetmaster/, <cwd>/.puppetmaster/, and <cwd>/.codegraph/. "
+            "Left intact by default."
+        ),
+    )
+    uninstall_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the interactive confirmation prompt.",
     )
 
     init_config = subcommands.add_parser("init-config", help="Write a starter workflow config.")
@@ -1413,6 +1448,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
     if args.command == "setup":
         return _run_setup(args)
 
+    if args.command == "uninstall":
+        return _run_uninstall(args)
+
     if args.command == "repair-codegraph":
         return _run_repair_codegraph(args)
 
@@ -2249,6 +2287,156 @@ def _print_install_result(result: InstallResult, host: str) -> int:
     for line in result.messages:
         print(f"[install-{host}-mcp] {line}")
     return 0 if result.status in {"installed", "unchanged", "would_install"} else 1
+
+
+def _print_uninstall_mcp_result(result: UninstallResult, host: str) -> int:
+    """Pretty-print an :class:`UninstallResult` and return the appropriate exit code."""
+    print(f"[uninstall-{host}-mcp] status: {result.status}")
+    print(f"[uninstall-{host}-mcp] target: {result.target}")
+    for line in result.messages:
+        print(f"[uninstall-{host}-mcp] {line}")
+    return 0 if result.status in {"removed", "unchanged", "would_remove"} else 1
+
+
+def _print_uninstall_rules_result(result: RulesInstallResult) -> int:
+    print(f"[uninstall-rules] overall: {result.overall_status}")
+    for outcome in result.outcomes:
+        print(
+            f"[uninstall-rules] {outcome.target:<16} {outcome.status:<14} {outcome.reason}"
+        )
+        if outcome.path:
+            print(f"[uninstall-rules] {' ' * 16} {' ' * 14} -> {outcome.path}")
+    for msg in result.messages:
+        print(f"[uninstall-rules] note: {msg}")
+    return 1 if result.overall_status == "error" else 0
+
+
+def _print_uninstall_hooks_result(result) -> int:
+    print(f"[uninstall-hooks] overall: {result.overall_status}")
+    for outcome in result.outcomes:
+        print(
+            f"[uninstall-hooks] {outcome.target:<8} {outcome.status:<14} {outcome.reason}"
+        )
+        if outcome.path:
+            print(f"[uninstall-hooks] {' ' * 8} {' ' * 14} -> {outcome.path}")
+    for msg in result.messages:
+        print(f"[uninstall-hooks] note: {msg}")
+    return 1 if result.overall_status == "error" else 0
+
+
+def _confirm_uninstall(*, yes: bool, dry_run: bool) -> bool:
+    if yes or dry_run:
+        return True
+    if not sys.stdin.isatty():
+        print(
+            "error: refusing to uninstall without --yes in non-interactive mode",
+            file=sys.stderr,
+        )
+        return False
+    print(
+        "This removes Puppetmaster MCP registrations, hooks, and rules "
+        "from Cursor/Codex/Claude host configs."
+    )
+    try:
+        answer = input("Continue? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return answer in {"y", "yes"}
+
+
+def _purge_uninstall_state(cwd: Path, *, dry_run: bool) -> list[tuple[str, str, str]]:
+    """Remove optional state dirs when ``--purge-state`` is passed."""
+    import shutil
+
+    targets = [
+        ("home-state", Path.home() / ".puppetmaster"),
+        ("workspace-state", cwd / ".puppetmaster"),
+        ("codegraph", cwd / ".codegraph"),
+    ]
+    outcomes: list[tuple[str, str, str]] = []
+    for label, path in targets:
+        if not path.exists():
+            outcomes.append((label, str(path), "unchanged"))
+            continue
+        if dry_run:
+            outcomes.append((label, str(path), "would_remove"))
+            continue
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        outcomes.append((label, str(path), "removed"))
+    return outcomes
+
+
+def _run_uninstall(args) -> int:
+    """Dispatch for ``puppetmaster uninstall`` — inverse of ``setup`` host wiring."""
+    cwd = Path(getattr(args, "cwd", ".")).expanduser().resolve()
+    dry_run = getattr(args, "dry_run", False)
+    if not _confirm_uninstall(yes=getattr(args, "yes", False), dry_run=dry_run):
+        return 1
+
+    overall_rc = 0
+
+    print("=== uninstall: cursor MCP (workspace + global) ===")
+    for label, target in (
+        ("workspace", cwd / ".cursor" / "mcp.json"),
+        ("global", Path.home() / ".cursor" / "mcp.json"),
+    ):
+        result = uninstall_cursor_mcp(target_path=target.resolve(), dry_run=dry_run)
+        overall_rc |= _print_uninstall_mcp_result(result, f"cursor-{label}")
+    print()
+
+    print("=== uninstall: codex MCP ===")
+    codex_result = uninstall_codex_mcp(dry_run=dry_run)
+    overall_rc |= _print_uninstall_mcp_result(codex_result, "codex")
+    print()
+
+    print("=== uninstall: rules ===")
+    rules_result = uninstall_rules(cwd=cwd, dry_run=dry_run)
+    overall_rc |= _print_uninstall_rules_result(rules_result)
+    print()
+
+    print("=== uninstall: hooks (project + global scopes) ===")
+    hooks_result = uninstall_hooks(cwd=cwd, dry_run=dry_run)
+    overall_rc |= _print_uninstall_hooks_result(hooks_result)
+    print()
+
+    print("=== uninstall: stale MCP processes ===")
+    if dry_run:
+        print("[uninstall-mcp-processes] status: would_remove")
+        print("[uninstall-mcp-processes] would run mcp cleanup --kill-stale")
+    else:
+        killed_entries = registry_kill_stale()
+        if killed_entries:
+            print(f"[uninstall-mcp-processes] status: removed")
+            for entry in killed_entries:
+                print(
+                    f"[uninstall-mcp-processes] killed stale PID {entry.pid} "
+                    f"({entry.workspace or '-'})"
+                )
+        else:
+            print("[uninstall-mcp-processes] status: unchanged")
+            print("[uninstall-mcp-processes] no stale Puppetmaster MCP processes")
+    print()
+
+    if getattr(args, "purge_state", False):
+        print("=== uninstall: state purge (--purge-state) ===")
+        for label, path, status in _purge_uninstall_state(cwd, dry_run=dry_run):
+            print(f"[uninstall-state] {label:<16} status: {status}")
+            print(f"[uninstall-state] {' ' * 16} target: {path}")
+        print()
+    else:
+        print(
+            "[uninstall-state] status: unchanged  "
+            "(left ~/.puppetmaster/, <cwd>/.puppetmaster/, and .codegraph/ intact; "
+            "pass --purge-state to remove)"
+        )
+        print()
+
+    print("Host integrations removed. Last step: pip uninstall puppetmaster-ai")
+    return overall_rc
 
 
 def _run_install_codex(args) -> int:
