@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.9.32
+
+**Fix: deny-redirect hooks no longer recommend Cursor-only verbs on non-Cursor hosts (field report: Claude Code on Windows, no Cursor installed).** The pre-tool hook denied the native Agent/Task tool and pointed at `puppetmaster_start_cursor_swarm` — a verb that host cannot invoke — so the turn was blocked with an unusable recommendation. Full suite **599** green (+3 focused tests); verified live through the real CLI hook path (`invocation-gate --host claude --event PreToolUse`).
+
+- **Host-portable verb translation.** Hooks now map cursor-specific verbs to the platform-routing equivalents for any non-Cursor host: `start_cursor_swarm`/`_review`/`_plan` → `puppetmaster_start_swarm`, `start_cursor_implement` → `puppetmaster_start_implement`. Applied to both the pre-tool deny reason and the prompt-submit directive; Cursor hosts keep the cursor daily-drivers.
+- **Known limits.** Mapping keys off the hook's `--host` flag, not off which platforms are actually installed — a Cursor host with a missing Cursor SDK still gets cursor verbs (the platform lock catches that at execution time, not at recommendation time). The generic verbs assume the MCP server is registered with the host; if only hooks are installed without the MCP, any recommendation remains uninvokable — `PUPPETMASTER_AUTO_INVOKE_DISABLED=1` stays the escape hatch.
+
 ## v0.9.31
 
 **Feature: per-model effort levels in the registry, plus an interactive registry wizard (field request: "the same model on different effort can have a huge impact on cost and capability").** Effort variants are now plain registry rows — `codex/gpt-5-5-high` and `codex/gpt-5-5-medium` compete in routing as distinct models with their own capability scores and honest token-burn cost estimates. No source edits required: everything is data in `models.json`, managed via `puppetmaster models setup` (interactive wizard) or `puppetmaster models set` (one-shot). Full suite **596** green (+13 focused tests); `ruff check puppetmaster/` clean; verified live end to end — routed effort variants executed against the real OpenAI API (`reasoning_effort=high` in the request) and the real Codex CLI (`-c model_reasoning_effort=high` on the invocation).
