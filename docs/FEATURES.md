@@ -27,7 +27,7 @@ Four production adapters live; eleven tiers in the starter registry (5 Cursor/Cl
 | Plan-first auto-discovery (v0.9.0+) | First `auto_route` job auto-merges the authenticated subscription's frontier so hard tasks stay in-plan (`$0`). Cursor self-enumerates; Claude Code / Codex use curated catalogs (`models discover --source claude\|codex`) since their CLIs can't list models |
 | OpenTelemetry (optional, v0.9.0+) | Zero-cost unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set: per-task spans, job metrics, cross-process trace context. `pip install puppetmaster-ai[otel]` |
 | Async await (v0.9.0+) | `puppetmaster await <job_id>` (CLI), `puppetmaster_await_job` (MCP), and a TypeScript blocking client in [`clients/typescript`](../clients/typescript) |
-| One-line MCP installers (v0.7.2+) | `install-cursor-mcp`, `install-codex-mcp` — resolve `sys.executable`, handshake before write, idempotent |
+| One-line MCP installers (v0.7.2+) | `install-cursor-mcp`, `install-codex-mcp`, `install-claude-mcp` — resolve `sys.executable`, handshake before write, idempotent |
 | One-line rule installer (v0.7.3+) | `install-rules` — Cursor `.mdc` + cross-tool `AGENTS.md` + global Codex/Claude rules, merge-don't-overwrite |
 | `puppetmaster setup` (v0.7.3+) | One-shot wizard chaining doctor → models init → MCP installers → rules |
 | Cursor Agent MCP | Async start tools, status polling, logs, live artifacts, partial summaries, routing tools |

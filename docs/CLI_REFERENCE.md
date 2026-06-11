@@ -7,7 +7,7 @@ visible via `python -m puppetmaster --help`.
 ## Setup and inspection
 
 ```bash
-python -m puppetmaster setup            # one-shot: doctor + models init + install-cursor-mcp + install-codex-mcp + install-rules
+python -m puppetmaster setup            # one-shot: doctor + models init + install-cursor-mcp + install-codex-mcp + install-claude-mcp + install-rules
 python -m puppetmaster doctor           # 15 health checks
 python -m puppetmaster adapters         # list available worker adapters (json)
 python -m puppetmaster state            # print the resolved per-workspace state dir
@@ -21,6 +21,7 @@ python -m puppetmaster init-config --path puppetmaster.json
 python -m puppetmaster install-cursor-mcp           # workspace .cursor/mcp.json
 python -m puppetmaster install-cursor-mcp --global  # ~/.cursor/mcp.json
 python -m puppetmaster install-codex-mcp            # codex mcp add ...
+python -m puppetmaster install-claude-mcp           # claude mcp add --scope user ...
 python -m puppetmaster install-rules                # write .cursor/rules/puppetmaster.mdc + AGENTS.md
 python -m puppetmaster install-rules --global       # also ~/.codex/instructions.md and ~/.claude/CLAUDE.md
 ```

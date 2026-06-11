@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.9.33
+
+**Feature: `install-claude-mcp` — `puppetmaster setup` now registers the MCP server with Claude Code (field report: "ran setup, Claude enabled, but no MCP in Claude's list").** Setup wired Cursor and Codex hosts but never Claude Code — the "Claude enabled" line users saw was the platform lock (Claude as a *worker*), not host registration, so driving Puppetmaster *from* Claude Code silently got nothing. Full suite **605** green (+6 focused tests); `ruff check puppetmaster/` clean; verified live end to end — real `claude mcp add` (user scope), `claude mcp get` shows `✔ Connected`, re-run reports `unchanged`.
+
+- **`puppetmaster install-claude-mcp`.** Mirrors the Codex installer: shells out to `claude mcp add --scope user` (Claude Code owns `~/.claude.json`'s schema — it also stores OAuth state there, so we never hand-edit it), runs the same pre-registration handshake (spawn server, `tools/list`, refuse to register a broken entry), and is idempotent via `claude mcp get`. `--force`, `--dry-run`, `--skip-handshake`, and `--claude <cmd>` (multi-word OK, e.g. `npx -y @anthropic-ai/claude-code`) match the sibling installers; the CLI resolves from `claude` on PATH, then `CLAUDE_CODE_COMMAND`.
+- **Wired into `setup` (now 8 steps) and `uninstall`.** Setup step 6 registers with Claude Code when the `claude-code` platform is enabled and the CLI is resolvable — same gating shape as the Codex step. `puppetmaster uninstall` removes the user-scope entry alongside the Cursor and Codex ones.
+- **User scope on purpose.** Cursor's installer defaults to workspace-local because `.cursor/mcp.json` travels with the repo; Claude Code registration goes to user scope so the server is available in every project, matching how people drive Puppetmaster from Claude.
+- **Known limits.** Only the user scope is managed: an existing local/project-scope `puppetmaster` entry shadows ours in Claude's precedence order and is left untouched. The installer needs the Claude CLI resolvable at install time (`npm install -g @anthropic-ai/claude-code` or `CLAUDE_CODE_COMMAND`); there is no config-file fallback, by design. No timeout tuning is written — Claude Code's MCP timeouts are env-var driven (`MCP_TIMEOUT`/`MCP_TOOL_TIMEOUT`), and the server's own block cap keeps calls short.
+
 ## v0.9.32
 
 **Fix: deny-redirect hooks no longer recommend Cursor-only verbs on non-Cursor hosts (field report: Claude Code on Windows, no Cursor installed).** The pre-tool hook denied the native Agent/Task tool and pointed at `puppetmaster_start_cursor_swarm` — a verb that host cannot invoke — so the turn was blocked with an unusable recommendation. Full suite **599** green (+3 focused tests); verified live through the real CLI hook path (`invocation-gate --host claude --event PreToolUse`).
