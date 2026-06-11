@@ -77,8 +77,22 @@ class HooksInstallResult:
         return "installed"
 
 
+def _shell_safe_executable(exe: str) -> str:
+    """Make a Python path safe to embed in a hook command string.
+
+    Hosts execute hook commands through a POSIX-style shell — on Windows
+    that's Git Bash, where unquoted backslashes are escape characters, so
+    ``C:\\Users\\me\\python.exe`` arrives as ``C:Usersmepython.exe`` (field
+    report: Claude Code on Windows). Forward slashes are valid Windows path
+    separators everywhere this command runs, and quoting protects spaces
+    (``Program Files``-style paths) in any shell.
+    """
+    safe = exe.replace("\\", "/")
+    return f'"{safe}"' if " " in safe else safe
+
+
 def _gate_command(host: str, event: str, python: Optional[str] = None) -> str:
-    exe = python or sys.executable or "python3"
+    exe = _shell_safe_executable(python or sys.executable or "python3")
     return f"{exe} -m puppetmaster invocation-gate --host {host} --event {event}"
 
 

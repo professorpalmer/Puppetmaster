@@ -13058,6 +13058,40 @@ class HookInstallerTests(unittest.TestCase):
         result = install_hooks(scope="bogus")
         self.assertEqual(result.overall_status, "error")
 
+    def test_gate_command_uses_forward_slashes_for_windows_python(self):
+        """Windows python paths must survive the host's POSIX-shell hook exec.
+
+        Field report (Claude Code on Windows): the backslashed path written
+        by setup lost every backslash by the time the hook ran — Git Bash
+        treats unquoted backslashes as escapes. Forward slashes are valid
+        Windows separators and pass through every layer unmangled.
+        """
+        from puppetmaster.hook_installers import _gate_command
+
+        command = _gate_command(
+            "claude", "pre-tool", python=r"C:\Users\pawel\AppData\Local\Programs\Python\python.exe"
+        )
+        self.assertNotIn("\\", command)
+        self.assertTrue(
+            command.startswith("C:/Users/pawel/AppData/Local/Programs/Python/python.exe ")
+        )
+
+    def test_gate_command_quotes_paths_with_spaces(self):
+        from puppetmaster.hook_installers import _gate_command
+
+        command = _gate_command(
+            "claude", "user-prompt", python=r"C:\Program Files\Python312\python.exe"
+        )
+        self.assertTrue(command.startswith('"C:/Program Files/Python312/python.exe" -m'))
+
+    def test_gate_command_leaves_posix_paths_untouched(self):
+        from puppetmaster.hook_installers import _gate_command
+
+        command = _gate_command("cursor", "user-prompt", python="/usr/local/bin/python3")
+        self.assertTrue(
+            command.startswith("/usr/local/bin/python3 -m puppetmaster invocation-gate")
+        )
+
 
 class InvocationGateCliTests(unittest.TestCase):
     """The should-delegate / install-hooks CLI surface."""
