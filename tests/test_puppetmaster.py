@@ -10683,6 +10683,60 @@ class SetupPlatformStepTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertFalse(pl.is_restricted())
 
+    def test_first_run_noninteractive_locks_to_detected_platforms(self) -> None:
+        """Field report: a Claude-Code-only user ended up with cursor enabled
+        because setup defaulted to all-on instead of detecting."""
+        from puppetmaster.cli import _setup_platform_step
+        from puppetmaster import platform_lock as pl
+
+        with TemporaryDirectory() as tmp:
+            self._isolated(tmp)
+            detected = {"cursor": False, "claude-code": True, "codex": True, "openai": False}
+            with patch("puppetmaster.cli._detected_platforms", return_value=detected):
+                rc = _setup_platform_step(self._args())
+            self.assertEqual(rc, 0)
+            self.assertEqual(pl.enabled_adapters(), {"claude-code", "codex"})
+
+    def test_noninteractive_respects_existing_lock(self) -> None:
+        from puppetmaster.cli import _setup_platform_step
+        from puppetmaster import platform_lock as pl
+
+        with TemporaryDirectory() as tmp:
+            self._isolated(tmp)
+            pl.set_enabled({"cursor"})
+            detected = {"cursor": False, "claude-code": True, "codex": False, "openai": False}
+            with patch("puppetmaster.cli._detected_platforms", return_value=detected):
+                rc = _setup_platform_step(self._args())
+            self.assertEqual(rc, 0)
+            self.assertEqual(pl.enabled_adapters(), {"cursor"})
+
+    def test_nothing_detected_leaves_default_unrestricted(self) -> None:
+        from puppetmaster.cli import _setup_platform_step
+        from puppetmaster import platform_lock as pl
+
+        with TemporaryDirectory() as tmp:
+            self._isolated(tmp)
+            detected = {a: False for a in pl.KNOWN_ADAPTERS}
+            with patch("puppetmaster.cli._detected_platforms", return_value=detected):
+                rc = _setup_platform_step(self._args())
+            self.assertEqual(rc, 0)
+            self.assertFalse(pl.is_restricted())
+
+    def test_state_display_flags_undetected_platforms(self) -> None:
+        from puppetmaster.cli import _setup_platform_step
+
+        with TemporaryDirectory() as tmp:
+            self._isolated(tmp)
+            detected = {"cursor": False, "claude-code": True, "codex": True, "openai": False}
+            buf = io.StringIO()
+            with patch("puppetmaster.cli._detected_platforms", return_value=detected):
+                with contextlib.redirect_stdout(buf):
+                    rc = _setup_platform_step(self._args(platforms="cursor"))
+            self.assertEqual(rc, 0)
+            output = buf.getvalue()
+            self.assertIn("not detected on this machine", output)
+            self.assertIn("enabled anyway (explicit --platforms)", output)
+
 
 class RoutingBaselineSnapshotTests(unittest.TestCase):
     """The router stamps a decision-time savings baseline onto every decision."""

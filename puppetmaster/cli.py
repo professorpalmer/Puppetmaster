@@ -2655,15 +2655,41 @@ def _run_install_rules(args) -> int:
     return _print_rules_result(result)
 
 
+def _detected_platforms(root: Path) -> dict[str, bool]:
+    """Which platform-billed adapters look *usable on this machine*.
+
+    Presence probes, not auth audits: cursor needs its bundled SDK plus a
+    ``CURSOR_API_KEY``; claude-code and codex need their CLI resolvable;
+    openai needs ``OPENAI_API_KEY``. Codex login state is deliberately not
+    probed (subscription auth is opaque from here) — the billing checks in
+    doctor cover that separately.
+    """
+    from puppetmaster.diagnostics import (
+        _claude_code_installed,
+        _codex_cli_installed,
+        _cursor_sdk_installed,
+    )
+
+    return {
+        "cursor": _cursor_sdk_installed(root) and bool(os.environ.get("CURSOR_API_KEY")),
+        "claude-code": _claude_code_installed(),
+        "codex": _codex_cli_installed(),
+        "openai": bool(os.environ.get("OPENAI_API_KEY")),
+    }
+
+
 def _setup_platform_step(args) -> int:
     """The `setup` wizard's platform-lock step.
 
-    Lets the user pick which platforms Puppetmaster may route to right out of
-    the gate — a single Cursor plan, Cursor + Claude Code, etc. Three modes:
+    Defaults to *what is detected on this machine* instead of "everything on"
+    (field report: a Claude-Code-only user got cursor recommendations because
+    setup silently left all platforms enabled). Modes:
 
-    * ``--platforms cursor,claude-code`` — explicit, non-interactive.
-    * a TTY with no flag — interactive toggle prompt.
-    * non-interactive shell with no flag — left unchanged, with a hint.
+    * ``--platforms cursor,claude-code`` — explicit, always wins.
+    * a TTY with no flag — interactive prompt; on first run, Enter applies
+      the detected set.
+    * non-interactive shell with no flag — first run locks to the detected
+      set; an existing lock is respected and left unchanged.
 
     Returns non-zero only for an invalid *explicit* ``--platforms`` value; the
     interactive and skipped paths never fail the wizard on a typo.
@@ -2671,12 +2697,15 @@ def _setup_platform_step(args) -> int:
     from puppetmaster import platform_lock as pl
 
     known = pl.KNOWN_ADAPTERS
+    detected = _detected_platforms(Path.cwd())
+    detected_set = {a for a, present in detected.items() if present}
 
     def _show_state() -> None:
         enabled = pl.enabled_adapters()
         for adapter in known:
             mark = "on " if adapter in enabled else "off"
-            print(f"  [{mark}] {adapter}")
+            note = "" if detected.get(adapter, True) else "   (not detected on this machine)"
+            print(f"  [{mark}] {adapter}{note}")
 
     raw = getattr(args, "platforms", None)
     if raw is not None:
@@ -2694,6 +2723,12 @@ def _setup_platform_step(args) -> int:
             return 1
         pl.set_enabled(valid)
         print(f"  locked  routing restricted to: {', '.join(sorted(valid))}")
+        undetected = sorted(a for a in valid if not detected.get(a, True))
+        if undetected:
+            print(
+                f"  note: not detected on this machine: {', '.join(undetected)} — "
+                "enabled anyway (explicit --platforms)"
+            )
         _show_state()
         return 0
 
@@ -2702,24 +2737,45 @@ def _setup_platform_step(args) -> int:
         _show_state()
         return 0
 
+    first_run = not pl.platform_config_path().is_file()
+
     if not sys.stdin.isatty():
-        print(
-            "  skipped  non-interactive shell and no --platforms flag — "
-            "platform lock left unchanged"
-        )
-        print(
-            "  note: set later with `puppetmaster platform only cursor` "
-            "(or enable/disable/reset)"
-        )
+        if not first_run:
+            print(
+                "  unchanged  existing platform lock respected "
+                "(non-interactive shell, no --platforms flag)"
+            )
+        elif detected_set:
+            pl.set_enabled(detected_set)
+            print(
+                "  detected  locked to the platforms found on this machine: "
+                f"{', '.join(sorted(detected_set))}"
+            )
+            print(
+                "  note: adjust anytime with `puppetmaster platform "
+                "enable/disable/only/reset` or `setup --platforms ...`"
+            )
+        else:
+            print(
+                "  skipped  no platforms detected on this machine — lock left "
+                "at default (all enabled); set explicitly with --platforms"
+            )
         _show_state()
         return 0
 
     print("Puppetmaster routes work across these platforms:")
     _show_state()
-    print(
-        "Enter a comma-separated list of platforms to ENABLE (all others off),\n"
-        "'all' to keep every platform on, or press Enter to leave unchanged."
-    )
+    if first_run and detected_set:
+        print(f"Detected on this machine: {', '.join(sorted(detected_set))}")
+        print(
+            "Enter a comma-separated list of platforms to ENABLE (all others off),\n"
+            "'all' to keep every platform on, or press Enter to use the detected set."
+        )
+    else:
+        print(
+            "Enter a comma-separated list of platforms to ENABLE (all others off),\n"
+            "'all' to keep every platform on, or press Enter to leave unchanged."
+        )
     try:
         answer = input("  platforms> ").strip()
     except (EOFError, KeyboardInterrupt):
@@ -2727,7 +2783,14 @@ def _setup_platform_step(args) -> int:
         return 0
 
     if not answer:
-        print("  unchanged  platform lock left as-is")
+        if first_run and detected_set:
+            pl.set_enabled(detected_set)
+            print(
+                "  locked  routing restricted to detected platforms: "
+                f"{', '.join(sorted(detected_set))}"
+            )
+        else:
+            print("  unchanged  platform lock left as-is")
         _show_state()
         return 0
     if answer.lower() == "all":
