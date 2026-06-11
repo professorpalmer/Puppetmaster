@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.9.38
+
+**Docs: the PyPI/README tagline now credits AWS Bedrock as a Claude Code billing path.** Bedrock support itself shipped in v0.9.27 (posture detection, credential health, live-verified completion through `CLAUDE_CODE_USE_BEDROCK`) but the project description never mentioned it. Docs-only release so the frozen PyPI project page picks it up; no code changes.
+
+- **Known limits.** Bedrock remains a Claude Code billing path, not a standalone adapter — there is no native Bedrock API worker, and Vertex AI (`CLAUDE_CODE_USE_VERTEX`) is still undetected.
+
 ## v0.9.37
 
 **Managed rules now mandate CodeGraph-first exploration, not just suggest it.** The installed rules (Cursor `.mdc` + the `AGENTS.md` managed block read by Claude Code and Codex) forced Puppetmaster delegation hard — trigger convention, delegate-first gate, hooks — but CodeGraph got one "prefer" sentence buried in the gate. Now it has its own must-obey section. Full suite **623** green (+1 focused test); `ruff check puppetmaster/` clean; repo `AGENTS.md` block refreshed via `install-rules` live.
