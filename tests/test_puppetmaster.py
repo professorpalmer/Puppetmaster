@@ -12684,6 +12684,56 @@ class HookRunnerTests(unittest.TestCase):
         out = r.to_host_json("claude")
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
 
+    def test_deny_redirect_suggests_host_portable_verb(self):
+        """Field fix: a Claude Code host with no Cursor installed was told to
+        use `puppetmaster_start_cursor_swarm`, a verb it cannot run — the deny
+        blocked native Task AND the recommendation was uninvokable, wedging the
+        turn. Non-Cursor hosts must be pointed at platform-routing verbs."""
+        from puppetmaster.hook_runner import handle_hook
+
+        claude = handle_hook({"tool_name": "Task"}, host="claude", event="PreToolUse")
+        self.assertEqual(claude.action, "deny")
+        self.assertIn("puppetmaster_start_swarm", claude.reason)
+        self.assertNotIn("cursor", claude.reason)
+
+        cursor = handle_hook({"tool_name": "Task"}, host="cursor", event="pre-tool")
+        self.assertEqual(cursor.action, "deny")
+        self.assertIn("puppetmaster_start_cursor_swarm", cursor.reason)
+
+    def test_prompt_directive_suggests_host_portable_verb(self):
+        from puppetmaster.hook_runner import handle_hook
+
+        prompt = {"prompt": "review the whole repo for security risks"}
+        claude = handle_hook(prompt, host="claude", event="UserPromptSubmit")
+        self.assertEqual(claude.action, "allow")
+        self.assertTrue(claude.decision.should_delegate)
+        self.assertNotIn("cursor", claude.decision.suggested_verb)
+        self.assertNotIn("cursor", claude.context)
+
+        cursor = handle_hook(prompt, host="cursor", event="beforeSubmitPrompt")
+        self.assertEqual(cursor.decision.suggested_verb, "puppetmaster_start_cursor_review")
+
+    def test_verb_for_host_translation_table(self):
+        from puppetmaster.hook_runner import verb_for_host
+
+        self.assertEqual(
+            verb_for_host("puppetmaster_start_cursor_swarm", "claude"),
+            "puppetmaster_start_swarm",
+        )
+        self.assertEqual(
+            verb_for_host("puppetmaster_start_cursor_implement", "codex"),
+            "puppetmaster_start_implement",
+        )
+        # Generic verbs pass through untouched on every host.
+        self.assertEqual(
+            verb_for_host("puppetmaster_codegraph_search", "claude"),
+            "puppetmaster_codegraph_search",
+        )
+        self.assertEqual(
+            verb_for_host("puppetmaster_start_cursor_swarm", "cursor"),
+            "puppetmaster_start_cursor_swarm",
+        )
+
     def test_pre_tool_allows_native_grep_glob(self):
         # Field fix: native search tools are read-only inspection in disguise as
         # often as not, and their scope isn't visible in the hook payload — so we

@@ -26,7 +26,7 @@ from __future__ import annotations
 import json
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Optional
 
 from puppetmaster.invocation_gate import DelegationDecision, gate_disabled, should_delegate
@@ -52,6 +52,30 @@ _TOOL_REDIRECT = {
     "task": "puppetmaster_start_cursor_swarm",
     "agent": "puppetmaster_start_cursor_swarm",
 }
+
+# Cursor-specific verbs translated for non-Cursor hosts. The ``*_cursor_*``
+# verbs require the Cursor SDK platform; recommending them on a Claude Code or
+# Codex host points the model at a tool it cannot run (field-reported: the
+# hook denied Claude's Agent tool and suggested ``puppetmaster_start_cursor_swarm``
+# on a machine with no Cursor installed, wedging the turn). The generic verbs
+# route to whatever platform the lock enables, so they are safe everywhere.
+_HOST_PORTABLE_VERBS = {
+    "puppetmaster_start_cursor_swarm": "puppetmaster_start_swarm",
+    "puppetmaster_start_cursor_review": "puppetmaster_start_swarm",
+    "puppetmaster_start_cursor_plan": "puppetmaster_start_swarm",
+    "puppetmaster_start_cursor_implement": "puppetmaster_start_implement",
+}
+
+
+def verb_for_host(verb: str, host: str) -> str:
+    """Return a verb the ``host`` agent can actually invoke.
+
+    Cursor hosts keep the cursor-specific daily drivers; every other host gets
+    the platform-routing equivalent instead of a verb it may not have.
+    """
+    if (host or "").strip().lower() == "cursor":
+        return verb
+    return _HOST_PORTABLE_VERBS.get(verb, verb)
 
 # NOTE on native search/glob tools (Grep/Glob/codebase_search): we deliberately
 # do NOT hard-deny these. Field testing showed Cursor's hook payload for them
@@ -239,6 +263,7 @@ def handle_hook(
         tool_name, tool_input = extract_tool(payload)
         redirect, verb = classify_tool(tool_name, tool_input)
         if redirect:
+            verb = verb_for_host(verb, host)
             return HookResponse(
                 action="deny",
                 reason=(
@@ -255,6 +280,9 @@ def handle_hook(
     if not prompt:
         return HookResponse(action="allow")
     decision = should_delegate(prompt, env=env)
+    decision = replace(
+        decision, suggested_verb=verb_for_host(decision.suggested_verb, host)
+    )
     if decision.should_delegate:
         return HookResponse(action="allow", context=decision.directive(), decision=decision)
     return HookResponse(action="allow", decision=decision)
