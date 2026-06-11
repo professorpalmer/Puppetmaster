@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.9.37
+
+**Managed rules now mandate CodeGraph-first exploration, not just suggest it.** The installed rules (Cursor `.mdc` + the `AGENTS.md` managed block read by Claude Code and Codex) forced Puppetmaster delegation hard — trigger convention, delegate-first gate, hooks — but CodeGraph got one "prefer" sentence buried in the gate. Now it has its own must-obey section. Full suite **623** green (+1 focused test); `ruff check puppetmaster/` clean; repo `AGENTS.md` block refreshed via `install-rules` live.
+
+- **"CodeGraph-first exploration (must obey)" section in the managed rule body.** Graph every directory you interact with: check `puppetmaster_codegraph_status` before exploring any directory (root or subtree), `puppetmaster_codegraph_init` (`index: true`) if no `.codegraph/`, then answer where/what-calls/what-implements questions from `_search`/`_context`/`_affected`/`_files` instead of crawling the tree.
+- **Unsupported-language policy: partial coverage is still coverage.** CodeGraph indexes the languages it supports; ungraphable files simply don't enter the graph. The rule now tells agents to keep answering from the graph for everything it covers, scope native search narrowly to the ungraphed paths only, and reuse that shared context — never let multiple workers/agents each re-crawl directories the graph already covers.
+- **Honest carve-outs and fallback baked in.** Native search stays legitimate for plain-text matches, single known file paths, and explicit "just grep"; transport failures route to the ABI-safe `python -m puppetmaster codegraph …` passthrough, never a bare `codegraph` shell call.
+- **Known limits.** This is rule pressure, not deterministic enforcement — a host agent can still ignore prose; the `install-hooks` deny-redirect gate remains the hard backstop for broad native exploration. Existing installs pick up the new body on the next `puppetmaster install-rules` (or `setup`) run; rules already on disk don't self-update.
+
 ## v0.9.36
 
 **Fix: `setup` locks the platform set to what's actually on the machine (field report: "it still says I have cursor… I assumed it detects them, it simply supports them").** The platform-lock step defaulted to all-on, so a Claude-Code-only Windows user ran for a day with cursor enabled — cursor verbs recommended, cursor preferred by implement routing, "[on ] cursor" in every status display. Full suite **622** green (+4 focused tests); `ruff check puppetmaster/` clean; detection verified live on this machine (cursor+codex+openai found, npx-only claude correctly not; existing lock respected, not stomped).

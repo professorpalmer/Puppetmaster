@@ -90,6 +90,34 @@ RULE_BODY = textwrap.dedent(
     and deny-redirect broad native exploration automatically. The kill switch
     is `PUPPETMASTER_AUTO_INVOKE_DISABLED=1`.
 
+    ## CodeGraph-first exploration (must obey)
+
+    CodeGraph is the default way to explore code — graph every directory you
+    interact with, then explore the graph instead of crawling the tree:
+
+    1. **Graph it first.** Before exploring any directory (the workspace root
+       or a subtree you're diving into), check `puppetmaster_codegraph_status`;
+       if it has no `.codegraph/`, run `puppetmaster_codegraph_init`
+       (`index: true`) — it returns immediately and indexes in the background.
+       Do not start grepping while you wait.
+    2. **Ask the graph, not the tree.** Resolve "where is X / what calls Y /
+       what implements Z" with `puppetmaster_codegraph_search` /
+       `_context` / `_affected` / `_files`, then `Read` only the files it
+       points to.
+    3. **Partial coverage is still coverage.** CodeGraph indexes the languages
+       it supports; unsupported files simply don't enter the graph. When part
+       of the tree is ungraphable, still answer from the graph for everything
+       it covers and scope native search narrowly to the ungraphed paths
+       only — never re-crawl directories the graph already covers, and reuse
+       that shared context instead of letting multiple workers/agents each
+       re-explore the same graphed code.
+
+    Native search is fine for plain-text matches (log strings, config values,
+    comments), a single known file path, or when the user says "just grep".
+    If a codegraph MCP call returns a transport error, fall back to the CLI
+    passthrough `python -m puppetmaster codegraph …` — never a bare
+    `codegraph` from the shell (Node ABI mismatch).
+
     ## When NOT to use Puppetmaster (stay inline)
 
     - Trivial single-file edits, typos, one-line fixes

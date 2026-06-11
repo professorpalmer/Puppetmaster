@@ -7538,6 +7538,22 @@ class InstallRulesTests(unittest.TestCase):
         self.assertIn("# Puppetmaster orchestration", block)
         self.assertIn("Delegate-first gate", block)
 
+    def test_rules_mandate_codegraph_first_exploration(self):
+        """The managed rules must push CodeGraph as hard as delegation:
+        graph every directory touched, explore the graph not the tree, and
+        use partial graphs + narrow native search for unsupported languages
+        instead of re-crawling covered code."""
+        from puppetmaster.rules import RULE_BODY, render_cursor_mdc
+
+        for content in (RULE_BODY, render_cursor_mdc()):
+            flattened = " ".join(content.split())
+            self.assertIn("CodeGraph-first exploration (must obey)", flattened)
+            self.assertIn("graph every directory you interact with", flattened)
+            self.assertIn("puppetmaster_codegraph_init", flattened)
+            self.assertIn("puppetmaster_codegraph_status", flattened)
+            self.assertIn("Partial coverage is still coverage", flattened)
+            self.assertIn("never re-crawl directories the graph already covers", flattened)
+
     def test_merge_into_empty_creates_block(self):
         from puppetmaster.rules import merge_block_into_text, render_agents_block
 
