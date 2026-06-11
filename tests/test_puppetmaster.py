@@ -3226,7 +3226,15 @@ class PuppetmasterTests(unittest.TestCase):
             emitter=lambda payload: (with_token.append(payload) or True),
         )
         keepalive.start()
-        time.sleep(0.12)
+        # Poll instead of a fixed sleep: on a loaded CI runner the keepalive
+        # thread can be starved past a hardcoded window (observed flake on
+        # GitHub macOS runners), but it always emits eventually.
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            methods = {frame["method"] for frame in with_token}
+            if {"notifications/message", "notifications/progress"} <= methods:
+                break
+            time.sleep(0.01)
         keepalive.stop(wait=True)
 
         methods = {frame["method"] for frame in with_token}
@@ -3253,7 +3261,9 @@ class PuppetmasterTests(unittest.TestCase):
             emitter=lambda payload: (without_token.append(payload) or True),
         )
         bare.start()
-        time.sleep(0.12)
+        deadline = time.time() + 5.0
+        while time.time() < deadline and not without_token:
+            time.sleep(0.01)
         bare.stop(wait=True)
         self.assertTrue(without_token)
         self.assertTrue(

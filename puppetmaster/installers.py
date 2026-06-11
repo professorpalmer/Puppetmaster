@@ -155,7 +155,10 @@ def ensure_cursor_sdk(
     install_root = package_root or Path(__file__).resolve().parent.parent
     try:
         completed = subprocess.run(
-            [npm, "install", "@cursor/sdk", "--prefix", str(install_root)],
+            # as_posix(): npm accepts forward slashes on every platform, and
+            # native backslashes get mangled by Git-Bash-style shells on
+            # Windows (same class of bug as the v0.9.34 hook-path fix).
+            [npm, "install", "@cursor/sdk", "--prefix", install_root.as_posix()],
             capture_output=True,
             text=True,
             timeout=timeout_seconds,

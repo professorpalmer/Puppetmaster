@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.9.40
+
+**Fix: green CI on Windows runners (the v0.9.39 npm bootstrap built a backslash path the test rightly rejected) plus a timing flake on macOS runners.** Two distinct failures were red on `main`: `test (windows-latest, 3.12)` since v0.9.39, and an intermittent keepalive flake that even hit a README-only commit. Diagnosed from the actual Actions logs, not local guessing — the local macOS suite was green the whole time.
+
+- **Windows: `ensure_cursor_sdk` now passes npm a forward-slash prefix.** `str(Path)` stringifies to backslashes on Windows (`\fake\site-packages`), which both failed the exact-command test and risks Git-Bash-style mangling in the field — the same bug class as the v0.9.34 hook-path fix. `as_posix()` is correct on every platform; npm accepts forward slashes everywhere.
+- **Flake: `test_keepalive_emits_progress_only_with_token` polls instead of sleeping.** A fixed 0.12s window assumed the keepalive thread got scheduled promptly; loaded CI runners starved it past the window (observed: `'notifications/message' not found in set()` on a docs-only commit). The test now polls up to 5s for the frames it asserts on — deterministic on slow runners, still fast (~0.05s) locally.
+- **Known limits.** The Windows fix is verified by the platform-exact unit test on CI, not by a live `npm install` on a Windows machine. The flake fix removes the observed starvation mode; other timing-sensitive tests in the suite were not audited in this pass.
+
 ## v0.9.39
 
 **Fix: PyPI installs never had the Cursor SDK — setup now bootstraps `@cursor/sdk` via npm (field report: our own demo recording showed "cursor (not detected on this machine)" on a Cursor machine).** Wheels can't ship `node_modules`, so every pip/pipx install landed without the SDK that `cursor_sdk_runner.mjs` resolves at runtime: platform detection read cursor as absent and the cursor adapter itself couldn't run. Dev-tree installs masked this for months because the repo has `node_modules` sitting next to the package. Full suite **630** green (+7 focused tests); `ruff check puppetmaster/` clean; verified end to end on a fresh wheel venv — detection True pre-bootstrap, `install-cursor-mcp` npm-fetches the SDK into site-packages, Node resolves it from the runner's directory, MCP handshake 42 tools, `setup` shows `[on ] cursor` unannotated.
