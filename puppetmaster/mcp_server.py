@@ -132,6 +132,16 @@ _DEFAULT_KEEPALIVE_INTERVAL_SECONDS = 10.0
 # server that has not received an inbound JSON-RPC message in
 # ``_DEFAULT_INPUT_STALE_SECONDS`` AND currently has zero in-flight tool
 # calls. Active sessions are unaffected; only true orphans reap.
+#
+# Idle reaping is HOST-GATED: it only solves a Cursor problem, and only
+# Cursor transparently respawns a reaped server on the next call. Claude
+# Code and Codex mark the connection failed and stay dead until the user
+# restarts their session (field reports: Codex "Transport closed", Claude
+# Code "Connection status failed for some reason" after an idle gap). On
+# those hosts — and on unknown hosts — a leaked-but-alive server is far
+# cheaper than a dead transport, so idle reaping stays off. True orphans
+# on every host are still caught by the parent-death check, which fires
+# when this process is reparented to init because the spawning host died.
 _DEFAULT_INPUT_STALE_SECONDS = 600.0  # 10 minutes
 _DEFAULT_INPUT_STALE_CHECK_SECONDS = 30.0
 
@@ -464,6 +474,35 @@ def _input_staleness_disabled() -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _input_staleness_forced() -> bool:
+    """``PUPPETMASTER_MCP_INPUT_STALE_FORCED=1`` re-enables idle reaping on
+    hosts that don't transparently respawn (for users who'd rather restart
+    their session than carry an idle server)."""
+    raw = os.environ.get("PUPPETMASTER_MCP_INPUT_STALE_FORCED")
+    if raw is None:
+        return False
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _host_transparently_respawns(env: Optional[dict] = None) -> bool:
+    """True when the spawning host respawns a reaped MCP server on demand.
+
+    Only Cursor does — its lease lifecycle both creates the orphan-server
+    problem the idle reaper exists for and transparently respawns the server
+    on the next tool call. Claude Code (``CLAUDECODE`` /
+    ``CLAUDE_CODE_ENTRYPOINT``) and Codex mark the connection failed and stay
+    dead, so an idle reap turns into a user-visible outage on those hosts.
+    Detection is deliberately biased toward "no": any Claude/Codex marker
+    wins over Cursor markers, and an unrecognized host never idle-reaps.
+    """
+    environ = env if env is not None else dict(os.environ)
+    if environ.get("CLAUDECODE") or environ.get("CLAUDE_CODE_ENTRYPOINT"):
+        return False
+    if any(key.startswith("CODEX_") for key in environ):
+        return False
+    return any(key.startswith("CURSOR_") for key in environ)
+
+
 def _resolve_input_stale_seconds(env_key: str, default: float) -> float:
     raw = os.environ.get(env_key)
     if not raw:
@@ -514,9 +553,16 @@ class _InputStalenessWatcher(threading.Thread):
     measures Python process liveness, not stdin liveness — so we
     measure inbound JSON-RPC traffic directly.
 
-    A server is "orphaned" when both:
-      - No stdin message has arrived in ``stale_after_seconds``.
-      - There are zero in-flight tool calls.
+    Two independent orphan signals:
+
+    * **Parent death** (every host): the spawning host process died and we
+      were reparented to init. Nobody owns this server or will ever read a
+      response from it — reap immediately.
+    * **Idle staleness** (Cursor only, see ``idle_reap_enabled``): no stdin
+      message in ``stale_after_seconds`` and zero in-flight tool calls.
+      Only Cursor both leaks lease-cycle orphans and transparently respawns
+      a reaped server; on Claude Code / Codex the same reap presents as a
+      dead connection until the user restarts their session.
 
     On detection we close stdin, which causes the ``for line in sys.stdin``
     loop in ``main()`` to terminate with EOF. The existing finally
@@ -530,11 +576,13 @@ class _InputStalenessWatcher(threading.Thread):
         stale_after_seconds: float,
         check_interval_seconds: float,
         on_shutdown: Callable[[], None],
+        idle_reap_enabled: bool = True,
     ) -> None:
         super().__init__(daemon=True, name="puppetmaster-mcp-input-stale-watcher")
         self._stale_after = stale_after_seconds
         self._interval = check_interval_seconds
         self._on_shutdown = on_shutdown
+        self._idle_reap_enabled = idle_reap_enabled
         self._stop = threading.Event()
         self._triggered = False
 
@@ -545,13 +593,26 @@ class _InputStalenessWatcher(threading.Thread):
     def stop(self) -> None:
         self._stop.set()
 
+    @staticmethod
+    def _parent_is_dead() -> bool:
+        if os.name != "posix":
+            return False  # no reparenting signal on Windows; idle path only
+        try:
+            return os.getppid() == 1
+        except OSError:
+            return False
+
+    def _should_reap(self) -> bool:
+        if self._parent_is_dead():
+            return True
+        if not self._idle_reap_enabled:
+            return False
+        last_msg, active = _input_state_snapshot()
+        return (time.time() - last_msg) >= self._stale_after and active == 0
+
     def run(self) -> None:  # pragma: no cover - exercised via integration tests
         while not self._stop.wait(self._interval):
-            last_msg, active = _input_state_snapshot()
-            age = time.time() - last_msg
-            if age < self._stale_after:
-                continue
-            if active > 0:
+            if not self._should_reap():
                 continue
             self._triggered = True
             _SHUTDOWN_REQUESTED.set()
@@ -764,6 +825,7 @@ def main() -> int:
                 _DEFAULT_INPUT_STALE_CHECK_SECONDS,
             ),
             on_shutdown=_request_clean_shutdown,
+            idle_reap_enabled=_input_staleness_forced() or _host_transparently_respawns(),
         )
         input_watcher.start()
 
@@ -1618,12 +1680,20 @@ def codegraph_response(payload: JsonObject) -> JsonObject:
 def run_cursor(
     args: JsonObject, review: bool = False, plan: bool = False, implement: bool = False
 ) -> JsonObject:
+    if implement:
+        blocked = _worktree_preflight(args)
+        if blocked is not None:
+            return blocked
     return run_cli(cursor_command(args, review=review, plan=plan, implement=implement), args)
 
 
 def start_cursor(
     args: JsonObject, review: bool = False, plan: bool = False, implement: bool = False
 ) -> JsonObject:
+    if implement:
+        blocked = _worktree_preflight(args)
+        if blocked is not None:
+            return blocked
     return start_cli(cursor_command(args, review=review, plan=plan, implement=implement), args)
 
 
@@ -1638,6 +1708,8 @@ def cursor_command(
         command.append("--implement")
         if args.get("allow_dirty"):
             command.append("--allow-dirty")
+        if args.get("allow_non_worktree"):
+            command.append("--allow-non-worktree")
     else:
         command.append("--dry-run")
         if review:
@@ -1654,6 +1726,42 @@ def cursor_command(
     if disable_memory is True or (disable_memory is None and (review or plan)):
         command.append("--disable-memory")
     return command
+
+
+def _worktree_preflight(args: JsonObject) -> Optional[JsonObject]:
+    """Fail a full-edit verb fast when its cwd is not inside a git work tree.
+
+    The worker-level guard (:func:`puppetmaster.adapters.worktree_guard`)
+    already blocks these runs, but only *after* a worker has spawned — the
+    caller experiences a failed job it then has to investigate (field
+    report: "use puppetmaster to..." in a non-git experiment dir). Checking
+    at the verb means the agent learns the remediation in the same turn and
+    no worker is wasted. Indeterminate results (no git binary, timeout)
+    return ``None`` and defer to the worker-level guard rather than blocking
+    a run the guard might allow.
+    """
+    if args.get("allow_non_worktree"):
+        return None
+    directory = cwd(args)
+    try:
+        completed = subprocess.run(
+            ["git", "-C", directory, "rev-parse", "--is-inside-work-tree"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if completed.returncode == 0 and completed.stdout.strip() == "true":
+        return None
+    return tool_error(
+        "cwd is not inside a git work tree, and full-edit runs need one for "
+        "clean-tree gating and diff attribution. Fix: run `git init` in the "
+        "directory (restores diff capture), point cwd at an existing repo, or "
+        "pass allow_non_worktree=true to run without diff attribution.",
+        {"failure": "not_a_worktree", "cwd": directory},
+    )
 
 
 # Adapters that can run a full-edit "implement" worker, in the order the generic
@@ -1686,6 +1794,8 @@ def codex_command(args: JsonObject) -> list[str]:
         command.extend(["--timeout-seconds", str(args["timeout_seconds"])])
     if args.get("allow_dirty"):
         command.append("--allow-dirty")
+    if args.get("allow_non_worktree"):
+        command.append("--allow-non-worktree")
     if args.get("executable"):
         command.extend(["--executable", str(args["executable"])])
     if args.get("dangerously_bypass_approvals_and_sandbox"):
@@ -1728,6 +1838,9 @@ def start_implement(args: JsonObject) -> JsonObject:
                 f"{', '.join(_IMPLEMENT_ADAPTER_PRIORITY)} via the platform lock.",
                 {"enabled": sorted(enabled)},
             )
+    blocked = _worktree_preflight(args)
+    if blocked is not None:
+        return blocked
     result = start_cli(_implement_command(args, adapter), args)
     if isinstance(result, dict):
         result.setdefault("implement_adapter", adapter)
@@ -1735,18 +1848,41 @@ def start_implement(args: JsonObject) -> JsonObject:
 
 
 def run_claude(args: JsonObject) -> JsonObject:
+    blocked = _worktree_preflight(args)
+    if blocked is not None:
+        return blocked
     return run_cli(claude_command(args), args)
 
 
 def start_claude(args: JsonObject) -> JsonObject:
+    blocked = _worktree_preflight(args)
+    if blocked is not None:
+        return blocked
     return start_cli(claude_command(args), args)
 
 
+def _codex_is_write_capable(args: JsonObject) -> bool:
+    # Mirrors the adapter: a read-only sandbox can't mutate the tree, so the
+    # worktree requirement doesn't apply (unless the sandbox is bypassed).
+    sandbox = str(args.get("sandbox") or "workspace-write")
+    return sandbox != "read-only" or bool(
+        args.get("dangerously_bypass_approvals_and_sandbox")
+    )
+
+
 def run_codex(args: JsonObject) -> JsonObject:
+    if _codex_is_write_capable(args):
+        blocked = _worktree_preflight(args)
+        if blocked is not None:
+            return blocked
     return run_cli(codex_command(args), args)
 
 
 def start_codex(args: JsonObject) -> JsonObject:
+    if _codex_is_write_capable(args):
+        blocked = _worktree_preflight(args)
+        if blocked is not None:
+            return blocked
     return start_cli(codex_command(args), args)
 
 
@@ -1766,6 +1902,8 @@ def claude_command(args: JsonObject) -> list[str]:
         command.extend(["--timeout-seconds", str(args["timeout_seconds"])])
     if args.get("allow_dirty"):
         command.append("--allow-dirty")
+    if args.get("allow_non_worktree"):
+        command.append("--allow-non-worktree")
     if args.get("disable_memory"):
         command.append("--disable-memory")
     return command
@@ -3025,6 +3163,14 @@ def codex_schema() -> JsonObject:
                 "default": False,
                 "description": "Allow Codex to run in a dirty working tree.",
             },
+            "allow_non_worktree": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "Allow a write-capable run outside a git work tree "
+                    "(no diff attribution; `git init` is usually better)."
+                ),
+            },
             "executable": {
                 "type": "string",
                 "description": "Optional Codex CLI executable or command override.",
@@ -3072,6 +3218,14 @@ def claude_schema() -> JsonObject:
                 "default": False,
                 "description": "Allow Claude Code to run in a dirty working tree.",
             },
+            "allow_non_worktree": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "Allow the run outside a git work tree "
+                    "(no diff attribution; `git init` is usually better)."
+                ),
+            },
             "anthropic_api_key": {
                 "type": "string",
                 "description": "Optional Anthropic API key. Prefer MCP env config instead.",
@@ -3093,6 +3247,14 @@ def cursor_implement_schema() -> JsonObject:
                 "type": "boolean",
                 "default": False,
                 "description": "Allow the implement run to start in a dirty working tree.",
+            },
+            "allow_non_worktree": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "Allow the implement run outside a git work tree "
+                    "(no diff attribution; `git init` is usually better)."
+                ),
             },
         }
     )

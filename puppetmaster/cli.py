@@ -794,6 +794,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow an --implement run to start in a dirty working tree.",
     )
     cursor.add_argument(
+        "--allow-non-worktree",
+        action="store_true",
+        help="Allow an --implement run outside a git work tree (no diff attribution).",
+    )
+    cursor.add_argument(
         "--disable-memory",
         action="store_true",
         help="Skip promoted shared-memory injection for a fresh perspective.",
@@ -823,6 +828,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-dirty",
         action="store_true",
         help="Allow Claude Code to run in a dirty working tree.",
+    )
+    claude.add_argument(
+        "--allow-non-worktree",
+        action="store_true",
+        help="Allow Claude Code to run outside a git work tree (no diff attribution).",
     )
     claude.add_argument(
         "--disable-memory",
@@ -935,6 +945,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-dirty",
         action="store_true",
         help="Allow Codex to run in a dirty working tree.",
+    )
+    codex.add_argument(
+        "--allow-non-worktree",
+        action="store_true",
+        help="Allow Codex to run outside a git work tree (no diff attribution).",
     )
     codex.add_argument(
         "--disable-codegraph",
@@ -1619,6 +1634,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
         if implement:
             payload["mode"] = "implement"
             payload["allow_dirty"] = getattr(args, "allow_dirty", False)
+            payload["allow_non_worktree"] = getattr(args, "allow_non_worktree", False)
         if args.disable_memory or args.review or args.plan:
             payload["disable_memory"] = True
         payload.update(routing_payload_from_args(args, adapter="cursor"))
@@ -1649,6 +1665,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
             "executable": args.executable,
             "timeout_seconds": args.timeout_seconds,
             "allow_dirty": args.allow_dirty,
+            "allow_non_worktree": args.allow_non_worktree,
         }
         if args.disable_memory:
             payload["disable_memory"] = True
@@ -1718,6 +1735,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
             "approval_policy": args.approval_policy,
             "timeout_seconds": args.timeout_seconds,
             "allow_dirty": args.allow_dirty,
+            "allow_non_worktree": args.allow_non_worktree,
             "dangerously_bypass_approvals_and_sandbox": args.dangerously_bypass_approvals_and_sandbox,
         }
         if args.executable:

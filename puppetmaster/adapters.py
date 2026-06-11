@@ -2043,8 +2043,9 @@ def worktree_guard(
                 "message": (
                     f"{adapter} full-edit runs require cwd to be inside a git work tree "
                     "so Puppetmaster can gate on a clean tree and attribute the resulting "
-                    "diff. Point cwd at a repo/worktree, or set "
-                    "payload.allow_non_worktree=true to run unsandboxed anyway."
+                    "diff. Fix: run `git init` in the directory (restores diff capture), "
+                    "point cwd at an existing repo, or set allow_non_worktree=true "
+                    "(CLI: --allow-non-worktree) to run without diff attribution."
                 ),
                 "cwd": str(cwd),
             },

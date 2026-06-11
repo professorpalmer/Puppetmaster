@@ -13093,6 +13093,121 @@ class HookInstallerTests(unittest.TestCase):
         )
 
 
+class HostGatedIdleReapTests(unittest.TestCase):
+    """Idle reaping only fires on hosts that transparently respawn (Cursor).
+
+    Field reports: Codex "Transport closed" and Claude Code "Connection
+    status failed" after an idle gap — both were the staleness watcher
+    reaping a server its host would never respawn.
+    """
+
+    def test_cursor_markers_enable_idle_reap(self):
+        from puppetmaster.mcp_server import _host_transparently_respawns
+
+        self.assertTrue(_host_transparently_respawns({"CURSOR_TRACE_ID": "abc"}))
+        self.assertTrue(_host_transparently_respawns({"CURSOR_AGENT": "1", "PATH": "/usr/bin"}))
+
+    def test_claude_and_codex_markers_disable_idle_reap(self):
+        from puppetmaster.mcp_server import _host_transparently_respawns
+
+        # Claude/Codex markers win even when Cursor markers are also present
+        # (e.g. env inherited through nested tooling) — bias toward not reaping.
+        self.assertFalse(_host_transparently_respawns({"CLAUDECODE": "1", "CURSOR_TRACE_ID": "x"}))
+        self.assertFalse(_host_transparently_respawns({"CLAUDE_CODE_ENTRYPOINT": "cli"}))
+        self.assertFalse(_host_transparently_respawns({"CODEX_SANDBOX": "1", "CURSOR_AGENT": "1"}))
+
+    def test_unknown_host_never_idle_reaps(self):
+        from puppetmaster.mcp_server import _host_transparently_respawns
+
+        self.assertFalse(_host_transparently_respawns({"PATH": "/usr/bin"}))
+        self.assertFalse(_host_transparently_respawns({}))
+
+    def test_watcher_skips_idle_reap_when_disabled_for_host(self):
+        from puppetmaster import mcp_server
+
+        with mcp_server._INPUT_STATE_LOCK:
+            prior = (mcp_server._LAST_INBOUND_MESSAGE_AT, mcp_server._ACTIVE_TOOL_CALLS)
+            mcp_server._LAST_INBOUND_MESSAGE_AT = time.time() - 99999
+            mcp_server._ACTIVE_TOOL_CALLS = 0
+        try:
+            stale_args = dict(
+                stale_after_seconds=1.0,
+                check_interval_seconds=1.0,
+                on_shutdown=lambda: None,
+            )
+            gated = mcp_server._InputStalenessWatcher(idle_reap_enabled=False, **stale_args)
+            open_reap = mcp_server._InputStalenessWatcher(idle_reap_enabled=True, **stale_args)
+            self.assertFalse(gated._should_reap())
+            self.assertTrue(open_reap._should_reap())
+        finally:
+            with mcp_server._INPUT_STATE_LOCK:
+                mcp_server._LAST_INBOUND_MESSAGE_AT, mcp_server._ACTIVE_TOOL_CALLS = prior
+
+    def test_parent_death_reaps_regardless_of_host_gating(self):
+        from puppetmaster import mcp_server
+
+        watcher = mcp_server._InputStalenessWatcher(
+            stale_after_seconds=99999.0,
+            check_interval_seconds=1.0,
+            on_shutdown=lambda: None,
+            idle_reap_enabled=False,
+        )
+        with patch.object(
+            mcp_server._InputStalenessWatcher, "_parent_is_dead", staticmethod(lambda: True)
+        ):
+            self.assertTrue(watcher._should_reap())
+
+    def test_forced_flag_reenables_idle_reap(self):
+        from puppetmaster.mcp_server import _input_staleness_forced
+
+        os.environ["PUPPETMASTER_MCP_INPUT_STALE_FORCED"] = "1"
+        try:
+            self.assertTrue(_input_staleness_forced())
+        finally:
+            del os.environ["PUPPETMASTER_MCP_INPUT_STALE_FORCED"]
+        self.assertFalse(_input_staleness_forced())
+
+
+class WorktreePreflightTests(unittest.TestCase):
+    """Full-edit MCP verbs refuse non-git cwds at the verb, not after spawn."""
+
+    def test_non_worktree_cwd_fails_fast_with_remediation(self):
+        from puppetmaster.mcp_server import _worktree_preflight
+
+        with TemporaryDirectory() as tmp:
+            result = _worktree_preflight({"cwd": tmp})
+            self.assertIsNotNone(result)
+            self.assertTrue(result.get("isError"))
+            text = result["content"][0]["text"]
+            self.assertIn("not_a_worktree", text)
+            self.assertIn("git init", text)
+            self.assertIn("allow_non_worktree", text)
+
+    def test_allow_non_worktree_skips_preflight(self):
+        from puppetmaster.mcp_server import _worktree_preflight
+
+        with TemporaryDirectory() as tmp:
+            self.assertIsNone(_worktree_preflight({"cwd": tmp, "allow_non_worktree": True}))
+
+    def test_git_repo_cwd_passes_preflight(self):
+        from puppetmaster.mcp_server import _worktree_preflight
+
+        with TemporaryDirectory() as tmp:
+            subprocess.run(["git", "init", "-q"], cwd=tmp, check=True, capture_output=True)
+            self.assertIsNone(_worktree_preflight({"cwd": tmp}))
+
+    def test_codex_read_only_sandbox_is_exempt(self):
+        from puppetmaster.mcp_server import _codex_is_write_capable
+
+        self.assertFalse(_codex_is_write_capable({"sandbox": "read-only"}))
+        self.assertTrue(_codex_is_write_capable({}))  # default workspace-write
+        self.assertTrue(
+            _codex_is_write_capable(
+                {"sandbox": "read-only", "dangerously_bypass_approvals_and_sandbox": True}
+            )
+        )
+
+
 class InvocationGateCliTests(unittest.TestCase):
     """The should-delegate / install-hooks CLI surface."""
 
