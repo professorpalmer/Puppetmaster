@@ -5238,6 +5238,30 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
             expected = (fake_package_root / "node_modules" / "@cursor" / "sdk").resolve()
             self.assertEqual(location.resolve(), expected)
 
+    def test_cursor_sdk_detected_inside_package_dir_node_modules(self) -> None:
+        """Field report (Zane): a valid install at
+        site-packages/puppetmaster/node_modules/@cursor/sdk — Node's FIRST
+        resolution hop from cursor_sdk_runner.mjs — was invisible to the probe,
+        which only checked one fixed level up. Runtime worked; diagnostics said
+        'SDK not found' on a working machine. The probe must mirror Node's full
+        upward node_modules walk."""
+        from puppetmaster import diagnostics
+
+        with TemporaryDirectory() as tmp:
+            unrelated_repo = Path(tmp) / "some-workspace"
+            unrelated_repo.mkdir()
+            site_packages = Path(tmp) / "site-packages"
+            package_dir = site_packages / "puppetmaster"
+            sdk = package_dir / "node_modules" / "@cursor" / "sdk"
+            sdk.mkdir(parents=True)
+            fake_diagnostics_file = package_dir / "diagnostics.py"
+            fake_diagnostics_file.write_text("# stub", encoding="utf-8")
+            with patch.object(diagnostics, "__file__", str(fake_diagnostics_file)):
+                self.assertTrue(diagnostics._cursor_sdk_installed(unrelated_repo))
+                location = diagnostics._find_cursor_sdk_install(unrelated_repo)
+            self.assertIsNotNone(location)
+            self.assertEqual(location.resolve(), sdk.resolve())
+
     def test_cursor_sdk_detection_honors_workspace_install(self) -> None:
         """Local repo node_modules install still counts (precedence over package dir)."""
         from puppetmaster import diagnostics

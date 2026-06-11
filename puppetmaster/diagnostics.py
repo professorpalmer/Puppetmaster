@@ -419,7 +419,7 @@ def _cursor_sdk_check(root: Path) -> Check:
     return Check(
         "cursor-sdk",
         "optional",
-        "run `npm install` in the Puppetmaster package dir to enable the cursor adapter",
+        "run `puppetmaster install-cursor-mcp` to bootstrap @cursor/sdk (needs Node/npm)",
     )
 
 
@@ -442,12 +442,15 @@ def _find_cursor_sdk_install(root: Path) -> Optional[Path]:
     candidates: list[Path] = []
     if root is not None:
         candidates.append(Path(root) / "node_modules" / "@cursor" / "sdk")
-    # The Puppetmaster package directory ships its own package.json and
-    # node_modules; cursor_sdk_runner.mjs uses Node's resolution which
-    # walks upward from its own file path. We mirror that here so
-    # diagnostics agree with runtime behavior.
-    package_root = Path(__file__).resolve().parent.parent
-    candidates.append(package_root / "node_modules" / "@cursor" / "sdk")
+    # cursor_sdk_runner.mjs resolves @cursor/sdk with Node's resolution,
+    # which walks node_modules upward from the runner's own directory.
+    # Mirror the full walk so diagnostics agree with runtime: a probe
+    # pinned to one fixed level (the old `parent.parent`) missed valid
+    # installs at e.g. site-packages/puppetmaster/node_modules — Node's
+    # *first* hop — and reported "SDK not found" on working machines.
+    package_dir = Path(__file__).resolve().parent
+    for ancestor in [package_dir, *package_dir.parents]:
+        candidates.append(ancestor / "node_modules" / "@cursor" / "sdk")
     # An editable install ($PUPPETMASTER_HOME / install dir) may live
     # somewhere else entirely; honor an explicit override so users on
     # weird layouts can self-correct without code changes.

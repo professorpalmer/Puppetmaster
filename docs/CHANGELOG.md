@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.9.42
+
+**Fix: "Cursor SDK not found" on machines where it was installed and working (field report: Zane, with a valid `@cursor/sdk` at `site-packages/puppetmaster/node_modules`).** The diagnostics probe checked exactly one directory level (`parent.parent` of the package — `site-packages/node_modules`), but `cursor_sdk_runner.mjs` resolves the SDK with Node's upward `node_modules` walk, whose *first* hop is the package dir itself. Result: runtime worked, diagnostics reported the SDK missing, detection/setup disagreed with reality. Our dev tree masked the bug because the repo root happens to have `node_modules` at the one level the old probe checked. Full suite **640** green (+1 regression test on the exact reported layout); `ruff` clean; probe live-verified.
+
+- **Probe mirrors Node's resolution.** `_find_cursor_sdk_install` now walks `node_modules/@cursor/sdk` from the package directory up through every ancestor — same algorithm the runner uses — plus the workspace root and `PUPPETMASTER_HOME` as before. Diagnostics and runtime can no longer disagree about where the SDK lives.
+- **Doctor advice un-staled.** The cursor-sdk warning said "run `npm install` in the Puppetmaster package dir" — pre-v0.9.39 advice that points pipx users into a venv they shouldn't touch. It now says what works: "run `puppetmaster install-cursor-mcp` to bootstrap @cursor/sdk (needs Node/npm)".
+- **Known limits.** The probe checks directory existence, not SDK integrity — a corrupt or half-installed package still reads as present; the preflight generation check remains the runtime truth.
+
 ## v0.9.41
 
 **Fix: implement workers no longer look "degraded" after doing the job — the final report now becomes durable artifacts (field report: the v0.9.40 CI fix itself, where a cursor implement worker shipped the right patch and correct diagnosis but the job read "Findings: None").** The cursor implement path never asked for a report and never parsed the agent's final message; Claude's path had the same gap; Codex labeled every prose-reporting write run a degraded RISK. Full suite **639** green (+9 focused tests); `ruff check` clean on touched files.
