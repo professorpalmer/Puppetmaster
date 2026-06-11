@@ -55,6 +55,45 @@ ASYNC_PROCESSES: list[subprocess.Popen] = []
 _ASYNC_PROCESSES_LOCK = threading.Lock()
 _DEFAULT_REAP_INTERVAL_SECONDS = 15.0
 
+# The JSON-RPC frame stream. ``main()`` calls ``_isolate_protocol_stdout`` to
+# dup the real stdout fd into ``_PROTOCOL_STREAM`` and repoint fd 1 at stderr.
+# From then on, only frame writes reach the MCP client; a stray ``print()``
+# anywhere in this process (or in a child that inherits fd 1) lands in stderr
+# instead. That distinction is load-bearing for OpenAI Codex: its rmcp client
+# treats the first non-JSON-RPC byte on the pipe as a fatal transport error
+# and never reconnects, while Cursor's client just skips unparseable lines.
+# Outside ``main()`` (unit tests calling handlers directly) the stream stays
+# None and frame writes fall back to ``sys.stdout``.
+_PROTOCOL_STREAM: Optional[Any] = None
+
+
+def _protocol_stream() -> Any:
+    return _PROTOCOL_STREAM if _PROTOCOL_STREAM is not None else sys.stdout
+
+
+def _isolate_protocol_stdout() -> None:
+    """Reserve the real stdout for JSON-RPC frames; divert fd 1 to stderr.
+
+    Best-effort: if the dup dance fails (exotic hosts, closed fds), keep
+    serving on ``sys.stdout`` exactly as before rather than refusing to start.
+    """
+    global _PROTOCOL_STREAM
+    if _PROTOCOL_STREAM is not None:
+        return
+    try:
+        protocol_fd = os.dup(sys.stdout.fileno())
+        stream = os.fdopen(protocol_fd, "w", encoding="utf-8", newline="\n")
+        os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+    except (OSError, ValueError) as exc:
+        print(
+            f"puppetmaster-mcp: stdout isolation unavailable ({exc}); "
+            "stray prints may corrupt the protocol stream under Codex.",
+            file=sys.stderr,
+        )
+        return
+    _PROTOCOL_STREAM = stream
+
+
 # Concurrency primitives for the stdio loop.
 #
 # The original implementation ran tools synchronously on the same thread
@@ -274,8 +313,9 @@ def _emit_notification(notification: JsonObject) -> bool:
     serialized = json.dumps(notification) + "\n"
     try:
         with _STDOUT_LOCK:
-            sys.stdout.write(serialized)
-            sys.stdout.flush()
+            stream = _protocol_stream()
+            stream.write(serialized)
+            stream.flush()
     except (BrokenPipeError, OSError):
         return False
     return True
@@ -675,6 +715,11 @@ class McpTool:
 
 
 def main() -> int:
+    # Claim fd 1 for JSON-RPC frames before anything else runs, so no
+    # stray print — ours, a library's, or an fd-inheriting child's — can
+    # corrupt the protocol stream (fatal and unrecoverable under Codex).
+    _isolate_protocol_stdout()
+
     # Sweep dead tracking files from prior server runs before we
     # advertise ourselves. This is how Cursor users escape the
     # "Restart MCP, see 3 orphan PIDs in `ps`" trap without typing
@@ -838,8 +883,9 @@ def _process_message_safely(message: JsonObject) -> None:
         return
     serialized = json.dumps(response) + "\n"
     with _STDOUT_LOCK:
-        sys.stdout.write(serialized)
-        sys.stdout.flush()
+        stream = _protocol_stream()
+        stream.write(serialized)
+        stream.flush()
 
 
 def handle_message(message: JsonObject) -> Optional[JsonObject]:
