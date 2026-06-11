@@ -19,6 +19,7 @@ from puppetmaster.installers import (
     CURSOR_NEXT_STEPS_GUIDANCE,
     InstallResult,
     UninstallResult,
+    ensure_cursor_sdk,
     install_claude_mcp,
     install_codex_mcp,
     install_cursor_mcp,
@@ -2606,6 +2607,9 @@ def _run_install_cursor(args) -> int:
         target = (Path.home() / ".cursor" / "mcp.json").resolve()
     else:
         target = (Path.cwd() / ".cursor" / "mcp.json").resolve()
+    if not getattr(args, "dry_run", False):
+        sdk = ensure_cursor_sdk(Path.cwd())
+        print(f"[install-cursor-mcp] sdk {sdk.status}: {sdk.detail}")
     result = install_cursor_mcp(
         target_path=target,
         force=getattr(args, "force", False),
@@ -2658,20 +2662,26 @@ def _run_install_rules(args) -> int:
 def _detected_platforms(root: Path) -> dict[str, bool]:
     """Which platform-billed adapters look *usable on this machine*.
 
-    Presence probes, not auth audits: cursor needs its bundled SDK plus a
-    ``CURSOR_API_KEY``; claude-code and codex need their CLI resolvable;
-    openai needs ``OPENAI_API_KEY``. Codex login state is deliberately not
-    probed (subscription auth is opaque from here) — the billing checks in
+    Presence probes, not auth audits: cursor needs ``CURSOR_API_KEY`` plus
+    either its bundled SDK or an ``npm`` that setup can bootstrap it with
+    (PyPI wheels can't ship ``node_modules``, so a fresh pip/pipx install
+    legitimately lacks the SDK until the install-cursor-mcp step fetches
+    it); claude-code and codex need their CLI resolvable; openai needs
+    ``OPENAI_API_KEY``. Codex login state is deliberately not probed
+    (subscription auth is opaque from here) — the billing checks in
     doctor cover that separately.
     """
+    import shutil as _shutil
+
     from puppetmaster.diagnostics import (
         _claude_code_installed,
         _codex_cli_installed,
         _cursor_sdk_installed,
     )
 
+    cursor_sdk_available = _cursor_sdk_installed(root) or _shutil.which("npm") is not None
     return {
-        "cursor": _cursor_sdk_installed(root) and bool(os.environ.get("CURSOR_API_KEY")),
+        "cursor": bool(os.environ.get("CURSOR_API_KEY")) and cursor_sdk_available,
         "claude-code": _claude_code_installed(),
         "codex": _codex_cli_installed(),
         "openai": bool(os.environ.get("OPENAI_API_KEY")),
@@ -2882,6 +2892,10 @@ def _run_setup(args) -> int:
         print("=== step 3/8: models init SKIPPED (--skip-models) ===\n")
 
     print("=== step 4/8: install-cursor-mcp (workspace .cursor/mcp.json) ===")
+    from puppetmaster import platform_lock as _platform_lock
+    if "cursor" in _platform_lock.enabled_adapters():
+        sdk = ensure_cursor_sdk(cwd)
+        print(f"  sdk {sdk.status}  {sdk.detail}")
     cursor_result = install_cursor_mcp(
         target_path=(cwd / ".cursor" / "mcp.json").resolve(),
         force=getattr(args, "force", False),

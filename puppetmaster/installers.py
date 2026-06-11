@@ -103,6 +103,89 @@ class InstallResult:
     messages: list[str] = field(default_factory=list)
 
 
+@dataclass
+class SdkBootstrapResult:
+    """Outcome of an :func:`ensure_cursor_sdk` run.
+
+    ``status`` is ``"installed"`` (npm fetched the SDK), ``"unchanged"``
+    (already resolvable), ``"skipped"`` (no npm to bootstrap with), or
+    ``"error"``. ``location`` is the resolved ``@cursor/sdk`` directory
+    when one exists.
+    """
+
+    status: str
+    detail: str
+    location: Optional[str] = None
+
+
+def ensure_cursor_sdk(
+    root: Optional[Path] = None,
+    *,
+    package_root: Optional[Path] = None,
+    npm_executable: Optional[str] = None,
+    timeout_seconds: int = 180,
+) -> SdkBootstrapResult:
+    """Make ``@cursor/sdk`` resolvable for the installed Puppetmaster package.
+
+    PyPI wheels cannot ship ``node_modules``, so a pip/pipx install lands
+    without the SDK that ``cursor_sdk_runner.mjs`` resolves at runtime —
+    leaving the cursor adapter dead and platform detection reporting
+    "not detected" for users who are literally running Cursor. This
+    bootstraps the SDK with ``npm install @cursor/sdk --prefix <package
+    dir>``: the same directory Node's resolution walks up to from the
+    runner script, so diagnostics and runtime agree afterward.
+    """
+    from puppetmaster.diagnostics import _find_cursor_sdk_install
+
+    probe_root = root if root is not None else Path.cwd()
+    existing = _find_cursor_sdk_install(probe_root)
+    if existing is not None:
+        return SdkBootstrapResult(
+            "unchanged", f"@cursor/sdk already installed ({existing})", str(existing)
+        )
+
+    npm = npm_executable or shutil.which("npm")
+    if npm is None:
+        return SdkBootstrapResult(
+            "skipped",
+            "npm not on PATH — install Node.js, then re-run "
+            "`puppetmaster install-cursor-mcp` to bootstrap @cursor/sdk",
+        )
+
+    install_root = package_root or Path(__file__).resolve().parent.parent
+    try:
+        completed = subprocess.run(
+            [npm, "install", "@cursor/sdk", "--prefix", str(install_root)],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return SdkBootstrapResult(
+            "error", f"npm install @cursor/sdk timed out after {timeout_seconds}s"
+        )
+    except OSError as exc:
+        return SdkBootstrapResult("error", f"failed to spawn npm: {exc!r}")
+    if completed.returncode != 0:
+        output_lines = (completed.stderr or completed.stdout or "").strip().splitlines()
+        tail = output_lines[-1] if output_lines else "no output"
+        return SdkBootstrapResult(
+            "error",
+            f"npm install @cursor/sdk failed (exit {completed.returncode}): {tail}",
+        )
+    location = _find_cursor_sdk_install(probe_root)
+    if location is None:
+        return SdkBootstrapResult(
+            "error",
+            f"npm install succeeded but @cursor/sdk is still not resolvable "
+            f"under {install_root}/node_modules",
+        )
+    return SdkBootstrapResult(
+        "installed", f"@cursor/sdk bootstrapped into {location}", str(location)
+    )
+
+
 def handshake_mcp_server(
     python_executable: Optional[str] = None,
     timeout_seconds: float = 10.0,

@@ -10638,6 +10638,82 @@ class ReadsLogTests(unittest.TestCase):
             self.assertEqual(rl.load_reads(), [])
 
 
+class EnsureCursorSdkTests(unittest.TestCase):
+    """Bootstrap @cursor/sdk for pip/pipx installs (wheels can't ship node_modules)."""
+
+    def test_unchanged_when_sdk_already_resolvable(self) -> None:
+        from puppetmaster.installers import ensure_cursor_sdk
+
+        with patch(
+            "puppetmaster.diagnostics._find_cursor_sdk_install",
+            return_value=Path("/fake/site-packages/node_modules/@cursor/sdk"),
+        ):
+            result = ensure_cursor_sdk(Path("/tmp"))
+        self.assertEqual(result.status, "unchanged")
+        self.assertIn("@cursor/sdk", result.detail)
+
+    def test_skipped_when_npm_missing(self) -> None:
+        from puppetmaster.installers import ensure_cursor_sdk
+
+        with patch("puppetmaster.diagnostics._find_cursor_sdk_install", return_value=None), \
+                patch("puppetmaster.installers.shutil.which", return_value=None):
+            result = ensure_cursor_sdk(Path("/tmp"))
+        self.assertEqual(result.status, "skipped")
+        self.assertIn("npm not on PATH", result.detail)
+
+    def test_installs_via_npm_into_package_root(self) -> None:
+        from types import SimpleNamespace
+
+        from puppetmaster.installers import ensure_cursor_sdk
+
+        sdk_path = Path("/fake/site-packages/node_modules/@cursor/sdk")
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="added 13 packages", stderr="")
+
+        with patch(
+            "puppetmaster.diagnostics._find_cursor_sdk_install",
+            side_effect=[None, sdk_path],
+        ), patch("puppetmaster.installers.subprocess.run", side_effect=fake_run):
+            result = ensure_cursor_sdk(
+                Path("/tmp"),
+                package_root=Path("/fake/site-packages"),
+                npm_executable="/usr/local/bin/npm",
+            )
+        self.assertEqual(result.status, "installed")
+        self.assertEqual(result.location, str(sdk_path))
+        self.assertEqual(
+            calls[0],
+            ["/usr/local/bin/npm", "install", "@cursor/sdk", "--prefix", "/fake/site-packages"],
+        )
+
+    def test_error_when_npm_fails(self) -> None:
+        from types import SimpleNamespace
+
+        from puppetmaster.installers import ensure_cursor_sdk
+
+        def fake_run(cmd, **kwargs):
+            return SimpleNamespace(returncode=1, stdout="", stderr="npm ERR! network timeout")
+
+        with patch("puppetmaster.diagnostics._find_cursor_sdk_install", return_value=None), \
+                patch("puppetmaster.installers.subprocess.run", side_effect=fake_run):
+            result = ensure_cursor_sdk(Path("/tmp"), npm_executable="/usr/local/bin/npm")
+        self.assertEqual(result.status, "error")
+        self.assertIn("npm ERR! network timeout", result.detail)
+
+    def test_billing_detail_no_longer_overclaims_sdk_auth(self) -> None:
+        """Step 1 used to print 'Cursor SDK authenticated' while only checking
+        an env var — the same run's step 2 then said 'not detected'."""
+        from puppetmaster.platform_billing import detect_cursor_billing
+
+        status = detect_cursor_billing(env={"CURSOR_API_KEY": "key_x"})
+        self.assertTrue(status.healthy)
+        self.assertNotIn("SDK authenticated", status.detail)
+        self.assertIn("CURSOR_API_KEY is set", status.detail)
+
+
 class SetupPlatformStepTests(unittest.TestCase):
     """The `setup` wizard's platform-lock step (non-interactive paths)."""
 
@@ -10698,6 +10774,27 @@ class SetupPlatformStepTests(unittest.TestCase):
             rc = _setup_platform_step(self._args(skip_platforms=True))
             self.assertEqual(rc, 0)
             self.assertFalse(pl.is_restricted())
+
+    def test_cursor_detected_when_npm_can_bootstrap_missing_sdk(self) -> None:
+        """Field report: a pipx-installed Cursor user read '(not detected on
+        this machine)' because wheels can't ship node_modules — npm
+        availability must count, since install-cursor-mcp bootstraps the SDK."""
+        from puppetmaster.cli import _detected_platforms
+
+        with patch("puppetmaster.diagnostics._cursor_sdk_installed", return_value=False), \
+                patch("shutil.which", return_value="/usr/local/bin/npm"), \
+                patch.dict(os.environ, {"CURSOR_API_KEY": "key_x"}):
+            detected = _detected_platforms(Path("/tmp"))
+        self.assertTrue(detected["cursor"])
+
+    def test_cursor_not_detected_without_sdk_or_npm(self) -> None:
+        from puppetmaster.cli import _detected_platforms
+
+        with patch("puppetmaster.diagnostics._cursor_sdk_installed", return_value=False), \
+                patch("shutil.which", return_value=None), \
+                patch.dict(os.environ, {"CURSOR_API_KEY": "key_x"}):
+            detected = _detected_platforms(Path("/tmp"))
+        self.assertFalse(detected["cursor"])
 
     def test_first_run_noninteractive_locks_to_detected_platforms(self) -> None:
         """Field report: a Claude-Code-only user ended up with cursor enabled

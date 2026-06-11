@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.9.39
+
+**Fix: PyPI installs never had the Cursor SDK — setup now bootstraps `@cursor/sdk` via npm (field report: our own demo recording showed "cursor (not detected on this machine)" on a Cursor machine).** Wheels can't ship `node_modules`, so every pip/pipx install landed without the SDK that `cursor_sdk_runner.mjs` resolves at runtime: platform detection read cursor as absent and the cursor adapter itself couldn't run. Dev-tree installs masked this for months because the repo has `node_modules` sitting next to the package. Full suite **630** green (+7 focused tests); `ruff check puppetmaster/` clean; verified end to end on a fresh wheel venv — detection True pre-bootstrap, `install-cursor-mcp` npm-fetches the SDK into site-packages, Node resolves it from the runner's directory, MCP handshake 42 tools, `setup` shows `[on ] cursor` unannotated.
+
+- **`ensure_cursor_sdk` bootstrap.** `install-cursor-mcp` (and `setup` step 4, when the platform lock enables cursor) now runs `npm install @cursor/sdk --prefix <package dir>` when the SDK is missing — the same directory Node's resolution walks up to from the runner script, so diagnostics and runtime agree afterward. Idempotent (`unchanged` when resolvable), honest when blocked (`skipped` with remediation when npm is absent, `error` with npm's last line on failure).
+- **Detection counts a bootstrappable SDK.** `_detected_platforms` no longer demands the SDK be pre-installed: cursor is detected when `CURSOR_API_KEY` is set and either the SDK resolves *or* npm is available to fetch it — so first-run setup doesn't lock cursor off one step before the bootstrap that would fix it.
+- **Step 1 stops overclaiming.** The billing probe printed "Cursor SDK authenticated" while only checking an env var — directly contradicting step 2's "not detected" in the same run. It now says what it verified: "CURSOR_API_KEY is set; work bills against the Cursor plan."
+- **Known limits.** The bootstrap needs Node/npm on PATH — without it, cursor is honestly not detected and the skip message says what to install. npm fetches over the network at setup time (one-time, ~5s); air-gapped machines must vendor `node_modules` manually next to the installed package. Detection still does not validate the API key itself — doctor's billing checks remain the auth truth.
+
 ## v0.9.38
 
 **Docs: the PyPI/README tagline now credits AWS Bedrock as a Claude Code billing path.** Bedrock support itself shipped in v0.9.27 (posture detection, credential health, live-verified completion through `CLAUDE_CODE_USE_BEDROCK`) but the project description never mentioned it. Docs-only release so the frozen PyPI project page picks it up; no code changes.

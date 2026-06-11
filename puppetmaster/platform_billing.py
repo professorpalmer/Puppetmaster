@@ -79,7 +79,7 @@ def detect_cursor_billing(
             adapter="cursor",
             billing="plan",
             healthy=True,
-            detail="Cursor SDK authenticated; work bills against the Cursor plan.",
+            detail="CURSOR_API_KEY is set; work bills against the Cursor plan.",
             evidence=["cursor_api_key:set"],
         )
     return BillingStatus(
