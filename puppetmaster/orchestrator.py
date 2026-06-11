@@ -62,6 +62,22 @@ def _memory_injection_enabled(spec: WorkerSpec) -> bool:
     return spec.role not in _FRESH_JUDGMENT_ROLES
 
 
+def merge_routing_payload(payload: dict, decision, extra_fields: Optional[dict] = None) -> dict:
+    """Stamp a routing decision while letting explicit task payload keys win."""
+    merged = {
+        **(decision.model.payload_defaults or {}),
+        **(payload or {}),
+        "model": decision.model.adapter_model_name,
+        "router_model_id": decision.model.id,
+        "router_policy": decision.policy,
+        "router_capability_needed": decision.capability_needed,
+        "router_estimated_cost_usd": decision.estimated_cost_usd,
+    }
+    if extra_fields:
+        merged.update(extra_fields)
+    return merged
+
+
 @dataclass(frozen=True)
 class RunResult:
     job: Job
@@ -451,16 +467,14 @@ class Orchestrator:
                 continue
 
             attempts = int((task.payload or {}).get("fallback_attempts", 0)) + 1
-            new_payload = {
-                **(task.payload or {}),
-                "model": decision.model.adapter_model_name,
-                "router_model_id": decision.model.id,
-                "router_policy": decision.policy,
-                "router_capability_needed": decision.capability_needed,
-                "router_estimated_cost_usd": decision.estimated_cost_usd,
-                "fallback_attempts": attempts,
-                "fallback_from_adapter": failed_adapter,
-            }
+            new_payload = merge_routing_payload(
+                task.payload or {},
+                decision,
+                {
+                    "fallback_attempts": attempts,
+                    "fallback_from_adapter": failed_adapter,
+                },
+            )
             requeued = replace(
                 task,
                 adapter=decision.model.adapter,
@@ -625,17 +639,15 @@ class Orchestrator:
                 continue
 
             attempts = int(payload.get("escalation_attempts", 0)) + 1
-            new_payload = {
-                **payload,
-                "model": decision.model.adapter_model_name,
-                "router_model_id": decision.model.id,
-                "router_policy": decision.policy,
-                "router_capability_needed": decision.capability_needed,
-                "router_estimated_cost_usd": decision.estimated_cost_usd,
-                "escalation_attempts": attempts,
-                "escalated_from_model": current_model_id,
-                "escalated_from_confidence": confidence,
-            }
+            new_payload = merge_routing_payload(
+                payload,
+                decision,
+                {
+                    "escalation_attempts": attempts,
+                    "escalated_from_model": current_model_id,
+                    "escalated_from_confidence": confidence,
+                },
+            )
             requeued = replace(
                 task,
                 adapter=decision.model.adapter,
@@ -835,16 +847,14 @@ class Orchestrator:
                 continue  # no genuine upgrade available — leave it FAILED
 
             attempts = int(payload.get("review_escalation_attempts", 0)) + 1
-            new_payload = {
-                **payload,
-                "model": decision.model.adapter_model_name,
-                "router_model_id": decision.model.id,
-                "router_policy": decision.policy,
-                "router_capability_needed": decision.capability_needed,
-                "router_estimated_cost_usd": decision.estimated_cost_usd,
-                "review_escalation_attempts": attempts,
-                "review_escalated_from_model": current_model_id,
-            }
+            new_payload = merge_routing_payload(
+                payload,
+                decision,
+                {
+                    "review_escalation_attempts": attempts,
+                    "review_escalated_from_model": current_model_id,
+                },
+            )
             requeued = replace(
                 task,
                 adapter=decision.model.adapter,
@@ -1251,14 +1261,7 @@ class Orchestrator:
                 result.append(spec)
                 continue
 
-            new_payload = {
-                **payload,
-                "model": decision.model.adapter_model_name,
-                "router_model_id": decision.model.id,
-                "router_policy": decision.policy,
-                "router_capability_needed": decision.capability_needed,
-                "router_estimated_cost_usd": decision.estimated_cost_usd,
-            }
+            new_payload = merge_routing_payload(payload, decision)
             routed_spec = replace(
                 spec,
                 adapter=decision.model.adapter,

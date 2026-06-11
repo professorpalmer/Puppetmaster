@@ -122,6 +122,38 @@ puppetmaster claude "Implement the approved change and run focused tests" --perm
 puppetmaster show $(puppetmaster last)
 ```
 
+### Effort levels & payload defaults
+
+The router reads your user-owned model registry at `~/.puppetmaster/models.json`.
+Use the interactive registry wizard when you want high/low effort variants
+without hand-editing JSON:
+
+```bash
+puppetmaster models setup
+puppetmaster models set codex/gpt-5-5-high effort=high
+```
+
+Effort is stored as adapter-specific `payload_defaults`, which Puppetmaster
+injects whenever that registry entry is picked. Explicit task payload keys still
+win. A high-effort OpenAI variant can look like:
+
+```json
+{
+  "id": "openai/gpt-5-5-high",
+  "adapter": "openai",
+  "adapter_model_name": "gpt-5.5",
+  "capability_score": 98,
+  "input_per_mtok_usd": 5.0,
+  "output_per_mtok_usd": 30.0,
+  "context_window": 1000000,
+  "billing": "api",
+  "tags": ["openai", "reasoning", "effort:high"],
+  "payload_defaults": {"reasoning_effort": "high"},
+  "output_token_multiplier": 2.0,
+  "notes": "High-effort variant of openai/gpt-5-5."
+}
+```
+
 More recipes in [docs/DAILY_DRIVER.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/DAILY_DRIVER.md).
 
 ## Recommended setup: a cheap chat model that delegates to Puppetmaster

@@ -270,7 +270,7 @@ class RoutingDecision:
     baseline_model_id: str = ""
 
     def to_artifact_payload(self) -> dict:
-        return {
+        payload = {
             "model_id": self.model.id,
             "adapter": self.model.adapter,
             "adapter_model_name": self.model.adapter_model_name,
@@ -290,6 +290,9 @@ class RoutingDecision:
                 {"id": spec.id, "reason": why} for spec, why in self.rejected
             ],
         }
+        if self.model.payload_defaults:
+            payload["payload_defaults"] = self.model.payload_defaults
+        return payload
 
 
 class NoEligibleModelError(RuntimeError):

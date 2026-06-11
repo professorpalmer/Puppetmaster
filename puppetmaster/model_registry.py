@@ -24,6 +24,10 @@ Each entry pairs:
 * ``context_window`` in tokens
 * free-form ``tags`` for policy matching (e.g. ``frontier``, ``cheap``,
   ``long-context``, ``reasoning``, ``code``)
+* optional ``payload_defaults`` injected into task payloads whenever this
+  entry is routed (for adapter-specific knobs such as effort)
+* optional ``output_token_multiplier`` for honest cost estimates when a
+  variant burns more or fewer output tokens than its base model
 """
 from __future__ import annotations
 
@@ -59,6 +63,8 @@ class ModelSpec:
     tags: list[str] = field(default_factory=list)
     notes: str = ""
     enabled: bool = True
+    payload_defaults: dict[str, Any] = field(default_factory=dict)
+    output_token_multiplier: float = 1.0
     # Billing source for routing cost-containment. ``plan`` = covered by a
     # subscription the user already pays for (Cursor plan, Claude Max,
     # ChatGPT/Codex sub) so marginal spend stays inside that package;
@@ -77,6 +83,15 @@ class ModelSpec:
             )
         if self.input_per_mtok_usd < 0 or self.output_per_mtok_usd < 0:
             raise ValueError(f"per-token cost for {self.id} must be non-negative")
+        if self.output_token_multiplier <= 0:
+            raise ValueError(
+                f"output_token_multiplier for {self.id} must be greater than 0"
+            )
+        if not isinstance(self.payload_defaults, dict):
+            raise ValueError(
+                f"payload_defaults for {self.id} must be a JSON object, "
+                f"got {type(self.payload_defaults).__name__}"
+            )
         if self.billing not in self._VALID_BILLING:
             raise ValueError(
                 f"billing for {self.id} must be one of {self._VALID_BILLING}, got {self.billing!r}"
@@ -89,9 +104,10 @@ class ModelSpec:
 
     def estimate_cost_usd(self, tokens_in: int, tokens_out: int) -> float:
         """USD cost estimate for one call. Linear; ignores caching / batching."""
+        scaled_tokens_out = tokens_out * self.output_token_multiplier
         return (
             (tokens_in / 1_000_000.0) * self.input_per_mtok_usd
-            + (tokens_out / 1_000_000.0) * self.output_per_mtok_usd
+            + (scaled_tokens_out / 1_000_000.0) * self.output_per_mtok_usd
         )
 
     def marginal_cost_usd(self, tokens_in: int, tokens_out: int) -> float:
@@ -157,6 +173,8 @@ def _spec_to_jsonable(spec: ModelSpec) -> dict[str, Any]:
         ("tags", []),
         ("context_window", 0),
         ("billing", "unknown"),
+        ("payload_defaults", {}),
+        ("output_token_multiplier", 1.0),
     ]:
         if data.get(k) == default_value:
             data.pop(k)

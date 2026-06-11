@@ -5265,6 +5265,66 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
                 proc.kill()
                 proc.wait(timeout=2)
 
+    def test_stray_prints_never_reach_protocol_stdout(self) -> None:
+        """fd 1 is reserved for JSON-RPC frames. A stray print() during a
+        tool call must be diverted to stderr instead of corrupting the
+        protocol stream — Codex's rmcp client treats the first non-frame
+        byte as a fatal transport error and never reconnects, so one loose
+        line means 'Transport closed' for the whole session."""
+        import subprocess
+
+        repo_root = Path(__file__).resolve().parent.parent
+        bootstrap = (
+            "import sys\n"
+            "from puppetmaster import mcp_server\n"
+            "_orig = mcp_server.handle_message\n"
+            "def noisy(message):\n"
+            "    print('STRAY-DIAGNOSTIC-LINE')\n"
+            "    return _orig(message)\n"
+            "mcp_server.handle_message = noisy\n"
+            "sys.exit(mcp_server.main())\n"
+        )
+        frames = "".join(
+            json.dumps(message) + "\n"
+            for message in (
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+                {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            )
+        )
+        with TemporaryDirectory() as tmp:
+            proc = subprocess.run(
+                [sys.executable, "-c", bootstrap],
+                input=frames.encode("utf-8"),
+                capture_output=True,
+                cwd=str(repo_root),
+                env={
+                    **os.environ,
+                    "PUPPETMASTER_MCP_REGISTRY_DIR": tmp,
+                    "PUPPETMASTER_MCP_INPUT_STALE_DISABLED": "1",
+                    "PUPPETMASTER_MCP_IDLE_KEEPALIVE_DISABLED": "1",
+                },
+                timeout=60,
+            )
+
+        stdout_text = proc.stdout.decode("utf-8", errors="replace")
+        stdout_lines = [line for line in stdout_text.splitlines() if line.strip()]
+        self.assertTrue(stdout_lines, "server produced no protocol frames")
+        for line in stdout_lines:
+            json.loads(line)  # every stdout line must be a parseable frame
+        response_ids = {
+            frame.get("id")
+            for frame in map(json.loads, stdout_lines)
+            if "id" in frame
+        }
+        self.assertLessEqual({1, 2}, response_ids, "handshake responses missing")
+        self.assertNotIn("STRAY-DIAGNOSTIC-LINE", stdout_text)
+        self.assertIn(
+            "STRAY-DIAGNOSTIC-LINE",
+            proc.stderr.decode("utf-8", errors="replace"),
+            "stray output should be diverted to stderr, not dropped",
+        )
+
     def test_idle_keepalive_can_be_disabled_via_env(self) -> None:
         from puppetmaster.mcp_server import _idle_keepalive_disabled
 
@@ -5710,6 +5770,281 @@ class ModelRouterTests(unittest.TestCase):
         small = spec.estimate_cost_usd(1_000, 1_000)
         big = spec.estimate_cost_usd(10_000, 10_000)
         self.assertAlmostEqual(big, small * 10, places=6)
+
+    def test_payload_defaults_round_trip_and_drop_empty_defaults(self) -> None:
+        from puppetmaster.model_registry import ModelSpec, load_registry, save_registry
+
+        specs = [
+            ModelSpec(
+                id="openai/high",
+                adapter="openai",
+                adapter_model_name="gpt-5.5",
+                payload_defaults={"reasoning_effort": "high"},
+            ),
+            ModelSpec(
+                id="openai/plain",
+                adapter="openai",
+                adapter_model_name="gpt-5.4",
+            ),
+        ]
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "models.json"
+            save_registry(specs, path)
+            raw = path.read_text(encoding="utf-8")
+            self.assertIn('"payload_defaults"', raw)
+            self.assertEqual(raw.count('"payload_defaults"'), 1)
+            loaded = {spec.id: spec for spec in load_registry(path)}
+            self.assertEqual(
+                loaded["openai/high"].payload_defaults,
+                {"reasoning_effort": "high"},
+            )
+            self.assertEqual(loaded["openai/plain"].payload_defaults, {})
+
+    def test_routing_payload_merge_applies_defaults_below_task_payload(self) -> None:
+        from puppetmaster.model_registry import ModelSpec
+        from puppetmaster.orchestrator import merge_routing_payload
+        from puppetmaster.router import RoutingDecision
+
+        spec = ModelSpec(
+            id="openai/high",
+            adapter="openai",
+            adapter_model_name="gpt-5.5",
+            payload_defaults={"reasoning_effort": "high", "temperature": 0},
+        )
+        decision = RoutingDecision(
+            model=spec,
+            policy="balanced",
+            capability_needed=75,
+            estimated_tokens_in=1000,
+            estimated_tokens_out=1000,
+            estimated_cost_usd=0.01,
+            reason="test",
+        )
+        merged = merge_routing_payload(
+            {"reasoning_effort": "low", "prompt": "keep me"},
+            decision,
+            {"attempt": 1},
+        )
+        self.assertEqual(merged["reasoning_effort"], "low")
+        self.assertEqual(merged["temperature"], 0)
+        self.assertEqual(merged["model"], "gpt-5.5")
+        self.assertEqual(merged["router_model_id"], "openai/high")
+        self.assertEqual(merged["attempt"], 1)
+
+    def test_output_token_multiplier_scales_cost_and_rejects_non_positive(self) -> None:
+        from puppetmaster.model_registry import ModelSpec
+
+        base = ModelSpec(
+            id="base",
+            adapter="openai",
+            adapter_model_name="gpt-5.5",
+            input_per_mtok_usd=1.0,
+            output_per_mtok_usd=10.0,
+        )
+        high = ModelSpec(
+            id="high",
+            adapter="openai",
+            adapter_model_name="gpt-5.5",
+            input_per_mtok_usd=1.0,
+            output_per_mtok_usd=10.0,
+            output_token_multiplier=3.0,
+        )
+        self.assertAlmostEqual(high.estimate_cost_usd(1_000, 2_000), 0.061)
+        self.assertGreater(high.estimate_cost_usd(1_000, 2_000), base.estimate_cost_usd(1_000, 2_000))
+        with self.assertRaises(ValueError):
+            ModelSpec(
+                id="bad",
+                adapter="openai",
+                adapter_model_name="gpt-5.5",
+                output_token_multiplier=0,
+            )
+
+    def test_models_setup_wizard_adds_openai_effort_variant(self) -> None:
+        from puppetmaster.cli import ModelRegistryWizard
+        from puppetmaster.model_registry import ModelSpec, load_registry, save_registry
+
+        base = ModelSpec(
+            id="openai/gpt-5-5",
+            adapter="openai",
+            adapter_model_name="gpt-5.5",
+            capability_score=96,
+            tags=["openai", "reasoning"],
+        )
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "models.json"
+            save_registry([base], path)
+            stdin = io.StringIO("1\n1\nhigh\n\n\n\n\nq\n\n")
+            stdout = io.StringIO()
+            code = ModelRegistryWizard(path, stdin, stdout).run()
+            self.assertEqual(code, 0)
+            loaded = {spec.id: spec for spec in load_registry(path)}
+            self.assertIn("openai/gpt-5-5-high", loaded)
+            variant = loaded["openai/gpt-5-5-high"]
+            self.assertEqual(variant.payload_defaults, {"reasoning_effort": "high"})
+            self.assertIn("effort:high", variant.tags)
+
+    def test_models_setup_wizard_refuses_cursor_effort_variant(self) -> None:
+        from puppetmaster.cli import ModelRegistryWizard
+        from puppetmaster.model_registry import ModelSpec, load_registry, save_registry
+
+        base = ModelSpec(
+            id="cursor/gpt-5-5",
+            adapter="cursor",
+            adapter_model_name="gpt-5.5",
+        )
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "models.json"
+            save_registry([base], path)
+            stdin = io.StringIO("1\n1\nq\n")
+            stdout = io.StringIO()
+            code = ModelRegistryWizard(path, stdin, stdout).run()
+            self.assertEqual(code, 0)
+            self.assertIn("does not expose an effort knob", stdout.getvalue())
+            loaded = load_registry(path)
+            self.assertEqual(len(loaded), 1)
+
+    def test_models_set_applies_codex_effort_payload_defaults(self) -> None:
+        from puppetmaster.model_registry import ModelSpec, load_registry, save_registry
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "models.json"
+            save_registry(
+                [
+                    ModelSpec(
+                        id="codex/gpt-5-5",
+                        adapter="codex",
+                        adapter_model_name="gpt-5.5",
+                    )
+                ],
+                path,
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = cli_main(
+                    [
+                        "models",
+                        "set",
+                        "--registry-path",
+                        str(path),
+                        "codex/gpt-5-5",
+                        "effort=high",
+                    ]
+                )
+            self.assertEqual(code, 0)
+            printed = json.loads(stdout.getvalue())
+            self.assertEqual(
+                printed["payload_defaults"],
+                {"extra_args": ["-c", "model_reasoning_effort=high"]},
+            )
+            loaded = {spec.id: spec for spec in load_registry(path)}
+            self.assertEqual(
+                loaded["codex/gpt-5-5"].payload_defaults,
+                {"extra_args": ["-c", "model_reasoning_effort=high"]},
+            )
+
+    def test_models_setup_wizard_exits_on_closed_stdin(self) -> None:
+        from puppetmaster.cli import ModelRegistryWizard
+        from puppetmaster.model_registry import ModelSpec, save_registry
+
+        base = ModelSpec(id="openai/gpt-5-5", adapter="openai", adapter_model_name="gpt-5.5")
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "models.json"
+            save_registry([base], path)
+            stdin = io.StringIO("")  # immediate EOF: must exit, never loop
+            stdout = io.StringIO()
+            code = ModelRegistryWizard(path, stdin, stdout).run()
+            self.assertEqual(code, 0)
+            self.assertIn("Input closed", stdout.getvalue())
+
+    def test_models_setup_wizard_refuses_duplicate_variant_id(self) -> None:
+        from puppetmaster.cli import ModelRegistryWizard
+        from puppetmaster.model_registry import ModelSpec, load_registry, save_registry
+
+        base = ModelSpec(id="openai/gpt-5-5", adapter="openai", adapter_model_name="gpt-5.5")
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "models.json"
+            save_registry([base], path)
+            # Accept the suggested id but override it to collide with the base entry.
+            stdin = io.StringIO("1\n1\nhigh\nopenai/gpt-5-5\nq\n\n")
+            stdout = io.StringIO()
+            code = ModelRegistryWizard(path, stdin, stdout).run()
+            self.assertEqual(code, 0)
+            self.assertIn("already exists", stdout.getvalue())
+            self.assertEqual(len(load_registry(path)), 1)
+
+    def test_models_set_effort_merges_defaults_and_swaps_tag(self) -> None:
+        from puppetmaster.model_registry import ModelSpec, load_registry, save_registry
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "models.json"
+            save_registry(
+                [
+                    ModelSpec(
+                        id="openai/gpt-5-5",
+                        adapter="openai",
+                        adapter_model_name="gpt-5.5",
+                        tags=["openai", "effort:low"],
+                        payload_defaults={"temperature": 0.2, "reasoning_effort": "low"},
+                    )
+                ],
+                path,
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = cli_main(
+                    [
+                        "models",
+                        "set",
+                        "--registry-path",
+                        str(path),
+                        "openai/gpt-5-5",
+                        "effort=high",
+                    ]
+                )
+            self.assertEqual(code, 0)
+            loaded = {spec.id: spec for spec in load_registry(path)}
+            updated = loaded["openai/gpt-5-5"]
+            self.assertEqual(
+                updated.payload_defaults,
+                {"temperature": 0.2, "reasoning_effort": "high"},
+            )
+            self.assertIn("effort:high", updated.tags)
+            self.assertNotIn("effort:low", updated.tags)
+
+    def test_model_spec_rejects_non_dict_payload_defaults(self) -> None:
+        from puppetmaster.model_registry import ModelSpec
+
+        with self.assertRaises(ValueError):
+            ModelSpec(
+                id="bad",
+                adapter="openai",
+                adapter_model_name="gpt-5.5",
+                payload_defaults=["not", "a", "dict"],
+            )
+
+    def test_models_set_unknown_id_exits_nonzero(self) -> None:
+        from puppetmaster.model_registry import ModelSpec, save_registry
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "models.json"
+            save_registry(
+                [ModelSpec(id="known", adapter="openai", adapter_model_name="gpt-5.5")],
+                path,
+            )
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code = cli_main(
+                    [
+                        "models",
+                        "set",
+                        "--registry-path",
+                        str(path),
+                        "missing",
+                        "effort=high",
+                    ]
+                )
+            self.assertEqual(code, 1)
+            self.assertIn("unknown model id", stderr.getvalue())
 
     def test_models_init_writes_starter_registry(self) -> None:
         with TemporaryDirectory() as tmp:
