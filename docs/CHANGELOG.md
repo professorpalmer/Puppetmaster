@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.9.34
+
+**Fix: hook commands survive Windows — forward-slash python paths instead of backslash escape-layer roulette (field report: Claude Code on Windows, "when claude tried to execute the hook there were no \ at all").** `install-hooks` embedded `sys.executable` verbatim in the hook command string; on Windows that path has to survive two unescape layers (JSON decode, then the POSIX-style shell — Git Bash — that hosts run hook commands through). It survived only the first, so Git Bash ate every backslash and the invocation gate never executed. Full suite **608** green (+3 focused tests); `ruff check puppetmaster/` clean.
+
+- **`_shell_safe_executable`.** The shared gate-command builder (Claude + Cursor hooks) now writes the python path with forward slashes — valid Windows separators at every layer, nothing to escape — and double-quotes it when it contains spaces (`Program Files`-style paths), which is safe in both POSIX shells and cmd.
+- **Affected users:** anyone on Windows who ran `puppetmaster setup` or `install-hooks`. Re-run `python -m puppetmaster install-hooks --force` after updating to rewrite the broken command; the merge logic identifies our entries by marker, so user-authored hooks are untouched.
+- **Known limits.** macOS/Linux installs are byte-identical unless the python path contains a space (then it gains quotes — harmless, but the entry rewrites once). Verified by unit tests asserting the rendered command shape, not by a live Windows host; Pawel's machine is the live confirmation loop.
+
 ## v0.9.33
 
 **Feature: `install-claude-mcp` — `puppetmaster setup` now registers the MCP server with Claude Code (field report: "ran setup, Claude enabled, but no MCP in Claude's list").** Setup wired Cursor and Codex hosts but never Claude Code — the "Claude enabled" line users saw was the platform lock (Claude as a *worker*), not host registration, so driving Puppetmaster *from* Claude Code silently got nothing. Full suite **605** green (+6 focused tests); `ruff check puppetmaster/` clean; verified live end to end — real `claude mcp add` (user scope), `claude mcp get` shows `✔ Connected`, re-run reports `unchanged`.
