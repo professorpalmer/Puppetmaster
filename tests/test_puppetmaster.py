@@ -7385,6 +7385,129 @@ class InstallerTests(unittest.TestCase):
             )
             self.assertEqual(result.status, "unchanged")
 
+    def test_install_claude_reports_error_when_cli_missing(self):
+        from puppetmaster.installers import install_claude_mcp
+
+        result = install_claude_mcp(
+            claude_executable="/nonexistent/claude-that-cannot-exist",
+            skip_handshake=True,
+        )
+        self.assertEqual(result.status, "error")
+        joined = " ".join(result.messages).lower()
+        self.assertIn("not found", joined)
+
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "bash CLI stub is POSIX-only scaffolding; installer logic is OS-agnostic "
+        "and covered on Linux + macOS",
+    )
+    def test_install_claude_invokes_mcp_add_user_scope_via_stub(self):
+        """Stub the `claude` CLI and verify the user-scope `mcp add` argv."""
+        from puppetmaster.installers import install_claude_mcp
+
+        with TemporaryDirectory() as tmp:
+            stub_log = Path(tmp) / "claude_calls.log"
+            stub = Path(tmp) / "claude"
+            stub.write_text(
+                "#!/usr/bin/env bash\n"
+                f'echo "$@" >> {stub_log}\n'
+                'if [ "$1" = "mcp" ] && [ "$2" = "get" ]; then\n'
+                '  echo "No MCP server found with name: puppetmaster" >&2\n'
+                "  exit 1\n"
+                "fi\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            stub.chmod(0o755)
+            result = install_claude_mcp(
+                claude_executable=str(stub),
+                skip_handshake=True,
+            )
+            self.assertEqual(
+                result.status,
+                "installed",
+                msg=f"expected install, got {result.status}: {result.messages}",
+            )
+            log = stub_log.read_text("utf-8")
+            self.assertIn("mcp get puppetmaster", log)
+            self.assertIn(
+                f"mcp add --scope user puppetmaster -- {sys.executable} -m puppetmaster.mcp_server",
+                log,
+                msg=f"unexpected claude args. full log:\n{log}",
+            )
+
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "bash CLI stub is POSIX-only scaffolding; installer logic is OS-agnostic "
+        "and covered on Linux + macOS",
+    )
+    def test_install_claude_idempotent_when_entry_already_matches(self):
+        """When `claude mcp get` reports a matching entry, skip the rewrite."""
+        from puppetmaster.installers import install_claude_mcp
+
+        with TemporaryDirectory() as tmp:
+            stub = Path(tmp) / "claude"
+            stub.write_text(
+                "#!/usr/bin/env bash\n"
+                'if [ "$1" = "mcp" ] && [ "$2" = "get" ]; then\n'
+                '  echo "puppetmaster:"\n'
+                '  echo "  Type: stdio"\n'
+                f'  echo "  Command: {sys.executable}"\n'
+                '  echo "  Args: -m puppetmaster.mcp_server"\n'
+                "  exit 0\n"
+                "fi\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            stub.chmod(0o755)
+            result = install_claude_mcp(
+                claude_executable=str(stub),
+                skip_handshake=True,
+            )
+            self.assertEqual(result.status, "unchanged")
+
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "bash CLI stub is POSIX-only scaffolding; installer logic is OS-agnostic "
+        "and covered on Linux + macOS",
+    )
+    def test_uninstall_claude_removes_user_scope_entry(self):
+        from puppetmaster.installers import uninstall_claude_mcp
+
+        with TemporaryDirectory() as tmp:
+            stub_log = Path(tmp) / "claude_calls.log"
+            stub = Path(tmp) / "claude"
+            stub.write_text(
+                "#!/usr/bin/env bash\n"
+                f'echo "$@" >> {stub_log}\n'
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            stub.chmod(0o755)
+            result = uninstall_claude_mcp(claude_executable=str(stub))
+            self.assertEqual(result.status, "removed")
+            self.assertIn(
+                "mcp remove --scope user puppetmaster",
+                stub_log.read_text("utf-8"),
+            )
+
+    def test_uninstall_claude_unchanged_when_cli_missing(self):
+        from puppetmaster.installers import uninstall_claude_mcp
+
+        result = uninstall_claude_mcp(
+            claude_executable="/nonexistent/claude-that-cannot-exist",
+        )
+        self.assertEqual(result.status, "unchanged")
+
+    def test_resolve_claude_command_multiword_and_missing(self):
+        from puppetmaster.installers import resolve_claude_command
+
+        # Multi-word commands resolve their head and keep the tail.
+        resolved = resolve_claude_command(f"{sys.executable} -m something")
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved[1:], ["-m", "something"])
+        self.assertIsNone(resolve_claude_command("/nonexistent/claude-nope"))
+
 
 class InstallRulesTests(unittest.TestCase):
     """Tests for :mod:`puppetmaster.rules`.

@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -767,3 +768,305 @@ def uninstall_codex_mcp(
         return UninstallResult(status="unchanged", target=target_label, messages=messages)
 
     return UninstallResult(status="removed", target=target_label, messages=messages)
+
+
+# ---------------------------------------------------------------------------
+# Claude Code
+# ---------------------------------------------------------------------------
+
+_CLAUDE_USER_CONFIG_LABEL = "~/.claude.json"
+
+CLAUDE_NEXT_STEPS_GUIDANCE = (
+    "Restart Claude Code (or start a fresh session) to pick up the new MCP server.\n"
+    "Verify with `claude mcp list` — puppetmaster should show as connected — or ask\n"
+    "Claude to call `puppetmaster_doctor` and report the results.\n"
+    "Long jobs: prefer the async pattern — fire a `start_*` verb, then re-poll with\n"
+    "bounded `live_artifacts_follow` / `await_job` — instead of one multi-minute block."
+)
+
+
+def resolve_claude_command(claude_executable: Optional[str] = None) -> Optional[list[str]]:
+    """Resolve the Claude Code CLI into an argv prefix, or ``None`` if absent.
+
+    Resolution order: explicit ``claude_executable`` (may be multi-word, e.g.
+    ``npx -y @anthropic-ai/claude-code``), then the ``CLAUDE_CODE_COMMAND`` env
+    var the adapters already honor, then a bare ``claude`` on PATH. The first
+    token must resolve to a real file or PATH entry; the rest ride along.
+    """
+    candidate = claude_executable or os.environ.get("CLAUDE_CODE_COMMAND") or "claude"
+    try:
+        parts = shlex.split(candidate, posix=(os.name != "nt"))
+    except ValueError:
+        return None
+    if not parts:
+        return None
+    head = parts[0]
+    resolved = shutil.which(head) or (head if Path(head).expanduser().exists() else None)
+    if resolved is None:
+        return None
+    return [resolved, *parts[1:]]
+
+
+def _parse_claude_mcp_get(stdout: str) -> tuple[Optional[str], list[str]]:
+    """Extract (command, args) from ``claude mcp get`` human-readable output."""
+    command: Optional[str] = None
+    args: list[str] = []
+    for raw in (stdout or "").splitlines():
+        stripped = raw.strip()
+        lower = stripped.lower()
+        if lower.startswith("command:"):
+            command = stripped.split(":", 1)[1].strip()
+        elif lower.startswith("args:"):
+            args = stripped.split(":", 1)[1].strip().split()
+    return command, args
+
+
+def install_claude_mcp(
+    *,
+    python_executable: Optional[str] = None,
+    claude_executable: Optional[str] = None,
+    force: bool = False,
+    dry_run: bool = False,
+    skip_handshake: bool = False,
+) -> InstallResult:
+    """Register Puppetmaster as a user-scope MCP server in Claude Code.
+
+    Shells out to ``claude mcp add --scope user`` rather than hand-editing
+    ``~/.claude.json`` — Claude Code owns that file's schema (it also stores
+    OAuth/onboarding state there), so going through its CLI is the only safe
+    path. User scope makes the server available in every project, matching
+    how people actually drive Puppetmaster from Claude Code.
+
+    Idempotency: when ``claude mcp get puppetmaster`` reports a command + args
+    matching what we would register, reports ``status="unchanged"``.
+    ``force=True`` removes and re-adds the entry.
+
+    Known limit: an existing *local/project*-scope puppetmaster entry shadows
+    the user-scope one in Claude's precedence order; we manage only the user
+    scope and surface a message instead of touching other scopes.
+    """
+    python = python_executable or sys.executable
+    messages: list[str] = []
+    claude_cmd = resolve_claude_command(claude_executable)
+    if claude_cmd is None:
+        messages.append(
+            "Claude Code CLI not found (looked for "
+            f"{claude_executable or os.environ.get('CLAUDE_CODE_COMMAND') or 'claude'!r}). "
+            "Install with `npm install -g @anthropic-ai/claude-code` or set "
+            "CLAUDE_CODE_COMMAND, then re-run."
+        )
+        return InstallResult(
+            status="error",
+            target=_CLAUDE_USER_CONFIG_LABEL,
+            python_executable=python,
+            messages=messages,
+        )
+
+    desired_command = python
+    desired_args = ["-m", "puppetmaster.mcp_server"]
+
+    get_result: Optional[subprocess.CompletedProcess] = None
+    try:
+        get_result = subprocess.run(
+            [*claude_cmd, "mcp", "get", "puppetmaster"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        messages.append(f"`claude mcp get puppetmaster` failed: {exc!r}")
+
+    entry_exists = get_result is not None and get_result.returncode == 0
+    if entry_exists:
+        existing_command, existing_args = _parse_claude_mcp_get(get_result.stdout)
+        if (
+            existing_command == desired_command
+            and existing_args == desired_args
+            and not force
+        ):
+            messages.append(
+                "claude `puppetmaster` MCP entry already matches sys.executable; nothing to do"
+            )
+            return InstallResult(
+                status="unchanged",
+                target=_CLAUDE_USER_CONFIG_LABEL,
+                python_executable=python,
+                handshake=None,
+                messages=messages,
+            )
+        if existing_command:
+            messages.append(
+                f"existing claude entry will be replaced ({existing_command!r} -> {desired_command!r})"
+            )
+
+    handshake: Optional[HandshakeResult] = None
+    if not skip_handshake:
+        handshake = handshake_mcp_server(python)
+        if not handshake.ok:
+            messages.append(
+                f"handshake FAILED — refusing to register a broken MCP entry in Claude Code. "
+                f"Reason: {handshake.error}"
+            )
+            return InstallResult(
+                status="error",
+                target=_CLAUDE_USER_CONFIG_LABEL,
+                python_executable=python,
+                handshake=handshake,
+                messages=messages,
+            )
+        messages.append(
+            f"handshake OK ({handshake.tool_count} tools advertised by {python})"
+        )
+
+    if dry_run:
+        messages.append(
+            f"DRY RUN — would run: "
+            f"`{' '.join(claude_cmd)} mcp add --scope user puppetmaster -- "
+            f"{desired_command} {' '.join(desired_args)}`"
+        )
+        return InstallResult(
+            status="would_install",
+            target=_CLAUDE_USER_CONFIG_LABEL,
+            python_executable=python,
+            handshake=handshake,
+            messages=messages,
+        )
+
+    if entry_exists:
+        try:
+            subprocess.run(
+                [*claude_cmd, "mcp", "remove", "--scope", "user", "puppetmaster"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            messages.append(f"failed to remove existing entry: {exc!r}")
+
+    add_cmd = [
+        *claude_cmd,
+        "mcp",
+        "add",
+        "--scope",
+        "user",
+        "puppetmaster",
+        "--",
+        desired_command,
+        *desired_args,
+    ]
+    try:
+        add_result = subprocess.run(
+            add_cmd,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        messages.append(f"`claude mcp add` failed: {exc!r}")
+        return InstallResult(
+            status="error",
+            target=_CLAUDE_USER_CONFIG_LABEL,
+            python_executable=python,
+            handshake=handshake,
+            messages=messages,
+        )
+    if add_result.returncode != 0:
+        messages.append(
+            f"`claude mcp add` exited rc={add_result.returncode}: "
+            f"stderr={(add_result.stderr or '')[-300:]!r}"
+        )
+        return InstallResult(
+            status="error",
+            target=_CLAUDE_USER_CONFIG_LABEL,
+            python_executable=python,
+            handshake=handshake,
+            messages=messages,
+        )
+    messages.append(
+        "registered puppetmaster MCP entry with Claude Code (user scope) via `claude mcp add`"
+    )
+    return InstallResult(
+        status="installed",
+        target=_CLAUDE_USER_CONFIG_LABEL,
+        python_executable=python,
+        handshake=handshake,
+        messages=messages,
+    )
+
+
+def uninstall_claude_mcp(
+    *,
+    claude_executable: Optional[str] = None,
+    dry_run: bool = False,
+) -> UninstallResult:
+    """Remove Puppetmaster's user-scope MCP entry from Claude Code.
+
+    Idempotent: reports ``unchanged`` when no entry exists or the Claude CLI
+    is absent (nothing we could have installed through it).
+    """
+    messages: list[str] = []
+    claude_cmd = resolve_claude_command(claude_executable)
+    if claude_cmd is None:
+        messages.append("Claude Code CLI not found; no claude MCP entry to remove")
+        return UninstallResult(
+            status="unchanged", target=_CLAUDE_USER_CONFIG_LABEL, messages=messages
+        )
+
+    try:
+        get_result = subprocess.run(
+            [*claude_cmd, "mcp", "get", "puppetmaster"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        messages.append(f"`claude mcp get puppetmaster` failed: {exc!r}")
+        return UninstallResult(
+            status="error", target=_CLAUDE_USER_CONFIG_LABEL, messages=messages
+        )
+
+    if get_result.returncode != 0:
+        messages.append("no puppetmaster MCP entry in Claude Code config")
+        return UninstallResult(
+            status="unchanged", target=_CLAUDE_USER_CONFIG_LABEL, messages=messages
+        )
+
+    if dry_run:
+        messages.append(
+            f"DRY RUN — would run: `{' '.join(claude_cmd)} mcp remove --scope user puppetmaster`"
+        )
+        return UninstallResult(
+            status="would_remove", target=_CLAUDE_USER_CONFIG_LABEL, messages=messages
+        )
+
+    try:
+        remove_result = subprocess.run(
+            [*claude_cmd, "mcp", "remove", "--scope", "user", "puppetmaster"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        messages.append(f"`claude mcp remove puppetmaster` failed: {exc!r}")
+        return UninstallResult(
+            status="error", target=_CLAUDE_USER_CONFIG_LABEL, messages=messages
+        )
+    if remove_result.returncode != 0:
+        messages.append(
+            f"`claude mcp remove` exited rc={remove_result.returncode}: "
+            f"stderr={(remove_result.stderr or '')[-300:]!r}"
+        )
+        return UninstallResult(
+            status="error", target=_CLAUDE_USER_CONFIG_LABEL, messages=messages
+        )
+    messages.append(
+        "removed puppetmaster MCP entry from Claude Code via `claude mcp remove`"
+    )
+    return UninstallResult(
+        status="removed", target=_CLAUDE_USER_CONFIG_LABEL, messages=messages
+    )
