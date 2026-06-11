@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.9.41
+
+**Fix: implement workers no longer look "degraded" after doing the job — the final report now becomes durable artifacts (field report: the v0.9.40 CI fix itself, where a cursor implement worker shipped the right patch and correct diagnosis but the job read "Findings: None").** The cursor implement path never asked for a report and never parsed the agent's final message; Claude's path had the same gap; Codex labeled every prose-reporting write run a degraded RISK. Full suite **639** green (+9 focused tests); `ruff check` clean on touched files.
+
+- **Reporting contract in implement prompts.** Cursor's implement wrapper and Claude worker prompts now end with a contract: close your final message with what changed, files touched, and what you ran to verify. Prompts that already carry the structured JSON artifact contract (swarm review/plan roles) are left alone — no conflicting instructions.
+- **Final message parsed into artifacts, with a prose fallback.** `implement_report_artifacts` first tries the structured JSON contract (typed findings/decisions/risks, same parser as analyze mode); anything else is preserved verbatim as a FINDING (`claim` = report headline, `payload.report` = full text, evidence `report:final-message`). Cursor implement, Claude runs, and write-capable Codex runs all route through it on success. Quality verdicts flip from "degraded" to "ok" organically because a substantive artifact now exists.
+- **Codex prose semantics split by capability.** A workspace-write/bypass Codex run that reports in prose passes with a report FINDING; read-only (review-style) runs keep the strict degraded-RISK semantics — their whole contract is structured findings.
+- **CLI surfaces the report.** `puppetmaster cursor --implement` (and every edit-mode run) prints a `report:` headline after the outcome line, plus the `puppetmaster artifacts <job_id>` pointer to the full report.
+- **Known limits.** Reports are capped at 20k chars (tail-biased) inside the FINDING; the full transcript stays in the stdout sidecar. Failed runs (non-zero exit) intentionally emit no report finding — output from a crashed agent isn't a report. The OpenAI adapter's analyze-only degraded semantics are unchanged.
+
 ## v0.9.40
 
 **Fix: green CI on Windows runners (the v0.9.39 npm bootstrap built a backslash path the test rightly rejected) plus a timing flake on macOS runners.** Two distinct failures were red on `main`: `test (windows-latest, 3.12)` since v0.9.39, and an intermittent keepalive flake that even hit a README-only commit. Diagnosed from the actual Actions logs, not local guessing — the local macOS suite was green the whole time.

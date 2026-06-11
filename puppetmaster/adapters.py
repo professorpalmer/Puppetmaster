@@ -699,6 +699,7 @@ class CursorAdapter:
 
         after = git_snapshot(cwd, base_tree=str(before.get("tree") or "") or None)
         failure = classify_cursor_failure(completed.stderr + completed.stdout)
+        cursor_status, result_text = cursor_result_text(completed.stdout)
         usage = token_usage(
             sdk_usage=sdk_usage_from_stdout(completed.stdout),
             prompt_text=prompt,
@@ -732,6 +733,7 @@ class CursorAdapter:
                     "live_log": completed.live_log_path,
                     "model": model,
                     "cwd": str(cwd),
+                    "cursor_status": cursor_status,
                     "base_sha": before["sha"],
                     "head_sha": after["sha"],
                     "changed_files": after["changed_files"],
@@ -741,6 +743,15 @@ class CursorAdapter:
                 },
             )
         ]
+        # The agent's final message is its report (root cause, files touched,
+        # verification). Persist it as artifacts so the stitched summary and
+        # quality verdict see the work instead of calling the run degraded.
+        if completed.returncode == 0:
+            artifacts.extend(
+                implement_report_artifacts(
+                    task, worker_id, result_text, adapter="cursor-sdk"
+                )
+            )
         if _should_emit_patch_artifact(before, after):
             artifacts.append(
                 self._patch_artifact(
@@ -928,6 +939,7 @@ class CursorAdapter:
                 "Keep the change focused on the task; run any obvious local checks you can. "
                 "Puppetmaster captures the resulting git diff as a PATCH artifact, so leave "
                 "the working tree containing your final intended changes.",
+                _IMPLEMENT_REPORT_CONTRACT,
             ]
         )
 
@@ -956,7 +968,7 @@ class ClaudeCodeAdapter:
     name = "claude-code"
 
     def run(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
-        base_prompt = task.payload.get("prompt") or task.instruction
+        base_prompt = with_report_contract(task.payload.get("prompt") or task.instruction)
         cwd = Path(task.payload.get("cwd") or ".").resolve()
         prompt, codegraph_used = enrich_prompt_with_codegraph(
             prompt_with_memory(base_prompt, task),
@@ -1156,6 +1168,17 @@ class ClaudeCodeAdapter:
             },
         )
         artifacts = [verification]
+        # Same reporting gap as the cursor implement path: Claude's final
+        # message (the `result` field of its --output-format json envelope)
+        # carried the worker's report but never became an artifact, so swarm
+        # findings and implement reports alike vanished from synthesis.
+        if completed.returncode == 0:
+            _, result_text = cursor_result_text(completed.stdout)
+            artifacts.extend(
+                implement_report_artifacts(
+                    task, worker_id, result_text, adapter="claude-code"
+                )
+            )
         if _should_emit_patch_artifact(before, after):
             artifacts.append(
                 Artifact(
@@ -1436,9 +1459,11 @@ class CodexAdapter:
 
         parsed_artifacts = cursor_result_artifacts(task, worker_id, last_message)
         process_failed = completed.returncode != 0 or turn_failed
-        # "degraded" mirrors OpenAIAdapter / CursorAdapter: the process
-        # succeeded but didn't return parseable Puppetmaster artifacts.
-        degraded = not process_failed and not parsed_artifacts and bool(last_message.strip())
+        unstructured = not process_failed and not parsed_artifacts and bool(last_message.strip())
+        # A write-capable run (implement-style) normally reports in prose —
+        # that's its report, not a degradation. Only read-only runs, whose
+        # whole job is structured findings, count as degraded on prose.
+        degraded = unstructured and not write_capable
 
         verification = verification_artifact(
             task=task,
@@ -1504,7 +1529,11 @@ class CodexAdapter:
             },
         )
         artifacts: list[Artifact] = [verification]
-        if degraded:
+        if unstructured and write_capable:
+            artifacts.extend(
+                implement_report_artifacts(task, worker_id, last_message, adapter="codex")
+            )
+        elif degraded:
             artifacts.append(
                 Artifact(
                     job_id=task.job_id,
@@ -2084,6 +2113,66 @@ def cursor_result_text(stdout: str) -> tuple[Optional[str], str]:
         str(payload.get("status")) if payload.get("status") is not None else None,
         str(result).strip() if result is not None else "",
     )
+
+
+_REPORT_TAIL_CHARS = 20000
+
+_IMPLEMENT_REPORT_CONTRACT = (
+    "Reporting contract: when you are done, end your final message with a short "
+    "report — what you changed and why, the files you touched, and exactly what "
+    "you ran to verify it. Puppetmaster persists that report as a durable "
+    "artifact; without it the run looks like it did nothing."
+)
+
+
+def with_report_contract(prompt: str) -> str:
+    """Append the implement reporting contract unless the prompt already
+    carries a structured artifact contract (swarm review/plan prompts do)."""
+    if "Puppetmaster artifact contract" in prompt or _IMPLEMENT_REPORT_CONTRACT in prompt:
+        return prompt
+    return f"{prompt}\n\n{_IMPLEMENT_REPORT_CONTRACT}"
+
+
+def implement_report_artifacts(
+    task: Task,
+    worker_id: str,
+    result_text: str,
+    *,
+    adapter: str,
+) -> list[Artifact]:
+    """Turn a full-edit worker's final message into durable artifacts.
+
+    Field report (the v0.9.40 CI fix): a cursor implement worker correctly
+    diagnosed both failures and shipped the right patch, but its final report
+    lived only in a stdout tail — the stitched summary showed "Findings: None"
+    and a perfectly good run read as degraded. Structured JSON parses into
+    typed artifacts; anything else is preserved verbatim as a FINDING so the
+    report survives synthesis instead of dying in a log nobody reads.
+    """
+    parsed = cursor_result_artifacts(task, worker_id, result_text)
+    if parsed:
+        return parsed
+    report = redact_secrets(result_text or "").strip()
+    if not report:
+        return []
+    headline = next(
+        (line.strip().lstrip("#").strip() for line in report.splitlines() if line.strip()),
+        "Worker report",
+    )
+    return [
+        Artifact(
+            job_id=task.job_id,
+            task_id=task.id,
+            type=ArtifactType.FINDING,
+            created_by=worker_id,
+            confidence=0.75,
+            evidence=[f"adapter:{adapter}", "report:final-message"],
+            payload={
+                "claim": headline[:300],
+                "report": report[-_REPORT_TAIL_CHARS:],
+            },
+        )
+    ]
 
 
 def cursor_result_artifacts(task: Task, worker_id: str, result_text: str) -> list[Artifact]:

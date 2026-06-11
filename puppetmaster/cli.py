@@ -2176,6 +2176,25 @@ def finalize_cli_run(result: Any) -> int:
             f"artifacts={len(result.artifacts)}",
             file=sys.stderr,
         )
+        report_headline = next(
+            (
+                str(
+                    (a.payload or {}).get("claim")
+                    or (a.payload or {}).get("decision")
+                    or ""
+                ).strip()
+                for a in result.artifacts
+                if a.type in {ArtifactType.FINDING, ArtifactType.DECISION}
+                and ((a.payload or {}).get("claim") or (a.payload or {}).get("decision"))
+            ),
+            None,
+        )
+        if report_headline:
+            print(f"report: {report_headline}", file=sys.stderr)
+            print(
+                f"  full report: puppetmaster artifacts {result.job.id}",
+                file=sys.stderr,
+            )
 
     verdict = assess_run_quality(result.artifacts)
     quality = verdict["quality"]

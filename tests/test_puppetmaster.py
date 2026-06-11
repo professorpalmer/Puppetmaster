@@ -1371,6 +1371,151 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertIn("diff --git", patch_artifact.payload["unified_diff"])
         self.assertEqual(artifacts[0].payload["result"], "passed")
 
+    def test_cursor_implement_prompt_demands_a_final_report(self) -> None:
+        """Field report (v0.9.40 CI fix): the implement worker's diagnosis only
+        existed as prose the pipeline threw away. The prompt must now ask for a
+        closing report so there is always something to persist."""
+        from puppetmaster.adapters import CursorAdapter
+
+        prompt = CursorAdapter._implement_prompt("Fix the failing tests")
+        self.assertIn("Reporting contract", prompt)
+        self.assertIn("what you ran to verify", prompt)
+
+    def test_cursor_implement_wraps_prose_report_as_finding(self) -> None:
+        """A successful implement run whose final message is prose must keep
+        that report as a FINDING artifact — not drop it and let the stitched
+        summary read 'Findings: None' for a perfectly good run."""
+        task = Task(
+            job_id="job",
+            role="cursor",
+            instruction="fix CI",
+            adapter="cursor",
+            payload={
+                "prompt": "Fix CI",
+                "cwd": ".",
+                "mode": "implement",
+                "disable_codegraph": True,
+            },
+        )
+        report = (
+            "## CI fix report\n"
+            "Root cause: npm --prefix got backslashes on Windows.\n"
+            "Changed puppetmaster/installers.py to use as_posix(); ran pytest."
+        )
+        completed = StreamedProcess(
+            returncode=0,
+            stdout=json.dumps({"status": "finished", "result": report}),
+            stderr="",
+            timed_out=False,
+            live_log_path=None,
+        )
+        clean = {"sha": "s", "changed_files": [], "untracked_files": [], "diff": ""}
+        with patch("puppetmaster.adapters.git_snapshot", side_effect=[clean, clean]), patch(
+            "puppetmaster.adapters.run_streamed_subprocess", return_value=completed
+        ):
+            artifacts = CursorAdapter().run(task, "goal", "worker-cursor")
+
+        findings = [a for a in artifacts if a.type == ArtifactType.FINDING]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].payload["claim"], "CI fix report")
+        self.assertIn("as_posix()", findings[0].payload["report"])
+        self.assertIn("report:final-message", findings[0].evidence)
+        self.assertEqual(artifacts[0].payload["result"], "passed")
+
+    def test_cursor_implement_parses_structured_report_into_typed_artifacts(self) -> None:
+        """If the implement worker does return the JSON artifact contract, it
+        parses into typed artifacts exactly like analyze mode."""
+        task = Task(
+            job_id="job",
+            role="cursor",
+            instruction="fix CI",
+            adapter="cursor",
+            payload={
+                "prompt": "Fix CI",
+                "cwd": ".",
+                "mode": "implement",
+                "disable_codegraph": True,
+            },
+        )
+        structured = json.dumps(
+            {
+                "artifacts": [
+                    {
+                        "type": "finding",
+                        "claim": "Windows paths broke npm --prefix",
+                        "evidence": ["puppetmaster/installers.py"],
+                        "confidence": 0.9,
+                    },
+                    {
+                        "type": "decision",
+                        "decision": "Use as_posix() for npm arguments",
+                        "why": "npm chokes on backslashes",
+                        "evidence": ["puppetmaster/installers.py"],
+                        "confidence": 0.9,
+                    },
+                ]
+            }
+        )
+        completed = StreamedProcess(
+            returncode=0,
+            stdout=json.dumps({"status": "finished", "result": structured}),
+            stderr="",
+            timed_out=False,
+            live_log_path=None,
+        )
+        clean = {"sha": "s", "changed_files": [], "untracked_files": [], "diff": ""}
+        with patch("puppetmaster.adapters.git_snapshot", side_effect=[clean, clean]), patch(
+            "puppetmaster.adapters.run_streamed_subprocess", return_value=completed
+        ):
+            artifacts = CursorAdapter().run(task, "goal", "worker-cursor")
+
+        types = [a.type for a in artifacts]
+        self.assertIn(ArtifactType.FINDING, types)
+        self.assertIn(ArtifactType.DECISION, types)
+
+    def test_cursor_implement_failed_run_emits_no_report_finding(self) -> None:
+        """A failed implement run must not dress its output up as a report."""
+        task = Task(
+            job_id="job",
+            role="cursor",
+            instruction="fix CI",
+            adapter="cursor",
+            payload={
+                "prompt": "Fix CI",
+                "cwd": ".",
+                "mode": "implement",
+                "disable_codegraph": True,
+            },
+        )
+        completed = StreamedProcess(
+            returncode=1,
+            stdout="boom",
+            stderr="agent crashed",
+            timed_out=False,
+            live_log_path=None,
+        )
+        clean = {"sha": "s", "changed_files": [], "untracked_files": [], "diff": ""}
+        with patch("puppetmaster.adapters.git_snapshot", side_effect=[clean, clean]), patch(
+            "puppetmaster.adapters.run_streamed_subprocess", return_value=completed
+        ):
+            artifacts = CursorAdapter().run(task, "goal", "worker-cursor")
+
+        self.assertNotIn(ArtifactType.FINDING, [a.type for a in artifacts])
+        self.assertEqual(artifacts[0].payload["result"], "failed")
+
+    def test_with_report_contract_skips_structured_prompts(self) -> None:
+        """Prompts that already demand the JSON artifact contract (swarm
+        review/plan roles) must not get a conflicting prose-report request."""
+        from puppetmaster.adapters import _IMPLEMENT_REPORT_CONTRACT, with_report_contract
+
+        structured = "Review the repo.\n\nPuppetmaster artifact contract:\nReturn only JSON."
+        self.assertEqual(with_report_contract(structured), structured)
+
+        plain = "Fix the failing tests"
+        wrapped = with_report_contract(plain)
+        self.assertIn(_IMPLEMENT_REPORT_CONTRACT, wrapped)
+        self.assertEqual(with_report_contract(wrapped), wrapped)
+
     def test_cursor_implement_blocks_on_dirty_tree(self) -> None:
         task = Task(
             job_id="job",
@@ -4190,6 +4335,83 @@ print('{"result":"ok"}')
 
             self.assertNotIn("context:codegraph", artifacts[0].evidence)
 
+    def test_claude_code_run_persists_final_report_as_finding(self) -> None:
+        """Claude's final message (the json envelope's `result`) is the worker's
+        report; it must land as a FINDING instead of dying in a stdout tail."""
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+
+            fake_claude = root / "fake_claude.py"
+            fake_claude.write_text(
+                """#!/usr/bin/env python3
+print('{"result":"Fixed the auth bug in auth.py; ran pytest, all green."}')
+""",
+                encoding="utf-8",
+            )
+            fake_claude.chmod(0o755)
+
+            task = Task(
+                job_id="job",
+                role="claude-code",
+                instruction="fix the auth bug",
+                adapter="claude-code",
+                payload={
+                    "executable": [sys.executable, str(fake_claude)],
+                    "cwd": str(repo),
+                    "timeout_seconds": 10,
+                    "prompt": "Fix the auth bug.",
+                    "disable_codegraph": True,
+                },
+            )
+            artifacts = ClaudeCodeAdapter().run(task, "goal", "worker")
+
+        findings = [a for a in artifacts if a.type == ArtifactType.FINDING]
+        self.assertEqual(len(findings), 1)
+        self.assertIn("Fixed the auth bug", findings[0].payload["claim"])
+        self.assertIn("adapter:claude-code", findings[0].evidence)
+        self.assertIn("report:final-message", findings[0].evidence)
+
+    def test_claude_code_prompt_carries_report_contract(self) -> None:
+        """Claude workers get the reporting contract appended unless the prompt
+        already demands the structured JSON artifact contract."""
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+
+            fake_claude = root / "fake_claude.py"
+            fake_claude.write_text(
+                """#!/usr/bin/env python3
+print('{"result":"ok"}')
+""",
+                encoding="utf-8",
+            )
+            fake_claude.chmod(0o755)
+
+            task = Task(
+                job_id="job",
+                role="claude-code",
+                instruction="fix it",
+                adapter="claude-code",
+                payload={
+                    "executable": [sys.executable, str(fake_claude)],
+                    "cwd": str(repo),
+                    "timeout_seconds": 10,
+                    "prompt": "Fix it.",
+                },
+            )
+            with patch(
+                "puppetmaster.adapters.enrich_prompt_with_codegraph",
+                return_value=("Fix it.", False),
+            ) as enrich:
+                ClaudeCodeAdapter().run(task, "goal", "worker")
+
+            self.assertIn("Reporting contract", enrich.call_args[0][0])
+
     def test_claude_code_adapter_captures_tracked_git_diff(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -4679,6 +4901,96 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
         self.assertEqual(verification.payload["adapter"], "codex")
         self.assertEqual(verification.payload["result"], "passed")
         self.assertEqual(verification.payload["live_log"], "/tmp/codex_exec_live.log")
+
+    def test_codex_write_capable_prose_is_report_not_degraded(self) -> None:
+        """A workspace-write Codex run that reports in prose did its job — the
+        report becomes a FINDING and the run passes. Only read-only runs (whose
+        whole contract is structured findings) stay degraded on prose."""
+        events_stdout = "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "th_test"}),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "agent_message",
+                            "text": "Patched cli.py to handle empty args; pytest passes.",
+                        },
+                    }
+                ),
+                json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}}),
+            ]
+        )
+        streamed = StreamedProcess(
+            returncode=0,
+            stdout=events_stdout,
+            stderr="",
+            timed_out=False,
+            live_log_path=None,
+        )
+        task = Task(
+            id="t-codex-report",
+            job_id="job-codex-report",
+            role="codex-implement",
+            adapter="codex",
+            instruction="Fix the CLI crash.",
+            payload={"cwd": str(Path.cwd()), "sandbox": "workspace-write", "disable_codegraph": True},
+        )
+        clean = {"sha": "s", "changed_files": [], "untracked_files": [], "diff": ""}
+        with patch("puppetmaster.adapters.resolve_command", return_value="/usr/bin/codex"), patch(
+            "puppetmaster.adapters.worktree_guard", return_value=None
+        ), patch(
+            "puppetmaster.adapters.git_snapshot", side_effect=[clean, clean]
+        ), patch(
+            "puppetmaster.adapters.run_streamed_subprocess", return_value=streamed
+        ):
+            artifacts = CodexAdapter().run(task, "goal", "worker")
+
+        verification = artifacts[0]
+        self.assertEqual(verification.payload["result"], "passed")
+        findings = [a for a in artifacts if a.type == ArtifactType.FINDING]
+        self.assertEqual(len(findings), 1)
+        self.assertIn("Patched cli.py", findings[0].payload["claim"])
+        self.assertNotIn(ArtifactType.RISK, [a.type for a in artifacts])
+
+    def test_codex_read_only_prose_still_degrades(self) -> None:
+        """Read-only Codex (review-style) keeps strict semantics: prose without
+        structured artifacts is degraded, with the RISK marker preserved."""
+        events_stdout = "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {"type": "agent_message", "text": "Looks fine to me."},
+                    }
+                ),
+            ]
+        )
+        streamed = StreamedProcess(
+            returncode=0,
+            stdout=events_stdout,
+            stderr="",
+            timed_out=False,
+            live_log_path=None,
+        )
+        task = Task(
+            id="t-codex-ro",
+            job_id="job-codex-ro",
+            role="codex-review",
+            adapter="codex",
+            instruction="Review the repo.",
+            payload={"cwd": str(Path.cwd()), "sandbox": "read-only", "disable_codegraph": True},
+        )
+        clean = {"sha": "s", "changed_files": [], "untracked_files": [], "diff": ""}
+        with patch("puppetmaster.adapters.resolve_command", return_value="/usr/bin/codex"), patch(
+            "puppetmaster.adapters.git_snapshot", side_effect=[clean, clean]
+        ), patch("puppetmaster.adapters.run_streamed_subprocess", return_value=streamed):
+            artifacts = CodexAdapter().run(task, "goal", "worker")
+
+        self.assertEqual(artifacts[0].payload["result"], "degraded")
+        risks = [a for a in artifacts if a.type == ArtifactType.RISK]
+        self.assertEqual(len(risks), 1)
+        self.assertNotIn(ArtifactType.FINDING, [a.type for a in artifacts])
 
     def test_codex_adapter_timeout_surfaces_failed_with_live_log(self) -> None:
         """A timed-out Codex run reports ``failed`` + ``timeout`` and still
