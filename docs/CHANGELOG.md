@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.9.36
+
+**Fix: `setup` locks the platform set to what's actually on the machine (field report: "it still says I have cursor… I assumed it detects them, it simply supports them").** The platform-lock step defaulted to all-on, so a Claude-Code-only Windows user ran for a day with cursor enabled — cursor verbs recommended, cursor preferred by implement routing, "[on ] cursor" in every status display. Full suite **622** green (+4 focused tests); `ruff check puppetmaster/` clean; detection verified live on this machine (cursor+codex+openai found, npx-only claude correctly not; existing lock respected, not stomped).
+
+- **Detection-based first-run default.** On a first run (no `platform.json` yet), the non-interactive path now locks to the platforms detected on the machine; the interactive prompt offers the detected set as the Enter default. Probes are presence checks, not auth audits: cursor = bundled SDK + `CURSOR_API_KEY`; claude-code/codex = CLI resolvable; openai = `OPENAI_API_KEY`.
+- **Existing locks are never stomped.** A re-run of `setup` respects a prior platform choice (printed as `unchanged`); explicit `--platforms` still always wins, now with an honest note when it enables something undetected.
+- **Status display says why.** Every platform listing in the setup step annotates undetected entries — `[on ] cursor   (not detected on this machine)` — so "why does it say I have cursor" answers itself.
+- **Known limits.** Detection is resolvability-based: an npx-only Claude Code (no `claude` on PATH, no `CLAUDE_CODE_COMMAND`) is not detected — set `CLAUDE_CODE_COMMAND` or use `--platforms`. Codex login state is not probed (subscription auth is opaque); a logged-out codex CLI still counts as detected, and doctor's billing checks remain the auth truth. Existing all-on locks created by older setups are left as-is — re-run `puppetmaster setup` after `rm ~/.puppetmaster/platform.json`, or use `puppetmaster platform only ...`, to adopt detection.
+
 ## v0.9.35
 
 **Fix: idle self-termination is now Cursor-only (field report: Claude Code "Connection status failed" after an idle gap), plus non-git directories fail fast with a real remediation (field report: `not_a_worktree` in experiment dirs).** Full suite **618** green (+10 focused tests); `ruff check puppetmaster/` clean; live smoke — server handshake under a simulated Claude Code env (42 tools), preflight exercised against real `git rev-parse` calls.
