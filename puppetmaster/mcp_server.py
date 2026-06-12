@@ -185,6 +185,13 @@ _LAST_INBOUND_MESSAGE_AT = time.time()
 _ACTIVE_TOOL_CALLS = 0
 _SHUTDOWN_REQUESTED = threading.Event()
 
+# Client identity from the MCP `initialize` handshake (params.clientInfo).
+# Codex sends ``{"name": "codex-mcp-client", "title": "Codex", ...}``; Cursor
+# and Claude Code send their own names. This is the reliable, in-protocol way
+# to know which host is driving us — Codex scrubs ``CODEX_*`` env vars from the
+# MCP server it spawns, so env sniffing alone misses it.
+_CLIENT_INFO: dict = {}
+
 
 def _reap_async_processes_locked() -> int:
     """Poll every tracked launcher and drop the ones that have exited.
@@ -501,6 +508,69 @@ def _host_transparently_respawns(env: Optional[dict] = None) -> bool:
     if any(key.startswith("CODEX_") for key in environ):
         return False
     return any(key.startswith("CURSOR_") for key in environ)
+
+
+def _client_is_codex(client_info: Optional[dict] = None) -> bool:
+    """True when the MCP `initialize` handshake identifies the client as Codex.
+
+    Codex's rmcp client sends ``clientInfo = {"name": "codex-mcp-client",
+    "title": "Codex", ...}``. This is the reliable signal because Codex spawns
+    the MCP server with a scrubbed environment (no ``CODEX_*`` vars), so env
+    sniffing on the server side misses it.
+    """
+    info = client_info if client_info is not None else _CLIENT_INFO
+    if not isinstance(info, dict):
+        return False
+    name = str(info.get("name") or "").lower()
+    title = str(info.get("title") or "").lower()
+    return "codex" in name or title == "codex"
+
+
+def _host_enforces_tool_timeout(env: Optional[dict] = None) -> bool:
+    """True when the spawning host hard-cancels a tool call after a fixed budget.
+
+    OpenAI Codex (rmcp client) enforces a per-tool ``tool_timeout_sec`` (default
+    60s, often 300s) and — unlike Cursor — does NOT reset it on our progress/log
+    keepalives, because Codex never sends a ``progressToken`` for us to address
+    progress to. A synchronous worker verb (cursor/claude/codex/openai
+    review/plan/implement) routinely runs for minutes, so under Codex it gets
+    cancelled mid-run and a healthy job reads as a failed tool.
+
+    Primary signal is the ``initialize`` clientInfo (Codex identifies itself as
+    ``codex-mcp-client``); the ``CODEX_*`` env markers are a fallback used only
+    when the handshake identity hasn't been captured yet, so a known non-Codex
+    client (Cursor/Claude Code) is never misread from stray env vars. Cursor and
+    Claude Code don't impose this hard cap, so they keep inline-result behavior.
+    """
+    if _CLIENT_INFO:
+        return _client_is_codex()
+    environ = env if env is not None else dict(os.environ)
+    return any(key.startswith("CODEX_") for key in environ)
+
+
+def _sync_autodetach_disabled(env: Optional[dict] = None) -> bool:
+    """``PUPPETMASTER_MCP_SYNC_AUTODETACH=0`` keeps synchronous worker verbs
+    blocking inline even on a hard-timeout host — for users who raised their
+    Codex ``tool_timeout_sec`` high enough to wait out a full worker run."""
+    environ = env if env is not None else os.environ
+    raw = environ.get("PUPPETMASTER_MCP_SYNC_AUTODETACH")
+    if raw is None:
+        return False
+    return raw.strip().lower() in {"0", "false", "no", "off"}
+
+
+def _should_autodetach_worker(args: JsonObject) -> bool:
+    """Whether a synchronous worker verb should run async (return a job_id to
+    poll) instead of blocking the MCP turn until the host kills the transport.
+
+    Only fires on a host with a hard per-tool timeout (Codex), and only when the
+    operator hasn't opted out. A per-call ``autodetach`` arg overrides both."""
+    override = args.get("autodetach")
+    if isinstance(override, bool):
+        return override
+    if _sync_autodetach_disabled():
+        return False
+    return _host_enforces_tool_timeout()
 
 
 def _resolve_input_stale_seconds(env_key: str, default: float) -> float:
@@ -959,6 +1029,11 @@ def handle_message(message: JsonObject) -> Optional[JsonObject]:
 
     try:
         if method == "initialize":
+            params = message.get("params") or {}
+            client_info = params.get("clientInfo")
+            if isinstance(client_info, dict):
+                global _CLIENT_INFO
+                _CLIENT_INFO = client_info
             result = {
                 "protocolVersion": "2024-11-05",
                 # `logging` advertises that we emit `notifications/message`
@@ -1684,7 +1759,7 @@ def run_cursor(
         blocked = _worktree_preflight(args)
         if blocked is not None:
             return blocked
-    return run_cli(cursor_command(args, review=review, plan=plan, implement=implement), args)
+    return run_worker_cli(cursor_command(args, review=review, plan=plan, implement=implement), args)
 
 
 def start_cursor(
@@ -1851,7 +1926,7 @@ def run_claude(args: JsonObject) -> JsonObject:
     blocked = _worktree_preflight(args)
     if blocked is not None:
         return blocked
-    return run_cli(claude_command(args), args)
+    return run_worker_cli(claude_command(args), args)
 
 
 def start_claude(args: JsonObject) -> JsonObject:
@@ -1875,7 +1950,7 @@ def run_codex(args: JsonObject) -> JsonObject:
         blocked = _worktree_preflight(args)
         if blocked is not None:
             return blocked
-    return run_cli(codex_command(args), args)
+    return run_worker_cli(codex_command(args), args)
 
 
 def start_codex(args: JsonObject) -> JsonObject:
@@ -1910,7 +1985,7 @@ def claude_command(args: JsonObject) -> list[str]:
 
 
 def run_openai(args: JsonObject) -> JsonObject:
-    return run_cli(openai_command(args), args)
+    return run_worker_cli(openai_command(args), args)
 
 
 def start_openai(args: JsonObject) -> JsonObject:
@@ -2228,6 +2303,48 @@ def _coerce_subprocess_text(value: object) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return str(value)
+
+
+def run_worker_cli(command: list[str], args: JsonObject) -> JsonObject:
+    """Run a long worker verb, auto-detaching on hard-timeout hosts.
+
+    Synchronous worker verbs (cursor/claude/codex/openai review/plan/implement)
+    block the MCP turn for the whole worker run — up to 30 minutes. That's fine
+    on Cursor, which tolerates long calls as bytes flow, but Codex hard-cancels
+    any tool past its ``tool_timeout_sec`` and won't honor our keepalive (no
+    ``progressToken``), so a healthy multi-minute job reads as a failed tool.
+
+    On such a host we transparently switch to the async path: start the same
+    worker detached and return its ``job_id`` immediately, with guidance to poll
+    (``puppetmaster_await_job`` / ``status`` / ``show``). The work is identical
+    and its artifacts persist — only the delivery changes from inline-blocking to
+    poll-for-result, which is the only delivery Codex can actually complete.
+    """
+    if not _should_autodetach_worker(args):
+        return run_cli(command, args)
+    result = start_cli(command, args)
+    if isinstance(result, dict) and not result.get("isError"):
+        content = result.get("content")
+        if isinstance(content, list) and content and isinstance(content[0], dict):
+            try:
+                body = json.loads(content[0].get("text") or "{}")
+            except (ValueError, TypeError):
+                body = None
+            if isinstance(body, dict):
+                job_id = body.get("job_id")
+                body["autodetached"] = True
+                body["autodetach_reason"] = (
+                    "This host (Codex) enforces a hard per-tool timeout and does "
+                    "not honor MCP progress keepalives, so a synchronous worker "
+                    "run would be cancelled mid-flight. Ran it asynchronously "
+                    "instead; the job is live."
+                )
+                body["next_steps"] = [
+                    f"Call puppetmaster_await_job with job_id={job_id} to block for the result",
+                    f"Or puppetmaster_status / puppetmaster_show with job_id={job_id}",
+                ]
+                content[0]["text"] = json.dumps(body, indent=2)
+    return result
 
 
 def run_cli(command: list[str], args: JsonObject) -> JsonObject:

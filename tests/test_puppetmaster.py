@@ -1267,6 +1267,125 @@ class PuppetmasterTests(unittest.TestCase):
             )
         self.assertTrue(result.get("isError"))
 
+    def test_client_is_codex_from_handshake_info(self) -> None:
+        from puppetmaster import mcp_server
+
+        self.assertTrue(
+            mcp_server._client_is_codex({"name": "codex-mcp-client", "title": "Codex"})
+        )
+        self.assertTrue(mcp_server._client_is_codex({"name": "codex", "version": "0.134.0"}))
+        self.assertFalse(mcp_server._client_is_codex({"name": "cursor-vscode"}))
+        self.assertFalse(mcp_server._client_is_codex({"name": "claude-code"}))
+        self.assertFalse(mcp_server._client_is_codex({}))
+
+    def test_host_enforces_tool_timeout_prefers_handshake_then_env(self) -> None:
+        from puppetmaster import mcp_server
+
+        original = dict(mcp_server._CLIENT_INFO)
+        try:
+            # Known Codex client wins regardless of env.
+            mcp_server._CLIENT_INFO = {"name": "codex-mcp-client", "title": "Codex"}
+            self.assertTrue(mcp_server._host_enforces_tool_timeout({}))
+            # Known non-Codex client is never misread from stray CODEX_ env vars.
+            mcp_server._CLIENT_INFO = {"name": "cursor-vscode"}
+            self.assertFalse(mcp_server._host_enforces_tool_timeout({"CODEX_CI": "1"}))
+            # No handshake captured yet -> fall back to env markers.
+            mcp_server._CLIENT_INFO = {}
+            self.assertTrue(mcp_server._host_enforces_tool_timeout({"CODEX_THREAD_ID": "x"}))
+            self.assertFalse(mcp_server._host_enforces_tool_timeout({"CURSOR_AGENT": "1"}))
+            self.assertFalse(mcp_server._host_enforces_tool_timeout({}))
+        finally:
+            mcp_server._CLIENT_INFO = original
+
+    def test_initialize_captures_client_info(self) -> None:
+        from puppetmaster import mcp_server
+
+        original = dict(mcp_server._CLIENT_INFO)
+        try:
+            mcp_server._CLIENT_INFO = {}
+            mcp_server.handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {"clientInfo": {"name": "codex-mcp-client", "title": "Codex"}},
+                }
+            )
+            self.assertEqual(mcp_server._CLIENT_INFO.get("name"), "codex-mcp-client")
+            self.assertTrue(mcp_server._host_enforces_tool_timeout({}))
+        finally:
+            mcp_server._CLIENT_INFO = original
+
+    def test_should_autodetach_respects_arg_and_kill_switch(self) -> None:
+        from puppetmaster import mcp_server
+
+        # Explicit per-call override wins over everything.
+        self.assertTrue(mcp_server._should_autodetach_worker({"autodetach": True}))
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ["CODEX_CI"] = "1"
+            self.assertFalse(mcp_server._should_autodetach_worker({"autodetach": False}))
+        # On a Codex host, default is to auto-detach...
+        with patch.object(mcp_server, "_host_enforces_tool_timeout", return_value=True):
+            self.assertTrue(mcp_server._should_autodetach_worker({}))
+            # ...unless the operator opts out via the kill switch.
+            with patch.dict(os.environ, {"PUPPETMASTER_MCP_SYNC_AUTODETACH": "0"}):
+                self.assertFalse(mcp_server._should_autodetach_worker({}))
+        # Non-hard-timeout host keeps inline blocking.
+        with patch.object(mcp_server, "_host_enforces_tool_timeout", return_value=False):
+            self.assertFalse(mcp_server._should_autodetach_worker({}))
+
+    def test_run_worker_cli_blocks_inline_off_hard_timeout_host(self) -> None:
+        from puppetmaster import mcp_server
+
+        with patch.object(mcp_server, "_should_autodetach_worker", return_value=False), patch.object(
+            mcp_server, "run_cli", return_value={"ran": "inline"}
+        ) as run_cli, patch.object(mcp_server, "start_cli") as start_cli:
+            result = mcp_server.run_worker_cli(["cursor", "goal"], {"goal": "g"})
+
+        run_cli.assert_called_once()
+        start_cli.assert_not_called()
+        self.assertEqual(result, {"ran": "inline"})
+
+    def test_run_worker_cli_autodetaches_to_job_on_hard_timeout_host(self) -> None:
+        from puppetmaster import mcp_server
+
+        start_body = {"job_id": "job_abc123", "run_id": "mcp_1", "next_steps": ["old"]}
+        start_result = {
+            "content": [{"type": "text", "text": json.dumps(start_body)}],
+            "isError": False,
+        }
+        with patch.object(mcp_server, "_should_autodetach_worker", return_value=True), patch.object(
+            mcp_server, "start_cli", return_value=start_result
+        ) as start_cli, patch.object(mcp_server, "run_cli") as run_cli:
+            result = mcp_server.run_worker_cli(["cursor", "goal"], {"goal": "g"})
+
+        start_cli.assert_called_once()
+        run_cli.assert_not_called()
+        body = json.loads(result["content"][0]["text"])
+        self.assertTrue(body["autodetached"])
+        self.assertEqual(body["job_id"], "job_abc123")
+        self.assertTrue(any("job_abc123" in step for step in body["next_steps"]))
+        self.assertFalse(result["isError"])
+
+    def test_run_codex_autodetaches_under_codex_host(self) -> None:
+        from puppetmaster import mcp_server
+
+        start_body = {"job_id": "job_zzz", "run_id": "mcp_2"}
+        start_result = {
+            "content": [{"type": "text", "text": json.dumps(start_body)}],
+            "isError": False,
+        }
+        with patch.object(mcp_server, "_worktree_preflight", return_value=None), patch.object(
+            mcp_server, "_should_autodetach_worker", return_value=True
+        ), patch.object(mcp_server, "start_cli", return_value=start_result), patch.object(
+            mcp_server, "run_cli"
+        ) as run_cli:
+            result = mcp_server.run_codex({"goal": "fix it", "cwd": ".", "sandbox": "read-only"})
+
+        run_cli.assert_not_called()
+        body = json.loads(result["content"][0]["text"])
+        self.assertTrue(body["autodetached"])
+
     def test_cursor_failure_classification_is_actionable(self) -> None:
         self.assertEqual(classify_cursor_failure("CURSOR_API_KEY is required"), "missing_api_key")
         self.assertEqual(classify_cursor_failure("model invalid"), "model_unavailable")
