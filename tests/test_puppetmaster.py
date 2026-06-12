@@ -3653,6 +3653,16 @@ class PuppetmasterTests(unittest.TestCase):
         """No inbound messages for `stale_after_seconds` -> shutdown callback fires."""
         from puppetmaster import mcp_server
 
+        # Pin off the orthogonal parent-death reap: on loaded macOS CI runners a
+        # test process can transiently reparent to launchd (getppid()==1), which
+        # would fire this watcher independently of the idle-staleness path under
+        # test. Parent-death has its own dedicated test elsewhere.
+        no_orphan = patch.object(
+            mcp_server._InputStalenessWatcher, "_parent_is_dead", return_value=False
+        )
+        no_orphan.start()
+        self.addCleanup(no_orphan.stop)
+
         triggered = threading.Event()
         try:
             with mcp_server._INPUT_STATE_LOCK:
@@ -3678,6 +3688,14 @@ class PuppetmasterTests(unittest.TestCase):
         """Even if input is stale, an in-flight tool call defers shutdown."""
         from puppetmaster import mcp_server
 
+        # Pin off parent-death (see test_input_staleness_watcher_triggers_when_idle):
+        # an orphan reparent on CI must not be mistaken for the idle path here.
+        no_orphan = patch.object(
+            mcp_server._InputStalenessWatcher, "_parent_is_dead", return_value=False
+        )
+        no_orphan.start()
+        self.addCleanup(no_orphan.stop)
+
         triggered = threading.Event()
         try:
             with mcp_server._INPUT_STATE_LOCK:
@@ -3701,6 +3719,15 @@ class PuppetmasterTests(unittest.TestCase):
     def test_input_staleness_watcher_resets_when_message_arrives(self) -> None:
         """A new inbound message bumps the timestamp; watcher then ignores the staleness."""
         from puppetmaster import mcp_server
+
+        # Pin off parent-death (see test_input_staleness_watcher_triggers_when_idle):
+        # with a 0.2s stale window and a fresh mark, only an orphan reparent could
+        # fire within the 0.1s assertion window, and that's the CI flake we saw.
+        no_orphan = patch.object(
+            mcp_server._InputStalenessWatcher, "_parent_is_dead", return_value=False
+        )
+        no_orphan.start()
+        self.addCleanup(no_orphan.stop)
 
         triggered = threading.Event()
         try:
