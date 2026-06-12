@@ -24,6 +24,7 @@ exact JSON keys can track each host's evolving schema in one place.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass, replace
@@ -44,14 +45,16 @@ _PRE_TOOL_ALIASES = {
     "beforemcpexecution", "pre_tool", "tool",
 }
 
-# Built-in agent fan-out — the one native tool we still deny-redirect, because a
-# subagent fan-out is unambiguously "this should be a Puppetmaster swarm" and
-# carries no read-only-inspection use. (Caught by the Claude PreToolUse matcher.)
-_BROAD_AGENT_TOOLS = {"task", "agent"}
-_TOOL_REDIRECT = {
-    "task": "puppetmaster_start_cursor_swarm",
-    "agent": "puppetmaster_start_cursor_swarm",
-}
+# We deliberately do NOT hard-deny the built-in agent fan-out (``Task`` /
+# ``Agent``). Two field reports (Claude with no Cursor; Cursor with the swarm
+# tools not connected) showed the deny wedging the turn: native Task is blocked
+# while the suggested ``puppetmaster_start_*swarm`` verb isn't callable. It also
+# over-reaches — Puppetmaster explicitly does NOT replace several native
+# subagents (``browser-use``, ``ci-investigator``, ``cursor-guide``,
+# ``best-of-n-runner``), and the hook payload can't reliably tell those apart
+# from a swarm-worthy fan-out. Steering toward a swarm is left to the
+# non-blocking prompt-submit directive, which never blocks the native tool.
+_ASSUME_TOOLS_ENV = "PUPPETMASTER_HOOK_ASSUME_TOOLS"
 
 # Cursor-specific verbs translated for non-Cursor hosts. The ``*_cursor_*``
 # verbs require the Cursor SDK platform; recommending them on a Claude Code or
@@ -211,17 +214,18 @@ def classify_tool(tool_name: str, tool_input: Any) -> tuple[bool, str]:
     """Decide whether a native tool call should be redirected to Puppetmaster.
 
     Returns ``(should_redirect, suggested_verb)``. Deliberately conservative —
-    a false deny obstructs legitimate read-only work (the field-reported failure
-    mode), which is worse than a false allow. So we only redirect:
+    a false deny obstructs legitimate work (the field-reported failure mode),
+    which is worse than a false allow. The *only* native call we redirect is a
+    shell command that is a genuinely recursive/repo-wide search, with an
+    explicit read-only carve-out (``git log/show/diff``, ``ls``, ``cat`` …),
+    because the command string makes the broad scope unambiguous and CodeGraph
+    is the strictly better tool for it.
 
-    * a shell command that is a genuinely recursive/repo-wide search, with an
-      explicit read-only carve-out (``git log/show/diff``, ``ls``, ``cat`` …);
-    * built-in agent fan-out (``Task``) — unambiguously "should be a swarm."
-
-    Native search/glob tools (Grep/Glob/codebase_search) are NOT denied — their
-    scope isn't visible in the hook payload, so blocking them all wedges benign
-    inspection. Anything namespaced ``puppetmaster`` / ``mcp`` is always allowed,
-    and plain file reads (``Read``) are never touched.
+    Native search/glob tools (Grep/Glob/codebase_search) and the built-in agent
+    fan-out (``Task``/``Agent``) are NOT denied — their scope isn't visible in
+    the hook payload and the agent tool has irreplaceable native uses, so
+    blocking them wedges benign work. Anything namespaced ``puppetmaster`` /
+    ``mcp`` is always allowed, and plain file reads (``Read``) are never touched.
     """
     name = (tool_name or "").strip().lower()
     if not name:
@@ -240,10 +244,29 @@ def classify_tool(tool_name: str, tool_input: Any) -> tuple[bool, str]:
             return True, "puppetmaster_codegraph_search"
         return False, ""
 
-    if base in _BROAD_AGENT_TOOLS:
-        return True, _TOOL_REDIRECT.get(base, "puppetmaster_start_cursor_swarm")
-
     return False, ""
+
+
+def _puppetmaster_tools_available(env: Optional[Mapping[str, str]] = None) -> bool:
+    """Best-effort: is a Puppetmaster MCP server actually alive to redirect to?
+
+    The hook must never steer a native tool toward a Puppetmaster verb the agent
+    can't call. Reads the per-user MCP server registry and reports whether any
+    tracked server process is alive. Fails closed (``False`` → the hook becomes a
+    no-op) on any error, because allowing the native tool is always safe and a
+    wrongful deny is the bug we're fixing. ``PUPPETMASTER_HOOK_ASSUME_TOOLS``
+    (truthy/falsy) overrides the probe for power users and tests.
+    """
+    environ = env if env is not None else os.environ
+    override = environ.get(_ASSUME_TOOLS_ENV)
+    if override is not None:
+        return str(override).strip().lower() in {"1", "true", "yes", "on"}
+    try:
+        from puppetmaster import mcp_registry
+
+        return any(entry.is_alive() for entry in mcp_registry.list_entries())
+    except Exception:
+        return False
 
 
 def handle_hook(
@@ -253,8 +276,17 @@ def handle_hook(
     event: str,
     env: Optional[Mapping[str, str]] = None,
 ) -> HookResponse:
-    """Core hook policy. Pure: same payload/event → same response."""
+    """Core hook policy. Same payload/event → same response (modulo whether a
+    Puppetmaster MCP server is alive, which is what makes steering safe)."""
     if gate_disabled(env):
+        return HookResponse(action="allow")
+
+    # If no Puppetmaster MCP server is alive, the hook is a complete no-op: it
+    # must never deny a native tool or inject a "use <verb>" directive for a
+    # tool the agent can't call. Field reports: the hook denied the native Agent
+    # tool and insisted on puppetmaster_start_swarm while the swarm tools weren't
+    # connected, leaving the turn wedged.
+    if not _puppetmaster_tools_available(env):
         return HookResponse(action="allow")
 
     kind = normalize_event(event)
@@ -267,10 +299,11 @@ def handle_hook(
             return HookResponse(
                 action="deny",
                 reason=(
-                    f"[Puppetmaster] Native '{tool_name}' is broad exploration. "
-                    f"Use `{verb}` instead — CodeGraph/swarm is faster, cheaper, "
-                    f"and auditable. (Set PUPPETMASTER_AUTO_INVOKE_DISABLED=1 to "
-                    f"turn this off.)"
+                    f"[Puppetmaster] Native '{tool_name}' is a repo-wide search. "
+                    f"Use `{verb}` instead — CodeGraph is faster, cheaper, and "
+                    f"auditable. If the MCP tool isn't reachable, run "
+                    f"`python -m puppetmaster codegraph search '<query>'`. "
+                    f"(Set PUPPETMASTER_AUTO_INVOKE_DISABLED=1 to turn this off.)"
                 ),
             )
         return HookResponse(action="allow")

@@ -13577,12 +13577,18 @@ class InvocationGateTests(unittest.TestCase):
 class HookRunnerTests(unittest.TestCase):
     """Tests for host hook payload → response translation."""
 
+    # When a Puppetmaster MCP server is alive, steering is in effect. Most hook
+    # tests assert that behavior, so assume tools-available unless a test says
+    # otherwise. (The "no server alive -> no-op" contract has its own tests.)
+    _TOOLS_ON = {"PUPPETMASTER_HOOK_ASSUME_TOOLS": "1"}
+    _TOOLS_OFF = {"PUPPETMASTER_HOOK_ASSUME_TOOLS": "0"}
+
     def test_user_prompt_injects_directive_when_delegating(self):
         from puppetmaster.hook_runner import handle_hook
 
         r = handle_hook(
             {"prompt": "refactor the auth module across all files"},
-            host="cursor", event="beforeSubmitPrompt",
+            host="cursor", event="beforeSubmitPrompt", env=self._TOOLS_ON,
         )
         self.assertEqual(r.action, "allow")
         self.assertIn("Puppetmaster", r.context)
@@ -13590,41 +13596,70 @@ class HookRunnerTests(unittest.TestCase):
         self.assertEqual(out["permission"], "allow")
         self.assertIn("additionalContext", out)
 
-    def test_pre_tool_denies_native_task_fanout(self):
+    def test_pre_tool_allows_native_task_fanout(self):
+        """Native Task/Agent must NOT be hard-denied: it wedged turns when the
+        swarm tools weren't connected, and it over-reaches onto native subagents
+        Puppetmaster does not replace (browser-use, ci-investigator, …).
+        Steering toward a swarm stays at the non-blocking prompt layer."""
         from puppetmaster.hook_runner import handle_hook
 
-        r = handle_hook({"tool_name": "Task"}, host="claude", event="PreToolUse")
-        self.assertEqual(r.action, "deny")
-        out = r.to_host_json("claude")
-        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        for host, event in (("claude", "PreToolUse"), ("cursor", "pre-tool")):
+            for tool in ("Task", "Agent"):
+                r = handle_hook(
+                    {"tool_name": tool}, host=host, event=event, env=self._TOOLS_ON
+                )
+                self.assertEqual(r.action, "allow", f"{host}/{tool}")
 
-    def test_deny_redirect_suggests_host_portable_verb(self):
-        """Field fix: a Claude Code host with no Cursor installed was told to
-        use `puppetmaster_start_cursor_swarm`, a verb it cannot run — the deny
-        blocked native Task AND the recommendation was uninvokable, wedging the
-        turn. Non-Cursor hosts must be pointed at platform-routing verbs."""
+    def test_hook_is_noop_when_no_mcp_server_available(self):
+        """The core fix: with no Puppetmaster MCP server alive there is nothing
+        to redirect to, so the hook must allow every native tool and inject no
+        directive — never wedge a session toward an unreachable verb."""
         from puppetmaster.hook_runner import handle_hook
 
-        claude = handle_hook({"tool_name": "Task"}, host="claude", event="PreToolUse")
+        # A recursive shell search would normally be redirected...
+        redirected = handle_hook(
+            {"tool_name": "shell", "command": "rg -r TODO ./src"},
+            host="cursor", event="pre-tool", env=self._TOOLS_ON,
+        )
+        self.assertEqual(redirected.action, "deny")
+        # ...but not when no server is available.
+        for payload, event in (
+            ({"tool_name": "shell", "command": "rg -r TODO ./src"}, "pre-tool"),
+            ({"tool_name": "Task"}, "pre-tool"),
+            ({"prompt": "audit the whole repo for security risks"}, "beforeSubmitPrompt"),
+        ):
+            r = handle_hook(payload, host="cursor", event=event, env=self._TOOLS_OFF)
+            self.assertEqual(r.action, "allow")
+            self.assertEqual(r.context, "")
+
+    def test_deny_redirect_names_cli_fallback(self):
+        """A redirected recursive search must not be a dead-end if the MCP tool
+        isn't reachable — the deny reason names the CLI passthrough."""
+        from puppetmaster.hook_runner import handle_hook
+
+        claude = handle_hook(
+            {"tool_name": "shell", "command": "grep -R foo ."},
+            host="claude", event="PreToolUse", env=self._TOOLS_ON,
+        )
         self.assertEqual(claude.action, "deny")
-        self.assertIn("puppetmaster_start_swarm", claude.reason)
-        self.assertNotIn("cursor", claude.reason)
-
-        cursor = handle_hook({"tool_name": "Task"}, host="cursor", event="pre-tool")
-        self.assertEqual(cursor.action, "deny")
-        self.assertIn("puppetmaster_start_cursor_swarm", cursor.reason)
+        self.assertIn("puppetmaster_codegraph_search", claude.reason)
+        self.assertIn("python -m puppetmaster codegraph", claude.reason)
 
     def test_prompt_directive_suggests_host_portable_verb(self):
         from puppetmaster.hook_runner import handle_hook
 
         prompt = {"prompt": "review the whole repo for security risks"}
-        claude = handle_hook(prompt, host="claude", event="UserPromptSubmit")
+        claude = handle_hook(
+            prompt, host="claude", event="UserPromptSubmit", env=self._TOOLS_ON
+        )
         self.assertEqual(claude.action, "allow")
         self.assertTrue(claude.decision.should_delegate)
         self.assertNotIn("cursor", claude.decision.suggested_verb)
         self.assertNotIn("cursor", claude.context)
 
-        cursor = handle_hook(prompt, host="cursor", event="beforeSubmitPrompt")
+        cursor = handle_hook(
+            prompt, host="cursor", event="beforeSubmitPrompt", env=self._TOOLS_ON
+        )
         self.assertEqual(cursor.decision.suggested_verb, "puppetmaster_start_cursor_review")
 
     def test_verb_for_host_translation_table(self):
@@ -13705,7 +13740,11 @@ class HookRunnerTests(unittest.TestCase):
 
         stdin = io.StringIO(json.dumps({"prompt": "audit the whole repo for races"}))
         stdout = io.StringIO()
-        rc = run(["--host", "cursor", "--event", "user-prompt"], stdin=stdin, stdout=stdout)
+        rc = run(
+            ["--host", "cursor", "--event", "user-prompt"],
+            stdin=stdin, stdout=stdout,
+            env={"PUPPETMASTER_HOOK_ASSUME_TOOLS": "1"},
+        )
         self.assertEqual(rc, 0)
         payload = json.loads(stdout.getvalue())
         self.assertIn("additionalContext", payload)
