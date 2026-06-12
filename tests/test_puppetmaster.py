@@ -10896,6 +10896,138 @@ class RoutingAuditTests(unittest.TestCase):
         self.assertIsNone(strong.suggested_score)  # no counterfactual -> no number
         self.assertEqual(report.suggestions, [])
 
+    def _rec_with_tokens(self, model_id, *, est_in, est_out, act_in, act_out,
+                         measured, cost=0.001):
+        from puppetmaster.audit import TaskAuditRecord
+
+        return TaskAuditRecord(
+            model_id=model_id, adapter="cursor", capability_needed=40,
+            est_cost_usd=cost, confidence=0.9, escalated=False,
+            escalated_from=None, fell_back=False,
+            est_tokens_in=est_in, est_tokens_out=est_out,
+            actual_tokens_in=act_in, actual_tokens_out=act_out,
+            actual_tokens_measured=measured,
+        )
+
+    def test_token_drift_reconciled_per_model_and_jobwide(self) -> None:
+        from puppetmaster.audit import build_audit_report
+
+        # Estimated 1000 tokens/task, actually burned 1500 — router under-estimated.
+        records = [
+            self._rec_with_tokens("m/60", est_in=600, est_out=400,
+                                  act_in=900, act_out=600, measured=True)
+            for _ in range(4)
+        ]
+        report = build_audit_report(records, {"m/60": 60})
+        m = next(x for x in report.models if x.model_id == "m/60")
+        self.assertEqual(m.runs_with_actuals, 4)
+        self.assertEqual(m.measured_runs, 4)
+        self.assertEqual(m.est_tokens, 4000)
+        self.assertEqual(m.actual_tokens, 6000)
+        self.assertAlmostEqual(m.token_drift_ratio, 1.5, places=3)
+        # Job-wide rollup mirrors the per-model figures.
+        self.assertEqual(report.tasks_with_actuals, 4)
+        self.assertAlmostEqual(report.token_drift_ratio, 1.5, places=3)
+
+    def test_cost_drift_uses_injected_price_fn(self) -> None:
+        from puppetmaster.audit import build_audit_report
+
+        records = [
+            self._rec_with_tokens("metered/70", est_in=1000, est_out=0,
+                                  act_in=2000, act_out=0, measured=True, cost=0.001),
+            # A task with no actuals must not anchor the cost-drift denominator,
+            # even though its est_cost still counts toward headline est spend.
+            self._rec("metered/70", conf=0.9, cost=0.005),
+        ]
+        # $1/Mtok input -> 2000 tokens actual = $0.002 actual vs $0.001 estimated.
+        report = build_audit_report(
+            records, {"metered/70": 70},
+            actual_cost_fn=lambda mid, tin, tout: (tin / 1_000_000.0) * 1.0,
+        )
+        m = next(x for x in report.models if x.model_id == "metered/70")
+        self.assertAlmostEqual(m.actual_spend_usd, 0.002, places=6)
+        self.assertAlmostEqual(m.cost_drift_ratio, 2.0, places=3)
+        self.assertAlmostEqual(report.total_actual_spend_usd, 0.002, places=6)
+        # Denominator is the reconciled task's est ($0.001), NOT all-tasks est.
+        self.assertAlmostEqual(report.total_est_spend_reconciled_usd, 0.001, places=6)
+        self.assertAlmostEqual(report.cost_drift_ratio, 2.0, places=3)
+
+    def test_records_without_actuals_excluded_from_drift(self) -> None:
+        from puppetmaster.audit import build_audit_report
+
+        # No usage reported (actual_tokens_measured stays None) -> not reconciled,
+        # and drift is left unknown rather than faked as zero.
+        records = [self._rec("m/60", conf=0.9) for _ in range(3)]
+        report = build_audit_report(records, {"m/60": 60})
+        m = next(x for x in report.models if x.model_id == "m/60")
+        self.assertEqual(m.runs_with_actuals, 0)
+        self.assertIsNone(m.token_drift_ratio)
+        self.assertEqual(report.tasks_with_actuals, 0)
+        self.assertIsNone(report.token_drift_ratio)
+
+    def test_approximated_actuals_counted_but_flagged_unmeasured(self) -> None:
+        from puppetmaster.audit import build_audit_report
+
+        records = [
+            self._rec_with_tokens("m/60", est_in=500, est_out=500,
+                                  act_in=400, act_out=400, measured=False)
+        ]
+        report = build_audit_report(records, {"m/60": 60})
+        m = next(x for x in report.models if x.model_id == "m/60")
+        self.assertEqual(m.runs_with_actuals, 1)
+        self.assertEqual(m.measured_runs, 0)  # char/4 approximation, not measured
+        self.assertAlmostEqual(m.token_drift_ratio, 0.8, places=3)
+
+    def test_collect_records_captures_token_usage(self) -> None:
+        from puppetmaster.audit import build_audit_report, collect_records
+        from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
+        from puppetmaster.store import SwarmStore
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            job = store.create_job("recon goal")
+            task = Task(
+                job_id=job.id, role="implement", instruction="do it",
+                adapter="cursor", status=TaskStatus.COMPLETE,
+                payload={
+                    "router_model_id": "m/60",
+                    "router_capability_needed": 60,
+                    "router_estimated_cost_usd": 0.001,
+                },
+            )
+            store.save_task(task)
+            store.save_artifact(Artifact(
+                job_id=job.id, task_id=task.id, type=ArtifactType.ROUTING,
+                created_by="router",
+                payload={"model_id": "m/60", "adapter": "cursor",
+                         "policy": "balanced", "capability_needed": 60,
+                         "estimated_cost_usd": 0.001,
+                         "estimated_tokens_in": 800, "estimated_tokens_out": 200},
+                confidence=0.9, evidence=["role:implement"],
+            ))
+            store.save_artifact(Artifact(
+                job_id=job.id, task_id=task.id, type=ArtifactType.VERIFICATION,
+                created_by="w",
+                payload={"check": "x", "result": "passed",
+                         "tokens_in": 1200, "tokens_out": 300,
+                         "tokens_estimated": False},
+                confidence=0.92, evidence=["e"],
+            ))
+
+            records, jobs = collect_records(store)
+            self.assertEqual(len(records), 1)
+            r = records[0]
+            self.assertEqual(r.est_tokens_total, 1000)
+            self.assertEqual(r.actual_tokens_total, 1500)
+            self.assertTrue(r.actual_tokens_measured)
+            self.assertTrue(r.has_actuals)
+
+            report = build_audit_report(records, {"m/60": 60})
+            self.assertEqual(report.total_est_tokens, 1000)
+            self.assertEqual(report.total_actual_tokens, 1500)
+            self.assertAlmostEqual(report.token_drift_ratio, 1.5, places=3)
+
     def test_collect_records_from_store(self) -> None:
         from puppetmaster.audit import build_audit_report, collect_records
         from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus

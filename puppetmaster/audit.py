@@ -22,7 +22,7 @@ feedback ratchets that only ever raise cost — the opposite of the point. So:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 # Confidence at or above this is "fine"; below it counts toward low-confidence.
 LOW_CONFIDENCE_BAR = 0.6
@@ -52,6 +52,30 @@ class TaskAuditRecord:
     escalated: bool  # this task was escalated up from a weaker model
     escalated_from: Optional[str]  # the weaker model it escalated off of
     fell_back: bool  # this task fell back after an adapter failure
+    # Estimate-vs-actual reconciliation. The router's pre-flight token/cost
+    # estimate drives every routing decision; measuring it against what the run
+    # actually consumed is the only way to know the estimate (and therefore the
+    # savings ledger) is calibrated rather than asserted.
+    est_tokens_in: int = 0
+    est_tokens_out: int = 0
+    actual_tokens_in: int = 0
+    actual_tokens_out: int = 0
+    # True when actuals came from a real SDK usage object; False when they are a
+    # char/4 approximation. None when the run reported no token usage at all
+    # (so drift is simply unknown, never faked as zero).
+    actual_tokens_measured: Optional[bool] = None
+
+    @property
+    def has_actuals(self) -> bool:
+        return self.actual_tokens_measured is not None
+
+    @property
+    def est_tokens_total(self) -> int:
+        return self.est_tokens_in + self.est_tokens_out
+
+    @property
+    def actual_tokens_total(self) -> int:
+        return self.actual_tokens_in + self.actual_tokens_out
 
 
 @dataclass
@@ -68,6 +92,16 @@ class ModelAudit:
     escalated_away_rate: float
     fell_back_away: int
     est_spend_usd: float
+    # Estimate-vs-actual reconciliation, aggregated over this model's retained
+    # tasks that reported token usage. ``*_drift_ratio`` is actual/estimated:
+    # 1.0 = spot on, >1 = the router under-estimated, <1 = it over-estimated.
+    runs_with_actuals: int = 0
+    measured_runs: int = 0  # of runs_with_actuals, how many were measured (not char/4)
+    est_tokens: int = 0
+    actual_tokens: int = 0
+    token_drift_ratio: Optional[float] = None
+    actual_spend_usd: float = 0.0
+    cost_drift_ratio: Optional[float] = None
     flags: list[str] = field(default_factory=list)
     suggested_score: Optional[int] = None
     rationale: Optional[str] = None
@@ -80,6 +114,24 @@ class AuditReport:
     window_days: Optional[float]
     total_est_spend_usd: float
     models: list[ModelAudit]
+    # Job-wide reconciliation rollup across every task that reported usage.
+    tasks_with_actuals: int = 0
+    total_est_tokens: int = 0
+    total_actual_tokens: int = 0
+    total_actual_spend_usd: float = 0.0
+    # Estimated spend over *only the reconciled tasks* — the apples-to-apples
+    # denominator for cost drift (``total_est_spend_usd`` covers every task,
+    # including ones with no actuals, so it must not anchor the ratio).
+    total_est_spend_reconciled_usd: float = 0.0
+
+    @property
+    def token_drift_ratio(self) -> Optional[float]:
+        return (self.total_actual_tokens / self.total_est_tokens) if self.total_est_tokens else None
+
+    @property
+    def cost_drift_ratio(self) -> Optional[float]:
+        denom = self.total_est_spend_reconciled_usd
+        return (self.total_actual_spend_usd / denom) if denom else None
 
     @property
     def suggestions(self) -> list[dict]:
@@ -109,9 +161,17 @@ def build_audit_report(
     jobs_considered: int = 0,
     low_confidence_bar: float = LOW_CONFIDENCE_BAR,
     min_sample: int = MIN_SAMPLE,
+    actual_cost_fn: Optional[Callable[[str, int, int], float]] = None,
 ) -> AuditReport:
     """Aggregate per-model routing behavior and propose conservative score
-    adjustments. Pure function — no I/O."""
+    adjustments. Pure function — no I/O.
+
+    ``actual_cost_fn(model_id, tokens_in, tokens_out)`` prices measured token
+    consumption the same way the router priced its estimate (marginal cost, so
+    plan-billed models read $0 on both sides — an honest apples-to-apples
+    comparison). When omitted, only token drift is reconciled and actual-cost
+    columns stay zero rather than guessing a dollar figure.
+    """
     model_ids = set(registry_scores) | {r.model_id for r in records}
     model_ids |= {r.escalated_from for r in records if r.escalated_from}
 
@@ -139,6 +199,18 @@ def build_audit_report(
         escalated_away_rate = (away / selections) if selections else 0.0
         low_conf_rate = (len(low) / len(confidences)) if confidences else 0.0
 
+        reconciled = [r for r in retained if r.has_actuals]
+        est_tokens = sum(r.est_tokens_total for r in reconciled)
+        actual_tokens = sum(r.actual_tokens_total for r in reconciled)
+        measured_runs = sum(1 for r in reconciled if r.actual_tokens_measured)
+        actual_spend = 0.0
+        if actual_cost_fn is not None:
+            actual_spend = sum(
+                actual_cost_fn(r.model_id, r.actual_tokens_in, r.actual_tokens_out)
+                for r in reconciled
+            )
+        recon_est_spend = sum(r.est_cost_usd for r in reconciled)
+
         audit = ModelAudit(
             model_id=model_id,
             adapter=retained[0].adapter if retained else "",
@@ -152,17 +224,40 @@ def build_audit_report(
             escalated_away_rate=round(escalated_away_rate, 3),
             fell_back_away=fell_back_away,
             est_spend_usd=round(spend, 6),
+            runs_with_actuals=len(reconciled),
+            measured_runs=measured_runs,
+            est_tokens=est_tokens,
+            actual_tokens=actual_tokens,
+            token_drift_ratio=round(actual_tokens / est_tokens, 3) if est_tokens else None,
+            actual_spend_usd=round(actual_spend, 6),
+            cost_drift_ratio=(
+                round(actual_spend / recon_est_spend, 3) if recon_est_spend else None
+            ),
         )
         _classify(audit, retained, low_confidence_bar, min_sample)
         audits.append(audit)
 
     audits.sort(key=lambda m: (m.selections, m.est_spend_usd), reverse=True)
+    reconciled_all = [r for r in records if r.has_actuals]
+    total_actual_spend = 0.0
+    if actual_cost_fn is not None:
+        total_actual_spend = sum(
+            actual_cost_fn(r.model_id, r.actual_tokens_in, r.actual_tokens_out)
+            for r in reconciled_all
+        )
     return AuditReport(
         jobs_considered=jobs_considered,
         tasks_considered=len(records),
         window_days=window_days,
         total_est_spend_usd=round(sum(r.est_cost_usd for r in records), 6),
         models=audits,
+        tasks_with_actuals=len(reconciled_all),
+        total_est_tokens=sum(r.est_tokens_total for r in reconciled_all),
+        total_actual_tokens=sum(r.actual_tokens_total for r in reconciled_all),
+        total_actual_spend_usd=round(total_actual_spend, 6),
+        total_est_spend_reconciled_usd=round(
+            sum(r.est_cost_usd for r in reconciled_all), 6
+        ),
     )
 
 
@@ -260,6 +355,10 @@ def collect_records(store, *, window_days: Optional[float] = None) -> tuple[list
         escalated_from: dict[str, str] = {}
         fell_back: set[str] = set()
         latest_conf: dict[str, tuple[str, float]] = {}  # task_id -> (created_at, confidence)
+        # task_id -> (created_at, tokens_in, tokens_out, estimated) for the latest
+        # run that actually reported token usage. Only verification artifacts that
+        # carry a usage record contribute, so a task with no usage stays unknown.
+        latest_usage: dict[str, tuple[str, int, int, bool]] = {}
         for a in artifacts:
             payload = a.payload or {}
             kind = a.type.value
@@ -276,6 +375,15 @@ def collect_records(store, *, window_days: Optional[float] = None) -> tuple[list
                 prev = latest_conf.get(a.task_id)
                 if prev is None or a.created_at >= prev[0]:
                     latest_conf[a.task_id] = (a.created_at, float(a.confidence))
+                if "tokens_in" in payload or "tokens_out" in payload:
+                    prev_usage = latest_usage.get(a.task_id)
+                    if prev_usage is None or a.created_at >= prev_usage[0]:
+                        latest_usage[a.task_id] = (
+                            a.created_at,
+                            int(payload.get("tokens_in") or 0),
+                            int(payload.get("tokens_out") or 0),
+                            bool(payload.get("tokens_estimated")),
+                        )
 
         for task_id, task in tasks.items():
             payload = task.payload or {}
@@ -284,6 +392,7 @@ def collect_records(store, *, window_days: Optional[float] = None) -> tuple[list
                 continue  # not a router-placed task
             initial = initial_by_task.get(task_id, {})
             conf = latest_conf.get(task_id)
+            usage = latest_usage.get(task_id)
             records.append(
                 TaskAuditRecord(
                     model_id=final_model,
@@ -298,6 +407,11 @@ def collect_records(store, *, window_days: Optional[float] = None) -> tuple[list
                     escalated=task_id in escalated_from,
                     escalated_from=escalated_from.get(task_id),
                     fell_back=task_id in fell_back,
+                    est_tokens_in=int(initial.get("estimated_tokens_in") or 0),
+                    est_tokens_out=int(initial.get("estimated_tokens_out") or 0),
+                    actual_tokens_in=usage[1] if usage else 0,
+                    actual_tokens_out=usage[2] if usage else 0,
+                    actual_tokens_measured=(not usage[3]) if usage else None,
                 )
             )
     return records, jobs_considered

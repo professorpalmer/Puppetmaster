@@ -4470,10 +4470,21 @@ def _run_audit_command(args, store) -> int:
     registry_path = _registry_path_from_args(args) or default_registry_path()
     registry = load_registry(registry_path)
     scores = {s.id: s.capability_score for s in registry}
+    specs_by_id = {s.id: s for s in registry}
+
+    def actual_cost_fn(model_id: str, tokens_in: int, tokens_out: int) -> float:
+        spec = specs_by_id.get(model_id)
+        # Price actuals with the same marginal-cost basis the router used for its
+        # estimate, so plan-billed models read $0 on both sides (honest parity).
+        return spec.marginal_cost_usd(tokens_in, tokens_out) if spec else 0.0
 
     records, jobs_considered = collect_records(store, window_days=args.window)
     report = build_audit_report(
-        records, scores, window_days=args.window, jobs_considered=jobs_considered
+        records,
+        scores,
+        window_days=args.window,
+        jobs_considered=jobs_considered,
+        actual_cost_fn=actual_cost_fn,
     )
 
     if args.json:
@@ -4484,6 +4495,14 @@ def _run_audit_command(args, store) -> int:
                     "tasks_considered": report.tasks_considered,
                     "window_days": report.window_days,
                     "total_est_spend_usd": report.total_est_spend_usd,
+                    "reconciliation": {
+                        "tasks_with_actuals": report.tasks_with_actuals,
+                        "total_est_tokens": report.total_est_tokens,
+                        "total_actual_tokens": report.total_actual_tokens,
+                        "token_drift_ratio": report.token_drift_ratio,
+                        "total_actual_spend_usd": report.total_actual_spend_usd,
+                        "cost_drift_ratio": report.cost_drift_ratio,
+                    },
                     "models": [asdict(m) for m in report.models],
                     "suggestions": report.suggestions,
                 },
@@ -4504,16 +4523,39 @@ def _run_audit_command(args, store) -> int:
             )
         else:
             print(
-                f"  {'model':<26}{'picks':>6}{'conf':>7}{'esc%':>7}  flags"
+                f"  {'model':<26}{'picks':>6}{'conf':>7}{'esc%':>7}{'drift':>8}  flags"
             )
             for m in report.models:
                 if m.selections == 0 and m.runs_with_confidence == 0:
                     continue
                 conf = f"{m.mean_confidence:.2f}" if m.mean_confidence is not None else "  -"
                 esc = f"{m.escalated_away_rate:.0%}"
+                drift = f"{m.token_drift_ratio:.2f}x" if m.token_drift_ratio is not None else "  -"
                 print(
-                    f"  {m.model_id:<26}{m.selections:>6}{conf:>7}{esc:>7}  "
+                    f"  {m.model_id:<26}{m.selections:>6}{conf:>7}{esc:>7}{drift:>8}  "
                     f"{', '.join(m.flags)}"
+                )
+            if report.tasks_with_actuals:
+                tok = report.token_drift_ratio
+                tok_str = f"{tok:.2f}x actual/est" if tok is not None else "n/a"
+                line = (
+                    f"  reconciled {report.tasks_with_actuals}/{report.tasks_considered} "
+                    f"tasks: tokens {report.total_actual_tokens:,} actual vs "
+                    f"{report.total_est_tokens:,} est ({tok_str})"
+                )
+                cost = report.cost_drift_ratio
+                if cost is not None:
+                    line += (
+                        f"; metered cost ${report.total_actual_spend_usd:.4f} actual vs "
+                        f"${report.total_est_spend_reconciled_usd:.4f} est ({cost:.2f}x)"
+                    )
+                else:
+                    line += "; cost $0 (plan-billed — tokens are the real signal)"
+                print(line)
+            else:
+                print(
+                    "  No token usage recorded yet — estimate-vs-actual drift will "
+                    "populate once routed runs report usage."
                 )
         if report.suggestions:
             print("\nSuggested score changes (your assertion stays the source of truth):")
