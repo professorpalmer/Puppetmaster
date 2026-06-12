@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.9.44
+
+**CI/test reliability: green the macOS release lane — no product behavior change from v0.9.43.** The v0.9.43 *tag* CI went red on `macos-latest` only (the same commit was green on `main`): `test_input_staleness_watcher_resets_when_message_arrives` failed on `self.assertFalse(triggered.wait(timeout=0.1))`, and a rerun reproduced it — so it's environmental, not a rare flake. By construction that test uses `stale_after=0.2s` with a fresh inbound mark, so the idle-staleness path *mathematically cannot* fire inside the 0.1s window; the only other trigger is the watcher's parent-death reap (`os.getppid() == 1`), and loaded macOS GitHub runners transiently reparent a test process to `launchd`. That orthogonal orphan signal was leaking into three idle-focused watcher tests. Full suite **647** green.
+
+- **Idle-staleness tests pin off the parent-death reap.** All three `_InputStalenessWatcher` idle tests now patch `_parent_is_dead -> False`, so each exercises only the idle-staleness guarantee it claims. Parent-death keeps its own dedicated test (which patches it `True`), so coverage is unchanged.
+- **Product code untouched.** `mcp_server.py` and every shipping module are byte-identical to v0.9.43; the Codex auto-detach fix from v0.9.43 stands. This release exists solely to carry the test de-flake on a green release tag.
+
 ## v0.9.43
 
 **Fix: synchronous worker verbs are now Codex-safe — they auto-detach to a `job_id` instead of blocking past Codex's hard tool timeout (investigation: Victor's recurring "Transport closed" on Codex).** Driving real Codex (codex-cli 0.134.0) against the MCP with full `rmcp=trace` exonerated the prime suspects with receipts: the idle keepalive's `notifications/message` frames are parsed and accepted by rmcp (7 frames over 45s, zero errors), the `2024-11-05` handshake is accepted, and a per-tool timeout firing mid-call does **not** drop the transport (the next call succeeds). The one real Codex gap: Codex enforces a hard `tool_timeout_sec` and sends **no `progressToken`**, so our progress keepalive can never extend it — any synchronous worker verb (cursor/claude/codex/openai review·plan·implement) that runs past the budget gets cancelled and a healthy job reads as failed. Full suite **647** green (+8 focused tests); fix live-verified end-to-end against real Codex.
