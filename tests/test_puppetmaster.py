@@ -13965,27 +13965,67 @@ class HostGatedIdleReapTests(unittest.TestCase):
                 check_interval_seconds=1.0,
                 on_shutdown=lambda: None,
             )
-            gated = mcp_server._InputStalenessWatcher(idle_reap_enabled=False, **stale_args)
-            open_reap = mcp_server._InputStalenessWatcher(idle_reap_enabled=True, **stale_args)
+            gated = mcp_server._InputStalenessWatcher(reap_enabled=False, **stale_args)
+            open_reap = mcp_server._InputStalenessWatcher(reap_enabled=True, **stale_args)
             self.assertFalse(gated._should_reap())
             self.assertTrue(open_reap._should_reap())
         finally:
             with mcp_server._INPUT_STATE_LOCK:
                 mcp_server._LAST_INBOUND_MESSAGE_AT, mcp_server._ACTIVE_TOOL_CALLS = prior
 
-    def test_parent_death_reaps_regardless_of_host_gating(self):
+    def test_parent_death_reap_is_host_gated(self):
+        """Regression: a reparented-to-init (``getppid()==1``) server on a
+        non-respawn host (Codex/Claude) must NOT self-reap. An exiting
+        intermediate launcher reparents us to init while the real owner is
+        alive and still holds the pipe; reaping there closes stdin and the
+        host sees a false "Transport closed". stdin EOF is the authoritative
+        owner-death signal on those hosts. Reap stays on for respawn hosts."""
         from puppetmaster import mcp_server
 
+        with patch.object(
+            mcp_server._InputStalenessWatcher, "_parent_is_dead", staticmethod(lambda: True)
+        ):
+            codex_like = mcp_server._InputStalenessWatcher(
+                stale_after_seconds=99999.0,
+                check_interval_seconds=1.0,
+                on_shutdown=lambda: None,
+                reap_enabled=False,
+            )
+            cursor_like = mcp_server._InputStalenessWatcher(
+                stale_after_seconds=99999.0,
+                check_interval_seconds=1.0,
+                on_shutdown=lambda: None,
+                reap_enabled=True,
+            )
+            self.assertFalse(codex_like._should_reap())
+            self.assertTrue(cursor_like._should_reap())
+
+    def test_codex_handshake_suppresses_reap_despite_respawn_env(self):
+        """Regression: Codex scrubs CODEX_* from our env, so a Codex session
+        launched from a Cursor terminal leaks CURSOR_* and freezes
+        ``reap_enabled=True`` at startup. Once the handshake identifies a Codex
+        client, parent-death must NOT reap — otherwise the server self-kills
+        and Codex reports "Transport closed"."""
+        from puppetmaster import mcp_server
+
+        # Env-derived gate said "respawn host" (looks like Cursor).
         watcher = mcp_server._InputStalenessWatcher(
             stale_after_seconds=99999.0,
             check_interval_seconds=1.0,
             on_shutdown=lambda: None,
-            idle_reap_enabled=False,
+            reap_enabled=True,
         )
-        with patch.object(
-            mcp_server._InputStalenessWatcher, "_parent_is_dead", staticmethod(lambda: True)
-        ):
-            self.assertTrue(watcher._should_reap())
+        prior_client = dict(mcp_server._CLIENT_INFO)
+        try:
+            mcp_server._CLIENT_INFO.clear()
+            mcp_server._CLIENT_INFO.update({"name": "codex-mcp-client", "title": "Codex"})
+            with patch.object(
+                mcp_server._InputStalenessWatcher, "_parent_is_dead", staticmethod(lambda: True)
+            ):
+                self.assertFalse(watcher._should_reap())
+        finally:
+            mcp_server._CLIENT_INFO.clear()
+            mcp_server._CLIENT_INFO.update(prior_client)
 
     def test_forced_flag_reenables_idle_reap(self):
         from puppetmaster.mcp_server import _input_staleness_forced

@@ -623,16 +623,31 @@ class _InputStalenessWatcher(threading.Thread):
     measures Python process liveness, not stdin liveness — so we
     measure inbound JSON-RPC traffic directly.
 
-    Two independent orphan signals:
+    All self-reaping is **host-gated** by ``reap_enabled`` (see ``main()``):
+    on only — Cursor (or an explicit ``PUPPETMASTER_MCP_INPUT_STALE_FORCED``
+    override). The reason is that the only authoritative owner-death signal
+    for a stdio server is **stdin EOF**: the host holds the write end of our
+    stdin, so when the host dies the pipe closes and the ``for line in
+    sys.stdin`` loop in ``main()`` exits cleanly on its own — on every host,
+    with no watcher involved. The watcher exists purely to clean up Cursor's
+    *lease-cycle orphan*: a server Cursor abandons without closing stdin and
+    then transparently respawns on the next call. A false reap there is
+    invisible. On Claude Code / Codex a reaped server instead presents as a
+    dead transport (Codex "Transport closed") until the user restarts, so on
+    those hosts a leaked-but-alive server is far cheaper than a wrong reap —
+    the watcher stays out of the way and stdin EOF does the cleanup.
 
-    * **Parent death** (every host): the spawning host process died and we
-      were reparented to init. Nobody owns this server or will ever read a
-      response from it — reap immediately.
-    * **Idle staleness** (Cursor only, see ``idle_reap_enabled``): no stdin
-      message in ``stale_after_seconds`` and zero in-flight tool calls.
-      Only Cursor both leaks lease-cycle orphans and transparently respawns
-      a reaped server; on Claude Code / Codex the same reap presents as a
-      dead connection until the user restarts their session.
+    When reaping is enabled, two signals fire it:
+
+    * **Parent death**: ``getppid() == 1`` — we were reparented to init.
+    * **Idle staleness**: no stdin message in ``stale_after_seconds`` and
+      zero in-flight tool calls.
+
+    Neither is authoritative on its own. ``getppid() == 1`` in particular is
+    a false positive when the host spawns us through an intermediate launcher
+    that exits: the launcher's death reparents us to init while the real
+    owner is alive and still holding the pipe. That is exactly why the signal
+    is gated to respawn-hosts where a wrong reap costs nothing.
 
     On detection we close stdin, which causes the ``for line in sys.stdin``
     loop in ``main()`` to terminate with EOF. The existing finally
@@ -646,13 +661,13 @@ class _InputStalenessWatcher(threading.Thread):
         stale_after_seconds: float,
         check_interval_seconds: float,
         on_shutdown: Callable[[], None],
-        idle_reap_enabled: bool = True,
+        reap_enabled: bool = True,
     ) -> None:
         super().__init__(daemon=True, name="puppetmaster-mcp-input-stale-watcher")
         self._stale_after = stale_after_seconds
         self._interval = check_interval_seconds
         self._on_shutdown = on_shutdown
-        self._idle_reap_enabled = idle_reap_enabled
+        self._reap_enabled = reap_enabled
         self._stop = threading.Event()
         self._triggered = False
 
@@ -673,10 +688,22 @@ class _InputStalenessWatcher(threading.Thread):
             return False
 
     def _should_reap(self) -> bool:
+        # Host-gated: on hosts that surface a reaped server as a dead
+        # transport (Codex "Transport closed", Claude Code), never self-reap.
+        # Their authoritative owner-death signal is stdin EOF, handled by the
+        # main loop — so a server reparented to init by an exiting launcher
+        # while the owner is alive must NOT kill itself.
+        if not self._reap_enabled:
+            return False
+        # Live handshake override: ``reap_enabled`` is frozen at startup from
+        # env, but Codex scrubs CODEX_* from our env, so a Codex session
+        # launched from a Cursor terminal leaks CURSOR_* and is misread as a
+        # respawn host. Once the ``initialize`` handshake reveals a Codex
+        # client, never self-reap regardless of the startup env guess.
+        if _client_is_codex():
+            return False
         if self._parent_is_dead():
             return True
-        if not self._idle_reap_enabled:
-            return False
         last_msg, active = _input_state_snapshot()
         return (time.time() - last_msg) >= self._stale_after and active == 0
 
@@ -895,7 +922,7 @@ def main() -> int:
                 _DEFAULT_INPUT_STALE_CHECK_SECONDS,
             ),
             on_shutdown=_request_clean_shutdown,
-            idle_reap_enabled=_input_staleness_forced() or _host_transparently_respawns(),
+            reap_enabled=_input_staleness_forced() or _host_transparently_respawns(),
         )
         input_watcher.start()
 
