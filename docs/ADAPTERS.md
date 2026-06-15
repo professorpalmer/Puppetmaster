@@ -135,10 +135,11 @@ For Puppetmaster MCP inside Codex, install selected credential env explicitly:
 
 ```bash
 python -m puppetmaster install-codex-mcp --inherit-env OPENAI_API_KEY,CODEX_HOME
+python -m puppetmaster install-codex-mcp --map-env CODEX_HOME=MY_CODEX_API_HOME
 python -m puppetmaster install-codex-mcp --env-file ~/.config/puppetmaster/env.zsh
 ```
 
-Keep secrets in a private env file (`chmod 600`) instead of inline MCP config. `puppetmaster doctor` reports whether `OPENAI_API_KEY` and `CODEX_HOME` are visible to the MCP server without printing their values, and Codex billing detection reads `$CODEX_HOME/auth.json` before falling back to `~/.codex/auth.json`.
+Keep secrets in a private env file (`chmod 600`) instead of inline MCP config. `CODEX_HOME` is Codex's canonical auth-home variable, not a Puppetmaster requirement; use `--map-env CODEX_HOME=YOUR_LOCAL_NAME` if your machine uses a different local variable name. `puppetmaster doctor --json` reports credential visibility and billing-source evidence without printing values, and Codex billing detection reads `$CODEX_HOME/auth.json` before falling back to `~/.codex/auth.json`.
 
 Defaults are tuned for non-interactive automation: `approval_policy="never"`, `--sandbox workspace-write`, `--ephemeral`, `--skip-git-repo-check`. Use `payload.sandbox="read-only"` for explore / plan tasks that should never touch the worktree. Opt in to `payload.dangerously_bypass_approvals_and_sandbox=true` only when the surrounding environment is already externally sandboxed.
 

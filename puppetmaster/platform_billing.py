@@ -55,6 +55,33 @@ class BillingStatus:
         return self.billing == "plan"
 
 
+@dataclass(frozen=True)
+class AuthContext:
+    """Effective credential context used to detect one adapter's billing.
+
+    This keeps provider-specific detectors honest about *which* environment
+    and home directory they inspected without making any one provider's
+    variable name (for example ``CODEX_HOME``) a Puppetmaster-wide concept.
+    """
+
+    env: Mapping[str, str]
+    home: Path
+    label: str = "process"
+
+
+def auth_context(
+    *,
+    env: Optional[Mapping[str, str]] = None,
+    home: Optional[Path] = None,
+    label: str = "process",
+) -> AuthContext:
+    return AuthContext(
+        env=env if env is not None else os.environ,
+        home=home if home is not None else Path.home(),
+        label=label,
+    )
+
+
 def _default_runner(command: list[str]) -> "tuple[int, str, str]":
     try:
         completed = subprocess.run(
@@ -335,6 +362,7 @@ def detect_codex_billing(
     codex_command: str = "codex",
     env: Optional[Mapping[str, str]] = None,
     home: Optional[Path] = None,
+    context: Optional[AuthContext] = None,
 ) -> BillingStatus:
     """Codex: API key (api) vs ChatGPT subscription (plan).
 
@@ -342,12 +370,11 @@ def detect_codex_billing(
     ``~/.codex/auth.json`` (fast, deterministic, no subprocess), and only
     falls back to parsing ``codex login status`` when the file is missing.
     """
-    env = env if env is not None else os.environ
-    home = home if home is not None else Path.home()
-    auth_path, auth_label = _codex_auth_path(env, home)
+    ctx = context or auth_context(env=env, home=home)
+    auth_path, auth_label = _codex_auth_path(ctx.env, ctx.home)
     from_file = _read_codex_auth(auth_path, auth_label)
     if from_file is not None:
-        return from_file
+        return replace(from_file, evidence=[*from_file.evidence, f"auth_context:{ctx.label}"])
     run = run or _default_runner
     returncode, stdout, stderr = run([codex_command, "login", "status"])
     text = f"{stdout}\n{stderr}".lower()
@@ -357,7 +384,7 @@ def detect_codex_billing(
             billing="unknown",
             healthy=False,
             detail="Codex CLI not found on PATH.",
-            evidence=["codex_cli:missing"],
+            evidence=["codex_cli:missing", f"auth_context:{ctx.label}"],
         )
     if "not logged in" in text or "not authenticated" in text:
         return BillingStatus(
@@ -365,7 +392,7 @@ def detect_codex_billing(
             billing="unknown",
             healthy=False,
             detail="Codex is not logged in (run `codex login`).",
-            evidence=["codex_login:none"],
+            evidence=["codex_login:none", f"auth_context:{ctx.label}"],
         )
     if "api key" in text:
         return BillingStatus(
@@ -376,7 +403,7 @@ def detect_codex_billing(
                 "Codex is logged in with an OpenAI API key — work bills "
                 "per-token to that account (out-of-pocket)."
             ),
-            evidence=["codex_login:api_key"],
+            evidence=["codex_login:api_key", f"auth_context:{ctx.label}"],
         )
     if "logged in" in text or "chatgpt" in text:
         return BillingStatus(
@@ -387,14 +414,14 @@ def detect_codex_billing(
                 "Codex is logged in via a ChatGPT subscription — work is "
                 "covered by that plan."
             ),
-            evidence=["codex_login:chatgpt"],
+            evidence=["codex_login:chatgpt", f"auth_context:{ctx.label}"],
         )
     return BillingStatus(
         adapter="codex",
         billing="unknown",
         healthy=False,
         detail="Codex is not logged in (run `codex login`).",
-        evidence=["codex_login:none"],
+        evidence=["codex_login:none", f"auth_context:{ctx.label}"],
     )
 
 
@@ -423,7 +450,7 @@ _DETECTORS: dict[str, Callable[..., BillingStatus]] = {
         env=kw.get("env"), home=kw.get("home")
     ),
     "codex": lambda **kw: detect_codex_billing(
-        run=kw.get("run"), env=kw.get("env"), home=kw.get("home")
+        run=kw.get("run"), env=kw.get("env"), home=kw.get("home"), context=kw.get("context")
     ),
     "openai": lambda **kw: detect_openai_billing(env=kw.get("env")),
 }
@@ -435,6 +462,7 @@ def detect_adapter_billing(
     env: Optional[Mapping[str, str]] = None,
     home: Optional[Path] = None,
     run: Optional[CommandRunner] = None,
+    context: Optional[AuthContext] = None,
 ) -> BillingStatus:
     """Detect the billing posture for ``adapter``.
 
@@ -451,7 +479,7 @@ def detect_adapter_billing(
             detail=f"No billing detector for adapter {adapter!r}; treating as pass-through.",
             evidence=[f"adapter:{adapter}", "detector:none"],
         )
-    return detector(env=env, home=home, run=run)
+    return detector(env=env, home=home, run=run, context=context)
 
 
 _BILLING_CACHE: dict[str, tuple[BillingStatus, float]] = {}

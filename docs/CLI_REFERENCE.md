@@ -36,7 +36,8 @@ For Codex MCP credentials, prefer a private env file (`chmod 600`) over
 inline secrets in MCP JSON/TOML; env-file and secret-like inherited values are
 loaded through a Puppetmaster-managed Python wrapper/private env file so values
 are not printed or embedded in the wrapper. If your local variable name differs
-from the provider's canonical variable, map it with `--map-env TARGET=SOURCE`.
+from the provider's canonical variable, map it with `--map-env TARGET=SOURCE`
+instead of renaming your shell environment.
 
 ## Running swarms
 
