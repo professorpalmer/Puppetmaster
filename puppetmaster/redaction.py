@@ -27,6 +27,11 @@ _SECRET_ENV_VARS = (
     "ANTHROPIC_API_KEY",
     "CURSOR_API_KEY",
     "OPENAI_ORG_ID",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "NPM_TOKEN",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
 )
 _SECRET_SK = re.compile(r"sk-[A-Za-z0-9_\-]{8,}")
 _SECRET_BEARER = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-]{8,}")

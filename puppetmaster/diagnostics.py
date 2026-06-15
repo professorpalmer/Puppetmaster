@@ -65,6 +65,9 @@ def run_doctor(root: Path, state_dir: Optional[Path] = None) -> list[Check]:
         _guard("mcp-servers", _mcp_servers_check),
         _guard("CURSOR_API_KEY", lambda: _env_check("CURSOR_API_KEY")),
         _guard("OPENAI_API_KEY", lambda: _env_check("OPENAI_API_KEY")),
+        _guard("CODEX_HOME", lambda: _env_check("CODEX_HOME")),
+        _guard("mcp-env:OPENAI_API_KEY", lambda: _mcp_env_check("OPENAI_API_KEY")),
+        _guard("mcp-env:CODEX_HOME", lambda: _mcp_env_check("CODEX_HOME")),
         _guard("sqlite-state", lambda: _sqlite_state_check(state_path / "state.sqlite3")),
         _guard("git-status", lambda: _git_clean_check(root)),
         _guard("agent-rules", lambda: _agent_rules_check(root)),
@@ -541,6 +544,12 @@ def _env_check(name: str) -> Check:
     return Check(name, "optional", "not set")
 
 
+def _mcp_env_check(name: str) -> Check:
+    if os.environ.get(name):
+        return Check(f"mcp-env:{name}", "ok", "visible to this process (value hidden)")
+    return Check(f"mcp-env:{name}", "optional", "not visible to this process")
+
+
 def _sqlite_state_check(path: Path) -> Check:
     if not path.exists():
         return Check("sqlite-state", "optional", "no local sqlite state yet")
@@ -585,4 +594,3 @@ def _git_clean_check(root: Path) -> Check:
         return Check("git-status", "optional", "not a git repository")
     detail = completed.stdout.strip()
     return Check("git-status", "ok" if not detail else "warn", detail or "clean")
-

@@ -41,6 +41,7 @@ from puppetmaster.mcp_registry import (
     prune_dead as registry_prune_dead,
     summarize as registry_summarize,
 )
+from puppetmaster.redaction import redact_secrets
 from puppetmaster.orchestrator import Orchestrator
 from puppetmaster.state import (
     find_state_dir_for_job,
@@ -123,6 +124,17 @@ def build_parser() -> argparse.ArgumentParser:
     install_codex = subcommands.add_parser(
         "install-codex-mcp",
         help="Register Puppetmaster as an MCP server in the OpenAI Codex CLI.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  puppetmaster install-codex-mcp --inherit-env OPENAI_API_KEY,CODEX_HOME\n"
+            "  puppetmaster install-codex-mcp --map-env CODEX_HOME=MY_CODEX_API_HOME\n"
+            "  puppetmaster install-codex-mcp --env-file ~/.config/puppetmaster/env.zsh\n"
+            "\n"
+            "Recommended: keep secrets in a private env file (`chmod 600`) rather "
+            "than inline MCP JSON/TOML. Use --map-env when your local variable "
+            "name differs from the provider's canonical variable."
+        ),
     )
     install_codex.add_argument(
         "--force",
@@ -143,6 +155,51 @@ def build_parser() -> argparse.ArgumentParser:
         "--codex",
         default=None,
         help="Override the `codex` CLI path (defaults to the first `codex` on PATH).",
+    )
+    install_codex.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help=(
+            "Set a selected MCP-server environment variable. Intended for "
+            "non-secret values; repeat for multiple keys."
+        ),
+    )
+    install_codex.add_argument(
+        "--inherit-env",
+        action="append",
+        default=[],
+        metavar="KEY[,KEY...]",
+        help=(
+            "Copy only these environment variables from the installer process "
+            "into the MCP server environment."
+        ),
+    )
+    install_codex.add_argument(
+        "--env-file",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help=(
+            "Read selected MCP-server env from a shell-style env file, for "
+            "example ~/.config/puppetmaster/env.zsh. File contents are never printed."
+        ),
+    )
+    install_codex.add_argument(
+        "--map-env",
+        action="append",
+        default=[],
+        metavar="TARGET=SOURCE",
+        help=(
+            "Map a canonical MCP-server env key from a local installer env key, "
+            "for example CODEX_HOME=MY_CODEX_API_HOME."
+        ),
+    )
+    install_codex.add_argument(
+        "--force-env",
+        action="store_true",
+        help="Allow requested env values to override existing puppetmaster MCP env keys.",
     )
 
     install_claude = subcommands.add_parser(
@@ -2398,17 +2455,17 @@ def _print_install_result(result: InstallResult, host: str) -> int:
     ``1`` for any error so a CI step can fail fast on a broken install.
     """
     print(f"[install-{host}-mcp] status: {result.status}")
-    print(f"[install-{host}-mcp] target: {result.target}")
-    print(f"[install-{host}-mcp] python: {result.python_executable}")
+    print(f"[install-{host}-mcp] target: {redact_secrets(result.target)}")
+    print(f"[install-{host}-mcp] python: {redact_secrets(result.python_executable)}")
     if result.handshake is not None:
         if result.handshake.ok:
             print(
                 f"[install-{host}-mcp] handshake: OK ({result.handshake.tool_count} tools)"
             )
         else:
-            print(f"[install-{host}-mcp] handshake: FAILED — {result.handshake.error}")
+            print(f"[install-{host}-mcp] handshake: FAILED — {redact_secrets(result.handshake.error)}")
     for line in result.messages:
-        print(f"[install-{host}-mcp] {line}")
+        print(f"[install-{host}-mcp] {redact_secrets(line)}")
     return 0 if result.status in {"installed", "unchanged", "would_install"} else 1
 
 
@@ -2577,6 +2634,11 @@ def _run_install_codex(args) -> int:
     result = install_codex_mcp(
         codex_executable=getattr(args, "codex", None),
         force=getattr(args, "force", False),
+        force_env=getattr(args, "force_env", False),
+        env=tuple(getattr(args, "env", []) or []),
+        inherit_env=tuple(getattr(args, "inherit_env", []) or []),
+        env_files=tuple(Path(p).expanduser() for p in (getattr(args, "env_file", []) or [])),
+        map_env=tuple(getattr(args, "map_env", []) or []),
         dry_run=getattr(args, "dry_run", False),
         skip_handshake=getattr(args, "skip_handshake", False),
     )
