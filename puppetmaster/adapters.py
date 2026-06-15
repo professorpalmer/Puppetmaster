@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -964,6 +965,72 @@ class CursorAdapter:
 DEFAULT_CLAUDE_CODE_MODEL = "claude-opus-4-8"
 
 
+# Bedrock model identifiers are inference-profile / ARN shaped, never the short
+# Cursor-style names the registry carries ("claude-opus-4-8"). The `claude` CLI
+# on Bedrock rejects a short name outright — the failure mode that took down a
+# worker (invalid model id) before it ever ran. Match a real Bedrock id so we
+# can forward it untouched and refuse to forward anything else.
+_BEDROCK_MODEL_ID = re.compile(
+    r"^(arn:aws[\w-]*:bedrock:|(?:[a-z]{2}(?:-[a-z]+)?\.)?anthropic\.)"
+)
+
+
+def is_bedrock_model_id(model: object) -> bool:
+    """True when ``model`` is a Bedrock model id / inference-profile ARN.
+
+    Bedrock expects ``anthropic.claude-...-v1:0``, a region-prefixed inference
+    profile (``us.anthropic.claude-...``), or a full ``arn:aws:bedrock:...`` ARN
+    — never a short ``claude-opus-4-8`` name.
+    """
+    if not model:
+        return False
+    return bool(_BEDROCK_MODEL_ID.match(str(model).strip()))
+
+
+def resolve_claude_code_model(
+    payload: "Optional[dict]" = None,
+    *,
+    env: "Optional[Any]" = None,
+    home: Optional[Path] = None,
+) -> "tuple[Optional[str], Optional[str]]":
+    """Pick the model id to hand the ``claude`` CLI, Bedrock-aware.
+
+    Returns ``(model, note)``. ``model`` is ``None`` when ``--model`` must be
+    omitted so the CLI uses its own ``ANTHROPIC_MODEL`` / configured default;
+    ``note`` is a diagnostic to record as evidence, or ``None``.
+
+    Off Bedrock, behavior is unchanged — the requested model or the default. On
+    Bedrock we never forward a non-Bedrock short name (precisely what the CLI
+    rejects). Precedence: an explicit Bedrock override (``payload.bedrock_model``
+    or ``ANTHROPIC_MODEL``) > a requested id already Bedrock-shaped > omit
+    ``--model`` with a clear, actionable note.
+    """
+    payload = payload or {}
+    env = env if env is not None else os.environ
+    requested = payload.get("model") or DEFAULT_CLAUDE_CODE_MODEL
+
+    from puppetmaster.platform_billing import _claude_bedrock_enabled
+
+    home_path = home if home is not None else Path.home()
+    if not _claude_bedrock_enabled(env, home_path):
+        return str(requested), None
+
+    override = payload.get("bedrock_model") or env.get("ANTHROPIC_MODEL")
+    if override:
+        return str(override), None
+    if is_bedrock_model_id(requested):
+        return str(requested), None
+    return (
+        None,
+        (
+            f"CLAUDE_CODE_USE_BEDROCK is on but {str(requested)!r} is not a Bedrock "
+            "model id; omitting --model so the CLI uses its configured Bedrock "
+            "default. Set ANTHROPIC_MODEL (or payload.bedrock_model) to a Bedrock "
+            "inference-profile, e.g. us.anthropic.claude-opus-4-1-20250805-v1:0."
+        ),
+    )
+
+
 class ClaudeCodeAdapter:
     name = "claude-code"
 
@@ -1001,10 +1068,11 @@ class ClaudeCodeAdapter:
                 )
             ]
 
+        model_for_cli, model_note = resolve_claude_code_model(task.payload)
         command = build_claude_code_command(
             prompt=prompt,
             executable=[resolved, *command_base[1:]],
-            model=task.payload.get("model") or DEFAULT_CLAUDE_CODE_MODEL,
+            model=model_for_cli,
             output_format=task.payload.get("output_format", "json"),
             permission_mode=task.payload.get("permission_mode", "acceptEdits"),
             allowed_tools=task.payload.get("allowed_tools"),
@@ -1148,6 +1216,7 @@ class ClaudeCodeAdapter:
                     f"permission_mode:{task.payload.get('permission_mode', 'acceptEdits')}",
                 ]
                 + (["context:codegraph"] if codegraph_used else [])
+                + (["bedrock:model-omitted"] if model_note else [])
             ),
             payload={
                 "failure": None if completed.returncode == 0 else classify_claude_code_failure(completed.stderr + completed.stdout),
@@ -1159,6 +1228,7 @@ class ClaudeCodeAdapter:
                 "live_log": completed.live_log_path,
                 "cwd": str(cwd),
                 "permission_mode": task.payload.get("permission_mode", "acceptEdits"),
+                **({"bedrock_model_note": model_note} if model_note else {}),
                 "base_sha": before["sha"],
                 "head_sha": after["sha"],
                 "changed_files": after["changed_files"],

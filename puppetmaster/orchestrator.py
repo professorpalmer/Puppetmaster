@@ -438,6 +438,7 @@ class Orchestrator:
             return billing_cache[adapter]
 
         from puppetmaster.platform_lock import is_adapter_enabled
+        from puppetmaster.preflight import adapter_cli_present
 
         rerouted = 0
         for task in failed:
@@ -454,6 +455,12 @@ class Orchestrator:
                 if status is None or not getattr(status, "healthy", False):
                     continue
                 if getattr(status, "billing", "unknown") == "api" and not allow_api:
+                    continue
+                if not adapter_cli_present(spec.adapter):
+                    # Billing can read healthy off a stale auth file long after
+                    # the CLI was uninstalled; never cascade into a missing
+                    # binary (the failure Rishi hit when fallback chose an
+                    # uninstalled Codex).
                     continue
                 candidates.append(spec)
             if not candidates:
@@ -562,6 +569,7 @@ class Orchestrator:
         from puppetmaster.model_registry import default_registry_path, load_registry
         from puppetmaster.platform_billing import detect_adapter_billing
         from puppetmaster.platform_lock import is_adapter_enabled
+        from puppetmaster.preflight import adapter_cli_present
         from puppetmaster.router import (
             NoEligibleModelError,
             route_task,
@@ -614,6 +622,8 @@ class Orchestrator:
                 if status is None or not getattr(status, "healthy", False):
                     continue
                 if getattr(status, "billing", "unknown") == "api" and not allow_api:
+                    continue
+                if not adapter_cli_present(spec.adapter):
                     continue
                 candidates.append(spec)
             if not candidates:
@@ -777,6 +787,7 @@ class Orchestrator:
         from puppetmaster.model_registry import default_registry_path, load_registry
         from puppetmaster.platform_billing import detect_adapter_billing
         from puppetmaster.platform_lock import is_adapter_enabled
+        from puppetmaster.preflight import adapter_cli_present
         from puppetmaster.router import (
             NoEligibleModelError,
             route_task,
@@ -826,6 +837,8 @@ class Orchestrator:
                 if status is None or not getattr(status, "healthy", False):
                     continue
                 if getattr(status, "billing", "unknown") == "api" and not allow_api:
+                    continue
+                if not adapter_cli_present(spec.adapter):
                     continue
                 candidates.append(spec)
             if not candidates:
@@ -1221,6 +1234,30 @@ class Orchestrator:
                                 "dropped": registry_reconciliation.dropped,
                             },
                         )
+                    # Billing detection can't see an uninstalled CLI (a stale
+                    # auth file keeps it "healthy"). Drop adapters whose binary
+                    # isn't on PATH so the router never first-picks a model it
+                    # can't launch — but never fail closed: if that would empty
+                    # the registry (e.g. CI with no CLIs at all), keep it intact
+                    # and let dispatch/fallback surface the precise error.
+                    from puppetmaster.preflight import adapter_cli_present
+
+                    installed = [
+                        spec
+                        for spec in registry_cache
+                        if adapter_cli_present(spec.adapter)
+                    ]
+                    if installed and len(installed) < len(registry_cache):
+                        missing = sorted(
+                            {spec.adapter for spec in registry_cache}
+                            - {spec.adapter for spec in installed}
+                        )
+                        self.store.emit(
+                            job.id,
+                            "router.adapter_cli_missing",
+                            {"adapters": missing},
+                        )
+                        registry_cache = installed
             if not registry_cache:
                 # No registry on disk yet (user hasn't run `models init`).
                 # Don't fail the run — pass the spec through unmodified.

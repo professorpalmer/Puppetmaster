@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.9.51
+
+**Routing and fallback now gate on whether an adapter can *actually run*, not just whether it's enabled — plus Bedrock-aware Claude Code model IDs.** Field report (Rishi): a worker tried Cursor-style Claude IDs (`claude-opus-4-8`) that Bedrock rejected as invalid, then fell back to a Codex that wasn't installed and died. Two independent root causes, both fixed at the root with defense in depth. Full suite **683** green (+11 tests).
+
+- **Fallback no longer cascades into an uninstalled CLI.** All three reroute paths already gated on the platform lock *and* billing health — but a stale `~/.codex/auth.json` / `~/.claude.json` keeps an adapter reading billing-*healthy* long after its CLI binary is gone, so billing-healthy ≠ runnable. A new single-source `preflight.adapter_cli_present` resolves the adapter's real binary on PATH (honoring `CLAUDE_CODE_COMMAND` / `CODEX_COMMAND`); CLI-less adapters (Cursor's bundled SDK runner, OpenAI's HTTP path) stay "present" since their readiness is purely a credentials question. Reroute now skips an adapter whose binary isn't there and leaves the task cleanly FAILED instead of dispatching a doomed worker.
+- **The router won't first-pick a model it can't launch either.** After registry reconciliation, `_route_specs` drops CLI-missing adapters — with a strict **never-fail-closed** guard: if that would empty the registry (e.g. CI with no CLIs at all), it keeps the registry intact and lets dispatch/fallback surface the precise error. Emits `router.adapter_cli_missing` for the audit trail.
+- **Claude Code on Bedrock gets a real model id or a precise error — never an invalid one.** The `claude` CLI on Bedrock accepts only inference-profile IDs / ARNs (`us.anthropic.claude-opus-4-1-20250805-v1:0`), never the registry's short `claude-opus-4-8`. `resolve_claude_code_model` is now Bedrock-aware: off Bedrock, unchanged; on Bedrock, precedence is an explicit override (`ANTHROPIC_MODEL` / `payload.bedrock_model`) → an already-Bedrock-shaped request → **omit `--model`** so the CLI uses its configured default, with a clear, actionable note (rather than forwarding a short name Bedrock will reject). No region-specific ARNs are guessed.
+- **Setup detection unchanged — already correct.** `setup` already auto-detects and pre-selects only genuinely usable platforms (CLI resolvable, `CURSOR_API_KEY` + SDK, `OPENAI_API_KEY`); the new runtime gating is the defense-in-depth that also protects zero-config users who never run `setup`.
+
 ## v0.9.50
 
 **Setup honors the platform lock, real Cursor-SDK token metering, a fixed Windows `doctor` probe, and CodeGraph that reaches every agentic harness.** A batch of field-reported rough edges (Pawel's setup/`doctor` notes plus a large parallel-swarm test) resolved end-to-end. Full suite **672** green; the token fix verified against a live Cursor composer run.

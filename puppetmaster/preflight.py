@@ -521,3 +521,59 @@ def preflight_check(
         reason=f"ready ({status.billing}-billed): {status.detail}",
         evidence=[*status.evidence, "preflight:ok"],
     )
+
+
+# Adapters that shell out to a standalone CLI binary, with the env var that
+# overrides the default executable. Cursor (bundled SDK runner) and OpenAI
+# (HTTP) have no separate CLI to install, so they are absent here — their
+# readiness is purely a credentials question, answered by billing detection.
+_ADAPTER_CLI_DEFAULT: dict[str, "tuple[str, str]"] = {
+    "claude-code": ("CLAUDE_CODE_COMMAND", "claude"),
+    "codex": ("CODEX_COMMAND", "codex"),
+}
+
+# Injectable executable resolver: name -> resolved path or None. Defaults to the
+# adapter layer's PATH/expanduser resolution; tests pass a stub.
+CommandResolver = Callable[[str], Optional[str]]
+
+
+def adapter_cli_executable(
+    adapter: str, env: Optional[Mapping[str, str]] = None
+) -> Optional[str]:
+    """The CLI binary ``adapter`` will try to launch, honoring env overrides.
+
+    Returns ``None`` for adapters that have no standalone CLI (cursor, openai).
+    """
+    spec = _ADAPTER_CLI_DEFAULT.get(adapter)
+    if spec is None:
+        return None
+    env = env if env is not None else os.environ
+    env_var, default = spec
+    return env.get(env_var) or default
+
+
+def _default_command_resolver(executable: str) -> Optional[str]:
+    from puppetmaster.adapters import resolve_command
+
+    return resolve_command(executable)
+
+
+def adapter_cli_present(
+    adapter: str,
+    *,
+    env: Optional[Mapping[str, str]] = None,
+    resolver: Optional[CommandResolver] = None,
+) -> bool:
+    """True when ``adapter`` needs no CLI, or its CLI is actually installed.
+
+    This closes the gap billing detection cannot: a stale ``~/.codex/auth.json``
+    or ``~/.claude.json`` keeps an adapter reading as billing-*healthy* long
+    after its CLI binary was uninstalled. Routing or falling back onto such an
+    adapter dispatches a doomed worker that dies with ``missing_cli``. Gating on
+    real executable resolution prevents that cascade.
+    """
+    cli = adapter_cli_executable(adapter, env)
+    if cli is None:
+        return True
+    resolve = resolver or _default_command_resolver
+    return resolve(cli) is not None

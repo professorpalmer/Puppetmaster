@@ -6805,6 +6805,89 @@ class ModelRouterTests(unittest.TestCase):
             self.assertEqual(routing[0].payload["adapter"], "claude-code")
             self.assertIn("rejected", routing[0].payload)
 
+    def test_initial_route_drops_adapter_with_missing_cli(self) -> None:
+        """The router must not first-pick a model whose CLI isn't installed —
+        even when billing reads healthy — and must record why it skipped it."""
+        from unittest.mock import patch
+
+        from puppetmaster.model_registry import ModelSpec, save_registry
+        from puppetmaster.orchestrator import Orchestrator
+        from puppetmaster.platform_billing import BillingStatus
+        from puppetmaster.store_factory import create_store
+        from puppetmaster.workers import WorkerSpec
+
+        registry = [
+            ModelSpec(id="claude-code/opus", adapter="claude-code", adapter_model_name="claude-opus-4-8", capability_score=99, billing="plan"),
+            ModelSpec(id="cursor/gpt", adapter="cursor", adapter_model_name="gpt-5.5", capability_score=95, billing="plan", tags=["cursor"]),
+        ]
+
+        def _healthy(adapter, **kw):
+            return BillingStatus(adapter=adapter, billing="plan", healthy=True, detail="ok", evidence=[])
+
+        with TemporaryDirectory() as tmp:
+            rp = Path(tmp) / "models.json"
+            save_registry(registry, rp)
+            store = create_store("file", Path(tmp) / ".puppetmaster")
+            store.init()
+            orch = Orchestrator(store)
+            job = store.create_job("router cli check")
+            spec = WorkerSpec(
+                role="implement",
+                instruction="implement the thing",
+                adapter="local",
+                payload={"auto_route": True, "registry_path": str(rp), "routing_policy": "balanced"},
+                depends_on_roles=[],
+            )
+            with patch("puppetmaster.platform_billing.detect_adapter_billing_cached", side_effect=_healthy), \
+                 patch("puppetmaster.platform_lock.is_adapter_enabled", return_value=True), \
+                 patch("puppetmaster.preflight.adapter_cli_present", side_effect=lambda a, **kw: a != "claude-code"):
+                tasks = orch._create_tasks(job, [spec])
+            self.assertEqual(tasks[0].adapter, "cursor")
+            events = store.read_events(job.id)
+            missing = [e for e in events if e.get("event") == "router.adapter_cli_missing"]
+            self.assertEqual(len(missing), 1)
+            self.assertEqual(missing[0]["payload"]["adapters"], ["claude-code"])
+
+    def test_initial_route_never_fails_closed_when_no_cli_installed(self) -> None:
+        """If dropping CLI-missing adapters would empty the registry (e.g. a host
+        with no CLIs), keep it intact so dispatch/fallback surface the precise
+        error instead of the router silently routing nothing."""
+        from unittest.mock import patch
+
+        from puppetmaster.model_registry import save_registry
+        from puppetmaster.orchestrator import Orchestrator
+        from puppetmaster.platform_billing import BillingStatus
+        from puppetmaster.store_factory import create_store
+        from puppetmaster.workers import WorkerSpec
+
+        def _healthy(adapter, **kw):
+            return BillingStatus(adapter=adapter, billing="plan", healthy=True, detail="ok", evidence=[])
+
+        with TemporaryDirectory() as tmp:
+            rp = Path(tmp) / "models.json"
+            save_registry(self._three_tier_registry(), rp)  # all claude-code
+            store = create_store("file", Path(tmp) / ".puppetmaster")
+            store.init()
+            orch = Orchestrator(store)
+            job = store.create_job("router never-closed check")
+            spec = WorkerSpec(
+                role="implement",
+                instruction="implement the thing",
+                adapter="local",
+                payload={"auto_route": True, "registry_path": str(rp), "routing_policy": "balanced"},
+                depends_on_roles=[],
+            )
+            with patch("puppetmaster.platform_billing.detect_adapter_billing_cached", side_effect=_healthy), \
+                 patch("puppetmaster.platform_lock.is_adapter_enabled", return_value=True), \
+                 patch("puppetmaster.preflight.adapter_cli_present", return_value=False):
+                tasks = orch._create_tasks(job, [spec])
+            self.assertEqual(tasks[0].adapter, "claude-code")
+            events = store.read_events(job.id)
+            self.assertEqual(
+                [e for e in events if e.get("event") == "router.adapter_cli_missing"],
+                [],
+            )
+
     def test_vision_signal_detection_finds_image_references(self) -> None:
         from puppetmaster.router import has_detailed_vision_signal, has_vision_signal
 
@@ -9392,6 +9475,129 @@ class PreflightTests(unittest.TestCase):
         self.assertIn("catalog unverified", r.reason)
 
 
+class AdapterCliPresenceTests(unittest.TestCase):
+    """`adapter_cli_present` closes the gap billing detection can't see: an
+    adapter that reads billing-healthy off a stale auth file but whose CLI
+    binary is gone."""
+
+    def test_cli_less_adapters_are_always_present(self) -> None:
+        from puppetmaster.preflight import adapter_cli_executable, adapter_cli_present
+
+        # cursor (bundled SDK runner) and openai (HTTP) have no CLI to install.
+        for adapter in ("cursor", "openai"):
+            self.assertIsNone(adapter_cli_executable(adapter))
+            self.assertTrue(
+                adapter_cli_present(adapter, resolver=lambda _name: None)
+            )
+
+    def test_claude_and_codex_gate_on_resolvable_binary(self) -> None:
+        from puppetmaster.preflight import adapter_cli_executable, adapter_cli_present
+
+        self.assertEqual(adapter_cli_executable("claude-code"), "claude")
+        self.assertEqual(adapter_cli_executable("codex"), "codex")
+
+        present = lambda name: f"/usr/local/bin/{name}"
+        absent = lambda _name: None
+        for adapter in ("claude-code", "codex"):
+            self.assertTrue(adapter_cli_present(adapter, resolver=present))
+            self.assertFalse(adapter_cli_present(adapter, resolver=absent))
+
+    def test_executable_honors_env_override(self) -> None:
+        from puppetmaster.preflight import adapter_cli_executable
+
+        self.assertEqual(
+            adapter_cli_executable(
+                "claude-code", env={"CLAUDE_CODE_COMMAND": "/opt/claude"}
+            ),
+            "/opt/claude",
+        )
+        self.assertEqual(
+            adapter_cli_executable("codex", env={"CODEX_COMMAND": "codex-next"}),
+            "codex-next",
+        )
+
+
+class BedrockModelResolutionTests(unittest.TestCase):
+    """Claude Code on Bedrock rejects short Cursor-style model names; resolution
+    must forward a real Bedrock id or omit --model with a precise note rather
+    than letting Bedrock reject e.g. `claude-opus-4-8`."""
+
+    def test_is_bedrock_model_id_recognizes_real_ids(self) -> None:
+        from puppetmaster.adapters import is_bedrock_model_id
+
+        for good in (
+            "us.anthropic.claude-opus-4-1-20250805-v1:0",
+            "eu.anthropic.claude-sonnet-4-20250514-v1:0",
+            "anthropic.claude-opus-4-1-20250805-v1:0",
+            "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-opus-4-1-20250805-v1:0",
+        ):
+            self.assertTrue(is_bedrock_model_id(good), good)
+        for bad in ("claude-opus-4-8", "claude-opus-4-6", "gpt-5.5", "", None):
+            self.assertFalse(is_bedrock_model_id(bad), repr(bad))
+
+    def test_off_bedrock_returns_requested_model_unchanged(self) -> None:
+        from puppetmaster.adapters import DEFAULT_CLAUDE_CODE_MODEL, resolve_claude_code_model
+
+        with TemporaryDirectory() as tmp:
+            model, note = resolve_claude_code_model(
+                {"model": "claude-opus-4-8"}, env={}, home=Path(tmp)
+            )
+            self.assertEqual(model, "claude-opus-4-8")
+            self.assertIsNone(note)
+            # No payload model -> the adapter default, still unchanged.
+            model2, note2 = resolve_claude_code_model({}, env={}, home=Path(tmp))
+            self.assertEqual(model2, DEFAULT_CLAUDE_CODE_MODEL)
+            self.assertIsNone(note2)
+
+    def test_bedrock_prefers_explicit_override(self) -> None:
+        from puppetmaster.adapters import resolve_claude_code_model
+
+        env = {
+            "CLAUDE_CODE_USE_BEDROCK": "1",
+            "ANTHROPIC_MODEL": "us.anthropic.claude-opus-4-1-20250805-v1:0",
+        }
+        with TemporaryDirectory() as tmp:
+            model, note = resolve_claude_code_model(
+                {"model": "claude-opus-4-8"}, env=env, home=Path(tmp)
+            )
+            self.assertEqual(model, "us.anthropic.claude-opus-4-1-20250805-v1:0")
+            self.assertIsNone(note)
+            # payload.bedrock_model wins even over a short requested model.
+            model2, note2 = resolve_claude_code_model(
+                {"model": "claude-opus-4-8", "bedrock_model": "anthropic.claude-x-v1:0"},
+                env={"CLAUDE_CODE_USE_BEDROCK": "1"},
+                home=Path(tmp),
+            )
+            self.assertEqual(model2, "anthropic.claude-x-v1:0")
+            self.assertIsNone(note2)
+
+    def test_bedrock_passes_through_already_bedrock_shaped_request(self) -> None:
+        from puppetmaster.adapters import resolve_claude_code_model
+
+        with TemporaryDirectory() as tmp:
+            model, note = resolve_claude_code_model(
+                {"model": "us.anthropic.claude-opus-4-1-20250805-v1:0"},
+                env={"CLAUDE_CODE_USE_BEDROCK": "1"},
+                home=Path(tmp),
+            )
+            self.assertEqual(model, "us.anthropic.claude-opus-4-1-20250805-v1:0")
+            self.assertIsNone(note)
+
+    def test_bedrock_short_name_omits_model_with_actionable_note(self) -> None:
+        from puppetmaster.adapters import resolve_claude_code_model
+
+        with TemporaryDirectory() as tmp:
+            model, note = resolve_claude_code_model(
+                {"model": "claude-opus-4-8"},
+                env={"CLAUDE_CODE_USE_BEDROCK": "1"},
+                home=Path(tmp),
+            )
+            self.assertIsNone(model)  # --model omitted, not forwarded to Bedrock
+            self.assertIsNotNone(note)
+            self.assertIn("ANTHROPIC_MODEL", note)
+            self.assertIn("Bedrock", note)
+
+
 class StitcherAlertTests(unittest.TestCase):
     def _verification(self, *, failure=None, result="passed"):
         from puppetmaster.models import Artifact, ArtifactType
@@ -10155,6 +10361,85 @@ class AutoFallbackTests(unittest.TestCase):
             self.assertEqual(updated.adapter, "cursor")
             self.assertEqual(updated.payload["fallback_attempts"], 1)
             self.assertEqual(updated.payload["fallback_from_adapter"], "claude-code")
+
+    def test_fallback_skips_adapter_with_missing_cli(self) -> None:
+        """Regression (Rishi): a stale auth file keeps claude-code/codex reading
+        billing-healthy after the CLI is uninstalled. Fallback must NOT cascade
+        into a binary that isn't there — it must leave the task FAILED instead."""
+        from unittest.mock import patch
+
+        from puppetmaster.model_registry import ModelSpec
+        from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
+        from puppetmaster.orchestrator import Orchestrator
+        from puppetmaster.platform_billing import BillingStatus
+        from puppetmaster.store import SwarmStore
+
+        registry = [
+            ModelSpec(
+                id="claude-code/opus-4-8",
+                adapter="claude-code",
+                adapter_model_name="claude-opus-4-8",
+                capability_score=99,
+                input_per_mtok_usd=5,
+                output_per_mtok_usd=25,
+                billing="unknown",
+            ),
+        ]
+
+        def _healthy(adapter, **kw):
+            # Billing reads healthy off the stale ~/.claude.json — the trap.
+            return BillingStatus(
+                adapter=adapter, billing="plan", healthy=True, detail="oauth", evidence=[]
+            )
+
+        def _make(tmp):
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("fix the bug")
+            task = Task(
+                job_id=job.id,
+                role="implement",
+                instruction="implement the fix",
+                adapter="cursor",
+                status=TaskStatus.FAILED,
+                payload={"auto_route": True, "model": "x", "router_model_id": "cursor/x"},
+            )
+            store.save_task(task)
+            store.save_artifact(
+                Artifact(
+                    job_id=job.id,
+                    task_id=task.id,
+                    type=ArtifactType.VERIFICATION,
+                    created_by="w",
+                    payload={"check": "x", "result": "blocked", "failure": "billing_or_quota", "adapter": "cursor"},
+                    confidence=0.5,
+                    evidence=["adapter:cursor"],
+                )
+            )
+            return store, job, task
+
+        # CLI uninstalled -> no reroute, task stays FAILED (no doomed cascade).
+        with TemporaryDirectory() as tmp:
+            store, job, task = _make(tmp)
+            orch = Orchestrator(store)
+            with patch("puppetmaster.model_registry.load_registry", return_value=registry), \
+                 patch("puppetmaster.platform_billing.detect_adapter_billing", side_effect=_healthy), \
+                 patch("puppetmaster.platform_lock.is_adapter_enabled", return_value=True), \
+                 patch("puppetmaster.preflight.adapter_cli_present", return_value=False):
+                rerouted = orch._reroute_recoverable_failures(job)
+            self.assertEqual(rerouted, 0)
+            self.assertEqual(store.get_task_by_id(task.id).status, TaskStatus.FAILED)
+
+        # Same setup, CLI installed -> the fallback proceeds normally.
+        with TemporaryDirectory() as tmp:
+            store, job, task = _make(tmp)
+            orch = Orchestrator(store)
+            with patch("puppetmaster.model_registry.load_registry", return_value=registry), \
+                 patch("puppetmaster.platform_billing.detect_adapter_billing", side_effect=_healthy), \
+                 patch("puppetmaster.platform_lock.is_adapter_enabled", return_value=True), \
+                 patch("puppetmaster.preflight.adapter_cli_present", return_value=True):
+                rerouted = orch._reroute_recoverable_failures(job)
+            self.assertEqual(rerouted, 1)
+            self.assertEqual(store.get_task_by_id(task.id).adapter, "claude-code")
 
     def test_model_unavailable_on_fable_5_reroutes_to_opus_4_8(self) -> None:
         from unittest.mock import patch
