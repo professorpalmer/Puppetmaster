@@ -28,6 +28,7 @@ from puppetmaster.fs_permissions import mkdir_private, open_private
 
 
 CODEGRAPH_COMMAND = "codegraph"
+CODEGRAPH_PACKAGE = "@colbymchenry/codegraph"
 MAX_CONTEXT_CHARS = 4000
 DEFAULT_CONTEXT_TIMEOUT_SECONDS = 30
 DEFAULT_STATUS_TIMEOUT_SECONDS = 10
@@ -43,8 +44,12 @@ DEFAULT_INIT_TIMEOUT_SECONDS = 60
 
 
 CODEGRAPH_MISSING_HINT = (
-    "codegraph CLI not on PATH. Install with `npm install -g @colbymchenry/codegraph` "
-    "or run `npx @colbymchenry/codegraph` once to set it up."
+    "CodeGraph is unavailable because Node.js is not installed on this machine. "
+    "Puppetmaster auto-provisions the CodeGraph CLI via `npx @colbymchenry/codegraph` "
+    "whenever Node is present (no manual install needed), but it cannot run a Node CLI "
+    "without a Node runtime. Install Node.js 18+ (https://nodejs.org) and retry; "
+    "or, if you keep a global install, `npm install -g @colbymchenry/codegraph`. "
+    "Set PUPPETMASTER_CODEGRAPH_NO_NPX=1 to disable the npx fallback."
 )
 CODEGRAPH_NOT_INITIALIZED_HINT = (
     "workspace is not initialized for CodeGraph. Run `puppetmaster_codegraph_init` "
@@ -67,16 +72,45 @@ CODEGRAPH_NATIVE_SQLITE_HINT = (
 )
 
 
+def _npx_disabled() -> bool:
+    raw = os.environ.get("PUPPETMASTER_CODEGRAPH_NO_NPX")
+    if raw is None:
+        return False
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _npx_codegraph_invocation() -> Optional[list[str]]:
+    """Return ``[npx, -y, @colbymchenry/codegraph]`` when npx is available.
+
+    This is the universal fallback that makes CodeGraph "always available" on
+    any machine with Node, with zero manual setup: ``npx`` fetches the package
+    into its cache on first use and reuses it thereafter. Because the package's
+    native ``better-sqlite3`` is built and run under the *same* (system) Node,
+    the ABI matches — so unlike a cross-runtime shim, this never falls back to
+    slow WASM SQLite. Opt out with ``PUPPETMASTER_CODEGRAPH_NO_NPX=1``.
+    """
+    if _npx_disabled():
+        return None
+    npx = shutil.which("npx")
+    if not npx:
+        return None
+    return [npx, "-y", CODEGRAPH_PACKAGE]
+
+
 def codegraph_available() -> bool:
     """Return True when CodeGraph can be invoked.
 
-    Either the ``codegraph`` shim is on PATH, or we can run it directly under
-    Cursor's bundled Node (the ABI-safe path), so a machine whose shell lacks
-    the global shim still works as long as Cursor + the install are present.
+    Resolved in order of speed: the ``codegraph`` shim on PATH, then Cursor's
+    bundled Node (the ABI-safe path), then the universal ``npx`` fallback. The
+    npx leg means a machine only needs Node — no global install, no Cursor — so
+    CodeGraph is effectively always available short of a host with no Node at
+    all (the one floor we can't cross: it's a Node CLI).
     """
     if shutil.which(CODEGRAPH_COMMAND) is not None:
         return True
-    return _cursor_codegraph_invocation() is not None
+    if _cursor_codegraph_invocation() is not None:
+        return True
+    return _npx_codegraph_invocation() is not None
 
 
 def resolve_codegraph_invocation() -> list[str]:
@@ -96,8 +130,13 @@ def resolve_codegraph_invocation() -> list[str]:
        envs (escape hatch for non-standard installs).
     2. Cursor's bundled Node + the global ``@colbymchenry/codegraph``
        JS entrypoint resolved via ``npm root -g``.
-    3. The bare ``codegraph`` shim on PATH (preserves prior behavior
-       when Cursor is not installed and on non-macOS hosts).
+    3. The bare ``codegraph`` shim on PATH (a global install — fast, no
+       per-call resolution).
+    4. The universal ``npx @colbymchenry/codegraph`` fallback, so any host
+       with Node can run CodeGraph with zero manual setup.
+
+    Only when none of the above resolve (no Node at all) do we return the bare
+    ``codegraph`` command, whose "not found" failure surfaces the install hint.
     """
     env_node = os.environ.get("PUPPETMASTER_CODEGRAPH_NODE")
     env_js = os.environ.get("PUPPETMASTER_CODEGRAPH_JS")
@@ -107,6 +146,13 @@ def resolve_codegraph_invocation() -> list[str]:
     cursor_invocation = _cursor_codegraph_invocation()
     if cursor_invocation is not None:
         return cursor_invocation
+
+    if shutil.which(CODEGRAPH_COMMAND) is not None:
+        return [CODEGRAPH_COMMAND]
+
+    npx_invocation = _npx_codegraph_invocation()
+    if npx_invocation is not None:
+        return npx_invocation
 
     return [CODEGRAPH_COMMAND]
 
@@ -158,6 +204,115 @@ def _compute_cursor_codegraph_invocation() -> Optional[list[str]]:
     if not js.is_file():
         return None
     return [str(node), str(js)]
+
+
+# One-time, best-effort provisioning so CodeGraph is genuinely "always there"
+# on any Node host — not just resolvable, but warm enough that the first timed
+# call doesn't lose a race against a cold npx download / native build.
+_PROVISION_LOCK = threading.Lock()
+_PROVISION_DONE = False
+
+
+def reset_codegraph_provisioning_state() -> None:
+    """Clear the once-guard (used by tests)."""
+    global _PROVISION_DONE
+    _PROVISION_DONE = False
+
+
+def _global_install_disabled() -> bool:
+    raw = os.environ.get("PUPPETMASTER_CODEGRAPH_NO_GLOBAL_INSTALL")
+    if raw is None:
+        return False
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _provision_timeout_seconds() -> int:
+    raw = os.environ.get("PUPPETMASTER_CODEGRAPH_PROVISION_TIMEOUT_SECONDS")
+    if raw:
+        try:
+            return max(30, int(float(raw)))
+        except ValueError:
+            pass
+    return 300
+
+
+def ensure_codegraph_provisioned() -> bool:
+    """Make CodeGraph invocable on this host, persistently, on first use.
+
+    Idempotent (once per process) and fully best-effort — every failure mode
+    falls through to "use whatever's resolvable" rather than raising. Strategy:
+
+    * If a fast path already resolves (global ``codegraph`` shim, Cursor's
+      bundled Node, or the ``PUPPETMASTER_CODEGRAPH_*`` env override) there is
+      nothing to do.
+    * Otherwise, when ``npm`` is present, do a one-time global install
+      (``npm install -g @colbymchenry/codegraph``) so future calls hit a real
+      shim with no per-call ``npx`` overhead, this session and every session
+      after. Opt out with ``PUPPETMASTER_CODEGRAPH_NO_GLOBAL_INSTALL=1``.
+    * If the global install can't run or doesn't land on PATH, warm the ``npx``
+      cache once (the native build happens here, off the timed call path) so the
+      universal fallback is fast.
+
+    Returns True when CodeGraph is invocable afterward. The only False is a host
+    with no Node at all — a Node CLI cannot run without Node.
+    """
+    global _PROVISION_DONE
+    if (
+        shutil.which(CODEGRAPH_COMMAND) is not None
+        or _cursor_codegraph_invocation() is not None
+    ):
+        return True
+    env_node = os.environ.get("PUPPETMASTER_CODEGRAPH_NODE")
+    env_js = os.environ.get("PUPPETMASTER_CODEGRAPH_JS")
+    if env_node and env_js and Path(env_node).is_file() and Path(env_js).is_file():
+        return True
+
+    npx_invocation = _npx_codegraph_invocation()
+    if npx_invocation is None:
+        return False  # no Node — the one floor we cannot cross
+
+    if _PROVISION_DONE:
+        return True
+    with _PROVISION_LOCK:
+        if _PROVISION_DONE:
+            return True
+        _PROVISION_DONE = True
+
+        if not _global_install_disabled():
+            npm = shutil.which("npm")
+            if npm is not None:
+                try:
+                    completed = subprocess.run(
+                        [npm, "install", "-g", CODEGRAPH_PACKAGE],
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        text=True,
+                        timeout=_provision_timeout_seconds(),
+                        check=False,
+                    )
+                    if (
+                        completed.returncode == 0
+                        and shutil.which(CODEGRAPH_COMMAND) is not None
+                    ):
+                        return True
+                except (OSError, subprocess.SubprocessError):
+                    pass  # fall through to npx warm
+
+        # Warm the npx cache so the first real (timed) call doesn't pay the
+        # cold download + native build. Exit code is irrelevant — the point is
+        # the fetch+build side effect.
+        try:
+            subprocess.run(
+                npx_invocation + ["--help"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=_provision_timeout_seconds(),
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return True
 
 
 def codegraph_initialized(cwd: Union[Path, str, None]) -> bool:
@@ -305,6 +460,10 @@ def run_codegraph_cli(
     """
     rendered_command = "codegraph " + " ".join(cli_args)
     cwd_str = str(cwd) if cwd else ""
+
+    # Provision on first use (global install or npx warm) so the timed call
+    # below isn't racing a cold download/build. No-op once provisioned.
+    ensure_codegraph_provisioned()
 
     if not codegraph_available():
         return {

@@ -1871,7 +1871,10 @@ class PuppetmasterTests(unittest.TestCase):
                 payload = run_codegraph_cli(["status"], tmp)
 
             self.assertFalse(payload["ok"])
-            self.assertIn("codegraph CLI not on PATH", payload["error"])
+            # With no Node at all (npx also absent), the only floor we can't
+            # cross — the hint names Node as the prerequisite.
+            self.assertIn("Node.js", payload["error"])
+            self.assertIn("npm install -g @colbymchenry/codegraph", payload["error"])
 
     def test_run_codegraph_cli_reports_uninitialized_workspace(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -2059,7 +2062,7 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertTrue(result["isError"])
         body = json.loads(result["content"][0]["text"])
         self.assertFalse(body["ok"])
-        self.assertIn("codegraph CLI not on PATH", body["error"])
+        self.assertIn("Node.js", body["error"])
 
     def test_mcp_codegraph_affected_requires_files(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -3617,8 +3620,9 @@ class PuppetmasterTests(unittest.TestCase):
             self.assertEqual(argv[0], str(node))
             self.assertEqual(argv[1], str(install / "dist" / "bin" / "codegraph.js"))
 
-    def test_resolve_codegraph_invocation_falls_back_to_shim(self) -> None:
-        """Without a Cursor install, we fall back to the codegraph shim on PATH."""
+    def test_resolve_codegraph_invocation_falls_back_to_bare_command(self) -> None:
+        """With no Cursor install, no shim, and npx disabled, fall through to the
+        bare ``codegraph`` command (whose failure surfaces the install hint)."""
         from puppetmaster import codegraph as codegraph_mod
         from puppetmaster import codegraph_repair
 
@@ -3627,9 +3631,99 @@ class PuppetmasterTests(unittest.TestCase):
 
         with patch.object(codegraph_repair, "find_cursor_node", return_value=None), patch.object(
             codegraph_repair, "find_codegraph_install", return_value=None
-        ):
+        ), patch("puppetmaster.codegraph.shutil.which", return_value=None):
             argv = codegraph_mod.resolve_codegraph_invocation()
         self.assertEqual(argv, [codegraph_mod.CODEGRAPH_COMMAND])
+
+    def test_resolve_codegraph_invocation_uses_npx_when_only_node_present(self) -> None:
+        """No shim, no Cursor — but Node/npx present: resolve to the universal
+        npx fallback so CodeGraph is available with zero manual install."""
+        from puppetmaster import codegraph as codegraph_mod
+        from puppetmaster import codegraph_repair
+
+        codegraph_mod.reset_cursor_codegraph_invocation_cache()
+        self.addCleanup(codegraph_mod.reset_cursor_codegraph_invocation_cache)
+
+        def fake_which(cmd):
+            return "/usr/local/bin/npx" if cmd == "npx" else None
+
+        with patch.object(codegraph_repair, "find_cursor_node", return_value=None), patch.object(
+            codegraph_repair, "find_codegraph_install", return_value=None
+        ), patch("puppetmaster.codegraph.shutil.which", side_effect=fake_which), patch.dict(
+            os.environ, {}, clear=False
+        ):
+            os.environ.pop("PUPPETMASTER_CODEGRAPH_NO_NPX", None)
+            argv = codegraph_mod.resolve_codegraph_invocation()
+            self.assertEqual(argv, ["/usr/local/bin/npx", "-y", codegraph_mod.CODEGRAPH_PACKAGE])
+            self.assertTrue(codegraph_mod.codegraph_available())
+
+    def test_npx_fallback_disabled_by_env(self) -> None:
+        """PUPPETMASTER_CODEGRAPH_NO_NPX=1 removes the npx leg entirely."""
+        from puppetmaster import codegraph as codegraph_mod
+
+        def fake_which(cmd):
+            return "/usr/local/bin/npx" if cmd == "npx" else None
+
+        with patch("puppetmaster.codegraph.shutil.which", side_effect=fake_which), patch.object(
+            codegraph_mod, "_cursor_codegraph_invocation", return_value=None
+        ), patch.dict(os.environ, {"PUPPETMASTER_CODEGRAPH_NO_NPX": "1"}):
+            self.assertIsNone(codegraph_mod._npx_codegraph_invocation())
+            self.assertFalse(codegraph_mod.codegraph_available())
+
+    def test_ensure_provisioned_global_installs_then_uses_shim(self) -> None:
+        """On first use with only Node present, a one-time global install lands
+        the fast shim on PATH so future calls skip npx entirely."""
+        from puppetmaster import codegraph as codegraph_mod
+
+        codegraph_mod.reset_codegraph_provisioning_state()
+        self.addCleanup(codegraph_mod.reset_codegraph_provisioning_state)
+
+        which_calls = {"n": 0}
+
+        def fake_which(cmd):
+            if cmd == "npx":
+                return "/usr/local/bin/npx"
+            if cmd == "npm":
+                return "/usr/local/bin/npm"
+            if cmd == codegraph_mod.CODEGRAPH_COMMAND:
+                # Shim appears only after the global install has run.
+                return "/usr/local/bin/codegraph" if which_calls["n"] else None
+            return None
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:3] == ["/usr/local/bin/npm", "install", "-g"]:
+                which_calls["n"] = 1  # install succeeded → shim now on PATH
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with patch.object(codegraph_mod, "_cursor_codegraph_invocation", return_value=None), patch(
+            "puppetmaster.codegraph.shutil.which", side_effect=fake_which
+        ), patch("puppetmaster.codegraph.subprocess.run", side_effect=fake_run) as run_mock, patch.dict(
+            os.environ, {}, clear=False
+        ):
+            for var in ("PUPPETMASTER_CODEGRAPH_NO_NPX", "PUPPETMASTER_CODEGRAPH_NO_GLOBAL_INSTALL",
+                        "PUPPETMASTER_CODEGRAPH_NODE", "PUPPETMASTER_CODEGRAPH_JS"):
+                os.environ.pop(var, None)
+            self.assertTrue(codegraph_mod.ensure_codegraph_provisioned())
+            installed = any(
+                call.args[0][:3] == ["/usr/local/bin/npm", "install", "-g"]
+                for call in run_mock.call_args_list
+            )
+            self.assertTrue(installed)
+
+    def test_ensure_provisioned_returns_false_without_node(self) -> None:
+        """No Node anywhere → provisioning can't bootstrap a Node CLI."""
+        from puppetmaster import codegraph as codegraph_mod
+
+        codegraph_mod.reset_codegraph_provisioning_state()
+        self.addCleanup(codegraph_mod.reset_codegraph_provisioning_state)
+
+        with patch("puppetmaster.codegraph.shutil.which", return_value=None), patch.object(
+            codegraph_mod, "_cursor_codegraph_invocation", return_value=None
+        ), patch.dict(os.environ, {}, clear=False):
+            for var in ("PUPPETMASTER_CODEGRAPH_NODE", "PUPPETMASTER_CODEGRAPH_JS"):
+                os.environ.pop(var, None)
+            self.assertFalse(codegraph_mod.ensure_codegraph_provisioned())
 
     def test_resolve_codegraph_invocation_honors_env_override(self) -> None:
         """Explicit env vars short-circuit auto-detection (escape hatch for weird installs)."""
