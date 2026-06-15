@@ -5335,6 +5335,54 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
         streamed.assert_not_called()
         self.assertIs(artifacts, blocked)
 
+    def test_codex_and_claude_workers_get_codegraph_cli_on_pythonpath(self) -> None:
+        """Every agentic harness must put Puppetmaster's source root on the
+        worker's PYTHONPATH so the injected `python -m puppetmaster codegraph`
+        instructions resolve to this tree instead of a stale pip install.
+
+        Regression guard: Codex and Claude previously omitted
+        inject_worker_cli_env (only Cursor had it), so on a host with an older
+        pip puppetmaster their workers hit "unknown command" on codegraph and
+        silently fell back to grep."""
+        from puppetmaster.adapters import ClaudeCodeAdapter, CodexAdapter
+        from puppetmaster.codegraph import puppetmaster_source_root
+
+        root = puppetmaster_source_root()
+        streamed = StreamedProcess(
+            returncode=0, stdout="{}", stderr="", timed_out=False, live_log_path=None
+        )
+        clean = {"sha": "s", "changed_files": [], "untracked_files": [], "diff": ""}
+
+        def captured_env(adapter_cls, adapter_name, role):
+            task = Task(
+                id=f"t-{adapter_name}-env",
+                job_id=f"job-{adapter_name}-env",
+                role=role,
+                adapter=adapter_name,
+                instruction="Do work.",
+                payload={
+                    "cwd": str(Path.cwd()),
+                    "sandbox": "read-only",
+                    "disable_codegraph": True,
+                },
+            )
+            with patch(
+                "puppetmaster.adapters.resolve_command",
+                return_value=f"/usr/bin/{adapter_name}",
+            ), patch(
+                "puppetmaster.adapters.git_snapshot", side_effect=[clean, clean]
+            ), patch(
+                "puppetmaster.adapters.run_streamed_subprocess", return_value=streamed
+            ) as run:
+                adapter_cls().run(task, "goal", "worker")
+            return run.call_args.kwargs["env"]
+
+        codex_env = captured_env(CodexAdapter, "codex", "codex-review")
+        self.assertTrue(codex_env["PYTHONPATH"].startswith(root))
+
+        claude_env = captured_env(ClaudeCodeAdapter, "claude-code", "implement")
+        self.assertTrue(claude_env["PYTHONPATH"].startswith(root))
+
     def test_run_streamed_subprocess_closes_stdin_so_readers_see_eof(self) -> None:
         """The streamed runner must close the child's stdin (DEVNULL). A CLI
         that reads stdin would otherwise block forever on a non-interactive

@@ -1046,7 +1046,7 @@ class ClaudeCodeAdapter:
         # wedge waiting on terminal input.
         completed = run_streamed_subprocess(
             command=command,
-            env=apply_worktree_ports(os.environ.copy(), cwd),
+            env=inject_worker_cli_env(apply_worktree_ports(os.environ.copy(), cwd)),
             task=task,
             sidecar_name="claude_implement",
             timeout_seconds=timeout_seconds,
@@ -1338,7 +1338,7 @@ class CodexAdapter:
         # The streamed runner closes stdin, so codex can never wedge on input.
         completed = run_streamed_subprocess(
             command=command,
-            env=apply_worktree_ports(os.environ.copy(), cwd),
+            env=inject_worker_cli_env(apply_worktree_ports(os.environ.copy(), cwd)),
             task=task,
             sidecar_name="codex_exec",
             timeout_seconds=timeout_seconds,
