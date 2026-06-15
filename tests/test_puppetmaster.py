@@ -3655,7 +3655,10 @@ class PuppetmasterTests(unittest.TestCase):
             os.environ.pop("PUPPETMASTER_CODEGRAPH_NO_NPX", None)
             argv = codegraph_mod.resolve_codegraph_invocation()
             self.assertEqual(argv, ["/usr/local/bin/npx", "-y", codegraph_mod.CODEGRAPH_PACKAGE])
-            self.assertTrue(codegraph_mod.codegraph_available())
+            # The cheap readiness probe deliberately ignores the npx leg: npx
+            # "availability" means Node exists, not that CodeGraph is warm (the
+            # first run pays a cold download). Only explicit commands take it.
+            self.assertFalse(codegraph_mod.codegraph_available())
 
     def test_npx_fallback_disabled_by_env(self) -> None:
         """PUPPETMASTER_CODEGRAPH_NO_NPX=1 removes the npx leg entirely."""
@@ -3669,6 +3672,35 @@ class PuppetmasterTests(unittest.TestCase):
         ), patch.dict(os.environ, {"PUPPETMASTER_CODEGRAPH_NO_NPX": "1"}):
             self.assertIsNone(codegraph_mod._npx_codegraph_invocation())
             self.assertFalse(codegraph_mod.codegraph_available())
+            # With npx disabled and no shim/Cursor, invocation falls through to
+            # the bare command, whose "not found" surfaces the install hint.
+            self.assertEqual(
+                codegraph_mod.resolve_codegraph_invocation(),
+                [codegraph_mod.CODEGRAPH_COMMAND],
+            )
+
+    def test_codegraph_available_is_cheap_and_never_provisions(self) -> None:
+        """Regression: ``codegraph_available()`` must stay a cheap probe.
+
+        It once counted the npx leg, so on a plain Node host (npx present, no
+        shim/Cursor) it returned True — sending ``doctor`` and per-worker
+        adapters into a synchronous ``npm install -g`` that blocked the MCP
+        server (Codex "handshake never returned"). The probe must report
+        not-ready without shelling out at all; the npx fallback belongs only to
+        explicit ``run_codegraph_cli`` commands.
+        """
+        from puppetmaster import codegraph as codegraph_mod
+
+        def fake_which(cmd):
+            return "/usr/local/bin/npx" if cmd == "npx" else None
+
+        with patch.object(
+            codegraph_mod, "_cursor_codegraph_invocation", return_value=None
+        ), patch("puppetmaster.codegraph.shutil.which", side_effect=fake_which), patch(
+            "puppetmaster.codegraph.subprocess.run"
+        ) as run_mock:
+            self.assertFalse(codegraph_mod.codegraph_available())
+            run_mock.assert_not_called()
 
     def test_ensure_provisioned_global_installs_then_uses_shim(self) -> None:
         """On first use with only Node present, a one-time global install lands

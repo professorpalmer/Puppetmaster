@@ -98,19 +98,24 @@ def _npx_codegraph_invocation() -> Optional[list[str]]:
 
 
 def codegraph_available() -> bool:
-    """Return True when CodeGraph can be invoked.
+    """Return True when CodeGraph is *already* invocable with no network work.
 
-    Resolved in order of speed: the ``codegraph`` shim on PATH, then Cursor's
-    bundled Node (the ABI-safe path), then the universal ``npx`` fallback. The
-    npx leg means a machine only needs Node — no global install, no Cursor — so
-    CodeGraph is effectively always available short of a host with no Node at
-    all (the one floor we can't cross: it's a Node CLI).
+    A cheap, side-effect-free readiness probe meant for hot paths — the
+    ``doctor`` health check and per-worker context injection both gate on it.
+    It counts only what resolves instantly: the ``codegraph`` shim on PATH or
+    Cursor's bundled Node + the installed package.
+
+    It deliberately does **not** count the ``npx`` fallback. npx "availability"
+    means *Node exists*, not that CodeGraph is ready — the first npx run pays a
+    cold download + native build. Treating that as "available" made ``doctor``
+    (and every adapter) synchronously trigger a global install on any plain
+    Node host, blocking the MCP server. The universal npx provisioning is
+    reached only by an *explicit* CodeGraph command via :func:`run_codegraph_cli`
+    / :func:`ensure_codegraph_provisioned`, where paying that cost is expected.
     """
     if shutil.which(CODEGRAPH_COMMAND) is not None:
         return True
-    if _cursor_codegraph_invocation() is not None:
-        return True
-    return _npx_codegraph_invocation() is not None
+    return _cursor_codegraph_invocation() is not None
 
 
 def resolve_codegraph_invocation() -> list[str]:
@@ -462,10 +467,13 @@ def run_codegraph_cli(
     cwd_str = str(cwd) if cwd else ""
 
     # Provision on first use (global install or npx warm) so the timed call
-    # below isn't racing a cold download/build. No-op once provisioned.
-    ensure_codegraph_provisioned()
-
-    if not codegraph_available():
+    # below isn't racing a cold download/build. This is also the real
+    # invocability gate: it returns False only on a host with no Node at all
+    # (the one floor a Node CLI can't cross), and True when the shim, Cursor's
+    # Node, an env override, or the npx fallback can run CodeGraph. Unlike the
+    # cheap codegraph_available() probe (used on hot paths like doctor), it
+    # accounts for npx — so explicit `codegraph` commands work on any Node host.
+    if not ensure_codegraph_provisioned():
         return {
             "ok": False,
             "command": rendered_command,
