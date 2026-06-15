@@ -195,7 +195,7 @@ The hardest part of that pattern is getting the host agent to *actually* delegat
 
 **Daily-driver beta.** Real runtime contract, automated tests, SQLite default backend, fail-closed jobs, live Cursor Agent MCP, validated full-edit adapters. Credible for supervised local engineering; not yet a hosted multi-user service. Full feature matrix: [docs/FEATURES.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/FEATURES.md).
 
-**Pip name:** PyPI lists this as [`puppetmaster-ai`](https://pypi.org/project/puppetmaster-ai/) because [PEP-503 normalization](https://peps.python.org/pep-0503/#normalized-names) collides `puppetmaster` with an [abandoned 2019 `puppet-master`](https://pypi.org/project/puppet-master/). The import name, CLI, repo, and brand stay `puppetmaster`. ([tracking](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/PYPI_NAME_REQUEST.md))
+**Pip name:** PyPI lists this as [`puppetmaster-ai`](https://pypi.org/project/puppetmaster-ai/) because [PEP-503 normalization](https://peps.python.org/pep-0503/#normalized-names) collides `puppetmaster` with an [abandoned 2019 `puppet-master`](https://pypi.org/project/puppet-master/). The import name, CLI, repo, and brand stay `puppetmaster`.
 
 ## License
 

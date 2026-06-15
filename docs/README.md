@@ -35,7 +35,6 @@ The full documentation set. Start at the [project README](../README.md) for the 
 | [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md) | Cutting a tagged release + PyPI upload |
 | [CHANGELOG.md](CHANGELOG.md) | Versioned changes |
 | [ROADMAP.md](ROADMAP.md) | What's next |
-| [PYPI_NAME_REQUEST.md](PYPI_NAME_REQUEST.md) | The bare-`puppetmaster` name reassignment effort |
 
 ## Per-directory guides
 

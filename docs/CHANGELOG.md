@@ -487,7 +487,7 @@ Also in this release (the previously-deferred "last-mile" setup work):
 
 One-line MCP installers for Cursor and Codex, plus the previously-deferred Codex MCP documentation that sat ahead of the v0.7.1 tag.
 
-> **First PyPI release** (2026-05-28). Published as `puppetmaster-ai` (https://pypi.org/project/puppetmaster-ai/0.7.2/) because PyPI's PEP-503 name normalization treats `puppetmaster` and `puppet-master` as the same name, and the bare `puppet-master` is held by an [abandoned 2019 single-release project](https://pypi.org/project/puppet-master/) that hasn't had activity in 6+ years. Import name stays `puppetmaster`; CLI, GitHub repo, and README branding are unchanged — only `pip install <name>` differs. Name-reassignment request tracked in [`docs/PYPI_NAME_REQUEST.md`](PYPI_NAME_REQUEST.md). Install:
+> **First PyPI release** (2026-05-28). Published as `puppetmaster-ai` (https://pypi.org/project/puppetmaster-ai/0.7.2/) because PyPI's PEP-503 name normalization treats `puppetmaster` and `puppet-master` as the same name, and the bare `puppet-master` is held by an [abandoned 2019 single-release project](https://pypi.org/project/puppet-master/) that hasn't had activity in 6+ years. Import name stays `puppetmaster`; CLI, GitHub repo, and README branding are unchanged — only `pip install <name>` differs. Name-reassignment request tracked separately. Install:
 >
 > ```bash
 > pip install puppetmaster-ai
