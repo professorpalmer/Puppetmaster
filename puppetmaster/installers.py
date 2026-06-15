@@ -34,7 +34,9 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional
+
+from puppetmaster.redaction import redact_secrets, register_secret_value
 
 
 # Codex's MCP client enforces a hard per-tool timeout (`tool_timeout_sec`,
@@ -49,6 +51,10 @@ from typing import Optional
 # user override is never clobbered.
 CODEX_STARTUP_TIMEOUT_SEC = 30
 CODEX_TOOL_TIMEOUT_SEC = 300
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SECRET_KEY_HINTS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
+_CODEX_WRAPPER_PATH = Path("~/.config/puppetmaster/codex-mcp-wrapper.py").expanduser()
+_CODEX_MANAGED_ENV_PATH = Path("~/.config/puppetmaster/codex-mcp.env.json").expanduser()
 
 
 @dataclass(frozen=True)
@@ -187,6 +193,290 @@ def ensure_cursor_sdk(
     return SdkBootstrapResult(
         "installed", f"@cursor/sdk bootstrapped into {location}", str(location)
     )
+
+
+@dataclass(frozen=True)
+class McpEnvRequest:
+    """User-requested MCP environment sources.
+
+    ``direct`` comes from ``--env KEY=VALUE``. ``inherit`` comes from
+    ``--inherit-env KEY[,KEY...]`` and is copied from the installer process.
+    ``env_files`` are parsed as simple shell-style env files. ``map_env`` maps
+    a provider's canonical key from a local user key (``TARGET=SOURCE``).
+    ``force`` lets requested values override existing MCP env keys; otherwise
+    existing keys win to avoid silently clobbering user-owned credentials on
+    reinstall.
+    """
+
+    direct: tuple[str, ...] = ()
+    inherit: tuple[str, ...] = ()
+    env_files: tuple[Path, ...] = ()
+    map_env: tuple[str, ...] = ()
+    force: bool = False
+
+
+@dataclass
+class McpEnvResolution:
+    env: dict[str, str] = field(default_factory=dict)
+    messages: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    secret_keys: set[str] = field(default_factory=set)
+    requested_keys: set[str] = field(default_factory=set)
+    uses_env_file: bool = False
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors
+
+
+def _is_valid_env_key(key: str) -> bool:
+    return bool(_ENV_KEY_RE.match(key))
+
+
+def _is_secret_like_key(key: str) -> bool:
+    upper = key.upper()
+    return any(hint in upper for hint in _SECRET_KEY_HINTS)
+
+
+def _register_env_secrets(env: Mapping[str, str]) -> set[str]:
+    secret_keys: set[str] = set()
+    for key, value in env.items():
+        if _is_secret_like_key(key):
+            secret_keys.add(key)
+            register_secret_value(value)
+            continue
+        if re.search(r"sk-[A-Za-z0-9_\-]{8,}", value) or re.search(
+            r"(?i)bearer\s+[A-Za-z0-9._\-]{8,}", value
+        ):
+            secret_keys.add(key)
+            register_secret_value(value)
+    return secret_keys
+
+
+def _parse_direct_env(assignments: tuple[str, ...]) -> tuple[dict[str, str], list[str]]:
+    env: dict[str, str] = {}
+    errors: list[str] = []
+    for raw in assignments:
+        if "=" not in raw:
+            errors.append("--env entries must be KEY=VALUE")
+            continue
+        key, value = raw.split("=", 1)
+        key = key.strip()
+        if not _is_valid_env_key(key):
+            errors.append(f"invalid env key {key!r}")
+            continue
+        env[key] = value
+    return env, errors
+
+
+def _parse_env_mappings(mappings: tuple[str, ...]) -> tuple[list[tuple[str, str]], list[str]]:
+    parsed: list[tuple[str, str]] = []
+    errors: list[str] = []
+    for raw in mappings:
+        if "=" not in raw:
+            errors.append("--map-env entries must be TARGET=SOURCE")
+            continue
+        target, source = (part.strip() for part in raw.split("=", 1))
+        if not _is_valid_env_key(target):
+            errors.append(f"invalid target env key {target!r}")
+            continue
+        if not _is_valid_env_key(source):
+            errors.append(f"invalid source env key {source!r}")
+            continue
+        parsed.append((target, source))
+    return parsed, errors
+
+
+def _split_inherit_keys(raw_keys: tuple[str, ...]) -> tuple[list[str], list[str]]:
+    keys: list[str] = []
+    errors: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_keys:
+        for part in raw.split(","):
+            key = part.strip()
+            if not key:
+                continue
+            if not _is_valid_env_key(key):
+                errors.append(f"invalid env key {key!r}")
+                continue
+            if key not in seen:
+                keys.append(key)
+                seen.add(key)
+    return keys, errors
+
+
+def _parse_env_file(path: Path) -> tuple[dict[str, str], list[str], list[str]]:
+    """Parse a conservative shell-style env file without executing it."""
+
+    env: dict[str, str] = {}
+    warnings: list[str] = []
+    errors: list[str] = []
+    expanded = path.expanduser()
+    if not expanded.is_file():
+        return env, warnings, [f"env file not found: {expanded}"]
+    try:
+        mode = expanded.stat().st_mode
+    except OSError as exc:
+        return env, warnings, [f"could not stat env file {expanded}: {exc!r}"]
+    if mode & 0o077:
+        warnings.append(
+            f"env file {expanded} is group/world readable; recommended permissions are 0600 "
+            f"(`chmod 600 {expanded}`)"
+        )
+    try:
+        lines = expanded.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        return env, warnings, [f"could not read env file {expanded}: {exc!r}"]
+
+    for lineno, raw in enumerate(lines, start=1):
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        try:
+            parts = shlex.split(stripped, comments=True, posix=True)
+        except ValueError as exc:
+            errors.append(f"{expanded}:{lineno}: could not parse shell env line: {exc}")
+            continue
+        if not parts:
+            continue
+        if parts[0] == "export":
+            parts = parts[1:]
+        elif parts[0] in {"set", "setenv", "source", "."}:
+            warnings.append(f"{expanded}:{lineno}: ignored unsupported shell command")
+            continue
+        elif "=" not in parts[0]:
+            warnings.append(f"{expanded}:{lineno}: ignored unsupported shell command")
+            continue
+        parsed_any = False
+        for part in parts:
+            if "=" not in part:
+                warnings.append(f"{expanded}:{lineno}: ignored token without KEY=VALUE")
+                continue
+            key, value = part.split("=", 1)
+            if not _is_valid_env_key(key):
+                errors.append(f"{expanded}:{lineno}: invalid env key {key!r}")
+                continue
+            env[key] = value
+            parsed_any = True
+        if not parsed_any and parts:
+            warnings.append(f"{expanded}:{lineno}: no env assignments found")
+    return env, warnings, errors
+
+
+def resolve_mcp_env(
+    request: Optional[McpEnvRequest],
+    *,
+    existing_env: Optional[Mapping[str, str]] = None,
+    source_env: Optional[Mapping[str, str]] = None,
+) -> McpEnvResolution:
+    """Resolve requested MCP env with deterministic precedence."""
+
+    resolution = McpEnvResolution()
+    if request is None:
+        request = McpEnvRequest()
+    source_env = source_env if source_env is not None else os.environ
+    requested: dict[str, str] = {}
+
+    for env_file in request.env_files:
+        file_env, warnings, errors = _parse_env_file(env_file)
+        resolution.uses_env_file = True
+        resolution.messages.extend(warnings)
+        resolution.errors.extend(errors)
+        requested.update(file_env)
+    inherit_keys, inherit_errors = _split_inherit_keys(request.inherit)
+    resolution.errors.extend(inherit_errors)
+    for key in inherit_keys:
+        if key in source_env:
+            requested[key] = str(source_env[key])
+        else:
+            resolution.messages.append(f"requested inherited env {key} is not set in installer environment")
+    mappings, mapping_errors = _parse_env_mappings(request.map_env)
+    resolution.errors.extend(mapping_errors)
+    for target, source in mappings:
+        if source in source_env:
+            requested[target] = str(source_env[source])
+        else:
+            resolution.messages.append(
+                f"requested env mapping {target}={source} skipped because {source} is not set"
+            )
+    direct, direct_errors = _parse_direct_env(request.direct)
+    resolution.errors.extend(direct_errors)
+    requested.update(direct)
+    resolution.requested_keys = set(requested)
+
+    existing = dict(existing_env or {})
+    if request.force:
+        merged = {**existing, **requested}
+        overridden = sorted(set(existing) & set(requested))
+        if overridden:
+            resolution.messages.append(
+                f"--force-env overriding existing env key(s): {', '.join(overridden)}"
+            )
+    else:
+        merged = {**requested, **existing}
+        preserved = sorted(set(existing) & set(requested))
+        if preserved:
+            resolution.messages.append(
+                "preserved existing env key(s) "
+                f"{', '.join(preserved)}; pass --force-env to override"
+            )
+    resolution.env = merged
+    resolution.secret_keys = _register_env_secrets(merged)
+    return resolution
+
+
+def _managed_env_content(env: Mapping[str, str]) -> str:
+    """Private, machine-readable managed env content for wrapper launchers."""
+
+    return json.dumps({key: str(env[key]) for key in sorted(env)}, indent=2, sort_keys=True) + "\n"
+
+
+def _write_private_file(path: Path, content: str, mode: int) -> bool:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    current = None
+    if path.exists():
+        try:
+            current = path.read_text(encoding="utf-8")
+        except OSError:
+            current = None
+    if current == content:
+        try:
+            os.chmod(path, mode)
+        except OSError:
+            pass
+        return False
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(content, encoding="utf-8")
+    os.chmod(tmp_path, mode)
+    os.replace(tmp_path, path)
+    return True
+
+
+def _codex_wrapper_content(managed_env_path: Path) -> str:
+    # Python wrapper instead of shell/zsh keeps the env-file/secret fallback
+    # portable across Unix shells and Windows process launchers.
+    return (
+        "#!/usr/bin/env python3\n"
+        "# Managed by Puppetmaster; re-run `puppetmaster install-codex-mcp` to update.\n"
+        "import json\n"
+        "import os\n"
+        "import runpy\n"
+        "from pathlib import Path\n"
+        f"env_path = Path({str(managed_env_path)!r})\n"
+        "if env_path.is_file():\n"
+        "    with env_path.open('r', encoding='utf-8') as handle:\n"
+        "        for key, value in json.load(handle).items():\n"
+        "            os.environ[str(key)] = str(value)\n"
+        "runpy.run_module('puppetmaster.mcp_server', run_name='__main__')\n"
+    )
+
+
+def _codex_config_path(env: Optional[Mapping[str, str]] = None) -> Path:
+    env = env if env is not None else os.environ
+    codex_home = env.get("CODEX_HOME")
+    if codex_home:
+        return Path(codex_home).expanduser() / "config.toml"
+    return Path("~/.codex/config.toml").expanduser()
 
 
 def handshake_mcp_server(
@@ -465,11 +755,82 @@ def _ensure_codex_timeouts(config_path: Path) -> list[str]:
     return messages
 
 
+def _parse_toml_string(value: str) -> str:
+    stripped = value.strip()
+    if stripped.startswith('"') and stripped.endswith('"'):
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            return stripped[1:-1]
+    if stripped.startswith("'") and stripped.endswith("'"):
+        return stripped[1:-1]
+    return stripped
+
+
+def _read_codex_puppetmaster_env(config_path: Path) -> dict[str, str]:
+    """Read the existing ``[mcp_servers.puppetmaster.env]`` table best-effort."""
+
+    try:
+        lines = config_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+    header = re.compile(r"^\s*\[\s*mcp_servers\.puppetmaster\.env\s*\]\s*$")
+    next_table = re.compile(r"^\s*\[")
+    header_idx = next((i for i, line in enumerate(lines) if header.match(line)), None)
+    if header_idx is None:
+        return {}
+    env: dict[str, str] = {}
+    for line in lines[header_idx + 1 :]:
+        if next_table.match(line):
+            break
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        key = key.strip().strip('"')
+        if _is_valid_env_key(key):
+            env[key] = _parse_toml_string(value)
+    return env
+
+
+def _codex_supports_stdio_env(codex: str) -> bool:
+    try:
+        result = subprocess.run(
+            [codex, "mcp", "add", "--help"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    text = f"{result.stdout}\n{result.stderr}"
+    return "--env <KEY=VALUE>" in text or "--env" in text
+
+
+def _codex_needs_wrapper(
+    resolution: McpEnvResolution,
+    *,
+    codex_supports_env: bool,
+) -> bool:
+    if not resolution.env:
+        return False
+    if not codex_supports_env:
+        return True
+    return resolution.uses_env_file or bool(resolution.secret_keys)
+
+
 def install_codex_mcp(
     *,
     python_executable: Optional[str] = None,
     codex_executable: Optional[str] = None,
     force: bool = False,
+    force_env: bool = False,
+    env: tuple[str, ...] = (),
+    inherit_env: tuple[str, ...] = (),
+    env_files: tuple[Path, ...] = (),
+    map_env: tuple[str, ...] = (),
     dry_run: bool = False,
     skip_handshake: bool = False,
 ) -> InstallResult:
@@ -490,17 +851,22 @@ def install_codex_mcp(
     entry is removed and re-added so a stale Python path can be fixed
     without manual intervention.
 
-    Note: Codex stores no per-server env block on stdio MCP entries by
-    default in the same way Cursor does, so this installer does not
-    forward env vars. Users who need to pass env to the MCP subprocess
-    should re-run with ``--env KEY=VAL`` after install via
-    ``codex mcp add puppetmaster --env KEY=VAL -- <python> -m ...``
-    or hand-edit the TOML.
+    Env handling: ``env`` maps to explicit ``--env KEY=VALUE`` values,
+    ``inherit_env`` copies selected keys from this installer process,
+    ``map_env`` maps a canonical provider key from a local key, and
+    ``env_files`` parses shell-style env files. Existing Codex env table keys
+    are preserved unless ``force_env=True``. When the local Codex CLI supports
+    stdio ``--env`` and the requested values are non-secret, we register native
+    Codex env entries. For env-files, secret-like values, or Codex CLIs without
+    stdio env support, we register a deterministic Puppetmaster-owned Python
+    wrapper that loads a private 0600 JSON env file instead, keeping raw
+    credentials out of Codex TOML and wrapper code.
     """
     python = python_executable or sys.executable
     codex = codex_executable or "codex"
     resolved_codex = shutil.which(codex) or (codex if Path(codex).expanduser().exists() else None)
     messages: list[str] = []
+    target_path = _codex_config_path()
     if resolved_codex is None:
         messages.append(
             f"`codex` CLI not found on PATH (looked for {codex!r}). "
@@ -508,18 +874,60 @@ def install_codex_mcp(
         )
         return InstallResult(
             status="error",
-            target="~/.codex/config.toml",
+            target=str(target_path),
             python_executable=python,
             messages=messages,
         )
 
+    existing_env = _read_codex_puppetmaster_env(target_path)
+    env_request = McpEnvRequest(
+        direct=tuple(env),
+        inherit=tuple(inherit_env),
+        env_files=tuple(Path(p).expanduser() for p in env_files),
+        map_env=tuple(map_env),
+        force=force_env,
+    )
+    env_resolution = resolve_mcp_env(env_request, existing_env=existing_env)
+    messages.extend(env_resolution.messages)
+    if env_resolution.errors:
+        messages.extend(env_resolution.errors)
+        return InstallResult(
+            status="error",
+            target=str(target_path),
+            python_executable=python,
+            messages=[redact_secrets(m) or "" for m in messages],
+        )
+
+    codex_supports_env = _codex_supports_stdio_env(resolved_codex) if env_resolution.env else True
+    use_wrapper = bool(env_resolution.env) and _codex_needs_wrapper(
+        env_resolution, codex_supports_env=codex_supports_env
+    )
+    wrapper_path = _CODEX_WRAPPER_PATH
+    managed_env_path = _CODEX_MANAGED_ENV_PATH
     desired_command = python
-    desired_args = ["-m", "puppetmaster.mcp_server"]
+    desired_args = [str(wrapper_path)] if use_wrapper else ["-m", "puppetmaster.mcp_server"]
+    if use_wrapper:
+        desired_env = {}
+    else:
+        desired_env = env_resolution.env
+    desired_env = dict(desired_env)
     existing_command = None
     existing_args: list[str] = []
+    managed_files_current = True
+    if use_wrapper:
+        managed_env_content = _managed_env_content(env_resolution.env)
+        wrapper_content = _codex_wrapper_content(managed_env_path)
+        try:
+            managed_files_current = (
+                managed_env_path.read_text(encoding="utf-8") == managed_env_content
+                and wrapper_path.read_text(encoding="utf-8") == wrapper_content
+            )
+        except OSError:
+            managed_files_current = False
     try:
         get_result = subprocess.run(
             [resolved_codex, "mcp", "get", "puppetmaster"],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=10,
@@ -540,17 +948,29 @@ def install_codex_mcp(
         if (
             existing_command == desired_command
             and existing_args == desired_args
+            and existing_env == desired_env
+            and managed_files_current
             and not force
         ):
+            timeout_messages = _ensure_codex_timeouts(target_path)
+            messages.extend(timeout_messages)
+            if any(message.startswith("set Codex timeouts") for message in timeout_messages):
+                return InstallResult(
+                    status="installed",
+                    target=str(target_path),
+                    python_executable=python,
+                    handshake=None,
+                    messages=[redact_secrets(m) or "" for m in messages],
+                )
             messages.append(
                 "codex `puppetmaster` MCP entry already matches sys.executable; nothing to do"
             )
             return InstallResult(
                 status="unchanged",
-                target="~/.codex/config.toml",
+                target=str(target_path),
                 python_executable=python,
                 handshake=None,
-                messages=messages,
+                messages=[redact_secrets(m) or "" for m in messages],
             )
         if existing_command:
             messages.append(
@@ -567,34 +987,66 @@ def install_codex_mcp(
             )
             return InstallResult(
                 status="error",
-                target="~/.codex/config.toml",
+                target=str(target_path),
                 python_executable=python,
                 handshake=handshake,
-                messages=messages,
+                messages=[redact_secrets(m) or "" for m in messages],
             )
         messages.append(
             f"handshake OK ({handshake.tool_count} tools advertised by {python})"
         )
 
     if dry_run:
+        env_note = ""
+        if env_resolution.env:
+            keys = ", ".join(sorted(env_resolution.env))
+            env_note = f"; env key(s): {keys}"
+        wrapper_note = ""
+        if use_wrapper:
+            wrapper_note = (
+                f"; would register managed Python wrapper {wrapper_path} backed by private env file "
+                f"{managed_env_path}"
+            )
+        elif env_resolution.env:
+            wrapper_note = "; would use Codex native --env entries"
         messages.append(
             f"DRY RUN — would run: "
-            f"`{resolved_codex} mcp add puppetmaster -- {desired_command} {' '.join(desired_args)}`"
+            f"`{resolved_codex} mcp add puppetmaster"
+            f"{' [--env KEY=<redacted> ...]' if desired_env else ''}"
+            f" -- {desired_command} {' '.join(desired_args)}`"
             f", then set startup_timeout_sec={CODEX_STARTUP_TIMEOUT_SEC}/"
             f"tool_timeout_sec={CODEX_TOOL_TIMEOUT_SEC} on the entry if unset"
+            f"{env_note}{wrapper_note}"
         )
         return InstallResult(
             status="would_install",
-            target="~/.codex/config.toml",
+            target=str(target_path),
             python_executable=python,
             handshake=handshake,
-            messages=messages,
+            messages=[redact_secrets(m) or "" for m in messages],
+        )
+
+    if use_wrapper:
+        env_changed = _write_private_file(managed_env_path, managed_env_content, 0o600)
+        wrapper_changed = _write_private_file(wrapper_path, wrapper_content, 0o700)
+        messages.append(
+            "using managed Codex MCP Python wrapper with private env file "
+            f"({len(env_resolution.env)} key(s); values not printed)"
+        )
+        if env_changed:
+            messages.append(f"wrote private managed env file {managed_env_path} (0600)")
+        if wrapper_changed:
+            messages.append(f"wrote managed wrapper {wrapper_path} (0700)")
+    elif env_resolution.env:
+        messages.append(
+            f"using Codex native MCP env entries for key(s): {', '.join(sorted(env_resolution.env))}"
         )
 
     if get_result is not None and get_result.returncode == 0:
         try:
             subprocess.run(
                 [resolved_codex, "mcp", "remove", "puppetmaster"],
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -608,13 +1060,14 @@ def install_codex_mcp(
         "mcp",
         "add",
         "puppetmaster",
-        "--",
-        desired_command,
-        *desired_args,
     ]
+    for key in sorted(desired_env):
+        add_cmd.extend(["--env", f"{key}={desired_env[key]}"])
+    add_cmd.extend(["--", desired_command, *desired_args])
     try:
         add_result = subprocess.run(
             add_cmd,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=15,
@@ -624,10 +1077,10 @@ def install_codex_mcp(
         messages.append(f"`codex mcp add` failed: {exc!r}")
         return InstallResult(
             status="error",
-            target="~/.codex/config.toml",
+            target=str(target_path),
             python_executable=python,
             handshake=handshake,
-            messages=messages,
+            messages=[redact_secrets(m) or "" for m in messages],
         )
     if add_result.returncode != 0:
         messages.append(
@@ -636,21 +1089,21 @@ def install_codex_mcp(
         )
         return InstallResult(
             status="error",
-            target="~/.codex/config.toml",
+            target=str(target_path),
             python_executable=python,
             handshake=handshake,
-            messages=messages,
+            messages=[redact_secrets(m) or "" for m in messages],
         )
     messages.append(
         f"registered puppetmaster MCP entry with Codex via `{resolved_codex} mcp add`"
     )
-    messages.extend(_ensure_codex_timeouts(Path("~/.codex/config.toml").expanduser()))
+    messages.extend(_ensure_codex_timeouts(target_path))
     return InstallResult(
         status="installed",
-        target="~/.codex/config.toml",
+        target=str(target_path),
         python_executable=python,
         handshake=handshake,
-        messages=messages,
+        messages=[redact_secrets(m) or "" for m in messages],
     )
 
 
@@ -722,6 +1175,28 @@ def _remove_codex_puppetmaster_table(config_path: Path) -> tuple[bool, list[str]
     return True, messages
 
 
+def _remove_codex_managed_files(*, dry_run: bool = False) -> tuple[bool, list[str]]:
+    """Remove Puppetmaster-owned Codex wrapper/env artifacts if present."""
+
+    removed_any = False
+    messages: list[str] = []
+    for path in (_CODEX_WRAPPER_PATH, _CODEX_MANAGED_ENV_PATH):
+        if not path.exists():
+            continue
+        if dry_run:
+            removed_any = True
+            messages.append(f"DRY RUN — would remove managed Codex MCP file {path}")
+            continue
+        try:
+            path.unlink()
+        except OSError as exc:
+            messages.append(f"could not remove managed Codex MCP file {path}: {exc!r}")
+            continue
+        removed_any = True
+        messages.append(f"removed managed Codex MCP file {path}")
+    return removed_any, messages
+
+
 def uninstall_cursor_mcp(
     *,
     target_path: Path,
@@ -779,7 +1254,7 @@ def uninstall_codex_mcp(
     table cannot survive a missing CLI.
     """
     codex = codex_executable or "codex"
-    config_path = Path("~/.codex/config.toml").expanduser()
+    config_path = _codex_config_path()
     target_label = str(config_path)
     messages: list[str] = []
     resolved_codex = shutil.which(codex) or (codex if Path(codex).expanduser().exists() else None)
@@ -805,7 +1280,9 @@ def uninstall_codex_mcp(
         header = re.compile(r"^\s*\[\s*mcp_servers\.puppetmaster\s*\]\s*$")
         table_present = any(header.match(line) for line in config_path.read_text(encoding="utf-8").splitlines())
 
-    if not has_entry and not table_present:
+    managed_files_present = any(path.exists() for path in (_CODEX_WRAPPER_PATH, _CODEX_MANAGED_ENV_PATH))
+
+    if not has_entry and not table_present and not managed_files_present:
         messages.append("no puppetmaster MCP entry in Codex config")
         return UninstallResult(status="unchanged", target=target_label, messages=messages)
 
@@ -818,6 +1295,8 @@ def uninstall_codex_mcp(
             messages.append(
                 f"DRY RUN — would remove [mcp_servers.puppetmaster] from {config_path}"
             )
+        _, managed_messages = _remove_codex_managed_files(dry_run=True)
+        messages.extend(managed_messages)
         return UninstallResult(status="would_remove", target=target_label, messages=messages)
 
     removed_any = False
@@ -847,6 +1326,10 @@ def uninstall_codex_mcp(
     removed_table, table_messages = _remove_codex_puppetmaster_table(config_path)
     messages.extend(table_messages)
     removed_any = removed_any or removed_table
+
+    removed_managed, managed_messages = _remove_codex_managed_files()
+    messages.extend(managed_messages)
+    removed_any = removed_any or removed_managed
 
     if not removed_any:
         if messages:

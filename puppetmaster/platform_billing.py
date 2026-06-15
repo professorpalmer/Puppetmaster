@@ -13,9 +13,10 @@ authenticated on this machine right now:
   (not mere file existence, which survives a logout) — per-token to the console
   account when ``ANTHROPIC_API_KEY`` is set — or per-token to the AWS account
   when ``CLAUDE_CODE_USE_BEDROCK`` is enabled with usable AWS credentials.
-* **Codex** reads ``~/.codex/auth.json`` (``auth_mode``/``tokens``) directly —
-  an API key is out-of-pocket; a ChatGPT login is subscription-covered —
-  falling back to ``codex login status`` only when that file is absent.
+* **Codex** reads ``$CODEX_HOME/auth.json`` when ``CODEX_HOME`` is set, else
+  ``~/.codex/auth.json`` (``auth_mode``/``tokens``) directly — an API key is
+  out-of-pocket; a ChatGPT login is subscription-covered — falling back to
+  ``codex login status`` only when that file is absent.
 
 Every probe is a pure function with injectable ``env`` / ``home`` / ``run``
 dependencies so the test suite can exercise each branch without real
@@ -277,8 +278,15 @@ def detect_claude_billing(
     )
 
 
-def _read_codex_auth(home: Path) -> "Optional[BillingStatus]":
-    """Detect Codex billing from ``~/.codex/auth.json`` without a subprocess.
+def _codex_auth_path(env: Mapping[str, str], home: Path) -> tuple[Path, str]:
+    codex_home = env.get("CODEX_HOME")
+    if codex_home:
+        return Path(codex_home).expanduser() / "auth.json", "$CODEX_HOME/auth.json"
+    return home / ".codex" / "auth.json", "~/.codex/auth.json"
+
+
+def _read_codex_auth(path: Path, label: str) -> "Optional[BillingStatus]":
+    """Detect Codex billing from Codex auth.json without a subprocess.
 
     The file is authoritative and fast: ``auth_mode == "apikey"`` (or a present
     ``OPENAI_API_KEY``) is out-of-pocket; ``auth_mode == "chatgpt"`` (or a
@@ -286,8 +294,6 @@ def _read_codex_auth(home: Path) -> "Optional[BillingStatus]":
     absent/unreadable so the caller can fall back to ``codex login status``.
     """
     import json
-
-    path = home / ".codex" / "auth.json"
     if not path.is_file():
         return None
     try:
@@ -305,10 +311,10 @@ def _read_codex_auth(home: Path) -> "Optional[BillingStatus]":
             billing="api",
             healthy=True,
             detail=(
-                "Codex is authenticated with an OpenAI API key (~/.codex/auth.json) "
+                f"Codex is authenticated with an OpenAI API key ({label}) "
                 "— work bills per-token to that account (out-of-pocket)."
             ),
-            evidence=["codex_auth:apikey"],
+            evidence=["codex_auth:apikey", f"codex_auth_path:{label}"],
         )
     if mode == "chatgpt" or has_tokens:
         return BillingStatus(
@@ -316,10 +322,10 @@ def _read_codex_auth(home: Path) -> "Optional[BillingStatus]":
             billing="plan",
             healthy=True,
             detail=(
-                "Codex is signed in via a ChatGPT subscription (~/.codex/auth.json) "
+                f"Codex is signed in via a ChatGPT subscription ({label}) "
                 "— work is covered by that plan (no marginal API spend)."
             ),
-            evidence=["codex_auth:chatgpt"],
+            evidence=["codex_auth:chatgpt", f"codex_auth_path:{label}"],
         )
     return None
 
@@ -327,15 +333,19 @@ def _read_codex_auth(home: Path) -> "Optional[BillingStatus]":
 def detect_codex_billing(
     run: Optional[CommandRunner] = None,
     codex_command: str = "codex",
+    env: Optional[Mapping[str, str]] = None,
     home: Optional[Path] = None,
 ) -> BillingStatus:
     """Codex: API key (api) vs ChatGPT subscription (plan).
 
-    Reads ``~/.codex/auth.json`` first (fast, deterministic, no subprocess) and
-    only falls back to parsing ``codex login status`` when the file is missing.
+    Reads ``$CODEX_HOME/auth.json`` first when CODEX_HOME is set, otherwise
+    ``~/.codex/auth.json`` (fast, deterministic, no subprocess), and only
+    falls back to parsing ``codex login status`` when the file is missing.
     """
+    env = env if env is not None else os.environ
     home = home if home is not None else Path.home()
-    from_file = _read_codex_auth(home)
+    auth_path, auth_label = _codex_auth_path(env, home)
+    from_file = _read_codex_auth(auth_path, auth_label)
     if from_file is not None:
         return from_file
     run = run or _default_runner
@@ -412,7 +422,9 @@ _DETECTORS: dict[str, Callable[..., BillingStatus]] = {
     "claude-code": lambda **kw: detect_claude_billing(
         env=kw.get("env"), home=kw.get("home")
     ),
-    "codex": lambda **kw: detect_codex_billing(run=kw.get("run"), home=kw.get("home")),
+    "codex": lambda **kw: detect_codex_billing(
+        run=kw.get("run"), env=kw.get("env"), home=kw.get("home")
+    ),
     "openai": lambda **kw: detect_openai_billing(env=kw.get("env")),
 }
 

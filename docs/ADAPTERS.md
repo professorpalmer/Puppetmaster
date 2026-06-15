@@ -131,6 +131,15 @@ Requirements:
 - Codex CLI authenticated locally. The simplest path is `printenv OPENAI_API_KEY | codex login --with-api-key` (or `codex login` for ChatGPT-account auth).
 - A reviewed workflow config, because this adapter can modify files in the configured `cwd` under the default `workspace-write` sandbox.
 
+For Puppetmaster MCP inside Codex, install selected credential env explicitly:
+
+```bash
+python -m puppetmaster install-codex-mcp --inherit-env OPENAI_API_KEY,CODEX_HOME
+python -m puppetmaster install-codex-mcp --env-file ~/.config/puppetmaster/env.zsh
+```
+
+Keep secrets in a private env file (`chmod 600`) instead of inline MCP config. `puppetmaster doctor` reports whether `OPENAI_API_KEY` and `CODEX_HOME` are visible to the MCP server without printing their values, and Codex billing detection reads `$CODEX_HOME/auth.json` before falling back to `~/.codex/auth.json`.
+
 Defaults are tuned for non-interactive automation: `approval_policy="never"`, `--sandbox workspace-write`, `--ephemeral`, `--skip-git-repo-check`. Use `payload.sandbox="read-only"` for explore / plan tasks that should never touch the worktree. Opt in to `payload.dangerously_bypass_approvals_and_sandbox=true` only when the surrounding environment is already externally sandboxed.
 
 If the adapter returns `failure=not_authenticated`, run `printenv OPENAI_API_KEY | codex login --with-api-key` once.
@@ -162,4 +171,3 @@ Like Claude Code, when Codex edits tracked files, Puppetmaster records a `patch`
 4. Add tests that prove provider failures become artifacts.
 
 Provider adapters should avoid raw transcript dumps. Return claims, decisions, patches, risks, or verification results with evidence.
-
