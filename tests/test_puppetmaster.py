@@ -7335,11 +7335,11 @@ class ModelRouterTests(unittest.TestCase):
 
         captured = {}
 
-        def fake_run_cli(command, args):
+        def fake_run_worker_cli(command, args):
             captured["command"] = command
             return {"ok": True}
 
-        with patch.object(mcp_server, "run_cli", side_effect=fake_run_cli):
+        with patch.object(mcp_server, "run_worker_cli", side_effect=fake_run_worker_cli):
             mcp_server.run_codex(
                 {
                     "goal": "ship codex worker",
@@ -7396,11 +7396,11 @@ class ModelRouterTests(unittest.TestCase):
 
         captured = []
 
-        def fake_run_cli(command, args):
+        def fake_run_worker_cli(command, args):
             captured.append(command)
             return {"ok": True}
 
-        with patch.object(mcp_server, "run_cli", side_effect=fake_run_cli):
+        with patch.object(mcp_server, "run_worker_cli", side_effect=fake_run_worker_cli):
             mcp_server.run_claude({"goal": "fresh claude", "cwd": ".", "disable_memory": True})
             mcp_server.run_openai({"goal": "fresh openai", "cwd": ".", "disable_memory": True})
             mcp_server.run_codex({"goal": "fresh codex", "cwd": ".", "disable_memory": True})
@@ -7993,7 +7993,7 @@ class InstallerTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             stub_log = Path(tmp) / "codex_calls.log"
-            stub = Path(tmp) / "codex"
+            stub = Path(tmp) / "codex-stub"
             stub.write_text(
                 "#!/usr/bin/env bash\n"
                 f'echo "$@" >> {stub_log}\n'
@@ -8032,7 +8032,17 @@ class InstallerTests(unittest.TestCase):
         from puppetmaster.installers import install_codex_mcp
 
         with TemporaryDirectory() as tmp:
-            stub = Path(tmp) / "codex"
+            codex_home = Path(tmp) / "codex"
+            codex_home.mkdir()
+            (codex_home / "config.toml").write_text(
+                "[mcp_servers.puppetmaster]\n"
+                f'command = "{sys.executable}"\n'
+                'args = ["-m", "puppetmaster.mcp_server"]\n'
+                "startup_timeout_sec = 30\n"
+                "tool_timeout_sec = 300\n",
+                encoding="utf-8",
+            )
+            stub = Path(tmp) / "codex-stub"
             stub.write_text(
                 "#!/usr/bin/env bash\n"
                 'if [ "$1" = "mcp" ] && [ "$2" = "get" ]; then\n'
@@ -8045,11 +8055,285 @@ class InstallerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             stub.chmod(0o755)
-            result = install_codex_mcp(
-                codex_executable=str(stub),
-                skip_handshake=True,
-            )
+            with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
+                result = install_codex_mcp(
+                    codex_executable=str(stub),
+                    skip_handshake=True,
+                )
             self.assertEqual(result.status, "unchanged")
+
+    def test_resolve_mcp_env_precedence_map_and_redaction(self):
+        from puppetmaster.installers import McpEnvRequest, resolve_mcp_env
+        from puppetmaster.redaction import clear_registered_secrets, redact_secrets
+
+        with TemporaryDirectory() as tmp:
+            clear_registered_secrets()
+            env_file = Path(tmp) / "env.zsh"
+            secret = "sk-" + "x" * 24
+            env_file.write_text(
+                f"export FOO=file\nSHARED=file\nOPENAI_API_KEY={secret}\n",
+                encoding="utf-8",
+            )
+            env_file.chmod(0o600)
+            try:
+                resolved = resolve_mcp_env(
+                    McpEnvRequest(
+                        direct=("FOO=direct",),
+                        inherit=("SHARED",),
+                        env_files=(env_file,),
+                        map_env=("CODEX_HOME=MY_CODEX_API_HOME",),
+                    ),
+                    existing_env={"FOO": "existing"},
+                    source_env={
+                        "SHARED": "inherited",
+                        "MY_CODEX_API_HOME": "/tmp/api-codex",
+                    },
+                )
+                self.assertTrue(resolved.ok, msg=resolved.errors)
+                self.assertEqual(resolved.env["FOO"], "existing")
+                self.assertEqual(resolved.env["SHARED"], "inherited")
+                self.assertEqual(resolved.env["CODEX_HOME"], "/tmp/api-codex")
+                self.assertNotIn(secret, redact_secrets(f"leaked {secret}") or "")
+            finally:
+                clear_registered_secrets()
+
+    def test_env_file_permission_warning_and_missing_file_error(self):
+        from puppetmaster.installers import McpEnvRequest, resolve_mcp_env
+
+        with TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / "env.zsh"
+            env_file.write_text("export CODEX_HOME=/tmp/codex-api\n", encoding="utf-8")
+            env_file.chmod(0o644)
+            resolved = resolve_mcp_env(McpEnvRequest(env_files=(env_file,)))
+            self.assertTrue(resolved.ok, msg=resolved.errors)
+            self.assertEqual(resolved.env["CODEX_HOME"], "/tmp/codex-api")
+            self.assertTrue(any("group/world readable" in m for m in resolved.messages))
+
+            missing = resolve_mcp_env(McpEnvRequest(env_files=(Path(tmp) / "missing.env",)))
+            self.assertFalse(missing.ok)
+            self.assertTrue(any("env file not found" in e for e in missing.errors))
+
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "bash CLI stub is POSIX-only scaffolding; installer logic is OS-agnostic "
+        "and covered on Linux + macOS",
+    )
+    def test_install_codex_idempotent_entry_still_sets_missing_timeouts(self):
+        from puppetmaster.installers import (
+            CODEX_STARTUP_TIMEOUT_SEC,
+            CODEX_TOOL_TIMEOUT_SEC,
+            install_codex_mcp,
+        )
+
+        with TemporaryDirectory() as tmp:
+            codex_home = Path(tmp) / "codex"
+            codex_home.mkdir()
+            config = codex_home / "config.toml"
+            config.write_text(
+                "[mcp_servers.puppetmaster]\n"
+                f'command = "{sys.executable}"\n'
+                'args = ["-m", "puppetmaster.mcp_server"]\n',
+                encoding="utf-8",
+            )
+            stub = Path(tmp) / "codex-stub"
+            stub.write_text(
+                "#!/usr/bin/env bash\n"
+                'if [ "$1" = "mcp" ] && [ "$2" = "get" ]; then\n'
+                '  echo "name: puppetmaster"\n'
+                f'  echo "command: {sys.executable}"\n'
+                '  echo "args: -m puppetmaster.mcp_server"\n'
+                "  exit 0\n"
+                "fi\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            stub.chmod(0o755)
+            with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
+                result = install_codex_mcp(codex_executable=str(stub), skip_handshake=True)
+
+            self.assertEqual(result.status, "installed", msg=result.messages)
+            text = config.read_text("utf-8")
+            self.assertIn(f"startup_timeout_sec = {CODEX_STARTUP_TIMEOUT_SEC}", text)
+            self.assertIn(f"tool_timeout_sec = {CODEX_TOOL_TIMEOUT_SEC}", text)
+
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "bash CLI stub is POSIX-only scaffolding; installer logic is OS-agnostic "
+        "and covered on Linux + macOS",
+    )
+    def test_install_codex_preserves_existing_env_unless_force_env(self):
+        from puppetmaster.installers import install_codex_mcp
+
+        with TemporaryDirectory() as tmp:
+            codex_home = Path(tmp) / "codex"
+            codex_home.mkdir()
+            (codex_home / "config.toml").write_text(
+                "[mcp_servers.puppetmaster]\n"
+                f'command = "{sys.executable}"\n'
+                'args = ["-m", "puppetmaster.mcp_server"]\n\n'
+                "[mcp_servers.puppetmaster.env]\n"
+                'FOO = "old"\n',
+                encoding="utf-8",
+            )
+            stub_log = Path(tmp) / "codex_calls.log"
+            stub = Path(tmp) / "codex-stub"
+            stub.write_text(
+                "#!/usr/bin/env bash\n"
+                f'echo "$@" >> {stub_log}\n'
+                'if [ "$1" = "mcp" ] && [ "$2" = "add" ] && [ "$3" = "--help" ]; then\n'
+                '  echo "--env <KEY=VALUE>"\n'
+                "  exit 0\n"
+                "fi\n"
+                'if [ "$1" = "mcp" ] && [ "$2" = "get" ]; then\n'
+                '  echo "name: puppetmaster"\n'
+                f'  echo "command: {sys.executable}"\n'
+                '  echo "args: -m puppetmaster.mcp_server"\n'
+                "  exit 0\n"
+                "fi\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            stub.chmod(0o755)
+            with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False):
+                result = install_codex_mcp(
+                    codex_executable=str(stub),
+                    env=("FOO=new", "BAR=1"),
+                    skip_handshake=True,
+                )
+                self.assertEqual(result.status, "installed", msg=result.messages)
+                log = stub_log.read_text("utf-8")
+                self.assertIn("--env FOO=old", log)
+                self.assertIn("--env BAR=1", log)
+                self.assertNotIn("--env FOO=new", log)
+
+                stub_log.write_text("", encoding="utf-8")
+                forced = install_codex_mcp(
+                    codex_executable=str(stub),
+                    env=("FOO=new",),
+                    force_env=True,
+                    skip_handshake=True,
+                )
+                self.assertEqual(forced.status, "installed", msg=forced.messages)
+                forced_log = stub_log.read_text("utf-8")
+                self.assertIn("--env FOO=new", forced_log)
+
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "bash CLI stub is POSIX-only scaffolding; installer logic is OS-agnostic "
+        "and covered on Linux + macOS",
+    )
+    def test_install_codex_env_file_uses_wrapper_without_raw_secret_in_outputs(self):
+        from puppetmaster.installers import install_codex_mcp
+
+        with TemporaryDirectory() as tmp:
+            secret = "sk-" + "z" * 24
+            env_file = Path(tmp) / "env.zsh"
+            env_file.write_text(
+                f"export OPENAI_API_KEY={secret}\nexport CODEX_HOME={Path(tmp) / 'api-home'}\n",
+                encoding="utf-8",
+            )
+            env_file.chmod(0o600)
+            codex_home = Path(tmp) / "codex"
+            codex_home.mkdir()
+            (codex_home / "config.toml").write_text(
+                "[mcp_servers.puppetmaster]\n"
+                f'command = "{sys.executable}"\n'
+                'args = ["-m", "puppetmaster.mcp_server"]\n\n'
+                "[mcp_servers.puppetmaster.env]\n"
+                'LEGACY = "keep-me"\n',
+                encoding="utf-8",
+            )
+            stub_log = Path(tmp) / "codex_calls.log"
+            stub = Path(tmp) / "codex-stub"
+            stub.write_text(
+                "#!/usr/bin/env bash\n"
+                f'echo "$@" >> {stub_log}\n'
+                'if [ "$1" = "mcp" ] && [ "$2" = "add" ] && [ "$3" = "--help" ]; then\n'
+                '  echo "--env <KEY=VALUE>"\n'
+                "  exit 0\n"
+                "fi\n"
+                'if [ "$1" = "mcp" ] && [ "$2" = "get" ]; then\n'
+                '  echo "name: puppetmaster"\n'
+                f'  echo "command: {sys.executable}"\n'
+                '  echo "args: -m puppetmaster.mcp_server"\n'
+                "  exit 0\n"
+                "fi\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            stub.chmod(0o755)
+            wrapper = Path(tmp) / "codex-mcp-wrapper.py"
+            managed_env = Path(tmp) / "codex-mcp.env.json"
+            with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False), \
+                    patch("puppetmaster.installers._CODEX_WRAPPER_PATH", wrapper), \
+                    patch("puppetmaster.installers._CODEX_MANAGED_ENV_PATH", managed_env):
+                result = install_codex_mcp(
+                    codex_executable=str(stub),
+                    env_files=(env_file,),
+                    skip_handshake=True,
+                )
+            self.assertEqual(result.status, "installed", msg=result.messages)
+            self.assertTrue(wrapper.exists())
+            self.assertTrue(managed_env.exists())
+            self.assertEqual(managed_env.stat().st_mode & 0o777, 0o600)
+            self.assertNotIn(secret, wrapper.read_text("utf-8"))
+            log = stub_log.read_text("utf-8")
+            self.assertNotIn("--env", log)
+            self.assertNotIn(secret, log)
+            self.assertNotIn(secret, "\n".join(result.messages))
+            managed = json.loads(managed_env.read_text("utf-8"))
+            self.assertEqual(managed["LEGACY"], "keep-me")
+            self.assertEqual(managed["OPENAI_API_KEY"], secret)
+
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "bash CLI stub is POSIX-only scaffolding; installer logic is OS-agnostic "
+        "and covered on Linux + macOS",
+    )
+    def test_install_codex_without_env_support_uses_wrapper_not_env_flags(self):
+        from puppetmaster.installers import install_codex_mcp
+
+        with TemporaryDirectory() as tmp:
+            codex_home = Path(tmp) / "codex"
+            codex_home.mkdir()
+            (codex_home / "config.toml").write_text(
+                "[mcp_servers.puppetmaster]\n"
+                f'command = "{sys.executable}"\n'
+                'args = ["-m", "puppetmaster.mcp_server"]\n\n'
+                "[mcp_servers.puppetmaster.env]\n"
+                'FOO = "old"\n',
+                encoding="utf-8",
+            )
+            stub_log = Path(tmp) / "codex_calls.log"
+            stub = Path(tmp) / "codex-stub"
+            stub.write_text(
+                "#!/usr/bin/env bash\n"
+                f'echo "$@" >> {stub_log}\n'
+                'if [ "$1" = "mcp" ] && [ "$2" = "add" ] && [ "$3" = "--help" ]; then\n'
+                '  echo "Usage: codex mcp add <NAME> -- <COMMAND>"\n'
+                "  exit 0\n"
+                "fi\n"
+                'if [ "$1" = "mcp" ] && [ "$2" = "get" ]; then\n'
+                '  echo "name: puppetmaster"\n'
+                f'  echo "command: {sys.executable}"\n'
+                '  echo "args: -m puppetmaster.mcp_server"\n'
+                "  exit 0\n"
+                "fi\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            stub.chmod(0o755)
+            wrapper = Path(tmp) / "codex-mcp-wrapper.py"
+            managed_env = Path(tmp) / "codex-mcp.env.json"
+            with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False), \
+                    patch("puppetmaster.installers._CODEX_WRAPPER_PATH", wrapper), \
+                    patch("puppetmaster.installers._CODEX_MANAGED_ENV_PATH", managed_env):
+                result = install_codex_mcp(codex_executable=str(stub), skip_handshake=True)
+            self.assertEqual(result.status, "installed", msg=result.messages)
+            log = stub_log.read_text("utf-8")
+            self.assertNotIn("--env", log)
+            self.assertIn(f"mcp add puppetmaster -- {sys.executable} {wrapper}", log)
+            self.assertTrue(managed_env.exists())
 
     def test_install_claude_reports_error_when_cli_missing(self):
         from puppetmaster.installers import install_claude_mcp
@@ -9153,7 +9437,7 @@ class PlatformBillingDetectionTests(unittest.TestCase):
             def _boom(cmd):
                 raise AssertionError("subprocess must not run when auth.json present")
 
-            s = detect_codex_billing(run=_boom, home=home)
+            s = detect_codex_billing(run=_boom, env={}, home=home)
             self.assertEqual(s.billing, "api")
             self.assertIn("codex_auth:apikey", s.evidence)
 
@@ -9165,9 +9449,43 @@ class PlatformBillingDetectionTests(unittest.TestCase):
                 _json.dumps({"auth_mode": "chatgpt", "tokens": {"access": "x"}}),
                 encoding="utf-8",
             )
-            s = detect_codex_billing(run=lambda cmd: (1, "", ""), home=home)
+            s = detect_codex_billing(run=lambda cmd: (1, "", ""), env={}, home=home)
             self.assertEqual(s.billing, "plan")
             self.assertIn("codex_auth:chatgpt", s.evidence)
+
+    def test_codex_billing_uses_codex_home_auth_before_default_home(self) -> None:
+        import json as _json
+
+        from puppetmaster.platform_billing import detect_codex_billing
+
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            codex_home = Path(tmp) / "api-codex-home"
+            (home / ".codex").mkdir(parents=True)
+            codex_home.mkdir()
+            (home / ".codex" / "auth.json").write_text(
+                _json.dumps({"auth_mode": "chatgpt", "tokens": {"access": "x"}}),
+                encoding="utf-8",
+            )
+            (codex_home / "auth.json").write_text(
+                _json.dumps({"OPENAI_API_KEY": "sk-x", "auth_mode": "apikey"}),
+                encoding="utf-8",
+            )
+
+            api = detect_codex_billing(
+                run=lambda cmd: (_ for _ in ()).throw(
+                    AssertionError("subprocess must not run when auth.json exists")
+                ),
+                env={"CODEX_HOME": str(codex_home)},
+                home=home,
+            )
+            self.assertEqual(api.billing, "api")
+            self.assertIn("codex_auth_path:$CODEX_HOME/auth.json", api.evidence)
+            self.assertIn("auth_context:process", api.evidence)
+
+            plan = detect_codex_billing(run=lambda cmd: (1, "", ""), env={}, home=home)
+            self.assertEqual(plan.billing, "plan")
+            self.assertIn("codex_auth_path:~/.codex/auth.json", plan.evidence)
 
     def test_codex_billing_falls_back_to_login_status(self) -> None:
         from puppetmaster.platform_billing import detect_codex_billing
@@ -9176,19 +9494,29 @@ class PlatformBillingDetectionTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             home = Path(tmp)  # empty: no ~/.codex/auth.json
             api = detect_codex_billing(
-                run=lambda cmd: (0, "Logged in using an API key - sk-***", ""), home=home
+                run=lambda cmd: (0, "Logged in using an API key - sk-***", ""),
+                env={},
+                home=home,
             )
             self.assertEqual(api.billing, "api")
             chatgpt = detect_codex_billing(
-                run=lambda cmd: (0, "Logged in using ChatGPT", ""), home=home
+                run=lambda cmd: (0, "Logged in using ChatGPT", ""),
+                env={},
+                home=home,
             )
             self.assertEqual(chatgpt.billing, "plan")
             missing = detect_codex_billing(
-                run=lambda cmd: (127, "", "command not found"), home=home
+                run=lambda cmd: (127, "", "command not found"),
+                env={},
+                home=home,
             )
             self.assertEqual(missing.billing, "unknown")
             self.assertFalse(missing.healthy)
-            out = detect_codex_billing(run=lambda cmd: (1, "Not logged in", ""), home=home)
+            out = detect_codex_billing(
+                run=lambda cmd: (1, "Not logged in", ""),
+                env={},
+                home=home,
+            )
             self.assertEqual(out.billing, "unknown")
             self.assertFalse(out.healthy)
 
@@ -14626,6 +14954,32 @@ class UninstallTests(unittest.TestCase):
             self.assertIn("[features]", text)
             again, _ = _remove_codex_puppetmaster_table(config)
             self.assertFalse(again)
+
+    def test_uninstall_codex_mcp_removes_managed_wrapper_files(self):
+        from puppetmaster.installers import uninstall_codex_mcp
+
+        with TemporaryDirectory() as tmp:
+            codex_home = Path(tmp) / "codex"
+            codex_home.mkdir()
+            config = codex_home / "config.toml"
+            config.write_text(
+                "[mcp_servers.puppetmaster]\n"
+                f'command = "{sys.executable}"\n'
+                'args = ["-m", "puppetmaster.mcp_server"]\n',
+                encoding="utf-8",
+            )
+            wrapper = Path(tmp) / "codex-mcp-wrapper.py"
+            managed_env = Path(tmp) / "codex-mcp.env.json"
+            wrapper.write_text("# managed\n", encoding="utf-8")
+            managed_env.write_text("{}\n", encoding="utf-8")
+            with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}, clear=False), \
+                    patch("puppetmaster.installers._CODEX_WRAPPER_PATH", wrapper), \
+                    patch("puppetmaster.installers._CODEX_MANAGED_ENV_PATH", managed_env):
+                result = uninstall_codex_mcp(codex_executable="/nonexistent/codex")
+            self.assertEqual(result.status, "removed", msg=result.messages)
+            self.assertFalse(wrapper.exists())
+            self.assertFalse(managed_env.exists())
+            self.assertNotIn("[mcp_servers.puppetmaster]", config.read_text("utf-8"))
 
     def test_uninstall_hooks_preserves_foreign_hooks(self):
         from puppetmaster.hook_installers import install_hooks, uninstall_hooks

@@ -6,7 +6,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -27,6 +27,7 @@ class Check:
     name: str
     status: str
     detail: str
+    evidence: list[str] = field(default_factory=list)
 
 
 def _guard(name: str, fn: "Callable[[], Check]") -> Check:
@@ -65,13 +66,11 @@ def run_doctor(root: Path, state_dir: Optional[Path] = None) -> list[Check]:
         _guard("mcp-servers", _mcp_servers_check),
         _guard("CURSOR_API_KEY", lambda: _env_check("CURSOR_API_KEY")),
         _guard("OPENAI_API_KEY", lambda: _env_check("OPENAI_API_KEY")),
-        _guard("CODEX_HOME", lambda: _env_check("CODEX_HOME")),
-        _guard("mcp-env:OPENAI_API_KEY", lambda: _mcp_env_check("OPENAI_API_KEY")),
-        _guard("mcp-env:CODEX_HOME", lambda: _mcp_env_check("CODEX_HOME")),
         _guard("sqlite-state", lambda: _sqlite_state_check(state_path / "state.sqlite3")),
         _guard("git-status", lambda: _git_clean_check(root)),
         _guard("agent-rules", lambda: _agent_rules_check(root)),
     ]
+    checks.extend(_guard_many(_credential_env_checks))
     checks.extend(_guard_many(_billing_checks))
     checks.append(_guard("catalog-freshness", _catalog_freshness_check))
     checks.append(_guard("platform-lock", _platform_lock_check))
@@ -156,8 +155,52 @@ def _billing_checks() -> list[Check]:
             continue
         state = "ok" if status.healthy else "warn"
         checks.append(
-            Check(f"billing:{adapter}", state, f"{status.billing} — {status.detail}")
+            Check(
+                f"billing:{adapter}",
+                state,
+                f"{status.billing} — {status.detail}",
+                evidence=list(status.evidence),
+            )
         )
+    return checks
+
+
+_PROVIDER_CREDENTIAL_ENV_KEYS: dict[str, tuple[str, ...]] = {
+    "cursor": ("CURSOR_API_KEY",),
+    "openai": ("OPENAI_API_KEY",),
+    "codex": ("CODEX_HOME", "OPENAI_API_KEY"),
+    "claude-code": (
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "AWS_PROFILE",
+        "AWS_BEARER_TOKEN_BEDROCK",
+    ),
+}
+
+
+def _credential_env_checks() -> list[Check]:
+    checks: list[Check] = []
+    seen: set[tuple[str, str]] = set()
+    for provider, keys in _PROVIDER_CREDENTIAL_ENV_KEYS.items():
+        for key in keys:
+            marker = (provider, key)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            status = "ok" if os.environ.get(key) else "optional"
+            detail = (
+                f"{key} visible to this process (value hidden)"
+                if status == "ok"
+                else f"{key} not visible to this process"
+            )
+            checks.append(
+                Check(
+                    f"credential-env:{provider}:{key}",
+                    status,
+                    detail,
+                    evidence=[f"provider:{provider}", f"env:{key}", f"visible:{status == 'ok'}"],
+                )
+            )
     return checks
 
 
@@ -344,6 +387,12 @@ def adapter_status(root: Path) -> list[dict[str, object]]:
     claude_installed = _claude_code_installed()
     codex_installed = _codex_cli_installed()
     openai_key = bool(os.environ.get("OPENAI_API_KEY"))
+    try:
+        from puppetmaster.platform_billing import detect_codex_billing
+
+        codex_auth = detect_codex_billing()
+    except Exception:
+        codex_auth = None
     rows = []
     for info in ADAPTER_INFO:
         configured = info.status == "built-in"
@@ -354,11 +403,7 @@ def adapter_status(root: Path) -> list[dict[str, object]]:
         elif info.name == "openai":
             configured = openai_key
         elif info.name == "codex":
-            # Codex needs BOTH: the CLI installed AND OpenAI auth. We don't
-            # introspect `codex login` state from here (the auth file is
-            # outside our purview), so OPENAI_API_KEY is a decent proxy
-            # that we don't false-positive on a never-authed Codex install.
-            configured = codex_installed and openai_key
+            configured = codex_installed and bool(codex_auth and codex_auth.healthy)
         if info.status == "stub":
             configured = False
         rows.append(
@@ -540,8 +585,8 @@ def _codex_command() -> str:
 
 def _env_check(name: str) -> Check:
     if os.environ.get(name):
-        return Check(name, "ok", "set")
-    return Check(name, "optional", "not set")
+        return Check(name, "ok", "set", evidence=[f"env:{name}", "visible:true"])
+    return Check(name, "optional", "not set", evidence=[f"env:{name}", "visible:false"])
 
 
 def _mcp_env_check(name: str) -> Check:

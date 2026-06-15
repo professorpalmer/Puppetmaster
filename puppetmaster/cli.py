@@ -118,7 +118,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     subcommands.add_parser("init", help="Create the local Puppetmaster state store.")
     subcommands.add_parser("state", help="Print the resolved Puppetmaster state directory.")
-    subcommands.add_parser("doctor", help="Check local runtime dependencies.")
+    doctor_parser = subcommands.add_parser("doctor", help="Check local runtime dependencies.")
+    doctor_parser.add_argument("--json", action="store_true", help="Emit structured JSON.")
     subcommands.add_parser("adapters", help="List available worker adapters.")
 
     install_codex = subcommands.add_parser(
@@ -1565,7 +1566,24 @@ def _main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     if args.command == "doctor":
-        for check in run_doctor(Path.cwd(), state_dir):
+        checks = run_doctor(Path.cwd(), state_dir)
+        if getattr(args, "json", False):
+            print(
+                json.dumps(
+                    [
+                        {
+                            "name": check.name,
+                            "status": check.status,
+                            "detail": check.detail,
+                            "evidence": check.evidence,
+                        }
+                        for check in checks
+                    ],
+                    indent=2,
+                )
+            )
+            return 0
+        for check in checks:
             print(f"{check.status:8} {check.name:16} {check.detail}")
         return 0
 

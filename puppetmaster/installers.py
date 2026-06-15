@@ -427,7 +427,6 @@ def resolve_mcp_env(
 
 def _managed_env_content(env: Mapping[str, str]) -> str:
     """Private, machine-readable managed env content for wrapper launchers."""
-
     return json.dumps({key: str(env[key]) for key in sorted(env)}, indent=2, sort_keys=True) + "\n"
 
 
@@ -907,6 +906,9 @@ def install_codex_mcp(
     desired_command = python
     desired_args = [str(wrapper_path)] if use_wrapper else ["-m", "puppetmaster.mcp_server"]
     if use_wrapper:
+        # Wrapper mode exists specifically to keep secret-like values and
+        # env-file contents out of Codex TOML. Put the full effective env in
+        # the private managed env file and clear native Codex env entries.
         desired_env = {}
     else:
         desired_env = env_resolution.env
