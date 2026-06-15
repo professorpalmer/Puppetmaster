@@ -301,13 +301,20 @@ def _codegraph_check(root: Path) -> Check:
         return Check(
             "codegraph",
             "optional",
-            "install codegraph for shared repo intelligence (npx @colbymchenry/codegraph)",
+            "codegraph not found — it powers the shared repo intelligence injected "
+            "into every worker (CodeGraph search/context). It is a Node/npm package: "
+            "`npm install -g @colbymchenry/codegraph` (or run via `npx "
+            "@colbymchenry/codegraph`). Note: do NOT `pip install codegraph` — the "
+            "PyPI package of that name is unrelated and will not work.",
         )
     if not codegraph_initialized(root):
         return Check(
             "codegraph",
             "optional",
-            "codegraph installed; run `codegraph init` in target repos to enable shared context",
+            "codegraph installed but this repo isn't indexed yet — run "
+            "`python -m puppetmaster codegraph init --index` here to enable shared "
+            "context (always invoke via `python -m puppetmaster codegraph …`, never a "
+            "bare `codegraph`, so it runs under Cursor's bundled Node).",
         )
     status = codegraph_status_command(root)
     combined = (status.get("stdout") or "") + "\n" + (status.get("stderr") or "")
@@ -391,8 +398,31 @@ def starter_config() -> str:
 """
 
 
+def _resolve_probe_command(command: list[str]) -> Optional[list[str]]:
+    """Resolve ``command`` to a form ``subprocess`` can actually launch.
+
+    ``shutil.which`` honors ``PATHEXT``, so on Windows it locates the
+    ``npm.cmd`` / ``npx.cmd`` shims that a bare ``npm`` would miss. But
+    ``subprocess`` with ``shell=False`` cannot launch a batch shim directly
+    (``CreateProcess`` only runs PE binaries), so probing bare ``npm`` there
+    raised ``FileNotFoundError`` (WinError 2) even though npm was installed —
+    surfacing a misleading ``error`` row in ``doctor``. Route a resolved
+    ``.cmd`` / ``.bat`` through the command processor instead.
+
+    Returns ``None`` when the executable isn't on PATH.
+    """
+    resolved = shutil.which(command[0])
+    if resolved is None:
+        return None
+    if os.name == "nt" and resolved.lower().endswith((".cmd", ".bat")):
+        comspec = os.environ.get("COMSPEC", "cmd.exe")
+        return [comspec, "/c", resolved, *command[1:]]
+    return [resolved, *command[1:]]
+
+
 def _command_check(name: str, command: list[str]) -> Check:
-    if shutil.which(command[0]) is None:
+    resolved = _resolve_probe_command(command)
+    if resolved is None:
         return Check(name, "missing", f"{command[0]} not found on PATH")
     # stdin=DEVNULL is critical when this runs inside the MCP server: by
     # default subprocess inherits fd 0 from the parent, and certain
@@ -401,7 +431,7 @@ def _command_check(name: str, command: list[str]) -> Check:
     # EOF — silently exiting the server with code 0. See
     # bench/mcp_stress.py for the repro.
     completed = subprocess.run(
-        command,
+        resolved,
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,

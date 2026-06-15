@@ -8250,6 +8250,50 @@ class InstallRulesTests(unittest.TestCase):
             agents = (cwd / "AGENTS.md").read_text("utf-8")
             self.assertIn("puppetmaster:rules:begin", agents)
 
+    def test_install_rules_skips_cursor_when_platform_lock_excludes_it(self):
+        """A claude-code-only user (git repo cwd) must not get a .cursor rule.
+
+        Auto-detection treats any git repo as "cursor present", so without the
+        platform-lock filter setup would write .cursor/rules/puppetmaster.mdc on a
+        machine where the user never routes to Cursor. ``agents`` (cross-tool)
+        still lands.
+        """
+        from puppetmaster.rules import install_rules
+
+        with TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            (cwd / ".git").mkdir()
+            result = install_rules(cwd=cwd, enabled_adapters={"claude-code"})
+            self.assertEqual(result.overall_status, "installed")
+            self.assertFalse(
+                (cwd / ".cursor" / "rules" / "puppetmaster.mdc").exists(),
+                msg="cursor disabled by the lock must not write a .cursor rule",
+            )
+            self.assertTrue((cwd / "AGENTS.md").is_file())
+            self.assertEqual(
+                {o.target for o in result.outcomes}, {"agents"}
+            )
+
+    def test_install_rules_includes_cursor_when_lock_enables_it(self):
+        from puppetmaster.rules import install_rules
+
+        with TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            (cwd / ".git").mkdir()
+            result = install_rules(cwd=cwd, enabled_adapters={"cursor"})
+            self.assertTrue((cwd / ".cursor" / "rules" / "puppetmaster.mdc").is_file())
+            self.assertIn("cursor", {o.target for o in result.outcomes})
+
+    def test_install_rules_unfiltered_default_still_writes_cursor_in_git_repo(self):
+        """enabled_adapters=None (standalone install-rules) preserves behavior."""
+        from puppetmaster.rules import install_rules
+
+        with TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            (cwd / ".git").mkdir()
+            result = install_rules(cwd=cwd)
+            self.assertTrue((cwd / ".cursor" / "rules" / "puppetmaster.mdc").is_file())
+
     def test_install_rules_dry_run_writes_nothing(self):
         from puppetmaster.rules import install_rules
 
@@ -10205,6 +10249,50 @@ class AutoFallbackTests(unittest.TestCase):
             store.update_task_status(hard, TaskStatus.COMPLETE)
             self.assertFalse(orch._has_hard_failure(job, allowed))
             self.assertFalse(orch._should_fail_closed(job, allowed))
+
+
+class CommandProbeResolutionTests(unittest.TestCase):
+    """`_resolve_probe_command` must launch Windows .cmd shims correctly.
+
+    Regression: ``doctor`` probed bare ``npm``, which on Windows raised
+    FileNotFoundError (WinError 2) because subprocess(shell=False) can't run a
+    .cmd shim — surfacing a misleading ``error`` row even when npm was installed.
+    """
+
+    def test_resolves_posix_executable_to_full_path(self) -> None:
+        from unittest.mock import patch
+
+        from puppetmaster.diagnostics import _resolve_probe_command
+
+        with patch("puppetmaster.diagnostics.os.name", "posix"), patch(
+            "puppetmaster.diagnostics.shutil.which", return_value="/usr/bin/npm"
+        ):
+            self.assertEqual(
+                _resolve_probe_command(["npm", "--version"]),
+                ["/usr/bin/npm", "--version"],
+            )
+
+    def test_windows_cmd_shim_routed_through_command_processor(self) -> None:
+        from unittest.mock import patch
+
+        from puppetmaster.diagnostics import _resolve_probe_command
+
+        cmd_path = r"C:\Program Files\nodejs\npm.cmd"
+        with patch("puppetmaster.diagnostics.os.name", "nt"), patch(
+            "puppetmaster.diagnostics.shutil.which", return_value=cmd_path
+        ), patch.dict("os.environ", {"COMSPEC": r"C:\Windows\System32\cmd.exe"}):
+            self.assertEqual(
+                _resolve_probe_command(["npm", "--version"]),
+                [r"C:\Windows\System32\cmd.exe", "/c", cmd_path, "--version"],
+            )
+
+    def test_returns_none_when_executable_absent(self) -> None:
+        from unittest.mock import patch
+
+        from puppetmaster.diagnostics import _resolve_probe_command
+
+        with patch("puppetmaster.diagnostics.shutil.which", return_value=None):
+            self.assertIsNone(_resolve_probe_command(["npm", "--version"]))
 
 
 class LiveProbeTests(unittest.TestCase):
@@ -13431,6 +13519,49 @@ class PuppetmasterUsageTests(unittest.TestCase):
         self.assertEqual(sdk_usage_from_stdout(stdout), {"inputTokens": 9})
         self.assertIsNone(sdk_usage_from_stdout("not json"))
 
+    def test_cursor_turn_ended_usage_is_measured_with_cache(self) -> None:
+        """The real Cursor `turn-ended` usage shape yields measured (not
+        estimated) counts and preserves cache read/write tokens for the cost axis."""
+        from puppetmaster.usage import token_usage, usage_from_sdk
+
+        # Exactly the shape the streaming runner now accumulates and emits.
+        sdk_usage = {
+            "inputTokens": 48000,
+            "outputTokens": 1200,
+            "cacheReadTokens": 30000,
+            "cacheWriteTokens": 500,
+        }
+        self.assertEqual(
+            usage_from_sdk(sdk_usage),
+            {
+                "tokens_in": 48000,
+                "tokens_out": 1200,
+                "cache_read_tokens": 30000,
+                "cache_write_tokens": 500,
+            },
+        )
+        record = token_usage(sdk_usage=sdk_usage)
+        self.assertFalse(record["tokens_estimated"])
+        self.assertEqual(record["tokens_in"], 48000)
+        self.assertEqual(record["tokens_out"], 1200)
+        self.assertEqual(record["cache_read_tokens"], 30000)
+        self.assertEqual(record["cache_write_tokens"], 500)
+
+    def test_cursor_runner_null_usage_falls_back_to_estimate(self) -> None:
+        """When the runtime reports no usage (runner emits usage: null), the
+        record must be a clearly-labeled estimate, never a fake-measured zero."""
+        from puppetmaster.adapters import sdk_usage_from_stdout
+        from puppetmaster.usage import token_usage
+
+        stdout = json.dumps({"status": "finished", "result": "hello", "usage": None})
+        record = token_usage(
+            sdk_usage=sdk_usage_from_stdout(stdout),
+            prompt_text="x" * 80,
+            output_text="hello",
+        )
+        self.assertTrue(record["tokens_estimated"])
+        self.assertNotIn("cache_read_tokens", record)
+
     def test_aggregate_splits_measured_and_estimated(self) -> None:
         from puppetmaster.models import Artifact, ArtifactType
         from puppetmaster.usage import aggregate_token_usage
@@ -13960,6 +14091,50 @@ class HookInstallerTests(unittest.TestCase):
             again = install_hooks(cwd=cwd)
             self.assertEqual(again.overall_status, "unchanged")
 
+    def test_install_filters_to_enabled_cursor_only(self):
+        """A cursor-only lock must not write .claude/settings.json hooks."""
+        from puppetmaster.hook_installers import install_hooks
+
+        with TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            result = install_hooks(cwd=cwd, enabled_adapters={"cursor"})
+            self.assertEqual(result.overall_status, "installed")
+            self.assertTrue((cwd / ".cursor" / "hooks.json").exists())
+            self.assertFalse((cwd / ".claude" / "settings.json").exists())
+            self.assertEqual({o.target for o in result.outcomes}, {"cursor"})
+
+    def test_install_filters_to_enabled_claude_only(self):
+        from puppetmaster.hook_installers import install_hooks
+
+        with TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            result = install_hooks(cwd=cwd, enabled_adapters={"claude-code"})
+            self.assertTrue((cwd / ".claude" / "settings.json").exists())
+            self.assertFalse((cwd / ".cursor" / "hooks.json").exists())
+            self.assertEqual({o.target for o in result.outcomes}, {"claude"})
+
+    def test_install_with_no_enabled_platforms_writes_nothing(self):
+        from puppetmaster.hook_installers import install_hooks
+
+        with TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            result = install_hooks(cwd=cwd, enabled_adapters=set())
+            self.assertEqual(result.overall_status, "unchanged")
+            self.assertFalse((cwd / ".cursor" / "hooks.json").exists())
+            self.assertFalse((cwd / ".claude" / "settings.json").exists())
+
+    def test_explicit_targets_override_enabled_filter(self):
+        """Explicit targets win over the lock filter (explicit intent)."""
+        from puppetmaster.hook_installers import install_hooks
+
+        with TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            result = install_hooks(
+                cwd=cwd, targets=["claude"], enabled_adapters={"cursor"}
+            )
+            self.assertTrue((cwd / ".claude" / "settings.json").exists())
+            self.assertFalse((cwd / ".cursor" / "hooks.json").exists())
+
     def test_install_preserves_user_hooks(self):
         from puppetmaster.hook_installers import install_hooks
 
@@ -14278,7 +14453,10 @@ class SetupHooksStepTests(unittest.TestCase):
                 os.chdir(tmp)
                 with patch.object(cli, "install_cursor_mcp", return_value=_Res()), \
                         patch.object(cli, "install_codex_mcp", return_value=_Res()), \
-                        patch("puppetmaster.platform_lock.enabled_adapters", return_value={"cursor"}):
+                        patch.object(cli, "install_claude_mcp", return_value=_Res()), \
+                        patch.object(cli, "resolve_claude_command", return_value="claude"), \
+                        patch("puppetmaster.platform_lock.enabled_adapters",
+                              return_value={"cursor", "claude-code"}):
                     rc = cli._run_setup(self._args())
                 self.assertEqual(rc, 0)
                 self.assertTrue((Path(tmp) / ".cursor" / "hooks.json").exists())

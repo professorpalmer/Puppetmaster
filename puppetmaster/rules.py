@@ -470,6 +470,7 @@ def install_rules(
     install_global: bool = False,
     dry_run: bool = False,
     force: bool = False,
+    enabled_adapters: Optional[set[str]] = None,
 ) -> RulesInstallResult:
     """Detect host tools and install Puppetmaster rule files.
 
@@ -487,26 +488,47 @@ def install_rules(
     - ``claude_global`` is included only with ``--global`` AND when
       claude is detected (``claude`` on PATH or ``~/.claude/`` present).
 
+    ``enabled_adapters`` (when provided) further filters the auto-detected
+    set to the platforms the user actually routes to — e.g. a Claude-Code-only
+    user shouldn't get a ``.cursor/rules/`` file written just because the cwd
+    is a git repo. ``None`` (the default) means "don't filter", preserving
+    standalone ``install-rules`` behavior. Ignored when ``targets`` is given
+    (explicit intent always wins). The portable ``agents`` target is never
+    filtered: ``AGENTS.md`` is cross-tool and harmless.
+
     Pass an explicit ``targets`` iterable to override detection.
     """
     cwd = cwd or Path.cwd()
     result = RulesInstallResult()
 
+    def _adapter_enabled(adapter: str) -> bool:
+        return enabled_adapters is None or adapter in enabled_adapters
+
     detected: list[str] = []
     if targets is None:
-        if _detect_cursor(cwd):
+        if _detect_cursor(cwd) and _adapter_enabled("cursor"):
             detected.append("cursor")
         detected.append("agents")
         if install_global:
-            if _detect_codex_cli():
+            if _detect_codex_cli() and _adapter_enabled("codex"):
                 detected.append("codex_global")
+            elif _detect_codex_cli():
+                result.messages.append(
+                    "codex detected but disabled by the platform lock — "
+                    "skipping ~/.codex/instructions.md"
+                )
             else:
                 result.messages.append(
                     "codex CLI not detected — skipping ~/.codex/instructions.md "
                     "(install `codex` and re-run with --global to enable)"
                 )
-            if _detect_claude_cli():
+            if _detect_claude_cli() and _adapter_enabled("claude-code"):
                 detected.append("claude_global")
+            elif _detect_claude_cli():
+                result.messages.append(
+                    "claude detected but disabled by the platform lock — "
+                    "skipping ~/.claude/CLAUDE.md"
+                )
             else:
                 result.messages.append(
                     "claude CLI not detected — skipping ~/.claude/CLAUDE.md "

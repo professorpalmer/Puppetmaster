@@ -2910,27 +2910,33 @@ def _run_setup(args) -> int:
     else:
         print("=== step 3/8: models init SKIPPED (--skip-models) ===\n")
 
+    from puppetmaster import platform_lock as _pl
+    enabled_adapters = _pl.enabled_adapters()
+
     print("=== step 4/8: install-cursor-mcp (workspace .cursor/mcp.json) ===")
-    from puppetmaster import platform_lock as _platform_lock
-    if "cursor" in _platform_lock.enabled_adapters():
+    if "cursor" not in enabled_adapters:
+        print(
+            "  skipped  cursor platform disabled by the platform lock — not "
+            "installing its MCP client (.cursor/mcp.json)"
+        )
+    else:
         sdk = ensure_cursor_sdk(cwd)
         print(f"  sdk {sdk.status}  {sdk.detail}")
-    cursor_result = install_cursor_mcp(
-        target_path=(cwd / ".cursor" / "mcp.json").resolve(),
-        force=getattr(args, "force", False),
-        dry_run=False,
-        skip_handshake=False,
-    )
-    for line in cursor_result.messages:
-        print(f"  {line}")
-    if cursor_result.status not in {"installed", "unchanged", "would_install"}:
-        overall_rc = 1
+        cursor_result = install_cursor_mcp(
+            target_path=(cwd / ".cursor" / "mcp.json").resolve(),
+            force=getattr(args, "force", False),
+            dry_run=False,
+            skip_handshake=False,
+        )
+        for line in cursor_result.messages:
+            print(f"  {line}")
+        if cursor_result.status not in {"installed", "unchanged", "would_install"}:
+            overall_rc = 1
     print()
 
     print("=== step 5/8: install-codex-mcp ===")
     import shutil as _shutil
-    from puppetmaster import platform_lock as _pl
-    if "codex" not in _pl.enabled_adapters():
+    if "codex" not in enabled_adapters:
         print("  skipped  codex platform disabled by the platform lock — not installing its MCP client")
     elif _shutil.which("codex") is None:
         print("  skipped  `codex` CLI not on PATH — install with `npm install -g @openai/codex` and re-run `puppetmaster install-codex-mcp` later")
@@ -2947,7 +2953,7 @@ def _run_setup(args) -> int:
     print()
 
     print("=== step 6/8: install-claude-mcp ===")
-    if "claude-code" not in _pl.enabled_adapters():
+    if "claude-code" not in enabled_adapters:
         print("  skipped  claude-code platform disabled by the platform lock — not installing its MCP client")
     elif resolve_claude_command() is None:
         print(
@@ -2974,6 +2980,7 @@ def _run_setup(args) -> int:
             install_global=getattr(args, "global_rules", False),
             dry_run=False,
             force=getattr(args, "force", False),
+            enabled_adapters=enabled_adapters,
         )
         for outcome in rules_result.outcomes:
             print(f"  {outcome.target:<14} {outcome.status:<14} {outcome.reason}")
@@ -2993,6 +3000,7 @@ def _run_setup(args) -> int:
             dry_run=False,
             force=getattr(args, "force", False),
             scope=hooks_scope,
+            enabled_adapters=enabled_adapters,
         )
         for outcome in hooks_result.outcomes:
             print(f"  {outcome.target:<14} {outcome.status:<14} {outcome.reason}")

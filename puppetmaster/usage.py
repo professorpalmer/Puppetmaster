@@ -60,7 +60,21 @@ def usage_from_sdk(sdk_usage: Any) -> Optional[dict[str, int]]:
     )
     if tokens_in is None and tokens_out is None:
         return None
-    return {"tokens_in": tokens_in or 0, "tokens_out": tokens_out or 0}
+    result = {"tokens_in": tokens_in or 0, "tokens_out": tokens_out or 0}
+    # Cursor's turn-ended usage also splits out cache read/write tokens. They're
+    # priced differently from fresh input, so preserve them for the cost axis
+    # instead of folding them into tokens_in (which would lie about pricing).
+    cache_read = _coerce_int(sdk_usage.get("cacheReadTokens")) or _coerce_int(
+        sdk_usage.get("cache_read_tokens")
+    )
+    cache_write = _coerce_int(sdk_usage.get("cacheWriteTokens")) or _coerce_int(
+        sdk_usage.get("cache_write_tokens")
+    )
+    if cache_read is not None:
+        result["cache_read_tokens"] = cache_read
+    if cache_write is not None:
+        result["cache_write_tokens"] = cache_write
+    return result
 
 
 def token_usage(
@@ -77,11 +91,15 @@ def token_usage(
     """
     measured = usage_from_sdk(sdk_usage)
     if measured is not None:
-        return {
+        record = {
             "tokens_in": measured["tokens_in"],
             "tokens_out": measured["tokens_out"],
             "tokens_estimated": False,
         }
+        for cache_key in ("cache_read_tokens", "cache_write_tokens"):
+            if cache_key in measured:
+                record[cache_key] = measured[cache_key]
+        return record
     return {
         "tokens_in": _approx_tokens(prompt_text),
         "tokens_out": _approx_tokens(output_text),

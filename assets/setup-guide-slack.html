@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Puppetmaster — Easy Setup Guide</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { background: #0d1020; }
+  body {
+    width: 1200px;
+    font-family: -apple-system, "SF Pro Display", "Segoe UI", Helvetica, Arial, sans-serif;
+    color: #e8edff;
+  }
+  .poster {
+    width: 1200px;
+    background:
+      radial-gradient(1100px 500px at 85% -10%, rgba(124, 92, 255, 0.28), transparent 60%),
+      radial-gradient(900px 480px at 0% 110%, rgba(64, 196, 255, 0.14), transparent 55%),
+      #0d1020;
+    padding: 56px 60px 44px;
+  }
+
+  /* ---------- header ---------- */
+  .header { display: flex; align-items: center; gap: 24px; margin-bottom: 14px; }
+  .mask { font-size: 64px; line-height: 1; filter: drop-shadow(0 6px 18px rgba(124,92,255,.5)); }
+  .title h1 { font-size: 44px; font-weight: 800; letter-spacing: -0.5px; }
+  .title h1 span { color: #a78bfa; }
+  .title p { font-size: 19px; color: #93a0c4; margin-top: 6px; max-width: 860px; }
+  .pin {
+    margin-left: auto; flex-shrink: 0;
+    background: rgba(167,139,250,.12); border: 1px solid rgba(167,139,250,.4);
+    color: #c4b5fd; font-size: 14px; font-weight: 700; letter-spacing: .8px;
+    padding: 8px 16px; border-radius: 999px; text-transform: uppercase;
+  }
+
+  /* ---------- step 1 banner ---------- */
+  .install {
+    margin-top: 30px;
+    background: linear-gradient(135deg, rgba(124,92,255,.22), rgba(64,196,255,.10));
+    border: 1px solid rgba(167,139,250,.45);
+    border-radius: 18px; padding: 26px 30px;
+  }
+  .step-label {
+    display: inline-block; font-size: 13px; font-weight: 800; letter-spacing: 1.2px;
+    text-transform: uppercase; color: #0d1020; background: #a78bfa;
+    padding: 5px 12px; border-radius: 7px; margin-bottom: 12px;
+  }
+  .install h2 { font-size: 24px; font-weight: 700; margin-bottom: 14px; }
+  .install h2 em { font-style: normal; color: #93a0c4; font-weight: 500; font-size: 18px; }
+  code, .code {
+    font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  }
+  .code {
+    display: block; background: #090b16; border: 1px solid #252a45;
+    border-radius: 12px; padding: 16px 20px; font-size: 16.5px; line-height: 1.75;
+    color: #d6e2ff; white-space: pre;
+  }
+  .code .c { color: #5b6585; }      /* comment */
+  .code .p { color: #67e8f9; }      /* prompt $ */
+  .code .hl { color: #c4b5fd; font-weight: 600; }
+
+  /* ---------- platform grid ---------- */
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; margin-top: 26px; }
+  .card {
+    background: rgba(255,255,255,.035); border: 1px solid #252a45;
+    border-radius: 18px; padding: 24px 26px;
+    min-width: 0; /* keep long pre lines from widening the grid track */
+  }
+  .card .code, .vcard .code { overflow-x: hidden; }
+  .card-head { display: flex; align-items: center; gap: 12px; margin-bottom: 6px; }
+  .badge {
+    width: 40px; height: 40px; border-radius: 11px; display: flex;
+    align-items: center; justify-content: center; font-size: 21px; font-weight: 800;
+    flex-shrink: 0;
+  }
+  .b-cursor { background: rgba(167,139,250,.18); border: 1px solid rgba(167,139,250,.5); color: #c4b5fd; }
+  .b-claude { background: rgba(255,160,90,.15);  border: 1px solid rgba(255,160,90,.5);  color: #ffb380; }
+  .b-codex  { background: rgba(110,231,183,.13); border: 1px solid rgba(110,231,183,.5); color: #6ee7b7; }
+  .b-openai { background: rgba(103,232,249,.13); border: 1px solid rgba(103,232,249,.5); color: #67e8f9; }
+  .card h3 { font-size: 22px; font-weight: 700; }
+  .card .sub { font-size: 14.5px; color: #93a0c4; margin-bottom: 14px; }
+  .card .code { font-size: 13.5px; padding: 13px 16px; line-height: 1.7; }
+  .card .note { font-size: 14px; color: #93a0c4; margin-top: 11px; line-height: 1.5; }
+  .card .note b { color: #e8edff; font-weight: 600; }
+  .card .note code { color: #c4b5fd; font-size: 13px; background: rgba(167,139,250,.1); padding: 1px 6px; border-radius: 5px; }
+
+  /* ---------- footer ---------- */
+  .verify {
+    margin-top: 26px; display: grid; grid-template-columns: 1.05fr 1.5fr; gap: 22px;
+  }
+  .vcard {
+    background: rgba(255,255,255,.035); border: 1px solid #252a45;
+    border-radius: 18px; padding: 22px 26px;
+    min-width: 0;
+  }
+  .vcard h3 { font-size: 18px; font-weight: 700; margin-bottom: 12px; display: flex; align-items: center; gap: 9px; }
+  .vcard .code { font-size: 14.5px; padding: 13px 16px; line-height: 1.7; }
+  .vcard .quote {
+    background: #090b16; border: 1px solid #252a45; border-left: 3px solid #a78bfa;
+    border-radius: 12px; padding: 13px 16px; font-size: 14.5px; line-height: 1.65;
+    color: #d6e2ff; font-style: italic;
+  }
+  .footer {
+    margin-top: 30px; display: flex; align-items: center; justify-content: space-between;
+    border-top: 1px solid #252a45; padding-top: 22px;
+    font-size: 15px; color: #93a0c4;
+  }
+  .footer b { color: #c4b5fd; font-weight: 600; }
+  .footer .repo { font-family: "SF Mono", ui-monospace, Menlo, monospace; font-size: 14.5px; color: #67e8f9; }
+</style>
+</head>
+<body>
+<div class="poster">
+
+  <div class="header">
+    <div class="mask">🎭</div>
+    <div class="title">
+      <h1><span>Puppetmaster</span> — Easy Setup Guide</h1>
+      <p>Routes every task to the cheapest model that can handle it, runs workers as independent processes, and stores results so follow-ups cost $0.</p>
+    </div>
+    <div class="pin">📌 Pin me</div>
+  </div>
+
+  <div class="install">
+    <span class="step-label">Step 1 — Everyone</span>
+    <h2>Install once, wire everything &nbsp;<em>(idempotent — safe to re-run)</em></h2>
+    <div class="code"><span class="p">$</span> pipx install puppetmaster-ai     <span class="c"># or: pip install puppetmaster-ai</span>
+<span class="p">$</span> <span class="hl">puppetmaster setup</span>               <span class="c"># doctor + models + MCP installers + rules + hooks</span></div>
+  </div>
+
+  <div style="margin-top:26px;"><span class="step-label" style="background:#67e8f9;">Step 2 — Your platform</span></div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="card-head"><div class="badge b-cursor">⌘</div><h3>Cursor</h3></div>
+      <div class="sub">MCP is registered by <b>setup</b> automatically — just restart.</div>
+      <div class="code"><span class="p">$</span> puppetmaster install-cursor-mcp <span class="hl">--global</span>
+    <span class="c"># optional: register for all workspaces</span></div>
+      <div class="note"><b>Then:</b> restart Cursor → the agent sees 32+ <code>puppetmaster_*</code> tools. Workspace default writes <code>.cursor/mcp.json</code>.</div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><div class="badge b-claude">✳</div><h3>Claude Code</h3></div>
+      <div class="sub">Needs the <b>claude</b> CLI installed &amp; logged in first.</div>
+      <div class="code"><span class="p">$</span> npm i -g @anthropic-ai/claude-code
+<span class="p">$</span> claude   <span class="c"># complete /login once</span>
+<span class="p">$</span> <span class="hl">puppetmaster install-claude-mcp</span></div>
+      <div class="note"><b>Then:</b> open a fresh Claude session — <code>claude mcp get puppetmaster</code> should show ✔ Connected.</div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><div class="badge b-codex">▸</div><h3>Codex CLI</h3></div>
+      <div class="sub">Needs the <b>codex</b> CLI installed &amp; authenticated first.</div>
+      <div class="code"><span class="p">$</span> npm i -g @openai/codex && codex login
+<span class="p">$</span> <span class="hl">puppetmaster install-codex-mcp</span></div>
+      <div class="note"><b>Then:</b> start a fresh Codex session — <code>[mcp_servers.puppetmaster]</code> lands in <code>~/.codex/config.toml</code>.</div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><div class="badge b-openai">⬡</div><h3>OpenAI API</h3></div>
+      <div class="sub">No MCP needed — used directly as a worker adapter.</div>
+      <div class="code"><span class="p">$</span> export OPENAI_API_KEY=sk-...
+<span class="p">$</span> puppetmaster route "audit the api" \
+    --role audit          <span class="c"># dry-run the routing</span></div>
+      <div class="note"><b>Bonus:</b> billing-grade token telemetry per task. <code>OPENAI_BASE_URL</code> works for compatible providers.</div>
+    </div>
+  </div>
+
+  <div class="verify">
+    <div class="vcard">
+      <h3>✅ Step 3 — Verify</h3>
+      <div class="code"><span class="p">$</span> puppetmaster doctor
+<span class="p">$</span> puppetmaster show $(puppetmaster last)</div>
+    </div>
+    <div class="vcard">
+      <h3>🚀 First prompt to try (in Cursor / Claude / Codex)</h3>
+      <div class="quote">"Use Puppetmaster to run doctor in this repo and summarize what is missing."<br>"Use Puppetmaster to start a cursor swarm for this repo and return the job id immediately."</div>
+    </div>
+  </div>
+
+  <div class="footer">
+    <div><b>$0 follow-ups:</b> results persist in SQLite — re-read any job with <b>puppetmaster artifacts &lt;job_id&gt;</b></div>
+    <div class="repo">github.com/professorpalmer/Puppetmaster</div>
+  </div>
+
+</div>
+</body>
+</html>

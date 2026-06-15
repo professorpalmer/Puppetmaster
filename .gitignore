@@ -22,3 +22,7 @@ build/
 coverage/
 .coverage
 
+# Separate research project — lives in its own repo (durable-state-vs-context).
+# Never track or push it with Puppetmaster.
+research/
+

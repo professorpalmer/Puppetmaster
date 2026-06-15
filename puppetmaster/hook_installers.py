@@ -230,6 +230,9 @@ def _install_claude(base_dir: Path, *, scope: str, dry_run: bool, force: bool, p
     return HookOutcome("claude", str(path), "installed", f"wrote Claude {scope} UserPromptSubmit + PreToolUse(Grep|Glob|Task) hooks")
 
 
+_HOOK_TARGET_ADAPTERS = {"cursor": "cursor", "claude": "claude-code"}
+
+
 def install_hooks(
     *,
     cwd: Optional[Path] = None,
@@ -239,6 +242,7 @@ def install_hooks(
     python: Optional[str] = None,
     scope: str = "project",
     home: Optional[Path] = None,
+    enabled_adapters: Optional[set[str]] = None,
 ) -> HooksInstallResult:
     """Install Puppetmaster auto-invocation hooks for ``targets``.
 
@@ -252,13 +256,38 @@ def install_hooks(
     Only the base directory differs between scopes — the ``.cursor`` / ``.claude``
     subpaths are identical. Defaults to both Cursor and Claude Code; pass
     ``targets`` to restrict. ``home`` is an injectable override of ``~`` for tests.
+
+    ``enabled_adapters`` (when provided) filters the *default* target set to the
+    platforms the user actually routes to — e.g. a Cursor-only user shouldn't get
+    a ``.claude/settings.json`` hook written. ``None`` (the default) means "don't
+    filter", preserving standalone ``install-hooks`` behavior. Ignored when
+    ``targets`` is given (explicit intent always wins).
     """
     result = HooksInstallResult()
     if scope not in VALID_HOOK_SCOPES:
         result.outcomes.append(HookOutcome("", "", "error", f"unknown hook scope: {scope!r}"))
         return result
     base = (home or Path.home()) if scope == "global" else (cwd or Path.cwd())
-    selected = list(targets) if targets else ["cursor", "claude"]
+    if targets:
+        selected = list(targets)
+    else:
+        selected = [
+            target
+            for target in ("cursor", "claude")
+            if enabled_adapters is None
+            or _HOOK_TARGET_ADAPTERS[target] in enabled_adapters
+        ]
+        if not selected:
+            result.outcomes.append(
+                HookOutcome(
+                    "",
+                    "",
+                    "unchanged",
+                    "no enabled platform needs host hooks (cursor + claude-code both "
+                    "disabled by the platform lock)",
+                )
+            )
+            return result
     for target in selected:
         if target == "cursor":
             result.outcomes.append(_install_cursor(base, scope=scope, dry_run=dry_run, force=force, python=python))
