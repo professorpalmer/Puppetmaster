@@ -679,6 +679,11 @@ def build_parser() -> argparse.ArgumentParser:
             "use on a trusted network."
         ),
     )
+    dashboard_cmd.add_argument(
+        "--all-projects",
+        action="store_true",
+        help="Show jobs from every Puppetmaster project state dir on this machine.",
+    )
 
     await_cmd = subcommands.add_parser(
         "await",
@@ -1982,6 +1987,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
             port=args.port,
             open_browser=not args.no_open,
             allow_external=getattr(args, "allow_external", False),
+            all_projects=getattr(args, "all_projects", False),
         )
         return 0
 
