@@ -485,16 +485,58 @@ class SwarmStore:
             )
         return out
 
-    def status_snapshot(self, job_id: str) -> dict[str, Any]:
+    @staticmethod
+    def _compact_text_ref(value: Any) -> dict[str, Any]:
+        text = str(value)
+        return {
+            "chars": len(text),
+            "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        }
+
+    @classmethod
+    def _compact_status_payload(cls, payload: Any) -> Any:
+        if not isinstance(payload, dict):
+            return payload
+        compacted = dict(payload)
+        prompt = compacted.pop("prompt", None)
+        if prompt is not None:
+            compacted["prompt_ref"] = cls._compact_text_ref(prompt)
+        return compacted
+
+    @classmethod
+    def _compact_status_job(cls, job: dict[str, Any]) -> dict[str, Any]:
+        compacted = dict(job)
+        goal = compacted.pop("goal", None)
+        if goal is not None:
+            compacted["goal_ref"] = cls._compact_text_ref(goal)
+        return compacted
+
+    @classmethod
+    def _compact_status_task(cls, task: dict[str, Any]) -> dict[str, Any]:
+        compacted = dict(task)
+        instruction = compacted.pop("instruction", None)
+        if instruction is not None:
+            compacted["instruction_ref"] = cls._compact_text_ref(instruction)
+        compacted["payload"] = cls._compact_status_payload(compacted.get("payload"))
+        return compacted
+
+    def status_snapshot(self, job_id: str, *, compact: bool = False) -> dict[str, Any]:
         self.refresh_blocked_tasks(job_id)
         tasks = self.list_tasks(job_id)
         status_counts: dict[str, int] = {}
         for task in tasks:
             status_counts[str(task.status)] = status_counts.get(str(task.status), 0) + 1
         artifacts = self.list_artifacts(job_id)
+        job_payload = to_jsonable(self.get_job(job_id))
+        task_payloads = [to_jsonable(task) for task in tasks]
+        if compact:
+            job_payload = self._compact_status_job(job_payload)
+            task_payloads = [
+                self._compact_status_task(task_payload) for task_payload in task_payloads
+            ]
         return {
-            "job": to_jsonable(self.get_job(job_id)),
-            "tasks": [to_jsonable(task) for task in tasks],
+            "job": job_payload,
+            "tasks": task_payloads,
             "task_counts": status_counts,
             "artifact_count": len(artifacts),
             "stale_task_ids": [task.id for task in tasks if self.is_task_stale(task)],

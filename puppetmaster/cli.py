@@ -394,6 +394,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = subcommands.add_parser("status", help="Show task, artifact, and stale lease state.")
     status.add_argument("job_id")
+    status.add_argument(
+        "--compact",
+        action="store_true",
+        help=(
+            "Omit high-churn prompt bodies from JSON output and replace them "
+            "with deterministic char-count/SHA-256 refs."
+        ),
+    )
 
     watch = subcommands.add_parser("watch", help="Poll status for a job.")
     watch.add_argument("job_id")
@@ -1842,7 +1850,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
         # status never reports a wedged job as live.
         _reap_quietly(store)
         _warn_job_liveness(store, args.job_id)
-        print(json.dumps(store.status_snapshot(args.job_id), indent=2))
+        print(json.dumps(store.status_snapshot(args.job_id, compact=args.compact), indent=2))
         return 0
 
     if args.command == "watch":
