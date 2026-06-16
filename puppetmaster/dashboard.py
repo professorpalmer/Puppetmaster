@@ -398,6 +398,33 @@ def list_jobs_snapshot(store: SwarmStore, *, limit: int = 50) -> list[dict[str, 
     return rows[:limit]
 
 
+def list_all_projects_snapshot(*, backend: str = "sqlite", limit: int = 200) -> list[dict[str, Any]]:
+    """Aggregate jobs from every project state dir on this machine."""
+    from puppetmaster.state import list_project_state_dirs
+    from puppetmaster.store_factory import create_store
+
+    rows: list[dict[str, Any]] = []
+    for project_dir in list_project_state_dirs():
+        try:
+            store = create_store(backend, project_dir)
+            short = re.sub(r"-[0-9a-f]{12}$", "", project_dir.name) or project_dir.name
+            for job in store.list_jobs():
+                rows.append(
+                    {
+                        "id": job.id,
+                        "goal": job.goal,
+                        "status": job.status.value,
+                        "created_at": job.created_at,
+                        "completed_at": job.completed_at,
+                        "project": short,
+                    }
+                )
+        except Exception:
+            continue
+    rows.sort(key=lambda r: r.get("created_at") or "", reverse=True)
+    return rows[:limit]
+
+
 # --- HTTP layer ------------------------------------------------------------
 
 # The markdown renderer lives in its own constant (rather than inlined in the
@@ -672,6 +699,18 @@ _PAGE_HEAD = r"""<!doctype html>
     text-overflow: ellipsis;
   }
   .job-row:hover .job-goal { color: #c9d1d9; }
+  .job-project {
+    display: inline;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11px;
+    color: #8b949e;
+    background: #21262d;
+    border-radius: 4px;
+    padding: 1px 5px;
+    margin-right: 6px;
+    vertical-align: middle;
+    white-space: nowrap;
+  }
   .job-time {
     color: #6e7681;
     font-size: 12px;
@@ -1061,7 +1100,7 @@ async function loadIndex() {
       html += `<a class="job-row" href="?job=${encodeURIComponent(j.id)}">
         ${pill(j.status)}
         <span class="job-id">${esc(j.id)}</span>
-        <span class="job-goal" title="${esc(j.goal)}">${truncateGoal(j.goal, 160)}</span>
+        <span class="job-goal" title="${esc(j.goal)}">${j.project ? `<span class="job-project">${esc(j.project)}</span>` : ""}${truncateGoal(j.goal, 160)}</span>
         <span class="job-time">${fmtAgo(j.created_at)}</span>
       </a>`;
     }
@@ -1362,7 +1401,7 @@ setInterval(tick, 1500);
 INDEX_HTML = _PAGE_HEAD + RENDERER_JS + _PAGE_APP_JS
 
 
-def make_handler(store_factory: Callable[[], SwarmStore]):
+def make_handler(store_factory: Callable[[], SwarmStore], *, all_projects: bool = False, backend: str = "sqlite"):
     from http.server import BaseHTTPRequestHandler
     from urllib.parse import parse_qs, urlparse
 
@@ -1388,7 +1427,10 @@ def make_handler(store_factory: Callable[[], SwarmStore]):
                     self._send(200, INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
                     return
                 if path == "/api/jobs":
-                    self._json(200, list_jobs_snapshot(store_factory()))
+                    if all_projects:
+                        self._json(200, list_all_projects_snapshot(backend=backend))
+                    else:
+                        self._json(200, list_jobs_snapshot(store_factory()))
                     return
                 if path == "/api/job":
                     params = parse_qs(parsed.query)
@@ -1402,7 +1444,14 @@ def make_handler(store_factory: Callable[[], SwarmStore]):
                         self._json(400, {"error": "invalid id"})
                         return
                     try:
-                        self._json(200, build_job_snapshot(store_factory(), job_id))
+                        if all_projects:
+                            from puppetmaster.state import find_state_dir_for_job
+                            from puppetmaster.store_factory import create_store as _cs
+                            found = find_state_dir_for_job(job_id)
+                            store = _cs(backend, found) if found else store_factory()
+                        else:
+                            store = store_factory()
+                        self._json(200, build_job_snapshot(store, job_id))
                     except (FileNotFoundError, KeyError):
                         self._json(404, {"error": "job not found", "id": job_id})
                     return
@@ -1428,6 +1477,7 @@ def serve(
     open_browser: bool = True,
     serve_forever: bool = True,
     allow_external: bool = False,
+    all_projects: bool = False,
 ):
     """Start the dashboard HTTP server. Returns the server (already bound).
 
@@ -1462,10 +1512,13 @@ def serve(
         # avoids cross-thread cursor reuse under the threading server.
         return create_store(backend, resolved)
 
-    httpd = ThreadingHTTPServer((host, port), make_handler(store_factory))
+    httpd = ThreadingHTTPServer((host, port), make_handler(store_factory, all_projects=all_projects, backend=backend))
     url = f"http://{host}:{port}/" + (f"?job={job_id}" if job_id else "")
     print(f"Puppetmaster dashboard: {url}")
-    print("Reading durable state from:", resolved)
+    if all_projects:
+        print("Serving all projects (--all-projects mode)")
+    else:
+        print("Reading durable state from:", resolved)
     print("Press Ctrl-C to stop.")
     if open_browser:
         try:
