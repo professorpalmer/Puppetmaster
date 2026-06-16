@@ -29,6 +29,7 @@ class WorkerRuntime:
         worker_id: str,
         lease_seconds: int = 5,
         poll_seconds: float = 0.1,
+        heartbeat_seconds: Optional[float] = None,
         simulate_seconds: float = 0.0,
         crash_after_claim: bool = False,
     ) -> None:
@@ -38,9 +39,16 @@ class WorkerRuntime:
         self.worker_id = worker_id
         self.lease_seconds = lease_seconds
         self.poll_seconds = poll_seconds
+        self.heartbeat_seconds = heartbeat_seconds
         self.simulate_seconds = simulate_seconds
         self.crash_after_claim = crash_after_claim
         self._lease_lost = threading.Event()
+
+    def _heartbeat_interval(self) -> float:
+        configured = self.heartbeat_seconds
+        if configured is None:
+            configured = 2.0 if self.poll_seconds == 0.1 else self.poll_seconds
+        return max(0.01, min(configured, max(0.1, self.lease_seconds / 3)))
 
     def run_once(self) -> bool:
         task = self.store.claim_next_task(
@@ -70,7 +78,9 @@ class WorkerRuntime:
 
         deadline = time.monotonic() + self.simulate_seconds
         while time.monotonic() < deadline:
-            time.sleep(min(self.poll_seconds, max(0.0, deadline - time.monotonic())))
+            time.sleep(
+                min(self._heartbeat_interval(), max(0.0, deadline - time.monotonic()))
+            )
             run = self.store.heartbeat_run(run)
             self.store.renew_task_lease(task.id, self.worker_id, self.lease_seconds)
 
@@ -298,7 +308,7 @@ class WorkerRuntime:
         task_id: str,
         stop: threading.Event,
     ) -> None:
-        while not stop.wait(self.poll_seconds):
+        while not stop.wait(self._heartbeat_interval()):
             run = self.store.heartbeat_run(run)
             renewed = self.store.renew_task_lease(
                 task_id, self.worker_id, self.lease_seconds
@@ -400,6 +410,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--worker-id")
     parser.add_argument("--lease-seconds", type=int, default=5)
     parser.add_argument("--poll-seconds", type=float, default=0.1)
+    parser.add_argument("--heartbeat-seconds", type=float)
     parser.add_argument("--simulate-seconds", type=float, default=0.0)
     parser.add_argument("--crash-after-claim", action="store_true")
     return parser
@@ -457,6 +468,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             worker_id=worker_id,
             lease_seconds=args.lease_seconds,
             poll_seconds=args.poll_seconds,
+            heartbeat_seconds=args.heartbeat_seconds,
             simulate_seconds=args.simulate_seconds,
             crash_after_claim=args.crash_after_claim,
         )
@@ -472,4 +484,3 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import os
 import subprocess
 import sys
 import time
@@ -60,6 +62,19 @@ def _memory_injection_enabled(spec: WorkerSpec) -> bool:
     if override is False:
         return True
     return spec.role not in _FRESH_JUDGMENT_ROLES
+
+
+@contextlib.contextmanager
+def _temporary_env_var(name: str, value: str):
+    previous = os.environ.get(name)
+    os.environ[name] = value
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = previous
 
 
 def merge_routing_payload(payload: dict, decision, extra_fields: Optional[dict] = None) -> dict:
@@ -1486,39 +1501,40 @@ class Orchestrator:
         allowed_task_ids: Optional[set[str]] = None,
     ) -> None:
         allowed_task_ids = allowed_task_ids or {task.id for task in tasks}
-        while True:
-            record_orchestrator_heartbeat(self.store, job.id)
-            self.store.recover_stale_tasks(job.id)
-            self.store.refresh_blocked_tasks(job.id)
-            ready_tasks = [
-                task
-                for task in self.store.list_tasks(job.id)
-                if task.id in allowed_task_ids
-                and task.status in {TaskStatus.QUEUED, TaskStatus.RUNNING}
-            ]
-            if not ready_tasks:
-                if self._should_fail_closed(job, allowed_task_ids):
-                    raise RuntimeError("swarm exited with incomplete tasks")
-                # Either fully complete, or only recoverable adapter-billing
-                # failures remain — hand back to the auto-fallback sweep.
-                return
+        with _temporary_env_var("PUPPETMASTER_STATE_DIR", str(self.store.root)):
+            while True:
+                record_orchestrator_heartbeat(self.store, job.id)
+                self.store.recover_stale_tasks(job.id)
+                self.store.refresh_blocked_tasks(job.id)
+                ready_tasks = [
+                    task
+                    for task in self.store.list_tasks(job.id)
+                    if task.id in allowed_task_ids
+                    and task.status in {TaskStatus.QUEUED, TaskStatus.RUNNING}
+                ]
+                if not ready_tasks:
+                    if self._should_fail_closed(job, allowed_task_ids):
+                        raise RuntimeError("swarm exited with incomplete tasks")
+                    # Either fully complete, or only recoverable adapter-billing
+                    # failures remain — hand back to the auto-fallback sweep.
+                    return
 
-            completed = 0
-            for role in sorted({task.role for task in ready_tasks}):
-                runtime = WorkerRuntime(
-                    store=self.store,
-                    job_id=job.id,
-                    role=role,
-                    worker_id=f"worker-{role}-inline",
-                    lease_seconds=lease_seconds,
-                )
-                completed += runtime.run_until_idle()
-            if completed == 0:
-                if self._should_fail_closed(job, allowed_task_ids):
-                    raise RuntimeError("swarm exited with incomplete tasks")
-                # No progress and only recoverable failures left — stop spinning
-                # and let auto_fallback re-route on a funded adapter.
-                return
+                completed = 0
+                for role in sorted({task.role for task in ready_tasks}):
+                    runtime = WorkerRuntime(
+                        store=self.store,
+                        job_id=job.id,
+                        role=role,
+                        worker_id=f"worker-{role}-inline",
+                        lease_seconds=lease_seconds,
+                    )
+                    completed += runtime.run_until_idle()
+                if completed == 0:
+                    if self._should_fail_closed(job, allowed_task_ids):
+                        raise RuntimeError("swarm exited with incomplete tasks")
+                    # No progress and only recoverable failures left — stop spinning
+                    # and let auto_fallback re-route on a funded adapter.
+                    return
 
     def _wait_for_daemon_workers(
         self,
@@ -1781,4 +1797,3 @@ class Orchestrator:
             self.store.save_artifact(artifact)
         except Exception:
             pass
-

@@ -15304,12 +15304,78 @@ class AuditFixTests(unittest.TestCase):
             role="coder",
             worker_id="worker-a",
             poll_seconds=0.01,
+            heartbeat_seconds=0.01,
         )
         stop = threading.Event()
         run = MagicMock()
         runtime._heartbeat_until_stopped(run, "task_x", stop)
         self.assertTrue(stop.is_set())
         self.assertTrue(runtime._lease_lost.is_set())
+
+    def test_heartbeat_loop_uses_heartbeat_interval_not_poll_interval(self) -> None:
+        from puppetmaster.worker_runtime import WorkerRuntime
+
+        store = MagicMock()
+        store.heartbeat_run.side_effect = lambda run: run
+        store.renew_task_lease.return_value = MagicMock()
+        runtime = WorkerRuntime(
+            store=store,
+            job_id="job_x",
+            role="coder",
+            worker_id="worker-a",
+            lease_seconds=10,
+            poll_seconds=0.01,
+            heartbeat_seconds=0.25,
+        )
+        stop = MagicMock()
+        stop.wait.side_effect = [False, True]
+
+        runtime._heartbeat_until_stopped(MagicMock(), "task_x", stop)
+
+        stop.wait.assert_any_call(0.25)
+        self.assertEqual(store.heartbeat_run.call_count, 1)
+        self.assertEqual(store.renew_task_lease.call_count, 1)
+
+    def test_heartbeat_interval_keeps_margin_for_short_leases(self) -> None:
+        from puppetmaster.worker_runtime import WorkerRuntime
+
+        runtime = WorkerRuntime(
+            store=MagicMock(),
+            job_id="job_x",
+            role="coder",
+            worker_id="worker-a",
+            lease_seconds=2,
+            heartbeat_seconds=2.0,
+        )
+
+        self.assertAlmostEqual(runtime._heartbeat_interval(), 2 / 3)
+
+    def test_inline_workers_scope_state_dir_env_to_store_root(self) -> None:
+        from puppetmaster.orchestrator import Orchestrator
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("inline state dir")
+            task = Task(job_id=job.id, role="codex", instruction="x")
+            store.save_task(task)
+            seen = []
+
+            def complete_task(runtime):
+                seen.append(os.environ.get("PUPPETMASTER_STATE_DIR"))
+                stored = store.get_task_by_id(task.id)
+                store.update_task_status(stored, TaskStatus.COMPLETE)
+                return 1
+
+            with patch.dict(os.environ, {"PUPPETMASTER_STATE_DIR": "parent-state"}):
+                with patch(
+                    "puppetmaster.orchestrator.WorkerRuntime.run_until_idle",
+                    autospec=True,
+                    side_effect=complete_task,
+                ):
+                    Orchestrator(store)._run_inline_workers(job, [task])
+                self.assertEqual(os.environ["PUPPETMASTER_STATE_DIR"], "parent-state")
+
+            self.assertEqual(seen, [str(store.root)])
 
     def test_redact_secrets_scrubs_argument_supplied_keys(self) -> None:
         from puppetmaster.redaction import (
