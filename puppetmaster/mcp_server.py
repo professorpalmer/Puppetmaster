@@ -2135,7 +2135,18 @@ def write_generated_swarm_config(args: JsonObject, roles: list[str], adapter: st
             "Do not modify files unless the user explicitly requested implementation. "
             "Return only Puppetmaster artifact JSON with an artifacts array."
         )
-        payload: JsonObject = {"prompt": prompt, "cwd": cwd(args), "timeout_seconds": timeout_seconds}
+        payload: JsonObject = {
+            "prompt": prompt,
+            "cwd": cwd(args),
+            "timeout_seconds": timeout_seconds,
+            # Generated MCP swarms are analysis workers: they emit structured
+            # artifacts and must be able to review the caller's dirty diff.
+            # If routing lands on an edit-capable adapter such as Codex, keep
+            # it on the adapter's existing read-only/no-edit path.
+            "read_only": True,
+            "sandbox": "read-only",
+            "dangerously_bypass_approvals_and_sandbox": False,
+        }
         if adapter == "cursor":
             payload["model"] = model
         if auto_route_enabled:

@@ -5264,6 +5264,79 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
         self.assertEqual(len(risks), 1)
         self.assertNotIn(ArtifactType.FINDING, [a.type for a in artifacts])
 
+    def test_generated_swarm_codex_read_only_allows_dirty_diff_review(self) -> None:
+        """A generated MCP analysis swarm may route to Codex. Its read-only
+        payload must keep Codex out of the full-edit dirty-worktree guard so the
+        worker can review the caller's existing dirty diff.
+        """
+        from puppetmaster.mcp_server import write_generated_swarm_config
+
+        events_stdout = "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "agent_message",
+                            "text": json.dumps(
+                                {
+                                    "artifacts": [
+                                        {
+                                            "type": "finding",
+                                            "claim": "dirty diff reviewed",
+                                            "evidence": ["diff"],
+                                            "confidence": 0.9,
+                                        }
+                                    ]
+                                }
+                            ),
+                        },
+                    }
+                )
+            ]
+        )
+        streamed = StreamedProcess(
+            returncode=0,
+            stdout=events_stdout,
+            stderr="",
+            timed_out=False,
+            live_log_path=None,
+        )
+        with TemporaryDirectory() as tmp:
+            config_path = write_generated_swarm_config(
+                {"goal": "review dirty diff", "cwd": tmp, "state_dir": str(Path(tmp) / "state")},
+                ["audit"],
+                "cursor",
+            )
+            payload = json.loads(Path(config_path).read_text())["workers"][0]["payload"]
+            task = Task(
+                id="t-generated-codex-ro",
+                job_id="job-generated-codex-ro",
+                role="audit",
+                adapter="codex",
+                instruction="Review the dirty diff.",
+                payload={**payload, "model": "gpt-5.4-mini", "disable_codegraph": True},
+            )
+            dirty = {
+                "sha": "s",
+                "changed_files": ["puppetmaster/mcp_server.py"],
+                "untracked_files": [],
+                "diff": "diff --git a/puppetmaster/mcp_server.py b/puppetmaster/mcp_server.py",
+            }
+            with patch("puppetmaster.adapters.resolve_command", return_value="/usr/bin/codex"), patch(
+                "puppetmaster.adapters.git_snapshot", side_effect=[dirty, dirty]
+            ), patch("puppetmaster.adapters.worktree_guard") as guard, patch(
+                "puppetmaster.adapters.run_streamed_subprocess", return_value=streamed
+            ) as run:
+                artifacts = CodexAdapter().run(task, "goal", "worker")
+
+        guard.assert_not_called()
+        command = run.call_args.kwargs["command"]
+        self.assertIn("--sandbox", command)
+        self.assertIn("read-only", command)
+        self.assertEqual(artifacts[0].payload["result"], "passed")
+        self.assertTrue(any(a.type == ArtifactType.FINDING for a in artifacts))
+
     def test_codex_adapter_timeout_surfaces_failed_with_live_log(self) -> None:
         """A timed-out Codex run reports ``failed`` + ``timeout`` and still
         carries the live log path so the operator can see how far it got."""
@@ -7230,6 +7303,38 @@ class ModelRouterTests(unittest.TestCase):
                     f"auto_route should default to True for MCP swarm role={worker['role']}, "
                     f"got payload={payload}",
                 )
+
+    def test_mcp_swarm_config_writer_marks_generated_workers_read_only(self) -> None:
+        """Generated MCP swarms are analysis runs. If routing later selects an
+        edit-capable adapter, the payload must keep it on the adapter's
+        read-only path so dirty diffs can be reviewed without tripping the
+        full-edit clean-tree guard.
+        """
+        from puppetmaster.mcp_server import write_generated_swarm_config
+        from puppetmaster.workers import WorkerSpec, swarm_mode
+
+        with TemporaryDirectory() as tmp:
+            args = {"goal": "review dirty diff", "cwd": tmp, "state_dir": str(Path(tmp) / "state")}
+            config_path = write_generated_swarm_config(args, ["audit"], "cursor")
+            cfg = json.loads(Path(config_path).read_text())
+
+            payload = cfg["workers"][0]["payload"]
+            self.assertTrue(payload["read_only"])
+            self.assertEqual(payload["sandbox"], "read-only")
+            self.assertFalse(payload["dangerously_bypass_approvals_and_sandbox"])
+            self.assertEqual(
+                swarm_mode(
+                    [
+                        WorkerSpec(
+                            role="audit",
+                            instruction="review",
+                            adapter="codex",
+                            payload=payload,
+                        )
+                    ]
+                ),
+                "analysis",
+            )
 
     def test_mcp_swarm_config_writer_respects_pinned_model(self) -> None:
         """When the MCP caller pins a model, auto_route should default to off so the
