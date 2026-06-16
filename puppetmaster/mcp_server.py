@@ -1282,8 +1282,8 @@ def _build_tools() -> list[McpTool]:
         McpTool(
             name="puppetmaster_status",
             description="Return task, artifact, and stale lease state for a Puppetmaster job.",
-            input_schema=job_schema(required=True),
-            handler=lambda args: run_cli(["status", require_string(args, "job_id")], args),
+            input_schema=status_schema(),
+            handler=run_status,
         ),
         McpTool(
             name="puppetmaster_logs",
@@ -2287,6 +2287,13 @@ def run_route_task(args: JsonObject) -> JsonObject:
     }
 
 
+def run_status(args: JsonObject) -> JsonObject:
+    command = ["status", require_string(args, "job_id")]
+    if args.get("compact"):
+        command.append("--compact")
+    return run_cli(command, args)
+
+
 def run_list_models(args: JsonObject) -> JsonObject:
     """Return the registry as JSON. Mirrors `puppetmaster models list --json`."""
     from dataclasses import asdict
@@ -2836,6 +2843,18 @@ def job_schema(required: bool = False) -> JsonObject:
     schema["properties"]["job_id"] = {"type": "string", "description": "Puppetmaster job id."}
     if required:
         schema["required"] = ["job_id"]
+    return schema
+
+
+def status_schema() -> JsonObject:
+    schema = job_schema(required=True)
+    schema["properties"]["compact"] = {
+        "type": "boolean",
+        "description": (
+            "Omit high-churn prompt bodies from status JSON and replace them "
+            "with deterministic char-count/SHA-256 refs."
+        ),
+    }
     return schema
 
 

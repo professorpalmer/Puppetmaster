@@ -321,6 +321,21 @@ class PuppetmasterTests(unittest.TestCase):
             self.assertIn("demo local adapter", payload["error"])
             self.assertIn("puppetmaster_start_cursor_swarm", payload["fix"])
 
+    def test_mcp_status_compact_arg_maps_to_cli_flag(self) -> None:
+        from puppetmaster import mcp_server
+
+        captured = {}
+
+        def fake_run_cli(command, args):
+            captured["command"] = command
+            return {"content": [{"type": "text", "text": "{}"}], "isError": False}
+
+        with patch.object(mcp_server, "run_cli", side_effect=fake_run_cli):
+            result = mcp_server.run_status({"job_id": "job_x", "compact": True})
+
+        self.assertFalse(result["isError"])
+        self.assertEqual(captured["command"], ["status", "job_x", "--compact"])
+
     def test_mcp_adapter_generates_config_for_custom_roles(self) -> None:
         with TemporaryDirectory() as tmp:
             before_process_count = len(ASYNC_PROCESSES)
@@ -873,7 +888,12 @@ class PuppetmasterTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             store = SwarmStore(Path(tmp) / ".puppetmaster")
             job = store.create_job("inspect runtime state")
-            task = Task(job_id=job.id, role="reviewer", instruction="look for risks")
+            task = Task(
+                job_id=job.id,
+                role="reviewer",
+                instruction="look for risks",
+                payload={"prompt": "review the long prompt body"},
+            )
             store.save_task(task)
             claimed = store.claim_task(task.id, "worker-a", lease_seconds=60)
             store.save_task(replace(claimed, lease_expires_at=seconds_from_now(-1)))
@@ -881,8 +901,46 @@ class PuppetmasterTests(unittest.TestCase):
             snapshot = store.status_snapshot(job.id)
 
             self.assertIsNotNone(claimed)
+            self.assertEqual(snapshot["job"]["goal"], "inspect runtime state")
+            self.assertEqual(snapshot["tasks"][0]["instruction"], "look for risks")
+            self.assertEqual(
+                snapshot["tasks"][0]["payload"]["prompt"],
+                "review the long prompt body",
+            )
             self.assertEqual(snapshot["task_counts"][str(TaskStatus.RUNNING)], 1)
             self.assertEqual(snapshot["stale_task_ids"], [task.id])
+
+    def test_status_snapshot_compact_omits_prompt_bodies(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("inspect runtime state")
+            task = Task(
+                job_id=job.id,
+                role="reviewer",
+                instruction="look for risks",
+                payload={"prompt": "review the long prompt body", "model": "m"},
+            )
+            store.save_task(task)
+
+            snapshot = store.status_snapshot(job.id, compact=True)
+            task_snapshot = snapshot["tasks"][0]
+
+            self.assertNotIn("goal", snapshot["job"])
+            self.assertEqual(snapshot["job"]["goal_ref"]["chars"], len("inspect runtime state"))
+            self.assertEqual(len(snapshot["job"]["goal_ref"]["sha256"]), 64)
+            self.assertNotIn("instruction", task_snapshot)
+            self.assertEqual(
+                task_snapshot["instruction_ref"]["chars"],
+                len("look for risks"),
+            )
+            self.assertEqual(len(task_snapshot["instruction_ref"]["sha256"]), 64)
+            self.assertNotIn("prompt", task_snapshot["payload"])
+            self.assertEqual(
+                task_snapshot["payload"]["prompt_ref"]["chars"],
+                len("review the long prompt body"),
+            )
+            self.assertEqual(len(task_snapshot["payload"]["prompt_ref"]["sha256"]), 64)
+            self.assertEqual(task_snapshot["payload"]["model"], "m")
 
     def test_stitching_is_deterministic_for_existing_artifacts(self) -> None:
         with TemporaryDirectory() as tmp:
