@@ -1870,7 +1870,7 @@ def _worktree_preflight(args: JsonObject) -> Optional[JsonObject]:
 # `puppetmaster_start_implement` verb prefers when several are enabled. Codex is
 # last (cursor/claude are the daily drivers) but is a full-edit, PATCH-producing
 # adapter, so a codex-only platform lock can still use the generic verb.
-_IMPLEMENT_ADAPTER_PRIORITY = ("cursor", "claude-code", "codex")
+_IMPLEMENT_ADAPTER_PRIORITY = ("cursor", "claude-code", "codex", "hermes")
 
 
 def _implement_command(args: JsonObject, adapter: str) -> list[str]:
@@ -1880,6 +1880,8 @@ def _implement_command(args: JsonObject, adapter: str) -> list[str]:
         return claude_command(args)
     if adapter == "codex":
         return codex_command(args)
+    if adapter == "hermes":
+        return hermes_command(args, implement=True)
     raise ValueError(f"adapter {adapter!r} has no implement command")
 
 
@@ -1906,6 +1908,33 @@ def codex_command(args: JsonObject) -> list[str]:
         command.append("--disable-codegraph")
     if args.get("disable_memory"):
         command.append("--disable-memory")
+    return command
+
+
+def hermes_command(args: JsonObject, implement: bool = True) -> list[str]:
+    prompt = require_string(args, "goal")
+    command = ["hermes", prompt, "--cwd", cwd(args)]
+    command.extend(["--mode", "implement" if implement else "analyze"])
+    if args.get("model"):
+        command.extend(["--model", str(args["model"])])
+    if args.get("provider"):
+        command.extend(["--provider", str(args["provider"])])
+    if args.get("max_turns") is not None:
+        command.extend(["--max-turns", str(args["max_turns"])])
+    if args.get("toolsets"):
+        command.extend(["--toolsets", str(args["toolsets"])])
+    if args.get("timeout_seconds"):
+        command.extend(["--timeout-seconds", str(args["timeout_seconds"])])
+    if args.get("executable"):
+        command.extend(["--executable", str(args["executable"])])
+    if args.get("allow_dirty"):
+        command.append("--allow-dirty")
+    if args.get("allow_non_worktree"):
+        command.append("--allow-non-worktree")
+    if args.get("use_hermes_rules"):
+        command.append("--use-hermes-rules")
+    if args.get("disable_codegraph"):
+        command.append("--disable-codegraph")
     return command
 
 

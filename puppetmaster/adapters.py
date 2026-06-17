@@ -154,6 +154,7 @@ def run_streamed_subprocess(
     timeout_seconds: int,
     cwd: Optional[str] = None,
     heartbeat_seconds: float = 30.0,
+    start_new_session: bool = False,
 ) -> StreamedProcess:
     """Run ``command`` while teeing its output to a live sidecar log.
 
@@ -199,6 +200,13 @@ def run_streamed_subprocess(
         except Exception:
             pass
 
+    popen_kwargs: dict[str, Any] = {}
+    if start_new_session:
+        # Hermes tears down its own process group on exit and has been observed
+        # signal-killing a parent shell loop. Launching in a fresh session keeps
+        # that teardown confined to the child and away from Puppetmaster.
+        popen_kwargs["start_new_session"] = True
+
     process = subprocess.Popen(
         command,
         cwd=cwd,
@@ -211,6 +219,7 @@ def run_streamed_subprocess(
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
+        **popen_kwargs,
     )
 
     stdout_lines: list[str] = []
@@ -1773,6 +1782,578 @@ def classify_codex_failure(output: str) -> str:
     return "unknown"
 
 
+# Hermes toolsets are passed verbatim to ``hermes chat -t`` and select the
+# tools a worker may call. They deliberately EXCLUDE the ``memory`` and
+# ``session_search`` toolsets: both read state from prior Hermes sessions and
+# would let one Puppetmaster task observe another (or the user's interactive
+# history), breaking swarm isolation. The stock ``coding`` alias bundles both,
+# so we enumerate granular toolsets instead. Memory injection into the system
+# prompt is separately suppressed via ``--ignore-rules`` (see
+# ``build_hermes_chat_command``); together they make each worker hermetic.
+DEFAULT_HERMES_ANALYZE_TOOLSETS = "file,web,vision"
+DEFAULT_HERMES_IMPLEMENT_TOOLSETS = "file,terminal,code_execution,web,vision"
+_HERMES_ENV_CREDENTIAL_KEYS = (
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+)
+
+
+def build_hermes_chat_command(
+    *,
+    executable: Union[str, list[str]] = "hermes",
+    prompt: str,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    max_turns: Optional[int] = None,
+    toolsets: object = None,
+    yolo: bool = False,
+    source: str = "tool",
+    quiet: bool = True,
+    cli: bool = True,
+    ignore_rules: bool = True,
+    safe_mode: bool = False,
+    extra_args: object = None,
+) -> list[str]:
+    """Build a headless ``hermes chat`` invocation for Puppetmaster workers.
+
+    ``ignore_rules`` defaults to ``True`` so each worker runs hermetically:
+    Hermes's auto-injected AGENTS.md/SOUL.md/.cursorrules and — critically —
+    its cross-session **memory** tool are skipped. Without this, a fact stored
+    by one task ("remember codeword BANANA42") leaks into unrelated later tasks,
+    which would corrupt swarm isolation and replayability. Puppetmaster injects
+    its own repo context (CodeGraph, report contract, per-task memory), so the
+    native Hermes injection is redundant as well as unsafe here.
+    """
+    command = command_parts(executable)
+    command.extend(["chat", "-q", prompt])
+    if quiet:
+        command.append("-Q")
+    command.extend(["--source", source])
+    if cli:
+        command.append("--cli")
+    if ignore_rules:
+        command.append("--ignore-rules")
+    if safe_mode:
+        command.append("--safe-mode")
+    if yolo:
+        command.append("--yolo")
+    if model:
+        command.extend(["-m", str(model)])
+    if provider:
+        command.extend(["--provider", str(provider)])
+    if max_turns is not None:
+        command.extend(["--max-turns", str(max_turns)])
+    if toolsets:
+        command.extend(["-t", tool_list(toolsets)])
+    if extra_args:
+        command.extend(command_parts(extra_args))
+    return command
+
+
+def hermes_credentials_available() -> bool:
+    """True when Hermes can likely reach a provider without inlining secrets.
+
+    Checks ``~/.hermes/.env`` for common API keys, OAuth state in
+    ``~/.hermes/auth.json``, and keys already present in the process
+    environment (which the adapter passes through unchanged).
+    """
+    for key in _HERMES_ENV_CREDENTIAL_KEYS:
+        if os.environ.get(key):
+            return True
+    env_file = Path.home() / ".hermes" / ".env"
+    if env_file.is_file():
+        try:
+            text = env_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        for key in _HERMES_ENV_CREDENTIAL_KEYS:
+            if re.search(rf"^\s*{re.escape(key)}\s*=\s*\S+", text, re.MULTILINE):
+                return True
+    auth_file = Path.home() / ".hermes" / "auth.json"
+    if auth_file.is_file():
+        try:
+            payload = json.loads(auth_file.read_text(encoding="utf-8", errors="replace") or "{}")
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+        providers = payload.get("providers")
+        if isinstance(providers, dict) and providers:
+            return True
+    return False
+
+
+class HermesAdapter:
+    """Shells out to the NousResearch Hermes CLI (``hermes chat``).
+
+    Mirrors :class:`CodexAdapter` / :class:`ClaudeCodeAdapter` for subprocess,
+    git-snapshot, sidecar-spool, and PATCH attribution semantics. Hermes has
+    two operational quirks Puppetmaster must respect:
+
+    - **Process-group isolation**: Hermes kills its own process group on exit.
+      Runs always use ``start_new_session=True`` so teardown cannot reach the
+      orchestrator parent.
+    - **Unreliable exit codes**: A non-zero exit after a successful edit is
+      common (provider flakiness, pgroup teardown). Implement-mode success is
+      determined from the captured git diff; analyze-mode success is parsed
+      from stdout.
+    """
+
+    name = "hermes"
+
+    def run(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
+        if task.payload.get("mode") == "implement" or task.payload.get("implement"):
+            return self._run_implement(task, goal, worker_id)
+        return self._run_analyze(task, goal, worker_id)
+
+    def _run_implement(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
+        base_prompt = with_report_contract(task.payload.get("prompt") or task.instruction)
+        cwd = Path(task.payload.get("cwd") or ".").resolve()
+        prompt, codegraph_used = enrich_prompt_with_codegraph(
+            prompt_with_memory(CursorAdapter._implement_prompt(base_prompt), task),
+            task_description=task.payload.get("codegraph_task") or task.instruction or goal,
+            cwd=cwd,
+            disabled=bool(task.payload.get("disable_codegraph", False)),
+        )
+        timeout_seconds = int(task.payload.get("timeout_seconds", 900))
+        executable = task.payload.get("executable") or os.environ.get("HERMES_COMMAND") or "hermes"
+        command_base = command_parts(executable)
+        resolved = resolve_command(command_base[0])
+        if resolved is None:
+            return [
+                verification_artifact(
+                    task=task,
+                    worker_id=worker_id,
+                    adapter="hermes",
+                    check=task.instruction,
+                    result="blocked",
+                    confidence=0.45,
+                    evidence=["adapter:hermes", "status:missing-cli"],
+                    payload={
+                        "failure": "missing_cli",
+                        "message": (
+                            "Hermes CLI was not found. Install it or set "
+                            "HERMES_COMMAND / payload.executable."
+                        ),
+                        "executable": executable,
+                    },
+                )
+            ]
+
+        command = build_hermes_chat_command(
+            executable=[resolved, *command_base[1:]],
+            prompt=prompt,
+            model=task.payload.get("model"),
+            provider=task.payload.get("provider"),
+            max_turns=task.payload.get("max_turns"),
+            toolsets=task.payload.get("toolsets", DEFAULT_HERMES_IMPLEMENT_TOOLSETS),
+            yolo=bool(task.payload.get("yolo", True)),
+            source=str(task.payload.get("source", "tool")),
+            quiet=bool(task.payload.get("quiet", True)),
+            cli=bool(task.payload.get("cli", True)),
+            ignore_rules=bool(task.payload.get("ignore_rules", True)),
+            safe_mode=bool(task.payload.get("safe_mode", False)),
+            extra_args=task.payload.get("extra_args", []),
+        )
+
+        before = git_snapshot(cwd)
+        blocked = worktree_guard(task, worker_id, "hermes", cwd, before)
+        if blocked is not None:
+            return blocked
+        if not task.payload.get("allow_dirty", False) and (
+            before["changed_files"] or before["untracked_files"]
+        ):
+            return [
+                verification_artifact(
+                    task=task,
+                    worker_id=worker_id,
+                    adapter="hermes",
+                    check=task.instruction,
+                    result="blocked",
+                    confidence=0.8,
+                    evidence=["adapter:hermes", "status:dirty-repo"],
+                    payload={
+                        "failure": "dirty_worktree",
+                        "message": (
+                            "Hermes full-edit runs require a clean working tree by default "
+                            "so Puppetmaster can attribute resulting diffs correctly. Commit, "
+                            "stash, use a worktree, or set payload.allow_dirty=true."
+                        ),
+                        "changed_files": before["changed_files"],
+                        "untracked_files": before["untracked_files"],
+                        **diff_source_payload(before, {}),
+                    },
+                )
+            ]
+
+        completed = run_streamed_subprocess(
+            command=command,
+            env=inject_worker_cli_env(apply_worktree_ports(os.environ.copy(), cwd)),
+            task=task,
+            sidecar_name="hermes_implement",
+            timeout_seconds=timeout_seconds,
+            cwd=str(cwd),
+            start_new_session=True,
+        )
+        if completed.timed_out:
+            after = git_snapshot(cwd, base_tree=str(before.get("tree") or "") or None)
+            stdout_capture = capture_subprocess_stdout(
+                text=completed.stdout,
+                task=task,
+                sidecar_name="hermes_stdout_timeout",
+                tail_chars=12000,
+            )
+            stderr_capture = capture_subprocess_stdout(
+                text=completed.stderr,
+                task=task,
+                sidecar_name="hermes_stderr_timeout",
+            )
+            artifacts: list[Artifact] = [
+                verification_artifact(
+                    task=task,
+                    worker_id=worker_id,
+                    adapter="hermes",
+                    check=task.instruction,
+                    result="failed",
+                    confidence=0.6,
+                    evidence=["adapter:hermes", "mode:implement", "timeout"],
+                    payload={
+                        "failure": "timeout",
+                        "returncode": None,
+                        "stdout": _redacted_tail(completed.stdout, _STDOUT_TAIL_CHARS),
+                        "stderr": _redacted_tail(completed.stderr, _STDOUT_TAIL_CHARS),
+                        "stdout_capture": stdout_capture,
+                        "stderr_capture": stderr_capture,
+                        "live_log": completed.live_log_path,
+                        "timeout_seconds": timeout_seconds,
+                        "base_sha": before["sha"],
+                        "head_sha": after["sha"],
+                        "changed_files": after["changed_files"],
+                        "untracked_files": after["untracked_files"],
+                        **diff_source_payload(before, after),
+                    },
+                )
+            ]
+            if _should_emit_patch_artifact(before, after):
+                artifacts.append(
+                    self._patch_artifact(task, worker_id, before, after, status="failed")
+                )
+            return artifacts
+
+        after = git_snapshot(cwd, base_tree=str(before.get("tree") or "") or None)
+        has_work = _should_emit_patch_artifact(before, after)
+        process_failed = completed.returncode != 0 and not has_work
+        stdout_capture = capture_subprocess_stdout(
+            text=completed.stdout,
+            task=task,
+            sidecar_name="hermes_stdout",
+            tail_chars=12000,
+        )
+        stderr_capture = capture_subprocess_stdout(
+            text=completed.stderr,
+            task=task,
+            sidecar_name="hermes_stderr",
+        )
+        usage = token_usage(
+            prompt_text=prompt,
+            output_text=completed.stdout,
+        )
+        artifacts = [
+            verification_artifact(
+                task=task,
+                worker_id=worker_id,
+                adapter="hermes",
+                check=task.instruction,
+                result="passed" if not process_failed else "failed",
+                confidence=0.9 if not process_failed else 0.55,
+                evidence=(
+                    ["adapter:hermes", "mode:implement"]
+                    + (["context:codegraph"] if codegraph_used else [])
+                    + (["exit:ignored-after-diff"] if has_work and completed.returncode != 0 else [])
+                ),
+                payload={
+                    "failure": (
+                        None
+                        if not process_failed
+                        else classify_hermes_failure(completed.stderr + completed.stdout)
+                    ),
+                    "returncode": completed.returncode,
+                    "stdout": _redacted_tail(completed.stdout, 12000),
+                    "stderr": _redacted_tail(completed.stderr, _STDOUT_TAIL_CHARS),
+                    "stdout_capture": stdout_capture,
+                    "stderr_capture": stderr_capture,
+                    "live_log": completed.live_log_path,
+                    "cwd": str(cwd),
+                    "model": task.payload.get("model"),
+                    "provider": task.payload.get("provider"),
+                    "has_work": has_work,
+                    "base_sha": before["sha"],
+                    "head_sha": after["sha"],
+                    "changed_files": after["changed_files"],
+                    "untracked_files": after["untracked_files"],
+                    **diff_source_payload(before, after),
+                    **usage,
+                },
+            )
+        ]
+        if not process_failed:
+            artifacts.extend(
+                implement_report_artifacts(
+                    task, worker_id, completed.stdout, adapter="hermes"
+                )
+            )
+        if has_work:
+            artifacts.append(
+                self._patch_artifact(
+                    task,
+                    worker_id,
+                    before,
+                    after,
+                    status="applied" if not process_failed else "failed",
+                )
+            )
+        return artifacts
+
+    def _run_analyze(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
+        base_prompt = task.payload.get("prompt") or task.instruction
+        cwd = Path(task.payload.get("cwd") or ".").resolve()
+        prompt, codegraph_used = enrich_prompt_with_codegraph(
+            prompt_with_memory(CodexAdapter._structured_prompt(base_prompt), task),
+            task_description=task.payload.get("codegraph_task") or task.instruction or goal,
+            cwd=cwd,
+            disabled=bool(task.payload.get("disable_codegraph", False)),
+        )
+        timeout_seconds = int(task.payload.get("timeout_seconds", 600))
+        executable = task.payload.get("executable") or os.environ.get("HERMES_COMMAND") or "hermes"
+        command_base = command_parts(executable)
+        resolved = resolve_command(command_base[0])
+        if resolved is None:
+            return [
+                verification_artifact(
+                    task=task,
+                    worker_id=worker_id,
+                    adapter="hermes",
+                    check=task.instruction,
+                    result="blocked",
+                    confidence=0.45,
+                    evidence=["adapter:hermes", "status:missing-cli"],
+                    payload={
+                        "failure": "missing_cli",
+                        "message": (
+                            "Hermes CLI was not found. Install it or set "
+                            "HERMES_COMMAND / payload.executable."
+                        ),
+                        "executable": executable,
+                    },
+                )
+            ]
+
+        command = build_hermes_chat_command(
+            executable=[resolved, *command_base[1:]],
+            prompt=prompt,
+            model=task.payload.get("model"),
+            provider=task.payload.get("provider"),
+            max_turns=task.payload.get("max_turns"),
+            toolsets=task.payload.get("toolsets", DEFAULT_HERMES_ANALYZE_TOOLSETS),
+            yolo=False,
+            source=str(task.payload.get("source", "tool")),
+            quiet=bool(task.payload.get("quiet", True)),
+            cli=bool(task.payload.get("cli", True)),
+            ignore_rules=bool(task.payload.get("ignore_rules", True)),
+            safe_mode=bool(task.payload.get("safe_mode", False)),
+            extra_args=task.payload.get("extra_args", []),
+        )
+
+        completed = run_streamed_subprocess(
+            command=command,
+            env=inject_worker_cli_env(apply_worktree_ports(os.environ.copy(), cwd)),
+            task=task,
+            sidecar_name="hermes_analyze",
+            timeout_seconds=timeout_seconds,
+            cwd=str(cwd),
+            start_new_session=True,
+        )
+        if completed.timed_out:
+            stdout_capture = capture_subprocess_stdout(
+                text=completed.stdout,
+                task=task,
+                sidecar_name="hermes_stdout_timeout",
+            )
+            stderr_capture = capture_subprocess_stdout(
+                text=completed.stderr,
+                task=task,
+                sidecar_name="hermes_stderr_timeout",
+            )
+            return [
+                verification_artifact(
+                    task=task,
+                    worker_id=worker_id,
+                    adapter="hermes",
+                    check=task.instruction,
+                    result="failed",
+                    confidence=0.55,
+                    evidence=["adapter:hermes", "mode:analyze", "timeout"],
+                    payload={
+                        "failure": "timeout",
+                        "returncode": None,
+                        "stdout": _redacted_tail(completed.stdout, _STDOUT_TAIL_CHARS),
+                        "stderr": _redacted_tail(completed.stderr, _STDOUT_TAIL_CHARS),
+                        "stdout_capture": stdout_capture,
+                        "stderr_capture": stderr_capture,
+                        "live_log": completed.live_log_path,
+                        "timeout_seconds": timeout_seconds,
+                        "model": task.payload.get("model"),
+                        "provider": task.payload.get("provider"),
+                    },
+                )
+            ]
+
+        result_text = completed.stdout.strip()
+        parsed_artifacts = cursor_result_artifacts(task, worker_id, result_text)
+        if not parsed_artifacts:
+            salvaged = cursor_result_artifacts(task, worker_id, completed.stdout)
+            if salvaged:
+                parsed_artifacts = salvaged
+        has_structured = bool(parsed_artifacts)
+        process_failed = completed.returncode != 0 and not has_structured
+        degraded = not process_failed and not has_structured
+        stdout_capture = capture_subprocess_stdout(
+            text=completed.stdout,
+            task=task,
+            sidecar_name="hermes_stdout",
+            tail_chars=12000,
+        )
+        stderr_capture = capture_subprocess_stdout(
+            text=completed.stderr,
+            task=task,
+            sidecar_name="hermes_stderr",
+        )
+        artifacts = [
+            verification_artifact(
+                task=task,
+                worker_id=worker_id,
+                adapter="hermes",
+                check=task.instruction,
+                result=(
+                    "failed"
+                    if process_failed
+                    else "degraded"
+                    if degraded
+                    else "passed"
+                ),
+                confidence=0.55 if process_failed else 0.65 if degraded else 0.9,
+                evidence=(
+                    ["adapter:hermes", "mode:analyze"]
+                    + (["context:codegraph"] if codegraph_used else [])
+                    + (["exit:ignored-after-parse"] if has_structured and completed.returncode != 0 else [])
+                ),
+                payload={
+                    "returncode": completed.returncode,
+                    "stdout": _redacted_tail(completed.stdout, 12000),
+                    "stderr": _redacted_tail(completed.stderr, _STDOUT_TAIL_CHARS),
+                    "stdout_capture": stdout_capture,
+                    "stderr_capture": stderr_capture,
+                    "live_log": completed.live_log_path,
+                    "model": task.payload.get("model"),
+                    "provider": task.payload.get("provider"),
+                    "cwd": str(cwd),
+                    "failure": (
+                        None
+                        if not process_failed and not degraded
+                        else (
+                            "empty_or_unstructured_hermes_result"
+                            if degraded
+                            else classify_hermes_failure(completed.stderr + completed.stdout)
+                        )
+                    ),
+                },
+            )
+        ]
+        if degraded:
+            artifacts.append(
+                Artifact(
+                    job_id=task.job_id,
+                    task_id=task.id,
+                    type=ArtifactType.RISK,
+                    created_by=worker_id,
+                    confidence=0.85,
+                    evidence=["adapter:hermes", "result:empty-or-unstructured"],
+                    payload={
+                        "risk": "Hermes call completed without structured Puppetmaster findings.",
+                        "mitigation": (
+                            "Treat this swarm as degraded; rerun with a stricter prompt or "
+                            "inspect the repo directly before implementation."
+                        ),
+                        "stdout_excerpt": (redact_secrets(result_text) or "")[:_STDOUT_HEAD_CHARS],
+                        "stdout_capture": stdout_capture,
+                    },
+                )
+            )
+        artifacts.extend(parsed_artifacts)
+        return artifacts
+
+    @staticmethod
+    def _patch_artifact(task: Task, worker_id: str, before, after, *, status: str) -> Artifact:
+        return Artifact(
+            job_id=task.job_id,
+            task_id=task.id,
+            type=ArtifactType.PATCH,
+            created_by=worker_id,
+            confidence=0.8 if status == "applied" else 0.5,
+            evidence=["adapter:hermes", f"base:{before['sha']}"],
+            payload=build_patch_payload(
+                task=task,
+                before=before,
+                after=after,
+                status=status,
+                change="Hermes modified repository files.",
+                sidecar_name="hermes_implement",
+            ),
+        )
+
+
+def classify_hermes_failure(output: str) -> str:
+    lowered = (output or "").lower()
+    if "command not found" in lowered or (
+        "no such file or directory" in lowered and "hermes" in lowered
+    ):
+        return "missing_cli"
+    if (
+        "api key" in lowered
+        or "not authenticated" in lowered
+        or "authentication" in lowered
+        or "unauthorized" in lowered
+        or "401" in lowered
+        or "please login" in lowered
+        or "hermes login" in lowered
+        or "missing credentials" in lowered
+        or "no provider" in lowered
+        or "provider credentials" in lowered
+    ):
+        return "not_authenticated"
+    if "verification" in lowered and ("failed" in lowered or "required" in lowered):
+        return "not_authenticated"
+    if "context length" in lowered or "maximum context" in lowered or "context window" in lowered:
+        return "context_length_exceeded"
+    if "rate limit" in lowered or "429" in lowered:
+        return "rate_limit"
+    if "billing" in lowered or "quota" in lowered or "credit" in lowered:
+        return "billing_or_quota"
+    if "model" in lowered and (
+        "unavailable" in lowered
+        or "not found" in lowered
+        or "invalid" in lowered
+        or "does not exist" in lowered
+        or "404" in lowered
+    ):
+        return "model_unavailable"
+    if "timeout" in lowered or "timed out" in lowered:
+        return "timeout"
+    if "network" in lowered or "dns" in lowered or "connect" in lowered:
+        return "network_error"
+    return "unknown"
+
+
 class UnconfiguredProviderAdapter:
     def __init__(self, name: str, description: str) -> None:
         self.name = name
@@ -2733,6 +3314,7 @@ ADAPTERS: dict[str, WorkerAdapter] = {
     "claude-code": ClaudeCodeAdapter(),
     "openai": OpenAIAdapter(),
     "codex": CodexAdapter(),
+    "hermes": HermesAdapter(),
 }
 
 
@@ -2779,6 +3361,20 @@ ADAPTER_INFO = [
         requires=[
             "codex CLI (`npm install -g @openai/codex`)",
             "OPENAI_API_KEY or `codex login`",
+        ],
+    ),
+    AdapterInfo(
+        name="hermes",
+        status="optional",
+        description=(
+            "Runs the NousResearch Hermes CLI (`hermes chat`) headlessly for "
+            "analyze and full-edit implement modes. Launches in an isolated "
+            "process session and attributes file edits via git diff rather "
+            "than exit code."
+        ),
+        requires=[
+            "hermes CLI on PATH",
+            "provider credential in ~/.hermes/.env or `hermes login` OAuth",
         ],
     ),
 ]

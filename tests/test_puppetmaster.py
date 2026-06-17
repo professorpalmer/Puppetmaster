@@ -28,14 +28,17 @@ from puppetmaster.adapters import (
     ClaudeCodeAdapter,
     CodexAdapter,
     CursorAdapter,
+    HermesAdapter,
     OpenAIAdapter,
     StreamedProcess,
     UnconfiguredProviderAdapter,
     build_claude_code_command,
     build_codex_exec_command,
+    build_hermes_chat_command,
     classify_claude_code_failure,
     classify_codex_failure,
     classify_cursor_failure,
+    classify_hermes_failure,
     classify_openai_failure,
     last_codex_agent_message,
     parse_codex_events,
@@ -5658,6 +5661,234 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
         self.assertEqual(classify_codex_failure("approval was denied by user"), "approval_denied")
         self.assertEqual(classify_codex_failure("sandbox: write blocked"), "sandbox_denied")
         self.assertEqual(classify_codex_failure("completely unrelated text"), "unknown")
+
+    def test_build_hermes_chat_command_implement_flags(self) -> None:
+        command = build_hermes_chat_command(
+            prompt="ship it",
+            model="anthropic/claude-sonnet-4",
+            provider="anthropic",
+            max_turns=42,
+            toolsets="coding",
+            yolo=True,
+        )
+        self.assertEqual(command[0], "hermes")
+        self.assertIn("chat", command)
+        self.assertIn("-q", command)
+        self.assertIn("ship it", command)
+        self.assertIn("-Q", command)
+        self.assertIn("--source", command)
+        self.assertEqual(command[command.index("--source") + 1], "tool")
+        self.assertIn("--cli", command)
+        self.assertIn("--yolo", command)
+        self.assertIn("-m", command)
+        self.assertEqual(command[command.index("-m") + 1], "anthropic/claude-sonnet-4")
+        self.assertIn("--provider", command)
+        self.assertEqual(command[command.index("--provider") + 1], "anthropic")
+        self.assertIn("--max-turns", command)
+        self.assertEqual(command[command.index("--max-turns") + 1], "42")
+        self.assertIn("-t", command)
+        self.assertEqual(command[command.index("-t") + 1], "coding")
+        self.assertIn("--ignore-rules", command)
+
+    def test_build_hermes_chat_command_analyze_omits_yolo(self) -> None:
+        command = build_hermes_chat_command(
+            prompt="review",
+            toolsets="web,search",
+            yolo=False,
+        )
+        self.assertNotIn("--yolo", command)
+        self.assertIn("-t", command)
+        self.assertEqual(command[command.index("-t") + 1], "web,search")
+
+    def test_build_hermes_chat_command_isolation_default_and_override(self) -> None:
+        default_command = build_hermes_chat_command(prompt="x")
+        self.assertIn("--ignore-rules", default_command)
+        self.assertNotIn("--safe-mode", default_command)
+
+        opted_out = build_hermes_chat_command(prompt="x", ignore_rules=False)
+        self.assertNotIn("--ignore-rules", opted_out)
+
+    def test_hermes_adapter_implement_uses_isolated_session(self) -> None:
+        streamed = StreamedProcess(
+            returncode=0,
+            stdout="done",
+            stderr="",
+            timed_out=False,
+            live_log_path="/tmp/hermes_implement_live.log",
+        )
+        task = Task(
+            id="t-hermes-session",
+            job_id="job-hermes-session",
+            role="hermes-implement",
+            adapter="hermes",
+            instruction="Fix the bug.",
+            payload={
+                "cwd": str(Path.cwd()),
+                "implement": True,
+                "disable_codegraph": True,
+            },
+        )
+        clean = {"sha": "s", "changed_files": [], "untracked_files": [], "diff": ""}
+        with patch("puppetmaster.adapters.resolve_command", return_value="/usr/bin/hermes"), patch(
+            "puppetmaster.adapters.worktree_guard", return_value=None
+        ), patch(
+            "puppetmaster.adapters.git_snapshot", side_effect=[clean, clean]
+        ), patch(
+            "puppetmaster.adapters.run_streamed_subprocess", return_value=streamed
+        ) as streamed_run:
+            HermesAdapter().run(task, "goal", "worker")
+
+        streamed_run.assert_called_once()
+        self.assertTrue(streamed_run.call_args.kwargs["start_new_session"])
+        command = streamed_run.call_args.kwargs["command"]
+        self.assertEqual(command[0], "/usr/bin/hermes")
+        self.assertIn("chat", command)
+        self.assertIn("--yolo", command)
+        self.assertIn("--cli", command)
+        self.assertIn("-Q", command)
+        self.assertIn("--ignore-rules", command)
+        self.assertEqual(command[command.index("--source") + 1], "tool")
+
+    def test_hermes_implement_nonzero_exit_with_diff_is_success(self) -> None:
+        streamed = StreamedProcess(
+            returncode=1,
+            stdout="Applied fix despite provider flake.",
+            stderr="provider teardown warning",
+            timed_out=False,
+            live_log_path=None,
+        )
+        task = Task(
+            id="t-hermes-diff",
+            job_id="job-hermes-diff",
+            role="hermes-implement",
+            adapter="hermes",
+            instruction="Fix the bug.",
+            payload={
+                "cwd": str(Path.cwd()),
+                "implement": True,
+                "disable_codegraph": True,
+            },
+        )
+        clean = {"sha": "s", "changed_files": [], "untracked_files": [], "diff": ""}
+        dirty = {
+            "sha": "s2",
+            "changed_files": ["cli.py"],
+            "untracked_files": [],
+            "diff": "diff --git a/cli.py b/cli.py\n+fix",
+            "worker_diff": "diff --git a/cli.py b/cli.py\n+fix",
+        }
+        with patch("puppetmaster.adapters.resolve_command", return_value="/usr/bin/hermes"), patch(
+            "puppetmaster.adapters.worktree_guard", return_value=None
+        ), patch(
+            "puppetmaster.adapters.git_snapshot", side_effect=[clean, dirty]
+        ), patch(
+            "puppetmaster.adapters.run_streamed_subprocess", return_value=streamed
+        ):
+            artifacts = HermesAdapter().run(task, "goal", "worker")
+
+        verification = artifacts[0]
+        self.assertEqual(verification.payload["result"], "passed")
+        self.assertIsNone(verification.payload["failure"])
+        self.assertTrue(verification.payload["has_work"])
+        patches = [a for a in artifacts if a.type == ArtifactType.PATCH]
+        self.assertEqual(len(patches), 1)
+        self.assertEqual(patches[0].payload["status"], "applied")
+
+    def test_classify_hermes_failure_known_signals(self) -> None:
+        self.assertEqual(
+            classify_hermes_failure("hermes: command not found"),
+            "missing_cli",
+        )
+        self.assertEqual(
+            classify_hermes_failure("No provider credentials configured; run hermes login"),
+            "not_authenticated",
+        )
+        self.assertEqual(
+            classify_hermes_failure("Provider verification failed for anthropic"),
+            "not_authenticated",
+        )
+        self.assertEqual(
+            classify_hermes_failure("maximum context length exceeded"),
+            "context_length_exceeded",
+        )
+        self.assertEqual(
+            classify_hermes_failure("401 Unauthorized from provider"),
+            "not_authenticated",
+        )
+        self.assertEqual(
+            classify_hermes_failure(
+                "API call failed after 3 retries: HTTP 404: model: claude-sonnet-4-20250514"
+            ),
+            "model_unavailable",
+        )
+        self.assertEqual(classify_hermes_failure("completely unrelated text"), "unknown")
+
+    def test_hermes_is_lockable_platform(self) -> None:
+        from puppetmaster import platform_lock
+
+        self.assertIn("hermes", platform_lock.KNOWN_ADAPTERS)
+
+    def test_mcp_hermes_command_builds_implement_invocation(self) -> None:
+        from puppetmaster.mcp_server import (
+            _IMPLEMENT_ADAPTER_PRIORITY,
+            _implement_command,
+            hermes_command,
+        )
+
+        self.assertIn("hermes", _IMPLEMENT_ADAPTER_PRIORITY)
+        command = hermes_command(
+            {
+                "goal": "ship it",
+                "cwd": "/repo",
+                "model": "gpt-5",
+                "provider": "openai-api",
+                "max_turns": 8,
+                "use_hermes_rules": True,
+            },
+            implement=True,
+        )
+        self.assertEqual(command[0], "hermes")
+        self.assertIn("ship it", command)
+        self.assertEqual(command[command.index("--mode") + 1], "implement")
+        self.assertEqual(command[command.index("--model") + 1], "gpt-5")
+        self.assertEqual(command[command.index("--provider") + 1], "openai-api")
+        self.assertEqual(command[command.index("--max-turns") + 1], "8")
+        self.assertIn("--use-hermes-rules", command)
+        # The implement dispatcher routes the hermes adapter to this builder.
+        self.assertEqual(
+            _implement_command({"goal": "x", "cwd": "/r"}, "hermes")[0], "hermes"
+        )
+
+    def test_hermes_curated_catalog_stamps_provider(self) -> None:
+        from puppetmaster.static_catalog import curated_to_specs
+
+        specs = {s.adapter_model_name: s for s in curated_to_specs("hermes", "api", [])}
+        self.assertIn("gemini-2.5-flash", specs)
+        self.assertIn("claude-sonnet-4-5", specs)
+        self.assertIn("gpt-5", specs)
+        self.assertEqual(specs["gemini-2.5-flash"].payload_defaults["provider"], "gemini")
+        self.assertEqual(specs["claude-sonnet-4-5"].payload_defaults["provider"], "anthropic")
+        self.assertEqual(specs["gpt-5"].payload_defaults["provider"], "openai-api")
+        for spec in specs.values():
+            self.assertEqual(spec.adapter, "hermes")
+            self.assertEqual(spec.billing, "api")
+
+    def test_routing_stamps_hermes_provider_into_payload(self) -> None:
+        from puppetmaster.orchestrator import merge_routing_payload
+        from puppetmaster.router import TaskSignals, route_task
+        from puppetmaster.static_catalog import curated_to_specs
+
+        registry = curated_to_specs("hermes", "api", [])
+        signals = TaskSignals(
+            role="hermes-implement",
+            instruction="Fix a typo in the docs",
+            allowed_adapters={"hermes"},
+        )
+        decision = route_task(signals, registry, policy="balanced")
+        self.assertEqual(decision.model.adapter, "hermes")
+        payload = merge_routing_payload({"cwd": "/repo", "mode": "implement"}, decision)
+        self.assertEqual(payload["model"], decision.model.adapter_model_name)
+        self.assertEqual(payload["provider"], decision.model.payload_defaults["provider"])
 
     def test_diagnostics_list_provider_neutral_adapters(self) -> None:
         rows = adapter_status(Path.cwd())

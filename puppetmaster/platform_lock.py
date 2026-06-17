@@ -30,7 +30,7 @@ from puppetmaster.model_registry import default_registry_path
 # The user-billable adapters the lock governs. ``shell`` and any future
 # internal adapter are intentionally excluded — they are never platform-billed
 # and must not be blocked by a platform lock.
-KNOWN_ADAPTERS: tuple[str, ...] = ("cursor", "claude-code", "codex", "openai")
+KNOWN_ADAPTERS: tuple[str, ...] = ("cursor", "claude-code", "codex", "openai", "hermes")
 
 ONLY_ENV = "PUPPETMASTER_ONLY_ADAPTERS"
 

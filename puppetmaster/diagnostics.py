@@ -387,6 +387,13 @@ def adapter_status(root: Path) -> list[dict[str, object]]:
     claude_installed = _claude_code_installed()
     codex_installed = _codex_cli_installed()
     openai_key = bool(os.environ.get("OPENAI_API_KEY"))
+    hermes_installed = _hermes_cli_installed()
+    try:
+        from puppetmaster.adapters import hermes_credentials_available
+
+        hermes_creds = hermes_credentials_available()
+    except Exception:
+        hermes_creds = False
     try:
         from puppetmaster.platform_billing import detect_codex_billing
 
@@ -412,6 +419,10 @@ def adapter_status(root: Path) -> list[dict[str, object]]:
             configured = codex_installed and (
                 openai_key or bool(codex_auth and codex_auth.healthy)
             )
+        elif info.name == "hermes":
+            # Usable when the CLI is on PATH and at least one provider credential
+            # is reachable (env var, ~/.hermes/.env, or `hermes login` OAuth).
+            configured = hermes_installed and hermes_creds
         if info.status == "stub":
             configured = False
         rows.append(
@@ -589,6 +600,20 @@ def _codex_cli_installed() -> bool:
 
 def _codex_command() -> str:
     return os.environ.get("CODEX_COMMAND", "codex")
+
+
+def _hermes_cli_installed() -> bool:
+    command = shlex.split(_hermes_command())
+    if not command:
+        return False
+    first = command[0]
+    if Path(first).expanduser().exists():
+        return True
+    return shutil.which(first) is not None
+
+
+def _hermes_command() -> str:
+    return os.environ.get("HERMES_COMMAND", "hermes")
 
 
 def _env_check(name: str) -> Check:

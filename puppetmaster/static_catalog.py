@@ -117,6 +117,49 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             ],
         },
     ],
+    # Hermes is API-billed: each entry routes through the user's own provider
+    # key (Gemini / Anthropic / OpenAI). ``payload_defaults.provider`` is the
+    # critical field — a bare model name routes to unconfigured OpenRouter, so
+    # the router must stamp the explicit Hermes provider alongside the model.
+    # Prices are the public per-token reference rates for the underlying model.
+    "hermes": [
+        {
+            "model": "gemini-2.5-flash",
+            "capability": 60,
+            "input": 0.30,
+            "output": 2.5,
+            "context": 1_000_000,
+            "tags": ["hermes", "gemini", "cheap", "fast", "vision", "code", "long-context"],
+            "payload_defaults": {"provider": "gemini"},
+        },
+        {
+            "model": "gemini-2.5-pro",
+            "capability": 84,
+            "input": 1.25,
+            "output": 10.0,
+            "context": 1_000_000,
+            "tags": ["hermes", "gemini", "balanced", "vision", "code", "reasoning", "long-context"],
+            "payload_defaults": {"provider": "gemini"},
+        },
+        {
+            "model": "claude-sonnet-4-5",
+            "capability": 82,
+            "input": 3.0,
+            "output": 15.0,
+            "context": 200_000,
+            "tags": ["hermes", "anthropic", "balanced", "vision", "code", "reasoning"],
+            "payload_defaults": {"provider": "anthropic"},
+        },
+        {
+            "model": "gpt-5",
+            "capability": 90,
+            "input": 1.25,
+            "output": 10.0,
+            "context": 400_000,
+            "tags": ["hermes", "openai", "quality", "vision", "code", "reasoning", "long-context"],
+            "payload_defaults": {"provider": "openai-api"},
+        },
+    ],
 }
 
 # Map an adapter to the discovery-meta source key (and the `models discover
@@ -177,6 +220,15 @@ def curated_to_specs(
                 f"Curated {adapter} catalog entry, API-billed at the reference "
                 "per-token rate. Tune capability_score / prices to match your account."
             )
+        # A curated entry may pin payload defaults (e.g. Hermes needs an
+        # explicit ``provider`` stamped alongside the model so a routed worker
+        # reaches the right credential/wire protocol). Preserve any prior,
+        # user-tuned defaults; the curated value seeds new entries.
+        payload_defaults = (
+            dict(prior.payload_defaults)
+            if (prior and prior.payload_defaults)
+            else dict(item.get("payload_defaults", {}))
+        )
         specs.append(
             ModelSpec(
                 id=spec_id,
@@ -190,6 +242,7 @@ def curated_to_specs(
                 tags=sorted(tags),
                 notes=note,
                 enabled=prior.enabled if prior else True,
+                payload_defaults=payload_defaults,
             )
         )
     return specs

@@ -1035,6 +1035,65 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_routing_flags(codex)
 
+    hermes = subcommands.add_parser(
+        "hermes",
+        help="Run a NousResearch Hermes CLI worker (hermes chat) headlessly.",
+    )
+    hermes.add_argument("prompt", help="Prompt for the Hermes worker.")
+    hermes.add_argument("--cwd", default=str(Path.cwd()), help="Workspace for Hermes.")
+    hermes.add_argument(
+        "--mode",
+        choices=["implement", "analyze"],
+        default="implement",
+        help="implement = full-edit with git-diff PATCH attribution; analyze = read-only structured findings.",
+    )
+    hermes.add_argument(
+        "--model",
+        help="Model passed to `hermes chat -m` (e.g. gemini-2.5-flash, claude-sonnet-4-5, gpt-5).",
+    )
+    hermes.add_argument(
+        "--provider",
+        help="Hermes provider (e.g. gemini, anthropic, openai-api). Routes credentials/wire protocol.",
+    )
+    hermes.add_argument(
+        "--max-turns",
+        type=int,
+        help="Cap on Hermes tool-use iterations (`hermes chat --max-turns`).",
+    )
+    hermes.add_argument(
+        "--toolsets",
+        help="Override the comma-separated Hermes toolsets. Defaults exclude memory/session_search for worker isolation.",
+    )
+    hermes.add_argument("--executable", help="Override the hermes executable / command.")
+    hermes.add_argument("--timeout-seconds", type=int, default=900)
+    hermes.add_argument(
+        "--worker-mode",
+        choices=["subprocess", "inline", "daemon"],
+        default="inline",
+        help="Hermes runs default to inline orchestration while Hermes remains a separate process.",
+    )
+    hermes.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="Allow Hermes to run in a dirty working tree.",
+    )
+    hermes.add_argument(
+        "--allow-non-worktree",
+        action="store_true",
+        help="Allow Hermes to run outside a git work tree (no diff attribution).",
+    )
+    hermes.add_argument(
+        "--use-hermes-rules",
+        action="store_true",
+        help="Opt OUT of worker isolation: let Hermes inject its own AGENTS.md/memory and expose the memory tool. Off by default so workers stay hermetic.",
+    )
+    hermes.add_argument(
+        "--disable-codegraph",
+        action="store_true",
+        help="Skip CodeGraph context injection (e.g. for non-repo prompts).",
+    )
+    _add_routing_flags(hermes)
+
     demo = subcommands.add_parser("demo", help="Run the Puppetmaster concept demo.")
     demo.add_argument(
         "--goal",
@@ -1224,14 +1283,15 @@ def build_parser() -> argparse.ArgumentParser:
     models_discover.add_argument("--registry-path", help="Override the registry path.")
     models_discover.add_argument(
         "--source",
-        choices=["cursor", "openai", "anthropic", "claude", "codex", "all"],
+        choices=["cursor", "openai", "anthropic", "claude", "codex", "hermes", "all"],
         default="cursor",
         help=(
             "Which platform catalog to enumerate. cursor (plan, default), "
             "openai (GET /v1/models, needs OPENAI_API_KEY), anthropic "
             "(needs ANTHROPIC_API_KEY for discovery), claude / codex (curated "
             "catalogs for the CLI agent loops that can't self-enumerate; billed "
-            "as your detected subscription/API posture), or all."
+            "as your detected subscription/API posture), hermes (curated "
+            "multi-provider catalog, API-billed via your own keys), or all."
         ),
     )
     models_discover.add_argument(
@@ -1846,6 +1906,46 @@ def _main(argv: Optional[list[str]] = None) -> int:
                     role="codex",
                     instruction=args.prompt,
                     adapter="codex",
+                    payload=payload,
+                )
+            ],
+            lease_seconds=10,
+            worker_mode=args.worker_mode,
+            on_job_created=on_job_created,
+        )
+        return finalize_cli_run(result)
+
+    if args.command == "hermes":
+        payload = {
+            "prompt": args.prompt,
+            "cwd": args.cwd,
+            "mode": args.mode,
+            "timeout_seconds": args.timeout_seconds,
+            "allow_dirty": args.allow_dirty,
+            "allow_non_worktree": args.allow_non_worktree,
+        }
+        if args.model:
+            payload["model"] = args.model
+        if args.provider:
+            payload["provider"] = args.provider
+        if args.max_turns is not None:
+            payload["max_turns"] = args.max_turns
+        if args.toolsets:
+            payload["toolsets"] = args.toolsets
+        if args.executable:
+            payload["executable"] = args.executable
+        if args.use_hermes_rules:
+            payload["ignore_rules"] = False
+        if args.disable_codegraph:
+            payload["disable_codegraph"] = True
+        payload.update(routing_payload_from_args(args, adapter="hermes"))
+        result = Orchestrator(store).run(
+            args.prompt,
+            specs=[
+                WorkerSpec(
+                    role=f"hermes-{args.mode}",
+                    instruction=args.prompt,
+                    adapter="hermes",
                     payload=payload,
                 )
             ],
@@ -4070,6 +4170,19 @@ def _discover_one_source(source: str, registry: list):
             raise _DiscoverSourceError(str(exc)) from exc
         merged, report = merge_catalog_into_registry(registry, catalog)
         report["source"] = "cursor"
+        return merged, report, catalog
+
+    if source == "hermes":
+        from puppetmaster.static_catalog import (
+            curated_catalog,
+            merge_curated_into_registry,
+        )
+
+        # Hermes always bills per-token to the user's own provider key — there
+        # is no subscription posture to detect, so it is unconditionally "api".
+        merged, report = merge_curated_into_registry("hermes", "api", registry)
+        catalog = [{"id": item["model"]} for item in curated_catalog("hermes")]
+        report["source"] = "hermes"
         return merged, report, catalog
 
     if source in ("claude", "codex"):
