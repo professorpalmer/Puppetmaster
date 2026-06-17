@@ -2836,6 +2836,54 @@ def _run_install_claude(args) -> int:
     return rc
 
 
+def _seed_hermes_registry() -> None:
+    """Seed credential-backed Hermes models into the router registry.
+
+    Called from the ``setup`` wizard after the Hermes MCP install. Only models
+    whose provider has a usable credential are added, so ``auto_route`` can pick
+    Hermes immediately without ever landing on a provider the user can't call.
+    Skipped models and the no-credential case are surfaced as actionable lines.
+    Best-effort: any failure prints a note and never aborts the wizard.
+    """
+    try:
+        from puppetmaster.adapters import available_hermes_providers
+        from puppetmaster.model_registry import (
+            default_registry_path,
+            load_registry,
+            save_registry,
+        )
+        from puppetmaster.static_catalog import merge_curated_into_registry
+
+        registry_path = default_registry_path()
+        if not registry_path.is_file():
+            print("  registry  skipped — no registry yet; run `puppetmaster models init` first")
+            return
+        allowed = available_hermes_providers()
+        existing = load_registry(registry_path)
+        merged, report = merge_curated_into_registry(
+            "hermes", "api", existing, allowed_providers=allowed
+        )
+        save_registry(merged, registry_path)
+        if report["added"] or report["refreshed"]:
+            print(
+                f"  registry  seeded hermes models "
+                f"(added={report['added']}, refreshed={report['refreshed']})"
+            )
+        for skip in report.get("skipped", []):
+            print(
+                f"  registry  skipped {skip['model']} — no credential for provider "
+                f"'{skip['provider']}'"
+            )
+        if not allowed:
+            print(
+                "  registry  note: no Hermes provider credentials found "
+                "(~/.hermes/.env or `hermes login`). Add a key and re-run "
+                "`puppetmaster models discover --source hermes --write`."
+            )
+    except Exception as exc:  # never let registry seeding abort the wizard
+        print(f"  registry  note: hermes registry seeding skipped ({exc!r})")
+
+
 def _run_install_hermes(args) -> int:
     """Dispatch for ``puppetmaster install-hermes-mcp``."""
     explicit = getattr(args, "path", None)
@@ -3222,7 +3270,7 @@ def _run_setup(args) -> int:
             overall_rc = 1
     print()
 
-    print("=== step 7/9: install-hermes-mcp ===")
+    print("=== step 7/9: install-hermes-mcp + router registry ===")
     if "hermes" not in enabled_adapters:
         print("  skipped  hermes platform disabled by the platform lock — not installing its MCP client")
     elif _shutil.which("hermes") is None:
@@ -3240,6 +3288,8 @@ def _run_setup(args) -> int:
             print(f"  {line}")
         if hermes_result.status not in {"installed", "unchanged", "would_install"}:
             overall_rc = 1
+        if not getattr(args, "skip_models", False):
+            _seed_hermes_registry()
     print()
 
     if not getattr(args, "skip_rules", False):
@@ -4168,9 +4218,18 @@ def _run_models_discover(args, path: Path) -> int:
     except RuntimeError:
         registry = starter_registry()
 
-    sources = (
-        ["cursor", "openai", "anthropic"] if args.source == "all" else [args.source]
-    )
+    if args.source == "all":
+        sources = ["cursor", "openai", "anthropic"]
+        # Fold Hermes into the catch-all only when its CLI is actually present,
+        # so users who don't run Hermes don't get hermes/* entries injected just
+        # because they happen to have an OPENAI/ANTHROPIC/GEMINI key set. The
+        # explicit `--source hermes` path always works regardless.
+        from puppetmaster.diagnostics import _hermes_cli_installed
+
+        if _hermes_cli_installed():
+            sources.append("hermes")
+    else:
+        sources = [args.source]
     reports: list[dict] = []
     catalogs: dict[str, list] = {}
     errors: dict[str, str] = {}
@@ -4248,16 +4307,27 @@ def _discover_one_source(source: str, registry: list):
         return merged, report, catalog
 
     if source == "hermes":
+        from puppetmaster.adapters import available_hermes_providers
         from puppetmaster.static_catalog import (
             curated_catalog,
             merge_curated_into_registry,
         )
 
-        # Hermes always bills per-token to the user's own provider key — there
-        # is no subscription posture to detect, so it is unconditionally "api".
-        merged, report = merge_curated_into_registry("hermes", "api", registry)
-        catalog = [{"id": item["model"]} for item in curated_catalog("hermes")]
+        # Hermes always bills per-token to the user's own provider key (no
+        # subscription posture to detect, so billing is unconditionally "api").
+        # Seed only models whose provider has a usable credential so the router
+        # never picks a Hermes model it can't actually call.
+        allowed = available_hermes_providers()
+        merged, report = merge_curated_into_registry(
+            "hermes", "api", registry, allowed_providers=allowed
+        )
         report["source"] = "hermes"
+        report["available_providers"] = sorted(allowed)
+        catalog = [
+            {"id": item["model"]}
+            for item in curated_catalog("hermes")
+            if (item.get("payload_defaults") or {}).get("provider") in allowed
+        ]
         return merged, report, catalog
 
     if source in ("claude", "codex"):

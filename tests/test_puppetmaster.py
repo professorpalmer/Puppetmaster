@@ -9149,6 +9149,120 @@ class InstallHermesMcpTests(unittest.TestCase):
             self.assertEqual(result.status, "unchanged")
 
 
+class HermesRegistryCredentialTests(unittest.TestCase):
+    """Credential-aware filtering of the curated Hermes catalog.
+
+    The router must never seed a Hermes model whose provider has no usable
+    credential, or it will confidently route a worker to a guaranteed runtime
+    failure. These tests isolate ``$HOME`` (so the developer's real
+    ``~/.hermes`` never leaks in) and the process environment.
+    """
+
+    def _isolated(self, tmp, env):
+        """Patch ``Path.home`` to a tempdir and replace os.environ with ``env``."""
+        from pathlib import Path as _P
+
+        return (
+            patch("puppetmaster.adapters.Path.home", return_value=_P(tmp)),
+            patch.dict(os.environ, env, clear=True),
+        )
+
+    def test_available_providers_from_process_env(self):
+        from puppetmaster.adapters import available_hermes_providers
+
+        with TemporaryDirectory() as tmp:
+            home_patch, env_patch = self._isolated(
+                tmp, {"GEMINI_API_KEY": "g", "ANTHROPIC_API_KEY": "a"}
+            )
+            with home_patch, env_patch:
+                self.assertEqual(
+                    available_hermes_providers(), {"gemini", "anthropic"}
+                )
+
+    def test_google_key_satisfies_gemini_only(self):
+        from puppetmaster.adapters import available_hermes_providers
+
+        with TemporaryDirectory() as tmp:
+            home_patch, env_patch = self._isolated(tmp, {"GOOGLE_API_KEY": "g"})
+            with home_patch, env_patch:
+                self.assertEqual(available_hermes_providers(), {"gemini"})
+
+    def test_available_providers_from_env_file(self):
+        from puppetmaster.adapters import available_hermes_providers
+
+        with TemporaryDirectory() as tmp:
+            hermes_dir = Path(tmp) / ".hermes"
+            hermes_dir.mkdir()
+            (hermes_dir / ".env").write_text("OPENAI_API_KEY=sk-x\n", encoding="utf-8")
+            home_patch, env_patch = self._isolated(tmp, {})
+            with home_patch, env_patch:
+                self.assertEqual(available_hermes_providers(), {"openai-api"})
+
+    def test_oauth_providers_counted(self):
+        from puppetmaster.adapters import available_hermes_providers
+
+        with TemporaryDirectory() as tmp:
+            hermes_dir = Path(tmp) / ".hermes"
+            hermes_dir.mkdir()
+            (hermes_dir / "auth.json").write_text(
+                json.dumps({"providers": {"nous": {"token": "x"}}}), encoding="utf-8"
+            )
+            home_patch, env_patch = self._isolated(tmp, {})
+            with home_patch, env_patch:
+                self.assertEqual(available_hermes_providers(), {"nous"})
+
+    def test_no_credentials_returns_empty(self):
+        from puppetmaster.adapters import available_hermes_providers
+
+        with TemporaryDirectory() as tmp:
+            home_patch, env_patch = self._isolated(tmp, {})
+            with home_patch, env_patch:
+                self.assertEqual(available_hermes_providers(), set())
+
+    def test_curated_to_specs_filters_by_allowed_providers(self):
+        from puppetmaster.static_catalog import curated_to_specs
+
+        specs = {
+            s.adapter_model_name: s
+            for s in curated_to_specs(
+                "hermes", "api", [], allowed_providers={"gemini"}
+            )
+        }
+        self.assertIn("gemini-2.5-flash", specs)
+        self.assertNotIn("gpt-5", specs)
+        self.assertNotIn("claude-sonnet-4-5", specs)
+
+    def test_curated_to_specs_none_keeps_all(self):
+        from puppetmaster.static_catalog import curated_to_specs
+
+        specs = curated_to_specs("hermes", "api", [], allowed_providers=None)
+        names = {s.adapter_model_name for s in specs}
+        self.assertIn("gpt-5", names)
+        self.assertIn("gemini-2.5-flash", names)
+        self.assertIn("claude-sonnet-4-5", names)
+
+    def test_merge_reports_skipped_models(self):
+        from puppetmaster.static_catalog import merge_curated_into_registry
+
+        merged, report = merge_curated_into_registry(
+            "hermes", "api", [], allowed_providers={"gemini"}
+        )
+        seeded = {s.adapter_model_name for s in merged if s.adapter == "hermes"}
+        self.assertIn("gemini-2.5-flash", seeded)
+        self.assertNotIn("gpt-5", seeded)
+        skipped_models = {s["model"] for s in report["skipped"]}
+        self.assertIn("gpt-5", skipped_models)
+        self.assertIn("claude-sonnet-4-5", skipped_models)
+        providers = {s["provider"] for s in report["skipped"]}
+        self.assertEqual(providers, {"openai-api", "anthropic"})
+
+    def test_merge_no_filter_reports_empty_skipped(self):
+        from puppetmaster.static_catalog import merge_curated_into_registry
+
+        _, report = merge_curated_into_registry("hermes", "api", [])
+        self.assertEqual(report["skipped"], [])
+
+
 class InstallRulesTests(unittest.TestCase):
     """Tests for :mod:`puppetmaster.rules`.
 

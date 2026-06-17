@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.9.56
+
+**Hermes joins the model router — credential-aware, so `auto_route` can pick Hermes the moment setup finishes without ever landing on a provider you can't call.** v0.9.53 made Hermes a routable worker and shipped a curated catalog; v0.9.55 wired the host MCP. This closes the last gap: the curated Hermes models are now *seeded into the router registry* during `setup`, filtered to the providers you actually have credentials for. Full suite **731** green (+9 tests).
+
+- **Per-provider credential detection.** New `available_hermes_providers()` resolves which Hermes providers (`gemini`/`anthropic`/`openai-api`) are callable — reading process env, `~/.hermes/.env`, and OAuth state in `~/.hermes/auth.json` (so a `hermes login` provider counts too). `GOOGLE_API_KEY` or `GEMINI_API_KEY` satisfies `gemini`. The existing `hermes_credentials_available()` is refactored onto the same shared key-detection helper (behavior unchanged).
+- **Credential-filtered seeding (no dead routes).** `curated_to_specs` / `merge_curated_into_registry` take an optional `allowed_providers` filter; a curated entry whose `payload_defaults.provider` lacks a credential is skipped and reported under `skipped` (with its provider), so a missing key surfaces as an actionable line instead of a model the router would route to and then fail on. `allowed_providers=None` is the default and preserves every existing caller byte-for-byte.
+- **Wizard auto-seeds on enable.** `setup` step 7 (now "install-hermes-mcp + router registry") seeds the credential-backed Hermes models into `models.json` right after the MCP install, prints `added`/`refreshed`/`skipped`, and — when no provider credential is found — tells you exactly how to fix it (`add a key, re-run models discover --source hermes --write`). Best-effort: registry seeding never aborts the wizard.
+- **`models discover` is credential-aware for Hermes.** `--source hermes` now seeds only callable models (filtered + `skipped` reporting), and `--source all` folds Hermes in **only when the `hermes` CLI is actually present** — so users who don't run Hermes don't get `hermes/*` entries injected just because they happen to have an `OPENAI_API_KEY` set.
+
 ## v0.9.55
 
 **`puppetmaster install-hermes-mcp` — turnkey host wiring so Hermes can orchestrate Puppetmaster.** v0.9.53 made Hermes a routable *worker*; this closes the other direction (Hermes-on-top), registering Puppetmaster's MCP server into Hermes for parity with `install-cursor-mcp` / `install-codex-mcp` / `install-claude-mcp`. Verified end-to-end: Hermes lists `puppetmaster ✓ enabled` from the config we write. Full suite **722** green (+10 tests).

@@ -182,6 +182,8 @@ def curated_to_specs(
     adapter: str,
     billing: str,
     existing: list[ModelSpec],
+    *,
+    allowed_providers: Optional[set] = None,
 ) -> list[ModelSpec]:
     """Turn the curated catalog for ``adapter`` into :class:`ModelSpec`s.
 
@@ -191,11 +193,22 @@ def curated_to_specs(
     seeded from the curated entry. ``plan`` billing means a subscription covers
     it, so input/output prices are 0; ``api`` keeps the reference per-token
     rates so cost routing still works.
+
+    When ``allowed_providers`` is given, a curated entry whose
+    ``payload_defaults.provider`` is not in the set is skipped — so a Hermes
+    model is only seeded when its provider has a usable credential. Entries
+    without a pinned provider are always kept (the filter is a no-op for
+    catalogs like Cursor/Claude that don't stamp one). ``None`` disables
+    filtering entirely (the default — preserves every existing caller).
     """
     plan = billing == "plan"
     by_name = {s.adapter_model_name: s for s in existing if s.adapter == adapter}
     specs: list[ModelSpec] = []
     for item in curated_catalog(adapter):
+        if allowed_providers is not None:
+            provider = (item.get("payload_defaults") or {}).get("provider")
+            if provider is not None and provider not in allowed_providers:
+                continue
         model = str(item["model"])
         prior = by_name.get(model)
         capability = prior.capability_score if prior else int(item["capability"])
@@ -252,14 +265,23 @@ def merge_curated_into_registry(
     adapter: str,
     billing: str,
     existing: list[ModelSpec],
+    *,
+    allowed_providers: Optional[set] = None,
 ) -> "tuple[list[ModelSpec], dict]":
     """Reconcile the curated catalog for ``adapter`` into ``existing``.
 
     Refresh-or-add, never drop (like the API merge): a curated model already in
     the registry is replaced by its restamped counterpart; new ones are
     appended; every other adapter and any hand-tuned entry is preserved.
+
+    ``allowed_providers`` filters provider-stamped entries to those with a
+    usable credential (see :func:`curated_to_specs`); the filtered-out models
+    are reported under ``skipped`` so callers can warn the user. ``None``
+    (default) disables filtering.
     """
-    discovered = curated_to_specs(adapter, billing, existing)
+    discovered = curated_to_specs(
+        adapter, billing, existing, allowed_providers=allowed_providers
+    )
     by_name = {s.adapter_model_name: s for s in discovered}
     existing_names = {s.adapter_model_name for s in existing if s.adapter == adapter}
     added = sorted(by_name.keys() - existing_names)
@@ -276,12 +298,20 @@ def merge_curated_into_registry(
         if name not in seen:
             merged.append(spec)
 
+    skipped: list[dict] = []
+    if allowed_providers is not None:
+        for item in curated_catalog(adapter):
+            provider = (item.get("payload_defaults") or {}).get("provider")
+            if provider is not None and provider not in allowed_providers:
+                skipped.append({"model": str(item["model"]), "provider": provider})
+
     report = {
         "adapter": adapter,
         "source": ADAPTER_TO_SOURCE.get(adapter, adapter),
         "discovered_count": len(discovered),
         "added": added,
         "refreshed": sorted(seen),
+        "skipped": skipped,
         "billing": billing,
     }
     return merged, report

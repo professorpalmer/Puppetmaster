@@ -1799,6 +1799,18 @@ _HERMES_ENV_CREDENTIAL_KEYS = (
     "GOOGLE_API_KEY",
 )
 
+# Map each Hermes provider that appears in Puppetmaster's curated Hermes catalog
+# (see ``static_catalog.CURATED_CATALOGS["hermes"]``) to the API-key env vars
+# that make it callable. The router stamps these provider names via
+# ``payload_defaults.provider``; seeding a model whose provider has no
+# credential would route a worker to a guaranteed runtime failure, so the
+# discover/wizard paths filter against ``available_hermes_providers()``.
+_HERMES_PROVIDER_CREDENTIAL_ENV = {
+    "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+    "anthropic": ("ANTHROPIC_API_KEY",),
+    "openai-api": ("OPENAI_API_KEY",),
+}
+
 
 def build_hermes_chat_command(
     *,
@@ -1852,16 +1864,14 @@ def build_hermes_chat_command(
     return command
 
 
-def hermes_credentials_available() -> bool:
-    """True when Hermes can likely reach a provider without inlining secrets.
+def _hermes_present_credential_keys() -> set:
+    """Return the set of known credential env keys Hermes can see.
 
-    Checks ``~/.hermes/.env`` for common API keys, OAuth state in
-    ``~/.hermes/auth.json``, and keys already present in the process
-    environment (which the adapter passes through unchanged).
+    Unions the process environment (which the adapter passes through unchanged)
+    with any ``KEY=value`` assignments in ``~/.hermes/.env``. Only non-empty
+    values count.
     """
-    for key in _HERMES_ENV_CREDENTIAL_KEYS:
-        if os.environ.get(key):
-            return True
+    present = {key for key in _HERMES_ENV_CREDENTIAL_KEYS if os.environ.get(key)}
     env_file = Path.home() / ".hermes" / ".env"
     if env_file.is_file():
         try:
@@ -1870,17 +1880,52 @@ def hermes_credentials_available() -> bool:
             text = ""
         for key in _HERMES_ENV_CREDENTIAL_KEYS:
             if re.search(rf"^\s*{re.escape(key)}\s*=\s*\S+", text, re.MULTILINE):
-                return True
+                present.add(key)
+    return present
+
+
+def _hermes_oauth_providers() -> set:
+    """Return Hermes provider names with OAuth state in ``~/.hermes/auth.json``."""
     auth_file = Path.home() / ".hermes" / "auth.json"
-    if auth_file.is_file():
-        try:
-            payload = json.loads(auth_file.read_text(encoding="utf-8", errors="replace") or "{}")
-        except (OSError, json.JSONDecodeError):
-            payload = {}
-        providers = payload.get("providers")
-        if isinstance(providers, dict) and providers:
-            return True
-    return False
+    if not auth_file.is_file():
+        return set()
+    try:
+        payload = json.loads(auth_file.read_text(encoding="utf-8", errors="replace") or "{}")
+    except (OSError, json.JSONDecodeError):
+        return set()
+    providers = payload.get("providers")
+    if isinstance(providers, dict):
+        return {str(name).lower() for name in providers}
+    return set()
+
+
+def hermes_credentials_available() -> bool:
+    """True when Hermes can likely reach a provider without inlining secrets.
+
+    Checks ``~/.hermes/.env`` for common API keys, OAuth state in
+    ``~/.hermes/auth.json``, and keys already present in the process
+    environment (which the adapter passes through unchanged).
+    """
+    return bool(_hermes_present_credential_keys()) or bool(_hermes_oauth_providers())
+
+
+def available_hermes_providers() -> set:
+    """Return the set of Hermes providers that have a usable credential.
+
+    A provider qualifies when an API-key env var that satisfies it is present
+    (process env or ``~/.hermes/.env``) or it has OAuth state in
+    ``~/.hermes/auth.json``. Used to filter Puppetmaster's curated Hermes
+    catalog down to models that can actually be called, so the router never
+    picks a Hermes model whose provider is unconfigured.
+    """
+    present_keys = _hermes_present_credential_keys()
+    available = {
+        provider
+        for provider, keys in _HERMES_PROVIDER_CREDENTIAL_ENV.items()
+        if any(key in present_keys for key in keys)
+    }
+    available |= _hermes_oauth_providers()
+    return available
 
 
 class HermesAdapter:
