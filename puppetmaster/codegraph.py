@@ -400,6 +400,30 @@ def inject_worker_cli_env(env: dict[str, str]) -> dict[str, str]:
     return env
 
 
+# Python env vars that select an interpreter's import roots. They are correct
+# for ``python -m puppetmaster ...`` children (same interpreter as the parent),
+# but poison for a worker that spawns a *foreign* Python.
+_FOREIGN_PYTHON_ENV_VARS = ("PYTHONPATH", "PYTHONHOME")
+
+
+def scrub_foreign_interpreter_env(env: dict[str, str]) -> dict[str, str]:
+    """Strip Python import-root vars before handing ``env`` to a foreign Python.
+
+    Puppetmaster's parent process runs under its own interpreter (e.g. a pyenv
+    3.9 install) with ``PYTHONPATH`` pointed at this source tree — correct for
+    its own ``python -m puppetmaster`` children. But an adapter that spawns a
+    *different* Python CLI (e.g. the Hermes 3.11 binary) inherits the same env
+    and imports the parent's site-packages first, which is a cross-interpreter
+    version clash (observed: ``load_dotenv() got an unexpected keyword argument
+    'override'`` from a stale python-dotenv). Node-based adapters (Cursor /
+    Claude / Codex) ignore ``PYTHONPATH``, so a Python-CLI adapter is the first
+    to hit this; any future one wants the same scrub. Mutates and returns
+    ``env``."""
+    for var in _FOREIGN_PYTHON_ENV_VARS:
+        env.pop(var, None)
+    return env
+
+
 def codegraph_prompt_section(context: str) -> str:
     """Format a CodeGraph context string for prompt injection."""
     return "\n".join(

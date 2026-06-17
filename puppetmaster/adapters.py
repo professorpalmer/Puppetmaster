@@ -16,7 +16,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Protocol, Union
 
-from puppetmaster.codegraph import enrich_prompt_with_codegraph, inject_worker_cli_env
+from puppetmaster.codegraph import (
+    enrich_prompt_with_codegraph,
+    inject_worker_cli_env,
+    scrub_foreign_interpreter_env,
+)
 from puppetmaster.fs_permissions import mkdir_private, open_private, write_private_text
 from puppetmaster.models import Artifact, ArtifactType, Task
 from puppetmaster.openai_security import (
@@ -2123,7 +2127,12 @@ class HermesAdapter:
                 )
             ]
 
-        worker_env = inject_worker_cli_env(apply_worktree_ports(os.environ.copy(), cwd))
+        # Hermes spawns a foreign Python interpreter; scrub the parent's
+        # PYTHONPATH/PYTHONHOME so it can't import Puppetmaster's site-packages
+        # and crash on a version clash (e.g. stale python-dotenv).
+        worker_env = scrub_foreign_interpreter_env(
+            apply_worktree_ports(os.environ.copy(), cwd)
+        )
         with hermes_reasoning_effort_env(
             worker_env, task.payload.get("reasoning_effort")
         ) as run_env:
@@ -2305,7 +2314,12 @@ class HermesAdapter:
             extra_args=task.payload.get("extra_args", []),
         )
 
-        worker_env = inject_worker_cli_env(apply_worktree_ports(os.environ.copy(), cwd))
+        # Hermes spawns a foreign Python interpreter; scrub the parent's
+        # PYTHONPATH/PYTHONHOME so it can't import Puppetmaster's site-packages
+        # and crash on a version clash (e.g. stale python-dotenv).
+        worker_env = scrub_foreign_interpreter_env(
+            apply_worktree_ports(os.environ.copy(), cwd)
+        )
         with hermes_reasoning_effort_env(
             worker_env, task.payload.get("reasoning_effort")
         ) as run_env:

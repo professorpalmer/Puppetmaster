@@ -14899,6 +14899,32 @@ class PuppetmasterSalvageAndLivenessTests(unittest.TestCase):
         self.assertTrue(env2["PYTHONPATH"].startswith(root))
         self.assertIn("/existing", env2["PYTHONPATH"])
 
+    def test_scrub_foreign_interpreter_env_drops_python_path(self) -> None:
+        """A foreign Python worker (Hermes) must not inherit the parent's
+        PYTHONPATH/PYTHONHOME, or it imports Puppetmaster's site-packages and
+        crashes on a cross-interpreter version clash."""
+        from puppetmaster.codegraph import scrub_foreign_interpreter_env
+
+        env = scrub_foreign_interpreter_env(
+            {"PYTHONPATH": "/pyenv/3.9/site-packages", "PYTHONHOME": "/pyenv/3.9", "PATH": "/usr/bin"}
+        )
+        self.assertNotIn("PYTHONPATH", env)
+        self.assertNotIn("PYTHONHOME", env)
+        # Unrelated vars are left intact.
+        self.assertEqual(env["PATH"], "/usr/bin")
+
+    def test_hermes_adapter_scrubs_foreign_python_env_not_inject(self) -> None:
+        """The Hermes worker env must be built with the foreign-interpreter
+        scrub, never inject_worker_cli_env — the latter leaks the parent's
+        PYTHONPATH into the foreign Hermes Python and crashes the worker."""
+        import inspect
+        from puppetmaster import adapters
+
+        for fn in (adapters.HermesAdapter._run_implement, adapters.HermesAdapter._run_analyze):
+            src = inspect.getsource(fn)
+            self.assertIn("scrub_foreign_interpreter_env", src, fn.__name__)
+            self.assertNotIn("inject_worker_cli_env", src, fn.__name__)
+
     def test_liveness_summary_flags_dead_pid(self) -> None:
         from puppetmaster.liveness import liveness_summary
 

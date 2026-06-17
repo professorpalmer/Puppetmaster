@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.9.59
+
+**Fix: Hermes workers no longer inherit Puppetmaster's `PYTHONPATH` (cross-interpreter poisoning).** Hermes is the first Python-CLI adapter; the others spawn Node CLIs that ignore `PYTHONPATH`. The Hermes worker env was built with `inject_worker_cli_env`, which prepends this install's source root (the pyenv-3.9 site-packages) to `PYTHONPATH` — correct for `python -m puppetmaster codegraph` children, but poison for the foreign Hermes interpreter, which then imports the parent's stale `python-dotenv` and crashes with `load_dotenv() got an unexpected keyword argument 'override'`. Full suite **743** green (+2 tests).
+
+- **`scrub_foreign_interpreter_env` (new, in `codegraph.py`).** Strips `PYTHONPATH`/`PYTHONHOME` from an env before it is handed to a non-Puppetmaster Python. Fixes the whole bug class: any future foreign-Python adapter gets the same treatment instead of re-discovering the clash.
+- **`HermesAdapter._run_implement` / `_run_analyze` use the scrub** instead of `inject_worker_cli_env` — Hermes workers don't self-serve `python -m puppetmaster codegraph` from the parent's tree, so they never needed the injected source root. Node-based adapters (Cursor/Claude/Codex) are unchanged: they ignore `PYTHONPATH` and still get the CLI-resolving injection.
+- Regression tests pin the helper's behavior and that both Hermes paths scrub (and never re-introduce `inject_worker_cli_env`).
+
 ## v0.9.58
 
 **Coupling-aware delegation — stop fanning out a single feature into a swarm.** The invocation gate was steering *every* delegated task toward a "fan it out to a swarm" framing, even single implementations. Fanning out one tightly-coupled change makes parallel workers re-ingest the same context and stack commits that are unaware of each other → conflicts, rework, broken delivery, and zero net token savings. The gate now matches the verb to the task shape. Full suite **741** green (+4 tests).
