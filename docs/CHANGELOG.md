@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.9.58
+
+**Coupling-aware delegation — stop fanning out a single feature into a swarm.** The invocation gate was steering *every* delegated task toward a "fan it out to a swarm" framing, even single implementations. Fanning out one tightly-coupled change makes parallel workers re-ingest the same context and stack commits that are unaware of each other → conflicts, rework, broken delivery, and zero net token savings. The gate now matches the verb to the task shape. Full suite **741** green (+4 tests).
+
+- **Implementation intent routes to ONE implement worker, not the swarm default.** `infer_role_and_verb` previously matched only a narrow verb list (`refactor|implement|build|…`), so plain feature work ("add a CSV export endpoint", "create the webhook handler", "wire up retries") fell through to the read-only `*_swarm` default — the exact task-shape mismatch behind the collision reports. The implement pattern is broadened to catch ordinary feature/fix verbs and maps to `puppetmaster_start_implement` (a single worker in a clean worktree that yields one reviewable `PATCH`).
+- **Verb-aware injected directive.** `DelegationDecision.directive()` is no longer one-size-fits-all: implement verbs are described as a single clean-worktree worker ("not a fan-out swarm; parallel editors stack commits that are unaware of each other"), CodeGraph verbs as a structural lookup, and only genuinely read-only analysis keeps the swarm framing. The implement directive explicitly reserves swarms for the explore/review/audit passes *around* the feature.
+- **Trivial carve-out hardened against the broadening.** An explicit trivial signal ("add a comment", "fix a typo", rename, one-line/single-file) now stays inline regardless of the role-inflated capability score, so widening implement detection never starts delegating routine one-liners (the fastest way to train users to disable the gate).
+- **Guidance follows the code.** `AGENTS.md` gains a "match the verb to the task shape" section: single feature → single implement worker; independent slices → fan out split by non-overlapping files; broad investigation → read-only swarm. It also states the honest positioning — Puppetmaster wins on mixed workloads, trivial-heavy batches, long-context horizons, and zero-token artifact recall, and output-compression tools (e.g. RTK) are **additive**, not competitors.
+
 ## v0.9.57
 
 **Reasoning-effort routing for Hermes + two frontier models on your own keys.** Hermes lets you dial each model's reasoning depth (`minimal`→`xhigh`); the router now treats `(model × effort)` as a first-class cost/capability dimension, so a hard task can land on a high-effort mid-tier model instead of paying frontier prices. Full suite **737** green (+6 tests).

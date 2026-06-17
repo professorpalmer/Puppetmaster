@@ -26,6 +26,18 @@ Every implement verb runs full-edit in a clean worktree (clean-tree guard; set `
 
 Start tools return a `job_id` immediately. Do **not** wait inside one long MCP call.
 
+## Match the verb to the task shape (single feature ≠ swarm)
+
+A swarm is for **read-only, decomposable analysis** — explore, review, audit, plan, redteam — where independent roles can run in parallel without touching the same code. It is **not** the right shape for one coupled feature. Fanning out a single tightly-coupled change makes parallel workers re-ingest the same context and land commits that are unaware of each other, which produces conflicts, rework, and broken delivery — and erases any token savings.
+
+So:
+
+- **Implementing one feature / fixing one ticket → a single `puppetmaster_start_implement` worker** in a clean worktree. One worker keeps the change coherent and yields one reviewable `PATCH`. Reserve swarms for the explore/review/audit passes *around* the feature, not the edit itself.
+- **Genuinely independent slices** (e.g. "add the same header to 30 unrelated endpoints") can fan out — but split by non-overlapping files so workers never collide.
+- **Broad investigation / audit / "find all X" → a read-only swarm.** That is what it is built for.
+
+Puppetmaster's edge is mixed workloads, heavy trivial sub-tasks, long-context horizons, and zero-token artifact recall across sessions — not winning a single hard implementation against one strong steered agent. Output-compression and context-hygiene tools (e.g. RTK) are **additive** to Puppetmaster, not competitors: let them shrink tool-output tokens while Puppetmaster owns orchestration and durable state.
+
 ## When NOT to route through Puppetmaster
 
 Use native tooling directly for:

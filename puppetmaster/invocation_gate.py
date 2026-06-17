@@ -114,10 +114,46 @@ _ROLE_INFERENCE = [
     (re.compile(r"\b(security|vuln|exploit|cve)\b"), "security-review", "puppetmaster_start_cursor_review"),
     (re.compile(r"\b(audit|review|risk|find issues|what could break)\b"), "review", "puppetmaster_start_cursor_review"),
     (re.compile(r"\b(architect|design|approach|trade[-\s]?off|plan|scope)\b"), "plan", "puppetmaster_start_cursor_plan"),
-    (re.compile(r"\b(refactor|migrat|implement|build|add support|rewrite|fix the)\b"), "implement", "puppetmaster_start_implement"),
+    # Implementation intent → a SINGLE implement worker, never a fan-out swarm.
+    # Broadened beyond the old narrow verb list because plain feature work
+    # ("add a CSV export endpoint", "create the webhook handler", "wire up
+    # retries") previously fell through to the read-only swarm default — the
+    # task-shape mismatch that makes coupled changes collide. Trivial edits
+    # ("add a comment", "fix a typo") are held inline by the trivial carve-out
+    # in should_delegate, not here.
+    (
+        re.compile(
+            r"\b(refactor|migrat(e|ion)|implement|build|create|add|writ(e|ing)|"
+            r"wire[-\s]?up|set[-\s]?up|scaffold|integrat(e|ion)|port|patch|fix|"
+            r"rewrite|endpoint|feature|hook up)\b"
+        ),
+        "implement",
+        "puppetmaster_start_implement",
+    ),
     (re.compile(r"\b(where is|who calls|what implements|find all|trace|call graph)\b"), "explore", "puppetmaster_codegraph_search"),
 ]
 _DEFAULT_VERB = "puppetmaster_start_cursor_swarm"
+
+# Verbs that run a single edit-capable worker in an isolated worktree. These
+# must NOT be described as a "fan-out swarm": the whole point is that a coupled
+# implementation lands as one coherent change (one branch, one PATCH artifact)
+# instead of parallel editors stacking commits that are unaware of each other.
+_IMPLEMENT_VERBS = frozenset(
+    {
+        "puppetmaster_start_implement",
+        "puppetmaster_start_cursor_implement",
+        "puppetmaster_start_claude_implement",
+    }
+)
+
+# Verbs that resolve a "where/what/how is X" question structurally instead of
+# crawling the tree. Framed as look-up, not fan-out.
+_CODEGRAPH_VERBS = frozenset(
+    {
+        "puppetmaster_codegraph_search",
+        "puppetmaster_codegraph_context",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -148,15 +184,44 @@ class DelegationDecision:
         }
 
     def directive(self) -> str:
-        """One-line instruction a hook can inject into the host's context."""
+        """Instruction a hook injects into the host's context when delegating.
+
+        The framing is verb-aware on purpose. The old one-size message told the
+        host to "fan it out to a swarm" for *every* delegated task — including
+        single implementations, which is exactly the misfire that makes parallel
+        workers stack uncoordinated commits. So implementation work is steered
+        to one worker in a clean worktree, lookups to CodeGraph, and only
+        genuinely read-only analysis to a swarm.
+        """
         if not self.should_delegate:
             return ""
+        verb = self.suggested_verb
+        tail = "If this is actually trivial, say 'do it inline' to skip."
+        if verb in _IMPLEMENT_VERBS:
+            return (
+                f"[Puppetmaster] This is a single implementation task (capability "
+                f"{self.capability_score}, {self.reason}). Delegate it to ONE "
+                f"implement worker in a clean worktree via `{verb}` — not a "
+                f"fan-out swarm. A single worker keeps the change coherent and "
+                f"captures a PATCH artifact; parallel editors stack commits that "
+                f"are unaware of each other. Reserve swarms for the "
+                f"explore/review/audit passes around the feature. {tail}"
+            )
+        if verb in _CODEGRAPH_VERBS:
+            return (
+                f"[Puppetmaster] Resolve this with CodeGraph first (capability "
+                f"{self.capability_score}, {self.reason}): call `{verb}` to locate "
+                f"the code instead of grepping, then read only what it points to. "
+                f"If the MCP tool isn't reachable, run `python -m puppetmaster "
+                f"codegraph search '<query>'`. {tail}"
+            )
         return (
-            f"[Puppetmaster] This task warrants delegation (capability "
-            f"{self.capability_score}, {self.reason}). Before working inline, "
-            f"call `{self.suggested_verb}` to fan it out to a swarm; recall "
-            f"results with puppetmaster_artifacts at zero token cost. "
-            f"If this is actually trivial, say 'do it inline' to skip."
+            f"[Puppetmaster] This warrants a read-only analysis pass (capability "
+            f"{self.capability_score}, {self.reason}). Call `{verb}` to fan it out "
+            f"to a swarm; recall results with puppetmaster_artifacts at zero token "
+            f"cost. For the implementation itself, follow up with a single "
+            f"`puppetmaster_start_implement` worker rather than editing in the "
+            f"swarm. {tail}"
         )
 
 
@@ -243,17 +308,21 @@ def should_delegate(
     has_hard_scope = _matches_any(_HARD_SCOPE_PATTERNS, lower)
     has_trivial = _matches_any(_TRIVIAL_PATTERNS, lower)
 
-    # Trivial carve-out: short prompt, easy intent, no broad scope, modest
-    # score. Stay inline so routine edits never get blocked.
+    # Trivial carve-out: a short prompt with an explicit easy-intent signal and
+    # no broad scope stays inline — even if role inference (e.g. "add ...") put
+    # it in the high-scoring `implement` bucket. An explicit trivial signal
+    # ("add a comment", "fix a typo", "rename", one-line/single-file) should win
+    # over a role-inflated score; otherwise broadening implement detection would
+    # start delegating routine one-liners, which is how users learn to disable
+    # the gate entirely.
     if (
         has_trivial
         and not has_hard_scope
         and len(prompt) <= _TRIVIAL_MAX_CHARS
-        and score < threshold
     ):
         return DelegationDecision(
             False,
-            f"trivial task signal and score {score} < threshold {threshold}",
+            f"explicit trivial signal (score {score}); staying inline",
             suggested_verb, score, role, ("trivial",),
         )
 

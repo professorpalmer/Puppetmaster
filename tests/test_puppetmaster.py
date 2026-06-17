@@ -15455,6 +15455,51 @@ class InvocationGateTests(unittest.TestCase):
         self.assertEqual(infer_role_and_verb("design the caching layer")[1], "puppetmaster_start_cursor_plan")
         self.assertEqual(infer_role_and_verb("where is ClientError defined")[1], "puppetmaster_codegraph_search")
 
+    def test_feature_implementation_routes_to_single_implement_worker(self):
+        """Plain feature work must delegate to ONE implement worker, not the
+        read-only swarm default. This is the task-shape fix: a coupled single
+        feature run through a fan-out swarm is what stacks uncoordinated commits.
+        """
+        from puppetmaster.invocation_gate import should_delegate
+
+        for prompt in (
+            "add a CSV export endpoint to the billing service",
+            "create the webhook handler for Stripe events",
+            "wire up retries with backoff in the API client",
+        ):
+            d = should_delegate(prompt)
+            self.assertTrue(d.should_delegate, prompt)
+            self.assertEqual(d.suggested_verb, "puppetmaster_start_implement", prompt)
+
+    def test_implement_directive_steers_to_clean_worktree_not_swarm(self):
+        """The injected directive for an implement task must point at a single
+        clean-worktree worker and must NOT tell the host to fan out a swarm."""
+        from puppetmaster.invocation_gate import should_delegate
+
+        d = should_delegate("add a CSV export endpoint to the billing service")
+        directive = d.directive()
+        self.assertIn("clean worktree", directive)
+        self.assertIn("not a", directive.lower())
+        self.assertNotIn("fan it out to a swarm", directive)
+
+    def test_review_directive_still_uses_swarm_framing(self):
+        """Read-only analysis keeps the swarm framing — swarms are correct there."""
+        from puppetmaster.invocation_gate import should_delegate
+
+        d = should_delegate("audit the auth module for security issues across the repo")
+        self.assertEqual(d.suggested_verb, "puppetmaster_start_cursor_review")
+        self.assertIn("fan it out to a swarm", d.directive())
+
+    def test_trivial_add_comment_stays_inline_despite_broadened_implement(self):
+        """Broadening implement detection to include 'add' must not start
+        delegating routine one-liners; the trivial carve-out wins."""
+        from puppetmaster.invocation_gate import should_delegate
+
+        for prompt in ("add a comment to the parser", "fix a typo in the docstring"):
+            d = should_delegate(prompt)
+            self.assertFalse(d.should_delegate, prompt)
+            self.assertIn("trivial", d.matched_signals, prompt)
+
 
 class HookRunnerTests(unittest.TestCase):
     """Tests for host hook payload → response translation."""
