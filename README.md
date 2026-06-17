@@ -19,12 +19,16 @@
 
 ```bash
 pipx install puppetmaster-ai     # or: pip install puppetmaster-ai
-puppetmaster setup               # doctor + models init + MCP installers + rules + auto-invocation hooks, idempotent
+puppetmaster setup               # doctor + models init + MCP installers + rules + hooks — idempotent
 ```
 
-That's the whole install. `setup` runs every step idempotently, skips any tool that isn't present, and prints what it did. Restart Cursor (or open a fresh Codex / Claude session) and the agent sees 32+ `puppetmaster_*` tools, a rule nudging it to reach for them, **and deterministic auto-invocation hooks** that inject a "delegate now" directive on prompt submit and redirect genuinely broad shell searches (recursive `rg`/`grep`/`find`) plus `Task` fan-out to Puppetmaster — so you stop having to remind it. Read-only inspection (`git log`/`diff`, single-file greps, the native Grep/Glob tools) passes straight through; it's classifier-gated (trivial edits stay inline) and fully kill-switchable with `PUPPETMASTER_AUTO_INVOKE_DISABLED=1`. See [Auto-invocation](https://github.com/professorpalmer/Puppetmaster#auto-invocation).
+<p align="center">
+<img src="https://raw.githubusercontent.com/professorpalmer/Puppetmaster/main/docs/setup-guide.jpg" alt="Puppetmaster setup guide: install once with pipx, wire your platform (Cursor, Claude Code, Codex CLI, or the OpenAI API), then verify with puppetmaster doctor." width="640" />
+</p>
 
-To run benchmarks or hack on it, clone instead — see [Contributing](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/CONTRIBUTING.md). (`pipx` keeps the CLI in its own isolated environment, which is the recommended way to install a command-line app.)
+That's the whole install. `setup` runs every step idempotently, skips any tool that isn't present, and prints what it did. Restart Cursor (or open a fresh Codex / Claude session) and the agent gains 32+ `puppetmaster_*` tools, a rule nudging it to use them, and deterministic [auto-invocation hooks](https://github.com/professorpalmer/Puppetmaster#auto-invocation) that delegate real work for you. The classifier keeps trivial edits and read-only inspection inline, and the whole thing is kill-switchable with `PUPPETMASTER_AUTO_INVOKE_DISABLED=1`.
+
+To run benchmarks or hack on it, clone instead — see [Contributing](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/CONTRIBUTING.md). (`pipx` keeps the CLI in its own isolated environment — the recommended way to install a command-line app.)
 
 ## Uninstall
 

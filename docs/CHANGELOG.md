@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.9.54
+
+**Docs: README polish + a visual setup guide.** No code changes — refreshes the project page on GitHub and PyPI.
+
+- Adds a one-glance setup graphic (install once, wire your platform, verify) to the README, hosted via an absolute raw-GitHub URL so it renders identically on GitHub and PyPI.
+- Tightens the Install section: condensed the dense auto-invocation paragraph to its essentials and pointed the detail at the existing [Auto-invocation](https://github.com/professorpalmer/Puppetmaster#auto-invocation) section.
+
 ## v0.9.53
 
 **NousResearch Hermes is now a first-class Puppetmaster platform — analyze + full-edit implement across Gemini, Anthropic, and OpenAI — with hermetic worker isolation.** The Hermes CLI (`hermes chat`) joins Cursor / Claude Code / Codex as a routable adapter, verified end-to-end across all three providers for both modes. Full suite **712** green (+10 tests).
