@@ -5794,6 +5794,108 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
         self.assertEqual(len(patches), 1)
         self.assertEqual(patches[0].payload["status"], "applied")
 
+    def test_hermes_reasoning_effort_injects_isolated_config(self) -> None:
+        try:
+            import yaml  # noqa: F401
+        except Exception:
+            self.skipTest("PyYAML (hermes extra) not installed")
+        from puppetmaster.adapters import hermes_reasoning_effort_env
+
+        with TemporaryDirectory() as tmp:
+            real_home = Path(tmp) / "hermes_home"
+            real_home.mkdir()
+            (real_home / "config.yaml").write_text(
+                "model:\n  default: claude-sonnet-4-5\n"
+                "mcp_servers:\n  puppetmaster:\n    command: pm\n",
+                encoding="utf-8",
+            )
+            (real_home / "auth.json").write_text('{"active_provider": "anthropic"}', encoding="utf-8")
+            base_env = {"HERMES_HOME": str(real_home), "PATH": os.environ.get("PATH", "")}
+
+            with hermes_reasoning_effort_env(base_env, "high") as run_env:
+                effort_home = Path(run_env["HERMES_HOME"])
+                # A fresh ephemeral home, never the user's real one.
+                self.assertNotEqual(effort_home, real_home)
+                # auth.json is preserved verbatim via symlink (credentials intact).
+                self.assertTrue((effort_home / "auth.json").is_symlink())
+                self.assertEqual(
+                    (effort_home / "auth.json").read_text(), '{"active_provider": "anthropic"}'
+                )
+                # config.yaml is a real rewritten file carrying the effort, with
+                # the user's MCP servers preserved.
+                self.assertFalse((effort_home / "config.yaml").is_symlink())
+                import yaml as _yaml
+
+                cfg = _yaml.safe_load((effort_home / "config.yaml").read_text())
+                self.assertEqual(cfg["agent"]["reasoning_effort"], "high")
+                self.assertIn("puppetmaster", cfg["mcp_servers"])
+                self.assertEqual(cfg["model"]["default"], "claude-sonnet-4-5")
+            # Cleaned up on exit; the real home is untouched.
+            self.assertFalse(effort_home.exists())
+            self.assertTrue((real_home / "config.yaml").is_file())
+
+    def test_hermes_reasoning_effort_env_passthrough_when_invalid_or_empty(self) -> None:
+        from puppetmaster.adapters import hermes_reasoning_effort_env
+
+        base_env = {"HERMES_HOME": "/nonexistent", "X": "1"}
+        for bad in (None, "", "turbo", "none"):
+            with hermes_reasoning_effort_env(base_env, bad) as run_env:
+                # Unknown/empty effort must never fail the worker or relocate home.
+                self.assertIs(run_env, base_env)
+
+    def test_hermes_implement_reasoning_effort_reaches_subprocess(self) -> None:
+        try:
+            import yaml as _yaml  # noqa: F401
+        except Exception:
+            self.skipTest("PyYAML (hermes extra) not installed")
+
+        streamed = StreamedProcess(
+            returncode=0, stdout="done", stderr="", timed_out=False, live_log_path=None
+        )
+        captured: dict = {}
+
+        def fake_run(**kwargs):
+            env = kwargs["env"]
+            home = env.get("HERMES_HOME")
+            captured["home"] = home
+            if home and (Path(home) / "config.yaml").is_file():
+                import yaml as _y
+
+                cfg = _y.safe_load((Path(home) / "config.yaml").read_text())
+                captured["effort"] = (cfg.get("agent") or {}).get("reasoning_effort")
+            return streamed
+
+        with TemporaryDirectory() as tmp:
+            real_home = Path(tmp) / "hermes_home"
+            real_home.mkdir()
+            (real_home / "config.yaml").write_text("model:\n  default: gpt-5.5\n", encoding="utf-8")
+            (real_home / "auth.json").write_text("{}", encoding="utf-8")
+            task = Task(
+                id="t-hermes-effort",
+                job_id="job-hermes-effort",
+                role="hermes-implement",
+                adapter="hermes",
+                instruction="Fix the bug.",
+                payload={
+                    "cwd": str(Path.cwd()),
+                    "implement": True,
+                    "disable_codegraph": True,
+                    "reasoning_effort": "xhigh",
+                },
+            )
+            clean = {"sha": "s", "changed_files": [], "untracked_files": [], "diff": ""}
+            with patch.dict(os.environ, {"HERMES_HOME": str(real_home)}), patch(
+                "puppetmaster.adapters.resolve_command", return_value="/usr/bin/hermes"
+            ), patch("puppetmaster.adapters.worktree_guard", return_value=None), patch(
+                "puppetmaster.adapters.git_snapshot", side_effect=[clean, clean]
+            ), patch(
+                "puppetmaster.adapters.run_streamed_subprocess", side_effect=fake_run
+            ):
+                HermesAdapter().run(task, "goal", "worker")
+
+        self.assertEqual(captured.get("effort"), "xhigh")
+        self.assertNotEqual(captured.get("home"), str(real_home))
+
     def test_classify_hermes_failure_known_signals(self) -> None:
         self.assertEqual(
             classify_hermes_failure("hermes: command not found"),
@@ -6989,6 +7091,82 @@ class ModelRouterTests(unittest.TestCase):
                 loaded["codex/gpt-5-5"].payload_defaults,
                 {"extra_args": ["-c", "model_reasoning_effort=high"]},
             )
+
+    def test_models_set_applies_hermes_effort_payload_defaults(self) -> None:
+        from puppetmaster.model_registry import ModelSpec, load_registry, save_registry
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "models.json"
+            save_registry(
+                [
+                    ModelSpec(
+                        id="hermes/gpt-5-5",
+                        adapter="hermes",
+                        adapter_model_name="gpt-5.5",
+                        payload_defaults={"provider": "openai-api"},
+                    )
+                ],
+                path,
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = cli_main(
+                    [
+                        "models",
+                        "set",
+                        "--registry-path",
+                        str(path),
+                        "hermes/gpt-5-5",
+                        "effort=high",
+                    ]
+                )
+            self.assertEqual(code, 0)
+            loaded = {spec.id: spec for spec in load_registry(path)}
+            # Effort is stamped without clobbering the existing provider default.
+            self.assertEqual(
+                loaded["hermes/gpt-5-5"].payload_defaults,
+                {"provider": "openai-api", "reasoning_effort": "high"},
+            )
+            self.assertIn("effort:high", loaded["hermes/gpt-5-5"].tags)
+
+    def test_model_payload_defaults_for_effort_hermes_rejects_unknown(self) -> None:
+        from puppetmaster.cli import model_payload_defaults_for_effort
+
+        self.assertEqual(
+            model_payload_defaults_for_effort("hermes", "xhigh"),
+            {"reasoning_effort": "xhigh"},
+        )
+        with self.assertRaises(ValueError):
+            model_payload_defaults_for_effort("hermes", "none")
+
+    def test_models_setup_wizard_adds_hermes_effort_variant(self) -> None:
+        from puppetmaster.cli import ModelRegistryWizard
+        from puppetmaster.model_registry import ModelSpec, load_registry, save_registry
+
+        base = ModelSpec(
+            id="hermes/gpt-5-5",
+            adapter="hermes",
+            adapter_model_name="gpt-5.5",
+            tags=["hermes", "openai"],
+            payload_defaults={"provider": "openai-api"},
+        )
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "models.json"
+            save_registry([base], path)
+            # menu 1 (effort variant) -> base #1 -> effort high -> accept suggested
+            # id -> capability 97 -> default multiplier -> confirm add -> q -> save.
+            stdin = io.StringIO("1\n1\nhigh\n\n97\n\ny\nq\ny\n")
+            stdout = io.StringIO()
+            code = ModelRegistryWizard(path, stdin, stdout).run()
+            self.assertEqual(code, 0)
+            variants = {s.id: s for s in load_registry(path)}
+            variant = variants.get("hermes/gpt-5-5-high")
+            self.assertIsNotNone(variant, stdout.getvalue())
+            self.assertEqual(
+                variant.payload_defaults,
+                {"provider": "openai-api", "reasoning_effort": "high"},
+            )
+            self.assertIn("effort:high", variant.tags)
 
     def test_models_setup_wizard_exits_on_closed_stdin(self) -> None:
         from puppetmaster.cli import ModelRegistryWizard

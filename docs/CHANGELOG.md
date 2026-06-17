@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.9.57
+
+**Reasoning-effort routing for Hermes + two frontier models on your own keys.** Hermes lets you dial each model's reasoning depth (`minimal`→`xhigh`); the router now treats `(model × effort)` as a first-class cost/capability dimension, so a hard task can land on a high-effort mid-tier model instead of paying frontier prices. Full suite **737** green (+6 tests).
+
+- **`HermesAdapter` honors `payload.reasoning_effort`.** Hermes has no `hermes chat` effort flag — the headless source of truth is `agent.reasoning_effort` in the loaded `config.yaml` (read at every CLI startup). The adapter applies per-task effort via an **ephemeral `HERMES_HOME`** that symlinks the real home (preserving `auth.json`, `.env`, sessions, and MCP servers verbatim) and overrides only `config.yaml` with the chosen level. No mutation of the user's `~/.hermes`, so parallel swarm workers can run at different efforts safely; the temp home is torn down after the run. Degrades to the default effort when the level is empty/invalid, PyYAML is absent, or the home can't be read — a routing knob never fails a worker.
+- **`models set <id> effort=<level>` and the setup wizard now support `hermes`** (`minimal`/`low`/`medium`/`high`/`xhigh`), alongside the existing `openai`/`codex` support. Effort is stamped as `payload_defaults.reasoning_effort` with an `effort:<level>` tag and an output-token-cost multiplier so estimates stay honest (high effort ≈ 2× output burn). The wizard's effort-variant builder now **merges** onto the base entry's defaults instead of replacing them, so Hermes' adapter-critical `provider` survives a variant (also benefits any future provider-bearing model).
+- **Frontier models added to the curated Hermes catalog:** `gpt-5.5` (cap 96, OpenAI) and `claude-opus-4-8` (cap 99, Anthropic) — so `models discover --source hermes` seeds a full frontier suite on your own API keys, and they survive a registry reset.
+
 ## v0.9.56
 
 **Hermes joins the model router — credential-aware, so `auto_route` can pick Hermes the moment setup finishes without ever landing on a provider you can't call.** v0.9.53 made Hermes a routable worker and shipped a curated catalog; v0.9.55 wired the host MCP. This closes the last gap: the curated Hermes models are now *seeded into the router registry* during `setup`, filtered to the providers you actually have credentials for. Full suite **731** green (+9 tests).

@@ -3667,8 +3667,13 @@ def _run_platform_subcommand(args) -> int:
 
 _OPENAI_EFFORT_LEVELS = ("none", "low", "medium", "high", "xhigh")
 _CODEX_EFFORT_LEVELS = ("low", "medium", "high")
+# Hermes maps ``agent.reasoning_effort`` to each provider's native reasoning
+# knob. Mirrors ``adapters.VALID_HERMES_REASONING_EFFORTS`` (Hermes rejects
+# ``"none"``, silently falling back to medium, so it is intentionally absent).
+_HERMES_EFFORT_LEVELS = ("minimal", "low", "medium", "high", "xhigh")
 _EFFORT_TOKEN_MULTIPLIERS = {
     "none": 0.7,
+    "minimal": 0.7,
     "low": 0.7,
     "medium": 1.0,
     "high": 2.0,
@@ -3690,6 +3695,14 @@ def model_payload_defaults_for_effort(adapter: str, effort: str) -> dict[str, An
         if normalized not in _CODEX_EFFORT_LEVELS:
             raise ValueError("codex effort must be one of " + ", ".join(_CODEX_EFFORT_LEVELS))
         return {"extra_args": ["-c", f"model_reasoning_effort={normalized}"]}
+    if adapter == "hermes":
+        if normalized not in _HERMES_EFFORT_LEVELS:
+            raise ValueError(
+                "hermes effort must be one of " + ", ".join(_HERMES_EFFORT_LEVELS)
+            )
+        # The HermesAdapter reads ``payload.reasoning_effort`` and applies it via
+        # an ephemeral ``HERMES_HOME`` carrying ``agent.reasoning_effort``.
+        return {"reasoning_effort": normalized}
     if adapter in ("claude-code", "cursor"):
         raise ValueError(
             f"{adapter} does not expose an effort knob through its CLI/SDK today."
@@ -3882,14 +3895,23 @@ class ModelRegistryWizard:
                 f"{base.adapter} does not expose an effort knob through its CLI/SDK today."
             )
             return
-        levels = _OPENAI_EFFORT_LEVELS if base.adapter == "openai" else _CODEX_EFFORT_LEVELS
+        if base.adapter == "openai":
+            levels = _OPENAI_EFFORT_LEVELS
+        elif base.adapter == "hermes":
+            levels = _HERMES_EFFORT_LEVELS
+        else:
+            levels = _CODEX_EFFORT_LEVELS
         self._write("Supported efforts: " + ", ".join(levels))
         effort = self._prompt_default("Effort level", "high").strip().lower()
         try:
-            payload_defaults = model_payload_defaults_for_effort(base.adapter, effort)
+            effort_defaults = model_payload_defaults_for_effort(base.adapter, effort)
         except ValueError as exc:
             self._write(f"error: {exc}")
             return
+        # Merge onto the base entry's defaults so adapter-critical keys survive
+        # (e.g. Hermes' ``provider``, which selects the API key the variant bills
+        # to). Matches the merge semantics of ``models set <id> effort=<level>``.
+        payload_defaults = {**(base.payload_defaults or {}), **effort_defaults}
 
         suggested_id = f"{base.id}-{effort}"
         model_id = self._prompt_default("New model id", suggested_id).strip()

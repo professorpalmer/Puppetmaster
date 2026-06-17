@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -1792,6 +1793,13 @@ def classify_codex_failure(output: str) -> str:
 # ``build_hermes_chat_command``); together they make each worker hermetic.
 DEFAULT_HERMES_ANALYZE_TOOLSETS = "file,web,vision"
 DEFAULT_HERMES_IMPLEMENT_TOOLSETS = "file,terminal,code_execution,web,vision"
+# Reasoning-effort levels Hermes accepts for ``agent.reasoning_effort`` and maps
+# to each provider's native reasoning knob (OpenAI ``reasoning_effort``,
+# Anthropic thinking budget, Gemini thinking). Mirrors Hermes'
+# ``hermes_constants.VALID_REASONING_EFFORTS`` exactly — Hermes' own parser
+# rejects anything outside this set (including ``"none"``, which silently falls
+# back to the medium default), so the router and adapter use the same vocabulary.
+VALID_HERMES_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 _HERMES_ENV_CREDENTIAL_KEYS = (
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
@@ -1862,6 +1870,90 @@ def build_hermes_chat_command(
     if extra_args:
         command.extend(command_parts(extra_args))
     return command
+
+
+@contextlib.contextmanager
+def hermes_reasoning_effort_env(base_env: dict, effort: object):
+    """Yield a subprocess env that runs ``hermes chat`` at ``effort`` reasoning.
+
+    Hermes has no ``hermes chat`` flag for reasoning effort; the headless source
+    of truth is ``agent.reasoning_effort`` in the loaded ``config.yaml`` (read at
+    every CLI startup in Hermes' ``cli.py``). The only knob that redirects which
+    config file Hermes loads is ``HERMES_HOME``. So to set per-task effort
+    *without mutating the user's real ``~/.hermes``* (which would be unsafe for
+    parallel swarm workers), we point ``HERMES_HOME`` at an ephemeral home that
+    symlinks every entry of the real home — preserving ``auth.json``, ``.env``,
+    sessions, and MCP servers verbatim — except ``config.yaml``, which is
+    rewritten with ``agent.reasoning_effort: <effort>`` merged in. The temp home
+    lives only for the subprocess run and is removed on exit (only symlinks plus
+    the one rewritten config are deleted; real state is never touched).
+
+    Degrades to the unmodified ``base_env`` (default effort) when ``effort`` is
+    empty/invalid, PyYAML is unavailable (it ships only with the ``hermes``
+    extra), or the real home can't be read. A routing knob must never fail a
+    worker.
+    """
+    level = str(effort or "").strip().lower()
+    if level not in VALID_HERMES_REASONING_EFFORTS:
+        yield base_env
+        return
+    try:
+        import yaml  # type: ignore
+    except Exception:  # pragma: no cover - hosts without the hermes extra
+        yield base_env
+        return
+
+    real_home = Path(
+        base_env.get("HERMES_HOME")
+        or os.environ.get("HERMES_HOME")
+        or (Path.home() / ".hermes")
+    )
+    if not real_home.is_dir():
+        yield base_env
+        return
+
+    tmp_home = Path(tempfile.mkdtemp(prefix="pm-hermes-effort-"))
+    try:
+        for entry in real_home.iterdir():
+            if entry.name == "config.yaml":
+                continue
+            try:
+                os.symlink(entry, tmp_home / entry.name)
+            except OSError:
+                # A single un-symlinkable entry shouldn't sink the run; the
+                # ones that matter (auth.json, .env) are simple files.
+                pass
+
+        config: dict = {}
+        cfg_file = real_home / "config.yaml"
+        if cfg_file.is_file():
+            try:
+                loaded = yaml.safe_load(cfg_file.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    config = loaded
+            except (OSError, yaml.YAMLError):
+                config = {}
+
+        agent_cfg = config.get("agent")
+        if not isinstance(agent_cfg, dict):
+            agent_cfg = {}
+        agent_cfg["reasoning_effort"] = level
+        config["agent"] = agent_cfg
+
+        effort_config = tmp_home / "config.yaml"
+        effort_config.write_text(
+            yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
+        )
+        try:
+            os.chmod(effort_config, 0o600)
+        except OSError:
+            pass
+
+        run_env = dict(base_env)
+        run_env["HERMES_HOME"] = str(tmp_home)
+        yield run_env
+    finally:
+        shutil.rmtree(tmp_home, ignore_errors=True)
 
 
 def _hermes_present_credential_keys() -> set:
@@ -2031,15 +2123,19 @@ class HermesAdapter:
                 )
             ]
 
-        completed = run_streamed_subprocess(
-            command=command,
-            env=inject_worker_cli_env(apply_worktree_ports(os.environ.copy(), cwd)),
-            task=task,
-            sidecar_name="hermes_implement",
-            timeout_seconds=timeout_seconds,
-            cwd=str(cwd),
-            start_new_session=True,
-        )
+        worker_env = inject_worker_cli_env(apply_worktree_ports(os.environ.copy(), cwd))
+        with hermes_reasoning_effort_env(
+            worker_env, task.payload.get("reasoning_effort")
+        ) as run_env:
+            completed = run_streamed_subprocess(
+                command=command,
+                env=run_env,
+                task=task,
+                sidecar_name="hermes_implement",
+                timeout_seconds=timeout_seconds,
+                cwd=str(cwd),
+                start_new_session=True,
+            )
         if completed.timed_out:
             after = git_snapshot(cwd, base_tree=str(before.get("tree") or "") or None)
             stdout_capture = capture_subprocess_stdout(
@@ -2209,15 +2305,19 @@ class HermesAdapter:
             extra_args=task.payload.get("extra_args", []),
         )
 
-        completed = run_streamed_subprocess(
-            command=command,
-            env=inject_worker_cli_env(apply_worktree_ports(os.environ.copy(), cwd)),
-            task=task,
-            sidecar_name="hermes_analyze",
-            timeout_seconds=timeout_seconds,
-            cwd=str(cwd),
-            start_new_session=True,
-        )
+        worker_env = inject_worker_cli_env(apply_worktree_ports(os.environ.copy(), cwd))
+        with hermes_reasoning_effort_env(
+            worker_env, task.payload.get("reasoning_effort")
+        ) as run_env:
+            completed = run_streamed_subprocess(
+                command=command,
+                env=run_env,
+                task=task,
+                sidecar_name="hermes_analyze",
+                timeout_seconds=timeout_seconds,
+                cwd=str(cwd),
+                start_new_session=True,
+            )
         if completed.timed_out:
             stdout_capture = capture_subprocess_stdout(
                 text=completed.stdout,

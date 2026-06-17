@@ -159,6 +159,24 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "tags": ["hermes", "openai", "quality", "vision", "code", "reasoning", "long-context"],
             "payload_defaults": {"provider": "openai-api"},
         },
+        {
+            "model": "gpt-5.5",
+            "capability": 96,
+            "input": 5.0,
+            "output": 30.0,
+            "context": 400_000,
+            "tags": ["hermes", "openai", "frontier", "quality", "vision", "code", "reasoning", "long-context"],
+            "payload_defaults": {"provider": "openai-api"},
+        },
+        {
+            "model": "claude-opus-4-8",
+            "capability": 99,
+            "input": 15.0,
+            "output": 75.0,
+            "context": 200_000,
+            "tags": ["hermes", "anthropic", "frontier", "quality", "vision", "code", "reasoning"],
+            "payload_defaults": {"provider": "anthropic"},
+        },
     ],
 }
 
