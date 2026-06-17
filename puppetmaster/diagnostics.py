@@ -403,7 +403,15 @@ def adapter_status(root: Path) -> list[dict[str, object]]:
         elif info.name == "openai":
             configured = openai_key
         elif info.name == "codex":
-            configured = codex_installed and bool(codex_auth and codex_auth.healthy)
+            # Availability is intentionally separate from billing context.
+            # The CLI plus *any* credential signal — an OPENAI_API_KEY in the
+            # environment, or a healthy Codex auth context ($CODEX_HOME/auth.json
+            # or `codex login`) — marks Codex usable. Which account work bills to
+            # is reported on its own by the `billing:codex` doctor check, so an
+            # OPENAI_API_KEY-only setup is never silently demoted to "unconfigured".
+            configured = codex_installed and (
+                openai_key or bool(codex_auth and codex_auth.healthy)
+            )
         if info.status == "stub":
             configured = False
         rows.append(

@@ -5667,6 +5667,26 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
         self.assertIn("claude-code", names)
         self.assertIn("codex", names)
 
+    def test_codex_configured_does_not_regress_for_openai_key_only(self) -> None:
+        """Availability must not be gated on billing context: an
+        OPENAI_API_KEY-only setup (no healthy Codex auth) stays configured,
+        while a setup with neither key nor healthy auth is unconfigured.
+        """
+        from puppetmaster import diagnostics
+
+        def codex_row() -> dict:
+            return next(r for r in adapter_status(Path.cwd()) if r["name"] == "codex")
+
+        with patch.object(diagnostics, "_codex_cli_installed", return_value=True), patch(
+            "puppetmaster.platform_billing.detect_codex_billing"
+        ) as billing:
+            billing.return_value = MagicMock(healthy=False)
+            with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-present"}, clear=False):
+                self.assertTrue(codex_row()["configured"])
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("OPENAI_API_KEY", None)
+                self.assertFalse(codex_row()["configured"])
+
     def test_cursor_sdk_detected_in_puppetmaster_package_dir(self) -> None:
         """`puppetmaster adapters` from an unrelated workspace must still see
         the bundled @cursor/sdk install — the adapter resolves the SDK from
