@@ -17033,5 +17033,97 @@ class CodegraphFreshnessTests(unittest.TestCase):
         self.assertIn("STALE", check.detail)
 
 
+class JsonPrefixDecodeTests(unittest.TestCase):
+    """Trailing-brace trailers must not falsely degrade a good analyze run.
+
+    A worker can emit valid JSON followed by a brace-bearing trailer (a
+    Hermes -Q session/cost footer, a courtesy "Done {ok}", or a second JSON
+    blob). The greedy first-opener-to-last-closer slice over-reaches into the
+    trailer and json.loads raises, so the run was falsely marked
+    empty_or_unstructured. The raw_decode fallback recovers the real payload
+    while genuine prose still yields nothing.
+    """
+
+    def setUp(self) -> None:
+        from puppetmaster.adapters import parse_cursor_artifact_payload
+
+        self.parse = parse_cursor_artifact_payload
+        self.good = {"findings": [{"type": "finding", "claim": "x"}]}
+        self.good_json = json.dumps(self.good)
+
+    def test_clean_json_still_parses(self) -> None:
+        self.assertEqual(self.parse(self.good_json), self.good)
+
+    def test_trailing_session_cost_footer(self) -> None:
+        text = f"{self.good_json}\n[session abc | 1,240 tokens | $0.003]"
+        self.assertEqual(self.parse(text), self.good)
+
+    def test_trailing_courtesy_brace_line(self) -> None:
+        text = f"{self.good_json}\n\nDone {{ok}}"
+        self.assertEqual(self.parse(text), self.good)
+
+    def test_trailing_second_json_object(self) -> None:
+        text = f'{self.good_json}\n\n{{"session":"abc"}}'
+        self.assertEqual(self.parse(text), self.good)
+
+    def test_trailing_prose_without_brace_already_worked(self) -> None:
+        text = f"{self.good_json}\n\nLet me know!"
+        self.assertEqual(self.parse(text), self.good)
+
+    def test_fenced_json_with_trailing_footer(self) -> None:
+        text = f"```json\n{self.good_json}\n```\n[session abc | 12 tokens]"
+        self.assertEqual(self.parse(text), self.good)
+
+    def test_leading_whitespace_and_prose_then_json(self) -> None:
+        text = f"   Here is the report:\n\n{self.good_json}\n[session]"
+        self.assertEqual(self.parse(text), self.good)
+
+    def test_crlf_line_endings(self) -> None:
+        text = f"{self.good_json}\r\n\r\n[session abc | 5 tokens]"
+        self.assertEqual(self.parse(text), self.good)
+
+    def test_first_brace_is_false_opener_then_real_json(self) -> None:
+        text = f"Use {{x}} then:\n{self.good_json}\n[session]"
+        self.assertEqual(self.parse(text), self.good)
+
+    def test_genuine_prose_still_returns_none(self) -> None:
+        # The guard against over-correction: real unstructured prose must NOT
+        # be salvaged, so genuine degrades aren't masked.
+        self.assertIsNone(self.parse("The entrypoint is main() in cli.py."))
+
+    def test_prose_with_unparseable_braces_returns_none(self) -> None:
+        self.assertIsNone(self.parse("Wrap it in {curly} or [square] brackets."))
+
+    def test_hermes_analyze_recovers_artifacts_through_trailer(self) -> None:
+        from puppetmaster.adapters import cursor_result_artifacts
+
+        task = Task(
+            job_id="job",
+            role="pipeline-mapper",
+            instruction="inspect repo",
+            adapter="hermes",
+            payload={"prompt": "Inspect repo", "cwd": "."},
+        )
+        text = f"{self.good_json}\n[session abc | 1,240 tokens | $0.003]"
+        artifacts = cursor_result_artifacts(task, "worker-hermes", text)
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(artifacts[0].type, ArtifactType.FINDING)
+
+    def test_prose_yields_zero_artifacts(self) -> None:
+        from puppetmaster.adapters import cursor_result_artifacts
+
+        task = Task(
+            job_id="job",
+            role="pipeline-mapper",
+            instruction="inspect repo",
+            adapter="hermes",
+            payload={"prompt": "Inspect repo", "cwd": "."},
+        )
+        artifacts = cursor_result_artifacts(
+            task, "worker-hermes", "The entrypoint is main()."
+        )
+        self.assertEqual(artifacts, [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.9.61
+
+**Fix: trailing-brace trailers no longer falsely degrade a good analyze run.** The shared analyze-result parser (`parse_cursor_artifact_payload`, used by the Hermes *and* Cursor analyze paths) sliced from the first `{`/`[` to the **last** `}`/`]`. When a worker emitted valid JSON followed by any brace-bearing trailer — a Hermes `-Q` `[session abc | 1,240 tokens | $0.003]` cost footer, a courtesy `Done {ok}`, or a second JSON blob — the slice over-reached into the trailer, `json.loads` raised, and the run was falsely marked `degraded` → `empty_or_unstructured_*_result`. This was the deterministic root cause of the intermittent "good work silently downgraded" nit (it only fired when the trailer happened to carry a brace). Full suite **768** green (+13 tests).
+
+- **`_json_prefix_decode` (new candidate, pure addition).** A final fallback in the candidate loop: scans each `{`/`[` opener and lets `json.JSONDecoder().raw_decode` consume exactly one complete value, ignoring trailing junk. Tries every opener so a false opener in prose (`Use {x} then: {…real…}`) still resolves to the real payload. Added *after* the existing `text` / `_strip_json_fence` / `_json_object_slice` candidates, so happy paths are untouched — no regression risk.
+- **Guarded against over-correction.** Only structured containers (`dict`/`list`) count; a bare scalar after a brace or genuine unstructured prose (no parseable opener) still returns `None`, so real degrades aren't masked. A true-prose test row pins this.
+- **Test matrix (13).** Clean JSON, session/cost footer, courtesy brace line, second JSON object, no-brace trailer, fenced JSON + footer, leading prose, CRLF, false-opener-then-JSON, genuine prose → `None`, prose with unparseable braces → `None`, plus end-to-end `cursor_result_artifacts` recovery through a trailer and zero-artifacts for prose.
+
 ## v0.9.60
 
 **CodeGraph index-freshness detection + background self-heal.** A stale index was CodeGraph's worst failure mode: nothing re-read the repo after `codegraph index`, so once the working tree moved on (an agent edits files, a `git pull` lands commits) queries silently returned a view that no longer matched the code — the agent "couldn't find" code that plainly existed. PM now *knows* when its own index is behind and says so, instead of relying on the user knowing to run `repair-codegraph` / `codegraph sync`. Full suite **755** green (+12 tests).

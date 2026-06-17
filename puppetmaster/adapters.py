@@ -3020,7 +3020,14 @@ def parse_cursor_artifact_payload(result_text: str) -> Optional[Any]:
             return json.loads(candidate)
         except json.JSONDecodeError:
             continue
-    return None
+    # Final fallback: a valid JSON object/array followed by a brace-bearing
+    # trailer (a Hermes -Q "[session abc | 1,240 tokens | $0.003]" footer, a
+    # courtesy "Done {ok}", or a second JSON blob) makes every greedy
+    # candidate above fail — the slice over-reaches into the trailer and
+    # json.loads raises. raw_decode parses one complete value from the first
+    # opener and ignores trailing junk, recovering the real payload without
+    # salvaging genuine prose (which has no parseable opener → still None).
+    return _json_prefix_decode(text)
 
 
 def cursor_artifact_from_item(task: Task, worker_id: str, item: object) -> Optional[Artifact]:
@@ -3122,6 +3129,28 @@ def _json_object_slice(text: str) -> Optional[str]:
     start = min(starts)
     end = max(text.rfind("}"), text.rfind("]"))
     return text[start : end + 1] if end > start else None
+
+
+def _json_prefix_decode(text: str) -> Optional[Any]:
+    """Decode the first complete JSON object/array, ignoring any trailing junk.
+
+    Scans for each ``{``/``[`` opener and lets ``raw_decode`` consume exactly
+    one JSON value from there, so a valid payload followed by a non-JSON trailer
+    still parses. Only structured containers count as artifact payloads — a bare
+    scalar that happens to sit after a brace (or genuine prose with no parseable
+    opener) yields ``None`` so real degrades aren't masked.
+    """
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char not in "{[":
+            continue
+        try:
+            decoded, _ = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(decoded, (dict, list)):
+            return decoded
+    return None
 
 
 def _string_list(value: object) -> list[str]:
