@@ -3444,6 +3444,31 @@ def _hoist_global_codegraph_flags(
     return cwd, timeout, remaining
 
 
+def _print_codegraph_freshness(target: str) -> int:
+    """CLI entrypoint for `python -m puppetmaster codegraph freshness`.
+
+    Reports whether the repo's CodeGraph index still reflects the working tree.
+    Exit code mirrors the verdict so it's scriptable: 0 fresh/unknown/absent,
+    1 stale (so CI / pre-commit hooks can gate on a drifted index)."""
+    from puppetmaster.codegraph import codegraph_freshness
+
+    freshness = codegraph_freshness(target)
+    label = {
+        "fresh": "fresh — index matches the working tree",
+        "stale": "STALE",
+        "unknown": "unknown — workspace too large to scan within budget",
+        "no_index": "not indexed yet — run `codegraph init --index`",
+        "uninitialized": "no .codegraph/ here — run `codegraph init --index`",
+    }.get(freshness.state, freshness.state)
+    print(f"codegraph index: {label}")
+    if freshness.is_stale:
+        print(f"  {freshness.warning_text()}")
+        return 1
+    if freshness.reason and freshness.state not in {"fresh"}:
+        print(f"  {freshness.reason}")
+    return 0
+
+
 def _run_codegraph_passthrough(args) -> int:
     """CLI entrypoint for `python -m puppetmaster codegraph <args>`.
 
@@ -3471,8 +3496,13 @@ def _run_codegraph_passthrough(args) -> int:
         cli_args = cli_args[1:]
     if not cli_args:
         print("usage: python -m puppetmaster codegraph <subcommand> [args...]", file=sys.stderr)
-        print("examples: codegraph status | codegraph search 'router' | codegraph context 'task'", file=sys.stderr)
+        print("examples: codegraph status | codegraph search 'router' | codegraph context 'task' | codegraph freshness", file=sys.stderr)
         return 2
+
+    # `freshness` is a Puppetmaster-native check (not a codegraph subcommand):
+    # report whether the index still matches the working tree.
+    if cli_args[0] == "freshness":
+        return _print_codegraph_freshness(args.cwd or os.getcwd())
 
     target = args.cwd or os.getcwd()
     # `status`, `init`, and `help` work before/while a workspace is indexed;

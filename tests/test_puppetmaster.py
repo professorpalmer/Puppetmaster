@@ -16821,5 +16821,217 @@ class SecurityHardeningTests(unittest.TestCase):
             self.assertEqual(mode, 0o700)
 
 
+class CodegraphFreshnessTests(unittest.TestCase):
+    """Index-freshness detection, surfacing, and background self-heal."""
+
+    def setUp(self) -> None:
+        from puppetmaster import codegraph as cg
+
+        cg.reset_codegraph_autosync_state()
+        self.addCleanup(cg.reset_codegraph_autosync_state)
+
+    def _make_indexed_repo(self, tmp: str, *, db_mtime: float) -> Path:
+        root = Path(tmp)
+        (root / ".codegraph").mkdir(exist_ok=True)
+        db = root / ".codegraph" / "codegraph.db"
+        db.write_text("index", encoding="utf-8")
+        os.utime(db, (db_mtime, db_mtime))
+        return root
+
+    def test_freshness_uninitialized_when_no_codegraph_dir(self) -> None:
+        from puppetmaster.codegraph import codegraph_freshness
+
+        with TemporaryDirectory() as tmp:
+            verdict = codegraph_freshness(tmp)
+            self.assertEqual(verdict.state, "uninitialized")
+            self.assertFalse(verdict.is_stale)
+            self.assertIsNone(verdict.warning_text())
+
+    def test_freshness_no_index_when_db_missing(self) -> None:
+        from puppetmaster.codegraph import codegraph_freshness
+
+        with TemporaryDirectory() as tmp:
+            (Path(tmp) / ".codegraph").mkdir()
+            verdict = codegraph_freshness(tmp)
+            self.assertEqual(verdict.state, "no_index")
+
+    def test_freshness_fresh_when_sources_older_than_index_fs(self) -> None:
+        from puppetmaster.codegraph import codegraph_freshness
+
+        with TemporaryDirectory() as tmp:
+            root = self._make_indexed_repo(tmp, db_mtime=10_000.0)
+            src = root / "module.py"
+            src.write_text("x = 1\n", encoding="utf-8")
+            os.utime(src, (9_000.0, 9_000.0))  # older than the index
+            # Force the filesystem fallback (no git work tree resolution).
+            with patch("puppetmaster.codegraph._run_git", return_value=None):
+                verdict = codegraph_freshness(tmp)
+            self.assertEqual(verdict.state, "fresh")
+            self.assertEqual(verdict.changed_count, 0)
+
+    def test_freshness_stale_when_source_newer_than_index_fs(self) -> None:
+        from puppetmaster.codegraph import codegraph_freshness
+
+        with TemporaryDirectory() as tmp:
+            root = self._make_indexed_repo(tmp, db_mtime=10_000.0)
+            src = root / "module.py"
+            src.write_text("x = 1\n", encoding="utf-8")
+            os.utime(src, (20_000.0, 20_000.0))  # newer than the index
+            with patch("puppetmaster.codegraph._run_git", return_value=None):
+                verdict = codegraph_freshness(tmp)
+            self.assertEqual(verdict.state, "stale")
+            self.assertGreaterEqual(verdict.changed_count, 1)
+            self.assertIn("module.py", verdict.changed_sample)
+            warning = verdict.warning_text()
+            self.assertIsNotNone(warning)
+            self.assertIn("STALE", warning)
+            self.assertIn("codegraph sync", warning)
+
+    def test_freshness_unknown_when_scan_budget_exhausted(self) -> None:
+        from puppetmaster import codegraph as cg
+
+        with TemporaryDirectory() as tmp:
+            root = self._make_indexed_repo(tmp, db_mtime=10_000.0)
+            src = root / "old.py"
+            src.write_text("x = 1\n", encoding="utf-8")
+            os.utime(src, (9_000.0, 9_000.0))  # older — no drift to find
+            with patch("puppetmaster.codegraph._run_git", return_value=None), patch.object(
+                cg, "_FRESHNESS_MAX_FILES", 0
+            ):
+                verdict = cg.codegraph_freshness(tmp)
+            # Budget blown before confirming freshness → never a false "fresh".
+            self.assertEqual(verdict.state, "unknown")
+
+    def test_freshness_stale_via_git_dirty_file(self) -> None:
+        import shutil as _shutil
+
+        from puppetmaster.codegraph import codegraph_freshness
+
+        if _shutil.which("git") is None:
+            self.skipTest("git not available")
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env = {
+                **os.environ,
+                "GIT_AUTHOR_NAME": "t",
+                "GIT_AUTHOR_EMAIL": "t@t",
+                "GIT_COMMITTER_NAME": "t",
+                "GIT_COMMITTER_EMAIL": "t@t",
+            }
+            subprocess.run(["git", "init", "-q"], cwd=tmp, check=True, env=env)
+            tracked = root / "tracked.py"
+            tracked.write_text("x = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=tmp, check=True, env=env)
+            subprocess.run(["git", "commit", "-qm", "init"], cwd=tmp, check=True, env=env)
+            # Index built in the past; then a dirty edit lands after it.
+            self._make_indexed_repo(tmp, db_mtime=1_000.0)
+            tracked.write_text("x = 2\n", encoding="utf-8")
+            os.utime(tracked, (2_000_000_000.0, 2_000_000_000.0))
+            verdict = codegraph_freshness(tmp)
+            self.assertEqual(verdict.state, "stale")
+            self.assertIn("tracked.py", verdict.changed_sample)
+
+    def test_autosync_returns_none_when_disabled(self) -> None:
+        from puppetmaster.codegraph import maybe_autosync_codegraph
+
+        with TemporaryDirectory() as tmp:
+            self._make_indexed_repo(tmp, db_mtime=10_000.0)
+            with patch.dict(os.environ, {"PUPPETMASTER_CODEGRAPH_AUTOSYNC": "0"}):
+                self.assertIsNone(maybe_autosync_codegraph(tmp))
+
+    def test_autosync_skips_when_not_stale(self) -> None:
+        from puppetmaster.codegraph import CodegraphFreshness, maybe_autosync_codegraph
+
+        with TemporaryDirectory() as tmp:
+            self._make_indexed_repo(tmp, db_mtime=10_000.0)
+            fresh = CodegraphFreshness(state="fresh")
+            with patch.dict(
+                os.environ, {"PUPPETMASTER_CODEGRAPH_AUTOSYNC": "1"}
+            ), patch("puppetmaster.codegraph._spawn_codegraph_autosync") as spawn:
+                self.assertIsNone(maybe_autosync_codegraph(tmp, fresh))
+            spawn.assert_not_called()
+
+    def test_autosync_spawns_once_then_dedupes_within_cooldown(self) -> None:
+        from puppetmaster.codegraph import CodegraphFreshness, maybe_autosync_codegraph
+
+        with TemporaryDirectory() as tmp:
+            self._make_indexed_repo(tmp, db_mtime=10_000.0)
+            stale = CodegraphFreshness(state="stale", changed_count=3)
+            with patch.dict(
+                os.environ, {"PUPPETMASTER_CODEGRAPH_AUTOSYNC": "1"}
+            ), patch(
+                "puppetmaster.codegraph._spawn_codegraph_autosync",
+                return_value={"ok": True, "action": "spawned"},
+            ) as spawn:
+                first = maybe_autosync_codegraph(tmp, stale)
+                second = maybe_autosync_codegraph(tmp, stale)
+            self.assertEqual(first["action"], "spawned")
+            self.assertEqual(second["action"], "skipped")
+            self.assertEqual(spawn.call_count, 1)
+
+    def test_enrich_prompt_appends_stale_warning_and_triggers_autosync(self) -> None:
+        from puppetmaster.codegraph import CodegraphFreshness, enrich_prompt_with_codegraph
+
+        stale = CodegraphFreshness(state="stale", changed_count=2)
+        with patch(
+            "puppetmaster.codegraph.codegraph_context",
+            return_value="auth.py:1 -> login()",
+        ), patch(
+            "puppetmaster.codegraph.codegraph_freshness", return_value=stale
+        ), patch(
+            "puppetmaster.codegraph.maybe_autosync_codegraph"
+        ) as autosync:
+            prompt, used = enrich_prompt_with_codegraph(
+                "Inspect repo", task_description="map auth", cwd="/repo"
+            )
+        self.assertTrue(used)
+        self.assertIn("STALE", prompt)
+        autosync.assert_called_once()
+
+    def test_mcp_status_attaches_freshness_block(self) -> None:
+        import json
+
+        from puppetmaster import mcp_server
+        from puppetmaster.codegraph import CodegraphFreshness
+
+        stale = CodegraphFreshness(state="stale", changed_count=4)
+        with patch(
+            "puppetmaster.mcp_server.codegraph_status_command",
+            return_value={"ok": True, "command": "codegraph status", "stdout": "ok"},
+        ), patch(
+            "puppetmaster.mcp_server.codegraph_freshness", return_value=stale
+        ), patch(
+            "puppetmaster.mcp_server.maybe_autosync_codegraph"
+        ) as autosync:
+            result = mcp_server.run_codegraph_status({"cwd": "/repo"})
+        payload = json.loads(result["content"][0]["text"])
+        self.assertTrue(payload.get("index_stale"))
+        self.assertEqual(payload["index_freshness"]["state"], "stale")
+        self.assertIn("STALE", payload.get("hint", ""))
+        autosync.assert_called_once()
+
+    def test_doctor_codegraph_check_warns_when_index_stale(self) -> None:
+        from puppetmaster import diagnostics
+        from puppetmaster.codegraph import CodegraphFreshness
+
+        stale = CodegraphFreshness(state="stale", changed_count=5)
+        with patch(
+            "puppetmaster.diagnostics.codegraph_available", return_value=True
+        ), patch(
+            "puppetmaster.diagnostics.codegraph_initialized", return_value=True
+        ), patch(
+            "puppetmaster.diagnostics.codegraph_status_command",
+            return_value={"ok": True, "stdout": "Backend: native", "stderr": ""},
+        ), patch(
+            "puppetmaster.diagnostics.codegraph_native_sqlite_broken",
+            return_value=False,
+        ), patch(
+            "puppetmaster.diagnostics.codegraph_freshness", return_value=stale
+        ):
+            check = diagnostics._codegraph_check(Path("/repo"))
+        self.assertEqual(check.status, "warn")
+        self.assertIn("STALE", check.detail)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.9.60
+
+**CodeGraph index-freshness detection + background self-heal.** A stale index was CodeGraph's worst failure mode: nothing re-read the repo after `codegraph index`, so once the working tree moved on (an agent edits files, a `git pull` lands commits) queries silently returned a view that no longer matched the code — the agent "couldn't find" code that plainly existed. PM now *knows* when its own index is behind and says so, instead of relying on the user knowing to run `repair-codegraph` / `codegraph sync`. Full suite **755** green (+12 tests).
+
+- **`codegraph_freshness(cwd)` (new).** Cheap, never-raises drift probe. Git fast-path (`git status` enumerates only changed files; one `git log` settles the commit side) with a bounded filesystem fallback for non-git trees (file-count + wall-clock budget; runs out → `unknown`, never a false `fresh`). Returns a structured verdict: `fresh` / `stale` / `unknown` / `no_index` / `uninitialized`, with a changed-file sample and commits-since-index count. A 2s mtime tolerance keeps a freshly-built index from being flagged against its own inputs.
+- **Loud surfacing where agents actually look.** `puppetmaster_codegraph_status` / `_search` / `_context` now attach an `index_freshness` block and fold a `STALE` warning into the result `hint`; injected worker prompts get the same warning appended; `doctor` reports the codegraph leg as `warn` when the index has drifted. The silent-wrong failure becomes visible at every entry point.
+- **Background auto-sync (self-heal).** When a query/worker path sees a stale index, PM kicks a deduped, detached `codegraph index` re-sync (reusing the per-repo indexer lock, so it cleanly no-ops when an indexer is already running) — the *next* call gets fresh data without blocking this one. Per-repo cooldown prevents a herd of indexers; opt out with `PUPPETMASTER_CODEGRAPH_AUTOSYNC=0`.
+- **`python -m puppetmaster codegraph freshness` (new CLI).** Scriptable freshness check — exit 1 when stale — so a pre-commit hook or CI step can gate on a drifted index.
+
 ## v0.9.59
 
 **Fix: Hermes workers no longer inherit Puppetmaster's `PYTHONPATH` (cross-interpreter poisoning).** Hermes is the first Python-CLI adapter; the others spawn Node CLIs that ignore `PYTHONPATH`. The Hermes worker env was built with `inject_worker_cli_env`, which prepends this install's source root (the pyenv-3.9 site-packages) to `PYTHONPATH` — correct for `python -m puppetmaster codegraph` children, but poison for the foreign Hermes interpreter, which then imports the parent's stale `python-dotenv` and crashes with `load_dotenv() got an unexpected keyword argument 'override'`. Full suite **743** green (+2 tests).

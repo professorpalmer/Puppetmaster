@@ -22,11 +22,13 @@ from puppetmaster.codegraph import (
     codegraph_available,
     codegraph_context_command,
     codegraph_files_listing,
+    codegraph_freshness,
     codegraph_init_command,
     codegraph_lock_path,
     codegraph_native_sqlite_broken,
     codegraph_query,
     codegraph_status_command,
+    maybe_autosync_codegraph,
 )
 from puppetmaster.codegraph_repair import repair_codegraph_sqlite
 from puppetmaster.mcp_registry import (
@@ -1485,6 +1487,33 @@ def _build_tools() -> list[McpTool]:
     ]
 
 
+def _attach_codegraph_freshness(payload: JsonObject, args: JsonObject) -> JsonObject:
+    """Annotate a codegraph tool payload with index-freshness + self-heal.
+
+    Surfaces a structured ``index_freshness`` block so the agent can *see*
+    when the graph is behind the code (the otherwise-silent failure that makes
+    a query "miss" code that exists), folds a loud warning into ``hint`` when
+    stale, and kicks a deduped background re-sync. Best-effort: any probe error
+    leaves the payload untouched."""
+    try:
+        target = cwd(args)
+        freshness = codegraph_freshness(target)
+    except Exception:
+        return payload
+    if freshness.state == "uninitialized":
+        return payload
+    annotated = dict(payload)
+    annotated["index_freshness"] = freshness.to_payload()
+    if freshness.is_stale:
+        annotated["index_stale"] = True
+        warning = freshness.warning_text()
+        if warning:
+            existing = annotated.get("hint") or ""
+            annotated["hint"] = (existing + "\n\n" + warning).strip() if existing else warning
+        maybe_autosync_codegraph(target, freshness)
+    return annotated
+
+
 def run_codegraph_search(args: JsonObject) -> JsonObject:
     payload = codegraph_query(
         require_string(args, "query"),
@@ -1493,7 +1522,7 @@ def run_codegraph_search(args: JsonObject) -> JsonObject:
         limit=int(args["limit"]) if args.get("limit") is not None else None,
         json_output=bool(args.get("json", True)),
     )
-    return codegraph_response(payload)
+    return codegraph_response(_attach_codegraph_freshness(payload, args))
 
 
 def run_codegraph_context(args: JsonObject) -> JsonObject:
@@ -1503,7 +1532,7 @@ def run_codegraph_context(args: JsonObject) -> JsonObject:
         max_nodes=int(args.get("max_nodes") or 15),
         fmt=str(args.get("format") or "markdown"),
     )
-    return codegraph_response(payload)
+    return codegraph_response(_attach_codegraph_freshness(payload, args))
 
 
 def run_codegraph_affected(args: JsonObject) -> JsonObject:
@@ -1539,7 +1568,7 @@ def run_codegraph_status(args: JsonObject) -> JsonObject:
         payload["native_sqlite_broken"] = True
         existing_hint = payload.get("hint") or ""
         payload["hint"] = (existing_hint + "\n\n" + CODEGRAPH_NATIVE_SQLITE_HINT).strip()
-    return codegraph_response(payload)
+    return codegraph_response(_attach_codegraph_freshness(payload, args))
 
 
 def run_codegraph_init(args: JsonObject) -> JsonObject:

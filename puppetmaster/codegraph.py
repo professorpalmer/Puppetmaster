@@ -13,6 +13,7 @@ times out, so adapters can call it without conditional plumbing.
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import os
 import re
@@ -21,6 +22,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional, Union
 
@@ -471,7 +473,21 @@ def enrich_prompt_with_codegraph(
     context = codegraph_context(task_description, cwd, max_nodes=max_nodes)
     if not context:
         return prompt, False
-    return prompt + codegraph_prompt_section(context), True
+    enriched = prompt + codegraph_prompt_section(context)
+    # Staleness guard: a snapshot that no longer matches the tree is the worst
+    # CodeGraph failure (the worker "can't find" code that exists). Tell the
+    # worker the view may be behind, and kick a background refresh so the next
+    # worker gets a current index — both best-effort, neither fails the run.
+    try:
+        freshness = codegraph_freshness(cwd)
+    except Exception:
+        freshness = None
+    if freshness is not None and freshness.is_stale:
+        warning = freshness.warning_text()
+        if warning:
+            enriched += "\nNote: " + warning + "\n"
+        maybe_autosync_codegraph(cwd, freshness)
+    return enriched, True
 
 
 def run_codegraph_cli(
@@ -1207,3 +1223,473 @@ def codegraph_native_sqlite_broken(status_output: str) -> bool:
         "different node.js version",
     )
     return any(marker in lowered for marker in fallback_markers)
+
+
+# --- Index freshness (staleness) detection ----------------------------------
+#
+# CodeGraph's index is a point-in-time snapshot: nothing re-reads the repo
+# after `codegraph index` finishes. When the working tree moves on — an agent
+# edits files, a `git pull` lands new commits — the index silently goes stale
+# and queries return a view that no longer matches the code. That "silently
+# wrong" mode (an agent that "can't find" code which plainly exists) is worse
+# than a slow one: it derails the whole task. These helpers detect drift
+# cheaply so callers can warn loudly and self-heal in the background, instead
+# of relying on the user knowing to run `repair-codegraph` / `codegraph sync`.
+
+CODEGRAPH_INDEX_DB_NAME = "codegraph.db"
+
+# A source file must be newer than the index by more than this margin to count
+# as a change. Indexing writes the DB *after* reading sources, so a just-indexed
+# file can carry an mtime a hair under the DB's; the tolerance plus coarse
+# filesystem mtime granularity (some filesystems round to 1-2s) prevents a
+# freshly-built index from being reported stale against its own inputs.
+_FRESHNESS_TOLERANCE_SECONDS = 2.0
+
+# Bounds for the non-git filesystem fallback so a huge unindexed monorepo can
+# never turn a freshness probe into a multi-second tree crawl. Exceeding either
+# bound *without having found drift yet* yields "unknown" (never a false alarm).
+_FRESHNESS_MAX_FILES = 20000
+_FRESHNESS_TIME_BUDGET_SECONDS = 2.0
+_FRESHNESS_SAMPLE_CAP = 8
+_FRESHNESS_COUNT_CAP = 50
+
+# Directories the filesystem fallback never descends into: VCS internals, the
+# index itself, dependency/build/cache trees. Keeps the scan to actual sources
+# and matches what a sane .gitignore would exclude (the git path gets this for
+# free via `git status`).
+_FRESHNESS_SKIP_DIRS = frozenset(
+    {
+        ".git",
+        ".codegraph",
+        ".hg",
+        ".svn",
+        "node_modules",
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".tox",
+        "dist",
+        "build",
+        ".next",
+        ".nuxt",
+        "target",
+        ".gradle",
+        ".idea",
+        ".cache",
+        "coverage",
+        "vendor",
+    }
+)
+
+
+@dataclass
+class CodegraphFreshness:
+    """Verdict on whether a repo's CodeGraph index matches its current code.
+
+    ``state`` is one of:
+
+    * ``"fresh"``         — index is at or ahead of every source file/commit.
+    * ``"stale"``         — at least one source file or commit post-dates it.
+    * ``"unknown"``       — couldn't determine cheaply (huge tree, probe error).
+    * ``"no_index"``      — ``.codegraph/`` exists but holds no index DB yet.
+    * ``"uninitialized"`` — the repo has no ``.codegraph/`` at all.
+
+    Only ``"stale"`` should ever drive a user-facing nudge or a self-heal:
+    ``"unknown"`` deliberately stays quiet so a probe that *can't tell* never
+    cries wolf.
+    """
+
+    state: str
+    reason: str = ""
+    changed_count: int = 0
+    changed_count_capped: bool = False
+    changed_sample: list[str] = field(default_factory=list)
+    commits_since_index: Optional[int] = None
+    index_mtime: Optional[float] = None
+
+    @property
+    def is_stale(self) -> bool:
+        return self.state == "stale"
+
+    def _file_phrase(self) -> str:
+        suffix = "+" if self.changed_count_capped else ""
+        unit = "file" if (self.changed_count == 1 and not self.changed_count_capped) else "files"
+        return f"{self.changed_count}{suffix} {unit}"
+
+    def warning_text(self) -> Optional[str]:
+        """One-line, actionable staleness banner — or None when not stale."""
+        if self.state != "stale":
+            return None
+        drivers: list[str] = []
+        if self.changed_count:
+            drivers.append(f"{self._file_phrase()} changed in the working tree")
+        if self.commits_since_index:
+            plural = "s" if self.commits_since_index != 1 else ""
+            drivers.append(f"{self.commits_since_index} commit{plural} since index")
+        if not drivers:
+            drivers.append("the working tree moved since the index was built")
+        text = (
+            "CodeGraph index is STALE — "
+            + "; ".join(drivers)
+            + ". Results may miss recent code. Refresh with "
+            "`python -m puppetmaster codegraph sync` "
+            "(Puppetmaster auto-syncs in the background when enabled)."
+        )
+        if self.changed_sample:
+            text += " Recently changed: " + ", ".join(self.changed_sample[:5]) + "."
+        return text
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "state": self.state,
+            "stale": self.is_stale,
+            "reason": self.reason,
+            "changed_count": self.changed_count,
+            "changed_count_capped": self.changed_count_capped,
+            "changed_sample": list(self.changed_sample),
+            "commits_since_index": self.commits_since_index,
+        }
+
+
+def codegraph_index_mtime(cwd: Union[Path, str, None]) -> Optional[float]:
+    """Return the modification time of the repo's CodeGraph index, or None.
+
+    Prefers the canonical ``.codegraph/codegraph.db``; if a future CodeGraph
+    renames it, falls back to the newest mtime among index artifacts so the
+    "cut line" still tracks the last build. Returns None when no index file
+    can be found (caller maps that to ``no_index``)."""
+    if not cwd:
+        return None
+    root = Path(cwd) / ".codegraph"
+    db = root / CODEGRAPH_INDEX_DB_NAME
+    try:
+        if db.is_file():
+            return db.stat().st_mtime
+    except OSError:
+        pass
+    newest: Optional[float] = None
+    try:
+        for entry in root.rglob("*"):
+            name = entry.name
+            if name.endswith(".lock") or name.endswith(".tmp"):
+                continue
+            try:
+                if entry.is_file():
+                    mtime = entry.stat().st_mtime
+                    if newest is None or mtime > newest:
+                        newest = mtime
+            except OSError:
+                continue
+    except OSError:
+        return None
+    return newest
+
+
+def _run_git(
+    cwd: Union[Path, str], git_args: list[str], *, timeout: float = 5.0
+) -> Optional[str]:
+    """Run a git subcommand in ``cwd``; return stdout or None on any failure."""
+    git = shutil.which("git")
+    if not git:
+        return None
+    try:
+        completed = subprocess.run(
+            [git, "-C", str(cwd), *git_args],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout
+
+
+def _porcelain_path(line: str) -> Optional[str]:
+    """Extract the path from a `git status --porcelain` line (dest on rename)."""
+    if len(line) < 4:
+        return None
+    rest = line[3:]
+    if " -> " in rest:
+        rest = rest.split(" -> ", 1)[1]
+    rest = rest.strip()
+    if len(rest) >= 2 and rest[0] == '"' and rest[-1] == '"':
+        rest = rest[1:-1]
+    return rest or None
+
+
+def _git_changes_since(
+    cwd: Union[Path, str], index_mtime: float, tolerance: float
+) -> Optional[tuple[list[str], int, bool, Optional[int]]]:
+    """Find working-tree + commit drift past ``index_mtime`` using git.
+
+    Returns ``(sample, count, capped, commits_since)`` or None when ``cwd`` is
+    not a usable git work tree (caller then falls back to a filesystem scan).
+    Cheap by construction: `git status` only enumerates *changed* files, and a
+    single `git log` settles the commit side."""
+    inside = _run_git(cwd, ["rev-parse", "--is-inside-work-tree"])
+    if inside is None or inside.strip() != "true":
+        return None
+
+    cutoff = index_mtime + tolerance
+    sample: list[str] = []
+    count = 0
+    capped = False
+
+    porcelain = _run_git(cwd, ["status", "--porcelain", "--untracked-files=all"])
+    if porcelain:
+        for line in porcelain.splitlines():
+            if not line.strip():
+                continue
+            rel = _porcelain_path(line)
+            if not rel:
+                continue
+            try:
+                mtime = (Path(cwd) / rel).stat().st_mtime
+            except OSError:
+                # Deleted/renamed-away path the index hasn't seen is still drift,
+                # but we can't mtime-confirm it — count it as changed.
+                mtime = cutoff + 1
+            if mtime > cutoff:
+                count += 1
+                if len(sample) < _FRESHNESS_SAMPLE_CAP:
+                    sample.append(rel)
+                if count >= _FRESHNESS_COUNT_CAP:
+                    capped = True
+                    break
+
+    commits_since: Optional[int] = None
+    head_ct = _run_git(cwd, ["log", "-1", "--format=%ct"])
+    if head_ct and head_ct.strip().isdigit() and float(head_ct.strip()) > cutoff:
+        commits_since = 1  # HEAD itself post-dates the index; at least one.
+        since_iso = datetime.datetime.fromtimestamp(cutoff).strftime(
+            "%Y-%m-%dT%H:%M:%S"
+        )
+        rev = _run_git(cwd, ["rev-list", "--count", f"--since={since_iso}", "HEAD"])
+        if rev and rev.strip().isdigit():
+            counted = int(rev.strip())
+            if counted > 0:
+                commits_since = counted
+
+    return sample, count, capped, commits_since
+
+
+def _walk_changes_since(
+    cwd: Union[Path, str], index_mtime: float, tolerance: float
+) -> tuple[str, list[str], int, bool]:
+    """Bounded filesystem mtime scan for non-git workspaces.
+
+    Returns ``(state, sample, count, capped)`` where state is fresh/stale/
+    unknown. Honors a file-count and wall-clock budget: if it runs out before
+    finishing *and has found no drift*, it returns ``unknown`` rather than a
+    false ``fresh``."""
+    cutoff = index_mtime + tolerance
+    root = Path(cwd)
+    sample: list[str] = []
+    count = 0
+    scanned = 0
+    deadline = time.monotonic() + _FRESHNESS_TIME_BUDGET_SECONDS
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _FRESHNESS_SKIP_DIRS]
+        for filename in filenames:
+            scanned += 1
+            if scanned > _FRESHNESS_MAX_FILES or time.monotonic() > deadline:
+                if count > 0:
+                    return "stale", sample, count, True
+                return "unknown", sample, count, False
+            file_path = Path(dirpath) / filename
+            try:
+                mtime = file_path.stat().st_mtime
+            except OSError:
+                continue
+            if mtime > cutoff:
+                count += 1
+                if len(sample) < _FRESHNESS_SAMPLE_CAP:
+                    try:
+                        sample.append(str(file_path.relative_to(root)))
+                    except ValueError:
+                        sample.append(filename)
+                if count >= _FRESHNESS_COUNT_CAP:
+                    return "stale", sample, count, True
+
+    return ("stale" if count > 0 else "fresh"), sample, count, False
+
+
+def codegraph_freshness(
+    cwd: Union[Path, str, None],
+    *,
+    tolerance_seconds: float = _FRESHNESS_TOLERANCE_SECONDS,
+) -> CodegraphFreshness:
+    """Decide whether the repo's CodeGraph index reflects its current code.
+
+    Never raises — every failure mode degrades to ``unknown``/``uninitialized``
+    so callers can probe on hot paths without guarding. Git-aware (precise and
+    cheap) with a bounded filesystem fallback for non-git trees."""
+    if not cwd or not codegraph_initialized(cwd):
+        return CodegraphFreshness(
+            state="uninitialized", reason="no .codegraph/ in this workspace"
+        )
+    index_mtime = codegraph_index_mtime(cwd)
+    if index_mtime is None:
+        return CodegraphFreshness(
+            state="no_index",
+            reason=".codegraph/ exists but has no index database yet",
+        )
+
+    try:
+        git_result = _git_changes_since(cwd, index_mtime, tolerance_seconds)
+    except Exception:
+        git_result = None
+
+    if git_result is not None:
+        sample, count, capped, commits_since = git_result
+        if count > 0 or commits_since:
+            return CodegraphFreshness(
+                state="stale",
+                reason="working tree or commits changed since the last index (git)",
+                changed_count=count,
+                changed_count_capped=capped,
+                changed_sample=sample,
+                commits_since_index=commits_since,
+                index_mtime=index_mtime,
+            )
+        return CodegraphFreshness(
+            state="fresh",
+            reason="index at or ahead of HEAD and the working tree (git)",
+            index_mtime=index_mtime,
+        )
+
+    try:
+        state, sample, count, capped = _walk_changes_since(
+            cwd, index_mtime, tolerance_seconds
+        )
+    except Exception:
+        return CodegraphFreshness(
+            state="unknown",
+            reason="freshness probe failed",
+            index_mtime=index_mtime,
+        )
+    reason = {
+        "stale": "files modified since the last index (filesystem scan)",
+        "fresh": "no files newer than the index (filesystem scan)",
+        "unknown": "workspace too large to scan within budget",
+    }.get(state, "")
+    return CodegraphFreshness(
+        state=state,
+        reason=reason,
+        changed_count=count,
+        changed_count_capped=capped,
+        changed_sample=sample,
+        index_mtime=index_mtime,
+    )
+
+
+# --- Background self-heal (auto-sync) ---------------------------------------
+#
+# When a query/worker path observes a stale index, we kick a re-index in the
+# background so the *next* call gets fresh data — without blocking this one and
+# without the user having to know `codegraph sync` exists. Deduped per repo
+# with a cooldown so a burst of stale queries can't spawn a herd of indexers,
+# and it cleanly no-ops when an indexer is already holding the per-repo lock.
+
+_AUTOSYNC_LOCK = threading.Lock()
+_AUTOSYNC_COOLDOWN_SECONDS = 120.0
+_AUTOSYNC_STATE: dict[str, float] = {}
+
+
+def reset_codegraph_autosync_state() -> None:
+    """Clear the per-repo autosync dedup bookkeeping (used by tests)."""
+    with _AUTOSYNC_LOCK:
+        _AUTOSYNC_STATE.clear()
+
+
+def codegraph_autosync_enabled() -> bool:
+    """Auto-sync is on by default; opt out with PUPPETMASTER_CODEGRAPH_AUTOSYNC=0."""
+    return os.environ.get(
+        "PUPPETMASTER_CODEGRAPH_AUTOSYNC", "1"
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _claim_autosync(repo_key: str) -> bool:
+    """True for the first caller per repo per cooldown window; False otherwise."""
+    with _AUTOSYNC_LOCK:
+        now = time.monotonic()
+        last = _AUTOSYNC_STATE.get(repo_key, 0.0)
+        if last and now - last < _AUTOSYNC_COOLDOWN_SECONDS:
+            return False
+        _AUTOSYNC_STATE[repo_key] = now
+        return True
+
+
+def maybe_autosync_codegraph(
+    cwd: Union[Path, str, None],
+    freshness: Optional[CodegraphFreshness] = None,
+) -> Optional[dict[str, Any]]:
+    """Best-effort background re-index when the index is stale.
+
+    Never raises, never blocks. Returns a small dict describing the action
+    (spawned/skipped/error) for observability, or None when disabled or not
+    applicable."""
+    if not codegraph_autosync_enabled():
+        return None
+    if not cwd or not codegraph_initialized(cwd):
+        return None
+    if freshness is None:
+        try:
+            freshness = codegraph_freshness(cwd)
+        except Exception:
+            return None
+    if not freshness.is_stale:
+        return None
+    try:
+        repo_key = str(Path(cwd).expanduser().resolve())
+    except OSError:
+        repo_key = str(cwd)
+    if not _claim_autosync(repo_key):
+        return {"ok": True, "action": "skipped", "reason": "within autosync cooldown"}
+    return _spawn_codegraph_autosync(cwd)
+
+
+def _spawn_codegraph_autosync(cwd: Union[Path, str]) -> dict[str, Any]:
+    """Launch a detached `codegraph index` re-sync, guarded by the repo lock."""
+    if not codegraph_available():
+        return {"ok": False, "action": "skipped", "reason": "codegraph unavailable"}
+    lock_path = codegraph_lock_path(cwd)
+    try:
+        lock = acquire_codegraph_lock(lock_path=lock_path)
+    except CodegraphLockBusy:
+        # An indexer is already running for this repo — the self-heal we'd
+        # trigger is effectively already underway.
+        return {"ok": True, "action": "skipped", "reason": "indexer already running"}
+    except Exception as exc:  # pragma: no cover - defensive
+        return {"ok": False, "action": "error", "reason": f"lock error: {exc}"}
+    # We only acquired the lock to validate availability; the launched process
+    # re-acquires and holds it for its lifetime.
+    lock.release()
+
+    launcher = [
+        sys.executable,
+        "-m",
+        "puppetmaster.codegraph_index_runner",
+        str(cwd),
+        str(lock_path),
+    ]
+    try:
+        subprocess.Popen(
+            launcher,
+            cwd=str(cwd),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "action": "error", "reason": str(exc)}
+    return {"ok": True, "action": "spawned", "lock_path": str(lock_path)}

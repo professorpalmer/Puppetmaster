@@ -13,6 +13,7 @@ from typing import Callable, Optional
 from puppetmaster.adapters import ADAPTER_INFO
 from puppetmaster.codegraph import (
     codegraph_available,
+    codegraph_freshness,
     codegraph_initialized,
     codegraph_native_sqlite_broken,
     codegraph_status_command,
@@ -374,10 +375,23 @@ def _codegraph_check(root: Path) -> Check:
             "Cursor's bundled Node so MCP picks it up). Common cause: shell Node "
             "ABI differs from Cursor Node ABI.",
         )
+    freshness = codegraph_freshness(root)
+    if freshness.is_stale:
+        return Check(
+            "codegraph",
+            "warn",
+            "index is STALE — "
+            + (freshness.warning_text() or "the working tree moved since indexing")
+            + " A stale index silently misses recent code; refresh with "
+            "`python -m puppetmaster codegraph sync` (Puppetmaster also "
+            "auto-syncs in the background unless PUPPETMASTER_CODEGRAPH_AUTOSYNC=0).",
+        )
     invocation = resolve_codegraph_invocation()
     detail = "codegraph installed and target workspace initialized"
     if len(invocation) >= 2 and "Cursor.app" in invocation[0]:
         detail += " (verified under Cursor's bundled Node)"
+    if freshness.state == "fresh":
+        detail += "; index fresh"
     return Check("codegraph", "ok", detail)
 
 
