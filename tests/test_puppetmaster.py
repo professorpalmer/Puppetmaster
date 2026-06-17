@@ -10224,6 +10224,38 @@ class DashboardTests(unittest.TestCase):
             # the billing failure surfaces as an alert
             self.assertTrue(any("billing_or_quota" in a for a in snap["alerts"]))
 
+    def test_list_all_projects_snapshot_aggregates_across_projects(self) -> None:
+        """--all-projects aggregates jobs from every project state dir and
+        labels each row with the digest-stripped project slug."""
+        from puppetmaster.dashboard import list_all_projects_snapshot
+        from puppetmaster.store_factory import create_store
+
+        with TemporaryDirectory() as tmp:
+            projects_root = Path(tmp) / "projects"
+            dir_a = projects_root / "alpha-0123456789ab"
+            dir_b = projects_root / "beta-ba9876543210"
+            store_a = create_store("sqlite", dir_a)
+            store_a.init()
+            job_a = store_a.create_job("alpha goal")
+            store_b = create_store("sqlite", dir_b)
+            store_b.init()
+            job_b = store_b.create_job("beta goal")
+
+            with patch(
+                "puppetmaster.state.list_project_state_dirs",
+                return_value=[dir_a, dir_b],
+            ):
+                rows = list_all_projects_snapshot()
+
+            by_id = {row["id"]: row for row in rows}
+            self.assertIn(job_a.id, by_id)
+            self.assertIn(job_b.id, by_id)
+            self.assertEqual(by_id[job_a.id]["project"], "alpha")
+            self.assertEqual(by_id[job_b.id]["project"], "beta")
+            required = {"id", "goal", "status", "created_at", "completed_at", "project"}
+            for row in rows:
+                self.assertTrue(required <= set(row))
+
     def test_dashboard_http_serves_index_and_job(self) -> None:
         import threading
         import urllib.request
