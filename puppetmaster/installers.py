@@ -1641,3 +1641,263 @@ def uninstall_claude_mcp(
     return UninstallResult(
         status="removed", target=_CLAUDE_USER_CONFIG_LABEL, messages=messages
     )
+
+
+# --- Hermes (NousResearch hermes-agent) -----------------------------------
+#
+# Hermes stores MCP servers under ``mcp_servers.<name>`` in ``~/.hermes/
+# config.yaml`` (overridable via ``$HERMES_HOME``). Unlike Codex and Claude
+# Code — whose CLIs expose a non-interactive ``mcp add`` we can shell out to —
+# ``hermes mcp add`` is discovery-first: it probes the server, then drops into
+# an interactive tool-selection checklist that aborts without a TTY. So we
+# register Puppetmaster the same way :func:`install_cursor_mcp` does for
+# ``mcp.json``: a direct, idempotent edit of the config file Hermes owns,
+# preserving every other key. ``yaml`` is imported lazily so Puppetmaster's
+# zero-runtime-dependency contract holds for users who never touch Hermes;
+# it is declared in the optional ``[hermes]`` extra.
+
+HERMES_NEXT_STEPS_GUIDANCE = (
+    "Restart Hermes (or start a fresh session) to pick up the new MCP server.\n"
+    "Verify with `hermes mcp list` — puppetmaster should appear — or ask Hermes to\n"
+    "call `puppetmaster_doctor` and report the results.\n"
+    "Long jobs: prefer the async pattern — fire a `start_*` verb, then re-poll with\n"
+    "bounded `live_artifacts_follow` / `await_job` — instead of one multi-minute block."
+)
+
+_HERMES_PIP_HINT = (
+    "PyYAML is required to edit Hermes' config.yaml but is not importable in "
+    "this Python environment. Install it with `pip install puppetmaster-ai[hermes]` "
+    "(or `pip install pyyaml`) into the same interpreter that runs Puppetmaster, "
+    "then re-run `puppetmaster install-hermes-mcp`."
+)
+
+
+def hermes_config_path(env: Optional[Mapping[str, str]] = None) -> Path:
+    """Return the path to Hermes' ``config.yaml``.
+
+    Honors ``$HERMES_HOME`` (the same override Hermes itself reads) and falls
+    back to ``~/.hermes/config.yaml``.
+    """
+    env = env if env is not None else os.environ
+    hermes_home = env.get("HERMES_HOME")
+    base = Path(hermes_home).expanduser() if hermes_home else Path("~/.hermes").expanduser()
+    return base / "config.yaml"
+
+
+def build_hermes_mcp_entry(python_executable: str, *, prior: Optional[Mapping] = None) -> dict:
+    """Build the ``mcp_servers.puppetmaster`` entry for Hermes' config.
+
+    Starts from any ``prior`` entry so user-set keys (``env``, ``tools``
+    filters, ``timeout``) survive a re-install, and overrides only the launch
+    ``command``/``args`` — mirroring how :func:`install_cursor_mcp` preserves
+    an existing ``env`` block.
+    """
+    entry: dict = dict(prior) if isinstance(prior, Mapping) else {}
+    # A stale HTTP transport from a hand-edited entry must not coexist with a
+    # stdio command, or Hermes can't tell which transport to use.
+    entry.pop("url", None)
+    entry.pop("headers", None)
+    entry["command"] = python_executable
+    entry["args"] = ["-m", "puppetmaster.mcp_server"]
+    return entry
+
+
+def install_hermes_mcp(
+    *,
+    python_executable: Optional[str] = None,
+    target_path: Optional[Path] = None,
+    force: bool = False,
+    dry_run: bool = False,
+    skip_handshake: bool = False,
+) -> InstallResult:
+    """Register Puppetmaster as an MCP server in Hermes' ``config.yaml``.
+
+    Idempotent: when the existing ``mcp_servers.puppetmaster`` entry already
+    launches this interpreter's MCP server, reports ``status="unchanged"`` and
+    leaves the file untouched. ``force=True`` rewrites even on a match. Any
+    other keys on the entry (``env``, ``tools``, ``timeout``) and every other
+    server/section in the config are preserved verbatim.
+    """
+    python = python_executable or sys.executable
+    target = target_path or hermes_config_path()
+    messages: list[str] = []
+
+    try:
+        import yaml  # type: ignore
+    except Exception:  # pragma: no cover - exercised on hosts without PyYAML
+        messages.append(_HERMES_PIP_HINT)
+        return InstallResult(
+            status="error",
+            target=str(target),
+            python_executable=python,
+            messages=messages,
+        )
+
+    if target.exists():
+        try:
+            loaded = yaml.safe_load(target.read_text(encoding="utf-8"))
+        except yaml.YAMLError as exc:
+            messages.append(f"existing config at {target} is not valid YAML: {exc!r}")
+            return InstallResult(
+                status="error",
+                target=str(target),
+                python_executable=python,
+                messages=messages,
+            )
+        config = loaded if isinstance(loaded, dict) else {}
+        if loaded is not None and not isinstance(loaded, dict):
+            messages.append(f"top-level of {target} is not a mapping; cannot merge")
+            return InstallResult(
+                status="error",
+                target=str(target),
+                python_executable=python,
+                messages=messages,
+            )
+    else:
+        config = {}
+
+    mcp_servers = config.setdefault("mcp_servers", {})
+    if not isinstance(mcp_servers, dict):
+        messages.append(f"'mcp_servers' in {target} is not a mapping; cannot merge")
+        return InstallResult(
+            status="error",
+            target=str(target),
+            python_executable=python,
+            messages=messages,
+        )
+
+    prior = mcp_servers.get("puppetmaster")
+    prior = prior if isinstance(prior, dict) else None
+    desired_entry = build_hermes_mcp_entry(python, prior=prior)
+
+    if prior is not None and not force:
+        same_command = prior.get("command") == desired_entry["command"]
+        same_args = list(prior.get("args") or []) == desired_entry["args"]
+        if same_command and same_args:
+            messages.append(
+                f"puppetmaster entry in {target} already launches {python}; nothing to do"
+            )
+            return InstallResult(
+                status="unchanged",
+                target=str(target),
+                python_executable=python,
+                messages=messages,
+            )
+        if not same_command:
+            messages.append(
+                f"updating command: {prior.get('command')!r} -> {desired_entry['command']!r}"
+            )
+        if not same_args:
+            messages.append(
+                f"updating args: {prior.get('args')!r} -> {desired_entry['args']!r}"
+            )
+
+    handshake: Optional[HandshakeResult] = None
+    if not skip_handshake:
+        handshake = handshake_mcp_server(python)
+        if not handshake.ok:
+            messages.append(
+                "handshake FAILED — refusing to write a broken registration. "
+                f"Reason: {handshake.error}"
+            )
+            return InstallResult(
+                status="error",
+                target=str(target),
+                python_executable=python,
+                handshake=handshake,
+                messages=messages,
+            )
+        messages.append(
+            f"handshake OK ({handshake.tool_count} tools advertised by {python})"
+        )
+
+    mcp_servers["puppetmaster"] = desired_entry
+
+    if dry_run:
+        messages.append(f"DRY RUN — would write puppetmaster MCP entry to {target}")
+        return InstallResult(
+            status="would_install",
+            target=str(target),
+            python_executable=python,
+            handshake=handshake,
+            messages=messages,
+        )
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    rendered = yaml.safe_dump(
+        config,
+        sort_keys=False,
+        allow_unicode=True,
+        default_flow_style=False,
+        width=4096,
+    )
+    tmp_path = target.with_suffix(target.suffix + ".tmp")
+    tmp_path.write_text(rendered, encoding="utf-8")
+    os.replace(tmp_path, target)
+    messages.append(f"wrote puppetmaster MCP entry to {target}")
+    if prior and isinstance(prior.get("env"), dict) and prior["env"]:
+        messages.append(f"preserved existing env block ({len(prior['env'])} key(s))")
+    return InstallResult(
+        status="installed",
+        target=str(target),
+        python_executable=python,
+        handshake=handshake,
+        messages=messages,
+    )
+
+
+def uninstall_hermes_mcp(
+    *,
+    target_path: Optional[Path] = None,
+    dry_run: bool = False,
+) -> UninstallResult:
+    """Remove Puppetmaster's MCP entry from Hermes' ``config.yaml``.
+
+    Idempotent: reports ``unchanged`` when the config, the ``mcp_servers``
+    block, or the ``puppetmaster`` entry is absent. Every other server and
+    section is preserved.
+    """
+    target = target_path or hermes_config_path()
+    messages: list[str] = []
+
+    if not target.exists():
+        messages.append(f"no Hermes config at {target}; nothing to remove")
+        return UninstallResult(status="unchanged", target=str(target), messages=messages)
+
+    try:
+        import yaml  # type: ignore
+    except Exception:  # pragma: no cover - exercised on hosts without PyYAML
+        messages.append(_HERMES_PIP_HINT)
+        return UninstallResult(status="error", target=str(target), messages=messages)
+
+    try:
+        loaded = yaml.safe_load(target.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        messages.append(f"existing config at {target} is not valid YAML: {exc!r}")
+        return UninstallResult(status="error", target=str(target), messages=messages)
+
+    config = loaded if isinstance(loaded, dict) else {}
+    mcp_servers = config.get("mcp_servers")
+    if not isinstance(mcp_servers, dict) or "puppetmaster" not in mcp_servers:
+        messages.append(f"no puppetmaster MCP entry in {target}")
+        return UninstallResult(status="unchanged", target=str(target), messages=messages)
+
+    if dry_run:
+        messages.append(f"DRY RUN — would remove puppetmaster MCP entry from {target}")
+        return UninstallResult(status="would_remove", target=str(target), messages=messages)
+
+    del mcp_servers["puppetmaster"]
+    if not mcp_servers:
+        config.pop("mcp_servers", None)
+    rendered = yaml.safe_dump(
+        config,
+        sort_keys=False,
+        allow_unicode=True,
+        default_flow_style=False,
+        width=4096,
+    )
+    tmp_path = target.with_suffix(target.suffix + ".tmp")
+    tmp_path.write_text(rendered, encoding="utf-8")
+    os.replace(tmp_path, target)
+    messages.append(f"removed puppetmaster MCP entry from {target}")
+    return UninstallResult(status="removed", target=str(target), messages=messages)

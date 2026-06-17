@@ -17,16 +17,19 @@ from puppetmaster.installers import (
     CLAUDE_NEXT_STEPS_GUIDANCE,
     CODEX_SANDBOX_GUIDANCE,
     CURSOR_NEXT_STEPS_GUIDANCE,
+    HERMES_NEXT_STEPS_GUIDANCE,
     InstallResult,
     UninstallResult,
     ensure_cursor_sdk,
     install_claude_mcp,
     install_codex_mcp,
     install_cursor_mcp,
+    install_hermes_mcp,
     resolve_claude_command,
     uninstall_claude_mcp,
     uninstall_codex_mcp,
     uninstall_cursor_mcp,
+    uninstall_hermes_mcp,
 )
 from puppetmaster.rules import (
     VALID_TARGETS,
@@ -231,6 +234,31 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    install_hermes = subcommands.add_parser(
+        "install-hermes-mcp",
+        help="Register Puppetmaster as an MCP server in Hermes' config.yaml.",
+    )
+    install_hermes.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace any existing puppetmaster MCP entry even if it already matches.",
+    )
+    install_hermes.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print what would be registered without modifying any config.",
+    )
+    install_hermes.add_argument(
+        "--skip-handshake",
+        action="store_true",
+        help="Do not spawn the MCP server to verify it responds before registering.",
+    )
+    install_hermes.add_argument(
+        "--path",
+        default=None,
+        help="Explicit path to Hermes' config.yaml (defaults to $HERMES_HOME or ~/.hermes/config.yaml).",
+    )
+
     install_cursor = subcommands.add_parser(
         "install-cursor-mcp",
         help="Register Puppetmaster as an MCP server in a Cursor mcp.json file.",
@@ -301,7 +329,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     setup_parser = subcommands.add_parser(
         "setup",
-        help="One-shot first-run: doctor + models init + install-cursor-mcp + install-codex-mcp + install-claude-mcp + install-rules. Skips steps where the tool isn't present.",
+        help="One-shot first-run: doctor + models init + install-cursor-mcp + install-codex-mcp + install-claude-mcp + install-hermes-mcp + install-rules. Skips steps where the tool isn't present.",
     )
     setup_parser.add_argument(
         "--skip-doctor",
@@ -1666,6 +1694,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
     if args.command == "install-claude-mcp":
         return _run_install_claude(args)
 
+    if args.command == "install-hermes-mcp":
+        return _run_install_hermes(args)
+
     if args.command == "install-cursor-mcp":
         return _run_install_cursor(args)
 
@@ -2710,6 +2741,11 @@ def _run_uninstall(args) -> int:
     overall_rc |= _print_uninstall_mcp_result(claude_result, "claude")
     print()
 
+    print("=== uninstall: hermes MCP ===")
+    hermes_result = uninstall_hermes_mcp(dry_run=dry_run)
+    overall_rc |= _print_uninstall_mcp_result(hermes_result, "hermes")
+    print()
+
     print("=== uninstall: rules ===")
     rules_result = uninstall_rules(cwd=cwd, dry_run=dry_run)
     overall_rc |= _print_uninstall_rules_result(rules_result)
@@ -2796,6 +2832,25 @@ def _run_install_claude(args) -> int:
         print()
         print("Next steps:")
         for line in CLAUDE_NEXT_STEPS_GUIDANCE.splitlines():
+            print(f"  {line}")
+    return rc
+
+
+def _run_install_hermes(args) -> int:
+    """Dispatch for ``puppetmaster install-hermes-mcp``."""
+    explicit = getattr(args, "path", None)
+    target_path = Path(explicit).expanduser().resolve() if explicit else None
+    result = install_hermes_mcp(
+        target_path=target_path,
+        force=getattr(args, "force", False),
+        dry_run=getattr(args, "dry_run", False),
+        skip_handshake=getattr(args, "skip_handshake", False),
+    )
+    rc = _print_install_result(result, "hermes")
+    if result.status in {"installed", "unchanged"}:
+        print()
+        print("Next steps:")
+        for line in HERMES_NEXT_STEPS_GUIDANCE.splitlines():
             print(f"  {line}")
     return rc
 
@@ -3065,7 +3120,7 @@ def _run_setup(args) -> int:
     overall_rc = 0
 
     if not getattr(args, "skip_doctor", False):
-        print("=== step 1/8: doctor ===")
+        print("=== step 1/9: doctor ===")
         checks = list(run_doctor(cwd, state_dir))
         for check in checks:
             print(f"  {check.status:8} {check.name:16} {check.detail}")
@@ -3075,15 +3130,15 @@ def _run_setup(args) -> int:
             return 1
         print()
     else:
-        print("=== step 1/8: doctor SKIPPED (--skip-doctor) ===\n")
+        print("=== step 1/9: doctor SKIPPED (--skip-doctor) ===\n")
 
-    print("=== step 2/8: platform lock ===")
+    print("=== step 2/9: platform lock ===")
     if _setup_platform_step(args) != 0:
         overall_rc = 1
     print()
 
     if not getattr(args, "skip_models", False):
-        print("=== step 3/8: models init ===")
+        print("=== step 3/9: models init ===")
         try:
             from puppetmaster.model_registry import (
                 default_registry_path,
@@ -3102,12 +3157,12 @@ def _run_setup(args) -> int:
             overall_rc = 1
         print()
     else:
-        print("=== step 3/8: models init SKIPPED (--skip-models) ===\n")
+        print("=== step 3/9: models init SKIPPED (--skip-models) ===\n")
 
     from puppetmaster import platform_lock as _pl
     enabled_adapters = _pl.enabled_adapters()
 
-    print("=== step 4/8: install-cursor-mcp (workspace .cursor/mcp.json) ===")
+    print("=== step 4/9: install-cursor-mcp (workspace .cursor/mcp.json) ===")
     if "cursor" not in enabled_adapters:
         print(
             "  skipped  cursor platform disabled by the platform lock — not "
@@ -3128,7 +3183,7 @@ def _run_setup(args) -> int:
             overall_rc = 1
     print()
 
-    print("=== step 5/8: install-codex-mcp ===")
+    print("=== step 5/9: install-codex-mcp ===")
     import shutil as _shutil
     if "codex" not in enabled_adapters:
         print("  skipped  codex platform disabled by the platform lock — not installing its MCP client")
@@ -3146,7 +3201,7 @@ def _run_setup(args) -> int:
             overall_rc = 1
     print()
 
-    print("=== step 6/8: install-claude-mcp ===")
+    print("=== step 6/9: install-claude-mcp ===")
     if "claude-code" not in enabled_adapters:
         print("  skipped  claude-code platform disabled by the platform lock — not installing its MCP client")
     elif resolve_claude_command() is None:
@@ -3167,8 +3222,28 @@ def _run_setup(args) -> int:
             overall_rc = 1
     print()
 
+    print("=== step 7/9: install-hermes-mcp ===")
+    if "hermes" not in enabled_adapters:
+        print("  skipped  hermes platform disabled by the platform lock — not installing its MCP client")
+    elif _shutil.which("hermes") is None:
+        print(
+            "  skipped  `hermes` CLI not on PATH — install NousResearch hermes-agent "
+            "and re-run `puppetmaster install-hermes-mcp` later"
+        )
+    else:
+        hermes_result = install_hermes_mcp(
+            force=getattr(args, "force", False),
+            dry_run=False,
+            skip_handshake=False,
+        )
+        for line in hermes_result.messages:
+            print(f"  {line}")
+        if hermes_result.status not in {"installed", "unchanged", "would_install"}:
+            overall_rc = 1
+    print()
+
     if not getattr(args, "skip_rules", False):
-        print("=== step 7/8: install-rules (soft agent nudges) ===")
+        print("=== step 8/9: install-rules (soft agent nudges) ===")
         rules_result = install_rules(
             cwd=cwd,
             install_global=getattr(args, "global_rules", False),
@@ -3183,12 +3258,12 @@ def _run_setup(args) -> int:
         if rules_result.overall_status == "error":
             overall_rc = 1
     else:
-        print("=== step 7/8: install-rules SKIPPED (--skip-rules) ===")
+        print("=== step 8/9: install-rules SKIPPED (--skip-rules) ===")
     print()
 
     if not getattr(args, "skip_hooks", False):
         hooks_scope = "global" if getattr(args, "global_hooks", False) else "project"
-        print(f"=== step 8/8: install-hooks (deterministic auto-invocation, scope={hooks_scope}) ===")
+        print(f"=== step 9/9: install-hooks (deterministic auto-invocation, scope={hooks_scope}) ===")
         hooks_result = install_hooks(
             cwd=cwd,
             dry_run=False,
@@ -3215,7 +3290,7 @@ def _run_setup(args) -> int:
             "PUPPETMASTER_AUTO_INVOKE_DISABLED=1."
         )
     else:
-        print("=== step 8/8: install-hooks SKIPPED (--skip-hooks) ===")
+        print("=== step 9/9: install-hooks SKIPPED (--skip-hooks) ===")
     print()
 
     if overall_rc == 0:

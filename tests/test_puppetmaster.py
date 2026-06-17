@@ -8956,6 +8956,199 @@ class InstallerTests(unittest.TestCase):
         self.assertIsNone(resolve_claude_command("/nonexistent/claude-nope"))
 
 
+class InstallHermesMcpTests(unittest.TestCase):
+    """Tests for :func:`install_hermes_mcp` / :func:`uninstall_hermes_mcp`.
+
+    Hermes owns ``~/.hermes/config.yaml``; the installer edits it directly
+    (idempotent, preserving every other key) rather than shelling out to the
+    interactive ``hermes mcp add``. These tests target a tempdir config so the
+    user's real ``~/.hermes`` is never touched.
+    """
+
+    def setUp(self):
+        try:
+            import yaml  # noqa: F401
+        except Exception:
+            self.skipTest("PyYAML not installed; install puppetmaster-ai[hermes]")
+
+    def _load(self, path):
+        import yaml
+
+        return yaml.safe_load(path.read_text("utf-8"))
+
+    def test_install_hermes_writes_entry_into_empty_config(self):
+        from puppetmaster.installers import install_hermes_mcp
+
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "config.yaml"
+            result = install_hermes_mcp(
+                target_path=target,
+                python_executable=sys.executable,
+                skip_handshake=True,
+            )
+            self.assertEqual(result.status, "installed")
+            data = self._load(target)
+            entry = data["mcp_servers"]["puppetmaster"]
+            self.assertEqual(entry["command"], sys.executable)
+            self.assertEqual(entry["args"], ["-m", "puppetmaster.mcp_server"])
+
+    def test_install_hermes_preserves_other_servers_and_keys(self):
+        from puppetmaster.installers import install_hermes_mcp
+        import yaml
+
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "config.yaml"
+            prior = {
+                "model": {"default": "nous/hermes", "provider": "nous"},
+                "mcp_servers": {
+                    "navdata": {"url": "https://example.com/sse"},
+                    "puppetmaster": {
+                        "command": "python",
+                        "args": ["-m", "puppetmaster.mcp_server"],
+                        "env": {"PUPPETMASTER_STATE_DIR": "/keep/me"},
+                        "tools": {"include": ["puppetmaster_doctor"]},
+                    },
+                },
+            }
+            target.write_text(yaml.safe_dump(prior, sort_keys=False), encoding="utf-8")
+            result = install_hermes_mcp(
+                target_path=target,
+                python_executable=sys.executable,
+                skip_handshake=True,
+            )
+            self.assertEqual(result.status, "installed")
+            data = self._load(target)
+            self.assertEqual(data["model"]["default"], "nous/hermes")
+            self.assertEqual(
+                data["mcp_servers"]["navdata"]["url"],
+                "https://example.com/sse",
+                msg="install must not touch unrelated MCP servers",
+            )
+            entry = data["mcp_servers"]["puppetmaster"]
+            self.assertEqual(entry["command"], sys.executable)
+            self.assertEqual(
+                entry["env"]["PUPPETMASTER_STATE_DIR"],
+                "/keep/me",
+                msg="install must preserve user-set env keys",
+            )
+            self.assertEqual(
+                entry["tools"]["include"],
+                ["puppetmaster_doctor"],
+                msg="install must preserve a user's tool-include filter",
+            )
+
+    def test_install_hermes_idempotent_when_entry_already_matches(self):
+        from puppetmaster.installers import install_hermes_mcp
+
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "config.yaml"
+            first = install_hermes_mcp(
+                target_path=target,
+                python_executable=sys.executable,
+                skip_handshake=True,
+            )
+            self.assertEqual(first.status, "installed")
+            mtime_after_first = target.stat().st_mtime_ns
+            second = install_hermes_mcp(
+                target_path=target,
+                python_executable=sys.executable,
+                skip_handshake=True,
+            )
+            self.assertEqual(second.status, "unchanged")
+            self.assertEqual(
+                target.stat().st_mtime_ns,
+                mtime_after_first,
+                msg="unchanged install must not rewrite the file",
+            )
+
+    def test_install_hermes_force_rewrites_even_when_match(self):
+        from puppetmaster.installers import install_hermes_mcp
+
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "config.yaml"
+            install_hermes_mcp(
+                target_path=target,
+                python_executable=sys.executable,
+                skip_handshake=True,
+            )
+            result = install_hermes_mcp(
+                target_path=target,
+                python_executable=sys.executable,
+                force=True,
+                skip_handshake=True,
+            )
+            self.assertEqual(result.status, "installed")
+
+    def test_install_hermes_dry_run_does_not_write(self):
+        from puppetmaster.installers import install_hermes_mcp
+
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "config.yaml"
+            result = install_hermes_mcp(
+                target_path=target,
+                python_executable=sys.executable,
+                dry_run=True,
+                skip_handshake=True,
+            )
+            self.assertEqual(result.status, "would_install")
+            self.assertFalse(target.exists())
+
+    def test_install_hermes_reports_error_on_invalid_yaml(self):
+        from puppetmaster.installers import install_hermes_mcp
+
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "config.yaml"
+            target.write_text("model: [unclosed\n", encoding="utf-8")
+            result = install_hermes_mcp(
+                target_path=target,
+                python_executable=sys.executable,
+                skip_handshake=True,
+            )
+            self.assertEqual(result.status, "error")
+
+    def test_build_hermes_entry_drops_stale_http_transport(self):
+        from puppetmaster.installers import build_hermes_mcp_entry
+
+        entry = build_hermes_mcp_entry(
+            sys.executable,
+            prior={"url": "https://old", "headers": {"x": "y"}, "env": {"A": "B"}},
+        )
+        self.assertNotIn("url", entry)
+        self.assertNotIn("headers", entry)
+        self.assertEqual(entry["command"], sys.executable)
+        self.assertEqual(entry["env"], {"A": "B"})
+
+    def test_hermes_config_path_honors_hermes_home(self):
+        from puppetmaster.installers import hermes_config_path
+
+        with TemporaryDirectory() as tmp:
+            path = hermes_config_path({"HERMES_HOME": tmp})
+            self.assertEqual(path, Path(tmp) / "config.yaml")
+
+    def test_uninstall_hermes_removes_entry_and_is_idempotent(self):
+        from puppetmaster.installers import install_hermes_mcp, uninstall_hermes_mcp
+
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "config.yaml"
+            install_hermes_mcp(
+                target_path=target,
+                python_executable=sys.executable,
+                skip_handshake=True,
+            )
+            removed = uninstall_hermes_mcp(target_path=target)
+            self.assertEqual(removed.status, "removed")
+            self.assertNotIn("puppetmaster", self._load(target).get("mcp_servers", {}))
+            again = uninstall_hermes_mcp(target_path=target)
+            self.assertEqual(again.status, "unchanged")
+
+    def test_uninstall_hermes_unchanged_when_config_missing(self):
+        from puppetmaster.installers import uninstall_hermes_mcp
+
+        with TemporaryDirectory() as tmp:
+            result = uninstall_hermes_mcp(target_path=Path(tmp) / "config.yaml")
+            self.assertEqual(result.status, "unchanged")
+
+
 class InstallRulesTests(unittest.TestCase):
     """Tests for :mod:`puppetmaster.rules`.
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.9.55
+
+**`puppetmaster install-hermes-mcp` — turnkey host wiring so Hermes can orchestrate Puppetmaster.** v0.9.53 made Hermes a routable *worker*; this closes the other direction (Hermes-on-top), registering Puppetmaster's MCP server into Hermes for parity with `install-cursor-mcp` / `install-codex-mcp` / `install-claude-mcp`. Verified end-to-end: Hermes lists `puppetmaster ✓ enabled` from the config we write. Full suite **722** green (+10 tests).
+
+- **`install-hermes-mcp` (idempotent, schema-correct).** Unlike Codex/Claude, `hermes mcp add` is discovery-first and drops into an interactive tool-selection checklist that can't run headlessly — so the installer edits the `mcp_servers.puppetmaster` block in the `config.yaml` Hermes owns directly (the same direct-write approach `install-cursor-mcp` uses for `mcp.json`), honoring `$HERMES_HOME`. It preserves every other server/section and any user-set `env` / `tools` / `timeout` keys on the entry, runs the same MCP `tools/list` handshake smoke test before writing (refuses to register a broken launch command), and reports `unchanged` on a match. `--force`, `--dry-run`, `--skip-handshake`, `--path` mirror the sibling installers; a matching `uninstall_hermes_mcp` is wired into `puppetmaster uninstall`, and `setup` gains a gated Hermes step.
+- **Zero-dependency contract intact.** Editing Hermes' YAML needs PyYAML, so the installer imports it lazily and prints an actionable hint (`pip install puppetmaster-ai[hermes]`) when it's absent — the core package still declares no runtime dependencies. PyYAML is declared only in the new optional `[hermes]` extra.
+- **Rules already flow for free; hooks deliberately deferred.** Hermes auto-injects `AGENTS.md` on every session, so the Puppetmaster directive `install-rules` already writes reaches Hermes today — no Hermes-specific rules target needed. A Hermes hooks target is intentionally *not* shipped: Hermes hooks are shell-script hooks gated by a first-use consent allowlist (`shell-hooks-allowlist.json`), and auto-installing one would subvert that security boundary by design. MCP + AGENTS.md is the established parity bar for a non-Cursor/Claude platform (Codex has no hooks target either).
+
 ## v0.9.54
 
 **Docs: README polish + a visual setup guide.** No code changes — refreshes the project page on GitHub and PyPI.
