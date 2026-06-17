@@ -2469,6 +2469,7 @@ def run_dashboard(args: JsonObject) -> JsonObject:
     port = int(args.get("port") or 8787)
     job_id = args.get("job_id")
     job = job_id.strip() if isinstance(job_id, str) and job_id.strip() else None
+    all_projects = bool(args.get("all_projects"))
     url = f"http://127.0.0.1:{port}/" + (f"?job={job}" if job else "")
 
     already_running = _dashboard_alive(port)
@@ -2485,6 +2486,8 @@ def run_dashboard(args: JsonObject) -> JsonObject:
             str(port),
             "--no-open",
         ]
+        if all_projects:
+            command.append("--all-projects")
         if job:
             command.append(job)
         process = _spawn_dashboard_server(command, args)
@@ -2511,12 +2514,13 @@ def run_dashboard(args: JsonObject) -> JsonObject:
         "url": url,
         "port": port,
         "state_dir": state_dir,
+        "all_projects": all_projects,
         "already_running": already_running,
         "started": not already_running,
         "pid": pid,
         "note": (
             "Reused the dashboard already listening on this port — it may be "
-            "serving a different project's state dir."
+            "serving a different project's state dir or all-projects mode."
             if already_running
             else "Open the URL in a browser tab for the user."
         ),
@@ -2878,6 +2882,13 @@ def dashboard_schema() -> JsonObject:
         "type": "integer",
         "default": 8787,
         "description": "Dashboard port (default 8787).",
+    }
+    schema["properties"]["all_projects"] = {
+        "type": "boolean",
+        "description": (
+            "Aggregate jobs from every Puppetmaster project state dir on this "
+            "machine instead of just the current project."
+        ),
     }
     return schema
 

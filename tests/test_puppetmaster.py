@@ -14633,6 +14633,39 @@ class PuppetmasterMcpVerbTests(unittest.TestCase):
         self.assertEqual(body["pid"], 4321)
         self.assertEqual(body["url"], "http://127.0.0.1:9000/")
 
+    def test_dashboard_tool_forwards_all_projects_flag(self) -> None:
+        import puppetmaster.mcp_server as mcp
+
+        schema = mcp.dashboard_schema()
+        self.assertIn("all_projects", schema["properties"])
+
+        spawned = MagicMock()
+        spawned.pid = 5555
+        spawned.poll.return_value = None
+        with patch.object(
+            mcp, "_dashboard_alive", side_effect=[False, True, True]
+        ), patch.object(mcp, "_spawn_dashboard_server", return_value=spawned) as popen:
+            result = mcp.call_tool(
+                "puppetmaster_dashboard", {"cwd": "/tmp", "all_projects": True}
+            )
+        body = json.loads(result["content"][0]["text"])
+        command = popen.call_args.args[0]
+        self.assertIn("--all-projects", command)
+        self.assertTrue(body["all_projects"])
+
+    def test_dashboard_tool_omits_all_projects_by_default(self) -> None:
+        import puppetmaster.mcp_server as mcp
+
+        spawned = MagicMock()
+        spawned.pid = 5556
+        spawned.poll.return_value = None
+        with patch.object(
+            mcp, "_dashboard_alive", side_effect=[False, True, True]
+        ), patch.object(mcp, "_spawn_dashboard_server", return_value=spawned) as popen:
+            mcp.call_tool("puppetmaster_dashboard", {"cwd": "/tmp"})
+        command = popen.call_args.args[0]
+        self.assertNotIn("--all-projects", command)
+
     def test_dashboard_tool_reports_failed_start(self) -> None:
         import puppetmaster.mcp_server as mcp
 
