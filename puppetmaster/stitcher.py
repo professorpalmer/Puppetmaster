@@ -80,17 +80,29 @@ class Stitcher:
             lines.append(f"- [{memory.scope}] {memory.statement}")
 
         lines.extend(["", "## Findings"])
-        lines.extend(self._bullet_payloads(grouped.get(str(ArtifactType.FINDING), []), "claim"))
+        lines.extend(
+            self._bullet_payloads(
+                grouped.get(str(ArtifactType.FINDING), []), "claim", dedupe=True
+            )
+        )
 
         lines.extend(["", "## Decisions"])
         lines.extend(
-            self._bullet_payloads(grouped.get(str(ArtifactType.DECISION), []), "decision")
+            self._bullet_payloads(
+                grouped.get(str(ArtifactType.DECISION), []), "decision", dedupe=True
+            )
         )
 
         lines.extend(["", "## Risks"])
-        lines.extend(self._bullet_payloads(grouped.get(str(ArtifactType.RISK), []), "risk"))
+        lines.extend(
+            self._bullet_payloads(
+                grouped.get(str(ArtifactType.RISK), []), "risk", dedupe=True
+            )
+        )
 
         lines.extend(["", "## Verification"])
+        # Verification lines are per-worker run status — each is meaningful on its
+        # own, so they are never collapsed.
         lines.extend(
             self._bullet_payloads(grouped.get(str(ArtifactType.VERIFICATION), []), "check")
         )
@@ -150,19 +162,88 @@ class Stitcher:
         return "unknown"
 
     @staticmethod
-    def _bullet_payloads(artifacts: list[Artifact], key: str) -> list[str]:
+    def _bullet_payloads(
+        artifacts: list[Artifact], key: str, *, dedupe: bool = False
+    ) -> list[str]:
         if not artifacts:
             return ["- None"]
 
+        if dedupe:
+            clusters = Stitcher._dedup_clusters(artifacts, key)
+        else:
+            clusters = [(artifact, [artifact]) for artifact in artifacts]
+
         bullets = []
-        for artifact in artifacts:
-            headline = artifact.payload.get(key, artifact.payload)
-            evidence = ", ".join(artifact.evidence) or "no evidence"
+        for representative, members in clusters:
+            headline = representative.payload.get(key, representative.payload)
+            evidence = ", ".join(representative.evidence) or "no evidence"
+            confidence = max(member.confidence for member in members)
+            suffix = (
+                f" (reported by {len(members)} workers)" if len(members) > 1 else ""
+            )
             bullets.append(
-                f"- {headline}\n"
-                f"{indent(f'confidence={artifact.confidence:.2f}; evidence={evidence}', '  ')}"
+                f"- {headline}{suffix}\n"
+                f"{indent(f'confidence={confidence:.2f}; evidence={evidence}', '  ')}"
             )
         return bullets
+
+    @staticmethod
+    def _dedup_clusters(
+        artifacts: list[Artifact], key: str
+    ) -> list[tuple[Artifact, list[Artifact]]]:
+        """Collapse near-identical claims so N workers finding the same thing read
+        as one bullet ("reported by N workers") instead of N near-duplicates.
+
+        Clustering is order-preserving and greedy: each artifact joins the first
+        existing cluster whose claim is similar (exact, substring-contained, or
+        high token overlap), else it seeds a new one. The most detailed /
+        highest-confidence claim becomes the representative. Artifacts without a
+        string claim are never merged.
+        """
+        clusters: list[list] = []  # [representative, members, normalized_claim]
+        for artifact in artifacts:
+            headline = artifact.payload.get(key)
+            normalized = (
+                Stitcher._normalize_claim(headline)
+                if isinstance(headline, str)
+                else ""
+            )
+            if not normalized:
+                clusters.append([artifact, [artifact], ""])
+                continue
+            placed = False
+            for cluster in clusters:
+                if cluster[2] and Stitcher._claims_similar(normalized, cluster[2]):
+                    cluster[1].append(artifact)
+                    if Stitcher._is_better_representative(artifact, cluster[0]):
+                        cluster[0] = artifact
+                        cluster[2] = normalized
+                    placed = True
+                    break
+            if not placed:
+                clusters.append([artifact, [artifact], normalized])
+        return [(cluster[0], cluster[1]) for cluster in clusters]
+
+    @staticmethod
+    def _normalize_claim(claim: str) -> str:
+        return " ".join(claim.lower().split()).strip(" .;:!?-\"'")
+
+    @staticmethod
+    def _claims_similar(left: str, right: str) -> bool:
+        if left == right or left in right or right in left:
+            return True
+        left_tokens, right_tokens = set(left.split()), set(right.split())
+        if not left_tokens or not right_tokens:
+            return False
+        intersection = len(left_tokens & right_tokens)
+        union = len(left_tokens | right_tokens)
+        return bool(union) and intersection / union >= 0.8
+
+    @staticmethod
+    def _is_better_representative(candidate: Artifact, current: Artifact) -> bool:
+        if candidate.confidence != current.confidence:
+            return candidate.confidence > current.confidence
+        return len(str(candidate.payload)) > len(str(current.payload))
 
     @staticmethod
     def _statement_for(artifact: Artifact) -> Optional[str]:

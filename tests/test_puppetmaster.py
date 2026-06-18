@@ -17487,6 +17487,139 @@ class RepoFileCensusTests(unittest.TestCase):
         self.assertTrue(seen.get("called"))
 
 
+class HermesAnalyzeRetryTests(unittest.TestCase):
+    """A clean Hermes analyze run that returns prose the parser can't structure
+    (the minimal-effort flicker) gets one stricter JSON-only reprompt before it
+    is accepted as degraded."""
+
+    def _prose(self) -> "StreamedProcess":
+        return StreamedProcess(
+            returncode=0,
+            stdout="The repository looks healthy; I found nothing notable.",
+            stderr="",
+            timed_out=False,
+            live_log_path=None,
+        )
+
+    def _json(self) -> "StreamedProcess":
+        body = json.dumps(
+            {"artifacts": [{"type": "finding", "claim": "real bug", "evidence": ["cli.py:5"], "confidence": 0.9}]}
+        )
+        return StreamedProcess(
+            returncode=0, stdout=body, stderr="", timed_out=False, live_log_path=None
+        )
+
+    def _task(self, **payload) -> Task:
+        base = {"cwd": str(Path.cwd()), "disable_codegraph": True}
+        base.update(payload)
+        return Task(
+            id="t-retry",
+            job_id="job-retry",
+            role="explore",
+            adapter="hermes",
+            instruction="Map the repo.",
+            payload=base,
+        )
+
+    def test_retry_recovers_structured_output(self) -> None:
+        with patch("puppetmaster.adapters.resolve_command", return_value="/usr/bin/hermes"), patch(
+            "puppetmaster.adapters.run_streamed_subprocess",
+            side_effect=[self._prose(), self._json()],
+        ) as run:
+            artifacts = HermesAdapter().run(self._task(), "goal", "worker")
+        self.assertEqual(run.call_count, 2)
+        verification = artifacts[0]
+        self.assertEqual(verification.payload["result"], "passed")
+        self.assertIn("retry:recovered", verification.evidence)
+        self.assertTrue(any(a.type == ArtifactType.FINDING for a in artifacts))
+
+    def test_retry_exhausted_stays_degraded(self) -> None:
+        with patch("puppetmaster.adapters.resolve_command", return_value="/usr/bin/hermes"), patch(
+            "puppetmaster.adapters.run_streamed_subprocess",
+            side_effect=[self._prose(), self._prose()],
+        ) as run:
+            artifacts = HermesAdapter().run(self._task(), "goal", "worker")
+        self.assertEqual(run.call_count, 2)
+        verification = artifacts[0]
+        self.assertEqual(verification.payload["result"], "degraded")
+        self.assertIn("retry:exhausted", verification.evidence)
+
+    def test_retry_can_be_disabled(self) -> None:
+        with patch("puppetmaster.adapters.resolve_command", return_value="/usr/bin/hermes"), patch(
+            "puppetmaster.adapters.run_streamed_subprocess",
+            side_effect=[self._prose()],
+        ) as run:
+            artifacts = HermesAdapter().run(self._task(analyze_retry=False), "goal", "worker")
+        self.assertEqual(run.call_count, 1)
+        verification = artifacts[0]
+        self.assertEqual(verification.payload["result"], "degraded")
+        self.assertNotIn("retry:recovered", verification.evidence)
+        self.assertNotIn("retry:exhausted", verification.evidence)
+
+
+class StitcherDedupTests(unittest.TestCase):
+    """N workers finding the same thing collapses to one bullet, not N near-dupes."""
+
+    def _finding(self, claim: str, conf: float, by: str) -> Artifact:
+        return Artifact(
+            job_id="j",
+            task_id="t",
+            type=ArtifactType.FINDING,
+            created_by=by,
+            confidence=conf,
+            evidence=["adapter:hermes"],
+            payload={"claim": claim},
+        )
+
+    def test_near_identical_findings_collapse(self) -> None:
+        from puppetmaster.stitcher import Stitcher
+
+        arts = [
+            self._finding("multiply uses an O(n) loop instead of native *", 0.8, "w1"),
+            self._finding("Multiply uses an O(n) loop instead of native *.", 0.9, "w2"),
+            self._finding("The multiply function uses an O(n) loop instead of native *", 0.7, "w3"),
+        ]
+        bullets = Stitcher._bullet_payloads(arts, "claim", dedupe=True)
+        self.assertEqual(len(bullets), 1)
+        self.assertIn("reported by 3 workers", bullets[0])
+        # Representative keeps the highest confidence in the cluster.
+        self.assertIn("confidence=0.90", bullets[0])
+
+    def test_distinct_findings_are_kept(self) -> None:
+        from puppetmaster.stitcher import Stitcher
+
+        arts = [
+            self._finding("no division support in the CLI", 0.9, "w1"),
+            self._finding("parse() crashes on malformed input", 0.9, "w2"),
+        ]
+        bullets = Stitcher._bullet_payloads(arts, "claim", dedupe=True)
+        self.assertEqual(len(bullets), 2)
+        self.assertNotIn("reported by", " ".join(bullets))
+
+    def test_dedupe_off_keeps_all(self) -> None:
+        from puppetmaster.stitcher import Stitcher
+
+        arts = [
+            self._finding("same claim", 0.9, "w1"),
+            self._finding("same claim", 0.9, "w2"),
+        ]
+        bullets = Stitcher._bullet_payloads(arts, "claim")
+        self.assertEqual(len(bullets), 2)
+
+    def test_claims_similarity_helpers(self) -> None:
+        from puppetmaster.stitcher import Stitcher
+
+        a = Stitcher._normalize_claim("Multiply is O(n).")
+        b = Stitcher._normalize_claim("multiply is o(n)")
+        self.assertTrue(Stitcher._claims_similar(a, b))
+        self.assertFalse(
+            Stitcher._claims_similar(
+                Stitcher._normalize_claim("no division support"),
+                Stitcher._normalize_claim("input validation crash"),
+            )
+        )
+
+
 class McpServerUpdateNudgeTests(unittest.TestCase):
     """A long-lived stdio MCP server can't hot-reload; surface newer on-disk
     code as a one-line nudge in every tool response instead of a silent gap."""

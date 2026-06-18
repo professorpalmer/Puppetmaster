@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.9.66
+
+**The last two Hermes stress-test edges: the `empty_or_unstructured` flicker and duplicated findings in the stitch.** Both observed across two concurrent swarms on 0.9.65 — mechanically green, but a minimal-effort worker occasionally degraded on prose, and the same finding from three workers read as three near-identical bullets. Full suite **809** green (+7 tests).
+
+- **One stricter JSON-only retry before accepting a degrade (Hermes analyze).** A clean run (no timeout, no process failure) that returns prose the parser can't structure now gets a single reprompt — *"respond with ONLY a JSON object `{\"artifacts\":[...]}`… if you genuinely found nothing, return `{\"artifacts\":[]}`"* — before being marked degraded. This is exactly the `gemini-2.5-flash-minimal` flicker class: cheapest model, minimal reasoning, occasionally chatty. The verification artifact records `retry:recovered` or `retry:exhausted` so the behavior is auditable; gated by `analyze_retry` (default on), and a process failure or timeout never triggers a retry. Scoped to the Hermes adapter because the minimal-effort tier that causes this is Hermes-only.
+- **Near-identical findings collapse in the stitched summary.** The stitcher now runs an order-preserving, greedy dedup over Findings/Decisions/Risks: claims that are exact, substring-contained, or ≥0.8 token-overlap join one cluster rendered as a single bullet with *"(reported by N workers)"*, keeping the highest-confidence/most-detailed claim as the representative. Per-worker Verification lines are never collapsed (each is meaningful on its own). Tightens the summary without dropping signal.
+
 ## v0.9.65
 
 **The MCP reconnect dance is now a visible nudge, not a silent guess.** A long-lived stdio MCP server keeps whatever code it loaded at startup; an in-place `pip install -U puppetmaster-ai` changes what's on disk but can't hot-reload the running server (the client owns the pipe). v0.9.62 made this *detectable* on pull (`mcp status`/`mcp list`); now it's *pushed* — every tool response self-reports staleness so a daily-driver user discovers it without going looking. Full suite **802** green (+7 tests).

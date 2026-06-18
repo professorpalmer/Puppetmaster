@@ -419,6 +419,19 @@ _ARTIFACT_EMPTY_GUIDANCE = (
     "or a risk about the prompt, the contract, or the run being degraded."
 )
 
+# Appended to the prompt for a single retry when an analyze worker returns no
+# structured artifacts. The cheapest/minimal-effort workers occasionally answer
+# in prose the parser can't structure; one stricter JSON-only reprompt recovers
+# the run instead of letting it flicker as degraded.
+_ANALYZE_JSON_ONLY_RETRY = (
+    "\n\nIMPORTANT: your previous response did not contain the required "
+    "structured output. Respond with ONLY a single JSON object of the form "
+    '{"artifacts": [...]} exactly as specified above — no prose, no explanation, '
+    "no markdown fences, nothing before or after the JSON. If you genuinely found "
+    'nothing for your role, return {"artifacts": []}.'
+)
+
+
 def with_repo_census(prompt: str, cwd: Union[Path, str, None]) -> str:
     """Append an authoritative repo file census so a worker can't hallucinate
     an empty repository.
@@ -2398,40 +2411,43 @@ class HermesAdapter:
                 )
             ]
 
-        command = build_hermes_chat_command(
-            executable=[resolved, *command_base[1:]],
-            prompt=prompt,
-            model=task.payload.get("model"),
-            provider=task.payload.get("provider"),
-            max_turns=task.payload.get("max_turns"),
-            toolsets=task.payload.get("toolsets", DEFAULT_HERMES_ANALYZE_TOOLSETS),
-            yolo=False,
-            source=str(task.payload.get("source", "tool")),
-            quiet=bool(task.payload.get("quiet", True)),
-            cli=bool(task.payload.get("cli", True)),
-            ignore_rules=bool(task.payload.get("ignore_rules", True)),
-            safe_mode=bool(task.payload.get("safe_mode", False)),
-            extra_args=task.payload.get("extra_args", []),
-        )
-
-        # Hermes spawns a foreign Python interpreter; scrub the parent's
-        # PYTHONPATH/PYTHONHOME so it can't import Puppetmaster's site-packages
-        # and crash on a version clash (e.g. stale python-dotenv).
-        worker_env = scrub_foreign_interpreter_env(
-            apply_worktree_ports(os.environ.copy(), cwd)
-        )
-        with hermes_reasoning_effort_env(
-            worker_env, task.payload.get("reasoning_effort")
-        ) as run_env:
-            completed = run_streamed_subprocess(
-                command=command,
-                env=run_env,
-                task=task,
-                sidecar_name="hermes_analyze",
-                timeout_seconds=timeout_seconds,
-                cwd=str(cwd),
-                start_new_session=True,
+        def _invoke_hermes(run_prompt: str, sidecar: str):
+            command = build_hermes_chat_command(
+                executable=[resolved, *command_base[1:]],
+                prompt=run_prompt,
+                model=task.payload.get("model"),
+                provider=task.payload.get("provider"),
+                max_turns=task.payload.get("max_turns"),
+                toolsets=task.payload.get("toolsets", DEFAULT_HERMES_ANALYZE_TOOLSETS),
+                yolo=False,
+                source=str(task.payload.get("source", "tool")),
+                quiet=bool(task.payload.get("quiet", True)),
+                cli=bool(task.payload.get("cli", True)),
+                ignore_rules=bool(task.payload.get("ignore_rules", True)),
+                safe_mode=bool(task.payload.get("safe_mode", False)),
+                extra_args=task.payload.get("extra_args", []),
             )
+            # Hermes spawns a foreign Python interpreter; scrub the parent's
+            # PYTHONPATH/PYTHONHOME so it can't import Puppetmaster's
+            # site-packages and crash on a version clash (e.g. stale
+            # python-dotenv).
+            worker_env = scrub_foreign_interpreter_env(
+                apply_worktree_ports(os.environ.copy(), cwd)
+            )
+            with hermes_reasoning_effort_env(
+                worker_env, task.payload.get("reasoning_effort")
+            ) as run_env:
+                return run_streamed_subprocess(
+                    command=command,
+                    env=run_env,
+                    task=task,
+                    sidecar_name=sidecar,
+                    timeout_seconds=timeout_seconds,
+                    cwd=str(cwd),
+                    start_new_session=True,
+                )
+
+        completed = _invoke_hermes(prompt, "hermes_analyze")
         if completed.timed_out:
             stdout_capture = capture_subprocess_stdout(
                 text=completed.stdout,
@@ -2467,15 +2483,42 @@ class HermesAdapter:
                 )
             ]
 
+        def _parse(text_completed) -> list:
+            text = text_completed.stdout.strip()
+            found = cursor_result_artifacts(task, worker_id, text, adapter="hermes")
+            if not found:
+                found = cursor_result_artifacts(
+                    task, worker_id, text_completed.stdout, adapter="hermes"
+                )
+            return found
+
         result_text = completed.stdout.strip()
-        parsed_artifacts = cursor_result_artifacts(task, worker_id, result_text, adapter="hermes")
-        if not parsed_artifacts:
-            salvaged = cursor_result_artifacts(task, worker_id, completed.stdout, adapter="hermes")
-            if salvaged:
-                parsed_artifacts = salvaged
+        parsed_artifacts = _parse(completed)
         has_structured = bool(parsed_artifacts)
         process_failed = completed.returncode != 0 and not has_structured
         degraded = not process_failed and not has_structured
+
+        # One stricter JSON-only reprompt before accepting a degrade: a clean run
+        # that returned prose the parser couldn't structure (the minimal-effort
+        # flicker) usually recovers on a single retry. Gated by analyze_retry
+        # (default on); never retries a process failure or a timeout.
+        retry_recovered = False
+        retry_attempted = False
+        if degraded and bool(task.payload.get("analyze_retry", True)):
+            retry_attempted = True
+            retry_completed = _invoke_hermes(
+                prompt + _ANALYZE_JSON_ONLY_RETRY, "hermes_analyze_retry"
+            )
+            if not retry_completed.timed_out:
+                retry_parsed = _parse(retry_completed)
+                if retry_parsed:
+                    completed = retry_completed
+                    result_text = retry_completed.stdout.strip()
+                    parsed_artifacts = retry_parsed
+                    has_structured = True
+                    process_failed = retry_completed.returncode != 0
+                    degraded = False
+                    retry_recovered = True
         stdout_capture = capture_subprocess_stdout(
             text=completed.stdout,
             task=task,
@@ -2505,6 +2548,8 @@ class HermesAdapter:
                     ["adapter:hermes", "mode:analyze"]
                     + (["context:codegraph"] if codegraph_used else [])
                     + (["exit:ignored-after-parse"] if has_structured and completed.returncode != 0 else [])
+                    + (["retry:recovered"] if retry_recovered else [])
+                    + (["retry:exhausted"] if retry_attempted and not retry_recovered else [])
                 ),
                 payload={
                     "returncode": completed.returncode,
