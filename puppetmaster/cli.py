@@ -299,7 +299,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     install_rules_parser = subcommands.add_parser(
         "install-rules",
-        help="Write agent rule files (Cursor / AGENTS.md / Codex / Claude) that nudge hosts to reach for Puppetmaster on the right tasks.",
+        help="Write agent rule files (Cursor / AGENTS.md / Codex / Claude / Hermes) that nudge hosts to reach for Puppetmaster on the right tasks.",
     )
     install_rules_parser.add_argument(
         "--target",
@@ -314,7 +314,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--global",
         dest="rules_global",
         action="store_true",
-        help="Also write user-level rules (~/.codex/instructions.md, ~/.claude/CLAUDE.md) when those tools are detected.",
+        help="Also write user-level rules (~/.codex/instructions.md, ~/.claude/CLAUDE.md, ~/.hermes/SOUL.md) when those tools are detected.",
     )
     install_rules_parser.add_argument(
         "--force",

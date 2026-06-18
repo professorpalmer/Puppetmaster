@@ -9839,6 +9839,98 @@ class InstallRulesTests(unittest.TestCase):
                 msg="force-rerun must not duplicate the puppetmaster block",
             )
 
+    def test_install_rules_writes_hermes_soul_block(self):
+        """Explicit hermes_global target writes a managed block into SOUL.md."""
+        from puppetmaster.rules import install_rules, hermes_soul_path
+
+        with TemporaryDirectory() as home_tmp:
+            with patch.dict(os.environ, {"HERMES_HOME": home_tmp}):
+                soul = hermes_soul_path()
+                result = install_rules(targets=["hermes_global"])
+                self.assertEqual(result.overall_status, "installed")
+                self.assertEqual(soul, Path(home_tmp) / "SOUL.md")
+                self.assertTrue(soul.is_file())
+                text = soul.read_text(encoding="utf-8")
+                self.assertIn("puppetmaster:rules:begin", text)
+                self.assertIn("Puppetmaster orchestration", text)
+
+    def test_install_rules_hermes_preserves_existing_soul_content(self):
+        """The managed block must merge into a populated SOUL.md, not clobber it."""
+        from puppetmaster.rules import install_rules, hermes_soul_path
+
+        with TemporaryDirectory() as home_tmp:
+            with patch.dict(os.environ, {"HERMES_HOME": home_tmp}):
+                soul = hermes_soul_path()
+                soul.write_text("# Persona\nload-bearing user content\n", encoding="utf-8")
+                install_rules(targets=["hermes_global"])
+                text = soul.read_text(encoding="utf-8")
+                self.assertIn("# Persona", text)
+                self.assertIn("load-bearing user content", text)
+                self.assertIn("puppetmaster:rules:begin", text)
+
+    def test_install_rules_hermes_idempotent_on_rerun(self):
+        from puppetmaster.rules import install_rules, hermes_soul_path
+
+        with TemporaryDirectory() as home_tmp:
+            with patch.dict(os.environ, {"HERMES_HOME": home_tmp}):
+                soul = hermes_soul_path()
+                install_rules(targets=["hermes_global"])
+                result = install_rules(targets=["hermes_global"])
+                self.assertEqual(result.outcomes[0].status, "unchanged")
+                self.assertEqual(
+                    soul.read_text(encoding="utf-8").count("puppetmaster:rules:begin"),
+                    1,
+                    msg="re-run must not duplicate the Hermes block",
+                )
+
+    def test_install_rules_auto_detects_hermes_with_global(self):
+        """--global picks up hermes_global when ~/.hermes exists (HERMES_HOME).
+
+        ``enabled_adapters`` is pinned to ``{"hermes"}`` so the run stays
+        hermetic — it must not touch the host's real ~/.codex / ~/.claude.
+        """
+        from puppetmaster.rules import install_rules
+
+        with TemporaryDirectory() as home_tmp, TemporaryDirectory() as work_tmp:
+            with patch.dict(os.environ, {"HERMES_HOME": home_tmp}):
+                result = install_rules(
+                    cwd=Path(work_tmp),
+                    install_global=True,
+                    enabled_adapters={"hermes"},
+                )
+                targets = {o.target for o in result.outcomes}
+                self.assertIn("hermes_global", targets)
+                self.assertNotIn("codex_global", targets)
+                self.assertNotIn("claude_global", targets)
+
+    def test_install_rules_skips_hermes_when_platform_lock_excludes_it(self):
+        from puppetmaster.rules import install_rules
+
+        with TemporaryDirectory() as home_tmp, TemporaryDirectory() as work_tmp:
+            with patch.dict(os.environ, {"HERMES_HOME": home_tmp}):
+                result = install_rules(
+                    cwd=Path(work_tmp),
+                    install_global=True,
+                    enabled_adapters={"cursor"},
+                )
+                targets = {o.target for o in result.outcomes}
+                self.assertNotIn("hermes_global", targets)
+
+    def test_uninstall_rules_strips_hermes_block_preserving_content(self):
+        from puppetmaster.rules import install_rules, uninstall_rules, hermes_soul_path
+
+        with TemporaryDirectory() as home_tmp:
+            with patch.dict(os.environ, {"HERMES_HOME": home_tmp}):
+                soul = hermes_soul_path()
+                soul.write_text("# Persona\nkeep me\n", encoding="utf-8")
+                install_rules(targets=["hermes_global"])
+                result = uninstall_rules(targets=["hermes_global"])
+                self.assertEqual(result.outcomes[0].status, "removed")
+                text = soul.read_text(encoding="utf-8")
+                self.assertIn("# Persona", text)
+                self.assertIn("keep me", text)
+                self.assertNotIn("puppetmaster:rules:begin", text)
+
     def test_doctor_agent_rules_check_warns_when_mcp_present_but_no_rules(self):
         """Doctor should nudge the user when MCP is wired but rules are missing."""
         from puppetmaster import diagnostics

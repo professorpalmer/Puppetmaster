@@ -19,6 +19,8 @@ patterns" rule files into the conventions each host respects:
   scope)
 - ``~/.claude/CLAUDE.md`` (Claude Code user-level instructions, global
   scope)
+- ``~/.hermes/SOUL.md`` (NousResearch Hermes global system-prompt file,
+  injected into every Hermes session — global scope; honors ``$HERMES_HOME``)
 
 For the multi-line markdown targets (``AGENTS.md``, ``CLAUDE.md``,
 ``instructions.md``), the writer uses an HTML-comment-delimited block
@@ -34,11 +36,12 @@ convention) so we simply write the file.
 
 from __future__ import annotations
 
+import os
 import shutil
 import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Mapping, Optional
 
 
 BEGIN_MARKER = "<!-- puppetmaster:rules:begin -->"
@@ -335,6 +338,36 @@ def _detect_claude_cli() -> bool:
     return shutil.which("claude") is not None or (Path.home() / ".claude").exists()
 
 
+def _detect_hermes_cli() -> bool:
+    """Return True if NousResearch Hermes looks present on this machine.
+
+    Mirrors :func:`puppetmaster.diagnostics._hermes_cli_installed`: a `hermes`
+    executable on PATH (honoring the ``HERMES_COMMAND`` override) or a
+    ``~/.hermes`` (or ``$HERMES_HOME``) directory left by a prior run.
+    """
+    command = os.environ.get("HERMES_COMMAND", "hermes")
+    parts = command.split()
+    first = parts[0] if parts else ""
+    if first and (Path(first).expanduser().exists() or shutil.which(first) is not None):
+        return True
+    return hermes_soul_path().parent.exists()
+
+
+def hermes_soul_path(env: Optional[Mapping[str, str]] = None) -> Path:
+    """Return the path to Hermes' global ``SOUL.md``.
+
+    ``SOUL.md`` is the file Hermes injects into *every* session's system
+    prompt, so it is the correct global-bias surface for Hermes — the
+    counterpart to ``~/.claude/CLAUDE.md`` / ``~/.codex/instructions.md`` for
+    the other hosts. Honors ``$HERMES_HOME`` (the same override Hermes and the
+    MCP installer read) and falls back to ``~/.hermes/SOUL.md``.
+    """
+    env = env if env is not None else os.environ
+    hermes_home = env.get("HERMES_HOME")
+    base = Path(hermes_home).expanduser() if hermes_home else Path("~/.hermes").expanduser()
+    return base / "SOUL.md"
+
+
 def _write_atomic(path: Path, content: str) -> None:
     """Write to a temp sibling and rename, so a partial write never leaves a corrupt file."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -463,6 +496,36 @@ def _install_claude_global(*, dry_run: bool, force: bool) -> TargetOutcome:
     )
 
 
+def _install_hermes_global(*, dry_run: bool, force: bool) -> TargetOutcome:
+    target_path = hermes_soul_path()
+    new_block = render_agents_block()
+    existing = target_path.read_text(encoding="utf-8") if target_path.exists() else ""
+    merged, action = merge_block_into_text(existing, new_block)
+    if action == "unchanged" and not force:
+        return TargetOutcome(
+            target="hermes_global",
+            path=str(target_path),
+            status="unchanged",
+            reason="Hermes SOUL.md already has an up-to-date block",
+        )
+    if dry_run:
+        return TargetOutcome(
+            target="hermes_global",
+            path=str(target_path),
+            status="would_install",
+            reason=f"would update {target_path} (applies to every Hermes session)",
+        )
+    if force and action == "unchanged":
+        merged = (existing.replace(new_block, "") + "\n" + new_block).strip() + "\n"
+    _write_atomic(target_path, merged)
+    return TargetOutcome(
+        target="hermes_global",
+        path=str(target_path),
+        status="installed",
+        reason="wrote Hermes SOUL.md block (applies to every Hermes session)",
+    )
+
+
 def install_rules(
     *,
     cwd: Optional[Path] = None,
@@ -487,6 +550,10 @@ def install_rules(
       is detected (``codex`` on PATH or ``~/.codex/`` present).
     - ``claude_global`` is included only with ``--global`` AND when
       claude is detected (``claude`` on PATH or ``~/.claude/`` present).
+    - ``hermes_global`` is included only with ``--global`` AND when Hermes
+      is detected (``hermes`` on PATH, ``$HERMES_COMMAND``, or ``~/.hermes/``
+      present). Writes the managed block into Hermes' global ``SOUL.md`` —
+      the only host-global surface Hermes injects into every session.
 
     ``enabled_adapters`` (when provided) further filters the auto-detected
     set to the platforms the user actually routes to — e.g. a Claude-Code-only
@@ -534,6 +601,18 @@ def install_rules(
                     "claude CLI not detected — skipping ~/.claude/CLAUDE.md "
                     "(install `claude` and re-run with --global to enable)"
                 )
+            if _detect_hermes_cli() and _adapter_enabled("hermes"):
+                detected.append("hermes_global")
+            elif _detect_hermes_cli():
+                result.messages.append(
+                    "Hermes detected but disabled by the platform lock — "
+                    "skipping Hermes SOUL.md"
+                )
+            else:
+                result.messages.append(
+                    "Hermes not detected — skipping SOUL.md "
+                    "(install Hermes and re-run with --global to enable)"
+                )
     else:
         detected = list(targets)
 
@@ -550,6 +629,8 @@ def install_rules(
             result.outcomes.append(_install_codex_global(dry_run=dry_run, force=force))
         elif target == "claude_global":
             result.outcomes.append(_install_claude_global(dry_run=dry_run, force=force))
+        elif target == "hermes_global":
+            result.outcomes.append(_install_hermes_global(dry_run=dry_run, force=force))
         else:
             result.outcomes.append(
                 TargetOutcome(
@@ -570,7 +651,7 @@ def install_rules(
     return result
 
 
-VALID_TARGETS = {"cursor", "agents", "codex_global", "claude_global"}
+VALID_TARGETS = {"cursor", "agents", "codex_global", "claude_global", "hermes_global"}
 VALID_UNINSTALL_TARGETS = VALID_TARGETS | {"claude_workspace"}
 
 
@@ -672,6 +753,7 @@ def uninstall_rules(
         "claude_workspace",
         "claude_global",
         "codex_global",
+        "hermes_global",
     ]
 
     for target in selected:
@@ -711,6 +793,16 @@ def uninstall_rules(
                     target="codex_global",
                     dry_run=dry_run,
                     label="~/.codex/instructions.md",
+                )
+            )
+        elif target == "hermes_global":
+            soul = hermes_soul_path()
+            result.outcomes.append(
+                _uninstall_markdown_block_file(
+                    soul,
+                    target="hermes_global",
+                    dry_run=dry_run,
+                    label=str(soul),
                 )
             )
         else:
