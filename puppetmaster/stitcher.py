@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections import Counter
 from textwrap import indent
 from typing import Optional
@@ -195,12 +196,21 @@ class Stitcher:
         as one bullet ("reported by N workers") instead of N near-duplicates.
 
         Clustering is order-preserving and greedy: each artifact joins the first
-        existing cluster whose claim is similar (exact, substring-contained, or
-        high token overlap), else it seeds a new one. The most detailed /
-        highest-confidence claim becomes the representative. Artifacts without a
-        string claim are never merged.
+        cluster it's similar to, else seeds a new one. The most
+        detailed/highest-confidence claim becomes the representative.
+
+        Similarity is *evidence-locus-anchored* rather than pure token overlap,
+        because different workers paraphrase the same bug in lexically diverse
+        words ("multiply uses an O(n) loop" vs "multiplication is implemented
+        inefficiently") that a high token gate misses — but they cite the same
+        files. So two claims merge when they cite a shared code locus AND clear a
+        low token gate (the gate keeps genuinely distinct findings at the same
+        file — e.g. a KeyError vs a missing-division bug both in cli.py — apart),
+        OR when their wording overlaps strongly on its own. Exact and
+        substring-contained claims always merge. Claims with neither a string
+        body nor anything to compare are never merged.
         """
-        clusters: list[list] = []  # [representative, members, normalized_claim]
+        clusters: list[list] = []  # [representative, members, member_keys]
         for artifact in artifacts:
             headline = artifact.payload.get(key)
             normalized = (
@@ -208,36 +218,121 @@ class Stitcher:
                 if isinstance(headline, str)
                 else ""
             )
+            loci = Stitcher._evidence_loci(artifact)
             if not normalized:
-                clusters.append([artifact, [artifact], ""])
+                clusters.append([artifact, [artifact], [(normalized, loci)]])
                 continue
             placed = False
             for cluster in clusters:
-                if cluster[2] and Stitcher._claims_similar(normalized, cluster[2]):
+                # Match against ANY member, not just the representative — workers
+                # paraphrase the same bug in chains (A≈B, B≈C, A≉C), so anchoring
+                # only on the rep would strand the far end of the chain.
+                if any(
+                    member_norm
+                    and Stitcher._claims_similar(
+                        normalized, member_norm, loci, member_loci
+                    )
+                    for member_norm, member_loci in cluster[2]
+                ):
                     cluster[1].append(artifact)
+                    cluster[2].append((normalized, loci))
                     if Stitcher._is_better_representative(artifact, cluster[0]):
                         cluster[0] = artifact
-                        cluster[2] = normalized
                     placed = True
                     break
             if not placed:
-                clusters.append([artifact, [artifact], normalized])
+                clusters.append([artifact, [artifact], [(normalized, loci)]])
         return [(cluster[0], cluster[1]) for cluster in clusters]
+
+    # When two claims already share a code locus, merging needs only a couple of
+    # shared *content* words (stopwords excluded). A shared file is a strong
+    # prior, and content-token overlap discriminates paraphrases of one bug ("…
+    # repeated addition …") from genuinely distinct bugs at the same file (a
+    # KeyError vs a missing-division bug in cli.py share zero content words) far
+    # better than a token-ratio gate, which paraphrases routinely fall under.
+    _LOCUS_GATED_MIN_SHARED_CONTENT = 2
+    # Token overlap needed to merge claims with NO shared locus. High on purpose:
+    # without a citation anchor, only strongly-overlapping wording is safe.
+    _PURE_TOKEN_SIMILARITY = 0.6
+    # Grammatical / low-signal words ignored when counting shared content.
+    _STOPWORDS = frozenset(
+        {
+            "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+            "to", "of", "in", "on", "for", "and", "or", "but", "with", "without",
+            "that", "which", "this", "these", "those", "it", "its", "as", "at",
+            "by", "from", "into", "than", "then", "so", "such", "not", "no",
+            "can", "may", "might", "will", "would", "should", "could", "using",
+            "use", "uses", "used", "when", "if", "there", "their", "they", "has",
+            "have", "had", "does", "do", "due",
+        }
+    )
+
+    # Evidence tags that are not code loci (provenance/status, not file:line).
+    _NON_LOCUS_PREFIXES = frozenset(
+        {
+            "adapter",
+            "context",
+            "result",
+            "status",
+            "mode",
+            "base",
+            "exit",
+            "node",
+            "retry",
+            "check",
+        }
+    )
+    # A path-like token with a short extension, optionally with a :line or
+    # :line-range suffix (e.g. arithmetic.py, cli.py:5, parser.py:3-4).
+    _LOCUS_RE = re.compile(r"\b([\w./\\-]+\.[A-Za-z][A-Za-z0-9]{0,9})(?::\d+(?:-\d+)?)?\b")
+
+    @staticmethod
+    def _evidence_loci(artifact: Artifact) -> frozenset:
+        """Code loci (lowercased file paths) cited in an artifact's evidence.
+
+        Only the structured ``evidence`` list is scanned — it's where the
+        contract puts ``file.ext:line`` citations — so prose like "e.g." in a
+        claim can't masquerade as a locus.
+        """
+        loci: set[str] = set()
+        for item in artifact.evidence or []:
+            head = item.split(":", 1)[0].strip().lower()
+            if "." not in head and head in Stitcher._NON_LOCUS_PREFIXES:
+                continue
+            for match in Stitcher._LOCUS_RE.finditer(item):
+                loci.add(match.group(1).lower())
+        return frozenset(loci)
 
     @staticmethod
     def _normalize_claim(claim: str) -> str:
         return " ".join(claim.lower().split()).strip(" .;:!?-\"'")
 
     @staticmethod
-    def _claims_similar(left: str, right: str) -> bool:
-        if left == right or left in right or right in left:
-            return True
+    def _token_similarity(left: str, right: str) -> float:
         left_tokens, right_tokens = set(left.split()), set(right.split())
         if not left_tokens or not right_tokens:
-            return False
-        intersection = len(left_tokens & right_tokens)
+            return 0.0
         union = len(left_tokens | right_tokens)
-        return bool(union) and intersection / union >= 0.8
+        return len(left_tokens & right_tokens) / union if union else 0.0
+
+    @staticmethod
+    def _content_tokens(text: str) -> frozenset:
+        return frozenset(
+            token
+            for token in text.split()
+            if token not in Stitcher._STOPWORDS and len(token) > 1
+        )
+
+    @staticmethod
+    def _claims_similar(
+        left: str, right: str, left_loci: frozenset, right_loci: frozenset
+    ) -> bool:
+        if left == right or left in right or right in left:
+            return True
+        if left_loci & right_loci:
+            shared_content = Stitcher._content_tokens(left) & Stitcher._content_tokens(right)
+            return len(shared_content) >= Stitcher._LOCUS_GATED_MIN_SHARED_CONTENT
+        return Stitcher._token_similarity(left, right) >= Stitcher._PURE_TOKEN_SIMILARITY
 
     @staticmethod
     def _is_better_representative(candidate: Artifact, current: Artifact) -> bool:

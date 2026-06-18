@@ -17558,43 +17558,86 @@ class HermesAnalyzeRetryTests(unittest.TestCase):
 
 
 class StitcherDedupTests(unittest.TestCase):
-    """N workers finding the same thing collapses to one bullet, not N near-dupes."""
+    """N workers finding the same thing collapses to one bullet, not N near-dupes.
 
-    def _finding(self, claim: str, conf: float, by: str) -> Artifact:
+    Uses the real lexically-diverse paraphrases from the live stress test that
+    a pure high token gate missed but that all cite the same files.
+    """
+
+    def _finding(self, claim: str, conf: float, by: str, evidence=None) -> Artifact:
         return Artifact(
             job_id="j",
             task_id="t",
             type=ArtifactType.FINDING,
             created_by=by,
             confidence=conf,
-            evidence=["adapter:hermes"],
+            evidence=evidence if evidence is not None else ["adapter:hermes"],
             payload={"claim": claim},
         )
 
-    def test_near_identical_findings_collapse(self) -> None:
+    def test_paraphrased_findings_sharing_a_locus_collapse(self) -> None:
         from puppetmaster.stitcher import Stitcher
 
+        ev = ["arithmetic.py:5-8", "adapter:hermes"]
         arts = [
-            self._finding("multiply uses an O(n) loop instead of native *", 0.8, "w1"),
-            self._finding("Multiply uses an O(n) loop instead of native *.", 0.9, "w2"),
-            self._finding("The multiply function uses an O(n) loop instead of native *", 0.7, "w3"),
+            self._finding(
+                "The 'multiply' function is implemented using repeated addition, "
+                "which can be less efficient for large numbers",
+                0.90,
+                "w1",
+                ev,
+            ),
+            self._finding(
+                "Multiplication is implemented inefficiently using repeated addition",
+                1.00,
+                "w2",
+                ev,
+            ),
+            self._finding(
+                "The multiplication operation is implemented using repeated addition, "
+                "which may be less efficient than Python's native",
+                0.90,
+                "w3",
+                ev,
+            ),
         ]
         bullets = Stitcher._bullet_payloads(arts, "claim", dedupe=True)
         self.assertEqual(len(bullets), 1)
         self.assertIn("reported by 3 workers", bullets[0])
-        # Representative keeps the highest confidence in the cluster.
-        self.assertIn("confidence=0.90", bullets[0])
+        self.assertIn("confidence=1.00", bullets[0])
 
-    def test_distinct_findings_are_kept(self) -> None:
+    def test_distinct_bugs_at_same_file_stay_separate(self) -> None:
+        """The collision guard: two unrelated bugs both citing cli.py must not
+        merge just because they share a locus."""
         from puppetmaster.stitcher import Stitcher
 
         arts = [
-            self._finding("no division support in the CLI", 0.9, "w1"),
-            self._finding("parse() crashes on malformed input", 0.9, "w2"),
+            self._finding("KeyError on unsupported operators", 0.9, "w1", ["cli.py:5", "cli.py:9"]),
+            self._finding("No division support in the CLI", 0.95, "w2", ["cli.py:5"]),
         ]
         bullets = Stitcher._bullet_payloads(arts, "claim", dedupe=True)
         self.assertEqual(len(bullets), 2)
         self.assertNotIn("reported by", " ".join(bullets))
+
+    def test_strong_wording_overlap_merges_without_locus(self) -> None:
+        from puppetmaster.stitcher import Stitcher
+
+        arts = [
+            self._finding("parse() crashes on malformed input", 0.9, "w1"),
+            self._finding("parse() crashes on malformed input strings", 0.9, "w2"),
+        ]
+        bullets = Stitcher._bullet_payloads(arts, "claim", dedupe=True)
+        self.assertEqual(len(bullets), 1)
+
+    def test_unrelated_findings_without_locus_stay_separate(self) -> None:
+        from puppetmaster.stitcher import Stitcher
+
+        arts = [
+            self._finding("no division support in the calculator", 0.9, "w1"),
+            self._finding("the parser rejects negative numbers", 0.9, "w2"),
+        ]
+        bullets = Stitcher._bullet_payloads(arts, "claim", dedupe=True)
+        self.assertEqual(len(bullets), 2)
 
     def test_dedupe_off_keeps_all(self) -> None:
         from puppetmaster.stitcher import Stitcher
@@ -17606,16 +17649,38 @@ class StitcherDedupTests(unittest.TestCase):
         bullets = Stitcher._bullet_payloads(arts, "claim")
         self.assertEqual(len(bullets), 2)
 
-    def test_claims_similarity_helpers(self) -> None:
+    def test_evidence_loci_extraction(self) -> None:
         from puppetmaster.stitcher import Stitcher
 
-        a = Stitcher._normalize_claim("Multiply is O(n).")
-        b = Stitcher._normalize_claim("multiply is o(n)")
-        self.assertTrue(Stitcher._claims_similar(a, b))
+        art = self._finding(
+            "x", 0.9, "w1", ["arithmetic.py:5-8", "cli.py", "adapter:hermes", "context:codegraph"]
+        )
+        loci = Stitcher._evidence_loci(art)
+        self.assertIn("arithmetic.py", loci)
+        self.assertIn("cli.py", loci)
+        self.assertNotIn("adapter", loci)
+        self.assertNotIn("hermes", loci)
+
+    def test_claims_similar_signature(self) -> None:
+        from puppetmaster.stitcher import Stitcher
+
+        same = frozenset({"arithmetic.py"})
+        # Low lexical overlap but shared locus -> merge.
+        self.assertTrue(
+            Stitcher._claims_similar(
+                "multiplication is implemented inefficiently using repeated addition",
+                "the multiply function uses repeated addition for large numbers",
+                same,
+                same,
+            )
+        )
+        # Zero overlap, shared locus -> still separate (collision guard).
         self.assertFalse(
             Stitcher._claims_similar(
-                Stitcher._normalize_claim("no division support"),
-                Stitcher._normalize_claim("input validation crash"),
+                "keyerror on unsupported operators",
+                "no division support in the cli",
+                same,
+                same,
             )
         )
 

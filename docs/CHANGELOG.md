@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.9.67
+
+**Findings dedup that actually collapses paraphrases: evidence-locus-anchored clustering.** The 0.9.66 dedup was wired correctly (the stitch path renders Findings through `_bullet_payloads(dedupe=True)`, and `show`/`await` read that stitched output) — but its similarity test required exact/substring match or ≥0.8 token overlap, which paraphrase-level duplicates from different workers ("multiply uses an O(n) loop" vs "multiplication is implemented inefficiently") fall well under. On a live run, one bug still surfaced 3–5× because the workers cited the same files but worded it differently. (A stress run that showed *zero* collapse, including exact dupes, was a stale-server artifact — the daemon was still on pre-0.9.66 code; the 0.9.65 staleness nudge now surfaces exactly that.) Full suite **812** green.
+
+- **Cluster on the shared code locus, not just wording.** Two claims now merge when they cite a shared file (parsed from the structured `evidence` list, e.g. `arithmetic.py:5-8`) **and** share at least two *content* words (stopwords excluded) — paraphrases of one bug clear this easily, while two genuinely distinct bugs at the same file (a `KeyError` vs a missing-division bug both in `cli.py`, zero shared content) stay apart. Claims with no shared locus still require strong wording overlap (≥0.6) to merge, so an un-anchored merge stays conservative.
+- **Match against any cluster member, not just the representative.** Workers paraphrase in chains (A≈B, B≈C, A≉C); anchoring only on the representative stranded the far end. A claim now joins a cluster if it's similar to any member, so all three phrasings of one finding collapse to a single *"(reported by N workers)"* bullet keeping the highest-confidence representative. On the live fixture this took 9 findings → 5 distinct, with both `cli.py` bugs correctly kept separate.
+- Per-worker Verification lines remain un-collapsed (each is meaningful run status).
+
 ## v0.9.66
 
 **The last two Hermes stress-test edges: the `empty_or_unstructured` flicker and duplicated findings in the stitch.** Both observed across two concurrent swarms on 0.9.65 — mechanically green, but a minimal-effort worker occasionally degraded on prose, and the same finding from three workers read as three near-identical bullets. Full suite **809** green (+7 tests).
