@@ -452,15 +452,59 @@ def _read_entry(path: Path) -> Optional[dict]:
     return json.loads(raw)
 
 
-def summarize(entries: Iterable[McpServerEntry], *, now: Optional[float] = None) -> dict:
-    """Render a registry snapshot as a JSON-safe payload for CLI/MCP output."""
+def installed_puppetmaster_version() -> Optional[str]:
+    """Currently-installed puppetmaster version (from package metadata).
+
+    A long-lived stdio MCP server holds whatever code it loaded at startup; an
+    in-place ``pip install -U puppetmaster-ai`` bumps this value but cannot
+    reload the running server. Comparing a server's registered ``version``
+    against this is how we make that staleness detectable.
+    """
+    try:
+        from importlib.metadata import PackageNotFoundError, version as _version
+
+        for dist_name in ("puppetmaster-ai", "puppetmaster"):
+            try:
+                return _version(dist_name)
+            except PackageNotFoundError:
+                continue
+    except Exception:
+        return None
+    return None
+
+
+def summarize(
+    entries: Iterable[McpServerEntry],
+    *,
+    now: Optional[float] = None,
+    installed: Optional[str] = None,
+) -> dict:
+    """Render a registry snapshot as a JSON-safe payload for CLI/MCP output.
+
+    ``code_stale`` flags an alive server whose registered version no longer
+    matches the installed package — it's serving pre-upgrade code and needs a
+    restart (toggle the MCP server, or ``puppetmaster mcp cleanup``) for the new
+    code to take effect.
+    """
     current = now if now is not None else time.time()
-    rows = [entry.to_payload(now=current) for entry in entries]
+    current_version = installed if installed is not None else installed_puppetmaster_version()
+    rows = []
+    for entry in entries:
+        row = entry.to_payload(now=current)
+        row["code_stale"] = bool(
+            row["alive"]
+            and current_version
+            and row.get("version")
+            and row["version"] != current_version
+        )
+        rows.append(row)
     return {
         "now": current,
+        "installed_version": current_version,
         "count": len(rows),
         "alive": sum(1 for row in rows if row["alive"]),
         "stale": sum(1 for row in rows if row["stale"] and row["alive"]),
+        "code_stale": sum(1 for row in rows if row["code_stale"]),
         "dead": sum(1 for row in rows if not row["alive"]),
         "servers": rows,
     }

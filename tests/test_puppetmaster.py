@@ -5834,6 +5834,32 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
             self.assertFalse(effort_home.exists())
             self.assertTrue((real_home / "config.yaml").is_file())
 
+    def test_hermes_reasoning_effort_env_sessions_are_hermetic(self) -> None:
+        """An effort-run must not write sessions into the user's real ~/.hermes."""
+        try:
+            import yaml  # noqa: F401
+        except Exception:
+            self.skipTest("PyYAML (hermes extra) not installed")
+        from puppetmaster.adapters import hermes_reasoning_effort_env
+
+        with TemporaryDirectory() as tmp:
+            real_home = Path(tmp) / "hermes_home"
+            (real_home / "sessions").mkdir(parents=True)
+            (real_home / "config.yaml").write_text("model:\n  default: x\n", encoding="utf-8")
+            base_env = {"HERMES_HOME": str(real_home), "PATH": os.environ.get("PATH", "")}
+
+            with hermes_reasoning_effort_env(base_env, "high") as run_env:
+                effort_home = Path(run_env["HERMES_HOME"])
+                effort_sessions = effort_home / "sessions"
+                # sessions/ is a real throwaway dir, NOT a symlink to the real one.
+                self.assertTrue(effort_sessions.is_dir())
+                self.assertFalse(effort_sessions.is_symlink())
+                # A session a worker writes lands in the temp home, not the real one.
+                (effort_sessions / "abc.json").write_text("{}", encoding="utf-8")
+
+            # The user's real session store stays empty after the run.
+            self.assertEqual(list((real_home / "sessions").iterdir()), [])
+
     def test_hermes_reasoning_effort_env_passthrough_when_invalid_or_empty(self) -> None:
         from puppetmaster.adapters import hermes_reasoning_effort_env
 
@@ -17123,6 +17149,191 @@ class JsonPrefixDecodeTests(unittest.TestCase):
             task, "worker-hermes", "The entrypoint is main()."
         )
         self.assertEqual(artifacts, [])
+
+
+class AdapterProvenanceTests(unittest.TestCase):
+    """Artifacts must record which adapter actually produced them.
+
+    The shared parser previously hardcoded ``adapter:cursor-sdk`` as the
+    evidence fallback, so a Hermes/Codex/OpenAI worker that emitted a
+    finding/risk/decision without its own evidence was mislabeled as Cursor.
+    """
+
+    def _task(self) -> Task:
+        return Task(
+            job_id="job",
+            role="pipeline-mapper",
+            instruction="inspect repo",
+            adapter="hermes",
+            payload={"prompt": "Inspect repo", "cwd": "."},
+        )
+
+    def test_item_evidence_default_uses_calling_adapter(self) -> None:
+        from puppetmaster.adapters import cursor_artifact_from_item
+
+        artifact = cursor_artifact_from_item(
+            self._task(), "w", {"type": "risk", "risk": "x"}, adapter="hermes"
+        )
+        self.assertIsNotNone(artifact)
+        self.assertIn("adapter:hermes", artifact.evidence)
+        self.assertNotIn("adapter:cursor-sdk", artifact.evidence)
+
+    def test_item_evidence_default_back_compat_cursor(self) -> None:
+        from puppetmaster.adapters import cursor_artifact_from_item
+
+        artifact = cursor_artifact_from_item(
+            self._task(), "w", {"type": "finding", "claim": "x"}
+        )
+        self.assertIn("adapter:cursor-sdk", artifact.evidence)
+
+    def test_explicit_evidence_is_preserved(self) -> None:
+        from puppetmaster.adapters import cursor_artifact_from_item
+
+        artifact = cursor_artifact_from_item(
+            self._task(),
+            "w",
+            {"type": "finding", "claim": "x", "evidence": ["file:foo.py"]},
+            adapter="hermes",
+        )
+        self.assertEqual(artifact.evidence, ["file:foo.py"])
+
+    def test_result_artifacts_thread_adapter_label(self) -> None:
+        from puppetmaster.adapters import cursor_result_artifacts
+
+        text = json.dumps({"risks": [{"type": "risk", "risk": "boom"}]})
+        artifacts = cursor_result_artifacts(self._task(), "w", text, adapter="hermes")
+        self.assertEqual(len(artifacts), 1)
+        self.assertIn("adapter:hermes", artifacts[0].evidence)
+
+    def test_degraded_artifact_labels_adapter(self) -> None:
+        from puppetmaster.adapters import cursor_degraded_artifact
+
+        with patch.dict(os.environ, {"PUPPETMASTER_STATE_DIR": "/tmp"}):
+            artifact = cursor_degraded_artifact(
+                self._task(), "w", "blah", adapter="hermes"
+            )
+        self.assertIn("adapter:hermes", artifact.evidence)
+        self.assertIn("hermes", artifact.payload["risk"])
+
+    def test_decision_why_default_is_vendor_neutral(self) -> None:
+        from puppetmaster.adapters import cursor_artifact_from_item
+
+        artifact = cursor_artifact_from_item(
+            self._task(), "w", {"type": "decision", "decision": "do x"}, adapter="hermes"
+        )
+        self.assertNotIn("Cursor", artifact.payload["why"])
+
+
+class DirtyWorktreePathsNoteTests(unittest.TestCase):
+    """The clean-tree block should name the offending paths, not just say 'dirty'."""
+
+    def test_note_lists_changed_and_untracked(self) -> None:
+        from puppetmaster.adapters import dirty_worktree_paths_note
+
+        note = dirty_worktree_paths_note(["a.py"], ["__pycache__/x.pyc"])
+        self.assertIn("a.py (modified)", note)
+        self.assertIn("__pycache__/x.pyc (untracked)", note)
+
+    def test_note_empty_when_clean(self) -> None:
+        from puppetmaster.adapters import dirty_worktree_paths_note
+
+        self.assertEqual(dirty_worktree_paths_note([], []), "")
+
+    def test_note_truncates_long_lists(self) -> None:
+        from puppetmaster.adapters import dirty_worktree_paths_note
+
+        note = dirty_worktree_paths_note([f"f{i}.py" for i in range(15)], [], limit=10)
+        self.assertIn("(+5 more)", note)
+
+    def test_guard_message_includes_paths(self) -> None:
+        from puppetmaster.adapters import HermesAdapter, git_snapshot
+
+        task = Task(
+            job_id="job",
+            role="impl",
+            instruction="build it",
+            adapter="hermes",
+            payload={"cwd": ".", "mode": "implement"},
+        )
+        dirty = {
+            "changed_files": ["a.py"],
+            "untracked_files": ["junk/__pycache__/x.pyc"],
+            "sha": "abc",
+        }
+        with patch(
+            "puppetmaster.adapters.enrich_prompt_with_codegraph",
+            return_value=("p", False),
+        ), patch(
+            "puppetmaster.adapters.resolve_command", return_value="/usr/bin/hermes"
+        ), patch(
+            "puppetmaster.adapters.git_snapshot", return_value=dirty
+        ), patch(
+            "puppetmaster.adapters.worktree_guard", return_value=None
+        ), patch("puppetmaster.adapters.snapshot_has_diff", return_value=False):
+            artifacts = HermesAdapter()._run_implement(task, "goal", "w")
+        msg = artifacts[0].payload["message"]
+        self.assertEqual(artifacts[0].payload["failure"], "dirty_worktree")
+        self.assertIn("a.py (modified)", msg)
+        self.assertIn("junk/__pycache__/x.pyc (untracked)", msg)
+
+
+class McpServerCodeStalenessTests(unittest.TestCase):
+    """A long-lived MCP server on pre-upgrade code must be detectable."""
+
+    def _entry(self, version, **kw):
+        from puppetmaster.mcp_registry import McpServerEntry
+
+        defaults = dict(
+            pid=os.getpid(),  # alive
+            workspace="/repo",
+            started_at=time.time(),
+            last_heartbeat=time.time(),
+            version=version,
+        )
+        defaults.update(kw)
+        return McpServerEntry(**defaults)
+
+    def test_summarize_flags_version_mismatch_as_code_stale(self) -> None:
+        from puppetmaster.mcp_registry import summarize
+
+        snap = summarize([self._entry("0.9.60")], installed="0.9.61")
+        self.assertEqual(snap["code_stale"], 1)
+        self.assertEqual(snap["installed_version"], "0.9.61")
+        self.assertTrue(snap["servers"][0]["code_stale"])
+
+    def test_summarize_matching_version_is_not_code_stale(self) -> None:
+        from puppetmaster.mcp_registry import summarize
+
+        snap = summarize([self._entry("0.9.61")], installed="0.9.61")
+        self.assertEqual(snap["code_stale"], 0)
+        self.assertFalse(snap["servers"][0]["code_stale"])
+
+    def test_dead_server_is_never_code_stale(self) -> None:
+        from puppetmaster.mcp_registry import summarize
+
+        # PID 0 is never alive; a dead/old server isn't actionable.
+        snap = summarize([self._entry("0.9.60", pid=0)], installed="0.9.61")
+        self.assertEqual(snap["code_stale"], 0)
+
+    def test_missing_version_is_not_code_stale(self) -> None:
+        from puppetmaster.mcp_registry import summarize
+
+        snap = summarize([self._entry(None)], installed="0.9.61")
+        self.assertEqual(snap["code_stale"], 0)
+
+    def test_status_hint_surfaced_when_code_stale(self) -> None:
+        from puppetmaster import mcp_server
+        from puppetmaster.mcp_registry import summarize
+
+        stale = summarize([self._entry("0.9.60")], installed="0.9.61")
+        with patch("puppetmaster.mcp_server.registry_prune_dead", return_value=[]), patch(
+            "puppetmaster.mcp_server.registry_list_entries", return_value=[]
+        ), patch(
+            "puppetmaster.mcp_server.registry_summarize", return_value=stale
+        ):
+            resp = mcp_server.run_mcp_status({})
+        text = json.dumps(resp)
+        self.assertIn("pre-upgrade code", text)
 
 
 if __name__ == "__main__":

@@ -378,6 +378,29 @@ def diff_source_payload(before: dict, after: dict) -> dict[str, bool]:
     }
 
 
+def dirty_worktree_paths_note(
+    changed_files: object,
+    untracked_files: object,
+    *,
+    limit: int = 10,
+) -> str:
+    """A short, named sample of the paths that make the tree dirty.
+
+    The clean-tree guard is correct to block, but a bare "dirty worktree"
+    reads like a real failure when the only offender is a stray ``__pycache__/``.
+    Naming the paths in the message (not just the payload fields) lets a user
+    see at a glance whether it's junk or real work without drilling in.
+    """
+    labeled = [f"{path} (modified)" for path in (changed_files or [])]
+    labeled += [f"{path} (untracked)" for path in (untracked_files or [])]
+    if not labeled:
+        return ""
+    shown = labeled[:limit]
+    overflow = len(labeled) - len(shown)
+    suffix = f" (+{overflow} more)" if overflow > 0 else ""
+    return " Offending paths: " + ", ".join(shown) + suffix + "."
+
+
 def _spool_patch_sidecar(*, task: Task, sidecar_name: str, diff: str) -> Optional[str]:
     """Write the full (already-redacted) diff to a sidecar file next to the
     task's other spooled output. Returns the path, or ``None`` if no state dir
@@ -646,6 +669,9 @@ class CursorAdapter:
                             "Cursor implement runs require a clean working tree by default "
                             "so Puppetmaster can attribute the resulting diff correctly. Commit, "
                             "stash, use a worktree, or set payload.allow_dirty=true."
+                            + dirty_worktree_paths_note(
+                                before["changed_files"], before["untracked_files"]
+                            )
                         ),
                         "changed_files": before["changed_files"],
                         "untracked_files": before["untracked_files"],
@@ -1115,6 +1141,9 @@ class ClaudeCodeAdapter:
                             "Claude Code full-edit runs require a clean working tree by default "
                             "so Puppetmaster can attribute resulting diffs correctly. Commit, stash, "
                             "use a worktree, or set payload.allow_dirty=true."
+                            + dirty_worktree_paths_note(
+                                before["changed_files"], before["untracked_files"]
+                            )
                         ),
                         "changed_files": before["changed_files"],
                         "untracked_files": before["untracked_files"],
@@ -1408,6 +1437,9 @@ class CodexAdapter:
                             "so Puppetmaster can attribute resulting diffs correctly. Commit, "
                             "stash, use a worktree, set payload.allow_dirty=true, or pass "
                             "payload.sandbox='read-only' for review-only tasks."
+                            + dirty_worktree_paths_note(
+                                before["changed_files"], before["untracked_files"]
+                            )
                         ),
                         "changed_files": before["changed_files"],
                         "untracked_files": before["untracked_files"],
@@ -1541,7 +1573,7 @@ class CodexAdapter:
             sidecar_name="codex_last_message",
         )
 
-        parsed_artifacts = cursor_result_artifacts(task, worker_id, last_message)
+        parsed_artifacts = cursor_result_artifacts(task, worker_id, last_message, adapter="codex")
         process_failed = completed.returncode != 0 or turn_failed
         unstructured = not process_failed and not parsed_artifacts and bool(last_message.strip())
         # A write-capable run (implement-style) normally reports in prose —
@@ -1919,7 +1951,11 @@ def hermes_reasoning_effort_env(base_env: dict, effort: object):
     tmp_home = Path(tempfile.mkdtemp(prefix="pm-hermes-effort-"))
     try:
         for entry in real_home.iterdir():
-            if entry.name == "config.yaml":
+            # config.yaml is rewritten below; sessions/ is deliberately NOT
+            # symlinked so an effort-run is hermetic — a symlinked sessions/
+            # would write-through to the user's real ~/.hermes/sessions/. It
+            # gets its own throwaway empty dir instead.
+            if entry.name in ("config.yaml", "sessions"):
                 continue
             try:
                 os.symlink(entry, tmp_home / entry.name)
@@ -1927,6 +1963,13 @@ def hermes_reasoning_effort_env(base_env: dict, effort: object):
                 # A single un-symlinkable entry shouldn't sink the run; the
                 # ones that matter (auth.json, .env) are simple files.
                 pass
+
+        # Real empty sessions dir so Hermes has somewhere to write session
+        # files without touching the user's personal session store.
+        try:
+            (tmp_home / "sessions").mkdir(exist_ok=True)
+        except OSError:
+            pass
 
         config: dict = {}
         cfg_file = real_home / "config.yaml"
@@ -2119,6 +2162,9 @@ class HermesAdapter:
                             "Hermes full-edit runs require a clean working tree by default "
                             "so Puppetmaster can attribute resulting diffs correctly. Commit, "
                             "stash, use a worktree, or set payload.allow_dirty=true."
+                            + dirty_worktree_paths_note(
+                                before["changed_files"], before["untracked_files"]
+                            )
                         ),
                         "changed_files": before["changed_files"],
                         "untracked_files": before["untracked_files"],
@@ -2368,9 +2414,9 @@ class HermesAdapter:
             ]
 
         result_text = completed.stdout.strip()
-        parsed_artifacts = cursor_result_artifacts(task, worker_id, result_text)
+        parsed_artifacts = cursor_result_artifacts(task, worker_id, result_text, adapter="hermes")
         if not parsed_artifacts:
-            salvaged = cursor_result_artifacts(task, worker_id, completed.stdout)
+            salvaged = cursor_result_artifacts(task, worker_id, completed.stdout, adapter="hermes")
             if salvaged:
                 parsed_artifacts = salvaged
         has_structured = bool(parsed_artifacts)
@@ -2959,7 +3005,7 @@ def implement_report_artifacts(
     typed artifacts; anything else is preserved verbatim as a FINDING so the
     report survives synthesis instead of dying in a log nobody reads.
     """
-    parsed = cursor_result_artifacts(task, worker_id, result_text)
+    parsed = cursor_result_artifacts(task, worker_id, result_text, adapter=adapter)
     if parsed:
         return parsed
     report = redact_secrets(result_text or "").strip()
@@ -2985,7 +3031,13 @@ def implement_report_artifacts(
     ]
 
 
-def cursor_result_artifacts(task: Task, worker_id: str, result_text: str) -> list[Artifact]:
+def cursor_result_artifacts(
+    task: Task,
+    worker_id: str,
+    result_text: str,
+    *,
+    adapter: str = "cursor-sdk",
+) -> list[Artifact]:
     payload = parse_cursor_artifact_payload(result_text)
     if payload is None:
         return []
@@ -3003,7 +3055,7 @@ def cursor_result_artifacts(task: Task, worker_id: str, result_text: str) -> lis
 
     artifacts = []
     for item in raw_artifacts:
-        artifact = cursor_artifact_from_item(task, worker_id, item)
+        artifact = cursor_artifact_from_item(task, worker_id, item, adapter=adapter)
         if artifact is not None:
             artifacts.append(artifact)
     return artifacts
@@ -3030,7 +3082,13 @@ def parse_cursor_artifact_payload(result_text: str) -> Optional[Any]:
     return _json_prefix_decode(text)
 
 
-def cursor_artifact_from_item(task: Task, worker_id: str, item: object) -> Optional[Artifact]:
+def cursor_artifact_from_item(
+    task: Task,
+    worker_id: str,
+    item: object,
+    *,
+    adapter: str = "cursor-sdk",
+) -> Optional[Artifact]:
     if not isinstance(item, dict):
         return None
     artifact_type = str(item.get("type") or "").lower().strip()
@@ -3039,7 +3097,7 @@ def cursor_artifact_from_item(task: Task, worker_id: str, item: object) -> Optio
     if artifact_type not in {"finding", "risk", "decision"}:
         return None
 
-    evidence = _string_list(item.get("evidence")) or ["adapter:cursor-sdk"]
+    evidence = _string_list(item.get("evidence")) or [f"adapter:{adapter}"]
     confidence = _confidence(item.get("confidence"))
     payload = {key: value for key, value in item.items() if key not in {"type", "evidence", "confidence"}}
 
@@ -3061,7 +3119,7 @@ def cursor_artifact_from_item(task: Task, worker_id: str, item: object) -> Optio
         if not decision:
             return None
         payload["decision"] = str(decision)
-        payload["why"] = str(payload.get("why") or "Recommended by Cursor SDK analysis.")
+        payload["why"] = str(payload.get("why") or "Recommended by automated analysis.")
         kind = ArtifactType.DECISION
 
     return Artifact(
@@ -3080,10 +3138,11 @@ def cursor_degraded_artifact(
     worker_id: str,
     result_text: str,
     *,
+    adapter: str = "cursor-sdk",
     stdout_capture: Optional[dict[str, Any]] = None,
 ) -> Artifact:
     payload: dict[str, Any] = {
-        "risk": "Cursor SDK completed without structured Puppetmaster findings.",
+        "risk": f"{adapter} completed without structured Puppetmaster findings.",
         "mitigation": "Treat this swarm as degraded; rerun with a stricter prompt or inspect the repo directly before implementation.",
         "stdout_excerpt": result_text[:_STDOUT_HEAD_CHARS],
     }
@@ -3100,7 +3159,7 @@ def cursor_degraded_artifact(
         type=ArtifactType.RISK,
         created_by=worker_id,
         confidence=0.85,
-        evidence=["adapter:cursor-sdk", "cursor-result:empty-or-unstructured"],
+        evidence=[f"adapter:{adapter}", "cursor-result:empty-or-unstructured"],
         payload=payload,
     )
 
@@ -3385,7 +3444,7 @@ class OpenAIAdapter:
         completion_tokens = int(usage.get("completion_tokens") or 0)
         total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
 
-        parsed_artifacts = cursor_result_artifacts(task, worker_id, result_text)
+        parsed_artifacts = cursor_result_artifacts(task, worker_id, result_text, adapter="openai")
         degraded = not parsed_artifacts and bool(result_text)
         failed = finish_reason not in (None, "stop", "length") and not parsed_artifacts
 

@@ -1657,6 +1657,13 @@ def run_mcp_status(args: JsonObject) -> JsonObject:
     snapshot = registry_summarize(registry_list_entries())
     snapshot["self_pid"] = os.getpid()
     snapshot["pruned_dead"] = [entry.to_payload() for entry in cleaned]
+    if snapshot.get("code_stale"):
+        snapshot["hint"] = (
+            f"{snapshot['code_stale']} MCP server(s) are running pre-upgrade code "
+            f"(installed {snapshot.get('installed_version')}). Restart them — toggle "
+            "the MCP server in your client, or run `puppetmaster mcp cleanup "
+            "--kill-stale` — so the new code takes effect."
+        )
     snapshot["ok"] = True
     return _mcp_diagnostic_response(snapshot)
 

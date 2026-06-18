@@ -5444,6 +5444,7 @@ def _run_mcp_list(args) -> int:
     print(
         f"{snapshot['count']} tracked  "
         f"({snapshot['alive']} alive, {snapshot['stale']} stale, "
+        f"{snapshot.get('code_stale', 0)} old-code, "
         f"{snapshot['dead']} dead)"
     )
     print(
@@ -5455,6 +5456,8 @@ def _run_mcp_list(args) -> int:
             state = "dead"
         elif row["stale"]:
             state = "stale"
+        elif row.get("code_stale"):
+            state = "old"
         else:
             state = "ok"
         workspace = row.get("workspace") or "-"
@@ -5467,6 +5470,13 @@ def _run_mcp_list(args) -> int:
             f"{parent_pid:>7}  "
             f"{parent_process:<12}  "
             f"{workspace}"
+        )
+    if snapshot.get("code_stale"):
+        print(
+            f"\n  {snapshot['code_stale']} server(s) marked 'old' are running "
+            f"pre-upgrade code (installed {snapshot.get('installed_version')}). "
+            "Restart them — toggle the MCP server in your client or run "
+            "`puppetmaster mcp cleanup --kill-stale` — for the new code to load."
         )
     return 0
 
