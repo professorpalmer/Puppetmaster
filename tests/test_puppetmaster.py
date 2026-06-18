@@ -204,6 +204,21 @@ class PuppetmasterTests(unittest.TestCase):
             os.environ["PUPPETMASTER_MODELS_PATH"] = cls._prev_models_env
         shutil.rmtree(cls._models_path_tmp, ignore_errors=True)
 
+    def setUp(self) -> None:
+        # CodeGraph's Cursor-Node invocation is memoized process-wide for perf
+        # (codegraph._CURSOR_INVOCATION_CACHE). On a dev host that actually has
+        # Cursor + a global codegraph install, the first test to trigger real
+        # resolution caches a concrete invocation, which then bypasses the
+        # shutil.which / subprocess mocks the codegraph helper tests rely on.
+        # Reset the memo before each test so resolution is recomputed under
+        # whatever each test mocks. (CI hosts have neither Cursor nor a global
+        # shim, so this is a no-op there, but it makes the suite deterministic
+        # everywhere.)
+        from puppetmaster import codegraph as _codegraph_mod
+
+        _codegraph_mod.reset_cursor_codegraph_invocation_cache()
+        self.addCleanup(_codegraph_mod.reset_cursor_codegraph_invocation_cache)
+
     def test_mcp_lists_puppetmaster_agent_tools(self) -> None:
         response = handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         tool_names = {tool["name"] for tool in response["result"]["tools"]}
@@ -2542,15 +2557,107 @@ class PuppetmasterTests(unittest.TestCase):
             )
 
     def test_repair_codegraph_returns_failure_without_cursor_node(self) -> None:
-        """Without a discoverable Cursor Node we surface a clear next-step list."""
+        """Without any discoverable Node we surface a clear next-step list."""
         from puppetmaster import codegraph_repair
 
-        with patch.object(codegraph_repair, "find_cursor_node", return_value=None):
+        # Patch the generalized resolver the repair path actually calls.
+        with patch.object(codegraph_repair, "find_runtime_node", return_value=None):
             result = codegraph_repair.repair_codegraph_sqlite(verify=False)
 
         self.assertFalse(result.ok)
-        self.assertIn("Cursor", result.message)
+        self.assertIn("Node", result.message)
         self.assertTrue(result.next_steps)
+
+    def test_find_runtime_node_falls_back_to_path_node(self) -> None:
+        """On a non-Cursor host, find_runtime_node returns `node` from PATH.
+
+        This is the fix for harnesses other than Cursor (claude-code, codex,
+        openai, hermes): no Cursor.app, no env override, but `node` on PATH
+        must still resolve so repair-codegraph can run.
+        """
+        from puppetmaster import codegraph_repair
+
+        with TemporaryDirectory() as tmp:
+            path_node = Path(tmp) / "node"
+            path_node.write_text("#!/bin/sh\necho v22.0.0\n", encoding="utf-8")
+            path_node.chmod(0o755)
+            env = {k: v for k, v in os.environ.items()
+                   if k != "PUPPETMASTER_CODEGRAPH_NODE"}
+            with patch.dict(os.environ, env, clear=True), patch.object(
+                codegraph_repair, "_CURSOR_NODE_CANDIDATES_MAC", ()
+            ), patch.object(
+                codegraph_repair, "_CURSOR_NODE_CANDIDATES_LINUX", ()
+            ), patch.object(
+                codegraph_repair, "_CURSOR_NODE_CANDIDATES_WIN", ()
+            ), patch.object(
+                codegraph_repair.shutil, "which", return_value=str(path_node)
+            ):
+                resolved = codegraph_repair.find_runtime_node()
+            self.assertEqual(str(resolved), str(path_node))
+
+    def test_find_runtime_node_honors_env_override(self) -> None:
+        """PUPPETMASTER_CODEGRAPH_NODE wins over auto-detection."""
+        from puppetmaster import codegraph_repair
+
+        with TemporaryDirectory() as tmp:
+            env_node = Path(tmp) / "envnode"
+            env_node.write_text("ok", encoding="utf-8")
+            with patch.dict(
+                os.environ, {"PUPPETMASTER_CODEGRAPH_NODE": str(env_node)}
+            ):
+                resolved = codegraph_repair.find_runtime_node()
+            self.assertEqual(str(resolved), str(env_node))
+
+    def test_find_cursor_node_alias_points_at_runtime_node(self) -> None:
+        """The back-compat alias must resolve to the generalized function."""
+        from puppetmaster import codegraph_repair
+
+        self.assertIs(
+            codegraph_repair.find_cursor_node, codegraph_repair.find_runtime_node
+        )
+
+    def test_find_codegraph_install_from_shim_when_npm_misses(self) -> None:
+        """When `npm root -g` points at the wrong prefix, follow the shim.
+
+        Reproduces the cross-prefix trap: the package is installed under one
+        Node's prefix (e.g. Homebrew) while the PATH npm leads elsewhere (e.g.
+        a pyenv/Hermes npm). `npm root -g` misses the package, but the
+        `codegraph` shim symlinks straight into it.
+        """
+        from puppetmaster import codegraph_repair
+
+        with TemporaryDirectory() as tmp:
+            # Real install lives under a "homebrew" prefix.
+            pkg = Path(tmp) / "homebrew" / "lib" / "node_modules" / "@colbymchenry" / "codegraph"
+            (pkg / "dist" / "bin").mkdir(parents=True)
+            real_js = pkg / "dist" / "bin" / "codegraph.js"
+            real_js.write_text("// stub", encoding="utf-8")
+            # `codegraph` shim symlinks to the real JS entry point.
+            shim = Path(tmp) / "bin" / "codegraph"
+            shim.parent.mkdir(parents=True)
+            shim.symlink_to(real_js)
+            # `npm root -g` returns a DIFFERENT prefix that lacks the package.
+            empty_root = Path(tmp) / "other" / "node_modules"
+            empty_root.mkdir(parents=True)
+
+            def fake_run(cmd, **kwargs):  # noqa: ANN001
+                return subprocess.CompletedProcess(cmd, 0, str(empty_root) + "\n", "")
+
+            def fake_which(name):  # noqa: ANN001
+                if name == "npm":
+                    return "/usr/bin/npm"
+                if name == "codegraph":
+                    return str(shim)
+                return None
+
+            with patch.object(
+                codegraph_repair.subprocess, "run", side_effect=fake_run
+            ), patch.object(
+                codegraph_repair.shutil, "which", side_effect=fake_which
+            ):
+                resolved = codegraph_repair.find_codegraph_install()
+            self.assertIsNotNone(resolved)
+            self.assertEqual(resolved, pkg.resolve())
 
     def test_repair_codegraph_runs_npm_rebuild_with_cursor_node_in_path(self) -> None:
         """Happy path: rebuild is invoked with Cursor's Node ahead of $PATH."""

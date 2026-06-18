@@ -59,18 +59,18 @@ CODEGRAPH_NOT_INITIALIZED_HINT = (
 )
 CODEGRAPH_NATIVE_SQLITE_HINT = (
     "CodeGraph's native SQLite (better-sqlite3) is broken on this machine — almost "
-    "always a Node ABI mismatch. The common Cursor trap: your terminal's Node "
-    "(e.g. Homebrew v23, ABI 131) and Cursor's bundled Node (v22, ABI 127) "
-    "have different ABIs, so a plain `npm rebuild` from your shell builds "
-    "better-sqlite3 for the wrong runtime and Puppetmaster's MCP keeps falling "
-    "back to slow WASM SQLite (you'll see `database is locked` errors). "
+    "always a Node ABI mismatch. The common trap: the Node that built "
+    "better-sqlite3 differs from the Node your harness runs CodeGraph under, so "
+    "the native module fails to load and Puppetmaster's MCP keeps falling back "
+    "to slow WASM SQLite (you'll see `database is locked` errors). One concrete "
+    "example is Cursor (terminal Homebrew Node v23/ABI 131 vs Cursor's bundled "
+    "Node v22/ABI 127), but the same mismatch hits any harness. "
     "Easiest fix: run `python -m puppetmaster repair-codegraph` (or call the "
     "`puppetmaster_repair_codegraph` MCP tool) — it rebuilds better-sqlite3 "
-    "against Cursor's Node automatically and verifies Backend: native. Manual "
-    "equivalent: `CURSOR_NODE=\"/Applications/Cursor.app/Contents/Resources/app/"
-    "resources/helpers/node\" && cd \"$(npm root -g)/@colbymchenry/codegraph\" && "
-    "PATH=\"$(dirname \"$CURSOR_NODE\"):$PATH\" npm rebuild better-sqlite3`. "
-    "Restart the Puppetmaster MCP server in Cursor afterwards."
+    "against the Node your harness actually uses and verifies Backend: native. "
+    "Manual equivalent: `cd \"$(npm root -g)/@colbymchenry/codegraph\" && "
+    "npm rebuild better-sqlite3` with the right Node first on PATH. "
+    "Restart the Puppetmaster MCP server in your harness afterwards."
 )
 
 

@@ -1147,7 +1147,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     repair.add_argument(
         "--cursor-node",
-        help="Path to Cursor's bundled Node binary. Auto-detected if omitted.",
+        "--runtime-node",
+        dest="cursor_node",
+        help=(
+            "Path to the Node binary to rebuild CodeGraph against. Auto-detected "
+            "if omitted (PUPPETMASTER_CODEGRAPH_NODE, then Cursor's bundled Node, "
+            "then `node` on PATH). Works for any harness, not just Cursor."
+        ),
     )
     repair.add_argument(
         "--codegraph-install",

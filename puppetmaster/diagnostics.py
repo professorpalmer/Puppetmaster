@@ -388,8 +388,12 @@ def _codegraph_check(root: Path) -> Check:
         )
     invocation = resolve_codegraph_invocation()
     detail = "codegraph installed and target workspace initialized"
-    if len(invocation) >= 2 and "Cursor.app" in invocation[0]:
-        detail += " (verified under Cursor's bundled Node)"
+    if len(invocation) >= 2:
+        node_name = invocation[0]
+        if "Cursor.app" in node_name:
+            detail += " (verified under Cursor's bundled Node)"
+        else:
+            detail += " (verified under the harness Node runtime)"
     if freshness.state == "fresh":
         detail += "; index fresh"
     return Check("codegraph", "ok", detail)
