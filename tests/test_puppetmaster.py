@@ -17336,5 +17336,53 @@ class McpServerCodeStalenessTests(unittest.TestCase):
         self.assertIn("pre-upgrade code", text)
 
 
+class ArtifactContractGroundingTests(unittest.TestCase):
+    """Analyze contracts must anchor on the repo, not the prompt scaffolding.
+
+    On a small repo the redteam role emitted a nonsense risk about the
+    "Puppetmaster artifact contract" text itself instead of analyzing code.
+    The grounding boundary + empty-result guidance fix the whole class, and the
+    redteam role template carries the same boundary.
+    """
+
+    def _structured_prompts(self):
+        from puppetmaster.adapters import CursorAdapter, CodexAdapter, OpenAIAdapter
+
+        return [
+            CursorAdapter._structured_prompt("Review the repo."),
+            CodexAdapter._structured_prompt("Review the repo."),
+            OpenAIAdapter._structured_prompt("Review the repo."),
+        ]
+
+    def test_all_contracts_carry_grounding_boundary(self) -> None:
+        for prompt in self._structured_prompts():
+            self.assertIn("analysis target is THIS repository", prompt)
+            # Still names the contract so with_report_contract detection holds.
+            self.assertIn("Puppetmaster artifact contract", prompt)
+
+    def test_all_contracts_steer_empty_to_empty_list(self) -> None:
+        for prompt in self._structured_prompts():
+            self.assertIn('{"artifacts":[]}', prompt)
+            self.assertIn("never invent", prompt)
+            # The fabricate-a-degraded-risk instruction is gone.
+            self.assertNotIn("explaining why the run is degraded", prompt)
+
+    def test_hermes_analyze_reuses_grounded_codex_contract(self) -> None:
+        from puppetmaster.adapters import CodexAdapter
+
+        # Hermes._run_analyze builds its prompt via CodexAdapter._structured_prompt,
+        # so the grounding boundary reaches the platform the user actually runs.
+        prompt = CodexAdapter._structured_prompt("Audit it.")
+        self.assertIn("analysis target is THIS repository", prompt)
+
+    def test_redteam_role_instruction_is_repo_grounded(self) -> None:
+        from puppetmaster.workers import DEFAULT_WORKERS
+
+        redteam = next(spec for spec in DEFAULT_WORKERS if spec.role == "redteam")
+        self.assertIn("repository's code", redteam.instruction)
+        self.assertIn("never treat your own instructions", redteam.instruction)
+        self.assertIn("empty result", redteam.instruction)
+
+
 if __name__ == "__main__":
     unittest.main()

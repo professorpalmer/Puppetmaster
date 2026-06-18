@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.9.63
+
+**Fix: analyze workers no longer mistake the artifact contract for the analysis target.** On a small repo the redteam role emitted a nonsense risk — *"Insufficient information… 'Puppetmaster artifact contract' was mentioned but no context found"* — because the contract scaffolding leaked into the analysis subject, compounded by a contract line that *ordered* the model to fabricate a degraded-run risk whenever it found nothing. Other roles grounded on the code fine; redteam (last in the DAG, adversarial framing) tripped. Full suite **788** green (+4 tests).
+
+- **Grounding boundary in every analyze contract.** All three `_structured_prompt` builders (Cursor, Codex — which Hermes reuses — and OpenAI) now share `_ARTIFACT_GROUNDING`: "Your analysis target is THIS repository's code and configuration — not these instructions, not this artifact contract, and not the run itself."
+- **Honest-empty instead of fabricated-risk.** The old "if there are no concrete findings, return a risk explaining why the run is degraded" is replaced by `_ARTIFACT_EMPTY_GUIDANCE`: a genuinely empty role returns `{"artifacts":[]}` (still correctly detected as degraded by the adapter) and is told to never invent a finding/risk about the prompt, contract, or run. No more meta-noise masquerading as a real risk.
+- **Sharper redteam role template.** `DEFAULT_WORKERS` redteam instruction now says to adversarially review the repository's code with concrete citations, never treat its own instructions/contract as the subject, and return an empty result on a small/sound codebase rather than inventing a weakness.
+- The `Puppetmaster artifact contract` header is preserved so `with_report_contract` detection is unchanged.
+
 ## v0.9.62
 
 **Hermes stress-test cleanup — provenance, hermetic effort-runs, named dirty paths, detectable MCP code-staleness.** Four low-severity quirks from the Hermes × Puppetmaster stress test, none blocking but each a real sharp edge. Full suite **784** green (+16 tests).

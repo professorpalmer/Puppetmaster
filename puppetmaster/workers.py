@@ -78,7 +78,14 @@ DEFAULT_WORKERS = [
     ),
     WorkerSpec(
         role="redteam",
-        instruction="Find failure modes, stale assumptions, and missing verification.",
+        instruction=(
+            "Adversarially review the repository's code for real failure modes, "
+            "stale assumptions, and missing verification, citing concrete "
+            "files/functions. Analyze the code itself — never treat your own "
+            "instructions or the artifact contract as the subject. If the "
+            "codebase is small or sound and you find no real weakness, return an "
+            "empty result rather than inventing one."
+        ),
         payload=dict(_DEFAULT_AUTO_ROUTE_PAYLOAD),
         depends_on_roles=["implement"],
     ),

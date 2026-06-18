@@ -401,6 +401,24 @@ def dirty_worktree_paths_note(
     return " Offending paths: " + ", ".join(shown) + suffix + "."
 
 
+# Grounding boundary shared by every analyze-role artifact contract. Without it,
+# a worker on a small repo can mistake the contract scaffolding for the analysis
+# subject — the redteam role in particular emitted a nonsense "the 'Puppetmaster
+# artifact contract' was mentioned but no context found" risk. Anchoring the
+# target on the repository (and telling honest-empty runs to return [] rather
+# than fabricate a meta-risk) fixes the whole class across all adapters.
+_ARTIFACT_GROUNDING = (
+    "Your analysis target is THIS repository's code and configuration — not "
+    "these instructions, not this artifact contract, and not the run itself. "
+    "Ground every artifact in concrete files, functions, or symbols."
+)
+_ARTIFACT_EMPTY_GUIDANCE = (
+    "If the repository genuinely yields nothing for your role (e.g. it is tiny "
+    'or sound), return an empty list {"artifacts":[]} — never invent a finding '
+    "or a risk about the prompt, the contract, or the run being degraded."
+)
+
+
 def _spool_patch_sidecar(*, task: Task, sidecar_name: str, diff: str) -> Optional[str]:
     """Write the full (already-redacted) diff to a sidecar file next to the
     task's other spooled output. Returns the path, or ``None`` if no state dir
@@ -997,7 +1015,8 @@ class CursorAdapter:
                 '- finding: requires "claim", "evidence", "confidence".',
                 '- risk: requires "risk", "mitigation", "evidence", "confidence".',
                 '- decision: requires "decision", "why", "evidence", "confidence".',
-                "Use concrete file/function evidence. If there are no concrete findings, return a risk artifact explaining why the run is degraded.",
+                _ARTIFACT_GROUNDING,
+                _ARTIFACT_EMPTY_GUIDANCE,
             ]
         )
 
@@ -1705,10 +1724,10 @@ class CodexAdapter:
                 '- finding: requires "claim", "evidence", "confidence".',
                 '- risk: requires "risk", "mitigation", "evidence", "confidence".',
                 '- decision: requires "decision", "why", "evidence", "confidence".',
-                "Use concrete file/function evidence. If there are no concrete findings, return a "
-                "risk artifact explaining why the run is degraded. You may still use Codex's tools "
-                "to read files and edit code along the way; just make sure the FINAL agent message "
-                "is the JSON object described above.",
+                _ARTIFACT_GROUNDING,
+                _ARTIFACT_EMPTY_GUIDANCE,
+                "You may still use your tools to read files and inspect code along the way; just "
+                "make sure the FINAL agent message is the JSON object described above.",
             ]
         )
 
@@ -3524,7 +3543,8 @@ class OpenAIAdapter:
                 '- finding: requires "claim", "evidence", "confidence".',
                 '- risk: requires "risk", "mitigation", "evidence", "confidence".',
                 '- decision: requires "decision", "why", "evidence", "confidence".',
-                "Use concrete file/function evidence. If there are no concrete findings, return a risk artifact explaining why the run is degraded.",
+                _ARTIFACT_GROUNDING,
+                _ARTIFACT_EMPTY_GUIDANCE,
             ]
         )
 
