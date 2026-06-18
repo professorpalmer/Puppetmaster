@@ -1411,6 +1411,55 @@ def _run_git(
     return completed.stdout
 
 
+_CENSUS_FILE_LIMIT = 100
+_CENSUS_WALK_CAP = 2000
+
+
+def repo_file_census(
+    cwd: Union[Path, str, None],
+    *,
+    limit: int = _CENSUS_FILE_LIMIT,
+) -> tuple[list[str], int]:
+    """Bounded, ground-truth listing of files in a worker's working directory.
+
+    Returns ``(sample, total)`` — a sorted sample of at most ``limit``
+    repo-relative paths and the full file count. Prefers ``git ls-files`` (fast,
+    honours ``.gitignore``); falls back to a bounded ``os.walk`` for non-git
+    trees. Never raises: an unreadable/missing directory yields ``([], 0)``.
+
+    This is the anti-hallucination ground truth behind the analyze-prompt
+    census — the cheapest, earliest analyze worker was asserting "the repository
+    is empty" at full confidence when files plainly existed.
+
+    Uses a bounded ``os.walk`` (never spawns a subprocess) that skips the same
+    VCS/build/cache directories CodeGraph freshness ignores, so the listing is
+    real source rather than tooling noise.
+    """
+    if not cwd:
+        return [], 0
+    root = Path(cwd)
+    if not root.is_dir():
+        return [], 0
+    files = _census_walk_files(root)
+    files.sort()
+    return files[:limit], len(files)
+
+
+def _census_walk_files(root: Path) -> list[str]:
+    """Bounded filesystem walk skipping VCS/build/cache dirs. Never raises."""
+    found: list[str] = []
+    try:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in _FRESHNESS_SKIP_DIRS]
+            for name in filenames:
+                found.append(os.path.relpath(os.path.join(dirpath, name), root))
+                if len(found) >= _CENSUS_WALK_CAP:
+                    return found
+    except OSError:
+        return found
+    return found
+
+
 def _porcelain_path(line: str) -> Optional[str]:
     """Extract the path from a `git status --porcelain` line (dest on rename)."""
     if len(line) < 4:

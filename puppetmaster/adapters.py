@@ -19,6 +19,7 @@ from typing import Any, Optional, Protocol, Union
 from puppetmaster.codegraph import (
     enrich_prompt_with_codegraph,
     inject_worker_cli_env,
+    repo_file_census,
     scrub_foreign_interpreter_env,
 )
 from puppetmaster.fs_permissions import mkdir_private, open_private, write_private_text
@@ -417,6 +418,37 @@ _ARTIFACT_EMPTY_GUIDANCE = (
     'or sound), return an empty list {"artifacts":[]} — never invent a finding '
     "or a risk about the prompt, the contract, or the run being degraded."
 )
+
+def with_repo_census(prompt: str, cwd: Union[Path, str, None]) -> str:
+    """Append an authoritative repo file census so a worker can't hallucinate
+    an empty repository.
+
+    When files exist, the census states plainly that the repo is NOT empty and
+    tells the worker to read them (and to report a tooling failure rather than
+    assert emptiness if its own tools can't). When nothing can be enumerated we
+    add only a soft boundary — we never assert emptiness ourselves, since an
+    enumeration miss is not proof of an empty tree.
+    """
+    sample, total = repo_file_census(cwd)
+    if total <= 0:
+        return (
+            prompt
+            + "\n\nRepository file census: none enumerated. Do not assert the "
+            "repository is empty unless your own tools also show no files — if "
+            "they error, report a tooling failure, not an empty repository."
+        )
+    shown = ", ".join(sample)
+    overflow = total - len(sample)
+    more = f" (+{overflow} more)" if overflow > 0 else ""
+    return (
+        prompt
+        + f"\n\nRepository file census (ground truth — {total} file(s) under the "
+        f"working directory): {shown}{more}.\nThis census is authoritative: the "
+        "repository is NOT empty. Read the relevant files before reporting. Never "
+        "claim the repo is empty or 'starting from scratch' when files are listed "
+        "here; if your own tools cannot read them, report a tooling failure, not "
+        "an empty repository."
+    )
 
 
 def _spool_patch_sidecar(*, task: Task, sidecar_name: str, diff: str) -> Optional[str]:
@@ -855,6 +887,7 @@ class CursorAdapter:
             cwd=cwd,
             disabled=bool(task.payload.get("disable_codegraph", False)),
         )
+        prompt = with_repo_census(prompt, cwd)
         runner = Path(__file__).with_name("cursor_sdk_runner.mjs")
         environment = inject_worker_cli_env(os.environ.copy())
         apply_worktree_ports(environment, cwd)
@@ -1378,6 +1411,7 @@ class CodexAdapter:
             cwd=cwd,
             disabled=bool(task.payload.get("disable_codegraph", False)),
         )
+        prompt = with_repo_census(prompt, cwd)
         timeout_seconds = int(task.payload.get("timeout_seconds", 600))
         executable = task.payload.get("executable") or os.environ.get("CODEX_COMMAND") or "codex"
         command_base = command_parts(executable)
@@ -2338,6 +2372,7 @@ class HermesAdapter:
             cwd=cwd,
             disabled=bool(task.payload.get("disable_codegraph", False)),
         )
+        prompt = with_repo_census(prompt, cwd)
         timeout_seconds = int(task.payload.get("timeout_seconds", 600))
         executable = task.payload.get("executable") or os.environ.get("HERMES_COMMAND") or "hermes"
         command_base = command_parts(executable)
@@ -3268,6 +3303,7 @@ class OpenAIAdapter:
             cwd=cwd,
             disabled=bool(task.payload.get("disable_codegraph", False)),
         )
+        prompt = with_repo_census(prompt, cwd)
 
         api_key = task.payload.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
         base_url = (

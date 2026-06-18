@@ -17384,5 +17384,108 @@ class ArtifactContractGroundingTests(unittest.TestCase):
         self.assertIn("empty result", redteam.instruction)
 
 
+class RepoFileCensusTests(unittest.TestCase):
+    """A worker must not be able to hallucinate an empty repo at conf 1.00.
+
+    The cheapest, earliest analyze worker (explore, no deps, minimal effort)
+    was asserting "the repository is empty" while siblings analyzed six files.
+    An authoritative file census injected into the analyze prompt makes the
+    emptiness claim falsifiable.
+    """
+
+    def test_census_lists_files_and_skips_junk(self) -> None:
+        from puppetmaster.adapters import repo_file_census
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "cli.py").write_text("x", encoding="utf-8")
+            (root / "parser.py").write_text("x", encoding="utf-8")
+            (root / "__pycache__").mkdir()
+            (root / "__pycache__" / "junk.pyc").write_text("x", encoding="utf-8")
+            (root / ".git").mkdir()
+            (root / ".git" / "HEAD").write_text("ref", encoding="utf-8")
+            sample, total = repo_file_census(root)
+        self.assertIn("cli.py", sample)
+        self.assertIn("parser.py", sample)
+        self.assertNotIn("__pycache__/junk.pyc", sample)
+        self.assertEqual(total, 2)
+
+    def test_census_empty_dir(self) -> None:
+        from puppetmaster.adapters import repo_file_census
+
+        with TemporaryDirectory() as tmp:
+            self.assertEqual(repo_file_census(tmp), ([], 0))
+
+    def test_census_missing_dir_is_safe(self) -> None:
+        from puppetmaster.adapters import repo_file_census
+
+        self.assertEqual(repo_file_census("/no/such/dir/xyz"), ([], 0))
+        self.assertEqual(repo_file_census(None), ([], 0))
+
+    def test_census_truncates_with_overflow(self) -> None:
+        from puppetmaster.adapters import repo_file_census
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for i in range(120):
+                (root / f"f{i:03d}.py").write_text("x", encoding="utf-8")
+            sample, total = repo_file_census(root, limit=100)
+        self.assertEqual(total, 120)
+        self.assertEqual(len(sample), 100)
+
+    def test_with_census_states_not_empty_when_files_exist(self) -> None:
+        from puppetmaster.adapters import with_repo_census
+
+        with TemporaryDirectory() as tmp:
+            (Path(tmp) / "main.py").write_text("x", encoding="utf-8")
+            grounded = with_repo_census("PROMPT", tmp)
+        self.assertIn("PROMPT", grounded)
+        self.assertIn("main.py", grounded)
+        self.assertIn("NOT empty", grounded)
+        self.assertIn("tooling failure", grounded)
+
+    def test_with_census_soft_note_when_unenumerable(self) -> None:
+        from puppetmaster.adapters import with_repo_census
+
+        with TemporaryDirectory() as tmp:
+            grounded = with_repo_census("PROMPT", tmp)
+        # We never assert emptiness ourselves on a miss.
+        self.assertIn("none enumerated", grounded)
+        self.assertIn("Do not assert the repository is empty", grounded)
+
+    def test_analyze_paths_inject_census(self) -> None:
+        """Every read-only analyze adapter grounds its prompt with the census."""
+        from puppetmaster import adapters
+
+        task = Task(
+            job_id="job",
+            role="explore",
+            instruction="Map the problem.",
+            adapter="hermes",
+            payload={"prompt": "Map it", "cwd": "."},
+        )
+        seen = {}
+
+        def _capture(prompt, cwd):
+            seen["called"] = True
+            return prompt + "\n[CENSUS]"
+
+        # The census is injected before the worker subprocess; make the
+        # subprocess raise so we assert grounding happened without simulating a
+        # full Hermes run. Hermes analyze is the platform under migration.
+        with patch.object(adapters, "with_repo_census", side_effect=_capture), patch(
+            "puppetmaster.adapters.enrich_prompt_with_codegraph",
+            return_value=("P", False),
+        ), patch(
+            "puppetmaster.adapters.resolve_command", return_value="/usr/bin/hermes"
+        ), patch(
+            "puppetmaster.adapters.run_streamed_subprocess",
+            side_effect=RuntimeError("stop-after-census"),
+        ):
+            with self.assertRaises(RuntimeError):
+                adapters.HermesAdapter()._run_analyze(task, "goal", "w")
+        self.assertTrue(seen.get("called"))
+
+
 if __name__ == "__main__":
     unittest.main()

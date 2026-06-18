@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.9.64
+
+**Fix: the first/cheapest analyze worker can no longer hallucinate an empty repository.** On a 6-file fixture the `explore` worker — first in the DAG (no deps), routed to the cheapest model at `reasoning_effort: minimal` — reported *"The repository is empty."* at confidence **1.00** while every downstream worker analyzed the same files in detail. Root cause was a context-delivery gap, not a model whim: Puppetmaster only injects a file listing via CodeGraph when `.codegraph/` exists, and dependent workers also inherit prior findings (which already cite files) through `prompt_with_memory`. The dependency-free first worker had neither — no index context, no memory — so the laziest model "saw" a bare cwd and asserted emptiness. Full suite **795** green (+7 tests).
+
+- **Authoritative repo file census on every analyze prompt.** A new `repo_file_census` (bounded `os.walk`, skips the same VCS/build/cache dirs as CodeGraph freshness, never spawns a subprocess) feeds `with_repo_census`, which appends a ground-truth file listing to all four analyze adapters (Cursor, Codex, Hermes, OpenAI) *after* CodeGraph enrichment. When files exist the prompt states plainly that the repository is **NOT empty**, tells the worker to read them, and instructs it to report a *tooling failure* rather than assert emptiness if its own tools can't read them — so a "starting from scratch" claim is now falsifiable against the listing the model is holding.
+- **No false-empty on an enumeration miss.** When nothing can be enumerated the census adds only a soft boundary ("do not assert empty unless your tools also show none; if they error, report a tooling failure") — Puppetmaster never asserts emptiness on the worker's behalf.
+- **Independent of CodeGraph and memory.** The census grounds every analyze worker regardless of `.codegraph/` presence, `disable_codegraph`, or DAG position, closing the gap that left the dependency-free first worker ungrounded.
+
 ## v0.9.63
 
 **Fix: analyze workers no longer mistake the artifact contract for the analysis target.** On a small repo the redteam role emitted a nonsense risk — *"Insufficient information… 'Puppetmaster artifact contract' was mentioned but no context found"* — because the contract scaffolding leaked into the analysis subject, compounded by a contract line that *ordered* the model to fabricate a degraded-run risk whenever it found nothing. Other roles grounded on the code fine; redteam (last in the DAG, adversarial framing) tripped. Full suite **788** green (+4 tests).
