@@ -1,6 +1,6 @@
 # How Puppetmaster compares
 
-Short version: **Puppetmaster is not another agent framework.** LangGraph, CrewAI, AutoGen/AG2, and the Claude Agent SDK are libraries you write code against to *build* an agent. Puppetmaster sits one layer up — it's a **supervisor that drives the agent CLIs/SDKs you already pay for** (Cursor, Claude Code, Codex, the OpenAI API), routes each task to the cheapest model that can handle it, keeps the spend inside your existing subscription, and stores every worker's output as a typed artifact so follow-ups cost zero tokens.
+Short version: **Puppetmaster is not another agent framework.** LangGraph, CrewAI, AutoGen/AG2, and the Claude Agent SDK are libraries you write code against to *build* an agent. Puppetmaster sits one layer up — it's a **supervisor that drives the agent CLIs/SDKs you already pay for** (Cursor, Claude Code, Codex, the OpenAI API, and Hermes), routes each task to the cheapest model that can handle it, keeps the spend inside your existing subscription, and stores every worker's output as a typed artifact so follow-ups cost zero tokens.
 
 So this isn't "Puppetmaster vs LangGraph, who wins." They solve different problems and compose fine. This page is here to answer the only question that matters at a glance: *given what I'm trying to do, do I want this?*
 

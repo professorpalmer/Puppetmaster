@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.9.69
+
+**Hermes is now documented and marketed as a first-class worker adapter — validated end-to-end through the orchestrator.** The NousResearch [Hermes](https://hermes-agent.nousresearch.com) CLI joins Cursor, Claude Code, Codex, and OpenAI as a supported analyze + full-edit adapter. (The adapter code shipped earlier; this release validates it on a real run and surfaces it across the README, FEATURES, ADAPTERS, and COMPARISON docs.)
+
+- **`hermes` adapter (analyze + full-edit).** Shells out to `hermes chat` headlessly, mirroring the Claude Code / Codex subprocess + git-snapshot + sidecar-spool + PATCH-attribution semantics. Handles Hermes' two quirks — process-group isolation (`start_new_session=True`) and unreliable exit codes (success is read from the git diff in implement mode, from stdout in analyze mode). CodeGraph context is auto-injected when `.codegraph/` exists. Wire the MCP into Hermes with `puppetmaster install-hermes-mcp`. Adapter docs in [docs/ADAPTERS.md](ADAPTERS.md#hermes).
+- **Validated end-to-end.** A real analyze run through the orchestrator returned `result: passed`, read the repo (cited `router.py`, `models.py`, `sqlite_store.py`), confirmed `context:codegraph` injection, and parsed the worker output into 3 typed `finding` artifacts + 1 `verification` that stitched and promoted to memory cleanly. 29 Hermes adapter unit tests pass.
+
+## v0.9.68
+
+**The CodeGraph better-sqlite3 repair/resolve path works on every harness, not just Cursor.** The repair that was hardwired to Cursor's bundled Node now resolves a runtime Node on any harness.
+
+- **CodeGraph repair works on every harness.** `find_cursor_node` → `find_runtime_node` (env override → Cursor's Node → `node` on PATH), and `find_codegraph_install` now follows the `codegraph` shim back to its package root when `npm root -g` points at the wrong prefix. Harness-neutral user-facing messages throughout.
+
 ## v0.9.67
 
 **Findings dedup that actually collapses paraphrases: evidence-locus-anchored clustering.** The 0.9.66 dedup was wired correctly (the stitch path renders Findings through `_bullet_payloads(dedupe=True)`, and `show`/`await` read that stitched output) — but its similarity test required exact/substring match or ≥0.8 token overlap, which paraphrase-level duplicates from different workers ("multiply uses an O(n) loop" vs "multiplication is implemented inefficiently") fall well under. On a live run, one bug still surfaced 3–5× because the workers cited the same files but worded it differently. (A stress run that showed *zero* collapse, including exact dupes, was a stale-server artifact — the daemon was still on pre-0.9.66 code; the 0.9.65 staleness nudge now surfaces exactly that.) Full suite **812** green.

@@ -164,6 +164,46 @@ If it returns `failure=missing_cli`, install the CLI with `npm install -g @opena
 
 Like Claude Code, when Codex edits tracked files, Puppetmaster records a `patch` artifact alongside the verification artifact.
 
+### `hermes`
+
+Shells out to the NousResearch [Hermes](https://hermes-agent.nousresearch.com) CLI (`hermes chat`) — a personal AI agent with its own terminal, browser, memory, and skills. The adapter runs Hermes headlessly (`-q`/`--quiet`/`--cli`) as either an **analyze** worker (read-only findings) or a **full-edit** worker (`payload.mode="implement"`), mirroring the Claude Code / Codex subprocess, git-snapshot, sidecar-spool, and PATCH-attribution semantics.
+
+Two Hermes quirks the adapter handles explicitly:
+
+- **Process-group isolation.** Hermes kills its own process group on exit, so every run uses `start_new_session=True` — teardown can never reach the orchestrator parent.
+- **Unreliable exit codes.** A non-zero exit after a successful edit is common (provider flakiness, pgroup teardown). Implement-mode success is therefore determined from the captured **git diff**, and analyze-mode success is parsed from stdout — not from the exit code alone.
+
+Like the other CodeGraph-aware adapters, a Hermes worker gets task-relevant CodeGraph context auto-injected into its prompt when `.codegraph/` exists; the verification artifact's `evidence` then includes `context:codegraph`.
+
+Requirements:
+
+- Hermes CLI installed and on PATH (binary: `hermes`), or `HERMES_COMMAND` / `payload.executable` set to a custom path.
+- Hermes authenticated with at least one inference provider (`~/.hermes/.env` API keys or `~/.hermes/auth.json` OAuth state). `puppetmaster doctor` reports Hermes credential visibility without printing values.
+
+Register the Puppetmaster MCP inside Hermes so the Hermes agent can drive swarms:
+
+```bash
+python -m puppetmaster install-hermes-mcp
+```
+
+If the adapter returns `failure=missing_cli`, install Hermes or set `HERMES_COMMAND` / `payload.executable`.
+If it returns `failure=dirty_worktree` in implement mode, run from a clean tree or set `payload.allow_dirty=true`.
+
+```json
+{
+  "role": "hermes-analyze",
+  "instruction": "Use Hermes to map the auth flow and emit evidenced findings.",
+  "adapter": "hermes",
+  "payload": {
+    "cwd": ".",
+    "toolsets": [],
+    "timeout_seconds": 240
+  }
+}
+```
+
+When a Hermes implement worker edits tracked files, Puppetmaster records a `patch` artifact alongside the verification artifact.
+
 ## Adding A Provider
 
 1. Implement a class with `run(task, goal, worker_id) -> list[Artifact]`.

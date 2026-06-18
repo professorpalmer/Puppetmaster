@@ -4,7 +4,7 @@ A full map of what ships today, plus the adapter matrix. For the design rational
 
 ## Adapters
 
-Four production adapters live; eleven tiers in the starter registry (5 Cursor/Claude + 4 OpenAI + 2 Codex). Tier and pricing details in [docs/MODEL_ROUTING.md](MODEL_ROUTING.md); adapter wiring details in [docs/ADAPTERS.md](ADAPTERS.md).
+Five production adapters live; eleven tiers in the starter registry (5 Cursor/Claude + 4 OpenAI + 2 Codex). Tier and pricing details in [docs/MODEL_ROUTING.md](MODEL_ROUTING.md); adapter wiring details in [docs/ADAPTERS.md](ADAPTERS.md).
 
 | Adapter | What it's for | Telemetry | Setup |
 |---|---|---|---|
@@ -12,6 +12,7 @@ Four production adapters live; eleven tiers in the starter registry (5 Cursor/Cl
 | `claude-code` | Full-edit workflows via the `claude` CLI | usage from CLI | `npm i -g @anthropic-ai/claude-code` + `ANTHROPIC_API_KEY` |
 | `openai` | Direct Chat Completions (the most pricing-transparent path) | real `usage.prompt_tokens`/`completion_tokens` | `OPENAI_API_KEY` |
 | `codex` | Full-edit via the OpenAI Codex CLI agent loop | `input_tokens` + `output_tokens` + `cached_input_tokens` + `reasoning_output_tokens` per turn | `npm i -g @openai/codex` + `codex login` |
+| `hermes` | Analyze + full-edit via the NousResearch Hermes CLI (`hermes chat`); auto-injects CodeGraph context, parses typed artifacts | exit-code- and diff-based success (Hermes exit codes are unreliable) | `pipx install hermes-agent` (or any `hermes` on PATH) + `puppetmaster install-hermes-mcp` |
 | `shell` | Bounded verification commands | n/a | none |
 
 ## What works today
@@ -40,4 +41,4 @@ Four production adapters live; eleven tiers in the starter registry (5 Cursor/Cl
 
 ## Status
 
-Puppetmaster is **daily-driver beta software**. The runtime contract is real, tests are automated, SQLite is the default backend, jobs fail closed, Cursor Agent MCP is live, and Claude Code + Codex have both been validated as full-edit adapters that emit patch artifacts. It is credible for supervised local engineering workflows. It is not yet a hosted multi-user production service.
+Puppetmaster is **daily-driver beta software**. The runtime contract is real, tests are automated, SQLite is the default backend, jobs fail closed, Cursor Agent MCP is live, and Claude Code + Codex have both been validated as full-edit adapters that emit patch artifacts. Hermes is wired as a fifth adapter (analyze + full-edit), with an end-to-end analyze run validated through the orchestrator (typed findings, CodeGraph context injection, stitched summary). It is credible for supervised local engineering workflows. It is not yet a hosted multi-user production service.

@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/professorpalmer/Puppetmaster/blob/main/LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://github.com/professorpalmer/Puppetmaster/blob/main/pyproject.toml)
 
-**Turn Cursor, Claude Code (Anthropic or AWS Bedrock), the OpenAI API, or the Codex CLI into an orchestrator that routes every task to the cheapest model that can handle it, runs workers as independent processes, and stores their output as typed SQLite artifacts so follow-ups cost zero tokens.**
+**Turn Cursor, Claude Code (Anthropic or AWS Bedrock), the OpenAI API, the Codex CLI, or Hermes into an orchestrator that routes every task to the cheapest model that can handle it, runs workers as independent processes, and stores their output as typed SQLite artifacts so follow-ups cost zero tokens.**
 
 <img src="https://raw.githubusercontent.com/professorpalmer/Puppetmaster/main/docs/demo.gif" alt="Puppetmaster 60-second demo: cost routing, swarm fan-out, stitched summary, $0 follow-ups" width="100%" />
 
@@ -26,7 +26,14 @@ puppetmaster setup               # doctor + models init + MCP installers + rules
 <img src="https://raw.githubusercontent.com/professorpalmer/Puppetmaster/main/docs/setup-guide.jpg" alt="Puppetmaster setup guide: install once with pipx, wire your platform (Cursor, Claude Code, Codex CLI, or the OpenAI API), then verify with puppetmaster doctor." width="640" />
 </p>
 
-That's the whole install. `setup` runs every step idempotently, skips any tool that isn't present, and prints what it did. Restart Cursor (or open a fresh Codex / Claude session) and the agent gains 32+ `puppetmaster_*` tools, a rule nudging it to use them, and deterministic [auto-invocation hooks](https://github.com/professorpalmer/Puppetmaster#auto-invocation) that delegate real work for you. The classifier keeps trivial edits and read-only inspection inline, and the whole thing is kill-switchable with `PUPPETMASTER_AUTO_INVOKE_DISABLED=1`.
+That's the whole install. `setup` runs every step idempotently, skips any tool that isn't present, and prints what it did. Restart Cursor (or open a fresh Codex / Claude / Hermes session) and the agent gains 32+ `puppetmaster_*` tools, a rule nudging it to use them, and deterministic [auto-invocation hooks](https://github.com/professorpalmer/Puppetmaster#auto-invocation) that delegate real work for you. The classifier keeps trivial edits and read-only inspection inline, and the whole thing is kill-switchable with `PUPPETMASTER_AUTO_INVOKE_DISABLED=1`.
+
+> **🪽 New — Hermes support.** [Hermes](https://hermes-agent.nousresearch.com) is now a first-class worker adapter alongside Cursor, Claude Code, Codex, and OpenAI. Wire it with `puppetmaster install-hermes-mcp`, then run Hermes workers through the same router, swarms, typed artifacts, and `$0` recall as every other harness. Details in [docs/ADAPTERS.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/ADAPTERS.md#hermes).
+
+<p align="center">
+<img src="https://raw.githubusercontent.com/professorpalmer/Puppetmaster/main/docs/hermes-support.png" alt="Hermes × Puppetmaster: Hermes is now a first-class adapter. Puppetmaster brings cost-aware routing, swarm fan-out, CodeGraph context, $0 follow-ups, self-healing, and durable auditable state to Hermes — five harnesses, one orchestrator." width="100%" />
+</p>
+
 
 To run benchmarks or hack on it, clone instead — see [Contributing](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/CONTRIBUTING.md). (`pipx` keeps the CLI in its own isolated environment — the recommended way to install a command-line app.)
 
@@ -61,7 +68,7 @@ pip uninstall puppetmaster-ai   # or: pipx uninstall puppetmaster-ai
 Think **Redis/Gunicorn for agentic engineering**:
 
 ```text
-Cursor Agent / Claude Code / OpenAI / Codex CLI / shell
+Cursor Agent / Claude Code / OpenAI / Codex CLI / Hermes / shell
         |
         v
 Puppetmaster supervisor  ──>  task-aware model router (auto-routes by cost)
@@ -75,7 +82,7 @@ live artifact board  ──>  stitched summary  ──>  0-token follow-up reads
 
 Puppetmaster isn't trying to beat native IDE subagents at every tiny task. It's for the work that gets messy: long repo investigations, conflicting hypotheses, repeated handoffs, flaky memory, and code changes that need evidence, replay, and approval gates. The rationale and failure modes it fixes are in [docs/WHY.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/WHY.md).
 
-**How it's different:** LangGraph, CrewAI, and the Claude Agent SDK are libraries you write code against to *build* an agent. Puppetmaster sits one layer up — it **orchestrates the agent CLIs you already pay for** (Cursor, Claude Code, Codex, OpenAI), routes each task to the cheapest sufficient model, keeps the spend inside your subscription, and self-heals when a provider is down. Full side-by-side + "pick X instead if…" in [docs/COMPARISON.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/COMPARISON.md).
+**How it's different:** LangGraph, CrewAI, and the Claude Agent SDK are libraries you write code against to *build* an agent. Puppetmaster sits one layer up — it **orchestrates the agent CLIs you already pay for** (Cursor, Claude Code, Codex, OpenAI, and now **Hermes**), routes each task to the cheapest sufficient model, keeps the spend inside your subscription, and self-heals when a provider is down. Full side-by-side + "pick X instead if…" in [docs/COMPARISON.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/COMPARISON.md).
 
 <p align="center">
 <img src="https://raw.githubusercontent.com/professorpalmer/Puppetmaster/main/docs/layer-above.jpg" alt="A layer above your agents, not another framework. Cursor / Claude Code / Codex / OpenAI feed into Puppetmaster (cost-aware router + supervisor), which fans out to independent worker processes, SQLite typed artifacts, and $0 follow-up reads. LangGraph / CrewAI are libraries you write code against to build an agent; Puppetmaster drives the agent CLIs you already use." width="100%" />

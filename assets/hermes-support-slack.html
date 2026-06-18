@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Hermes × Puppetmaster — Support Added</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { background: #0d1020; }
+  body {
+    width: 1200px;
+    font-family: -apple-system, "SF Pro Display", "Segoe UI", Helvetica, Arial, sans-serif;
+    color: #e8edff;
+  }
+  .poster {
+    width: 1200px;
+    background:
+      radial-gradient(1100px 520px at 88% -12%, rgba(255, 196, 92, 0.20), transparent 58%),
+      radial-gradient(1000px 520px at 6% -8%, rgba(124, 92, 255, 0.26), transparent 60%),
+      radial-gradient(900px 480px at 0% 112%, rgba(64, 196, 255, 0.14), transparent 55%),
+      #0d1020;
+    padding: 54px 60px 44px;
+  }
+
+  /* ---------- header ---------- */
+  .header { display: flex; align-items: center; gap: 22px; margin-bottom: 16px; }
+  .wing { font-size: 60px; line-height: 1; filter: drop-shadow(0 6px 18px rgba(255,196,92,.45)); }
+  .title h1 { font-size: 42px; font-weight: 800; letter-spacing: -0.5px; }
+  .title h1 .h { color: #ffd27d; }
+  .title h1 .x { color: #5b6585; font-weight: 600; margin: 0 6px; }
+  .title h1 .p { color: #a78bfa; }
+  .title p { font-size: 18.5px; color: #93a0c4; margin-top: 7px; max-width: 880px; }
+  .pin {
+    margin-left: auto; flex-shrink: 0;
+    background: rgba(255,210,125,.12); border: 1px solid rgba(255,210,125,.42);
+    color: #ffd27d; font-size: 13.5px; font-weight: 700; letter-spacing: .8px;
+    padding: 8px 16px; border-radius: 999px; text-transform: uppercase; text-align: center;
+    line-height: 1.35;
+  }
+
+  /* ---------- announcement banner ---------- */
+  .ann {
+    margin-top: 26px;
+    background: linear-gradient(135deg, rgba(255,196,92,.18), rgba(124,92,255,.14));
+    border: 1px solid rgba(255,210,125,.4);
+    border-radius: 18px; padding: 24px 30px;
+    display: flex; align-items: center; gap: 22px;
+  }
+  .ann .tag {
+    flex-shrink: 0;
+    font-size: 13px; font-weight: 800; letter-spacing: 1.2px;
+    text-transform: uppercase; color: #0d1020; background: #ffd27d;
+    padding: 7px 14px; border-radius: 7px;
+  }
+  .ann .msg { font-size: 21px; font-weight: 600; line-height: 1.5; }
+  .ann .msg b { color: #ffd27d; font-weight: 800; }
+  .ann .msg .pp { color: #c4b5fd; font-weight: 800; }
+
+  /* ---------- "from Hermes' mouth" quote ---------- */
+  .speak {
+    margin-top: 24px;
+    background: #090b16; border: 1px solid #252a45; border-left: 4px solid #ffd27d;
+    border-radius: 14px; padding: 22px 28px;
+    display: flex; gap: 20px; align-items: flex-start;
+  }
+  .speak .av {
+    width: 50px; height: 50px; border-radius: 13px; flex-shrink: 0;
+    background: rgba(255,210,125,.14); border: 1px solid rgba(255,210,125,.5);
+    display: flex; align-items: center; justify-content: center; font-size: 26px;
+  }
+  .speak .q { font-size: 18px; line-height: 1.65; color: #d6e2ff; font-style: italic; }
+  .speak .q b { color: #ffe7b3; font-weight: 700; font-style: normal; }
+  .speak .who { margin-top: 10px; font-size: 13.5px; color: #7c8099; font-style: normal; letter-spacing: .3px; }
+  .speak .who b { color: #ffd27d; }
+
+  /* ---------- what it brings grid ---------- */
+  .sec-label {
+    margin-top: 30px; margin-bottom: 4px;
+    display: inline-block; font-size: 13px; font-weight: 800; letter-spacing: 1.2px;
+    text-transform: uppercase; color: #0d1020; background: #a78bfa;
+    padding: 5px 13px; border-radius: 7px;
+  }
+  .grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 18px; margin-top: 18px; }
+  .card {
+    background: rgba(255,255,255,.035); border: 1px solid #252a45;
+    border-radius: 16px; padding: 20px 22px; min-width: 0;
+  }
+  .card .ic {
+    width: 38px; height: 38px; border-radius: 10px; display: flex;
+    align-items: center; justify-content: center; font-size: 19px; margin-bottom: 12px;
+    background: rgba(124,92,255,.16); border: 1px solid rgba(167,139,250,.45);
+  }
+  .card.cy .ic { background: rgba(103,232,249,.13); border-color: rgba(103,232,249,.45); }
+  .card.gd .ic { background: rgba(255,210,125,.13); border-color: rgba(255,210,125,.45); }
+  .card.gr .ic { background: rgba(110,231,183,.13); border-color: rgba(110,231,183,.45); }
+  .card h3 { font-size: 18px; font-weight: 700; margin-bottom: 7px; }
+  .card p { font-size: 14.5px; color: #93a0c4; line-height: 1.55; }
+  .card p b { color: #e8edff; font-weight: 600; }
+
+  /* ---------- setup strip ---------- */
+  .setup {
+    margin-top: 26px; display: grid; grid-template-columns: 1.35fr 1fr; gap: 20px;
+  }
+  .scard {
+    background: rgba(255,255,255,.035); border: 1px solid #252a45;
+    border-radius: 16px; padding: 20px 24px; min-width: 0;
+  }
+  .scard h3 { font-size: 17px; font-weight: 700; margin-bottom: 12px; display: flex; align-items: center; gap: 9px; }
+  .code {
+    font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+    display: block; background: #090b16; border: 1px solid #252a45;
+    border-radius: 11px; padding: 15px 18px; font-size: 14.5px; line-height: 1.75;
+    color: #d6e2ff; white-space: pre; overflow-x: hidden;
+  }
+  .code .c { color: #5b6585; }
+  .code .p { color: #67e8f9; }
+  .code .hl { color: #ffd27d; font-weight: 600; }
+  .scard .note { font-size: 13.5px; color: #93a0c4; margin-top: 11px; line-height: 1.5; }
+  .scard .note code { color: #c4b5fd; font-size: 12.5px; background: rgba(167,139,250,.1); padding: 1px 6px; border-radius: 5px; }
+
+  /* ---------- footer ---------- */
+  .footer {
+    margin-top: 28px; display: flex; align-items: center; justify-content: space-between;
+    border-top: 1px solid #252a45; padding-top: 20px;
+    font-size: 14.5px; color: #93a0c4;
+  }
+  .footer b { color: #ffd27d; font-weight: 600; }
+  .footer .repo { font-family: "SF Mono", ui-monospace, Menlo, monospace; font-size: 14px; color: #67e8f9; }
+</style>
+</head>
+<body>
+<div class="poster">
+
+  <div class="header">
+    <div class="wing">🪽</div>
+    <div class="title">
+      <h1><span class="h">Hermes</span><span class="x">×</span><span class="p">Puppetmaster</span></h1>
+      <p>Hermes is now a first-class adapter. The orchestrator that drives Cursor, Claude Code, Codex &amp; OpenAI now drives Hermes too — same routing, same swarms, same $0 recall.</p>
+    </div>
+    <div class="pin">🚀 Now<br>Shipping</div>
+  </div>
+
+  <div class="ann">
+    <span class="tag">New</span>
+    <div class="msg"><b>Hermes support added.</b> Run me as a worker harness under <span class="pp">Puppetmaster</span> — fan out parallel agents, route every task to the cheapest model that can do it, and replay results for free.</div>
+  </div>
+
+  <div class="speak">
+    <div class="av">🤖</div>
+    <div>
+      <div class="q">"I'm good on my own — but with Puppetmaster behind me I stop re-reading the same repo on every turn. It <b>fans my work into parallel workers</b>, routes each one to the <b>cheapest model that can handle it</b>, feeds them <b>CodeGraph repo intelligence</b> before they think, and stores every result so your follow-up questions cost <b>$0</b>. I keep the conversation; it keeps the receipts."</div>
+      <div class="who">— <b>Hermes</b>, on what changed</div>
+    </div>
+  </div>
+
+  <div class="sec-label">What Puppetmaster brings to me</div>
+  <div class="grid">
+    <div class="card">
+      <div class="ic">🧠</div>
+      <h3>Cost-aware routing</h3>
+      <p>Every task lands on the <b>cheapest sufficient model</b>, with a per-decision audit trail and a savings ledger. Pin a model only when you mean to.</p>
+    </div>
+    <div class="card cy">
+      <div class="ic">🕸️</div>
+      <h3>Swarm fan-out</h3>
+      <p>Audits, reviews and "find all X" run as <b>independent parallel workers</b> in isolated worktrees — no context flooding, no clobbered edits.</p>
+    </div>
+    <div class="card gd">
+      <div class="ic">📈</div>
+      <h3>CodeGraph context</h3>
+      <p>Workers get <b>task-relevant graph context injected</b> before the model call — symbols, callers, blast radius — instead of grepping blind.</p>
+    </div>
+    <div class="card gr">
+      <div class="ic">💾</div>
+      <h3>$0 follow-ups</h3>
+      <p>Results persist as typed artifacts in SQLite. <b>Re-read any past job for free</b> — zero tokens, across sessions.</p>
+    </div>
+    <div class="card">
+      <div class="ic">🔁</div>
+      <h3>Self-healing</h3>
+      <p>Provider down or model unavailable? It <b>reroutes to a funded alternate</b> and escalates low-confidence work automatically.</p>
+    </div>
+    <div class="card cy">
+      <div class="ic">🧾</div>
+      <h3>Durable &amp; auditable</h3>
+      <p>Fail-closed jobs, replayable runs, approval gates before edits. <b>Aviation-grade rigor</b> for handing it your repo.</p>
+    </div>
+  </div>
+
+  <div class="setup">
+    <div class="scard">
+      <h3>⚙️ Wire Hermes in</h3>
+      <div class="code"><span class="p">$</span> pipx install puppetmaster-ai
+<span class="p">$</span> <span class="hl">puppetmaster setup</span>            <span class="c"># doctor + models + MCP</span>
+<span class="p">$</span> <span class="hl">puppetmaster install-hermes-mcp</span></div>
+      <div class="note">Then restart your Hermes session — <code>puppetmaster doctor</code> should list <code>hermes</code> as an enabled adapter.</div>
+    </div>
+    <div class="scard">
+      <h3>🚀 First thing to ask me</h3>
+      <div class="code"><span class="c"># straight to Hermes:</span>
+"Use Puppetmaster to start a
+ swarm on this repo and give
+ me the job id."</div>
+      <div class="note">I return the <code>job_id</code> instantly and stream findings as workers land them.</div>
+    </div>
+  </div>
+
+  <div class="footer">
+    <div><b>v0.9.68</b> — five harnesses, one orchestrator. Cursor · Claude Code · Codex · OpenAI · <b>Hermes</b></div>
+    <div class="repo">github.com/professorpalmer/Puppetmaster</div>
+  </div>
+
+</div>
+</body>
+</html>
