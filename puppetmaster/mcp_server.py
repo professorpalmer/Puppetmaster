@@ -34,6 +34,7 @@ from puppetmaster.codegraph_repair import repair_codegraph_sqlite
 from puppetmaster.mcp_registry import (
     HeartbeatThread,
     deregister as registry_deregister,
+    installed_puppetmaster_version,
     kill_stale as registry_kill_stale,
     list_entries as registry_list_entries,
     prune_dead as registry_prune_dead,
@@ -42,6 +43,13 @@ from puppetmaster.mcp_registry import (
 )
 from puppetmaster.state import resolve_state_dir
 from puppetmaster.store_factory import create_store
+
+# Snapshot the version this server process loaded at startup. A long-lived stdio
+# MCP server keeps these modules in memory; an in-place `pip install -U` changes
+# what's on disk but cannot reload us, so this constant stays the running value
+# while `installed_puppetmaster_version()` reflects the disk. Comparing them is
+# how we turn silent staleness into a visible per-call nudge.
+from puppetmaster import __version__ as _SERVER_RUNNING_VERSION
 
 
 JsonObject = dict[str, Any]
@@ -1087,11 +1095,85 @@ def handle_message(message: JsonObject) -> Optional[JsonObject]:
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
 
+_SERVER_UPDATE_CHECK_TTL_SECONDS = 30.0
+_server_update_cache: dict[str, Any] = {"checked_at": 0.0, "note": None}
+_server_update_lock = threading.Lock()
+
+
+def reset_server_update_cache() -> None:
+    """Drop the cached staleness verdict (used by tests; harmless in prod)."""
+    with _server_update_lock:
+        _server_update_cache["checked_at"] = 0.0
+        _server_update_cache["note"] = None
+
+
+def _version_tuple(value: str) -> Optional[tuple[int, ...]]:
+    """Leading-numeric dotted version as a tuple, or None if unparseable."""
+    nums: list[int] = []
+    for part in value.strip().split("."):
+        digits = ""
+        for ch in part:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if not digits:
+            return None
+        nums.append(int(digits))
+    return tuple(nums) or None
+
+
+def _on_disk_is_newer(on_disk: str, running: str) -> bool:
+    parsed_disk, parsed_running = _version_tuple(on_disk), _version_tuple(running)
+    if parsed_disk is not None and parsed_running is not None:
+        return parsed_disk > parsed_running
+    # Unparseable on either side: any difference is worth surfacing rather than
+    # silently swallowing a real upgrade.
+    return on_disk != running
+
+
+def server_update_note(*, now: Optional[float] = None) -> Optional[str]:
+    """One-line nudge when newer puppetmaster-ai code is on disk than this
+    long-lived server loaded at startup.
+
+    The stdio server can't hot-reload (the client owns the pipe), so silent
+    staleness cost a manual kill/toggle/reconnect round-trip every upgrade.
+    Surfacing it in every tool response makes it a visible nudge. Cached with a
+    short TTL so the hot path doesn't re-scan package metadata on every call.
+    """
+    moment = time.time() if now is None else now
+    with _server_update_lock:
+        age = moment - _server_update_cache["checked_at"]
+        if age < _SERVER_UPDATE_CHECK_TTL_SECONDS and _server_update_cache["checked_at"]:
+            return _server_update_cache["note"]
+    running = _SERVER_RUNNING_VERSION
+    on_disk = installed_puppetmaster_version()
+    note: Optional[str] = None
+    if running and on_disk and on_disk != running and _on_disk_is_newer(on_disk, running):
+        note = (
+            f"Puppetmaster MCP server is running {running} but {on_disk} is "
+            "installed on disk. Restart it — toggle the MCP server in your client, "
+            "or run `puppetmaster mcp cleanup --kill-stale` — to load the new code."
+        )
+    with _server_update_lock:
+        _server_update_cache["checked_at"] = moment
+        _server_update_cache["note"] = note
+    return note
+
+
 def call_tool(name: str, arguments: JsonObject) -> JsonObject:
     tool = _tool_registry().get(name)
     if tool is None:
         raise ValueError(f"Unknown Puppetmaster tool: {name}")
-    return tool.handler(arguments)
+    result = tool.handler(arguments)
+    # Push-style staleness nudge: every tool response carries a one-line warning
+    # when a newer puppetmaster-ai is installed than this server is running, so a
+    # daily-driver user doesn't have to run `mcp status` to discover it.
+    if isinstance(result, dict):
+        note = server_update_note()
+        if note:
+            result.setdefault("server_update_available", note)
+    return result
 
 
 # The tool list and name->tool map are static for the life of the process, but

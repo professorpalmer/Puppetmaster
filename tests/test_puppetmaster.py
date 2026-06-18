@@ -17487,5 +17487,81 @@ class RepoFileCensusTests(unittest.TestCase):
         self.assertTrue(seen.get("called"))
 
 
+class McpServerUpdateNudgeTests(unittest.TestCase):
+    """A long-lived stdio MCP server can't hot-reload; surface newer on-disk
+    code as a one-line nudge in every tool response instead of a silent gap."""
+
+    def setUp(self) -> None:
+        from puppetmaster import mcp_server
+
+        self.mcp = mcp_server
+        mcp_server.reset_server_update_cache()
+        self.addCleanup(mcp_server.reset_server_update_cache)
+
+    def test_note_when_disk_is_newer(self) -> None:
+        with patch.object(self.mcp, "_SERVER_RUNNING_VERSION", "0.9.63"), patch.object(
+            self.mcp, "installed_puppetmaster_version", return_value="0.9.64"
+        ):
+            note = self.mcp.server_update_note(now=1000.0)
+        self.assertIsNotNone(note)
+        self.assertIn("0.9.63", note)
+        self.assertIn("0.9.64", note)
+        self.assertIn("Restart", note)
+
+    def test_no_note_when_versions_match(self) -> None:
+        with patch.object(self.mcp, "_SERVER_RUNNING_VERSION", "0.9.64"), patch.object(
+            self.mcp, "installed_puppetmaster_version", return_value="0.9.64"
+        ):
+            self.assertIsNone(self.mcp.server_update_note(now=1000.0))
+
+    def test_no_note_on_downgrade(self) -> None:
+        # A stale env where disk is *older* shouldn't nag — that's not an upgrade.
+        with patch.object(self.mcp, "_SERVER_RUNNING_VERSION", "0.9.64"), patch.object(
+            self.mcp, "installed_puppetmaster_version", return_value="0.9.63"
+        ):
+            self.assertIsNone(self.mcp.server_update_note(now=1000.0))
+
+    def test_no_note_when_disk_version_unknown(self) -> None:
+        with patch.object(self.mcp, "_SERVER_RUNNING_VERSION", "0.9.64"), patch.object(
+            self.mcp, "installed_puppetmaster_version", return_value=None
+        ):
+            self.assertIsNone(self.mcp.server_update_note(now=1000.0))
+
+    def test_note_is_cached_within_ttl(self) -> None:
+        with patch.object(self.mcp, "_SERVER_RUNNING_VERSION", "0.9.63"), patch.object(
+            self.mcp, "installed_puppetmaster_version", return_value="0.9.64"
+        ) as disk:
+            first = self.mcp.server_update_note(now=1000.0)
+            second = self.mcp.server_update_note(now=1005.0)  # within 30s TTL
+        self.assertEqual(first, second)
+        self.assertEqual(disk.call_count, 1)
+
+    def test_call_tool_annotates_stale_response(self) -> None:
+        from types import SimpleNamespace
+
+        fake = {"x": SimpleNamespace(handler=lambda args: {"ok": True})}
+        with patch.object(self.mcp, "_tool_registry", return_value=fake), patch.object(
+            self.mcp, "_SERVER_RUNNING_VERSION", "0.9.63"
+        ), patch.object(
+            self.mcp, "installed_puppetmaster_version", return_value="0.9.64"
+        ):
+            result = self.mcp.call_tool("x", {})
+        self.assertTrue(result["ok"])
+        self.assertIn("server_update_available", result)
+        self.assertIn("0.9.64", result["server_update_available"])
+
+    def test_call_tool_clean_when_current(self) -> None:
+        from types import SimpleNamespace
+
+        fake = {"x": SimpleNamespace(handler=lambda args: {"ok": True})}
+        with patch.object(self.mcp, "_tool_registry", return_value=fake), patch.object(
+            self.mcp, "_SERVER_RUNNING_VERSION", "0.9.64"
+        ), patch.object(
+            self.mcp, "installed_puppetmaster_version", return_value="0.9.64"
+        ):
+            result = self.mcp.call_tool("x", {})
+        self.assertNotIn("server_update_available", result)
+
+
 if __name__ == "__main__":
     unittest.main()

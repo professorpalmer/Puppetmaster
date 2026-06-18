@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.9.65
+
+**The MCP reconnect dance is now a visible nudge, not a silent guess.** A long-lived stdio MCP server keeps whatever code it loaded at startup; an in-place `pip install -U puppetmaster-ai` changes what's on disk but can't hot-reload the running server (the client owns the pipe). v0.9.62 made this *detectable* on pull (`mcp status`/`mcp list`); now it's *pushed* — every tool response self-reports staleness so a daily-driver user discovers it without going looking. Full suite **802** green (+7 tests).
+
+- **Per-call `server_update_available` warning.** `call_tool` — the single dispatch chokepoint every `tools/call` flows through — compares the version this server loaded at startup (`_SERVER_RUNNING_VERSION`, snapshotted at import) against `installed_puppetmaster_version()` (read fresh from disk). When a newer version is installed, the tool response carries a one-line nudge: *"running 0.9.64 but 0.9.65 is installed — restart the MCP server (toggle it in your client, or `puppetmaster mcp cleanup --kill-stale`) to load the new code."*
+- **Cheap and quiet by default.** The check is TTL-cached (30s) so the hot path doesn't re-scan package metadata per call, only nudges on a genuine *upgrade* (a downgrade or unknown disk version stays silent), and `setdefault` never clobbers a handler's own payload. No warning is emitted when the server is current — the common case adds nothing.
+
 ## v0.9.64
 
 **Fix: the first/cheapest analyze worker can no longer hallucinate an empty repository.** On a 6-file fixture the `explore` worker — first in the DAG (no deps), routed to the cheapest model at `reasoning_effort: minimal` — reported *"The repository is empty."* at confidence **1.00** while every downstream worker analyzed the same files in detail. Root cause was a context-delivery gap, not a model whim: Puppetmaster only injects a file listing via CodeGraph when `.codegraph/` exists, and dependent workers also inherit prior findings (which already cite files) through `prompt_with_memory`. The dependency-free first worker had neither — no index context, no memory — so the laziest model "saw" a bare cwd and asserted emptiness. Full suite **795** green (+7 tests).
