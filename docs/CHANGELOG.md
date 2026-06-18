@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.9.70
+
+**Hotfix: a non-path `npm root -g` result no longer crashes CodeGraph install resolution.** The v0.9.68 shim-fallback work made `find_codegraph_install` reachable on hosts where it previously short-circuited (any host with `node` on PATH but no Cursor). On a misconfigured npm — or, as caught by CI, a test that globally stubs `subprocess.run` to return a large non-path blob — the raw stdout was fed into `Path(root).is_dir()`, raising `OSError: File name too long` (ENAMETOOLONG). Two CI legs went red on v0.9.68/v0.9.69 because of this.
+
+- **Sanity-gate `npm root -g` output before touching the filesystem.** A new `_looks_like_single_path` check rejects empty, multi-line, NUL-bearing, or oversized (>4096 char) results, and the `is_dir()` probe is wrapped in `try/except (OSError, ValueError)`. A non-path result now falls through to the shim resolver instead of crashing.
+- **Harden the shim resolver too.** `_codegraph_install_from_shim` wraps its path walk in the same guard so a malformed shim path can never raise.
+- Regression tests added for the garbage/giant `npm root -g` case and the path sanity-gate.
+
 ## v0.9.69
 
 **Hermes is now documented and marketed as a first-class worker adapter — validated end-to-end through the orchestrator.** The NousResearch [Hermes](https://hermes-agent.nousresearch.com) CLI joins Cursor, Claude Code, Codex, and OpenAI as a supported analyze + full-edit adapter. (The adapter code shipped earlier; this release validates it on a real run and surfaces it across the README, FEATURES, ADAPTERS, and COMPARISON docs.)

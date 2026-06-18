@@ -2659,6 +2659,46 @@ class PuppetmasterTests(unittest.TestCase):
             self.assertIsNotNone(resolved)
             self.assertEqual(resolved, pkg.resolve())
 
+    def test_find_codegraph_install_survives_garbage_npm_root(self) -> None:
+        """A non-path `npm root -g` result must not raise ENAMETOOLONG.
+
+        Regression: a misconfigured npm (or, as surfaced in CI, a test that
+        globally mocks subprocess.run to return a giant JSON blob) made
+        find_codegraph_install feed a 50KB string into Path(...).is_dir(),
+        raising `OSError: File name too long`. The function must treat any
+        result that doesn't look like a single path as "not found" and fall
+        through to the shim resolver (here: no shim -> None), never crash.
+        """
+        from puppetmaster import codegraph_repair
+
+        giant = '{"status": "finished", "result": "' + ("PADDING line\\n" * 4000) + '"}'
+
+        def fake_run(cmd, **kwargs):  # noqa: ANN001
+            return subprocess.CompletedProcess(cmd, 0, giant, "")
+
+        def fake_which(name):  # noqa: ANN001
+            if name == "npm":
+                return "/usr/bin/npm"
+            return None  # no codegraph shim
+
+        with patch.object(
+            codegraph_repair.subprocess, "run", side_effect=fake_run
+        ), patch.object(
+            codegraph_repair.shutil, "which", side_effect=fake_which
+        ):
+            # Must not raise; resolves to None because nothing valid was found.
+            resolved = codegraph_repair.find_codegraph_install()
+        self.assertIsNone(resolved)
+
+    def test_looks_like_single_path_rejects_multiline_and_huge(self) -> None:
+        from puppetmaster import codegraph_repair as cr
+
+        self.assertTrue(cr._looks_like_single_path("/opt/homebrew/lib/node_modules"))
+        self.assertFalse(cr._looks_like_single_path(""))
+        self.assertFalse(cr._looks_like_single_path("line1\nline2"))
+        self.assertFalse(cr._looks_like_single_path("has\x00null"))
+        self.assertFalse(cr._looks_like_single_path("x" * 5000))
+
     def test_repair_codegraph_runs_npm_rebuild_with_cursor_node_in_path(self) -> None:
         """Happy path: rebuild is invoked with Cursor's Node ahead of $PATH."""
         from puppetmaster import codegraph_repair

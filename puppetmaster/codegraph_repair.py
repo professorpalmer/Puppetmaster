@@ -168,13 +168,31 @@ def _codegraph_install_from_shim() -> Optional[Path]:
         return None
     try:
         target = Path(shim).resolve()
-    except (OSError, RuntimeError):
+        for parent in target.parents:
+            if parent.name == "codegraph" and parent.parent.name == "@colbymchenry":
+                if parent.is_dir():
+                    return parent
+    except (OSError, RuntimeError, ValueError):
+        # A malformed shim path (too long, embedded NULs, weird mocks in tests)
+        # must never crash CodeGraph resolution — treat as "not found".
         return None
-    for parent in target.parents:
-        if parent.name == "codegraph" and parent.parent.name == "@colbymchenry":
-            if parent.is_dir():
-                return parent
     return None
+
+
+def _looks_like_single_path(value: str) -> bool:
+    """True when ``value`` plausibly is a single filesystem path.
+
+    ``npm root -g`` returns exactly one line: an absolute directory path. A
+    misconfigured npm, a shim/alias that prints banners, or (in tests) a mocked
+    ``subprocess.run`` can hand back multi-line blobs or huge JSON. Feeding that
+    straight into ``Path(...).is_dir()`` raises ``OSError: File name too long``
+    on most platforms, so we sanity-gate before touching the filesystem.
+    """
+    if not value or "\n" in value or "\x00" in value:
+        return False
+    # A real node_modules root is short; cap well under the OS path limit so a
+    # giant blob is rejected before it can raise ENAMETOOLONG.
+    return len(value) <= 4096
 
 
 def find_codegraph_install(npm_command: str = "npm") -> Optional[Path]:
@@ -206,12 +224,19 @@ def find_codegraph_install(npm_command: str = "npm") -> Optional[Path]:
             completed = None
         if completed is not None and completed.returncode == 0:
             root = (completed.stdout or "").strip()
-            if root:
-                codegraph_dir = Path(root) / "@colbymchenry" / "codegraph"
-                if codegraph_dir.is_dir():
-                    return codegraph_dir
-    # npm root -g missed (no npm, wrong prefix, or not installed there).
-    # Fall back to the shim, which points straight at the real package.
+            # Only touch the filesystem when the output actually looks like a
+            # single path — a garbage/multi-line/huge result would otherwise
+            # raise ENAMETOOLONG from is_dir().
+            if root and _looks_like_single_path(root):
+                try:
+                    codegraph_dir = Path(root) / "@colbymchenry" / "codegraph"
+                    if codegraph_dir.is_dir():
+                        return codegraph_dir
+                except (OSError, ValueError):
+                    pass  # fall through to the shim resolver
+    # npm root -g missed (no npm, wrong prefix, not installed there, or a
+    # non-path result). Fall back to the shim, which points straight at the
+    # real package.
     return _codegraph_install_from_shim()
 
 
