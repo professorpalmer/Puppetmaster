@@ -1128,6 +1128,51 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_routing_flags(hermes)
 
+    edit = subcommands.add_parser(
+        "edit",
+        help=(
+            "Single in-place edit: cheapest sufficient model + CodeGraph, edits "
+            "the working tree directly, captures a reviewable PATCH. The "
+            "lightweight verb between an inline edit and a full implement job."
+        ),
+    )
+    edit.add_argument("instruction", help="What to change, in plain language.")
+    edit.add_argument("--cwd", default=str(Path.cwd()), help="Workspace to edit in.")
+    edit.add_argument(
+        "--adapter",
+        help=(
+            "Force a full-edit adapter (cursor | claude-code | codex | hermes). "
+            "Default: the highest-priority adapter the platform lock enables."
+        ),
+    )
+    edit.add_argument(
+        "--model",
+        help="Pin the model (overrides cheap auto-routing).",
+    )
+    edit.add_argument(
+        "--provider",
+        help="Inference provider (Hermes adapter only; routes credentials).",
+    )
+    edit.add_argument("--timeout-seconds", type=int, default=300)
+    edit.add_argument(
+        "--routing-policy",
+        default="cheap",
+        choices=["cheap", "balanced", "quality", "escalating"],
+        help="Router policy when not pinning --model (default: cheap).",
+    )
+    edit.add_argument(
+        "--no-auto-route",
+        dest="auto_route_edit",
+        action="store_false",
+        help="Disable routing; use the adapter's default model.",
+    )
+    edit.add_argument(
+        "--disable-codegraph",
+        action="store_true",
+        help="Skip CodeGraph context injection (e.g. for non-repo edits).",
+    )
+    edit.add_argument("--executable", help="Override the adapter executable / command.")
+
     demo = subcommands.add_parser("demo", help="Run the Puppetmaster concept demo.")
     demo.add_argument(
         "--goal",
@@ -1994,6 +2039,48 @@ def _main(argv: Optional[list[str]] = None) -> int:
             ],
             lease_seconds=10,
             worker_mode=args.worker_mode,
+            on_job_created=on_job_created,
+        )
+        return finalize_cli_run(result)
+
+    if args.command == "edit":
+        from puppetmaster import platform_lock
+        from puppetmaster.workers import (
+            NoImplementAdapterError,
+            build_edit_spec,
+            pick_implement_adapter,
+        )
+
+        enabled = platform_lock.enabled_adapters()
+        try:
+            adapter = pick_implement_adapter(enabled, args.adapter)
+        except NoImplementAdapterError as exc:
+            print(f"edit: {exc}", file=sys.stderr)
+            if exc.requested:
+                print(
+                    f"  enable it: puppetmaster platform enable {exc.requested}",
+                    file=sys.stderr,
+                )
+            print(f"  enabled adapters: {', '.join(sorted(exc.enabled)) or '(none)'}", file=sys.stderr)
+            return 2
+        spec = build_edit_spec(
+            instruction=args.instruction,
+            adapter=adapter,
+            cwd=args.cwd,
+            model=args.model,
+            provider=args.provider,
+            timeout_seconds=args.timeout_seconds,
+            routing_policy=args.routing_policy,
+            auto_route=getattr(args, "auto_route_edit", True),
+            disable_codegraph=args.disable_codegraph,
+        )
+        if args.executable:
+            spec.payload["executable"] = args.executable
+        result = Orchestrator(store).run(
+            args.instruction,
+            specs=[spec],
+            lease_seconds=10,
+            worker_mode="inline",
             on_job_created=on_job_created,
         )
         return finalize_cli_run(result)

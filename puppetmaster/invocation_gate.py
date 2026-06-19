@@ -146,6 +146,13 @@ _IMPLEMENT_VERBS = frozenset(
     }
 )
 
+# The lightweight single in-place edit verb. Distinct from the implement verbs:
+# synchronous, edits the working tree directly (no isolated worktree), cheapest
+# sufficient model, returns the diff. The gate steers a *focused* implement
+# intent (no broad-scope signal) here instead of the heavier implement job.
+_EDIT_VERB = "puppetmaster_edit"
+_EDIT_VERBS = frozenset({_EDIT_VERB})
+
 # Verbs that resolve a "where/what/how is X" question structurally instead of
 # crawling the tree. Framed as look-up, not fan-out.
 _CODEGRAPH_VERBS = frozenset(
@@ -197,6 +204,17 @@ class DelegationDecision:
             return ""
         verb = self.suggested_verb
         tail = "If this is actually trivial, say 'do it inline' to skip."
+        if verb in _EDIT_VERBS:
+            return (
+                f"[Puppetmaster] This is a single, focused edit (capability "
+                f"{self.capability_score}, {self.reason}). Delegate it to "
+                f"`{verb}` — one in-place edit on the cheapest sufficient model, "
+                f"with CodeGraph to locate the site, returned as a reviewable "
+                f"diff. It's the snappy path between editing inline yourself and "
+                f"a full implement job; no isolated worktree, no job to poll. "
+                f"Reach for `puppetmaster_start_implement` instead only if this "
+                f"grows into a coupled multi-file change. {tail}"
+            )
         if verb in _IMPLEMENT_VERBS:
             return (
                 f"[Puppetmaster] This is a single implementation task (capability "
@@ -307,6 +325,15 @@ def should_delegate(
 
     has_hard_scope = _matches_any(_HARD_SCOPE_PATTERNS, lower)
     has_trivial = _matches_any(_TRIVIAL_PATTERNS, lower)
+
+    # Scope-aware refinement: a focused implementation intent with NO broad-scope
+    # signal is a single edit, not a coupled multi-file job — steer it to the
+    # lightweight in-place ``edit`` verb (cheap model, CodeGraph, inline diff)
+    # rather than the heavier ``start_implement`` worktree job. Broad scope
+    # ("across the repo", "every caller", refactor/migrate) keeps the implement
+    # verb, where an isolated worktree + one coherent PATCH is the right shape.
+    if suggested_verb in _IMPLEMENT_VERBS and not has_hard_scope:
+        suggested_verb = _EDIT_VERB
 
     # Trivial carve-out: a short prompt with an explicit easy-intent signal and
     # no broad scope stays inline — even if role inference (e.g. "add ...") put

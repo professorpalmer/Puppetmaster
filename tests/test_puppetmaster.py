@@ -13908,6 +13908,204 @@ class PuppetmasterFrictionFixTests(unittest.TestCase):
             )
         )
 
+    # --- edit verb (Tier 2: lightweight single in-place edit) -----------
+    def test_build_edit_payload_defaults_are_cheap_inplace(self) -> None:
+        from puppetmaster.workers import build_edit_payload
+
+        p = build_edit_payload(
+            instruction="fix the bug", cwd="/repo", adapter="hermes"
+        )
+        # In-place: dirty tree allowed, no isolated worktree guard.
+        self.assertTrue(p["allow_dirty"])
+        self.assertTrue(p["allow_non_worktree"])
+        # Actually edits (→ swarm_mode == edit).
+        self.assertEqual(p["mode"], "implement")
+        # Cheap auto-routing by default, pinned to the chosen adapter only.
+        self.assertTrue(p["auto_route"])
+        self.assertEqual(p["routing_policy"], "cheap")
+        self.assertEqual(p["allowed_adapters"], ["hermes"])
+        # CodeGraph stays on (no disable flag).
+        self.assertNotIn("disable_codegraph", p)
+
+    def test_build_edit_payload_pinned_model_disables_routing(self) -> None:
+        from puppetmaster.workers import build_edit_payload
+
+        p = build_edit_payload(
+            instruction="x", cwd="/repo", adapter="hermes", model="gpt-5-nano"
+        )
+        # An explicit model pin wins — never auto-route around it.
+        self.assertEqual(p["model"], "gpt-5-nano")
+        self.assertNotIn("auto_route", p)
+        self.assertNotIn("routing_policy", p)
+
+    def test_build_edit_payload_can_opt_out_of_routing_and_codegraph(self) -> None:
+        from puppetmaster.workers import build_edit_payload
+
+        p = build_edit_payload(
+            instruction="x", cwd="/repo", adapter="codex",
+            auto_route=False, disable_codegraph=True,
+        )
+        self.assertNotIn("auto_route", p)
+        self.assertTrue(p["disable_codegraph"])
+
+    def test_build_edit_spec_is_edit_mode(self) -> None:
+        from puppetmaster.workers import build_edit_spec, spec_edits_files, swarm_mode
+
+        spec = build_edit_spec(
+            instruction="fix it", adapter="hermes", cwd="/repo"
+        )
+        self.assertEqual(spec.adapter, "hermes")
+        self.assertTrue(spec_edits_files(spec))
+        self.assertEqual(swarm_mode([spec]), "edit")
+
+    def test_pick_implement_adapter_priority_and_lock(self) -> None:
+        from puppetmaster.workers import (
+            NoImplementAdapterError,
+            pick_implement_adapter,
+        )
+
+        # Priority order honored when several enabled.
+        self.assertEqual(
+            pick_implement_adapter({"hermes", "cursor", "codex"}), "cursor"
+        )
+        # Falls through to the only enabled one.
+        self.assertEqual(pick_implement_adapter({"hermes"}), "hermes")
+        # Explicit request honored when enabled.
+        self.assertEqual(
+            pick_implement_adapter({"hermes", "codex"}, "codex"), "codex"
+        )
+        # Requested-but-disabled raises with context.
+        with self.assertRaises(NoImplementAdapterError) as ctx:
+            pick_implement_adapter({"hermes"}, "cursor")
+        self.assertEqual(ctx.exception.requested, "cursor")
+        # Non-implement adapter raises.
+        with self.assertRaises(NoImplementAdapterError):
+            pick_implement_adapter({"openai"}, "openai")
+        # Nothing enabled raises.
+        with self.assertRaises(NoImplementAdapterError):
+            pick_implement_adapter(set())
+
+    def test_edit_verb_e2e_through_orchestrator(self) -> None:
+        """End-to-end: an edit spec runs through the real Orchestrator with a
+        stub edit-capable adapter that makes a real on-disk change, completes,
+        classifies the run as ``edit``, satisfies the auto-attached require_diff
+        gate, and persists the worker's PATCH artifact. Network-free (the adapter
+        is faked) — asserts the wiring spec → run → gate → edit mode → artifact,
+        not the LLM (the live LLM path is verified separately via the CLI E2E).
+        """
+        import subprocess as _sp
+
+        from puppetmaster.models import Artifact, ArtifactType
+        from puppetmaster.orchestrator import Orchestrator
+        from puppetmaster.workers import build_edit_spec
+
+        with TemporaryDirectory() as tmp:
+            # A real git repo so the require_diff gate (auto-attached for
+            # mode=implement) can observe an actual change.
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            (repo / "x.py").write_text("bug\n", encoding="utf-8")
+            for cmd in (
+                ["git", "init", "-q"],
+                ["git", "config", "user.email", "t@t.co"],
+                ["git", "config", "user.name", "t"],
+                ["git", "add", "-A"],
+                ["git", "commit", "-qm", "init"],
+            ):
+                _sp.run(cmd, cwd=repo, check=True, capture_output=True)
+
+            store = self._store(tmp)
+            spec = build_edit_spec(
+                instruction="fix the bug", adapter="hermes", cwd=str(repo),
+                auto_route=False,  # wiring test: don't depend on a model registry
+            )
+
+            class _FakeEditAdapter:
+                def run(self, task, goal, worker_id):
+                    # Make the real edit the require_diff gate expects.
+                    (repo / "x.py").write_text("fixed\n", encoding="utf-8")
+                    return [
+                        Artifact(
+                            job_id=task.job_id,
+                            task_id=task.id,
+                            type=ArtifactType.PATCH,
+                            created_by=worker_id,
+                            payload={
+                                "change": "rewrite x.py: bug -> fixed",
+                                "diff": "--- a/x.py\n+++ b/x.py\n@@\n-bug\n+fixed\n",
+                                "files": ["x.py"],
+                                "worker_diff_present": True,
+                            },
+                            confidence=0.9,
+                            evidence=["adapter:hermes"],
+                        )
+                    ]
+
+            with patch(
+                "puppetmaster.workers.get_adapter", return_value=_FakeEditAdapter()
+            ):
+                result = Orchestrator(store).run(
+                    "fix the bug", specs=[spec], lease_seconds=5,
+                    worker_mode="inline",
+                )
+
+            self.assertEqual(result.mode, "edit")
+            self.assertEqual(result.job.status, JobStatus.COMPLETE)
+            self.assertTrue(
+                any(a.type == ArtifactType.PATCH for a in result.artifacts),
+                "edit run should persist a PATCH artifact",
+            )
+            # The require_diff gate is auto-attached for mode=implement and must
+            # have observed the real change.
+            self.assertEqual((repo / "x.py").read_text(encoding="utf-8"), "fixed\n")
+
+    def test_mcp_edit_command_builder_maps_args(self) -> None:
+        from puppetmaster import mcp_server
+
+        cmd = mcp_server.edit_command(
+            {
+                "instruction": "fix the bug",
+                "cwd": "/repo",
+                "adapter": "hermes",
+                "routing_policy": "cheap",
+                "disable_codegraph": True,
+            }
+        )
+        self.assertEqual(cmd[0], "edit")
+        self.assertEqual(cmd[1], "fix the bug")
+        self.assertIn("--adapter", cmd)
+        self.assertIn("hermes", cmd)
+        self.assertIn("--routing-policy", cmd)
+        self.assertIn("--disable-codegraph", cmd)
+
+    def test_mcp_edit_command_no_auto_route_flag(self) -> None:
+        from puppetmaster import mcp_server
+
+        cmd = mcp_server.edit_command(
+            {"instruction": "x", "cwd": "/r", "auto_route": False}
+        )
+        self.assertIn("--no-auto-route", cmd)
+
+    def test_mcp_run_edit_rejects_disabled_adapter(self) -> None:
+        from puppetmaster import mcp_server
+
+        with patch(
+            "puppetmaster.platform_lock.enabled_adapters", return_value={"hermes"}
+        ):
+            result = mcp_server.run_edit(
+                {"instruction": "x", "cwd": ".", "adapter": "cursor"}
+            )
+        self.assertTrue(result.get("isError"))
+
+    def test_mcp_edit_tool_registered(self) -> None:
+        from puppetmaster import mcp_server
+
+        resp = mcp_server.handle_message(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        )
+        names = {t["name"] for t in resp["result"]["tools"]}
+        self.assertIn("puppetmaster_edit", names)
+
     # --- #2 / #4: stalled-job reaper -----------------------------------
     def test_reaper_marks_dead_orchestrator_job_stalled(self) -> None:
         from puppetmaster.liveness import reap_stalled_jobs
@@ -15747,9 +15945,11 @@ class InvocationGateTests(unittest.TestCase):
         self.assertEqual(infer_role_and_verb("where is ClientError defined")[1], "puppetmaster_codegraph_search")
 
     def test_feature_implementation_routes_to_single_implement_worker(self):
-        """Plain feature work must delegate to ONE implement worker, not the
-        read-only swarm default. This is the task-shape fix: a coupled single
-        feature run through a fan-out swarm is what stacks uncoordinated commits.
+        """Plain, focused feature work must delegate to a SINGLE worker, not the
+        read-only swarm default. With the scope-aware refinement these focused
+        intents (no broad-scope signal) land on the lightweight ``edit`` verb —
+        still one coherent worker, never a fan-out swarm. Broad-scope work keeps
+        ``start_implement`` (see test_broad_scope_implementation_uses_implement).
         """
         from puppetmaster.invocation_gate import should_delegate
 
@@ -15760,17 +15960,44 @@ class InvocationGateTests(unittest.TestCase):
         ):
             d = should_delegate(prompt)
             self.assertTrue(d.should_delegate, prompt)
+            self.assertEqual(d.suggested_verb, "puppetmaster_edit", prompt)
+
+    def test_broad_scope_implementation_uses_implement_worker(self):
+        """A coupled, multi-file change (broad-scope signal) keeps the heavier
+        ``start_implement`` verb, where an isolated worktree + one PATCH is the
+        right shape — not the in-place ``edit`` verb."""
+        from puppetmaster.invocation_gate import should_delegate
+
+        for prompt in (
+            "refactor the auth module across the whole codebase",
+            "migrate every caller of the old client to the new api",
+        ):
+            d = should_delegate(prompt)
+            self.assertTrue(d.should_delegate, prompt)
             self.assertEqual(d.suggested_verb, "puppetmaster_start_implement", prompt)
 
     def test_implement_directive_steers_to_clean_worktree_not_swarm(self):
-        """The injected directive for an implement task must point at a single
-        clean-worktree worker and must NOT tell the host to fan out a swarm."""
+        """The injected directive for a broad-scope implement task must point at
+        a single clean-worktree worker and must NOT tell the host to fan out a
+        swarm."""
         from puppetmaster.invocation_gate import should_delegate
 
-        d = should_delegate("add a CSV export endpoint to the billing service")
+        d = should_delegate("refactor the auth module across the whole codebase")
         directive = d.directive()
         self.assertIn("clean worktree", directive)
         self.assertIn("not a", directive.lower())
+        self.assertNotIn("fan it out to a swarm", directive)
+
+    def test_focused_edit_directive_steers_to_edit_verb(self):
+        """A focused edit's directive must point at the lightweight ``edit`` verb
+        (in-place, cheap, inline diff) and not a fan-out swarm."""
+        from puppetmaster.invocation_gate import should_delegate
+
+        d = should_delegate("add a CSV export endpoint to the billing service")
+        self.assertEqual(d.suggested_verb, "puppetmaster_edit")
+        directive = d.directive()
+        self.assertIn("puppetmaster_edit", directive)
+        self.assertIn("single", directive.lower())
         self.assertNotIn("fan it out to a swarm", directive)
 
     def test_review_directive_still_uses_swarm_framing(self):
@@ -15908,9 +16135,10 @@ class HookRunnerTests(unittest.TestCase):
         )
 
     def test_hermes_pre_llm_call_injects_context_for_single_implement(self):
-        """Hermes' pre_llm_call carries user_message under `extra`; a single
-        implement intent must inject a delegate directive as {"context": ...}
-        and steer to a single implement worker (not a cursor verb)."""
+        """Hermes' pre_llm_call carries user_message under `extra`; a single,
+        focused edit intent must inject a delegate directive as {"context": ...}
+        and steer to the lightweight in-place ``edit`` verb (not a cursor verb,
+        not a fan-out swarm)."""
         from puppetmaster.hook_runner import handle_hook
 
         payload = {
@@ -15925,10 +16153,11 @@ class HookRunnerTests(unittest.TestCase):
         r = handle_hook(payload, host="hermes", event="pre_llm_call", env=self._TOOLS_ON)
         self.assertEqual(r.action, "allow")
         self.assertTrue(r.decision.should_delegate)
-        self.assertEqual(r.decision.suggested_verb, "puppetmaster_start_implement")
+        self.assertEqual(r.decision.suggested_verb, "puppetmaster_edit")
         out = r.to_host_json("hermes")
         self.assertIn("context", out)
         self.assertIn("Puppetmaster", out["context"])
+        self.assertIn("puppetmaster_edit", out["context"])
         self.assertNotIn("cursor", out["context"])
 
     def test_hermes_pre_llm_call_noop_for_trivial_edit(self):

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import AbstractSet, Optional
 
 from puppetmaster.adapters import get_adapter, verification_artifact
 from puppetmaster.models import AgentRun, Artifact, Task, TaskStatus, now_iso
@@ -215,6 +215,148 @@ def swarm_mode(specs: list[WorkerSpec]) -> str:
     """Classify a swarm as ``"edit"`` (some worker can change files) or
     ``"analysis"`` (read-only — emits artifacts only)."""
     return "edit" if any(spec_edits_files(spec) for spec in specs) else "analysis"
+
+
+# Full-edit, PATCH-producing adapters in preference order. Cursor/Claude are the
+# daily-driver editors; Codex and Hermes are full-edit too, so a host locked to
+# either can still implement. This is the single source of truth — the MCP
+# ``start_implement`` verb, the CLI, and the lightweight ``edit`` verb all import
+# it instead of re-declaring the order.
+IMPLEMENT_ADAPTER_PRIORITY = ("cursor", "claude-code", "codex", "hermes")
+
+
+class NoImplementAdapterError(RuntimeError):
+    """Raised when no implement-capable adapter is available/enabled.
+
+    Carries the resolved ``enabled`` set and the (optional) ``requested`` adapter
+    so callers can render a precise, actionable error without re-deriving state.
+    """
+
+    def __init__(self, message: str, *, enabled: AbstractSet[str], requested: Optional[str] = None):
+        super().__init__(message)
+        self.enabled = enabled
+        self.requested = requested
+
+
+def pick_implement_adapter(
+    enabled: AbstractSet[str], requested: Optional[str] = None
+) -> str:
+    """Resolve the full-edit adapter to use, honoring the platform lock.
+
+    * ``requested`` set → validate it's implement-capable AND enabled, else raise.
+    * ``requested`` unset → pick the first enabled adapter in priority order.
+
+    Raising (vs. returning ``None``) keeps the single decision point honest: every
+    caller gets the same precise failure with the same ``enabled``/``requested``
+    context, instead of each re-inventing the error message.
+    """
+    if requested:
+        adapter = str(requested)
+        if adapter not in IMPLEMENT_ADAPTER_PRIORITY:
+            raise NoImplementAdapterError(
+                f"adapter {adapter!r} cannot implement. Implement-capable: "
+                f"{', '.join(IMPLEMENT_ADAPTER_PRIORITY)}.",
+                enabled=enabled,
+                requested=adapter,
+            )
+        if adapter not in enabled:
+            raise NoImplementAdapterError(
+                f"adapter {adapter!r} is disabled by the platform lock.",
+                enabled=enabled,
+                requested=adapter,
+            )
+        return adapter
+    adapter = next((a for a in IMPLEMENT_ADAPTER_PRIORITY if a in enabled), None)
+    if adapter is None:
+        raise NoImplementAdapterError(
+            "No implement-capable platform is enabled. Enable one of "
+            f"{', '.join(IMPLEMENT_ADAPTER_PRIORITY)} via the platform lock.",
+            enabled=enabled,
+        )
+    return adapter
+
+
+def build_edit_payload(
+    *,
+    instruction: str,
+    cwd: str,
+    adapter: str,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    timeout_seconds: int = 300,
+    routing_policy: str = "cheap",
+    auto_route: bool = True,
+    disable_codegraph: bool = False,
+) -> dict:
+    """Build the worker payload for a lightweight, in-place single edit.
+
+    This is the ``edit`` verb's defining policy — the deliberate divergence from
+    ``start_implement``:
+
+    * ``mode="implement"`` so the adapter actually edits (→ ``swarm_mode`` == edit).
+    * ``allow_dirty=True`` + ``allow_non_worktree=True``: edit the working tree
+      in place, no isolated worktree and no clean-tree guard. A single edit
+      should land where you're working, fast. The PATCH artifact is still
+      captured from the git diff, so the change is fully reviewable/revertable.
+    * ``auto_route=True`` + ``routing_policy="cheap"`` by default: the cheapest
+      sufficient model handles a mechanical edit, instead of burning a frontier
+      model. A pinned ``model`` overrides routing.
+    * CodeGraph stays ON (unless explicitly disabled): locate the exact edit site
+      structurally instead of grepping.
+    """
+    payload: dict = {
+        "prompt": instruction,
+        "cwd": cwd,
+        "mode": "implement",
+        "timeout_seconds": timeout_seconds,
+        "allow_dirty": True,
+        "allow_non_worktree": True,
+    }
+    if disable_codegraph:
+        payload["disable_codegraph"] = True
+    if model:
+        # An explicit model pin wins over routing — don't auto-route around it.
+        payload["model"] = model
+    elif auto_route:
+        payload["auto_route"] = True
+        payload["allowed_adapters"] = [adapter]
+        if routing_policy:
+            payload["routing_policy"] = routing_policy
+    if provider:
+        payload["provider"] = provider
+    return payload
+
+
+def build_edit_spec(
+    *,
+    instruction: str,
+    adapter: str,
+    cwd: str,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    timeout_seconds: int = 300,
+    routing_policy: str = "cheap",
+    auto_route: bool = True,
+    disable_codegraph: bool = False,
+) -> WorkerSpec:
+    """A single full-edit worker spec tuned for snappy in-place single edits."""
+    payload = build_edit_payload(
+        instruction=instruction,
+        cwd=cwd,
+        adapter=adapter,
+        model=model,
+        provider=provider,
+        timeout_seconds=timeout_seconds,
+        routing_policy=routing_policy,
+        auto_route=auto_route,
+        disable_codegraph=disable_codegraph,
+    )
+    return WorkerSpec(
+        role=f"edit-{adapter}",
+        instruction=instruction,
+        adapter=adapter,
+        payload=payload,
+    )
 
 
 def specs_for_roles(roles: Optional[list[str]] = None) -> list[WorkerSpec]:

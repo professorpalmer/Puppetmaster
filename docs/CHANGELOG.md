@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.9.73
+
+**New `edit` verb — the lightweight, in-place single-edit path between an inline edit and a full implement job.** Focused single-file changes ("fix this function", "add a flag", "wire up retries") no longer have to choose between editing inline yourself (no CodeGraph, no cheap-model routing, no receipt) or spinning up a heavyweight `start_implement` worktree job. The new `edit` verb is the snappy middle: cheapest sufficient model, CodeGraph to locate the site, edits the working tree directly, returns the diff synchronously, and still captures a reviewable PATCH artifact.
+
+- **`puppetmaster edit "<instruction>"` (CLI) + `puppetmaster_edit` (MCP).** Both run a single full-edit worker through the existing orchestrator — no new orchestration. Defaults are the verb's policy: `auto_route` with `routing_policy=cheap` (stop burning a frontier model on mechanical edits), CodeGraph on, `allow_dirty`/`allow_non_worktree` so the edit lands in place, and synchronous delivery so you see the diff immediately. A pinned `--model` overrides routing; `--no-auto-route` opts out. Picks the highest-priority enabled implement adapter (cursor → claude-code → codex → hermes) unless `--adapter` forces one.
+- **The require_diff safety gate applies.** An `edit` run that produces no diff fails closed — a "done" edit that changed nothing can't masquerade as success.
+- **The invocation gate now routes focused single-edit intent to `puppetmaster_edit`.** A focused implementation prompt with *no* broad-scope signal (no audit/refactor/migrate/"across the repo"/"every caller") steers to the in-place `edit` verb; broad-scope coupled work keeps `start_implement`, where an isolated worktree + one coherent PATCH is the right shape. The Hermes/Cursor/Claude hooks all inject the refined directive.
+- **Single source of truth for implement-adapter selection.** Extracted `pick_implement_adapter` / `IMPLEMENT_ADAPTER_PRIORITY` into `puppetmaster.workers`; `start_implement` and `edit` both use it, so the priority order and the disabled/invalid-adapter errors can never drift.
+- **Fix:** the `puppetmaster_start_implement` MCP schema's `adapter` enum was missing `hermes` (it's implement-capable). Added.
+
 ## v0.9.72
 
 **Hermes is now a full auto-invocation host — single edits get steered to Puppetmaster automatically.** Puppetmaster's deterministic invocation-gate previously only spoke Cursor and Claude Code; it now speaks Hermes' native shell-hook protocol, so the same delegate-vs-inline brain runs on every supported host. Validated end-to-end inside a live Hermes turn.

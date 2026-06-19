@@ -1322,6 +1322,20 @@ def _build_tools() -> list[McpTool]:
             handler=start_implement,
         ),
         McpTool(
+            name="puppetmaster_edit",
+            description=(
+                "PREFER over an inline single-file edit when the change benefits from "
+                "CodeGraph to locate the site or from cheap-model routing to save frontier "
+                "tokens. Lightweight SINGLE in-place edit: picks the cheapest sufficient "
+                "model, uses CodeGraph, edits the working tree directly, and returns the "
+                "diff synchronously (no job_id). Captures a reviewable PATCH artifact. "
+                "Use start_implement instead for multi-file/coupled features that want an "
+                "isolated worktree. Keep truly trivial edits (typo/rename/comment) inline."
+            ),
+            input_schema=edit_schema(),
+            handler=run_edit,
+        ),
+        McpTool(
             name="puppetmaster_openai",
             description=(
                 "Run an OpenAI Chat Completions worker through Puppetmaster and wait for "
@@ -1988,7 +2002,9 @@ def _worktree_preflight(args: JsonObject) -> Optional[JsonObject]:
 # `puppetmaster_start_implement` verb prefers when several are enabled. Codex is
 # last (cursor/claude are the daily drivers) but is a full-edit, PATCH-producing
 # adapter, so a codex-only platform lock can still use the generic verb.
-_IMPLEMENT_ADAPTER_PRIORITY = ("cursor", "claude-code", "codex", "hermes")
+# Canonical order lives in puppetmaster.workers (single source of truth); aliased
+# here for the local helpers that still reference the name.
+from puppetmaster.workers import IMPLEMENT_ADAPTER_PRIORITY as _IMPLEMENT_ADAPTER_PRIORITY
 
 
 def _implement_command(args: JsonObject, adapter: str) -> list[str]:
@@ -2061,32 +2077,17 @@ def start_implement(args: JsonObject) -> JsonObject:
     platform the user is locked to, so `implement` works no matter which single
     platform is enabled (not Claude-Code-only)."""
     from puppetmaster import platform_lock
+    from puppetmaster.workers import NoImplementAdapterError, pick_implement_adapter
 
     enabled = platform_lock.enabled_adapters()
-    requested = args.get("adapter")
-    if requested:
-        adapter = str(requested)
-        if adapter not in _IMPLEMENT_ADAPTER_PRIORITY:
-            return tool_error(
-                f"adapter {adapter!r} cannot implement. Implement-capable: "
-                f"{', '.join(_IMPLEMENT_ADAPTER_PRIORITY)}.",
-                {"requested": adapter},
-            )
-        if adapter not in enabled:
-            return tool_error(
-                f"adapter {adapter!r} is disabled by the platform lock.",
-                {"enabled": sorted(enabled), "fix": "puppetmaster platform enable " + adapter},
-            )
-    else:
-        adapter = next(
-            (a for a in _IMPLEMENT_ADAPTER_PRIORITY if a in enabled), None
-        )
-        if adapter is None:
-            return tool_error(
-                "No implement-capable platform is enabled. Enable one of "
-                f"{', '.join(_IMPLEMENT_ADAPTER_PRIORITY)} via the platform lock.",
-                {"enabled": sorted(enabled)},
-            )
+    try:
+        adapter = pick_implement_adapter(enabled, args.get("adapter"))
+    except NoImplementAdapterError as exc:
+        details: JsonObject = {"enabled": sorted(exc.enabled)}
+        if exc.requested is not None:
+            details["requested"] = exc.requested
+            details["fix"] = "puppetmaster platform enable " + exc.requested
+        return tool_error(str(exc), details)
     blocked = _worktree_preflight(args)
     if blocked is not None:
         return blocked
@@ -2094,6 +2095,54 @@ def start_implement(args: JsonObject) -> JsonObject:
     if isinstance(result, dict):
         result.setdefault("implement_adapter", adapter)
     return result
+
+
+def edit_command(args: JsonObject) -> list[str]:
+    """Build the ``puppetmaster edit`` CLI invocation from MCP args."""
+    instruction = require_string(args, "instruction")
+    command = ["edit", instruction, "--cwd", cwd(args)]
+    if args.get("adapter"):
+        command.extend(["--adapter", str(args["adapter"])])
+    if args.get("model"):
+        command.extend(["--model", str(args["model"])])
+    if args.get("provider"):
+        command.extend(["--provider", str(args["provider"])])
+    if args.get("timeout_seconds"):
+        command.extend(["--timeout-seconds", str(args["timeout_seconds"])])
+    if args.get("routing_policy"):
+        command.extend(["--routing-policy", str(args["routing_policy"])])
+    if args.get("auto_route") is False:
+        command.append("--no-auto-route")
+    if args.get("disable_codegraph"):
+        command.append("--disable-codegraph")
+    if args.get("executable"):
+        command.extend(["--executable", str(args["executable"])])
+    return command
+
+
+def run_edit(args: JsonObject) -> JsonObject:
+    """Lightweight single in-place edit — runs SYNCHRONOUSLY and returns the diff.
+
+    Unlike ``start_implement`` (async, isolated worktree, frontier-capable), this
+    is the snappy verb for one focused change: cheapest sufficient model, CodeGraph
+    to locate the site, edits the working tree in place, and blocks until the diff
+    is ready so the caller sees the result immediately. A PATCH artifact is still
+    captured for review/revert. Validate the adapter up front so a disabled/invalid
+    platform fails with the same precise guidance as the implement verbs.
+    """
+    from puppetmaster import platform_lock
+    from puppetmaster.workers import NoImplementAdapterError, pick_implement_adapter
+
+    enabled = platform_lock.enabled_adapters()
+    try:
+        pick_implement_adapter(enabled, args.get("adapter"))
+    except NoImplementAdapterError as exc:
+        details: JsonObject = {"enabled": sorted(exc.enabled)}
+        if exc.requested is not None:
+            details["requested"] = exc.requested
+            details["fix"] = "puppetmaster platform enable " + exc.requested
+        return tool_error(str(exc), details)
+    return run_cli(edit_command(args), args)
 
 
 def run_claude(args: JsonObject) -> JsonObject:
@@ -3599,11 +3648,11 @@ def implement_schema() -> JsonObject:
         {
             "adapter": {
                 "type": "string",
-                "enum": ["cursor", "claude-code", "codex"],
+                "enum": ["cursor", "claude-code", "codex", "hermes"],
                 "description": (
                     "Force a specific implement-capable platform. Omit to use whichever "
                     "platform the lock has enabled (cursor preferred, then claude-code, "
-                    "then codex)."
+                    "then codex, then hermes)."
                 ),
             },
             "sandbox": {
@@ -3618,6 +3667,63 @@ def implement_schema() -> JsonObject:
         }
     )
     return schema
+
+
+def edit_schema() -> JsonObject:
+    """Schema for the lightweight, synchronous in-place ``edit`` verb."""
+    return {
+        "type": "object",
+        "properties": {
+            "instruction": {
+                "type": "string",
+                "description": "What to change, in plain language (one focused edit).",
+            },
+            "cwd": {
+                "type": "string",
+                "description": "Workspace/repo to edit in. Defaults to the server's cwd.",
+            },
+            "adapter": {
+                "type": "string",
+                "enum": ["cursor", "claude-code", "codex", "hermes"],
+                "description": (
+                    "Force a full-edit adapter. Omit to use the highest-priority "
+                    "adapter the platform lock enables."
+                ),
+            },
+            "model": {
+                "type": "string",
+                "description": "Pin the model (overrides cheap auto-routing).",
+            },
+            "provider": {
+                "type": "string",
+                "description": "Inference provider (Hermes adapter only).",
+            },
+            "routing_policy": {
+                "type": "string",
+                "enum": ["cheap", "balanced", "quality", "escalating"],
+                "default": "cheap",
+                "description": "Router policy when not pinning a model (default: cheap).",
+            },
+            "auto_route": {
+                "type": "boolean",
+                "default": True,
+                "description": "Let the router pick the cheapest sufficient model. Set false to use the adapter default.",
+            },
+            "timeout_seconds": {
+                "type": "integer",
+                "description": "Adapter timeout (default 300).",
+            },
+            "disable_codegraph": {
+                "type": "boolean",
+                "description": "Skip CodeGraph context injection (e.g. non-repo edits).",
+            },
+            "executable": {
+                "type": "string",
+                "description": "Override the adapter executable / command.",
+            },
+        },
+        "required": ["instruction"],
+    }
 
 
 def openai_schema() -> JsonObject:

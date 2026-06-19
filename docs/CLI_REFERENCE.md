@@ -52,6 +52,19 @@ python -m puppetmaster openai "Goal"
 python -m puppetmaster crash-demo
 ```
 
+## Single in-place edit (lightweight)
+
+The `edit` verb is the snappy path between editing inline yourself and a full `start_implement` job: cheapest sufficient model (`--routing-policy cheap` by default), CodeGraph to locate the site, edits the working tree in place, returns the diff synchronously, and captures a reviewable PATCH artifact. Use it for one focused change; reach for `start_implement` when a change grows into a coupled multi-file feature.
+
+```bash
+python -m puppetmaster edit "fix the off-by-one in paginate() in api/list.py"
+python -m puppetmaster edit "add a --verbose flag to the savings command" --adapter hermes
+python -m puppetmaster edit "rename Foo to Bar in models.py" --model gpt-5-nano   # pin a model (overrides cheap routing)
+python -m puppetmaster edit "tidy the imports in cli.py" --no-auto-route          # use the adapter's default model
+```
+
+Also available as the `puppetmaster_edit` MCP tool (synchronous; returns the diff).
+
 ## Routing / cost
 
 ```bash
