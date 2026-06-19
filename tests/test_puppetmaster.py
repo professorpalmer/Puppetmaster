@@ -18609,5 +18609,96 @@ class McpServerUpdateNudgeTests(unittest.TestCase):
         self.assertNotIn("server_update_available", result)
 
 
+class HermesToolSessionPruneTests(unittest.TestCase):
+    """Puppetmaster prunes throwaway Hermes worker sessions (--source tool) after
+    each worker run, so they don't pile up in Hermes' session store / desktop
+    panel. It does this via Hermes' own ``sessions prune`` CLI (cascade-correct,
+    only deletes ENDED sessions so a sibling worker is never disturbed)."""
+
+    def test_cleanup_enabled_by_default(self) -> None:
+        from puppetmaster.adapters import _hermes_session_cleanup_enabled
+
+        self.assertTrue(_hermes_session_cleanup_enabled({}))
+
+    def test_cleanup_opt_out(self) -> None:
+        from puppetmaster.adapters import _hermes_session_cleanup_enabled
+
+        for off in ("0", "false", "no", "off", "OFF"):
+            self.assertFalse(
+                _hermes_session_cleanup_enabled({"PUPPETMASTER_HERMES_PRUNE_SESSIONS": off}),
+                off,
+            )
+
+    def test_prune_builds_correct_cli_command(self) -> None:
+        import puppetmaster.adapters as adapters
+        from types import SimpleNamespace
+
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["kwargs"] = kwargs
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch("puppetmaster.adapters.resolve_command", return_value="/usr/bin/hermes"), \
+                patch("puppetmaster.adapters.subprocess.run", side_effect=fake_run):
+            adapters.prune_hermes_tool_sessions("hermes")
+
+        cmd = captured["cmd"]
+        self.assertEqual(cmd[:1], ["/usr/bin/hermes"])
+        self.assertIn("sessions", cmd)
+        self.assertIn("prune", cmd)
+        self.assertIn("--source", cmd)
+        self.assertIn("tool", cmd)
+        self.assertIn("--older-than", cmd)
+        self.assertIn("0", cmd)
+        self.assertIn("--yes", cmd)
+
+    def test_prune_skipped_when_disabled(self) -> None:
+        import puppetmaster.adapters as adapters
+
+        with patch("puppetmaster.adapters.subprocess.run") as run:
+            adapters.prune_hermes_tool_sessions(
+                "hermes", env={"PUPPETMASTER_HERMES_PRUNE_SESSIONS": "0"}
+            )
+        run.assert_not_called()
+
+    def test_prune_only_targets_tool_source_never_user_sessions(self) -> None:
+        """A guard so we can never delete a real user source (cli / tui / telegram)
+        even if a task payload sets a weird source."""
+        import puppetmaster.adapters as adapters
+
+        with patch("puppetmaster.adapters.subprocess.run") as run:
+            adapters.prune_hermes_tool_sessions("hermes", source="cli")
+            adapters.prune_hermes_tool_sessions("hermes", source="telegram")
+        run.assert_not_called()
+
+    def test_prune_never_raises(self) -> None:
+        import puppetmaster.adapters as adapters
+
+        # Missing CLI -> resolve_command returns None -> clean no-op.
+        with patch("puppetmaster.adapters.resolve_command", return_value=None):
+            adapters.prune_hermes_tool_sessions("nope")  # must not raise
+        # subprocess blowing up -> swallowed.
+        with patch("puppetmaster.adapters.resolve_command", return_value="/usr/bin/hermes"), \
+                patch("puppetmaster.adapters.subprocess.run", side_effect=OSError("boom")):
+            adapters.prune_hermes_tool_sessions("hermes")  # must not raise
+
+    def test_adapter_run_invokes_prune_in_finally(self) -> None:
+        """The prune fires from HermesAdapter.run() even when the worker path
+        raises — session hygiene must not depend on a happy path."""
+        from puppetmaster.adapters import HermesAdapter
+
+        task = Task(
+            id="t", job_id="j", role="explore", adapter="hermes",
+            instruction="x", payload={"cwd": ".", "source": "tool"},
+        )
+        with patch.object(HermesAdapter, "_run_analyze", side_effect=RuntimeError("worker died")), \
+                patch("puppetmaster.adapters.prune_hermes_tool_sessions") as prune:
+            with self.assertRaises(RuntimeError):
+                HermesAdapter().run(task, "goal", "worker")
+        prune.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

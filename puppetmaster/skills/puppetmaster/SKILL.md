@@ -140,3 +140,8 @@ outcome.patch_artifact_emitted == true   # for edit / implement runs
 - **Job complete ≠ success.** Check `outcome.trustworthy` and `stale_task_ids`.
 - **`launcher_pid` is not the worker** — monitor via `job_id` + status/logs/feed.
 - **Platform-lock rejections are expected mid-migration,** not router failures.
+- **Hermes worker sessions auto-prune.** Each `hermes` worker persists a
+  `source=tool` session; Puppetmaster prunes the ended ones after every run (via
+  `hermes sessions prune`, race-safe — only ended sessions). Set
+  `PUPPETMASTER_HERMES_PRUNE_SESSIONS=0` to keep them for debugging, or clean up
+  manually with `hermes sessions prune --source tool --older-than 0 --yes`.

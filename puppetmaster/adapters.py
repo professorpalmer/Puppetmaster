@@ -14,7 +14,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Protocol, Union
+from typing import Any, Mapping, Optional, Protocol, Union
 
 from puppetmaster.codegraph import (
     enrich_prompt_with_codegraph,
@@ -1974,6 +1974,68 @@ def build_hermes_chat_command(
     return command
 
 
+# Hermes worker runs use ``--source tool`` so they're tagged as third-party
+# integration sessions. Hermes still PERSISTS every such session to its state DB
+# (and the desktop sessions panel lists them regardless of source), so a busy
+# swarm leaves a trail of throwaway worker sessions under random worktree cwds.
+# After a worker finishes we prune the ended ``source=tool`` sessions via
+# Hermes' OWN CLI (``hermes sessions prune``), which deletes cascade-correctly
+# (messages + compression_locks + on-disk transcripts) and — critically — only
+# touches ENDED sessions, so a sibling worker still running in the same swarm is
+# never disturbed. We never touch Hermes' SQLite directly: that would couple us
+# to its private schema and risk orphaning rows on a refactor.
+_HERMES_SESSION_PRUNE_ENV = "PUPPETMASTER_HERMES_PRUNE_SESSIONS"
+
+
+def _hermes_session_cleanup_enabled(env: Optional[Mapping[str, str]] = None) -> bool:
+    """True unless the user opts out. Worker sessions are pure clutter, so the
+    cleanup defaults ON; set ``PUPPETMASTER_HERMES_PRUNE_SESSIONS=0`` to keep
+    them (e.g. to debug a worker by resuming its session)."""
+    env = env if env is not None else os.environ
+    raw = env.get(_HERMES_SESSION_PRUNE_ENV)
+    if raw is None:
+        return True
+    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def prune_hermes_tool_sessions(
+    executable: object,
+    *,
+    source: str = "tool",
+    env: Optional[Mapping[str, str]] = None,
+) -> None:
+    """Best-effort prune of ended Hermes worker sessions tagged ``source``.
+
+    Shells out to ``hermes sessions prune --source <source> --older-than 0
+    --yes``. Race-safe (Hermes only prunes ended sessions) and never raises —
+    session hygiene must never fail a worker run. No-op when the cleanup is
+    disabled, the source isn't the worker tag, or the CLI can't be resolved.
+    """
+    if not _hermes_session_cleanup_enabled(env):
+        return
+    # Only ever prune the worker tag — never a real user source like ``cli``.
+    if source != "tool":
+        return
+    try:
+        command_base = command_parts(executable)
+        resolved = resolve_command(command_base[0])
+        if resolved is None:
+            return
+        subprocess.run(
+            [resolved, *command_base[1:], "sessions", "prune",
+             "--source", source, "--older-than", "0", "--yes"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            start_new_session=True,
+        )
+    except Exception:
+        # Cleanup is best-effort: a missing CLI, timeout, or any other failure
+        # must not affect the worker's result.
+        return
+
+
+
 @contextlib.contextmanager
 def hermes_reasoning_effort_env(base_env: dict, effort: object):
     """Yield a subprocess env that runs ``hermes chat`` at ``effort`` reasoning.
@@ -2152,9 +2214,22 @@ class HermesAdapter:
     name = "hermes"
 
     def run(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
-        if task.payload.get("mode") == "implement" or task.payload.get("implement"):
-            return self._run_implement(task, goal, worker_id)
-        return self._run_analyze(task, goal, worker_id)
+        try:
+            if task.payload.get("mode") == "implement" or task.payload.get("implement"):
+                return self._run_implement(task, goal, worker_id)
+            return self._run_analyze(task, goal, worker_id)
+        finally:
+            # Worker sessions are throwaway (--source tool). Prune the ended ones
+            # so they don't pile up in Hermes' session store / desktop panel.
+            # In ``finally`` so it runs whether the worker passed, failed, or
+            # raised — but it only deletes ENDED sessions, so a sibling worker
+            # still running in the same swarm is never touched. Best-effort.
+            prune_hermes_tool_sessions(
+                task.payload.get("executable")
+                or os.environ.get("HERMES_COMMAND")
+                or "hermes",
+                source=str(task.payload.get("source", "tool")),
+            )
 
     def _run_implement(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
         base_prompt = with_report_contract(task.payload.get("prompt") or task.instruction)

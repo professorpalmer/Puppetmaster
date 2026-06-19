@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.9.77
+
+**Hermes worker sessions self-clean — no more pile-up of throwaway `source=tool` sessions under random worktree dirs.** Every Puppetmaster `hermes` worker shells out to `hermes chat`, and Hermes persists each run as a session. The adapter already tagged them `--source tool` (the documented "don't show in user lists" tag), but Hermes still writes them to its state DB and the desktop sessions panel lists them regardless — so a busy swarm left a trail of disposable worker sessions.
+
+- **Auto-prune after every worker run.** `HermesAdapter.run()` now prunes ended `source=tool` sessions in a `finally` block (so it runs whether the worker passed, failed, or raised). It shells out to Hermes' **own** `hermes sessions prune --source tool --older-than 0 --yes` — never touching Hermes' SQLite directly — so deletion is cascade-correct (messages + compression_locks + on-disk transcripts) and version-safe.
+- **Race-safe by construction.** Hermes' prune only deletes *ended* sessions, so a sibling worker still running in the same swarm is never disturbed. The helper also hard-guards on `source == "tool"` — it can never delete a real user source (`cli`/`tui`/`telegram`) even if a payload sets a weird source.
+- **Best-effort, never fatal.** A missing CLI, timeout, or any error during cleanup is swallowed — session hygiene can't fail a worker's result.
+- **Opt-out:** set `PUPPETMASTER_HERMES_PRUNE_SESSIONS=0` to keep worker sessions (e.g. to resume one for debugging). Manual cleanup anytime: `hermes sessions prune --source tool --older-than 0 --yes`.
+- Verified live: a real `puppetmaster edit` ran a Hermes worker, landed the edit, and left **0** `source=tool` sessions behind. Bundled skill updated. Full suite: 865 passed.
+
 ## v0.9.76
 
 **The invocation gate now hands ALL structural code lookups to CodeGraph, regardless of score — closing the last "Hermes still greps it itself" gap.** Single edits and implements already auto-delegated (v0.9.73); broad searches ("find all", "trace") already routed to CodeGraph. But *point lookups* — "where is X", "who calls Y", "what implements Z" — scored below the delegate threshold and stayed inline, so the host fell back to grepping the tree.
