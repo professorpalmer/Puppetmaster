@@ -25,6 +25,7 @@ from puppetmaster.installers import (
     install_codex_mcp,
     install_cursor_mcp,
     install_hermes_mcp,
+    install_hermes_skill,
     resolve_claude_command,
     uninstall_claude_mcp,
     uninstall_codex_mcp,
@@ -3012,6 +3013,19 @@ def _run_install_hermes(args) -> int:
         )
         if hook_outcome.status == "error":
             rc = rc or 1
+        # Install the bundled Hermes skill so Hermes has durable procedural
+        # knowledge of Puppetmaster (verb decision tree, CodeGraph-first flow,
+        # trust gate) — not just the per-turn hook nudge. Non-destructive: an
+        # existing customized skill is left alone unless --force.
+        skill_outcome = install_hermes_skill(
+            force=getattr(args, "force", False),
+            dry_run=getattr(args, "dry_run", False),
+        )
+        print(
+            f"[install-hermes-skill] {skill_outcome.status:<14} {skill_outcome.reason}"
+        )
+        if skill_outcome.status == "error":
+            rc = rc or 1
     if result.status in {"installed", "unchanged"}:
         print()
         print("Next steps:")
@@ -3425,6 +3439,22 @@ def _run_setup(args) -> int:
                 overall_rc = 1
         elif getattr(args, "skip_hooks", False):
             print("  [hermes-hooks] skipped (--skip-hooks)")
+        # Install the bundled Hermes skill (durable procedural knowledge), gated
+        # by --skip-rules since a skill is the same category of artifact as the
+        # agent rule files installed in step 8. Non-destructive (won't clobber a
+        # customized skill without --force).
+        if (
+            hermes_result.status in {"installed", "unchanged", "would_install"}
+            and not getattr(args, "skip_rules", False)
+        ):
+            hermes_skill = install_hermes_skill(force=getattr(args, "force", False))
+            print(
+                f"  [hermes-skill] {hermes_skill.status:<14} {hermes_skill.reason}"
+            )
+            if hermes_skill.status == "error":
+                overall_rc = 1
+        elif getattr(args, "skip_rules", False):
+            print("  [hermes-skill] skipped (--skip-rules)")
         if not getattr(args, "skip_models", False):
             _seed_hermes_registry()
     print()

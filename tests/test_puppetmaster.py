@@ -9500,6 +9500,75 @@ class InstallHermesMcpTests(unittest.TestCase):
             self.assertEqual(result.status, "unchanged")
 
 
+class InstallHermesSkillTests(unittest.TestCase):
+    """Tests for :func:`install_hermes_skill` — shipping the bundled Puppetmaster
+    skill into Hermes' skills dir so a fresh `pip install` has procedural
+    knowledge, not just the per-turn hook nudge."""
+
+    def test_bundled_skill_is_packaged(self):
+        from puppetmaster.installers import bundled_skill_dir
+
+        src = bundled_skill_dir()
+        self.assertIsNotNone(src, "the puppetmaster skill must ship in the package")
+        self.assertTrue((src / "SKILL.md").is_file())
+        body = (src / "SKILL.md").read_text(encoding="utf-8")
+        # The skill must teach the edit verb — the whole point of v0.9.73+.
+        self.assertIn("puppetmaster_edit", body)
+        self.assertIn("name: puppetmaster", body)
+
+    def test_install_skill_into_empty_dir(self):
+        from puppetmaster.installers import install_hermes_skill
+
+        with TemporaryDirectory() as tmp:
+            skills = Path(tmp)
+            out = install_hermes_skill(skills_dir=skills)
+            self.assertEqual(out.status, "installed")
+            landed = skills / "autonomous-ai-agents" / "puppetmaster" / "SKILL.md"
+            self.assertTrue(landed.is_file())
+
+    def test_install_skill_idempotent(self):
+        from puppetmaster.installers import install_hermes_skill
+
+        with TemporaryDirectory() as tmp:
+            skills = Path(tmp)
+            install_hermes_skill(skills_dir=skills)
+            again = install_hermes_skill(skills_dir=skills)
+            self.assertEqual(again.status, "unchanged")
+
+    def test_install_skill_does_not_clobber_customized_without_force(self):
+        from puppetmaster.installers import install_hermes_skill
+
+        with TemporaryDirectory() as tmp:
+            skills = Path(tmp)
+            target = skills / "autonomous-ai-agents" / "puppetmaster"
+            target.mkdir(parents=True)
+            (target / "SKILL.md").write_text("# my customized skill\n", encoding="utf-8")
+            out = install_hermes_skill(skills_dir=skills)
+            self.assertEqual(out.status, "skipped")
+            # The user's content is preserved.
+            self.assertIn(
+                "customized", (target / "SKILL.md").read_text(encoding="utf-8")
+            )
+            # ...until they opt in with force.
+            forced = install_hermes_skill(skills_dir=skills, force=True)
+            self.assertEqual(forced.status, "updated")
+            self.assertIn(
+                "name: puppetmaster",
+                (target / "SKILL.md").read_text(encoding="utf-8"),
+            )
+
+    def test_install_skill_dry_run_writes_nothing(self):
+        from puppetmaster.installers import install_hermes_skill
+
+        with TemporaryDirectory() as tmp:
+            skills = Path(tmp)
+            out = install_hermes_skill(skills_dir=skills, dry_run=True)
+            self.assertEqual(out.status, "would_install")
+            self.assertFalse(
+                (skills / "autonomous-ai-agents" / "puppetmaster").exists()
+            )
+
+
 class HermesRegistryCredentialTests(unittest.TestCase):
     """Credential-aware filtering of the curated Hermes catalog.
 

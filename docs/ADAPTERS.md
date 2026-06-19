@@ -186,6 +186,8 @@ Register the Puppetmaster MCP inside Hermes so the Hermes agent can drive swarms
 python -m puppetmaster install-hermes-mcp
 ```
 
+One command makes Hermes a **full auto-invocation host**: it registers the MCP server in `~/.hermes/config.yaml`, wires Hermes' native `pre_llm_call` / `pre_tool_call` shell hooks (so focused single edits auto-steer to `puppetmaster_edit` and broad work to a swarm), and installs the bundled `puppetmaster` skill into `~/.hermes/skills` (durable procedural knowledge — verb decision tree, CodeGraph-first flow, trust gate). All three steps are idempotent and non-destructive; an existing customized skill is left untouched unless you pass `--force`. `puppetmaster setup` does the same as part of first-run.
+
 If the adapter returns `failure=missing_cli`, install Hermes or set `HERMES_COMMAND` / `payload.executable`.
 If it returns `failure=dirty_worktree` in implement mode, run from a clean tree or set `payload.allow_dirty=true`.
 

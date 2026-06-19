@@ -1690,6 +1690,112 @@ def hermes_config_path(env: Optional[Mapping[str, str]] = None) -> Path:
     return base / "config.yaml"
 
 
+def hermes_skills_dir(env: Optional[Mapping[str, str]] = None) -> Path:
+    """Return Hermes' skills directory (``$HERMES_HOME/skills`` or ~/.hermes/skills)."""
+    env = env if env is not None else os.environ
+    hermes_home = env.get("HERMES_HOME")
+    base = Path(hermes_home).expanduser() if hermes_home else Path("~/.hermes").expanduser()
+    return base / "skills"
+
+
+def bundled_skill_dir() -> Optional[Path]:
+    """Locate the Puppetmaster Hermes skill shipped inside the package.
+
+    Returns ``None`` when the skill data wasn't packaged (defensive — keeps the
+    installer a no-op rather than crashing on a partial install)."""
+    candidate = Path(__file__).with_name("skills") / "puppetmaster"
+    return candidate if (candidate / "SKILL.md").is_file() else None
+
+
+@dataclass
+class SkillInstallOutcome:
+    """Result of installing the bundled Hermes skill. ``status`` is one of
+    ``installed`` / ``updated`` / ``unchanged`` / ``skipped`` / ``error``."""
+
+    status: str
+    target: str
+    reason: str = ""
+
+
+def install_hermes_skill(
+    *,
+    skills_dir: Optional[Path] = None,
+    force: bool = False,
+    dry_run: bool = False,
+    env: Optional[Mapping[str, str]] = None,
+) -> SkillInstallOutcome:
+    """Copy the bundled Puppetmaster skill into Hermes' skills directory.
+
+    Idempotent and non-destructive:
+
+    * No bundled skill packaged → ``skipped`` (never an error).
+    * Target identical to the bundled copy → ``unchanged``.
+    * Target exists but differs and ``force`` is False → ``skipped`` with a
+      reason (we never silently overwrite a user-customized skill; the user opts
+      in with ``--force``). A fresh install (no target) always writes.
+    * Otherwise copy the whole skill tree (SKILL.md + references/ + scripts/).
+
+    The skill lands under ``<skills>/autonomous-ai-agents/puppetmaster`` to match
+    Hermes' category convention.
+    """
+    import filecmp
+    import shutil
+
+    src = bundled_skill_dir()
+    if src is None:
+        return SkillInstallOutcome(
+            status="skipped",
+            target="",
+            reason="no bundled skill in this install (package-data missing)",
+        )
+
+    base = skills_dir or hermes_skills_dir(env)
+    target = base / "autonomous-ai-agents" / "puppetmaster"
+    src_skill = src / "SKILL.md"
+    dst_skill = target / "SKILL.md"
+
+    if dst_skill.is_file():
+        # Compare just SKILL.md — the body is what carries the guidance; a byte
+        # match means our bundled copy is already in place.
+        if filecmp.cmp(src_skill, dst_skill, shallow=False):
+            return SkillInstallOutcome(
+                status="unchanged", target=str(target),
+                reason="bundled skill already current",
+            )
+        if not force:
+            return SkillInstallOutcome(
+                status="skipped", target=str(target),
+                reason="existing skill differs (customized?) — re-run with --force to overwrite",
+            )
+        verb = "updated"
+    else:
+        verb = "installed"
+
+    if dry_run:
+        return SkillInstallOutcome(
+            status="would_install", target=str(target),
+            reason=f"DRY RUN — would {verb} bundled skill",
+        )
+
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        # Copy the whole tree so references/ + scripts/ travel with SKILL.md.
+        for item in src.iterdir():
+            dest = target / item.name
+            if item.is_dir():
+                shutil.copytree(item, dest, dirs_exist_ok=True)
+            else:
+                shutil.copy2(item, dest)
+    except OSError as exc:
+        return SkillInstallOutcome(
+            status="error", target=str(target), reason=f"copy failed: {exc}"
+        )
+
+    return SkillInstallOutcome(
+        status=verb, target=str(target), reason=f"{verb} bundled Puppetmaster skill"
+    )
+
+
 def build_hermes_mcp_entry(python_executable: str, *, prior: Optional[Mapping] = None) -> dict:
     """Build the ``mcp_servers.puppetmaster`` entry for Hermes' config.
 

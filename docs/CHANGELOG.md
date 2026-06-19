@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.9.75
+
+**Puppetmaster now ships a bundled Hermes skill — a fresh `pip install` makes Hermes a fully native host (MCP + hooks + skill) in one command.** Closes the last "native package" gap: previously the rich `puppetmaster` skill existed only on the maintainer's machine (hand-built across sessions), so a new user got the MCP server and auto-invoke hooks but **no durable procedural knowledge** — Hermes only learned Puppetmaster through the per-turn hook nudge.
+
+- **Bundled skill shipped in the wheel.** `puppetmaster/skills/puppetmaster/SKILL.md` is now package-data (verified present in the built wheel). It teaches the verb decision tree (`edit` for one focused change, `start_implement` for coupled multi-file work, swarm for read-only analysis), the CodeGraph-first exploration flow, routing, the async monitoring pattern, and the trust gate.
+- **`install-hermes-mcp` / `setup` install it.** A new `install_hermes_skill` copies the bundled skill into `~/.hermes/skills/autonomous-ai-agents/puppetmaster`. Idempotent and **non-destructive**: a fresh install writes it, an unchanged install is a no-op, and an existing *customized* skill is left untouched unless `--force` (so the maintainer's richer local skill is never clobbered). Verified end-to-end from a clean venv + built wheel into a temp `HERMES_HOME`.
+- **One command = full native host.** `install-hermes-mcp` now wires all three: MCP server registration, the `pre_llm_call` / `pre_tool_call` hooks, and the skill. Docs (ADAPTERS.md, Hermes next-steps guidance) updated to match.
+- **No regressions on other platforms** — the skill is Hermes-only (its install path is the Hermes skills dir); Cursor/Claude/Codex are untouched. Full suite: 854 passed.
+
 ## v0.9.74
 
 **`puppetmaster setup` now makes Hermes a full auto-invocation host in one shot — no regressions on the other harnesses.** Follow-up hardening for the v0.9.73 `edit` verb.
