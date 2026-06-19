@@ -16013,6 +16013,54 @@ class InvocationGateTests(unittest.TestCase):
         self.assertEqual(infer_role_and_verb("design the caching layer")[1], "puppetmaster_start_cursor_plan")
         self.assertEqual(infer_role_and_verb("where is ClientError defined")[1], "puppetmaster_codegraph_search")
 
+    def test_codegraph_lookups_delegate_regardless_of_score(self):
+        """A structural "where is X / who calls Y / what implements Z" lookup must
+        delegate to CodeGraph even when its capability score is low. Unlike an
+        edit (where a small change *might* be faster inline, so the score gate
+        guards the round-trip), a lookup is cheap and strictly beats inline grep —
+        there's no penalty to protect against, so score must not hold it back.
+        """
+        from puppetmaster.invocation_gate import should_delegate
+
+        for prompt in (
+            "where is ClientError defined",
+            "who calls the retry helper",
+            "what implements the SwarmStore interface",
+            "find all usages of deprecated_fn",
+            "trace how the auth token flows through the request",
+        ):
+            d = should_delegate(prompt)
+            self.assertTrue(d.should_delegate, prompt)
+            self.assertEqual(d.suggested_verb, "puppetmaster_codegraph_search", prompt)
+
+    def test_codegraph_lookup_directive_points_at_codegraph(self):
+        from puppetmaster.invocation_gate import should_delegate
+
+        d = should_delegate("who calls the retry helper")
+        directive = d.directive()
+        self.assertIn("puppetmaster_codegraph_search", directive)
+        self.assertIn("CodeGraph", directive)
+        self.assertNotIn("fan it out to a swarm", directive)
+
+    def test_conceptual_question_stays_inline_not_a_lookup(self):
+        """A conceptual "what is X" / "what does the flag do" question is NOT a
+        structural lookup and must stay inline — only the where/who/what-implements
+        family delegates to CodeGraph."""
+        from puppetmaster.invocation_gate import should_delegate
+
+        for prompt in ("what is a SwarmStore", "what does the --cwd flag do"):
+            d = should_delegate(prompt)
+            self.assertFalse(d.should_delegate, prompt)
+
+    def test_lookup_explicit_inline_optout_wins_over_codegraph(self):
+        """The explicit-inline opt-out must beat the always-delegate lookup rule —
+        "just answer me / no puppetmaster" keeps even a lookup inline."""
+        from puppetmaster.invocation_gate import should_delegate
+
+        d = should_delegate("where is ClientError defined — no puppetmaster, just answer")
+        self.assertFalse(d.should_delegate)
+        self.assertIn("explicit-inline", d.matched_signals)
+
     def test_feature_implementation_routes_to_single_implement_worker(self):
         """Plain, focused feature work must delegate to a SINGLE worker, not the
         read-only swarm default. With the scope-aware refinement these focused

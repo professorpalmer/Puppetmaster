@@ -74,6 +74,11 @@ CodeGraph first, then read only the files it points to. Verbs: `codegraph_search
   `$HOME`, not the repo — without it, `codegraph_status` reports "Not initialized"
   even for a healthy index.
 - If `.codegraph/` doesn't exist, run `codegraph_init` once first.
+- **Lookups always delegate, never grep.** A structural "where is X / who calls Y /
+  what implements Z / find all / trace" query is cheap and strictly beats an inline
+  grep, so the invocation gate routes it to CodeGraph regardless of score. Don't fall
+  back to ripgrep for a symbol/usage/impl question — reach for `codegraph_search`.
+  (Plain text matches — log strings, config values — may still use ripgrep.)
 
 ## Routing
 

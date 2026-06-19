@@ -353,6 +353,21 @@ def should_delegate(
             suggested_verb, score, role, ("trivial",),
         )
 
+    # CodeGraph lookups always delegate, regardless of score. A structural
+    # "where is X / who calls Y / what implements Z" query is cheap, fast, and
+    # strictly better than letting the host grep the tree — there is no
+    # round-trip penalty to protect against the way there is for an edit, so the
+    # score threshold (which exists to keep cheap *edits* inline) shouldn't hold
+    # a lookup back. The explicit-inline opt-out and trivial carve-out above
+    # still win, so "just answer me" / "what is X" stays inline.
+    if suggested_verb in _CODEGRAPH_VERBS:
+        return DelegationDecision(
+            True,
+            f"CodeGraph lookup — delegate regardless of score ({score}); "
+            f"structural lookup beats inline grep",
+            suggested_verb, score, role, ("codegraph-lookup",),
+        )
+
     if score < trivial_threshold and not has_hard_scope:
         return DelegationDecision(
             False, f"score {score} below trivial threshold {trivial_threshold}",

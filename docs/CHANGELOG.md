@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.9.76
+
+**The invocation gate now hands ALL structural code lookups to CodeGraph, regardless of score — closing the last "Hermes still greps it itself" gap.** Single edits and implements already auto-delegated (v0.9.73); broad searches ("find all", "trace") already routed to CodeGraph. But *point lookups* — "where is X", "who calls Y", "what implements Z" — scored below the delegate threshold and stayed inline, so the host fell back to grepping the tree.
+
+- **CodeGraph lookups delegate unconditionally.** When the gate infers a CodeGraph lookup intent (`where is / who calls / what implements / find all / trace / call graph`), it now delegates regardless of capability score. Rationale: unlike an edit — where a tiny change *might* be faster inline, so the score gate guards the round-trip — a structural lookup is cheap, fast, and strictly beats an inline grep. There's no penalty to protect against, so score must not hold it back.
+- **Conceptual questions still stay inline.** "what is a SwarmStore" / "what does the --cwd flag do" are NOT structural lookups and remain inline; only the where/who/what-implements/find-all/trace family delegates. The explicit-inline opt-out ("just answer me" / "no puppetmaster") and the trivial carve-out still win over the new rule.
+- **Net effect:** Hermes now pilots edits, implements, AND searches to Puppetmaster automatically, keeping only trivial edits and conceptual Q&A inline. Verified live through the real Hermes hook.
+- Bundled skill updated to state the lookups-always-delegate rule. Hermes-only behavior surface; no change to how Cursor/Claude/Codex hosts are treated beyond the same (correct) routing. Full suite: 858 passed.
+
 ## v0.9.75
 
 **Puppetmaster now ships a bundled Hermes skill — a fresh `pip install` makes Hermes a fully native host (MCP + hooks + skill) in one command.** Closes the last "native package" gap: previously the rich `puppetmaster` skill existed only on the maintainer's machine (hand-built across sessions), so a new user got the MCP server and auto-invoke hooks but **no durable procedural knowledge** — Hermes only learned Puppetmaster through the per-turn hook nudge.
