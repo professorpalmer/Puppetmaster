@@ -143,13 +143,20 @@ RULE_BODY = textwrap.dedent(
        read-only analysis; `puppetmaster_start_implement` /
        `puppetmaster_start_claude_implement` / `puppetmaster_start_codex`
        for full-edit builds.
-    3. `puppetmaster_artifacts <job_id>` — read structured outputs at zero
+    3. `puppetmaster_edit "<instruction>"` — a SINGLE focused in-place edit:
+       cheapest sufficient model, CodeGraph to locate the site, edits the
+       working tree directly, returns the diff synchronously, captures a
+       reviewable PATCH. Prefer it over an inline single-file edit when the
+       change benefits from CodeGraph or cheap-model routing; reserve
+       `puppetmaster_start_implement` for coupled multi-file features (isolated
+       worktree). Keep truly trivial edits (typo/rename/comment) inline.
+    4. `puppetmaster_artifacts <job_id>` — read structured outputs at zero
        token cost (results persist in SQLite).
-    4. `puppetmaster_dashboard [job_id]` — when the user asks to see/open
+    5. `puppetmaster_dashboard [job_id]` — when the user asks to see/open
        the job dashboard, call this (it starts the local server if needed)
        and open the returned URL in a browser tab for them. CLI fallback:
        `python -m puppetmaster dashboard [job_id]`.
-    5. `puppetmaster_doctor` — sanity-check Puppetmaster's runtime
+    6. `puppetmaster_doctor` — sanity-check Puppetmaster's runtime
        dependencies once per session.
 
     If `puppetmaster_doctor` reports critical failures, surface them to

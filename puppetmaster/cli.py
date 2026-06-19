@@ -335,7 +335,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     setup_parser = subcommands.add_parser(
         "setup",
-        help="One-shot first-run: doctor + models init + install-cursor-mcp + install-codex-mcp + install-claude-mcp + install-hermes-mcp + install-rules. Skips steps where the tool isn't present.",
+        help="One-shot first-run: doctor + models init + install-cursor-mcp + install-codex-mcp + install-claude-mcp + install-hermes-mcp (+ Hermes hooks) + install-rules + install-hooks. Skips steps where the tool isn't present.",
     )
     setup_parser.add_argument(
         "--skip-doctor",
@@ -3405,6 +3405,26 @@ def _run_setup(args) -> int:
             print(f"  {line}")
         if hermes_result.status not in {"installed", "unchanged", "would_install"}:
             overall_rc = 1
+        # Wire Hermes' native shell hooks too, so `setup` makes Hermes a full
+        # auto-invocation host (MCP server + per-turn delegate hook) — parity
+        # with the Cursor/Claude hooks installed in step 9, which only touch
+        # those harnesses' hook files. Skipped when the MCP step errored (a hook
+        # without a live server is a no-op) or when --skip-hooks is set.
+        if (
+            hermes_result.status in {"installed", "unchanged", "would_install"}
+            and not getattr(args, "skip_hooks", False)
+        ):
+            hermes_hooks = install_hermes_hooks(
+                force=getattr(args, "force", False),
+                dry_run=False,
+            )
+            print(
+                f"  [hermes-hooks] {hermes_hooks.status:<14} {hermes_hooks.reason}"
+            )
+            if hermes_hooks.status == "error":
+                overall_rc = 1
+        elif getattr(args, "skip_hooks", False):
+            print("  [hermes-hooks] skipped (--skip-hooks)")
         if not getattr(args, "skip_models", False):
             _seed_hermes_registry()
     print()

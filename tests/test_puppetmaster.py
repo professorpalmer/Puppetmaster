@@ -16894,6 +16894,73 @@ class SetupHooksStepTests(unittest.TestCase):
             finally:
                 os.chdir(cwd0)
 
+    def test_setup_installs_hermes_hooks_when_hermes_enabled(self):
+        """The wizard's Hermes step must wire Hermes' native shell hooks too —
+        parity with the Cursor/Claude hooks in the final step. Regression guard:
+        early versions only installed the Hermes MCP server and silently skipped
+        its auto-invocation hooks, so `setup` left Hermes a non-delegating host.
+        """
+        import puppetmaster.cli as cli
+
+        class _Res:
+            status = "installed"
+            messages: list = []
+
+        captured = {"hermes_hooks": 0}
+
+        def fake_hermes_hooks(**kwargs):
+            captured["hermes_hooks"] += 1
+            return MagicMock(status="installed", reason="wrote hermes hooks")
+
+        with TemporaryDirectory() as tmp:
+            cwd0 = Path.cwd()
+            try:
+                os.chdir(tmp)
+                with patch.object(cli, "install_cursor_mcp", return_value=_Res()), \
+                        patch.object(cli, "install_codex_mcp", return_value=_Res()), \
+                        patch.object(cli, "install_hermes_mcp", return_value=_Res()), \
+                        patch.object(cli, "install_hermes_hooks", side_effect=fake_hermes_hooks), \
+                        patch.object(cli, "_seed_hermes_registry"), \
+                        patch("shutil.which", return_value="/usr/local/bin/hermes"), \
+                        patch("puppetmaster.platform_lock.enabled_adapters",
+                              return_value={"hermes"}):
+                    rc = cli._run_setup(self._args())
+                self.assertEqual(rc, 0)
+                self.assertEqual(
+                    captured["hermes_hooks"], 1,
+                    "setup must install Hermes hooks when hermes is enabled",
+                )
+            finally:
+                os.chdir(cwd0)
+
+    def test_setup_skip_hooks_skips_hermes_hooks_too(self):
+        """--skip-hooks must suppress the Hermes hooks too, not just Cursor/Claude."""
+        import puppetmaster.cli as cli
+
+        class _Res:
+            status = "installed"
+            messages: list = []
+
+        captured = {"hermes_hooks": 0}
+
+        with TemporaryDirectory() as tmp:
+            cwd0 = Path.cwd()
+            try:
+                os.chdir(tmp)
+                with patch.object(cli, "install_hermes_mcp", return_value=_Res()), \
+                        patch.object(cli, "install_hermes_hooks",
+                                     side_effect=lambda **k: captured.__setitem__(
+                                         "hermes_hooks", captured["hermes_hooks"] + 1)), \
+                        patch.object(cli, "_seed_hermes_registry"), \
+                        patch("shutil.which", return_value="/usr/local/bin/hermes"), \
+                        patch("puppetmaster.platform_lock.enabled_adapters",
+                              return_value={"hermes"}):
+                    rc = cli._run_setup(self._args(skip_hooks=True))
+                self.assertEqual(rc, 0)
+                self.assertEqual(captured["hermes_hooks"], 0)
+            finally:
+                os.chdir(cwd0)
+
 
 class UninstallTests(unittest.TestCase):
     """Tests for ``puppetmaster uninstall`` and its removal helpers."""

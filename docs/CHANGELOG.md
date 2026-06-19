@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.9.74
+
+**`puppetmaster setup` now makes Hermes a full auto-invocation host in one shot — no regressions on the other harnesses.** Follow-up hardening for the v0.9.73 `edit` verb.
+
+- **Setup-wizard parity for Hermes hooks.** The `setup` wizard's Hermes step previously installed only the MCP server and silently skipped Hermes' native `pre_llm_call` / `pre_tool_call` hooks — so `puppetmaster setup` left Hermes a non-delegating host while Cursor/Claude got their hooks. The wizard now installs the Hermes hooks too (respecting `--skip-hooks`), matching the standalone `install-hermes-mcp` command. Regression-tested both ways.
+- **`edit` verb advertised everywhere.** The installed agent rules (`rules.py`, written into every harness) and the Hermes next-steps guidance now document `puppetmaster_edit`, so all hosts discover the lightweight single-edit path.
+- **Cross-harness regression audit (no behavior change, verified).** The v0.9.73 gate change (focused single-edit intent → `puppetmaster_edit`) is host-agnostic; confirmed it routes correctly and injects the right host-shaped directive on Cursor, Claude Code, Codex, and Hermes, with no cursor-verb leakage into non-cursor hosts, `verb_for_host` passing the new verb through unchanged, and the `puppetmaster_edit` MCP tool visible to every client.
+
 ## v0.9.73
 
 **New `edit` verb — the lightweight, in-place single-edit path between an inline edit and a full implement job.** Focused single-file changes ("fix this function", "add a flag", "wire up retries") no longer have to choose between editing inline yourself (no CodeGraph, no cheap-model routing, no receipt) or spinning up a heavyweight `start_implement` worktree job. The new `edit` verb is the snappy middle: cheapest sufficient model, CodeGraph to locate the site, edits the working tree directly, returns the diff synchronously, and still captures a reviewable PATCH artifact.

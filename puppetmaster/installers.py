@@ -1660,8 +1660,14 @@ HERMES_NEXT_STEPS_GUIDANCE = (
     "Restart Hermes (or start a fresh session) to pick up the new MCP server.\n"
     "Verify with `hermes mcp list` — puppetmaster should appear — or ask Hermes to\n"
     "call `puppetmaster_doctor` and report the results.\n"
-    "Long jobs: prefer the async pattern — fire a `start_*` verb, then re-poll with\n"
-    "bounded `live_artifacts_follow` / `await_job` — instead of one multi-minute block."
+    "Auto-invocation: the install also wired Hermes' native pre_llm_call / pre_tool_call\n"
+    "hooks, so focused single edits get steered to `puppetmaster_edit` and broad work to\n"
+    "a swarm automatically. Approve them once at the TTY prompt (or pass --accept-hooks),\n"
+    "then check `hermes hooks list` / `hermes hooks doctor`. Disable anytime with\n"
+    "PUPPETMASTER_AUTO_INVOKE_DISABLED=1.\n"
+    "Single edits: `puppetmaster_edit \"<instruction>\"` (cheap model + CodeGraph, in place,\n"
+    "returns a diff). Long jobs: prefer the async pattern — fire a `start_*` verb, then\n"
+    "re-poll with bounded `live_artifacts_follow` / `await_job` instead of one long block."
 )
 
 _HERMES_PIP_HINT = (
