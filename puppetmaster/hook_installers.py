@@ -38,7 +38,7 @@ import json
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Mapping, Optional
 
 _GATE_MARKER = "puppetmaster invocation-gate"
 
@@ -231,6 +231,180 @@ def _install_claude(base_dir: Path, *, scope: str, dry_run: bool, force: bool, p
 
 
 _HOOK_TARGET_ADAPTERS = {"cursor": "cursor", "claude": "claude-code"}
+
+
+# ---------------------------------------------------------------------------
+# Hermes hooks (YAML config.yaml, not a JSON sidecar)
+# ---------------------------------------------------------------------------
+#
+# Hermes drives auto-invocation through its native shell-hook system
+# (agent/shell_hooks.py): a ``hooks:`` block in ``~/.hermes/config.yaml`` maps
+# each event to a list of ``{command: ...}`` entries. Hermes runs the command,
+# pipes the hook payload as JSON on stdin, and reads the command's stdout:
+#
+#   * ``pre_llm_call``  → honors ``{"context": "<str>"}`` (injected into the
+#                         user message; the per-turn delegate directive).
+#   * ``pre_tool_call`` → honors ``{"action": "block", "message": ...}`` (the
+#                         broad-native-search deny-redirect).
+#
+# Both events shell into the same ``python -m puppetmaster invocation-gate
+# --host hermes`` brain the Cursor/Claude hooks use, so there is exactly one
+# policy across every host. We register both entries, identified (for
+# idempotent re-install / clean uninstall) by the gate-command marker.
+
+#: Hermes events we own and the canonical gate event each maps to.
+_HERMES_HOOK_EVENTS = {
+    "pre_llm_call": "user-prompt",
+    "pre_tool_call": "pre-tool",
+}
+
+
+def render_hermes_hooks(python: Optional[str] = None) -> dict:
+    """The Hermes ``hooks:`` entries Puppetmaster owns, keyed by event."""
+    return {
+        event: [{"command": _gate_command("hermes", gate_event, python)}]
+        for event, gate_event in _HERMES_HOOK_EVENTS.items()
+    }
+
+
+def merge_hermes_hooks(existing_hooks: object, ours: dict) -> tuple[dict, bool]:
+    """Merge our Hermes hook entries into an existing ``hooks:`` mapping.
+
+    Returns ``(merged, changed)``. For each event we drop any prior Puppetmaster
+    entries (matched by the gate-command marker), keep the user's, and append
+    ours. ``changed`` is False when the result is byte-identical to the input so
+    callers can report ``unchanged``. ``existing_hooks`` may be ``{}`` (Hermes'
+    default), ``None``, or a populated mapping.
+    """
+    merged = dict(existing_hooks) if isinstance(existing_hooks, dict) else {}
+    for event, our_entries in ours.items():
+        prior_list = merged.get(event)
+        prior = [e for e in (prior_list or []) if not _is_ours(e)] if isinstance(prior_list, list) else []
+        merged[event] = prior + list(our_entries)
+    changed = json.dumps(existing_hooks if isinstance(existing_hooks, dict) else {}, sort_keys=True) != json.dumps(merged, sort_keys=True)
+    return merged, changed
+
+
+def strip_hermes_hooks(existing_hooks: object) -> tuple[dict, bool]:
+    """Remove Puppetmaster entries from a Hermes ``hooks:`` mapping.
+
+    Returns ``(stripped, changed)``. User-authored hook entries are preserved;
+    an event whose only entries were ours is dropped entirely.
+    """
+    merged = dict(existing_hooks) if isinstance(existing_hooks, dict) else {}
+    changed = False
+    for event, entries in list(merged.items()):
+        if not isinstance(entries, list):
+            continue
+        prior = [e for e in entries if not _is_ours(e)]
+        if len(prior) != len(entries):
+            changed = True
+        if prior:
+            merged[event] = prior
+        else:
+            del merged[event]
+    return merged, changed
+
+
+def install_hermes_hooks(
+    *,
+    target_path: Optional[Path] = None,
+    dry_run: bool = False,
+    force: bool = False,
+    python: Optional[str] = None,
+    env: Optional[Mapping[str, str]] = None,
+) -> HookOutcome:
+    """Register Puppetmaster auto-invocation hooks in Hermes' ``config.yaml``.
+
+    Edits only the ``hooks:`` block; every other server/section is preserved
+    verbatim. Idempotent and non-destructive. Requires PyYAML (ships with the
+    ``puppetmaster-ai[hermes]`` extra and with Hermes itself).
+    """
+    from puppetmaster.installers import hermes_config_path
+
+    target = target_path or hermes_config_path(env)
+    label = str(target)
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return HookOutcome(
+            "hermes", label, "error",
+            "PyYAML is required to edit Hermes' config.yaml but is not "
+            "importable. Install it (pip install pyyaml) and re-run.",
+        )
+
+    if target.exists():
+        try:
+            loaded = yaml.safe_load(target.read_text(encoding="utf-8"))
+        except yaml.YAMLError as exc:
+            return HookOutcome("hermes", label, "error", f"{target} is not valid YAML: {exc!r}")
+        config = loaded if isinstance(loaded, dict) else {}
+        if loaded is not None and not isinstance(loaded, dict):
+            return HookOutcome("hermes", label, "error", f"top-level of {target} is not a mapping; cannot merge")
+    else:
+        config = {}
+
+    existing_hooks = config.get("hooks")
+    if existing_hooks is not None and not isinstance(existing_hooks, dict):
+        return HookOutcome("hermes", label, "error", f"'hooks' in {target} is not a mapping; cannot merge")
+
+    merged_hooks, changed = merge_hermes_hooks(existing_hooks, render_hermes_hooks(python))
+    if not changed and not force:
+        return HookOutcome("hermes", label, "unchanged", f"{label} already current")
+    if dry_run:
+        return HookOutcome("hermes", label, "would_install", f"would register Hermes pre_llm_call + pre_tool_call hooks in {label}")
+
+    config["hooks"] = merged_hooks
+    target.parent.mkdir(parents=True, exist_ok=True)
+    rendered = yaml.safe_dump(config, sort_keys=False, allow_unicode=True, default_flow_style=False, width=4096)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    tmp.write_text(rendered, encoding="utf-8")
+    tmp.replace(target)
+    return HookOutcome(
+        "hermes", label, "installed",
+        f"wrote Hermes pre_llm_call (prompt-inject) + pre_tool_call (deny-redirect) hooks to {label}",
+    )
+
+
+def uninstall_hermes_hooks(
+    *,
+    target_path: Optional[Path] = None,
+    dry_run: bool = False,
+    env: Optional[Mapping[str, str]] = None,
+) -> HookOutcome:
+    """Remove Puppetmaster auto-invocation hooks from Hermes' ``config.yaml``."""
+    from puppetmaster.installers import hermes_config_path
+
+    target = target_path or hermes_config_path(env)
+    label = str(target)
+    if not target.is_file():
+        return HookOutcome("hermes", label, "unchanged", f"no {label}")
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return HookOutcome("hermes", label, "error", "PyYAML required to edit Hermes config.yaml; not importable")
+    try:
+        loaded = yaml.safe_load(target.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        return HookOutcome("hermes", label, "error", f"{target} is not valid YAML: {exc!r}")
+    config = loaded if isinstance(loaded, dict) else {}
+    existing_hooks = config.get("hooks")
+    if not isinstance(existing_hooks, dict):
+        return HookOutcome("hermes", label, "unchanged", f"{label} has no Puppetmaster hooks")
+
+    stripped, changed = strip_hermes_hooks(existing_hooks)
+    if not changed:
+        return HookOutcome("hermes", label, "unchanged", f"{label} has no Puppetmaster hooks")
+    if dry_run:
+        return HookOutcome("hermes", label, "would_remove", f"would remove Puppetmaster hooks from {label}")
+
+    # Preserve Hermes' default empty ``hooks: {}`` so the key shape is unchanged.
+    config["hooks"] = stripped
+    rendered = yaml.safe_dump(config, sort_keys=False, allow_unicode=True, default_flow_style=False, width=4096)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    tmp.write_text(rendered, encoding="utf-8")
+    tmp.replace(target)
+    return HookOutcome("hermes", label, "removed", f"removed Puppetmaster hooks from {label}")
 
 
 def install_hooks(

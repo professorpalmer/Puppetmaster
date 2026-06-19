@@ -39,10 +39,17 @@ EVENT_PRE_TOOL = "pre-tool"
 _USER_PROMPT_ALIASES = {
     "user-prompt", "userpromptsubmit", "beforesubmitprompt", "user_prompt",
     "submitprompt", "prompt",
+    # Hermes fires its per-turn context-injection hook as ``pre_llm_call``;
+    # it carries the user message and accepts an injected ``{"context": ...}``,
+    # so it maps onto our user-prompt event exactly like Cursor's
+    # beforeSubmitPrompt / Claude's UserPromptSubmit.
+    "prellmcall", "pre_llm_call",
 }
 _PRE_TOOL_ALIASES = {
     "pre-tool", "pretooluse", "beforeshellexecution", "beforereadfile",
     "beforemcpexecution", "pre_tool", "tool",
+    # Hermes' canonical tool-gate event.
+    "pretoolcall", "pre_tool_call",
 }
 
 # We deliberately do NOT hard-deny the built-in agent fan-out (``Task`` /
@@ -131,6 +138,8 @@ class HookResponse:
         host = (host or "").lower()
         if host == "claude":
             return self._claude_json()
+        if host == "hermes":
+            return self._hermes_json()
         return self._cursor_json()
 
     def _cursor_json(self) -> dict:
@@ -165,6 +174,27 @@ class HookResponse:
             }
         return out
 
+    def _hermes_json(self) -> dict:
+        """Render for Hermes' shell-hook wire protocol (agent/shell_hooks.py).
+
+        Hermes parses hook stdout per event:
+
+        * ``pre_llm_call`` honors ONLY ``{"context": "<non-empty str>"}`` and
+          injects it into the user message (cache-safe — never the system
+          prompt). Anything else (incl. ``{}``) is a silent no-op.
+        * ``pre_tool_call`` honors ``{"action": "block", "message": ...}``
+          (canonical) or the Claude-style ``{"decision": "block", "reason": ...}``.
+
+        We never block a user prompt — injection beats refusal — so a delegate
+        decision emits ``context``; a deny (broad native search) emits the block
+        shape. An allow/no-op emits ``{}``, which Hermes ignores.
+        """
+        if self.action == "deny":
+            return {"action": "block", "message": self.reason}
+        if self.context:
+            return {"context": self.context}
+        return {}
+
 
 def normalize_event(event: str) -> str:
     """Map a host-specific event name onto a canonical event kind."""
@@ -178,13 +208,23 @@ def normalize_event(event: str) -> str:
 
 
 def extract_prompt(payload: Mapping[str, Any]) -> str:
-    """Pull the user prompt text out of a host hook payload, tolerantly."""
-    for key in ("prompt", "user_prompt", "userPrompt", "message", "text", "input"):
+    """Pull the user prompt text out of a host hook payload, tolerantly.
+
+    Handles Cursor/Claude shapes (``prompt`` / ``message`` / ``text`` …) and
+    Hermes' ``pre_llm_call`` shape, where the turn's user message arrives as
+    ``user_message`` — nested under ``extra`` by Hermes' shell-hook bridge
+    (``_serialize_payload`` puts non-top-level kwargs under ``extra``).
+    """
+    for key in (
+        "prompt", "user_prompt", "userPrompt", "user_message", "userMessage",
+        "message", "text", "input",
+    ):
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
             return value
-    # Cursor sometimes nests under conversation/last message shapes.
-    nested = payload.get("hook_input") or payload.get("data")
+    # Cursor sometimes nests under conversation/last message shapes; Hermes
+    # nests the user message under ``extra``.
+    nested = payload.get("hook_input") or payload.get("data") or payload.get("extra")
     if isinstance(nested, Mapping):
         return extract_prompt(nested)
     return ""
@@ -208,6 +248,28 @@ def extract_tool(payload: Mapping[str, Any]) -> tuple[str, Any]:
     if isinstance(command, str):
         return "shell", command
     return "", {}
+
+
+def _command_str(tool_input: Any) -> str:
+    """Extract the shell command string from a tool-call's input, tolerantly.
+
+    Hosts pass the command differently: Cursor/Claude shell payloads carry the
+    raw command string; Hermes' ``terminal`` tool carries ``{"command": "..."}``
+    (Codex ``execute`` may carry ``{"command": [...]}``). Pulling the actual
+    command out — rather than ``json.dumps``-ing the whole dict — keeps the
+    read-only carve-out regex (anchored at start-of-command) correct: a
+    ``{"command": "git log"}`` wrapper would otherwise hide ``git log`` behind
+    the JSON prefix and defeat the carve-out.
+    """
+    if isinstance(tool_input, str):
+        return tool_input
+    if isinstance(tool_input, Mapping):
+        cmd = tool_input.get("command")
+        if isinstance(cmd, str):
+            return cmd
+        if isinstance(cmd, list):
+            return " ".join(str(part) for part in cmd)
+    return json.dumps(tool_input)
 
 
 def classify_tool(tool_name: str, tool_input: Any) -> tuple[bool, str]:
@@ -235,8 +297,10 @@ def classify_tool(tool_name: str, tool_input: Any) -> tuple[bool, str]:
 
     base = name.split("__")[-1]  # strip any "mcp__server__tool" prefixing
 
-    if base in {"shell", "bash", "sh", "zsh", "run_terminal_cmd", "execute"}:
-        command = tool_input if isinstance(tool_input, str) else json.dumps(tool_input)
+    # Shell-execution tool names across hosts: Cursor/Claude use shell/bash/…;
+    # Hermes' shell tool is named ``terminal``; Codex uses ``execute``.
+    if base in {"shell", "bash", "sh", "zsh", "run_terminal_cmd", "terminal", "execute"}:
+        command = tool_input if isinstance(tool_input, str) else _command_str(tool_input)
         command = command or ""
         if _READONLY_SHELL_RE.search(command):
             return False, ""

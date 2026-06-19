@@ -15900,6 +15900,85 @@ class HookRunnerTests(unittest.TestCase):
             verb_for_host("puppetmaster_start_cursor_swarm", "cursor"),
             "puppetmaster_start_cursor_swarm",
         )
+        # Hermes is not Cursor → gets the platform-portable verb, never a
+        # cursor-specific one it can't invoke.
+        self.assertEqual(
+            verb_for_host("puppetmaster_start_cursor_implement", "hermes"),
+            "puppetmaster_start_implement",
+        )
+
+    def test_hermes_pre_llm_call_injects_context_for_single_implement(self):
+        """Hermes' pre_llm_call carries user_message under `extra`; a single
+        implement intent must inject a delegate directive as {"context": ...}
+        and steer to a single implement worker (not a cursor verb)."""
+        from puppetmaster.hook_runner import handle_hook
+
+        payload = {
+            "hook_event_name": "pre_llm_call",
+            "session_id": "s1",
+            "cwd": "/repo",
+            "extra": {
+                "user_message": "add a --verbose flag to the savings command and wire it through",
+                "is_first_turn": True,
+            },
+        }
+        r = handle_hook(payload, host="hermes", event="pre_llm_call", env=self._TOOLS_ON)
+        self.assertEqual(r.action, "allow")
+        self.assertTrue(r.decision.should_delegate)
+        self.assertEqual(r.decision.suggested_verb, "puppetmaster_start_implement")
+        out = r.to_host_json("hermes")
+        self.assertIn("context", out)
+        self.assertIn("Puppetmaster", out["context"])
+        self.assertNotIn("cursor", out["context"])
+
+    def test_hermes_pre_llm_call_noop_for_trivial_edit(self):
+        """A trivial edit stays inline: Hermes must receive an empty {} (which
+        its shell-hook bridge treats as a silent no-op), never a directive."""
+        from puppetmaster.hook_runner import handle_hook
+
+        payload = {
+            "hook_event_name": "pre_llm_call",
+            "extra": {"user_message": "fix a typo in the README header"},
+        }
+        r = handle_hook(payload, host="hermes", event="pre_llm_call", env=self._TOOLS_ON)
+        self.assertEqual(r.action, "allow")
+        self.assertFalse(r.decision.should_delegate)
+        self.assertEqual(r.to_host_json("hermes"), {})
+
+    def test_hermes_pre_tool_call_blocks_broad_search(self):
+        """A genuinely recursive shell search on Hermes is deny-redirected using
+        Hermes' canonical block shape {"action": "block", "message": ...}.
+
+        Matches Hermes' real wire shape from agent/shell_hooks._serialize_payload:
+        top-level `tool_name` + `tool_input` (the tool's args dict).
+        """
+        from puppetmaster.hook_runner import handle_hook
+
+        payload = {
+            "hook_event_name": "pre_tool_call",
+            "tool_name": "terminal",
+            "tool_input": {"command": "grep -R TODO ."},
+            "session_id": "s1",
+            "cwd": "/repo",
+        }
+        r = handle_hook(payload, host="hermes", event="pre_tool_call", env=self._TOOLS_ON)
+        self.assertEqual(r.action, "deny")
+        out = r.to_host_json("hermes")
+        self.assertEqual(out["action"], "block")
+        self.assertIn("puppetmaster_codegraph_search", out["message"])
+
+    def test_hermes_host_is_noop_when_no_mcp_server(self):
+        """No alive Puppetmaster MCP server → the Hermes hook is a pure no-op,
+        never injecting a directive for a verb the agent can't call."""
+        from puppetmaster.hook_runner import handle_hook
+
+        payload = {
+            "hook_event_name": "pre_llm_call",
+            "extra": {"user_message": "refactor the auth module across all files"},
+        }
+        r = handle_hook(payload, host="hermes", event="pre_llm_call", env=self._TOOLS_OFF)
+        self.assertEqual(r.action, "allow")
+        self.assertEqual(r.to_host_json("hermes"), {})
 
     def test_pre_tool_allows_native_grep_glob(self):
         # Field fix: native search tools are read-only inspection in disguise as
@@ -16183,6 +16262,123 @@ class HookInstallerTests(unittest.TestCase):
         self.assertTrue(
             command.startswith("/usr/local/bin/python3 -m puppetmaster invocation-gate")
         )
+
+
+class HermesHookInstallerTests(unittest.TestCase):
+    """Tests for the Hermes YAML hooks installer (idempotent + non-destructive)."""
+
+    def setUp(self):
+        try:
+            import yaml  # noqa: F401
+        except Exception:
+            self.skipTest("PyYAML not installed; install puppetmaster-ai[hermes]")
+
+    def _load(self, path):
+        import yaml
+        return yaml.safe_load(path.read_text("utf-8"))
+
+    def test_install_writes_pre_llm_and_pre_tool_hooks(self):
+        from puppetmaster.hook_installers import install_hermes_hooks
+
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "config.yaml"
+            outcome = install_hermes_hooks(target_path=target, python="/usr/bin/python3")
+            self.assertEqual(outcome.status, "installed")
+            cfg = self._load(target)
+            hooks = cfg["hooks"]
+            self.assertIn("pre_llm_call", hooks)
+            self.assertIn("pre_tool_call", hooks)
+            cmd = hooks["pre_llm_call"][0]["command"]
+            self.assertIn("puppetmaster invocation-gate", cmd)
+            self.assertIn("--host hermes", cmd)
+            self.assertIn("--event user-prompt", cmd)
+            self.assertIn("--event pre-tool", hooks["pre_tool_call"][0]["command"])
+
+    def test_install_is_idempotent(self):
+        from puppetmaster.hook_installers import install_hermes_hooks
+
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "config.yaml"
+            install_hermes_hooks(target_path=target, python="/usr/bin/python3")
+            again = install_hermes_hooks(target_path=target, python="/usr/bin/python3")
+            self.assertEqual(again.status, "unchanged")
+
+    def test_install_preserves_other_config_and_user_hooks(self):
+        """Must merge into an existing config.yaml: keep mcp_servers, other
+        sections, and any user-authored hook entries untouched."""
+        import yaml
+        from puppetmaster.hook_installers import install_hermes_hooks
+
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "config.yaml"
+            target.write_text(yaml.safe_dump({
+                "mcp_servers": {"puppetmaster": {"command": "python", "args": ["-m", "puppetmaster.mcp_server"]}},
+                "model": "anthropic/claude-opus-4-8",
+                "hooks": {
+                    "pre_tool_call": [
+                        {"matcher": "terminal", "command": "~/.hermes/agent-hooks/block-rm.sh"}
+                    ]
+                },
+            }), encoding="utf-8")
+            outcome = install_hermes_hooks(target_path=target, python="/usr/bin/python3")
+            self.assertEqual(outcome.status, "installed")
+            cfg = self._load(target)
+            # Untouched config preserved.
+            self.assertEqual(cfg["model"], "anthropic/claude-opus-4-8")
+            self.assertIn("puppetmaster", cfg["mcp_servers"])
+            # User's pre_tool_call hook survives alongside ours.
+            cmds = [e.get("command", "") for e in cfg["hooks"]["pre_tool_call"]]
+            self.assertIn("~/.hermes/agent-hooks/block-rm.sh", cmds)
+            self.assertTrue(any("invocation-gate" in c for c in cmds))
+            self.assertIn("pre_llm_call", cfg["hooks"])
+
+    def test_install_into_default_empty_hooks_block(self):
+        """Hermes ships `hooks: {}` by default — installer must populate it."""
+        import yaml
+        from puppetmaster.hook_installers import install_hermes_hooks
+
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "config.yaml"
+            target.write_text(yaml.safe_dump({"hooks": {}, "model": "x"}), encoding="utf-8")
+            outcome = install_hermes_hooks(target_path=target, python="/usr/bin/python3")
+            self.assertEqual(outcome.status, "installed")
+            cfg = self._load(target)
+            self.assertIn("pre_llm_call", cfg["hooks"])
+
+    def test_uninstall_removes_only_our_hooks(self):
+        import yaml
+        from puppetmaster.hook_installers import install_hermes_hooks, uninstall_hermes_hooks
+
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "config.yaml"
+            target.write_text(yaml.safe_dump({
+                "hooks": {"pre_tool_call": [{"matcher": "terminal", "command": "~/keep.sh"}]},
+            }), encoding="utf-8")
+            install_hermes_hooks(target_path=target, python="/usr/bin/python3")
+            outcome = uninstall_hermes_hooks(target_path=target)
+            self.assertEqual(outcome.status, "removed")
+            cfg = self._load(target)
+            # Ours gone, user's kept, pre_llm_call (ours-only) dropped.
+            self.assertNotIn("pre_llm_call", cfg["hooks"])
+            cmds = [e.get("command", "") for e in cfg["hooks"]["pre_tool_call"]]
+            self.assertEqual(cmds, ["~/keep.sh"])
+
+    def test_uninstall_is_idempotent_and_noop_without_config(self):
+        from puppetmaster.hook_installers import uninstall_hermes_hooks
+
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "config.yaml"
+            outcome = uninstall_hermes_hooks(target_path=target)
+            self.assertEqual(outcome.status, "unchanged")
+
+    def test_dry_run_writes_nothing(self):
+        from puppetmaster.hook_installers import install_hermes_hooks
+
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "config.yaml"
+            outcome = install_hermes_hooks(target_path=target, dry_run=True, python="/usr/bin/python3")
+            self.assertEqual(outcome.status, "would_install")
+            self.assertFalse(target.exists())
 
 
 class HostGatedIdleReapTests(unittest.TestCase):

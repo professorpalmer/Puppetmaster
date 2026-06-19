@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.9.72
+
+**Hermes is now a full auto-invocation host — single edits get steered to Puppetmaster automatically.** Puppetmaster's deterministic invocation-gate previously only spoke Cursor and Claude Code; it now speaks Hermes' native shell-hook protocol, so the same delegate-vs-inline brain runs on every supported host. Validated end-to-end inside a live Hermes turn.
+
+- **`hermes` host in the hook runner.** `pre_llm_call` (per-turn) maps to the user-prompt gate event; the directive is returned as `{"context": "..."}` and injected into the user message (cache-safe — never the system prompt). `pre_tool_call` maps to the tool-gate event and returns Hermes' canonical `{"action": "block", "message": ...}`. The user message is read from Hermes' `extra.user_message` nesting. A trivial edit returns `{}` (silent no-op); an absent live MCP server makes the whole hook a no-op.
+- **`install-hermes-mcp` now wires hooks too.** One command makes Hermes a full host: MCP server registration **plus** `pre_llm_call` + `pre_tool_call` hooks merged idempotently into `~/.hermes/config.yaml` (user-authored hooks and every other section preserved). `uninstall` removes them cleanly.
+- **Cross-host shell-tool fix.** The broad-search deny-redirect now recognizes Hermes' `terminal` tool (and extracts the command from `{"command": ...}` payloads) so the read-only carve-out (`git log`, `ls`, `cat`) still works and only genuinely recursive searches are redirected.
+
 ## v0.9.70
 
 **Hotfix: a non-path `npm root -g` result no longer crashes CodeGraph install resolution.** The v0.9.68 shim-fallback work made `find_codegraph_install` reachable on hosts where it previously short-circuited (any host with `node` on PATH but no Cursor). On a misconfigured npm — or, as caught by CI, a test that globally stubs `subprocess.run` to return a large non-path blob — the raw stdout was fed into `Path(root).is_dir()`, raising `OSError: File name too long` (ENAMETOOLONG). Two CI legs went red on v0.9.68/v0.9.69 because of this.

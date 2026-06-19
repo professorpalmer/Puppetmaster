@@ -37,7 +37,13 @@ from puppetmaster.rules import (
     install_rules,
     uninstall_rules,
 )
-from puppetmaster.hook_installers import VALID_HOOK_TARGETS, install_hooks, uninstall_hooks
+from puppetmaster.hook_installers import (
+    VALID_HOOK_TARGETS,
+    install_hermes_hooks,
+    install_hooks,
+    uninstall_hermes_hooks,
+    uninstall_hooks,
+)
 from puppetmaster.mcp_registry import (
     kill_stale as registry_kill_stale,
     list_entries as registry_list_entries,
@@ -2750,6 +2756,10 @@ def _run_uninstall(args) -> int:
     print("=== uninstall: hermes MCP ===")
     hermes_result = uninstall_hermes_mcp(dry_run=dry_run)
     overall_rc |= _print_uninstall_mcp_result(hermes_result, "hermes")
+    hermes_hooks = uninstall_hermes_hooks(dry_run=dry_run)
+    print(f"[uninstall-hermes-hooks] {hermes_hooks.status:<14} {hermes_hooks.reason}")
+    if hermes_hooks.status == "error":
+        overall_rc |= 1
     print()
 
     print("=== uninstall: rules ===")
@@ -2901,6 +2911,20 @@ def _run_install_hermes(args) -> int:
         skip_handshake=getattr(args, "skip_handshake", False),
     )
     rc = _print_install_result(result, "hermes")
+    # Wire Hermes' native shell hooks too, so a single command makes Hermes a
+    # full auto-invocation host (MCP server + per-turn delegate hook). Skipped
+    # only when the MCP step errored, since hooks without a server are no-ops.
+    if result.status in {"installed", "unchanged", "would_install"}:
+        hook_outcome = install_hermes_hooks(
+            target_path=target_path,
+            force=getattr(args, "force", False),
+            dry_run=getattr(args, "dry_run", False),
+        )
+        print(
+            f"[install-hermes-hooks] {hook_outcome.status:<14} {hook_outcome.reason}"
+        )
+        if hook_outcome.status == "error":
+            rc = rc or 1
     if result.status in {"installed", "unchanged"}:
         print()
         print("Next steps:")
