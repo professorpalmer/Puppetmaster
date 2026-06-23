@@ -149,7 +149,12 @@ RULE_BODY = textwrap.dedent(
        reviewable PATCH. Prefer it over an inline single-file edit when the
        change benefits from CodeGraph or cheap-model routing; reserve
        `puppetmaster_start_implement` for coupled multi-file features (isolated
-       worktree). Keep truly trivial edits (typo/rename/comment) inline.
+       worktree). Because it edits the live tree in place, `edit` is also the
+       right verb for **last-mile work that builds on uncommitted changes**
+       ("finish the module I just wrote", "add tests for the code I just
+       added") — `puppetmaster_start_implement` branches off HEAD in a clean
+       worktree and would never see that uncommitted work. Keep truly trivial
+       edits (typo/rename/comment) inline.
     4. `puppetmaster_artifacts <job_id>` — read structured outputs at zero
        token cost (results persist in SQLite).
     5. `puppetmaster_dashboard [job_id]` — when the user asks to see/open

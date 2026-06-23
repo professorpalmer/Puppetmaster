@@ -33,6 +33,7 @@ A swarm is for **read-only, decomposable analysis** — explore, review, audit, 
 So:
 
 - **Implementing one feature / fixing one ticket → a single `puppetmaster_start_implement` worker** in a clean worktree. One worker keeps the change coherent and yields one reviewable `PATCH`. Reserve swarms for the explore/review/audit passes *around* the feature, not the edit itself.
+- **A focused single edit, or any change that builds on uncommitted work → `puppetmaster_edit`** (in-place, `allow_dirty`, cheapest sufficient model + CodeGraph, reviewable `PATCH`). This is the verb for last-mile work — "finish the module I just wrote", "add tests for the code I just added". `puppetmaster_start_implement` branches off HEAD in an isolated worktree, so it **cannot see uncommitted modules** and would clobber or rebuild them; never reach for it when the work depends on dirty-tree state. Keep truly trivial edits (typo/rename/comment) inline.
 - **Genuinely independent slices** (e.g. "add the same header to 30 unrelated endpoints") can fan out — but split by non-overlapping files so workers never collide.
 - **Broad investigation / audit / "find all X" → a read-only swarm.** That is what it is built for.
 

@@ -95,6 +95,28 @@ _HARD_SCOPE_PATTERNS = [
     re.compile(r"\bflows? through\b"),
 ]
 
+# "Last-mile" / dirty-tree-dependency signals: the work explicitly builds on
+# changes that already exist in the working tree but aren't committed yet
+# ("finish the module I just wrote", "add this on top of my uncommitted
+# changes", "wrap up the WIP"). These must route to the in-place `edit` verb,
+# never an isolated-worktree implement job — the implement verbs branch off
+# HEAD and can't see uncommitted work, so they'd clobber it or rebuild it from
+# scratch. That mismatch is exactly what forces a fallback to editing inline by
+# hand; detecting it lets the gate keep the work in Puppetmaster instead.
+_LAST_MILE_PATTERNS = [
+    re.compile(r"\blast[-\s]?mile\b"),
+    re.compile(r"\buncommitted\b"),
+    re.compile(r"\bdirty tree\b"),
+    re.compile(r"\bwork[-\s]?in[-\s]?progress\b"),
+    re.compile(r"\bwip\b"),
+    re.compile(r"\bi just (wrote|added|created|made|implemented|built|changed|wired)\b"),
+    re.compile(
+        r"\b(module|modules|file|files|code|change|changes|edit|edits) i just "
+        r"(wrote|added|created|made|implemented|built|changed)\b"
+    ),
+    re.compile(r"\b(on top of|build on|building on) (my|the|these|those|what)\b"),
+]
+
 # Trivial signals — short, obviously-inline intents.
 _TRIVIAL_PATTERNS = [
     re.compile(r"\btypo\b"),
@@ -210,10 +232,15 @@ class DelegationDecision:
                 f"{self.capability_score}, {self.reason}). Delegate it to "
                 f"`{verb}` — one in-place edit on the cheapest sufficient model, "
                 f"with CodeGraph to locate the site, returned as a reviewable "
-                f"diff. It's the snappy path between editing inline yourself and "
-                f"a full implement job; no isolated worktree, no job to poll. "
-                f"Reach for `puppetmaster_start_implement` instead only if this "
-                f"grows into a coupled multi-file change. {tail}"
+                f"diff. It edits your live working tree (including uncommitted "
+                f"changes), so it's the right verb for last-mile work that builds "
+                f"on what's already there — `puppetmaster_start_implement` "
+                f"branches off HEAD in an isolated worktree and would miss it. "
+                f"It's the snappy path between editing inline yourself and a full "
+                f"implement job; no isolated worktree, no job to poll. Reach for "
+                f"`puppetmaster_start_implement` instead only if this grows into a "
+                f"coupled multi-file change that doesn't depend on uncommitted "
+                f"state. {tail}"
             )
         if verb in _IMPLEMENT_VERBS:
             return (
@@ -351,6 +378,27 @@ def should_delegate(
             False,
             f"explicit trivial signal (score {score}); staying inline",
             suggested_verb, score, role, ("trivial",),
+        )
+
+    # Last-mile / dirty-tree dependency: the prompt explicitly builds on work
+    # that is already in the tree but uncommitted. The isolated-worktree
+    # implement verbs branch off HEAD and can't see uncommitted work, so they
+    # would clobber or rebuild it — the exact misfire that forces a fallback to
+    # editing inline by hand. Steer to the in-place `edit` verb (allow_dirty, no
+    # worktree, cheapest sufficient model + CodeGraph, reviewable PATCH) so the
+    # change lands on top of what's already there. This wins over the hard-scope
+    # → start_implement preference above: when the work depends on uncommitted
+    # state, that dependency is the binding constraint regardless of file count.
+    builds_on_uncommitted = _matches_any(_LAST_MILE_PATTERNS, lower)
+    if builds_on_uncommitted and (
+        suggested_verb in _IMPLEMENT_VERBS or suggested_verb in _EDIT_VERBS
+    ):
+        return DelegationDecision(
+            True,
+            f"builds on uncommitted work in the tree (score {score}); the "
+            f"in-place edit verb sees the dirty tree that an isolated-worktree "
+            f"implement job (branched off HEAD) would miss",
+            _EDIT_VERB, score, role, ("last-mile",),
         )
 
     # CodeGraph lookups always delegate, regardless of score. A structural

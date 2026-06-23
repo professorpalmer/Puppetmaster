@@ -9929,12 +9929,17 @@ class PuppetmasterLearnPluginTests(unittest.TestCase):
         Regression guard: `status --compact` strips prompt bodies including the
         goal, which silently produced empty "Untitled" candidates.
         """
+        from datetime import datetime, timezone
+
         mod = self._load_plugin_module()
+        # Durability requires a *recent* completion (30-min window), so generate
+        # the timestamp dynamically — a hardcoded one silently goes stale within
+        # the hour and turns this into a clock-dependent time-bomb.
         payload = {
             "job": {
                 "goal": "Build the auto-/learn flywheel",
                 "status": "complete",
-                "completed_at": "2026-06-23T22:50:27+00:00",
+                "completed_at": datetime.now(timezone.utc).isoformat(),
             },
             "tasks": [{"id": "task_1"}, {"id": "task_2"}],
         }
@@ -16525,6 +16530,59 @@ class InvocationGateTests(unittest.TestCase):
             d = should_delegate(prompt)
             self.assertFalse(d.should_delegate, prompt)
             self.assertIn("trivial", d.matched_signals, prompt)
+
+    def test_last_mile_work_routes_to_edit_not_implement(self):
+        """Work that builds on uncommitted changes must route to the in-place
+        ``edit`` verb — an isolated-worktree implement job branched off HEAD
+        can't see uncommitted modules and would clobber or rebuild them."""
+        from puppetmaster.invocation_gate import should_delegate
+
+        for prompt in (
+            "finish the module I just wrote and add a test suite",
+            "build on my uncommitted changes to wire the new adapter in",
+            "implement the last mile on top of the code I just added",
+            "wrap up this WIP and create the README caveats",
+        ):
+            d = should_delegate(prompt)
+            self.assertTrue(d.should_delegate, prompt)
+            self.assertEqual(d.suggested_verb, "puppetmaster_edit", prompt)
+            self.assertIn("last-mile", d.matched_signals, prompt)
+
+    def test_last_mile_overrides_broad_scope_implement(self):
+        """The dirty-tree dependency is the binding constraint: even with a
+        broad-scope signal (which normally keeps ``start_implement``), a prompt
+        that builds on uncommitted work routes to the in-place ``edit`` verb —
+        ``start_implement``'s worktree off HEAD would miss that work entirely."""
+        from puppetmaster.invocation_gate import should_delegate
+
+        d = should_delegate(
+            "refactor every caller to build on the uncommitted client I just wrote"
+        )
+        self.assertTrue(d.should_delegate)
+        self.assertEqual(d.suggested_verb, "puppetmaster_edit")
+        self.assertIn("last-mile", d.matched_signals)
+
+    def test_trivial_wins_over_last_mile(self):
+        """A trivial edit that happens to reference just-written code stays
+        inline — the trivial carve-out is evaluated before the last-mile
+        redirect, so a one-liner never spins up a worker."""
+        from puppetmaster.invocation_gate import should_delegate
+
+        d = should_delegate("fix a typo in the file I just wrote")
+        self.assertFalse(d.should_delegate)
+        self.assertIn("trivial", d.matched_signals)
+
+    def test_last_mile_directive_calls_out_uncommitted_work(self):
+        """The injected directive for last-mile work must explain that ``edit``
+        sees the live tree (uncommitted changes) where ``start_implement`` would
+        not — that rationale is what stops the host falling back to inline."""
+        from puppetmaster.invocation_gate import should_delegate
+
+        d = should_delegate("finish the module I just wrote and add tests")
+        directive = d.directive()
+        self.assertIn("puppetmaster_edit", directive)
+        self.assertIn("uncommitted", directive.lower())
+        self.assertNotIn("fan it out to a swarm", directive)
 
 
 class HookRunnerTests(unittest.TestCase):
