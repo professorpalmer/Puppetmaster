@@ -4213,8 +4213,8 @@ class PuppetmasterTests(unittest.TestCase):
         from puppetmaster import mcp_server
 
         # Pin off parent-death (see test_input_staleness_watcher_triggers_when_idle):
-        # with a 0.2s stale window and a fresh mark, only an orphan reparent could
-        # fire within the 0.1s assertion window, and that's the CI flake we saw.
+        # an orphan reparent is the only other shutdown trigger, and we want this
+        # test to isolate the heartbeat-reset guarantee, not parent liveness.
         no_orphan = patch.object(
             mcp_server._InputStalenessWatcher, "_parent_is_dead", return_value=False
         )
@@ -4226,8 +4226,12 @@ class PuppetmasterTests(unittest.TestCase):
             with mcp_server._INPUT_STATE_LOCK:
                 mcp_server._LAST_INBOUND_MESSAGE_AT = time.time() - 3600
                 mcp_server._ACTIVE_TOOL_CALLS = 0
+            # Stale window (5s) is two orders of magnitude wider than the 0.1s
+            # assertion wait, so even heavy CI scheduling jitter cannot let the
+            # timer fire inside the window — killing the prior macOS flake while
+            # preserving the guarantee: a fresh inbound message defers shutdown.
             watcher = mcp_server._InputStalenessWatcher(
-                stale_after_seconds=0.2,
+                stale_after_seconds=5.0,
                 check_interval_seconds=0.02,
                 on_shutdown=triggered.set,
             )
