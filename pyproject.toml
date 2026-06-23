@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "puppetmaster-ai"
-version = "0.9.77"
+version = "0.9.78"
 description = "Gunicorn-style agent swarms with Redis-like shared memory and artifact stitching. (Imported as `puppetmaster`; published as `puppetmaster-ai` because the bare PyPI name is held by an abandoned 2019 project, name-reassignment pending.)"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -61,7 +61,17 @@ exclude = ["node_modules*", "docs*", "examples*", "tests*"]
 # MUST be in the wheel/sdist or pip-installed Cursor support is broken.
 # Ship the bundled Hermes skill too, so `install-hermes-mcp` / `setup` can copy
 # it into ~/.hermes/skills (a fresh pip install otherwise has no skill).
-puppetmaster = ["*.mjs", "skills/**/*.md", "skills/**/*"]
+# Ship the bundled Hermes auto-/learn plugin the same way, so the installer can
+# copy it into ~/.hermes/plugins (a fresh pip install otherwise has no plugin).
+puppetmaster = [
+  "*.mjs",
+  "skills/**/*.md",
+  "skills/**/*",
+  "hermes_plugin/**/*.py",
+  "hermes_plugin/**/*.yaml",
+  "hermes_plugin/**/*.md",
+  "hermes_plugin/**/*",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

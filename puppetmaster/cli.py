@@ -25,6 +25,7 @@ from puppetmaster.installers import (
     install_codex_mcp,
     install_cursor_mcp,
     install_hermes_mcp,
+    install_hermes_plugin,
     install_hermes_skill,
     resolve_claude_command,
     uninstall_claude_mcp,
@@ -3026,12 +3027,46 @@ def _run_install_hermes(args) -> int:
         )
         if skill_outcome.status == "error":
             rc = rc or 1
+        rc = rc or _install_hermes_rule_status(
+            force=getattr(args, "force", False),
+            dry_run=getattr(args, "dry_run", False),
+            label="[install-hermes-rule]",
+        )
+        # Bundle the opt-in auto-/learn plugin so a finished swarm can distill
+        # itself into a Hermes skill candidate. Non-destructive (won't clobber a
+        # customized plugin without --force); inert until PUPPETMASTER_LEARN=1.
+        plugin_outcome = install_hermes_plugin(
+            force=getattr(args, "force", False),
+            dry_run=getattr(args, "dry_run", False),
+        )
+        print(
+            f"[install-hermes-plugin] {plugin_outcome.status:<14} {plugin_outcome.reason}"
+        )
+        if plugin_outcome.status == "error":
+            rc = rc or 1
     if result.status in {"installed", "unchanged"}:
         print()
         print("Next steps:")
         for line in HERMES_NEXT_STEPS_GUIDANCE.splitlines():
             print(f"  {line}")
     return rc
+
+
+def _install_hermes_rule_status(*, force: bool, dry_run: bool, label: str) -> int:
+    """Install Hermes' persistent SOUL.md routing rule and print one status line."""
+    result = install_rules(
+        cwd=Path.cwd(),
+        targets=["hermes_global"],
+        install_global=True,
+        force=force,
+        dry_run=dry_run,
+    )
+    outcome = result.outcomes[0] if result.outcomes else None
+    if outcome is None:
+        print(f"{label} error          no hermes_global outcome returned")
+        return 1
+    print(f"{label} {outcome.status:<14} {outcome.reason}")
+    return 1 if result.overall_status == "error" else 0
 
 
 def _run_install_cursor(args) -> int:
@@ -3453,8 +3488,22 @@ def _run_setup(args) -> int:
             )
             if hermes_skill.status == "error":
                 overall_rc = 1
+            if _install_hermes_rule_status(
+                force=getattr(args, "force", False),
+                dry_run=getattr(args, "dry_run", False),
+                label="  [install-hermes-rule]",
+            ):
+                overall_rc = 1
+            hermes_plugin = install_hermes_plugin(force=getattr(args, "force", False))
+            print(
+                f"  [hermes-plugin] {hermes_plugin.status:<14} {hermes_plugin.reason}"
+            )
+            if hermes_plugin.status == "error":
+                overall_rc = 1
         elif getattr(args, "skip_rules", False):
             print("  [hermes-skill] skipped (--skip-rules)")
+            print("  [install-hermes-rule] skipped (--skip-rules)")
+            print("  [hermes-plugin] skipped (--skip-rules)")
         if not getattr(args, "skip_models", False):
             _seed_hermes_registry()
     print()

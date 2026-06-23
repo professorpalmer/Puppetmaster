@@ -1,0 +1,6 @@
+name: puppetmaster-learn
+version: "0.1.0"
+description: "On session end, distill a recent durable Puppetmaster swarm (one that COMPLETEd with a finding or patch artifact) into a reusable Hermes skill CANDIDATE under ~/.hermes/skills-candidates/. Opt-in via PUPPETMASTER_LEARN=1, runs in a background daemon thread, and is strictly best-effort — it writes candidates (never live skills), never spawns an agent loop, and never disrupts a session."
+author: "Puppetmaster"
+hooks:
+  - on_session_end

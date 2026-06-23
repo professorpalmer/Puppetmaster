@@ -76,6 +76,7 @@ from puppetmaster.cli import (
     main as cli_main,
 )
 from puppetmaster.diagnostics import adapter_status, run_doctor, starter_config
+from puppetmaster.hermes_spawn_tree import emit_spawn_tree
 from puppetmaster.mcp_server import ASYNC_PROCESSES, call_tool, handle_message
 from puppetmaster.models import Artifact, ArtifactType, JobStatus, Task, TaskStatus, seconds_from_now
 from puppetmaster.orchestrator import Orchestrator
@@ -418,6 +419,163 @@ class PuppetmasterTests(unittest.TestCase):
             self.assertIn("artifact", feed[0])
             self.assertIn("# Puppetmaster Live Summary", partial)
             self.assertIn("make live artifacts inspectable", partial)
+
+    def test_hermes_spawn_tree_emitter_writes_snapshot_and_index(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = SwarmStore(root / ".puppetmaster")
+            store.init()
+            job = store.create_job("show completed swarm in Hermes history")
+            tasks = [
+                Task(
+                    job_id=job.id,
+                    role="implement",
+                    instruction="write the patch",
+                    adapter="cursor",
+                    status=TaskStatus.COMPLETE,
+                ),
+                Task(
+                    job_id=job.id,
+                    role="review",
+                    instruction="verify the patch",
+                    adapter="cursor",
+                    status=TaskStatus.COMPLETE,
+                ),
+            ]
+            store.save_tasks(tasks)
+            artifacts = [
+                Artifact(
+                    job_id=job.id,
+                    task_id=tasks[0].id,
+                    type=ArtifactType.FINDING,
+                    created_by="worker-implement",
+                    payload={"claim": "implemented Hermes replay snapshot support"},
+                    confidence=0.95,
+                    evidence=["puppetmaster/hermes_spawn_tree.py"],
+                ),
+                Artifact(
+                    job_id=job.id,
+                    task_id=tasks[0].id,
+                    type=ArtifactType.VERIFICATION,
+                    created_by="worker-implement",
+                    payload={"check": "tests", "result": "completed", "tokens_in": 123, "tokens_out": 45},
+                    confidence=0.9,
+                    evidence=["pytest"],
+                ),
+                Artifact(
+                    job_id=job.id,
+                    task_id=tasks[0].id,
+                    type=ArtifactType.ROUTING,
+                    created_by="router",
+                    payload={
+                        "model_id": "cursor/gpt-5-5",
+                        "model": "gpt-5.5",
+                        "adapter": "cursor",
+                        "policy": "balanced",
+                        "estimated_cost_usd": 0.0,
+                    },
+                    confidence=0.9,
+                    evidence=["policy:balanced"],
+                ),
+                Artifact(
+                    job_id=job.id,
+                    task_id=tasks[1].id,
+                    type=ArtifactType.FINDING,
+                    created_by="worker-review",
+                    payload={"claim": "verified the snapshot schema"},
+                    confidence=0.95,
+                    evidence=["tests/test_puppetmaster.py"],
+                ),
+                Artifact(
+                    job_id=job.id,
+                    task_id=tasks[1].id,
+                    type=ArtifactType.VERIFICATION,
+                    created_by="worker-review",
+                    payload={"check": "schema", "result": "completed"},
+                    confidence=0.9,
+                    evidence=["pytest"],
+                ),
+            ]
+            store.save_artifacts(artifacts)
+            completed = store.update_job_status(job.id, JobStatus.COMPLETE)
+
+            snapshot_path = emit_spawn_tree(
+                store,
+                completed,
+                store.list_artifacts(job.id),
+                [],
+                env={
+                    "HERMES_HOME": str(root / "hermes-home"),
+                    "HERMES_SESSION_ID": "session:one",
+                },
+            )
+
+            self.assertIsNotNone(snapshot_path)
+            assert snapshot_path is not None
+            session_dir = root / "hermes-home" / "spawn-trees" / "session_one"
+            self.assertEqual(snapshot_path.parent, session_dir)
+            snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                list(snapshot.keys()),
+                ["session_id", "started_at", "finished_at", "label", "subagents"],
+            )
+            self.assertEqual(snapshot["session_id"], "session:one")
+            self.assertEqual(snapshot["label"], "show completed swarm in Hermes history")
+            self.assertEqual(len(snapshot["subagents"]), len(tasks))
+            entries_by_id = {e["subagent_id"]: e for e in snapshot["subagents"]}
+            self.assertEqual(set(entries_by_id), {t.id for t in tasks})
+            self.assertEqual(entries_by_id[tasks[0].id]["model"], "gpt-5.5")
+            self.assertEqual(entries_by_id[tasks[0].id]["status"], "completed")
+
+            index_lines = (session_dir / "_index.jsonl").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(index_lines), 1)
+            index_entry = json.loads(index_lines[0])
+            self.assertEqual(
+                list(index_entry.keys()),
+                ["path", "session_id", "started_at", "finished_at", "label", "count"],
+            )
+            self.assertEqual(index_entry["path"], str(snapshot_path.resolve()))
+            self.assertEqual(index_entry["count"], len(tasks))
+
+    def test_hermes_spawn_tree_emitter_honors_opt_out(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = SwarmStore(root / ".puppetmaster")
+            store.init()
+            job = store.create_job("do not write Hermes history")
+            task = Task(
+                job_id=job.id,
+                role="implement",
+                instruction="write nothing",
+                status=TaskStatus.COMPLETE,
+            )
+            store.save_task(task)
+            artifact = Artifact(
+                job_id=job.id,
+                task_id=task.id,
+                type=ArtifactType.VERIFICATION,
+                created_by="worker-implement",
+                payload={"check": "opt out", "result": "completed"},
+                confidence=0.9,
+                evidence=["env"],
+            )
+            store.save_artifact(artifact)
+            completed = store.update_job_status(job.id, JobStatus.COMPLETE)
+            hermes_home = root / "hermes-opt-out"
+
+            emitted = emit_spawn_tree(
+                store,
+                completed,
+                store.list_artifacts(job.id),
+                [],
+                env={
+                    "HERMES_HOME": str(hermes_home),
+                    "PUPPETMASTER_HERMES_SPAWN_TREE": "0",
+                },
+            )
+
+            self.assertIsNone(emitted)
+            self.assertFalse((hermes_home / "spawn-trees").exists())
 
     def _store_for_backend(self, backend: str, root: Path):
         if backend == "file":
@@ -9444,6 +9602,69 @@ class InstallHermesMcpTests(unittest.TestCase):
             self.assertEqual(result.status, "would_install")
             self.assertFalse(target.exists())
 
+    def test_install_hermes_dispatch_writes_persistent_soul_rule(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hermes_home = root / "hermes"
+            state_dir = root / "state"
+            config = hermes_home / "config.yaml"
+            soul = hermes_home / "SOUL.md"
+
+            with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}, clear=False):
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    rc = cli_main([
+                        "--state-dir",
+                        str(state_dir),
+                        "install-hermes-mcp",
+                        "--path",
+                        str(config),
+                        "--skip-handshake",
+                    ])
+                self.assertEqual(rc, 0)
+                self.assertTrue(soul.is_file())
+                self.assertIn("puppetmaster:rules:begin", soul.read_text("utf-8"))
+                self.assertIn("[install-hermes-rule] installed", stdout.getvalue())
+
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    rc = cli_main([
+                        "--state-dir",
+                        str(state_dir),
+                        "install-hermes-mcp",
+                        "--path",
+                        str(config),
+                        "--skip-handshake",
+                    ])
+                self.assertEqual(rc, 0)
+                self.assertIn("[install-hermes-rule] unchanged", stdout.getvalue())
+                self.assertEqual(
+                    soul.read_text("utf-8").count("puppetmaster:rules:begin"),
+                    1,
+                    msg="re-run must not duplicate the Hermes SOUL.md rule block",
+                )
+
+            with TemporaryDirectory() as dry_tmp:
+                dry_root = Path(dry_tmp)
+                dry_home = dry_root / "hermes"
+                dry_state = dry_root / "state"
+                dry_config = dry_home / "config.yaml"
+                with patch.dict(os.environ, {"HERMES_HOME": str(dry_home)}, clear=False):
+                    stdout = io.StringIO()
+                    with contextlib.redirect_stdout(stdout):
+                        rc = cli_main([
+                            "--state-dir",
+                            str(dry_state),
+                            "install-hermes-mcp",
+                            "--path",
+                            str(dry_config),
+                            "--skip-handshake",
+                            "--dry-run",
+                        ])
+                    self.assertEqual(rc, 0)
+                    self.assertIn("[install-hermes-rule] would_install", stdout.getvalue())
+                    self.assertFalse((dry_home / "SOUL.md").exists())
+
     def test_install_hermes_reports_error_on_invalid_yaml(self):
         from puppetmaster.installers import install_hermes_mcp
 
@@ -9567,6 +9788,172 @@ class InstallHermesSkillTests(unittest.TestCase):
             self.assertFalse(
                 (skills / "autonomous-ai-agents" / "puppetmaster").exists()
             )
+
+
+class InstallHermesPluginTests(unittest.TestCase):
+    """Tests for :func:`install_hermes_plugin` — shipping the bundled
+    puppetmaster-learn plugin into Hermes' plugins dir so the auto-/learn
+    flywheel is present after a fresh `pip install`."""
+
+    def test_bundled_plugin_is_packaged(self):
+        from puppetmaster.installers import bundled_plugin_dir
+
+        src = bundled_plugin_dir()
+        self.assertIsNotNone(src, "the puppetmaster-learn plugin must ship in the package")
+        self.assertTrue((src / "plugin.yaml").is_file())
+        self.assertTrue((src / "__init__.py").is_file())
+
+    def test_install_plugin_into_empty_dir(self):
+        from puppetmaster.installers import install_hermes_plugin
+
+        with TemporaryDirectory() as tmp:
+            plugins = Path(tmp)
+            out = install_hermes_plugin(plugins_dir=plugins)
+            self.assertEqual(out.status, "installed")
+            landed = plugins / "puppetmaster-learn"
+            self.assertTrue((landed / "plugin.yaml").is_file())
+            self.assertTrue((landed / "__init__.py").is_file())
+
+    def test_install_plugin_honors_hermes_home(self):
+        from puppetmaster.installers import install_hermes_plugin
+
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp) / "fakehermes"
+            out = install_hermes_plugin(env={"HERMES_HOME": str(home)})
+            self.assertEqual(out.status, "installed")
+            self.assertTrue((home / "plugins" / "puppetmaster-learn" / "plugin.yaml").is_file())
+
+    def test_install_plugin_idempotent(self):
+        from puppetmaster.installers import install_hermes_plugin
+
+        with TemporaryDirectory() as tmp:
+            plugins = Path(tmp)
+            install_hermes_plugin(plugins_dir=plugins)
+            again = install_hermes_plugin(plugins_dir=plugins)
+            self.assertEqual(again.status, "unchanged")
+
+    def test_install_plugin_dry_run_writes_nothing(self):
+        from puppetmaster.installers import install_hermes_plugin
+
+        with TemporaryDirectory() as tmp:
+            plugins = Path(tmp)
+            out = install_hermes_plugin(plugins_dir=plugins, dry_run=True)
+            self.assertEqual(out.status, "would_install")
+            self.assertFalse((plugins / "puppetmaster-learn").exists())
+
+
+class PuppetmasterLearnPluginTests(unittest.TestCase):
+    """Tests for the bundled plugin's pure helpers. The plugin is not importable
+    as a normal package (its dir name has a hyphen and must not import
+    puppetmaster), so we load it by file path via importlib."""
+
+    @staticmethod
+    def _load_plugin_module():
+        import importlib.util
+
+        from puppetmaster.installers import bundled_plugin_dir
+
+        src = bundled_plugin_dir()
+        assert src is not None, "bundled plugin must be packaged"
+        spec = importlib.util.spec_from_file_location(
+            "puppetmaster_learn_under_test", src / "__init__.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_build_skill_candidate_shape(self):
+        mod = self._load_plugin_module()
+        job = {
+            "id": "job-abc123",
+            "goal": "Fix the flaky retry backoff in the network client",
+            "summary": "The backoff used a fixed delay; switched to exponential with jitter.",
+            "cwd": "/tmp/project",
+        }
+        candidate = mod.build_skill_candidate(job)
+
+        self.assertIn("slug", candidate)
+        self.assertTrue(candidate["slug"])
+        self.assertLessEqual(len(candidate["slug"]), 60)
+        self.assertNotIn(" ", candidate["slug"])
+
+        skill_md = candidate["skill_md"]
+        # Provenance line names the source job.
+        self.assertIn("from job job-abc123", skill_md)
+        # Frontmatter carries a name.
+        self.assertIn("name:", skill_md)
+        self.assertTrue(skill_md.startswith("---\n"))
+
+        meta = candidate["meta"]
+        self.assertEqual(meta["job_id"], "job-abc123")
+        self.assertEqual(meta["source"], "puppetmaster-auto-learn")
+        self.assertIn("created_iso", meta)
+
+    def test_write_candidate_writes_files_and_is_idempotent(self):
+        mod = self._load_plugin_module()
+        job = {
+            "id": "job-xyz789",
+            "goal": "Add structured logging to the ingest pipeline",
+            "summary": "Introduced a JSON formatter and request-id propagation.",
+            "cwd": "/tmp/project",
+        }
+        candidate = mod.build_skill_candidate(job)
+
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = mod._write_candidate(
+                candidate["slug"], candidate["skill_md"], candidate["meta"], home=home
+            )
+            self.assertIsNotNone(path)
+            written = Path(path)
+            self.assertTrue((written / "SKILL.md").is_file())
+            self.assertTrue((written / "candidate.json").is_file())
+            recorded = json.loads((written / "candidate.json").read_text(encoding="utf-8"))
+            self.assertEqual(recorded["job_id"], "job-xyz789")
+
+            # Second call for the same job_id is a no-op (idempotent).
+            again = mod._write_candidate(
+                candidate["slug"], candidate["skill_md"], candidate["meta"], home=home
+            )
+            self.assertIsNone(again)
+            dirs = [p for p in (home / "skills-candidates").iterdir() if p.is_dir()]
+            self.assertEqual(len(dirs), 1)
+
+    def test_normalize_detail_reads_full_status_snapshot(self):
+        """`status <job>` (full JSON, not --compact) carries goal/status/tasks.
+
+        Regression guard: `status --compact` strips prompt bodies including the
+        goal, which silently produced empty "Untitled" candidates.
+        """
+        mod = self._load_plugin_module()
+        payload = {
+            "job": {
+                "goal": "Build the auto-/learn flywheel",
+                "status": "complete",
+                "completed_at": "2026-06-23T22:50:27+00:00",
+            },
+            "tasks": [{"id": "task_1"}, {"id": "task_2"}],
+        }
+        detail = mod._normalize_detail(payload)
+        self.assertEqual(detail["goal"], "Build the auto-/learn flywheel")
+        self.assertEqual(detail["status"], "complete")
+        self.assertEqual(detail["task_count"], 2)
+        # A completed swarm with tasks is durable enough for a candidate.
+        self.assertTrue(mod._is_durable(detail))
+
+    def test_goal_from_summary_parses_goal_line(self):
+        mod = self._load_plugin_module()
+        summary = (
+            "# Puppetmaster Stitched Summary\n\n"
+            "Goal: Wire the Hermes SOUL.md reflexive-routing rule\n\n"
+            "## Findings\n- did the thing\n"
+        )
+        self.assertEqual(
+            mod._goal_from_summary(summary),
+            "Wire the Hermes SOUL.md reflexive-routing rule",
+        )
+        self.assertEqual(mod._goal_from_summary(""), "")
+        self.assertEqual(mod._goal_from_summary("no goal here"), "")
 
 
 class HermesRegistryCredentialTests(unittest.TestCase):

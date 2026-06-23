@@ -1707,6 +1707,23 @@ def bundled_skill_dir() -> Optional[Path]:
     return candidate if (candidate / "SKILL.md").is_file() else None
 
 
+def hermes_plugins_dir(env: Optional[Mapping[str, str]] = None) -> Path:
+    """Return Hermes' plugins directory (``$HERMES_HOME/plugins`` or ~/.hermes/plugins)."""
+    env = env if env is not None else os.environ
+    hermes_home = env.get("HERMES_HOME")
+    base = Path(hermes_home).expanduser() if hermes_home else Path("~/.hermes").expanduser()
+    return base / "plugins"
+
+
+def bundled_plugin_dir() -> Optional[Path]:
+    """Locate the Puppetmaster Hermes plugin shipped inside the package.
+
+    Returns ``None`` when the plugin data wasn't packaged (defensive — keeps the
+    installer a no-op rather than crashing on a partial install)."""
+    candidate = Path(__file__).with_name("hermes_plugin") / "puppetmaster-learn"
+    return candidate if (candidate / "plugin.yaml").is_file() else None
+
+
 @dataclass
 class SkillInstallOutcome:
     """Result of installing the bundled Hermes skill. ``status`` is one of
@@ -1793,6 +1810,88 @@ def install_hermes_skill(
 
     return SkillInstallOutcome(
         status=verb, target=str(target), reason=f"{verb} bundled Puppetmaster skill"
+    )
+
+
+def install_hermes_plugin(
+    *,
+    plugins_dir: Optional[Path] = None,
+    force: bool = False,
+    dry_run: bool = False,
+    env: Optional[Mapping[str, str]] = None,
+) -> SkillInstallOutcome:
+    """Copy the bundled ``puppetmaster-learn`` plugin into Hermes' plugins dir.
+
+    Mirrors :func:`install_hermes_skill` — idempotent and non-destructive:
+
+    * No bundled plugin packaged → ``skipped`` (never an error).
+    * Target identical to the bundled copy → ``unchanged``.
+    * Target exists but differs and ``force`` is False → ``skipped`` with a
+      reason (we never silently overwrite a user-customized plugin). A fresh
+      install (no target) always writes.
+    * Otherwise copy the whole plugin tree (plugin.yaml + __init__.py + README).
+
+    The plugin lands under ``<plugins>/puppetmaster-learn`` so Hermes discovers
+    it like any other ``~/.hermes/plugins/<name>`` plugin.
+    """
+    import filecmp
+    import shutil
+
+    src = bundled_plugin_dir()
+    if src is None:
+        return SkillInstallOutcome(
+            status="skipped",
+            target="",
+            reason="no bundled plugin in this install (package-data missing)",
+        )
+
+    base = plugins_dir or hermes_plugins_dir(env)
+    target = base / "puppetmaster-learn"
+    src_manifest = src / "plugin.yaml"
+    dst_manifest = target / "plugin.yaml"
+
+    if dst_manifest.is_file():
+        # Compare both files that define the plugin's behaviour; a byte match on
+        # the manifest and entrypoint means our bundled copy is already in place.
+        manifest_same = filecmp.cmp(src_manifest, dst_manifest, shallow=False)
+        init_same = filecmp.cmp(src / "__init__.py", target / "__init__.py", shallow=False) if (
+            (src / "__init__.py").is_file() and (target / "__init__.py").is_file()
+        ) else False
+        if manifest_same and init_same:
+            return SkillInstallOutcome(
+                status="unchanged", target=str(target),
+                reason="bundled plugin already current",
+            )
+        if not force:
+            return SkillInstallOutcome(
+                status="skipped", target=str(target),
+                reason="existing plugin differs (customized?) — re-run with --force to overwrite",
+            )
+        verb = "updated"
+    else:
+        verb = "installed"
+
+    if dry_run:
+        return SkillInstallOutcome(
+            status="would_install", target=str(target),
+            reason=f"DRY RUN — would {verb} bundled plugin",
+        )
+
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        for item in src.iterdir():
+            dest = target / item.name
+            if item.is_dir():
+                shutil.copytree(item, dest, dirs_exist_ok=True)
+            else:
+                shutil.copy2(item, dest)
+    except OSError as exc:
+        return SkillInstallOutcome(
+            status="error", target=str(target), reason=f"copy failed: {exc}"
+        )
+
+    return SkillInstallOutcome(
+        status=verb, target=str(target), reason=f"{verb} bundled puppetmaster-learn plugin"
     )
 
 

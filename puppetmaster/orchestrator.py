@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
+from puppetmaster.hermes_spawn_tree import emit_spawn_tree
 from puppetmaster.liveness import record_orchestrator_heartbeat
 from puppetmaster.models import Artifact, ArtifactType, Job, JobStatus, Task, TaskStatus, now_iso
 from puppetmaster.stitcher import Stitcher
@@ -156,6 +157,7 @@ class Orchestrator:
             self.store.update_job_status(job.id, JobStatus.STITCHING)
             summary = Stitcher(self.store).stitch(job.id)
             completed = self.store.update_job_status(job.id, JobStatus.COMPLETE)
+            self._emit_hermes_spawn_tree(completed, artifacts, specs)
             summary_path = self.store.job_dir(job.id) / "summaries" / "stitched.md"
             self._emit_telemetry(completed, artifacts)
             return RunResult(
@@ -383,6 +385,18 @@ class Orchestrator:
             record_job_metrics(job, tasks, artifacts)
         except Exception:
             pass
+
+    def _emit_hermes_spawn_tree(
+        self, job: Job, artifacts: list[Artifact], specs: list[WorkerSpec]
+    ) -> None:
+        """Best-effort Hermes `/agents` replay snapshot for completed swarms."""
+        try:
+            emit_spawn_tree(self.store, job, artifacts, specs)
+        except Exception as exc:
+            try:
+                self.store.emit(job.id, "hermes.spawn_tree_ignored", {"error": str(exc)})
+            except Exception:
+                pass
 
     def _auto_fallback(
         self, job: Job, *, lease_seconds: int, worker_mode: str
