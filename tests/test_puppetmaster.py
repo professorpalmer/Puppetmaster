@@ -1892,6 +1892,9 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertEqual(len(artifacts), 1)
         self.assertEqual(artifacts[0].payload["result"], "blocked")
         self.assertEqual(artifacts[0].payload["failure"], "dirty_worktree")
+        # The guard routes last-mile users to the purpose-built verb instead of
+        # leaving them to guess between allow_dirty and a worktree.
+        self.assertIn("puppetmaster_edit", artifacts[0].payload["message"])
 
     def test_cursor_implement_allow_dirty_runs_agent(self) -> None:
         task = Task(

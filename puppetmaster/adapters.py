@@ -731,7 +731,9 @@ class CursorAdapter:
                         "message": (
                             "Cursor implement runs require a clean working tree by default "
                             "so Puppetmaster can attribute the resulting diff correctly. Commit, "
-                            "stash, use a worktree, or set payload.allow_dirty=true."
+                            "stash, use a worktree, or set payload.allow_dirty=true. For focused "
+                            "edits on a dirty tree (docs, tests), use puppetmaster_edit — it edits "
+                            "in place and needs no clean tree."
                             + dirty_worktree_paths_note(
                                 before["changed_files"], before["untracked_files"]
                             )
@@ -1205,7 +1207,9 @@ class ClaudeCodeAdapter:
                         "message": (
                             "Claude Code full-edit runs require a clean working tree by default "
                             "so Puppetmaster can attribute resulting diffs correctly. Commit, stash, "
-                            "use a worktree, or set payload.allow_dirty=true."
+                            "use a worktree, or set payload.allow_dirty=true. For focused edits on a "
+                            "dirty tree (docs, tests), use puppetmaster_edit — it edits in place and "
+                            "needs no clean tree."
                             + dirty_worktree_paths_note(
                                 before["changed_files"], before["untracked_files"]
                             )
@@ -1502,7 +1506,9 @@ class CodexAdapter:
                             "Codex full-edit runs require a clean working tree by default "
                             "so Puppetmaster can attribute resulting diffs correctly. Commit, "
                             "stash, use a worktree, set payload.allow_dirty=true, or pass "
-                            "payload.sandbox='read-only' for review-only tasks."
+                            "payload.sandbox='read-only' for review-only tasks. For focused edits "
+                            "on a dirty tree (docs, tests), use puppetmaster_edit — it edits in "
+                            "place and needs no clean tree."
                             + dirty_worktree_paths_note(
                                 before["changed_files"], before["untracked_files"]
                             )
@@ -2305,7 +2311,9 @@ class HermesAdapter:
                         "message": (
                             "Hermes full-edit runs require a clean working tree by default "
                             "so Puppetmaster can attribute resulting diffs correctly. Commit, "
-                            "stash, use a worktree, or set payload.allow_dirty=true."
+                            "stash, use a worktree, or set payload.allow_dirty=true. For focused "
+                            "edits on a dirty tree (docs, tests), use puppetmaster_edit — it edits "
+                            "in place and needs no clean tree."
                             + dirty_worktree_paths_note(
                                 before["changed_files"], before["untracked_files"]
                             )
