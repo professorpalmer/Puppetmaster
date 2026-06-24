@@ -27,6 +27,8 @@ from puppetmaster.installers import (
     install_hermes_mcp,
     install_hermes_plugin,
     install_hermes_skill,
+    list_skill_candidates,
+    promote_skill_candidate,
     resolve_claude_command,
     uninstall_claude_mcp,
     uninstall_codex_mcp,
@@ -1433,6 +1435,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     platform_reset.add_argument("--registry-path", help="Override the registry path.")
 
+    skills_cmd = subcommands.add_parser(
+        "skills",
+        help=(
+            "Review and promote Hermes skill CANDIDATES distilled by the "
+            "puppetmaster-learn flywheel. Promotion is always explicit — nothing "
+            "is ever auto-promoted into a live skill."
+        ),
+    )
+    skills_sub = skills_cmd.add_subparsers(dest="skills_command", required=True)
+    skills_list = skills_sub.add_parser(
+        "list-candidates", help="List review-ready skill candidates."
+    )
+    skills_list.add_argument("--json", action="store_true", help="Emit JSON.")
+    skills_promote = skills_sub.add_parser(
+        "promote-candidate",
+        help="Promote a reviewed candidate into a live Hermes skill (by slug or dir name).",
+    )
+    skills_promote.add_argument(
+        "slug", help="Candidate slug (e.g. fix-the-thing) or exact directory name."
+    )
+    skills_promote.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an existing live skill that differs from the candidate.",
+    )
+    skills_promote.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be promoted without writing anything.",
+    )
+
     preflight_cmd = subcommands.add_parser(
         "preflight",
         help=(
@@ -1782,6 +1815,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
 
     if args.command == "platform":
         return _run_platform_subcommand(args)
+
+    if args.command == "skills":
+        return _run_skills_subcommand(args)
 
     if args.command == "route":
         return _run_route_command(args)
@@ -3834,6 +3870,50 @@ def _run_mcp_doctor(args) -> int:
 def _registry_path_from_args(args) -> Optional[Path]:
     raw = getattr(args, "registry_path", None)
     return Path(raw).expanduser() if raw else None
+
+
+def _run_skills_subcommand(args) -> int:
+    """Dispatch `python -m puppetmaster skills ...`.
+
+    Closes the puppetmaster-learn flywheel: list the candidates the learn plugin
+    distilled, then promote a reviewed one into a live Hermes skill. Promotion is
+    only ever this explicit human action — the plugin never auto-promotes.
+    """
+    sub = args.skills_command
+
+    if sub == "list-candidates":
+        candidates = list_skill_candidates()
+        if getattr(args, "json", False):
+            print(json.dumps(candidates, indent=2))
+            return 0
+        if not candidates:
+            print(
+                "No skill candidates yet. They appear here after a durable "
+                "Puppetmaster swarm with PUPPETMASTER_LEARN enabled."
+            )
+            return 0
+        print(f"{len(candidates)} skill candidate(s) — promote with "
+              f"`puppetmaster skills promote-candidate <slug>`:")
+        for candidate in candidates:
+            goal = candidate["goal"] or "(no recorded goal)"
+            print(f"  {candidate['slug']:40} {goal}")
+            print(f"  {'':40} dir={candidate['dir']}  job={candidate['job_id'] or '-'}")
+        return 0
+
+    if sub == "promote-candidate":
+        outcome = promote_skill_candidate(
+            args.slug,
+            force=getattr(args, "force", False),
+            dry_run=getattr(args, "dry_run", False),
+        )
+        ok_statuses = {"promoted", "unchanged", "would_promote"}
+        stream = sys.stdout if outcome.status in ok_statuses else sys.stderr
+        print(f"promote-candidate: {outcome.status} — {outcome.reason}", file=stream)
+        if outcome.target and outcome.status in ok_statuses:
+            print(f"  live skill: {outcome.target}", file=stream)
+        return 0 if outcome.status in ok_statuses else 1
+
+    raise SystemExit(f"unknown skills subcommand: {sub}")
 
 
 def _run_platform_subcommand(args) -> int:

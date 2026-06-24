@@ -1707,6 +1707,194 @@ def bundled_skill_dir() -> Optional[Path]:
     return candidate if (candidate / "SKILL.md").is_file() else None
 
 
+def hermes_skill_candidates_dir(env: Optional[Mapping[str, str]] = None) -> Path:
+    """Return Hermes' skill-CANDIDATES directory (where puppetmaster-learn writes).
+
+    Candidates live at ``$HERMES_HOME/skills-candidates`` (or
+    ``~/.hermes/skills-candidates``), one directory per candidate named
+    ``<YYYYMMDD>-<slug>`` containing ``SKILL.md`` + ``candidate.json``.
+    """
+    env = env if env is not None else os.environ
+    hermes_home = env.get("HERMES_HOME")
+    base = Path(hermes_home).expanduser() if hermes_home else Path("~/.hermes").expanduser()
+    return base / "skills-candidates"
+
+
+def _candidate_slug(dir_name: str) -> str:
+    """Strip the ``<YYYYMMDD>-`` date prefix the learn plugin adds, if present."""
+    match = re.match(r"^\d{8}-(.+)$", dir_name)
+    return match.group(1) if match else dir_name
+
+
+def list_skill_candidates(
+    *,
+    candidates_dir: Optional[Path] = None,
+    env: Optional[Mapping[str, str]] = None,
+) -> "list[dict]":
+    """Enumerate review-ready skill candidates, newest directory name last.
+
+    Each entry carries ``dir`` (on-disk name), ``slug`` (date-stripped),
+    ``path``, and the candidate's recorded ``goal``/``job_id``/``created_iso``
+    provenance (empty strings when ``candidate.json`` is missing/unreadable).
+    """
+    base = candidates_dir or hermes_skill_candidates_dir(env)
+    out: "list[dict]" = []
+    if not base.is_dir():
+        return out
+    for entry in sorted(base.iterdir()):
+        if not entry.is_dir() or not (entry / "SKILL.md").is_file():
+            continue
+        meta: dict = {}
+        meta_path = entry / "candidate.json"
+        if meta_path.is_file():
+            try:
+                loaded = json.loads(meta_path.read_text(encoding="utf-8"))
+                meta = loaded if isinstance(loaded, dict) else {}
+            except (OSError, json.JSONDecodeError):
+                meta = {}
+        out.append(
+            {
+                "dir": entry.name,
+                "slug": _candidate_slug(entry.name),
+                "path": str(entry),
+                "goal": str(meta.get("goal") or ""),
+                "job_id": str(meta.get("job_id") or ""),
+                "created_iso": str(meta.get("created_iso") or ""),
+            }
+        )
+    return out
+
+
+@dataclass
+class PromoteOutcome:
+    """Result of promoting a skill candidate into a live Hermes skill.
+
+    ``status`` is one of ``promoted`` / ``unchanged`` / ``skipped`` /
+    ``would_promote`` / ``not_found`` / ``ambiguous`` / ``error``.
+    """
+
+    status: str
+    slug: str
+    candidate: str = ""
+    target: str = ""
+    reason: str = ""
+
+
+def promote_skill_candidate(
+    slug: str,
+    *,
+    candidates_dir: Optional[Path] = None,
+    skills_dir: Optional[Path] = None,
+    force: bool = False,
+    dry_run: bool = False,
+    env: Optional[Mapping[str, str]] = None,
+) -> PromoteOutcome:
+    """Promote a reviewed candidate into Hermes' live skills directory.
+
+    This is the human-in-the-loop other half of the puppetmaster-learn
+    flywheel. The learn plugin only ever writes CANDIDATES and never a live
+    skill; promotion happens *only* through this explicit, user-invoked path —
+    so the "never auto-promote" guarantee is preserved.
+
+    Resolution accepts either the exact candidate directory name
+    (``20260624-fix-the-thing``) or the bare slug (``fix-the-thing``). The copy
+    is non-destructive and idempotent:
+
+    * No match → ``not_found``; more than one slug match → ``ambiguous`` (re-run
+      with the exact directory name).
+    * Live skill already byte-identical → ``unchanged``.
+    * Live skill exists but differs and ``force`` is False → ``skipped`` (never
+      silently clobber a hand-edited live skill).
+    * Otherwise copy the candidate's ``SKILL.md`` (plus any ``references/`` /
+      ``scripts/`` siblings) into ``<skills>/<slug>/``. ``candidate.json`` is
+      preserved as ``.promoted-from.json`` for provenance rather than shipped as
+      part of the live skill. The candidate is left in place.
+    """
+    candidates = list_skill_candidates(candidates_dir=candidates_dir, env=env)
+    exact = [c for c in candidates if c["dir"] == slug]
+    matches = exact or [c for c in candidates if c["slug"] == slug]
+
+    if not matches:
+        available = ", ".join(c["slug"] for c in candidates) or "(none)"
+        return PromoteOutcome(
+            status="not_found",
+            slug=slug,
+            reason=f"no candidate matching {slug!r}. Available: {available}",
+        )
+    if len(matches) > 1:
+        names = ", ".join(c["dir"] for c in matches)
+        return PromoteOutcome(
+            status="ambiguous",
+            slug=slug,
+            reason=f"multiple candidates match {slug!r}: {names}. Re-run with the exact directory name.",
+        )
+
+    candidate = matches[0]
+    src_dir = Path(candidate["path"])
+    src_skill = src_dir / "SKILL.md"
+    target = (skills_dir or hermes_skills_dir(env)) / candidate["slug"]
+    dst_skill = target / "SKILL.md"
+
+    import filecmp
+
+    if dst_skill.is_file():
+        if filecmp.cmp(src_skill, dst_skill, shallow=False):
+            return PromoteOutcome(
+                status="unchanged",
+                slug=candidate["slug"],
+                candidate=str(src_dir),
+                target=str(target),
+                reason="a live skill already matches this candidate",
+            )
+        if not force:
+            return PromoteOutcome(
+                status="skipped",
+                slug=candidate["slug"],
+                candidate=str(src_dir),
+                target=str(target),
+                reason="a live skill already exists and differs — re-run with --force to overwrite",
+            )
+
+    if dry_run:
+        return PromoteOutcome(
+            status="would_promote",
+            slug=candidate["slug"],
+            candidate=str(src_dir),
+            target=str(target),
+            reason=f"DRY RUN — would promote candidate into {target}",
+        )
+
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        for item in src_dir.iterdir():
+            if item.name == "candidate.json":
+                continue
+            dest = target / item.name
+            if item.is_dir():
+                shutil.copytree(item, dest, dirs_exist_ok=True)
+            else:
+                shutil.copy2(item, dest)
+        meta_path = src_dir / "candidate.json"
+        if meta_path.is_file():
+            shutil.copy2(meta_path, target / ".promoted-from.json")
+    except OSError as exc:
+        return PromoteOutcome(
+            status="error",
+            slug=candidate["slug"],
+            candidate=str(src_dir),
+            target=str(target),
+            reason=f"copy failed: {exc}",
+        )
+
+    return PromoteOutcome(
+        status="promoted",
+        slug=candidate["slug"],
+        candidate=str(src_dir),
+        target=str(target),
+        reason=f"promoted candidate into {target}",
+    )
+
+
 def hermes_plugins_dir(env: Optional[Mapping[str, str]] = None) -> Path:
     """Return Hermes' plugins directory (``$HERMES_HOME/plugins`` or ~/.hermes/plugins)."""
     env = env if env is not None else os.environ

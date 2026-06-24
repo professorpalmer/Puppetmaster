@@ -425,6 +425,122 @@ def detect_codex_billing(
     )
 
 
+# Hermes is a meta-router CLI: it reaches an underlying provider (Anthropic,
+# OpenAI, Gemini) via a provider API key or an OAuth login. Its billing posture
+# is therefore the posture of whatever credential it's configured to use. These
+# detectors are re-implemented here (rather than imported from ``adapters``) on
+# purpose: ``adapters`` imports this module, so importing it back would be a
+# cycle. They mirror ``adapters._hermes_present_credential_keys`` /
+# ``_hermes_oauth_providers`` with injectable ``env``/``home`` for testability.
+_HERMES_CREDENTIAL_ENV_KEYS = (
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+)
+
+
+def _hermes_present_credential_keys(env: Mapping[str, str], home: Path) -> "set[str]":
+    """Provider API-key env vars Hermes can see (process env ∪ ~/.hermes/.env)."""
+    import re
+
+    present = {key for key in _HERMES_CREDENTIAL_ENV_KEYS if env.get(key)}
+    env_file = home / ".hermes" / ".env"
+    if env_file.is_file():
+        try:
+            text = env_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        for key in _HERMES_CREDENTIAL_ENV_KEYS:
+            if re.search(rf"^\s*{re.escape(key)}\s*=\s*\S+", text, re.MULTILINE):
+                present.add(key)
+    return present
+
+
+def _hermes_oauth_providers(home: Path) -> "set[str]":
+    """Hermes provider names that carry OAuth state in ~/.hermes/auth.json."""
+    import json
+
+    auth_file = home / ".hermes" / "auth.json"
+    if not auth_file.is_file():
+        return set()
+    try:
+        payload = json.loads(auth_file.read_text(encoding="utf-8", errors="replace") or "{}")
+    except (OSError, json.JSONDecodeError):
+        return set()
+    providers = payload.get("providers") if isinstance(payload, dict) else None
+    if isinstance(providers, dict):
+        return {str(name).lower() for name in providers}
+    return set()
+
+
+def detect_hermes_billing(
+    env: Optional[Mapping[str, str]] = None,
+    home: Optional[Path] = None,
+) -> BillingStatus:
+    """Hermes billing posture = the posture of its configured provider credential.
+
+    Hermes routes to an underlying provider, so the question "will this cost me
+    extra?" reduces to which credential it will use:
+
+    * A provider **API key** (``ANTHROPIC_API_KEY`` / ``OPENAI_API_KEY`` /
+      ``GEMINI_API_KEY`` / ``GOOGLE_API_KEY``, from the process env or
+      ``~/.hermes/.env``) bills per-token to that provider — ``api``.
+    * An **OAuth login** (``~/.hermes/auth.json``) is covered by that provider
+      login — ``plan``.
+    * Neither → ``unknown`` and unhealthy: Hermes cannot run.
+
+    When both are configured we report ``api`` — at least one out-of-pocket path
+    exists, and underselling the cost would be the wrong way to be wrong.
+    """
+    env = env if env is not None else os.environ
+    home = home if home is not None else Path.home()
+
+    keys = sorted(_hermes_present_credential_keys(env, home))
+    oauth = sorted(_hermes_oauth_providers(home))
+    evidence = [f"hermes_api_key:{key}" for key in keys]
+    evidence += [f"hermes_oauth:{provider}" for provider in oauth]
+
+    if not keys and not oauth:
+        return BillingStatus(
+            adapter="hermes",
+            billing="unknown",
+            healthy=False,
+            detail=(
+                "No Hermes provider credential found — set a provider API key "
+                "(ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY) in "
+                "~/.hermes/.env or run `hermes login`."
+            ),
+            evidence=evidence or ["hermes_credentials:missing"],
+        )
+
+    if keys:
+        oauth_note = (
+            f" OAuth login also present for: {', '.join(oauth)}." if oauth else ""
+        )
+        return BillingStatus(
+            adapter="hermes",
+            billing="api",
+            healthy=True,
+            detail=(
+                f"Hermes has provider API key(s) configured ({', '.join(keys)}) — "
+                f"those providers bill per-token (out-of-pocket).{oauth_note}"
+            ),
+            evidence=evidence,
+        )
+
+    return BillingStatus(
+        adapter="hermes",
+        billing="plan",
+        healthy=True,
+        detail=(
+            f"Hermes is signed in via OAuth ({', '.join(oauth)}) — work is covered "
+            "by that provider login (no marginal API-key spend)."
+        ),
+        evidence=evidence,
+    )
+
+
 # OpenAI raw-API and shell are not subscription-coverable.
 def detect_openai_billing(
     env: Optional[Mapping[str, str]] = None,
@@ -451,6 +567,9 @@ _DETECTORS: dict[str, Callable[..., BillingStatus]] = {
     ),
     "codex": lambda **kw: detect_codex_billing(
         run=kw.get("run"), env=kw.get("env"), home=kw.get("home"), context=kw.get("context")
+    ),
+    "hermes": lambda **kw: detect_hermes_billing(
+        env=kw.get("env"), home=kw.get("home")
     ),
     "openai": lambda **kw: detect_openai_billing(env=kw.get("env")),
 }

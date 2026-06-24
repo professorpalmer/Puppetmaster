@@ -148,7 +148,7 @@ def _billing_checks() -> list[Check]:
     from puppetmaster.platform_billing import detect_adapter_billing
 
     checks: list[Check] = []
-    for adapter in ("cursor", "claude-code", "codex"):
+    for adapter in ("cursor", "claude-code", "codex", "hermes"):
         try:
             status = detect_adapter_billing(adapter)
         except Exception as exc:  # pragma: no cover - defensive

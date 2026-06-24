@@ -9794,6 +9794,128 @@ class InstallHermesSkillTests(unittest.TestCase):
             )
 
 
+class PromoteSkillCandidateTests(unittest.TestCase):
+    """Tests for the candidate→live-skill promotion half of the learn flywheel.
+
+    Promotion must be explicit and non-destructive — the plugin never
+    auto-promotes, and a human-invoked promote must not silently clobber a
+    customized live skill.
+    """
+
+    def _write_candidate(self, candidates_dir, dir_name, *, body="# learned\n", meta=None):
+        import json as _json
+
+        target = candidates_dir / dir_name
+        target.mkdir(parents=True)
+        (target / "SKILL.md").write_text(body, encoding="utf-8")
+        if meta is not None:
+            (target / "candidate.json").write_text(
+                _json.dumps(meta), encoding="utf-8"
+            )
+        return target
+
+    def test_list_candidates_reads_dir_slug_and_meta(self):
+        from puppetmaster.installers import list_skill_candidates
+
+        with TemporaryDirectory() as tmp:
+            cands = Path(tmp) / "skills-candidates"
+            self._write_candidate(
+                cands,
+                "20260624-fix-the-thing",
+                meta={"goal": "Fix the thing", "job_id": "job_abc"},
+            )
+            listed = list_skill_candidates(candidates_dir=cands)
+            self.assertEqual(len(listed), 1)
+            self.assertEqual(listed[0]["dir"], "20260624-fix-the-thing")
+            self.assertEqual(listed[0]["slug"], "fix-the-thing")
+            self.assertEqual(listed[0]["goal"], "Fix the thing")
+            self.assertEqual(listed[0]["job_id"], "job_abc")
+
+    def test_promote_by_slug_writes_live_skill(self):
+        from puppetmaster.installers import promote_skill_candidate
+
+        with TemporaryDirectory() as tmp:
+            cands = Path(tmp) / "skills-candidates"
+            skills = Path(tmp) / "skills"
+            self._write_candidate(
+                cands, "20260624-fix-the-thing", meta={"job_id": "job_abc"}
+            )
+            out = promote_skill_candidate(
+                "fix-the-thing", candidates_dir=cands, skills_dir=skills
+            )
+            self.assertEqual(out.status, "promoted")
+            live = skills / "fix-the-thing" / "SKILL.md"
+            self.assertTrue(live.is_file())
+            # Provenance is preserved out-of-band, not as part of the live skill.
+            self.assertTrue((skills / "fix-the-thing" / ".promoted-from.json").is_file())
+            # The candidate is left in place (non-destructive).
+            self.assertTrue((cands / "20260624-fix-the-thing" / "SKILL.md").is_file())
+
+    def test_promote_is_idempotent_then_blocks_on_diff(self):
+        from puppetmaster.installers import promote_skill_candidate
+
+        with TemporaryDirectory() as tmp:
+            cands = Path(tmp) / "skills-candidates"
+            skills = Path(tmp) / "skills"
+            self._write_candidate(cands, "20260624-thing", body="# v1\n")
+            first = promote_skill_candidate("thing", candidates_dir=cands, skills_dir=skills)
+            self.assertEqual(first.status, "promoted")
+            again = promote_skill_candidate("thing", candidates_dir=cands, skills_dir=skills)
+            self.assertEqual(again.status, "unchanged")
+            # A user hand-edits the live skill; promotion must not clobber it.
+            (skills / "thing" / "SKILL.md").write_text("# hand edited\n", encoding="utf-8")
+            blocked = promote_skill_candidate("thing", candidates_dir=cands, skills_dir=skills)
+            self.assertEqual(blocked.status, "skipped")
+            self.assertIn("hand edited", (skills / "thing" / "SKILL.md").read_text())
+            forced = promote_skill_candidate(
+                "thing", candidates_dir=cands, skills_dir=skills, force=True
+            )
+            self.assertEqual(forced.status, "promoted")
+            self.assertIn("# v1", (skills / "thing" / "SKILL.md").read_text())
+
+    def test_promote_unknown_slug_is_not_found(self):
+        from puppetmaster.installers import promote_skill_candidate
+
+        with TemporaryDirectory() as tmp:
+            cands = Path(tmp) / "skills-candidates"
+            skills = Path(tmp) / "skills"
+            self._write_candidate(cands, "20260624-real-one")
+            out = promote_skill_candidate(
+                "does-not-exist", candidates_dir=cands, skills_dir=skills
+            )
+            self.assertEqual(out.status, "not_found")
+            self.assertIn("real-one", out.reason)
+
+    def test_promote_ambiguous_slug_requires_dir_name(self):
+        from puppetmaster.installers import promote_skill_candidate
+
+        with TemporaryDirectory() as tmp:
+            cands = Path(tmp) / "skills-candidates"
+            skills = Path(tmp) / "skills"
+            self._write_candidate(cands, "20260101-dup")
+            self._write_candidate(cands, "20260624-dup")
+            out = promote_skill_candidate("dup", candidates_dir=cands, skills_dir=skills)
+            self.assertEqual(out.status, "ambiguous")
+            # The exact directory name disambiguates.
+            exact = promote_skill_candidate(
+                "20260624-dup", candidates_dir=cands, skills_dir=skills
+            )
+            self.assertEqual(exact.status, "promoted")
+
+    def test_promote_dry_run_writes_nothing(self):
+        from puppetmaster.installers import promote_skill_candidate
+
+        with TemporaryDirectory() as tmp:
+            cands = Path(tmp) / "skills-candidates"
+            skills = Path(tmp) / "skills"
+            self._write_candidate(cands, "20260624-thing")
+            out = promote_skill_candidate(
+                "thing", candidates_dir=cands, skills_dir=skills, dry_run=True
+            )
+            self.assertEqual(out.status, "would_promote")
+            self.assertFalse((skills / "thing").exists())
+
+
 class InstallHermesPluginTests(unittest.TestCase):
     """Tests for :func:`install_hermes_plugin` — shipping the bundled
     puppetmaster-learn plugin into Hermes' plugins dir so the auto-/learn
@@ -10955,6 +11077,52 @@ class PlatformBillingDetectionTests(unittest.TestCase):
         s2 = detect_cursor_billing(env={})
         self.assertEqual(s2.billing, "unknown")
         self.assertFalse(s2.healthy)
+
+    def test_hermes_billing_none_api_oauth(self) -> None:
+        from puppetmaster.platform_billing import detect_hermes_billing
+
+        import json as _json
+
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            # No credentials anywhere -> unknown + unhealthy (Hermes can't run).
+            none = detect_hermes_billing(env={}, home=home)
+            self.assertEqual(none.billing, "unknown")
+            self.assertFalse(none.healthy)
+
+            # A provider API key (process env) -> api / out-of-pocket.
+            api = detect_hermes_billing(env={"ANTHROPIC_API_KEY": "k"}, home=home)
+            self.assertEqual(api.billing, "api")
+            self.assertTrue(api.healthy)
+            self.assertIn("hermes_api_key:ANTHROPIC_API_KEY", api.evidence)
+
+            # A key in ~/.hermes/.env is detected the same way.
+            (home / ".hermes").mkdir()
+            (home / ".hermes" / ".env").write_text(
+                "GEMINI_API_KEY=abc123\n", encoding="utf-8"
+            )
+            from_file = detect_hermes_billing(env={}, home=home)
+            self.assertEqual(from_file.billing, "api")
+            self.assertIn("hermes_api_key:GEMINI_API_KEY", from_file.evidence)
+
+        with TemporaryDirectory() as tmp2:
+            home2 = Path(tmp2)
+            (home2 / ".hermes").mkdir()
+            (home2 / ".hermes" / "auth.json").write_text(
+                _json.dumps({"providers": {"anthropic": {"token": "x"}}}),
+                encoding="utf-8",
+            )
+            # OAuth login only -> plan / covered.
+            plan = detect_hermes_billing(env={}, home=home2)
+            self.assertEqual(plan.billing, "plan")
+            self.assertTrue(plan.healthy)
+            self.assertIn("hermes_oauth:anthropic", plan.evidence)
+
+    def test_doctor_billing_includes_hermes_row(self) -> None:
+        from puppetmaster.diagnostics import _billing_checks
+
+        names = {check.name for check in _billing_checks()}
+        self.assertIn("billing:hermes", names)
 
     def test_claude_billing_api_key_vs_oauth_vs_none(self) -> None:
         from puppetmaster.platform_billing import detect_claude_billing
