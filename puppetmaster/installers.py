@@ -1667,7 +1667,15 @@ HERMES_NEXT_STEPS_GUIDANCE = (
     "PUPPETMASTER_AUTO_INVOKE_DISABLED=1.\n"
     "Single edits: `puppetmaster_edit \"<instruction>\"` (cheap model + CodeGraph, in place,\n"
     "returns a diff). Long jobs: prefer the async pattern — fire a `start_*` verb, then\n"
-    "re-poll with bounded `live_artifacts_follow` / `await_job` instead of one long block."
+    "re-poll with bounded `live_artifacts_follow` / `await_job` instead of one long block.\n"
+    "Learn flywheel (opt-in): set PUPPETMASTER_LEARN=1 on the puppetmaster MCP entry in\n"
+    "Hermes config.yaml — a finished swarm distills itself into a skill CANDIDATE (never\n"
+    "auto-promoted). Review with `puppetmaster skills list-candidates`, then promote a\n"
+    "keeper with `puppetmaster skills promote-candidate <slug>`.\n"
+    "Skill injection (opt-in): set PUPPETMASTER_INJECT_HERMES_SKILLS=1 so routed Hermes\n"
+    "workers inherit your curated live skill bodies — honest caveat: injected bodies ride\n"
+    "every worker turn (per-turn token cost), bounded by PUPPETMASTER_SKILL_TOKEN_BUDGET\n"
+    "(default 1200). Tune the budget in the same env block if needed."
 )
 
 _HERMES_PIP_HINT = (
@@ -2241,6 +2249,124 @@ def install_hermes_mcp(
         target=str(target),
         python_executable=python,
         handshake=handshake,
+        messages=messages,
+    )
+
+
+def set_hermes_mcp_env(
+    updates: Mapping[str, str],
+    *,
+    target_path: Optional[Path] = None,
+    dry_run: bool = False,
+    env: Optional[Mapping[str, str]] = None,
+) -> InstallResult:
+    """Merge ``updates`` into ``mcp_servers.puppetmaster.env`` in Hermes config.
+
+    Creates the puppetmaster MCP entry via :func:`build_hermes_mcp_entry` when
+    missing. Preserves command/args and every other server/section. Idempotent
+    when the merged env already matches.
+    """
+    python = sys.executable
+    target = target_path or hermes_config_path(env)
+    messages: list[str] = []
+
+    if not updates:
+        messages.append("no env updates requested")
+        return InstallResult(
+            status="unchanged",
+            target=str(target),
+            python_executable=python,
+            messages=messages,
+        )
+
+    try:
+        import yaml  # type: ignore
+    except Exception:  # pragma: no cover - exercised on hosts without PyYAML
+        messages.append(_HERMES_PIP_HINT)
+        return InstallResult(
+            status="error",
+            target=str(target),
+            python_executable=python,
+            messages=messages,
+        )
+
+    if target.exists():
+        try:
+            loaded = yaml.safe_load(target.read_text(encoding="utf-8"))
+        except yaml.YAMLError as exc:
+            messages.append(f"existing config at {target} is not valid YAML: {exc!r}")
+            return InstallResult(
+                status="error",
+                target=str(target),
+                python_executable=python,
+                messages=messages,
+            )
+        config = loaded if isinstance(loaded, dict) else {}
+        if loaded is not None and not isinstance(loaded, dict):
+            messages.append(f"top-level of {target} is not a mapping; cannot merge")
+            return InstallResult(
+                status="error",
+                target=str(target),
+                python_executable=python,
+                messages=messages,
+            )
+    else:
+        config = {}
+
+    mcp_servers = config.setdefault("mcp_servers", {})
+    if not isinstance(mcp_servers, dict):
+        messages.append(f"'mcp_servers' in {target} is not a mapping; cannot merge")
+        return InstallResult(
+            status="error",
+            target=str(target),
+            python_executable=python,
+            messages=messages,
+        )
+
+    prior = mcp_servers.get("puppetmaster")
+    prior = prior if isinstance(prior, dict) else None
+    entry = build_hermes_mcp_entry(python, prior=prior)
+    existing_env = entry.get("env")
+    merged_env = dict(existing_env) if isinstance(existing_env, dict) else {}
+    merged_env.update({str(k): str(v) for k, v in updates.items()})
+    entry["env"] = merged_env
+
+    if prior == entry:
+        messages.append(f"puppetmaster env in {target} already matches; nothing to do")
+        return InstallResult(
+            status="unchanged",
+            target=str(target),
+            python_executable=python,
+            messages=messages,
+        )
+
+    mcp_servers["puppetmaster"] = entry
+
+    if dry_run:
+        messages.append(f"DRY RUN — would merge {len(updates)} env key(s) into {target}")
+        return InstallResult(
+            status="would_install",
+            target=str(target),
+            python_executable=python,
+            messages=messages,
+        )
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    rendered = yaml.safe_dump(
+        config,
+        sort_keys=False,
+        allow_unicode=True,
+        default_flow_style=False,
+        width=4096,
+    )
+    tmp_path = target.with_suffix(target.suffix + ".tmp")
+    tmp_path.write_text(rendered, encoding="utf-8")
+    os.replace(tmp_path, target)
+    messages.append(f"merged {len(updates)} env key(s) into puppetmaster MCP entry at {target}")
+    return InstallResult(
+        status="installed",
+        target=str(target),
+        python_executable=python,
         messages=messages,
     )
 

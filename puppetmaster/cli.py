@@ -30,6 +30,7 @@ from puppetmaster.installers import (
     list_skill_candidates,
     promote_skill_candidate,
     resolve_claude_command,
+    set_hermes_mcp_env,
     uninstall_claude_mcp,
     uninstall_codex_mcp,
     uninstall_cursor_mcp,
@@ -393,6 +394,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-platforms",
         action="store_true",
         help="Skip the platform-lock selection step (leave the lock unchanged).",
+    )
+    setup_parser.add_argument(
+        "--skip-hermes-advanced",
+        action="store_true",
+        help=(
+            "Skip the optional in-depth Hermes setup branch (learn flywheel, skill "
+            "injection env knobs) during `setup` step 7."
+        ),
     )
 
     uninstall_parser = subcommands.add_parser(
@@ -3203,33 +3212,34 @@ def _detected_platforms(root: Path) -> dict[str, bool]:
         "claude-code": _claude_code_installed(),
         "codex": _codex_cli_installed(),
         "openai": bool(os.environ.get("OPENAI_API_KEY")),
+        "hermes": _shutil.which("hermes") is not None,
     }
 
 
 def _setup_platform_step(args) -> int:
-    """The `setup` wizard's platform-lock step.
+    """The `setup` wizard's platform-lock step — a forced-pick gate.
 
-    Defaults to *what is detected on this machine* instead of "everything on"
-    (field report: a Claude-Code-only user got cursor recommendations because
-    setup silently left all platforms enabled). Modes:
+    Runtime default stays permissive (no ``platform.json`` = all adapters on).
+    The wizard, however, starts with every platform shown OFF on first run and
+    requires an explicit choice of at least one adapter before proceeding.
 
-    * ``--platforms cursor,claude-code`` — explicit, always wins.
-    * a TTY with no flag — interactive prompt; on first run, Enter applies
-      the detected set.
-    * non-interactive shell with no flag — first run locks to the detected
-      set; an existing lock is respected and left unchanged.
+    Modes:
 
-    Returns non-zero only for an invalid *explicit* ``--platforms`` value; the
-    interactive and skipped paths never fail the wizard on a typo.
+    * ``--platforms cursor,claude-code`` or ``--platforms all`` — explicit,
+      always wins.
+    * TTY, no flag — interactive loop until >=1 known adapter is locked.
+    * non-interactive, no flag — respects an existing lock (grandfather);
+      fails on first run with actionable guidance.
     """
     from puppetmaster import platform_lock as pl
 
     known = pl.KNOWN_ADAPTERS
     detected = _detected_platforms(Path.cwd())
     detected_set = {a for a, present in detected.items() if present}
+    configured = pl.is_configured()
 
-    def _show_state() -> None:
-        enabled = pl.enabled_adapters()
+    def _show_state(*, wizard_first_run: bool = False) -> None:
+        enabled = set() if wizard_first_run else pl.enabled_adapters()
         for adapter in known:
             mark = "on " if adapter in enabled else "off"
             note = "" if detected.get(adapter, True) else "   (not detected on this machine)"
@@ -3237,6 +3247,11 @@ def _setup_platform_step(args) -> int:
 
     raw = getattr(args, "platforms", None)
     if raw is not None:
+        if raw.strip().lower() == "all":
+            pl.reset()
+            print("  reset  all platforms enabled")
+            _show_state()
+            return 0
         wanted = {a.strip() for a in raw.split(",") if a.strip()}
         unknown = sorted(a for a in wanted if a not in known)
         if unknown:
@@ -3262,86 +3277,186 @@ def _setup_platform_step(args) -> int:
 
     if getattr(args, "skip_platforms", False):
         print("  skipped  (--skip-platforms) — platform lock left unchanged")
-        _show_state()
+        _show_state(wizard_first_run=not configured)
         return 0
 
-    first_run = not pl.platform_config_path().is_file()
-
     if not sys.stdin.isatty():
-        if not first_run:
+        if configured:
             print(
                 "  unchanged  existing platform lock respected "
                 "(non-interactive shell, no --platforms flag)"
             )
-        elif detected_set:
-            pl.set_enabled(detected_set)
-            print(
-                "  detected  locked to the platforms found on this machine: "
-                f"{', '.join(sorted(detected_set))}"
-            )
-            print(
-                "  note: adjust anytime with `puppetmaster platform "
-                "enable/disable/only/reset` or `setup --platforms ...`"
-            )
-        else:
-            print(
-                "  skipped  no platforms detected on this machine — lock left "
-                "at default (all enabled); set explicitly with --platforms"
-            )
-        _show_state()
-        return 0
-
-    print("Puppetmaster routes work across these platforms:")
-    _show_state()
-    if first_run and detected_set:
-        print(f"Detected on this machine: {', '.join(sorted(detected_set))}")
+            _show_state()
+            return 0
         print(
+            "  error  no platform selected — re-run in an interactive terminal or "
+            f"pass --platforms <comma-list>. Known: {', '.join(known)}."
+        )
+        _show_state(wizard_first_run=True)
+        return 1
+
+    print("Puppetmaster routes work across these platforms.")
+    print(
+        "Most users enable a single platform (e.g. just cursor). Enabling multiple "
+        "platforms unlocks cross-platform router fallback/healing and free-tier "
+        "hopping — opt in anytime with `puppetmaster platform enable <name>`."
+    )
+    _show_state(wizard_first_run=not configured)
+    if not configured and detected_set:
+        print(
+            f"Detected on this machine: {', '.join(sorted(detected_set))} — "
+            "you must still choose at least one to enable."
+        )
+    if not configured:
+        prompt_hint = (
             "Enter a comma-separated list of platforms to ENABLE (all others off),\n"
-            "'all' to keep every platform on, or press Enter to use the detected set."
+            "or type 'all' to enable every platform."
         )
     else:
-        print(
+        prompt_hint = (
             "Enter a comma-separated list of platforms to ENABLE (all others off),\n"
             "'all' to keep every platform on, or press Enter to leave unchanged."
         )
-    try:
-        answer = input("  platforms> ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print("\n  skipped  no input — platform lock left unchanged")
+    print(prompt_hint)
+
+    reprompt = (
+        'You must enable at least one platform to continue '
+        '(or type "all" to enable every platform).'
+    )
+
+    while True:
+        try:
+            answer = input("  platforms> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print(
+                "\n  aborted  platform selection required — re-run setup in an "
+                "interactive terminal or pass --platforms <comma-list>."
+            )
+            return 1
+
+        if not answer:
+            if configured:
+                print("  unchanged  platform lock left as-is")
+                _show_state()
+                return 0
+            print(f"  {reprompt}")
+            continue
+
+        if answer.lower() == "all":
+            pl.reset()
+            print("  reset  all platforms enabled")
+            _show_state()
+            return 0
+
+        wanted = {a.strip() for a in answer.split(",") if a.strip()}
+        unknown = sorted(a for a in wanted if a not in known)
+        if unknown:
+            print(
+                f"  error  unknown platform(s): {', '.join(unknown)}. "
+                f"Known: {', '.join(known)}."
+            )
+            continue
+        valid = {a for a in wanted if a in known}
+        if not valid:
+            print(f"  {reprompt}")
+            continue
+        pl.set_enabled(valid)
+        print(f"  locked  routing restricted to: {', '.join(sorted(valid))}")
+        _show_state()
         return 0
 
-    if not answer:
-        if first_run and detected_set:
-            pl.set_enabled(detected_set)
-            print(
-                "  locked  routing restricted to detected platforms: "
-                f"{', '.join(sorted(detected_set))}"
-            )
-        else:
-            print("  unchanged  platform lock left as-is")
-        _show_state()
+
+def _setup_hermes_advanced(args) -> int:
+    """Optional Hermes flywheel + skill-injection knobs (setup step 7 extension).
+
+    Persists accepted toggles into ``mcp_servers.puppetmaster.env`` in Hermes'
+    config.yaml. Non-interactive runs print the knobs instead of prompting.
+    """
+    if getattr(args, "skip_hermes_advanced", False):
+        print("  [hermes-advanced] skipped (--skip-hermes-advanced)")
         return 0
-    if answer.lower() == "all":
-        pl.reset()
-        print("  reset  all platforms enabled")
-        _show_state()
+
+    guidance = [
+        "PUPPETMASTER_LEARN=1 — finished swarms distill into Hermes skill CANDIDATES "
+        "(never auto-promoted). Review: `puppetmaster skills list-candidates`; promote: "
+        "`puppetmaster skills promote-candidate <slug>`.",
+        "PUPPETMASTER_INJECT_HERMES_SKILLS=1 — routed Hermes workers inherit your "
+        "curated live skill bodies (per-turn token cost on every worker turn; tune with "
+        "PUPPETMASTER_SKILL_TOKEN_BUDGET, default 1200).",
+        "Set these on mcp_servers.puppetmaster.env in Hermes config.yaml, or re-run "
+        "`puppetmaster setup` interactively.",
+    ]
+
+    if not sys.stdin.isatty():
+        print("  [hermes-advanced] non-interactive — optional Hermes MCP env knobs:")
+        for line in guidance:
+            print(f"    {line}")
         return 0
-    wanted = {a.strip() for a in answer.split(",") if a.strip()}
-    unknown = sorted(a for a in wanted if a not in known)
-    if unknown:
+
+    print("  [hermes-advanced] Optional Hermes flywheel (writes to mcp_servers.puppetmaster.env)")
+    env_updates: dict[str, str] = {}
+
+    try:
+        learn_answer = input(
+            "  Enable learn flywheel (PUPPETMASTER_LEARN=1)? [y/N] "
+        ).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("\n  [hermes-advanced] skipped — no input")
+        return 0
+    if learn_answer in {"y", "yes"}:
+        env_updates["PUPPETMASTER_LEARN"] = "1"
         print(
-            f"  error  unknown platform(s): {', '.join(unknown)} — leaving "
-            f"unchanged. Known: {', '.join(known)}."
+            "  learn  enabled — finished swarms write skill CANDIDATES under "
+            "~/.hermes/skills-candidates/ (never auto-promoted)."
         )
-        return 0  # a typo shouldn't fail the whole wizard
-    valid = {a for a in wanted if a in known}
-    if not valid:
-        print("  unchanged  no known platform named — left as-is")
+        print(
+            "  review  `puppetmaster skills list-candidates` then "
+            "`puppetmaster skills promote-candidate <slug>` to promote a keeper."
+        )
+    else:
+        print("  learn  left off (enable later via Hermes MCP env or re-run setup)")
+
+    try:
+        inject_answer = input(
+            "  Enable skill injection (PUPPETMASTER_INJECT_HERMES_SKILLS=1)? "
+            "Injected skill bodies ride every worker turn (per-turn token cost). [y/N] "
+        ).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("\n  [hermes-advanced] skipped remaining prompts — no input")
+        if env_updates:
+            result = set_hermes_mcp_env(env_updates, dry_run=getattr(args, "dry_run", False))
+            for line in result.messages:
+                print(f"  [hermes-advanced] {line}")
+            if result.status == "error":
+                return 1
         return 0
-    pl.set_enabled(valid)
-    print(f"  locked  routing restricted to: {', '.join(sorted(valid))}")
-    _show_state()
-    return 0
+
+    if inject_answer in {"y", "yes"}:
+        env_updates["PUPPETMASTER_INJECT_HERMES_SKILLS"] = "1"
+        print(
+            "  inject  enabled — routed Hermes workers inherit curated live skill bodies."
+        )
+        try:
+            budget_answer = input(
+                "  Set PUPPETMASTER_SKILL_TOKEN_BUDGET (default 1200, Enter to keep default)? "
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            budget_answer = ""
+        if budget_answer:
+            env_updates["PUPPETMASTER_SKILL_TOKEN_BUDGET"] = budget_answer
+            print(f"  budget  PUPPETMASTER_SKILL_TOKEN_BUDGET={budget_answer}")
+        else:
+            print("  budget  using default (1200 tokens per worker turn)")
+    else:
+        print("  inject  left off (enable later via Hermes MCP env or re-run setup)")
+
+    if not env_updates:
+        return 0
+
+    result = set_hermes_mcp_env(env_updates, dry_run=getattr(args, "dry_run", False))
+    for line in result.messages:
+        print(f"  [hermes-advanced] {line}")
+    return 1 if result.status == "error" else 0
 
 
 def _run_setup(args) -> int:
@@ -3383,8 +3498,21 @@ def _run_setup(args) -> int:
         print("=== step 1/9: doctor SKIPPED (--skip-doctor) ===\n")
 
     print("=== step 2/9: platform lock ===")
-    if _setup_platform_step(args) != 0:
-        overall_rc = 1
+    platform_rc = _setup_platform_step(args)
+    if platform_rc != 0:
+        print(
+            "\nSetup aborted at platform lock — choose at least one platform "
+            "and re-run (interactive terminal or --platforms <comma-list>)."
+        )
+        return 1
+
+    from puppetmaster import platform_lock as _pl
+    if not _pl.is_configured():
+        print(
+            "\nSetup aborted — no platform selected. Re-run in an interactive "
+            "terminal or pass --platforms <comma-list>."
+        )
+        return 1
     print()
 
     if not getattr(args, "skip_models", False):
@@ -3542,6 +3670,12 @@ def _run_setup(args) -> int:
             print("  [hermes-plugin] skipped (--skip-rules)")
         if not getattr(args, "skip_models", False):
             _seed_hermes_registry()
+        if (
+            hermes_result.status in {"installed", "unchanged", "would_install"}
+            and not getattr(args, "skip_rules", False)
+        ):
+            if _setup_hermes_advanced(args) != 0:
+                overall_rc = 1
     print()
 
     if not getattr(args, "skip_rules", False):

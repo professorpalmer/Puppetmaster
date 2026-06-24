@@ -41,6 +41,15 @@ def platform_config_path(registry_path: Optional[Path] = None) -> Path:
     return base / "platform.json"
 
 
+def is_configured(registry_path: Optional[Path] = None) -> bool:
+    """True when the user has explicitly chosen platforms via ``platform.json``.
+
+    Absent file means runtime stays permissive (all adapters on) but the setup
+    wizard treats the user as unconfigured and requires an explicit pick.
+    """
+    return platform_config_path(registry_path).is_file()
+
+
 def _parse_adapters(raw: str) -> set[str]:
     return {part.strip() for part in raw.split(",") if part.strip()}
 

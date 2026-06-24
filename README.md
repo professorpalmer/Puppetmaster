@@ -28,6 +28,26 @@ puppetmaster setup               # doctor + models init + MCP installers + rules
 
 That's the whole install. `setup` runs every step idempotently, skips any tool that isn't present, and prints what it did. Restart Cursor (or open a fresh Codex / Claude / Hermes session) and the agent gains 32+ `puppetmaster_*` tools, a rule nudging it to use them, and deterministic [auto-invocation hooks](https://github.com/professorpalmer/Puppetmaster#auto-invocation) that delegate real work for you. The classifier keeps trivial edits and read-only inspection inline, and the whole thing is kill-switchable with `PUPPETMASTER_AUTO_INVOKE_DISABLED=1`.
 
+### Platform lock (setup step 2)
+
+The setup wizard starts with **every platform shown OFF** on first run — you must explicitly enable at least one execution adapter before setup continues (`--platforms cursor` or an interactive pick). **Single-platform is the expected setup** for most users (e.g. just Cursor or just Claude Code). Enabling multiple platforms is opt-in power-user territory: it unlocks cross-platform router fallback/healing and free-tier hopping. Add more anytime with `puppetmaster platform enable <name>`.
+
+Runtime without a prior choice stays permissive for upgrades: absent `~/.puppetmaster/platform.json`, routing still sees all adapters as available. The default-OFF display is wizard-only — it does not brick existing installs that never ran setup.
+
+`auto_route` still picks among models on whichever platform(s) you enabled — useful with a single platform. Cross-platform “healing” (rerouting a failed worker to a different harness) only applies when two or more platforms are enabled.
+
+Non-interactive CI: pass `--platforms <comma-list>` or `--platforms all`. Without `--platforms` on a fresh machine, setup fails with guidance instead of silently proceeding.
+
+### Hermes advanced setup (step 7)
+
+When Hermes is among your enabled platforms and the Hermes CLI is on PATH, setup offers an optional in-depth branch (skip with `--skip-hermes-advanced`):
+
+1. **Learn flywheel** — `PUPPETMASTER_LEARN=1` on the puppetmaster MCP entry: finished swarms distill into Hermes skill **candidates** (never auto-promoted).
+2. **Review & promote** — `puppetmaster skills list-candidates`, then `puppetmaster skills promote-candidate <slug>`.
+3. **Skill injection** — `PUPPETMASTER_INJECT_HERMES_SKILLS=1` so routed Hermes workers inherit your curated live skill bodies. **Caveat:** injected bodies ride every worker turn (per-turn token cost), bounded by `PUPPETMASTER_SKILL_TOKEN_BUDGET` (default 1200).
+
+Accepted toggles are written into `mcp_servers.puppetmaster.env` in Hermes `config.yaml` — durable and scoped to the Hermes-hosted puppetmaster MCP server.
+
 > **🪽 New — Hermes support.** [Hermes](https://hermes-agent.nousresearch.com) is now a first-class worker adapter alongside Cursor, Claude Code, Codex, and OpenAI. Wire it with `puppetmaster install-hermes-mcp`, then run Hermes workers through the same router, swarms, typed artifacts, and `$0` recall as every other harness. Details in [docs/ADAPTERS.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/ADAPTERS.md#hermes).
 
 <p align="center">

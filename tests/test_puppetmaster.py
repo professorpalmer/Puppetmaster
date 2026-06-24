@@ -9725,6 +9725,99 @@ class InstallHermesMcpTests(unittest.TestCase):
             self.assertEqual(result.status, "unchanged")
 
 
+class SetHermesMcpEnvTests(unittest.TestCase):
+    """Tests for :func:`set_hermes_mcp_env` — merging env toggles into Hermes config."""
+
+    def setUp(self):
+        try:
+            import yaml  # noqa: F401
+        except Exception:
+            self.skipTest("PyYAML not installed; install puppetmaster-ai[hermes]")
+
+    def _load(self, path):
+        import yaml
+
+        return yaml.safe_load(path.read_text("utf-8"))
+
+    def test_merges_env_into_existing_puppetmaster_entry(self):
+        from puppetmaster.installers import install_hermes_mcp, set_hermes_mcp_env
+
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "config.yaml"
+            install_hermes_mcp(
+                target_path=target,
+                python_executable=sys.executable,
+                skip_handshake=True,
+            )
+            result = set_hermes_mcp_env(
+                {"PUPPETMASTER_LEARN": "1", "PUPPETMASTER_INJECT_HERMES_SKILLS": "1"},
+                target_path=target,
+            )
+            self.assertEqual(result.status, "installed")
+            entry = self._load(target)["mcp_servers"]["puppetmaster"]
+            self.assertEqual(entry["command"], sys.executable)
+            self.assertEqual(entry["args"], ["-m", "puppetmaster.mcp_server"])
+            self.assertEqual(entry["env"]["PUPPETMASTER_LEARN"], "1")
+            self.assertEqual(entry["env"]["PUPPETMASTER_INJECT_HERMES_SKILLS"], "1")
+
+    def test_preserves_other_servers_and_idempotent(self):
+        from puppetmaster.installers import set_hermes_mcp_env
+        import yaml
+
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "config.yaml"
+            prior = {
+                "mcp_servers": {
+                    "navdata": {"url": "https://example.com/sse"},
+                    "puppetmaster": {
+                        "command": sys.executable,
+                        "args": ["-m", "puppetmaster.mcp_server"],
+                        "env": {"PUPPETMASTER_STATE_DIR": "/keep/me"},
+                    },
+                }
+            }
+            target.write_text(yaml.safe_dump(prior, sort_keys=False), encoding="utf-8")
+            first = set_hermes_mcp_env({"PUPPETMASTER_LEARN": "1"}, target_path=target)
+            second = set_hermes_mcp_env({"PUPPETMASTER_LEARN": "1"}, target_path=target)
+            self.assertEqual(first.status, "installed")
+            self.assertEqual(second.status, "unchanged")
+            data = self._load(target)
+            self.assertEqual(
+                data["mcp_servers"]["navdata"]["url"],
+                "https://example.com/sse",
+            )
+            entry = data["mcp_servers"]["puppetmaster"]
+            self.assertEqual(entry["env"]["PUPPETMASTER_STATE_DIR"], "/keep/me")
+            self.assertEqual(entry["env"]["PUPPETMASTER_LEARN"], "1")
+
+    def test_dry_run_writes_nothing(self):
+        from puppetmaster.installers import set_hermes_mcp_env
+        import yaml
+
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "config.yaml"
+            prior = {"mcp_servers": {"puppetmaster": {"command": "python", "args": []}}}
+            target.write_text(yaml.safe_dump(prior, sort_keys=False), encoding="utf-8")
+            before = target.read_text(encoding="utf-8")
+            result = set_hermes_mcp_env(
+                {"PUPPETMASTER_LEARN": "1"},
+                target_path=target,
+                dry_run=True,
+            )
+            self.assertEqual(result.status, "would_install")
+            self.assertEqual(target.read_text(encoding="utf-8"), before)
+
+
+class HermesNextStepsGuidanceTests(unittest.TestCase):
+    def test_guidance_covers_learn_promote_and_injection(self):
+        from puppetmaster.installers import HERMES_NEXT_STEPS_GUIDANCE
+
+        self.assertIn("PUPPETMASTER_LEARN", HERMES_NEXT_STEPS_GUIDANCE)
+        self.assertIn("promote-candidate", HERMES_NEXT_STEPS_GUIDANCE)
+        self.assertIn("PUPPETMASTER_INJECT_HERMES_SKILLS", HERMES_NEXT_STEPS_GUIDANCE)
+        self.assertIn("PUPPETMASTER_SKILL_TOKEN_BUDGET", HERMES_NEXT_STEPS_GUIDANCE)
+
+
 class InstallHermesSkillTests(unittest.TestCase):
     """Tests for :func:`install_hermes_skill` — shipping the bundled Puppetmaster
     skill into Hermes' skills dir so a fresh `pip install` has procedural
@@ -13445,6 +13538,17 @@ class PlatformLockTests(unittest.TestCase):
             self.assertEqual(pl.enabled_adapters(p), set(pl.KNOWN_ADAPTERS))
             self.assertFalse(pl.is_restricted(p))
             self.assertIsNone(pl.active_allowlist(p))
+            self.assertFalse(pl.is_configured(p))
+
+    def test_is_configured_after_set_enabled(self) -> None:
+        from puppetmaster import platform_lock as pl
+
+        with TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(pl.ONLY_ENV, None)
+            p = self._path(tmp)
+            self.assertFalse(pl.is_configured(p))
+            pl.set_enabled({"cursor"}, p)
+            self.assertTrue(pl.is_configured(p))
 
     def test_only_enable_disable_reset_roundtrip(self) -> None:
         from puppetmaster import platform_lock as pl
@@ -14323,19 +14427,19 @@ class SetupPlatformStepTests(unittest.TestCase):
             detected = _detected_platforms(Path("/tmp"))
         self.assertFalse(detected["cursor"])
 
-    def test_first_run_noninteractive_locks_to_detected_platforms(self) -> None:
-        """Field report: a Claude-Code-only user ended up with cursor enabled
-        because setup defaulted to all-on instead of detecting."""
+    def test_first_run_noninteractive_fails_without_platforms(self) -> None:
+        """First-run non-interactive setup must not auto-lock to detected platforms."""
         from puppetmaster.cli import _setup_platform_step
         from puppetmaster import platform_lock as pl
 
         with TemporaryDirectory() as tmp:
             self._isolated(tmp)
-            detected = {"cursor": False, "claude-code": True, "codex": True, "openai": False}
+            detected = {"cursor": False, "claude-code": True, "codex": True, "openai": False, "hermes": False}
             with patch("puppetmaster.cli._detected_platforms", return_value=detected):
                 rc = _setup_platform_step(self._args())
-            self.assertEqual(rc, 0)
-            self.assertEqual(pl.enabled_adapters(), {"claude-code", "codex"})
+            self.assertEqual(rc, 1)
+            self.assertFalse(pl.is_configured())
+            self.assertFalse(pl.is_restricted())
 
     def test_noninteractive_respects_existing_lock(self) -> None:
         from puppetmaster.cli import _setup_platform_step
@@ -14344,30 +14448,90 @@ class SetupPlatformStepTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             self._isolated(tmp)
             pl.set_enabled({"cursor"})
-            detected = {"cursor": False, "claude-code": True, "codex": False, "openai": False}
+            detected = {"cursor": False, "claude-code": True, "codex": False, "openai": False, "hermes": False}
             with patch("puppetmaster.cli._detected_platforms", return_value=detected):
                 rc = _setup_platform_step(self._args())
             self.assertEqual(rc, 0)
             self.assertEqual(pl.enabled_adapters(), {"cursor"})
 
-    def test_nothing_detected_leaves_default_unrestricted(self) -> None:
+    def test_unconfigured_noninteractive_does_not_write_lock(self) -> None:
         from puppetmaster.cli import _setup_platform_step
         from puppetmaster import platform_lock as pl
 
         with TemporaryDirectory() as tmp:
             self._isolated(tmp)
             detected = {a: False for a in pl.KNOWN_ADAPTERS}
+            buf = io.StringIO()
             with patch("puppetmaster.cli._detected_platforms", return_value=detected):
+                with contextlib.redirect_stdout(buf):
+                    rc = _setup_platform_step(self._args())
+            self.assertEqual(rc, 1)
+            self.assertFalse(pl.is_configured())
+            self.assertIn("no platform selected", buf.getvalue())
+
+    def test_explicit_platforms_all_enables_every_adapter(self) -> None:
+        from puppetmaster.cli import _setup_platform_step
+        from puppetmaster import platform_lock as pl
+
+        with TemporaryDirectory() as tmp:
+            self._isolated(tmp)
+            rc = _setup_platform_step(self._args(platforms="all"))
+            self.assertEqual(rc, 0)
+            self.assertTrue(pl.is_configured())
+            self.assertEqual(pl.enabled_adapters(), set(pl.KNOWN_ADAPTERS))
+            self.assertFalse(pl.is_restricted())
+
+    def test_explicit_platforms_cursor_hermes(self) -> None:
+        from puppetmaster.cli import _setup_platform_step
+        from puppetmaster import platform_lock as pl
+
+        with TemporaryDirectory() as tmp:
+            self._isolated(tmp)
+            rc = _setup_platform_step(self._args(platforms="cursor,hermes"))
+            self.assertEqual(rc, 0)
+            self.assertEqual(pl.enabled_adapters(), {"cursor", "hermes"})
+
+    def test_interactive_first_run_reprompts_then_locks(self) -> None:
+        from puppetmaster.cli import _setup_platform_step
+        from puppetmaster import platform_lock as pl
+
+        with TemporaryDirectory() as tmp:
+            self._isolated(tmp)
+            detected = {a: False for a in pl.KNOWN_ADAPTERS}
+            detected["cursor"] = True
+            inputs = iter(["", "cursor"])
+            with patch("puppetmaster.cli._detected_platforms", return_value=detected), \
+                    patch("sys.stdin.isatty", return_value=True), \
+                    patch("builtins.input", lambda _prompt="": next(inputs)):
                 rc = _setup_platform_step(self._args())
             self.assertEqual(rc, 0)
-            self.assertFalse(pl.is_restricted())
+            self.assertEqual(pl.enabled_adapters(), {"cursor"})
+
+    def test_interactive_zero_known_platforms_reprompts(self) -> None:
+        from puppetmaster.cli import _setup_platform_step
+        from puppetmaster import platform_lock as pl
+
+        with TemporaryDirectory() as tmp:
+            self._isolated(tmp)
+            detected = {a: False for a in pl.KNOWN_ADAPTERS}
+            inputs = iter([" , ", "cursor"])
+            buf = io.StringIO()
+            with patch("puppetmaster.cli._detected_platforms", return_value=detected), \
+                    patch("sys.stdin.isatty", return_value=True), \
+                    patch("builtins.input", lambda _prompt="": next(inputs)):
+                with contextlib.redirect_stdout(buf):
+                    rc = _setup_platform_step(self._args())
+            self.assertEqual(rc, 0)
+            self.assertEqual(pl.enabled_adapters(), {"cursor"})
+            output = buf.getvalue()
+            self.assertIn("You must enable at least one platform", output)
 
     def test_state_display_flags_undetected_platforms(self) -> None:
         from puppetmaster.cli import _setup_platform_step
 
         with TemporaryDirectory() as tmp:
             self._isolated(tmp)
-            detected = {"cursor": False, "claude-code": True, "codex": True, "openai": False}
+            detected = {"cursor": False, "claude-code": True, "codex": True, "openai": False, "hermes": False}
             buf = io.StringIO()
             with patch("puppetmaster.cli._detected_platforms", return_value=detected):
                 with contextlib.redirect_stdout(buf):
@@ -17755,6 +17919,7 @@ class SetupHooksStepTests(unittest.TestCase):
             skip_doctor=True, skip_models=True, skip_platforms=True,
             skip_rules=True, skip_hooks=False, global_rules=False,
             global_hooks=False, force=False, state_dir=None, platforms=None,
+            skip_hermes_advanced=True, dry_run=False,
         )
         base.update(over)
         return MagicMock(**base)
@@ -17774,6 +17939,7 @@ class SetupHooksStepTests(unittest.TestCase):
                         patch.object(cli, "install_codex_mcp", return_value=_Res()), \
                         patch.object(cli, "install_claude_mcp", return_value=_Res()), \
                         patch.object(cli, "resolve_claude_command", return_value="claude"), \
+                        patch("puppetmaster.platform_lock.is_configured", return_value=True), \
                         patch("puppetmaster.platform_lock.enabled_adapters",
                               return_value={"cursor", "claude-code"}):
                     rc = cli._run_setup(self._args())
@@ -17796,6 +17962,7 @@ class SetupHooksStepTests(unittest.TestCase):
                 os.chdir(tmp)
                 with patch.object(cli, "install_cursor_mcp", return_value=_Res()), \
                         patch.object(cli, "install_codex_mcp", return_value=_Res()), \
+                        patch("puppetmaster.platform_lock.is_configured", return_value=True), \
                         patch("puppetmaster.platform_lock.enabled_adapters", return_value={"cursor"}):
                     rc = cli._run_setup(self._args(skip_hooks=True))
                 self.assertEqual(rc, 0)
@@ -17818,6 +17985,7 @@ class SetupHooksStepTests(unittest.TestCase):
                 os.chdir(tmp)
                 with patch.object(cli, "install_cursor_mcp", return_value=_Res()), \
                         patch.object(cli, "install_codex_mcp", return_value=_Res()), \
+                        patch("puppetmaster.platform_lock.is_configured", return_value=True), \
                         patch("puppetmaster.platform_lock.enabled_adapters", return_value={"cursor"}), \
                         patch.object(hook_installers.Path, "home", return_value=home):
                     rc = cli._run_setup(self._args(global_hooks=True))
@@ -17855,6 +18023,7 @@ class SetupHooksStepTests(unittest.TestCase):
                         patch.object(cli, "install_hermes_hooks", side_effect=fake_hermes_hooks), \
                         patch.object(cli, "_seed_hermes_registry"), \
                         patch("shutil.which", return_value="/usr/local/bin/hermes"), \
+                        patch("puppetmaster.platform_lock.is_configured", return_value=True), \
                         patch("puppetmaster.platform_lock.enabled_adapters",
                               return_value={"hermes"}):
                     rc = cli._run_setup(self._args())
@@ -17886,6 +18055,7 @@ class SetupHooksStepTests(unittest.TestCase):
                                          "hermes_hooks", captured["hermes_hooks"] + 1)), \
                         patch.object(cli, "_seed_hermes_registry"), \
                         patch("shutil.which", return_value="/usr/local/bin/hermes"), \
+                        patch("puppetmaster.platform_lock.is_configured", return_value=True), \
                         patch("puppetmaster.platform_lock.enabled_adapters",
                               return_value={"hermes"}):
                     rc = cli._run_setup(self._args(skip_hooks=True))
