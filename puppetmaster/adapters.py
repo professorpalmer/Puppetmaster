@@ -2235,7 +2235,10 @@ class HermesAdapter:
         base_prompt = with_report_contract(task.payload.get("prompt") or task.instruction)
         cwd = Path(task.payload.get("cwd") or ".").resolve()
         prompt, codegraph_used = enrich_prompt_with_codegraph(
-            prompt_with_memory(CursorAdapter._implement_prompt(base_prompt), task),
+            prompt_with_skills(
+                prompt_with_memory(CursorAdapter._implement_prompt(base_prompt), task),
+                task,
+            ),
             task_description=task.payload.get("codegraph_task") or task.instruction or goal,
             cwd=cwd,
             disabled=bool(task.payload.get("disable_codegraph", False)),
@@ -2455,7 +2458,10 @@ class HermesAdapter:
         base_prompt = task.payload.get("prompt") or task.instruction
         cwd = Path(task.payload.get("cwd") or ".").resolve()
         prompt, codegraph_used = enrich_prompt_with_codegraph(
-            prompt_with_memory(CodexAdapter._structured_prompt(base_prompt), task),
+            prompt_with_skills(
+                prompt_with_memory(CodexAdapter._structured_prompt(base_prompt), task),
+                task,
+            ),
             task_description=task.payload.get("codegraph_task") or task.instruction or goal,
             cwd=cwd,
             disabled=bool(task.payload.get("disable_codegraph", False)),
@@ -2838,6 +2844,27 @@ def prompt_with_memory(prompt: str, task: Task) -> str:
     lines.append("")
     lines.append("Use this as retrieved context, but verify claims before relying on them.")
     return "\n".join(lines)
+
+
+def prompt_with_skills(prompt: str, task: Task) -> str:
+    """Append the orchestrator-selected live-skill packet to a worker prompt.
+
+    The mirror image of :func:`prompt_with_memory`: the trusted planner fills
+    ``task.payload["injected_skills"]`` (a list of ``{"name", "body"}``) and the
+    worker merely renders it. This is the return leg of the puppetmaster-learn
+    flywheel (skill -> worker). It injects skill BODIES only — never the
+    persona/rules layer, which ``--ignore-rules`` keeps suppressed — so the
+    worker's access surface is unchanged. No-op when nothing was injected.
+    """
+    injected = task.payload.get("injected_skills") or []
+    if not injected:
+        return prompt
+    from puppetmaster.skill_injection import render_skill_packet
+
+    packet = render_skill_packet(injected)
+    if not packet:
+        return prompt
+    return "\n".join([prompt, "", packet])
 
 
 def command_parts(command: object) -> list[str]:

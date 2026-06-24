@@ -65,6 +65,34 @@ def _memory_injection_enabled(spec: WorkerSpec) -> bool:
     return spec.role not in _FRESH_JUDGMENT_ROLES
 
 
+# Skill injection (skill -> worker, the return leg of the learn flywheel) is
+# OFF by default — it changes per-turn cost and is Hermes-specific. Opt in via
+# env or per-spec payload; an explicit per-spec ``inject_skills`` always wins.
+_SKILL_INJECTION_ENV = "PUPPETMASTER_INJECT_HERMES_SKILLS"
+_SKILL_TOKEN_BUDGET_ENV = "PUPPETMASTER_SKILL_TOKEN_BUDGET"
+_SKILL_COUNT_CAP_ENV = "PUPPETMASTER_SKILL_COUNT_CAP"
+_SKILL_OPT_IN_VALUES = {"1", "true", "yes", "on"}
+
+
+def _skill_injection_enabled(spec: WorkerSpec) -> bool:
+    override = spec.payload.get("inject_skills")
+    if override is True:
+        return True
+    if override is False:
+        return False
+    return os.environ.get(_SKILL_INJECTION_ENV, "").strip().lower() in _SKILL_OPT_IN_VALUES
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 @contextlib.contextmanager
 def _temporary_env_var(name: str, value: str):
     previous = os.environ.get(name)
@@ -142,6 +170,7 @@ class Orchestrator:
         self._begin_trace()
         try:
             specs = self._with_retrieved_memory(specs or specs_for_roles(roles), goal)
+            specs = self._with_injected_skills(job, specs)
             self._announce_mode(job, specs)
             self._ensure_plan_catalog(job, specs)
             self.store.update_job_status(job.id, JobStatus.RUNNING)
@@ -202,6 +231,7 @@ class Orchestrator:
         self._begin_trace()
         try:
             specs = self._with_retrieved_memory(specs_for_roles(roles), goal)
+            specs = self._with_injected_skills(job, specs)
             self.store.update_job_status(job.id, JobStatus.RUNNING)
             tasks = self._create_tasks(job, specs)
             self._run_prerequisites(job, tasks, crash_role, lease_seconds=2)
@@ -1365,6 +1395,90 @@ class Orchestrator:
                         "retrieved_memory": memory,
                     },
                 )
+            )
+        return result
+
+    def _with_injected_skills(
+        self, job: Job, specs: list[WorkerSpec]
+    ) -> list[WorkerSpec]:
+        """Hand opt-in workers the user's live Hermes skills (skill -> worker).
+
+        The return leg of the learn flywheel and a SECOND CONSUMER of the
+        trusted-planner injection seam (mirrors ``_with_retrieved_memory``).
+        Runs BEFORE ``_create_tasks`` -> ``_apply_auto_routing`` so the per-turn
+        packet cost is folded into ``estimated_tokens_in`` pre-route — which the
+        router reads directly (``router.estimate_tokens_in``) for both the chosen
+        model's cost and the savings baseline, keeping the receipt honest by
+        construction. Selection is instruction -> skill-description (available
+        pre-route, so no circular dependency). Off by default.
+
+        See ``docs/specs/hermes-skill-injection.md``.
+        """
+        if not any(_skill_injection_enabled(spec) for spec in specs):
+            return specs
+
+        from puppetmaster.router import estimate_tokens_in, signals_from_worker_spec
+        from puppetmaster.skill_injection import (
+            DEFAULT_SKILL_COUNT_CAP,
+            DEFAULT_SKILL_TOKEN_BUDGET,
+            discover_hermes_skills,
+            estimate_tokens,
+            packet_from_docs,
+            render_skill_packet_from_docs,
+            select_skills_for_task,
+        )
+
+        skills = discover_hermes_skills()
+        if not skills:
+            # Observable failure, not a silent no-op: if Hermes reorganized skill
+            # storage (the one coupling point), this surfaces in the ledger.
+            self.store.emit(
+                job.id,
+                "skills.none_discovered",
+                {"hint": "injection enabled but no live Hermes skills were found"},
+            )
+            return specs
+
+        token_budget = _env_int(_SKILL_TOKEN_BUDGET_ENV, DEFAULT_SKILL_TOKEN_BUDGET)
+        max_count = _env_int(_SKILL_COUNT_CAP_ENV, DEFAULT_SKILL_COUNT_CAP)
+
+        result: list[WorkerSpec] = []
+        for spec in specs:
+            if not _skill_injection_enabled(spec):
+                result.append(spec)
+                continue
+            selected = select_skills_for_task(
+                spec.instruction, skills,
+                token_budget=token_budget, max_count=max_count,
+            )
+            if not selected:
+                result.append(spec)
+                continue
+            packet_tokens = estimate_tokens(render_skill_packet_from_docs(selected))
+            existing = spec.payload.get("estimated_tokens_in")
+            base = (
+                existing
+                if existing is not None
+                else estimate_tokens_in(signals_from_worker_spec(spec))
+            )
+            result.append(
+                replace(
+                    spec,
+                    payload={
+                        **spec.payload,
+                        "injected_skills": packet_from_docs(selected),
+                        "estimated_tokens_in": base + packet_tokens,
+                    },
+                )
+            )
+            self.store.emit(
+                job.id,
+                "skills.injected",
+                {
+                    "role": spec.role,
+                    "skills": [skill.name for skill in selected],
+                    "packet_tokens": packet_tokens,
+                },
             )
         return result
 

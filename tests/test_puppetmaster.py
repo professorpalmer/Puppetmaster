@@ -9916,6 +9916,205 @@ class PromoteSkillCandidateTests(unittest.TestCase):
             self.assertFalse((skills / "thing").exists())
 
 
+class HermesSkillInjectionTests(unittest.TestCase):
+    """Tests for the skill -> worker return leg of the learn flywheel.
+
+    The load-bearing pieces — selection, the per-turn TOKEN budget cap, and
+    persona-isolation — are asserted STRUCTURALLY (on the constructed
+    prompt/command), never on model behavior. See
+    docs/specs/hermes-skill-injection.md.
+    """
+
+    def _write_skill(self, skills_dir, slug, *, description, body):
+        target = skills_dir / slug
+        target.mkdir(parents=True)
+        (target / "SKILL.md").write_text(
+            f"---\nname: {slug}\ndescription: {description}\n---\n\n{body}\n",
+            encoding="utf-8",
+        )
+        return target
+
+    def test_discover_parses_frontmatter_and_strips_body(self):
+        from puppetmaster.skill_injection import discover_hermes_skills
+
+        with TemporaryDirectory() as tmp:
+            skills = Path(tmp)
+            self._write_skill(
+                skills, "release-notes",
+                description="Generate release notes from a git range",
+                body="# Release notes\nUse git log to summarize commits.",
+            )
+            found = discover_hermes_skills(skills_dir=skills)
+            self.assertEqual(len(found), 1)
+            self.assertEqual(found[0].name, "release-notes")
+            self.assertIn("git range", found[0].description)
+            self.assertIn("Use git log", found[0].body)
+            # Frontmatter is stripped from the injected body.
+            self.assertNotIn("description:", found[0].body)
+
+    def test_discover_absent_dir_is_empty_not_error(self):
+        from puppetmaster.skill_injection import discover_hermes_skills
+
+        with TemporaryDirectory() as tmp:
+            self.assertEqual(discover_hermes_skills(skills_dir=Path(tmp) / "nope"), [])
+
+    def test_selection_ranks_by_instruction_to_description_match(self):
+        from puppetmaster.skill_injection import (
+            discover_hermes_skills,
+            select_skills_for_task,
+        )
+
+        with TemporaryDirectory() as tmp:
+            skills = Path(tmp)
+            self._write_skill(
+                skills, "release-notes",
+                description="Generate release notes from a git range",
+                body="notes body",
+            )
+            self._write_skill(
+                skills, "pdf-export",
+                description="Export a report to a PDF file",
+                body="pdf body",
+            )
+            docs = discover_hermes_skills(skills_dir=skills)
+            picked = select_skills_for_task(
+                "write release notes for this git range", docs,
+                token_budget=2000, max_count=3,
+            )
+            self.assertEqual([s.name for s in picked], ["release-notes"])
+
+    def test_cap_is_on_packet_tokens_not_skill_count(self):
+        from puppetmaster.skill_injection import (
+            SkillDoc,
+            estimate_tokens,
+            render_skill_packet_from_docs,
+            select_skills_for_task,
+        )
+
+        # Two equally-relevant skills; a budget that fits only the lean one must
+        # admit the lean one and reject the fat one — the cap is tokens, not count.
+        fat = SkillDoc("fat", "release git notes", "x" * 4000, "/x/fat")
+        lean = SkillDoc("lean", "release git notes", "small body", "/x/lean")
+        picked = select_skills_for_task(
+            "release git notes", [fat, lean], token_budget=100, max_count=3
+        )
+        self.assertEqual([s.name for s in picked], ["lean"])
+        self.assertLessEqual(
+            estimate_tokens(render_skill_packet_from_docs(picked)), 100
+        )
+
+    def test_prompt_with_skills_noop_then_appends_bodies(self):
+        from puppetmaster.adapters import prompt_with_skills
+        from puppetmaster.models import Task
+
+        bare = Task(job_id="job_x", role="explore", instruction="do it", payload={})
+        self.assertEqual(prompt_with_skills("BASE", bare), "BASE")
+
+        injected = Task(
+            job_id="job_x", role="explore", instruction="do it",
+            payload={"injected_skills": [{"name": "rn", "body": "RUN GIT LOG"}]},
+        )
+        out = prompt_with_skills("BASE", injected)
+        self.assertIn("BASE", out)
+        self.assertIn("RUN GIT LOG", out)
+
+    def test_persona_isolation_holds_structurally(self):
+        # KEYSTONE: assert on the constructed prompt + command, not on tone.
+        from puppetmaster.adapters import build_hermes_chat_command, prompt_with_skills
+        from puppetmaster.models import Task
+
+        task = Task(
+            job_id="job_x", role="explore", instruction="ship release notes",
+            payload={
+                "injected_skills": [
+                    {"name": "release-notes", "body": "SKILL_BODY_MARKER use git log"}
+                ]
+            },
+        )
+        prompt = prompt_with_skills("BASE PROMPT", task)
+        # Skill bodies present...
+        self.assertIn("SKILL_BODY_MARKER", prompt)
+        # ...persona / rules layer absent (we never read SOUL.md / AGENTS.md).
+        for forbidden in ("SOUL.md", "AGENTS.md", "calibrated honesty"):
+            self.assertNotIn(forbidden, prompt)
+        # --ignore-rules stays set: the persona/rules layer remains suppressed.
+        command = build_hermes_chat_command(prompt=prompt)
+        self.assertIn("--ignore-rules", command)
+        # The worker's access surface is unchanged — the default toolsets never
+        # grant skills / memory / session_search (those would re-open isolation).
+        from puppetmaster.adapters import (
+            DEFAULT_HERMES_ANALYZE_TOOLSETS,
+            DEFAULT_HERMES_IMPLEMENT_TOOLSETS,
+        )
+
+        for toolset in (DEFAULT_HERMES_IMPLEMENT_TOOLSETS, DEFAULT_HERMES_ANALYZE_TOOLSETS):
+            self.assertNotIn("skills", toolset)
+            self.assertNotIn("memory", toolset)
+            self.assertNotIn("session_search", toolset)
+
+    def test_orchestrator_off_by_default(self):
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            orch = Orchestrator(store)
+            job = store.create_job("g")
+            spec = WorkerSpec(role="explore", instruction="ship release notes")
+            out = orch._with_injected_skills(job, [spec])
+            self.assertNotIn("injected_skills", out[0].payload)
+
+    def test_orchestrator_injects_and_bumps_estimated_tokens_in(self):
+        from puppetmaster.router import estimate_tokens_in, signals_from_worker_spec
+
+        with TemporaryDirectory() as tmp:
+            # HERMES_HOME points directly at the hermes home, so skills live at
+            # $HERMES_HOME/skills (see installers.hermes_skills_dir).
+            home = Path(tmp) / "home"
+            self._write_skill(
+                home / "skills", "release-notes",
+                description="release notes from a git range",
+                body="USE GIT LOG to summarize commits into notes",
+            )
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            orch = Orchestrator(store)
+            job = store.create_job("g")
+            spec = WorkerSpec(
+                role="explore",
+                instruction="write release notes for this git range",
+                payload={"inject_skills": True},
+            )
+            base = estimate_tokens_in(signals_from_worker_spec(spec))
+            with patch.dict(os.environ, {"HERMES_HOME": str(home)}, clear=False):
+                out = orch._with_injected_skills(job, [spec])
+            payload = out[0].payload
+            self.assertIn("injected_skills", payload)
+            # Stored as a LIST so it is not counted in routing's payload_size_chars.
+            self.assertIsInstance(payload["injected_skills"], list)
+            # Cost-honest bump: estimated_tokens_in = base + packet (read by the
+            # router for both chosen-cost and baseline, keeping the receipt honest).
+            self.assertGreater(payload["estimated_tokens_in"], base)
+            events = {e["event"] for e in store.read_events(job.id)}
+            self.assertIn("skills.injected", events)
+
+    def test_orchestrator_emits_none_discovered_when_enabled_but_empty(self):
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp) / "empty-home"
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            orch = Orchestrator(store)
+            job = store.create_job("g")
+            spec = WorkerSpec(
+                role="explore", instruction="do something",
+                payload={"inject_skills": True},
+            )
+            with patch.dict(os.environ, {"HERMES_HOME": str(home)}, clear=False):
+                out = orch._with_injected_skills(job, [spec])
+            # Observable failure, not a silent no-op.
+            self.assertNotIn("injected_skills", out[0].payload)
+            events = {e["event"] for e in store.read_events(job.id)}
+            self.assertIn("skills.none_discovered", events)
+
+
 class InstallHermesPluginTests(unittest.TestCase):
     """Tests for :func:`install_hermes_plugin` — shipping the bundled
     puppetmaster-learn plugin into Hermes' plugins dir so the auto-/learn
