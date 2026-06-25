@@ -3258,7 +3258,12 @@ def goal_schema(default_goal: str) -> JsonObject:
             },
             "label": {
                 "type": "string",
-                "description": "Optional human-readable job label for the dashboard.",
+                "description": (
+                    "Short human-readable label (3-6 words) shown as the job's "
+                    "headline on the dashboard and in `puppetmaster_jobs`. Set one "
+                    "by default so runs stay scannable; when omitted, a title is "
+                    "derived from the goal."
+                ),
             },
             "model": {"type": "string", "description": "Optional provider model name."},
             "timeout_seconds": {

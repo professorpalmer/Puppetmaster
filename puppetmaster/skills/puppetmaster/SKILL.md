@@ -1,7 +1,7 @@
 ---
 name: puppetmaster
 description: "Operate Puppetmaster multi-agent orchestrator via MCP verbs (edit, swarm, implement, route, monitor)."
-version: 1.1.0
+version: 1.2.0
 author: professorpalmer
 license: MIT
 platforms: [linux, macos, windows]
@@ -46,6 +46,9 @@ broad investigation, multi-file audits, and cross-cutting changes.
   worker round-trip.
 - **A single coupled feature is NOT a swarm.** Fanning out one tightly-coupled
   change makes parallel workers stack uncoordinated commits. Use one worker.
+- **Label every job.** Pass a short `label` (3–6 words) to any `start_*` / `edit`
+  verb so the dashboard and `jobs` list stay scannable instead of showing bare
+  `job_<hash>` ids. Omitted labels fall back to a title derived from the goal.
 
 ## The `edit` verb (lightweight single in-place edit)
 

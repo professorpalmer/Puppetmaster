@@ -10541,6 +10541,17 @@ class InstallRulesTests(unittest.TestCase):
             self.assertIn("Partial coverage is still coverage", flattened)
             self.assertIn("never re-crawl directories the graph already covers", flattened)
 
+    def test_rules_nudge_labeling_every_job(self):
+        """Every platform's managed rules (they share RULE_BODY) must tell the
+        agent to pass a short `label` on start_*/edit verbs so dashboard jobs
+        stay scannable instead of bare job_<hash> ids."""
+        from puppetmaster.rules import RULE_BODY, render_agents_block, render_cursor_mdc
+
+        for content in (RULE_BODY, render_cursor_mdc(), render_agents_block()):
+            flattened = " ".join(content.split())
+            self.assertIn("Label every job you start", flattened)
+            self.assertIn("pass a short human-readable `label`", flattened)
+
     def test_merge_into_empty_creates_block(self):
         from puppetmaster.rules import merge_block_into_text, render_agents_block
 

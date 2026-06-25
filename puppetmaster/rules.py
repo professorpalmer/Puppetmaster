@@ -93,6 +93,15 @@ RULE_BODY = textwrap.dedent(
     and deny-redirect broad native exploration automatically. The kill switch
     is `PUPPETMASTER_AUTO_INVOKE_DISABLED=1`.
 
+    ## Label every job you start (do it by default)
+
+    When you start any job verb (`puppetmaster_start_*`, `puppetmaster_edit`,
+    or the matching sync verbs), pass a short human-readable `label` (3–6
+    words, e.g. `"auth refactor audit"`). It becomes the job's headline on the
+    dashboard and in `puppetmaster_jobs`, so runs stay scannable instead of
+    reading as bare `job_<hash>` ids. Omit it only for throwaway one-off runs;
+    when absent, Puppetmaster falls back to a title derived from the goal.
+
     ## CodeGraph-first exploration (must obey)
 
     CodeGraph is the default way to explore code — graph every directory you
