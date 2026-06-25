@@ -130,6 +130,13 @@ def build_parser() -> argparse.ArgumentParser:
             help="Force the routing capability floor (0..100).",
         )
 
+    def _add_label_argument(job_parser: argparse.ArgumentParser) -> None:
+        job_parser.add_argument(
+            "--label",
+            default=None,
+            help="Optional human-readable job label for the dashboard.",
+        )
+
     subcommands.add_parser("init", help="Create the local Puppetmaster state store.")
     subcommands.add_parser("state", help="Print the resolved Puppetmaster state directory.")
     doctor_parser = subcommands.add_parser("doctor", help="Check local runtime dependencies.")
@@ -476,6 +483,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Force promoted shared-memory injection on all workers.",
     )
+    _add_label_argument(run)
 
     jobs_parser = subcommands.add_parser("jobs", help="List known jobs.")
     jobs_parser.add_argument(
@@ -923,6 +931,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip promoted shared-memory injection for a fresh perspective.",
     )
     _add_routing_flags(cursor)
+    _add_label_argument(cursor)
 
     claude = subcommands.add_parser("claude", help="Run a full-featured Claude Code worker.")
     claude.add_argument("prompt", help="Prompt for the Claude Code worker.")
@@ -959,6 +968,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip promoted shared-memory injection for a fresh perspective.",
     )
     _add_routing_flags(claude)
+    _add_label_argument(claude)
 
     openai = subcommands.add_parser(
         "openai",
@@ -1024,6 +1034,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip promoted shared-memory injection for a fresh perspective.",
     )
     _add_routing_flags(openai)
+    _add_label_argument(openai)
 
     codex = subcommands.add_parser(
         "codex",
@@ -1081,6 +1092,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip promoted shared-memory injection for a fresh perspective.",
     )
     _add_routing_flags(codex)
+    _add_label_argument(codex)
 
     hermes = subcommands.add_parser(
         "hermes",
@@ -1140,6 +1152,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip CodeGraph context injection (e.g. for non-repo prompts).",
     )
     _add_routing_flags(hermes)
+    _add_label_argument(hermes)
 
     edit = subcommands.add_parser(
         "edit",
@@ -1185,6 +1198,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip CodeGraph context injection (e.g. for non-repo edits).",
     )
     edit.add_argument("--executable", help="Override the adapter executable / command.")
+    _add_label_argument(edit)
 
     demo = subcommands.add_parser("demo", help="Run the Puppetmaster concept demo.")
     demo.add_argument(
@@ -1897,6 +1911,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
             lease_seconds=lease_seconds,
             worker_mode=args.worker_mode,
             on_job_created=on_job_created,
+            label=args.label,
         )
         return finalize_cli_run(result)
 
@@ -1935,6 +1950,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
             lease_seconds=10,
             worker_mode=args.worker_mode,
             on_job_created=on_job_created,
+            label=args.label,
         )
         return finalize_cli_run(result)
 
@@ -1967,6 +1983,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
             lease_seconds=10,
             worker_mode=args.worker_mode,
             on_job_created=on_job_created,
+            label=args.label,
         )
         return finalize_cli_run(result)
 
@@ -2007,6 +2024,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
             lease_seconds=10,
             worker_mode=args.worker_mode,
             on_job_created=on_job_created,
+            label=args.label,
         )
         return finalize_cli_run(result)
 
@@ -2047,6 +2065,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
             lease_seconds=10,
             worker_mode=args.worker_mode,
             on_job_created=on_job_created,
+            label=args.label,
         )
         return finalize_cli_run(result)
 
@@ -2087,6 +2106,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
             lease_seconds=10,
             worker_mode=args.worker_mode,
             on_job_created=on_job_created,
+            label=args.label,
         )
         return finalize_cli_run(result)
 
@@ -2129,6 +2149,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
             lease_seconds=10,
             worker_mode="inline",
             on_job_created=on_job_created,
+            label=args.label,
         )
         return finalize_cli_run(result)
 
@@ -2158,12 +2179,18 @@ def _main(argv: Optional[list[str]] = None) -> int:
                 except Exception:
                     continue
                 for job in project_jobs:
-                    print(
-                        f"{job.id}\t{job.status}\t{job.created_at}\t{project.name}\t{job.goal}"
-                    )
+                    line = f"{job.id}\t{job.status}\t{job.created_at}\t{project.name}"
+                    if job.label:
+                        line += f"\t{job.label}"
+                    line += f"\t{job.goal}"
+                    print(line)
             return 0
         for job in store.list_jobs():
-            print(f"{job.id}\t{job.status}\t{job.created_at}\t{job.goal}")
+            line = f"{job.id}\t{job.status}\t{job.created_at}"
+            if job.label:
+                line += f"\t{job.label}"
+            line += f"\t{job.goal}"
+            print(line)
         return 0
 
     if args.command == "projects":
@@ -2398,9 +2425,10 @@ def _main(argv: Optional[list[str]] = None) -> int:
                 source_job.goal,
                 specs=config.workers,
                 lease_seconds=config.lease_seconds,
+                label=source_job.label,
             )
         else:
-            result = Orchestrator(store).run(source_job.goal)
+            result = Orchestrator(store).run(source_job.goal, label=source_job.label)
         print_run_result(result.job.id, len(result.artifacts), result.summary_path)
         return 0
 

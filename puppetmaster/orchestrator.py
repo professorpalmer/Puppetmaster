@@ -161,8 +161,9 @@ class Orchestrator:
         lease_seconds: int = 5,
         worker_mode: str = "subprocess",
         on_job_created: Optional[Callable[[Job], None]] = None,
+        label: Optional[str] = None,
     ) -> RunResult:
-        job = self.store.create_job(goal)
+        job = self.store.create_job(goal, label=label)
         _tag_job_effort(self.store, job.id)
         if on_job_created is not None:
             on_job_created(job)

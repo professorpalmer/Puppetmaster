@@ -19689,5 +19689,99 @@ class HermesToolSessionPruneTests(unittest.TestCase):
         prune.assert_called_once()
 
 
+class JobLabelTests(unittest.TestCase):
+    def test_label_round_trips_through_create_job_and_get_job(self) -> None:
+        from puppetmaster.models import JobStatus
+        from puppetmaster.sqlite_store import SQLiteSwarmStore
+        from puppetmaster.store import SwarmStore
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as tmp:
+            for store_cls in (SwarmStore, SQLiteSwarmStore):
+                store = store_cls(Path(tmp) / store_cls.__name__)
+                job = store.create_job("do the work", label="security audit")
+                loaded = store.get_job(job.id)
+                self.assertEqual(loaded.label, "security audit")
+                self.assertEqual(loaded.goal, "do the work")
+
+    def test_label_survives_update_job_status(self) -> None:
+        from puppetmaster.models import JobStatus
+        from puppetmaster.store import SwarmStore
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("fix routing", label="routing fix")
+            updated = store.update_job_status(job.id, JobStatus.RUNNING)
+            self.assertEqual(updated.label, "routing fix")
+            self.assertEqual(store.get_job(job.id).label, "routing fix")
+
+    def test_derive_job_title_strips_boilerplate_and_caps_length(self) -> None:
+        from puppetmaster.dashboard import derive_job_title
+
+        self.assertEqual(
+            derive_job_title("Audit this repository for auth bypass risks"),
+            "for auth bypass risks",
+        )
+        self.assertEqual(
+            derive_job_title("Review the orchestrator routing bug"),
+            "orchestrator routing bug",
+        )
+        self.assertEqual(
+            derive_job_title("Use Puppetmaster to implement job labels end to end"),
+            "job labels end to end",
+        )
+        long_goal = "Implement " + " ".join(f"word{i}" for i in range(20))
+        title = derive_job_title(long_goal)
+        self.assertLessEqual(len(title.split()), 8)
+        self.assertLessEqual(len(title), 60)
+
+    def test_derive_job_title_falls_back_on_empty_goal(self) -> None:
+        from puppetmaster.dashboard import derive_job_title
+
+        self.assertEqual(derive_job_title(""), "")
+        self.assertEqual(derive_job_title("   \n  "), "")
+        self.assertEqual(derive_job_title("Plan\n"), "Plan")
+
+    def test_start_swarm_with_label_appends_cli_flag(self) -> None:
+        from puppetmaster import mcp_server
+
+        captured = {}
+
+        def fake_start_cli(command, args):
+            captured["command"] = command
+            return {"ok": True}
+
+        with patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
+            mcp_server.start_swarm(
+                {
+                    "goal": "fresh swarm",
+                    "label": "auth review",
+                    "cwd": ".",
+                    "roles": ["explore"],
+                    "allow_local_demo": True,
+                }
+            )
+
+        self.assertIn("--label", captured["command"])
+        label_index = captured["command"].index("--label")
+        self.assertEqual(captured["command"][label_index + 1], "auth review")
+
+    def test_build_job_snapshot_includes_label_and_title(self) -> None:
+        from puppetmaster.dashboard import build_job_snapshot
+        from puppetmaster.store import SwarmStore
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job(
+                "Audit this repository for flaky tests",
+                label="flaky test audit",
+            )
+            snap = build_job_snapshot(store, job.id)
+            self.assertEqual(snap["job"]["label"], "flaky test audit")
+            self.assertEqual(snap["job"]["title"], "for flaky tests")
+
+
 if __name__ == "__main__":
     unittest.main()

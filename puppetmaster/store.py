@@ -89,9 +89,9 @@ class SwarmStore:
         ]:
             mkdir_private(directory)
 
-    def create_job(self, goal: str) -> Job:
+    def create_job(self, goal: str, *, label: Optional[str] = None) -> Job:
         self.init()
-        job = Job(goal=goal)
+        job = Job(goal=goal, label=label)
         job_dir = self.job_dir(job.id)
         for directory in [
             job_dir,
@@ -102,7 +102,10 @@ class SwarmStore:
         ]:
             mkdir_private(directory)
         self.write_json(job_dir / "job.json", job)
-        self.emit(job.id, "job.created", {"goal": goal})
+        payload: dict[str, Any] = {"goal": goal}
+        if label is not None:
+            payload["label"] = label
+        self.emit(job.id, "job.created", payload)
         return job
 
     def update_job_status(self, job_id: str, status: JobStatus) -> Job:
@@ -110,6 +113,7 @@ class SwarmStore:
         updated = Job(
             id=job.id,
             goal=job.goal,
+            label=job.label,
             status=status,
             created_at=job.created_at,
             completed_at=now_iso()

@@ -155,16 +155,19 @@ class SQLiteSwarmStore(SwarmStore):
         finally:
             connection.close()
 
-    def create_job(self, goal: str) -> Job:
+    def create_job(self, goal: str, *, label: Optional[str] = None) -> Job:
         self.init()
-        job = Job(goal=goal)
+        job = Job(goal=goal, label=label)
         self._ensure_job_dirs(job.id)
         with self._session() as connection:
             connection.execute(
                 "INSERT INTO jobs(id, data) VALUES(?, ?)",
                 (job.id, self._dumps(job)),
             )
-        self.emit(job.id, "job.created", {"goal": goal})
+        payload: dict[str, Any] = {"goal": goal}
+        if label is not None:
+            payload["label"] = label
+        self.emit(job.id, "job.created", payload)
         return job
 
     def update_job_status(self, job_id: str, status: JobStatus) -> Job:
@@ -172,6 +175,7 @@ class SQLiteSwarmStore(SwarmStore):
         updated = Job(
             id=job.id,
             goal=job.goal,
+            label=job.label,
             status=status,
             created_at=job.created_at,
             completed_at=now_iso()

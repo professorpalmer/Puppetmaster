@@ -2241,6 +2241,12 @@ def openai_command(args: JsonObject) -> list[str]:
     return command
 
 
+def _append_label_flag(command: list[str], args: JsonObject) -> None:
+    label = args.get("label")
+    if label:
+        command.extend(["--label", str(label)])
+
+
 def start_swarm(args: JsonObject) -> JsonObject:
     goal = require_string(args, "goal")
     command = ["run", goal]
@@ -2267,6 +2273,7 @@ def start_swarm(args: JsonObject) -> JsonObject:
     if worker_mode:
         command.extend(["--worker-mode", str(worker_mode)])
     _append_swarm_memory_flags(command, args)
+    _append_label_flag(command, args)
     return start_cli(command, args)
 
 
@@ -2282,6 +2289,7 @@ def start_cursor_swarm(args: JsonObject) -> JsonObject:
     worker_mode = args.get("worker_mode")
     if worker_mode:
         command.extend(["--worker-mode", str(worker_mode)])
+    _append_label_flag(command, args)
     return start_cli(command, args)
 
 
@@ -2854,6 +2862,8 @@ def run_await_job(args: JsonObject) -> JsonObject:
 
 
 def start_cli(command: list[str], args: JsonObject) -> JsonObject:
+    if command and command[0] != "run":
+        _append_label_flag(command, args)
     state_dir = str(mcp_state_dir(args))
     run_dir = Path(state_dir) / "mcp-runs"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -3245,6 +3255,10 @@ def goal_schema(default_goal: str) -> JsonObject:
                 "type": "string",
                 "description": "Goal/prompt to send to the worker.",
                 "default": default_goal,
+            },
+            "label": {
+                "type": "string",
+                "description": "Optional human-readable job label for the dashboard.",
             },
             "model": {"type": "string", "description": "Optional provider model name."},
             "timeout_seconds": {

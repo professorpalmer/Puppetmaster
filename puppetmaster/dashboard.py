@@ -27,7 +27,7 @@ import threading
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
-from puppetmaster.models import Artifact, ArtifactType, Task
+from puppetmaster.models import Artifact, ArtifactType, Job, Task
 from puppetmaster.store import SwarmStore
 
 # Reuse the stitcher's failure→remediation map so the dashboard Alerts match the
@@ -295,6 +295,56 @@ def cost_rollup(artifacts: list[Artifact]) -> dict[str, Any]:
     }
 
 
+_JOB_TITLE_BOILERPLATE_PREFIXES = (
+    "audit this repository",
+    "use puppetmaster to ",
+    "audit the ",
+    "review the ",
+    "review this ",
+    "implement ",
+    "investigate ",
+    "analyze ",
+    "plan ",
+)
+
+
+def derive_job_title(goal: str) -> str:
+    """Derive a short, scannable display title from a job goal (no LLM)."""
+    if not goal or not goal.strip():
+        return ""
+    first_line = ""
+    for line in goal.splitlines():
+        stripped = line.strip()
+        if stripped:
+            first_line = stripped
+            break
+    if not first_line:
+        return ""
+    original = first_line
+    lowered = first_line.lower()
+    for prefix in _JOB_TITLE_BOILERPLATE_PREFIXES:
+        if lowered.startswith(prefix):
+            first_line = first_line[len(prefix) :].strip()
+            lowered = first_line.lower()
+    first_line = " ".join(first_line.split())
+    if not first_line:
+        first_line = original
+    words = first_line.split()
+    if len(words) > 8:
+        first_line = " ".join(words[:8])
+    if len(first_line) > 60:
+        truncated = first_line[:60]
+        if " " in truncated:
+            truncated = truncated.rsplit(" ", 1)[0]
+        first_line = truncated
+    return first_line
+
+
+def _job_snapshot_meta(job: Job) -> dict[str, Any]:
+    title = derive_job_title(job.goal) or job.id
+    return {"label": job.label, "title": title}
+
+
 def build_job_snapshot(store: SwarmStore, job_id: str) -> dict[str, Any]:
     """Assemble a full, JSON-able snapshot of one job's durable state."""
     job = store.get_job(job_id)
@@ -369,6 +419,7 @@ def build_job_snapshot(store: SwarmStore, job_id: str) -> dict[str, Any]:
             "status": job.status.value,
             "created_at": job.created_at,
             "completed_at": job.completed_at,
+            **_job_snapshot_meta(job),
         },
         "tasks": task_rows,
         "counts": counts,
@@ -392,6 +443,7 @@ def list_jobs_snapshot(store: SwarmStore, *, limit: int = 50) -> list[dict[str, 
                 "status": job.status.value,
                 "created_at": job.created_at,
                 "completed_at": job.completed_at,
+                **_job_snapshot_meta(job),
             }
         )
     rows.sort(key=lambda r: r.get("created_at") or "", reverse=True)
@@ -417,6 +469,7 @@ def list_all_projects_snapshot(*, backend: str = "sqlite", limit: int = 200) -> 
                         "created_at": job.created_at,
                         "completed_at": job.completed_at,
                         "project": short,
+                        **_job_snapshot_meta(job),
                     }
                 )
         except Exception:
@@ -543,13 +596,20 @@ _PAGE_HEAD = r"""<!doctype html>
     margin: 0 auto;
   }
   .goal {
-    color: #8b949e;
-    margin: 0 0 20px;
-    font-size: 15px;
-    line-height: 1.5;
+    color: #f0f6fc;
+    margin: 0 0 6px;
+    font-size: 18px;
+    font-weight: 600;
+    line-height: 1.4;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  .job-id-subtitle {
+    color: #6e7681;
+    margin: 0 0 20px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
   }
   .grid {
     display: grid;
@@ -668,7 +728,7 @@ _PAGE_HEAD = r"""<!doctype html>
   }
   .job-row {
     display: grid;
-    grid-template-columns: 110px max-content minmax(0, 1fr) max-content;
+    grid-template-columns: 110px minmax(0, 1fr) max-content max-content;
     gap: 16px;
     align-items: center;
     padding: 11px 16px;
@@ -684,12 +744,23 @@ _PAGE_HEAD = r"""<!doctype html>
     text-decoration: none;
   }
   .job-row .pill { justify-self: start; }
-  .job-id {
+  .job-headline {
+    min-width: 0;
+    color: #f0f6fc;
+    font-size: 14px;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .job-row:hover .job-headline { color: #ffffff; }
+  .job-id-tag {
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    font-size: 12px;
-    color: #58a6ff;
+    font-size: 11px;
+    color: #6e7681;
     white-space: nowrap;
   }
+  .job-row:hover .job-id-tag { color: #8b949e; }
   .job-goal {
     min-width: 0;
     color: #8b949e;
@@ -1031,6 +1102,7 @@ _PAGE_HEAD = r"""<!doctype html>
 </header>
 <main>
   <p class="goal" id="goal" title=""></p>
+  <p class="job-id-subtitle mono" id="jobidsub"></p>
   <div class="grid" id="content"></div>
 </main>
 <script>
@@ -1047,6 +1119,10 @@ let lastContent = "";
 
 function pill(s) {
   return `<span class="pill s-${esc(s)}">${esc(s)}</span>`;
+}
+
+function jobHeadline(j) {
+  return j.label || j.title || j.id;
 }
 
 function truncateGoal(goal, maxChars = 120) {
@@ -1078,6 +1154,7 @@ async function loadIndex() {
   document.getElementById("goal").textContent = "";
   const _home = document.getElementById("home"); if (_home) _home.style.display = "none";
   const _jid = document.getElementById("jobid"); if (_jid) _jid.textContent = "";
+  const _jids = document.getElementById("jobidsub"); if (_jids) _jids.textContent = "";
   document.getElementById("status").outerHTML = '<span id="status" class="pill s-queued">jobs</span>';
 
   const counts = {};
@@ -1097,10 +1174,11 @@ async function loadIndex() {
   } else {
     html += '<div class="job-list">';
     for (const j of shown) {
+      const headline = esc(jobHeadline(j));
       html += `<a class="job-row" href="?job=${encodeURIComponent(j.id)}">
         ${pill(j.status)}
-        <span class="job-id">${esc(j.id)}</span>
-        <span class="job-goal" title="${esc(j.goal)}">${j.project ? `<span class="job-project">${esc(j.project)}</span>` : ""}${truncateGoal(j.goal, 160)}</span>
+        <span class="job-headline" title="${esc(j.goal)}">${j.project ? `<span class="job-project">${esc(j.project)}</span>` : ""}${headline}</span>
+        <span class="job-id-tag">${esc(j.id)}</span>
         <span class="job-time">${fmtAgo(j.created_at)}</span>
       </a>`;
     }
@@ -1301,11 +1379,13 @@ async function loadJob() {
   }
   const d = await r.json();
   document.getElementById("status").outerHTML = '<span id="status" class="pill s-' + esc(d.job.status) + '">' + esc(d.job.status) + '</span>';
-  document.getElementById("jobid").textContent = d.job.id;
-  const _g = (d.job.goal || "").split("\n")[0].trim();
+  document.getElementById("jobid").textContent = "";
+  const headline = d.job.label || d.job.title || d.job.id;
   const _goalEl = document.getElementById("goal");
-  _goalEl.textContent = _g.length > 110 ? _g.slice(0, 110) + "…" : _g;
+  _goalEl.textContent = headline.length > 110 ? headline.slice(0, 110) + "…" : headline;
   _goalEl.title = d.job.goal;
+  const _jobSub = document.getElementById("jobidsub");
+  if (_jobSub) _jobSub.textContent = d.job.id;
   document.getElementById("updated").textContent = "updated " + new Date().toLocaleTimeString();
 
   let html = "";

@@ -69,6 +69,7 @@ class ArtifactType(StringEnum):
 @dataclass(frozen=True)
 class Job:
     goal: str
+    label: Optional[str] = None
     id: str = field(default_factory=lambda: new_id("job"))
     status: JobStatus = JobStatus.QUEUED
     created_at: str = field(default_factory=now_iso)
@@ -169,6 +170,7 @@ def job_from_dict(data: dict[str, Any]) -> Job:
     return Job(
         id=data["id"],
         goal=data["goal"],
+        label=data.get("label"),
         status=JobStatus(data["status"]),
         created_at=data["created_at"],
         completed_at=data.get("completed_at"),
