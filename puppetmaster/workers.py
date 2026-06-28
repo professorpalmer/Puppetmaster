@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
-from typing import AbstractSet, Optional
+from typing import AbstractSet, Callable, Mapping, Optional
 
 from puppetmaster.adapters import get_adapter, verification_artifact
 from puppetmaster.models import AgentRun, Artifact, Task, TaskStatus, now_iso
@@ -238,13 +239,74 @@ class NoImplementAdapterError(RuntimeError):
         self.requested = requested
 
 
+# Actionable, per-adapter "how to make me runnable" hints, surfaced when the
+# auto pick finds nothing available so the user knows exactly what to install.
+_ADAPTER_AVAILABILITY_HINT: dict[str, str] = {
+    "cursor": "cursor (set CURSOR_API_KEY and run `puppetmaster install-cursor-mcp` to bootstrap @cursor/sdk)",
+    "claude-code": "claude-code (`npm install -g @anthropic-ai/claude-code`, then authenticate)",
+    "codex": "codex (`npm install -g @openai/codex`, then `codex login`)",
+    "hermes": "hermes (install the NousResearch hermes CLI on PATH)",
+}
+
+
+def adapter_is_available(
+    name: str,
+    *,
+    env: Optional[Mapping[str, str]] = None,
+    root: Optional["os.PathLike[str]"] = None,
+) -> bool:
+    """Cheap, no-network probe: can ``name``'s worker actually be dispatched?
+
+    Closes the gap between "enabled by the platform lock" and "runnable on this
+    machine" so the auto pick never silently lands on an adapter whose CLI or
+    credentials are absent (the Cursor-without-CURSOR_API_KEY footgun). Reuses
+    doctor's detection helpers so availability stays consistent with what
+    ``puppetmaster doctor`` reports.
+
+    * ``local``/``shell`` run no provider, so they're always available.
+    * ``cursor`` needs both ``CURSOR_API_KEY`` and the @cursor/sdk runner.
+    * ``claude-code`` / ``codex`` / ``hermes`` need their CLI resolvable.
+    * ``openai`` needs ``OPENAI_API_KEY``.
+    """
+    env = env if env is not None else os.environ
+    if name in ("local", "shell"):
+        return True
+    from pathlib import Path
+
+    from puppetmaster import diagnostics
+
+    if name == "cursor":
+        probe_root = Path(root) if root is not None else Path.cwd()
+        return bool(env.get("CURSOR_API_KEY")) and diagnostics._cursor_sdk_installed(probe_root)
+    if name == "claude-code":
+        return diagnostics._claude_code_installed()
+    if name == "codex":
+        return diagnostics._codex_cli_installed()
+    if name == "hermes":
+        return diagnostics._hermes_cli_installed()
+    if name == "openai":
+        return bool(env.get("OPENAI_API_KEY"))
+    return False
+
+
 def pick_implement_adapter(
-    enabled: AbstractSet[str], requested: Optional[str] = None
+    enabled: AbstractSet[str],
+    requested: Optional[str] = None,
+    *,
+    is_available: Optional[Callable[[str], bool]] = None,
 ) -> str:
     """Resolve the full-edit adapter to use, honoring the platform lock.
 
     * ``requested`` set → validate it's implement-capable AND enabled, else raise.
-    * ``requested`` unset → pick the first enabled adapter in priority order.
+    * ``requested`` unset → pick the first enabled adapter in priority order that
+      is also actually *runnable* on this machine (CLI/credentials present), so a
+      permissive default (no lock = every adapter "enabled") never silently lands
+      on Cursor when the user has only Claude/Codex/Hermes configured.
+
+    An explicit choice is never second-guessed for availability: a set ``requested``
+    or a lock pinned to exactly one implement-capable adapter is honored verbatim
+    (and fails later with a precise reason if its tooling is missing) rather than
+    being swapped out here.
 
     Raising (vs. returning ``None``) keeps the single decision point honest: every
     caller gets the same precise failure with the same ``enabled``/``requested``
@@ -266,14 +328,28 @@ def pick_implement_adapter(
                 requested=adapter,
             )
         return adapter
-    adapter = next((a for a in IMPLEMENT_ADAPTER_PRIORITY if a in enabled), None)
-    if adapter is None:
+    candidates = [a for a in IMPLEMENT_ADAPTER_PRIORITY if a in enabled]
+    if not candidates:
         raise NoImplementAdapterError(
             "No implement-capable platform is enabled. Enable one of "
             f"{', '.join(IMPLEMENT_ADAPTER_PRIORITY)} via the platform lock.",
             enabled=enabled,
         )
-    return adapter
+    # A lock pinned to exactly one implement-capable adapter is an explicit
+    # choice — honor it verbatim instead of overriding on availability.
+    if len(candidates) == 1:
+        return candidates[0]
+    available = is_available or adapter_is_available
+    runnable = next((a for a in candidates if available(a)), None)
+    if runnable is not None:
+        return runnable
+    hints = ", ".join(_ADAPTER_AVAILABILITY_HINT.get(a, a) for a in candidates)
+    raise NoImplementAdapterError(
+        "No implement-capable platform is runnable on this machine — these are "
+        f"enabled but their CLI/credentials are missing: {', '.join(candidates)}. "
+        f"Install/configure one of: {hints}.",
+        enabled=enabled,
+    )
 
 
 def build_edit_payload(

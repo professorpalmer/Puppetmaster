@@ -338,7 +338,10 @@ class PuppetmasterTests(unittest.TestCase):
 
             self.assertTrue(result["isError"])
             self.assertIn("demo local adapter", payload["error"])
-            self.assertIn("puppetmaster_start_cursor_swarm", payload["fix"])
+            # Guidance must be platform-neutral (NAG 3): tell the user to pass
+            # adapter=<their platform>, never push the cursor-specific verb.
+            self.assertIn("adapter=<your platform>", payload["fix"])
+            self.assertNotIn("puppetmaster_start_cursor_swarm", payload["fix"])
 
     def test_mcp_status_compact_arg_maps_to_cli_flag(self) -> None:
         from puppetmaster import mcp_server
@@ -8129,6 +8132,77 @@ class ModelRouterTests(unittest.TestCase):
                     f"got payload={payload}",
                 )
 
+    def test_mcp_swarm_config_writer_targets_non_cursor_adapters(self) -> None:
+        """BLOCKER 2 regression: a generic swarm with adapter=claude-code/hermes
+        must write a config whose workers actually target that adapter (and pin
+        routing to it), instead of rejecting every non-cursor adapter."""
+        from puppetmaster.mcp_server import write_generated_swarm_config
+
+        for adapter in ("claude-code", "hermes"):
+            with self.subTest(adapter=adapter), TemporaryDirectory() as tmp:
+                args = {
+                    "goal": "audit the module",
+                    "cwd": tmp,
+                    "state_dir": str(Path(tmp) / "state"),
+                }
+                config_path = write_generated_swarm_config(args, ["audit"], adapter)
+                cfg = json.loads(Path(config_path).read_text())
+                worker = cfg["workers"][0]
+                self.assertEqual(worker["adapter"], adapter)
+                # auto-route must stay constrained to the chosen adapter so the
+                # router can't hop the worker onto a different platform.
+                self.assertEqual(worker["payload"].get("allowed_adapters"), [adapter])
+                # still a read-only analysis swarm.
+                self.assertTrue(worker["payload"]["read_only"])
+
+    def test_mcp_swarm_config_writer_rejects_unknown_adapter_structurally(self) -> None:
+        """A genuinely unsupported adapter is reported via a structured tool error
+        from start_swarm (naming the supported adapters), never a raw ValueError
+        and never a 'use adapter=cursor' nudge."""
+        from puppetmaster.mcp_server import SWARM_ANALYSIS_ADAPTERS, start_swarm
+
+        with TemporaryDirectory() as tmp:
+            result = start_swarm(
+                {
+                    "goal": "do something",
+                    "cwd": tmp,
+                    "state_dir": str(Path(tmp) / "state"),
+                    "adapter": "gemini-cli",
+                }
+            )
+            self.assertTrue(result.get("isError"))
+            blob = json.dumps(result)
+            self.assertIn("gemini-cli", blob)
+            for supported in SWARM_ANALYSIS_ADAPTERS:
+                self.assertIn(supported, blob)
+
+    def test_mcp_swarm_custom_roles_guidance_is_platform_neutral(self) -> None:
+        """NAG 3 regression: the custom-role guidance must not push cursor; it
+        should tell the user to pass adapter=<their platform> and list the
+        enabled analysis adapters."""
+        from unittest.mock import patch
+
+        from puppetmaster.mcp_server import start_swarm
+
+        with TemporaryDirectory() as tmp, patch(
+            "puppetmaster.platform_lock.enabled_adapters",
+            return_value={"claude-code", "hermes"},
+        ):
+            result = start_swarm(
+                {
+                    "goal": "broad audit",
+                    "cwd": tmp,
+                    "state_dir": str(Path(tmp) / "state"),
+                    "roles": ["mapper", "auditor"],
+                }
+            )
+            self.assertTrue(result.get("isError"))
+            blob = json.dumps(result)
+            self.assertNotIn("start_cursor_swarm", blob)
+            self.assertNotIn("adapter='cursor'", blob)
+            self.assertIn("claude-code", blob)
+            self.assertIn("hermes", blob)
+
     def test_mcp_swarm_config_writer_marks_generated_workers_read_only(self) -> None:
         """Generated MCP swarms are analysis runs. If routing later selects an
         edit-capable adapter, the payload must keep it on the adapter's
@@ -14974,11 +15048,17 @@ class PuppetmasterFrictionFixTests(unittest.TestCase):
             pick_implement_adapter,
         )
 
-        # Priority order honored when several enabled.
+        # Priority order honored when several enabled AND all runnable: cursor
+        # wins. (Availability is injected so the test doesn't depend on the host
+        # actually having CURSOR_API_KEY + @cursor/sdk.)
         self.assertEqual(
-            pick_implement_adapter({"hermes", "cursor", "codex"}), "cursor"
+            pick_implement_adapter(
+                {"hermes", "cursor", "codex"}, is_available=lambda a: True
+            ),
+            "cursor",
         )
-        # Falls through to the only enabled one.
+        # Falls through to the only enabled one (single explicit choice is
+        # honored verbatim — availability is never second-guessed here).
         self.assertEqual(pick_implement_adapter({"hermes"}), "hermes")
         # Explicit request honored when enabled.
         self.assertEqual(
@@ -14994,6 +15074,45 @@ class PuppetmasterFrictionFixTests(unittest.TestCase):
         # Nothing enabled raises.
         with self.assertRaises(NoImplementAdapterError):
             pick_implement_adapter(set())
+
+    def test_pick_implement_adapter_prefers_available_over_cursor_default(self) -> None:
+        """BLOCKER 1 regression: no lock (every adapter "enabled") + Cursor not
+        runnable + Claude runnable must auto-pick claude-code, not silently land
+        on cursor and then die on a missing CURSOR_API_KEY/Node/@cursor/sdk."""
+        from puppetmaster import platform_lock as pl
+        from puppetmaster.workers import pick_implement_adapter
+
+        enabled = set(pl.KNOWN_ADAPTERS)  # what enabled_adapters() returns with no lock
+        picked = pick_implement_adapter(
+            enabled, is_available=lambda a: a == "claude-code"
+        )
+        self.assertEqual(picked, "claude-code")
+
+    def test_pick_implement_adapter_raises_when_none_runnable(self) -> None:
+        """BLOCKER 1 regression: when no enabled implement adapter is runnable,
+        raise an actionable error rather than falling back to cursor."""
+        from puppetmaster import platform_lock as pl
+        from puppetmaster.workers import (
+            NoImplementAdapterError,
+            pick_implement_adapter,
+        )
+
+        enabled = set(pl.KNOWN_ADAPTERS)
+        with self.assertRaises(NoImplementAdapterError) as ctx:
+            pick_implement_adapter(enabled, is_available=lambda a: False)
+        message = str(ctx.exception)
+        # The message must name what to install/configure (actionable), and must
+        # NOT silently resolve to a single 'cursor' pick.
+        self.assertIn("claude-code", message)
+        self.assertIn("install", message.lower())
+
+    def test_adapter_is_available_local_always_runnable(self) -> None:
+        from puppetmaster.workers import adapter_is_available
+
+        self.assertTrue(adapter_is_available("local"))
+        self.assertTrue(adapter_is_available("shell"))
+        # cursor without a key is never runnable regardless of SDK presence.
+        self.assertFalse(adapter_is_available("cursor", env={}))
 
     def test_edit_verb_e2e_through_orchestrator(self) -> None:
         """End-to-end: an edit spec runs through the real Orchestrator with a
@@ -20091,6 +20210,167 @@ class JobLabelTests(unittest.TestCase):
             snap = build_job_snapshot(store, job.id)
             self.assertEqual(snap["job"]["label"], "flaky test audit")
             self.assertEqual(snap["job"]["title"], "for flaky tests")
+
+
+class CursorDecouplingTests(unittest.TestCase):
+    """Standalone install / doctor / discover paths must not assume Cursor.
+
+    These cover the CLI entrypoints (not just the library helpers) since the
+    leftover Cursor coupling lived specifically in the direct commands, which
+    skipped the platform-lock filter that ``setup`` applies.
+    """
+
+    def _chdir(self, target: Path):
+        import os as _os
+
+        prior = Path.cwd()
+        _os.chdir(target)
+        self.addCleanup(_os.chdir, prior)
+
+    # --- NAG 4: standalone install-rules ----------------------------------
+    def test_install_rules_cli_skips_cursor_when_lock_excludes_it(self):
+        from puppetmaster.cli import main as cli_main
+
+        with TemporaryDirectory() as tmp:
+            self._chdir(Path(tmp))
+            subprocess.run(["git", "init", "-q"], cwd=tmp, check=True, capture_output=True)
+            with patch(
+                "puppetmaster.platform_lock.enabled_adapters",
+                return_value={"claude-code", "hermes"},
+            ), patch("puppetmaster.platform_lock.is_configured", return_value=True):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli_main(["install-rules"])
+            self.assertEqual(rc, 0)
+            self.assertTrue((Path(tmp) / "AGENTS.md").is_file())
+            self.assertFalse(
+                (Path(tmp) / ".cursor" / "rules" / "puppetmaster.mdc").exists(),
+                msg="non-cursor lock must not write .cursor/rules from a git repo",
+            )
+
+    def test_install_rules_cli_explicit_target_cursor_still_writes(self):
+        """Explicit --target cursor wins over the lock filter (explicit intent)."""
+        from puppetmaster.cli import main as cli_main
+
+        with TemporaryDirectory() as tmp:
+            self._chdir(Path(tmp))
+            with patch(
+                "puppetmaster.platform_lock.enabled_adapters",
+                return_value={"claude-code"},
+            ), patch("puppetmaster.platform_lock.is_configured", return_value=True):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli_main(["install-rules", "--target", "cursor"])
+            self.assertEqual(rc, 0)
+            self.assertTrue(
+                (Path(tmp) / ".cursor" / "rules" / "puppetmaster.mdc").is_file()
+            )
+
+    # --- NAG 5: standalone install-hooks ----------------------------------
+    def test_install_hooks_cli_skips_cursor_when_lock_excludes_it(self):
+        from puppetmaster.cli import main as cli_main
+
+        with TemporaryDirectory() as tmp:
+            self._chdir(Path(tmp))
+            with patch(
+                "puppetmaster.platform_lock.enabled_adapters",
+                return_value={"claude-code"},
+            ):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli_main(["install-hooks"])
+            self.assertEqual(rc, 0)
+            self.assertFalse(
+                (Path(tmp) / ".cursor" / "hooks.json").exists(),
+                msg="non-cursor lock must not write .cursor/hooks.json",
+            )
+            self.assertTrue((Path(tmp) / ".claude" / "settings.json").is_file())
+
+    # --- NAG 6: doctor node/npm + codegraph guidance ----------------------
+    def test_optional_tool_check_reports_optional_when_missing(self):
+        from puppetmaster import diagnostics
+
+        with patch.object(diagnostics, "_resolve_probe_command", return_value=None):
+            check = diagnostics._optional_tool_check("node", ["node", "--version"])
+        self.assertEqual(check.status, "optional")
+        self.assertNotEqual(check.status, "missing")
+        self.assertIn("Cursor adapter", check.detail)
+
+    def test_doctor_node_npm_never_report_missing(self):
+        from puppetmaster import diagnostics
+
+        with TemporaryDirectory() as tmp, patch.object(
+            diagnostics, "_resolve_probe_command", return_value=None
+        ):
+            checks = {c.name: c for c in diagnostics.run_doctor(Path(tmp), Path(tmp))}
+        # Reclassified as optional, not the alarming top-level "missing".
+        self.assertEqual(checks["node"].status, "optional")
+        self.assertEqual(checks["npm"].status, "optional")
+
+    def test_codegraph_doctor_guidance_says_runtime_node(self):
+        from puppetmaster import diagnostics
+
+        with patch.object(diagnostics, "codegraph_available", return_value=True), patch.object(
+            diagnostics, "codegraph_initialized", return_value=False
+        ):
+            check = diagnostics._codegraph_check(Path("/tmp"))
+        self.assertIn("runtime Node", check.detail)
+        self.assertNotIn("bundled Node", check.detail)
+
+    # --- NAG 7: setup next-steps from enabled adapters --------------------
+    def test_setup_next_steps_render_from_enabled_adapters(self):
+        from puppetmaster.cli import _setup_next_steps
+
+        hermes_steps = "\n".join(_setup_next_steps({"hermes"})).lower()
+        self.assertIn("hermes", hermes_steps)
+        self.assertNotIn("restart cursor", hermes_steps)
+
+        local_steps = "\n".join(_setup_next_steps(set())).lower()
+        self.assertIn("local", local_steps)
+
+        cursor_steps = "\n".join(_setup_next_steps({"cursor"})).lower()
+        self.assertIn("restart cursor", cursor_steps)
+
+    # --- NAG 8: models discover default source ----------------------------
+    def test_default_discover_sources_single_locked_platform(self):
+        from puppetmaster import cli
+
+        with patch("puppetmaster.platform_lock.is_restricted", return_value=True), patch(
+            "puppetmaster.platform_lock.enabled_adapters", return_value={"hermes"}
+        ):
+            self.assertEqual(cli._default_discover_sources(), ["hermes"])
+
+    def test_default_discover_sources_excludes_cursor_for_non_cursor_lock(self):
+        from puppetmaster import cli
+
+        with patch("puppetmaster.platform_lock.is_restricted", return_value=True), patch(
+            "puppetmaster.platform_lock.enabled_adapters",
+            return_value={"claude-code", "hermes"},
+        ):
+            sources = cli._default_discover_sources()
+        self.assertNotIn("cursor", sources)
+        self.assertIn("claude", sources)
+        self.assertIn("hermes", sources)
+
+    def test_models_discover_default_cursor_only_unavailable_prints_hint(self):
+        from puppetmaster import cli
+
+        with TemporaryDirectory() as tmp:
+            args = MagicMock(source=None, json=False, write=False, registry_path=None)
+            with patch(
+                "puppetmaster.platform_lock.is_restricted", return_value=True
+            ), patch(
+                "puppetmaster.platform_lock.enabled_adapters", return_value={"cursor"}
+            ), patch.object(
+                cli,
+                "_discover_one_source",
+                side_effect=cli._DiscoverSourceError("CURSOR_API_KEY not set"),
+            ):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    rc = cli._run_models_discover(args, Path(tmp) / "models.json")
+            self.assertEqual(rc, 1)
+            self.assertIn("hint:", err.getvalue())
 
 
 if __name__ == "__main__":

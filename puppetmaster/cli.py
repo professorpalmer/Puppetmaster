@@ -1396,13 +1396,15 @@ def build_parser() -> argparse.ArgumentParser:
     models_discover.add_argument(
         "--source",
         choices=["cursor", "openai", "anthropic", "claude", "codex", "hermes", "all"],
-        default="cursor",
+        default=None,
         help=(
-            "Which platform catalog to enumerate. cursor (plan, default), "
-            "openai (GET /v1/models, needs OPENAI_API_KEY), anthropic "
-            "(needs ANTHROPIC_API_KEY for discovery), claude / codex (curated "
-            "catalogs for the CLI agent loops that can't self-enumerate; billed "
-            "as your detected subscription/API posture), hermes (curated "
+            "Which platform catalog to enumerate. Default: derived from the "
+            "platform lock — a single locked platform is discovered directly; "
+            "otherwise every reachable source ('all'). cursor (plan, needs "
+            "CURSOR_API_KEY + node), openai (GET /v1/models, needs OPENAI_API_KEY), "
+            "anthropic (needs ANTHROPIC_API_KEY for discovery), claude / codex "
+            "(curated catalogs for the CLI agent loops that can't self-enumerate; "
+            "billed as your detected subscription/API posture), hermes (curated "
             "multi-provider catalog, API-billed via your own keys), or all."
         ),
     )
@@ -3199,17 +3201,37 @@ def _print_rules_result(result: RulesInstallResult) -> int:
 
 
 def _run_install_rules(args) -> int:
-    """Dispatch for ``puppetmaster install-rules``."""
+    """Dispatch for ``puppetmaster install-rules``.
+
+    When no explicit ``--target`` is given, the auto-detected set is filtered to
+    the platforms the persisted platform lock allows, and the Cursor rule is
+    written only when Cursor is actually *indicated* — an existing ``.cursor/``
+    directory or a lock that includes cursor — so a non-Cursor user in a plain
+    git repo no longer gets a ``.cursor/rules/`` file. An explicit ``--target``
+    always wins (filter bypassed), matching how ``setup`` passes its own filter.
+    """
+    cwd = Path.cwd()
     targets = None
     raw_target = getattr(args, "target", None)
     if raw_target:
         targets = [t.strip() for t in raw_target.split(",") if t.strip()]
+    enabled_adapters = None
+    if targets is None:
+        from puppetmaster import platform_lock as _pl
+
+        enabled_adapters = set(_pl.enabled_adapters())
+        cursor_indicated = (cwd / ".cursor").exists() or (
+            _pl.is_configured() and "cursor" in enabled_adapters
+        )
+        if not cursor_indicated:
+            enabled_adapters.discard("cursor")
     result = install_rules(
-        cwd=Path.cwd(),
+        cwd=cwd,
         targets=targets,
         install_global=getattr(args, "rules_global", False),
         dry_run=getattr(args, "dry_run", False),
         force=getattr(args, "force", False),
+        enabled_adapters=enabled_adapters,
     )
     return _print_rules_result(result)
 
@@ -3758,10 +3780,45 @@ def _run_setup(args) -> int:
     print()
 
     if overall_rc == 0:
-        print("Setup complete. Restart Cursor (or open a new Codex / Claude session) to pick up the MCP server.")
+        print("Setup complete.")
+        for line in _setup_next_steps(enabled_adapters):
+            print(f"  {line}")
     else:
         print("Setup completed with errors — see above. Individual `puppetmaster install-*` commands can be re-run after fixing.")
     return overall_rc
+
+
+def _setup_next_steps(enabled_adapters: set[str]) -> list[str]:
+    """Next-steps lines tailored to the platform(s) the user actually enabled.
+
+    Cursor/Codex/Claude/Hermes each pick up the MCP server differently (restart
+    vs. fresh session); the local/file mode needs no host at all. Rendering from
+    the enabled set means a non-Cursor user never sees a "restart Cursor" nudge
+    that doesn't apply to them.
+    """
+    steps: list[str] = []
+    if "cursor" in enabled_adapters:
+        steps.append("cursor: restart Cursor (or open a fresh chat) to pick up the MCP server.")
+    if "codex" in enabled_adapters:
+        steps.append("codex: start a new `codex` session to pick up the MCP server.")
+    if "claude-code" in enabled_adapters:
+        steps.append("claude-code: start a new Claude Code session; verify with `claude mcp list`.")
+    if "hermes" in enabled_adapters:
+        steps.append("hermes: start a new Hermes session; verify with `hermes mcp list`.")
+    if "openai" in enabled_adapters:
+        steps.append("openai: set OPENAI_API_KEY; the API adapter needs no host restart.")
+    if not steps:
+        # Lock excludes every host-backed adapter: only the local/file demo mode
+        # is available, which runs straight from the CLI without a host.
+        steps.append(
+            "local/file mode: no host to restart — drive Puppetmaster directly "
+            "via `python -m puppetmaster run …` (CLI / file workflows)."
+        )
+    steps.append(
+        "Verify any host by asking its agent to call `puppetmaster_doctor`, or run "
+        "`python -m puppetmaster doctor`."
+    )
+    return steps
 
 
 def _run_repair_codegraph(args) -> int:
@@ -4709,11 +4766,56 @@ def _run_models_subcommand(args) -> int:
     raise SystemExit(f"unknown models subcommand: {args.models_command}")
 
 
+# How each platform-lock adapter maps to a `models discover` source name.
+_DISCOVER_SOURCE_BY_ADAPTER = {
+    "cursor": "cursor",
+    "openai": "openai",
+    "claude-code": "claude",
+    "codex": "codex",
+    "hermes": "hermes",
+}
+
+
+def _all_discover_sources() -> list[str]:
+    """The catch-all source list (`--source all`)."""
+    sources = ["cursor", "openai", "anthropic"]
+    # Fold Hermes into the catch-all only when its CLI is actually present, so
+    # users who don't run Hermes don't get hermes/* entries injected just
+    # because they happen to have an OPENAI/ANTHROPIC/GEMINI key set. The
+    # explicit `--source hermes` path always works regardless.
+    from puppetmaster.diagnostics import _hermes_cli_installed
+
+    if _hermes_cli_installed():
+        sources.append("hermes")
+    return sources
+
+
+def _default_discover_sources() -> list[str]:
+    """Resolve a default discovery source set from the platform lock.
+
+    A cursor-first default punished non-Cursor users with a ``CURSOR_API_KEY``
+    failure on the obvious command. Instead: when the lock restricts platforms,
+    discover exactly those (so a Claude/Hermes user never touches Cursor); when
+    unrestricted, enumerate everything reachable, like ``--source all``.
+    """
+    from puppetmaster import platform_lock as pl
+
+    if not pl.is_restricted():
+        return _all_discover_sources()
+    enabled = pl.enabled_adapters()
+    return [
+        _DISCOVER_SOURCE_BY_ADAPTER[adapter]
+        for adapter in pl.KNOWN_ADAPTERS
+        if adapter in enabled and adapter in _DISCOVER_SOURCE_BY_ADAPTER
+    ]
+
+
 def _run_models_discover(args, path: Path) -> int:
     """Enumerate platform model catalogs and reconcile them into the registry.
 
-    Cursor (plan, default) uses the SDK; OpenAI and Anthropic use their
-    ``/v1/models`` endpoints. ``--source all`` runs every reachable source."""
+    Cursor (plan) uses the SDK; OpenAI and Anthropic use their ``/v1/models``
+    endpoints. The default source set is derived from the platform lock;
+    ``--source all`` runs every reachable source."""
     import json as _json
 
     from puppetmaster.model_registry import (
@@ -4728,18 +4830,19 @@ def _run_models_discover(args, path: Path) -> int:
     except RuntimeError:
         registry = starter_registry()
 
+    is_default = args.source is None
     if args.source == "all":
-        sources = ["cursor", "openai", "anthropic"]
-        # Fold Hermes into the catch-all only when its CLI is actually present,
-        # so users who don't run Hermes don't get hermes/* entries injected just
-        # because they happen to have an OPENAI/ANTHROPIC/GEMINI key set. The
-        # explicit `--source hermes` path always works regardless.
-        from puppetmaster.diagnostics import _hermes_cli_installed
-
-        if _hermes_cli_installed():
-            sources.append("hermes")
+        sources = _all_discover_sources()
+    elif is_default:
+        # No explicit source: derive from the platform lock so the obvious
+        # `models discover` command never hard-fails on a Cursor key for a user
+        # who never enabled Cursor. `--source cursor` stays the explicit path.
+        sources = _default_discover_sources()
     else:
         sources = [args.source]
+    # A multi-source run tolerates per-source failures (collect + continue); a
+    # single intended source failing is fatal so the user sees the reason.
+    tolerate_source_errors = len(sources) > 1
     reports: list[dict] = []
     catalogs: dict[str, list] = {}
     errors: dict[str, str] = {}
@@ -4749,8 +4852,17 @@ def _run_models_discover(args, path: Path) -> int:
             registry, report, catalog = _discover_one_source(source, registry)
         except _DiscoverSourceError as exc:
             errors[source] = str(exc)
-            if args.source != "all":
+            if not tolerate_source_errors:
                 print(f"error: {exc}", file=sys.stderr)
+                if is_default and source == "cursor":
+                    print(
+                        "hint: cursor is the only enabled platform but its catalog "
+                        "could not be discovered. Set CURSOR_API_KEY (and run "
+                        "`puppetmaster install-cursor-mcp`), enable another platform "
+                        "with `puppetmaster platform enable <name>`, or pass an "
+                        "explicit `--source` (e.g. openai / hermes / claude).",
+                        file=sys.stderr,
+                    )
                 return 1
             continue
         reports.append(report)
@@ -5700,11 +5812,23 @@ def _run_invocation_gate_command(args) -> int:
 
 
 def _run_install_hooks(args) -> int:
-    """Dispatch for ``puppetmaster install-hooks``."""
+    """Dispatch for ``puppetmaster install-hooks``.
+
+    With no explicit ``--target``, the default cursor+claude set is filtered to
+    the platforms the persisted platform lock allows, so a non-Cursor user no
+    longer gets a ``.cursor/hooks.json`` written just because that was the old
+    default. An explicit ``--target`` bypasses the filter (explicit intent wins),
+    matching how ``setup`` passes its own filter.
+    """
     targets = None
     raw = getattr(args, "target", None)
     if raw:
         targets = [t.strip() for t in raw.split(",") if t.strip()]
+    enabled_adapters = None
+    if targets is None:
+        from puppetmaster import platform_lock as _pl
+
+        enabled_adapters = _pl.enabled_adapters()
     scope = "global" if getattr(args, "global_scope", False) else "project"
     result = install_hooks(
         cwd=Path.cwd(),
@@ -5712,6 +5836,7 @@ def _run_install_hooks(args) -> int:
         dry_run=getattr(args, "dry_run", False),
         force=getattr(args, "force", False),
         scope=scope,
+        enabled_adapters=enabled_adapters,
     )
     print(f"[install-hooks] overall: {result.overall_status} (scope={scope})")
     for outcome in result.outcomes:

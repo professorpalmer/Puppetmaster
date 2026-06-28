@@ -2247,6 +2247,18 @@ def _append_label_flag(command: list[str], args: JsonObject) -> None:
         command.extend(["--label", str(label)])
 
 
+def _enabled_swarm_adapters() -> list[str]:
+    """Analysis-capable adapters the user has enabled, in priority order.
+
+    Used to give platform-neutral guidance (and a runnable shortlist) instead of
+    hard-coding Cursor when a generic swarm needs an adapter.
+    """
+    from puppetmaster import platform_lock
+
+    enabled = platform_lock.enabled_adapters()
+    return [a for a in SWARM_ANALYSIS_ADAPTERS if a in enabled or a == "local"]
+
+
 def start_swarm(args: JsonObject) -> JsonObject:
     goal = require_string(args, "goal")
     command = ["run", goal]
@@ -2255,16 +2267,35 @@ def start_swarm(args: JsonObject) -> JsonObject:
     if args.get("config"):
         command.extend(["--config", str(args["config"])])
     elif adapter:
+        if str(adapter) not in SWARM_ANALYSIS_ADAPTERS:
+            return tool_error(
+                f"adapter {str(adapter)!r} cannot run an analysis swarm.",
+                {
+                    "adapter": str(adapter),
+                    "supported_adapters": list(SWARM_ANALYSIS_ADAPTERS),
+                    "fix": (
+                        "Pass adapter=<one of the supported analysis adapters> "
+                        "or use the matching platform-specific start verb."
+                    ),
+                },
+            )
         config_path = write_generated_swarm_config(args, roles or ["explore"], str(adapter))
         command.extend(["--config", str(config_path)])
     elif roles:
         if not args.get("allow_local_demo"):
+            enabled = _enabled_swarm_adapters()
             return tool_error(
-                "Custom-role MCP swarms require a workflow config or adapter. "
+                "Custom-role MCP swarms require a workflow config or an explicit adapter. "
                 "Otherwise Puppetmaster would use the demo local adapter and return generic artifacts.",
                 {
                     "roles": roles,
-                    "fix": "Use puppetmaster_start_cursor_swarm, pass adapter='cursor', pass config, or set allow_local_demo=true for tests/demos.",
+                    "enabled_adapters": enabled,
+                    "fix": (
+                        "Pass adapter=<your platform> (one of: "
+                        f"{', '.join(enabled) or ', '.join(SWARM_ANALYSIS_ADAPTERS)}), "
+                        "pass a config, or use the platform-specific start verb that "
+                        "matches your platform. For tests/demos set allow_local_demo=true."
+                    ),
                 },
             )
         command.append("--workers")
@@ -2307,9 +2338,27 @@ def normalized_roles(args: JsonObject) -> list[str]:
     return [str(role) for role in roles if str(role).strip()]
 
 
+# Adapters that can back a generated *analysis* swarm: every adapter that can
+# run a worker and emit artifacts. ``local`` is the deterministic demo backend;
+# the rest run a real model in read-only/analyze mode. Edit-only concerns don't
+# apply here — the generated workers are marked read_only — so any runnable
+# adapter qualifies, not just cursor.
+SWARM_ANALYSIS_ADAPTERS: tuple[str, ...] = (
+    "cursor",
+    "local",
+    "claude-code",
+    "codex",
+    "hermes",
+    "openai",
+)
+
+
 def write_generated_swarm_config(args: JsonObject, roles: list[str], adapter: str) -> Path:
-    if adapter not in {"cursor", "local"}:
-        raise ValueError(f"MCP swarm adapter is not supported yet: {adapter}")
+    if adapter not in SWARM_ANALYSIS_ADAPTERS:
+        raise ValueError(
+            f"adapter {adapter!r} cannot run an analysis swarm. Supported: "
+            f"{', '.join(SWARM_ANALYSIS_ADAPTERS)}."
+        )
     root = mcp_state_dir(args)
     config_dir = root / "mcp-configs"
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -2353,8 +2402,17 @@ def write_generated_swarm_config(args: JsonObject, roles: list[str], adapter: st
         }
         if adapter == "cursor":
             payload["model"] = model
+        elif explicit_model:
+            # An explicit pin must reach non-cursor adapters too (cursor already
+            # carries a "default" model; the others only set a model when pinned).
+            payload["model"] = str(explicit_model)
         if auto_route_enabled:
             payload["auto_route"] = True
+            # An explicitly chosen non-cursor adapter must actually be dispatched
+            # to: constrain routing to it so the router can't hop off the user's
+            # pick. Cursor/local keep their historical unconstrained routing.
+            if adapter not in ("cursor", "local"):
+                payload["allowed_adapters"] = [adapter]
             if isinstance(routing_policy, str) and routing_policy:
                 payload["routing_policy"] = routing_policy
             if isinstance(max_cost_usd, (int, float)):

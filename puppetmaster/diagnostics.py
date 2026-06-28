@@ -58,8 +58,8 @@ def run_doctor(root: Path, state_dir: Optional[Path] = None) -> list[Check]:
         Check("python", "ok", sys.version.split()[0]),
         Check("sqlite", "ok", sqlite3.sqlite_version),
         _guard("git", lambda: _command_check("git", ["git", "--version"])),
-        _guard("node", lambda: _command_check("node", ["node", "--version"])),
-        _guard("npm", lambda: _command_check("npm", ["npm", "--version"])),
+        _guard("node", lambda: _optional_tool_check("node", ["node", "--version"])),
+        _guard("npm", lambda: _optional_tool_check("npm", ["npm", "--version"])),
         _guard("cursor-sdk", lambda: _cursor_sdk_check(root)),
         _guard("claude-code", _claude_code_check),
         _guard("codex", _codex_check),
@@ -361,7 +361,7 @@ def _codegraph_check(root: Path) -> Check:
             "codegraph installed but this repo isn't indexed yet — run "
             "`python -m puppetmaster codegraph init --index` here to enable shared "
             "context (always invoke via `python -m puppetmaster codegraph …`, never a "
-            "bare `codegraph`, so it runs under Cursor's bundled Node).",
+            "bare `codegraph`, so it runs under the runtime Node).",
         )
     status = codegraph_status_command(root)
     combined = (status.get("stdout") or "") + "\n" + (status.get("stderr") or "")
@@ -372,8 +372,8 @@ def _codegraph_check(root: Path) -> Check:
             "native better-sqlite3 broken under the runtime Puppetmaster MCP uses; "
             "codegraph is falling back to slow WASM SQLite. "
             "Fix with `python -m puppetmaster repair-codegraph` (rebuilds against "
-            "Cursor's bundled Node so MCP picks it up). Common cause: shell Node "
-            "ABI differs from Cursor Node ABI.",
+            "the runtime Node so MCP picks it up). Common cause: shell Node "
+            "ABI differs from the runtime Node ABI.",
         )
     freshness = codegraph_freshness(root)
     if freshness.is_stale:
@@ -503,6 +503,33 @@ def _resolve_probe_command(command: list[str]) -> Optional[list[str]]:
         comspec = os.environ.get("COMSPEC", "cmd.exe")
         return [comspec, "/c", resolved, *command[1:]]
     return [resolved, *command[1:]]
+
+
+# Node/npm are required only by the Cursor adapter (its bundled SDK runner) and
+# CodeGraph (a Node package). The local/OpenAI/Hermes/Claude-Code core flows do
+# not need them, so a missing Node must read as an adapter-scoped "optional"
+# rather than a top-level "missing" that makes the whole install look broken.
+_OPTIONAL_TOOL_SCOPE = (
+    "needed only for the Cursor adapter (@cursor/sdk runner) and CodeGraph "
+    "(`@colbymchenry/codegraph`); not required for local / OpenAI / Hermes / "
+    "Claude Code core flows"
+)
+
+
+def _optional_tool_check(name: str, command: list[str]) -> Check:
+    """Probe an optional, adapter-scoped tool (node/npm).
+
+    Reports ``optional`` (not ``missing``) when absent and names the flows that
+    actually need it, so a deliberately non-Node install doesn't look broken.
+    """
+    resolved = _resolve_probe_command(command)
+    if resolved is None:
+        return Check(
+            name,
+            "optional",
+            f"{command[0]} not found on PATH — {_OPTIONAL_TOOL_SCOPE}.",
+        )
+    return _command_check(name, command)
 
 
 def _command_check(name: str, command: list[str]) -> Check:
