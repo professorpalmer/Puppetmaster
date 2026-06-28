@@ -20227,64 +20227,75 @@ class CursorDecouplingTests(unittest.TestCase):
         _os.chdir(target)
         self.addCleanup(_os.chdir, prior)
 
+    def _temp_repo_cwd(self) -> Path:
+        """A TemporaryDirectory we chdir into, torn down Windows-safely.
+
+        The temp dir's cleanup is registered *before* the chdir-restore, so
+        ``addCleanup``'s LIFO order restores the original cwd first and only
+        then removes the directory. On Windows a directory that is still a
+        process's cwd cannot be deleted (``WinError 32``); a plain
+        ``with TemporaryDirectory()`` whose ``__exit__`` runs before the
+        ``addCleanup`` chdir-restore would therefore fail teardown there.
+        """
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        target = Path(tmp.name)
+        self._chdir(target)
+        return target
+
     # --- NAG 4: standalone install-rules ----------------------------------
     def test_install_rules_cli_skips_cursor_when_lock_excludes_it(self):
         from puppetmaster.cli import main as cli_main
 
-        with TemporaryDirectory() as tmp:
-            self._chdir(Path(tmp))
-            subprocess.run(["git", "init", "-q"], cwd=tmp, check=True, capture_output=True)
-            with patch(
-                "puppetmaster.platform_lock.enabled_adapters",
-                return_value={"claude-code", "hermes"},
-            ), patch("puppetmaster.platform_lock.is_configured", return_value=True):
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf):
-                    rc = cli_main(["install-rules"])
-            self.assertEqual(rc, 0)
-            self.assertTrue((Path(tmp) / "AGENTS.md").is_file())
-            self.assertFalse(
-                (Path(tmp) / ".cursor" / "rules" / "puppetmaster.mdc").exists(),
-                msg="non-cursor lock must not write .cursor/rules from a git repo",
-            )
+        tmp = self._temp_repo_cwd()
+        subprocess.run(["git", "init", "-q"], cwd=tmp, check=True, capture_output=True)
+        with patch(
+            "puppetmaster.platform_lock.enabled_adapters",
+            return_value={"claude-code", "hermes"},
+        ), patch("puppetmaster.platform_lock.is_configured", return_value=True):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli_main(["install-rules"])
+        self.assertEqual(rc, 0)
+        self.assertTrue((tmp / "AGENTS.md").is_file())
+        self.assertFalse(
+            (tmp / ".cursor" / "rules" / "puppetmaster.mdc").exists(),
+            msg="non-cursor lock must not write .cursor/rules from a git repo",
+        )
 
     def test_install_rules_cli_explicit_target_cursor_still_writes(self):
         """Explicit --target cursor wins over the lock filter (explicit intent)."""
         from puppetmaster.cli import main as cli_main
 
-        with TemporaryDirectory() as tmp:
-            self._chdir(Path(tmp))
-            with patch(
-                "puppetmaster.platform_lock.enabled_adapters",
-                return_value={"claude-code"},
-            ), patch("puppetmaster.platform_lock.is_configured", return_value=True):
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf):
-                    rc = cli_main(["install-rules", "--target", "cursor"])
-            self.assertEqual(rc, 0)
-            self.assertTrue(
-                (Path(tmp) / ".cursor" / "rules" / "puppetmaster.mdc").is_file()
-            )
+        tmp = self._temp_repo_cwd()
+        with patch(
+            "puppetmaster.platform_lock.enabled_adapters",
+            return_value={"claude-code"},
+        ), patch("puppetmaster.platform_lock.is_configured", return_value=True):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli_main(["install-rules", "--target", "cursor"])
+        self.assertEqual(rc, 0)
+        self.assertTrue((tmp / ".cursor" / "rules" / "puppetmaster.mdc").is_file())
 
     # --- NAG 5: standalone install-hooks ----------------------------------
     def test_install_hooks_cli_skips_cursor_when_lock_excludes_it(self):
         from puppetmaster.cli import main as cli_main
 
-        with TemporaryDirectory() as tmp:
-            self._chdir(Path(tmp))
-            with patch(
-                "puppetmaster.platform_lock.enabled_adapters",
-                return_value={"claude-code"},
-            ):
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf):
-                    rc = cli_main(["install-hooks"])
-            self.assertEqual(rc, 0)
-            self.assertFalse(
-                (Path(tmp) / ".cursor" / "hooks.json").exists(),
-                msg="non-cursor lock must not write .cursor/hooks.json",
-            )
-            self.assertTrue((Path(tmp) / ".claude" / "settings.json").is_file())
+        tmp = self._temp_repo_cwd()
+        with patch(
+            "puppetmaster.platform_lock.enabled_adapters",
+            return_value={"claude-code"},
+        ):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli_main(["install-hooks"])
+        self.assertEqual(rc, 0)
+        self.assertFalse(
+            (tmp / ".cursor" / "hooks.json").exists(),
+            msg="non-cursor lock must not write .cursor/hooks.json",
+        )
+        self.assertTrue((tmp / ".claude" / "settings.json").is_file())
 
     # --- NAG 6: doctor node/npm + codegraph guidance ----------------------
     def test_optional_tool_check_reports_optional_when_missing(self):
