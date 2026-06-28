@@ -89,6 +89,10 @@ class Task:
     attempts: int = 0
     lease_owner: Optional[str] = None
     lease_expires_at: Optional[str] = None
+    # Monotonic per-claim token. Stamped fresh on every successful claim so a
+    # worker that reuses the same ``lease_owner`` id after its lease was
+    # reclaimed cannot fence a *newer* claim's terminal write or renewal.
+    lease_id: Optional[str] = None
     created_at: str = field(default_factory=now_iso)
     updated_at: str = field(default_factory=now_iso)
     completed_at: Optional[str] = None
@@ -190,6 +194,7 @@ def task_from_dict(data: dict[str, Any]) -> Task:
         attempts=data.get("attempts", 0),
         lease_owner=data.get("lease_owner"),
         lease_expires_at=data.get("lease_expires_at"),
+        lease_id=data.get("lease_id"),
         created_at=data["created_at"],
         updated_at=data.get("updated_at", data["created_at"]),
         completed_at=data.get("completed_at"),

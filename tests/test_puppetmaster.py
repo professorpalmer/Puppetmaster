@@ -18263,11 +18263,17 @@ class AuditFixTests(unittest.TestCase):
 
             barrier = threading.Barrier(2)
             results: list[Optional[Task]] = []
+            errors: list[BaseException] = []
             lock = threading.Lock()
 
             def claim(worker_id: str) -> None:
                 barrier.wait()
-                claimed = store.claim_task(task.id, worker_id, lease_seconds=60)
+                try:
+                    claimed = store.claim_task(task.id, worker_id, lease_seconds=60)
+                except BaseException as exc:  # capture so a crash isn't swallowed
+                    with lock:
+                        errors.append(exc)
+                    return
                 with lock:
                     results.append(claimed)
 
@@ -18279,6 +18285,12 @@ class AuditFixTests(unittest.TestCase):
                 thread.start()
             for thread in threads:
                 thread.join(timeout=10)
+
+            # Both threads must have finished cleanly (no crash, none left
+            # hanging on the lock) and recorded a result.
+            self.assertEqual(errors, [])
+            self.assertFalse(any(thread.is_alive() for thread in threads))
+            self.assertEqual(len(results), 2)
 
             winners = [claimed for claimed in results if claimed is not None]
             self.assertEqual(len(winners), 1)
@@ -18317,6 +18329,293 @@ class AuditFixTests(unittest.TestCase):
                 claimed, TaskStatus.COMPLETE, worker_id="worker-b"
             )
             self.assertEqual(conflict.status, TaskStatus.RUNNING)
+
+    # ----- Router hardening regressions ----------------------------------
+
+    def _escalating_registry(self):
+        from puppetmaster.model_registry import ModelSpec
+
+        # Two sufficient (>= ~70) models: a CHEAP, higher-capability one and a
+        # PRICEY, barely-sufficient one. Both api-billed so plan-rank doesn't
+        # tip the tie-break. "cheapest sufficient" must choose the cheap one.
+        return [
+            ModelSpec(
+                id="cheap-strong",
+                adapter="claude-code",
+                adapter_model_name="cheap-strong-v1",
+                capability_score=85,
+                input_per_mtok_usd=0.10,
+                output_per_mtok_usd=0.40,
+                billing="api",
+                tags=[],
+            ),
+            ModelSpec(
+                id="pricey-barely",
+                adapter="claude-code",
+                adapter_model_name="pricey-barely-v1",
+                capability_score=72,
+                input_per_mtok_usd=20.0,
+                output_per_mtok_usd=80.0,
+                billing="api",
+                tags=[],
+            ),
+        ]
+
+    def test_escalating_prefers_cheaper_higher_capability_sufficient(self) -> None:
+        from puppetmaster.router import TaskSignals, route_task
+
+        # Pin need=70 so both models (cap 85 and 72) clear the bar. The cheaper
+        # model is also the higher-capability one, so the old capability-first
+        # sort would have wrongly picked the pricey barely-sufficient model.
+        signal = TaskSignals(
+            instruction="add a feature", role="implement", explicit_min_capability=70
+        )
+        decision = route_task(signal, self._escalating_registry(), policy="escalating")
+        self.assertEqual(decision.model.id, "cheap-strong")
+        # The escalation chain still lists the alternative.
+        rejected_ids = {spec.id for spec, _ in decision.rejected}
+        self.assertIn("pricey-barely", rejected_ids)
+
+    def test_malformed_routing_override_is_ignored(self) -> None:
+        from puppetmaster.router import TaskSignals, classify_capability_needed
+
+        with TemporaryDirectory() as home:
+            pmharness = Path(home) / ".pmharness"
+            pmharness.mkdir()
+            (pmharness / "routing.json").write_text(
+                json.dumps({"overrides": {"audit": "high"}}), encoding="utf-8"
+            )
+            signal = TaskSignals(instruction="review the module", role="audit")
+            with patch.dict(os.environ, {"HOME": home, "USERPROFILE": home}):
+                # A non-numeric override must be ignored, not crash with a
+                # TypeError when the weights are later added.
+                score = classify_capability_needed(signal)
+            self.assertIsInstance(score, int)
+            self.assertTrue(5 <= score <= 100)
+
+    def test_numeric_routing_override_is_clamped_and_applied(self) -> None:
+        from puppetmaster.router import TaskSignals, classify_capability_needed
+
+        with TemporaryDirectory() as home:
+            pmharness = Path(home) / ".pmharness"
+            pmharness.mkdir()
+            (pmharness / "routing.json").write_text(
+                json.dumps({"overrides": {"explore": 999}}), encoding="utf-8"
+            )
+            signal = TaskSignals(instruction="look around", role="explore")
+            with patch.dict(os.environ, {"HOME": home, "USERPROFILE": home}):
+                score = classify_capability_needed(signal)
+            # 999 clamps to the 0..100 ceiling.
+            self.assertEqual(score, 100)
+
+    def test_explicit_policy_not_overridden_by_routing_json(self) -> None:
+        from puppetmaster.router import TaskSignals, route_task
+
+        with TemporaryDirectory() as home:
+            pmharness = Path(home) / ".pmharness"
+            pmharness.mkdir()
+            (pmharness / "routing.json").write_text(
+                json.dumps({"routing_policy": "cheap"}), encoding="utf-8"
+            )
+            # A trivial task: balanced right-sizes to the cheaper-sufficient
+            # model, but cheap would pick the cheapest regardless. They differ
+            # here, so an override leak would change the pick.
+            signal = TaskSignals(
+                instruction="security audit across every module", role="audit"
+            )
+            registry = self._escalating_registry()
+            with patch.dict(os.environ, {"HOME": home, "USERPROFILE": home}):
+                explicit = route_task(signal, registry, policy="balanced")
+                deferred = route_task(signal, registry, policy=None)
+            # Explicit 'balanced' is honored verbatim.
+            self.assertEqual(explicit.policy, "balanced")
+            # Leaving policy unspecified DOES consult routing.json -> 'cheap'.
+            self.assertEqual(deferred.policy, "cheap")
+
+    def test_route_task_is_pure_with_home_patched(self) -> None:
+        from puppetmaster.router import TaskSignals, route_task
+
+        with TemporaryDirectory() as home:
+            # No routing.json present -> defaults must hold and repeat calls are
+            # identical (the file read is the only impurity and it's absent).
+            signal = TaskSignals(instruction="add a feature", role="implement")
+            registry = self._escalating_registry()
+            with patch.dict(os.environ, {"HOME": home, "USERPROFILE": home}):
+                first = route_task(signal, registry)
+                second = route_task(signal, registry)
+            self.assertEqual(first.model.id, second.model.id)
+            self.assertEqual(first.policy, "balanced")
+            self.assertEqual(second.policy, "balanced")
+
+    def test_signals_strict_bool_and_list_coercion(self) -> None:
+        from puppetmaster.router import signals_from_worker_spec
+        from puppetmaster.workers import WorkerSpec
+
+        spec = WorkerSpec(
+            role="implement",
+            instruction="do it",
+            payload={
+                # Stringy 'false' must NOT enable the flag (bool('false') is True).
+                "allow_api_billing": "false",
+                "prefer_plan_billed": "no",
+                # A single string must be one tag, not split into characters.
+                "required_tags": "vision",
+                "allowed_adapters": "openai",
+            },
+        )
+        signals = signals_from_worker_spec(spec)
+        self.assertFalse(signals.allow_api_billing)
+        self.assertFalse(signals.prefer_plan_billed)
+        self.assertEqual(signals.required_tags, ["vision"])
+        self.assertEqual(signals.allowed_adapters, frozenset({"openai"}))
+
+    # ----- Storage / concurrency regressions -----------------------------
+
+    def test_sqlite_claims_blocked_task_after_dependency_completes(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("blocked then runnable")
+            dep = Task(job_id=job.id, role="explore", instruction="dep")
+            child = Task(
+                job_id=job.id,
+                role="implement",
+                instruction="needs dep",
+                depends_on=[dep.id],
+            )
+            store.save_task(dep)
+            store.save_task(child)
+
+            # First claim attempt while the dep is incomplete persists BLOCKED.
+            self.assertIsNone(store.claim_task(child.id, "worker-a", lease_seconds=60))
+            self.assertEqual(
+                store.get_task_by_id(child.id).status, TaskStatus.BLOCKED
+            )
+
+            # Complete the dependency.
+            claimed_dep = store.claim_task(dep.id, "worker-dep", lease_seconds=60)
+            store.update_task_status(
+                claimed_dep, TaskStatus.COMPLETE, worker_id="worker-dep"
+            )
+
+            # Now the previously-BLOCKED child must be claimable.
+            claimed_child = store.claim_task(child.id, "worker-a", lease_seconds=60)
+            self.assertIsNotNone(claimed_child)
+            self.assertEqual(claimed_child.status, TaskStatus.RUNNING)
+            self.assertEqual(claimed_child.lease_owner, "worker-a")
+
+    def test_lease_token_fences_stale_same_worker_id_completion(self) -> None:
+        for store_factory in (
+            lambda root: SwarmStore(root),
+            lambda root: SQLiteSwarmStore(root),
+        ):
+            with TemporaryDirectory() as tmp:
+                store = store_factory(Path(tmp) / ".puppetmaster")
+                job = store.create_job("lease token fence")
+                task = Task(job_id=job.id, role="coder", instruction="work")
+                store.save_task(task)
+
+                first = store.claim_task(task.id, "worker-a", lease_seconds=0)
+                self.assertIsNotNone(first.lease_id)
+
+                # The lease expired (lease_seconds=0); a reclaim by the SAME
+                # worker id stamps a NEW lease token.
+                store.recover_stale_tasks(job.id)
+                second = store.claim_task(task.id, "worker-a", lease_seconds=60)
+                self.assertIsNotNone(second)
+                self.assertNotEqual(first.lease_id, second.lease_id)
+
+                # The stale claim (old lease_id) must NOT be able to complete the
+                # new claim, even though the worker id matches.
+                stale = store.update_task_status(
+                    first, TaskStatus.COMPLETE, worker_id="worker-a"
+                )
+                self.assertEqual(stale.status, TaskStatus.RUNNING)
+
+                # The current claim, carrying the fresh token, completes fine.
+                done = store.update_task_status(
+                    second, TaskStatus.COMPLETE, worker_id="worker-a"
+                )
+                self.assertEqual(done.status, TaskStatus.COMPLETE)
+
+    # ----- Subprocess hardening regressions ------------------------------
+
+    @unittest.skipUnless(os.name == "posix", "process groups are POSIX-only")
+    def test_timeout_kills_grandchild_process_group(self) -> None:
+        from puppetmaster.adapters import run_streamed_subprocess
+
+        # Parent spawns a long-lived grandchild, writes its PID, then sleeps past
+        # the timeout. With start_new_session the timeout must reap the whole
+        # group, so the grandchild is gone afterwards.
+        with TemporaryDirectory() as tmp:
+            pid_file = Path(tmp) / "grandchild.pid"
+            script = (
+                "import subprocess, sys, time\n"
+                "child = subprocess.Popen(['sleep', '30'])\n"
+                f"fh = open({str(pid_file)!r}, 'w')\n"
+                "fh.write(str(child.pid))\n"
+                "fh.flush()\n"
+                "fh.close()\n"
+                "sys.stdout.write('spawned\\n')\n"
+                "sys.stdout.flush()\n"
+                "time.sleep(30)\n"
+            )
+            task = Task(job_id="job_x", role="shell", instruction="spawn tree")
+            result = run_streamed_subprocess(
+                command=[sys.executable, "-c", script],
+                env=None,
+                task=task,
+                sidecar_name="grandchild",
+                timeout_seconds=2,
+                heartbeat_seconds=30,
+                start_new_session=True,
+            )
+            self.assertTrue(result.timed_out)
+
+            deadline = time.monotonic() + 5
+            grandchild_pid = None
+            while time.monotonic() < deadline:
+                if pid_file.exists() and pid_file.read_text().strip():
+                    grandchild_pid = int(pid_file.read_text().strip())
+                    break
+                time.sleep(0.05)
+            self.assertIsNotNone(grandchild_pid, "grandchild never recorded its pid")
+
+            # Give the group-kill a beat to propagate, then assert the
+            # grandchild is no longer alive.
+            time.sleep(0.5)
+            with self.assertRaises(OSError):
+                # signal 0 probes liveness; raises if the process is gone.
+                os.kill(grandchild_pid, 0)
+
+    def test_streamed_subprocess_spawn_failure_is_structured(self) -> None:
+        from puppetmaster.adapters import run_streamed_subprocess
+
+        task = Task(job_id="job_x", role="shell", instruction="bad spawn")
+        result = run_streamed_subprocess(
+            command=["definitely-not-a-real-binary-xyz"],
+            env=None,
+            task=task,
+            sidecar_name="spawn_fail",
+            timeout_seconds=5,
+        )
+        self.assertIsNotNone(result.spawn_error)
+        self.assertEqual(result.returncode, None)
+        self.assertFalse(result.timed_out)
+
+    def test_shell_adapter_missing_executable_yields_failed_artifact(self) -> None:
+        from puppetmaster.adapters import ShellAdapter
+
+        task = Task(
+            job_id="job_x",
+            role="shell",
+            instruction="run missing binary",
+            payload={"command": ["definitely-not-a-real-binary-xyz"]},
+        )
+        artifacts = ShellAdapter().run(task, "goal", "worker-a")
+        self.assertEqual(len(artifacts), 1)
+        payload = artifacts[0].payload
+        self.assertEqual(payload["result"], "failed")
+        self.assertEqual(payload["failure"], "spawn_error")
 
     def test_acquire_lock_breaks_stale_task_lock(self) -> None:
         with TemporaryDirectory() as tmp:

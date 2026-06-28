@@ -17,6 +17,7 @@ from puppetmaster.models import (
     TaskStatus,
     artifact_from_dict,
     job_from_dict,
+    new_id,
     now_iso,
     seconds_from_now,
     task_from_dict,
@@ -268,16 +269,25 @@ class SQLiteSwarmStore(SwarmStore):
         task: Task,
         status: TaskStatus,
         worker_id: Optional[str] = None,
+        lease_id: Optional[str] = None,
     ) -> Task:
         terminal = status in {TaskStatus.COMPLETE, TaskStatus.FAILED}
         stored = self.get_task_by_id(task.id)
-        if terminal and worker_id is not None and stored.lease_owner != worker_id:
+        # Fence terminal writes on the per-claim lease token when both sides
+        # have one, so a worker reusing the same id after a stale-lease reclaim
+        # cannot mark the NEW claim terminal. Fall back to owner-only fencing
+        # for pre-claim callers / older persisted tasks with no token.
+        expected_lease = lease_id if lease_id is not None else task.lease_id
+        if terminal and worker_id is not None and not self._lease_matches(
+            stored, worker_id, expected_lease
+        ):
             return stored
         updated = replace(
             stored,
             status=status,
             lease_owner=None if terminal else stored.lease_owner,
             lease_expires_at=None if terminal else stored.lease_expires_at,
+            lease_id=None if terminal else stored.lease_id,
             updated_at=now_iso(),
             completed_at=now_iso() if status == TaskStatus.COMPLETE else stored.completed_at,
         )
@@ -289,13 +299,34 @@ class SQLiteSwarmStore(SwarmStore):
         }
         with self._session() as connection:
             if terminal and worker_id is not None:
-                cursor = connection.execute(
-                    """
-                    UPDATE tasks SET status = ?, data = ?
-                    WHERE id = ? AND json_extract(data, '$.lease_owner') = ?
-                    """,
-                    (str(status), self._dumps(updated), task.id, worker_id),
-                )
+                # The CAS must re-check the lease in SQL (not just the Python
+                # read above) so a concurrent reclaim that lands between the
+                # read and the write still loses. We match the owner always and
+                # the token whenever one is expected.
+                if expected_lease is not None:
+                    cursor = connection.execute(
+                        """
+                        UPDATE tasks SET status = ?, data = ?
+                        WHERE id = ?
+                          AND json_extract(data, '$.lease_owner') = ?
+                          AND json_extract(data, '$.lease_id') = ?
+                        """,
+                        (
+                            str(status),
+                            self._dumps(updated),
+                            task.id,
+                            worker_id,
+                            expected_lease,
+                        ),
+                    )
+                else:
+                    cursor = connection.execute(
+                        """
+                        UPDATE tasks SET status = ?, data = ?
+                        WHERE id = ? AND json_extract(data, '$.lease_owner') = ?
+                        """,
+                        (str(status), self._dumps(updated), task.id, worker_id),
+                    )
                 if cursor.rowcount != 1:
                     return self.get_task_by_id(task.id)
             else:
@@ -322,6 +353,82 @@ class SQLiteSwarmStore(SwarmStore):
                 (updated.job_id, now_iso(), "task.saved", json.dumps(payload, sort_keys=True)),
             )
         return updated
+
+    def renew_task_lease(
+        self,
+        task_id: str,
+        worker_id: str,
+        lease_seconds: int = 60,
+        lease_id: Optional[str] = None,
+    ) -> Optional[Task]:
+        # The base implementation does a read-check-then-save_task, which on
+        # SQLite is not atomic: a concurrent reclaim landing between the read
+        # and the write could be silently overwritten. Override with a single
+        # CAS UPDATE fenced on (RUNNING, lease_owner, and the lease token when
+        # present) so a stale owner can never extend a lease it no longer holds.
+        self.init()
+        task = self.get_task_by_id(task_id)
+        if task.status != TaskStatus.RUNNING or not self._lease_matches(
+            task, worker_id, lease_id
+        ):
+            return None
+        renewed = replace(
+            task,
+            lease_expires_at=seconds_from_now(lease_seconds),
+            updated_at=now_iso(),
+        )
+        with self._session() as connection:
+            if lease_id is not None and task.lease_id is not None:
+                cursor = connection.execute(
+                    """
+                    UPDATE tasks SET data = ?
+                    WHERE id = ?
+                      AND status = ?
+                      AND json_extract(data, '$.lease_owner') = ?
+                      AND json_extract(data, '$.lease_id') = ?
+                    """,
+                    (
+                        self._dumps(renewed),
+                        task_id,
+                        str(TaskStatus.RUNNING),
+                        worker_id,
+                        task.lease_id,
+                    ),
+                )
+            else:
+                cursor = connection.execute(
+                    """
+                    UPDATE tasks SET data = ?
+                    WHERE id = ?
+                      AND status = ?
+                      AND json_extract(data, '$.lease_owner') = ?
+                    """,
+                    (
+                        self._dumps(renewed),
+                        task_id,
+                        str(TaskStatus.RUNNING),
+                        worker_id,
+                    ),
+                )
+            if cursor.rowcount != 1:
+                return None
+            connection.execute(
+                "INSERT INTO events(job_id, at, event, payload) VALUES(?, ?, ?, ?)",
+                (
+                    task.job_id,
+                    now_iso(),
+                    "task.lease_renewed",
+                    json.dumps(
+                        {
+                            "task_id": task.id,
+                            "worker_id": worker_id,
+                            "lease_expires_at": renewed.lease_expires_at,
+                        },
+                        sort_keys=True,
+                    ),
+                ),
+            )
+        return renewed
 
     def claim_task(
         self,
@@ -362,6 +469,7 @@ class SQLiteSwarmStore(SwarmStore):
             attempts=task.attempts + 1,
             lease_owner=worker_id,
             lease_expires_at=seconds_from_now(lease_seconds),
+            lease_id=new_id("lease"),
             updated_at=now,
         )
         claim_payload = {
@@ -371,11 +479,17 @@ class SQLiteSwarmStore(SwarmStore):
             "attempts": claimed.attempts,
         }
         with self._session() as connection:
+            # We only reach here once ``dependencies_complete`` has passed, so a
+            # task persisted as BLOCKED is now runnable: include it in the CAS
+            # WHERE clause alongside QUEUED and stale-RUNNING. Without this a
+            # BLOCKED task whose deps later completed could never be claimed on
+            # SQLite, diverging from the file-backed SwarmStore contract.
             cursor = connection.execute(
                 """
                 UPDATE tasks SET status = ?, data = ?
                 WHERE id = ? AND (
                   status = ?
+                  OR status = ?
                   OR (status = ? AND json_extract(data, '$.lease_expires_at') <= ?)
                 )
                 """,
@@ -384,6 +498,7 @@ class SQLiteSwarmStore(SwarmStore):
                     self._dumps(claimed),
                     task_id,
                     str(TaskStatus.QUEUED),
+                    str(TaskStatus.BLOCKED),
                     str(TaskStatus.RUNNING),
                     now,
                 ),

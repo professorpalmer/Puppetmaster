@@ -19,6 +19,7 @@ from puppetmaster.models import (
     TaskStatus,
     artifact_from_dict,
     job_from_dict,
+    new_id,
     now_iso,
     parse_iso,
     seconds_from_now,
@@ -146,25 +147,51 @@ class SwarmStore:
         task: Task,
         status: TaskStatus,
         worker_id: Optional[str] = None,
+        lease_id: Optional[str] = None,
     ) -> Task:
         terminal = status in {TaskStatus.COMPLETE, TaskStatus.FAILED}
         stored = self.get_task_by_id(task.id)
-        if terminal and worker_id is not None and stored.lease_owner != worker_id:
+        # The caller carries the lease token granted at claim time; default to
+        # the claimed task's own ``lease_id`` so existing call sites fence
+        # correctly without having to thread the token through explicitly.
+        expected_lease = lease_id if lease_id is not None else task.lease_id
+        if terminal and worker_id is not None and not self._lease_matches(
+            stored, worker_id, expected_lease
+        ):
             return stored
         updated = replace(
             stored,
             status=status,
             lease_owner=None if terminal else stored.lease_owner,
             lease_expires_at=None if terminal else stored.lease_expires_at,
+            lease_id=None if terminal else stored.lease_id,
             updated_at=now_iso(),
             completed_at=now_iso() if status == TaskStatus.COMPLETE else stored.completed_at,
         )
         if terminal and worker_id is not None:
             current = self.get_task_by_id(task.id)
-            if current.lease_owner != worker_id:
+            if not self._lease_matches(current, worker_id, expected_lease):
                 return current
         self.save_task(updated)
         return updated
+
+    @staticmethod
+    def _lease_matches(
+        task: Task, worker_id: str, expected_lease: Optional[str]
+    ) -> bool:
+        """True when ``worker_id`` (and, when known, the per-claim ``lease_id``)
+        still owns ``task``.
+
+        Owner identity is the baseline fence; the lease token is the stronger
+        one that survives a worker_id reuse across a stale-lease reclaim. We
+        only require the token when both sides actually have one, so pre-claim
+        callers and older persisted tasks keep working.
+        """
+        if task.lease_owner != worker_id:
+            return False
+        if expected_lease is not None and task.lease_id is not None:
+            return task.lease_id == expected_lease
+        return True
 
     def claim_task(
         self,
@@ -204,6 +231,7 @@ class SwarmStore:
             attempts=task.attempts + 1,
             lease_owner=worker_id,
             lease_expires_at=seconds_from_now(lease_seconds),
+            lease_id=new_id("lease"),
             updated_at=now_iso(),
         )
         if not self._save_task_if_matches(task.id, claim_snapshot, claimed):
@@ -225,9 +253,12 @@ class SwarmStore:
         task_id: str,
         worker_id: str,
         lease_seconds: int = 60,
+        lease_id: Optional[str] = None,
     ) -> Optional[Task]:
         task = self.get_task_by_id(task_id)
-        if task.status != TaskStatus.RUNNING or task.lease_owner != worker_id:
+        if task.status != TaskStatus.RUNNING or not self._lease_matches(
+            task, worker_id, lease_id
+        ):
             return None
         renewed = replace(
             task,

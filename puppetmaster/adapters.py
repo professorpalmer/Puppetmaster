@@ -6,6 +6,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -149,6 +150,32 @@ class StreamedProcess:
     timed_out: bool = False
     live_log_path: Optional[str] = None
     elapsed_seconds: float = 0.0
+    # Set when the process could not be spawned at all (missing executable,
+    # bad cwd, ...). Callers treat a non-None value as a hard adapter failure
+    # rather than an empty-but-successful run.
+    spawn_error: Optional[str] = None
+
+
+def _kill_process_tree(process: "subprocess.Popen", started_new_session: bool) -> None:
+    """Best-effort kill of a timed-out child *and its descendants*.
+
+    Adapters that launch with ``start_new_session=True`` (e.g. Hermes) put the
+    child in its own process group; grandchildren survive a bare
+    ``process.kill()`` of the direct child. On POSIX we signal the whole group
+    so nothing is orphaned. ``os.killpg`` / ``os.getpgid`` only exist on POSIX,
+    so non-POSIX falls back to killing the direct child.
+    """
+    if started_new_session and os.name == "posix":
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
+            # Group already gone or unkillable — fall through to the direct kill.
+            pass
+    try:
+        process.kill()
+    except Exception:
+        pass
 
 
 def run_streamed_subprocess(
@@ -213,20 +240,44 @@ def run_streamed_subprocess(
         # that teardown confined to the child and away from Puppetmaster.
         popen_kwargs["start_new_session"] = True
 
-    process = subprocess.Popen(
-        command,
-        cwd=cwd,
-        env=env,
-        # Close stdin: an agent CLI launched in a non-interactive worker must
-        # never block forever waiting on terminal input (a silent "stall").
-        # Callers that previously passed input="" rely on this EOF behavior.
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-        **popen_kwargs,
-    )
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=env,
+            # Close stdin: an agent CLI launched in a non-interactive worker must
+            # never block forever waiting on terminal input (a silent "stall").
+            # Callers that previously passed input="" rely on this EOF behavior.
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            **popen_kwargs,
+        )
+    except OSError as exc:
+        # Popen failed before any reader thread started (missing executable,
+        # bad cwd, ...). Close the live-log handle we already opened so it can't
+        # leak, and surface a structured failure instead of letting the OSError
+        # escape the adapter.
+        message = redact_secrets(f"{type(exc).__name__}: {exc}") or "spawn_error"
+        if live_handle is not None:
+            try:
+                live_handle.write(f"[puppetmaster] spawn failed: {message}\n")
+            except Exception:
+                pass
+            try:
+                live_handle.close()
+            except Exception:
+                pass
+        return StreamedProcess(
+            returncode=None,
+            stdout="",
+            stderr=message,
+            timed_out=False,
+            live_log_path=str(live_path) if live_path is not None else None,
+            spawn_error=message,
+        )
 
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
@@ -268,7 +319,10 @@ def run_streamed_subprocess(
         process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
         timed_out = True
-        process.kill()
+        # Kill the whole process group when we launched a new session, so
+        # grandchildren (e.g. Hermes' own spawned tree) don't survive the
+        # timeout as orphans; otherwise kill just the direct child.
+        _kill_process_tree(process, start_new_session)
         try:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
@@ -673,6 +727,30 @@ class ShellAdapter:
                     },
                 )
             ]
+        except OSError as exc:
+            # A missing executable or invalid cwd raises OSError
+            # (FileNotFoundError/NotADirectoryError) before any output exists.
+            # Surface a failed verification artifact instead of letting the
+            # exception escape and crash the worker run.
+            message = redact_secrets(f"{type(exc).__name__}: {exc}") or "spawn_error"
+            return [
+                verification_artifact(
+                    task=task,
+                    worker_id=worker_id,
+                    adapter="shell",
+                    check=task.instruction,
+                    result="failed",
+                    confidence=0.7,
+                    evidence=[f"command:{' '.join(command)}", "spawn_error"],
+                    payload={
+                        "returncode": None,
+                        "failure": "spawn_error",
+                        "executable": command[0] if command else None,
+                        "cwd": str(cwd) if cwd else None,
+                        "message": message,
+                    },
+                )
+            ]
         return [
             verification_artifact(
                 task=task,
@@ -920,8 +998,10 @@ class CursorAdapter:
                 env=environment,
             )
         except subprocess.TimeoutExpired as exc:
-            stderr = exc.stderr or ""
-            stdout = exc.stdout or ""
+            # ``TimeoutExpired`` output can be bytes (or None); normalize before
+            # classifying/persisting so the artifact never stores raw bytes.
+            stderr = _coerce_text(exc.stderr)
+            stdout = _coerce_text(exc.stdout)
             stdout_capture = capture_subprocess_stdout(
                 text=stdout,
                 task=task,
@@ -943,8 +1023,8 @@ class CursorAdapter:
                     evidence=["adapter:cursor-sdk", "timeout"],
                     payload={
                         "returncode": None,
-                        "stdout": stdout[-_STDOUT_TAIL_CHARS:],
-                        "stderr": stderr[-_STDOUT_TAIL_CHARS:],
+                        "stdout": _redacted_tail(stdout, _STDOUT_TAIL_CHARS),
+                        "stderr": _redacted_tail(stderr, _STDOUT_TAIL_CHARS),
                         "stdout_capture": stdout_capture,
                         "stderr_capture": stderr_capture,
                         "model": model,
@@ -1004,8 +1084,8 @@ class CursorAdapter:
                 ),
                 payload={
                     "returncode": completed.returncode,
-                    "stdout": completed.stdout[-_STDOUT_TAIL_CHARS:],
-                    "stderr": completed.stderr[-_STDOUT_TAIL_CHARS:],
+                    "stdout": _redacted_tail(completed.stdout, _STDOUT_TAIL_CHARS),
+                    "stderr": _redacted_tail(completed.stderr, _STDOUT_TAIL_CHARS),
                     "stdout_capture": stdout_capture,
                     "stderr_capture": stderr_capture,
                     "model": model,

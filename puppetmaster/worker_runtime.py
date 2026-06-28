@@ -82,12 +82,15 @@ class WorkerRuntime:
                 min(self._heartbeat_interval(), max(0.0, deadline - time.monotonic()))
             )
             run = self.store.heartbeat_run(run)
-            self.store.renew_task_lease(task.id, self.worker_id, self.lease_seconds)
+            self.store.renew_task_lease(
+                task.id, self.worker_id, self.lease_seconds, lease_id=task.lease_id
+            )
 
         stop_heartbeats = threading.Event()
         heartbeat = threading.Thread(
             target=self._heartbeat_until_stopped,
             args=(run, task.id, stop_heartbeats),
+            kwargs={"lease_id": task.lease_id},
             daemon=True,
         )
         heartbeat.start()
@@ -307,11 +310,12 @@ class WorkerRuntime:
         run: AgentRun,
         task_id: str,
         stop: threading.Event,
+        lease_id: Optional[str] = None,
     ) -> None:
         while not stop.wait(self._heartbeat_interval()):
             run = self.store.heartbeat_run(run)
             renewed = self.store.renew_task_lease(
-                task_id, self.worker_id, self.lease_seconds
+                task_id, self.worker_id, self.lease_seconds, lease_id=lease_id
             )
             if renewed is None:
                 self._lease_lost.set()

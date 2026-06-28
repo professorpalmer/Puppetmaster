@@ -19,11 +19,30 @@ the adapter actually runs the model.
 """
 from __future__ import annotations
 
+import json
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
 from puppetmaster.model_registry import ModelSpec, enabled_specs
+
+
+def _load_routing_overrides() -> dict:
+    """Read ``~/.pmharness/routing.json`` if present, else an empty dict.
+
+    Never raises: a missing/corrupt file simply means "no overrides". Kept in
+    one place so the classifier and ``route_task`` read the same source.
+    """
+    routing_path = os.path.expanduser("~/.pmharness/routing.json")
+    try:
+        if not os.path.exists(routing_path):
+            return {}
+        with open(routing_path) as handle:
+            data = json.load(handle)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 # ----- Task signals --------------------------------------------------------
@@ -150,7 +169,18 @@ def classify_capability_needed(task: TaskSignals) -> int:
     if task.explicit_min_capability is not None:
         return max(0, min(100, task.explicit_min_capability))
 
-    score = _ROLE_BASE_SCORE.get(task.role, 50)
+    role_base_score = _ROLE_BASE_SCORE.get(task.role, 50)
+    overrides = _load_routing_overrides().get("overrides", {})
+    if isinstance(overrides, dict) and task.role in overrides:
+        candidate = overrides[task.role]
+        # Only honor a real numeric override (bools are ints in Python but are
+        # never a meaningful capability score, so reject them too). A bad value
+        # — e.g. {"overrides": {"audit": "high"}} — is ignored so the later
+        # arithmetic can't blow up on a non-numeric base.
+        if isinstance(candidate, (int, float)) and not isinstance(candidate, bool):
+            role_base_score = max(0, min(100, int(candidate)))
+
+    score = role_base_score
 
     instruction_lower = task.instruction.lower()
     for pattern, weight in _HARD_SIGNAL_PATTERNS:
@@ -306,7 +336,7 @@ def route_task(
     task: TaskSignals,
     registry: Iterable[ModelSpec],
     *,
-    policy: str = "balanced",
+    policy: Optional[str] = None,
 ) -> RoutingDecision:
     """Pick a model for ``task`` from ``registry`` using ``policy``.
 
@@ -321,6 +351,13 @@ def route_task(
     hand instead of failing closed. Use ``payload.min_capability`` /
     ``payload.required_tags`` if you need a hard floor.
     """
+    # An explicitly-passed policy always wins. Only when the caller leaves it
+    # unspecified (``policy is None``) do we consult the saved routing.json
+    # preference, falling back to ``balanced`` when none is configured.
+    if policy is None:
+        saved_policy = _load_routing_overrides().get("routing_policy")
+        policy = saved_policy if saved_policy in VALID_POLICIES else "balanced"
+
     if policy not in VALID_POLICIES:
         raise ValueError(f"unknown policy {policy!r}; expected one of {VALID_POLICIES}")
 
@@ -497,24 +534,41 @@ def route_task(
         )
 
     if policy == "escalating":
-        # For escalating we still return one decision (the cheapest
-        # sufficient model), but ordered alternatives are listed in
-        # `rejected` so the orchestrator can retry up the chain.
-        sorted_by_cap = sorted(
-            after_cost,
-            key=lambda s: (
-                s.capability_score,
-                _plan_rank(s),
-                s.marginal_cost_usd(tokens_in, tokens_out),
-            ),
+        # Start with the cheapest *sufficient* model, then list the remaining
+        # models as an ordered escalation chain. The pick must be chosen among
+        # models that actually clear the capability bar — sorting the whole set
+        # by capability first would let a barely-sufficient but expensive model
+        # win over a cheaper higher-capability one, contradicting "cheapest
+        # sufficient". So filter to sufficient first, then order by
+        # (plan_rank, marginal_cost, capability_score).
+        def _escalation_key(spec: ModelSpec):
+            return (
+                _plan_rank(spec),
+                spec.marginal_cost_usd(tokens_in, tokens_out),
+                spec.capability_score,
+            )
+
+        sufficient = sorted(
+            (s for s in after_cost if s.capability_score >= need),
+            key=_escalation_key,
         )
-        sufficient = [s for s in sorted_by_cap if s.capability_score >= need]
-        pick = sufficient[0] if sufficient else sorted_by_cap[-1]
+        if sufficient:
+            pick = sufficient[0]
+        else:
+            # Nothing clears the bar; escalate to the strongest available.
+            pick = max(after_cost, key=lambda s: s.capability_score)
         reason = (
             "policy=escalating: start with cheapest sufficient; "
             "rejected list is the ordered escalation chain"
         )
-        for spec in sorted_by_cap:
+        # Order the escalation chain cheapest-first so the orchestrator retries
+        # up the ladder, with any insufficient models trailing the sufficient
+        # ones (they only get tried after every sufficient option is exhausted).
+        escalation_order = sorted(
+            after_cost,
+            key=lambda s: (0 if s.capability_score >= need else 1, *_escalation_key(s)),
+        )
+        for spec in escalation_order:
             if spec.id != pick.id:
                 rejected.append((spec, "escalation candidate"))
         return _decision(
@@ -629,6 +683,45 @@ def _decision(
 # ----- WorkerSpec -> TaskSignals helper -----------------------------------
 
 
+_TRUE_STRINGS = {"true", "1", "yes"}
+_FALSE_STRINGS = {"false", "0", "no"}
+
+
+def _coerce_bool(value: object, default: bool) -> bool:
+    """Strictly read a flag from payload.
+
+    Accepts only real bools or the literal strings ``true``/``false``/``1``/
+    ``0``/``yes``/``no`` (case-insensitive). Anything ambiguous — including
+    ``bool('false') is True`` traps — falls back to ``default`` rather than
+    silently flipping a billing/plan gate the wrong way.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _TRUE_STRINGS:
+            return True
+        if normalized in _FALSE_STRINGS:
+            return False
+    return default
+
+
+def _coerce_str_list(value: object) -> list[str]:
+    """Strictly read a list-of-strings from payload.
+
+    A real ``list``/``tuple`` keeps its string elements; a single ``str`` is
+    treated as one element (so ``"vision"`` does NOT explode into characters
+    the way ``list("vision")`` would). Anything else yields an empty list.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return [item for item in value if isinstance(item, str)]
+    return []
+
+
 def signals_from_worker_spec(spec, *, instruction_override: Optional[str] = None) -> TaskSignals:
     """Build a :class:`TaskSignals` from a ``workers.WorkerSpec``.
 
@@ -647,9 +740,11 @@ def signals_from_worker_spec(spec, *, instruction_override: Optional[str] = None
             payload_str += value
 
     # A per-task override wins; otherwise inherit the user's platform lock.
+    # A bare ``allowed_adapters: "openai"`` must mean the single adapter, not
+    # frozenset('openai') == {'o','p','e','n','a','i'}.
     allowed = payload.get("allowed_adapters")
     if allowed is not None:
-        allowed_adapters: Optional[frozenset[str]] = frozenset(allowed)
+        allowed_adapters: Optional[frozenset[str]] = frozenset(_coerce_str_list(allowed))
     else:
         from puppetmaster.platform_lock import active_allowlist
 
@@ -661,10 +756,10 @@ def signals_from_worker_spec(spec, *, instruction_override: Optional[str] = None
         payload_size_chars=len(payload_str),
         explicit_min_capability=payload.get("min_capability"),
         explicit_max_cost_usd=payload.get("max_cost_usd"),
-        required_tags=list(payload.get("required_tags") or []),
+        required_tags=_coerce_str_list(payload.get("required_tags")),
         estimated_tokens_in=payload.get("estimated_tokens_in"),
         estimated_tokens_out=payload.get("estimated_tokens_out"),
-        prefer_plan_billed=bool(payload.get("prefer_plan_billed", True)),
-        allow_api_billing=bool(payload.get("allow_api_billing", True)),
+        prefer_plan_billed=_coerce_bool(payload.get("prefer_plan_billed"), True),
+        allow_api_billing=_coerce_bool(payload.get("allow_api_billing"), True),
         allowed_adapters=allowed_adapters,
     )
