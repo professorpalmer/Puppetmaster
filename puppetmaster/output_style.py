@@ -17,16 +17,34 @@ Enable globally with ``PUPPETMASTER_OUTPUT_STYLE=terse|lithic`` or per task with
 ``payload.output_style``; an explicit payload value always wins over the env.
 Only *form* is compressed — every fact, number, name, path, condition, and
 caveat is preserved (lossless on content, lossy only on form).
+
+Custom directive (bring your own rules)
+---------------------------------------
+The two tiers are presets. To run your *own* wording instead, supply a verbatim
+directive that replaces the built-in block:
+
+- per task: ``payload.output_style_text`` (the directive string itself), or
+- globally: ``PUPPETMASTER_OUTPUT_STYLE_TEXT`` (inline) or
+  ``PUPPETMASTER_OUTPUT_STYLE_FILE`` (path to a directive file).
+
+Precedence, highest first: payload custom text, payload tier, env custom text,
+env tier. A disabled value (``off``/``none``/…) at the payload layer opts that
+one spec out even when the env default is on. A custom directive is used exactly
+as written — you own its content (and its failure modes).
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Optional
 
 OUTPUT_STYLE_ENV = "PUPPETMASTER_OUTPUT_STYLE"
+OUTPUT_STYLE_TEXT_ENV = "PUPPETMASTER_OUTPUT_STYLE_TEXT"
+OUTPUT_STYLE_FILE_ENV = "PUPPETMASTER_OUTPUT_STYLE_FILE"
 
 TERSE = "terse"
 LITHIC = "lithic"
+CUSTOM = "custom"
 _VALID_STYLES = (TERSE, LITHIC)
 _DISABLED_VALUES = {"", "off", "none", "0", "false", "no"}
 
@@ -102,3 +120,74 @@ def apply_output_style(instruction: str, style: Optional[str]) -> str:
     if not directive:
         return instruction
     return f"{directive}\n\n{instruction}"
+
+
+def normalize_custom_text(value: Optional[str]) -> Optional[str]:
+    """A verbatim custom directive: trimmed text, or ``None`` when empty/disabled.
+
+    A custom directive is used exactly as written, so only literal disable words
+    (``off``/``none``/…) and blank input map to ``None``; any other string is a
+    real directive the caller owns.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in _DISABLED_VALUES:
+        return None
+    return text
+
+
+def _is_disabled(value: Optional[str]) -> bool:
+    """True only when ``value`` is an explicit disable token (not merely unset)."""
+    return value is not None and str(value).strip().lower() in _DISABLED_VALUES
+
+
+def read_style_file(path: Optional[str]) -> Optional[str]:
+    """Read a directive file, returning its stripped contents or ``None``.
+
+    Missing path, unreadable file, or empty contents all resolve to ``None`` so
+    a stale ``PUPPETMASTER_OUTPUT_STYLE_FILE`` never silently injects nothing or
+    crashes a worker dispatch.
+    """
+    if not path:
+        return None
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return None
+    text = text.strip()
+    return text or None
+
+
+def resolve_output(
+    *,
+    payload_style: Optional[str],
+    payload_text: Optional[str],
+    env_style: Optional[str],
+    env_text: Optional[str],
+) -> Optional[tuple[str, str]]:
+    """Resolve the active ``(label, directive)`` for a spec, or ``None`` if off.
+
+    ``label`` is ``terse`` / ``lithic`` / ``custom`` (useful for stamping and
+    telemetry); ``directive`` is the block to prepend. Precedence, highest
+    first: payload custom text, payload tier, env custom text, env tier. An
+    explicit disabled value at the payload layer suppresses the env defaults for
+    that one spec — mirroring the skill/memory tri-state opt-in.
+    """
+    custom = normalize_custom_text(payload_text)
+    if custom is not None:
+        return (CUSTOM, custom)
+    if _is_disabled(payload_text):
+        return None
+    tier = normalize_style(payload_style)
+    if tier is not None:
+        return (tier, directive_for(tier))
+    if _is_disabled(payload_style):
+        return None
+    custom = normalize_custom_text(env_text)
+    if custom is not None:
+        return (CUSTOM, custom)
+    tier = normalize_style(env_style)
+    if tier is not None:
+        return (tier, directive_for(tier))
+    return None

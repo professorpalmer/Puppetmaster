@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.9.89
+
+**The optional Signal-maximizer output style now takes a custom directive — bring your own rules instead of the two built-in tiers.** The presets (`terse`, `lithic`) are unchanged; this adds a verbatim path for teams that want their own house style without forking the rule text.
+
+- **Per task:** `payload.output_style_text` — the directive string itself, used exactly as written.
+- **Globally:** `PUPPETMASTER_OUTPUT_STYLE_TEXT` (inline) or `PUPPETMASTER_OUTPUT_STYLE_FILE` (path to a directive file). A missing or empty file resolves to "off" rather than injecting nothing or failing dispatch.
+- **Precedence (highest first):** payload custom text → payload tier → env custom text → env file → env tier. A disabled value (`off`/`none`/`""`) at the payload layer still opts a single spec out even when a global default is on. A spec running a custom directive is stamped `output_style: "custom"` for telemetry.
+- Custom directives are used verbatim — you own the content and its failure modes. Like the tiers, the directive is applied equally to every candidate model, so it does not bias routing.
+- Full suite: **955 passed** (pytest + CI `unittest discover`). Docs: `docs/OUTPUT_STYLE.md`, bundled skill updated.
+
 ## v0.9.88
 
 **Killed the hot-path N+1 query patterns in the data layer, added an optional output-style directive, and rewrote the README — found and verified with Puppetmaster auditing itself.** A read-only Puppetmaster swarm audited the SQLite persistence layer for per-row database access; it confirmed the cross-job/feed/stitcher paths are already correctly batched and surfaced three genuinely unbounded hot-path patterns, all fixed here with regression tests.

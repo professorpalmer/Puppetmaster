@@ -20582,6 +20582,118 @@ class OutputStyleTests(unittest.TestCase):
             self.assertEqual(out[0].instruction, "map the repo")
             self.assertNotIn("output_style", out[0].payload)
 
+    def test_normalize_custom_text_keeps_real_directives(self) -> None:
+        from puppetmaster.output_style import normalize_custom_text
+
+        self.assertEqual(normalize_custom_text("  Answer in haiku.  "), "Answer in haiku.")
+        for disabled in (None, "", "   ", "off", "none", "false"):
+            self.assertIsNone(normalize_custom_text(disabled))
+
+    def test_read_style_file_handles_missing_and_empty(self) -> None:
+        from puppetmaster.output_style import read_style_file
+
+        self.assertIsNone(read_style_file(None))
+        self.assertIsNone(read_style_file("/no/such/directive/file.txt"))
+        with TemporaryDirectory() as tmp:
+            empty = Path(tmp) / "empty.txt"
+            empty.write_text("   \n", encoding="utf-8")
+            self.assertIsNone(read_style_file(str(empty)))
+            real = Path(tmp) / "rules.txt"
+            real.write_text("OUTPUT: bullet points only.\n", encoding="utf-8")
+            self.assertEqual(read_style_file(str(real)), "OUTPUT: bullet points only.")
+
+    def test_resolve_output_precedence_and_custom_label(self) -> None:
+        from puppetmaster.output_style import resolve_output
+
+        # payload custom text wins over everything, labeled "custom" and verbatim
+        self.assertEqual(
+            resolve_output(
+                payload_style="terse",
+                payload_text="just the diff",
+                env_style="lithic",
+                env_text="env rules",
+            ),
+            ("custom", "just the diff"),
+        )
+        # payload tier beats env layers
+        label, directive = resolve_output(
+            payload_style="lithic", payload_text=None, env_style="terse", env_text="env rules"
+        )
+        self.assertEqual(label, "lithic")
+        self.assertIn("OUTPUT STYLE (lithic)", directive)
+        # env custom text beats env tier when payload is silent
+        self.assertEqual(
+            resolve_output(
+                payload_style=None, payload_text=None, env_style="terse", env_text="env rules"
+            ),
+            ("custom", "env rules"),
+        )
+        # explicit payload disable suppresses env defaults for this spec
+        self.assertIsNone(
+            resolve_output(
+                payload_style="off", payload_text=None, env_style="terse", env_text="env rules"
+            )
+        )
+        # nothing set anywhere → off
+        self.assertIsNone(
+            resolve_output(payload_style=None, payload_text=None, env_style=None, env_text=None)
+        )
+
+    def test_orchestrator_seam_supports_custom_directive(self) -> None:
+        from puppetmaster.output_style import (
+            OUTPUT_STYLE_ENV,
+            OUTPUT_STYLE_FILE_ENV,
+            OUTPUT_STYLE_TEXT_ENV,
+        )
+
+        clean = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in {OUTPUT_STYLE_ENV, OUTPUT_STYLE_TEXT_ENV, OUTPUT_STYLE_FILE_ENV}
+        }
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            orch = Orchestrator(store)
+
+            # per-task custom text is used verbatim and stamped "custom"
+            with patch.dict(os.environ, clean, clear=True):
+                out = orch._with_output_style(
+                    [
+                        WorkerSpec(
+                            role="audit",
+                            instruction="audit endpoints",
+                            payload={"output_style_text": "Reply: bullet list, no prose."},
+                        )
+                    ]
+                )
+            self.assertTrue(out[0].instruction.startswith("Reply: bullet list, no prose."))
+            self.assertTrue(out[0].instruction.endswith("audit endpoints"))
+            self.assertEqual(out[0].payload.get("output_style"), "custom")
+            self.assertNotIn("OUTPUT STYLE", out[0].instruction)
+
+            # global env custom text applies to an un-opinionated spec
+            with patch.dict(os.environ, {**clean, OUTPUT_STYLE_TEXT_ENV: "Terse. Facts only."}, clear=True):
+                out = orch._with_output_style([WorkerSpec(role="explore", instruction="map repo")])
+            self.assertTrue(out[0].instruction.startswith("Terse. Facts only."))
+            self.assertEqual(out[0].payload.get("output_style"), "custom")
+
+            # global env directive file applies, and payload tier still wins over it
+            directive_file = Path(tmp) / "house_style.txt"
+            directive_file.write_text("House style: short sentences.", encoding="utf-8")
+            with patch.dict(os.environ, {**clean, OUTPUT_STYLE_FILE_ENV: str(directive_file)}, clear=True):
+                out = orch._with_output_style(
+                    [
+                        WorkerSpec(role="explore", instruction="map repo"),
+                        WorkerSpec(
+                            role="review",
+                            instruction="review diff",
+                            payload={"output_style": "terse"},
+                        ),
+                    ]
+                )
+            self.assertTrue(out[0].instruction.startswith("House style: short sentences."))
+            self.assertIn("OUTPUT STYLE (terse)", out[1].instruction)
+
 
 if __name__ == "__main__":
     unittest.main()

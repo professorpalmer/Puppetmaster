@@ -110,6 +110,10 @@ minority of an agentic bill).
 - `lithic` — `terse` plus telegraphic glue-dropping (articles/copulas). Marginal
   extra savings, mild quality risk; best for machine-consumed artifacts, not a
   human-facing summary.
+- Custom rules: replace the presets with your own verbatim directive via
+  `payload.output_style_text`, or globally with `PUPPETMASTER_OUTPUT_STYLE_TEXT`
+  / `PUPPETMASTER_OUTPUT_STYLE_FILE`. Custom text wins over the tiers; the spec
+  is stamped `output_style: "custom"`.
 
 Full reference: `docs/OUTPUT_STYLE.md`.
 

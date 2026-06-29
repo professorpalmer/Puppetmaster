@@ -83,12 +83,28 @@ def _skill_injection_enabled(spec: WorkerSpec) -> bool:
     return os.environ.get(_SKILL_INJECTION_ENV, "").strip().lower() in _SKILL_OPT_IN_VALUES
 
 
-def _resolved_output_style(spec: WorkerSpec) -> Optional[str]:
-    """The active output style for a spec: explicit payload wins over the env."""
-    from puppetmaster.output_style import OUTPUT_STYLE_ENV, resolve_output_style
+def _resolved_output_style(spec: WorkerSpec) -> Optional[tuple[str, str]]:
+    """The active ``(label, directive)`` for a spec, or ``None`` when off.
 
-    return resolve_output_style(
-        spec.payload.get("output_style"), os.environ.get(OUTPUT_STYLE_ENV)
+    Explicit payload wins over the env, and a verbatim custom directive
+    (``output_style_text`` / the env TEXT or FILE) wins over the built-in tiers.
+    """
+    from puppetmaster.output_style import (
+        OUTPUT_STYLE_ENV,
+        OUTPUT_STYLE_FILE_ENV,
+        OUTPUT_STYLE_TEXT_ENV,
+        read_style_file,
+        resolve_output,
+    )
+
+    env_text = os.environ.get(OUTPUT_STYLE_TEXT_ENV)
+    if env_text is None:
+        env_text = read_style_file(os.environ.get(OUTPUT_STYLE_FILE_ENV))
+    return resolve_output(
+        payload_style=spec.payload.get("output_style"),
+        payload_text=spec.payload.get("output_style_text"),
+        env_style=os.environ.get(OUTPUT_STYLE_ENV),
+        env_text=env_text,
     )
 
 
@@ -1416,23 +1432,22 @@ class Orchestrator:
         Mirrors ``_with_retrieved_memory``: a single adapter-agnostic seam that
         edits ``instruction`` (every adapter funnels through
         ``payload["prompt"] or instruction``). Off by default; gated by env or
-        per-spec ``output_style``. The directive is a fixed ~100-token block
-        applied to every candidate model equally, so it does not bias routing —
-        ``estimated_tokens_in`` is intentionally left untouched.
+        per-spec ``output_style`` / ``output_style_text``. The directive is a
+        fixed block applied to every candidate model equally, so it does not
+        bias routing — ``estimated_tokens_in`` is intentionally left untouched.
         """
-        from puppetmaster.output_style import apply_output_style
-
         result: list[WorkerSpec] = []
         for spec in specs:
-            style = _resolved_output_style(spec)
-            if style is None:
+            resolved = _resolved_output_style(spec)
+            if resolved is None:
                 result.append(spec)
                 continue
+            label, directive = resolved
             result.append(
                 replace(
                     spec,
-                    instruction=apply_output_style(spec.instruction, style),
-                    payload={**spec.payload, "output_style": style},
+                    instruction=f"{directive}\n\n{spec.instruction}",
+                    payload={**spec.payload, "output_style": label},
                 )
             )
         return result
