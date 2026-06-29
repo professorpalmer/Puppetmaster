@@ -83,6 +83,15 @@ def _skill_injection_enabled(spec: WorkerSpec) -> bool:
     return os.environ.get(_SKILL_INJECTION_ENV, "").strip().lower() in _SKILL_OPT_IN_VALUES
 
 
+def _resolved_output_style(spec: WorkerSpec) -> Optional[str]:
+    """The active output style for a spec: explicit payload wins over the env."""
+    from puppetmaster.output_style import OUTPUT_STYLE_ENV, resolve_output_style
+
+    return resolve_output_style(
+        spec.payload.get("output_style"), os.environ.get(OUTPUT_STYLE_ENV)
+    )
+
+
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None:
@@ -172,6 +181,7 @@ class Orchestrator:
         try:
             specs = self._with_retrieved_memory(specs or specs_for_roles(roles), goal)
             specs = self._with_injected_skills(job, specs)
+            specs = self._with_output_style(specs)
             self._announce_mode(job, specs)
             self._ensure_plan_catalog(job, specs)
             self.store.update_job_status(job.id, JobStatus.RUNNING)
@@ -233,6 +243,7 @@ class Orchestrator:
         try:
             specs = self._with_retrieved_memory(specs_for_roles(roles), goal)
             specs = self._with_injected_skills(job, specs)
+            specs = self._with_output_style(specs)
             self.store.update_job_status(job.id, JobStatus.RUNNING)
             tasks = self._create_tasks(job, specs)
             self._run_prerequisites(job, tasks, crash_role, lease_seconds=2)
@@ -1395,6 +1406,33 @@ class Orchestrator:
                         **spec.payload,
                         "retrieved_memory": memory,
                     },
+                )
+            )
+        return result
+
+    def _with_output_style(self, specs: list[WorkerSpec]) -> list[WorkerSpec]:
+        """Prepend the optional Signal-maximizer directive to worker prompts.
+
+        Mirrors ``_with_retrieved_memory``: a single adapter-agnostic seam that
+        edits ``instruction`` (every adapter funnels through
+        ``payload["prompt"] or instruction``). Off by default; gated by env or
+        per-spec ``output_style``. The directive is a fixed ~100-token block
+        applied to every candidate model equally, so it does not bias routing —
+        ``estimated_tokens_in`` is intentionally left untouched.
+        """
+        from puppetmaster.output_style import apply_output_style
+
+        result: list[WorkerSpec] = []
+        for spec in specs:
+            style = _resolved_output_style(spec)
+            if style is None:
+                result.append(spec)
+                continue
+            result.append(
+                replace(
+                    spec,
+                    instruction=apply_output_style(spec.instruction, style),
+                    payload={**spec.payload, "output_style": style},
                 )
             )
         return result

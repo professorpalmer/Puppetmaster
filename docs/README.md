@@ -23,6 +23,8 @@ The full documentation set. Start at the [project README](../README.md) for the 
 | [CLI_REFERENCE.md](CLI_REFERENCE.md) | Every CLI subcommand, workflow config schema, daemon mode |
 | [CURSOR_AGENT_MCP.md](CURSOR_AGENT_MCP.md) | The MCP tool surface in detail |
 | [CODEGRAPH.md](CODEGRAPH.md) | CodeGraph integration, bundled MCP tools, cost comparison |
+| [OUTPUT_STYLE.md](OUTPUT_STYLE.md) | Optional Signal-maximizer worker output tiers (`terse` / `lithic`) |
+| [COMPRESSION.md](COMPRESSION.md) | Why input-side compression isn't bundled + a bring-your-own recipe |
 
 ## Operate & contribute
 

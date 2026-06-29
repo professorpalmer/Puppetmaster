@@ -95,6 +95,24 @@ CodeGraph first, then read only the files it points to. Verbs: `codegraph_search
   adapters the router may pick. Lock rejections mid-migration are expected, not
   failures.
 
+## Output style (optional "Signal-maximizer")
+
+Workers can be told to write tighter. Off by default. Shapes *form*, not
+reasoning, so it never lowers answer quality — the win is readability and
+latency, with a small cost bonus on output-heavy roles (output tokens are a
+minority of an agentic bill).
+
+- Enable globally: `PUPPETMASTER_OUTPUT_STYLE=terse` (or `lithic`).
+- Enable per task: `payload.output_style = "terse" | "lithic" | "off"`. An
+  explicit payload value wins over the env; `"off"` opts one spec out.
+- `terse` — drop ceremony, filler, hedging, restatement; one claim per line;
+  state uncertainty as fact (`unconfirmed: X`). Safe; recommended tier.
+- `lithic` — `terse` plus telegraphic glue-dropping (articles/copulas). Marginal
+  extra savings, mild quality risk; best for machine-consumed artifacts, not a
+  human-facing summary.
+
+Full reference: `docs/OUTPUT_STYLE.md`.
+
 ## Async monitoring pattern (for `start_*` verbs)
 
 `start_*` returns immediately with `job_id`. Then:
