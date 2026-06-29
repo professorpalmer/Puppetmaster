@@ -20384,5 +20384,204 @@ class CursorDecouplingTests(unittest.TestCase):
             self.assertIn("hint:", err.getvalue())
 
 
+class NPlusOneRegressionTests(unittest.TestCase):
+    """Guards for the N+1 / repeated-scan patterns the data-layer audit found."""
+
+    def test_claim_reuses_task_map_without_per_dependency_fetch(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("dependency-heavy claim")
+            deps = []
+            for i in range(4):
+                dep = Task(
+                    job_id=job.id,
+                    role=f"dep{i}",
+                    instruction="done",
+                    status=TaskStatus.COMPLETE,
+                )
+                store.save_task(dep)
+                deps.append(dep)
+            main = Task(
+                job_id=job.id,
+                role="main",
+                instruction="runs after deps",
+                depends_on=[dep.id for dep in deps],
+            )
+            store.save_task(main)
+
+            fetched_ids: list[str] = []
+            original_get = store.get_task_by_id
+
+            def spy(task_id: str):
+                fetched_ids.append(task_id)
+                return original_get(task_id)
+
+            with patch.object(store, "get_task_by_id", side_effect=spy):
+                claimed = store.claim_next_task(
+                    job.id, "worker-a", role="main", lease_seconds=60
+                )
+
+            self.assertIsNotNone(claimed)
+            # The claim's dependency recheck must read deps from the preloaded
+            # task_map, never one get_task_by_id() SELECT per dependency edge.
+            for dep in deps:
+                self.assertNotIn(dep.id, fetched_ids)
+
+    def test_recover_stale_tasks_batches_into_one_transaction(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("crashed worker wave")
+            stale = []
+            for i in range(5):
+                task = Task(job_id=job.id, role=f"r{i}", instruction="x")
+                store.save_task(task)
+                claimed = store.claim_task(task.id, f"worker-{i}", lease_seconds=60)
+                store.save_task(replace(claimed, lease_expires_at=seconds_from_now(-1)))
+                stale.append(task)
+
+            sessions = {"count": 0}
+            original_session = store._session
+
+            def counting_session(*args, **kwargs):
+                sessions["count"] += 1
+                return original_session(*args, **kwargs)
+
+            with patch.object(store, "_session", side_effect=counting_session):
+                recovered = store.recover_stale_tasks(job.id)
+
+            self.assertEqual(
+                sorted(task.id for task in recovered),
+                sorted(task.id for task in stale),
+            )
+            # Constant session count for the whole wave (init + one batched
+            # write transaction), not one session per stale task. Pre-fix this
+            # was 1 + len(stale); the regression is a count that scales with N.
+            self.assertLess(sessions["count"], len(stale))
+            self.assertLessEqual(sessions["count"], 2)
+            for task in stale:
+                self.assertEqual(store.get_task_by_id(task.id).status, TaskStatus.QUEUED)
+
+    def test_recover_stale_tasks_skips_fresh_leases(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("mixed staleness")
+            fresh = Task(job_id=job.id, role="fresh", instruction="live")
+            store.save_task(fresh)
+            store.claim_task(fresh.id, "worker-live", lease_seconds=600)
+            stale = Task(job_id=job.id, role="stale", instruction="dead")
+            store.save_task(stale)
+            claimed = store.claim_task(stale.id, "worker-dead", lease_seconds=60)
+            store.save_task(replace(claimed, lease_expires_at=seconds_from_now(-1)))
+
+            recovered = store.recover_stale_tasks(job.id)
+
+            self.assertEqual([task.id for task in recovered], [stale.id])
+            self.assertEqual(store.get_task_by_id(fresh.id).status, TaskStatus.RUNNING)
+
+    def test_job_progress_cursor_uses_event_cursor_not_full_scan(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("progress signal")
+            orch = Orchestrator(store)
+
+            before = orch._job_progress_cursor(job.id)
+            store.emit(job.id, "tick", {"n": 1})
+            after = orch._job_progress_cursor(job.id)
+
+            self.assertEqual(after, store.event_cursor(job.id))
+            self.assertGreater(after, before)
+            # Must not fall back to the O(events) read_events() full scan.
+            with patch.object(
+                store, "read_events", side_effect=AssertionError("read_events called")
+            ):
+                self.assertGreaterEqual(orch._job_progress_cursor(job.id), after)
+
+
+class OutputStyleTests(unittest.TestCase):
+    def test_normalize_accepts_valid_and_rejects_junk(self) -> None:
+        from puppetmaster.output_style import normalize_style
+
+        self.assertEqual(normalize_style("terse"), "terse")
+        self.assertEqual(normalize_style("  LITHIC "), "lithic")
+        for disabled in (None, "", "off", "none", "false", "garbage"):
+            self.assertIsNone(normalize_style(disabled))
+
+    def test_resolve_payload_wins_over_env(self) -> None:
+        from puppetmaster.output_style import resolve_output_style
+
+        self.assertEqual(resolve_output_style("lithic", "terse"), "lithic")
+        # An explicit disabled payload suppresses the env default for that spec.
+        self.assertIsNone(resolve_output_style("off", "terse"))
+        # No payload → fall back to env.
+        self.assertEqual(resolve_output_style(None, "terse"), "terse")
+
+    def test_directive_tiers_and_uncertainty_rule(self) -> None:
+        from puppetmaster.output_style import directive_for
+
+        self.assertEqual(directive_for(None), "")
+        terse = directive_for("terse")
+        lithic = directive_for("lithic")
+        # The merged uncertainty rule must keep both halves so banning hedges
+        # never coerces false confidence.
+        self.assertIn("unconfirmed: X", terse)
+        self.assertIn("false confidence", terse)
+        # Only lithic drops grammatical glue.
+        self.assertNotIn("Drop articles", terse)
+        self.assertIn("Drop articles", lithic)
+        # Reasoning is explicitly preserved.
+        self.assertIn("not reasoning", terse)
+
+    def test_apply_is_noop_when_disabled_and_prepends_when_on(self) -> None:
+        from puppetmaster.output_style import apply_output_style
+
+        self.assertEqual(apply_output_style("do the thing", None), "do the thing")
+        applied = apply_output_style("do the thing", "terse")
+        self.assertTrue(applied.endswith("do the thing"))
+        self.assertIn("OUTPUT STYLE (terse)", applied)
+
+    def test_orchestrator_seam_respects_env_and_payload(self) -> None:
+        from puppetmaster.output_style import OUTPUT_STYLE_ENV
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            orch = Orchestrator(store)
+            specs = [
+                WorkerSpec(role="explore", instruction="map the repo"),
+                WorkerSpec(
+                    role="review",
+                    instruction="review the diff",
+                    payload={"output_style": "off"},
+                ),
+                WorkerSpec(
+                    role="audit",
+                    instruction="audit endpoints",
+                    payload={"output_style": "lithic"},
+                ),
+            ]
+            with patch.dict(os.environ, {OUTPUT_STYLE_ENV: "terse"}):
+                out = orch._with_output_style(specs)
+
+            # env default applies to the un-opinionated spec
+            self.assertIn("OUTPUT STYLE (terse)", out[0].instruction)
+            self.assertEqual(out[0].payload.get("output_style"), "terse")
+            # payload "off" opts this spec out even though env is on
+            self.assertEqual(out[1].instruction, "review the diff")
+            # payload tier wins over env tier
+            self.assertIn("OUTPUT STYLE (lithic)", out[2].instruction)
+
+    def test_orchestrator_seam_off_by_default(self) -> None:
+        from puppetmaster.output_style import OUTPUT_STYLE_ENV
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            orch = Orchestrator(store)
+            specs = [WorkerSpec(role="explore", instruction="map the repo")]
+            env = {k: v for k, v in os.environ.items() if k != OUTPUT_STYLE_ENV}
+            with patch.dict(os.environ, env, clear=True):
+                out = orch._with_output_style(specs)
+            self.assertEqual(out[0].instruction, "map the repo")
+            self.assertNotIn("output_style", out[0].payload)
+
+
 if __name__ == "__main__":
     unittest.main()

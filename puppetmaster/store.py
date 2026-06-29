@@ -198,9 +198,10 @@ class SwarmStore:
         task_id: str,
         worker_id: str,
         lease_seconds: int = 60,
+        task_map: Optional[dict[str, Task]] = None,
     ) -> Optional[Task]:
         task = self.get_task_by_id(task_id)
-        if not self.dependencies_complete(task):
+        if not self.dependencies_complete(task, task_map=task_map):
             blocked = replace(task, status=TaskStatus.BLOCKED, updated_at=now_iso())
             self.save_task(blocked)
             return None
@@ -303,7 +304,14 @@ class SwarmStore:
             if not self.acquire_lock(lock_name, worker_id, ttl_seconds=lock_ttl):
                 continue
             try:
-                return self.claim_task(task.id, worker_id, lease_seconds=lease_seconds)
+                # Reuse the task_map already built for this sweep so the claim's
+                # own dependency recheck doesn't re-fetch each dependency by id
+                # (one get_task_by_id / SQLite SELECT per edge). Dependencies are
+                # monotonic toward COMPLETE, so the map is as fresh as the scan
+                # that selected this task.
+                return self.claim_task(
+                    task.id, worker_id, lease_seconds=lease_seconds, task_map=task_map
+                )
             finally:
                 self.release_lock(lock_name, owner=worker_id)
         return None

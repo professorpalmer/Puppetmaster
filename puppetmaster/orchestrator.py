@@ -1849,12 +1849,18 @@ class Orchestrator:
         ]
         return max([base_timeout * 3, *explicit])
 
-    def _job_event_count(self, job_id: str) -> int:
-        """Total event count for a job — the cheap, backend-agnostic progress
-        signal. A growing count between polls means the worker is still doing
-        work (heartbeats, lease renewals, saved tasks/artifacts)."""
+    def _job_progress_cursor(self, job_id: str) -> int:
+        """Monotonic event cursor for a job — the cheap, backend-agnostic
+        progress signal. A growing cursor between polls means the worker is
+        still doing work (heartbeats, lease renewals, saved tasks/artifacts).
+
+        Uses ``event_cursor`` (SQLite ``MAX(id)``, file backend's size-keyed
+        cache) rather than ``len(read_events())`` so a long-running worker's
+        wait loop stays O(1) per poll instead of re-reading and deserializing
+        the entire event stream each tick — the SwarmStore cursor-read contract
+        in AGENTS.md."""
         try:
-            return len(self.store.read_events(job_id))
+            return self.store.event_cursor(job_id)
         except Exception:
             return 0
 
@@ -1872,7 +1878,7 @@ class Orchestrator:
         hard_cap = self._worker_hard_cap(tasks, base_timeout)
         poll = max(5, min(30, base_timeout // 4 or 5))
         start = time.monotonic()
-        last_event_count = self._job_event_count(job.id)
+        last_progress = self._job_progress_cursor(job.id)
         extended = False
         while True:
             elapsed = time.monotonic() - start
@@ -1884,9 +1890,9 @@ class Orchestrator:
                 elapsed = time.monotonic() - start
                 if elapsed < base_timeout:
                     continue
-                event_count = self._job_event_count(job.id)
-                progressed = event_count > last_event_count
-                last_event_count = event_count
+                progress = self._job_progress_cursor(job.id)
+                progressed = progress > last_progress
+                last_progress = progress
                 if progressed and elapsed < hard_cap:
                     if not extended:
                         self.store.emit(

@@ -435,10 +435,11 @@ class SQLiteSwarmStore(SwarmStore):
         task_id: str,
         worker_id: str,
         lease_seconds: int = 60,
+        task_map: Optional[dict[str, Task]] = None,
     ) -> Optional[Task]:
         self.init()
         task = self.get_task_by_id(task_id)
-        if not self.dependencies_complete(task):
+        if not self.dependencies_complete(task, task_map=task_map):
             blocked = replace(task, status=TaskStatus.BLOCKED, updated_at=now_iso())
             self.save_task(blocked)
             return None
@@ -519,22 +520,24 @@ class SQLiteSwarmStore(SwarmStore):
     def recover_stale_tasks(self, job_id: str) -> list[Task]:
         self.init()
         now = now_iso()
+        stale = [task for task in self.list_tasks(job_id) if self.is_task_stale(task)]
+        if not stale:
+            return []
+        # Recover every stale task inside ONE transaction instead of opening a
+        # fresh session (commit + fsync) per task. The per-row CAS guard and
+        # rowcount check are preserved exactly, so a task another worker recovers
+        # concurrently is still skipped; we just stop paying N commits when a
+        # crashed-worker wave leaves many leases expired at once.
         recovered: list[Task] = []
-        for task in self.list_tasks(job_id):
-            if not self.is_task_stale(task):
-                continue
-            queued = replace(
-                task,
-                status=TaskStatus.QUEUED,
-                lease_owner=None,
-                lease_expires_at=None,
-                updated_at=now,
-            )
-            recover_payload = {
-                "task_id": task.id,
-                "previous_owner": task.lease_owner,
-            }
-            with self._session() as connection:
+        with self._session() as connection:
+            for task in stale:
+                queued = replace(
+                    task,
+                    status=TaskStatus.QUEUED,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    updated_at=now,
+                )
                 cursor = connection.execute(
                     """
                     UPDATE tasks SET status = ?, data = ?
@@ -556,11 +559,18 @@ class SQLiteSwarmStore(SwarmStore):
                         job_id,
                         now,
                         "task.recovered",
-                        json.dumps(recover_payload, sort_keys=True),
+                        json.dumps(
+                            {"task_id": task.id, "previous_owner": task.lease_owner},
+                            sort_keys=True,
+                        ),
                     ),
                 )
+                recovered.append(queued)
+        # Locks are a separate store concern; release them only after the
+        # recovery transaction has committed, and never while holding the
+        # session connection.
+        for task in recovered:
             self.release_lock(f"task:{task.id}")
-            recovered.append(queued)
         return recovered
 
     def save_run(self, run: AgentRun) -> None:
