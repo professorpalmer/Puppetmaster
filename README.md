@@ -5,15 +5,30 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/professorpalmer/Puppetmaster/blob/main/LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://github.com/professorpalmer/Puppetmaster/blob/main/pyproject.toml)
 
-**Turn Cursor, Claude Code (Anthropic or AWS Bedrock), the OpenAI API, the Codex CLI, or Hermes into an orchestrator that routes every task to the cheapest model that can handle it, runs workers as independent processes, and stores their output as typed SQLite artifacts so follow-ups cost zero tokens.**
+Puppetmaster turns the agent CLIs you already pay for — Cursor, Claude Code (Anthropic or AWS Bedrock), the OpenAI API, the Codex CLI, or Hermes — into an orchestrator. It routes each task to the cheapest model that can handle it, runs workers as independent processes, and stores their output as typed SQLite artifacts, so follow-up reads cost zero tokens.
 
-<img src="https://raw.githubusercontent.com/professorpalmer/Puppetmaster/main/docs/demo.gif" alt="Puppetmaster 60-second demo: cost routing, swarm fan-out, stitched summary, $0 follow-ups" width="100%" />
+<img src="https://raw.githubusercontent.com/professorpalmer/Puppetmaster/main/docs/demo.gif" alt="Puppetmaster 60-second demo: cost routing, swarm fan-out, stitched summary, and zero-token follow-ups" width="100%" />
 
-<img src="https://raw.githubusercontent.com/professorpalmer/Puppetmaster/main/docs/receipts.svg" alt="The receipts — Scenario A (best case, live OpenAI A/B): 98.8% cheaper, 88% faster. Scenario B (everyday mixed workload, dry-run): 35.1% cheaper overall." width="100%" />
+## Contents
 
-> **💸 Reproduce the live A/B in ~$0.01 of spend** — `OPENAI_API_KEY=... python -m bench.router_live_ab`. Pinned `gpt-5.5` cost **\$0.0132**; Puppetmaster routed the same task to `gpt-5.4-nano` for **\$0.00016** (same prompt, equivalent answer). The 35.1% figure is a 6-task mixed-workload dry-run where the router *correctly* kept the frontier model on the 2 hard tasks — full method in [docs/CLAIMS.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/CLAIMS.md).
+- [Install](https://github.com/professorpalmer/Puppetmaster#install) and [Uninstall](https://github.com/professorpalmer/Puppetmaster#uninstall)
+- [What it does](https://github.com/professorpalmer/Puppetmaster#what-it-does) — the object model, and how it differs from agent frameworks
+- [Why it's credible](https://github.com/professorpalmer/Puppetmaster#why-its-credible) — four claims, four reproducible receipts
+- [Quickstart](https://github.com/professorpalmer/Puppetmaster#quickstart) — prompts and shell recipes
+- [Recommended setup](https://github.com/professorpalmer/Puppetmaster#recommended-setup) — a cheap chat model that delegates the real work
+- [Auto-invocation](https://github.com/professorpalmer/Puppetmaster#auto-invocation) — how delegation fires without reminding the agent
+- [Output style and compression](https://github.com/professorpalmer/Puppetmaster#output-style-and-compression)
+- [Status](https://github.com/professorpalmer/Puppetmaster#status)
 
-> **🔁 Self-healing — a dead provider doesn't kill the swarm (proven live, job `job_d82715bebc5d`):** a `claude-code` worker hit a real **\$0 Anthropic balance** → classified `billing_or_quota` → marked **FAILED** → **auto-rerouted to `cursor/gpt-5.5`** (plan-billed, `$0`) → the funded adapter **completed the task.** No silent degraded run.
+Documentation lives in [`docs/`](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/README.md):
+
+- Design and rationale — [WHY.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/WHY.md)
+- How it compares to LangGraph / CrewAI / native subagents — [COMPARISON.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/COMPARISON.md)
+- The proof behind the claims — [CLAIMS.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/CLAIMS.md)
+- Everything that ships, with the adapter table — [FEATURES.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/FEATURES.md)
+- Safety and threat model — [SECURITY.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/SECURITY.md)
+- Prompt and shell recipes — [DAILY_DRIVER.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/DAILY_DRIVER.md)
+- Model routing, architecture, adapters, CodeGraph, CLI — see the [docs index](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/README.md)
 
 ## Install
 
@@ -22,115 +37,61 @@ pipx install puppetmaster-ai     # or: pip install puppetmaster-ai
 puppetmaster setup               # doctor + models init + MCP installers + rules + hooks — idempotent
 ```
 
-<p align="center">
-<img src="https://raw.githubusercontent.com/professorpalmer/Puppetmaster/main/docs/setup-guide.jpg" alt="Puppetmaster setup guide: install once with pipx, wire your platform (Cursor, Claude Code, Codex CLI, or the OpenAI API), then verify with puppetmaster doctor." width="640" />
-</p>
+That is the whole install. `setup` runs each step idempotently, skips any tool that isn't present, and prints what it did. Restart Cursor (or open a fresh Codex, Claude, or Hermes session) and the agent gains the `puppetmaster_*` MCP tools, a rule nudging it to use them, and [auto-invocation hooks](https://github.com/professorpalmer/Puppetmaster#auto-invocation) that delegate real work. The whole thing is kill-switchable with `PUPPETMASTER_AUTO_INVOKE_DISABLED=1`.
 
-That's the whole install. `setup` runs every step idempotently, skips any tool that isn't present, and prints what it did. Restart Cursor (or open a fresh Codex / Claude / Hermes session) and the agent gains 32+ `puppetmaster_*` tools, a rule nudging it to use them, and deterministic [auto-invocation hooks](https://github.com/professorpalmer/Puppetmaster#auto-invocation) that delegate real work for you. The classifier keeps trivial edits and read-only inspection inline, and the whole thing is kill-switchable with `PUPPETMASTER_AUTO_INVOKE_DISABLED=1`.
+Setup starts with every platform off and asks you to enable at least one execution adapter (`--platforms cursor`, or an interactive pick). A single platform is the expected setup; enabling several is opt-in and unlocks cross-platform router fallback and free-tier hopping. Add more later with `puppetmaster platform enable <name>`. For CI, pass `--platforms <comma-list>` or `--platforms all`.
 
-### Platform lock (setup step 2)
-
-The setup wizard starts with **every platform shown OFF** on first run — you must explicitly enable at least one execution adapter before setup continues (`--platforms cursor` or an interactive pick). **Single-platform is the expected setup** for most users (e.g. just Cursor or just Claude Code). Enabling multiple platforms is opt-in power-user territory: it unlocks cross-platform router fallback/healing and free-tier hopping. Add more anytime with `puppetmaster platform enable <name>`.
-
-Runtime without a prior choice stays permissive for upgrades: absent `~/.puppetmaster/platform.json`, routing still sees all adapters as available. The default-OFF display is wizard-only — it does not brick existing installs that never ran setup.
-
-`auto_route` still picks among models on whichever platform(s) you enabled — useful with a single platform. Cross-platform “healing” (rerouting a failed worker to a different harness) only applies when two or more platforms are enabled.
-
-Non-interactive CI: pass `--platforms <comma-list>` or `--platforms all`. Without `--platforms` on a fresh machine, setup fails with guidance instead of silently proceeding.
-
-### Hermes advanced setup (step 7)
-
-When Hermes is among your enabled platforms and the Hermes CLI is on PATH, setup offers an optional in-depth branch (skip with `--skip-hermes-advanced`):
-
-1. **Learn flywheel** — `PUPPETMASTER_LEARN=1` on the puppetmaster MCP entry: finished swarms distill into Hermes skill **candidates** (never auto-promoted).
-2. **Review & promote** — `puppetmaster skills list-candidates`, then `puppetmaster skills promote-candidate <slug>`.
-3. **Skill injection** — `PUPPETMASTER_INJECT_HERMES_SKILLS=1` so routed Hermes workers inherit your curated live skill bodies. **Caveat:** injected bodies ride every worker turn (per-turn token cost), bounded by `PUPPETMASTER_SKILL_TOKEN_BUDGET` (default 1200).
-
-Accepted toggles are written into `mcp_servers.puppetmaster.env` in Hermes `config.yaml` — durable and scoped to the Hermes-hosted puppetmaster MCP server.
-
-> **🪽 New — Hermes support.** [Hermes](https://hermes-agent.nousresearch.com) is now a first-class worker adapter alongside Cursor, Claude Code, Codex, and OpenAI. Wire it with `puppetmaster install-hermes-mcp`, then run Hermes workers through the same router, swarms, typed artifacts, and `$0` recall as every other harness. Details in [docs/ADAPTERS.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/ADAPTERS.md#hermes).
-
-<p align="center">
-<img src="https://raw.githubusercontent.com/professorpalmer/Puppetmaster/main/docs/hermes-support.png" alt="Hermes × Puppetmaster: Hermes is now a first-class adapter. Puppetmaster brings cost-aware routing, swarm fan-out, CodeGraph context, $0 follow-ups, self-healing, and durable auditable state to Hermes — five harnesses, one orchestrator." width="100%" />
-</p>
-
-
-To run benchmarks or hack on it, clone instead — see [Contributing](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/CONTRIBUTING.md). (`pipx` keeps the CLI in its own isolated environment — the recommended way to install a command-line app.)
+Hermes has an optional in-depth setup branch (learn flywheel, skill promotion, skill injection); see [ADAPTERS.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/ADAPTERS.md#hermes). To run benchmarks or hack on the code, clone instead — see [CONTRIBUTING.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/CONTRIBUTING.md).
 
 ## Uninstall
-
-Remove host-side integrations first, then drop the Python package:
 
 ```bash
 puppetmaster uninstall          # MCP registrations, hooks, rules — idempotent
 pip uninstall puppetmaster-ai   # or: pipx uninstall puppetmaster-ai
 ```
 
-`uninstall` removes only Puppetmaster-owned artifacts: the `puppetmaster` entry from workspace and global Cursor `mcp.json` (other MCP servers stay), the Codex `[mcp_servers.puppetmaster]` table, auto-invocation hooks in `.cursor/hooks.json` and `.claude/settings.json` (project and global scopes), and rule files/blocks (`.cursor/rules/puppetmaster.mdc`, marked blocks in `AGENTS.md` / `CLAUDE.md`). It also kills stale Puppetmaster MCP daemon processes. Swarm state under `~/.puppetmaster/` and workspace `.codegraph/` are **left intact** unless you pass `--purge-state`. Use `--dry-run` to preview, `--yes` to skip confirmation, and `--cwd` to target a different workspace.
-
-## Index
-
-**New here?** Watch the GIF above, run `pipx install puppetmaster-ai && puppetmaster setup`, then skim [What it does](https://github.com/professorpalmer/Puppetmaster#what-it-does).
-
-| Want to… | Go to |
-|---|---|
-| Understand the design & what it fixes | [docs/WHY.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/WHY.md) |
-| Know how it differs from LangGraph / CrewAI / subagents | [docs/COMPARISON.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/COMPARISON.md) |
-| Know if it's safe to hand it your repo & plan | [docs/SECURITY.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/SECURITY.md) |
-| See the proof behind the claims | [docs/CLAIMS.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/CLAIMS.md) · receipts in [`bench/`](https://github.com/professorpalmer/Puppetmaster/tree/main/bench/) |
-| See everything that ships + adapters | [docs/FEATURES.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/FEATURES.md) |
-| Copy/paste prompts & shell recipes | [Quickstart](https://github.com/professorpalmer/Puppetmaster#quickstart) · [docs/DAILY_DRIVER.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/DAILY_DRIVER.md) |
-| Read the full docs set | [docs/README.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/README.md) |
-| Browse by directory | [`puppetmaster/`](https://github.com/professorpalmer/Puppetmaster/blob/main/puppetmaster/README.md) · [`bench/`](https://github.com/professorpalmer/Puppetmaster/blob/main/bench/README.md) · [`examples/`](https://github.com/professorpalmer/Puppetmaster/blob/main/examples/README.md) · [`scripts/`](https://github.com/professorpalmer/Puppetmaster/blob/main/scripts/README.md) · [`clients/typescript/`](https://github.com/professorpalmer/Puppetmaster/blob/main/clients/typescript/README.md) |
+`uninstall` removes only Puppetmaster-owned artifacts (its MCP entries, auto-invocation hooks, and rule files or marked blocks) and leaves other MCP servers untouched. Swarm state under `~/.puppetmaster/` and workspace `.codegraph/` are kept unless you pass `--purge-state`. Use `--dry-run` to preview and `--cwd` to target another workspace.
 
 ## What it does
 
-Think **Redis/Gunicorn for agentic engineering**:
+Think of it as Redis or Gunicorn for agentic engineering: a supervisor in front of worker processes, with durable shared state.
 
 ```text
-Cursor Agent / Claude Code / OpenAI / Codex CLI / Hermes / shell
+Cursor / Claude Code / OpenAI / Codex / Hermes / shell
         |
         v
-Puppetmaster supervisor  ──>  task-aware model router (auto-routes by cost)
+Puppetmaster supervisor  ->  task-aware model router (routes by cost)
         |
         v
-independent worker processes  ──>  SQLite (typed artifacts, events, memory)
+independent worker processes  ->  SQLite (typed artifacts, events, memory)
         |
         v
-live artifact board  ──>  stitched summary  ──>  0-token follow-up reads
+live artifact board  ->  stitched summary  ->  zero-token follow-up reads
 ```
 
-Puppetmaster isn't trying to beat native IDE subagents at every tiny task. It's for the work that gets messy: long repo investigations, conflicting hypotheses, repeated handoffs, flaky memory, and code changes that need evidence, replay, and approval gates. The rationale and failure modes it fixes are in [docs/WHY.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/WHY.md).
+It isn't meant to beat native IDE subagents at every small task. It's for work that gets messy: long repo investigations, conflicting hypotheses, repeated handoffs, flaky memory, and code changes that need evidence, replay, and approval gates.
 
-**How it's different:** LangGraph, CrewAI, and the Claude Agent SDK are libraries you write code against to *build* an agent. Puppetmaster sits one layer up — it **orchestrates the agent CLIs you already pay for** (Cursor, Claude Code, Codex, OpenAI, and now **Hermes**), routes each task to the cheapest sufficient model, keeps the spend inside your subscription, and self-heals when a provider is down. Full side-by-side + "pick X instead if…" in [docs/COMPARISON.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/COMPARISON.md).
+LangGraph, CrewAI, and the Claude Agent SDK are libraries you write code against to build an agent. Puppetmaster sits one layer up — it drives the agent CLIs you already pay for, routes each task to the cheapest sufficient model, keeps spend inside your subscription, and self-heals when a provider goes down. The rationale and the side-by-side are in [WHY.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/WHY.md) and [COMPARISON.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/COMPARISON.md).
 
-<p align="center">
-<img src="https://raw.githubusercontent.com/professorpalmer/Puppetmaster/main/docs/layer-above.jpg" alt="A layer above your agents, not another framework. Cursor / Claude Code / Codex / OpenAI feed into Puppetmaster (cost-aware router + supervisor), which fans out to independent worker processes, SQLite typed artifacts, and $0 follow-up reads. LangGraph / CrewAI are libraries you write code against to build an agent; Puppetmaster drives the agent CLIs you already use." width="100%" />
-</p>
-
-### The demo (no API keys)
-
-The whole story in one command — local + shell adapters, nothing to configure:
+You can see the whole story in one command, with no API keys:
 
 ```bash
-./scripts/demo.sh                  # the 60-second tour (clean machine, no keys)
-python -m puppetmaster dashboard   # live, zero-dependency web board for any job
+./scripts/demo.sh                  # 60-second tour on a clean machine
+python -m puppetmaster dashboard   # live web board for any job
 ```
 
-It routes a task mix by cost, fans out a 6-role swarm as independent processes, reads the stitched summary, then proves follow-up reads cost **\$0.00**. Script + GIF source: [`scripts/`](https://github.com/professorpalmer/Puppetmaster/blob/main/scripts/README.md).
+## Why it's credible
 
-## Why it's credible — four claims, four receipts
+Every number is reproducible from a script in [`bench/`](https://github.com/professorpalmer/Puppetmaster/tree/main/bench/); full method and caveats in [CLAIMS.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/CLAIMS.md).
 
-Every number is reproducible from a script in [`bench/`](https://github.com/professorpalmer/Puppetmaster/tree/main/bench/). Full detail + caveats: [docs/CLAIMS.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/CLAIMS.md).
-
-1. **Cost is fixed on two axes.** New work auto-routes to the cheapest sufficient model (**35% cheaper** on a fixture; **98.8% cheaper** in a live OpenAI A/B). Follow-ups are SQLite reads, not new agent runs (**40 queries, \$0.00, 0.5 ms each**).
-2. **Workers don't share a transcript.** They lease tasks and emit **typed artifacts** (payload + `evidence` + `confidence` + `sha256`); the stitcher reads JSON, not stdout. Inspect with `puppetmaster artifacts <job_id>`.
-3. **Graphing is [CodeGraph](https://github.com/colbymchenry/codegraph)'s win, wired in cleanly.** Workers auto-inject task-relevant graph context before the model call; fall back to grep/read without it. ([docs/CODEGRAPH.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/CODEGRAPH.md))
-4. **A dead provider doesn't kill the swarm (v0.9.0+).** Billing/quota/auth/missing-CLI failures are marked `FAILED` and **auto-rerouted to the next funded adapter**, preferring plan-billed models. Validated live; surfaced loudly in the summary's Alerts section.
+1. Cost is fixed on two axes. New work routes to the cheapest sufficient model (35% cheaper on a fixture; 98.8% cheaper in a live OpenAI A/B). Follow-ups are SQLite reads, not new runs (40 queries, $0.00, 0.5 ms each).
+2. Workers don't share a transcript. They lease tasks and emit typed artifacts (payload, evidence, confidence, sha256); the stitcher reads JSON, not stdout. Inspect with `puppetmaster artifacts <job_id>`.
+3. CodeGraph context is injected before the model call, so workers look up "where is X / what calls Y" structurally instead of grepping, and fall back to grep without it.
+4. A dead provider doesn't kill the swarm. Billing, quota, auth, and missing-CLI failures are marked `FAILED` and rerouted to the next funded adapter, preferring plan-billed models. Validated live and surfaced in the summary's alerts.
 
 ## Quickstart
 
-After install, try one of these inside Cursor Agent or Codex:
+Inside Cursor Agent or Codex:
 
 ```text
 Use Puppetmaster to run doctor in this repo and summarize what is missing.
@@ -143,7 +104,7 @@ Constraints: keep the patch focused, preserve public API behavior, run relevant 
 Do review/plan first. Poll status/logs by job id. Do not edit until you summarize findings and ask for approval.
 ```
 
-Or from the shell:
+From the shell:
 
 ```bash
 puppetmaster doctor
@@ -153,80 +114,46 @@ puppetmaster claude "Implement the approved change and run focused tests" --perm
 puppetmaster show $(puppetmaster last)
 ```
 
-### Effort levels & payload defaults
+More recipes — including high/low effort model variants via `puppetmaster models setup` — are in [DAILY_DRIVER.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/DAILY_DRIVER.md) and [MODEL_ROUTING.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/MODEL_ROUTING.md).
 
-The router reads your user-owned model registry at `~/.puppetmaster/models.json`.
-Use the interactive registry wizard when you want high/low effort variants
-without hand-editing JSON:
+## Recommended setup
 
-```bash
-puppetmaster models setup
-puppetmaster models set codex/gpt-5-5-high effort=high
-```
-
-Effort is stored as adapter-specific `payload_defaults`, which Puppetmaster
-injects whenever that registry entry is picked. Explicit task payload keys still
-win. A high-effort OpenAI variant can look like:
-
-```json
-{
-  "id": "openai/gpt-5-5-high",
-  "adapter": "openai",
-  "adapter_model_name": "gpt-5.5",
-  "capability_score": 98,
-  "input_per_mtok_usd": 5.0,
-  "output_per_mtok_usd": 30.0,
-  "context_window": 1000000,
-  "billing": "api",
-  "tags": ["openai", "reasoning", "effort:high"],
-  "payload_defaults": {"reasoning_effort": "high"},
-  "output_token_multiplier": 2.0,
-  "notes": "High-effort variant of openai/gpt-5-5."
-}
-```
-
-More recipes in [docs/DAILY_DRIVER.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/DAILY_DRIVER.md).
-
-## Recommended setup: a cheap chat model that delegates to Puppetmaster
-
-The pattern that works best — and the one `puppetmaster setup` nudges your agent toward — is to **keep a cheap conversational model in your IDE chat window and let it hand the technical work to Puppetmaster.** You talk to the fast/cheap model for everything conversational; the moment a request is real engineering (multi-file investigation, a refactor, a review, an implementation), it starts a Puppetmaster job and drives it.
+The pattern that works best, and the one `setup` nudges your agent toward, is to keep a cheap conversational model in your IDE chat window and let it hand the technical work to Puppetmaster.
 
 ```text
-You ── chat ──> cheap conversational model (fast, $-light)
-                      │
-                      │  "this is real work" → delegate
+You -- chat --> cheap conversational model (fast, low cost)
+                      |
+                      |  "this is real work" -> delegate
                       v
               Puppetmaster (routes to the cheapest sufficient model,
               runs durable workers, stores typed artifacts)
 ```
 
-Why this is the shape to aim for:
+Conversational asks stay instant and cheap. Real engineering — multi-file investigation, a refactor, a review, an implementation — gets the full machine: cost routing, independent workers, durable artifacts, replay, and zero-token follow-up reads. Context compounds in artifacts and promoted memory that later jobs reuse, instead of in a chat scrollback that evaporates.
 
-- **Conversational asks stay instant and cheap.** "What does this do?", "summarize that", "thanks" never pay orchestration cost.
-- **Technical work gets the full machine** — cost routing, independent workers, durable artifacts, replay, $0 follow-up reads — only when it's warranted.
-- **Context compounds where it belongs.** Each delegated job leaves typed artifacts and promoted memory that later jobs reuse, instead of living in a chat scrollback that evaporates.
-
-The agent rules installed by `puppetmaster setup` (Cursor `.mdc` + `AGENTS.md`) already encode this: *start a swarm for non-trivial work; use native tooling for trivial edits and conversational follow-ups.*
-
-### Puppetmaster is not a chat layer — on purpose
-
-Don't try to route **every** chat message through Puppetmaster "to capture context." It's a deliberate boundary, not a missing feature: spinning a durable worker for "hi" or "what's this function" inverts the entire value proposition (you'd add orchestration cost and latency to the cheapest turns), and it fights the IDE, which doesn't expose a clean intercept-every-message hook. Let the cheap model triage; let Puppetmaster do the work that deserves a job. The router-at-the-top decides what crosses that line.
+Don't try to route every chat message through Puppetmaster to "capture context." Spinning a durable worker for "hi" or "what's this function" inverts the value: it adds orchestration cost to the cheapest turns, and it fights the IDE, which has no clean intercept-every-message hook. Let the cheap model triage; let Puppetmaster do the work that deserves a job.
 
 ## Auto-invocation
 
-The hardest part of that pattern is getting the host agent to *actually* delegate without you reminding it every few turns. Rules help but decay with context distance. So `puppetmaster setup` also installs a layered, classifier-gated enforcement system — designed to fire automatically exactly when a task warrants a job, and stay out of the way otherwise.
+The hard part of that pattern is getting the host agent to actually delegate without reminders. `setup` installs a classifier-gated enforcement layer for it:
 
-- **The gate** (`puppetmaster should-delegate "<prompt>"`) reuses the router's existing pure-function classifier to answer delegate-vs-inline in microseconds — no LLM, no network. A trivial-task carve-out keeps typos/renames/one-liners/quick questions inline; a conservative threshold and a broad-scope override (audit/refactor/migrate/trace) catch real multi-file work.
-- **Deterministic hooks** (`puppetmaster install-hooks`, run automatically by `setup`) write idempotent, non-destructive entries into Cursor's `.cursor/hooks.json` and Claude Code's `.claude/settings.json`: they inject a "delegate now" directive on prompt submit and **deny-redirect** genuinely broad shell searches (recursive `rg`/`grep`/`find`) plus built-in `Task` fan-out to the Puppetmaster/CodeGraph equivalent. Read-only inspection — `git log`/`show`/`diff`, listing a directory, single-file greps, and the native Grep/Glob tools — is explicitly carved out and passes through, because their scope isn't visible to the hook and hard-denying them would wedge legitimate work. They fail open — a hook can never wedge your session. Default scope is per-repo; `puppetmaster install-hooks --global` (or `setup --global-hooks`) writes user-level hooks (`~/.cursor/hooks.json`, `~/.claude/settings.json`) that cover every repo you open without re-running setup.
-- **Optional proxy** (`puppetmaster proxy`) extends the same gate to OpenAI-compatible API-key/SDK clients that closed harnesses can't hook.
+- A pure-function gate (`puppetmaster should-delegate "<prompt>"`) answers delegate-vs-inline in microseconds with no LLM and no network. Typos, renames, one-liners, and quick questions stay inline; audits, refactors, migrations, and other broad-scope work delegate.
+- Deterministic hooks in Cursor's `.cursor/hooks.json` and Claude Code's `.claude/settings.json` inject a "delegate now" directive on prompt submit and redirect genuinely broad shell searches to the Puppetmaster/CodeGraph equivalent. Read-only inspection (git log/show/diff, listing a directory, single-file greps, native Grep/Glob) passes through. Hooks fail open and never wedge a session. Add `--global` to cover every repo.
+- An optional proxy (`puppetmaster proxy`) extends the same gate to OpenAI-compatible clients that closed harnesses can't hook.
 
-**Honest about the ceiling:** there is no universal *deterministic* invocation. Closed harnesses won't let anything sit on their LLM provider wire or force an MCP call, so the system is explicitly tiered — soft rules everywhere, hard hooks where the host exposes them (Cursor, Claude Code), proxy only for clients routed through it — and fully kill-switchable with `PUPPETMASTER_AUTO_INVOKE_DISABLED=1`. It enforces the "let the cheap model triage, let Puppetmaster do the real work" boundary above; it does not try to make Puppetmaster a chat layer.
+There is no universal deterministic invocation: closed harnesses won't let anything sit on their provider wire. So the system is tiered — soft rules everywhere, hard hooks where the host exposes them, proxy only for clients routed through it — and fully kill-switchable with `PUPPETMASTER_AUTO_INVOKE_DISABLED=1`.
+
+## Output style and compression
+
+Workers can optionally write tighter prose. `PUPPETMASTER_OUTPUT_STYLE=terse` (or `lithic`, or per-task `payload.output_style`) constrains form, not reasoning, so it trades verbosity for readability and latency without lowering answer quality. See [OUTPUT_STYLE.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/OUTPUT_STYLE.md).
+
+Puppetmaster does not bundle input-side context compressors (RTK, Headroom, caveman). We measured them: the net savings are small and the failure modes (a compressor dropping data the agent then re-reads) run the wrong way for a coding agent. [COMPRESSION.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/COMPRESSION.md) shows the evidence and how to wire one yourself if you want it.
 
 ## Status
 
-**Daily-driver beta.** Real runtime contract, automated tests, SQLite default backend, fail-closed jobs, live Cursor Agent MCP, validated full-edit adapters. Credible for supervised local engineering; not yet a hosted multi-user service. Full feature matrix: [docs/FEATURES.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/FEATURES.md).
+Daily-driver beta. Real runtime contract, automated tests, SQLite backend, fail-closed jobs, a live Cursor Agent MCP, and validated full-edit adapters. Credible for supervised local engineering; not yet a hosted multi-user service. Full feature matrix in [FEATURES.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/FEATURES.md).
 
-**Pip name:** PyPI lists this as [`puppetmaster-ai`](https://pypi.org/project/puppetmaster-ai/) because [PEP-503 normalization](https://peps.python.org/pep-0503/#normalized-names) collides `puppetmaster` with an [abandoned 2019 `puppet-master`](https://pypi.org/project/puppet-master/). The import name, CLI, repo, and brand stay `puppetmaster`.
+PyPI lists the package as [`puppetmaster-ai`](https://pypi.org/project/puppetmaster-ai/); [PEP 503 normalization](https://peps.python.org/pep-0503/#normalized-names) collides `puppetmaster` with an abandoned 2019 package. The import name, CLI, repo, and brand stay `puppetmaster`.
 
 ## License
 
