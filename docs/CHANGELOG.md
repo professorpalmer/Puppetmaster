@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.9.90
+
+**Opt-in PyPI update awareness plus an explicit `puppetmaster self-update` command — Puppetmaster can tell you when it's behind and upgrade on request, but it never auto-installs and deliberately never upgrades on error.** The long-lived stdio MCP server cannot hot-reload its own code (the client owns the pipe), so "self-update" means *detect + one-command upgrade + restart nudge*, not an in-process swap. Auto-upgrading mid-run — especially keyed on errors — would change code out from under a running swarm and turn one bad release into an outage, so it is intentionally not built.
+
+- **Opt-in PyPI latest-version check.** New `puppetmaster/update_check.py` queries the PyPI JSON API for the latest `puppetmaster-ai` release and, when newer than what's installed, surfaces a one-line nudge. Off by default; gated behind `PUPPETMASTER_PYPI_UPDATE_CHECK=1`. The network call uses the stdlib `urllib` (no new dependency) with a 3s timeout, fails completely silently (returns `None`) on any network/parse error, and is cached with a 6h TTL so the MCP hot path never makes a per-call network request.
+- **`puppetmaster self-update` CLI command.** Runs `pip install -U puppetmaster-ai` with the same interpreter, then prints the restart instruction (toggle the MCP server, or `puppetmaster mcp cleanup --kill-stale`) because the running stdio server can't reload in place. `--dry-run` prints the exact pip command and executes nothing. No code path ever invokes it automatically — it only runs when a user types it.
+- **Update nudge on errors, informational only.** When the opt-in check knows a newer release exists, the one-liner is appended to MCP error responses — purely as text, with zero install side effects and no retry-with-upgrade loop. Disabled or up-to-date behavior is unchanged.
+- **No duplication.** The version-parsing helpers (`_version_tuple` / `_on_disk_is_newer`) moved into `update_check.py`; the existing disk-vs-running staleness nudge now shares them.
+- Full suite: **962 passed** — verified under both `pytest` and the CI `unittest discover` command.
+
 ## v0.9.89
 
 **The optional Signal-maximizer output style now takes a custom directive — bring your own rules instead of the two built-in tiers.** The presets (`terse`, `lithic`) are unchanged; this adds a verbatim path for teams that want their own house style without forking the rule text.

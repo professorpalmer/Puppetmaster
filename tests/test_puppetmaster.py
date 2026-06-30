@@ -20027,6 +20027,154 @@ class McpServerUpdateNudgeTests(unittest.TestCase):
         self.assertNotIn("server_update_available", result)
 
 
+class PypiUpdateCheckTests(unittest.TestCase):
+    """Opt-in PyPI update awareness: informational only, never auto-installs."""
+
+    def setUp(self) -> None:
+        from puppetmaster import update_check
+
+        self.mod = update_check
+        update_check.reset_pypi_update_cache()
+        self.addCleanup(update_check.reset_pypi_update_cache)
+
+    def test_note_when_pypi_is_newer(self) -> None:
+        payload = json.dumps({"info": {"version": "9.0.0"}}).encode("utf-8")
+        response = io.BytesIO(payload)
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return response.getvalue()
+
+        with patch.dict(os.environ, {"PUPPETMASTER_PYPI_UPDATE_CHECK": "1"}, clear=False), patch.object(
+            self.mod, "installed_puppetmaster_version", return_value="0.9.64"
+        ), patch("puppetmaster.update_check.urllib.request.urlopen", return_value=FakeResponse()):
+            note = self.mod.pypi_update_note(now=1000.0)
+
+        self.assertIsNotNone(note)
+        self.assertIn("v9.0.0", note)
+        self.assertIn("0.9.64", note)
+        self.assertIn("puppetmaster self-update", note)
+
+    def test_no_note_when_up_to_date(self) -> None:
+        payload = json.dumps({"info": {"version": "0.9.64"}}).encode("utf-8")
+        response = io.BytesIO(payload)
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return response.getvalue()
+
+        with patch.dict(os.environ, {"PUPPETMASTER_PYPI_UPDATE_CHECK": "1"}, clear=False), patch.object(
+            self.mod, "installed_puppetmaster_version", return_value="0.9.64"
+        ), patch("puppetmaster.update_check.urllib.request.urlopen", return_value=FakeResponse()):
+            self.assertIsNone(self.mod.pypi_update_note(now=1000.0))
+
+    def test_network_failure_returns_none_silently(self) -> None:
+        with patch.dict(os.environ, {"PUPPETMASTER_PYPI_UPDATE_CHECK": "1"}, clear=False), patch.object(
+            self.mod, "installed_puppetmaster_version", return_value="0.9.64"
+        ), patch(
+            "puppetmaster.update_check.urllib.request.urlopen",
+            side_effect=OSError("network down"),
+        ):
+            self.assertIsNone(self.mod.pypi_update_note(now=1000.0))
+
+    def test_skipped_when_env_var_unset(self) -> None:
+        env = os.environ.copy()
+        env.pop("PUPPETMASTER_PYPI_UPDATE_CHECK", None)
+        with patch.dict(os.environ, env, clear=True), patch(
+            "puppetmaster.update_check.urllib.request.urlopen"
+        ) as urlopen:
+            self.assertIsNone(self.mod.pypi_update_note(now=1000.0))
+        urlopen.assert_not_called()
+
+    def test_pypi_note_cached_within_ttl(self) -> None:
+        payload = json.dumps({"info": {"version": "9.0.0"}}).encode("utf-8")
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return payload
+
+        with patch.dict(os.environ, {"PUPPETMASTER_PYPI_UPDATE_CHECK": "1"}, clear=False), patch.object(
+            self.mod, "installed_puppetmaster_version", return_value="0.9.64"
+        ), patch(
+            "puppetmaster.update_check.urllib.request.urlopen", return_value=FakeResponse()
+        ) as urlopen:
+            first = self.mod.pypi_update_note(now=1000.0)
+            second = self.mod.pypi_update_note(now=1000.0 + 60.0)
+        self.assertEqual(first, second)
+        self.assertEqual(urlopen.call_count, 1)
+
+    def test_call_tool_attaches_pypi_note_on_error(self) -> None:
+        from puppetmaster import mcp_server, update_check
+
+        payload = json.dumps({"info": {"version": "9.0.0"}}).encode("utf-8")
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return payload
+
+        from types import SimpleNamespace
+
+        fake = {
+            "x": SimpleNamespace(
+                handler=lambda args: {
+                    "content": [{"type": "text", "text": "failed"}],
+                    "isError": True,
+                }
+            )
+        }
+        with patch.dict(os.environ, {"PUPPETMASTER_PYPI_UPDATE_CHECK": "1"}, clear=False), patch.object(
+            mcp_server, "_tool_registry", return_value=fake
+        ), patch.object(
+            update_check, "installed_puppetmaster_version", return_value="0.9.64"
+        ), patch(
+            "puppetmaster.update_check.urllib.request.urlopen", return_value=FakeResponse()
+        ):
+            result = mcp_server.call_tool("x", {})
+        self.assertIn("pypi_update_available", result)
+        self.assertIn("v9.0.0", result["pypi_update_available"])
+
+
+class SelfUpdateCommandTests(unittest.TestCase):
+    def test_dry_run_prints_pip_command_without_invoking_pip(self) -> None:
+        from puppetmaster.cli import _run_self_update
+        from types import SimpleNamespace
+
+        args = SimpleNamespace(dry_run=True)
+        with patch("puppetmaster.cli.subprocess.run") as run, patch(
+            "puppetmaster.cli.sys.executable", "/usr/bin/python3"
+        ), patch("builtins.print") as printed:
+            rc = _run_self_update(args)
+        self.assertEqual(rc, 0)
+        run.assert_not_called()
+        printed.assert_called_once_with(
+            "/usr/bin/python3 -m pip install -U puppetmaster-ai"
+        )
+
+
 class HermesToolSessionPruneTests(unittest.TestCase):
     """Puppetmaster prunes throwaway Hermes worker sessions (--source tool) after
     each worker run, so they don't pile up in Hermes' session store / desktop

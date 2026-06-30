@@ -43,6 +43,7 @@ from puppetmaster.mcp_registry import (
 )
 from puppetmaster.state import resolve_state_dir
 from puppetmaster.store_factory import create_store
+from puppetmaster.update_check import pypi_update_note, version_is_newer
 
 # Snapshot the version this server process loaded at startup. A long-lived stdio
 # MCP server keeps these modules in memory; an in-place `pip install -U` changes
@@ -1042,7 +1043,9 @@ def _process_message_safely(message: JsonObject) -> None:
     try:
         response = handle_message(message)
     except Exception as exc:
-        response = error_response(message.get("id"), -32000, str(exc))
+        response = error_response(
+            message.get("id"), -32000, _error_message_with_update_nudges(str(exc))
+        )
     finally:
         if keepalive is not None:
             keepalive.stop()
@@ -1090,7 +1093,7 @@ def handle_message(message: JsonObject) -> Optional[JsonObject]:
         else:
             return error_response(request_id, -32601, f"Unknown MCP method: {method}")
     except Exception as exc:
-        return error_response(request_id, -32000, str(exc))
+        return error_response(request_id, -32000, _error_message_with_update_nudges(str(exc)))
 
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
@@ -1107,29 +1110,12 @@ def reset_server_update_cache() -> None:
         _server_update_cache["note"] = None
 
 
-def _version_tuple(value: str) -> Optional[tuple[int, ...]]:
-    """Leading-numeric dotted version as a tuple, or None if unparseable."""
-    nums: list[int] = []
-    for part in value.strip().split("."):
-        digits = ""
-        for ch in part:
-            if ch.isdigit():
-                digits += ch
-            else:
-                break
-        if not digits:
-            return None
-        nums.append(int(digits))
-    return tuple(nums) or None
-
-
-def _on_disk_is_newer(on_disk: str, running: str) -> bool:
-    parsed_disk, parsed_running = _version_tuple(on_disk), _version_tuple(running)
-    if parsed_disk is not None and parsed_running is not None:
-        return parsed_disk > parsed_running
-    # Unparseable on either side: any difference is worth surfacing rather than
-    # silently swallowing a real upgrade.
-    return on_disk != running
+def _error_message_with_update_nudges(message: str) -> str:
+    """Append opt-in PyPI update awareness to MCP error messages."""
+    pypi_note = pypi_update_note()
+    if pypi_note:
+        return f"{message}\n\n{pypi_note}"
+    return message
 
 
 def server_update_note(*, now: Optional[float] = None) -> Optional[str]:
@@ -1149,7 +1135,7 @@ def server_update_note(*, now: Optional[float] = None) -> Optional[str]:
     running = _SERVER_RUNNING_VERSION
     on_disk = installed_puppetmaster_version()
     note: Optional[str] = None
-    if running and on_disk and on_disk != running and _on_disk_is_newer(on_disk, running):
+    if running and on_disk and on_disk != running and version_is_newer(on_disk, running):
         note = (
             f"Puppetmaster MCP server is running {running} but {on_disk} is "
             "installed on disk. Restart it — toggle the MCP server in your client, "
@@ -1161,6 +1147,17 @@ def server_update_note(*, now: Optional[float] = None) -> Optional[str]:
     return note
 
 
+def _attach_update_nudges(result: dict) -> None:
+    """Push-style update awareness on tool responses (informational only)."""
+    note = server_update_note()
+    if note:
+        result.setdefault("server_update_available", note)
+    if result.get("isError"):
+        pypi_note = pypi_update_note()
+        if pypi_note:
+            result.setdefault("pypi_update_available", pypi_note)
+
+
 def call_tool(name: str, arguments: JsonObject) -> JsonObject:
     tool = _tool_registry().get(name)
     if tool is None:
@@ -1170,9 +1167,7 @@ def call_tool(name: str, arguments: JsonObject) -> JsonObject:
     # when a newer puppetmaster-ai is installed than this server is running, so a
     # daily-driver user doesn't have to run `mcp status` to discover it.
     if isinstance(result, dict):
-        note = server_update_note()
-        if note:
-            result.setdefault("server_update_available", note)
+        _attach_update_nudges(result)
     return result
 
 

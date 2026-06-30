@@ -141,6 +141,15 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands.add_parser("state", help="Print the resolved Puppetmaster state directory.")
     doctor_parser = subcommands.add_parser("doctor", help="Check local runtime dependencies.")
     doctor_parser.add_argument("--json", action="store_true", help="Emit structured JSON.")
+    self_update_parser = subcommands.add_parser(
+        "self-update",
+        help="Upgrade puppetmaster-ai with pip (requires an MCP server restart afterward).",
+    )
+    self_update_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the pip command that would run without executing it.",
+    )
     subcommands.add_parser("adapters", help="List available worker adapters.")
 
     install_codex = subcommands.add_parser(
@@ -1804,6 +1813,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
         for check in checks:
             print(f"{check.status:8} {check.name:16} {check.detail}")
         return 0
+
+    if args.command == "self-update":
+        return _run_self_update(args)
 
     if args.command == "install-codex-mcp":
         return _run_install_codex(args)
@@ -4013,6 +4025,26 @@ def _run_codegraph_passthrough(args) -> int:
         sys.stdout.write(result["stdout"])
     if result.get("stderr"):
         sys.stderr.write(result["stderr"])
+    return 0
+
+
+def _run_self_update(args) -> int:
+    """Explicit user-invoked upgrade — never called from the MCP server."""
+    cmd = [sys.executable, "-m", "pip", "install", "-U", "puppetmaster-ai"]
+    cmd_display = " ".join(cmd)
+    if args.dry_run:
+        print(cmd_display)
+        return 0
+
+    completed = subprocess.run(cmd)
+    if completed.returncode != 0:
+        return completed.returncode
+
+    print(
+        "Successfully upgraded puppetmaster-ai. The long-lived MCP stdio server "
+        "cannot reload in place — restart it: toggle the MCP server in your client, "
+        "or run `puppetmaster mcp cleanup --kill-stale`."
+    )
     return 0
 
 
