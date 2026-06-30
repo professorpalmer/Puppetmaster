@@ -175,6 +175,8 @@ Two Hermes quirks the adapter handles explicitly:
 
 Like the other CodeGraph-aware adapters, a Hermes worker gets task-relevant CodeGraph context auto-injected into its prompt when `.codegraph/` exists; the verification artifact's `evidence` then includes `context:codegraph`.
 
+**Browser-capable (the only adapter that is).** Hermes exposes a `browser` toolset (`hermes chat -t browser`), and the adapter passes `payload.toolsets` straight through. This makes Hermes the sole adapter that can drive a real browser, which is why the first-class **browser swarm** (`puppetmaster browser` / `puppetmaster_start_browser_swarm`, built on `puppetmaster/browser.py`) routes exclusively to it. Cursor/Claude Code/Codex have no headless browser toolset wired in Puppetmaster, so browser QA is Hermes-only by design. See `docs/CLI_REFERENCE.md` (Browser swarm) for the guardrails (React-controlled inputs, network-truth, strong-model floor) and the acting-agent safety posture.
+
 Requirements:
 
 - Hermes CLI installed and on PATH (binary: `hermes`), or `HERMES_COMMAND` / `payload.executable` set to a custom path.

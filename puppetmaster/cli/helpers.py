@@ -148,7 +148,7 @@ def finalize_cli_run(result: Any) -> int:
     """
     from puppetmaster.quality import assess_run_quality
 
-    print_mode_banner(result.mode)
+    print_mode_banner(result.mode, getattr(result, "acting", False))
     print_run_result(result.job.id, len(result.artifacts), result.summary_path)
 
     if result.mode == "edit":
@@ -217,9 +217,14 @@ def finalize_cli_run(result: Any) -> int:
     )
     return 0
 
-def print_mode_banner(mode: str) -> None:
+def print_mode_banner(mode: str, acting: bool = False) -> None:
     """Print a one-line read-only / edit banner to stderr so the user is never
-    surprised that an 'analysis' swarm wrote no files."""
+    surprised that an 'analysis' swarm wrote no files.
+
+    ``acting`` flags a swarm that edits no files but acts on the world beyond the
+    repo (e.g. drives a live browser — logins, form fills). Such a run is
+    read-only on the repo yet has external side effects, so it must never read as
+    a harmless no-op."""
     if mode == "edit":
         print(
             "puppetmaster: mode=edit — workers may modify files in the working tree.",
@@ -229,6 +234,13 @@ def print_mode_banner(mode: str) -> None:
         print(
             "puppetmaster: mode=analysis (read-only) — no files will be edited; "
             "this run only emits artifacts.",
+            file=sys.stderr,
+        )
+    if acting:
+        print(
+            "puppetmaster: ACTING AGENT — a worker drives a real browser against "
+            "a live system (external side effects: navigation, logins, form "
+            "fills). Treat with implement-style approval; not a no-op read-only run.",
             file=sys.stderr,
         )
 

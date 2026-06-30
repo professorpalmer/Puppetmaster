@@ -39,6 +39,7 @@ broad investigation, multi-file audits, and cross-cutting changes.
 | **One focused edit** ("fix this fn", "add a flag", "wire up retries") | `edit` | Cheapest sufficient model + CodeGraph + in-place edit + synchronous diff. The snappy path between editing inline and a full implement job. |
 | **One coupled multi-file feature** | `start_implement` | Isolated clean worktree, one coherent PATCH artifact. |
 | **Broad read-only analysis** (audit, review, "find all X") | `start_swarm` / `start_cursor_swarm` | Parallel roles over read-only analysis. |
+| **Live-site browser QA** (drive a real browser, capture real network payloads) | `start_browser_swarm` | N parallel Hermes browser workers with React-input/network-truth/strong-model guardrails. Hermes-only; ACTING AGENT (side effects). |
 | **"Where is X / what calls Y"** | `codegraph_search` | Structural lookup before reading files. |
 | **"What model / how much?"** | `route_task` | Pure decision, no spend. |
 

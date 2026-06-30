@@ -1335,6 +1335,22 @@ def _build_tools() -> list[McpTool]:
             handler=run_edit,
         ),
         McpTool(
+            name="puppetmaster_start_browser_swarm",
+            description=(
+                "Start a browser-QA swarm: N parallel Hermes workers, each driving a REAL "
+                "browser against a LIVE site to capture real network payloads (the QA "
+                "that mock-backend tests and read-only repo analysis cannot reach). Bakes "
+                "in three guardrails: React-controlled-input native-event entry, "
+                "network-truth (a 200 can hide an error body), and a strong-model "
+                "capability floor (cheap models fail browser grounding and lie about it). "
+                "ACTING AGENT — workers have external side effects (logins, form fills), so "
+                "treat with implement-style approval. Requires the Hermes platform. Returns "
+                "job_id immediately."
+            ),
+            input_schema=browser_swarm_schema(),
+            handler=start_browser_swarm,
+        ),
+        McpTool(
             name="puppetmaster_openai",
             description=(
                 "Run an OpenAI Chat Completions worker through Puppetmaster and wait for "
@@ -2142,6 +2158,67 @@ def run_edit(args: JsonObject) -> JsonObject:
             details["fix"] = "puppetmaster platform enable " + exc.requested
         return tool_error(str(exc), details)
     return run_cli(edit_command(args), args)
+
+
+def browser_swarm_command(args: JsonObject) -> list[str]:
+    """Build the ``puppetmaster browser`` CLI invocation from MCP args.
+
+    ``tasks`` is required and may be a single string or a list of strings; each
+    becomes one parallel browser worker.
+    """
+    raw_tasks = args.get("tasks")
+    if isinstance(raw_tasks, str):
+        tasks = [raw_tasks]
+    elif isinstance(raw_tasks, (list, tuple)):
+        tasks = [str(t) for t in raw_tasks if str(t).strip()]
+    else:
+        tasks = []
+    if not tasks:
+        raise ValueError("browser: 'tasks' must be a non-empty string or list of strings")
+    command = ["browser", *tasks, "--cwd", cwd(args)]
+    if args.get("model"):
+        command.extend(["--model", str(args["model"])])
+    if args.get("provider"):
+        command.extend(["--provider", str(args["provider"])])
+    if args.get("toolsets"):
+        command.extend(["--toolsets", str(args["toolsets"])])
+    if args.get("min_capability") is not None:
+        command.extend(["--min-capability", str(args["min_capability"])])
+    if args.get("timeout_seconds"):
+        command.extend(["--timeout-seconds", str(args["timeout_seconds"])])
+    if args.get("routing_policy"):
+        command.extend(["--routing-policy", str(args["routing_policy"])])
+    if args.get("worker_mode"):
+        command.extend(["--worker-mode", str(args["worker_mode"])])
+    if args.get("executable"):
+        command.extend(["--executable", str(args["executable"])])
+    return command
+
+
+def start_browser_swarm(args: JsonObject) -> JsonObject:
+    """Start a browser-QA swarm asynchronously and return job_id immediately.
+
+    Validates that Hermes (the only browser-capable adapter) is enabled before
+    dispatching, so a platform-locked host gets a precise error instead of
+    workers that silently cannot carry the toolset.
+    """
+    from puppetmaster import platform_lock
+    from puppetmaster.browser import BROWSER_ADAPTER
+
+    if not platform_lock.is_adapter_enabled(BROWSER_ADAPTER):
+        return tool_error(
+            f"the {BROWSER_ADAPTER!r} adapter is disabled by the platform lock, "
+            "but it is the only adapter that can drive a browser.",
+            {
+                "enabled": sorted(platform_lock.enabled_adapters()),
+                "fix": f"puppetmaster platform enable {BROWSER_ADAPTER}",
+            },
+        )
+    try:
+        command = browser_swarm_command(args)
+    except ValueError as exc:
+        return tool_error(str(exc))
+    return start_cli(command, args)
 
 
 def run_claude(args: JsonObject) -> JsonObject:
@@ -3799,6 +3876,65 @@ def edit_schema() -> JsonObject:
             },
         },
         "required": ["instruction"],
+    }
+
+
+def browser_swarm_schema() -> JsonObject:
+    """Schema for the async browser-QA swarm verb."""
+    return {
+        "type": "object",
+        "properties": {
+            "tasks": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "description": (
+                    "One or more QA missions. Each runs as its own parallel "
+                    "browser worker against the live site."
+                ),
+            },
+            "cwd": {
+                "type": "string",
+                "description": "Workspace/repo for context. Defaults to the server's cwd.",
+            },
+            "model": {
+                "type": "string",
+                "description": "Pin the Hermes model (overrides the strong-model routing floor).",
+            },
+            "provider": {
+                "type": "string",
+                "description": "Hermes provider (e.g. anthropic).",
+            },
+            "toolsets": {
+                "type": "string",
+                "description": "Override Hermes toolsets (default: file,web,vision,browser).",
+            },
+            "min_capability": {
+                "type": "integer",
+                "description": "Override the strong-model capability floor (default 80, 0..100).",
+            },
+            "timeout_seconds": {
+                "type": "integer",
+                "description": "Per-worker timeout (default 1200; live browser flows are slow).",
+            },
+            "routing_policy": {
+                "type": "string",
+                "enum": ["cheap", "balanced", "quality", "escalating"],
+                "default": "balanced",
+                "description": "Router policy above the capability floor (default: balanced).",
+            },
+            "worker_mode": {
+                "type": "string",
+                "enum": ["subprocess", "inline", "daemon"],
+                "default": "subprocess",
+                "description": "subprocess (default) runs workers in parallel; inline serializes them.",
+            },
+            "executable": {
+                "type": "string",
+                "description": "Override the hermes executable / command.",
+            },
+        },
+        "required": ["tasks"],
     }
 
 

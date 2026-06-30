@@ -587,6 +587,51 @@ def _main(argv: Optional[list[str]] = None) -> int:
         )
         return cli.finalize_cli_run(result)
 
+    if args.command == "browser":
+        from puppetmaster import platform_lock
+        from puppetmaster.browser import BROWSER_ADAPTER, browser_swarm_specs
+
+        # Only Hermes can drive a browser, so the browser verb is dead without
+        # it — fail fast with the exact remediation rather than dispatching
+        # workers that can't possibly carry the toolset.
+        if not platform_lock.is_adapter_enabled(BROWSER_ADAPTER):
+            print(
+                f"browser: the {BROWSER_ADAPTER!r} adapter is disabled by the "
+                "platform lock, but it is the only adapter that can drive a "
+                "browser.",
+                file=sys.stderr,
+            )
+            print(
+                f"  enable it: puppetmaster platform enable {BROWSER_ADAPTER}",
+                file=sys.stderr,
+            )
+            return 2
+        specs = browser_swarm_specs(
+            args.tasks,
+            args.cwd,
+            model=args.model,
+            provider=args.provider,
+            toolsets=args.toolsets,
+            min_capability=args.min_capability,
+            timeout_seconds=args.timeout_seconds,
+            routing_policy=args.routing_policy,
+            executable=args.executable,
+        )
+        goal = (
+            args.tasks[0]
+            if len(args.tasks) == 1
+            else f"Browser-QA swarm ({len(args.tasks)} parallel workers)"
+        )
+        result = cli.Orchestrator(store).run(
+            goal,
+            specs=specs,
+            lease_seconds=10,
+            worker_mode=args.worker_mode,
+            on_job_created=on_job_created,
+            label=args.label,
+        )
+        return cli.finalize_cli_run(result)
+
     if args.command == "demo":
         result = cli.Orchestrator(store).run(args.goal)
         print_run_result(result.job.id, len(result.artifacts), result.summary_path)

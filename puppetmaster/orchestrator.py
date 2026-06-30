@@ -20,6 +20,7 @@ from puppetmaster.workers import (
     RECOVERABLE_FAILURES,
     WorkerSpec,
     specs_for_roles,
+    swarm_is_acting,
     swarm_mode,
 )
 
@@ -158,6 +159,10 @@ class RunResult:
     # "edit" when a worker could change files, "analysis" when the swarm is
     # read-only (emits artifacts only). Lets the CLI print an honest banner.
     mode: str = "analysis"
+    # True when a worker acts on the world beyond the repo (e.g. drives a live
+    # browser). Read-only on files (mode stays "analysis") but an acting agent
+    # with side effects, so the CLI banner flags it instead of "harmless".
+    acting: bool = False
 
 
 def _tag_job_effort(store: SwarmStore, job_id: str) -> None:
@@ -223,6 +228,7 @@ class Orchestrator:
                 summary_path=summary_path,
                 rerouted_tasks=rerouted,
                 mode=swarm_mode(specs),
+                acting=swarm_is_acting(specs),
             )
         except Exception:
             self.store.update_job_status(job.id, JobStatus.FAILED)
@@ -244,7 +250,19 @@ class Orchestrator:
                 "only emits artifacts. Use an implement verb or an edit-capable "
                 "adapter to land code."
             )
-        self.store.emit(job.id, "job.mode", {"mode": mode, "detail": detail})
+        # A browser worker edits no files (mode stays analysis) but acts on a
+        # live system — logins, form fills, navigation. Flag it as an acting
+        # agent so the read-only framing above is never mistaken for "harmless".
+        acting = swarm_is_acting(specs)
+        if acting:
+            detail += (
+                " ACTING AGENT — at least one worker drives a real browser "
+                "against a live system (external side effects). Treat with "
+                "implement-style approval; this is not a no-op read-only run."
+            )
+        self.store.emit(
+            job.id, "job.mode", {"mode": mode, "detail": detail, "acting": acting}
+        )
         return mode
 
     def run_crash_recovery_demo(

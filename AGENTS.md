@@ -48,6 +48,23 @@ Use native tooling directly for:
 - Conversational follow-ups that don't change repo state.
 - Anything explicitly framed as "just answer me" / "no swarm".
 
+## Browser swarms (live-site QA)
+
+For QA that needs a **real browser against a live site** — capturing actual
+network payloads instead of mocked ones — use the first-class browser verb, not
+a read-only swarm. A read-only swarm can't reach it: the MCP swarm specs hardcode
+a `file,web,vision` toolset list with no `browser`, and the cursor swarm adapter
+has no browser at all. Only the **Hermes** adapter can drive a browser
+(`hermes chat -t browser`).
+
+- **Verb:** `puppetmaster_start_browser_swarm` (MCP) / `python -m puppetmaster browser "<task>" ["<task2>" ...]` (CLI). Each task becomes one parallel Hermes worker. Requires the Hermes platform enabled.
+- **Single source of truth:** `puppetmaster/browser.py`. It bakes in three hard-won guardrails so callers don't re-derive them:
+  1. **React-controlled inputs** — automation must use native value setters + dispatched `input`/`change` events, or submits fire nothing (a fake, reproducible "bug").
+  2. **Network truth** — judge success by the captured request/response, not the UI; an HTTP 200 can carry an application error body.
+  3. **Strong-model floor** — browser grounding needs a capable model; the spec carries a high `min_capability` (default 80) pinned to the Hermes adapter, because cheap models fail browser grounding *and lie about it*. Private/VPN-only hosts rely on Hermes' local-engine fallback for private URLs.
+- **Safety posture:** a browser worker edits no repo files (`swarm_mode` stays `analysis`, no clean-tree guard) but is an **acting agent** with external side effects (logins, form fills). Specs carry `payload.side_effecting = True`; `workers.spec_has_side_effects` / `swarm_is_acting` drive an acting-agent banner. Treat with implement-style approval, never the swarm's "read-only, harmless" framing.
+- The reusable playbook with the full gotcha derivation lives in the `jadui-browser-qa-swarm` skill.
+
 ## How to drive a started swarm
 
 1. Return the `job_id` to the user immediately, in one line.
@@ -99,7 +116,7 @@ Puppetmaster keeps a **read-only, local, numbers-only** ledger of what it saved,
 
 ## MCP surface (quick reference)
 
-Orchestration: `puppetmaster_doctor`, `puppetmaster_start_swarm`, `puppetmaster_start_cursor_swarm`, `puppetmaster_start_cursor_review`, `puppetmaster_start_cursor_plan`, `puppetmaster_start_claude_implement`, `puppetmaster_status`, `puppetmaster_logs`, `puppetmaster_live_artifacts`, `puppetmaster_live_artifacts_follow`, `puppetmaster_partial_summary`, `puppetmaster_artifacts`, `puppetmaster_show`, `puppetmaster_last_job`, `puppetmaster_dashboard`.
+Orchestration: `puppetmaster_doctor`, `puppetmaster_start_swarm`, `puppetmaster_start_cursor_swarm`, `puppetmaster_start_cursor_review`, `puppetmaster_start_cursor_plan`, `puppetmaster_start_claude_implement`, `puppetmaster_start_browser_swarm`, `puppetmaster_status`, `puppetmaster_logs`, `puppetmaster_live_artifacts`, `puppetmaster_live_artifacts_follow`, `puppetmaster_partial_summary`, `puppetmaster_artifacts`, `puppetmaster_show`, `puppetmaster_last_job`, `puppetmaster_dashboard`.
 
 Bundled CodeGraph: `puppetmaster_codegraph_search`, `puppetmaster_codegraph_context`, `puppetmaster_codegraph_affected`, `puppetmaster_codegraph_files`, `puppetmaster_codegraph_status`, `puppetmaster_codegraph_init`.
 

@@ -15259,6 +15259,155 @@ class PuppetmasterFrictionFixTests(unittest.TestCase):
             )
         )
 
+    # --- browser swarm (first-class browser-QA via Hermes) --------------
+    def test_browser_spec_carries_browser_toolset_and_guardrails(self) -> None:
+        from puppetmaster.browser import (
+            BROWSER_ADAPTER,
+            BROWSER_TOOLSETS,
+            build_browser_spec,
+        )
+
+        spec = build_browser_spec("QA the login flow on the dev box", cwd="/repo")
+        self.assertEqual(spec.adapter, BROWSER_ADAPTER)
+        # The toolset the MCP swarm path strips must be present.
+        self.assertEqual(spec.payload["toolsets"], BROWSER_TOOLSETS)
+        self.assertIn("browser", spec.payload["toolsets"].split(","))
+        # The three guardrails are baked into the prompt, ahead of the task.
+        prompt = spec.payload["prompt"]
+        self.assertIn("React-controlled", prompt)
+        self.assertIn("input", prompt.lower())
+        self.assertIn("change", prompt.lower())
+        self.assertIn("200", prompt)  # network-truth guardrail
+        self.assertIn("QA the login flow on the dev box", prompt)
+
+    def test_browser_spec_routing_floor_pins_hermes_strong_model(self) -> None:
+        from puppetmaster.browser import (
+            BROWSER_ADAPTER,
+            BROWSER_MIN_CAPABILITY,
+            build_browser_spec,
+        )
+
+        spec = build_browser_spec("x", cwd="/repo")
+        self.assertTrue(spec.payload["auto_route"])
+        # Only Hermes can drive a browser — routing must never leave the adapter.
+        self.assertEqual(spec.payload["allowed_adapters"], [BROWSER_ADAPTER])
+        # Strong-model floor (guardrail #2: cheap models fail browser grounding).
+        self.assertGreaterEqual(spec.payload["min_capability"], BROWSER_MIN_CAPABILITY)
+
+    def test_browser_spec_pinned_model_disables_routing(self) -> None:
+        from puppetmaster.browser import build_browser_spec
+
+        spec = build_browser_spec(
+            "x", cwd="/repo", model="claude-opus-4-8", provider="anthropic"
+        )
+        self.assertEqual(spec.payload["model"], "claude-opus-4-8")
+        self.assertEqual(spec.payload["provider"], "anthropic")
+        # An explicit pin wins — never auto-route around it.
+        self.assertNotIn("auto_route", spec.payload)
+        self.assertNotIn("min_capability", spec.payload)
+
+    def test_browser_spec_is_side_effecting_but_repo_readonly(self) -> None:
+        from puppetmaster.browser import build_browser_spec
+        from puppetmaster.workers import (
+            spec_edits_files,
+            spec_has_side_effects,
+            swarm_is_acting,
+            swarm_mode,
+        )
+
+        spec = build_browser_spec("x", cwd="/repo")
+        # Read-only on the repo: no clean-tree guard, swarm stays "analysis".
+        self.assertFalse(spec_edits_files(spec))
+        self.assertEqual(swarm_mode([spec]), "analysis")
+        # But an acting agent with external side effects.
+        self.assertTrue(spec.payload["side_effecting"])
+        self.assertTrue(spec_has_side_effects(spec))
+        self.assertTrue(swarm_is_acting([spec]))
+
+    def test_spec_has_side_effects_detects_bare_browser_toolset(self) -> None:
+        from puppetmaster.workers import spec_has_side_effects
+
+        # Even a hand-rolled spec that wired the browser toolset without the
+        # explicit flag is caught defensively.
+        spec = WorkerSpec(
+            role="x", instruction="x", adapter="hermes",
+            payload={"toolsets": "file,web,browser"},
+        )
+        self.assertTrue(spec_has_side_effects(spec))
+        plain = WorkerSpec(
+            role="x", instruction="x", adapter="hermes",
+            payload={"toolsets": "file,web,vision"},
+        )
+        self.assertFalse(spec_has_side_effects(plain))
+
+    def test_browser_swarm_specs_fans_out_independent_workers(self) -> None:
+        from puppetmaster.browser import browser_swarm_specs
+
+        specs = browser_swarm_specs(
+            ["QA route classes", "QA airports", "QA maintenance"], cwd="/repo"
+        )
+        self.assertEqual(len(specs), 3)
+        roles = [s.role for s in specs]
+        self.assertEqual(roles, ["browser-1", "browser-2", "browser-3"])
+        # Independent: no cross-worker dependencies, so they run in parallel.
+        self.assertTrue(all(not s.depends_on_roles for s in specs))
+        # A single task keeps the clean "browser" role.
+        self.assertEqual(browser_swarm_specs(["only one"], cwd="/repo")[0].role, "browser")
+
+    def test_browser_swarm_specs_rejects_empty(self) -> None:
+        from puppetmaster.browser import browser_swarm_specs
+
+        with self.assertRaises(ValueError):
+            browser_swarm_specs(["", "   "], cwd="/repo")
+
+    def test_hermes_command_threads_browser_toolset(self) -> None:
+        from puppetmaster.adapters.hermes import build_hermes_chat_command
+        from puppetmaster.browser import BROWSER_TOOLSETS
+
+        command = build_hermes_chat_command(
+            prompt="drive the browser", toolsets=BROWSER_TOOLSETS
+        )
+        self.assertIn("-t", command)
+        self.assertEqual(command[command.index("-t") + 1], BROWSER_TOOLSETS)
+
+    def test_mcp_browser_swarm_command_builds_cli_argv(self) -> None:
+        from puppetmaster.mcp_server import browser_swarm_command
+
+        command = browser_swarm_command(
+            {
+                "tasks": ["QA route classes", "QA airports"],
+                "cwd": "/repo",
+                "min_capability": 85,
+                "worker_mode": "subprocess",
+            }
+        )
+        self.assertEqual(command[0], "browser")
+        self.assertIn("QA route classes", command)
+        self.assertIn("QA airports", command)
+        self.assertIn("--cwd", command)
+        self.assertEqual(command[command.index("--min-capability") + 1], "85")
+        with self.assertRaises(ValueError):
+            browser_swarm_command({"tasks": []})
+
+    def test_mode_banner_flags_acting_agent(self) -> None:
+        import io
+        from contextlib import redirect_stderr
+
+        from puppetmaster.cli.helpers import print_mode_banner
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            print_mode_banner("analysis", acting=True)
+        out = buf.getvalue()
+        # Still read-only on files, but the acting-agent warning must surface.
+        self.assertIn("mode=analysis", out)
+        self.assertIn("ACTING AGENT", out)
+
+        quiet = io.StringIO()
+        with redirect_stderr(quiet):
+            print_mode_banner("analysis", acting=False)
+        self.assertNotIn("ACTING AGENT", quiet.getvalue())
+
     # --- edit verb (Tier 2: lightweight single in-place edit) -----------
     def test_build_edit_payload_defaults_are_cheap_inplace(self) -> None:
         from puppetmaster.workers import build_edit_payload

@@ -1204,6 +1204,61 @@ def build_parser() -> argparse.ArgumentParser:
     edit.add_argument("--executable", help="Override the adapter executable / command.")
     _add_label_argument(edit)
 
+    browser = subcommands.add_parser(
+        "browser",
+        help=(
+            "Browser-QA swarm: N parallel Hermes workers, each driving a real "
+            "browser against a live site to capture real network payloads. Bakes "
+            "in the React-controlled-input, network-truth, and strong-model "
+            "guardrails. ACTING AGENT — has external side effects."
+        ),
+    )
+    browser.add_argument(
+        "tasks",
+        nargs="+",
+        help="One or more QA missions; each runs as its own parallel browser worker.",
+    )
+    browser.add_argument(
+        "--cwd", default=str(Path.cwd()), help="Workspace for repo context."
+    )
+    browser.add_argument(
+        "--model",
+        help="Pin the Hermes model (overrides the strong-model routing floor).",
+    )
+    browser.add_argument(
+        "--provider",
+        help="Hermes provider (e.g. anthropic). Routes credentials/wire protocol.",
+    )
+    browser.add_argument(
+        "--toolsets",
+        help="Override the Hermes toolsets (default: file,web,vision,browser).",
+    )
+    browser.add_argument(
+        "--min-capability",
+        type=int,
+        help="Override the strong-model capability floor (default 80, 0..100).",
+    )
+    browser.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=1200,
+        help="Per-worker timeout (default 1200; live browser flows are slow).",
+    )
+    browser.add_argument(
+        "--routing-policy",
+        default="balanced",
+        choices=["cheap", "balanced", "quality", "escalating"],
+        help="Router policy above the capability floor (default: balanced).",
+    )
+    browser.add_argument(
+        "--worker-mode",
+        choices=["subprocess", "inline", "daemon"],
+        default="subprocess",
+        help="subprocess (default) runs the workers in parallel; inline serializes them.",
+    )
+    browser.add_argument("--executable", help="Override the hermes executable / command.")
+    _add_label_argument(browser)
+
     demo = subcommands.add_parser("demo", help="Run the Puppetmaster concept demo.")
     demo.add_argument(
         "--goal",

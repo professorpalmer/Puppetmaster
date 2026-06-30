@@ -219,6 +219,31 @@ def swarm_mode(specs: list[WorkerSpec]) -> str:
     return "edit" if any(spec_edits_files(spec) for spec in specs) else "analysis"
 
 
+def spec_has_side_effects(spec: WorkerSpec) -> bool:
+    """True when a worker acts on the world *beyond the repository*.
+
+    A browser worker drives a live site — navigation, logins, form fills — so it
+    is read-only on the *repo* (``spec_edits_files`` is False, ``swarm_mode``
+    stays ``"analysis"``, no clean-tree guard) yet is an **acting agent** with
+    external side effects. Treat it with an implement-style approval posture, not
+    the swarm's "this is just read-only analysis" assumption. Keyed off an
+    explicit ``payload.side_effecting`` flag, with a defensive fallback that also
+    catches a hand-rolled spec that wired the ``browser`` toolset directly.
+    """
+    payload = spec.payload or {}
+    if payload.get("side_effecting"):
+        return True
+    toolsets = payload.get("toolsets")
+    if isinstance(toolsets, str):
+        return "browser" in {part.strip() for part in toolsets.split(",")}
+    return False
+
+
+def swarm_is_acting(specs: list[WorkerSpec]) -> bool:
+    """True when any worker in the swarm has external side effects."""
+    return any(spec_has_side_effects(spec) for spec in specs)
+
+
 # Full-edit, PATCH-producing adapters in preference order. Cursor/Claude are the
 # daily-driver editors; Codex and Hermes are full-edit too, so a host locked to
 # either can still implement. This is the single source of truth — the MCP

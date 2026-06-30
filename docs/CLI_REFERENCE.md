@@ -65,6 +65,23 @@ python -m puppetmaster edit "tidy the imports in cli.py" --no-auto-route        
 
 Also available as the `puppetmaster_edit` MCP tool (synchronous; returns the diff).
 
+## Browser swarm (live-site QA)
+
+The `browser` verb runs N parallel **Hermes** workers, each driving a real browser against a live site to capture real network payloads — the QA that mock-backend tests and read-only repo analysis can't reach. It is Hermes-only: Hermes is the only adapter that exposes a `browser` toolset (`hermes chat -t browser`), so the verb pins the worker to it and fails fast if Hermes is disabled. Each task becomes its own parallel worker.
+
+Three guardrails are baked in: React-controlled-input native-event entry, network-truth (an HTTP 200 can carry an error body), and a strong-model capability floor (default `min_capability=80` — cheap models fail browser grounding and lie about it). Private/VPN-only hosts rely on Hermes' local-engine fallback for private URLs.
+
+A browser worker edits no files (`mode=analysis`) but is an **acting agent** with external side effects (logins, form fills), so the run prints an `ACTING AGENT` banner — treat it with implement-style approval, not as a harmless read-only run.
+
+```bash
+python -m puppetmaster browser "QA the login flow on https://app.example.com"
+python -m puppetmaster browser "QA route classes" "QA airports" "QA maintenance"   # 3 parallel workers
+python -m puppetmaster browser "QA the dev box" --model claude-opus-4-8 --provider anthropic   # pin a strong model
+python -m puppetmaster browser "QA login" --min-capability 90 --timeout-seconds 1800
+```
+
+Also available as the `puppetmaster_start_browser_swarm` MCP tool (async; returns `job_id`). Requires the Hermes platform enabled (`puppetmaster platform enable hermes`).
+
 ## Routing / cost
 
 ```bash

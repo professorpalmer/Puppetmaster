@@ -17,6 +17,7 @@ Puppetmaster exposes these MCP tools:
 - `puppetmaster_start_claude_implement`
 - `puppetmaster_start_swarm`
 - `puppetmaster_start_cursor_swarm`
+- `puppetmaster_start_browser_swarm`
 - `puppetmaster_last_job`
 - `puppetmaster_status`
 - `puppetmaster_logs`
