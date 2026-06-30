@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import os
+import threading
 import time
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -67,6 +69,9 @@ class SwarmStore:
 
     backend_name = "file"
     max_task_attempts = 3
+    # Monotonic, process-wide source of unique temp-file suffixes for atomic
+    # writes. itertools.count() is thread-safe for next() under CPython's GIL.
+    _temp_counter = itertools.count()
 
     def __init__(self, root: Optional[Union[Path, str]] = None) -> None:
         self.root = resolve_state_dir(root)
@@ -883,13 +888,33 @@ class SwarmStore:
         return raw
 
     @staticmethod
+    def _empty_lock_is_stale(path: Path, ttl_seconds: int) -> bool:
+        """Age-gate a contentless lock file by its own mtime.
+
+        ``acquire_lock`` creates the lock with ``O_EXCL`` and writes the owner
+        payload in a second step, so a racing acquirer can momentarily read a
+        zero-byte file. Treating that empty window as stale would let the racer
+        delete a *live* lock and double-claim the task, so reclaim only when the
+        empty file is itself older than the TTL (a genuinely orphaned lock).
+        """
+        try:
+            mtime = path.stat().st_mtime
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return True
+        return (time.time() - mtime) >= ttl_seconds
+
+    @staticmethod
     def _lock_is_stale(path: Path, ttl_seconds: int) -> bool:
         try:
             raw = path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            return True
         except OSError:
-            return True
+            return SwarmStore._empty_lock_is_stale(path, ttl_seconds)
         if not raw:
-            return True
+            return SwarmStore._empty_lock_is_stale(path, ttl_seconds)
         try:
             payload = json.loads(raw)
         except json.JSONDecodeError:
@@ -999,7 +1024,15 @@ class SwarmStore:
     @staticmethod
     def write_json(path: Path, value: Any) -> None:
         mkdir_private(path.parent)
-        temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        # The temp name must be unique per concurrent writer, not just per
+        # process: two threads writing the same file share a pid, so a
+        # pid-only suffix collides and the first os.replace moves the shared
+        # temp out from under the second writer -> FileNotFoundError. Add the
+        # thread id plus a monotonic counter so every writer gets its own temp.
+        temp_path = path.with_name(
+            f".{path.name}.{os.getpid()}.{threading.get_ident()}."
+            f"{next(SwarmStore._temp_counter)}.tmp"
+        )
         temp_path.write_text(
             json.dumps(
                 to_jsonable(_prepare_for_persistence(value)),
