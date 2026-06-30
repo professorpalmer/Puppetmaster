@@ -1,0 +1,87 @@
+from __future__ import annotations
+
+from ._base import AdapterInfo, WorkerAdapter
+from .claude_code import ClaudeCodeAdapter
+from .codex import CodexAdapter
+from .cursor import CursorAdapter
+from .hermes import HermesAdapter
+from .local import LocalAdapter, ShellAdapter
+from .openai import OpenAIAdapter
+
+ADAPTERS: dict[str, WorkerAdapter] = {
+    "local": LocalAdapter(),
+    "shell": ShellAdapter(),
+    "cursor": CursorAdapter(),
+    "claude-code": ClaudeCodeAdapter(),
+    "openai": OpenAIAdapter(),
+    "codex": CodexAdapter(),
+    "hermes": HermesAdapter(),
+}
+
+
+ADAPTER_INFO = [
+    AdapterInfo(
+        name="local",
+        status="built-in",
+        description="Deterministic structured artifacts for demo/runtime roles.",
+        requires=[],
+    ),
+    AdapterInfo(
+        name="shell",
+        status="built-in",
+        description="Runs bounded shell commands and emits verification artifacts.",
+        requires=[],
+    ),
+    AdapterInfo(
+        name="cursor",
+        status="optional",
+        description="Runs local Cursor SDK one-shot agents.",
+        requires=["node", "npm install", "CURSOR_API_KEY"],
+    ),
+    AdapterInfo(
+        name="claude-code",
+        status="optional",
+        description="Runs the Claude Code CLI in non-interactive full-edit mode.",
+        requires=["claude CLI", "Claude Code auth"],
+    ),
+    AdapterInfo(
+        name="openai",
+        status="optional",
+        description="Calls the OpenAI Chat Completions API directly with OPENAI_API_KEY.",
+        requires=["OPENAI_API_KEY"],
+    ),
+    AdapterInfo(
+        name="codex",
+        status="optional",
+        description=(
+            "Runs the official OpenAI Codex CLI (`codex exec --json`) "
+            "non-interactively. Captures billing-grade token counts from the "
+            "structured event stream and emits Puppetmaster artifacts plus a "
+            "PATCH artifact when the agent edits files."
+        ),
+        requires=[
+            "codex CLI (`npm install -g @openai/codex`)",
+            "OPENAI_API_KEY or `codex login`",
+        ],
+    ),
+    AdapterInfo(
+        name="hermes",
+        status="optional",
+        description=(
+            "Runs the NousResearch Hermes CLI (`hermes chat`) headlessly for "
+            "analyze and full-edit implement modes. Launches in an isolated "
+            "process session and attributes file edits via git diff rather "
+            "than exit code."
+        ),
+        requires=[
+            "hermes CLI on PATH",
+            "provider credential in ~/.hermes/.env or `hermes login` OAuth",
+        ],
+    ),
+]
+
+
+def get_adapter(name: str) -> WorkerAdapter:
+    if name not in ADAPTERS:
+        raise ValueError(f"unsupported adapter: {name}")
+    return ADAPTERS[name]
