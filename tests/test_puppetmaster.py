@@ -8138,6 +8138,214 @@ class ModelRouterTests(unittest.TestCase):
             )
             self.assertEqual(len(data["tasks"]), 1)
             self.assertEqual(data["tasks"][0]["role"], "audit")
+            # The routing-present job also reports an actual_cost block (zero
+            # here, since no worker ran and no usage was recorded) — proving the
+            # actual-spend path is additive and never breaks the routing fields.
+            self.assertIn("actual_cost", data)
+            self.assertEqual(data["actual_cost"]["total_marginal_cost_usd"], 0.0)
+
+    def _usage_verification(self, task_id, *, model, tokens_in, tokens_out, estimated, job_id="job_x"):
+        from puppetmaster.models import Artifact, ArtifactType
+
+        return Artifact(
+            job_id=job_id,
+            task_id=task_id,
+            type=ArtifactType.VERIFICATION,
+            created_by="worker-1",
+            confidence=0.9,
+            evidence=["adapter:test"],
+            payload={
+                "adapter": "test",
+                "check": "do the thing",
+                "result": "passed",
+                "model": model,
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
+                "tokens_estimated": estimated,
+            },
+        )
+
+    def _routing_artifact(self, task_id, *, model_id):
+        from puppetmaster.models import Artifact, ArtifactType
+
+        return Artifact(
+            job_id="job_x",
+            task_id=task_id,
+            type=ArtifactType.ROUTING,
+            created_by="router",
+            confidence=0.9,
+            evidence=["role:audit"],
+            payload={"model_id": model_id, "adapter": "claude-code", "policy": "balanced"},
+        )
+
+    def test_price_job_prices_pinned_run_from_usage(self) -> None:
+        """A pinned run emits no ROUTING artifact, but its token usage + the
+        registry price of the model it ran on still yield a priced ledger."""
+        from puppetmaster.cost import price_job
+
+        registry = self._three_tier_registry()  # mid-model: $3 in / $15 out
+        # The adapter stamps the model's adapter_model_name ("mid-v1"), not its
+        # registry id — pricing must resolve it either way.
+        artifacts = [
+            self._usage_verification(
+                "t1", model="mid-v1", tokens_in=1_000_000, tokens_out=1_000_000, estimated=False
+            )
+        ]
+        cost = price_job(artifacts, registry)
+        self.assertEqual(cost.priced_tasks, 1)
+        self.assertEqual(cost.unpriced_tasks, 0)
+        self.assertAlmostEqual(cost.total_marginal_cost_usd, 18.0, places=6)
+        # Measured tokens -> measured cost bucket, not estimated.
+        self.assertAlmostEqual(cost.measured_cost_usd, 18.0, places=6)
+        self.assertEqual(cost.estimated_cost_usd, 0.0)
+        self.assertEqual(cost.by_model["mid-model"]["billing"], "unknown")
+
+    def test_price_job_prefers_router_model_id_over_recorded_model(self) -> None:
+        from puppetmaster.cost import price_job
+
+        registry = self._three_tier_registry()
+        artifacts = [
+            self._routing_artifact("t1", model_id="frontier-model"),  # $15/$75
+            self._usage_verification(
+                "t1", model="mid-v1", tokens_in=1_000_000, tokens_out=1_000_000, estimated=False
+            ),
+        ]
+        cost = price_job(artifacts, registry)
+        # Priced against the router's recorded model, not the adapter's string.
+        self.assertAlmostEqual(cost.total_marginal_cost_usd, 90.0, places=6)
+        self.assertIn("frontier-model", cost.by_model)
+
+    def test_price_job_estimated_tokens_route_to_estimated_bucket(self) -> None:
+        from puppetmaster.cost import price_job
+
+        registry = self._three_tier_registry()
+        artifacts = [
+            self._usage_verification(
+                "t1", model="cheap-v1", tokens_in=1_000_000, tokens_out=0, estimated=True
+            )
+        ]
+        cost = price_job(artifacts, registry)  # cheap-model: $0.10 in
+        self.assertAlmostEqual(cost.total_marginal_cost_usd, 0.10, places=6)
+        self.assertAlmostEqual(cost.estimated_cost_usd, 0.10, places=6)
+        self.assertEqual(cost.measured_cost_usd, 0.0)
+        self.assertEqual(cost.estimated_runs, 1)
+
+    def test_price_job_unpriced_when_model_absent_from_registry(self) -> None:
+        from puppetmaster.cost import price_job
+
+        registry = self._three_tier_registry()
+        artifacts = [
+            self._usage_verification(
+                "t1", model="ghost-model", tokens_in=500, tokens_out=500, estimated=False
+            )
+        ]
+        cost = price_job(artifacts, registry)
+        self.assertEqual(cost.unpriced_tasks, 1)
+        self.assertEqual(cost.priced_tasks, 0)
+        self.assertEqual(cost.total_marginal_cost_usd, 0.0)
+        # Tokens are still attributed under the unknown model id.
+        self.assertEqual(cost.by_model["ghost-model"]["tokens_in"], 500)
+
+    def test_price_job_plan_billed_is_zero_marginal_but_counterfactual_prices_it(self) -> None:
+        from puppetmaster.cost import job_counterfactual, price_job
+        from puppetmaster.model_registry import ModelSpec
+
+        registry = [
+            ModelSpec(
+                id="plan/cursor",
+                adapter="cursor",
+                adapter_model_name="default",
+                capability_score=80,
+                input_per_mtok_usd=5.0,
+                output_per_mtok_usd=25.0,
+                billing="plan",
+            ),
+            ModelSpec(
+                id="api/flagship",
+                adapter="claude-code",
+                adapter_model_name="flagship-v1",
+                capability_score=99,
+                input_per_mtok_usd=15.0,
+                output_per_mtok_usd=75.0,
+                billing="api",
+            ),
+        ]
+        artifacts = [
+            self._usage_verification(
+                "t1", model="plan/cursor", tokens_in=1_000_000, tokens_out=1_000_000, estimated=False
+            )
+        ]
+        cost = price_job(artifacts, registry)
+        # Plan-billed -> zero marginal spend, but the run is still "priced".
+        self.assertEqual(cost.total_marginal_cost_usd, 0.0)
+        self.assertEqual(cost.priced_tasks, 1)
+        cf = job_counterfactual(cost, registry)
+        self.assertEqual(cf.reference_model_id, "api/flagship")
+        self.assertTrue(cf.reference_priced)
+        # 1M in @ $15 + 1M out @ $75 = $90 naive; actual $0 -> avoided $90.
+        self.assertAlmostEqual(cf.naive_cost_usd, 90.0, places=6)
+        self.assertAlmostEqual(cf.avoided_usd, 90.0, places=6)
+
+    def test_cost_command_prices_pinned_run_without_routing_artifacts(self) -> None:
+        """End-to-end: a job with usage but no ROUTING artifacts no longer dead-ends
+        at '$0, didn't auto-route' — it reports actual measured spend."""
+        from puppetmaster.model_registry import save_registry
+        from puppetmaster.store_factory import create_store
+
+        with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "models.json"
+            save_registry(self._three_tier_registry(), registry_path)
+            state_dir = Path(tmp) / ".puppetmaster"
+            store = create_store("file", state_dir)
+            store.init()
+            job = store.create_job("pinned cost check")
+            store.save_artifacts(
+                [
+                    self._usage_verification(
+                        "task-pinned",
+                        model="mid-v1",
+                        tokens_in=1_000_000,
+                        tokens_out=1_000_000,
+                        estimated=False,
+                        job_id=job.id,
+                    )
+                ]
+            )
+
+            prior_env = os.environ.get("PUPPETMASTER_MODELS_PATH")
+            os.environ["PUPPETMASTER_MODELS_PATH"] = str(registry_path)
+            try:
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    code = cli_main(
+                        [
+                            "--state-dir",
+                            str(state_dir),
+                            "--backend",
+                            "file",
+                            "cost",
+                            job.id,
+                            "--json",
+                        ]
+                    )
+            finally:
+                if prior_env is None:
+                    os.environ.pop("PUPPETMASTER_MODELS_PATH", None)
+                else:
+                    os.environ["PUPPETMASTER_MODELS_PATH"] = prior_env
+
+            self.assertEqual(code, 0)
+            data = json.loads(stdout.getvalue())
+            # No routing happened -> the pre-flight estimate is zero...
+            self.assertEqual(data["total_estimated_cost_usd"], 0.0)
+            # ...but actual measured spend is priced from usage × registry price.
+            self.assertAlmostEqual(
+                data["actual_cost"]["total_marginal_cost_usd"], 18.0, places=6
+            )
+            self.assertEqual(data["actual_cost"]["priced_tasks"], 1)
+            # The task breakdown falls back to the priced-usage rows.
+            self.assertEqual(len(data["tasks"]), 1)
+            self.assertEqual(data["tasks"][0]["model_id"], "mid-model")
 
     def test_orchestrator_passes_through_specs_without_auto_route(self) -> None:
         from puppetmaster.workers import WorkerSpec
@@ -19999,6 +20207,23 @@ class HermesAnalyzeRetryTests(unittest.TestCase):
         self.assertEqual(verification.payload["result"], "degraded")
         self.assertNotIn("retry:recovered", verification.evidence)
         self.assertNotIn("retry:exhausted", verification.evidence)
+
+    def test_analyze_verdict_stamps_token_usage(self) -> None:
+        """An analysis-mode Hermes run must be just as measurable as its
+        implement sibling: the analyze verdict carries token usage (char/4
+        estimate, flagged), so per-job cost can price it."""
+        with patch("puppetmaster.adapters.resolve_command", return_value="/usr/bin/hermes"), patch(
+            "puppetmaster.adapters.run_streamed_subprocess",
+            side_effect=[self._json()],
+        ):
+            artifacts = HermesAdapter().run(self._task(), "goal", "worker")
+        verification = artifacts[0]
+        self.assertEqual(verification.payload["result"], "passed")
+        self.assertIn("tokens_in", verification.payload)
+        self.assertIn("tokens_out", verification.payload)
+        # Hermes is a CLI with no SDK usage object -> honestly flagged estimate.
+        self.assertTrue(verification.payload["tokens_estimated"])
+        self.assertGreater(verification.payload["tokens_out"], 0)
 
 
 class StitcherDedupTests(unittest.TestCase):

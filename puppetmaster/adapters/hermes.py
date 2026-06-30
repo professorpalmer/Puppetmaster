@@ -757,6 +757,12 @@ class HermesAdapter(CliWorkerAdapter):
             task=task,
             sidecar_name="hermes_stderr",
         )
+        # Stamp token usage on the analyze verdict too, so an analysis-mode
+        # Hermes run is just as measurable as its implement-mode sibling. Hermes
+        # is shelled out as a CLI with no SDK usage object, so this is the
+        # honest char/4 estimate (tokens_estimated=True), never presented as
+        # measured.
+        usage = token_usage(prompt_text=prompt, output_text=result_text or completed.stdout)
         artifacts = [
             verification_artifact(
                 task=task,
@@ -797,6 +803,7 @@ class HermesAdapter(CliWorkerAdapter):
                             else classify_hermes_failure(completed.stderr + completed.stdout)
                         )
                     ),
+                    **usage,
                 },
             )
         ]

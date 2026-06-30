@@ -1228,10 +1228,14 @@ def _build_tools() -> list[McpTool]:
         McpTool(
             name="puppetmaster_job_cost",
             description=(
-                "Sum the estimated USD cost of every router decision for a job. "
-                "Returns per-model breakdown + grand total. Use to answer "
-                "'how much did this swarm cost?' or 'which model ate the most tokens?'. "
-                "Estimates are based on user-asserted prices in the registry — "
+                "Report a job's cost on two bases: ACTUAL measured spend "
+                "(tokens actually consumed × registry price of the model each "
+                "task ran on — works for pinned, auto-routed, or plan-billed "
+                "runs) plus a counterfactual ('what this volume would cost on "
+                "the flagship'), and the PRE-FLIGHT routing estimate when the "
+                "job auto-routed. Returns per-model breakdowns + totals. Use to "
+                "answer 'how much did this swarm cost?' or 'which model ate the "
+                "most tokens?'. Prices come from the user-asserted registry — "
                 "Puppetmaster does not call a billing API."
             ),
             input_schema=job_schema(required=True),
