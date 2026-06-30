@@ -16572,7 +16572,7 @@ class PuppetmasterSalvageAndLivenessTests(unittest.TestCase):
         import inspect
         from puppetmaster import adapters
 
-        for fn in (adapters.HermesAdapter._run_implement, adapters.HermesAdapter._run_analyze):
+        for fn in (adapters.HermesAdapter._invoke_cli, adapters.HermesAdapter._run_analyze):
             src = inspect.getsource(fn)
             self.assertIn("scrub_foreign_interpreter_env", src, fn.__name__)
             self.assertNotIn("inject_worker_cli_env", src, fn.__name__)
@@ -18433,6 +18433,50 @@ class UninstallTests(unittest.TestCase):
 
 
 class AuditFixTests(unittest.TestCase):
+    def _concurrent_claim_race(
+        self, store: SwarmStore, task: Task
+    ) -> tuple[list[Optional[Task]], list[BaseException]]:
+        barrier = threading.Barrier(2)
+        results: list[Optional[Task]] = []
+        errors: list[BaseException] = []
+        lock = threading.Lock()
+
+        def claim(worker_id: str) -> None:
+            barrier.wait()
+            try:
+                claimed = store.claim_task(task.id, worker_id, lease_seconds=60)
+            except BaseException as exc:
+                with lock:
+                    errors.append(exc)
+                return
+            with lock:
+                results.append(claimed)
+
+        threads = [
+            threading.Thread(target=claim, args=("worker-a",)),
+            threading.Thread(target=claim, args=("worker-b",)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        return results, errors
+
+    def test_file_concurrent_claim_has_exactly_one_winner(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("file race claim")
+            task = Task(job_id=job.id, role="coder", instruction="work")
+            store.save_task(task)
+
+            results, errors = self._concurrent_claim_race(store, task)
+
+            self.assertEqual(errors, [])
+            self.assertEqual(len(results), 2)
+            winners = [claimed for claimed in results if claimed is not None]
+            self.assertEqual(len(winners), 1)
+            self.assertEqual(store.get_task_by_id(task.id).lease_owner, winners[0].lease_owner)
+
     def test_sqlite_concurrent_claim_has_exactly_one_winner(self) -> None:
         with TemporaryDirectory() as tmp:
             store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
@@ -18440,40 +18484,72 @@ class AuditFixTests(unittest.TestCase):
             task = Task(job_id=job.id, role="coder", instruction="work")
             store.save_task(task)
 
-            barrier = threading.Barrier(2)
-            results: list[Optional[Task]] = []
-            errors: list[BaseException] = []
-            lock = threading.Lock()
-
-            def claim(worker_id: str) -> None:
-                barrier.wait()
-                try:
-                    claimed = store.claim_task(task.id, worker_id, lease_seconds=60)
-                except BaseException as exc:  # capture so a crash isn't swallowed
-                    with lock:
-                        errors.append(exc)
-                    return
-                with lock:
-                    results.append(claimed)
-
-            threads = [
-                threading.Thread(target=claim, args=("worker-a",)),
-                threading.Thread(target=claim, args=("worker-b",)),
-            ]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(timeout=10)
+            results, errors = self._concurrent_claim_race(store, task)
 
             # Both threads must have finished cleanly (no crash, none left
             # hanging on the lock) and recorded a result.
             self.assertEqual(errors, [])
-            self.assertFalse(any(thread.is_alive() for thread in threads))
             self.assertEqual(len(results), 2)
 
             winners = [claimed for claimed in results if claimed is not None]
             self.assertEqual(len(winners), 1)
             self.assertEqual(store.get_task_by_id(task.id).lease_owner, winners[0].lease_owner)
+
+    def test_max_attempts_exceeded_emits_event_on_file_and_sqlite(self) -> None:
+        for store_cls in (SwarmStore, SQLiteSwarmStore):
+            with self.subTest(backend=store_cls.backend_name):
+                with TemporaryDirectory() as tmp:
+                    store = store_cls(Path(tmp) / ".puppetmaster")
+                    job = store.create_job("max attempts event")
+                    task = Task(
+                        job_id=job.id,
+                        role="coder",
+                        instruction="poison",
+                        attempts=store.max_task_attempts,
+                    )
+                    store.save_task(task)
+
+                    claimed = store.claim_task(task.id, "worker-a")
+                    failed = store.get_task_by_id(task.id)
+
+                    self.assertIsNone(claimed)
+                    self.assertEqual(failed.status, TaskStatus.FAILED)
+                    events = store.read_events(job.id)
+                    self.assertTrue(
+                        any(
+                            event["event"] == "task.max_attempts_exceeded"
+                            and event["payload"].get("task_id") == task.id
+                            for event in events
+                        )
+                    )
+
+    def test_recover_stale_tasks_reclaims_expired_not_live_on_both_backends(self) -> None:
+        for store_cls in (SwarmStore, SQLiteSwarmStore):
+            with self.subTest(backend=store_cls.backend_name):
+                with TemporaryDirectory() as tmp:
+                    store = store_cls(Path(tmp) / ".puppetmaster")
+                    job = store.create_job("recover parity")
+                    fresh = Task(job_id=job.id, role="fresh", instruction="live")
+                    store.save_task(fresh)
+                    store.claim_task(fresh.id, "worker-live", lease_seconds=600)
+                    stale = Task(job_id=job.id, role="stale", instruction="dead")
+                    store.save_task(stale)
+                    claimed = store.claim_task(stale.id, "worker-dead", lease_seconds=60)
+                    store.save_task(replace(claimed, lease_expires_at=seconds_from_now(-1)))
+
+                    recovered = store.recover_stale_tasks(job.id)
+
+                    self.assertEqual([task.id for task in recovered], [stale.id])
+                    self.assertEqual(store.get_task_by_id(fresh.id).status, TaskStatus.RUNNING)
+                    self.assertEqual(store.get_task_by_id(stale.id).status, TaskStatus.QUEUED)
+                    events = store.read_events(job.id)
+                    self.assertTrue(
+                        any(
+                            event["event"] == "task.recovered"
+                            and event["payload"].get("task_id") == stale.id
+                            for event in events
+                        )
+                    )
 
     def test_lease_fenced_terminal_write_conflict(self) -> None:
         with TemporaryDirectory() as tmp:

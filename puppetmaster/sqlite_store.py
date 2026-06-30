@@ -17,9 +17,7 @@ from puppetmaster.models import (
     TaskStatus,
     artifact_from_dict,
     job_from_dict,
-    new_id,
     now_iso,
-    seconds_from_now,
     task_from_dict,
     to_jsonable,
 )
@@ -249,32 +247,32 @@ class SQLiteSwarmStore(SwarmStore):
         worker_id: Optional[str] = None,
         lease_id: Optional[str] = None,
     ) -> Task:
-        terminal = status in {TaskStatus.COMPLETE, TaskStatus.FAILED}
         stored = self.get_task_by_id(task.id)
-        # Fence terminal writes on the per-claim lease token when both sides
-        # have one, so a worker reusing the same id after a stale-lease reclaim
-        # cannot mark the NEW claim terminal. Fall back to owner-only fencing
-        # for pre-claim callers / older persisted tasks with no token.
         expected_lease = lease_id if lease_id is not None else task.lease_id
+        updated = self._build_status_update(stored, status)
+        terminal = status in {TaskStatus.COMPLETE, TaskStatus.FAILED}
         if terminal and worker_id is not None and not self._lease_matches(
             stored, worker_id, expected_lease
         ):
             return stored
-        updated = replace(
-            stored,
-            status=status,
-            lease_owner=None if terminal else stored.lease_owner,
-            lease_expires_at=None if terminal else stored.lease_expires_at,
-            lease_id=None if terminal else stored.lease_id,
-            updated_at=now_iso(),
-            completed_at=now_iso() if status == TaskStatus.COMPLETE else stored.completed_at,
+        return self._atomic_status_update(
+            task.id,
+            updated,
+            terminal=terminal,
+            worker_id=worker_id,
+            expected_lease=expected_lease,
         )
-        payload = {
-            "task_id": updated.id,
-            "role": updated.role,
-            "status": str(updated.status),
-            "adapter": updated.adapter,
-        }
+
+    def _atomic_status_update(
+        self,
+        task_id: str,
+        updated: Task,
+        *,
+        terminal: bool,
+        worker_id: Optional[str],
+        expected_lease: Optional[str],
+    ) -> Task:
+        payload = self._task_saved_payload(updated)
         with self._session() as connection:
             if terminal and worker_id is not None:
                 # The CAS must re-check the lease in SQL (not just the Python
@@ -290,9 +288,9 @@ class SQLiteSwarmStore(SwarmStore):
                           AND json_extract(data, '$.lease_id') = ?
                         """,
                         (
-                            str(status),
+                            str(updated.status),
                             self._dumps(updated),
-                            task.id,
+                            task_id,
                             worker_id,
                             expected_lease,
                         ),
@@ -303,10 +301,10 @@ class SQLiteSwarmStore(SwarmStore):
                         UPDATE tasks SET status = ?, data = ?
                         WHERE id = ? AND json_extract(data, '$.lease_owner') = ?
                         """,
-                        (str(status), self._dumps(updated), task.id, worker_id),
+                        (str(updated.status), self._dumps(updated), task_id, worker_id),
                     )
                 if cursor.rowcount != 1:
-                    return self.get_task_by_id(task.id)
+                    return self.get_task_by_id(task_id)
             else:
                 connection.execute(
                     """
@@ -339,22 +337,25 @@ class SQLiteSwarmStore(SwarmStore):
         lease_seconds: int = 60,
         lease_id: Optional[str] = None,
     ) -> Optional[Task]:
-        # The base implementation does a read-check-then-save_task, which on
-        # SQLite is not atomic: a concurrent reclaim landing between the read
-        # and the write could be silently overwritten. Override with a single
-        # CAS UPDATE fenced on (RUNNING, lease_owner, and the lease token when
-        # present) so a stale owner can never extend a lease it no longer holds.
-        self.init()
         task = self.get_task_by_id(task_id)
         if task.status != TaskStatus.RUNNING or not self._lease_matches(
             task, worker_id, lease_id
         ):
             return None
-        renewed = replace(
-            task,
-            lease_expires_at=seconds_from_now(lease_seconds),
-            updated_at=now_iso(),
-        )
+        renewed = self._build_renewed_task(task, lease_seconds)
+        return self._atomic_renew_lease(task_id, task, renewed, worker_id, lease_id)
+
+    def _atomic_renew_lease(
+        self,
+        task_id: str,
+        task: Task,
+        renewed: Task,
+        worker_id: str,
+        lease_id: Optional[str],
+    ) -> Optional[Task]:
+        # Single CAS UPDATE fenced on (RUNNING, lease_owner, and the lease token
+        # when present) so a stale owner can never extend a lease it no longer holds.
+        self.init()
         with self._session() as connection:
             if lease_id is not None and task.lease_id is not None:
                 cursor = connection.execute(
@@ -416,47 +417,35 @@ class SQLiteSwarmStore(SwarmStore):
         task_map: Optional[dict[str, Task]] = None,
     ) -> Optional[Task]:
         self.init()
-        task = self.get_task_by_id(task_id)
-        if not self.dependencies_complete(task, task_map=task_map):
-            blocked = replace(task, status=TaskStatus.BLOCKED, updated_at=now_iso())
-            self.save_task(blocked)
-            return None
-        if task.status == TaskStatus.COMPLETE:
-            return None
-        if task.attempts >= self.max_task_attempts:
-            failed = replace(
-                task,
-                status=TaskStatus.FAILED,
-                lease_owner=None,
-                lease_expires_at=None,
-                updated_at=now_iso(),
-            )
-            self.save_task(failed)
-            self.emit(
-                task.job_id,
-                "task.max_attempts_exceeded",
-                {"task_id": task.id, "attempts": task.attempts},
-            )
-            return None
-        if task.status == TaskStatus.RUNNING and not self.is_task_stale(task):
-            return None
-
-        now = now_iso()
-        claimed = replace(
-            task,
-            status=TaskStatus.RUNNING,
-            attempts=task.attempts + 1,
-            lease_owner=worker_id,
-            lease_expires_at=seconds_from_now(lease_seconds),
-            lease_id=new_id("lease"),
-            updated_at=now,
+        return self._perform_claim(
+            task_id, worker_id, lease_seconds=lease_seconds, task_map=task_map
         )
-        claim_payload = {
-            "task_id": task.id,
-            "worker_id": worker_id,
-            "lease_expires_at": claimed.lease_expires_at,
-            "attempts": claimed.attempts,
-        }
+
+    def _perform_claim(
+        self,
+        task_id: str,
+        worker_id: str,
+        lease_seconds: int = 60,
+        task_map: Optional[dict[str, Task]] = None,
+    ) -> Optional[Task]:
+        task = self.get_task_by_id(task_id)
+        if self._claim_precheck(task, task_map=task_map):
+            return None
+        claimed = self._build_claimed_task(task, worker_id, lease_seconds)
+        if not self._atomic_claim(task_id, task, claimed, worker_id=worker_id):
+            return None
+        return claimed
+
+    def _atomic_claim(
+        self,
+        task_id: str,
+        task: Task,
+        claimed: Task,
+        worker_id: Optional[str] = None,
+    ) -> bool:
+        owner = worker_id if worker_id is not None else (claimed.lease_owner or "")
+        now = now_iso()
+        claim_payload = self._task_claim_payload(task_id, owner, claimed)
         with self._session() as connection:
             # We only reach here once ``dependencies_complete`` has passed, so a
             # task persisted as BLOCKED is now runnable: include it in the CAS
@@ -483,7 +472,7 @@ class SQLiteSwarmStore(SwarmStore):
                 ),
             )
             if cursor.rowcount != 1:
-                return None
+                return False
             connection.execute(
                 "INSERT INTO events(job_id, at, event, payload) VALUES(?, ?, ?, ?)",
                 (
@@ -493,7 +482,7 @@ class SQLiteSwarmStore(SwarmStore):
                     json.dumps(claim_payload, sort_keys=True),
                 ),
             )
-        return claimed
+        return True
 
     def recover_stale_tasks(self, job_id: str) -> list[Task]:
         self.init()
@@ -501,35 +490,11 @@ class SQLiteSwarmStore(SwarmStore):
         stale = [task for task in self.list_tasks(job_id) if self.is_task_stale(task)]
         if not stale:
             return []
-        # Recover every stale task inside ONE transaction instead of opening a
-        # fresh session (commit + fsync) per task. The per-row CAS guard and
-        # rowcount check are preserved exactly, so a task another worker recovers
-        # concurrently is still skipped; we just stop paying N commits when a
-        # crashed-worker wave leaves many leases expired at once.
         recovered: list[Task] = []
         with self._session() as connection:
             for task in stale:
-                queued = replace(
-                    task,
-                    status=TaskStatus.QUEUED,
-                    lease_owner=None,
-                    lease_expires_at=None,
-                    updated_at=now,
-                )
-                cursor = connection.execute(
-                    """
-                    UPDATE tasks SET status = ?, data = ?
-                    WHERE id = ? AND status = ? AND json_extract(data, '$.lease_expires_at') <= ?
-                    """,
-                    (
-                        str(TaskStatus.QUEUED),
-                        self._dumps(queued),
-                        task.id,
-                        str(TaskStatus.RUNNING),
-                        now,
-                    ),
-                )
-                if cursor.rowcount != 1:
+                queued = self._build_recovered_task(task)
+                if not self._atomic_recover_stale(task, queued, connection=connection, now=now):
                     continue
                 connection.execute(
                     "INSERT INTO events(job_id, at, event, payload) VALUES(?, ?, ?, ?)",
@@ -544,12 +509,35 @@ class SQLiteSwarmStore(SwarmStore):
                     ),
                 )
                 recovered.append(queued)
-        # Locks are a separate store concern; release them only after the
-        # recovery transaction has committed, and never while holding the
-        # session connection.
         for task in recovered:
             self.release_lock(f"task:{task.id}")
         return recovered
+
+    def _atomic_recover_stale(
+        self,
+        task: Task,
+        queued: Task,
+        *,
+        connection: Optional[sqlite3.Connection] = None,
+        now: Optional[str] = None,
+    ) -> bool:
+        if connection is not None:
+            stamp = now or now_iso()
+            cursor = connection.execute(
+                """
+                UPDATE tasks SET status = ?, data = ?
+                WHERE id = ? AND status = ? AND json_extract(data, '$.lease_expires_at') <= ?
+                """,
+                (
+                    str(TaskStatus.QUEUED),
+                    self._dumps(queued),
+                    task.id,
+                    str(TaskStatus.RUNNING),
+                    stamp,
+                ),
+            )
+            return cursor.rowcount == 1
+        return super()._atomic_recover_stale(task, queued)
 
     def save_run(self, run: AgentRun) -> None:
         self.init()

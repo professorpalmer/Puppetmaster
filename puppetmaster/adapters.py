@@ -24,6 +24,7 @@ from puppetmaster.codegraph import (
     scrub_foreign_interpreter_env,
 )
 from puppetmaster.failure import (
+    NOT_AUTHENTICATED,
     classify_claude_code_failure,
     classify_codex_failure,
     classify_cursor_failure,
@@ -702,6 +703,136 @@ class FullEditWorkerAdapter:
         return None, before
 
 
+@dataclass
+class CliInvocation:
+    """Prepared CLI subprocess state for :class:`CliWorkerAdapter`."""
+
+    command: list[str]
+    sidecar_name: str
+    env: Optional[dict] = None
+    subprocess_kwargs: dict[str, Any] = field(default_factory=dict)
+    extras: dict[str, Any] = field(default_factory=dict)
+
+
+class CliWorkerAdapter(FullEditWorkerAdapter):
+    """Shared snapshot → guard → CLI invoke → snapshot → artifact lifecycle."""
+
+    default_timeout_seconds: int = 600
+
+    def _run_cli_lifecycle(
+        self,
+        task: Task,
+        goal: str,
+        worker_id: str,
+        *,
+        pre_guard: bool = False,
+    ) -> list[Artifact]:
+        cwd = Path(task.payload.get("cwd") or ".").resolve()
+        timeout_seconds = int(
+            task.payload.get("timeout_seconds", self.default_timeout_seconds)
+        )
+        before: dict = {}
+        if pre_guard:
+            blocked, before = self._early_run_guard(task, worker_id, cwd)
+            if blocked is not None:
+                return blocked
+
+        executable_label, resolved = self._resolve_cli_executable(task)
+        if resolved is None:
+            return self._missing_cli(task, worker_id, executable_label)
+
+        prepared = self._prepare_cli_invocation(
+            task, goal, worker_id, cwd, resolved
+        )
+        if isinstance(prepared, list):
+            return prepared
+
+        if not pre_guard:
+            blocked, before = self._apply_pre_run_guards(task, worker_id, cwd, prepared)
+            if blocked is not None:
+                return blocked
+        elif not before:
+            before = git_snapshot(cwd)
+
+        completed = self._invoke_cli(task, prepared, cwd, timeout_seconds)
+        after = git_snapshot(cwd, base_tree=str(before.get("tree") or "") or None)
+        return self._finalize_cli_run(
+            task, worker_id, goal, prepared, before, after, completed
+        )
+
+    def _resolve_cli_executable(self, task: Task) -> tuple[str, Optional[str]]:
+        raise NotImplementedError
+
+    def _missing_cli(
+        self, task: Task, worker_id: str, executable_label: str
+    ) -> list[Artifact]:
+        raise NotImplementedError
+
+    def _prepare_cli_invocation(
+        self,
+        task: Task,
+        goal: str,
+        worker_id: str,
+        cwd: Path,
+        resolved: str,
+    ) -> Union[list[Artifact], CliInvocation]:
+        raise NotImplementedError
+
+    def _early_run_guard(
+        self, task: Task, worker_id: str, cwd: Path
+    ) -> tuple[Optional[list[Artifact]], dict]:
+        return None, {}
+
+    def _apply_pre_run_guards(
+        self,
+        task: Task,
+        worker_id: str,
+        cwd: Path,
+        prepared: CliInvocation,
+    ) -> tuple[Optional[list[Artifact]], dict]:
+        return self.guard_full_edit_run(
+            task,
+            worker_id,
+            self.name,
+            cwd,
+            adapter_label=prepared.extras.get("adapter_label"),
+            extra_dirty_message=prepared.extras.get("extra_dirty_message", ""),
+        )
+
+    def _invoke_cli(
+        self,
+        task: Task,
+        prepared: CliInvocation,
+        cwd: Path,
+        timeout_seconds: int,
+    ) -> StreamedProcess:
+        env = prepared.env
+        if env is None:
+            env = inject_worker_cli_env(apply_worktree_ports(os.environ.copy(), cwd))
+        kwargs = dict(prepared.subprocess_kwargs)
+        kwargs.setdefault("cwd", str(cwd))
+        return run_streamed_subprocess(
+            command=prepared.command,
+            env=env,
+            task=task,
+            sidecar_name=prepared.sidecar_name,
+            timeout_seconds=timeout_seconds,
+            **kwargs,
+        )
+
+    def _finalize_cli_run(
+        self,
+        task: Task,
+        worker_id: str,
+        goal: str,
+        prepared: CliInvocation,
+        before: dict,
+        after: dict,
+        completed: StreamedProcess,
+    ) -> list[Artifact]:
+        raise NotImplementedError
+
+
 # Appended to the prompt for a single retry when an analyze worker returns no
 # structured artifacts. The cheapest/minimal-effort workers occasionally answer
 # in prose the parser can't structure; one stricter JSON-only reprompt recovers
@@ -998,7 +1129,7 @@ class ShellAdapter:
         ]
 
 
-class CursorAdapter(FullEditWorkerAdapter):
+class CursorAdapter(CliWorkerAdapter):
     name = "cursor"
 
     def run(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
@@ -1012,12 +1143,12 @@ class CursorAdapter(FullEditWorkerAdapter):
         return self._run_analyze(task, goal, worker_id)
 
     def _run_implement(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
-        base_prompt = task.payload.get("prompt") or task.instruction
-        cwd = Path(task.payload.get("cwd") or ".").resolve()
-        model = task.payload.get("model", "default")
+        return self._run_cli_lifecycle(task, goal, worker_id, pre_guard=True)
 
-        # Fail fast on a dirty tree before spending any work (codegraph, agent).
-        blocked, before = self.guard_full_edit_run(
+    def _early_run_guard(
+        self, task: Task, worker_id: str, cwd: Path
+    ) -> tuple[Optional[list[Artifact]], dict]:
+        return self.guard_full_edit_run(
             task,
             worker_id,
             "cursor",
@@ -1028,35 +1159,93 @@ class CursorAdapter(FullEditWorkerAdapter):
                 "in place and needs no clean tree."
             ),
         )
-        if blocked is not None:
-            return blocked
 
+    def _resolve_cli_executable(self, task: Task) -> tuple[str, Optional[str]]:
+        resolved = resolve_command("node")
+        if resolved is None:
+            return "node", None
+        return "node", resolved
+
+    def _missing_cli(
+        self, task: Task, worker_id: str, executable_label: str
+    ) -> list[Artifact]:
+        return missing_cli_artifact(
+            task,
+            worker_id,
+            "cursor",
+            executable_label,
+            "Node.js was not found. Install Node.js to run the Cursor SDK adapter.",
+        )
+
+    def _prepare_cli_invocation(
+        self,
+        task: Task,
+        goal: str,
+        worker_id: str,
+        cwd: Path,
+        resolved: str,
+    ) -> Union[list[Artifact], CliInvocation]:
+        base_prompt = task.payload.get("prompt") or task.instruction
+        model = task.payload.get("model", "default")
         prompt, codegraph_used = enrich_prompt_with_codegraph(
             prompt_with_memory(build_implement_prompt(base_prompt), task),
             task_description=task.payload.get("codegraph_task") or task.instruction or goal,
             cwd=cwd,
             disabled=bool(task.payload.get("disable_codegraph", False)),
         )
-
         runner = Path(__file__).with_name("cursor_sdk_runner.mjs")
+        return CliInvocation(
+            command=[resolved, str(runner)],
+            sidecar_name="cursor_implement",
+            extras={
+                "prompt": prompt,
+                "codegraph_used": codegraph_used,
+                "model": model,
+                "cwd": str(cwd),
+            },
+        )
+
+    def _invoke_cli(
+        self,
+        task: Task,
+        prepared: CliInvocation,
+        cwd: Path,
+        timeout_seconds: int,
+    ) -> StreamedProcess:
         environment = inject_worker_cli_env(os.environ.copy())
         apply_worktree_ports(environment, cwd)
         environment["PUPPETMASTER_CURSOR_INPUT"] = json.dumps(
-            {"prompt": prompt, "cwd": str(cwd), "model": model},
+            {
+                "prompt": prepared.extras["prompt"],
+                "cwd": prepared.extras["cwd"],
+                "model": prepared.extras["model"],
+            },
             sort_keys=True,
         )
-        timeout_seconds = int(task.payload.get("timeout_seconds", 900))
-        # Stream output to a live sidecar log so a multi-minute agent run is
-        # visibly making progress (no more 0-byte-log-then-flush ambiguity).
-        completed = run_streamed_subprocess(
-            command=["node", str(runner)],
+        return run_streamed_subprocess(
+            command=prepared.command,
             env=environment,
             task=task,
-            sidecar_name="cursor_implement",
+            sidecar_name=prepared.sidecar_name,
             timeout_seconds=timeout_seconds,
         )
+
+    def _finalize_cli_run(
+        self,
+        task: Task,
+        worker_id: str,
+        goal: str,
+        prepared: CliInvocation,
+        before: dict,
+        after: dict,
+        completed: StreamedProcess,
+    ) -> list[Artifact]:
+        prompt = str(prepared.extras.get("prompt") or "")
+        codegraph_used = bool(prepared.extras.get("codegraph_used"))
+        model = prepared.extras.get("model", "default")
+        cwd = Path(prepared.extras.get("cwd") or ".")
+        timeout_seconds = int(task.payload.get("timeout_seconds", 900))
         if completed.timed_out:
-            after = git_snapshot(cwd, base_tree=str(before.get("tree") or "") or None)
             artifacts: list[Artifact] = [
                 verification_artifact(
                     task=task,
@@ -1081,8 +1270,6 @@ class CursorAdapter(FullEditWorkerAdapter):
                     },
                 )
             ]
-            # A timed-out implement run may still have edited files; surface the
-            # partial diff so the work isn't silently lost.
             if _should_emit_patch_artifact(before, after):
                 artifacts.append(
                     make_patch_artifact(
@@ -1099,7 +1286,6 @@ class CursorAdapter(FullEditWorkerAdapter):
                 )
             return artifacts
 
-        after = git_snapshot(cwd, base_tree=str(before.get("tree") or "") or None)
         failure = classify_cursor_failure(completed.stderr + completed.stdout)
         cursor_status, result_text = cursor_result_text(completed.stdout)
         usage = token_usage(
@@ -1145,9 +1331,6 @@ class CursorAdapter(FullEditWorkerAdapter):
                 },
             )
         ]
-        # The agent's final message is its report (root cause, files touched,
-        # verification). Persist it as artifacts so the stitched summary and
-        # quality verdict see the work instead of calling the run degraded.
         if completed.returncode == 0:
             artifacts.extend(
                 implement_report_artifacts(
@@ -1384,34 +1567,60 @@ def resolve_claude_code_model(
     )
 
 
-class ClaudeCodeAdapter(FullEditWorkerAdapter):
+class ClaudeCodeAdapter(CliWorkerAdapter):
     name = "claude-code"
+    default_timeout_seconds = 600
 
     def run(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
+        return self._run_cli_lifecycle(task, goal, worker_id)
+
+    def _resolve_cli_executable(self, task: Task) -> tuple[str, Optional[str]]:
+        executable = (
+            task.payload.get("executable")
+            or os.environ.get("CLAUDE_CODE_COMMAND")
+            or "claude"
+        )
+        command_base = command_parts(executable)
+        resolved = resolve_command(command_base[0])
+        if resolved is None:
+            return str(executable), None
+        return str(executable), resolved
+
+    def _missing_cli(
+        self, task: Task, worker_id: str, executable_label: str
+    ) -> list[Artifact]:
+        return missing_cli_artifact(
+            task,
+            worker_id,
+            "claude-code",
+            executable_label,
+            (
+                "Claude Code CLI was not found. Install it or set "
+                "CLAUDE_CODE_COMMAND / payload.executable."
+            ),
+        )
+
+    def _prepare_cli_invocation(
+        self,
+        task: Task,
+        goal: str,
+        worker_id: str,
+        cwd: Path,
+        resolved: str,
+    ) -> Union[list[Artifact], CliInvocation]:
         base_prompt = with_report_contract(task.payload.get("prompt") or task.instruction)
-        cwd = Path(task.payload.get("cwd") or ".").resolve()
         prompt, codegraph_used = enrich_prompt_with_codegraph(
             prompt_with_memory(base_prompt, task),
             task_description=task.payload.get("codegraph_task") or task.instruction or goal,
             cwd=cwd,
             disabled=bool(task.payload.get("disable_codegraph", False)),
         )
-        timeout_seconds = int(task.payload.get("timeout_seconds", 600))
-        executable = task.payload.get("executable") or os.environ.get("CLAUDE_CODE_COMMAND") or "claude"
+        executable = (
+            task.payload.get("executable")
+            or os.environ.get("CLAUDE_CODE_COMMAND")
+            or "claude"
+        )
         command_base = command_parts(executable)
-        resolved = resolve_command(command_base[0])
-        if resolved is None:
-            return missing_cli_artifact(
-                task,
-                worker_id,
-                "claude-code",
-                executable,
-                (
-                    "Claude Code CLI was not found. Install it or set "
-                    "CLAUDE_CODE_COMMAND / payload.executable."
-                ),
-            )
-
         model_for_cli, model_note = resolve_claude_code_model(task.payload)
         command = build_claude_code_command(
             prompt=prompt,
@@ -1423,38 +1632,40 @@ class ClaudeCodeAdapter(FullEditWorkerAdapter):
             disallowed_tools=task.payload.get("disallowed_tools"),
             extra_args=task.payload.get("extra_args", []),
         )
-        before = git_snapshot(cwd)
-        blocked = worktree_guard(task, worker_id, "claude-code", cwd, before)
-        if blocked is not None:
-            return blocked
-        dirty = dirty_worktree_guard(
-            task,
-            worker_id,
-            "claude-code",
-            before,
-            extra_message=(
-                " For focused edits on a dirty tree (docs, tests), use puppetmaster_edit — it edits "
-                "in place and needs no clean tree."
-            ),
-        )
-        if dirty is not None:
-            return dirty
-        # Stream output to a live sidecar log + heartbeat so a long Claude Code
-        # run is visibly alive instead of looking hung behind a flat, silent
-        # blocking wait. The streamed runner closes stdin, so the CLI can never
-        # wedge waiting on terminal input.
-        completed = run_streamed_subprocess(
+        return CliInvocation(
             command=command,
-            env=inject_worker_cli_env(apply_worktree_ports(os.environ.copy(), cwd)),
-            task=task,
             sidecar_name="claude_implement",
-            timeout_seconds=timeout_seconds,
-            cwd=str(cwd),
+            extras={
+                "prompt": prompt,
+                "codegraph_used": codegraph_used,
+                "model_note": model_note,
+                "extra_dirty_message": (
+                    " For focused edits on a dirty tree (docs, tests), use puppetmaster_edit — it edits "
+                    "in place and needs no clean tree."
+                ),
+            },
+        )
+
+    def _finalize_cli_run(
+        self,
+        task: Task,
+        worker_id: str,
+        goal: str,
+        prepared: CliInvocation,
+        before: dict,
+        after: dict,
+        completed: StreamedProcess,
+    ) -> list[Artifact]:
+        prompt = str(prepared.extras.get("prompt") or "")
+        codegraph_used = bool(prepared.extras.get("codegraph_used"))
+        model_note = prepared.extras.get("model_note")
+        cwd = Path(task.payload.get("cwd") or ".").resolve()
+        timeout_seconds = int(
+            task.payload.get("timeout_seconds", self.default_timeout_seconds)
         )
         if completed.timed_out:
             stdout = completed.stdout
             stderr = completed.stderr
-            after = git_snapshot(cwd, base_tree=str(before.get("tree") or "") or None)
             stdout_capture = capture_subprocess_stdout(
                 text=stdout,
                 task=task,
@@ -1491,8 +1702,6 @@ class ClaudeCodeAdapter(FullEditWorkerAdapter):
                     },
                 )
             ]
-            # A timed-out run may have already edited files; surface the partial
-            # diff so the work isn't silently stranded in the tree.
             if _should_emit_patch_artifact(before, after):
                 artifacts.append(
                     Artifact(
@@ -1514,10 +1723,6 @@ class ClaudeCodeAdapter(FullEditWorkerAdapter):
                 )
             return artifacts
 
-        after = git_snapshot(cwd, base_tree=str(before.get("tree") or "") or None)
-        # Claude Code stdout often carries long edit transcripts. Give the
-        # head/tail more room than Cursor (12k tail vs 8k) but still spool the
-        # full transcript so middle bytes survive.
         stdout_capture = capture_subprocess_stdout(
             text=completed.stdout,
             task=task,
@@ -1569,10 +1774,6 @@ class ClaudeCodeAdapter(FullEditWorkerAdapter):
             },
         )
         artifacts = [verification]
-        # Same reporting gap as the cursor implement path: Claude's final
-        # message (the `result` field of its --output-format json envelope)
-        # carried the worker's report but never became an artifact, so swarm
-        # findings and implement reports alike vanished from synthesis.
         if completed.returncode == 0:
             _, result_text = cursor_result_text(completed.stdout)
             artifacts.extend(
@@ -1602,6 +1803,7 @@ class ClaudeCodeAdapter(FullEditWorkerAdapter):
         return artifacts
 
 
+
 def _should_emit_patch_artifact(before: dict, after: dict) -> bool:
     """True when a PATCH can be attributed to the worker run."""
     worker_diff = after.get("worker_diff")
@@ -1615,7 +1817,7 @@ def _should_emit_patch_artifact(before: dict, after: dict) -> bool:
 DEFAULT_CODEX_MODEL = "gpt-5.4-mini"
 
 
-class CodexAdapter(FullEditWorkerAdapter):
+class CodexAdapter(CliWorkerAdapter):
     """Shells out to the official OpenAI Codex CLI (``codex exec --json``).
 
     Codex is the closest OpenAI-side analog to the Claude Code CLI: a
@@ -1637,10 +1839,44 @@ class CodexAdapter(FullEditWorkerAdapter):
     """
 
     name = "codex"
+    default_timeout_seconds = 600
 
     def run(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
+        return self._run_cli_lifecycle(task, goal, worker_id)
+
+    def _resolve_cli_executable(self, task: Task) -> tuple[str, Optional[str]]:
+        executable = task.payload.get("executable") or os.environ.get("CODEX_COMMAND") or "codex"
+        command_base = command_parts(executable)
+        resolved = resolve_command(command_base[0])
+        if resolved is None:
+            return str(executable), None
+        return str(executable), resolved
+
+    def _missing_cli(
+        self, task: Task, worker_id: str, executable_label: str
+    ) -> list[Artifact]:
+        return missing_cli_artifact(
+            task,
+            worker_id,
+            "codex",
+            executable_label,
+            (
+                "Codex CLI was not found. Install it with "
+                "`npm install -g @openai/codex`, then `printenv "
+                "OPENAI_API_KEY | codex login --with-api-key`, or "
+                "set CODEX_COMMAND / payload.executable."
+            ),
+        )
+
+    def _prepare_cli_invocation(
+        self,
+        task: Task,
+        goal: str,
+        worker_id: str,
+        cwd: Path,
+        resolved: str,
+    ) -> Union[list[Artifact], CliInvocation]:
         base_prompt = task.payload.get("prompt") or task.instruction
-        cwd = Path(task.payload.get("cwd") or ".").resolve()
         prompt, codegraph_used = enrich_prompt_with_codegraph(
             prompt_with_memory(build_structured_prompt(base_prompt, final_message_note=True), task),
             task_description=task.payload.get("codegraph_task") or task.instruction or goal,
@@ -1648,31 +1884,14 @@ class CodexAdapter(FullEditWorkerAdapter):
             disabled=bool(task.payload.get("disable_codegraph", False)),
         )
         prompt = with_repo_census(prompt, cwd)
-        timeout_seconds = int(task.payload.get("timeout_seconds", 600))
         executable = task.payload.get("executable") or os.environ.get("CODEX_COMMAND") or "codex"
         command_base = command_parts(executable)
-        resolved = resolve_command(command_base[0])
-        if resolved is None:
-            return missing_cli_artifact(
-                task,
-                worker_id,
-                "codex",
-                executable,
-                (
-                    "Codex CLI was not found. Install it with "
-                    "`npm install -g @openai/codex`, then `printenv "
-                    "OPENAI_API_KEY | codex login --with-api-key`, or "
-                    "set CODEX_COMMAND / payload.executable."
-                ),
-            )
-
         model = str(task.payload.get("model") or DEFAULT_CODEX_MODEL)
         sandbox = str(task.payload.get("sandbox") or "workspace-write")
         approval_policy = str(task.payload.get("approval_policy") or "never")
         bypass = bool(task.payload.get("dangerously_bypass_approvals_and_sandbox", False))
         ephemeral = bool(task.payload.get("ephemeral", True))
         skip_git_repo_check = bool(task.payload.get("skip_git_repo_check", True))
-
         command = build_codex_exec_command(
             executable=[resolved, *command_base[1:]],
             prompt=prompt,
@@ -1685,47 +1904,61 @@ class CodexAdapter(FullEditWorkerAdapter):
             dangerously_bypass=bypass,
             extra_args=task.payload.get("extra_args", []),
         )
-
-        before = git_snapshot(cwd)
-        # Read-only sandbox can't mutate the worktree, so dirty-tree gating
-        # and worktree-boundary checks are unnecessary. For write-capable
-        # sandboxes we mirror Claude Code: require a git work tree and a clean
-        # tree by default so resulting diffs are attributable to this task.
         write_capable = sandbox != "read-only" or bypass
-        if write_capable:
-            blocked = worktree_guard(task, worker_id, "codex", cwd, before)
-            if blocked is not None:
-                return blocked
-            dirty = dirty_worktree_guard(
-                task,
-                worker_id,
-                "codex",
-                before,
-                extra_message=(
+        return CliInvocation(
+            command=command,
+            sidecar_name="codex_exec",
+            extras={
+                "prompt": prompt,
+                "codegraph_used": codegraph_used,
+                "model": model,
+                "sandbox": sandbox,
+                "approval_policy": approval_policy,
+                "bypass": bypass,
+                "ephemeral": ephemeral,
+                "write_capable": write_capable,
+                "extra_dirty_message": (
                     " Or pass payload.sandbox='read-only' for review-only tasks. For focused edits "
                     "on a dirty tree (docs, tests), use puppetmaster_edit — it edits in place and "
                     "needs no clean tree."
                 ),
-            )
-            if dirty is not None:
-                return dirty
-
-        # Stream output to a live sidecar log + heartbeat so a long `codex exec`
-        # run is visibly alive instead of looking hung behind a flat, silent
-        # blocking wait — the symptom that made Codex runs read as "stalled".
-        # The streamed runner closes stdin, so codex can never wedge on input.
-        completed = run_streamed_subprocess(
-            command=command,
-            env=inject_worker_cli_env(apply_worktree_ports(os.environ.copy(), cwd)),
-            task=task,
-            sidecar_name="codex_exec",
-            timeout_seconds=timeout_seconds,
-            cwd=str(cwd),
+            },
         )
+
+    def _apply_pre_run_guards(
+        self,
+        task: Task,
+        worker_id: str,
+        cwd: Path,
+        prepared: CliInvocation,
+    ) -> tuple[Optional[list[Artifact]], dict]:
+        if not prepared.extras.get("write_capable", True):
+            return None, git_snapshot(cwd)
+        return super()._apply_pre_run_guards(task, worker_id, cwd, prepared)
+
+    def _finalize_cli_run(
+        self,
+        task: Task,
+        worker_id: str,
+        goal: str,
+        prepared: CliInvocation,
+        before: dict,
+        after: dict,
+        completed: StreamedProcess,
+    ) -> list[Artifact]:
+        model = str(prepared.extras.get("model") or DEFAULT_CODEX_MODEL)
+        sandbox = str(prepared.extras.get("sandbox") or "workspace-write")
+        approval_policy = str(prepared.extras.get("approval_policy") or "never")
+        bypass = bool(prepared.extras.get("bypass"))
+        ephemeral = bool(prepared.extras.get("ephemeral", True))
+        codegraph_used = bool(prepared.extras.get("codegraph_used"))
+        write_capable = bool(prepared.extras.get("write_capable", True))
+        timeout_seconds = int(task.payload.get("timeout_seconds", self.default_timeout_seconds))
+        cwd = Path(task.payload.get("cwd") or ".").resolve()
+
         if completed.timed_out:
             stdout = completed.stdout
             stderr = completed.stderr
-            after = git_snapshot(cwd, base_tree=str(before.get("tree") or "") or None)
             stdout_capture = capture_subprocess_stdout(
                 text=stdout,
                 task=task,
@@ -1787,8 +2020,6 @@ class CodexAdapter(FullEditWorkerAdapter):
                 )
             return artifacts
 
-        after = git_snapshot(cwd, base_tree=str(before.get("tree") or "") or None)
-
         events = parse_codex_events(completed.stdout)
         usage = next(
             (
@@ -1838,9 +2069,6 @@ class CodexAdapter(FullEditWorkerAdapter):
         parsed_artifacts = cursor_result_artifacts(task, worker_id, last_message, adapter="codex")
         process_failed = completed.returncode != 0 or turn_failed
         unstructured = not process_failed and not parsed_artifacts and bool(last_message.strip())
-        # A write-capable run (implement-style) normally reports in prose —
-        # that's its report, not a degradation. Only read-only runs, whose
-        # whole job is structured findings, count as degraded on prose.
         degraded = unstructured and not write_capable
 
         verification = verification_artifact(
@@ -1946,6 +2174,7 @@ class CodexAdapter(FullEditWorkerAdapter):
                 )
             )
         return artifacts
+
 
 
 def build_codex_exec_command(
@@ -2337,7 +2566,7 @@ def available_hermes_providers() -> set:
     return available
 
 
-class HermesAdapter(FullEditWorkerAdapter):
+class HermesAdapter(CliWorkerAdapter):
     """Shells out to the NousResearch Hermes CLI (``hermes chat``).
 
     Mirrors :class:`CodexAdapter` / :class:`ClaudeCodeAdapter` for subprocess,
@@ -2374,8 +2603,39 @@ class HermesAdapter(FullEditWorkerAdapter):
             )
 
     def _run_implement(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
+        return self._run_cli_lifecycle(task, goal, worker_id)
+
+    def _resolve_cli_executable(self, task: Task) -> tuple[str, Optional[str]]:
+        executable = task.payload.get("executable") or os.environ.get("HERMES_COMMAND") or "hermes"
+        command_base = command_parts(executable)
+        resolved = resolve_command(command_base[0])
+        if resolved is None:
+            return str(executable), None
+        return str(executable), resolved
+
+    def _missing_cli(
+        self, task: Task, worker_id: str, executable_label: str
+    ) -> list[Artifact]:
+        return missing_cli_artifact(
+            task,
+            worker_id,
+            "hermes",
+            executable_label,
+            (
+                "Hermes CLI was not found. Install it or set "
+                "HERMES_COMMAND / payload.executable."
+            ),
+        )
+
+    def _prepare_cli_invocation(
+        self,
+        task: Task,
+        goal: str,
+        worker_id: str,
+        cwd: Path,
+        resolved: str,
+    ) -> Union[list[Artifact], CliInvocation]:
         base_prompt = with_report_contract(task.payload.get("prompt") or task.instruction)
-        cwd = Path(task.payload.get("cwd") or ".").resolve()
         prompt, codegraph_used = enrich_prompt_with_codegraph(
             prompt_with_skills(
                 prompt_with_memory(build_implement_prompt(base_prompt), task),
@@ -2385,22 +2645,8 @@ class HermesAdapter(FullEditWorkerAdapter):
             cwd=cwd,
             disabled=bool(task.payload.get("disable_codegraph", False)),
         )
-        timeout_seconds = int(task.payload.get("timeout_seconds", 900))
         executable = task.payload.get("executable") or os.environ.get("HERMES_COMMAND") or "hermes"
         command_base = command_parts(executable)
-        resolved = resolve_command(command_base[0])
-        if resolved is None:
-            return missing_cli_artifact(
-                task,
-                worker_id,
-                "hermes",
-                executable,
-                (
-                    "Hermes CLI was not found. Install it or set "
-                    "HERMES_COMMAND / payload.executable."
-                ),
-            )
-
         command = build_hermes_chat_command(
             executable=[resolved, *command_base[1:]],
             prompt=prompt,
@@ -2416,40 +2662,56 @@ class HermesAdapter(FullEditWorkerAdapter):
             safe_mode=bool(task.payload.get("safe_mode", False)),
             extra_args=task.payload.get("extra_args", []),
         )
-
-        blocked, before = FullEditWorkerAdapter.guard_full_edit_run(
-            task,
-            worker_id,
-            "hermes",
-            cwd,
-            extra_dirty_message=(
-                " For focused edits on a dirty tree (docs, tests), use puppetmaster_edit — it edits "
-                "in place and needs no clean tree."
-            ),
+        return CliInvocation(
+            command=command,
+            sidecar_name="hermes_implement",
+            subprocess_kwargs={"start_new_session": True},
+            extras={
+                "prompt": prompt,
+                "codegraph_used": codegraph_used,
+                "extra_dirty_message": (
+                    " For focused edits on a dirty tree (docs, tests), use puppetmaster_edit — it edits "
+                    "in place and needs no clean tree."
+                ),
+            },
         )
-        if blocked is not None:
-            return blocked
 
-        # Hermes spawns a foreign Python interpreter; scrub the parent's
-        # PYTHONPATH/PYTHONHOME so it can't import Puppetmaster's site-packages
-        # and crash on a version clash (e.g. stale python-dotenv).
+    def _invoke_cli(
+        self,
+        task: Task,
+        prepared: CliInvocation,
+        cwd: Path,
+        timeout_seconds: int,
+    ) -> StreamedProcess:
         worker_env = scrub_foreign_interpreter_env(
             apply_worktree_ports(os.environ.copy(), cwd)
         )
         with hermes_reasoning_effort_env(
             worker_env, task.payload.get("reasoning_effort")
         ) as run_env:
-            completed = run_streamed_subprocess(
-                command=command,
+            return run_streamed_subprocess(
+                command=prepared.command,
                 env=run_env,
                 task=task,
-                sidecar_name="hermes_implement",
+                sidecar_name=prepared.sidecar_name,
                 timeout_seconds=timeout_seconds,
                 cwd=str(cwd),
                 start_new_session=True,
             )
+
+    def _finalize_cli_run(
+        self,
+        task: Task,
+        worker_id: str,
+        goal: str,
+        prepared: CliInvocation,
+        before: dict,
+        after: dict,
+        completed: StreamedProcess,
+    ) -> list[Artifact]:
+        codegraph_used = bool(prepared.extras.get("codegraph_used"))
+        timeout_seconds = int(task.payload.get("timeout_seconds", 900))
         if completed.timed_out:
-            after = git_snapshot(cwd, base_tree=str(before.get("tree") or "") or None)
             stdout_capture = capture_subprocess_stdout(
                 text=completed.stdout,
                 task=task,
@@ -2502,7 +2764,6 @@ class HermesAdapter(FullEditWorkerAdapter):
                 )
             return artifacts
 
-        after = git_snapshot(cwd, base_tree=str(before.get("tree") or "") or None)
         has_work = _should_emit_patch_artifact(before, after)
         process_failed = completed.returncode != 0 and not has_work
         stdout_capture = capture_subprocess_stdout(
@@ -2517,7 +2778,7 @@ class HermesAdapter(FullEditWorkerAdapter):
             sidecar_name="hermes_stderr",
         )
         usage = token_usage(
-            prompt_text=prompt,
+            prompt_text=str(prepared.extras.get("prompt") or ""),
             output_text=completed.stdout,
         )
         artifacts = [
@@ -2545,7 +2806,7 @@ class HermesAdapter(FullEditWorkerAdapter):
                     "stdout_capture": stdout_capture,
                     "stderr_capture": stderr_capture,
                     "live_log": completed.live_log_path,
-                    "cwd": str(cwd),
+                    "cwd": str(Path(task.payload.get("cwd") or ".").resolve()),
                     "model": task.payload.get("model"),
                     "provider": task.payload.get("provider"),
                     "has_work": has_work,
@@ -3585,11 +3846,11 @@ class OpenAIAdapter:
                     check=task.instruction,
                     result="failed",
                     confidence=0.5,
-                    evidence=evidence_base + ["missing_api_key"],
+                    evidence=evidence_base + [NOT_AUTHENTICATED],
                     payload={
                         "returncode": None,
                         "model": model,
-                        "failure": "not_authenticated",
+                        "failure": NOT_AUTHENTICATED,
                         "stderr": (
                             "OPENAI_API_KEY is not set. Export it or pass openai_api_key "
                             "in the task payload."

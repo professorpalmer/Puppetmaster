@@ -157,17 +157,29 @@ class SwarmStore:
         worker_id: Optional[str] = None,
         lease_id: Optional[str] = None,
     ) -> Task:
-        terminal = status in {TaskStatus.COMPLETE, TaskStatus.FAILED}
         stored = self.get_task_by_id(task.id)
         # The caller carries the lease token granted at claim time; default to
         # the claimed task's own ``lease_id`` so existing call sites fence
         # correctly without having to thread the token through explicitly.
         expected_lease = lease_id if lease_id is not None else task.lease_id
+        updated = self._build_status_update(stored, status)
+        terminal = status in {TaskStatus.COMPLETE, TaskStatus.FAILED}
         if terminal and worker_id is not None and not self._lease_matches(
             stored, worker_id, expected_lease
         ):
             return stored
-        updated = replace(
+        return self._atomic_status_update(
+            task.id,
+            updated,
+            terminal=terminal,
+            worker_id=worker_id,
+            expected_lease=expected_lease,
+        )
+
+    @staticmethod
+    def _build_status_update(stored: Task, status: TaskStatus) -> Task:
+        terminal = status in {TaskStatus.COMPLETE, TaskStatus.FAILED}
+        return replace(
             stored,
             status=status,
             lease_owner=None if terminal else stored.lease_owner,
@@ -176,8 +188,18 @@ class SwarmStore:
             updated_at=now_iso(),
             completed_at=now_iso() if status == TaskStatus.COMPLETE else stored.completed_at,
         )
+
+    def _atomic_status_update(
+        self,
+        task_id: str,
+        updated: Task,
+        *,
+        terminal: bool,
+        worker_id: Optional[str],
+        expected_lease: Optional[str],
+    ) -> Task:
         if terminal and worker_id is not None:
-            current = self.get_task_by_id(task.id)
+            current = self.get_task_by_id(task_id)
             if not self._lease_matches(current, worker_id, expected_lease):
                 return current
         self.save_task(updated)
@@ -226,13 +248,43 @@ class SwarmStore:
         lease_seconds: int = 60,
         task_map: Optional[dict[str, Task]] = None,
     ) -> Optional[Task]:
+        return self._perform_claim(
+            task_id, worker_id, lease_seconds=lease_seconds, task_map=task_map
+        )
+
+    def _perform_claim(
+        self,
+        task_id: str,
+        worker_id: str,
+        lease_seconds: int = 60,
+        task_map: Optional[dict[str, Task]] = None,
+    ) -> Optional[Task]:
         task = self.get_task_by_id(task_id)
+        if self._claim_precheck(task, task_map=task_map):
+            return None
+        claimed = self._build_claimed_task(task, worker_id, lease_seconds)
+        if not self._atomic_claim(task_id, task, claimed, worker_id=worker_id):
+            return None
+        self.emit(
+            task.job_id,
+            "task.claimed",
+            self._task_claim_payload(task.id, worker_id, claimed),
+        )
+        return claimed
+
+    def _claim_precheck(
+        self,
+        task: Task,
+        *,
+        task_map: Optional[dict[str, Task]] = None,
+    ) -> bool:
+        """Shared claim decision logic. Returns True when the claim attempt must abort."""
         if not self.dependencies_complete(task, task_map=task_map):
             blocked = replace(task, status=TaskStatus.BLOCKED, updated_at=now_iso())
             self.save_task(blocked)
-            return None
+            return True
         if task.status == TaskStatus.COMPLETE:
-            return None
+            return True
         if task.attempts >= self.max_task_attempts:
             failed = replace(
                 task,
@@ -247,12 +299,14 @@ class SwarmStore:
                 "task.max_attempts_exceeded",
                 {"task_id": task.id, "attempts": task.attempts},
             )
-            return None
+            return True
         if task.status == TaskStatus.RUNNING and not self.is_task_stale(task):
-            return None
+            return True
+        return False
 
-        claim_snapshot = self._task_claim_snapshot(task)
-        claimed = replace(
+    @staticmethod
+    def _build_claimed_task(task: Task, worker_id: str, lease_seconds: int) -> Task:
+        return replace(
             task,
             status=TaskStatus.RUNNING,
             attempts=task.attempts + 1,
@@ -261,19 +315,29 @@ class SwarmStore:
             lease_id=new_id("lease"),
             updated_at=now_iso(),
         )
-        if not self._save_task_if_matches(task.id, claim_snapshot, claimed):
-            return None
-        self.emit(
-            task.job_id,
-            "task.claimed",
-            {
-                "task_id": task.id,
-                "worker_id": worker_id,
-                "lease_expires_at": claimed.lease_expires_at,
-                "attempts": claimed.attempts,
-            },
-        )
-        return claimed
+
+    @staticmethod
+    def _task_claim_payload(
+        task_id: str, worker_id: str, claimed: Task
+    ) -> dict[str, Any]:
+        return {
+            "task_id": task_id,
+            "worker_id": worker_id,
+            "lease_expires_at": claimed.lease_expires_at,
+            "attempts": claimed.attempts,
+        }
+
+    def _atomic_claim(
+        self,
+        task_id: str,
+        task: Task,
+        claimed: Task,
+        worker_id: Optional[str] = None,
+    ) -> bool:
+        claim_snapshot = self._task_claim_snapshot(task)
+        if not self._save_task_if_matches(task_id, claim_snapshot, claimed):
+            return False
+        return True
 
     def renew_task_lease(
         self,
@@ -287,11 +351,25 @@ class SwarmStore:
             task, worker_id, lease_id
         ):
             return None
-        renewed = replace(
+        renewed = self._build_renewed_task(task, lease_seconds)
+        return self._atomic_renew_lease(task_id, task, renewed, worker_id, lease_id)
+
+    @staticmethod
+    def _build_renewed_task(task: Task, lease_seconds: int) -> Task:
+        return replace(
             task,
             lease_expires_at=seconds_from_now(lease_seconds),
             updated_at=now_iso(),
         )
+
+    def _atomic_renew_lease(
+        self,
+        task_id: str,
+        task: Task,
+        renewed: Task,
+        worker_id: str,
+        lease_id: Optional[str],
+    ) -> Optional[Task]:
         self.save_task(renewed)
         self.emit(
             task.job_id,
@@ -337,14 +415,9 @@ class SwarmStore:
         for task in self.list_tasks(job_id):
             if not self.is_task_stale(task):
                 continue
-            queued = replace(
-                task,
-                status=TaskStatus.QUEUED,
-                lease_owner=None,
-                lease_expires_at=None,
-                updated_at=now_iso(),
-            )
-            self.save_task(queued)
+            queued = self._build_recovered_task(task)
+            if not self._atomic_recover_stale(task, queued):
+                continue
             self.release_lock(f"task:{task.id}")
             self.emit(
                 job_id,
@@ -353,6 +426,20 @@ class SwarmStore:
             )
             recovered.append(queued)
         return recovered
+
+    @staticmethod
+    def _build_recovered_task(task: Task) -> Task:
+        return replace(
+            task,
+            status=TaskStatus.QUEUED,
+            lease_owner=None,
+            lease_expires_at=None,
+            updated_at=now_iso(),
+        )
+
+    def _atomic_recover_stale(self, task: Task, queued: Task) -> bool:
+        self.save_task(queued)
+        return True
 
     def refresh_blocked_tasks(self, job_id: str) -> list[Task]:
         ready: list[Task] = []
