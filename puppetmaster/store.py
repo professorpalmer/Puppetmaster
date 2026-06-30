@@ -111,7 +111,14 @@ class SwarmStore:
 
     def update_job_status(self, job_id: str, status: JobStatus) -> Job:
         job = self.get_job(job_id)
-        updated = Job(
+        updated = self._job_with_status(job, status)
+        self.write_json(self.job_dir(job_id) / "job.json", updated)
+        self.emit(job_id, "job.status", {"status": str(status)})
+        return updated
+
+    @staticmethod
+    def _job_with_status(job: Job, status: JobStatus) -> Job:
+        return Job(
             id=job.id,
             goal=job.goal,
             label=job.label,
@@ -121,21 +128,22 @@ class SwarmStore:
             if status in {JobStatus.COMPLETE, JobStatus.FAILED, JobStatus.STALLED}
             else job.completed_at,
         )
-        self.write_json(self.job_dir(job_id) / "job.json", updated)
-        self.emit(job_id, "job.status", {"status": str(status)})
-        return updated
+
+    @staticmethod
+    def _task_saved_payload(task: Task) -> dict[str, Any]:
+        return {
+            "task_id": task.id,
+            "role": task.role,
+            "status": str(task.status),
+            "adapter": task.adapter,
+        }
 
     def save_task(self, task: Task) -> None:
         self.write_json(self.job_dir(task.job_id) / "tasks" / f"{task.id}.json", task)
         self.emit(
             task.job_id,
             "task.saved",
-            {
-                "task_id": task.id,
-                "role": task.role,
-                "status": str(task.status),
-                "adapter": task.adapter,
-            },
+            self._task_saved_payload(task),
         )
 
     def save_tasks(self, tasks: Iterable[Task]) -> None:
@@ -194,6 +202,24 @@ class SwarmStore:
         return True
 
     def claim_task(
+        self,
+        task_id: str,
+        worker_id: str,
+        lease_seconds: int = 60,
+        task_map: Optional[dict[str, Task]] = None,
+    ) -> Optional[Task]:
+        lock_name = f"task:{task_id}"
+        lock_ttl = max(lease_seconds * 3, lease_seconds + 1)
+        if not self.acquire_lock(lock_name, worker_id, ttl_seconds=lock_ttl):
+            return None
+        try:
+            return self._claim_task_locked(
+                task_id, worker_id, lease_seconds=lease_seconds, task_map=task_map
+            )
+        finally:
+            self.release_lock(lock_name, owner=worker_id)
+
+    def _claim_task_locked(
         self,
         task_id: str,
         worker_id: str,
@@ -299,21 +325,11 @@ class SwarmStore:
                 continue
             if role is not None and task.role != role:
                 continue
-            lock_name = f"task:{task.id}"
-            lock_ttl = max(lease_seconds * 3, lease_seconds + 1)
-            if not self.acquire_lock(lock_name, worker_id, ttl_seconds=lock_ttl):
-                continue
-            try:
-                # Reuse the task_map already built for this sweep so the claim's
-                # own dependency recheck doesn't re-fetch each dependency by id
-                # (one get_task_by_id / SQLite SELECT per edge). Dependencies are
-                # monotonic toward COMPLETE, so the map is as fresh as the scan
-                # that selected this task.
-                return self.claim_task(
-                    task.id, worker_id, lease_seconds=lease_seconds, task_map=task_map
-                )
-            finally:
-                self.release_lock(lock_name, owner=worker_id)
+            # claim_task acquires the per-task lock internally so direct callers
+            # are race-safe without requiring claim_next_task's sweep wrapper.
+            return self.claim_task(
+                task.id, worker_id, lease_seconds=lease_seconds, task_map=task_map
+            )
         return None
 
     def recover_stale_tasks(self, job_id: str) -> list[Task]:

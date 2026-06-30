@@ -20,12 +20,18 @@ the adapter actually runs the model.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
 from puppetmaster.model_registry import ModelSpec, enabled_specs
+
+logger = logging.getLogger(__name__)
+
+_ROUTING_OVERRIDES_CACHE: dict[str, tuple[float, dict]] = {}
+_ROUTING_OVERRIDES_PARSE_WARNED: set[str] = set()
 
 
 def _load_routing_overrides() -> dict:
@@ -36,13 +42,30 @@ def _load_routing_overrides() -> dict:
     """
     routing_path = os.path.expanduser("~/.pmharness/routing.json")
     try:
-        if not os.path.exists(routing_path):
-            return {}
-        with open(routing_path) as handle:
-            data = json.load(handle)
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
+        mtime = os.path.getmtime(routing_path) if os.path.exists(routing_path) else -1.0
+    except OSError:
+        mtime = -1.0
+    cached = _ROUTING_OVERRIDES_CACHE.get(routing_path)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    try:
+        if mtime < 0:
+            data: dict = {}
+        else:
+            with open(routing_path) as handle:
+                data = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        if routing_path not in _ROUTING_OVERRIDES_PARSE_WARNED:
+            logger.warning(
+                "Ignoring unreadable routing overrides at %s: %s",
+                routing_path,
+                exc,
+            )
+            _ROUTING_OVERRIDES_PARSE_WARNED.add(routing_path)
+        data = {}
+    result = data if isinstance(data, dict) else {}
+    _ROUTING_OVERRIDES_CACHE[routing_path] = (mtime, result)
+    return result
 
 
 # ----- Task signals --------------------------------------------------------

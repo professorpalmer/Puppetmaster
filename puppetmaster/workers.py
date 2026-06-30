@@ -24,6 +24,7 @@ RECOVERABLE_FAILURES = frozenset(
         "billing_or_quota",
         "preflight_blocked",
         "missing_api_key",
+        "not_authenticated",
         "missing_cli",
         "auth",
         "authentication",

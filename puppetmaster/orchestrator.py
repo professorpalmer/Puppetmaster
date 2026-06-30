@@ -320,8 +320,6 @@ class Orchestrator:
 
         Opt out with ``PUPPETMASTER_AUTODISCOVER=0``.
         """
-        import os
-
         if os.environ.get("PUPPETMASTER_AUTODISCOVER", "1") in ("0", "false", "no"):
             return
         if not any((s.payload or {}).get("auto_route") for s in specs):
@@ -441,7 +439,7 @@ class Orchestrator:
             tasks = self.store.list_tasks(job.id)
             record_job_trace(job, tasks, artifacts, traceparent=self._traceparent)
             record_job_metrics(job, tasks, artifacts)
-        except Exception:
+        except (OSError, TypeError, ValueError):
             pass
 
     def _emit_hermes_spawn_tree(
@@ -450,10 +448,10 @@ class Orchestrator:
         """Best-effort Hermes `/agents` replay snapshot for completed swarms."""
         try:
             emit_spawn_tree(self.store, job, artifacts, specs)
-        except Exception as exc:
+        except (OSError, TypeError, ValueError) as exc:
             try:
                 self.store.emit(job.id, "hermes.spawn_tree_ignored", {"error": str(exc)})
-            except Exception:
+            except OSError:
                 pass
 
     def _auto_fallback(
@@ -1008,8 +1006,6 @@ class Orchestrator:
         Per-task ``payload.min_confidence`` wins; otherwise
         ``$PUPPETMASTER_ESCALATE_CONFIDENCE`` enables it globally. Both must be a
         float in ``(0, 1]`` to take effect."""
-        import os
-
         payload = task.payload or {}
         raw = payload.get("min_confidence")
         if raw is None:
@@ -1829,8 +1825,6 @@ class Orchestrator:
         # Always hand the worker (and any agent it spawns) a PYTHONPATH that puts
         # this install first, so a self-served `python -m puppetmaster codegraph`
         # can't resolve a stale pip build that lacks the subcommand (#4).
-        import os
-
         from puppetmaster.codegraph import inject_worker_cli_env
 
         env = inject_worker_cli_env(dict(os.environ))

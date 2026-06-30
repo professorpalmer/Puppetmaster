@@ -123,6 +123,7 @@ class Stitcher:
             "plan-billed models)."
         ),
         "missing_api_key": "the adapter's API key env var is not set.",
+        "not_authenticated": "the adapter is not authenticated (API key, OAuth, or login required).",
         "missing_cli": "the adapter's CLI is not installed / not on PATH.",
         "sdk_not_installed": "the adapter SDK package is not installed.",
         "model_unavailable": "the requested model is invalid or not available to this account.",

@@ -156,6 +156,13 @@ class SQLiteSwarmStore(SwarmStore):
         finally:
             connection.close()
 
+    @staticmethod
+    def _emit(connection: sqlite3.Connection, job_id: str, event: str, payload: dict[str, Any]) -> None:
+        connection.execute(
+            "INSERT INTO events(job_id, at, event, payload) VALUES(?, ?, ?, ?)",
+            (job_id, now_iso(), event, json.dumps(payload, sort_keys=True)),
+        )
+
     def create_job(self, goal: str, *, label: Optional[str] = None) -> Job:
         self.init()
         job = Job(goal=goal, label=label)
@@ -173,26 +180,14 @@ class SQLiteSwarmStore(SwarmStore):
 
     def update_job_status(self, job_id: str, status: JobStatus) -> Job:
         job = self.get_job(job_id)
-        updated = Job(
-            id=job.id,
-            goal=job.goal,
-            label=job.label,
-            status=status,
-            created_at=job.created_at,
-            completed_at=now_iso()
-            if status in {JobStatus.COMPLETE, JobStatus.FAILED, JobStatus.STALLED}
-            else job.completed_at,
-        )
+        updated = self._job_with_status(job, status)
         payload = {"status": str(status)}
         with self._session() as connection:
             connection.execute(
                 "UPDATE jobs SET data = ? WHERE id = ?",
                 (self._dumps(updated), job_id),
             )
-            connection.execute(
-                "INSERT INTO events(job_id, at, event, payload) VALUES(?, ?, ?, ?)",
-                (job_id, now_iso(), "job.status", json.dumps(payload, sort_keys=True)),
-            )
+            self._emit(connection, job_id, "job.status", payload)
         return updated
 
     def save_task(self, task: Task) -> None:
@@ -202,12 +197,7 @@ class SQLiteSwarmStore(SwarmStore):
         # where a crash after the task write but before the event write would
         # produce state with no corresponding event (a torn write that breaks
         # event-cursor consumers).
-        payload = {
-            "task_id": task.id,
-            "role": task.role,
-            "status": str(task.status),
-            "adapter": task.adapter,
-        }
+        payload = self._task_saved_payload(task)
         with self._session() as connection:
             connection.execute(
                 """
@@ -221,10 +211,7 @@ class SQLiteSwarmStore(SwarmStore):
                 """,
                 (task.id, task.job_id, task.role, str(task.status), self._dumps(task)),
             )
-            connection.execute(
-                "INSERT INTO events(job_id, at, event, payload) VALUES(?, ?, ?, ?)",
-                (task.job_id, now_iso(), "task.saved", json.dumps(payload, sort_keys=True)),
-            )
+            self._emit(connection, task.job_id, "task.saved", payload)
 
     def save_tasks(self, tasks: Iterable[Task]) -> None:
         task_list = list(tasks)
@@ -234,18 +221,11 @@ class SQLiteSwarmStore(SwarmStore):
         rows: list[tuple[Any, ...]] = []
         event_rows: list[tuple[Any, ...]] = []
         for task in task_list:
-            payload = {
-                "task_id": task.id,
-                "role": task.role,
-                "status": str(task.status),
-                "adapter": task.adapter,
-            }
+            payload = self._task_saved_payload(task)
             rows.append(
                 (task.id, task.job_id, task.role, str(task.status), self._dumps(task))
             )
-            event_rows.append(
-                (task.job_id, now_iso(), "task.saved", json.dumps(payload, sort_keys=True))
-            )
+            event_rows.append((task.job_id, payload))
         with self._session() as connection:
             connection.executemany(
                 """
@@ -259,10 +239,8 @@ class SQLiteSwarmStore(SwarmStore):
                 """,
                 rows,
             )
-            connection.executemany(
-                "INSERT INTO events(job_id, at, event, payload) VALUES(?, ?, ?, ?)",
-                event_rows,
-            )
+            for job_id, payload in event_rows:
+                self._emit(connection, job_id, "task.saved", payload)
 
     def update_task_status(
         self,
@@ -596,8 +574,6 @@ class SQLiteSwarmStore(SwarmStore):
     def save_artifact(self, artifact: Artifact) -> None:
         artifact.validate()
         if artifact.sha256 is None:
-            from dataclasses import replace
-
             artifact = replace(artifact, sha256=self.artifact_hash(artifact))
         self.init()
         event_payload = {
@@ -637,8 +613,6 @@ class SQLiteSwarmStore(SwarmStore):
             )
 
     def save_artifacts(self, artifacts: Iterable[Artifact]) -> None:
-        from dataclasses import replace
-
         artifact_list = list(artifacts)
         if not artifact_list:
             return

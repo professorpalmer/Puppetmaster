@@ -274,14 +274,14 @@ class _AsyncProcessReaper(threading.Thread):
         # outlive us as a zombie handed back to init.
         try:
             _reap_async_processes()
-        except Exception:
+        except (OSError, ChildProcessError):
             pass
 
     def run(self) -> None:  # pragma: no cover - timing covered via direct tests
         while not self._stop.wait(self._interval):
             try:
                 _reap_async_processes()
-            except Exception:
+            except (OSError, ChildProcessError):
                 pass
 
 
@@ -726,7 +726,7 @@ class _InputStalenessWatcher(threading.Thread):
             _SHUTDOWN_REQUESTED.set()
             try:
                 self._on_shutdown()
-            except Exception:
+            except (OSError, RuntimeError):
                 pass
             return
 
@@ -995,7 +995,7 @@ def main() -> int:
         if registration_path is not None:
             try:
                 registry_deregister(registration_path)
-            except Exception:
+            except OSError:
                 pass
     return 0
 
@@ -2967,7 +2967,7 @@ def start_cli(command: list[str], args: JsonObject) -> JsonObject:
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 process.kill()
-        except Exception:
+        except (OSError, ProcessLookupError):
             pass
         raise
     body = {

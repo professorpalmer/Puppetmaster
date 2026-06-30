@@ -27,6 +27,7 @@ adapter.
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import time
@@ -127,8 +128,6 @@ def _read_claude_oauth(home: Path) -> "Optional[dict]":
     logout, so "the file exists" is NOT proof of authentication — we require an
     ``oauthAccount`` carrying an ``accountUuid`` or ``emailAddress``.
     """
-    import json
-
     path = home / ".claude.json"
     if not path.is_file():
         return None
@@ -155,8 +154,6 @@ def _is_truthy_env_value(value: Optional[str]) -> bool:
 def _claude_bedrock_enabled(env: Mapping[str, str], home: Path) -> bool:
     if _is_truthy_env_value(env.get("CLAUDE_CODE_USE_BEDROCK")):
         return True
-    import json
-
     path = home / ".claude" / "settings.json"
     if not path.is_file():
         return False
@@ -320,7 +317,6 @@ def _read_codex_auth(path: Path, label: str) -> "Optional[BillingStatus]":
     ``tokens`` block) is subscription-covered. Returns None when the file is
     absent/unreadable so the caller can fall back to ``codex login status``.
     """
-    import json
     if not path.is_file():
         return None
     try:
@@ -459,8 +455,6 @@ def _hermes_present_credential_keys(env: Mapping[str, str], home: Path) -> "set[
 
 def _hermes_oauth_providers(home: Path) -> "set[str]":
     """Hermes provider names that carry OAuth state in ~/.hermes/auth.json."""
-    import json
-
     auth_file = home / ".hermes" / "auth.json"
     if not auth_file.is_file():
         return set()

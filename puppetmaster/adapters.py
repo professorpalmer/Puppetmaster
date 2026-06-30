@@ -13,7 +13,7 @@ import sys
 import tempfile
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional, Protocol, Union
 
@@ -22,6 +22,13 @@ from puppetmaster.codegraph import (
     inject_worker_cli_env,
     repo_file_census,
     scrub_foreign_interpreter_env,
+)
+from puppetmaster.failure import (
+    classify_claude_code_failure,
+    classify_codex_failure,
+    classify_cursor_failure,
+    classify_hermes_failure,
+    classify_openai_failure,
 )
 from puppetmaster.fs_permissions import mkdir_private, open_private, write_private_text
 from puppetmaster.models import Artifact, ArtifactType, Task
@@ -230,7 +237,7 @@ def run_streamed_subprocess(
             with write_lock:
                 live_handle.write(redacted)
                 live_handle.flush()
-        except Exception:
+        except OSError:
             pass
 
     popen_kwargs: dict[str, Any] = {}
@@ -472,6 +479,228 @@ _ARTIFACT_EMPTY_GUIDANCE = (
     'or sound), return an empty list {"artifacts":[]} — never invent a finding '
     "or a risk about the prompt, the contract, or the run being degraded."
 )
+
+_IMPLEMENT_REPORT_CONTRACT = (
+    "Reporting contract: when you are done, end your final message with a short "
+    "report — what you changed and why, the files you touched, and exactly what "
+    "you ran to verify it. Puppetmaster persists that report as a durable "
+    "artifact; without it the run looks like it did nothing."
+)
+
+_PUPPETMASTER_ARTIFACT_CONTRACT_LINES = (
+    "Puppetmaster artifact contract:",
+    "Return only JSON, with no markdown wrapper, in this shape:",
+    '{"artifacts":[{"type":"finding","claim":"...","evidence":["path or symbol"],"confidence":0.8}]}',
+    "Allowed artifact types:",
+    '- finding: requires "claim", "evidence", "confidence".',
+    '- risk: requires "risk", "mitigation", "evidence", "confidence".',
+    '- decision: requires "decision", "why", "evidence", "confidence".',
+)
+
+
+def build_structured_prompt(prompt: str, *, final_message_note: bool = False) -> str:
+    lines = [prompt, ""]
+    if final_message_note:
+        lines.extend(
+            [
+                _PUPPETMASTER_ARTIFACT_CONTRACT_LINES[0],
+                "When you are finished, emit ONLY a single JSON object as your final agent message "
+                "(no prose around it, no markdown fences), in this shape:",
+                _PUPPETMASTER_ARTIFACT_CONTRACT_LINES[2],
+                _PUPPETMASTER_ARTIFACT_CONTRACT_LINES[3],
+                _PUPPETMASTER_ARTIFACT_CONTRACT_LINES[4],
+                _PUPPETMASTER_ARTIFACT_CONTRACT_LINES[5],
+                _PUPPETMASTER_ARTIFACT_CONTRACT_LINES[6],
+            ]
+        )
+    else:
+        lines.extend(_PUPPETMASTER_ARTIFACT_CONTRACT_LINES)
+    lines.extend([_ARTIFACT_GROUNDING, _ARTIFACT_EMPTY_GUIDANCE])
+    if final_message_note:
+        lines.append(
+            "You may still use your tools to read files and inspect code along the way; just "
+            "make sure the FINAL agent message is the JSON object described above."
+        )
+    return "\n".join(lines)
+
+
+def build_implement_prompt(prompt: str) -> str:
+    return "\n".join(
+        [
+            prompt,
+            "",
+            "Implement mode: you are running as a full-edit Puppetmaster worker "
+            "inside the user's repository. Actually make the code changes — create, "
+            "edit, and delete files as needed to complete the task end to end. Do not "
+            "just describe a plan or return findings.",
+            "Keep the change focused on the task; run any obvious local checks you can. "
+            "Puppetmaster captures the resulting git diff as a PATCH artifact, so leave "
+            "the working tree containing your final intended changes.",
+            _IMPLEMENT_REPORT_CONTRACT,
+        ]
+    )
+
+
+def make_patch_artifact(
+    task: Task,
+    worker_id: str,
+    before: dict,
+    after: dict,
+    *,
+    adapter: str,
+    status: str,
+    change: str,
+    sidecar_name: str,
+    evidence_adapter: Optional[str] = None,
+) -> Artifact:
+    label = evidence_adapter or adapter
+    return Artifact(
+        job_id=task.job_id,
+        task_id=task.id,
+        type=ArtifactType.PATCH,
+        created_by=worker_id,
+        confidence=0.8 if status == "applied" else 0.5,
+        evidence=[f"adapter:{label}", f"base:{before['sha']}"],
+        payload=build_patch_payload(
+            task=task,
+            before=before,
+            after=after,
+            status=status,
+            change=change,
+            sidecar_name=sidecar_name,
+        ),
+    )
+
+
+def dirty_worktree_guard(
+    task: Task,
+    worker_id: str,
+    adapter: str,
+    before: dict,
+    *,
+    adapter_label: Optional[str] = None,
+    extra_message: str = "",
+) -> Optional[list[Artifact]]:
+    if task.payload.get("allow_dirty", False):
+        return None
+    if not (before["changed_files"] or before["untracked_files"]):
+        return None
+    label = adapter_label or adapter
+    return [
+        verification_artifact(
+            task=task,
+            worker_id=worker_id,
+            adapter=adapter,
+            check=task.instruction,
+            result="blocked",
+            confidence=0.8,
+            evidence=[f"adapter:{label}", "status:dirty-repo"],
+            payload={
+                "failure": "dirty_worktree",
+                "message": (
+                    f"{label} full-edit runs require a clean working tree by default "
+                    "so Puppetmaster can attribute the resulting diff correctly. Commit, "
+                    "stash, use a worktree, or set payload.allow_dirty=true."
+                    + extra_message
+                    + dirty_worktree_paths_note(
+                        before["changed_files"], before["untracked_files"]
+                    )
+                ),
+                "changed_files": before["changed_files"],
+                "untracked_files": before["untracked_files"],
+                **diff_source_payload(before, {}),
+            },
+        )
+    ]
+
+
+def missing_cli_artifact(
+    task: Task,
+    worker_id: str,
+    adapter: str,
+    executable: object,
+    message: str,
+) -> list[Artifact]:
+    return [
+        verification_artifact(
+            task=task,
+            worker_id=worker_id,
+            adapter=adapter,
+            check=task.instruction,
+            result="blocked",
+            confidence=0.45,
+            evidence=[f"adapter:{adapter}", "status:missing-cli"],
+            payload={
+                "failure": "missing_cli",
+                "message": message,
+                "executable": executable,
+            },
+        )
+    ]
+
+
+def failure_verification(
+    task: Task,
+    worker_id: str,
+    adapter: str,
+    evidence: list[str],
+    failure: str,
+    stderr: str,
+    *,
+    returncode: Optional[int] = None,
+    confidence: float = 0.55,
+    extra: Optional[dict[str, Any]] = None,
+) -> Artifact:
+    payload: dict[str, Any] = {
+        "failure": failure,
+        "returncode": returncode,
+        "stderr": _redacted_tail(stderr, _STDOUT_TAIL_CHARS),
+    }
+    if extra:
+        payload.update(extra)
+    return verification_artifact(
+        task=task,
+        worker_id=worker_id,
+        adapter=adapter,
+        check=task.instruction,
+        result="failed",
+        confidence=confidence,
+        evidence=evidence,
+        payload=payload,
+    )
+
+
+class FullEditWorkerAdapter:
+    """Shared git snapshot + worktree/dirty guards for full-edit adapter runs."""
+
+    name: str
+
+    @staticmethod
+    def guard_full_edit_run(
+        task: Task,
+        worker_id: str,
+        adapter: str,
+        cwd: Path,
+        *,
+        adapter_label: Optional[str] = None,
+        extra_dirty_message: str = "",
+    ) -> tuple[Optional[list[Artifact]], dict]:
+        before = git_snapshot(cwd)
+        blocked = worktree_guard(task, worker_id, adapter, cwd, before)
+        if blocked is not None:
+            return blocked, before
+        dirty = dirty_worktree_guard(
+            task,
+            worker_id,
+            adapter,
+            before,
+            adapter_label=adapter_label,
+            extra_message=extra_dirty_message,
+        )
+        if dirty is not None:
+            return dirty, before
+        return None, before
+
 
 # Appended to the prompt for a single retry when an analyze worker returns no
 # structured artifacts. The cheapest/minimal-effort workers occasionally answer
@@ -769,7 +998,7 @@ class ShellAdapter:
         ]
 
 
-class CursorAdapter:
+class CursorAdapter(FullEditWorkerAdapter):
     name = "cursor"
 
     def run(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
@@ -788,43 +1017,22 @@ class CursorAdapter:
         model = task.payload.get("model", "default")
 
         # Fail fast on a dirty tree before spending any work (codegraph, agent).
-        before = git_snapshot(cwd)
-        blocked = worktree_guard(task, worker_id, "cursor", cwd, before)
+        blocked, before = self.guard_full_edit_run(
+            task,
+            worker_id,
+            "cursor",
+            cwd,
+            adapter_label="cursor-sdk",
+            extra_dirty_message=(
+                " For focused edits on a dirty tree (docs, tests), use puppetmaster_edit — it edits "
+                "in place and needs no clean tree."
+            ),
+        )
         if blocked is not None:
             return blocked
-        if not task.payload.get("allow_dirty", False) and (
-            before["changed_files"] or before["untracked_files"]
-        ):
-            return [
-                verification_artifact(
-                    task=task,
-                    worker_id=worker_id,
-                    adapter="cursor",
-                    check=task.instruction,
-                    result="blocked",
-                    confidence=0.8,
-                    evidence=["adapter:cursor-sdk", "status:dirty-repo"],
-                    payload={
-                        "failure": "dirty_worktree",
-                        "message": (
-                            "Cursor implement runs require a clean working tree by default "
-                            "so Puppetmaster can attribute the resulting diff correctly. Commit, "
-                            "stash, use a worktree, or set payload.allow_dirty=true. For focused "
-                            "edits on a dirty tree (docs, tests), use puppetmaster_edit — it edits "
-                            "in place and needs no clean tree."
-                            + dirty_worktree_paths_note(
-                                before["changed_files"], before["untracked_files"]
-                            )
-                        ),
-                        "changed_files": before["changed_files"],
-                        "untracked_files": before["untracked_files"],
-                        **diff_source_payload(before, {}),
-                    },
-                )
-            ]
 
         prompt, codegraph_used = enrich_prompt_with_codegraph(
-            prompt_with_memory(self._implement_prompt(base_prompt), task),
+            prompt_with_memory(build_implement_prompt(base_prompt), task),
             task_description=task.payload.get("codegraph_task") or task.instruction or goal,
             cwd=cwd,
             disabled=bool(task.payload.get("disable_codegraph", False)),
@@ -877,7 +1085,17 @@ class CursorAdapter:
             # partial diff so the work isn't silently lost.
             if _should_emit_patch_artifact(before, after):
                 artifacts.append(
-                    self._patch_artifact(task, worker_id, before, after, status="failed")
+                    make_patch_artifact(
+                        task,
+                        worker_id,
+                        before,
+                        after,
+                        adapter="cursor",
+                        status="failed",
+                        change="Cursor agent modified repository files.",
+                        sidecar_name="cursor_implement",
+                        evidence_adapter="cursor-sdk",
+                    )
                 )
             return artifacts
 
@@ -938,34 +1156,19 @@ class CursorAdapter:
             )
         if _should_emit_patch_artifact(before, after):
             artifacts.append(
-                self._patch_artifact(
+                make_patch_artifact(
                     task,
                     worker_id,
                     before,
                     after,
+                    adapter="cursor",
                     status="applied" if completed.returncode == 0 else "failed",
+                    change="Cursor agent modified repository files.",
+                    sidecar_name="cursor_implement",
+                    evidence_adapter="cursor-sdk",
                 )
             )
         return artifacts
-
-    @staticmethod
-    def _patch_artifact(task: Task, worker_id: str, before, after, *, status: str) -> Artifact:
-        return Artifact(
-            job_id=task.job_id,
-            task_id=task.id,
-            type=ArtifactType.PATCH,
-            created_by=worker_id,
-            confidence=0.8 if status == "applied" else 0.5,
-            evidence=["adapter:cursor-sdk", f"base:{before['sha']}"],
-            payload=build_patch_payload(
-                task=task,
-                before=before,
-                after=after,
-                status=status,
-                change="Cursor agent modified repository files.",
-                sidecar_name="cursor_implement",
-            ),
-        )
 
     def _run_analyze(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
         base_prompt = task.payload.get("prompt") or task.instruction
@@ -973,7 +1176,7 @@ class CursorAdapter:
         model = task.payload.get("model", "default")
         prompt, codegraph_used = enrich_prompt_with_codegraph(
             prompt_with_memory(
-                self._structured_prompt(base_prompt),
+                build_structured_prompt(base_prompt),
                 task,
             ),
             task_description=task.payload.get("codegraph_task") or task.instruction or goal,
@@ -988,20 +1191,17 @@ class CursorAdapter:
             {"prompt": prompt, "cwd": cwd, "model": model},
             sort_keys=True,
         )
-        try:
-            completed = subprocess.run(
-                ["node", str(runner)],
-                capture_output=True,
-                text=True,
-                timeout=int(task.payload.get("timeout_seconds", 300)),
-                check=False,
-                env=environment,
-            )
-        except subprocess.TimeoutExpired as exc:
-            # ``TimeoutExpired`` output can be bytes (or None); normalize before
-            # classifying/persisting so the artifact never stores raw bytes.
-            stderr = _coerce_text(exc.stderr)
-            stdout = _coerce_text(exc.stdout)
+        timeout_seconds = int(task.payload.get("timeout_seconds", 300))
+        completed = run_streamed_subprocess(
+            command=["node", str(runner)],
+            env=environment,
+            task=task,
+            sidecar_name="cursor_analyze",
+            timeout_seconds=timeout_seconds,
+        )
+        if completed.timed_out:
+            stdout = completed.stdout
+            stderr = completed.stderr
             stdout_capture = capture_subprocess_stdout(
                 text=stdout,
                 task=task,
@@ -1028,7 +1228,8 @@ class CursorAdapter:
                         "stdout_capture": stdout_capture,
                         "stderr_capture": stderr_capture,
                         "model": model,
-                        "failure": classify_cursor_failure(stderr + stdout),
+                        "failure": "timeout",
+                        "live_log": completed.live_log_path,
                     },
                 )
             ]
@@ -1113,41 +1314,6 @@ class CursorAdapter:
         artifacts.extend(parsed_artifacts)
         return artifacts
 
-    @staticmethod
-    def _implement_prompt(prompt: str) -> str:
-        return "\n".join(
-            [
-                prompt,
-                "",
-                "Implement mode: you are running as a full-edit Puppetmaster worker "
-                "inside the user's repository. Actually make the code changes — create, "
-                "edit, and delete files as needed to complete the task end to end. Do not "
-                "just describe a plan or return findings.",
-                "Keep the change focused on the task; run any obvious local checks you can. "
-                "Puppetmaster captures the resulting git diff as a PATCH artifact, so leave "
-                "the working tree containing your final intended changes.",
-                _IMPLEMENT_REPORT_CONTRACT,
-            ]
-        )
-
-    @staticmethod
-    def _structured_prompt(prompt: str) -> str:
-        return "\n".join(
-            [
-                prompt,
-                "",
-                "Puppetmaster artifact contract:",
-                "Return only JSON, with no markdown wrapper, in this shape:",
-                '{"artifacts":[{"type":"finding","claim":"...","evidence":["path or symbol"],"confidence":0.8}]}',
-                "Allowed artifact types:",
-                '- finding: requires "claim", "evidence", "confidence".',
-                '- risk: requires "risk", "mitigation", "evidence", "confidence".',
-                '- decision: requires "decision", "why", "evidence", "confidence".',
-                _ARTIFACT_GROUNDING,
-                _ARTIFACT_EMPTY_GUIDANCE,
-            ]
-        )
-
 
 DEFAULT_CLAUDE_CODE_MODEL = "claude-opus-4-8"
 
@@ -1218,7 +1384,7 @@ def resolve_claude_code_model(
     )
 
 
-class ClaudeCodeAdapter:
+class ClaudeCodeAdapter(FullEditWorkerAdapter):
     name = "claude-code"
 
     def run(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
@@ -1235,25 +1401,16 @@ class ClaudeCodeAdapter:
         command_base = command_parts(executable)
         resolved = resolve_command(command_base[0])
         if resolved is None:
-            return [
-                verification_artifact(
-                    task=task,
-                    worker_id=worker_id,
-                    adapter="claude-code",
-                    check=task.instruction,
-                    result="blocked",
-                    confidence=0.45,
-                    evidence=["adapter:claude-code", "status:missing-cli"],
-                    payload={
-                        "failure": "missing_cli",
-                        "message": (
-                            "Claude Code CLI was not found. Install it or set "
-                            "CLAUDE_CODE_COMMAND / payload.executable."
-                        ),
-                        "executable": executable,
-                    },
-                )
-            ]
+            return missing_cli_artifact(
+                task,
+                worker_id,
+                "claude-code",
+                executable,
+                (
+                    "Claude Code CLI was not found. Install it or set "
+                    "CLAUDE_CODE_COMMAND / payload.executable."
+                ),
+            )
 
         model_for_cli, model_note = resolve_claude_code_model(task.payload)
         command = build_claude_code_command(
@@ -1270,36 +1427,18 @@ class ClaudeCodeAdapter:
         blocked = worktree_guard(task, worker_id, "claude-code", cwd, before)
         if blocked is not None:
             return blocked
-        if not task.payload.get("allow_dirty", False) and (
-            before["changed_files"] or before["untracked_files"]
-        ):
-            return [
-                verification_artifact(
-                    task=task,
-                    worker_id=worker_id,
-                    adapter="claude-code",
-                    check=task.instruction,
-                    result="blocked",
-                    confidence=0.8,
-                    evidence=["adapter:claude-code", "status:dirty-repo"],
-                    payload={
-                        "failure": "dirty_worktree",
-                        "message": (
-                            "Claude Code full-edit runs require a clean working tree by default "
-                            "so Puppetmaster can attribute resulting diffs correctly. Commit, stash, "
-                            "use a worktree, or set payload.allow_dirty=true. For focused edits on a "
-                            "dirty tree (docs, tests), use puppetmaster_edit — it edits in place and "
-                            "needs no clean tree."
-                            + dirty_worktree_paths_note(
-                                before["changed_files"], before["untracked_files"]
-                            )
-                        ),
-                        "changed_files": before["changed_files"],
-                        "untracked_files": before["untracked_files"],
-                        **diff_source_payload(before, {}),
-                    },
-                )
-            ]
+        dirty = dirty_worktree_guard(
+            task,
+            worker_id,
+            "claude-code",
+            before,
+            extra_message=(
+                " For focused edits on a dirty tree (docs, tests), use puppetmaster_edit — it edits "
+                "in place and needs no clean tree."
+            ),
+        )
+        if dirty is not None:
+            return dirty
         # Stream output to a live sidecar log + heartbeat so a long Claude Code
         # run is visibly alive instead of looking hung behind a flat, silent
         # blocking wait. The streamed runner closes stdin, so the CLI can never
@@ -1476,7 +1615,7 @@ def _should_emit_patch_artifact(before: dict, after: dict) -> bool:
 DEFAULT_CODEX_MODEL = "gpt-5.4-mini"
 
 
-class CodexAdapter:
+class CodexAdapter(FullEditWorkerAdapter):
     """Shells out to the official OpenAI Codex CLI (``codex exec --json``).
 
     Codex is the closest OpenAI-side analog to the Claude Code CLI: a
@@ -1503,7 +1642,7 @@ class CodexAdapter:
         base_prompt = task.payload.get("prompt") or task.instruction
         cwd = Path(task.payload.get("cwd") or ".").resolve()
         prompt, codegraph_used = enrich_prompt_with_codegraph(
-            prompt_with_memory(self._structured_prompt(base_prompt), task),
+            prompt_with_memory(build_structured_prompt(base_prompt, final_message_note=True), task),
             task_description=task.payload.get("codegraph_task") or task.instruction or goal,
             cwd=cwd,
             disabled=bool(task.payload.get("disable_codegraph", False)),
@@ -1514,27 +1653,18 @@ class CodexAdapter:
         command_base = command_parts(executable)
         resolved = resolve_command(command_base[0])
         if resolved is None:
-            return [
-                verification_artifact(
-                    task=task,
-                    worker_id=worker_id,
-                    adapter="codex",
-                    check=task.instruction,
-                    result="blocked",
-                    confidence=0.45,
-                    evidence=["adapter:codex", "status:missing-cli"],
-                    payload={
-                        "failure": "missing_cli",
-                        "message": (
-                            "Codex CLI was not found. Install it with "
-                            "`npm install -g @openai/codex`, then `printenv "
-                            "OPENAI_API_KEY | codex login --with-api-key`, or "
-                            "set CODEX_COMMAND / payload.executable."
-                        ),
-                        "executable": executable,
-                    },
-                )
-            ]
+            return missing_cli_artifact(
+                task,
+                worker_id,
+                "codex",
+                executable,
+                (
+                    "Codex CLI was not found. Install it with "
+                    "`npm install -g @openai/codex`, then `printenv "
+                    "OPENAI_API_KEY | codex login --with-api-key`, or "
+                    "set CODEX_COMMAND / payload.executable."
+                ),
+            )
 
         model = str(task.payload.get("model") or DEFAULT_CODEX_MODEL)
         sandbox = str(task.payload.get("sandbox") or "workspace-write")
@@ -1566,39 +1696,19 @@ class CodexAdapter:
             blocked = worktree_guard(task, worker_id, "codex", cwd, before)
             if blocked is not None:
                 return blocked
-        if (
-            write_capable
-            and not task.payload.get("allow_dirty", False)
-            and (before["changed_files"] or before["untracked_files"])
-        ):
-            return [
-                verification_artifact(
-                    task=task,
-                    worker_id=worker_id,
-                    adapter="codex",
-                    check=task.instruction,
-                    result="blocked",
-                    confidence=0.8,
-                    evidence=["adapter:codex", "status:dirty-repo"],
-                    payload={
-                        "failure": "dirty_worktree",
-                        "message": (
-                            "Codex full-edit runs require a clean working tree by default "
-                            "so Puppetmaster can attribute resulting diffs correctly. Commit, "
-                            "stash, use a worktree, set payload.allow_dirty=true, or pass "
-                            "payload.sandbox='read-only' for review-only tasks. For focused edits "
-                            "on a dirty tree (docs, tests), use puppetmaster_edit — it edits in "
-                            "place and needs no clean tree."
-                            + dirty_worktree_paths_note(
-                                before["changed_files"], before["untracked_files"]
-                            )
-                        ),
-                        "changed_files": before["changed_files"],
-                        "untracked_files": before["untracked_files"],
-                        **diff_source_payload(before, {}),
-                    },
-                )
-            ]
+            dirty = dirty_worktree_guard(
+                task,
+                worker_id,
+                "codex",
+                before,
+                extra_message=(
+                    " Or pass payload.sandbox='read-only' for review-only tasks. For focused edits "
+                    "on a dirty tree (docs, tests), use puppetmaster_edit — it edits in place and "
+                    "needs no clean tree."
+                ),
+            )
+            if dirty is not None:
+                return dirty
 
         # Stream output to a live sidecar log + heartbeat so a long `codex exec`
         # run is visibly alive instead of looking hung behind a flat, silent
@@ -1824,45 +1934,18 @@ class CodexAdapter:
         artifacts.extend(parsed_artifacts)
         if _should_emit_patch_artifact(before, after):
             artifacts.append(
-                Artifact(
-                    job_id=task.job_id,
-                    task_id=task.id,
-                    type=ArtifactType.PATCH,
-                    created_by=worker_id,
-                    confidence=0.8 if not process_failed else 0.5,
-                    evidence=["adapter:codex", f"base:{before['sha']}"],
-                    payload=build_patch_payload(
-                        task=task,
-                        before=before,
-                        after=after,
-                        status="applied" if not process_failed else "failed",
-                        change="Codex modified repository files.",
-                        sidecar_name="codex_implement",
-                    ),
+                make_patch_artifact(
+                    task,
+                    worker_id,
+                    before,
+                    after,
+                    adapter="codex",
+                    status="applied" if not process_failed else "failed",
+                    change="Codex modified repository files.",
+                    sidecar_name="codex_implement",
                 )
             )
         return artifacts
-
-    @staticmethod
-    def _structured_prompt(prompt: str) -> str:
-        return "\n".join(
-            [
-                prompt,
-                "",
-                "Puppetmaster artifact contract:",
-                "When you are finished, emit ONLY a single JSON object as your final agent message "
-                "(no prose around it, no markdown fences), in this shape:",
-                '{"artifacts":[{"type":"finding","claim":"...","evidence":["path or symbol"],"confidence":0.8}]}',
-                "Allowed artifact types:",
-                '- finding: requires "claim", "evidence", "confidence".',
-                '- risk: requires "risk", "mitigation", "evidence", "confidence".',
-                '- decision: requires "decision", "why", "evidence", "confidence".',
-                _ARTIFACT_GROUNDING,
-                _ARTIFACT_EMPTY_GUIDANCE,
-                "You may still use your tools to read files and inspect code along the way; just "
-                "make sure the FINAL agent message is the JSON object described above.",
-            ]
-        )
 
 
 def build_codex_exec_command(
@@ -1942,33 +2025,6 @@ def last_codex_agent_message(events: list[dict[str, Any]]) -> str:
                 continue
             return str(text)
     return ""
-
-
-def classify_codex_failure(output: str) -> str:
-    lowered = (output or "").lower()
-    if "not logged in" in lowered or "codex login" in lowered:
-        return "not_authenticated"
-    if "missing bearer" in lowered or "401" in lowered or "unauthorized" in lowered:
-        return "not_authenticated"
-    if "rate limit" in lowered or "429" in lowered:
-        return "rate_limit"
-    if "billing" in lowered or "quota" in lowered or "credit" in lowered:
-        return "billing_or_quota"
-    if "model_not_found" in lowered:
-        return "model_unavailable"
-    if "model" in lowered and ("unavailable" in lowered or "not found" in lowered or "invalid" in lowered):
-        return "model_unavailable"
-    if "command not found" in lowered:
-        return "missing_cli"
-    if "approval" in lowered and ("denied" in lowered or "rejected" in lowered):
-        return "approval_denied"
-    if "sandbox" in lowered and ("denied" in lowered or "blocked" in lowered):
-        return "sandbox_denied"
-    if "timeout" in lowered or "timed out" in lowered:
-        return "timeout"
-    if "network" in lowered or "dns" in lowered or "connect" in lowered:
-        return "network_error"
-    return "unknown"
 
 
 # Hermes toolsets are passed verbatim to ``hermes chat -t`` and select the
@@ -2281,7 +2337,7 @@ def available_hermes_providers() -> set:
     return available
 
 
-class HermesAdapter:
+class HermesAdapter(FullEditWorkerAdapter):
     """Shells out to the NousResearch Hermes CLI (``hermes chat``).
 
     Mirrors :class:`CodexAdapter` / :class:`ClaudeCodeAdapter` for subprocess,
@@ -2322,7 +2378,7 @@ class HermesAdapter:
         cwd = Path(task.payload.get("cwd") or ".").resolve()
         prompt, codegraph_used = enrich_prompt_with_codegraph(
             prompt_with_skills(
-                prompt_with_memory(CursorAdapter._implement_prompt(base_prompt), task),
+                prompt_with_memory(build_implement_prompt(base_prompt), task),
                 task,
             ),
             task_description=task.payload.get("codegraph_task") or task.instruction or goal,
@@ -2334,25 +2390,16 @@ class HermesAdapter:
         command_base = command_parts(executable)
         resolved = resolve_command(command_base[0])
         if resolved is None:
-            return [
-                verification_artifact(
-                    task=task,
-                    worker_id=worker_id,
-                    adapter="hermes",
-                    check=task.instruction,
-                    result="blocked",
-                    confidence=0.45,
-                    evidence=["adapter:hermes", "status:missing-cli"],
-                    payload={
-                        "failure": "missing_cli",
-                        "message": (
-                            "Hermes CLI was not found. Install it or set "
-                            "HERMES_COMMAND / payload.executable."
-                        ),
-                        "executable": executable,
-                    },
-                )
-            ]
+            return missing_cli_artifact(
+                task,
+                worker_id,
+                "hermes",
+                executable,
+                (
+                    "Hermes CLI was not found. Install it or set "
+                    "HERMES_COMMAND / payload.executable."
+                ),
+            )
 
         command = build_hermes_chat_command(
             executable=[resolved, *command_base[1:]],
@@ -2370,40 +2417,18 @@ class HermesAdapter:
             extra_args=task.payload.get("extra_args", []),
         )
 
-        before = git_snapshot(cwd)
-        blocked = worktree_guard(task, worker_id, "hermes", cwd, before)
+        blocked, before = FullEditWorkerAdapter.guard_full_edit_run(
+            task,
+            worker_id,
+            "hermes",
+            cwd,
+            extra_dirty_message=(
+                " For focused edits on a dirty tree (docs, tests), use puppetmaster_edit — it edits "
+                "in place and needs no clean tree."
+            ),
+        )
         if blocked is not None:
             return blocked
-        if not task.payload.get("allow_dirty", False) and (
-            before["changed_files"] or before["untracked_files"]
-        ):
-            return [
-                verification_artifact(
-                    task=task,
-                    worker_id=worker_id,
-                    adapter="hermes",
-                    check=task.instruction,
-                    result="blocked",
-                    confidence=0.8,
-                    evidence=["adapter:hermes", "status:dirty-repo"],
-                    payload={
-                        "failure": "dirty_worktree",
-                        "message": (
-                            "Hermes full-edit runs require a clean working tree by default "
-                            "so Puppetmaster can attribute resulting diffs correctly. Commit, "
-                            "stash, use a worktree, or set payload.allow_dirty=true. For focused "
-                            "edits on a dirty tree (docs, tests), use puppetmaster_edit — it edits "
-                            "in place and needs no clean tree."
-                            + dirty_worktree_paths_note(
-                                before["changed_files"], before["untracked_files"]
-                            )
-                        ),
-                        "changed_files": before["changed_files"],
-                        "untracked_files": before["untracked_files"],
-                        **diff_source_payload(before, {}),
-                    },
-                )
-            ]
 
         # Hermes spawns a foreign Python interpreter; scrub the parent's
         # PYTHONPATH/PYTHONHOME so it can't import Puppetmaster's site-packages
@@ -2464,7 +2489,16 @@ class HermesAdapter:
             ]
             if _should_emit_patch_artifact(before, after):
                 artifacts.append(
-                    self._patch_artifact(task, worker_id, before, after, status="failed")
+                    make_patch_artifact(
+                        task,
+                        worker_id,
+                        before,
+                        after,
+                        adapter="hermes",
+                        status="failed",
+                        change="Hermes modified repository files.",
+                        sidecar_name="hermes_implement",
+                    )
                 )
             return artifacts
 
@@ -2532,12 +2566,15 @@ class HermesAdapter:
             )
         if has_work:
             artifacts.append(
-                self._patch_artifact(
+                make_patch_artifact(
                     task,
                     worker_id,
                     before,
                     after,
+                    adapter="hermes",
                     status="applied" if not process_failed else "failed",
+                    change="Hermes modified repository files.",
+                    sidecar_name="hermes_implement",
                 )
             )
         return artifacts
@@ -2547,7 +2584,7 @@ class HermesAdapter:
         cwd = Path(task.payload.get("cwd") or ".").resolve()
         prompt, codegraph_used = enrich_prompt_with_codegraph(
             prompt_with_skills(
-                prompt_with_memory(CodexAdapter._structured_prompt(base_prompt), task),
+                prompt_with_memory(build_structured_prompt(base_prompt, final_message_note=True), task),
                 task,
             ),
             task_description=task.payload.get("codegraph_task") or task.instruction or goal,
@@ -2560,25 +2597,16 @@ class HermesAdapter:
         command_base = command_parts(executable)
         resolved = resolve_command(command_base[0])
         if resolved is None:
-            return [
-                verification_artifact(
-                    task=task,
-                    worker_id=worker_id,
-                    adapter="hermes",
-                    check=task.instruction,
-                    result="blocked",
-                    confidence=0.45,
-                    evidence=["adapter:hermes", "status:missing-cli"],
-                    payload={
-                        "failure": "missing_cli",
-                        "message": (
-                            "Hermes CLI was not found. Install it or set "
-                            "HERMES_COMMAND / payload.executable."
-                        ),
-                        "executable": executable,
-                    },
-                )
-            ]
+            return missing_cli_artifact(
+                task,
+                worker_id,
+                "hermes",
+                executable,
+                (
+                    "Hermes CLI was not found. Install it or set "
+                    "HERMES_COMMAND / payload.executable."
+                ),
+            )
 
         def _invoke_hermes(run_prompt: str, sidecar: str):
             command = build_hermes_chat_command(
@@ -2765,67 +2793,6 @@ class HermesAdapter:
         artifacts.extend(parsed_artifacts)
         return artifacts
 
-    @staticmethod
-    def _patch_artifact(task: Task, worker_id: str, before, after, *, status: str) -> Artifact:
-        return Artifact(
-            job_id=task.job_id,
-            task_id=task.id,
-            type=ArtifactType.PATCH,
-            created_by=worker_id,
-            confidence=0.8 if status == "applied" else 0.5,
-            evidence=["adapter:hermes", f"base:{before['sha']}"],
-            payload=build_patch_payload(
-                task=task,
-                before=before,
-                after=after,
-                status=status,
-                change="Hermes modified repository files.",
-                sidecar_name="hermes_implement",
-            ),
-        )
-
-
-def classify_hermes_failure(output: str) -> str:
-    lowered = (output or "").lower()
-    if "command not found" in lowered or (
-        "no such file or directory" in lowered and "hermes" in lowered
-    ):
-        return "missing_cli"
-    if (
-        "api key" in lowered
-        or "not authenticated" in lowered
-        or "authentication" in lowered
-        or "unauthorized" in lowered
-        or "401" in lowered
-        or "please login" in lowered
-        or "hermes login" in lowered
-        or "missing credentials" in lowered
-        or "no provider" in lowered
-        or "provider credentials" in lowered
-    ):
-        return "not_authenticated"
-    if "verification" in lowered and ("failed" in lowered or "required" in lowered):
-        return "not_authenticated"
-    if "context length" in lowered or "maximum context" in lowered or "context window" in lowered:
-        return "context_length_exceeded"
-    if "rate limit" in lowered or "429" in lowered:
-        return "rate_limit"
-    if "billing" in lowered or "quota" in lowered or "credit" in lowered:
-        return "billing_or_quota"
-    if "model" in lowered and (
-        "unavailable" in lowered
-        or "not found" in lowered
-        or "invalid" in lowered
-        or "does not exist" in lowered
-        or "404" in lowered
-    ):
-        return "model_unavailable"
-    if "timeout" in lowered or "timed out" in lowered:
-        return "timeout"
-    if "network" in lowered or "dns" in lowered or "connect" in lowered:
-        return "network_error"
-    return "unknown"
-
 
 class UnconfiguredProviderAdapter:
     def __init__(self, name: str, description: str) -> None:
@@ -3005,7 +2972,57 @@ def tool_list(value: object) -> str:
     return str(value)
 
 
-def git_snapshot(cwd: Path, *, base_tree: Optional[str] = None) -> dict[str, object]:
+_GIT_SUBPROCESS_TIMEOUT = 30
+
+
+@dataclass
+class GitSnapshot:
+    """Typed git worktree snapshot for diff attribution and dirty-tree guards."""
+
+    sha: str
+    is_worktree: bool
+    changed_files: list[str]
+    untracked_files: list[str]
+    diff: str
+    tree: Optional[str] = None
+    worker_changed_files: Optional[list[str]] = None
+    worker_untracked_files: Optional[list[str]] = None
+    worker_diff: Optional[str] = None
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if not hasattr(self, key):
+            return default
+        value = getattr(self, key)
+        return default if value is None else value
+
+    def __getitem__(self, key: str) -> Any:
+        if not hasattr(self, key):
+            raise KeyError(key)
+        value = getattr(self, key)
+        if value is None:
+            raise KeyError(key)
+        return value
+
+
+def _run_git(cwd: Path, args: list[str], *, strip: bool = True) -> str:
+    try:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_GIT_SUBPROCESS_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return ""
+    stdout = completed.stdout if completed.stdout is not None else ""
+    if strip:
+        return stdout.strip() if completed.returncode == 0 else ""
+    return stdout if completed.returncode == 0 else ""
+
+
+def git_snapshot(cwd: Path, *, base_tree: Optional[str] = None) -> GitSnapshot:
     """Capture a diff-attributable snapshot of the working tree.
 
     Captures changes **against HEAD** (not just working-tree-vs-index) so that
@@ -3043,20 +3060,35 @@ def git_snapshot(cwd: Path, *, base_tree: Optional[str] = None) -> dict[str, obj
     if base_tree and tree:
         worker_changed = git_lines(root, ["diff", "--name-only", base_tree, tree, "--"])
         worker_diff = git_diff_output(root, ["diff", "--binary", base_tree, tree, "--"])
-    snapshot = {
-        "sha": sha or "uncommitted",
-        "is_worktree": inside,
-        "changed_files": changed,
-        "untracked_files": untracked,
-        "diff": diff,
-    }
+    snapshot = GitSnapshot(
+        sha=sha or "uncommitted",
+        is_worktree=inside,
+        changed_files=changed,
+        untracked_files=untracked,
+        diff=diff,
+    )
     if tree:
-        snapshot["tree"] = tree
+        snapshot = GitSnapshot(
+            sha=snapshot.sha,
+            is_worktree=snapshot.is_worktree,
+            changed_files=snapshot.changed_files,
+            untracked_files=snapshot.untracked_files,
+            diff=snapshot.diff,
+            tree=tree,
+        )
     if base_tree:
         worker_changed_set = set(worker_changed)
-        snapshot["worker_changed_files"] = worker_changed
-        snapshot["worker_untracked_files"] = [path for path in untracked if path in worker_changed_set]
-        snapshot["worker_diff"] = worker_diff
+        snapshot = GitSnapshot(
+            sha=snapshot.sha,
+            is_worktree=snapshot.is_worktree,
+            changed_files=snapshot.changed_files,
+            untracked_files=snapshot.untracked_files,
+            diff=snapshot.diff,
+            tree=snapshot.tree,
+            worker_changed_files=worker_changed,
+            worker_untracked_files=[path for path in untracked if path in worker_changed_set],
+            worker_diff=worker_diff,
+        )
     return snapshot
 
 
@@ -3085,6 +3117,7 @@ def git_worktree_tree(cwd: Path) -> str:
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=_GIT_SUBPROCESS_TIMEOUT,
             )
         else:
             read = subprocess.run(
@@ -3094,6 +3127,7 @@ def git_worktree_tree(cwd: Path) -> str:
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=_GIT_SUBPROCESS_TIMEOUT,
             )
         if read.returncode != 0:
             return ""
@@ -3104,6 +3138,7 @@ def git_worktree_tree(cwd: Path) -> str:
             capture_output=True,
             text=True,
             check=False,
+            timeout=_GIT_SUBPROCESS_TIMEOUT,
         )
         if add.returncode != 0:
             return ""
@@ -3114,8 +3149,11 @@ def git_worktree_tree(cwd: Path) -> str:
             capture_output=True,
             text=True,
             check=False,
+            timeout=_GIT_SUBPROCESS_TIMEOUT,
         )
         return written.stdout.strip() if written.returncode == 0 else ""
+    except subprocess.TimeoutExpired:
+        return ""
     finally:
         try:
             os.unlink(index_path)
@@ -3124,27 +3162,13 @@ def git_worktree_tree(cwd: Path) -> str:
 
 
 def git_output(cwd: Path, args: list[str]) -> str:
-    completed = subprocess.run(
-        ["git", *args],
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return completed.stdout.strip() if completed.returncode == 0 else ""
+    return _run_git(cwd, args, strip=True)
 
 
 def git_diff_output(cwd: Path, args: list[str]) -> str:
     """Like :func:`git_output` but does not strip — diff bytes are significant
     and a trailing context newline can matter for patch application."""
-    completed = subprocess.run(
-        ["git", *args],
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return completed.stdout if completed.returncode == 0 else ""
+    return _run_git(cwd, args, strip=False)
 
 
 def git_lines(cwd: Path, args: list[str]) -> list[str]:
@@ -3166,13 +3190,17 @@ def git_untracked_diff(cwd: Path, untracked: list[str]) -> str:
                 continue  # skip directories / submodules / special files
         except OSError:
             continue
-        completed = subprocess.run(
-            ["git", "diff", "--binary", "--no-index", "--", os.devnull, rel],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        try:
+            completed = subprocess.run(
+                ["git", "diff", "--binary", "--no-index", "--", os.devnull, rel],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=_GIT_SUBPROCESS_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            continue
         # 0 == identical (no output), 1 == differs (the diff we want), >1 == error.
         if completed.returncode in (0, 1) and completed.stdout.strip():
             chunks.append(completed.stdout)
@@ -3261,13 +3289,6 @@ def cursor_result_text(stdout: str) -> tuple[Optional[str], str]:
 
 
 _REPORT_TAIL_CHARS = 20000
-
-_IMPLEMENT_REPORT_CONTRACT = (
-    "Reporting contract: when you are done, end your final message with a short "
-    "report — what you changed and why, the files you touched, and exactly what "
-    "you ran to verify it. Puppetmaster persists that report as a durable "
-    "artifact; without it the run looks like it did nothing."
-)
 
 
 def with_report_contract(prompt: str) -> str:
@@ -3533,7 +3554,7 @@ class OpenAIAdapter:
         cwd = task.payload.get("cwd")
         model = task.payload.get("model") or DEFAULT_OPENAI_MODEL
         prompt, codegraph_used = enrich_prompt_with_codegraph(
-            prompt_with_memory(self._structured_prompt(base_prompt), task),
+            prompt_with_memory(build_structured_prompt(base_prompt), task),
             task_description=task.payload.get("codegraph_task") or task.instruction or goal,
             cwd=cwd,
             disabled=bool(task.payload.get("disable_codegraph", False)),
@@ -3568,7 +3589,7 @@ class OpenAIAdapter:
                     payload={
                         "returncode": None,
                         "model": model,
-                        "failure": "missing_api_key",
+                        "failure": "not_authenticated",
                         "stderr": (
                             "OPENAI_API_KEY is not set. Export it or pass openai_api_key "
                             "in the task payload."
@@ -3801,49 +3822,6 @@ class OpenAIAdapter:
         artifacts.extend(parsed_artifacts)
         return artifacts
 
-    @staticmethod
-    def _structured_prompt(prompt: str) -> str:
-        return "\n".join(
-            [
-                prompt,
-                "",
-                "Puppetmaster artifact contract:",
-                "Return only JSON, with no markdown wrapper, in this shape:",
-                '{"artifacts":[{"type":"finding","claim":"...","evidence":["path or symbol"],"confidence":0.8}]}',
-                "Allowed artifact types:",
-                '- finding: requires "claim", "evidence", "confidence".',
-                '- risk: requires "risk", "mitigation", "evidence", "confidence".',
-                '- decision: requires "decision", "why", "evidence", "confidence".',
-                _ARTIFACT_GROUNDING,
-                _ARTIFACT_EMPTY_GUIDANCE,
-            ]
-        )
-
-
-def classify_openai_failure(body: str, http_status: Optional[int] = None) -> str:
-    if http_status == 401:
-        return "missing_api_key"
-    if http_status == 403:
-        return "forbidden"
-    if http_status == 404:
-        return "model_unavailable"
-    if http_status == 429:
-        return "rate_limit"
-    if http_status is not None and 500 <= http_status < 600:
-        return "openai_server_error"
-    lowered = (body or "").lower()
-    if "api key" in lowered or "authorization" in lowered:
-        return "missing_api_key"
-    if "rate limit" in lowered:
-        return "rate_limit"
-    if "model_not_found" in lowered:
-        return "model_unavailable"
-    if "model" in lowered and ("not found" in lowered or "unavailable" in lowered):
-        return "model_unavailable"
-    if "context length" in lowered or "maximum context" in lowered:
-        return "context_length_exceeded"
-    return "unknown"
-
 
 ADAPTERS: dict[str, WorkerAdapter] = {
     "local": LocalAdapter(),
@@ -3922,53 +3900,3 @@ def get_adapter(name: str) -> WorkerAdapter:
     if name not in ADAPTERS:
         raise ValueError(f"unsupported adapter: {name}")
     return ADAPTERS[name]
-
-
-def classify_cursor_failure(output: str) -> str:
-    lowered = output.lower()
-    if "cursor_api_key" in lowered or "api key" in lowered:
-        return "missing_api_key"
-    if "cannot find package" in lowered or "@cursor/sdk" in lowered and "not found" in lowered:
-        return "sdk_not_installed"
-    if (
-        "forbidden-model" in lowered
-        or ("forbidden" in lowered and "model" in lowered)
-        or ("unknown" in lowered and "model" in lowered)
-        or (
-            "model" in lowered
-            and ("unavailable" in lowered or "not found" in lowered or "invalid" in lowered)
-        )
-    ):
-        return "model_unavailable"
-    if "timeout" in lowered or "timed out" in lowered:
-        return "timeout"
-    if "status" in lowered and "error" in lowered:
-        return "run_status_error"
-    return "unknown"
-
-
-def classify_claude_code_failure(output: str) -> str:
-    lowered = output.lower()
-    if "credit balance" in lowered or "billing" in lowered or "quota" in lowered:
-        return "billing_or_quota"
-    if (
-        "not_found_error" in lowered
-        or "permission_error" in lowered
-        or (
-            "model" in lowered
-            and ("unavailable" in lowered or "invalid" in lowered or "not found" in lowered)
-        )
-        or ("permission" in lowered and "model" in lowered)
-        or ("not allowed" in lowered and "model" in lowered)
-        or ("denied" in lowered and "model" in lowered)
-    ):
-        return "model_unavailable"
-    if "command not found" in lowered:
-        return "missing_cli"
-    if "auth" in lowered or "login" in lowered or "api key" in lowered:
-        return "not_authenticated"
-    if "permission" in lowered or "not allowed" in lowered or "denied" in lowered:
-        return "permission_denied"
-    if "timeout" in lowered or "timed out" in lowered:
-        return "timeout"
-    return "unknown"

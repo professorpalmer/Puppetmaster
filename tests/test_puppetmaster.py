@@ -1624,7 +1624,7 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertTrue(body["autodetached"])
 
     def test_cursor_failure_classification_is_actionable(self) -> None:
-        self.assertEqual(classify_cursor_failure("CURSOR_API_KEY is required"), "missing_api_key")
+        self.assertEqual(classify_cursor_failure("CURSOR_API_KEY is required"), "not_authenticated")
         self.assertEqual(classify_cursor_failure("model invalid"), "model_unavailable")
         self.assertEqual(
             classify_cursor_failure("forbidden-model: fable-5 is not on your plan"),
@@ -1666,14 +1666,15 @@ class PuppetmasterTests(unittest.TestCase):
                 }
             ),
         }
-        completed = subprocess.CompletedProcess(
-            args=["node"],
+        completed = StreamedProcess(
             returncode=0,
             stdout=json.dumps(sdk_result),
             stderr="",
+            timed_out=False,
+            live_log_path=None,
         )
 
-        with patch("puppetmaster.adapters.subprocess.run", return_value=completed) as run:
+        with patch("puppetmaster.adapters.run_streamed_subprocess", return_value=completed) as run:
             artifacts = CursorAdapter().run(task, "goal", "worker-cursor")
 
         cursor_input = json.loads(run.call_args.kwargs["env"]["PUPPETMASTER_CURSOR_INPUT"])
@@ -1731,9 +1732,9 @@ class PuppetmasterTests(unittest.TestCase):
         """Field report (v0.9.40 CI fix): the implement worker's diagnosis only
         existed as prose the pipeline threw away. The prompt must now ask for a
         closing report so there is always something to persist."""
-        from puppetmaster.adapters import CursorAdapter
+        from puppetmaster.adapters import build_implement_prompt
 
-        prompt = CursorAdapter._implement_prompt("Fix the failing tests")
+        prompt = build_implement_prompt("Fix the failing tests")
         self.assertIn("Reporting contract", prompt)
         self.assertIn("what you ran to verify", prompt)
 
@@ -1887,7 +1888,7 @@ class PuppetmasterTests(unittest.TestCase):
             "diff": "x",
         }
         with patch("puppetmaster.adapters.git_snapshot", return_value=dirty), patch(
-            "puppetmaster.adapters.subprocess.run"
+            "puppetmaster.adapters.run_streamed_subprocess"
         ) as run:
             artifacts = CursorAdapter().run(task, "goal", "worker-cursor")
 
@@ -4492,11 +4493,12 @@ class PuppetmasterTests(unittest.TestCase):
             adapter="cursor",
             payload={"prompt": "Inspect repo", "cwd": "/tmp/codegraph-repo"},
         )
-        completed = subprocess.CompletedProcess(
-            args=["node"],
+        completed = StreamedProcess(
             returncode=0,
             stdout=json.dumps({"status": "finished", "result": ""}),
             stderr="",
+            timed_out=False,
+            live_log_path=None,
         )
 
         with patch(
@@ -4506,7 +4508,7 @@ class PuppetmasterTests(unittest.TestCase):
                 True,
             ),
         ), patch(
-            "puppetmaster.adapters.subprocess.run",
+            "puppetmaster.adapters.run_streamed_subprocess",
             return_value=completed,
         ) as run:
             artifacts = CursorAdapter().run(task, "goal", "worker-cursor")
@@ -4523,18 +4525,19 @@ class PuppetmasterTests(unittest.TestCase):
             adapter="cursor",
             payload={"prompt": "Inspect repo", "cwd": "/tmp/no-codegraph"},
         )
-        completed = subprocess.CompletedProcess(
-            args=["node"],
+        completed = StreamedProcess(
             returncode=0,
             stdout=json.dumps({"status": "finished", "result": ""}),
             stderr="",
+            timed_out=False,
+            live_log_path=None,
         )
 
         with patch(
             "puppetmaster.adapters.enrich_prompt_with_codegraph",
             return_value=("Inspect repo", False),
         ), patch(
-            "puppetmaster.adapters.subprocess.run",
+            "puppetmaster.adapters.run_streamed_subprocess",
             return_value=completed,
         ):
             artifacts = CursorAdapter().run(task, "goal", "worker-cursor")
@@ -4549,14 +4552,15 @@ class PuppetmasterTests(unittest.TestCase):
             adapter="cursor",
             payload={"prompt": "Inspect repo", "cwd": "."},
         )
-        completed = subprocess.CompletedProcess(
-            args=["node"],
+        completed = StreamedProcess(
             returncode=0,
             stdout=json.dumps({"status": "finished", "result": ""}),
             stderr="",
+            timed_out=False,
+            live_log_path=None,
         )
 
-        with patch("puppetmaster.adapters.subprocess.run", return_value=completed):
+        with patch("puppetmaster.adapters.run_streamed_subprocess", return_value=completed):
             artifacts = CursorAdapter().run(task, "goal", "worker-cursor")
 
         self.assertEqual(artifacts[0].type, ArtifactType.VERIFICATION)
@@ -4685,13 +4689,13 @@ class PuppetmasterTests(unittest.TestCase):
                 + ("PADDING " * 2000),  # ~16KB padding
             }
         )
-        completed = subprocess.CompletedProcess(
-            args=["node"], returncode=0, stdout=long_stdout, stderr=""
+        completed = StreamedProcess(
+            returncode=0, stdout=long_stdout, stderr="", timed_out=False, live_log_path=None
         )
         with TemporaryDirectory() as tmp:
             with patch.dict(os.environ, {"PUPPETMASTER_STATE_DIR": tmp}):
                 with patch(
-                    "puppetmaster.adapters.subprocess.run", return_value=completed
+                    "puppetmaster.adapters.run_streamed_subprocess", return_value=completed
                 ):
                     artifacts = CursorAdapter().run(task, "goal", "worker-cursor")
 
@@ -4724,16 +4728,17 @@ class PuppetmasterTests(unittest.TestCase):
             + "MIDDLE-MARKER-SHOULD-SURVIVE\n"
             + ("PADDING line\n" * 2000)
         )
-        completed = subprocess.CompletedProcess(
-            args=["node"],
+        completed = StreamedProcess(
             returncode=0,
             stdout=json.dumps({"status": "finished", "result": long_result}),
             stderr="",
+            timed_out=False,
+            live_log_path=None,
         )
         with TemporaryDirectory() as tmp:
             with patch.dict(os.environ, {"PUPPETMASTER_STATE_DIR": tmp}):
                 with patch(
-                    "puppetmaster.adapters.subprocess.run", return_value=completed
+                    "puppetmaster.adapters.run_streamed_subprocess", return_value=completed
                 ):
                     artifacts = CursorAdapter().run(task, "goal", "worker-cursor")
 
@@ -5976,6 +5981,60 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
         self.assertEqual(classify_codex_failure("approval was denied by user"), "approval_denied")
         self.assertEqual(classify_codex_failure("sandbox: write blocked"), "sandbox_denied")
         self.assertEqual(classify_codex_failure("completely unrelated text"), "unknown")
+
+    def test_failure_classification_parity_across_adapters(self) -> None:
+        """Identical failure signals must bucket to the same canonical category."""
+        auth_samples = (
+            "401 Unauthorized",
+            "api key missing",
+            "please login first",
+            "CURSOR_API_KEY is required",
+        )
+        for sample in auth_samples:
+            self.assertEqual(
+                classify_codex_failure(sample),
+                "not_authenticated",
+                msg=f"codex: {sample!r}",
+            )
+            self.assertEqual(
+                classify_hermes_failure(sample),
+                "not_authenticated",
+                msg=f"hermes: {sample!r}",
+            )
+            self.assertEqual(
+                classify_cursor_failure(sample),
+                "not_authenticated",
+                msg=f"cursor: {sample!r}",
+            )
+            self.assertEqual(
+                classify_claude_code_failure(sample),
+                "not_authenticated",
+                msg=f"claude: {sample!r}",
+            )
+            self.assertEqual(
+                classify_openai_failure(sample, None),
+                "not_authenticated",
+                msg=f"openai: {sample!r}",
+            )
+        for classifier in (
+            classify_codex_failure,
+            classify_hermes_failure,
+            classify_cursor_failure,
+            classify_claude_code_failure,
+            classify_openai_failure,
+        ):
+            self.assertEqual(classifier("command not found"), "missing_cli")
+            self.assertEqual(classifier("rate limit exceeded"), "rate_limit")
+            self.assertEqual(classifier("request timed out"), "timeout")
+            self.assertEqual(classifier("DNS resolution failed"), "network_error")
+        self.assertEqual(
+            classify_hermes_failure("maximum context length exceeded"),
+            "context_length_exceeded",
+        )
+        self.assertEqual(
+            classify_openai_failure("maximum context length", None),
+            "context_length_exceeded",
+        )
 
     def test_build_hermes_chat_command_implement_flags(self) -> None:
         command = build_hermes_chat_command(
@@ -8634,7 +8693,7 @@ class OpenAIAdapterTests(unittest.TestCase):
 
         urlopen.assert_not_called()
         self.assertEqual(len(artifacts), 1)
-        self.assertEqual(artifacts[0].payload["failure"], "missing_api_key")
+        self.assertEqual(artifacts[0].payload["failure"], "not_authenticated")
         self.assertEqual(artifacts[0].payload["result"], "failed")
 
     def test_openai_adapter_accepts_api_key_from_payload(self) -> None:
@@ -8681,7 +8740,7 @@ class OpenAIAdapterTests(unittest.TestCase):
             artifacts = OpenAIAdapter().run(self._task(), "goal", "worker-openai")
 
         self.assertEqual(len(artifacts), 1)
-        self.assertEqual(artifacts[0].payload["failure"], "missing_api_key")
+        self.assertEqual(artifacts[0].payload["failure"], "not_authenticated")
         self.assertEqual(artifacts[0].payload["returncode"], 401)
 
     def test_openai_adapter_http_429_maps_to_rate_limit(self) -> None:
@@ -8852,7 +8911,7 @@ class OpenAIAdapterTests(unittest.TestCase):
         self.assertEqual(body["reasoning_effort"], "high")
 
     def test_classify_openai_failure_covers_known_buckets(self) -> None:
-        self.assertEqual(classify_openai_failure("", 401), "missing_api_key")
+        self.assertEqual(classify_openai_failure("", 401), "not_authenticated")
         self.assertEqual(classify_openai_failure("", 403), "forbidden")
         self.assertEqual(classify_openai_failure("", 404), "model_unavailable")
         self.assertEqual(classify_openai_failure("", 429), "rate_limit")
@@ -16469,13 +16528,14 @@ class PuppetmasterSalvageAndLivenessTests(unittest.TestCase):
         )
         # A non-zero run whose structured findings nonetheless sit in stdout —
         # previously lost; now salvaged before declaring degraded/failed.
-        completed = subprocess.CompletedProcess(
-            args=["node"],
+        completed = StreamedProcess(
             returncode=2,
             stdout=json.dumps([{"type": "finding", "claim": "recovered finding", "evidence": ["e"]}]),
             stderr="",
+            timed_out=False,
+            live_log_path=None,
         )
-        with patch("puppetmaster.adapters.subprocess.run", return_value=completed):
+        with patch("puppetmaster.adapters.run_streamed_subprocess", return_value=completed):
             artifacts = CursorAdapter().run(task, "goal", "worker-cursor")
         claims = [a.payload.get("claim") for a in artifacts if str(a.type) == "finding"]
         self.assertIn("recovered finding", claims)
@@ -18965,6 +19025,48 @@ class AuditFixTests(unittest.TestCase):
 class SecurityHardeningTests(unittest.TestCase):
     """Privacy/security defaults from the cross-cutting hardening pass."""
 
+    def test_validate_openai_base_url_allows_default_host(self) -> None:
+        from puppetmaster.openai_security import validate_openai_base_url
+
+        self.assertIsNone(validate_openai_base_url("https://api.openai.com/v1"))
+
+    def test_validate_openai_base_url_allows_loopback_http(self) -> None:
+        from puppetmaster.openai_security import validate_openai_base_url
+
+        self.assertIsNone(validate_openai_base_url("http://127.0.0.1:8080/v1"))
+        self.assertIsNone(validate_openai_base_url("http://localhost/v1"))
+
+    def test_validate_openai_base_url_rejects_non_https_remote(self) -> None:
+        from puppetmaster.openai_security import validate_openai_base_url
+
+        err = validate_openai_base_url("http://api.openai.com/v1")
+        self.assertIsNotNone(err)
+        self.assertIn("non-HTTPS", err)
+
+    def test_validate_openai_base_url_honors_allowlist_env(self) -> None:
+        from puppetmaster.openai_security import validate_openai_base_url
+
+        with patch.dict(os.environ, {"PUPPETMASTER_OPENAI_ALLOWED_HOSTS": "proxy.internal, alt.example"}, clear=False):
+            self.assertIsNone(validate_openai_base_url("https://proxy.internal/v1"))
+            self.assertIsNone(validate_openai_base_url("https://alt.example/v1"))
+            err = validate_openai_base_url("https://evil.example/v1")
+        self.assertIsNotNone(err)
+        self.assertIn("untrusted host", err)
+
+    def test_validate_openai_base_url_allow_untrusted_override(self) -> None:
+        from puppetmaster.openai_security import validate_openai_base_url
+
+        self.assertIsNone(
+            validate_openai_base_url("http://evil.example/v1", allow_untrusted=True)
+        )
+
+    def test_validate_openai_base_url_rejects_unparseable_url(self) -> None:
+        from puppetmaster.openai_security import validate_openai_base_url
+
+        err = validate_openai_base_url("not-a-url")
+        self.assertIsNotNone(err)
+        self.assertIn("could not parse", err)
+
     def test_run_streamed_subprocess_redacts_live_log_not_stdout(self) -> None:
         from puppetmaster.adapters import run_streamed_subprocess
 
@@ -19612,12 +19714,12 @@ class ArtifactContractGroundingTests(unittest.TestCase):
     """
 
     def _structured_prompts(self):
-        from puppetmaster.adapters import CursorAdapter, CodexAdapter, OpenAIAdapter
+        from puppetmaster.adapters import build_structured_prompt
 
         return [
-            CursorAdapter._structured_prompt("Review the repo."),
-            CodexAdapter._structured_prompt("Review the repo."),
-            OpenAIAdapter._structured_prompt("Review the repo."),
+            build_structured_prompt("Review the repo."),
+            build_structured_prompt("Review the repo.", final_message_note=True),
+            build_structured_prompt("Review the repo."),
         ]
 
     def test_all_contracts_carry_grounding_boundary(self) -> None:
@@ -19634,11 +19736,11 @@ class ArtifactContractGroundingTests(unittest.TestCase):
             self.assertNotIn("explaining why the run is degraded", prompt)
 
     def test_hermes_analyze_reuses_grounded_codex_contract(self) -> None:
-        from puppetmaster.adapters import CodexAdapter
+        from puppetmaster.adapters import build_structured_prompt
 
-        # Hermes._run_analyze builds its prompt via CodexAdapter._structured_prompt,
+        # Hermes._run_analyze builds its prompt via build_structured_prompt(final_message_note=True),
         # so the grounding boundary reaches the platform the user actually runs.
-        prompt = CodexAdapter._structured_prompt("Audit it.")
+        prompt = build_structured_prompt("Audit it.", final_message_note=True)
         self.assertIn("analysis target is THIS repository", prompt)
 
     def test_redteam_role_instruction_is_repo_grounded(self) -> None:
