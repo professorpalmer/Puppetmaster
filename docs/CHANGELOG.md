@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.9.95
+
+**The claude-code adapter now honors read-only intent, so analysis-swarm workers backed by Claude Code no longer trip the clean-tree guard.** Previously `ClaudeCodeAdapter` silently ignored the `read_only` / `sandbox=read-only` flags that analysis swarms stamp on every worker: it always ran with an edit-capable permission mode (`acceptEdits`) and always enforced the full-edit dirty-worktree guard. The result was an asymmetry — cursor analysis roles (which run `--dry-run`) reviewed a dirty tree fine, but a claude-code-backed analysis worker was blocked with `dirty_worktree` on the same tree, even though it was supposed to be read-only. This mirrors the fix codex already had.
+
+- **Read-only intent maps to a real non-editing mode.** In `puppetmaster/adapters/claude_code.py`, `_prepare_cli_invocation` now derives the effective permission mode from the task payload: an explicit `permission_mode` still wins; otherwise a read-only signal (`read_only` truthy or `sandbox == "read-only"`) selects Claude Code's read-only `plan` mode, and everything else keeps defaulting to `acceptEdits`. `write_capable = effective_mode != "plan"` is threaded through `CliInvocation.extras`.
+- **The dirty guard is skipped only when the worker genuinely cannot write.** `ClaudeCodeAdapter._apply_pre_run_guards` now mirrors codex: a non-write-capable (plan-mode) run takes a git snapshot but skips the worktree/dirty guards, so an analysis swarm can review the caller's existing diff. Write-capable implement runs are unchanged — they still default to `acceptEdits`, stay write-capable, and still enforce the clean-tree guard exactly as before.
+- **Verification artifacts report the effective mode.** The `permission_mode:` evidence tag and payload now reflect the mode actually used (e.g. `plan`), instead of the raw payload default.
+- **Deliberately not done:** no `allow_dirty` flag was added to `start_swarm`. That would have masked the real bug (read-only intent being ignored) and let a write-capable claude-code worker loose on a dirty tree — reintroducing the diff-attribution corruption the guard exists to prevent. `allow_dirty` remains where it belongs: the write-capable implement/edit verbs.
+- Full suite: **990 passed** (pytest), with a new test asserting a read-only claude-code run on a dirty tree skips the guard, runs `--permission-mode plan`, and reports `write_capable=False`, plus a strengthened test asserting a normal implement run still blocks on a dirty tree with `acceptEdits`.
+
 ## v0.9.94
 
 **First-class browser swarms: live-site QA as a real PM verb, not a hand-rolled `hermes chat -t browser` loop.** A browser swarm is N independent Hermes workers, each driving a real browser against a live site to capture real network payloads — the QA that mock-backend tests and read-only repo analysis can't reach. This promotes the proven manual workflow into a supported verb with the hard-won guardrails baked into code, plus a safety posture for acting agents.

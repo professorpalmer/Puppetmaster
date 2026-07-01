@@ -5202,10 +5202,88 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
                 },
             )
 
-            artifact = ClaudeCodeAdapter().run(task, "goal", "worker")[0]
+            with patch(
+                "puppetmaster.adapters.build_claude_code_command",
+                wraps=build_claude_code_command,
+            ) as build_command:
+                artifact = ClaudeCodeAdapter().run(task, "goal", "worker")[0]
 
+            build_command.assert_called_once()
+            self.assertEqual(build_command.call_args.kwargs["permission_mode"], "acceptEdits")
             self.assertEqual(artifact.payload["result"], "blocked")
             self.assertEqual(artifact.payload["failure"], "dirty_worktree")
+
+    def test_claude_code_read_only_allows_dirty_diff_review(self) -> None:
+        """Analysis swarms mark workers read-only. Plan mode must skip the
+        dirty-worktree guard so the worker can review the caller's existing diff."""
+        streamed = StreamedProcess(
+            returncode=0,
+            stdout='{"result":"Reviewed the dirty diff; no edits needed."}',
+            stderr="",
+            timed_out=False,
+            live_log_path=None,
+        )
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            target = repo / "sample.txt"
+            target.write_text("clean\n", encoding="utf-8")
+            subprocess.run(["git", "add", "sample.txt"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Puppetmaster Tests",
+                    "-c",
+                    "user.email=tests@example.com",
+                    "commit",
+                    "-m",
+                    "init",
+                ],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+            target.write_text("dirty\n", encoding="utf-8")
+            task = Task(
+                id="t-claude-read-only",
+                job_id="job-claude-read-only",
+                role="audit",
+                instruction="Review the dirty diff.",
+                adapter="claude-code",
+                payload={
+                    "read_only": True,
+                    "sandbox": "read-only",
+                    "cwd": str(repo),
+                    "disable_codegraph": True,
+                },
+            )
+            dirty = {
+                "sha": "s",
+                "tree": "t",
+                "changed_files": ["sample.txt"],
+                "untracked_files": [],
+                "diff": "diff --git a/sample.txt b/sample.txt",
+            }
+            with patch("puppetmaster.adapters.resolve_command", return_value="/usr/bin/claude"), patch(
+                "puppetmaster.adapters.git_snapshot", side_effect=[dirty, dirty]
+            ), patch("puppetmaster.adapters.worktree_guard") as guard, patch(
+                "puppetmaster.adapters.run_streamed_subprocess", return_value=streamed
+            ) as run:
+                artifacts = ClaudeCodeAdapter().run(task, "goal", "worker")
+
+        guard.assert_not_called()
+        command = run.call_args.kwargs["command"]
+        self.assertIn("--permission-mode", command)
+        self.assertIn("plan", command)
+        verification = artifacts[0]
+        self.assertEqual(verification.payload["result"], "passed")
+        self.assertEqual(verification.payload["permission_mode"], "plan")
+        self.assertIn("permission_mode:plan", verification.evidence)
+        prepared = ClaudeCodeAdapter()._prepare_cli_invocation(
+            task, "goal", "worker", repo, "/usr/bin/claude"
+        )
+        self.assertFalse(prepared.extras["write_capable"])
 
     def test_git_snapshot_captures_staged_and_untracked_changes(self) -> None:
         from puppetmaster.adapters import git_snapshot

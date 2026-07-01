@@ -156,12 +156,22 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
         )
         command_base = command_parts(executable)
         model_for_cli, model_note = resolve_claude_code_model(task.payload)
+        read_only_intent = bool(task.payload.get("read_only")) or (
+            task.payload.get("sandbox") == "read-only"
+        )
+        if "permission_mode" in task.payload:
+            effective_permission_mode = str(task.payload["permission_mode"])
+        elif read_only_intent:
+            effective_permission_mode = "plan"
+        else:
+            effective_permission_mode = "acceptEdits"
+        write_capable = effective_permission_mode != "plan"
         command = facade("build_claude_code_command")(
             prompt=prompt,
             executable=[resolved, *command_base[1:]],
             model=model_for_cli,
             output_format=task.payload.get("output_format", "json"),
-            permission_mode=task.payload.get("permission_mode", "acceptEdits"),
+            permission_mode=effective_permission_mode,
             allowed_tools=task.payload.get("allowed_tools"),
             disallowed_tools=task.payload.get("disallowed_tools"),
             extra_args=task.payload.get("extra_args", []),
@@ -173,12 +183,25 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
                 "prompt": prompt,
                 "codegraph_used": codegraph_used,
                 "model_note": model_note,
+                "permission_mode": effective_permission_mode,
+                "write_capable": write_capable,
                 "extra_dirty_message": (
                     " For focused edits on a dirty tree (docs, tests), use puppetmaster_edit — it edits "
                     "in place and needs no clean tree."
                 ),
             },
         )
+
+    def _apply_pre_run_guards(
+        self,
+        task: Task,
+        worker_id: str,
+        cwd: Path,
+        prepared: CliInvocation,
+    ) -> tuple[Optional[list[Artifact]], dict]:
+        if not prepared.extras.get("write_capable", True):
+            return None, facade("git_snapshot")(cwd)
+        return super()._apply_pre_run_guards(task, worker_id, cwd, prepared)
 
     def _finalize_cli_run(
         self,
@@ -193,6 +216,10 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
         prompt = str(prepared.extras.get("prompt") or "")
         codegraph_used = bool(prepared.extras.get("codegraph_used"))
         model_note = prepared.extras.get("model_note")
+        permission_mode = str(
+            prepared.extras.get("permission_mode")
+            or task.payload.get("permission_mode", "acceptEdits")
+        )
         cwd = Path(task.payload.get("cwd") or ".").resolve()
         timeout_seconds = int(
             task.payload.get("timeout_seconds", self.default_timeout_seconds)
@@ -283,7 +310,7 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
             evidence=(
                 [
                     "adapter:claude-code",
-                    f"permission_mode:{task.payload.get('permission_mode', 'acceptEdits')}",
+                    f"permission_mode:{permission_mode}",
                 ]
                 + (["context:codegraph"] if codegraph_used else [])
                 + (["bedrock:model-omitted"] if model_note else [])
@@ -297,7 +324,7 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
                 "stderr_capture": stderr_capture,
                 "live_log": completed.live_log_path,
                 "cwd": str(cwd),
-                "permission_mode": task.payload.get("permission_mode", "acceptEdits"),
+                "permission_mode": permission_mode,
                 **({"bedrock_model_note": model_note} if model_note else {}),
                 "base_sha": before["sha"],
                 "head_sha": after["sha"],
