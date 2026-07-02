@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/professorpalmer/Puppetmaster/blob/main/LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://github.com/professorpalmer/Puppetmaster/blob/main/pyproject.toml)
 
-Puppetmaster turns the agent CLIs you already pay for — Cursor, Claude Code (Anthropic or AWS Bedrock), the OpenAI API, the Codex CLI, or Hermes — into an orchestrator. It routes each task to the cheapest model that can handle it, runs workers as independent processes, and stores their output as typed SQLite artifacts, so follow-up reads cost zero tokens.
+Puppetmaster turns the agent CLIs you already pay for — Cursor, Claude Code (Anthropic or AWS Bedrock), the OpenAI API, the Codex CLI, or Hermes — into an orchestrator. Or run it with no external CLI at all: point the built-in `agentic` adapter at any provider API key (OpenAI, Anthropic, Gemini, OpenRouter) and it runs the whole tool-use loop itself — ideal for CI, containers, and headless servers. Either way it routes each task to the cheapest model that can handle it, runs workers as independent processes, and stores their output as typed SQLite artifacts, so follow-up reads cost zero tokens.
 
 <img src="https://raw.githubusercontent.com/professorpalmer/Puppetmaster/main/docs/demo.gif" alt="Puppetmaster 60-second demo: cost routing, swarm fan-out, stitched summary, and zero-token follow-ups" width="100%" />
 
@@ -88,6 +88,8 @@ Every number is reproducible from a script in [`bench/`](https://github.com/prof
 2. Workers don't share a transcript. They lease tasks and emit typed artifacts (payload, evidence, confidence, sha256); the stitcher reads JSON, not stdout. Inspect with `puppetmaster artifacts <job_id>`.
 3. CodeGraph context is injected before the model call, so workers look up "where is X / what calls Y" structurally instead of grepping, and fall back to grep without it.
 4. A dead provider doesn't kill the swarm. Billing, quota, auth, and missing-CLI failures are marked `FAILED` and rerouted to the next funded adapter, preferring plan-billed models. Validated live and surfaced in the summary's alerts.
+
+Beyond those internal receipts, the durable-state thesis holds up on an **independent third-party benchmark**. On [NL2Repo-Bench](https://professorpalmer.github.io/durable-state-vs-context/) (build a full Python library from a natural-language spec, scored by the benchmark's own pytest suites), durable-state orchestration reaches a **91.1% mean test-pass rate — about 2.28× the ~40% published state of the art** — and solves 53% of libraries to a fully green upstream suite. This is a field/single-vs-swarm comparison with only the agent swapped (not the clean 3-arm control), and packaging-bound failures are kept in the denominator — full method, caveats, and the controlled JS→TS study are in the paper ([site](https://professorpalmer.github.io/durable-state-vs-context/) · [Zenodo/DOI](https://doi.org/10.5281/zenodo.20709565)) and the [SWE-bench Lite cost/quality study](https://github.com/professorpalmer/swebench-pm).
 
 ## Quickstart
 

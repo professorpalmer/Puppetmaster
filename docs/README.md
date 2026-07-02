@@ -13,6 +13,16 @@ The full documentation set. Start at the [project README](../README.md) for the 
 | [SECURITY.md](SECURITY.md) | Threat model: what it can do, what it touches, network egress, and how to run it safely |
 | [DAILY_DRIVER.md](DAILY_DRIVER.md) | Prompt recipes for review, swarm, implement, post-job inspection |
 
+## Research & external results
+
+Reproducible evidence behind the durable-state thesis, including an independent third-party benchmark.
+
+| Source | What's in it |
+|---|---|
+| [State, Not Tokens (paper site)](https://professorpalmer.github.io/durable-state-vs-context/) | The controlled JS→TS migration study + NL2Repo-Bench external validation: **91.1% mean test-pass, ~2.28× the ~40% published SOTA**, with honest limits (the K≈10–12 concurrency cap is a serving-platform property, not durable state) |
+| [Zenodo record (citable, DOI)](https://doi.org/10.5281/zenodo.20709565) | Archived paper + self-contained source; concept DOI resolves to the latest version. Carries the model-attribution caveat and keeps packaging-bound tasks in the denominator |
+| [SWE-bench Lite study](https://github.com/professorpalmer/swebench-pm) | 3-arm controlled cost/quality study on SWE-bench Lite (routing + CodeGraph + durable retries vs a frontier baseline) |
+
 ## Concepts & reference
 
 | Doc | What's in it |
