@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.9.100
+
+**The dashboard gains a Marionette-style "Swarm Tracker" hero — every job now gets the same at-a-glance tracking, routing transparency, and progress the Marionette app shows, on top of the existing detail.** The local web board (`python -m puppetmaster dashboard` / `puppetmaster_dashboard`) already rendered per-task cards, cost, and typed artifacts; this adds a summary hero at the top of every job view and surfaces the router's audit trail.
+
+- **Swarm Tracker hero card** (rendered first, nothing existing removed): job title + status, the primary routed model, worker count, and adapter; the job's total **cost and total tokens**; the completion progress bar; and an aggregate **verification score**.
+- **Routing rollup.** One card per routed worker showing the model, its estimated cost, a plain-language "why this model won" line derived from the routing policy (`balanced` → "Right-sized: cheapest model that clears the task's need", etc., with a plan-billed note when applicable), and a collapsible **`N alternatives considered`** control that expands to the rejected models (rejection reason on hover) — straight from each `ROUTING` artifact's audited `rejected` list.
+- **Sticky job-total footer** — cost, tokens, and primary model, always in view; hidden on the jobs index.
+- **Data layer.** `build_job_snapshot` gained `tokens_total` (via `aggregate_token_usage`), `primary_model`, `worker_count`, `adapters` + `primary_adapter` (deterministic tie-break by adapter name, independent of task-store ordering), `verification_score`, and `routing_rollup` — all additive, all from existing helpers; existing keys unchanged so the detailed cards below are untouched.
+- **Docs.** New [`docs/DASHBOARD.md`](DASHBOARD.md), linked from the README and the docs index.
+- Zero new dependencies; the page stays offline and loopback-only, all artifact-derived text is HTML-escaped, and the no-op DOM-diff guard is preserved. Full suite green: **1009 passed**.
+
 ## v0.9.99
 
 Docs-only release so the PyPI project page reflects the keys-only story shipped in v0.9.98.

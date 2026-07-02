@@ -29,6 +29,7 @@ from typing import Any, Callable, Optional, Union
 
 from puppetmaster.models import Artifact, ArtifactType, Job, Task
 from puppetmaster.store import SwarmStore
+from puppetmaster.usage import aggregate_token_usage
 
 # Reuse the stitcher's failure→remediation map so the dashboard Alerts match the
 # stitched summary verbatim (one source of truth for "what went wrong + fix").
@@ -345,6 +346,89 @@ def _job_snapshot_meta(job: Job) -> dict[str, Any]:
     return {"label": job.label, "title": title}
 
 
+def _primary_model_from_routing(artifacts: list[Artifact]) -> Optional[str]:
+    """Most frequent ROUTING ``model_id``, else the first one seen."""
+    counts: dict[str, int] = {}
+    first: Optional[str] = None
+    for artifact in artifacts:
+        if artifact.type != ArtifactType.ROUTING:
+            continue
+        payload = artifact.payload or {}
+        model_id = payload.get("model_id")
+        if not isinstance(model_id, str) or not model_id:
+            continue
+        if first is None:
+            first = model_id
+        counts[model_id] = counts.get(model_id, 0) + 1
+    if counts:
+        return max(counts, key=lambda mid: counts[mid])
+    return first
+
+
+def _adapters_from_tasks(tasks: list[Task]) -> tuple[list[str], Optional[str]]:
+    adapters = sorted({task.adapter for task in tasks if task.adapter})
+    if not adapters:
+        return [], None
+    counts: dict[str, int] = {}
+    for task in tasks:
+        if task.adapter:
+            counts[task.adapter] = counts.get(task.adapter, 0) + 1
+    # Break ties on the adapter name so the primary is deterministic regardless
+    # of task-store ordering (the file store lists tasks by random task id).
+    primary = max(counts, key=lambda name: (counts[name], name))
+    return adapters, primary
+
+
+def _verification_score(artifacts: list[Artifact]) -> Optional[float]:
+    confidences = [
+        float(artifact.confidence)
+        for artifact in artifacts
+        if artifact.type == ArtifactType.VERIFICATION
+    ]
+    if not confidences:
+        return None
+    return round(sum(confidences) / len(confidences), 4)
+
+
+def _routing_rollup(tasks: list[Task], artifacts: list[Artifact]) -> list[dict[str, Any]]:
+    """One row per router ROUTING artifact, de-duplicated by task_id (earliest wins)."""
+    task_roles = {task.id: task.role for task in tasks}
+    by_task: dict[str, list[Artifact]] = {}
+    for artifact in artifacts:
+        if artifact.type != ArtifactType.ROUTING or artifact.created_by != "router":
+            continue
+        by_task.setdefault(artifact.task_id, []).append(artifact)
+
+    rollup: list[dict[str, Any]] = []
+    for task_id in sorted(by_task):
+        artifact = min(by_task[task_id], key=lambda row: (row.created_at or "", row.id))
+        payload = artifact.payload or {}
+        raw_rejected = payload.get("rejected") or []
+        rejected: list[dict[str, str]] = []
+        if isinstance(raw_rejected, list):
+            for item in raw_rejected:
+                if isinstance(item, dict):
+                    rejected.append(
+                        {
+                            "id": str(item.get("id") or ""),
+                            "reason": str(item.get("reason") or ""),
+                        }
+                    )
+        rollup.append(
+            {
+                "task_id": artifact.task_id,
+                "role": task_roles.get(artifact.task_id, ""),
+                "model_id": str(payload.get("model_id") or ""),
+                "estimated_cost_usd": _safe_float(payload.get("estimated_cost_usd")),
+                "policy": str(payload.get("policy") or ""),
+                "reason": str(payload.get("reason") or ""),
+                "rejected": rejected,
+                "rejected_count": len(rejected),
+            }
+        )
+    return rollup
+
+
 def build_job_snapshot(store: SwarmStore, job_id: str) -> dict[str, Any]:
     """Assemble a full, JSON-able snapshot of one job's durable state."""
     job = store.get_job(job_id)
@@ -412,6 +496,9 @@ def build_job_snapshot(store: SwarmStore, job_id: str) -> dict[str, Any]:
         for task in tasks
     ]
 
+    adapters, primary_adapter = _adapters_from_tasks(tasks)
+    token_usage = aggregate_token_usage(artifacts)
+
     return {
         "job": {
             "id": job.id,
@@ -428,6 +515,13 @@ def build_job_snapshot(store: SwarmStore, job_id: str) -> dict[str, Any]:
         "reroutes": reroutes,
         "cost": cost_rollup(artifacts),
         "alerts": collect_alerts(artifacts),
+        "tokens_total": int(token_usage["total_tokens"]),
+        "primary_model": _primary_model_from_routing(artifacts),
+        "worker_count": len(tasks),
+        "adapters": adapters,
+        "primary_adapter": primary_adapter,
+        "verification_score": _verification_score(artifacts),
+        "routing_rollup": _routing_rollup(tasks, artifacts),
     }
 
 
@@ -1090,6 +1184,199 @@ _PAGE_HEAD = r"""<!doctype html>
   }
   .home-link:hover { color: #c9d1d9; border-color: #30363d; background: #161b22; }
   .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+  .swarm-hero { margin-bottom: 14px; }
+  .swarm-hero-top {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+  }
+  .swarm-title {
+    font-size: 16px;
+    font-weight: 600;
+    color: #f0f6fc;
+    min-width: 0;
+    flex: 1;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .swarm-hero-meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .swarm-model-badge {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11px;
+    font-weight: 600;
+    color: #58a6ff;
+    background: rgba(88, 166, 255, 0.12);
+    border: 1px solid rgba(88, 166, 255, 0.25);
+    border-radius: 6px;
+    padding: 3px 8px;
+  }
+  .swarm-chip {
+    font-size: 11px;
+    font-weight: 600;
+    color: #8b949e;
+    background: #161b22;
+    border: 1px solid #21262d;
+    border-radius: 6px;
+    padding: 3px 8px;
+  }
+  .swarm-chip.swarm-adapter { text-transform: lowercase; }
+  .swarm-metrics {
+    display: flex;
+    align-items: baseline;
+    gap: 16px;
+    flex-wrap: wrap;
+    margin-bottom: 14px;
+  }
+  .swarm-cost {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 18px;
+    font-weight: 700;
+    color: #2ea043;
+  }
+  .swarm-tokens {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 14px;
+    color: #8b949e;
+  }
+  .swarm-verification {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: #58a6ff;
+    background: rgba(88, 166, 255, 0.1);
+    border: 1px solid rgba(88, 166, 255, 0.2);
+    border-radius: 6px;
+    padding: 4px 10px;
+  }
+  .swarm-subhead {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #6e7681;
+    font-weight: 700;
+    margin: 16px 0 10px;
+  }
+  .routing-rollup { display: flex; flex-direction: column; gap: 10px; }
+  .routing-card {
+    border: 1px solid #21262d;
+    border-radius: 8px;
+    padding: 12px 14px;
+    background: #161b22;
+  }
+  .routing-card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 6px;
+  }
+  .routing-model {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    font-weight: 600;
+    color: #f0f6fc;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .routing-cost {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    font-weight: 700;
+    color: #2ea043;
+    flex-shrink: 0;
+  }
+  .routing-role {
+    font-size: 11px;
+    color: #6e7681;
+    margin-bottom: 6px;
+  }
+  .routing-summary {
+    font-size: 12px;
+    color: #8b949e;
+    line-height: 1.5;
+    margin-bottom: 6px;
+  }
+  .alts-toggle {
+    background: none;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+    font-size: 11px;
+    color: #6e7681;
+    font-family: inherit;
+  }
+  .alts-toggle:hover { color: #8b949e; }
+  .alts-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+  }
+  .alt-chip {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 10px;
+    color: #8b949e;
+    background: #0d1117;
+    border: 1px solid #21262d;
+    border-radius: 4px;
+    padding: 2px 7px;
+    cursor: default;
+  }
+  .job-footer {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    z-index: 10;
+    display: none;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 12px 24px;
+    background: #161b22;
+    border-top: 1px solid #21262d;
+    box-shadow: 0 -1px 3px rgba(0,0,0,0.3);
+    font-size: 12px;
+    color: #8b949e;
+  }
+  .job-footer.visible { display: flex; }
+  .job-footer-totals {
+    display: flex;
+    align-items: baseline;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  .job-footer-cost {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-weight: 700;
+    color: #2ea043;
+  }
+  .job-footer-tokens {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-weight: 600;
+    color: #c9d1d9;
+  }
+  .job-footer-model {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11px;
+    color: #58a6ff;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  main.has-footer { padding-bottom: 72px; }
 </style>
 </head>
 <body>
@@ -1105,6 +1392,14 @@ _PAGE_HEAD = r"""<!doctype html>
   <p class="job-id-subtitle mono" id="jobidsub"></p>
   <div class="grid" id="content"></div>
 </main>
+<footer id="job-footer" class="job-footer">
+  <span class="job-footer-label">Job total</span>
+  <div class="job-footer-totals">
+    <span>Cost: <strong class="job-footer-cost" id="footer-cost">$0.0000</strong></span>
+    <span>Tokens: <strong class="job-footer-tokens" id="footer-tokens">0</strong></span>
+    <span class="job-footer-model" id="footer-model"></span>
+  </div>
+</footer>
 <script>
 """
 
@@ -1114,6 +1409,7 @@ let jobId = qs.get("job");
 let expandedTasks = new Set();
 let expandedGoals = new Set();
 let expandedSections = new Set();
+let expandedAlts = new Set();
 let taskFilter = "all";
 let lastContent = "";
 
@@ -1156,6 +1452,10 @@ async function loadIndex() {
   const _jid = document.getElementById("jobid"); if (_jid) _jid.textContent = "";
   const _jids = document.getElementById("jobidsub"); if (_jids) _jids.textContent = "";
   document.getElementById("status").outerHTML = '<span id="status" class="pill s-queued">jobs</span>';
+  const _footer = document.getElementById("job-footer");
+  if (_footer) _footer.classList.remove("visible");
+  const _main = document.querySelector("main");
+  if (_main) _main.classList.remove("has-footer");
 
   const counts = {};
   for (const j of jobs) counts[j.status] = (counts[j.status] || 0) + 1;
@@ -1342,6 +1642,15 @@ window.toggleSection = function(sectionId) {
   loadJob();
 };
 
+window.toggleAlts = function(taskId) {
+  if (expandedAlts.has(taskId)) {
+    expandedAlts.delete(taskId);
+  } else {
+    expandedAlts.add(taskId);
+  }
+  loadJob();
+};
+
 window.setTaskFilter = function(filter) {
   taskFilter = filter;
   loadJob();
@@ -1371,13 +1680,79 @@ function renderCollapsibleSection(title, id, items) {
   return html;
 }
 
+function summarizeRouting(entry) {
+  const policy = entry.policy || "";
+  const reason = entry.reason || "";
+  const planBilled = /plan-billed|in-subscription/i.test(reason);
+  const lead = {
+    balanced: "Right-sized: cheapest model that clears the task's need",
+    cheap: "Cheapest available model",
+    quality: "Highest-capability model for the task",
+    escalating: "Cheapest sufficient model, escalates if it stalls",
+  };
+  const base = lead[policy] || "Router pick";
+  return planBilled ? base + " \u00b7 plan-billed, no marginal cost" : base;
+}
+
+function renderRoutingRollup(rollup) {
+  if (!rollup || !rollup.length) {
+    return '<p class="muted">No routing decisions yet.</p>';
+  }
+  let html = '<div class="routing-rollup">';
+  for (const entry of rollup) {
+    const altKey = esc(entry.task_id);
+    const altsExpanded = expandedAlts.has(entry.task_id);
+    html += '<div class="routing-card">';
+    if (entry.role) {
+      html += `<div class="routing-role">${esc(entry.role)}</div>`;
+    }
+    html += `<div class="routing-card-head">
+      <span class="routing-model" title="${esc(entry.model_id)}">${esc(entry.model_id || "Unknown model")}</span>
+      <span class="routing-cost">$${(entry.estimated_cost_usd || 0).toFixed(4)}</span>
+    </div>`;
+    html += `<div class="routing-summary">${esc(summarizeRouting(entry))}</div>`;
+    if (entry.rejected_count > 0) {
+      html += `<button type="button" class="alts-toggle" onclick="toggleAlts('${altKey}')">${altsExpanded ? "\u25bc" : "\u25b6"} ${entry.rejected_count} alternatives considered</button>`;
+      if (altsExpanded) {
+        html += '<div class="alts-list">';
+        for (const rej of entry.rejected) {
+          html += `<span class="alt-chip" title="${esc(rej.reason)}">${esc(rej.id)}</span>`;
+        }
+        html += '</div>';
+      }
+    }
+    html += '</div>';
+  }
+  html += '</div>';
+  return html;
+}
+
+function updateJobFooter(d) {
+  const footer = document.getElementById("job-footer");
+  const main = document.querySelector("main");
+  if (!footer) return;
+  footer.classList.add("visible");
+  if (main) main.classList.add("has-footer");
+  const costEl = document.getElementById("footer-cost");
+  const tokensEl = document.getElementById("footer-tokens");
+  const modelEl = document.getElementById("footer-model");
+  if (costEl) costEl.textContent = "$" + (d.cost.total_estimated_cost_usd || 0).toFixed(4);
+  if (tokensEl) tokensEl.textContent = (d.tokens_total || 0).toLocaleString();
+  if (modelEl) modelEl.textContent = d.primary_model || "";
+}
+
 async function loadJob() {
   const r = await fetch("/api/job?id=" + encodeURIComponent(jobId));
   if (r.status === 404) {
     document.getElementById("content").innerHTML = '<div class="card">Job not found.</div>';
+    const _footer = document.getElementById("job-footer");
+    if (_footer) _footer.classList.remove("visible");
+    const _main = document.querySelector("main");
+    if (_main) _main.classList.remove("has-footer");
     return;
   }
   const d = await r.json();
+  updateJobFooter(d);
   document.getElementById("status").outerHTML = '<span id="status" class="pill s-' + esc(d.job.status) + '">' + esc(d.job.status) + '</span>';
   document.getElementById("jobid").textContent = "";
   const headline = d.job.label || d.job.title || d.job.id;
@@ -1397,6 +1772,29 @@ async function loadJob() {
   const failedTasks = prog.failed || 0;
   const queuedTasks = prog.queued || 0;
   const progressPct = totalTasks > 0 ? (completeTasks / totalTasks * 100) : 0;
+
+  html += `<div class="card"><h2>Swarm Tracker</h2>
+    <div class="swarm-hero">
+      <div class="swarm-hero-top">
+        <span class="swarm-title" title="${esc(d.job.goal)}">${esc(headline)}</span>
+        ${pill(d.job.status)}
+      </div>
+      <div class="swarm-hero-meta">
+        ${d.primary_model ? `<span class="swarm-model-badge" title="Primary model">${esc(d.primary_model)}</span>` : ""}
+        ${d.worker_count ? `<span class="swarm-chip">${d.worker_count} worker${d.worker_count !== 1 ? "s" : ""}</span>` : ""}
+        ${d.primary_adapter ? `<span class="swarm-chip swarm-adapter">${esc(d.primary_adapter)}</span>` : ""}
+      </div>
+    </div>
+    <div class="swarm-metrics">
+      <span class="swarm-cost">$${(d.cost.total_estimated_cost_usd || 0).toFixed(4)}</span>
+      <span class="swarm-tokens">${(d.tokens_total || 0).toLocaleString()}t</span>
+      ${d.verification_score != null ? `<span class="swarm-verification">VERIFICATION ${Math.round(d.verification_score * 100)}%</span>` : ""}
+    </div>
+    <div class="progress-bar"><div class="progress-fill" style="width: ${progressPct}%"></div></div>
+    <div class="progress-text">${completeTasks} / ${totalTasks} complete</div>
+    <h3 class="swarm-subhead">Routing</h3>
+    ${renderRoutingRollup(d.routing_rollup || [])}
+  </div>`;
 
   html += `<div class="card">
     <div class="summary-bar">

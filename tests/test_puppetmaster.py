@@ -12885,6 +12885,145 @@ class DashboardTests(unittest.TestCase):
             # the billing failure surfaces as an alert
             self.assertTrue(any("billing_or_quota" in a for a in snap["alerts"]))
 
+    def test_build_job_snapshot_swarm_tracker_fields(self) -> None:
+        """Swarm Tracker snapshot fields: tokens, routing rollup, verification score."""
+        import json
+
+        from puppetmaster.dashboard import build_job_snapshot
+        from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
+        from puppetmaster.store import SwarmStore
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            job = store.create_job("swarm tracker snapshot goal")
+            task_a = Task(
+                job_id=job.id,
+                role="implement",
+                instruction="build feature",
+                adapter="cursor",
+                status=TaskStatus.COMPLETE,
+                payload={"model": "gpt-5.5"},
+                attempts=1,
+            )
+            task_b = Task(
+                job_id=job.id,
+                role="review",
+                instruction="review feature",
+                adapter="claude-code",
+                status=TaskStatus.COMPLETE,
+                payload={"model": "claude-sonnet"},
+                attempts=1,
+            )
+            store.save_task(task_a)
+            store.save_task(task_b)
+
+            rejected = [
+                {"id": "cursor/gpt-4", "reason": "capability too low"},
+                {"id": "openai/gpt-4o", "reason": "adapter mismatch"},
+            ]
+            store.save_artifact(
+                Artifact(
+                    job_id=job.id,
+                    task_id=task_a.id,
+                    type=ArtifactType.ROUTING,
+                    created_by="router",
+                    payload={
+                        "model_id": "cursor/gpt-5-5",
+                        "adapter": "cursor",
+                        "policy": "balanced",
+                        "estimated_cost_usd": 0.12,
+                        "reason": "policy=balanced: cheapest sufficient model (plan-billed)",
+                        "rejected": rejected,
+                        "tokens_in": 1000,
+                        "tokens_out": 500,
+                    },
+                    confidence=1.0,
+                    evidence=["policy:balanced"],
+                )
+            )
+            store.save_artifact(
+                Artifact(
+                    job_id=job.id,
+                    task_id=task_b.id,
+                    type=ArtifactType.ROUTING,
+                    created_by="router",
+                    payload={
+                        "model_id": "cursor/gpt-5-5",
+                        "adapter": "claude-code",
+                        "policy": "balanced",
+                        "estimated_cost_usd": 0.08,
+                        "reason": "policy=balanced: cheapest sufficient model",
+                        "rejected": rejected,
+                        "tokens_in": 2000,
+                        "tokens_out": 800,
+                    },
+                    confidence=1.0,
+                    evidence=["policy:balanced"],
+                )
+            )
+            # Duplicate router artifact for task_a — rollup must keep first only.
+            store.save_artifact(
+                Artifact(
+                    job_id=job.id,
+                    task_id=task_a.id,
+                    type=ArtifactType.ROUTING,
+                    created_by="router",
+                    payload={
+                        "model_id": "cursor/other",
+                        "adapter": "cursor",
+                        "policy": "cheap",
+                        "estimated_cost_usd": 0.01,
+                        "reason": "duplicate should be ignored",
+                        "rejected": [],
+                    },
+                    confidence=1.0,
+                    evidence=["dup"],
+                    created_at="2099-01-01T00:00:00+00:00",
+                )
+            )
+            store.save_artifact(
+                Artifact(
+                    job_id=job.id,
+                    task_id=task_a.id,
+                    type=ArtifactType.VERIFICATION,
+                    created_by="worker-implement",
+                    payload={"check": "tests pass", "result": "passed"},
+                    confidence=0.9,
+                    evidence=["pytest"],
+                )
+            )
+            store.save_artifact(
+                Artifact(
+                    job_id=job.id,
+                    task_id=task_b.id,
+                    type=ArtifactType.VERIFICATION,
+                    created_by="worker-review",
+                    payload={"check": "review ok", "result": "passed"},
+                    confidence=0.7,
+                    evidence=["diff"],
+                )
+            )
+
+            snap = build_job_snapshot(store, job.id)
+            json.dumps(snap)
+
+            self.assertEqual(snap["worker_count"], 2)
+            self.assertEqual(snap["primary_model"], "cursor/gpt-5-5")
+            self.assertEqual(snap["tokens_total"], 4300)
+            self.assertAlmostEqual(snap["verification_score"], 0.8)
+            self.assertEqual(snap["primary_adapter"], "cursor")
+            self.assertEqual(sorted(snap["adapters"]), ["claude-code", "cursor"])
+
+            rollup = snap["routing_rollup"]
+            self.assertEqual(len(rollup), 2)
+            by_task = {row["task_id"]: row for row in rollup}
+            self.assertEqual(by_task[task_a.id]["model_id"], "cursor/gpt-5-5")
+            self.assertEqual(by_task[task_a.id]["rejected_count"], 2)
+            self.assertEqual(len(by_task[task_a.id]["rejected"]), 2)
+            self.assertEqual(by_task[task_b.id]["role"], "review")
+            self.assertEqual(by_task[task_b.id]["policy"], "balanced")
+
     def test_list_all_projects_snapshot_aggregates_across_projects(self) -> None:
         """--all-projects aggregates jobs from every project state dir and
         labels each row with the digest-stripped project slug."""
