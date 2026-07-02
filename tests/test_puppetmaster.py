@@ -21934,5 +21934,131 @@ class OutputStyleTests(unittest.TestCase):
             self.assertIn("OUTPUT STYLE (terse)", out[1].instruction)
 
 
+class KeysWizardTests(unittest.TestCase):
+    """`puppetmaster keys` — writes provider keys into an MCP config env block."""
+
+    def _read_env(self, path: Path) -> dict:
+        config = json.loads(path.read_text(encoding="utf-8"))
+        return config["mcpServers"]["puppetmaster"]["env"]
+
+    def test_set_writes_key_into_new_mcp_config_and_never_echoes_value(self) -> None:
+        from puppetmaster.cli.commands_keys import _apply_key
+        from puppetmaster.providers import get_provider
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mcp.json"
+            secret = "sk-" + "a" * 30
+            ok, message = _apply_key(get_provider("openai"), secret, path)
+            self.assertTrue(ok, msg=message)
+            self.assertEqual(self._read_env(path)["OPENAI_API_KEY"], secret)
+            # The result message must be safe to print — no raw secret in it.
+            self.assertNotIn(secret, message)
+            # The file holds a credential, so it must not be world/group readable.
+            self.assertEqual(path.stat().st_mode & 0o077, 0)
+
+    def test_set_preserves_existing_entry_and_other_env_keys(self) -> None:
+        from puppetmaster.cli.commands_keys import _apply_key
+        from puppetmaster.providers import get_provider
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mcp.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "puppetmaster": {
+                                "command": "/custom/python",
+                                "args": ["-m", "puppetmaster.mcp_server"],
+                                "env": {"CURSOR_API_KEY": "keep-me"},
+                            },
+                            "other": {"command": "x"},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            ok, _ = _apply_key(get_provider("anthropic"), "sk-ant-" + "b" * 24, path)
+            self.assertTrue(ok)
+            config = json.loads(path.read_text(encoding="utf-8"))
+            entry = config["mcpServers"]["puppetmaster"]
+            self.assertEqual(entry["command"], "/custom/python")  # not clobbered
+            self.assertEqual(entry["env"]["CURSOR_API_KEY"], "keep-me")  # preserved
+            self.assertIn("ANTHROPIC_API_KEY", entry["env"])
+            self.assertIn("other", config["mcpServers"])  # untouched neighbour
+
+    def test_empty_value_is_rejected(self) -> None:
+        from puppetmaster.cli.commands_keys import _apply_key
+        from puppetmaster.providers import get_provider
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mcp.json"
+            ok, message = _apply_key(get_provider("openai"), "   ", path)
+            self.assertFalse(ok)
+            self.assertFalse(path.exists())
+            self.assertIn("empty", message)
+
+    def test_wizard_sets_selected_provider_then_quits(self) -> None:
+        from puppetmaster.cli.commands_keys import KeyWizard
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mcp.json"
+            # Providers are listed alphabetically by label; [1] is Anthropic.
+            wizard = KeyWizard(
+                path,
+                io.StringIO("1\nq\n"),
+                io.StringIO(),
+                env={},
+                read_secret=lambda prompt: "sk-ant-" + "c" * 24,
+            )
+            self.assertEqual(wizard.run(), 0)
+            self.assertIn("ANTHROPIC_API_KEY", self._read_env(path))
+
+    def test_wizard_rejects_out_of_range_choice(self) -> None:
+        from puppetmaster.cli.commands_keys import KeyWizard
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mcp.json"
+            stdout = io.StringIO()
+            wizard = KeyWizard(
+                path,
+                io.StringIO("999\nq\n"),
+                stdout,
+                env={},
+                read_secret=lambda prompt: "unused",
+            )
+            self.assertEqual(wizard.run(), 0)
+            self.assertIn("Please enter", stdout.getvalue())
+            self.assertFalse(path.exists())  # nothing written
+
+    def test_wizard_exits_cleanly_on_closed_stdin(self) -> None:
+        from puppetmaster.cli.commands_keys import KeyWizard
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mcp.json"
+            wizard = KeyWizard(path, io.StringIO(""), io.StringIO(), env={})
+            self.assertEqual(wizard.run(), 1)  # closed stdin, nothing written
+
+    def test_status_reports_process_and_stored_without_values(self) -> None:
+        from puppetmaster.cli.commands_keys import _run_status
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mcp.json"
+            secret = "sk-" + "d" * 30
+            path.write_text(
+                json.dumps(
+                    {"mcpServers": {"puppetmaster": {"env": {"OPENAI_API_KEY": secret}}}}
+                ),
+                encoding="utf-8",
+            )
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = _run_status(path, {"ANTHROPIC_API_KEY": "visible-in-env"})
+            text = out.getvalue()
+            self.assertEqual(rc, 0)
+            self.assertNotIn(secret, text)  # stored value never printed
+            self.assertIn("OpenAI", text)
+            self.assertIn("Anthropic", text)
+
+
 if __name__ == "__main__":
     unittest.main()

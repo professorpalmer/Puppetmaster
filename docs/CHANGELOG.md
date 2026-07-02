@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.9.101
+
+**New `puppetmaster keys` command — a guided setup for agentic provider API keys, so the keys-only path is genuinely keys-*easy*.** The `agentic` adapter calls provider HTTP APIs directly with the user's own key, resolving credentials purely from the process environment (`puppetmaster/providers.py`). When Puppetmaster is driven through Cursor's MCP client, that "process" is the MCP server Cursor launches — so a key only reaches the worker if it lives in the `env` block of the `puppetmaster` entry in a Cursor `mcp.json`. Until now that meant hand-editing JSON; there was no key-setup wizard (the existing `models` wizard only edits the model registry, never credentials).
+
+- **Interactive wizard.** `puppetmaster keys` walks every keyed provider (OpenAI, Anthropic, Gemini, OpenRouter, xAI, DeepSeek, Groq, Mistral, Together, Nous), reads each value with a hidden prompt, and marks which providers are already visible to the shell.
+- **`keys status`.** A per-provider table of PROCESS (visible to this shell now) vs STORED (saved in the target MCP config). Values are never printed.
+- **`keys set <provider>`.** Non-interactive single write, reading the value from a hidden prompt or `--stdin` (handy for `printenv KEY | puppetmaster keys set openai --stdin`).
+- **Writes where the worker actually reads.** Keys land in the `puppetmaster` MCP entry's `env` block in `~/.cursor/mcp.json` by default (`--workspace` → `<cwd>/.cursor/mcp.json`, `--target PATH` overrides). A missing config or entry is created (matching what `install-cursor-mcp` writes); existing env keys and neighbouring MCP servers are preserved verbatim.
+- **Secret hygiene by construction.** Each value is registered with `register_secret_value` the moment it's handled (so any later log/artifact output is scrubbed), is never echoed back, and the config file is tightened to `0600` because it now holds a credential. Provider keys are never written into Puppetmaster-owned state (`~/.puppetmaster/`), only into the host MCP config the user already owns.
+- **Docs.** `docs/ADAPTERS.md` gains a "Setting keys" section under the agentic adapter.
+- 7 new focused tests (`KeysWizardTests`): create/write, entry+env preservation, empty-value rejection, wizard selection, out-of-range rejection, closed-stdin exit, and "status never prints values."
+
 ## v0.9.100
 
 **The dashboard gains a Marionette-style "Swarm Tracker" hero — every job now gets the same at-a-glance tracking, routing transparency, and progress the Marionette app shows, on top of the existing detail.** The local web board (`python -m puppetmaster dashboard` / `puppetmaster_dashboard`) already rendered per-task cards, cost, and typed artifacts; this adds a summary hero at the top of every job view and surfaces the router's audit trail.

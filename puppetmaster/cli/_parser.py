@@ -1558,6 +1558,47 @@ def build_parser() -> argparse.ArgumentParser:
     models_set.add_argument("model_id", help="Model id to update.")
     models_set.add_argument("assignments", nargs="+", help="key=value updates.")
 
+    keys_cmd = subcommands.add_parser(
+        "keys",
+        help=(
+            "Set agentic provider API keys into the Cursor MCP config so "
+            "direct-API workers can reach them (no external CLI required). "
+            "Run with no subcommand for an interactive wizard."
+        ),
+    )
+    keys_cmd.add_argument(
+        "--target",
+        help="Path to the mcp.json to write (default: ~/.cursor/mcp.json).",
+    )
+    keys_cmd.add_argument(
+        "--workspace",
+        action="store_true",
+        help="Write to <cwd>/.cursor/mcp.json instead of the global config.",
+    )
+    keys_sub = keys_cmd.add_subparsers(dest="keys_command", required=False)
+    keys_status = keys_sub.add_parser(
+        "status",
+        help="Show which provider keys are visible/stored (values hidden).",
+    )
+    keys_status.add_argument("--target", help="Path to the mcp.json to inspect.")
+    keys_status.add_argument(
+        "--workspace", action="store_true", help="Inspect <cwd>/.cursor/mcp.json."
+    )
+    keys_set = keys_sub.add_parser(
+        "set",
+        help="Set one provider's key (prompts hidden, or read from --stdin).",
+    )
+    keys_set.add_argument("provider", help="Provider slug, e.g. openai, anthropic, gemini.")
+    keys_set.add_argument("--target", help="Path to the mcp.json to write.")
+    keys_set.add_argument(
+        "--workspace", action="store_true", help="Write to <cwd>/.cursor/mcp.json."
+    )
+    keys_set.add_argument(
+        "--stdin",
+        action="store_true",
+        help="Read the key value from stdin instead of a hidden prompt.",
+    )
+
     platform_cmd = subcommands.add_parser(
         "platform",
         help=(

@@ -224,6 +224,18 @@ Requirements:
 - At least one provider API key visible to the process (see above). `puppetmaster doctor` reports credential visibility without printing values.
 - For implement mode: a git work tree (or `payload.allow_non_worktree=true`).
 
+Setting keys (`puppetmaster keys`):
+
+When you drive agentic through the Cursor MCP client, the "process" that resolves the key is the MCP server Cursor launches — so a key only reaches the worker if it lives in the `env` block of the `puppetmaster` entry in a Cursor `mcp.json`. The `keys` command walks you through that instead of hand-editing JSON:
+
+```bash
+python -m puppetmaster keys                 # interactive wizard over the known providers
+python -m puppetmaster keys status          # show which keys are visible/stored (values hidden)
+python -m puppetmaster keys set openai       # set one provider (hidden prompt, or --stdin)
+```
+
+Keys are written to `~/.cursor/mcp.json` by default (`--workspace` targets `<cwd>/.cursor/mcp.json`, `--target PATH` overrides). Values are registered as secrets and never echoed, and the config file is tightened to `0600` because it now holds a credential. Restart the Cursor MCP server (or reload the window) so new keys reach workers, then `puppetmaster models discover --source agentic --write` to seed models. Existing `env` entries and neighbouring MCP servers are preserved.
+
 CLI and MCP:
 
 ```bash
