@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.9.99
+
+Docs-only release so the PyPI project page reflects the keys-only story shipped in v0.9.98.
+
+- **README** now leads with the no-external-CLI path: the built-in `agentic` adapter runs the whole tool-use loop against any provider API key (OpenAI/Anthropic/Gemini/OpenRouter) — ideal for CI, containers, and headless servers — instead of framing Puppetmaster solely as a wrapper around agent CLIs.
+- **"Why it's credible"** adds an accurately-caveated external-validation paragraph: on the independent third-party NL2Repo-Bench, durable-state orchestration reaches a 91.1% mean test-pass rate (~2.28× the ~40% published SOTA), with the honest framing carried over (field/single-vs-swarm comparison, agent-only swap, packaging-bound tasks kept in the denominator).
+- **docs index** gains a "Research & external results" section linking the paper site, the Zenodo concept DOI (latest version), and the SWE-bench Lite cost/quality study.
+
+No code, API, or behavior changes.
+
 ## v0.9.98
 
 **The `agentic` adapter gets the full first-class-platform treatment.** v0.9.96 shipped the standalone provider-agnostic `agentic` worker (its own tool-use loop against a provider HTTP API on the user's own key, no external cursor/claude/codex/hermes CLI), but it was only wired into the runtime core (adapter registry, `KNOWN_ADAPTERS`, static catalog, key-aware router). This release brings it to parity with codex/openai/hermes across every user-facing and safety surface, so it is a real keys-only platform you can drive from the CLI/MCP — not just an internal building block Marionette consumes.
