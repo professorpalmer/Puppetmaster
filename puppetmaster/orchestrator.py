@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +37,10 @@ _MAX_FALLBACK_ROUNDS = 3
 # genuinely-hard task that no available model is confident about can't loop
 # forever (and can't quietly run up a frontier-model bill).
 _MAX_ESCALATION_ATTEMPTS = 2
+
+# Cap concurrent in-process role workers; matches the subprocess path's
+# "all roles at once" shape while bounding thread count on wide swarms.
+_INLINE_ROLE_WORKER_POOL_CAP = 8
 
 # Roles that judge or verify the system should not inherit prior promoted
 # conclusions — that would circularly feed audits their own past claims.
@@ -1715,22 +1720,42 @@ class Orchestrator:
                     # failures remain — hand back to the auto-fallback sweep.
                     return
 
-                completed = 0
-                for role in sorted({task.role for task in ready_tasks}):
-                    runtime = WorkerRuntime(
-                        store=self.store,
-                        job_id=job.id,
-                        role=role,
-                        worker_id=f"worker-{role}-inline",
-                        lease_seconds=lease_seconds,
-                    )
-                    completed += runtime.run_until_idle()
+                roles = sorted({task.role for task in ready_tasks})
+                completed = self._dispatch_inline_role_workers(
+                    job, roles, lease_seconds=lease_seconds
+                )
                 if completed == 0:
                     if self._should_fail_closed(job, allowed_task_ids):
                         raise RuntimeError("swarm exited with incomplete tasks")
                     # No progress and only recoverable failures left — stop spinning
                     # and let auto_fallback re-route on a funded adapter.
                     return
+
+    def _dispatch_inline_role_workers(
+        self,
+        job: Job,
+        roles: list[str],
+        *,
+        lease_seconds: int,
+    ) -> int:
+        """Run one idle loop per role concurrently; sum drives no-progress exit."""
+        if not roles:
+            return 0
+
+        def _run_role(role: str) -> int:
+            runtime = WorkerRuntime(
+                store=self.store,
+                job_id=job.id,
+                role=role,
+                worker_id=f"worker-{role}-inline",
+                lease_seconds=lease_seconds,
+            )
+            return runtime.run_until_idle()
+
+        pool_size = min(len(roles), _INLINE_ROLE_WORKER_POOL_CAP)
+        with ThreadPoolExecutor(max_workers=pool_size) as executor:
+            futures = [executor.submit(_run_role, role) for role in roles]
+            return sum(future.result() for future in futures)
 
     def _wait_for_daemon_workers(
         self,

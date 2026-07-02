@@ -1268,6 +1268,88 @@ class PuppetmasterTests(unittest.TestCase):
             self.assertTrue(all(artifact.created_by == "worker-explore-inline" for artifact in artifacts))
             self.assertEqual(store.latest_job().status, JobStatus.COMPLETE)
 
+    def test_inline_workers_run_roles_concurrently(self) -> None:
+        """Inline mode must dispatch ready roles in parallel, not one-by-one."""
+        from puppetmaster.worker_runtime import WorkerRuntime
+
+        _orig_run_until_idle = WorkerRuntime.run_until_idle
+        barrier = threading.Barrier(2)
+        roles_entered: list[str] = []
+        roles_lock = threading.Lock()
+
+        def _run_until_idle_with_barrier(self: WorkerRuntime) -> int:
+            with roles_lock:
+                roles_entered.append(self.role)
+            barrier.wait(timeout=2.0)
+            return _orig_run_until_idle(self)
+
+        specs = [
+            WorkerSpec(role="explore", instruction="find facts"),
+            WorkerSpec(role="architect", instruction="choose design"),
+        ]
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            with patch(
+                "puppetmaster.orchestrator.WorkerRuntime.run_until_idle",
+                _run_until_idle_with_barrier,
+            ):
+                result = Orchestrator(store).run(
+                    "prove inline concurrency",
+                    specs=specs,
+                    worker_mode="inline",
+                )
+
+            tasks = store.list_tasks(result.job.id)
+            self.assertEqual({task.role for task in tasks}, {"explore", "architect"})
+            self.assertTrue(
+                all(task.status == TaskStatus.COMPLETE for task in tasks),
+                msg=[(task.role, task.status) for task in tasks],
+            )
+            self.assertEqual(
+                {artifact.created_by for artifact in store.list_artifacts(result.job.id)},
+                {"worker-explore-inline", "worker-architect-inline"},
+            )
+            self.assertEqual(set(roles_entered), {"explore", "architect"})
+
+    def test_inline_workers_propagate_role_failures(self) -> None:
+        from puppetmaster.worker_runtime import WorkerRuntime
+
+        _orig_run_until_idle = WorkerRuntime.run_until_idle
+
+        def _explore_raises(self: WorkerRuntime) -> int:
+            if self.role == "explore":
+                raise RuntimeError("simulated inline worker failure")
+            return _orig_run_until_idle(self)
+
+        specs = [
+            WorkerSpec(role="explore", instruction="find facts"),
+            WorkerSpec(role="architect", instruction="choose design"),
+        ]
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("inline failure propagation")
+            for spec in specs:
+                store.save_task(
+                    Task(
+                        job_id=job.id,
+                        role=spec.role,
+                        instruction=spec.instruction,
+                        adapter=spec.adapter,
+                        payload=dict(spec.payload),
+                    )
+                )
+            with patch(
+                "puppetmaster.orchestrator.WorkerRuntime.run_until_idle",
+                _explore_raises,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "simulated inline worker failure"
+                ):
+                    Orchestrator(store)._run_inline_workers(
+                        job,
+                        store.list_tasks(job.id),
+                    )
+
     def test_daemon_worker_mode_uses_warm_worker(self) -> None:
         with TemporaryDirectory() as tmp:
             store = SwarmStore(Path(tmp) / ".puppetmaster")

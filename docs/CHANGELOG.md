@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.9.97
+
+**Inline worker mode now runs its per-role workers concurrently — `worker_mode="inline"` is a first-class parallel, in-process execution mode instead of a serial fallback.** Previously `Orchestrator._run_inline_workers` dispatched roles strictly one-at-a-time inside each round (`for role in sorted(...): runtime.run_until_idle()`), so an inline swarm of N roles took N × per-role wall time — even though the subprocess path already spawned all roles at once. Inline was the *only* serial mode, and it's the mode in-process consumers (pm-harness/Marionette analysis swarms, sandboxes, embedded/test use) opt into for clean key/env inheritance without the subprocess spawn tax.
+
+- **Bounded parallel dispatch.** A new `Orchestrator._dispatch_inline_role_workers` submits one `WorkerRuntime.run_until_idle()` per ready role to a `concurrent.futures.ThreadPoolExecutor` capped by `_INLINE_ROLE_WORKER_POOL_CAP = 8` (`min(len(roles), cap)`), mirroring the subprocess path's "all roles at once" shape while bounding thread count on wide swarms. Completions are summed and still gate the round's no-progress exit.
+- **Safe by construction, no new locking.** This only parallelizes the caller — the store's concurrency substrate was already built for N concurrent workers: `SQLiteSwarmStore` opens a fresh WAL connection per operation (`busy_timeout=5000`), and `claim_task` is an atomic compare-and-swap (`UPDATE … WHERE status IN (queued, blocked, stale-running)` guarded by `rowcount != 1`), so two racing role workers can never double-claim. No global locks were added and the connection model is unchanged.
+- **Semantics preserved.** The round-based `while` loop, `PUPPETMASTER_STATE_DIR` scoping, heartbeat/`recover_stale_tasks`/`refresh_blocked_tasks`, and both fail-closed exits are unchanged. Role dispatch order no longer affects correctness (claims are atomic) but `sorted(...)` is kept for stable worker ids. Exceptions from any role propagate via `future.result()` (raising `RuntimeError` like the subprocess path) with remaining threads joined on executor shutdown — no orphaned threads, no deadlock.
+- **Scope:** subprocess mode (the CLI/MCP default) and daemon mode are byte-identical; single-role inline jobs are unaffected. Benchmark (0.5s GIL-releasing per-role work, median of 3): 2 roles 2.00×, 4 roles 3.98×, 8 roles 7.97×, 16 roles 7.98× (two waves at the cap) — inline wall time drops from `N × work` to `ceil(N / 8) × work`.
+- Full suite: **992 passed** (pytest, `test_puppetmaster.py`), with a `threading.Barrier(2)` test that times out if dispatch serializes (proving overlap) and a failure-propagation test asserting a raising role surfaces `RuntimeError` rather than hanging.
+
+## v0.9.96
+
+**A standalone, provider-agnostic `agentic` worker adapter: run PM workers directly against a provider HTTP API on your own key, with no external agent CLI (hermes/cursor/claude/codex) required.** The `agentic` adapter runs its own tool-use loop against the provider wire, so a fresh install can do real agentic work with nothing but a provider API key.
+
+- **`providers.py` — stdlib-only descriptor registry** (methodology lifted from Hermes) for openai/anthropic/gemini/openrouter/xai/deepseek/groq/mistral/together/nous plus local ollama/lmstudio. Two wires (OpenAI-compatible + native Anthropic) are normalized behind `provider_chat → AssistantTurn`; `available_providers()` reports which have a usable credential.
+- **`adapters/agentic.py` — `AgenticAdapter`** (subclasses `FullEditWorkerAdapter`) with analyze (read-only) and implement (full-edit, git-attributed diff) modes. Confined filesystem tools; terminal/web are opt-in; all tool output, diffs, and provider error bodies are scrubbed via `redact_secrets`.
+- **Key-aware routing.** `router.py` drops agentic models whose provider key is absent, so a fresh install offers exactly what the user's keys unlock; `static_catalog.py` carries a curated provider-stamped agentic catalog; `platform_lock.py` governs `agentic` as a first-class adapter.
+- Full suite green with 18 new hermetic tests (`tests/test_agentic_standalone.py`) covering the registry, both provider wires, key-aware routing, confined tools, and loop mechanics.
+
 ## v0.9.95
 
 **The claude-code adapter now honors read-only intent, so analysis-swarm workers backed by Claude Code no longer trip the clean-tree guard.** Previously `ClaudeCodeAdapter` silently ignored the `read_only` / `sandbox=read-only` flags that analysis swarms stamp on every worker: it always ran with an edit-capable permission mode (`acceptEdits`) and always enforced the full-edit dirty-worktree guard. The result was an asymmetry — cursor analysis roles (which run `--dry-run`) reviewed a dirty tree fine, but a claude-code-backed analysis worker was blocked with `dirty_worktree` on the same tree, even though it was supposed to be read-only. This mirrors the fix codex already had.
