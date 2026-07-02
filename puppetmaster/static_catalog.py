@@ -122,6 +122,81 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
     # critical field — a bare model name routes to unconfigured OpenRouter, so
     # the router must stamp the explicit Hermes provider alongside the model.
     # Prices are the public per-token reference rates for the underlying model.
+    # Standalone direct-API worker catalog. Each entry routes through the
+    # AgenticAdapter's own tool loop against the stamped provider's HTTP API
+    # using the user's key -- no external agent CLI. ``payload_defaults.provider``
+    # is the critical field (same pattern as Hermes): it selects the provider
+    # descriptor (key env + base URL + wire protocol). Prices are public
+    # per-token reference rates; billing is API (out-of-pocket). The key-aware
+    # router filter drops any entry whose provider has no usable credential, so
+    # a fresh install offers exactly what the user's keys unlock.
+    "agentic": [
+        {
+            "model": "gemini-2.5-flash",
+            "capability": 60,
+            "input": 0.30,
+            "output": 2.5,
+            "context": 1_000_000,
+            "tags": ["agentic", "gemini", "cheap", "fast", "vision", "code", "long-context"],
+            "payload_defaults": {"provider": "gemini"},
+        },
+        {
+            "model": "gemini-2.5-pro",
+            "capability": 84,
+            "input": 1.25,
+            "output": 10.0,
+            "context": 1_000_000,
+            "tags": ["agentic", "gemini", "balanced", "vision", "code", "reasoning", "long-context"],
+            "payload_defaults": {"provider": "gemini"},
+        },
+        {
+            "model": "claude-haiku-4-5",
+            "capability": 55,
+            "input": 1.0,
+            "output": 5.0,
+            "context": 200_000,
+            "tags": ["agentic", "anthropic", "cheap", "fast", "vision", "code"],
+            "payload_defaults": {"provider": "anthropic"},
+        },
+        {
+            "model": "claude-sonnet-4-5",
+            "capability": 82,
+            "input": 3.0,
+            "output": 15.0,
+            "context": 200_000,
+            "tags": ["agentic", "anthropic", "balanced", "vision", "code", "reasoning"],
+            "payload_defaults": {"provider": "anthropic"},
+        },
+        {
+            "model": "claude-opus-4-8",
+            "capability": 99,
+            "input": 15.0,
+            "output": 75.0,
+            "context": 200_000,
+            "tags": ["agentic", "anthropic", "frontier", "quality", "vision", "code", "reasoning"],
+            "payload_defaults": {"provider": "anthropic"},
+        },
+        {
+            "model": "gpt-5",
+            "capability": 90,
+            "input": 1.25,
+            "output": 10.0,
+            "context": 400_000,
+            "tags": ["agentic", "openai", "quality", "vision", "code", "reasoning", "long-context"],
+            "payload_defaults": {"provider": "openai-api"},
+        },
+        {
+            "model": "gpt-5.5",
+            "capability": 96,
+            "input": 5.0,
+            "output": 30.0,
+            "context": 400_000,
+            "tags": ["agentic", "openai", "frontier", "quality", "vision", "code", "reasoning", "long-context"],
+            "payload_defaults": {"provider": "openai-api"},
+        },
+    ],
+    # Hermes is API-billed via the external hermes CLI (kept for users who have
+    # it installed). Prefer the ``agentic`` catalog above for standalone runs.
     "hermes": [
         {
             "model": "gemini-2.5-flash",

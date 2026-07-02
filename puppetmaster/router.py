@@ -429,6 +429,34 @@ def route_task(
             )
         candidates = after_platform
 
+    # Key-aware filter for standalone (agentic) models: a direct-API model can
+    # only run if its stamped provider actually has a usable credential right
+    # now. This is the direct-API analogue of the platform lock -- it drops a
+    # model whose provider key is absent so routing never picks one that would
+    # 401 on first call. Only 'agentic' specs are filtered (hermes and the CLI
+    # adapters keep their own availability logic); non-agentic candidates pass
+    # through untouched, so a mixed registry is unaffected.
+    try:
+        from puppetmaster.providers import available_providers as _available_providers
+        _providers_ready: Optional[set] = _available_providers()
+    except Exception:
+        _providers_ready = None
+    if _providers_ready is not None and any(s.adapter == "agentic" for s in candidates):
+        after_keys: list[ModelSpec] = []
+        for spec in candidates:
+            provider = (spec.payload_defaults or {}).get("provider")
+            if spec.adapter == "agentic" and provider and provider not in _providers_ready:
+                rejected.append((spec, f"provider {provider!r} has no usable API key"))
+                continue
+            after_keys.append(spec)
+        if not after_keys:
+            raise NoEligibleModelError(
+                "No standalone (agentic) model has a usable provider key. Set a "
+                "provider key (e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY, "
+                "GEMINI_API_KEY, OPENROUTER_API_KEY) or enable another platform."
+            )
+        candidates = after_keys
+
     # Tag filter first — cheap to evaluate, gives a clean reason on rejection.
     after_tags: list[ModelSpec] = []
     for spec in candidates:

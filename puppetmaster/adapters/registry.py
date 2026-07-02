@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from ._base import AdapterInfo, WorkerAdapter
+from .agentic import AgenticAdapter
 from .claude_code import ClaudeCodeAdapter
 from .codex import CodexAdapter
 from .cursor import CursorAdapter
@@ -11,6 +12,7 @@ from .openai import OpenAIAdapter
 ADAPTERS: dict[str, WorkerAdapter] = {
     "local": LocalAdapter(),
     "shell": ShellAdapter(),
+    "agentic": AgenticAdapter(),
     "cursor": CursorAdapter(),
     "claude-code": ClaudeCodeAdapter(),
     "openai": OpenAIAdapter(),
@@ -25,6 +27,17 @@ ADAPTER_INFO = [
         status="built-in",
         description="Deterministic structured artifacts for demo/runtime roles.",
         requires=[],
+    ),
+    AdapterInfo(
+        name="agentic",
+        status="built-in",
+        description=(
+            "Standalone provider-agnostic worker: runs its own tool-use loop "
+            "against a provider API directly (OpenAI-compatible or Anthropic) "
+            "for analyze and full-edit implement modes. No external agent CLI "
+            "required -- just the user's provider key."
+        ),
+        requires=["a provider API key (e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY)"],
     ),
     AdapterInfo(
         name="shell",
