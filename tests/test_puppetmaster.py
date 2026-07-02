@@ -231,6 +231,8 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertIn("puppetmaster_start_claude_implement", tool_names)
         self.assertIn("puppetmaster_codex", tool_names)
         self.assertIn("puppetmaster_start_codex", tool_names)
+        self.assertIn("puppetmaster_agentic", tool_names)
+        self.assertIn("puppetmaster_start_agentic", tool_names)
         self.assertIn("puppetmaster_start_swarm", tool_names)
         self.assertIn("puppetmaster_start_cursor_swarm", tool_names)
         self.assertIn("puppetmaster_status", tool_names)
@@ -8565,7 +8567,7 @@ class ModelRouterTests(unittest.TestCase):
         routing to it), instead of rejecting every non-cursor adapter."""
         from puppetmaster.mcp_server import write_generated_swarm_config
 
-        for adapter in ("claude-code", "hermes"):
+        for adapter in ("claude-code", "hermes", "agentic"):
             with self.subTest(adapter=adapter), TemporaryDirectory() as tmp:
                 args = {
                     "goal": "audit the module",
@@ -8937,6 +8939,244 @@ class ModelRouterTests(unittest.TestCase):
 
         self.assertEqual(captured["command"][0], "codex")
         self.assertIn("async codex", captured["command"])
+
+    def test_agentic_schema_requires_goal(self) -> None:
+        from puppetmaster.mcp_server import agentic_schema
+
+        schema = agentic_schema()
+        self.assertIn("goal", schema["required"])
+        self.assertIn("mode", schema["properties"])
+        self.assertIn("provider", schema["properties"])
+        self.assertIn("reasoning_effort", schema["properties"])
+        self.assertIn("auto_route", schema["properties"])
+
+    def test_run_agentic_builds_agentic_cli_command(self) -> None:
+        from puppetmaster import mcp_server
+
+        captured = {}
+
+        def fake_run_worker_cli(command, args):
+            captured["command"] = command
+            return {"ok": True}
+
+        with patch.object(mcp_server, "run_worker_cli", side_effect=fake_run_worker_cli):
+            mcp_server.run_agentic(
+                {
+                    "goal": "audit auth",
+                    "cwd": "/tmp/repo",
+                    "mode": "analyze",
+                    "provider": "anthropic",
+                    "model": "claude-sonnet-4-5",
+                    "max_turns": 6,
+                    "timeout_seconds": 120,
+                    "temperature": 0.2,
+                    "reasoning_effort": "high",
+                    "allow_dirty": True,
+                    "disable_memory": True,
+                    "auto_route": True,
+                    "routing_policy": "cheap",
+                }
+            )
+
+        command = captured["command"]
+        self.assertEqual(command[0], "agentic")
+        self.assertIn("audit auth", command)
+        self.assertEqual(command[command.index("--mode") + 1], "analyze")
+        self.assertEqual(command[command.index("--provider") + 1], "anthropic")
+        self.assertEqual(command[command.index("--model") + 1], "claude-sonnet-4-5")
+        self.assertIn("--disable-memory", command)
+        self.assertIn("--auto-route", command)
+        self.assertIn("--routing-policy", command)
+
+    def test_start_agentic_builds_agentic_cli_command(self) -> None:
+        from puppetmaster import mcp_server
+
+        captured = {}
+
+        def fake_start_cli(command, args):
+            captured["command"] = command
+            return {"ok": True}
+
+        with patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
+            mcp_server.start_agentic({"goal": "async agentic", "cwd": ".", "mode": "implement"})
+
+        self.assertEqual(captured["command"][0], "agentic")
+        self.assertEqual(captured["command"][captured["command"].index("--mode") + 1], "implement")
+
+    def test_agentic_mcp_commands_forward_disable_memory(self) -> None:
+        from puppetmaster import mcp_server
+
+        command = mcp_server.agentic_command(
+            {"goal": "fresh agentic", "cwd": ".", "disable_memory": True}
+        )
+        self.assertIn("--disable-memory", command)
+
+    def test_start_implement_supports_agentic_adapter(self) -> None:
+        from puppetmaster import mcp_server
+
+        captured = {}
+
+        def fake_start_cli(command, args):
+            captured["command"] = command
+            return {"ok": True}
+
+        with patch(
+            "puppetmaster.platform_lock.enabled_adapters", return_value={"agentic"}
+        ), patch(
+            "puppetmaster.workers.adapter_is_available", return_value=True
+        ), patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
+            result = mcp_server.start_implement({"goal": "ship it", "cwd": "."})
+
+        self.assertEqual(captured["command"][0], "agentic")
+        self.assertEqual(result["implement_adapter"], "agentic")
+
+    def test_pick_implement_adapter_selects_agentic_when_only_runnable(self) -> None:
+        from puppetmaster.workers import pick_implement_adapter
+
+        picked = pick_implement_adapter(
+            {"agentic"}, is_available=lambda a: a == "agentic"
+        )
+        self.assertEqual(picked, "agentic")
+
+    def test_adapter_is_available_agentic_requires_provider_key(self) -> None:
+        from puppetmaster.workers import adapter_is_available
+
+        with patch("puppetmaster.providers.available_providers", return_value=set()):
+            self.assertFalse(adapter_is_available("agentic", env={}))
+        with patch(
+            "puppetmaster.providers.available_providers", return_value={"openai"}
+        ):
+            self.assertTrue(adapter_is_available("agentic", env={"OPENAI_API_KEY": "k"}))
+
+    def test_agentic_adapter_status_reflects_provider_keys(self) -> None:
+        with patch(
+            "puppetmaster.providers.available_providers", return_value={"anthropic"}
+        ):
+            row = next(r for r in adapter_status(Path.cwd()) if r["name"] == "agentic")
+            self.assertTrue(row["configured"])
+        with patch("puppetmaster.providers.available_providers", return_value=set()):
+            row = next(r for r in adapter_status(Path.cwd()) if r["name"] == "agentic")
+            self.assertFalse(row["configured"])
+
+    def test_detect_agentic_billing_reports_api_and_providers(self) -> None:
+        from puppetmaster.platform_billing import detect_agentic_billing
+
+        with patch("puppetmaster.providers.available_providers", return_value={"openai"}):
+            status = detect_agentic_billing(env={"OPENAI_API_KEY": "k"})
+        self.assertTrue(status.healthy)
+        self.assertEqual(status.billing, "api")
+        self.assertIn("openai", status.detail)
+
+        with patch("puppetmaster.providers.available_providers", return_value=set()):
+            missing = detect_agentic_billing(env={})
+        self.assertFalse(missing.healthy)
+
+    def test_preflight_blocks_agentic_without_provider_key(self) -> None:
+        from puppetmaster.preflight import preflight_check
+
+        with patch("puppetmaster.providers.available_providers", return_value=set()):
+            result = preflight_check("agentic", env={})
+        self.assertFalse(result.ok)
+        self.assertIn("provider", result.reason.lower())
+
+    def test_preflight_passes_agentic_with_provider_key(self) -> None:
+        from puppetmaster.preflight import preflight_check
+
+        with patch("puppetmaster.providers.available_providers", return_value={"openai"}):
+            result = preflight_check("agentic", env={"OPENAI_API_KEY": "k"})
+        self.assertTrue(result.ok)
+
+    def test_cli_agentic_parser_and_dispatch_build_worker_spec(self) -> None:
+        from puppetmaster.cli._dispatch import _main
+        from puppetmaster.cli._parser import build_parser
+
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "agentic",
+                "fix the typo",
+                "--mode",
+                "analyze",
+                "--provider",
+                "openai",
+                "--model",
+                "gpt-5",
+                "--disable-memory",
+            ]
+        )
+        self.assertEqual(args.command, "agentic")
+        self.assertEqual(args.mode, "analyze")
+        self.assertTrue(args.disable_memory)
+
+        captured = {}
+
+        class FakeOrchestrator:
+            def __init__(self, store):
+                self.store = store
+
+            def run(self, goal, specs, **kwargs):
+                captured["specs"] = specs
+                return {"job_id": "job-agentic", "status": "complete"}
+
+        with patch("puppetmaster.cli.Orchestrator", FakeOrchestrator), patch(
+            "puppetmaster.cli.finalize_cli_run", return_value=0
+        ), patch("puppetmaster.cli._dispatch.create_store"):
+            _main(
+                [
+                    "agentic",
+                    "fix the typo",
+                    "--mode",
+                    "analyze",
+                    "--provider",
+                    "openai",
+                    "--model",
+                    "gpt-5",
+                    "--disable-memory",
+                ]
+            )
+
+        spec = captured["specs"][0]
+        self.assertEqual(spec.adapter, "agentic")
+        self.assertEqual(spec.payload["mode"], "analyze")
+        self.assertEqual(spec.payload["provider"], "openai")
+        self.assertTrue(spec.payload["disable_memory"])
+
+    def test_models_discover_agentic_filters_by_provider_keys(self) -> None:
+        from puppetmaster.cli.commands_models import _discover_one_source
+
+        with patch("puppetmaster.providers.available_providers", return_value={"anthropic"}):
+            merged, report, catalog = _discover_one_source("agentic", [])
+        self.assertEqual(report["source"], "agentic")
+        self.assertEqual(report["available_providers"], ["anthropic"])
+        agentic_models = [s for s in merged if s.adapter == "agentic"]
+        self.assertTrue(agentic_models)
+        for spec in agentic_models:
+            self.assertEqual(spec.payload_defaults.get("provider"), "anthropic")
+
+    def test_models_discover_all_injects_no_agentic_without_provider_keys(self) -> None:
+        from puppetmaster.cli.commands_models import _discover_one_source
+
+        with patch("puppetmaster.providers.available_providers", return_value=set()):
+            merged, report, catalog = _discover_one_source("agentic", [])
+        self.assertEqual(merged, [])
+        self.assertEqual(catalog, [])
+
+    def test_rules_mention_agentic_keys_only_verbs(self) -> None:
+        from puppetmaster.rules import RULE_BODY, render_agents_block, render_cursor_mdc
+
+        for content in (RULE_BODY, render_cursor_mdc(), render_agents_block()):
+            flattened = " ".join(content.split())
+            self.assertIn("puppetmaster_agentic", flattened)
+            self.assertIn("puppetmaster_start_agentic", flattened)
+            self.assertIn("keys-only", flattened)
+
+    def test_model_payload_defaults_for_effort_agentic(self) -> None:
+        from puppetmaster.cli.commands_models import model_payload_defaults_for_effort
+
+        self.assertEqual(
+            model_payload_defaults_for_effort("agentic", "high"),
+            {"reasoning_effort": "high"},
+        )
 
 
 class _FakeUrlopenResponse:

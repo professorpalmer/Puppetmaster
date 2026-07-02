@@ -267,16 +267,17 @@ report and ignore the diff — that's a supported mode, not a degraded one.
 
 ## Scope and honesty
 
-Four production adapters ship today: `cursor` (Cursor SDK via
+Four production adapters plus the keys-only `agentic` standalone worker ship today: `cursor` (Cursor SDK via
 `@cursor/sdk`), `claude-code` (Anthropic via the `claude` CLI),
 `openai` (direct Chat Completions via `OPENAI_API_KEY`, added in
-v0.6.1-beta.1), and `codex` (official OpenAI Codex CLI via
-`codex exec --json`, added in v0.7.0). Together they cover the entire
-starter registry. **Raw HTTP adapters for additional providers
-(Gemini, DeepSeek, Kimi) are not yet in.** They slot in cleanly as
-new `adapter` values — the registry + router/classifier framework
-doesn't need to change — but each one needs real validation against
-its provider's API before it ships.
+v0.6.1-beta.1), `codex` (official OpenAI Codex CLI via
+`codex exec --json`, added in v0.7.0), and `agentic` (direct provider
+HTTP APIs with your own key — no external CLI). Together they cover the
+starter registry and curated catalogs. **`agentic` is the portable
+keys-only path** when you have API keys but no vendor CLI installed;
+vendor CLIs remain the ceiling for mature tool surfaces. Additional
+providers slot in as new registry entries — the router/classifier
+framework doesn't need to change.
 
 Capability scores and prices stay **user-asserted**. Puppetmaster
 makes the **decision** transparent (full audit trail of why each

@@ -41,7 +41,7 @@ That is the whole install. `setup` runs each step idempotently, skips any tool t
 
 Setup starts with every platform off and asks you to enable at least one execution adapter (`--platforms cursor`, or an interactive pick). A single platform is the expected setup; enabling several is opt-in and unlocks cross-platform router fallback and free-tier hopping. Add more later with `puppetmaster platform enable <name>`. For CI, pass `--platforms <comma-list>` or `--platforms all`.
 
-Hermes has an optional in-depth setup branch (learn flywheel, skill promotion, skill injection); see [ADAPTERS.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/ADAPTERS.md#hermes). To run benchmarks or hack on the code, clone instead — see [CONTRIBUTING.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/CONTRIBUTING.md).
+Hermes has an optional in-depth setup branch (learn flywheel, skill promotion, skill injection); see [ADAPTERS.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/ADAPTERS.md#hermes). The `agentic` adapter needs only a provider API key (no external CLI) — see [ADAPTERS.md#agentic](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/ADAPTERS.md#agentic) and [DAILY_DRIVER.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/DAILY_DRIVER.md#keys-only-recipe-no-external-cli). To run benchmarks or hack on the code, clone instead — see [CONTRIBUTING.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/CONTRIBUTING.md).
 
 ## Uninstall
 
@@ -57,7 +57,7 @@ pip uninstall puppetmaster-ai   # or: pipx uninstall puppetmaster-ai
 Think of it as Redis or Gunicorn for agentic engineering: a supervisor in front of worker processes, with durable shared state.
 
 ```text
-Cursor / Claude Code / OpenAI / Codex / Hermes / shell
+Cursor / Claude Code / OpenAI / Codex / Hermes / agentic (keys-only) / shell
         |
         v
 Puppetmaster supervisor  ->  task-aware model router (routes by cost)

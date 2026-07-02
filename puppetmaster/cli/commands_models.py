@@ -98,6 +98,12 @@ def model_payload_defaults_for_effort(adapter: str, effort: str) -> dict[str, An
         # The HermesAdapter reads ``payload.reasoning_effort`` and applies it via
         # an ephemeral ``HERMES_HOME`` carrying ``agent.reasoning_effort``.
         return {"reasoning_effort": normalized}
+    if adapter == "agentic":
+        if normalized not in _OPENAI_EFFORT_LEVELS:
+            raise ValueError(
+                "agentic effort must be one of " + ", ".join(_OPENAI_EFFORT_LEVELS)
+            )
+        return {"reasoning_effort": normalized}
     if adapter in ("claude-code", "cursor"):
         raise ValueError(
             f"{adapter} does not expose an effort knob through its CLI/SDK today."
@@ -287,6 +293,8 @@ class ModelRegistryWizard:
             levels = _OPENAI_EFFORT_LEVELS
         elif base.adapter == "hermes":
             levels = _HERMES_EFFORT_LEVELS
+        elif base.adapter == "agentic":
+            levels = _OPENAI_EFFORT_LEVELS
         else:
             levels = _CODEX_EFFORT_LEVELS
         self._write("Supported efforts: " + ", ".join(levels))
@@ -607,6 +615,7 @@ def _run_models_subcommand(args) -> int:
     raise SystemExit(f"unknown models subcommand: {args.models_command}")
 
 _DISCOVER_SOURCE_BY_ADAPTER = {
+    "agentic": "agentic",
     "cursor": "cursor",
     "openai": "openai",
     "claude-code": "claude",
@@ -617,6 +626,10 @@ _DISCOVER_SOURCE_BY_ADAPTER = {
 def _all_discover_sources() -> list[str]:
     """The catch-all source list (`--source all`)."""
     sources = ["cursor", "openai", "anthropic"]
+    from puppetmaster.providers import available_providers
+
+    if available_providers():
+        sources.append("agentic")
     # Fold Hermes into the catch-all only when its CLI is actually present, so
     # users who don't run Hermes don't get hermes/* entries injected just
     # because they happen to have an OPENAI/ANTHROPIC/GEMINI key set. The
@@ -784,6 +797,26 @@ def _discover_one_source(source: str, registry: list):
         catalog = [
             {"id": item["model"]}
             for item in curated_catalog("hermes")
+            if (item.get("payload_defaults") or {}).get("provider") in allowed
+        ]
+        return merged, report, catalog
+
+    if source == "agentic":
+        from puppetmaster.providers import available_providers
+        from puppetmaster.static_catalog import (
+            curated_catalog,
+            merge_curated_into_registry,
+        )
+
+        allowed = available_providers()
+        merged, report = merge_curated_into_registry(
+            "agentic", "api", registry, allowed_providers=allowed
+        )
+        report["source"] = "agentic"
+        report["available_providers"] = sorted(allowed)
+        catalog = [
+            {"id": item["model"]}
+            for item in curated_catalog("agentic")
             if (item.get("payload_defaults") or {}).get("provider") in allowed
         ]
         return merged, report, catalog

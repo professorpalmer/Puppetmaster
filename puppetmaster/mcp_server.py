@@ -1296,6 +1296,25 @@ def _build_tools() -> list[McpTool]:
             handler=start_codex,
         ),
         McpTool(
+            name="puppetmaster_agentic",
+            description=(
+                "Run a standalone provider-agnostic worker through Puppetmaster and wait "
+                "for completion. Uses your provider API key directly (no external agent CLI); "
+                "supports analyze (read-only) and implement (full-edit) modes."
+            ),
+            input_schema=agentic_schema(),
+            handler=run_agentic,
+        ),
+        McpTool(
+            name="puppetmaster_start_agentic",
+            description=(
+                "Start a standalone provider-agnostic worker asynchronously and return "
+                "job_id immediately. Keys-only: calls the provider HTTP API directly."
+            ),
+            input_schema=agentic_schema(),
+            handler=start_agentic,
+        ),
+        McpTool(
             name="puppetmaster_cursor_implement",
             description="Run Cursor as a full-edit Puppetmaster worker (edits files, captures a PATCH) and wait for completion.",
             input_schema=cursor_implement_schema(),
@@ -1312,10 +1331,10 @@ def _build_tools() -> list[McpTool]:
             description=(
                 "PREFER over the built-in Task tool or an inline multi-file edit loop for "
                 "any cross-cutting change. Start a full-edit implement worker on whichever "
-                "platform you're locked to (cursor, claude-code, or codex), so implement "
-                "isn't Claude-Code-only. Runs in a clean worktree and captures a PATCH "
-                "artifact. Returns job_id immediately. Pass adapter to force one; otherwise "
-                "the enabled platform is used."
+                "platform you're locked to (cursor, claude-code, codex, hermes, or agentic), "
+                "so implement isn't Claude-Code-only. Runs in a clean worktree and captures "
+                "a PATCH artifact. Returns job_id immediately. Pass adapter to force one; "
+                "otherwise the enabled platform is used."
             ),
             input_schema=implement_schema(),
             handler=start_implement,
@@ -2031,6 +2050,8 @@ def _implement_command(args: JsonObject, adapter: str) -> list[str]:
         return codex_command(args)
     if adapter == "hermes":
         return hermes_command(args, implement=True)
+    if adapter == "agentic":
+        return agentic_command(args, implement=True)
     raise ValueError(f"adapter {adapter!r} has no implement command")
 
 
@@ -2260,6 +2281,69 @@ def start_codex(args: JsonObject) -> JsonObject:
     return start_cli(codex_command(args), args)
 
 
+def _agentic_is_write_capable(args: JsonObject) -> bool:
+    mode = str(args.get("mode") or "implement").strip().lower()
+    return mode == "implement" or bool(args.get("implement"))
+
+
+def run_agentic(args: JsonObject) -> JsonObject:
+    if _agentic_is_write_capable(args):
+        blocked = _worktree_preflight(args)
+        if blocked is not None:
+            return blocked
+    return run_worker_cli(agentic_command(args), args)
+
+
+def start_agentic(args: JsonObject) -> JsonObject:
+    if _agentic_is_write_capable(args):
+        blocked = _worktree_preflight(args)
+        if blocked is not None:
+            return blocked
+    return start_cli(agentic_command(args), args)
+
+
+def agentic_command(args: JsonObject, implement: Optional[bool] = None) -> list[str]:
+    goal = require_string(args, "goal")
+    command = ["agentic", goal, "--cwd", cwd(args)]
+    if implement is not None:
+        command.extend(["--mode", "implement" if implement else "analyze"])
+    elif args.get("mode"):
+        command.extend(["--mode", str(args["mode"])])
+    if args.get("provider"):
+        command.extend(["--provider", str(args["provider"])])
+    if args.get("model"):
+        command.extend(["--model", str(args["model"])])
+    if args.get("max_turns") is not None:
+        command.extend(["--max-turns", str(int(args["max_turns"]))])
+    if args.get("timeout_seconds"):
+        command.extend(["--timeout-seconds", str(args["timeout_seconds"])])
+    if args.get("temperature") is not None:
+        command.extend(["--temperature", str(float(args["temperature"]))])
+    if args.get("reasoning_effort"):
+        command.extend(["--reasoning-effort", str(args["reasoning_effort"])])
+    if args.get("allow_dirty"):
+        command.append("--allow-dirty")
+    if args.get("allow_non_worktree"):
+        command.append("--allow-non-worktree")
+    if args.get("disable_codegraph"):
+        command.append("--disable-codegraph")
+    if args.get("disable_memory"):
+        command.append("--disable-memory")
+    _append_routing_cli_flags(command, args)
+    return command
+
+
+def _append_routing_cli_flags(command: list[str], args: JsonObject) -> None:
+    if args.get("auto_route"):
+        command.append("--auto-route")
+    if args.get("routing_policy"):
+        command.extend(["--routing-policy", str(args["routing_policy"])])
+    if args.get("max_cost_usd") is not None:
+        command.extend(["--max-cost-usd", str(args["max_cost_usd"])])
+    if args.get("min_capability") is not None:
+        command.extend(["--min-capability", str(args["min_capability"])])
+
+
 def claude_command(args: JsonObject) -> list[str]:
     goal = require_string(args, "goal")
     command = [
@@ -2420,6 +2504,7 @@ def normalized_roles(args: JsonObject) -> list[str]:
 # apply here — the generated workers are marked read_only — so any runnable
 # adapter qualifies, not just cursor.
 SWARM_ANALYSIS_ADAPTERS: tuple[str, ...] = (
+    "agentic",
     "cursor",
     "local",
     "claude-code",
@@ -3801,11 +3886,11 @@ def implement_schema() -> JsonObject:
         {
             "adapter": {
                 "type": "string",
-                "enum": ["cursor", "claude-code", "codex", "hermes"],
+                "enum": ["cursor", "claude-code", "codex", "hermes", "agentic"],
                 "description": (
                     "Force a specific implement-capable platform. Omit to use whichever "
                     "platform the lock has enabled (cursor preferred, then claude-code, "
-                    "then codex, then hermes)."
+                    "then codex, then hermes, then agentic)."
                 ),
             },
             "sandbox": {
@@ -3837,7 +3922,7 @@ def edit_schema() -> JsonObject:
             },
             "adapter": {
                 "type": "string",
-                "enum": ["cursor", "claude-code", "codex", "hermes"],
+                "enum": ["cursor", "claude-code", "codex", "hermes", "agentic"],
                 "description": (
                     "Force a full-edit adapter. Omit to use the highest-priority "
                     "adapter the platform lock enables."
@@ -3849,7 +3934,7 @@ def edit_schema() -> JsonObject:
             },
             "provider": {
                 "type": "string",
-                "description": "Inference provider (Hermes adapter only).",
+                "description": "Inference provider (Hermes or agentic adapter).",
             },
             "routing_policy": {
                 "type": "string",
@@ -3936,6 +4021,91 @@ def browser_swarm_schema() -> JsonObject:
         },
         "required": ["tasks"],
     }
+
+
+def agentic_schema() -> JsonObject:
+    schema = goal_schema("Implement the requested change and run focused tests.")
+    schema["properties"].update(
+        {
+            "mode": {
+                "type": "string",
+                "enum": ["analyze", "implement"],
+                "default": "implement",
+                "description": (
+                    "analyze = read-only structured findings; implement = full-edit "
+                    "with git-diff PATCH attribution."
+                ),
+            },
+            "provider": {
+                "type": "string",
+                "description": (
+                    "Provider slug (openai, anthropic, gemini, openrouter, ...). "
+                    "Routes credentials and wire protocol."
+                ),
+            },
+            "model": {
+                "type": "string",
+                "description": "Optional provider model name.",
+            },
+            "max_turns": {
+                "type": "integer",
+                "description": "Cap on tool-use iterations (default 12).",
+            },
+            "temperature": {
+                "type": "number",
+                "description": "Sampling temperature override (only sent if provided).",
+            },
+            "reasoning_effort": {
+                "type": "string",
+                "enum": ["none", "low", "medium", "high", "xhigh"],
+                "description": "Reasoning effort level for OpenAI-style models.",
+            },
+            "allow_dirty": {
+                "type": "boolean",
+                "default": False,
+                "description": "Allow the run in a dirty working tree.",
+            },
+            "allow_non_worktree": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "Allow a write-capable run outside a git work tree "
+                    "(no diff attribution; `git init` is usually better)."
+                ),
+            },
+            "disable_codegraph": {
+                "type": "boolean",
+                "default": False,
+                "description": "Skip CodeGraph context injection.",
+            },
+            "auto_route": {
+                "type": "boolean",
+                "description": (
+                    "Enable per-task model routing. Defaults to true when no `model` "
+                    "is pinned, false otherwise."
+                ),
+            },
+            "routing_policy": {
+                "type": "string",
+                "enum": ["balanced", "cheap", "quality", "escalating"],
+                "description": "Routing policy for auto-routed workers.",
+            },
+            "max_cost_usd": {
+                "type": "number",
+                "description": "Hard cap on estimated per-call USD cost for auto-routed workers.",
+            },
+            "min_capability": {
+                "type": "integer",
+                "description": "Force classifier output to this value (0..100) for auto-routed workers.",
+            },
+            "required_tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Only consider models whose tags include ALL of these for auto-routed workers.",
+            },
+        }
+    )
+    return schema
 
 
 def openai_schema() -> JsonObject:

@@ -250,6 +250,14 @@ def _run_install_claude(args) -> int:
             print(f"  {line}")
     return rc
 
+def _agentic_providers_visible() -> set[str]:
+    try:
+        from puppetmaster.providers import available_providers
+
+        return available_providers()
+    except Exception:
+        return set()
+
 def _seed_hermes_registry() -> None:
     """Seed credential-backed Hermes models into the router registry.
 
@@ -296,6 +304,51 @@ def _seed_hermes_registry() -> None:
             )
     except Exception as exc:  # never let registry seeding abort the wizard
         print(f"  registry  note: hermes registry seeding skipped ({exc!r})")
+
+
+def _seed_agentic_registry() -> None:
+    """Seed credential-backed agentic models into the router registry.
+
+    Only models whose provider has a visible API key are added — agentic never
+    injects uncallable keyless entries.
+    """
+    try:
+        from puppetmaster.model_registry import (
+            default_registry_path,
+            load_registry,
+            save_registry,
+        )
+        from puppetmaster.static_catalog import merge_curated_into_registry
+
+        registry_path = default_registry_path()
+        if not registry_path.is_file():
+            print("  registry  skipped — no registry yet; run `puppetmaster models init` first")
+            return
+        allowed = _agentic_providers_visible()
+        existing = load_registry(registry_path)
+        merged, report = merge_curated_into_registry(
+            "agentic", "api", existing, allowed_providers=allowed
+        )
+        save_registry(merged, registry_path)
+        if report["added"] or report["refreshed"]:
+            print(
+                f"  registry  seeded agentic models "
+                f"(added={report['added']}, refreshed={report['refreshed']})"
+            )
+        for skip in report.get("skipped", []):
+            print(
+                f"  registry  skipped {skip['model']} — no credential for provider "
+                f"'{skip['provider']}'"
+            )
+        if not allowed:
+            print(
+                "  registry  note: no provider API keys visible for agentic "
+                "(OPENAI_API_KEY / ANTHROPIC_API_KEY / GEMINI_API_KEY / "
+                "GOOGLE_API_KEY / OPENROUTER_API_KEY). Add a key and re-run "
+                "`puppetmaster models discover --source agentic --write`."
+            )
+    except Exception as exc:  # never let registry seeding abort the wizard
+        print(f"  registry  note: agentic registry seeding skipped ({exc!r})")
 
 def _run_install_hermes(args) -> int:
     """Dispatch for ``puppetmaster install-hermes-mcp``."""
@@ -454,8 +507,9 @@ def _detected_platforms(root: Path) -> dict[str, bool]:
     either its bundled SDK or an ``npm`` that setup can bootstrap it with
     (PyPI wheels can't ship ``node_modules``, so a fresh pip/pipx install
     legitimately lacks the SDK until the install-cursor-mcp step fetches
-    it); claude-code and codex need their CLI resolvable; openai needs
-    ``OPENAI_API_KEY``. Codex login state is deliberately not probed
+    it);     claude-code and codex need their CLI resolvable; openai needs
+    ``OPENAI_API_KEY``; agentic needs any provider API key visible to
+    ``available_providers()``. Codex login state is deliberately not probed
     (subscription auth is opaque from here) — the billing checks in
     doctor cover that separately.
     """
@@ -469,6 +523,7 @@ def _detected_platforms(root: Path) -> dict[str, bool]:
 
     cursor_sdk_available = _cursor_sdk_installed(root) or _shutil.which("npm") is not None
     return {
+        "agentic": bool(_agentic_providers_visible()),
         "cursor": bool(os.environ.get("CURSOR_API_KEY")) and cursor_sdk_available,
         "claude-code": _claude_code_installed(),
         "codex": _codex_cli_installed(),
@@ -802,6 +857,20 @@ def _run_setup(args) -> int:
     from puppetmaster import platform_lock as _pl
     enabled_adapters = _pl.enabled_adapters()
 
+    if "agentic" in enabled_adapters:
+        print("=== agentic (keys-only standalone worker) ===")
+        providers = sorted(_agentic_providers_visible())
+        if providers:
+            print(f"  providers  ready: {', '.join(providers)}")
+        else:
+            print(
+                "  providers  none visible — set OPENAI_API_KEY, ANTHROPIC_API_KEY, "
+                "GEMINI_API_KEY, GOOGLE_API_KEY, or OPENROUTER_API_KEY"
+            )
+        if not getattr(args, "skip_models", False):
+            _seed_agentic_registry()
+        print()
+
     print("=== step 4/9: install-cursor-mcp (workspace .cursor/mcp.json) ===")
     if "cursor" not in enabled_adapters:
         print(
@@ -1018,6 +1087,13 @@ def _setup_next_steps(enabled_adapters: set[str]) -> list[str]:
         steps.append("hermes: start a new Hermes session; verify with `hermes mcp list`.")
     if "openai" in enabled_adapters:
         steps.append("openai: set OPENAI_API_KEY; the API adapter needs no host restart.")
+    if "agentic" in enabled_adapters:
+        steps.append(
+            "agentic: set a provider API key (OPENAI_API_KEY, ANTHROPIC_API_KEY, "
+            "GEMINI_API_KEY, GOOGLE_API_KEY, or OPENROUTER_API_KEY). No external "
+            "CLI or host restart — drive via `puppetmaster agentic` or "
+            "`puppetmaster_agentic` / `puppetmaster_start_agentic` MCP verbs."
+        )
     if not steps:
         # Lock excludes every host-backed adapter: only the local/file demo mode
         # is available, which runs straight from the CLI without a host.

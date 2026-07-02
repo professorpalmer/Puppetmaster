@@ -48,6 +48,8 @@ python -m puppetmaster cursor "Goal" --review --dry-run
 python -m puppetmaster cursor "Goal" --implement           # full-edit: Cursor edits files, captures a PATCH (add --allow-dirty to skip the clean-tree guard)
 python -m puppetmaster claude "Goal" --permission-mode acceptEdits
 python -m puppetmaster codex "Goal"
+python -m puppetmaster hermes "Goal" --mode analyze
+python -m puppetmaster agentic "Goal" --mode analyze --provider openai
 python -m puppetmaster openai "Goal"
 python -m puppetmaster crash-demo
 ```
@@ -89,6 +91,7 @@ python -m puppetmaster route "instruction" --role <role>     # dry-run, returns 
 python -m puppetmaster cost <job_id>                          # sum spend across all routing artifacts
 python -m puppetmaster models init                            # write starter registry
 python -m puppetmaster models list                            # show registered models
+python -m puppetmaster models discover --source agentic --write   # seed keys-only agentic catalog (filtered by visible provider keys)
 python -m puppetmaster models path                            # print resolved registry path
 ```
 

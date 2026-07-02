@@ -1,0 +1,20 @@
+{
+  "lease_seconds": 10,
+  "workers": [
+    {
+      "role": "agentic-implement",
+      "instruction": "Keys-only full-edit implement via direct provider API.",
+      "adapter": "agentic",
+      "payload": {
+        "prompt": "Implement the requested change end to end, run focused tests, and leave the diff in the tree.",
+        "mode": "implement",
+        "provider": "openai",
+        "model": "gpt-5.4-mini",
+        "cwd": ".",
+        "timeout_seconds": 900,
+        "max_turns": 12,
+        "reasoning_effort": "medium"
+      }
+    }
+  ]
+}

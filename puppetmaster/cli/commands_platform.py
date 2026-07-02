@@ -116,9 +116,10 @@ def _run_skills_subcommand(args) -> int:
 def _run_platform_subcommand(args) -> int:
     """Dispatch `python -m puppetmaster platform ...`.
 
-    The platform lock decides which adapters (cursor, claude-code, codex,
-    openai) Puppetmaster may route to, auto-discover, or fall back onto. It is
-    persisted next to the model registry; an empty lock means everything is on.
+    The platform lock decides which adapters Puppetmaster may route to,
+    auto-discover, or fall back onto (see ``platform_lock.KNOWN_ADAPTERS``:
+    agentic, cursor, claude-code, codex, openai, hermes). It is persisted next
+    to the model registry; an empty lock means everything is on.
     """
     import json as _json
 

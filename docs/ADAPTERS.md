@@ -208,6 +208,49 @@ If it returns `failure=dirty_worktree` in implement mode, run from a clean tree 
 
 When a Hermes implement worker edits tracked files, Puppetmaster records a `patch` artifact alongside the verification artifact.
 
+### `agentic`
+
+Runs Puppetmaster's **standalone, provider-agnostic worker**: an in-process tool-use loop that calls provider HTTP APIs directly with your own API key. No external agent CLI (no Cursor, Claude Code, Codex, or Hermes binary required) — just a visible provider key such as `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or `OPENROUTER_API_KEY`.
+
+Two modes share one loop:
+
+* **analyze** (read-only): read/search the tree, emit the same finding/risk/decision artifacts as other adapters.
+* **implement** (full-edit): additionally gets `write_file` / `edit_file` (and opt-in `run_terminal` / `web_fetch`), with git-diff PATCH attribution through the same machinery as the CLI adapters.
+
+**Portable floor, not ceiling.** The loop is deliberately conservative: bounded turns (default 12), basic filesystem tools, terminal/web opt-in, cwd-confined paths. It is newer and less battle-tested than mature vendor CLIs — prefer those when you need their full tool surface; reach for `agentic` when you want keys-only portability or a host with no external CLI installed.
+
+Requirements:
+
+- At least one provider API key visible to the process (see above). `puppetmaster doctor` reports credential visibility without printing values.
+- For implement mode: a git work tree (or `payload.allow_non_worktree=true`).
+
+CLI and MCP:
+
+```bash
+python -m puppetmaster agentic "Audit the auth module" --mode analyze --provider anthropic --model claude-sonnet-4-5
+python -m puppetmaster agentic "Fix the typo in README" --mode implement --provider openai --model gpt-5.4-mini
+```
+
+MCP verbs: `puppetmaster_agentic` (sync) and `puppetmaster_start_agentic` (async).
+
+```json
+{
+  "role": "agentic-analyze",
+  "instruction": "Map risks in the payments module.",
+  "adapter": "agentic",
+  "payload": {
+    "prompt": "Inspect payments/ and emit structured findings.",
+    "mode": "analyze",
+    "provider": "anthropic",
+    "model": "claude-sonnet-4-5",
+    "cwd": ".",
+    "timeout_seconds": 300
+  }
+}
+```
+
+When an agentic implement worker edits tracked files, Puppetmaster records a `patch` artifact alongside the verification artifact.
+
 ## Adding A Provider
 
 1. Implement a class with `run(task, goal, worker_id) -> list[Artifact]`.

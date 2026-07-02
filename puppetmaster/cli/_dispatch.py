@@ -544,6 +544,47 @@ def _main(argv: Optional[list[str]] = None) -> int:
         )
         return cli.finalize_cli_run(result)
 
+    if args.command == "agentic":
+        payload = {
+            "prompt": args.prompt,
+            "cwd": args.cwd,
+            "mode": args.mode,
+            "timeout_seconds": args.timeout_seconds,
+            "allow_dirty": args.allow_dirty,
+            "allow_non_worktree": args.allow_non_worktree,
+        }
+        if args.provider:
+            payload["provider"] = args.provider
+        if args.model:
+            payload["model"] = args.model
+        if args.max_turns is not None:
+            payload["max_turns"] = args.max_turns
+        if args.temperature is not None:
+            payload["temperature"] = args.temperature
+        if args.reasoning_effort:
+            payload["reasoning_effort"] = args.reasoning_effort
+        if args.disable_codegraph:
+            payload["disable_codegraph"] = True
+        if args.disable_memory:
+            payload["disable_memory"] = True
+        payload.update(routing_payload_from_args(args, adapter="agentic"))
+        result = cli.Orchestrator(store).run(
+            args.prompt,
+            specs=[
+                WorkerSpec(
+                    role=f"agentic-{args.mode}",
+                    instruction=args.prompt,
+                    adapter="agentic",
+                    payload=payload,
+                )
+            ],
+            lease_seconds=10,
+            worker_mode=args.worker_mode,
+            on_job_created=on_job_created,
+            label=args.label,
+        )
+        return cli.finalize_cli_run(result)
+
     if args.command == "edit":
         from puppetmaster import platform_lock
         from puppetmaster.workers import (

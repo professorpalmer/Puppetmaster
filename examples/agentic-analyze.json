@@ -1,0 +1,19 @@
+{
+  "lease_seconds": 10,
+  "workers": [
+    {
+      "role": "agentic-audit",
+      "instruction": "Read-only audit of the auth module using keys-only agentic worker.",
+      "adapter": "agentic",
+      "payload": {
+        "prompt": "Inspect the auth-related code paths and emit structured findings, risks, and decisions with evidence.",
+        "mode": "analyze",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-5",
+        "cwd": ".",
+        "timeout_seconds": 600,
+        "max_turns": 12
+      }
+    }
+  ]
+}

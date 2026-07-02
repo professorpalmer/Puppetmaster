@@ -13,6 +13,9 @@ from typing import Any, Optional, TextIO
 from puppetmaster.codegraph_repair import repair_codegraph_sqlite
 from puppetmaster.config import load_config
 from puppetmaster.diagnostics import adapter_status, run_doctor, starter_config
+from puppetmaster import platform_lock as _platform_lock
+
+_PLATFORM_ADAPTER_HELP = ", ".join(_platform_lock.KNOWN_ADAPTERS)
 from puppetmaster.installers import (
     CLAUDE_NEXT_STEPS_GUIDANCE,
     CODEX_SANDBOX_GUIDANCE,
@@ -1158,6 +1161,74 @@ def build_parser() -> argparse.ArgumentParser:
     _add_routing_flags(hermes)
     _add_label_argument(hermes)
 
+    agentic = subcommands.add_parser(
+        "agentic",
+        help=(
+            "Run a standalone provider-agnostic worker (keys-only, no external CLI). "
+            "Calls the provider HTTP API directly for analyze or implement modes."
+        ),
+    )
+    agentic.add_argument("prompt", help="Prompt for the agentic worker.")
+    agentic.add_argument("--cwd", default=str(Path.cwd()), help="Workspace for the worker.")
+    agentic.add_argument(
+        "--mode",
+        choices=["implement", "analyze"],
+        default="implement",
+        help="implement = full-edit with git-diff PATCH attribution; analyze = read-only structured findings.",
+    )
+    agentic.add_argument(
+        "--provider",
+        help="Provider slug (openai, anthropic, gemini, openrouter, ...). Routes credentials/wire protocol.",
+    )
+    agentic.add_argument(
+        "--model",
+        help="Model name passed to the provider API.",
+    )
+    agentic.add_argument(
+        "--max-turns",
+        type=int,
+        help="Cap on tool-use iterations (default 12).",
+    )
+    agentic.add_argument("--timeout-seconds", type=int, default=900)
+    agentic.add_argument(
+        "--temperature",
+        type=float,
+        help="Sampling temperature override.",
+    )
+    agentic.add_argument(
+        "--reasoning-effort",
+        choices=["none", "low", "medium", "high", "xhigh"],
+        help="Reasoning effort level for OpenAI-style models.",
+    )
+    agentic.add_argument(
+        "--worker-mode",
+        choices=["subprocess", "inline", "daemon"],
+        default="inline",
+        help="Agentic runs default to inline orchestration.",
+    )
+    agentic.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="Allow the worker to run in a dirty working tree.",
+    )
+    agentic.add_argument(
+        "--allow-non-worktree",
+        action="store_true",
+        help="Allow the worker to run outside a git work tree (no diff attribution).",
+    )
+    agentic.add_argument(
+        "--disable-codegraph",
+        action="store_true",
+        help="Skip CodeGraph context injection (e.g. for non-repo prompts).",
+    )
+    agentic.add_argument(
+        "--disable-memory",
+        action="store_true",
+        help="Skip promoted shared-memory injection for a fresh perspective.",
+    )
+    _add_routing_flags(agentic)
+    _add_label_argument(agentic)
+
     edit = subcommands.add_parser(
         "edit",
         help=(
@@ -1171,7 +1242,7 @@ def build_parser() -> argparse.ArgumentParser:
     edit.add_argument(
         "--adapter",
         help=(
-            "Force a full-edit adapter (cursor | claude-code | codex | hermes). "
+            "Force a full-edit adapter (cursor | claude-code | codex | hermes | agentic). "
             "Default: the highest-priority adapter the platform lock enables."
         ),
     )
@@ -1181,7 +1252,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     edit.add_argument(
         "--provider",
-        help="Inference provider (Hermes adapter only; routes credentials).",
+        help="Inference provider (Hermes or agentic adapter only; routes credentials).",
     )
     edit.add_argument("--timeout-seconds", type=int, default=300)
     edit.add_argument(
@@ -1454,7 +1525,7 @@ def build_parser() -> argparse.ArgumentParser:
     models_discover.add_argument("--registry-path", help="Override the registry path.")
     models_discover.add_argument(
         "--source",
-        choices=["cursor", "openai", "anthropic", "claude", "codex", "hermes", "all"],
+        choices=["cursor", "openai", "anthropic", "claude", "codex", "hermes", "agentic", "all"],
         default=None,
         help=(
             "Which platform catalog to enumerate. Default: derived from the "
@@ -1464,7 +1535,8 @@ def build_parser() -> argparse.ArgumentParser:
             "anthropic (needs ANTHROPIC_API_KEY for discovery), claude / codex "
             "(curated catalogs for the CLI agent loops that can't self-enumerate; "
             "billed as your detected subscription/API posture), hermes (curated "
-            "multi-provider catalog, API-billed via your own keys), or all."
+            "multi-provider catalog, API-billed via your own keys), agentic "
+            "(curated keys-only catalog filtered by visible provider keys), or all."
         ),
     )
     models_discover.add_argument(
@@ -1502,17 +1574,17 @@ def build_parser() -> argparse.ArgumentParser:
     platform_only = platform_sub.add_parser(
         "only", help="Enable exactly these platforms; disable all others."
     )
-    platform_only.add_argument("adapters", nargs="+", help="cursor, claude-code, codex, openai")
+    platform_only.add_argument("adapters", nargs="+", help=_PLATFORM_ADAPTER_HELP)
     platform_only.add_argument("--registry-path", help="Override the registry path.")
     platform_enable = platform_sub.add_parser(
         "enable", help="Turn these platforms back on."
     )
-    platform_enable.add_argument("adapters", nargs="+", help="cursor, claude-code, codex, openai")
+    platform_enable.add_argument("adapters", nargs="+", help=_PLATFORM_ADAPTER_HELP)
     platform_enable.add_argument("--registry-path", help="Override the registry path.")
     platform_disable = platform_sub.add_parser(
         "disable", help="Turn these platforms off (never routed or discovered)."
     )
-    platform_disable.add_argument("adapters", nargs="+", help="cursor, claude-code, codex, openai")
+    platform_disable.add_argument("adapters", nargs="+", help=_PLATFORM_ADAPTER_HELP)
     platform_disable.add_argument("--registry-path", help="Override the registry path.")
     platform_reset = platform_sub.add_parser(
         "reset", help="Clear the lock; enable every platform again."
@@ -1559,7 +1631,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     preflight_cmd.add_argument(
         "adapter",
-        help="Adapter to check (cursor, claude-code, codex, openai).",
+        help=f"Adapter to check ({_PLATFORM_ADAPTER_HELP}).",
     )
     preflight_cmd.add_argument("--model", help="Model id to validate (Cursor catalog).")
     preflight_cmd.add_argument(

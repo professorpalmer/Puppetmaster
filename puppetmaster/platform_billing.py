@@ -554,6 +554,43 @@ def detect_openai_billing(
     )
 
 
+def detect_agentic_billing(
+    env: Optional[Mapping[str, str]] = None,
+    home: Optional[Path] = None,
+) -> BillingStatus:
+    """Agentic bills per-token to whichever provider API key is actually available.
+
+    Unlike Hermes/Codex there is no external CLI or OAuth file to probe — the
+    standalone worker calls provider HTTP APIs directly, so readiness reduces to
+    ``available_providers()`` from :mod:`puppetmaster.providers`.
+    """
+    del home  # agentic never reads provider keys from Puppetmaster-owned files
+    from puppetmaster.providers import available_providers
+
+    env = env if env is not None else os.environ
+    providers = sorted(available_providers(env))
+    healthy = bool(providers)
+    if healthy:
+        detail = (
+            "Agentic adapter bills per-token to your provider API key(s) "
+            f"(out-of-pocket). Ready providers: {', '.join(providers)}."
+        )
+        evidence = [f"agentic_provider:{slug}" for slug in providers]
+    else:
+        detail = (
+            "No provider API key visible — set OPENAI_API_KEY, ANTHROPIC_API_KEY, "
+            "GEMINI_API_KEY, GOOGLE_API_KEY, or OPENROUTER_API_KEY (no external CLI)."
+        )
+        evidence = ["agentic_providers:none"]
+    return BillingStatus(
+        adapter="agentic",
+        billing="api",
+        healthy=healthy,
+        detail=detail,
+        evidence=evidence,
+    )
+
+
 _DETECTORS: dict[str, Callable[..., BillingStatus]] = {
     "cursor": lambda **kw: detect_cursor_billing(env=kw.get("env")),
     "claude-code": lambda **kw: detect_claude_billing(
@@ -566,6 +603,9 @@ _DETECTORS: dict[str, Callable[..., BillingStatus]] = {
         env=kw.get("env"), home=kw.get("home")
     ),
     "openai": lambda **kw: detect_openai_billing(env=kw.get("env")),
+    "agentic": lambda **kw: detect_agentic_billing(
+        env=kw.get("env"), home=kw.get("home")
+    ),
 }
 
 

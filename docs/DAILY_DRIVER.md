@@ -36,6 +36,20 @@ Use `--dry-run` for normal daily planning and review tasks. The Cursor adapter r
 
 Use `puppetmaster claude` when you intentionally want Claude Code to make real edits. It defaults to Claude Code `acceptEdits` permission mode and records tracked diffs as Puppetmaster patch artifacts.
 
+## Keys-only recipe (no external CLI)
+
+When you have provider API keys but no Cursor/Claude/Codex/Hermes CLI installed, enable the `agentic` platform and drive work directly:
+
+```bash
+export OPENAI_API_KEY=sk-...   # or ANTHROPIC_API_KEY / GEMINI_API_KEY / GOOGLE_API_KEY / OPENROUTER_API_KEY
+python -m puppetmaster platform enable agentic
+python -m puppetmaster models discover --source agentic --write
+python -m puppetmaster agentic "Audit the auth module for risks" --mode analyze --provider openai --model gpt-5.4-mini
+python -m puppetmaster agentic "Fix the README typo" --mode implement --provider openai --model gpt-5.4-mini
+```
+
+No host restart, no MCP registration into an external agent — call `puppetmaster agentic` from the CLI or `puppetmaster_agentic` / `puppetmaster_start_agentic` from any MCP client that has Puppetmaster wired.
+
 `puppetmaster cursor` and `puppetmaster claude` default to `--worker-mode inline` for daily-driver speed. That skips an extra Puppetmaster Python worker subprocess while preserving job state, task leases, artifacts, stitching, and the provider's own process boundary. Pass `--worker-mode subprocess` when strict worker process isolation matters more than latency.
 
 For repeated local-role swarms, keep workers warm:

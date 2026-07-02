@@ -150,8 +150,11 @@ RULE_BODY = textwrap.dedent(
        whenever spend matters or the task is ambiguous.
     2. `puppetmaster_start_cursor_swarm` / `puppetmaster_start_swarm` for
        read-only analysis; `puppetmaster_start_implement` /
-       `puppetmaster_start_claude_implement` / `puppetmaster_start_codex`
-       for full-edit builds.
+       `puppetmaster_start_claude_implement` / `puppetmaster_start_codex` /
+       `puppetmaster_start_agentic` for full-edit builds. For keys-only
+       portability (no external agent CLI), prefer `puppetmaster_agentic` /
+       `puppetmaster_start_agentic` when you have a provider API key but no
+       vendor CLI installed.
     3. `puppetmaster_edit "<instruction>"` — a SINGLE focused in-place edit:
        cheapest sufficient model, CodeGraph to locate the site, edits the
        working tree directly, returns the diff synchronously, captures a

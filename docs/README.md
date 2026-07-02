@@ -19,7 +19,7 @@ The full documentation set. Start at the [project README](../README.md) for the 
 |---|---|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Job / Task / Worker / Artifact / Stitcher / Memory object model |
 | [MODEL_ROUTING.md](MODEL_ROUTING.md) | Router policies, classifier, registry schema, the starter tiers |
-| [ADAPTERS.md](ADAPTERS.md) | All four production adapters + shell + how to add a new one |
+| [ADAPTERS.md](ADAPTERS.md) | All production adapters (cursor, claude-code, openai, codex, hermes, agentic) + shell + how to add a new one |
 | [CLI_REFERENCE.md](CLI_REFERENCE.md) | Every CLI subcommand, workflow config schema, daemon mode |
 | [CURSOR_AGENT_MCP.md](CURSOR_AGENT_MCP.md) | The MCP tool surface in detail |
 | [CODEGRAPH.md](CODEGRAPH.md) | CodeGraph integration, bundled MCP tools, cost comparison |

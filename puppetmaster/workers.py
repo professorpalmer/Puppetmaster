@@ -9,7 +9,7 @@ from puppetmaster.models import AgentRun, Artifact, Task, TaskStatus, now_iso
 
 # Adapters that bill an LLM provider and therefore benefit from a pre-dispatch
 # auth/billing gate. ``local``/``shell`` run no model, so they're never gated.
-_PREFLIGHTABLE_ADAPTERS = {"cursor", "claude-code", "codex", "openai"}
+_PREFLIGHTABLE_ADAPTERS = {"agentic", "cursor", "claude-code", "codex", "openai"}
 
 # Failure classes that are about *this adapter's account* (auth, billing,
 # quota, missing CLI/key, or a preflight block) rather than the task itself.
@@ -190,7 +190,7 @@ class LocalWorker:
 # artifacts, so a swarm built solely from those is read-only no matter how its
 # roles are named — including the analysis swarm's "implement" role, which
 # writes an implementation *plan*, not code.
-_EDIT_CAPABLE_ADAPTERS = frozenset({"claude-code", "codex"})
+_EDIT_CAPABLE_ADAPTERS = frozenset({"agentic", "claude-code", "codex"})
 
 
 def spec_explicitly_no_edit(spec: WorkerSpec) -> bool:
@@ -249,7 +249,7 @@ def swarm_is_acting(specs: list[WorkerSpec]) -> bool:
 # either can still implement. This is the single source of truth — the MCP
 # ``start_implement`` verb, the CLI, and the lightweight ``edit`` verb all import
 # it instead of re-declaring the order.
-IMPLEMENT_ADAPTER_PRIORITY = ("cursor", "claude-code", "codex", "hermes")
+IMPLEMENT_ADAPTER_PRIORITY = ("cursor", "claude-code", "codex", "hermes", "agentic")
 
 
 class NoImplementAdapterError(RuntimeError):
@@ -272,6 +272,10 @@ _ADAPTER_AVAILABILITY_HINT: dict[str, str] = {
     "claude-code": "claude-code (`npm install -g @anthropic-ai/claude-code`, then authenticate)",
     "codex": "codex (`npm install -g @openai/codex`, then `codex login`)",
     "hermes": "hermes (install the NousResearch hermes CLI on PATH)",
+    "agentic": (
+        "agentic (set a provider API key: OPENAI_API_KEY, ANTHROPIC_API_KEY, "
+        "GEMINI_API_KEY, GOOGLE_API_KEY, or OPENROUTER_API_KEY — no external CLI)"
+    ),
 }
 
 
@@ -312,6 +316,10 @@ def adapter_is_available(
         return diagnostics._hermes_cli_installed()
     if name == "openai":
         return bool(env.get("OPENAI_API_KEY"))
+    if name == "agentic":
+        from puppetmaster.providers import available_providers
+
+        return bool(available_providers(env))
     return False
 
 

@@ -148,7 +148,7 @@ def _billing_checks() -> list[Check]:
     from puppetmaster.platform_billing import detect_adapter_billing
 
     checks: list[Check] = []
-    for adapter in ("cursor", "claude-code", "codex", "hermes"):
+    for adapter in ("agentic", "cursor", "claude-code", "codex", "hermes", "openai"):
         try:
             status = detect_adapter_billing(adapter)
         except Exception as exc:  # pragma: no cover - defensive
@@ -167,6 +167,13 @@ def _billing_checks() -> list[Check]:
 
 
 _PROVIDER_CREDENTIAL_ENV_KEYS: dict[str, tuple[str, ...]] = {
+    "agentic": (
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "OPENROUTER_API_KEY",
+    ),
     "cursor": ("CURSOR_API_KEY",),
     "openai": ("OPENAI_API_KEY",),
     "codex": ("CODEX_HOME", "OPENAI_API_KEY"),
@@ -408,10 +415,13 @@ def adapter_status(root: Path) -> list[dict[str, object]]:
     hermes_installed = _hermes_cli_installed()
     try:
         from puppetmaster.adapters import hermes_credentials_available
+        from puppetmaster.providers import available_providers
 
         hermes_creds = hermes_credentials_available()
+        agentic_providers = available_providers()
     except Exception:
         hermes_creds = False
+        agentic_providers = set()
     try:
         from puppetmaster.platform_billing import detect_codex_billing
 
@@ -441,6 +451,8 @@ def adapter_status(root: Path) -> list[dict[str, object]]:
             # Usable when the CLI is on PATH and at least one provider credential
             # is reachable (env var, ~/.hermes/.env, or `hermes login` OAuth).
             configured = hermes_installed and hermes_creds
+        elif info.name == "agentic":
+            configured = bool(agentic_providers)
         if info.status == "stub":
             configured = False
         rows.append(

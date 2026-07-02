@@ -14,6 +14,8 @@ puppetmaster run "demo goal" --config examples/enterprise-workflow.json
 | [`cursor-dry-run-implementation.json`](cursor-dry-run-implementation.json) | Plan/implement dry-run that proposes edits without writing them |
 | [`cursor-live.json`](cursor-live.json) | Live `cursor` adapter run (requires `CURSOR_API_KEY`) |
 | [`claude-code-full-edit.json`](claude-code-full-edit.json) | Full-edit implementation via the `claude` CLI, emitting patch artifacts |
+| [`agentic-analyze.json`](agentic-analyze.json) | Read-only audit via the keys-only `agentic` adapter (provider API key only) |
+| [`agentic-implement.json`](agentic-implement.json) | Full-edit implement via `agentic` with PATCH attribution |
 
 The [`transcripts/`](transcripts) folder holds captured example outputs for reference.
 
