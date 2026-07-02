@@ -21937,6 +21937,15 @@ class OutputStyleTests(unittest.TestCase):
 class KeysWizardTests(unittest.TestCase):
     """`puppetmaster keys` — writes provider keys into an MCP config env block."""
 
+    def setUp(self) -> None:
+        # These tests register throwaway secret values for redaction; clear the
+        # process-global registry before and after so they never leak into
+        # other tests (e.g. the patch-redaction test) running in the same run.
+        from puppetmaster.redaction import clear_registered_secrets
+
+        clear_registered_secrets()
+        self.addCleanup(clear_registered_secrets)
+
     def _read_env(self, path: Path) -> dict:
         config = json.loads(path.read_text(encoding="utf-8"))
         return config["mcpServers"]["puppetmaster"]["env"]
@@ -21954,7 +21963,9 @@ class KeysWizardTests(unittest.TestCase):
             # The result message must be safe to print — no raw secret in it.
             self.assertNotIn(secret, message)
             # The file holds a credential, so it must not be world/group readable.
-            self.assertEqual(path.stat().st_mode & 0o077, 0)
+            # POSIX-only: Windows does not map chmod's group/other permission bits.
+            if os.name == "posix":
+                self.assertEqual(path.stat().st_mode & 0o077, 0)
 
     def test_set_preserves_existing_entry_and_other_env_keys(self) -> None:
         from puppetmaster.cli.commands_keys import _apply_key
