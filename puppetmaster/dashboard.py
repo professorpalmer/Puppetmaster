@@ -2322,15 +2322,40 @@ def clear_dashboard_runfile(state_dir: Union[Path, str]) -> None:
 
 
 def pid_alive(pid: int) -> bool:
-    """True when ``pid`` names a live process this user can signal."""
+    """True when ``pid`` names a live process.
+
+    ``os.kill(pid, 0)`` is the POSIX liveness idiom, but on Windows ``os.kill``
+    routes any non-CTRL signal through ``TerminateProcess`` — signal ``0`` would
+    *kill* the target, and a bad pid raises ``OSError(WinError 87)`` rather than
+    ``ProcessLookupError``. So Windows uses a non-destructive ``OpenProcess`` +
+    ``GetExitCodeProcess`` probe instead.
+    """
     if not pid or pid <= 0:
         return False
+    if os.name == "nt":
+        import ctypes
+
+        process_query_limited_information = 0x1000
+        still_active = 259
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = kernel32.OpenProcess(process_query_limited_information, False, int(pid))
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            return exit_code.value == still_active
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
         return True
+    except OSError:
+        return False
     return True
 
 
