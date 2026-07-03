@@ -17,7 +17,9 @@ python -m puppetmaster dashboard <job_id>   # deep-link straight to one job
 ```
 
 From an agent, the MCP verb `puppetmaster_dashboard` starts the server (if one
-isn't already listening) and returns the URL to open — pass `job_id` to deep-link.
+isn't already listening) and returns the URL to open — pass `job_id` to deep-link,
+`mobile: true` to get a phone URL + QR, and `stop: true` to tear it down. The
+server runs **detached**, so there's no terminal to keep open.
 
 | Flag | Default | Purpose |
 |---|---|---|
@@ -26,8 +28,74 @@ isn't already listening) and returns the URL to open — pass `job_id` to deep-l
 | `--no-open` | off | Don't auto-open a browser tab. |
 | `--all-projects` | off | Aggregate jobs from every Puppetmaster project state dir on this machine. |
 | `--allow-external` | off | Allow binding to a non-loopback host. The board is **unauthenticated**, so this exposes job state to the network — only on a trusted one. |
+| `--mobile` | off | Serve on a phone-reachable address: auto-detect a Tailscale IP (falls back to LAN IP), bind it (implies `--allow-external`), and print the URL. See below. |
+| `--qr` | off | With `--mobile`, also print a scannable QR of the URL (needs the optional `qrcode` package). |
+| `--background` / `-b` | off | Run detached like a backend service and return to the prompt instead of holding the terminal. Prints the URL (and QR with `--qr`), then keeps serving until `--stop`. |
+| `--stop` | off | Stop the detached background dashboard for this state dir. |
+| `--status` | off | Report whether a background dashboard is running for this state dir. |
+
+## Easiest setup: let the pilot run it (no second terminal)
+
+The lowest-lift path is to have the agent start it for you. The MCP
+`puppetmaster_dashboard` verb spawns a detached server and hands back a link (and
+a QR for phones) — you never open or babysit a terminal:
+
+- **On this machine:** ask the agent to open the dashboard → it returns a loopback
+  URL to click.
+- **On your phone:** ask the agent to open the *mobile* dashboard → it detects your
+  Tailscale/LAN address, serves there, and returns a scannable QR. Scan it and
+  you're in.
+- **Done:** ask the agent to stop the dashboard (`stop: true`) — or just leave the
+  lightweight server running.
+
+One-time prerequisites for the phone case (documented once, then it's automatic):
+install [Tailscale](https://tailscale.com/download) on both this Mac and your
+phone and sign in to the same account. That's what gives the board a stable
+`100.x` address reachable from anywhere.
+
+Prefer the CLI? The same detach-and-walk-away flow, by hand:
+
+```bash
+python -m puppetmaster dashboard --mobile --qr --background   # serve to phone, detached
+python -m puppetmaster dashboard --status                     # is it up? what's the URL?
+python -m puppetmaster dashboard --stop                       # shut it down
+```
+
+## Watch it from your phone
+
+**Full walkthrough (Tailscale + agent + install): [MOBILE.md](MOBILE.md).** The
+short version below covers the flags.
+
+`--mobile` is the blessed remote path — read-only swarm tracking on your phone
+with no app, no cloud, and no DOM-scraping. It resolves a bind address in
+order of preference and prints the URL (no browser is opened locally, since the
+browser is on your phone):
+
+1. **Tailscale** (`tailscale ip -4`) — a stable `100.x` address reachable from
+   your phone **anywhere**, without exposing the board to the public internet.
+   This is the recommended setup.
+2. **LAN IP** — fallback for a phone on the same Wi-Fi.
+
+```bash
+python -m puppetmaster dashboard --mobile          # print the phone URL
+python -m puppetmaster dashboard --mobile --qr      # + a scannable QR in the terminal
+python -m puppetmaster dashboard <job_id> --mobile  # deep-link one job to your phone
+```
+
+The board is **unauthenticated and read-only** — anyone who can reach the
+address can see job state, but not control anything. Keep it on Tailscale or a
+trusted LAN. On a fresh network with neither available, `--mobile` exits with a
+hint rather than binding to loopback.
+
+The pages are responsive (a `max-width: 640px` pass collapses the jobs grid,
+wraps long headlines, lets wide tables scroll, and reflows the footer), so the
+job view reads cleanly on a phone.
 
 ## What it shows
+
+Two views: the **jobs index** (`/`, the default landing on every viewport) and a
+single **job view** (`?job=<id>`). `?view=jobs` forces the index even when a
+stale job id lingers in the URL.
 
 ### Jobs index (`/`)
 
@@ -39,7 +107,7 @@ relative timestamp. Filter by status. Click through to a job.
 
 Top to bottom:
 
-- **Swarm Tracker** — the at-a-glance hero. Job title + status, the primary
+- **Swarm Overview** — the at-a-glance hero. Job title + status, the primary
   routed model, worker count, and adapter; the job's total **cost and tokens**;
   a completion **progress bar**; an aggregate **verification score**; and a
   **routing rollup** — one card per routed worker showing the model, its cost, a

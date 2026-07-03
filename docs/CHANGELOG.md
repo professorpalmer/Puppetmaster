@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.9.102
+
+**Watch your swarms from your phone with near-zero setup — the dashboard now runs as a detached background service and hands you a scannable QR, and the mobile UI is a clean, phone-shaped board.** Getting the board onto a phone previously meant holding a foreground terminal open and eyeballing a URL; and the Marionette-style "Swarm Tracker" hero (v0.9.100) turned out to be redundant with the jobs index + job detail. This release makes the phone path the easy path and simplifies the UI to match.
+
+- **Detached background service.** `puppetmaster dashboard --background` (`-b`) runs the server in its own session and returns you to the prompt — no terminal to babysit. `--status` reports whether it's up (URL + pid), `--stop` tears it down. A small `dashboard.run.json` runfile in the state dir tracks the process so status/stop don't have to hunt for the port owner.
+- **Phone handoff from the agent.** The MCP `puppetmaster_dashboard` verb gains `mobile: true` (detect Tailscale/LAN, bind a phone-reachable address, return the URL **and a QR image path** to embed inline), `qr: true`, and `stop: true`. It already spawned detached; now it can serve the phone case end to end. Idempotent — an already-listening server on the host:port is reused, never double-spawned.
+- **QR that just works.** New `[mobile]` extra (`pip install 'puppetmaster-ai[mobile]'`) pulls in `qrcode` + Pillow so the pilot can render a scannable PNG. Without it the board still works — you get an ASCII QR, then the bare URL.
+- **Swarm Tracker removed.** The v0.9.100 hero card, its `/api/tracker` endpoint, server-side builders, client JS/CSS, and tests are gone; the **jobs index is the default landing on every viewport**, and the job view keeps the "Swarm Overview" hero. Less surface, one source of truth.
+- **Mobile-clean layout.** A `max-width: 640px` pass stops horizontal overflow (grid `minmax(0, 1fr)`, `min-width: 0`, `overflow-wrap`) and stacks each job row into a grid-areas card so a long job hash can't stretch the row.
+- **Docs.** New [`docs/MOBILE.md`](MOBILE.md) — a full walkthrough of the Tailscale setup (Mac + phone), the agent and CLI start paths, the `[mobile]` install, and a troubleshooting table (including why an old QR URL can return `ERR_CONNECTION_REFUSED` after the server is stopped). Linked from the README, the docs index, and `DASHBOARD.md`.
+- New focused tests: background runfile roundtrip + idempotent stop, ASCII QR, and MCP mobile mode (external bind + QR, no-address error, stop delegation, schema surface).
+
 ## v0.9.101
 
 **New `puppetmaster keys` command — a guided setup for agentic provider API keys, so the keys-only path is genuinely keys-*easy*.** The `agentic` adapter calls provider HTTP APIs directly with the user's own key, resolving credentials purely from the process environment (`puppetmaster/providers.py`). When Puppetmaster is driven through Cursor's MCP client, that "process" is the MCP server Cursor launches — so a key only reaches the worker if it lives in the `env` block of the `puppetmaster` entry in a Cursor `mcp.json`. Until now that meant hand-editing JSON; there was no key-setup wizard (the existing `models` wizard only edits the model registry, never credentials).

@@ -812,6 +812,44 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Show jobs from every Puppetmaster project state dir on this machine.",
     )
+    dashboard_cmd.add_argument(
+        "--mobile",
+        action="store_true",
+        help=(
+            "Serve on a phone-reachable address: auto-detect a Tailscale IP "
+            "(falls back to LAN IP), bind it (implies --allow-external), and "
+            "print the URL. The board stays unauthenticated and read-only — only "
+            "use over Tailscale or a trusted LAN."
+        ),
+    )
+    dashboard_cmd.add_argument(
+        "--qr",
+        action="store_true",
+        help=(
+            "With --mobile, also print a scannable QR of the URL (needs the QR "
+            "extra: pip install 'puppetmaster-ai[mobile]')."
+        ),
+    )
+    dashboard_cmd.add_argument(
+        "--background",
+        "-b",
+        action="store_true",
+        help=(
+            "Run the server detached (like a backend service) and return to the "
+            "prompt instead of holding the terminal. Prints the URL (and QR with "
+            "--qr), then keeps serving until `dashboard --stop`."
+        ),
+    )
+    dashboard_cmd.add_argument(
+        "--stop",
+        action="store_true",
+        help="Stop the detached background dashboard started with --background.",
+    )
+    dashboard_cmd.add_argument(
+        "--status",
+        action="store_true",
+        help="Report whether a background dashboard is running for this state dir.",
+    )
 
     await_cmd = subcommands.add_parser(
         "await",

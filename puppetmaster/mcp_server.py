@@ -1473,11 +1473,15 @@ def _build_tools() -> list[McpTool]:
             name="puppetmaster_dashboard",
             description=(
                 "Open the live Puppetmaster web dashboard. Starts the "
-                "zero-dependency local server (loopback-only) if one isn't "
+                "zero-dependency local server (loopback by default) if one isn't "
                 "already listening on the port and returns the URL to open — "
                 "pass job_id to deep-link straight to one job. Use whenever the "
                 "user asks to see/open/show the job dashboard, then open the "
-                "returned URL in a browser tab for them."
+                "returned URL in a browser tab for them. Pass mobile=true to "
+                "serve a phone-reachable Tailscale/LAN address and get a QR to "
+                "hand off (embed qr_image_path inline); stop=true tears the "
+                "background server down. The server runs detached — no terminal "
+                "to keep open."
             ),
             input_schema=dashboard_schema(),
             handler=run_dashboard,
@@ -2858,11 +2862,11 @@ def run_cli(command: list[str], args: JsonObject) -> JsonObject:
     }
 
 
-def _dashboard_alive(port: int) -> bool:
-    """True when a dashboard already answers on the loopback port."""
+def _dashboard_alive(host: str = "127.0.0.1", port: int = 8787) -> bool:
+    """True when a dashboard already answers on ``host:port``."""
     try:
         with urllib.request.urlopen(
-            f"http://127.0.0.1:{port}/api/jobs", timeout=1.0
+            f"http://{host}:{port}/api/jobs", timeout=1.0
         ) as response:
             return response.status == 200
     except OSError:
@@ -2883,19 +2887,57 @@ def _spawn_dashboard_server(command: list[str], args: JsonObject) -> subprocess.
 
 
 def run_dashboard(args: JsonObject) -> JsonObject:
-    """Ensure a dashboard server is running and return its URL.
+    """Ensure a dashboard server is running and return its URL (and QR for phones).
 
-    Idempotent: an already-listening dashboard on the port is reused rather
-    than spawning a duplicate. The server binds loopback-only — exposing it
-    further requires the CLI's explicit --allow-external."""
+    Idempotent: an already-listening dashboard on the host:port is reused rather
+    than spawning a duplicate. Defaults to loopback; ``mobile=true`` binds a
+    phone-reachable Tailscale/LAN address (still unauthenticated + read-only) and
+    returns a scannable QR so the pilot can hand off a link with zero setup.
+    ``stop=true`` shuts down the detached background server."""
+    from puppetmaster.dashboard import (
+        qr_ascii,
+        read_dashboard_runfile,
+        resolve_mobile_host,
+        stop_background_dashboard,
+        write_dashboard_runfile,
+        write_qr_png,
+    )
+
     state_dir = str(mcp_state_dir(args))
     port = int(args.get("port") or 8787)
     job_id = args.get("job_id")
     job = job_id.strip() if isinstance(job_id, str) and job_id.strip() else None
     all_projects = bool(args.get("all_projects"))
-    url = f"http://127.0.0.1:{port}/" + (f"?job={job}" if job else "")
+    mobile = bool(args.get("mobile"))
+    want_qr = bool(args.get("qr")) or mobile
 
-    already_running = _dashboard_alive(port)
+    if bool(args.get("stop")):
+        result = stop_background_dashboard(state_dir)
+        result["state_dir"] = state_dir
+        return {"content": [{"type": "text", "text": json.dumps(result, indent=2)}]}
+
+    host = "127.0.0.1"
+    source = "loopback"
+    if mobile:
+        ip, source = resolve_mobile_host()
+        if ip is None:
+            body = {
+                "error": "no phone-reachable address",
+                "hint": (
+                    "Bring Tailscale up (or join a LAN) so this host has a 100.x / "
+                    "LAN IP, then retry. The user also installs Tailscale on the "
+                    "phone and signs in to the same tailnet."
+                ),
+            }
+            return {
+                "content": [{"type": "text", "text": json.dumps(body, indent=2)}],
+                "isError": True,
+            }
+        host = ip
+
+    url = f"http://{host}:{port}/" + (f"?job={job}" if job else "")
+
+    already_running = _dashboard_alive(host, port)
     pid: Optional[int] = None
     if not already_running:
         command = [
@@ -2909,6 +2951,8 @@ def run_dashboard(args: JsonObject) -> JsonObject:
             str(port),
             "--no-open",
         ]
+        if host != "127.0.0.1":
+            command += ["--host", host, "--allow-external"]
         if all_projects:
             command.append("--all-projects")
         if job:
@@ -2916,13 +2960,14 @@ def run_dashboard(args: JsonObject) -> JsonObject:
         process = _spawn_dashboard_server(command, args)
         pid = process.pid
         deadline = time.time() + 10
-        while time.time() < deadline and not _dashboard_alive(port):
+        while time.time() < deadline and not _dashboard_alive(host, port):
             if process.poll() is not None:
                 break
             time.sleep(0.2)
-        if not _dashboard_alive(port):
+        if not _dashboard_alive(host, port):
             body = {
                 "error": "dashboard failed to start",
+                "host": host,
                 "port": port,
                 "state_dir": state_dir,
                 "returncode": process.poll(),
@@ -2932,22 +2977,66 @@ def run_dashboard(args: JsonObject) -> JsonObject:
                 "content": [{"type": "text", "text": json.dumps(body, indent=2)}],
                 "isError": True,
             }
+        write_dashboard_runfile(
+            state_dir,
+            {
+                "pid": pid,
+                "host": host,
+                "port": port,
+                "url": url,
+                "source": source,
+                "all_projects": all_projects,
+            },
+        )
+    elif mobile:
+        # Keep the runfile pid current when reusing a server we can identify.
+        tracked = read_dashboard_runfile(state_dir)
+        if tracked and tracked.get("host") == host and int(tracked.get("port") or 0) == port:
+            pid = tracked.get("pid")
 
-    body = {
+    body: JsonObject = {
         "url": url,
+        "host": host,
         "port": port,
+        "source": source,
         "state_dir": state_dir,
         "all_projects": all_projects,
         "already_running": already_running,
         "started": not already_running,
         "pid": pid,
-        "note": (
+    }
+
+    if want_qr:
+        qr_path = str(Path(state_dir) / "dashboard-qr.png")
+        if write_qr_png(url, qr_path):
+            body["qr_image_path"] = qr_path
+            body["qr_hint"] = (
+                "Embed this image inline so the user can scan it: "
+                f"![Scan to open the dashboard]({qr_path})"
+            )
+        else:
+            ascii_art = qr_ascii(url)
+            if ascii_art:
+                body["qr_ascii"] = ascii_art
+            else:
+                body["qr_hint"] = (
+                    "Install the QR extra for a scannable image: "
+                    "pip install 'puppetmaster-ai[mobile]' — the URL above still works."
+                )
+
+    if mobile:
+        body["note"] = (
+            f"Phone-reachable over {source}. Unauthenticated + read-only — keep it "
+            "to Tailscale or a trusted LAN. Hand the user the URL/QR; stop later "
+            "with stop=true."
+        )
+    else:
+        body["note"] = (
             "Reused the dashboard already listening on this port — it may be "
             "serving a different project's state dir or all-projects mode."
             if already_running
             else "Open the URL in a browser tab for the user."
-        ),
-    }
+        )
     return {"content": [{"type": "text", "text": json.dumps(body, indent=2)}]}
 
 
@@ -3314,6 +3403,25 @@ def dashboard_schema() -> JsonObject:
             "Aggregate jobs from every Puppetmaster project state dir on this "
             "machine instead of just the current project."
         ),
+    }
+    schema["properties"]["mobile"] = {
+        "type": "boolean",
+        "description": (
+            "Serve on a phone-reachable Tailscale/LAN address (implies external "
+            "bind) and return a scannable QR. Still unauthenticated + read-only — "
+            "use only over Tailscale or a trusted LAN."
+        ),
+    }
+    schema["properties"]["qr"] = {
+        "type": "boolean",
+        "description": (
+            "Return a QR of the URL (a PNG path to embed inline, or ASCII "
+            "fallback). Implied by mobile."
+        ),
+    }
+    schema["properties"]["stop"] = {
+        "type": "boolean",
+        "description": "Stop the detached background dashboard tracked for this state dir.",
     }
     return schema
 

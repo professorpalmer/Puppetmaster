@@ -12885,8 +12885,8 @@ class DashboardTests(unittest.TestCase):
             # the billing failure surfaces as an alert
             self.assertTrue(any("billing_or_quota" in a for a in snap["alerts"]))
 
-    def test_build_job_snapshot_swarm_tracker_fields(self) -> None:
-        """Swarm Tracker snapshot fields: tokens, routing rollup, verification score."""
+    def test_build_job_snapshot_swarm_fields(self) -> None:
+        """Job snapshot swarm fields: tokens, routing rollup, verification score."""
         import json
 
         from puppetmaster.dashboard import build_job_snapshot
@@ -17970,6 +17970,73 @@ class PuppetmasterMcpVerbTests(unittest.TestCase):
         body = json.loads(result["content"][0]["text"])
         self.assertEqual(body["error"], "dashboard failed to start")
 
+    def test_dashboard_tool_mobile_binds_external_and_returns_qr(self) -> None:
+        import puppetmaster.mcp_server as mcp
+        import puppetmaster.dashboard as dash
+
+        spawned = MagicMock()
+        spawned.pid = 7777
+        spawned.poll.return_value = None
+        with patch.object(
+            dash, "resolve_mobile_host", return_value=("100.64.0.7", "tailscale")
+        ), patch.object(
+            mcp, "_dashboard_alive", side_effect=[False, True, True]
+        ), patch.object(
+            mcp, "_spawn_dashboard_server", return_value=spawned
+        ) as popen, patch.object(
+            dash, "write_qr_png", return_value=True
+        ), patch.object(
+            dash, "write_dashboard_runfile"
+        ):
+            result = mcp.call_tool(
+                "puppetmaster_dashboard", {"cwd": "/tmp", "mobile": True}
+            )
+        body = json.loads(result["content"][0]["text"])
+        command = popen.call_args.args[0]
+        self.assertIn("--host", command)
+        self.assertIn("100.64.0.7", command)
+        self.assertIn("--allow-external", command)
+        self.assertEqual(body["url"], "http://100.64.0.7:8787/")
+        self.assertEqual(body["source"], "tailscale")
+        self.assertIn("qr_image_path", body)
+
+    def test_dashboard_tool_mobile_errors_without_reachable_address(self) -> None:
+        import puppetmaster.mcp_server as mcp
+        import puppetmaster.dashboard as dash
+
+        with patch.object(dash, "resolve_mobile_host", return_value=(None, "none")):
+            result = mcp.call_tool(
+                "puppetmaster_dashboard", {"cwd": "/tmp", "mobile": True}
+            )
+        self.assertTrue(result["isError"])
+        body = json.loads(result["content"][0]["text"])
+        self.assertEqual(body["error"], "no phone-reachable address")
+
+    def test_dashboard_tool_stop_delegates_to_runfile(self) -> None:
+        import puppetmaster.mcp_server as mcp
+        import puppetmaster.dashboard as dash
+
+        with patch.object(
+            dash,
+            "stop_background_dashboard",
+            return_value={"stopped": True, "url": "http://127.0.0.1:8787/"},
+        ) as stop, patch.object(mcp, "_spawn_dashboard_server") as popen:
+            result = mcp.call_tool(
+                "puppetmaster_dashboard", {"cwd": "/tmp", "stop": True}
+            )
+        body = json.loads(result["content"][0]["text"])
+        stop.assert_called_once()
+        popen.assert_not_called()
+        self.assertTrue(body["stopped"])
+
+    def test_dashboard_schema_advertises_mobile_and_stop(self) -> None:
+        import puppetmaster.mcp_server as mcp
+
+        props = mcp.dashboard_schema()["properties"]
+        self.assertIn("mobile", props)
+        self.assertIn("qr", props)
+        self.assertIn("stop", props)
+
     def test_installed_rules_teach_the_dashboard_verb(self) -> None:
         from puppetmaster.rules import RULE_BODY
 
@@ -22069,6 +22136,229 @@ class KeysWizardTests(unittest.TestCase):
             self.assertNotIn(secret, text)  # stored value never printed
             self.assertIn("OpenAI", text)
             self.assertIn("Anthropic", text)
+
+
+class DashboardMobileTests(unittest.TestCase):
+    """`dashboard --mobile` host resolution + the responsive CSS pass."""
+
+    def test_resolve_mobile_host_prefers_tailscale(self) -> None:
+        import puppetmaster.dashboard as dash
+
+        with patch.object(dash, "_detect_tailscale_ip", return_value="100.64.0.7"), patch.object(
+            dash, "_detect_lan_ip", return_value="192.168.1.5"
+        ):
+            self.assertEqual(dash.resolve_mobile_host(), ("100.64.0.7", "tailscale"))
+
+    def test_resolve_mobile_host_falls_back_to_lan(self) -> None:
+        import puppetmaster.dashboard as dash
+
+        with patch.object(dash, "_detect_tailscale_ip", return_value=None), patch.object(
+            dash, "_detect_lan_ip", return_value="192.168.1.5"
+        ):
+            self.assertEqual(dash.resolve_mobile_host(), ("192.168.1.5", "lan"))
+
+    def test_resolve_mobile_host_none_when_isolated(self) -> None:
+        import puppetmaster.dashboard as dash
+
+        with patch.object(dash, "_detect_tailscale_ip", return_value=None), patch.object(
+            dash, "_detect_lan_ip", return_value=None
+        ):
+            self.assertEqual(dash.resolve_mobile_host(), (None, "none"))
+
+    def test_lan_ip_ignores_loopback(self) -> None:
+        import puppetmaster.dashboard as dash
+
+        class _LoopbackSock:
+            def connect(self, *_a):  # noqa: D401 - test double
+                return None
+
+            def getsockname(self):
+                return ("127.0.0.1", 0)
+
+            def close(self):
+                return None
+
+        with patch("socket.socket", return_value=_LoopbackSock()):
+            self.assertIsNone(dash._detect_lan_ip())
+
+    def test_mobile_banner_prints_url_but_not_a_wide_open_claim(self) -> None:
+        import puppetmaster.dashboard as dash
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            dash.print_mobile_banner("100.64.0.7", 8787, "tailscale", job_id="job_abc")
+        text = out.getvalue()
+        self.assertIn("http://100.64.0.7:8787/?job=job_abc", text)
+        self.assertIn("Unauthenticated", text)  # honest security note is present
+
+    def test_mobile_css_media_query_present(self) -> None:
+        import puppetmaster.dashboard as dash
+
+        self.assertIn("@media (max-width: 640px)", dash.INDEX_HTML)
+        # Mobile job rows stack into a grid-areas card so a long hash can't
+        # stretch the row (see .job-row override in the media query).
+        self.assertIn("grid-template-areas:", dash.INDEX_HTML)
+        self.assertIn('"pill time"', dash.INDEX_HTML)
+
+    def test_background_runfile_roundtrip_and_stop_is_idempotent(self) -> None:
+        import puppetmaster.dashboard as dash
+
+        with tempfile.TemporaryDirectory() as state_dir:
+            # A pid that cannot be alive so stop() takes the "stale" path.
+            dash.write_dashboard_runfile(
+                state_dir,
+                {"pid": 2_147_483_600, "host": "127.0.0.1", "port": 8787, "url": "http://x"},
+            )
+            info = dash.read_dashboard_runfile(state_dir)
+            self.assertEqual(info["url"], "http://x")
+
+            result = dash.stop_background_dashboard(state_dir)
+            self.assertTrue(result["stopped"])
+            # Runfile is cleared so a later status/stop won't chase a dead pid.
+            self.assertIsNone(dash.read_dashboard_runfile(state_dir))
+
+            # Stopping again is a no-op, not an error.
+            again = dash.stop_background_dashboard(state_dir)
+            self.assertFalse(again["stopped"])
+
+    def test_qr_ascii_returns_string_when_qrcode_present(self) -> None:
+        import puppetmaster.dashboard as dash
+
+        try:
+            import qrcode  # noqa: F401
+        except ImportError:
+            self.skipTest("optional 'qrcode' package not installed")
+        art = dash.qr_ascii("http://100.64.0.7:8787/")
+        self.assertIsInstance(art, str)
+        self.assertTrue(art.strip())
+
+    def test_tailscale_binary_falls_back_to_macos_app_bundle(self) -> None:
+        # The macOS GUI app leaves the CLI off PATH; detection must still find it
+        # in the app bundle, or --mobile silently degrades to a LAN-only address.
+        import puppetmaster.dashboard as dash
+
+        bundle = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+        with patch("shutil.which", return_value=None), patch(
+            "os.path.exists", side_effect=lambda p: p == bundle
+        ), patch("os.access", return_value=True):
+            self.assertEqual(dash._tailscale_binary(), bundle)
+
+
+class DashboardPhaseStripTests(unittest.TestCase):
+    """The job-detail PhaseStrip: server-side phase derivation + inlined markup."""
+
+    def _store(self, tmp):
+        from puppetmaster.store import SwarmStore
+
+        store = SwarmStore(Path(tmp) / ".puppetmaster")
+        store.init()
+        return store
+
+    def _routing_artifact(self, store, job_id, task_id=""):
+        from puppetmaster.models import Artifact, ArtifactType
+
+        store.save_artifact(
+            Artifact(
+                job_id=job_id, task_id=task_id, type=ArtifactType.ROUTING,
+                created_by="router",
+                payload={"model_id": "cursor/gpt-5-5", "adapter": "cursor", "policy": "balanced"},
+                confidence=1.0, evidence=["policy:balanced"],
+            )
+        )
+
+    def _task(self, store, job_id, status):
+        from puppetmaster.models import Task
+
+        store.save_task(Task(job_id=job_id, role="implement", instruction="x", adapter="cursor", status=status))
+
+    def _phase(self, store, job_id):
+        from puppetmaster.dashboard import build_job_snapshot
+
+        return build_job_snapshot(store, job_id)["phase"]
+
+    def test_phase_dispatched_when_no_tasks_or_routing(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            job = store.create_job("goal")
+            phase = self._phase(store, job.id)
+            self.assertEqual(phase["key"], "dispatched")
+            self.assertEqual(phase["index"], 0)
+            self.assertFalse(phase["failed"])
+
+    def test_phase_routing_when_routing_but_no_tasks(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            job = store.create_job("goal")
+            self._routing_artifact(store, job.id)
+            phase = self._phase(store, job.id)
+            self.assertEqual(phase["key"], "routing")
+            self.assertEqual(phase["index"], 1)
+            self.assertEqual(phase["label"], "routing")
+
+    def test_phase_workers_running_reports_done_over_total(self) -> None:
+        from puppetmaster.models import TaskStatus
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            job = store.create_job("goal")
+            self._task(store, job.id, TaskStatus.RUNNING)
+            self._task(store, job.id, TaskStatus.COMPLETE)
+            phase = self._phase(store, job.id)
+            self.assertEqual(phase["key"], "workers")
+            self.assertEqual(phase["index"], 2)
+            self.assertEqual(phase["label"], "running 1/2")
+
+    def test_phase_workers_idle_reports_worker_count(self) -> None:
+        from puppetmaster.models import TaskStatus
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            job = store.create_job("goal")
+            self._task(store, job.id, TaskStatus.QUEUED)
+            self._task(store, job.id, TaskStatus.QUEUED)
+            phase = self._phase(store, job.id)
+            self.assertEqual(phase["key"], "workers")
+            self.assertEqual(phase["label"], "2 workers")
+
+    def test_phase_done_when_job_complete(self) -> None:
+        from puppetmaster.models import JobStatus
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            job = store.create_job("goal")
+            store.update_job_status(job.id, JobStatus.COMPLETE)
+            phase = self._phase(store, job.id)
+            self.assertEqual(phase["key"], "done")
+            self.assertEqual(phase["index"], 3)
+            self.assertFalse(phase["failed"])
+
+    def test_phase_failed_paints_reached_segment_red(self) -> None:
+        from puppetmaster.models import JobStatus, TaskStatus
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            job = store.create_job("goal")
+            self._task(store, job.id, TaskStatus.FAILED)
+            store.update_job_status(job.id, JobStatus.FAILED)
+            phase = self._phase(store, job.id)
+            self.assertEqual(phase["key"], "failed")
+            self.assertEqual(phase["index"], 2)  # reached the workers segment
+            self.assertTrue(phase["failed"])
+
+    def test_phase_failed_without_tasks_falls_back_to_routing_or_dispatch(self) -> None:
+        from puppetmaster.dashboard import _job_phase
+
+        self.assertEqual(_job_phase("failed", [], {})["index"], 0)
+        self.assertEqual(_job_phase("failed", [], {"routing": 1})["index"], 1)
+
+    def test_phase_strip_css_and_markup_present_in_page(self) -> None:
+        import puppetmaster.dashboard as dash
+
+        self.assertIn(".phase-seg", dash.INDEX_HTML)
+        self.assertIn("@keyframes phase-pulse", dash.INDEX_HTML)
+        self.assertIn("phase-seg.failed", dash.INDEX_HTML)
+        self.assertIn("function phaseStrip(", dash.INDEX_HTML)
+        self.assertIn("phaseStrip(d.phase)", dash.INDEX_HTML)
 
 
 if __name__ == "__main__":

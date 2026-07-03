@@ -168,6 +168,193 @@ def _resolve_store_for_job(
     )
     return found, create_store(backend, found)
 
+
+def _start_background_dashboard(
+    args: argparse.Namespace,
+    state_dir: Path,
+    host: str,
+    *,
+    source: str,
+    allow_external: bool,
+) -> int:
+    """Spawn a detached dashboard, wait for it to answer, and return the link.
+
+    The detached child runs the ordinary foreground server in its own session,
+    so it survives this process exiting. We record its pid in the state dir so
+    ``--stop`` / ``--status`` can manage it without hunting for the port owner.
+    """
+    from puppetmaster.dashboard import (
+        dashboard_alive,
+        write_dashboard_runfile,
+    )
+
+    port = args.port
+    url = f"http://{host}:{port}/" + (f"?job={args.job_id}" if args.job_id else "")
+
+    if dashboard_alive(host, port):
+        print(f"Dashboard already serving at {url} — reusing it.")
+        _announce_background_dashboard(args, host, port, source)
+        return 0
+
+    command = [
+        sys.executable,
+        "-m",
+        "puppetmaster",
+        "--state-dir",
+        str(state_dir),
+        "--backend",
+        args.backend,
+        "dashboard",
+        "--port",
+        str(port),
+        "--no-open",
+    ]
+    if host.strip().lower() not in {"127.0.0.1", "localhost", "::1"}:
+        command += ["--host", host]
+    if allow_external:
+        command.append("--allow-external")
+    if getattr(args, "all_projects", False):
+        command.append("--all-projects")
+    if args.job_id:
+        command.append(args.job_id)
+
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    deadline = time.time() + 10
+    while time.time() < deadline and not dashboard_alive(host, port):
+        if process.poll() is not None:
+            break
+        time.sleep(0.2)
+    if not dashboard_alive(host, port):
+        print(
+            "puppetmaster dashboard --background: server did not come up. Run "
+            f"`python -m puppetmaster dashboard --port {port}` in the foreground "
+            "to see the error.",
+            file=sys.stderr,
+        )
+        return 1
+
+    write_dashboard_runfile(
+        state_dir,
+        {
+            "pid": process.pid,
+            "host": host,
+            "port": port,
+            "url": url,
+            "source": source,
+            "all_projects": getattr(args, "all_projects", False),
+        },
+    )
+    print(f"Dashboard running in the background (pid {process.pid}).")
+    _announce_background_dashboard(args, host, port, source)
+    print("Stop it with: python -m puppetmaster dashboard --stop")
+    return 0
+
+
+def _announce_background_dashboard(
+    args: argparse.Namespace, host: str, port: int, source: str
+) -> None:
+    """Print the phone banner (mobile) or a plain URL line (loopback)."""
+    from puppetmaster.dashboard import print_mobile_banner
+
+    if getattr(args, "mobile", False):
+        print_mobile_banner(
+            host, port, source, job_id=args.job_id, qr=getattr(args, "qr", False)
+        )
+    else:
+        url = f"http://{host}:{port}/" + (f"?job={args.job_id}" if args.job_id else "")
+        print(f"  {url}")
+
+
+def _run_dashboard_command(args: argparse.Namespace, state_dir: Path) -> int:
+    from puppetmaster.dashboard import (
+        dashboard_alive,
+        print_mobile_banner,
+        read_dashboard_runfile,
+        resolve_mobile_host,
+        serve,
+        stop_background_dashboard,
+    )
+
+    if getattr(args, "stop", False):
+        result = stop_background_dashboard(state_dir)
+        if result.get("stopped"):
+            where = f" ({result['url']})" if result.get("url") else ""
+            print(f"Stopped the background dashboard{where}.")
+            return 0
+        print(
+            f"No background dashboard to stop: {result.get('reason', 'none tracked')}.",
+            file=sys.stderr,
+        )
+        return 0
+
+    if getattr(args, "status", False):
+        info = read_dashboard_runfile(state_dir)
+        if info and dashboard_alive(
+            info.get("host", "127.0.0.1"), int(info.get("port") or args.port)
+        ):
+            print(
+                f"Background dashboard running: {info.get('url')} (pid {info.get('pid')})."
+            )
+        elif info:
+            print(
+                "A background dashboard is tracked here but isn't answering "
+                "(stale). Clear it with `dashboard --stop`."
+            )
+        else:
+            print("No background dashboard is running for this state dir.")
+        return 0
+
+    host = args.host
+    allow_external = getattr(args, "allow_external", False)
+    open_browser = not args.no_open
+    source = "loopback"
+    if getattr(args, "mobile", False):
+        ip, source = resolve_mobile_host()
+        if ip is None:
+            print(
+                "puppetmaster dashboard --mobile: could not detect a Tailscale "
+                "or LAN address. Join a network (or bring Tailscale up) and "
+                "retry, or set --host <ip> --allow-external manually.",
+                file=sys.stderr,
+            )
+            return 1
+        host = ip
+        allow_external = True
+        open_browser = False  # the browser is on the phone, not this host
+
+    if getattr(args, "background", False):
+        return _start_background_dashboard(
+            args, state_dir, host, source=source, allow_external=allow_external
+        )
+
+    if getattr(args, "mobile", False):
+        print_mobile_banner(
+            host,
+            args.port,
+            source,
+            job_id=args.job_id,
+            qr=getattr(args, "qr", False),
+        )
+
+    serve(
+        state_dir,
+        backend=args.backend,
+        job_id=args.job_id,
+        host=host,
+        port=args.port,
+        open_browser=open_browser,
+        allow_external=allow_external,
+        all_projects=getattr(args, "all_projects", False),
+    )
+    return 0
+
+
 def _main(argv: Optional[list[str]] = None) -> int:
     import puppetmaster.cli as cli
 
@@ -888,19 +1075,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
         return _run_wait_command(args, store)
 
     if args.command == "dashboard":
-        from puppetmaster.dashboard import serve
-
-        serve(
-            state_dir,
-            backend=args.backend,
-            job_id=args.job_id,
-            host=args.host,
-            port=args.port,
-            open_browser=not args.no_open,
-            allow_external=getattr(args, "allow_external", False),
-            all_projects=getattr(args, "all_projects", False),
-        )
-        return 0
+        return _run_dashboard_command(args, state_dir)
 
     if args.command == "await":
         return _run_await_command(args, store)

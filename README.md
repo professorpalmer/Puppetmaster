@@ -29,6 +29,7 @@ Documentation lives in [`docs/`](https://github.com/professorpalmer/Puppetmaster
 - Safety and threat model — [SECURITY.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/SECURITY.md)
 - Prompt and shell recipes — [DAILY_DRIVER.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/DAILY_DRIVER.md)
 - The live job dashboard — [DASHBOARD.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/DASHBOARD.md)
+- Watch swarms from your phone (Tailscale + QR) — [MOBILE.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/MOBILE.md)
 - Model routing, architecture, adapters, CodeGraph, CLI — see the [docs index](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/README.md)
 
 ## Install

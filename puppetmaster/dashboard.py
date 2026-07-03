@@ -429,6 +429,41 @@ def _routing_rollup(tasks: list[Task], artifacts: list[Artifact]) -> list[dict[s
     return rollup
 
 
+# A swarm advances through four visible phases; the dashboard renders them as a
+# filling strip so a running job reads as *moving* rather than a static spinner.
+# A dead job paints the phase it reached red instead of advancing.
+_FAILED_JOB_STATUS = {"failed", "cancelled"}
+_DONE_JOB_STATUS = {"complete", "completed"}
+
+
+def _job_phase(job_status: str, task_rows: list[dict[str, Any]], counts: dict[str, int]) -> dict[str, Any]:
+    """Derive the four-phase marker (dispatched → routing → workers → done).
+
+    Kept in Python so the phase is unit-testable and never drifts from the
+    client strip, and reuses the already-built task rows and artifact counts
+    rather than re-querying the store.
+    """
+    total = len(task_rows)
+    has_routing = counts.get("routing", 0) > 0
+
+    if job_status in _FAILED_JOB_STATUS:
+        reached = 2 if total else 1 if has_routing else 0
+        return {"key": "failed", "label": "failed", "index": reached, "failed": True}
+    if job_status in _DONE_JOB_STATUS:
+        return {"key": "done", "label": "done", "index": 3, "failed": False}
+    if total:
+        running = sum(1 for row in task_rows if row["status"] in ("running", "in_progress"))
+        if running:
+            done = sum(1 for row in task_rows if row["status"] == "complete")
+            label = f"running {done}/{total}"
+        else:
+            label = f"{total} worker" + ("s" if total != 1 else "")
+        return {"key": "workers", "label": label, "index": 2, "failed": False}
+    if has_routing:
+        return {"key": "routing", "label": "routing", "index": 1, "failed": False}
+    return {"key": "dispatched", "label": "dispatched", "index": 0, "failed": False}
+
+
 def build_job_snapshot(store: SwarmStore, job_id: str) -> dict[str, Any]:
     """Assemble a full, JSON-able snapshot of one job's durable state."""
     job = store.get_job(job_id)
@@ -522,6 +557,7 @@ def build_job_snapshot(store: SwarmStore, job_id: str) -> dict[str, Any]:
         "primary_adapter": primary_adapter,
         "verification_score": _verification_score(artifacts),
         "routing_rollup": _routing_rollup(tasks, artifacts),
+        "phase": _job_phase(job.status.value, task_rows, counts),
     }
 
 
@@ -634,6 +670,31 @@ function md(text){
   s=s.replace(/<p>(\s*<(?:h[1-4]|ul|ol|pre|blockquote)>)/g,"$1").replace(/(<\/(?:h[1-4]|ul|ol|pre|blockquote)>\s*)<\/p>/g,"$1");
   s=s.replace(/\uE000(\d+)\uE000/g,(_,n)=>blocks[+n]);
   return s;
+}
+
+// Four-segment progress strip (dispatched -> routing -> workers -> done) shown
+// in the job-detail hero. Pure render helper, so it lives alongside esc/md.
+function phaseStrip(phase) {
+  const p = phase || {};
+  const index = p.index != null ? p.index : 0;
+  const failed = !!p.failed;
+  const active = p.key !== "done" && !failed;
+  let segs = "";
+  for (let i = 0; i < 4; i++) {
+    let cls = "phase-seg";
+    if (failed && i === index) cls += " failed";
+    else if (i <= index) cls += p.key === "done" ? " done" : " reached";
+    if (i === index && active) cls += " active";
+    segs += `<div class="${cls}"></div>`;
+  }
+  const labelCls = failed ? "phase-label failed" : "phase-label";
+  return `<div class="phase-strip" title="dispatched → routing → workers → done">`
+    + `<div class="phase-segments">${segs}</div>`
+    + `<span class="${labelCls}">${esc(p.label || "")}</span></div>`;
+}
+
+function jobHeadline(j) {
+  return j.label || j.title || j.id;
 }
 """
 
@@ -761,6 +822,42 @@ _PAGE_HEAD = r"""<!doctype html>
     font-size: 12px;
     color: #8b949e;
     margin-top: 8px;
+  }
+  .phase-strip {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 10px 0 2px;
+  }
+  .phase-segments {
+    display: flex;
+    flex: 1;
+    gap: 4px;
+    min-width: 0;
+  }
+  .phase-seg {
+    flex: 1;
+    height: 4px;
+    border-radius: 999px;
+    background: #30363d;
+    transition: background 0.3s ease;
+  }
+  .phase-seg.reached { background: #58a6ff; }
+  .phase-seg.done { background: #2ea043; }
+  .phase-seg.failed { background: #f85149; }
+  /* Only the segment the swarm currently sits on breathes, so the eye lands on
+     where work is happening rather than the whole (static) filled run. */
+  .phase-seg.active { animation: phase-pulse 1.6s ease-in-out infinite; }
+  .phase-label {
+    font-size: 11px;
+    color: #8b949e;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .phase-label.failed { color: #f85149; }
+  @keyframes phase-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
   }
   table {
     width: 100%;
@@ -1377,6 +1474,71 @@ _PAGE_HEAD = r"""<!doctype html>
     white-space: nowrap;
   }
   main.has-footer { padding-bottom: 72px; }
+  /* Mobile / narrow-viewport pass (dashboard --mobile, phones over Tailscale or
+     LAN). The desktop job-row grid, nowrap cells, wide tables and the fixed
+     footer all overflow a phone: collapse the grid, let text wrap, and let wide
+     tables scroll horizontally instead of blowing out the viewport. */
+  @media (max-width: 640px) {
+    body { padding: 0; }
+    /* Collapse the desktop header into a thin app bar: the wrapping
+       "updated …" timestamp and raw job-id add a wasted top band on a phone.
+       Drop the noise and shrink the brand so the job list owns the screen. */
+    header { flex-wrap: wrap; gap: 8px; padding: 8px 12px; box-shadow: none; }
+    header h1 { font-size: 15px; }
+    #updated, #jobid { display: none; }
+    .home-link { padding: 4px 8px; font-size: 12px; }
+    /* Full-bleed content: cards run edge-to-edge like a native mobile list
+       instead of floating in a centered, padded desktop column. */
+    main { padding: 10px 10px 0; max-width: none; }
+    .goal { font-size: 15px; }
+    /* minmax(0,1fr) is load-bearing: a bare "1fr" is minmax(auto,1fr), whose
+       auto min is min-content, so nested flex/nowrap content (the goal line,
+       routing cards, phase strip) forced the single column ~810px wide -- 2x the
+       phone -- and the page scrolled sideways, clipping every right-edge
+       cost/pill. minmax(0,1fr) lets the track shrink to the viewport so content
+       wraps inside instead of overflowing. */
+    .grid { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+    html, body { overflow-x: hidden; }
+    /* Mobile job rows read as tidy stacked cards: status pill + time share the
+       top line, then the headline and the (truncated) job id line up flush-left
+       beneath -- so a long job hash can't stretch the row or knock the columns
+       out of alignment. */
+    .job-row {
+      grid-template-columns: 1fr auto;
+      grid-template-areas:
+        "pill time"
+        "head head"
+        "id   id";
+      gap: 6px 10px;
+      padding: 14px 16px;
+      align-items: center;
+    }
+    .job-row .pill { grid-area: pill; justify-self: start; }
+    .job-time { grid-area: time; justify-self: end; }
+    .job-headline { grid-area: head; white-space: normal; }
+    .job-id-tag {
+      grid-area: id;
+      justify-self: start;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    table { display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    .job-footer { padding: 10px 14px; font-size: 11px; gap: 10px; flex-wrap: wrap; }
+    .job-footer-totals { gap: 10px; }
+    main.has-footer { padding-bottom: 104px; }
+    .phase-strip { gap: 8px; }
+    .phase-label { font-size: 10px; }
+    /* Let the job view's routing + phase boxes shrink below their content
+       width, so nothing forces the single column wider than the phone; wrap
+       long model tokens instead of pushing the layout sideways. */
+    .phase-strip, .routing-rollup, .routing-card, .routing-card-head,
+    .routing-role, .routing-summary {
+      min-width: 0;
+      max-width: 100%;
+    }
+    .routing-role, .routing-summary { overflow-wrap: anywhere; }
+  }
 </style>
 </head>
 <body>
@@ -1406,6 +1568,12 @@ _PAGE_HEAD = r"""<!doctype html>
 _PAGE_APP_JS = r"""
 const qs = new URLSearchParams(location.search);
 let jobId = qs.get("job");
+const viewParam = qs.get("view");
+// Two views: the Jobs index (default) and a single job's detail (?job=<id>).
+// ?view=jobs forces the index even when a stale job id lingers in the URL.
+let activeView = viewParam === "jobs" ? "jobs"
+  : jobId ? "job"
+  : "jobs";
 let expandedTasks = new Set();
 let expandedGoals = new Set();
 let expandedSections = new Set();
@@ -1415,10 +1583,6 @@ let lastContent = "";
 
 function pill(s) {
   return `<span class="pill s-${esc(s)}">${esc(s)}</span>`;
-}
-
-function jobHeadline(j) {
-  return j.label || j.title || j.id;
 }
 
 function truncateGoal(goal, maxChars = 120) {
@@ -1648,7 +1812,7 @@ window.toggleAlts = function(taskId) {
   } else {
     expandedAlts.add(taskId);
   }
-  loadJob();
+  rerenderActive();
 };
 
 window.setTaskFilter = function(filter) {
@@ -1773,7 +1937,7 @@ async function loadJob() {
   const queuedTasks = prog.queued || 0;
   const progressPct = totalTasks > 0 ? (completeTasks / totalTasks * 100) : 0;
 
-  html += `<div class="card"><h2>Swarm Tracker</h2>
+  html += `<div class="card"><h2>Swarm Overview</h2>
     <div class="swarm-hero">
       <div class="swarm-hero-top">
         <span class="swarm-title" title="${esc(d.job.goal)}">${esc(headline)}</span>
@@ -1792,6 +1956,7 @@ async function loadJob() {
     </div>
     <div class="progress-bar"><div class="progress-fill" style="width: ${progressPct}%"></div></div>
     <div class="progress-text">${completeTasks} / ${totalTasks} complete</div>
+    ${phaseStrip(d.phase)}
     <h3 class="swarm-subhead">Routing</h3>
     ${renderRoutingRollup(d.routing_rollup || [])}
   </div>`;
@@ -1865,10 +2030,20 @@ async function loadJob() {
   }
 }
 
-async function tick() {
-  try { if (jobId) await loadJob(); else await loadIndex(); }
-  catch (e) { /* keep polling; transient during writes */ }
+// Re-render whichever view is live -- used by shared toggles (e.g. routing
+// alternatives) that the job view reuses.
+function rerenderActive() {
+  if (activeView === "job") loadJob();
+  else loadIndex();
 }
+
+async function tick() {
+  try {
+    if (activeView === "job") await loadJob();
+    else await loadIndex();
+  } catch (e) { /* keep polling; transient during writes */ }
+}
+
 tick();
 setInterval(tick, 1500);
 </script>
@@ -1943,6 +2118,258 @@ def make_handler(store_factory: Callable[[], SwarmStore], *, all_projects: bool 
 
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", ""})
+
+
+def _tailscale_binary() -> Optional[str]:
+    """Locate the tailscale CLI, including the macOS GUI-app path.
+
+    The Mac App Store / standalone Tailscale.app ships its CLI *inside the app
+    bundle* and never adds it to PATH, so a plain ``shutil.which`` misses it —
+    which silently demotes ``--mobile`` to a same-network-only LAN address.
+    """
+    import shutil
+
+    found = shutil.which("tailscale")
+    if found:
+        return found
+    for candidate in (
+        "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+        "/usr/local/bin/tailscale",
+        "/opt/homebrew/bin/tailscale",
+    ):
+        if os.path.exists(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _detect_tailscale_ip() -> Optional[str]:
+    """Return this host's Tailscale IPv4, or None if Tailscale isn't up.
+
+    Tailscale is the blessed remote path: a stable 100.x address reachable from
+    your phone anywhere, without exposing the board to the public internet.
+    """
+    import subprocess
+
+    binary = _tailscale_binary()
+    if binary is None:
+        return None
+    try:
+        result = subprocess.run(
+            [binary, "ip", "-4"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        candidate = line.strip()
+        if candidate:
+            return candidate
+    return None
+
+
+def _detect_lan_ip() -> Optional[str]:
+    """Best-effort primary LAN IPv4 for this host.
+
+    Opens a UDP socket toward a public address only so the OS picks the outbound
+    interface — no packet is sent — then reads back the local address it bound.
+    Returns None on an isolated host (or when only loopback is available).
+    """
+    import socket
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("8.8.8.8", 80))
+        ip = sock.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        sock.close()
+    if not ip or ip.startswith("127."):
+        return None
+    return ip
+
+
+def resolve_mobile_host() -> "tuple[Optional[str], str]":
+    """Pick the best phone-reachable bind address, preferring Tailscale.
+
+    Returns ``(ip, source)`` where ``source`` is ``"tailscale"`` or ``"lan"``,
+    or ``(None, "none")`` when neither is available.
+    """
+    ip = _detect_tailscale_ip()
+    if ip:
+        return ip, "tailscale"
+    ip = _detect_lan_ip()
+    if ip:
+        return ip, "lan"
+    return None, "none"
+
+
+def qr_ascii(url: str) -> Optional[str]:
+    """Return a scannable ASCII-art QR of ``url``, or None if 'qrcode' is absent."""
+    try:
+        import qrcode  # optional; not a hard dependency
+    except ImportError:
+        return None
+    try:
+        import io
+
+        code = qrcode.QRCode(border=1)
+        code.add_data(url)
+        code.make(fit=True)
+        buffer = io.StringIO()
+        code.print_ascii(out=buffer, invert=True)
+        return buffer.getvalue()
+    except Exception:
+        return None
+
+
+def write_qr_png(url: str, path: Union[Path, str]) -> bool:
+    """Write a scannable PNG QR of ``url`` to ``path``.
+
+    Returns False when the optional ``qrcode`` package (or its Pillow backend,
+    needed for PNG) is unavailable — callers fall back to the ASCII QR or the
+    bare URL. An image is what lets the agent embed the code inline in chat.
+    """
+    try:
+        import qrcode  # optional; not a hard dependency
+    except ImportError:
+        return False
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        qrcode.make(url).save(str(path))
+        return True
+    except Exception:
+        # Pillow missing (no PNG backend) or any render failure.
+        return False
+
+
+def _print_qr(url: str) -> None:
+    """Render a scannable QR of the URL, if the optional 'qrcode' package is present."""
+    ascii_art = qr_ascii(url)
+    if ascii_art is None:
+        print("     (--qr needs the QR extra: pip install 'puppetmaster-ai[mobile]')")
+        return
+    print(ascii_art)
+
+
+def print_mobile_banner(
+    host: str,
+    port: int,
+    source: str,
+    *,
+    job_id: Optional[str] = None,
+    qr: bool = False,
+) -> None:
+    """Print the phone URL (and an optional QR) with a one-line security note."""
+    url = f"http://{host}:{port}/" + (f"?job={job_id}" if job_id else "")
+    where = "Tailscale" if source == "tailscale" else "LAN"
+    print("")
+    print(f"  Open on your phone ({where}):")
+    print(f"     {url}")
+    if source == "lan":
+        print("     (phone must share this network; Tailscale reaches it from anywhere)")
+    print("     Unauthenticated + read-only — keep it to trusted networks.")
+    if qr:
+        _print_qr(url)
+    print("")
+
+
+# ---------------------------------------------------------------------------
+# Background ("just runs like the backend") lifecycle
+#
+# The pilot should be able to start the phone-reachable board once, hand back a
+# link/QR, and walk away — no second terminal held open. A detached child does
+# the serving; a small JSON runfile in the state dir records it so we can report
+# status and stop it later without hunting for the process.
+# ---------------------------------------------------------------------------
+
+_RUNFILE_NAME = "dashboard.run.json"
+
+
+def dashboard_runfile(state_dir: Union[Path, str]) -> Path:
+    """Path of the marker that tracks a detached background dashboard."""
+    return Path(state_dir) / _RUNFILE_NAME
+
+
+def write_dashboard_runfile(state_dir: Union[Path, str], info: dict) -> None:
+    """Persist the background server's pid/host/port/url so it can be managed."""
+    path = dashboard_runfile(state_dir)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(info, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def read_dashboard_runfile(state_dir: Union[Path, str]) -> Optional[dict]:
+    """Read the background dashboard marker, or None when absent/corrupt."""
+    try:
+        return json.loads(dashboard_runfile(state_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def clear_dashboard_runfile(state_dir: Union[Path, str]) -> None:
+    """Remove the background dashboard marker (best effort)."""
+    try:
+        dashboard_runfile(state_dir).unlink()
+    except OSError:
+        pass
+
+
+def pid_alive(pid: int) -> bool:
+    """True when ``pid`` names a live process this user can signal."""
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def dashboard_alive(host: str = "127.0.0.1", port: int = 8787, *, timeout: float = 1.0) -> bool:
+    """True when a dashboard already answers on ``host:port``."""
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/api/jobs", timeout=timeout) as response:
+            return response.status == 200
+    except OSError:
+        return False
+
+
+def stop_background_dashboard(state_dir: Union[Path, str]) -> dict:
+    """Stop the detached background dashboard recorded for ``state_dir``.
+
+    Idempotent: a missing or stale runfile is reported as "nothing to stop"
+    rather than an error, so the pilot can call it defensively.
+    """
+    import signal
+
+    info = read_dashboard_runfile(state_dir)
+    if not info:
+        return {"stopped": False, "reason": "no background dashboard is tracked here"}
+
+    pid = int(info.get("pid") or 0)
+    result: dict = {"stopped": False, "pid": pid, "url": info.get("url")}
+    if pid_alive(pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+            result["stopped"] = True
+        except OSError as exc:
+            result["reason"] = f"could not signal pid {pid}: {exc}"
+    else:
+        result["stopped"] = True
+        result["reason"] = "process was not running (cleared stale runfile)"
+    clear_dashboard_runfile(state_dir)
+    return result
 
 
 def serve(
