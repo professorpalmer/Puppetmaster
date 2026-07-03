@@ -204,6 +204,53 @@ class AgenticToolTests(unittest.TestCase):
         )
         self.assertIn("not available", out)
 
+    def test_edit_file_replace_all(self) -> None:
+        (self.cwd / "dup.py").write_text("x\nx\n", encoding="utf-8")
+        out = self.adapter._execute_tool(
+            "edit_file",
+            {"path": "dup.py", "old_string": "x", "new_string": "y", "replace_all": True},
+            self.cwd, True, _task(),
+        )
+        self.assertIn("2 replacements", out)
+        self.assertEqual((self.cwd / "dup.py").read_text(), "y\ny\n")
+
+    def test_delete_file(self) -> None:
+        (self.cwd / "gone.py").write_text("bye", encoding="utf-8")
+        out = self.adapter._execute_tool(
+            "delete_file", {"path": "gone.py"}, self.cwd, True, _task()
+        )
+        self.assertIn("deleted", out)
+        self.assertFalse((self.cwd / "gone.py").exists())
+
+    def test_delete_file_unavailable_in_analyze_mode(self) -> None:
+        (self.cwd / "keep.py").write_text("stay", encoding="utf-8")
+        out = self.adapter._execute_tool(
+            "delete_file", {"path": "keep.py"}, self.cwd, False, _task()
+        )
+        self.assertIn("not available", out)
+        self.assertTrue((self.cwd / "keep.py").exists())
+
+    def test_run_terminal_refuses_destructive_command(self) -> None:
+        out = self.adapter._execute_tool(
+            "run_terminal", {"command": "rm -rf /"}, self.cwd, True,
+            _task(payload={"allow_terminal": True}),
+        )
+        self.assertIn("destructive", out)
+
+    def test_run_terminal_allows_benign_command(self) -> None:
+        out = self.adapter._execute_tool(
+            "run_terminal", {"command": "echo hello"}, self.cwd, True,
+            _task(payload={"allow_terminal": True}),
+        )
+        self.assertIn("hello", out)
+
+    def test_binary_write_refused(self) -> None:
+        out = self.adapter._execute_tool(
+            "write_file", {"path": "b.bin", "content": "a\x00b"}, self.cwd, True, _task()
+        )
+        self.assertIn("NUL", out)
+        self.assertFalse((self.cwd / "b.bin").exists())
+
 
 class AgenticLoopTests(unittest.TestCase):
     def test_analyze_loop_feeds_tool_results_then_parses_artifacts(self) -> None:
@@ -265,13 +312,129 @@ class AgenticLoopTests(unittest.TestCase):
         self.assertEqual(len(arts), 1)
         self.assertEqual(arts[0].payload["result"], "failed")
 
+    def test_analyze_json_only_retry_recovers_a_prose_run(self) -> None:
+        from puppetmaster.adapters import agentic
+        from puppetmaster.providers import AssistantTurn
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cwd = Path(tmp.name)
+
+        turns = [
+            AssistantTurn(text="Here is a prose answer, not JSON.", tool_calls=[],
+                          usage={"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}),
+            AssistantTurn(
+                text=json.dumps({"artifacts": [{"type": "finding", "claim": "x", "confidence": 0.8, "evidence": ["a.py"]}]}),
+                tool_calls=[], usage={"prompt_tokens": 6, "completion_tokens": 3, "total_tokens": 9},
+            ),
+        ]
+        seen = []
+
+        def fake_chat(*, provider, model, messages, tools, extra, timeout):
+            seen.append(list(messages))
+            return turns[len(seen) - 1]
+
+        task = Task(
+            job_id="j", role="explore", instruction="analyze",
+            payload={"cwd": str(cwd), "provider": "anthropic", "model": "m", "disable_codegraph": True},
+        )
+        with mock.patch.object(agentic, "provider_chat", side_effect=fake_chat):
+            arts = self.adapter().run(task, task.instruction, "w1")
+
+        # The second call must carry the JSON-only retry directive.
+        self.assertTrue(any("single JSON object" in str(m) for m in seen[1]))
+        verif = next(a for a in arts if a.type == ArtifactType.VERIFICATION)
+        self.assertEqual(verif.payload["result"], "passed")
+        self.assertIn("retry:recovered", verif.evidence)
+        self.assertIn(ArtifactType.FINDING, [a.type for a in arts])
+
+    def test_implement_noop_is_degraded_and_nudged(self) -> None:
+        from puppetmaster.adapters import agentic
+        from puppetmaster.providers import AssistantTurn
+
+        cwd = _git_repo(self)
+        turns = [
+            AssistantTurn(text="I would change foo.py.", tool_calls=[],
+                          usage={"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}),
+            AssistantTurn(text="Still just describing, no edits.", tool_calls=[],
+                          usage={"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}),
+        ]
+        seen = []
+
+        def fake_chat(*, provider, model, messages, tools, extra, timeout):
+            seen.append(list(messages))
+            return turns[min(len(seen) - 1, len(turns) - 1)]
+
+        task = Task(
+            job_id="j", role="build", instruction="implement a thing",
+            payload={"cwd": str(cwd), "provider": "anthropic", "model": "m",
+                     "mode": "implement", "disable_codegraph": True},
+        )
+        with mock.patch.object(agentic, "provider_chat", side_effect=fake_chat):
+            arts = self.adapter().run(task, task.instruction, "w1")
+
+        verif = next(a for a in arts if a.type == ArtifactType.VERIFICATION)
+        self.assertEqual(verif.payload["result"], "degraded")
+        self.assertIn("nudge:applied", verif.evidence)
+        self.assertTrue(any(a.type == ArtifactType.RISK for a in arts))
+        # The nudge message must have been injected on the second turn.
+        self.assertTrue(any("without changing any files" in str(m) for m in seen[1]))
+
+    def test_implement_writes_file_passes_and_emits_patch(self) -> None:
+        from puppetmaster.adapters import agentic
+        from puppetmaster.providers import AssistantTurn
+
+        cwd = _git_repo(self)
+        turns = [
+            AssistantTurn(
+                text="", tool_calls=[{"id": "c1", "name": "write_file",
+                                      "arguments": {"path": "new.py", "content": "print('hi')\n"}}],
+                usage={"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
+            ),
+            AssistantTurn(text="Added new.py with a hello print.", tool_calls=[],
+                          usage={"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7}),
+        ]
+        seen = []
+
+        def fake_chat(*, provider, model, messages, tools, extra, timeout):
+            seen.append(1)
+            return turns[len(seen) - 1]
+
+        task = Task(
+            job_id="j", role="build", instruction="add new.py",
+            payload={"cwd": str(cwd), "provider": "anthropic", "model": "m",
+                     "mode": "implement", "disable_codegraph": True},
+        )
+        with mock.patch.object(agentic, "provider_chat", side_effect=fake_chat):
+            arts = self.adapter().run(task, task.instruction, "w1")
+
+        verif = next(a for a in arts if a.type == ArtifactType.VERIFICATION)
+        self.assertEqual(verif.payload["result"], "passed")
+        self.assertTrue(verif.payload["has_work"])
+        self.assertTrue(any(a.type == ArtifactType.PATCH for a in arts))
+        self.assertTrue((cwd / "new.py").exists())
+
     def adapter(self):
         from puppetmaster.adapters.agentic import AgenticAdapter
         return AgenticAdapter()
 
 
-def _task() -> Task:
-    return Task(job_id="j", role="explore", instruction="i", payload={})
+def _git_repo(test) -> Path:
+    tmp = tempfile.TemporaryDirectory()
+    test.addCleanup(tmp.cleanup)
+    cwd = Path(tmp.name)
+    env = {**__import__("os").environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    for args in (["init"], ["add", "-A"], ["commit", "-m", "init", "--allow-empty"]):
+        subprocess.run(["git", *args], cwd=str(cwd), env=env, capture_output=True, check=False)
+    (cwd / "seed.py").write_text("seed = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=str(cwd), env=env, capture_output=True, check=False)
+    subprocess.run(["git", "commit", "-m", "seed"], cwd=str(cwd), env=env, capture_output=True, check=False)
+    return cwd
+
+
+def _task(payload: dict = None) -> Task:
+    return Task(job_id="j", role="explore", instruction="i", payload=payload or {})
 
 
 if __name__ == "__main__":

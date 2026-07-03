@@ -1,5 +1,22 @@
 # Changelog
 
+## v1.0.0
+
+**The `agentic` adapter graduates from a keys-only floor into a legitimate provider-native worker harness — the engine Marionette rides on.** The standalone in-process tool loop (its own `provider_chat` loop against any provider key, no external CLI) was deliberately conservative: 12 turns, `os.walk` grep, opt-in terminal, and — critically — an implement run that changed nothing still reported `passed`, so a no-op could masquerade as success. This release lifts the worker-grade patterns from the Hermes agent core (as patterns, not vendored code) and closes that gap, so the loop is strong enough to power a standalone harness ("providers, not platforms") instead of only serving as a fallback.
+
+This is also the semver **1.0.0** cutover: the `0.9.x` line (through `0.9.102`) used the patch field as a running build counter and predates the policy in [`docs/RELEASE_CHECKLIST.md`](RELEASE_CHECKLIST.md); every bump from here carries semver meaning.
+
+- **No-op is now `degraded`, never `passed`.** An implement run that produces no attributable git diff is reported `degraded` with a `RISK` artifact (`failure=no_diff_produced`) — the exact "returned in ~1s with no diff" failure can no longer read as a successful implementation.
+- **Single no-op nudge.** When the model stops having changed nothing, it is re-prompted once to actually implement (or to explicitly cite the code that already satisfies the task) before the run is closed out (`nudge:applied`). Gated by `payload.noop_nudge` (default on).
+- **JSON-only retry on analyze** (lifted from the Hermes adapter): a clean run that returned prose the parser couldn't structure gets one stricter reprompt before being accepted as degraded (`retry:recovered` / `retry:exhausted`). Gated by `payload.analyze_retry` (default on).
+- **Mode-aware budget governor.** Analyze stays tight (14 turns / 300s); implement gets a real envelope (50 turns / 900s) so non-trivial edits aren't forced into a no-op. New optional cumulative `payload.token_budget`. Every run stamps a `stop_reason` (`model_stopped` / `max_turns` / `token_budget`).
+- **CodeGraph in the loop.** New `graph_search` (symbol index) and `graph_context` (task-scoped subgraph) tools, registered only when the repo is graphed — so the worker explores the symbol graph, not just a substring scan. `search_code` stays for plain-text matches.
+- **Richer, safer edit vocabulary.** New `delete_file`; `edit_file` gains `replace_all` and near-miss diagnostics so a failed exact match self-corrects instead of dead-ending.
+- **Headless guardrails lifted from Hermes.** `run_terminal` is on by default in implement mode for self-verification (opt out with `payload.allow_terminal=false`) but refuses an unambiguously destructive command via a conservative denylist (`rm -rf /`, fork bombs, `mkfs`, `dd of=/dev/…`, `git push --force`, `sudo`, pipe-to-shell). Filesystem tools gain binary-read/write protection alongside the existing symlink-escape confinement, and a latent `relative_to` bug on symlinked temp roots is fixed.
+- **Skills + report parity.** The adapter now injects orchestrator-selected skills (`prompt_with_skills`) and parses implement-mode final reports via `implement_report_artifacts`, matching the CLI adapters.
+- **Docs.** `docs/ADAPTERS.md` agentic section rewritten to reflect the modes, tools, guardrails, and per-task knobs (`max_turns`, `timeout_seconds`, `token_budget`, `allow_terminal`, `allow_web`, `analyze_retry`, `noop_nudge`).
+- Full suites green: **`test_puppetmaster.py` 1037 passed**, **`test_agentic_standalone.py` 27 passed** (10 new: JSON-retry recovery, no-op degrade + nudge, write→pass+PATCH, `delete_file` (+analyze gating), `edit_file` `replace_all`, destructive-command refusal, benign-command allow, binary-write refusal).
+
 ## v0.9.102
 
 **Watch your swarms from your phone with near-zero setup — the dashboard now runs as a detached background service and hands you a scannable QR, and the mobile UI is a clean, phone-shaped board.** Getting the board onto a phone previously meant holding a foreground terminal open and eyeballing a URL; and the Marionette-style "Swarm Tracker" hero (v0.9.100) turned out to be redundant with the jobs index + job detail. This release makes the phone path the easy path and simplifies the UI to match.

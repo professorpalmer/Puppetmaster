@@ -214,10 +214,12 @@ Runs Puppetmaster's **standalone, provider-agnostic worker**: an in-process tool
 
 Two modes share one loop:
 
-* **analyze** (read-only): read/search the tree, emit the same finding/risk/decision artifacts as other adapters.
-* **implement** (full-edit): additionally gets `write_file` / `edit_file` (and opt-in `run_terminal` / `web_fetch`), with git-diff PATCH attribution through the same machinery as the CLI adapters.
+* **analyze** (read-only): read/search the tree — including `graph_search` / `graph_context` over the CodeGraph symbol index when the repo is graphed — and emit the same finding/risk/decision artifacts as other adapters. A clean run that returns unstructured prose gets one stricter JSON-only reprompt before it is accepted as degraded (`retry:recovered` / `retry:exhausted` evidence).
+* **implement** (full-edit): additionally gets `write_file` / `edit_file` (with `replace_all`) / `delete_file` and a self-verify `run_terminal` (on by default in implement mode; opt out with `payload.allow_terminal=false`), plus opt-in `web_fetch`. Git-diff PATCH attribution runs through the same machinery as the CLI adapters. A run that stops without touching a file is nudged once to actually implement, and is reported **`degraded`** (never `passed`) when it still produces no diff — so a no-op can't masquerade as success.
 
-**Portable floor, not ceiling.** The loop is deliberately conservative: bounded turns (default 12), basic filesystem tools, terminal/web opt-in, cwd-confined paths. It is newer and less battle-tested than mature vendor CLIs — prefer those when you need their full tool surface; reach for `agentic` when you want keys-only portability or a host with no external CLI installed.
+**Worker-grade guardrails (lifted from the Hermes agent core).** Because a headless worker has no human to confirm, the loop bounds itself and defends the tree: a budget governor caps turns (analyze 14 / implement 50 by default), wall time (300s / 900s), and an optional cumulative `payload.token_budget`; filesystem tools are `cwd`-confined with symlink-escape and binary-read/write protection; and `run_terminal` refuses an unambiguously destructive command (e.g. `rm -rf /`, fork bombs, `mkfs`, `dd of=/dev/…`, `git push --force`, pipe-to-shell) via a conservative denylist. This is the provider-native worker that can power a standalone harness ("providers, not platforms"), not a keys-only toy — but it is still newer than the mature vendor CLIs, so prefer those when you want their full tool surface, and reach for `agentic` for keys-only portability or a host with no external CLI installed.
+
+Per-task budget/behavior knobs: `max_turns`, `timeout_seconds`, `token_budget`, `allow_terminal`, `allow_web`, `analyze_retry` (default on), `noop_nudge` (default on).
 
 Requirements:
 

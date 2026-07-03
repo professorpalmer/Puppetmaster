@@ -258,7 +258,7 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
 # Map an adapter to the discovery-meta source key (and the `models discover
 # --source` name). Kept distinct from the adapter id so `claude-code` reads as
 # `claude` on the CLI / in the sidecar, matching the existing `anthropic` style.
-ADAPTER_TO_SOURCE = {"agentic": "agentic", "claude-code": "claude", "codex": "codex"}
+ADAPTER_TO_SOURCE = {"claude-code": "claude", "codex": "codex"}
 SOURCE_TO_ADAPTER = {v: k for k, v in ADAPTER_TO_SOURCE.items()}
 
 

@@ -91,6 +91,16 @@ _ANALYZE_JSON_ONLY_RETRY = (
 )
 
 
+_IMPLEMENT_NOOP_NUDGE = (
+    "You ended the turn without changing any files. Your job is to IMPLEMENT the "
+    "task, not describe it — actually create, edit, or delete files now with your "
+    "write_file / edit_file / delete_file tools, then run any focused checks you "
+    "can to verify the change. If the task is genuinely already satisfied by the "
+    "current code, do not invent an edit: say so explicitly and cite the exact "
+    "file and lines that already satisfy it."
+)
+
+
 def with_repo_census(prompt: str, cwd: Union[Path, str, None]) -> str:
     """Append an authoritative repo file census so a worker can't hallucinate
     an empty repository.
