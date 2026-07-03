@@ -71,6 +71,7 @@ from ._base import (
 )
 from ._context_budget import compress_history
 from ._delta_bus import delta_sink_for
+from ._delta_stream import DurableDeltaWriter
 from ._facade import facade
 from ._prompts import (
     _ANALYZE_JSON_ONLY_RETRY,
@@ -93,9 +94,11 @@ from .cursor import (
 
 # Budget governor defaults, mode-aware: implementation is a long-horizon task
 # and 12 turns / 5 minutes forces a no-op on anything non-trivial, so it gets a
-# far larger envelope than a read-only analysis pass.
-DEFAULT_ANALYZE_MAX_TURNS = 14
-DEFAULT_IMPLEMENT_MAX_TURNS = 50
+# far larger envelope than a read-only analysis pass. The envelope also has to
+# absorb plan-tool turns and verify-before-submit fix iterations without
+# starving the actual work, so implement runs a generous turn budget.
+DEFAULT_ANALYZE_MAX_TURNS = 16
+DEFAULT_IMPLEMENT_MAX_TURNS = 64
 DEFAULT_ANALYZE_TIMEOUT_SECONDS = 300
 DEFAULT_IMPLEMENT_TIMEOUT_SECONDS = 900
 
@@ -112,6 +115,17 @@ _RETRYABLE_PROVIDER_REASONS = frozenset({"timeout", "network_error", "malformed_
 # empty-response nudge or the length-continuation retry.
 _MAX_EMPTY_RECOVERIES = 1
 _MAX_LENGTH_CONTINUATIONS = 3
+
+# Verify-before-submit loop (Codex/Claude-Code parity): before accepting an
+# implement worker's submit_report, run the project's verification command
+# (tests / typecheck / lint) and, on failure, feed the output back so the model
+# fixes its own regression before finishing -- an edit that doesn't pass the
+# checks is not a done edit. Bounded so a stubborn failure can't loop forever.
+# A baseline run on the clean tree separates a regression the change introduced
+# (gating: block on it) from a suite that was already red (advisory: report it,
+# never fail an otherwise-legitimate diff over pre-existing breakage).
+DEFAULT_VERIFY_MAX_RETRIES = 2
+_VERIFY_TIMEOUT_SECONDS = 300
 
 # Prompt-token budget before older tool outputs are elided (Hermes-style live
 # compression). Conservative default that fits common 128k-window models; the
@@ -140,6 +154,12 @@ _MUTATING_TOOLS = frozenset({"write_file", "edit_file", "delete_file"})
 _SUBMIT_FINDINGS_TOOL = "submit_findings"
 _SUBMIT_REPORT_TOOL = "submit_report"
 _SUBMIT_TOOLS = frozenset({_SUBMIT_FINDINGS_TOOL, _SUBMIT_REPORT_TOOL})
+
+# Plan/TODO tool (Codex/Claude-Code parity): a non-terminal tool the model calls
+# to record and update its step-by-step plan. It keeps a long, multi-step run
+# organized and gives the host a visible task list, without touching the repo.
+_PLAN_TOOL = "update_plan"
+_PLAN_STATUSES = ("pending", "in_progress", "done")
 
 # Headless destructive-command denylist (guardrail SHAPE lifted from Hermes'
 # tool_guardrails): there is no human to confirm a worker's shell command, so a
@@ -275,11 +295,17 @@ class AgenticAdapter(FullEditWorkerAdapter):
             state["attempted"] = True
             return _ANALYZE_JSON_ONLY_RETRY
 
+        plan_holder: dict = {"steps": []}
+
+        def _on_plan(steps: list) -> None:
+            plan_holder["steps"] = steps
+
         primary_provider, primary_model = provider, model
         try:
             loop, provider, model = self._run_loop_with_failover(
                 task=task, cwd=cwd, prompt=prompt, tools=tools, implement=False,
-                on_stop=_on_stop, worker_id=worker_id, provider=provider, model=model,
+                on_stop=_on_stop, on_plan=_on_plan,
+                worker_id=worker_id, provider=provider, model=model,
             )
         except ProviderError as exc:
             return [self._fail(task, worker_id, evidence_base, exc.reason,
@@ -315,6 +341,8 @@ class AgenticAdapter(FullEditWorkerAdapter):
             evidence.append("retry:recovered")
         elif state["attempted"]:
             evidence.append("retry:exhausted")
+        if plan_holder["steps"]:
+            evidence.append(f"plan:{len(plan_holder['steps'])}")
         artifacts: list[Artifact] = [
             verification_artifact(
                 task=task, worker_id=worker_id, adapter="agentic",
@@ -341,6 +369,9 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 },
             ))
         artifacts.extend(parsed)
+        plan_artifact = self._plan_artifact(task, worker_id, plan_holder["steps"])
+        if plan_artifact is not None:
+            artifacts.append(plan_artifact)
         return artifacts
 
     # --- implement mode ----------------------------------------------------
@@ -382,11 +413,56 @@ class AgenticAdapter(FullEditWorkerAdapter):
             nudged["done"] = True
             return _IMPLEMENT_NOOP_NUDGE
 
+        # Verify-before-submit: resolve the repo's verification command and, when
+        # present, capture a clean-tree baseline so a suite that was already red
+        # can't be blamed on this change (gating vs advisory). The _on_submit
+        # hook runs the command each time the model calls submit_report and, in
+        # gating mode, bounces failures back for a bounded number of fixes.
+        verify_command = self._resolve_verify_command(task, cwd)
+        verify_retries = int(task.payload.get("verify_retries", DEFAULT_VERIFY_MAX_RETRIES))
+        verify_state = {
+            "command": verify_command, "attempts": 0,
+            "passed": None, "output": "", "mode": "skipped",
+        }
+        if verify_command:
+            if bool(task.payload.get("verify_baseline", True)):
+                baseline_ok, _baseline_out = self._run_verification(cwd, verify_command)
+                verify_state["mode"] = "gating" if baseline_ok else "advisory"
+            else:
+                verify_state["mode"] = "gating"
+
+        def _on_submit(report_text: str) -> Optional[str]:
+            """Gate submit_report on verification. Return rejection feedback to
+            bounce the model back for another fix, or None to accept and finish.
+            """
+            if not verify_command:
+                return None
+            ok, output = self._run_verification(cwd, verify_command)
+            verify_state["attempts"] += 1
+            verify_state["passed"] = ok
+            verify_state["output"] = output
+            if ok or verify_state["mode"] == "advisory":
+                return None
+            if verify_state["attempts"] > verify_retries:
+                return None  # budget exhausted -- accept, but stamp verify:failed
+            return (
+                "Your change does not pass verification. The command "
+                f"`{verify_command}` failed:\n\n{_truncate(output, _TOOL_OUTPUT_LIMIT)}\n\n"
+                "Fix the cause of the failure, then call submit_report again. "
+                "Do not call submit_report until the command passes."
+            )
+
+        plan_holder: dict = {"steps": []}
+
+        def _on_plan(steps: list) -> None:
+            plan_holder["steps"] = steps
+
         primary_provider, primary_model = provider, model
         try:
             loop, provider, model = self._run_loop_with_failover(
                 task=task, cwd=cwd, prompt=prompt, tools=tools, implement=True,
-                on_stop=_on_stop, worker_id=worker_id, provider=provider, model=model,
+                on_stop=_on_stop, on_submit=_on_submit, on_plan=_on_plan,
+                worker_id=worker_id, provider=provider, model=model,
             )
         except ProviderError as exc:
             after = facade("git_snapshot")(cwd, base_tree=str(before.get("tree") or "") or None)
@@ -404,15 +480,26 @@ class AgenticAdapter(FullEditWorkerAdapter):
         final_text, usage, turns, mutated, stop_reason, _submitted = loop
         after = facade("git_snapshot")(cwd, base_tree=str(before.get("tree") or "") or None)
         has_work = _should_emit_patch_artifact(before, after)
-        # A run that produced no attributable diff is NOT a pass -- surface it as
-        # degraded so a no-op can never masquerade as a successful implementation.
-        degraded = not has_work
+        # A change that fails the repo's own verification (in gating mode) is not
+        # a clean pass -- an edit whose tests are red is a regression, not a done
+        # task. Surface it as degraded alongside the no-op case so neither a
+        # no-diff run nor a red-tests run can masquerade as a success.
+        verify_failed = verify_state["mode"] == "gating" and verify_state["passed"] is False
+        degraded = (not has_work) or verify_failed
         parsed = implement_report_artifacts(task, worker_id, final_text, adapter="agentic")
         evidence = evidence_base + [f"turns:{turns}", f"stop:{stop_reason}"]
         if (provider, model) != (primary_provider, primary_model):
             evidence.append("failover:used")
         if nudged["done"]:
             evidence.append("nudge:applied")
+        if plan_holder["steps"]:
+            evidence.append(f"plan:{len(plan_holder['steps'])}")
+        evidence.append(f"verify:{_verify_evidence_tag(verify_state)}")
+        failure = (
+            "no_diff_produced" if not has_work
+            else "verification_failed" if verify_failed
+            else None
+        )
         artifacts: list[Artifact] = [
             verification_artifact(
                 task=task, worker_id=worker_id, adapter="agentic",
@@ -426,12 +513,16 @@ class AgenticAdapter(FullEditWorkerAdapter):
                     "changed_files": after.get("changed_files", []),
                     "untracked_files": after.get("untracked_files", []),
                     **usage,
-                    "failure": "no_diff_produced" if degraded else None,
+                    "verification_command": verify_state["command"],
+                    "verification_mode": verify_state["mode"],
+                    "verification_passed": verify_state["passed"],
+                    "verification_attempts": verify_state["attempts"],
+                    "failure": failure,
                     "stdout": (final_text or "")[-_TOOL_OUTPUT_LIMIT:],
                 },
             )
         ]
-        if degraded:
+        if not has_work:
             artifacts.append(Artifact(
                 job_id=task.job_id, task_id=task.id, type=ArtifactType.RISK,
                 created_by=worker_id, confidence=0.85,
@@ -445,7 +536,29 @@ class AgenticAdapter(FullEditWorkerAdapter):
                     "stdout_excerpt": redact_secrets(final_text or "")[:2000],
                 },
             ))
+        elif verify_failed:
+            artifacts.append(Artifact(
+                job_id=task.job_id, task_id=task.id, type=ArtifactType.RISK,
+                created_by=worker_id, confidence=0.85,
+                evidence=["adapter:agentic", "result:verify-failed"],
+                payload={
+                    "risk": (
+                        "Agentic implement worker produced a diff that does not pass "
+                        f"verification (`{verify_state['command']}`)."
+                    ),
+                    "mitigation": (
+                        "Review the diff and the failing output before applying; rerun "
+                        "with a higher-capability model or a sharper task if needed."
+                    ),
+                    "verification_output_excerpt": redact_secrets(
+                        verify_state["output"] or ""
+                    )[-2000:],
+                },
+            ))
         artifacts.extend(parsed)
+        plan_artifact = self._plan_artifact(task, worker_id, plan_holder["steps"])
+        if plan_artifact is not None:
+            artifacts.append(plan_artifact)
         if has_work:
             artifacts.append(make_patch_artifact(
                 task, worker_id, before, after, adapter="agentic",
@@ -453,6 +566,28 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 sidecar_name="agentic_implement",
             ))
         return artifacts
+
+    @staticmethod
+    def _plan_artifact(
+        task: Task, worker_id: str, steps: list
+    ) -> "Optional[Artifact]":
+        """A DECISION artifact capturing the worker's final plan, so the host can
+        show the task list the model worked through. ``None`` when no plan was set.
+        """
+        if not steps:
+            return None
+        done = sum(1 for s in steps if isinstance(s, dict) and s.get("status") == "done")
+        return Artifact(
+            job_id=task.job_id, task_id=task.id, type=ArtifactType.DECISION,
+            created_by=worker_id, confidence=0.8,
+            evidence=["adapter:agentic", f"plan:{done}/{len(steps)}-done"],
+            payload={
+                "decision": f"Worker plan ({done}/{len(steps)} steps complete)",
+                "why": "Records the step-by-step plan the worker committed to via update_plan, so the host can audit the intended approach.",
+                "plan": steps,
+                "plan_rendered": _render_plan(steps),
+            },
+        )
 
     # --- the tool loop -----------------------------------------------------
 
@@ -512,6 +647,8 @@ class AgenticAdapter(FullEditWorkerAdapter):
         tools: list[dict], *, implement: bool,
         on_stop: Optional[Callable[[str, bool], Optional[str]]] = None,
         on_delta: Optional[Callable[[str, str], None]] = None,
+        on_submit: Optional[Callable[[str], Optional[str]]] = None,
+        on_plan: Optional[Callable[[list], None]] = None,
     ) -> tuple[str, dict, int, bool, str, Optional[list[dict]]]:
         """Run the provider tool-use loop until the model finishes.
 
@@ -632,7 +769,6 @@ class AgenticAdapter(FullEditWorkerAdapter):
             for call in turn.tool_calls:
                 name = call["name"]
                 if name in _SUBMIT_TOOLS:
-                    submitted_this_turn = True
                     if name == _SUBMIT_FINDINGS_TOOL:
                         items = _coerce_submit_findings(call.get("arguments"))
                         if submitted is None:
@@ -641,11 +777,31 @@ class AgenticAdapter(FullEditWorkerAdapter):
                         ack = f"Recorded {len(items)} artifact(s). Analysis complete."
                     else:  # submit_report
                         report = _coerce_submit_report(call.get("arguments"))
+                        # Gate the submission on verification when a hook is set:
+                        # a rejection is fed back as the tool result and the loop
+                        # keeps going so the model can fix and re-submit.
+                        rejection = on_submit(report) if on_submit else None
+                        if rejection is not None:
+                            messages.append({
+                                "role": "tool", "tool_call_id": call["id"],
+                                "content": _truncate(rejection, _TOOL_OUTPUT_LIMIT),
+                            })
+                            continue
                         if report:
                             final_text = report
                         ack = "Report recorded. Task complete."
+                    submitted_this_turn = True
                     messages.append({
                         "role": "tool", "tool_call_id": call["id"], "content": ack,
+                    })
+                    continue
+                if name == _PLAN_TOOL:
+                    steps = _coerce_plan_steps(call.get("arguments"))
+                    if on_plan is not None:
+                        on_plan(steps)
+                    messages.append({
+                        "role": "tool", "tool_call_id": call["id"],
+                        "content": "Plan updated.\n" + _render_plan(steps),
                     })
                     continue
                 output = self._execute_tool(name, call.get("arguments") or {}, cwd, implement, task)
@@ -689,6 +845,8 @@ class AgenticAdapter(FullEditWorkerAdapter):
         self, *, task: Task, cwd: Path, prompt: str, tools: list[dict],
         implement: bool, on_stop: Optional[Callable[[str, bool], Optional[str]]],
         worker_id: str, provider: str, model: str,
+        on_submit: Optional[Callable[[str], Optional[str]]] = None,
+        on_plan: Optional[Callable[[list], None]] = None,
     ) -> "tuple[tuple, str, str]":
         """Run the agent loop, failing over to each configured alternate on a
         hard :class:`ProviderError`. Returns ``(loop_result, used_provider,
@@ -699,19 +857,54 @@ class AgenticAdapter(FullEditWorkerAdapter):
         shaped tool-call history that the next provider can't parse).
         """
         last: Optional[ProviderError] = None
-        for target_provider, target_model in self._loop_targets(task, provider, model):
-            try:
-                loop = self._agent_loop(
-                    task, cwd, target_provider, target_model, prompt, tools,
-                    implement=implement, on_stop=on_stop,
-                    on_delta=delta_sink_for(worker_id),
-                )
-                return loop, target_provider, target_model
-            except ProviderError as exc:
-                last = exc
-                continue
-        assert last is not None
-        raise last
+        # Durable token stream: persist deltas to an NDJSON file under the job
+        # state dir so a subprocess/CLI/MCP follower can tail them live -- the
+        # streaming parity the in-process delta bus can only give inline hosts.
+        durable = (
+            DurableDeltaWriter.for_task(task, worker_id)
+            if bool(task.payload.get("stream_deltas", True)) else None
+        )
+        try:
+            for target_provider, target_model in self._loop_targets(task, provider, model):
+                try:
+                    loop = self._agent_loop(
+                        task, cwd, target_provider, target_model, prompt, tools,
+                        implement=implement, on_stop=on_stop, on_submit=on_submit,
+                        on_plan=on_plan,
+                        on_delta=self._compose_delta_sink(worker_id, durable),
+                    )
+                    return loop, target_provider, target_model
+                except ProviderError as exc:
+                    last = exc
+                    continue
+            assert last is not None
+            raise last
+        finally:
+            if durable is not None:
+                durable.close()
+
+    @staticmethod
+    def _compose_delta_sink(
+        worker_id: str, durable: "Optional[DurableDeltaWriter]"
+    ) -> "Optional[Callable[[str, str], None]]":
+        """Fan a run's token deltas to both the in-process bus (inline hosts) and
+        the durable NDJSON file (subprocess/CLI/MCP followers). Returns ``None``
+        when neither sink is active, so the loop keeps its non-streaming path.
+        """
+        inproc = delta_sink_for(worker_id)
+        if inproc is None and durable is None:
+            return None
+
+        def sink(kind: str, text: str) -> None:
+            if inproc is not None:
+                try:
+                    inproc(kind, text)
+                except Exception:  # noqa: BLE001 - a UI sink error must not sink the run
+                    pass
+            if durable is not None:
+                durable.emit(kind, text)
+
+        return sink
 
     def _tool_schema(self, *, implement: bool, task: Task, graph_on: bool = False) -> list[dict]:
         """OpenAI-format tool specs; provider_chat translates for Anthropic."""
@@ -765,6 +958,19 @@ class AgenticAdapter(FullEditWorkerAdapter):
         if bool(task.payload.get("allow_web", False)):
             tools.append(fn("web_fetch", "Fetch a URL and return its text content.",
                             {"url": {"type": "string"}}, ["url"]))
+        if bool(task.payload.get("plan_tool", True)):
+            tools.append(fn(
+                _PLAN_TOOL,
+                "Record or update your step-by-step plan for this task. Call it "
+                "once as you start on any multi-step work, then again to mark "
+                "steps in_progress/done as you go. Keeps a long run organized and "
+                "gives the user a live task list. It changes nothing in the repo.",
+                {"steps": {"type": "array", "description": "the ordered plan steps",
+                           "items": {"type": "object", "properties": {
+                               "step": {"type": "string"},
+                               "status": {"type": "string",
+                                          "description": "one of pending, in_progress, done"}}}}},
+                ["steps"]))
         tools.append(self._submit_tool(implement=implement, fn=fn))
         return tools
 
@@ -844,6 +1050,44 @@ class AgenticAdapter(FullEditWorkerAdapter):
         turns it off entirely for locked-down runs.
         """
         return bool(task.payload.get("allow_terminal", True))
+
+    def _resolve_verify_command(self, task: Task, cwd: Path) -> Optional[str]:
+        """The command that verifies an implement change (tests/typecheck/lint).
+
+        Resolution order: an explicit ``payload['verify_command']`` wins; a
+        falsey ``payload['verify']`` (``False`` / ``"off"`` / ``"none"``) disables
+        verification; otherwise, when ``verify`` is unset or ``"auto"``, detect a
+        standard command for the repo. Verification runs a shell command, so it
+        requires the terminal enabled -- a locked-down run has no verification.
+        """
+        if not self._terminal_enabled(task):
+            return None
+        explicit = task.payload.get("verify_command")
+        if explicit:
+            return str(explicit)
+        mode = task.payload.get("verify", "auto")
+        if mode in (False, "off", "none", "false", "0", 0):
+            return None
+        return _detect_verify_command(cwd)
+
+    def _run_verification(self, cwd: Path, command: str) -> "tuple[bool, str]":
+        """Run ``command`` in ``cwd`` (bounded + destructive-guarded). Returns
+        ``(passed, output)`` where ``passed`` is exit-code 0. Never raises: an
+        unrunnable command is reported as a failure with its cause as output."""
+        blocked = _destructive_command_match(command)
+        if blocked is not None:
+            return False, f"refused destructive verification command (matched {blocked})"
+        try:
+            proc = subprocess.run(
+                command, shell=True, cwd=str(cwd), capture_output=True,
+                text=True, timeout=_VERIFY_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            return False, f"verification timed out ({_VERIFY_TIMEOUT_SECONDS}s): {command}"
+        except Exception as exc:  # noqa: BLE001 - report, never crash the worker
+            return False, f"verification could not run: {type(exc).__name__}: {exc}"
+        out = (proc.stdout or "") + (("\n[stderr]\n" + proc.stderr) if proc.stderr else "")
+        return proc.returncode == 0, out
 
     def _execute_tool(
         self, name: str, args: dict, cwd: Path, implement: bool, task: Task
@@ -1096,6 +1340,58 @@ def _destructive_command_match(command: str) -> Optional[str]:
     return None
 
 
+def _detect_verify_command(cwd: Path) -> Optional[str]:
+    """Best-effort detection of a repo's verification command. Conservative --
+    returns a command only for clear, common signals, else ``None`` (so an
+    undetectable repo simply runs without verification rather than guessing).
+    """
+    try:
+        pkg = cwd / "package.json"
+        if pkg.is_file():
+            data = json.loads(pkg.read_text(encoding="utf-8"))
+            scripts = data.get("scripts") if isinstance(data, dict) else None
+            if isinstance(scripts, dict) and scripts.get("test"):
+                return "npm test --silent"
+        if (cwd / "pytest.ini").is_file() or (cwd / "tox.ini").is_file():
+            return "python -m pytest -q"
+        pyproject = cwd / "pyproject.toml"
+        if pyproject.is_file() and "pytest" in pyproject.read_text(
+            encoding="utf-8", errors="ignore"
+        ):
+            return "python -m pytest -q"
+        setup_cfg = cwd / "setup.cfg"
+        if setup_cfg.is_file() and "pytest" in setup_cfg.read_text(
+            encoding="utf-8", errors="ignore"
+        ):
+            return "python -m pytest -q"
+        tests_dir = cwd / "tests"
+        if tests_dir.is_dir() and any(tests_dir.glob("test_*.py")):
+            return "python -m pytest -q"
+    except Exception:  # noqa: BLE001 - detection is best-effort, never fatal
+        return None
+    return None
+
+
+def _verify_evidence_tag(verify_state: dict) -> str:
+    """The ``verify:<tag>`` evidence suffix summarizing a run's verification.
+
+    ``skipped`` (no command), ``passed`` / ``failed`` (gating), or
+    ``advisory-passed`` / ``advisory-failed`` / ``advisory`` when the clean-tree
+    baseline was already red so the result is reported but not gated on.
+    """
+    mode = verify_state.get("mode")
+    passed = verify_state.get("passed")
+    if mode == "skipped" or not verify_state.get("command"):
+        return "skipped"
+    if mode == "advisory":
+        if passed is True:
+            return "advisory-passed"
+        if passed is False:
+            return "advisory-failed"
+        return "advisory"
+    return "passed" if passed else "failed"
+
+
 def _last_message_role(messages: list[dict]) -> str:
     """The role of the most recent message, or '' when the log is empty."""
     return str(messages[-1].get("role") or "") if messages else ""
@@ -1178,6 +1474,42 @@ def _coerce_submit_report(args: object) -> str:
     if verification:
         parts.append("Verification: " + verification)
     return "\n\n".join(parts)
+
+
+def _coerce_plan_steps(args: object) -> list[dict]:
+    """Normalize an ``update_plan`` payload into a list of ``{"step", "status"}``
+    dicts. Tolerant of a bare list of strings, or a JSON string, so a model that
+    slightly misshapes the argument still gets a usable plan."""
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except ValueError:
+            return []
+    raw = args.get("steps") if isinstance(args, dict) else args
+    if not isinstance(raw, list):
+        return []
+    steps: list[dict] = []
+    for item in raw:
+        if isinstance(item, str):
+            steps.append({"step": item.strip(), "status": "pending"})
+        elif isinstance(item, dict):
+            step = str(item.get("step") or item.get("title") or "").strip()
+            if not step:
+                continue
+            status = str(item.get("status") or "pending").strip().lower()
+            if status not in _PLAN_STATUSES:
+                status = "pending"
+            steps.append({"step": step, "status": status})
+    return steps
+
+
+def _render_plan(steps: list[dict]) -> str:
+    """A compact checklist rendering of a plan for the tool ack (and artifact)."""
+    marks = {"done": "[x]", "in_progress": "[~]", "pending": "[ ]"}
+    return "\n".join(
+        f"{marks.get(s.get('status', 'pending'), '[ ]')} {s.get('step', '')}"
+        for s in steps
+    ) or "(empty plan)"
 
 
 def _near_miss_hint(text: str, old: str, *, max_len: int = 200) -> str:

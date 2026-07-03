@@ -579,6 +579,52 @@ def build_parser() -> argparse.ArgumentParser:
         help="Polling interval between cursor checks while following.",
     )
 
+    deltas = subcommands.add_parser(
+        "deltas",
+        help="Stream an agentic job's live token deltas (subprocess/CLI streaming).",
+    )
+    deltas.add_argument("job_id", nargs="?")
+    deltas.add_argument("--task-id", help="Only stream deltas for this task id.")
+    deltas.add_argument("--json", action="store_true", help="Print each delta record as JSON.")
+    deltas.add_argument(
+        "--follow",
+        action="store_true",
+        help="Tail the delta files for new tokens as they arrive.",
+    )
+    deltas.add_argument(
+        "--follow-timeout-seconds",
+        type=float,
+        default=0.0,
+        help="Stop following after this many seconds of inactivity (0 = until interrupted).",
+    )
+    deltas.add_argument(
+        "--follow-poll-seconds",
+        type=float,
+        default=0.1,
+        help="Polling interval between delta-file checks while following.",
+    )
+
+    eval_cmd = subcommands.add_parser(
+        "eval",
+        help="Run the seeded-bug eval harness against an implement adapter (pass-rate + diff quality).",
+    )
+    eval_cmd.add_argument(
+        "--adapter", default="agentic",
+        help="Adapter to evaluate (default: agentic). Also accepts cursor / claude-code.",
+    )
+    eval_cmd.add_argument("--model", help="Model to route the adapter to (default: adapter default).")
+    eval_cmd.add_argument("--provider", help="Provider override for the model (e.g. gemini, openai).")
+    eval_cmd.add_argument(
+        "--cases",
+        help="Comma-separated case names to run (default: all built-in cases).",
+    )
+    eval_cmd.add_argument(
+        "--no-verify-loop",
+        action="store_true",
+        help="Do not hand the case's verify command to the agentic verify-before-submit loop.",
+    )
+    eval_cmd.add_argument("--json", action="store_true", help="Print the report as JSON.")
+
     open_cmd = subcommands.add_parser("open", help="Open or print a local job artifact path.")
     open_cmd.add_argument("job_id", nargs="?")
     open_cmd.add_argument(

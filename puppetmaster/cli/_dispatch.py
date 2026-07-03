@@ -79,6 +79,7 @@ from puppetmaster.cli.helpers import (
     reject_target,
     require_latest_job_id,
     routing_payload_from_args,
+    run_deltas_follow,
     run_feed_follow,
     _warn_job_liveness,
     _warn_run_quality,
@@ -1014,6 +1015,53 @@ def _main(argv: Optional[list[str]] = None) -> int:
             for item in items:
                 print_feed_item(item)
         return 0
+
+    if args.command == "deltas":
+        from puppetmaster import reads_log
+
+        reads_log.record_read("deltas", caller="cli")
+        job_id = args.job_id or require_latest_job_id(store)
+        return run_deltas_follow(
+            store,
+            job_id,
+            task_id=args.task_id,
+            as_json=args.json,
+            follow=args.follow,
+            idle_timeout_seconds=args.follow_timeout_seconds,
+            poll_interval_seconds=args.follow_poll_seconds,
+        )
+
+    if args.command == "eval":
+        import dataclasses
+
+        from puppetmaster.eval_harness import (
+            adapter_apply_fn,
+            builtin_cases,
+            format_report,
+            run_eval,
+        )
+
+        cases = builtin_cases()
+        if args.cases:
+            wanted = {name.strip() for name in args.cases.split(",") if name.strip()}
+            cases = [case for case in cases if case.name in wanted]
+        if not cases:
+            print("no matching eval cases", file=sys.stderr)
+            return 1
+        apply_fn = adapter_apply_fn(
+            adapter=args.adapter, model=args.model, provider=args.provider,
+            use_verify_loop=not args.no_verify_loop,
+        )
+        report = run_eval(cases, apply_fn, adapter=args.adapter, model=args.model)
+        if args.json:
+            payload = dataclasses.asdict(report)
+            payload.update(
+                passed=report.passed, total=report.total, pass_rate=report.pass_rate
+            )
+            print(json.dumps(payload, default=str, indent=2))
+        else:
+            print(format_report(report))
+        return 0 if report.passed == report.total else 1
 
     if args.command == "open":
         job_id = args.job_id or require_latest_job_id(store)

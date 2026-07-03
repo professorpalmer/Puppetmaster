@@ -136,6 +136,7 @@ from puppetmaster.cli.helpers import (
     reject_target,
     require_latest_job_id,
     routing_payload_from_args,
+    run_deltas_follow,
     run_feed_follow,
 )
 from puppetmaster.config import load_config
@@ -340,6 +341,7 @@ __all__ = [
     "resolve_claude_command",
     "resolve_state_dir",
     "routing_payload_from_args",
+    "run_deltas_follow",
     "run_doctor",
     "run_feed_follow",
     "set_hermes_mcp_env",

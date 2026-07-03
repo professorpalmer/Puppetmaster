@@ -895,6 +895,332 @@ class AgenticLoopTests(unittest.TestCase):
         verif = next(a for a in arts if a.type == ArtifactType.VERIFICATION)
         self.assertEqual(verif.payload["result"], "passed")
 
+    def test_durable_delta_writer_roundtrip_and_no_statedir(self) -> None:
+        import os
+        from puppetmaster.adapters._delta_stream import (
+            DurableDeltaWriter, iter_deltas, delta_file_path,
+        )
+
+        task = _task({})
+        # No state dir in scope -> no durable writer (hermetic default).
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PUPPETMASTER_STATE_DIR", None)
+            self.assertIsNone(DurableDeltaWriter.for_task(task, "w1"))
+
+        state = tempfile.TemporaryDirectory()
+        self.addCleanup(state.cleanup)
+        with mock.patch.dict(os.environ, {"PUPPETMASTER_STATE_DIR": state.name}):
+            writer = DurableDeltaWriter.for_task(task, "w1")
+            self.assertIsNotNone(writer)
+            writer.emit("reasoning", "think ")
+            writer.emit("text", "answer")
+            writer.close()
+            path = delta_file_path(Path(state.name), task.job_id, task.id)
+            records = list(iter_deltas(path))
+        self.assertEqual([r["kind"] for r in records], ["reasoning", "text"])
+        self.assertEqual("".join(r["text"] for r in records), "think answer")
+        self.assertTrue(all(r["worker_id"] == "w1" for r in records))
+
+    def test_durable_delta_stream_persists_a_run(self) -> None:
+        import os
+        from puppetmaster.adapters import agentic
+        from puppetmaster.adapters._delta_stream import iter_deltas, delta_file_path
+        from puppetmaster.providers import AssistantTurn
+
+        work = tempfile.TemporaryDirectory()
+        self.addCleanup(work.cleanup)
+        state = tempfile.TemporaryDirectory()
+        self.addCleanup(state.cleanup)
+
+        def fake_stream(*, provider, model, messages, tools, extra, timeout, on_delta):
+            on_delta("text", "hel")
+            on_delta("text", "lo")
+            return AssistantTurn(
+                text="hello",
+                tool_calls=[{"id": "s1", "name": "submit_findings", "arguments": {"artifacts": []}}],
+                usage={"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            )
+
+        task = Task(
+            job_id="jd", role="explore", instruction="analyze",
+            payload={"cwd": work.name, "provider": "anthropic", "model": "m",
+                     "disable_codegraph": True},
+        )
+        # No in-process sink registered: the durable writer alone must drive
+        # streaming, proving a subprocess worker (state dir, no callback) streams.
+        with mock.patch.dict(os.environ, {"PUPPETMASTER_STATE_DIR": state.name}), \
+                mock.patch.object(agentic, "provider_chat_streaming", side_effect=fake_stream):
+            self.adapter().run(task, task.instruction, "w1")
+
+        path = delta_file_path(Path(state.name), task.job_id, task.id)
+        self.assertTrue(path.exists())
+        records = list(iter_deltas(path))
+        self.assertEqual("".join(r["text"] for r in records), "hello")
+
+    def test_run_deltas_follow_streams_persisted_records(self) -> None:
+        import io
+        import contextlib
+        from types import SimpleNamespace
+        from puppetmaster.adapters._delta_stream import _DELTA_FILE
+        from puppetmaster.cli import run_deltas_follow
+
+        state = tempfile.TemporaryDirectory()
+        self.addCleanup(state.cleanup)
+        task_dir = Path(state.name) / "jobs" / "j1" / "tasks" / "t1"
+        task_dir.mkdir(parents=True)
+        (task_dir / _DELTA_FILE).write_text(
+            json.dumps({"ts": 1.0, "worker_id": "w1", "kind": "text", "text": "Hello "})
+            + "\n"
+            + json.dumps({"ts": 2.0, "worker_id": "w1", "kind": "text", "text": "world"})
+            + "\n",
+            encoding="utf-8",
+        )
+        store = SimpleNamespace(root=state.name)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = run_deltas_follow(store, "j1", follow=False)
+        self.assertEqual(rc, 0)
+        self.assertEqual(buf.getvalue(), "Hello world")
+
+    def test_coerce_plan_steps_is_tolerant(self) -> None:
+        from puppetmaster.adapters.agentic import _coerce_plan_steps
+
+        steps = _coerce_plan_steps({"steps": [
+            "bare string",
+            {"step": "typed", "status": "in_progress"},
+            {"step": "bad status", "status": "wat"},
+            {"title": "alt key"},
+            {"status": "done"},  # no step -> dropped
+        ]})
+        self.assertEqual(
+            steps,
+            [
+                {"step": "bare string", "status": "pending"},
+                {"step": "typed", "status": "in_progress"},
+                {"step": "bad status", "status": "pending"},
+                {"step": "alt key", "status": "pending"},
+            ],
+        )
+
+    def test_plan_tool_absent_when_disabled(self) -> None:
+        adapter = self.adapter()
+        on = adapter._tool_schema(implement=True, task=_task({}))
+        off = adapter._tool_schema(implement=True, task=_task({"plan_tool": False}))
+        names_on = {t["function"]["name"] for t in on}
+        names_off = {t["function"]["name"] for t in off}
+        self.assertIn("update_plan", names_on)
+        self.assertNotIn("update_plan", names_off)
+
+    def test_plan_tool_emits_decision_artifact(self) -> None:
+        from puppetmaster.adapters import agentic
+        from puppetmaster.providers import AssistantTurn
+
+        cwd = _git_repo(self)
+        turns = [
+            AssistantTurn(text="", tool_calls=[{"id": "p1", "name": "update_plan",
+                          "arguments": {"steps": [
+                              {"step": "write new.py", "status": "in_progress"},
+                              {"step": "verify", "status": "pending"}]}}],
+                          usage={"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}),
+            AssistantTurn(text="", tool_calls=[{"id": "c1", "name": "write_file",
+                          "arguments": {"path": "new.py", "content": "print('hi')\n"}}],
+                          usage={"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}),
+            AssistantTurn(text="", tool_calls=[{"id": "p2", "name": "update_plan",
+                          "arguments": {"steps": [
+                              {"step": "write new.py", "status": "done"},
+                              {"step": "verify", "status": "done"}]}}],
+                          usage={"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}),
+            AssistantTurn(text="", tool_calls=[{"id": "r1", "name": "submit_report",
+                          "arguments": {"summary": "added new.py"}}],
+                          usage={"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}),
+        ]
+        seen = []
+
+        def fake_chat(*, provider, model, messages, tools, extra, timeout):
+            seen.append(list(messages))
+            return turns[min(len(seen) - 1, len(turns) - 1)]
+
+        task = Task(
+            job_id="j", role="build", instruction="add new.py",
+            payload={"cwd": str(cwd), "provider": "anthropic", "model": "m",
+                     "mode": "implement", "disable_codegraph": True},
+        )
+        with mock.patch.object(agentic, "provider_chat", side_effect=fake_chat):
+            arts = self.adapter().run(task, task.instruction, "w1")
+
+        verif = next(a for a in arts if a.type == ArtifactType.VERIFICATION)
+        self.assertEqual(verif.payload["result"], "passed")
+        self.assertIn("plan:2", verif.evidence)
+        decision = next(a for a in arts if a.type == ArtifactType.DECISION)
+        # The runtime validates every artifact on save; a plan DECISION must
+        # satisfy the DECISION contract (decision + why) or the worker fails.
+        decision.validate()
+        self.assertTrue(decision.payload["why"])
+        self.assertEqual(decision.payload["plan"][0]["status"], "done")
+        self.assertIn("[x] write new.py", decision.payload["plan_rendered"])
+        # The plan tool must have been acked as a checklist mid-run.
+        self.assertTrue(any("Plan updated" in str(m) for m in seen[1]))
+
+    def test_detect_verify_command_recognizes_pytest_and_npm(self) -> None:
+        from puppetmaster.adapters.agentic import _detect_verify_command
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        self.assertIsNone(_detect_verify_command(root))
+
+        (root / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+        self.assertEqual(_detect_verify_command(root), "python -m pytest -q")
+        (root / "pytest.ini").unlink()
+
+        (root / "tests").mkdir()
+        (root / "tests" / "test_x.py").write_text("def test_x():\n    assert True\n", encoding="utf-8")
+        self.assertEqual(_detect_verify_command(root), "python -m pytest -q")
+
+        node = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(node, ignore_errors=True))
+        (node / "package.json").write_text(
+            json.dumps({"scripts": {"test": "jest"}}), encoding="utf-8")
+        self.assertEqual(_detect_verify_command(node), "npm test --silent")
+
+    def test_verify_evidence_tag_covers_modes(self) -> None:
+        from puppetmaster.adapters.agentic import _verify_evidence_tag
+
+        self.assertEqual(_verify_evidence_tag({"mode": "skipped", "command": None}), "skipped")
+        self.assertEqual(
+            _verify_evidence_tag({"mode": "gating", "command": "x", "passed": True}), "passed")
+        self.assertEqual(
+            _verify_evidence_tag({"mode": "gating", "command": "x", "passed": False}), "failed")
+        self.assertEqual(
+            _verify_evidence_tag({"mode": "advisory", "command": "x", "passed": False}),
+            "advisory-failed")
+
+    def test_resolve_verify_command_explicit_and_disabled(self) -> None:
+        adapter = self.adapter()
+        cwd = Path(".")
+        explicit = _task({"verify_command": "make check"})
+        self.assertEqual(adapter._resolve_verify_command(explicit, cwd), "make check")
+        disabled = _task({"verify": False})
+        self.assertIsNone(adapter._resolve_verify_command(disabled, cwd))
+        locked = _task({"verify_command": "make check", "allow_terminal": False})
+        self.assertIsNone(adapter._resolve_verify_command(locked, cwd))
+
+    def test_implement_verify_bounces_failure_then_accepts_on_pass(self) -> None:
+        from puppetmaster.adapters import agentic
+        from puppetmaster.providers import AssistantTurn
+
+        cwd = _git_repo(self)
+        # Real verification: passes only once the sentinel file exists. Baseline
+        # off forces gating so a first (pre-fix) submit is genuinely bounced.
+        turns = [
+            AssistantTurn(text="", tool_calls=[{"id": "r0", "name": "submit_report",
+                          "arguments": {"summary": "done?"}}],
+                          usage={"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}),
+            AssistantTurn(text="", tool_calls=[{"id": "c1", "name": "write_file",
+                          "arguments": {"path": "FIXED", "content": "ok\n"}}],
+                          usage={"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}),
+            AssistantTurn(text="", tool_calls=[{"id": "r1", "name": "submit_report",
+                          "arguments": {"summary": "created sentinel"}}],
+                          usage={"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}),
+        ]
+        seen = []
+
+        def fake_chat(*, provider, model, messages, tools, extra, timeout):
+            seen.append(list(messages))
+            return turns[min(len(seen) - 1, len(turns) - 1)]
+
+        task = Task(
+            job_id="j", role="build", instruction="create sentinel",
+            payload={"cwd": str(cwd), "provider": "anthropic", "model": "m",
+                     "mode": "implement", "disable_codegraph": True,
+                     "verify_command": "test -f FIXED", "verify_baseline": False},
+        )
+        with mock.patch.object(agentic, "provider_chat", side_effect=fake_chat):
+            arts = self.adapter().run(task, task.instruction, "w1")
+
+        verif = next(a for a in arts if a.type == ArtifactType.VERIFICATION)
+        self.assertEqual(verif.payload["result"], "passed")
+        self.assertTrue(verif.payload["verification_passed"])
+        self.assertEqual(verif.payload["verification_attempts"], 2)
+        self.assertIn("verify:passed", verif.evidence)
+        self.assertTrue(any("does not pass verification" in str(m) for m in seen[-1]))
+        self.assertTrue((cwd / "FIXED").exists())
+
+    def test_implement_verify_failure_after_retries_degrades(self) -> None:
+        from puppetmaster.adapters import agentic
+        from puppetmaster.providers import AssistantTurn
+
+        cwd = _git_repo(self)
+        turns = [
+            AssistantTurn(text="", tool_calls=[{"id": "c1", "name": "write_file",
+                          "arguments": {"path": "new.py", "content": "print('x')\n"}}],
+                          usage={"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}),
+            AssistantTurn(text="", tool_calls=[{"id": "r1", "name": "submit_report",
+                          "arguments": {"summary": "try 1"}}],
+                          usage={"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}),
+            AssistantTurn(text="", tool_calls=[{"id": "r2", "name": "submit_report",
+                          "arguments": {"summary": "try 2"}}],
+                          usage={"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}),
+        ]
+        seen = []
+
+        def fake_chat(*, provider, model, messages, tools, extra, timeout):
+            seen.append(1)
+            return turns[min(len(seen) - 1, len(turns) - 1)]
+
+        task = Task(
+            job_id="j", role="build", instruction="make change",
+            payload={"cwd": str(cwd), "provider": "anthropic", "model": "m",
+                     "mode": "implement", "disable_codegraph": True,
+                     "verify_command": "false", "verify_baseline": False,
+                     "verify_retries": 1},
+        )
+        with mock.patch.object(agentic, "provider_chat", side_effect=fake_chat):
+            arts = self.adapter().run(task, task.instruction, "w1")
+
+        verif = next(a for a in arts if a.type == ArtifactType.VERIFICATION)
+        self.assertEqual(verif.payload["result"], "degraded")
+        self.assertEqual(verif.payload["failure"], "verification_failed")
+        self.assertTrue(verif.payload["has_work"])
+        self.assertIn("verify:failed", verif.evidence)
+        self.assertTrue(any(
+            a.type == ArtifactType.RISK and "result:verify-failed" in a.evidence for a in arts))
+
+    def test_implement_verify_advisory_does_not_degrade_a_diff(self) -> None:
+        from puppetmaster.adapters import agentic
+        from puppetmaster.providers import AssistantTurn
+
+        cwd = _git_repo(self)
+        # Baseline on + a command that is red on the clean tree => advisory: the
+        # failure is not attributable to this change, so a real diff still passes.
+        turns = [
+            AssistantTurn(text="", tool_calls=[{"id": "c1", "name": "write_file",
+                          "arguments": {"path": "new.py", "content": "print('x')\n"}}],
+                          usage={"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}),
+            AssistantTurn(text="", tool_calls=[{"id": "r1", "name": "submit_report",
+                          "arguments": {"summary": "did work"}}],
+                          usage={"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}),
+        ]
+        seen = []
+
+        def fake_chat(*, provider, model, messages, tools, extra, timeout):
+            seen.append(1)
+            return turns[min(len(seen) - 1, len(turns) - 1)]
+
+        task = Task(
+            job_id="j", role="build", instruction="make change",
+            payload={"cwd": str(cwd), "provider": "anthropic", "model": "m",
+                     "mode": "implement", "disable_codegraph": True,
+                     "verify_command": "false"},
+        )
+        with mock.patch.object(agentic, "provider_chat", side_effect=fake_chat):
+            arts = self.adapter().run(task, task.instruction, "w1")
+
+        verif = next(a for a in arts if a.type == ArtifactType.VERIFICATION)
+        self.assertEqual(verif.payload["result"], "passed")
+        self.assertEqual(verif.payload["verification_mode"], "advisory")
+        self.assertIn("verify:advisory-failed", verif.evidence)
+
     def adapter(self):
         from puppetmaster.adapters.agentic import AgenticAdapter
         return AgenticAdapter()

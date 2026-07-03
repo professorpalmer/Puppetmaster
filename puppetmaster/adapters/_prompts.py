@@ -84,12 +84,20 @@ def build_implement_prompt(prompt: str) -> str:
             "inside the user's repository. Actually make the code changes — create, "
             "edit, and delete files as needed to complete the task end to end. Do not "
             "just describe a plan or return findings.",
+            "For anything beyond a trivial one-line change, call the `update_plan` "
+            "tool first with your ordered steps, then update it (in_progress/done) as "
+            "you go — it keeps the work organized and shows the user your progress.",
             "Keep the change focused on the task; run any obvious local checks you can. "
             "Puppetmaster captures the resulting git diff as a PATCH artifact, so leave "
             "the working tree containing your final intended changes.",
-            "When all edits are done, finish by CALLING the `submit_report` tool with a "
-            "short summary, the files you changed, and how you verified. If you cannot "
-            "call tools, end with the same report as your final message instead.",
+            "Before you finish, VERIFY your work: run the project's tests (or the most "
+            "relevant focused subset) with the `run_terminal` tool and make them pass. "
+            "Your submission may be checked against the repo's verification command — if "
+            "it fails you will be asked to fix it and submit again, so verify first.",
+            "When all edits are done AND your checks pass, finish by CALLING the "
+            "`submit_report` tool with a short summary, the files you changed, and how "
+            "you verified. If you cannot call tools, end with the same report as your "
+            "final message instead.",
             _IMPLEMENT_REPORT_CONTRACT,
         ]
     )

@@ -381,6 +381,86 @@ def emit_feed_item(item: dict, *, as_json: bool) -> None:
         print_feed_item(item)
         sys.stdout.flush()
 
+def run_deltas_follow(
+    store,
+    job_id: str,
+    *,
+    task_id: Optional[str] = None,
+    as_json: bool = False,
+    follow: bool = False,
+    idle_timeout_seconds: float = 0.0,
+    poll_interval_seconds: float = 0.1,
+) -> int:
+    """Stream an agentic job's durable token deltas (all tasks, or one).
+
+    Tails the per-task ``agentic_deltas.ndjson`` files the agentic adapter
+    writes under the job state dir, multiplexed across tasks. This is the
+    subprocess/CLI face of token streaming -- the same tokens an inline host
+    sees over the in-process delta bus, made followable for detached workers.
+    """
+    from puppetmaster.adapters._delta_stream import _DELTA_FILE
+
+    base = Path(store.root) / "jobs" / job_id / "tasks"
+    offsets: dict[Path, int] = {}
+
+    def _drain() -> bool:
+        produced = False
+        if not base.exists():
+            return produced
+        for task_dir in sorted(base.iterdir()):
+            if task_id is not None and task_dir.name != task_id:
+                continue
+            delta_path = task_dir / _DELTA_FILE
+            if not delta_path.exists():
+                continue
+            offset = offsets.get(delta_path, 0)
+            try:
+                with open(delta_path, "r", encoding="utf-8", errors="replace") as handle:
+                    handle.seek(offset)
+                    for line in handle:
+                        if not line.endswith("\n"):
+                            break
+                        offset += len(line.encode("utf-8"))
+                        stripped = line.strip()
+                        if not stripped:
+                            continue
+                        try:
+                            record = json.loads(stripped)
+                        except ValueError:
+                            continue
+                        produced = True
+                        _emit_delta(record, task_dir.name, as_json=as_json)
+                offsets[delta_path] = offset
+            except OSError:
+                continue
+        return produced
+
+    _drain()
+    if not follow:
+        return 0
+    poll = max(0.02, poll_interval_seconds)
+    idle_deadline = (
+        time.monotonic() + idle_timeout_seconds if idle_timeout_seconds > 0 else None
+    )
+    try:
+        while True:
+            produced = _drain()
+            if produced and idle_timeout_seconds > 0:
+                idle_deadline = time.monotonic() + idle_timeout_seconds
+            if idle_deadline is not None and time.monotonic() >= idle_deadline:
+                return 0
+            time.sleep(poll)
+    except KeyboardInterrupt:
+        return 0
+
+def _emit_delta(record: dict, task_name: str, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(record, default=str), flush=True)
+        return
+    text = str(record.get("text", ""))
+    sys.stdout.write(text)
+    sys.stdout.flush()
+
 def artifact_headline(artifact: dict) -> str:
     payload = artifact.get("payload", {})
     if not isinstance(payload, dict):
