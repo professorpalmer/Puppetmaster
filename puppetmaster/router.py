@@ -105,6 +105,14 @@ class TaskSignals:
 # ----- Classifier ----------------------------------------------------------
 
 
+# Analyze roles stay deliberately cheap. The agentic adapter now carries its
+# structured output on the provider-native tool-calling channel (submit_findings
+# / submit_report), which every registered agentic model supports -- so even a
+# cheap-tier model returns reliably-structured artifacts and no longer degrades
+# to "empty findings" on a parse miss. That makes a capability floor unnecessary
+# for reliability; when a task genuinely needs deeper reasoning, escalate with
+# payload.min_capability or routing_policy=quality rather than paying for a
+# blanket bump here.
 _ROLE_BASE_SCORE = {
     # Cheap, deterministic checks. A 50-capability model is overkill.
     "verify-runtime": 25,

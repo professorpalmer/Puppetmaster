@@ -156,6 +156,148 @@ class KeyAwareRoutingTests(unittest.TestCase):
             with self.assertRaises(NoEligibleModelError):
                 route_task(signals, self._agentic_registry(), policy="balanced")
 
+    def test_agentic_analyze_role_routes_under_platform_lock(self) -> None:
+        # Regression pin: under an agentic-only platform lock, an analyze role
+        # routes to an agentic model (cheap by design -- the native submit-tool
+        # channel makes even a cheap model reliably structured).
+        from puppetmaster.router import TaskSignals, route_task
+
+        signals = TaskSignals(
+            role="review",
+            instruction="review this repository for risks and produce findings",
+            allowed_adapters={"agentic"},
+        )
+        with mock.patch(
+            "puppetmaster.providers.available_providers",
+            return_value={"gemini", "anthropic", "openai"},
+        ):
+            decision = route_task(signals, self._agentic_registry(), policy="balanced")
+        self.assertEqual(decision.model.adapter, "agentic")
+
+    def test_min_capability_escalates_agentic_route(self) -> None:
+        # The documented escape hatch: min_capability lifts the pick to a
+        # higher-capability agentic model without a blanket floor bump.
+        from puppetmaster.router import TaskSignals, route_task
+
+        base = TaskSignals(role="review", instruction="review this repo",
+                           allowed_adapters={"agentic"})
+        pinned = TaskSignals(role="review", instruction="review this repo",
+                             allowed_adapters={"agentic"}, explicit_min_capability=95)
+        with mock.patch(
+            "puppetmaster.providers.available_providers",
+            return_value={"gemini", "anthropic", "openai"},
+        ):
+            low = route_task(base, self._agentic_registry(), policy="balanced")
+            high = route_task(pinned, self._agentic_registry(), policy="balanced")
+        self.assertGreaterEqual(high.model.capability_score, low.model.capability_score)
+
+
+class ContextCompressionTests(unittest.TestCase):
+    def test_compress_history_elides_old_tool_output_keeps_recent(self) -> None:
+        from puppetmaster.adapters._context_budget import compress_history, estimate_message_tokens
+
+        big = "x" * 5000
+        messages = [{"role": "user", "content": "system prompt"}]
+        for i in range(6):
+            messages.append({
+                "role": "assistant", "content": "",
+                "tool_calls": [{"id": f"c{i}", "type": "function",
+                                "function": {"name": "read_file", "arguments": "{}"}}],
+            })
+            messages.append({"role": "tool", "tool_call_id": f"c{i}", "content": big})
+
+        before = estimate_message_tokens(messages)
+        out, changed = compress_history(messages, budget_tokens=before // 2, keep_recent=2)
+
+        self.assertTrue(changed)
+        self.assertLessEqual(estimate_message_tokens(out), before)
+        # The most recent tool output is preserved verbatim; an old one is elided.
+        self.assertEqual(out[-1]["content"], big)
+        self.assertTrue(any("elided" in (m.get("content") or "") for m in out))
+        # Structure intact: still one tool message per assistant tool_call.
+        self.assertEqual(sum(1 for m in out if m.get("role") == "tool"), 6)
+
+    def test_compress_history_noop_under_budget(self) -> None:
+        from puppetmaster.adapters._context_budget import compress_history
+
+        messages = [{"role": "user", "content": "hi"}, {"role": "tool", "tool_call_id": "c0", "content": "small"}]
+        out, changed = compress_history(messages, budget_tokens=10_000)
+        self.assertFalse(changed)
+        self.assertEqual(out[-1]["content"], "small")
+
+
+class ProviderKeyPoolTests(unittest.TestCase):
+    def test_provider_key_pool_unions_and_numbers(self) -> None:
+        from puppetmaster.providers import provider_key_pool
+
+        env = {"GEMINI_API_KEY": "a", "GEMINI_API_KEY_2": "c", "GOOGLE_API_KEY": "b"}
+        pool = provider_key_pool("gemini", env=env)
+        # base var + its numbered sibling first, then the next descriptor var.
+        self.assertEqual(pool, ["a", "c", "b"])
+
+    def test_provider_key_pool_dedupes_and_empty_for_keyless(self) -> None:
+        from puppetmaster.providers import provider_key_pool
+
+        env = {"OPENAI_API_KEY": "dup", "OPENAI_API_KEY_2": "dup"}
+        self.assertEqual(provider_key_pool("openai", env=env), ["dup"])
+        self.assertEqual(provider_key_pool("ollama", env={}), [])
+
+
+class ProviderStreamingTests(unittest.TestCase):
+    def test_openai_streaming_assembles_text_and_usage(self) -> None:
+        from puppetmaster import providers
+
+        lines = [
+            b'data: {"choices":[{"delta":{"content":"Hel"}}]}\n',
+            b'data: {"choices":[{"delta":{"content":"lo"}}]}\n',
+            b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n',
+            b'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}\n',
+            b'data: [DONE]\n',
+        ]
+
+        class FakeResp:
+            def __iter__(self):
+                return iter(lines)
+
+            def close(self):
+                pass
+
+        got = []
+        with mock.patch.object(providers, "_open_stream", return_value=FakeResp()):
+            turn = providers.provider_chat_streaming(
+                provider="openai", model="m", messages=[], api_key="k",
+                on_delta=lambda kind, text: got.append((kind, text)),
+            )
+        self.assertEqual(turn.text, "Hello")
+        self.assertEqual(turn.finish_reason, "stop")
+        self.assertEqual(turn.usage["total_tokens"], 5)
+        self.assertEqual(got, [("text", "Hel"), ("text", "lo")])
+
+    def test_openai_streaming_assembles_tool_call_arguments(self) -> None:
+        from puppetmaster import providers
+
+        lines = [
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"t1","function":{"name":"submit_findings","arguments":"{\\"artifacts\\""}}]}}]}\n',
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":":[]}"}}]}}]}\n',
+            b'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n',
+            b'data: [DONE]\n',
+        ]
+
+        class FakeResp:
+            def __iter__(self):
+                return iter(lines)
+
+            def close(self):
+                pass
+
+        with mock.patch.object(providers, "_open_stream", return_value=FakeResp()):
+            turn = providers.provider_chat_streaming(
+                provider="openai", model="m", messages=[], api_key="k",
+            )
+        self.assertEqual(len(turn.tool_calls), 1)
+        self.assertEqual(turn.tool_calls[0]["name"], "submit_findings")
+        self.assertEqual(turn.tool_calls[0]["arguments"], {"artifacts": []})
+
 
 class AgenticToolTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -413,6 +555,345 @@ class AgenticLoopTests(unittest.TestCase):
         self.assertTrue(verif.payload["has_work"])
         self.assertTrue(any(a.type == ArtifactType.PATCH for a in arts))
         self.assertTrue((cwd / "new.py").exists())
+
+    def test_analyze_submit_findings_tool_produces_artifacts(self) -> None:
+        from puppetmaster.adapters import agentic
+        from puppetmaster.providers import AssistantTurn
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cwd = Path(tmp.name)
+
+        turns = [
+            AssistantTurn(
+                text="",
+                tool_calls=[{"id": "s1", "name": "submit_findings", "arguments": {
+                    "artifacts": [{"type": "finding", "claim": "x calls y",
+                                   "evidence": ["a.py"], "confidence": 0.8}]}}],
+                usage={"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+            ),
+        ]
+        seen = []
+
+        def fake_chat(*, provider, model, messages, tools, extra, timeout):
+            seen.append(1)
+            return turns[len(seen) - 1]
+
+        task = Task(
+            job_id="j", role="explore", instruction="analyze",
+            payload={"cwd": str(cwd), "provider": "anthropic", "model": "m", "disable_codegraph": True},
+        )
+        with mock.patch.object(agentic, "provider_chat", side_effect=fake_chat):
+            arts = self.adapter().run(task, task.instruction, "w1")
+
+        verif = next(a for a in arts if a.type == ArtifactType.VERIFICATION)
+        self.assertEqual(verif.payload["result"], "passed")
+        self.assertEqual(verif.payload["stop_reason"], "submitted")
+        self.assertIn("submit:tool", verif.evidence)
+        self.assertIn(ArtifactType.FINDING, [a.type for a in arts])
+
+    def test_analyze_empty_submission_is_clean_pass_not_degraded(self) -> None:
+        # An explicit empty submission ("I found nothing") is an honest pass, not
+        # a degrade -- this is the core false-degrade fix.
+        from puppetmaster.adapters import agentic
+        from puppetmaster.providers import AssistantTurn
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cwd = Path(tmp.name)
+        turns = [
+            AssistantTurn(
+                text="",
+                tool_calls=[{"id": "s1", "name": "submit_findings", "arguments": {"artifacts": []}}],
+                usage={"prompt_tokens": 4, "completion_tokens": 1, "total_tokens": 5},
+            ),
+        ]
+        seen = []
+
+        def fake_chat(*, provider, model, messages, tools, extra, timeout):
+            seen.append(1)
+            return turns[len(seen) - 1]
+
+        task = Task(
+            job_id="j", role="explore", instruction="analyze",
+            payload={"cwd": str(cwd), "provider": "anthropic", "model": "m", "disable_codegraph": True},
+        )
+        with mock.patch.object(agentic, "provider_chat", side_effect=fake_chat):
+            arts = self.adapter().run(task, task.instruction, "w1")
+
+        verif = next(a for a in arts if a.type == ArtifactType.VERIFICATION)
+        self.assertEqual(verif.payload["result"], "passed")
+        self.assertIsNone(verif.payload["failure"])
+        self.assertIn("submit:tool", verif.evidence)
+        self.assertFalse(any(a.type == ArtifactType.RISK for a in arts))
+        self.assertFalse(any(a.type == ArtifactType.FINDING for a in arts))
+
+    def test_analyze_unstructured_prose_degrades_after_retry(self) -> None:
+        from puppetmaster.adapters import agentic
+        from puppetmaster.providers import AssistantTurn
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cwd = Path(tmp.name)
+        turns = [
+            AssistantTurn(text="Just prose.", tool_calls=[], finish_reason="stop",
+                          usage={"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}),
+            AssistantTurn(text="Still prose after the retry.", tool_calls=[], finish_reason="stop",
+                          usage={"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}),
+        ]
+        seen = []
+
+        def fake_chat(*, provider, model, messages, tools, extra, timeout):
+            seen.append(1)
+            return turns[min(len(seen) - 1, len(turns) - 1)]
+
+        task = Task(
+            job_id="j", role="explore", instruction="analyze",
+            payload={"cwd": str(cwd), "provider": "anthropic", "model": "m", "disable_codegraph": True},
+        )
+        with mock.patch.object(agentic, "provider_chat", side_effect=fake_chat):
+            arts = self.adapter().run(task, task.instruction, "w1")
+
+        verif = next(a for a in arts if a.type == ArtifactType.VERIFICATION)
+        self.assertEqual(verif.payload["result"], "degraded")
+        self.assertEqual(verif.payload["failure"], "empty_or_unstructured_agentic_result")
+        self.assertIn("retry:exhausted", verif.evidence)
+        self.assertTrue(any(a.type == ArtifactType.RISK for a in arts))
+
+    def test_analyze_retry_forces_submit_tool(self) -> None:
+        # After the structure retry, the next turn must FORCE the submit tool via
+        # tool_choice so a compliant model can't wander back into prose.
+        from puppetmaster.adapters import agentic
+        from puppetmaster.providers import AssistantTurn
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cwd = Path(tmp.name)
+        turns = [
+            AssistantTurn(text="prose, no structure", tool_calls=[], finish_reason="stop",
+                          usage={"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}),
+            AssistantTurn(
+                text="",
+                tool_calls=[{"id": "s1", "name": "submit_findings", "arguments": {
+                    "artifacts": [{"type": "finding", "claim": "recovered", "evidence": ["a.py"], "confidence": 0.7}]}}],
+                usage={"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
+            ),
+        ]
+        seen_extra = []
+
+        def fake_chat(*, provider, model, messages, tools, extra, timeout):
+            seen_extra.append(extra)
+            return turns[len(seen_extra) - 1]
+
+        task = Task(
+            job_id="j", role="explore", instruction="analyze",
+            payload={"cwd": str(cwd), "provider": "anthropic", "model": "m", "disable_codegraph": True},
+        )
+        with mock.patch.object(agentic, "provider_chat", side_effect=fake_chat):
+            arts = self.adapter().run(task, task.instruction, "w1")
+
+        self.assertIsNone(seen_extra[0].get("force_tool"))
+        self.assertEqual(seen_extra[1].get("force_tool"), "submit_findings")
+        verif = next(a for a in arts if a.type == ArtifactType.VERIFICATION)
+        self.assertEqual(verif.payload["result"], "passed")
+        self.assertIn("retry:recovered", verif.evidence)
+        self.assertIn("submit:tool", verif.evidence)
+
+    def test_provider_call_retries_transient_then_succeeds(self) -> None:
+        from puppetmaster.adapters import agentic
+        from puppetmaster.providers import AssistantTurn, ProviderError
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cwd = Path(tmp.name)
+        calls = {"n": 0}
+
+        def flaky(*, provider, model, messages, tools, extra, timeout):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ProviderError("timed out", reason="timeout")
+            return AssistantTurn(
+                text="",
+                tool_calls=[{"id": "s1", "name": "submit_findings", "arguments": {"artifacts": []}}],
+                usage={"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+            )
+
+        task = Task(
+            job_id="j", role="explore", instruction="analyze",
+            payload={"cwd": str(cwd), "provider": "anthropic", "model": "m", "disable_codegraph": True},
+        )
+        with mock.patch.object(agentic, "provider_chat", side_effect=flaky), \
+                mock.patch("time.sleep", lambda *_: None):
+            arts = self.adapter().run(task, task.instruction, "w1")
+
+        self.assertEqual(calls["n"], 2)  # one transient failure, one success
+        verif = next(a for a in arts if a.type == ArtifactType.VERIFICATION)
+        self.assertEqual(verif.payload["result"], "passed")
+
+    def test_provider_call_does_not_retry_terminal_auth_error(self) -> None:
+        from puppetmaster.adapters import agentic
+        from puppetmaster.providers import ProviderError
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cwd = Path(tmp.name)
+        calls = {"n": 0}
+
+        def auth_fail(*, provider, model, messages, tools, extra, timeout):
+            calls["n"] += 1
+            raise ProviderError("401", reason="http_status:401", status=401, body="bad key")
+
+        task = Task(
+            job_id="j", role="explore", instruction="analyze",
+            payload={"cwd": str(cwd), "provider": "anthropic", "model": "m", "disable_codegraph": True},
+        )
+        with mock.patch.object(agentic, "provider_chat", side_effect=auth_fail), \
+                mock.patch("time.sleep", lambda *_: None):
+            arts = self.adapter().run(task, task.instruction, "w1")
+
+        self.assertEqual(calls["n"], 1)  # terminal: no retry
+        self.assertEqual(arts[0].payload["result"], "failed")
+
+    def test_implement_submit_report_records_report_and_patches(self) -> None:
+        from puppetmaster.adapters import agentic
+        from puppetmaster.providers import AssistantTurn
+
+        cwd = _git_repo(self)
+        turns = [
+            AssistantTurn(
+                text="", tool_calls=[{"id": "c1", "name": "write_file",
+                                      "arguments": {"path": "new.py", "content": "print('hi')\n"}}],
+                usage={"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
+            ),
+            AssistantTurn(
+                text="", tool_calls=[{"id": "r1", "name": "submit_report", "arguments": {
+                    "summary": "Added new.py", "files_changed": ["new.py"],
+                    "verification": "ran python new.py"}}],
+                usage={"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7},
+            ),
+        ]
+        seen = []
+
+        def fake_chat(*, provider, model, messages, tools, extra, timeout):
+            seen.append(1)
+            return turns[len(seen) - 1]
+
+        task = Task(
+            job_id="j", role="build", instruction="add new.py",
+            payload={"cwd": str(cwd), "provider": "anthropic", "model": "m",
+                     "mode": "implement", "disable_codegraph": True},
+        )
+        with mock.patch.object(agentic, "provider_chat", side_effect=fake_chat):
+            arts = self.adapter().run(task, task.instruction, "w1")
+
+        verif = next(a for a in arts if a.type == ArtifactType.VERIFICATION)
+        self.assertEqual(verif.payload["result"], "passed")
+        self.assertEqual(verif.payload["stop_reason"], "submitted")
+        self.assertTrue(verif.payload["has_work"])
+        self.assertTrue(any(a.type == ArtifactType.PATCH for a in arts))
+        self.assertTrue(
+            any(a.type == ArtifactType.FINDING and "Added new.py" in str(a.payload) for a in arts)
+        )
+
+    def test_credential_rotation_on_rate_limit(self) -> None:
+        import os
+        from puppetmaster.adapters import agentic
+        from puppetmaster.providers import AssistantTurn, ProviderError
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cwd = Path(tmp.name)
+        used_keys = []
+
+        def flaky(*, provider, model, messages, tools, extra, timeout, api_key=None):
+            used_keys.append(api_key)
+            # First attempt (api_key=None) uses provider_chat's own resolution of
+            # the throttled primary key; the rotation passes the explicit second.
+            if api_key is None:
+                raise ProviderError("429", reason="http_status:429", status=429)
+            return AssistantTurn(
+                text="",
+                tool_calls=[{"id": "s1", "name": "submit_findings", "arguments": {"artifacts": []}}],
+                usage={"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+            )
+
+        task = Task(
+            job_id="j", role="explore", instruction="analyze",
+            payload={"cwd": str(cwd), "provider": "anthropic", "model": "m", "disable_codegraph": True},
+        )
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "k1", "ANTHROPIC_API_KEY_2": "k2"}, clear=False), \
+                mock.patch.object(agentic, "provider_chat", side_effect=flaky):
+            arts = self.adapter().run(task, task.instruction, "w1")
+
+        self.assertEqual(used_keys, [None, "k2"])  # rotated to the explicit second key
+        verif = next(a for a in arts if a.type == ArtifactType.VERIFICATION)
+        self.assertEqual(verif.payload["result"], "passed")
+
+    def test_model_failover_on_terminal_error(self) -> None:
+        from puppetmaster.adapters import agentic
+        from puppetmaster.providers import AssistantTurn, ProviderError
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cwd = Path(tmp.name)
+        calls = []
+
+        def by_model(*, provider, model, messages, tools, extra, timeout, api_key=None):
+            calls.append((provider, model))
+            if model == "primary":
+                raise ProviderError("500", reason="http_status:500", status=500)
+            return AssistantTurn(
+                text="",
+                tool_calls=[{"id": "s1", "name": "submit_findings", "arguments": {"artifacts": []}}],
+                usage={"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+            )
+
+        task = Task(
+            job_id="j", role="explore", instruction="analyze",
+            payload={"cwd": str(cwd), "provider": "anthropic", "model": "primary",
+                     "disable_codegraph": True, "provider_max_retries": 0,
+                     "failover_models": [{"provider": "openai", "model": "backup"}]},
+        )
+        with mock.patch.object(agentic, "provider_chat", side_effect=by_model), \
+                mock.patch("time.sleep", lambda *_: None):
+            arts = self.adapter().run(task, task.instruction, "w1")
+
+        self.assertEqual(calls[-1], ("openai", "backup"))
+        verif = next(a for a in arts if a.type == ArtifactType.VERIFICATION)
+        self.assertEqual(verif.payload["result"], "passed")
+        self.assertIn("failover:used", verif.evidence)
+
+    def test_streaming_sink_receives_deltas(self) -> None:
+        from puppetmaster.adapters import agentic
+        from puppetmaster.adapters._delta_bus import register_delta_sink, unregister_delta_sink
+        from puppetmaster.providers import AssistantTurn
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cwd = Path(tmp.name)
+        got = []
+        register_delta_sink("w1", lambda kind, text: got.append((kind, text)))
+        self.addCleanup(lambda: unregister_delta_sink("w1"))
+
+        def fake_stream(*, provider, model, messages, tools, extra, timeout, on_delta):
+            on_delta("text", "hel")
+            on_delta("text", "lo")
+            return AssistantTurn(
+                text="hello",
+                tool_calls=[{"id": "s1", "name": "submit_findings", "arguments": {"artifacts": []}}],
+                usage={"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            )
+
+        task = Task(
+            job_id="j", role="explore", instruction="analyze",
+            payload={"cwd": str(cwd), "provider": "anthropic", "model": "m", "disable_codegraph": True},
+        )
+        with mock.patch.object(agentic, "provider_chat_streaming", side_effect=fake_stream):
+            arts = self.adapter().run(task, task.instruction, "w1")
+
+        self.assertEqual(got, [("text", "hel"), ("text", "lo")])
+        verif = next(a for a in arts if a.type == ArtifactType.VERIFICATION)
+        self.assertEqual(verif.payload["result"], "passed")
 
     def adapter(self):
         from puppetmaster.adapters.agentic import AgenticAdapter

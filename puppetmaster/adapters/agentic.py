@@ -39,8 +39,10 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -51,7 +53,14 @@ from puppetmaster.codegraph import (
     enrich_prompt_with_codegraph,
 )
 from puppetmaster.models import Artifact, ArtifactType, Task
-from puppetmaster.providers import AssistantTurn, ProviderError, get_provider, provider_chat
+from puppetmaster.providers import (
+    AssistantTurn,
+    ProviderError,
+    get_provider,
+    provider_chat,
+    provider_chat_streaming,
+    provider_key_pool,
+)
 from puppetmaster.redaction import redact_secrets
 
 from ._base import (
@@ -60,10 +69,14 @@ from ._base import (
     verification_artifact,
     _should_emit_patch_artifact,
 )
+from ._context_budget import compress_history
+from ._delta_bus import delta_sink_for
 from ._facade import facade
 from ._prompts import (
     _ANALYZE_JSON_ONLY_RETRY,
+    _EMPTY_RESPONSE_NUDGE,
     _IMPLEMENT_NOOP_NUDGE,
+    _LENGTH_CONTINUATION_NUDGE,
     build_implement_prompt,
     build_structured_prompt,
     prompt_with_memory,
@@ -71,7 +84,12 @@ from ._prompts import (
     with_repo_census,
     with_report_contract,
 )
-from .cursor import cursor_result_artifacts, implement_report_artifacts
+from .cursor import (
+    cursor_artifact_from_item,
+    cursor_result_artifacts,
+    implement_report_artifacts,
+    parse_cursor_artifact_payload,
+)
 
 # Budget governor defaults, mode-aware: implementation is a long-horizon task
 # and 12 turns / 5 minutes forces a no-op on anything non-trivial, so it gets a
@@ -80,6 +98,25 @@ DEFAULT_ANALYZE_MAX_TURNS = 14
 DEFAULT_IMPLEMENT_MAX_TURNS = 50
 DEFAULT_ANALYZE_TIMEOUT_SECONDS = 300
 DEFAULT_IMPLEMENT_TIMEOUT_SECONDS = 900
+
+# Transient-failure retry envelope (Hermes parity): a single 429/5xx/timeout on
+# the wire must not sink an otherwise-healthy worker. We retry the provider call
+# with jittered exponential backoff on classifiably-transient failures only;
+# auth/quota/4xx (except 429) surface immediately, unretried.
+DEFAULT_PROVIDER_MAX_RETRIES = 2
+_PROVIDER_BACKOFF_BASE_SECONDS = 1.5
+_PROVIDER_BACKOFF_MAX_SECONDS = 30.0
+_RETRYABLE_PROVIDER_REASONS = frozenset({"timeout", "network_error", "malformed_response"})
+
+# Bounded recovery counts so a pathological model can't loop forever on the
+# empty-response nudge or the length-continuation retry.
+_MAX_EMPTY_RECOVERIES = 1
+_MAX_LENGTH_CONTINUATIONS = 3
+
+# Prompt-token budget before older tool outputs are elided (Hermes-style live
+# compression). Conservative default that fits common 128k-window models; the
+# caller can raise/lower it per model via payload['context_token_budget'].
+DEFAULT_CONTEXT_TOKEN_BUDGET = 120_000
 
 # Back-compat aliases (older callers/tests referenced the analyze-tier defaults).
 DEFAULT_MAX_TURNS = DEFAULT_ANALYZE_MAX_TURNS
@@ -91,6 +128,18 @@ _SEARCH_FILE_CAP = 400  # files scanned per search_code call
 _SEARCH_HIT_CAP = 60
 _TERMINAL_TIMEOUT_SECONDS = 120
 _MUTATING_TOOLS = frozenset({"write_file", "edit_file", "delete_file"})
+
+# Terminal "submit" tools. The parity fix (v2 overhaul): structured output rides
+# the provider-native tool-calling channel -- the model calls ``submit_findings``
+# (analyze) or ``submit_report`` (implement) with schema-constrained arguments --
+# instead of hoping the model emits a parseable JSON blob as free-text. This is
+# how Codex/Claude Code/Hermes get reliable structure across weak and strong
+# models: the provider constrains the tool arguments, so even a cheap model can't
+# "return prose the parser can't structure." Free-text JSON stays a fallback for
+# providers/models without tool calling.
+_SUBMIT_FINDINGS_TOOL = "submit_findings"
+_SUBMIT_REPORT_TOOL = "submit_report"
+_SUBMIT_TOOLS = frozenset({_SUBMIT_FINDINGS_TOOL, _SUBMIT_REPORT_TOOL})
 
 # Headless destructive-command denylist (guardrail SHAPE lifted from Hermes'
 # tool_guardrails): there is no human to confirm a worker's shell command, so a
@@ -226,22 +275,42 @@ class AgenticAdapter(FullEditWorkerAdapter):
             state["attempted"] = True
             return _ANALYZE_JSON_ONLY_RETRY
 
+        primary_provider, primary_model = provider, model
         try:
-            loop = self._agent_loop(
-                task, cwd, provider, model, prompt, tools, implement=False,
-                on_stop=_on_stop,
+            loop, provider, model = self._run_loop_with_failover(
+                task=task, cwd=cwd, prompt=prompt, tools=tools, implement=False,
+                on_stop=_on_stop, worker_id=worker_id, provider=provider, model=model,
             )
         except ProviderError as exc:
             return [self._fail(task, worker_id, evidence_base, exc.reason,
                                redact_secrets(exc.body or str(exc)) or str(exc),
                                status=exc.status)]
+        failed_over = (provider, model) != (primary_provider, primary_model)
 
-        final_text, usage, turns, _mutated, stop_reason = loop
-        parsed = cursor_result_artifacts(task, worker_id, final_text, adapter="agentic")
-        state["recovered"] = state["attempted"] and bool(parsed)
-        degraded = not parsed and bool(final_text)
+        final_text, usage, turns, _mutated, stop_reason, submitted = loop
+
+        # Structured output has two channels. Preferred: the model called
+        # submit_findings (native, schema-constrained) -- ``submitted`` is the
+        # item list, possibly empty for an honest "found nothing". Fallback: the
+        # model emitted a JSON blob as free-text (older/tool-less models). A run
+        # is degraded ONLY when neither channel produced structure AND the model
+        # actually said something -- an explicit empty submission is a clean pass.
+        if submitted is not None:
+            parsed = _items_to_artifacts(task, worker_id, submitted)
+            structured_ok = True
+            channel = "tool"
+        else:
+            parsed = cursor_result_artifacts(task, worker_id, final_text, adapter="agentic")
+            structured_ok = bool(parsed) or parse_cursor_artifact_payload(final_text) is not None
+            channel = "json"
+        state["recovered"] = state["attempted"] and structured_ok
+        degraded = not structured_ok and bool(final_text)
         result = "degraded" if degraded else "passed"
         evidence = evidence_base + [f"turns:{turns}", f"stop:{stop_reason}"]
+        if failed_over:
+            evidence.append("failover:used")
+        if not degraded:
+            evidence.append(f"submit:{channel}")
         if state["recovered"]:
             evidence.append("retry:recovered")
         elif state["attempted"]:
@@ -313,10 +382,11 @@ class AgenticAdapter(FullEditWorkerAdapter):
             nudged["done"] = True
             return _IMPLEMENT_NOOP_NUDGE
 
+        primary_provider, primary_model = provider, model
         try:
-            loop = self._agent_loop(
-                task, cwd, provider, model, prompt, tools, implement=True,
-                on_stop=_on_stop,
+            loop, provider, model = self._run_loop_with_failover(
+                task=task, cwd=cwd, prompt=prompt, tools=tools, implement=True,
+                on_stop=_on_stop, worker_id=worker_id, provider=provider, model=model,
             )
         except ProviderError as exc:
             after = facade("git_snapshot")(cwd, base_tree=str(before.get("tree") or "") or None)
@@ -331,7 +401,7 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 ))
             return arts
 
-        final_text, usage, turns, mutated, stop_reason = loop
+        final_text, usage, turns, mutated, stop_reason, _submitted = loop
         after = facade("git_snapshot")(cwd, base_tree=str(before.get("tree") or "") or None)
         has_work = _should_emit_patch_artifact(before, after)
         # A run that produced no attributable diff is NOT a pass -- surface it as
@@ -339,6 +409,8 @@ class AgenticAdapter(FullEditWorkerAdapter):
         degraded = not has_work
         parsed = implement_report_artifacts(task, worker_id, final_text, adapter="agentic")
         evidence = evidence_base + [f"turns:{turns}", f"stop:{stop_reason}"]
+        if (provider, model) != (primary_provider, primary_model):
+            evidence.append("failover:used")
         if nudged["done"]:
             evidence.append("nudge:applied")
         artifacts: list[Artifact] = [
@@ -384,24 +456,90 @@ class AgenticAdapter(FullEditWorkerAdapter):
 
     # --- the tool loop -----------------------------------------------------
 
+    def _provider_call(
+        self, *, provider: str, model: str, messages: list[dict],
+        tools: Optional[list[dict]], extra: dict, timeout: int, max_retries: int,
+        key_pool: "Optional[list[str]]" = None,
+        on_delta: Optional[Callable[[str, str], None]] = None,
+    ) -> AssistantTurn:
+        """One model turn, wrapped in the transient-failure retry envelope.
+
+        Two recovery layers, tried in order on failure:
+
+        * **Credential rotation** -- on an auth or rate-limit failure (401/403/
+          429) with another key in ``key_pool``, retry immediately with the next
+          key. A single throttled/revoked key never sinks a worker that has a
+          good one on hand.
+        * **Backoff retry** -- other transient failures (5xx/timeout/network) get
+          jittered exponential backoff. Terminal failures propagate immediately.
+
+        When ``on_delta`` is set, tokens stream to it as they arrive.
+        """
+        keys: list[Optional[str]] = list(key_pool) if key_pool else [None]
+        key_index = 0
+        attempt = 0
+        last: Optional[ProviderError] = None
+        while True:
+            api_key = keys[key_index]
+            kwargs: dict = dict(
+                provider=provider, model=model, messages=messages,
+                tools=tools or None, extra=extra, timeout=timeout,
+            )
+            # The first attempt lets provider_chat resolve the key itself, so the
+            # default single-credential path (and hermetic mocks that don't
+            # accept api_key) is untouched. Only an explicit rotation to a later
+            # key passes api_key.
+            if api_key is not None and key_index > 0:
+                kwargs["api_key"] = api_key
+            try:
+                if on_delta is not None:
+                    return provider_chat_streaming(on_delta=on_delta, **kwargs)
+                return provider_chat(**kwargs)
+            except ProviderError as exc:
+                last = exc
+                if exc.status in (401, 403, 429) and key_index + 1 < len(keys):
+                    key_index += 1
+                    continue
+                if attempt >= max_retries or not _is_retryable_provider_error(exc):
+                    raise
+                time.sleep(_provider_backoff_seconds(attempt))
+                attempt += 1
+        assert last is not None
+        raise last
+
     def _agent_loop(
         self, task: Task, cwd: Path, provider: str, model: str, system_prompt: str,
         tools: list[dict], *, implement: bool,
         on_stop: Optional[Callable[[str, bool], Optional[str]]] = None,
-    ) -> tuple[str, dict, int, bool, str]:
-        """Run the provider tool-use loop until the model stops calling tools.
+        on_delta: Optional[Callable[[str, str], None]] = None,
+    ) -> tuple[str, dict, int, bool, str, Optional[list[dict]]]:
+        """Run the provider tool-use loop until the model finishes.
 
-        Returns ``(final_text, usage_totals, turns, mutated, stop_reason)``. Each
-        turn: send the conversation, execute any tool calls, append their
-        results, repeat. A budget governor bounds the run three ways -- max
-        turns, a per-call wall-clock timeout, and an optional cumulative
-        ``token_budget`` -- so a runaway model can never spin forever.
+        Returns ``(final_text, usage_totals, turns, mutated, stop_reason,
+        submitted)``. ``submitted`` is ``None`` when the model never called
+        ``submit_findings``; otherwise it is the (possibly empty) list of
+        submitted artifact items -- so an explicit empty submission ("I found
+        nothing") is distinguishable from a model that just went silent.
 
-        When the model stops calling tools, ``on_stop`` (if given) may return a
-        follow-up user message to inject and continue (a JSON-only reprompt or a
-        no-op nudge); returning ``None`` ends the loop. ``mutated`` records
-        whether any write/edit/delete tool actually changed the tree.
+        Each turn: send the conversation, execute any tool calls, append their
+        results, repeat. Structured output rides the native tool channel: a
+        ``submit_findings`` / ``submit_report`` call is the terminal signal. A
+        budget governor bounds the run three ways -- max turns, a per-call
+        wall-clock timeout, and an optional cumulative ``token_budget``.
+
+        Robustness envelope (Hermes parity): transient wire failures are retried
+        with backoff (:meth:`_provider_call`); a model that goes silent right
+        after a tool result is nudged once to continue; a length-truncated turn
+        is continued a bounded number of times; and when the analyze retry fires
+        the next turn *forces* the submit tool via ``tool_choice`` so a compliant
+        model can't wander back into prose.
         """
+        max_retries = int(task.payload.get("provider_max_retries", DEFAULT_PROVIDER_MAX_RETRIES))
+        key_pool = provider_key_pool(provider)
+        context_budget = int(
+            task.payload.get("context_token_budget", DEFAULT_CONTEXT_TOKEN_BUDGET)
+        )
+        context_compressions = 0
         max_turns = int(task.payload.get(
             "max_turns",
             DEFAULT_IMPLEMENT_MAX_TURNS if implement else DEFAULT_ANALYZE_MAX_TURNS,
@@ -412,32 +550,74 @@ class AgenticAdapter(FullEditWorkerAdapter):
         ))
         token_budget = task.payload.get("token_budget")
         token_budget = int(token_budget) if token_budget else None
-        extra = self._extra_params(task)
+        base_extra = self._extra_params(task)
         messages: list[dict] = [{"role": "user", "content": system_prompt}]
         usage_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         final_text = ""
         mutated = False
         turns = 0
         stop_reason = "max_turns"
+        submitted: Optional[list[dict]] = None
+        empty_recoveries = 0
+        length_continuations = 0
+        force_submit_next = False
 
         for turns in range(1, max_turns + 1):
-            turn: AssistantTurn = provider_chat(
+            # Shed the oldest large tool outputs before the call if the running
+            # conversation is nearing the context budget, so a long run degrades
+            # gracefully instead of 413-ing mid-flight.
+            messages, compressed = compress_history(messages, budget_tokens=context_budget)
+            if compressed:
+                context_compressions += 1
+            call_extra = dict(base_extra)
+            # Force the submit tool on a turn that follows the structure retry, so
+            # a model that already ignored the JSON-only reprompt is compelled to
+            # emit the schema-constrained tool call instead of more prose.
+            if force_submit_next and not implement:
+                call_extra["force_tool"] = _SUBMIT_FINDINGS_TOOL
+            force_submit_next = False
+
+            turn: AssistantTurn = self._provider_call(
                 provider=provider, model=model, messages=messages,
-                tools=tools or None, extra=extra, timeout=timeout,
+                tools=tools or None, extra=call_extra, timeout=timeout,
+                max_retries=max_retries, key_pool=key_pool, on_delta=on_delta,
             )
             for key in usage_total:
                 usage_total[key] += int(turn.usage.get(key, 0))
             final_text = turn.text or final_text
+
             if not turn.tool_calls:
+                text_present = bool((turn.text or "").strip())
+                # A model that returns nothing right after a tool result usually
+                # just needs a poke to keep going or to submit -- recover once.
+                if (
+                    not text_present
+                    and empty_recoveries < _MAX_EMPTY_RECOVERIES
+                    and _last_message_role(messages) == "tool"
+                ):
+                    empty_recoveries += 1
+                    messages.append({"role": "user", "content": _EMPTY_RESPONSE_NUDGE})
+                    continue
+                # A truncated final turn (hit the output cap) is continued a
+                # bounded number of times so a long report isn't lost mid-word.
+                if (
+                    turn.finish_reason == "length"
+                    and length_continuations < _MAX_LENGTH_CONTINUATIONS
+                ):
+                    length_continuations += 1
+                    messages.append({"role": "user", "content": _LENGTH_CONTINUATION_NUDGE})
+                    continue
                 follow_up = on_stop(final_text, mutated) if on_stop else None
                 if follow_up:
                     messages.append({"role": "user", "content": follow_up})
+                    force_submit_next = not implement
                     if token_budget and usage_total["total_tokens"] >= token_budget:
                         stop_reason = "token_budget"
                         break
                     continue
                 stop_reason = "model_stopped"
                 break
+
             # Record the assistant's tool-call turn, then each tool's result.
             messages.append({
                 "role": "assistant",
@@ -448,15 +628,37 @@ class AgenticAdapter(FullEditWorkerAdapter):
                     for c in turn.tool_calls
                 ],
             })
+            submitted_this_turn = False
             for call in turn.tool_calls:
-                output = self._execute_tool(call["name"], call["arguments"], cwd, implement, task)
-                if call["name"] in _MUTATING_TOOLS and not output.startswith("error"):
+                name = call["name"]
+                if name in _SUBMIT_TOOLS:
+                    submitted_this_turn = True
+                    if name == _SUBMIT_FINDINGS_TOOL:
+                        items = _coerce_submit_findings(call.get("arguments"))
+                        if submitted is None:
+                            submitted = []
+                        submitted.extend(items)
+                        ack = f"Recorded {len(items)} artifact(s). Analysis complete."
+                    else:  # submit_report
+                        report = _coerce_submit_report(call.get("arguments"))
+                        if report:
+                            final_text = report
+                        ack = "Report recorded. Task complete."
+                    messages.append({
+                        "role": "tool", "tool_call_id": call["id"], "content": ack,
+                    })
+                    continue
+                output = self._execute_tool(name, call.get("arguments") or {}, cwd, implement, task)
+                if name in _MUTATING_TOOLS and not output.startswith("error"):
                     mutated = True
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call["id"],
                     "content": _truncate(redact_secrets(output) or "", _TOOL_OUTPUT_LIMIT),
                 })
+            if submitted_this_turn:
+                stop_reason = "submitted"
+                break
             if token_budget and usage_total["total_tokens"] >= token_budget:
                 stop_reason = "token_budget"
                 break
@@ -464,7 +666,52 @@ class AgenticAdapter(FullEditWorkerAdapter):
             "tokens_in": usage_total["prompt_tokens"],
             "tokens_out": usage_total["completion_tokens"],
             "tokens_total": usage_total["total_tokens"],
-        }, turns, mutated, stop_reason
+            "context_compressions": context_compressions,
+        }, turns, mutated, stop_reason, submitted
+
+    def _loop_targets(
+        self, task: Task, provider: str, model: str
+    ) -> "list[tuple[str, str]]":
+        """The primary (provider, model) plus any configured failover targets.
+
+        ``payload['failover_models']`` is an opt-in list of ``{"provider"?,
+        "model"}`` dicts. When a target omits ``provider`` it inherits the
+        primary's. Failover is off unless the caller supplies this list, so
+        default runs are unchanged.
+        """
+        targets: list[tuple[str, str]] = [(provider, model)]
+        for entry in task.payload.get("failover_models") or []:
+            if isinstance(entry, dict) and entry.get("model"):
+                targets.append((str(entry.get("provider") or provider), str(entry["model"])))
+        return targets
+
+    def _run_loop_with_failover(
+        self, *, task: Task, cwd: Path, prompt: str, tools: list[dict],
+        implement: bool, on_stop: Optional[Callable[[str, bool], Optional[str]]],
+        worker_id: str, provider: str, model: str,
+    ) -> "tuple[tuple, str, str]":
+        """Run the agent loop, failing over to each configured alternate on a
+        hard :class:`ProviderError`. Returns ``(loop_result, used_provider,
+        used_model)``; raises the last error only when every target fails.
+
+        Failover restarts the loop from a clean conversation on the new provider
+        (rather than switching mid-conversation, which would leave provider-
+        shaped tool-call history that the next provider can't parse).
+        """
+        last: Optional[ProviderError] = None
+        for target_provider, target_model in self._loop_targets(task, provider, model):
+            try:
+                loop = self._agent_loop(
+                    task, cwd, target_provider, target_model, prompt, tools,
+                    implement=implement, on_stop=on_stop,
+                    on_delta=delta_sink_for(worker_id),
+                )
+                return loop, target_provider, target_model
+            except ProviderError as exc:
+                last = exc
+                continue
+        assert last is not None
+        raise last
 
     def _tool_schema(self, *, implement: bool, task: Task, graph_on: bool = False) -> list[dict]:
         """OpenAI-format tool specs; provider_chat translates for Anthropic."""
@@ -518,7 +765,75 @@ class AgenticAdapter(FullEditWorkerAdapter):
         if bool(task.payload.get("allow_web", False)):
             tools.append(fn("web_fetch", "Fetch a URL and return its text content.",
                             {"url": {"type": "string"}}, ["url"]))
+        tools.append(self._submit_tool(implement=implement, fn=fn))
         return tools
+
+    @staticmethod
+    def _submit_tool(*, implement: bool, fn: Callable) -> dict:
+        """The terminal tool that carries structured output on the native
+        tool-calling channel. Analyze workers finish by calling
+        ``submit_findings`` with a schema-constrained ``artifacts`` array;
+        implement workers finish by calling ``submit_report``. Provider-native
+        argument schemas make this reliable where a free-text JSON contract is
+        not -- the model literally cannot return unparseable prose here.
+        """
+        if implement:
+            return fn(
+                _SUBMIT_REPORT_TOOL,
+                "Submit your final report and finish the task. Call this ONCE, "
+                "after you have made all your edits, to record what you changed, "
+                "which files you touched, and how you verified the change.",
+                {
+                    "summary": {"type": "string", "description": "What you changed and why."},
+                    "files_changed": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "Workspace-relative paths you created, edited, or deleted.",
+                    },
+                    "verification": {
+                        "type": "string",
+                        "description": "Exactly what you ran to verify the change (e.g. the test command and its result).",
+                    },
+                },
+                ["summary"],
+            )
+        return fn(
+            _SUBMIT_FINDINGS_TOOL,
+            "Submit your final structured findings and finish the task. Call this "
+            "EXACTLY ONCE when your analysis is complete. Pass an 'artifacts' "
+            "array. If you genuinely found nothing for your role, submit an empty "
+            "array -- do not invent a finding.",
+            {
+                "artifacts": {
+                    "type": "array",
+                    "description": "Zero or more finding/risk/decision artifacts grounded in concrete files or symbols.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "type": {
+                                "type": "string",
+                                "enum": ["finding", "risk", "decision"],
+                                "description": "Artifact kind.",
+                            },
+                            "claim": {"type": "string", "description": "For type=finding: the claim."},
+                            "risk": {"type": "string", "description": "For type=risk: the risk."},
+                            "mitigation": {"type": "string", "description": "For type=risk: how to mitigate it."},
+                            "decision": {"type": "string", "description": "For type=decision: the decision."},
+                            "why": {"type": "string", "description": "For type=decision: the rationale."},
+                            "evidence": {
+                                "type": "array", "items": {"type": "string"},
+                                "description": "Concrete file paths or symbols that ground this artifact.",
+                            },
+                            "confidence": {
+                                "type": "number",
+                                "description": "0.0-1.0 confidence in this artifact.",
+                            },
+                        },
+                        "required": ["type", "evidence"],
+                    },
+                }
+            },
+            ["artifacts"],
+        )
 
     def _terminal_enabled(self, task: Task) -> bool:
         """Whether implement-mode workers may self-verify with ``run_terminal``.
@@ -779,6 +1094,90 @@ def _destructive_command_match(command: str) -> Optional[str]:
         if pattern.search(command):
             return pattern.pattern
     return None
+
+
+def _last_message_role(messages: list[dict]) -> str:
+    """The role of the most recent message, or '' when the log is empty."""
+    return str(messages[-1].get("role") or "") if messages else ""
+
+
+def _is_retryable_provider_error(exc: ProviderError) -> bool:
+    """A provider failure is worth retrying only when it is classifiably
+    transient -- a timeout, a network blip, a malformed body, a 429 rate-limit,
+    or a 5xx. Auth (401/403), bad-request (400), and not-found (404) are
+    terminal: retrying just burns time and money.
+    """
+    if exc.reason in _RETRYABLE_PROVIDER_REASONS:
+        return True
+    status = exc.status
+    if status is not None and (status == 429 or 500 <= status < 600):
+        return True
+    return False
+
+
+def _provider_backoff_seconds(attempt: int) -> float:
+    """Jittered exponential backoff for provider retries (attempt is 0-indexed)."""
+    ceiling = min(
+        _PROVIDER_BACKOFF_MAX_SECONDS,
+        _PROVIDER_BACKOFF_BASE_SECONDS * (2 ** attempt),
+    )
+    return random.uniform(_PROVIDER_BACKOFF_BASE_SECONDS, ceiling)
+
+
+def _coerce_submit_findings(args: object) -> list[dict]:
+    """Normalize a ``submit_findings`` tool payload into artifact-item dicts.
+
+    Tolerant on purpose: the canonical shape is ``{"artifacts": [ ... ]}``, but a
+    model may pass a single finding at the top level or a lone dict. Anything
+    that clearly isn't an artifact item is dropped rather than fabricated.
+    """
+    if not isinstance(args, dict):
+        return []
+    items = args.get("artifacts")
+    if items is None:
+        if any(key in args for key in ("claim", "risk", "decision", "finding", "summary")):
+            items = [args]
+        else:
+            items = []
+    if isinstance(items, dict):
+        items = [items]
+    if not isinstance(items, list):
+        return []
+    normalized: list[dict] = []
+    for item in items:
+        if isinstance(item, dict):
+            normalized.append({**item, "type": item.get("type") or "finding"})
+    return normalized
+
+
+def _items_to_artifacts(task: Task, worker_id: str, items: list[dict]) -> list[Artifact]:
+    """Convert submitted artifact items into durable Artifacts, dropping any that
+    don't satisfy the finding/risk/decision contract."""
+    artifacts: list[Artifact] = []
+    for item in items:
+        artifact = cursor_artifact_from_item(task, worker_id, item, adapter="agentic")
+        if artifact is not None:
+            artifacts.append(artifact)
+    return artifacts
+
+
+def _coerce_submit_report(args: object) -> str:
+    """Fold a ``submit_report`` tool payload into a single report string that the
+    existing ``implement_report_artifacts`` path can turn into a durable finding.
+    """
+    if not isinstance(args, dict):
+        return ""
+    parts: list[str] = []
+    summary = str(args.get("summary") or "").strip()
+    if summary:
+        parts.append(summary)
+    files = args.get("files_changed")
+    if isinstance(files, list) and files:
+        parts.append("Files changed: " + ", ".join(str(f) for f in files))
+    verification = str(args.get("verification") or "").strip()
+    if verification:
+        parts.append("Verification: " + verification)
+    return "\n\n".join(parts)
 
 
 def _near_miss_hint(text: str, old: str, *, max_len: int = 200) -> str:

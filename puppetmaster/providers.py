@@ -32,7 +32,7 @@ import socket
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 
 
 # --- provider descriptors ---------------------------------------------------
@@ -199,6 +199,39 @@ def resolve_api_key(
     return None
 
 
+def _numbered_env_names(name: str) -> "list[str]":
+    """``NAME`` followed by ``NAME_2 .. NAME_9`` -- the convention for holding
+    several rotating keys for one provider in the environment."""
+    return [name] + [f"{name}_{i}" for i in range(2, 10)]
+
+
+def provider_key_pool(
+    provider: str, env: Optional[Mapping[str, str]] = None
+) -> "list[str]":
+    """All usable API keys for ``provider``, in rotation order.
+
+    Unions every key env var the descriptor lists (e.g. Gemini's
+    ``GEMINI_API_KEY`` + ``GOOGLE_API_KEY``) with numbered siblings
+    (``OPENAI_API_KEY``, ``OPENAI_API_KEY_2``, ...), de-duplicated while
+    preserving order. The adapter rotates through this pool on auth / rate-limit
+    failures so one throttled or revoked key doesn't sink a worker that has
+    another good key on hand. Empty for a keyless provider or an unknown slug.
+    """
+    desc = get_provider(provider)
+    if desc is None:
+        return []
+    env = env if env is not None else os.environ
+    keys: list[str] = []
+    seen: set[str] = set()
+    for base in desc.api_key_env_vars:
+        for name in _numbered_env_names(base):
+            value = env.get(name)
+            if value and value.strip() and value.strip() not in seen:
+                seen.add(value.strip())
+                keys.append(value.strip())
+    return keys
+
+
 def resolve_base_url(
     desc: ProviderDescriptor, env: Optional[Mapping[str, str]] = None
 ) -> str:
@@ -299,7 +332,11 @@ def _openai_chat(
     body: dict[str, Any] = {"model": model, "messages": messages}
     if tools:
         body["tools"] = tools
+    extra = dict(extra)
+    force_tool = extra.pop("force_tool", None)
     body.update(extra)
+    if force_tool and tools:
+        body["tool_choice"] = {"type": "function", "function": {"name": str(force_tool)}}
     auth = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     data = _post_json(
         f"{base_url}/chat/completions",
@@ -349,6 +386,9 @@ def _anthropic_chat(
         body["system"] = "\n\n".join(str(p) for p in system_parts)
     if tools:
         body["tools"] = [_to_anthropic_tool(t) for t in tools]
+    force_tool = extra.get("force_tool")
+    if force_tool and tools:
+        body["tool_choice"] = {"type": "tool", "name": str(force_tool)}
     for key in ("temperature", "top_p", "stop_sequences"):
         if key in extra:
             body[key] = extra[key]
@@ -437,6 +477,266 @@ def _to_anthropic_tool(tool: dict) -> dict:
         "description": fn.get("description") or "",
         "input_schema": fn.get("parameters") or {"type": "object", "properties": {}},
     }
+
+
+def _open_stream(url: str, *, headers: dict, body: dict, timeout: int):
+    """POST ``body`` and return the raw streaming response for SSE iteration.
+
+    Mirrors :func:`_post_json`'s error normalization so a streaming call raises
+    the same classifiable :class:`ProviderError` on HTTP/transport failure.
+    """
+    request = urllib.request.Request(
+        url,
+        data=json.dumps({**body, "stream": True}).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "text/event-stream", **headers},
+        method="POST",
+    )
+    try:
+        return urllib.request.urlopen(request, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        err_body = ""
+        try:
+            err_body = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            err_body = ""
+        raise ProviderError(
+            f"HTTP {exc.code}", reason=f"http_status:{exc.code}", status=exc.code, body=err_body
+        ) from exc
+    except (socket.timeout, TimeoutError) as exc:
+        raise ProviderError("request timed out", reason="timeout") from exc
+    except urllib.error.URLError as exc:
+        raise ProviderError(str(exc), reason="network_error") from exc
+
+
+def _iter_sse_data(response) -> "Any":
+    """Yield the payload of each ``data:`` SSE line from a streaming response."""
+    for raw in response:
+        line = raw.decode("utf-8", errors="replace").strip() if isinstance(raw, bytes) else str(raw).strip()
+        if not line or not line.startswith("data:"):
+            continue
+        yield line[len("data:"):].strip()
+
+
+def _openai_chat_stream(
+    *, base_url: str, api_key: Optional[str], model: str, messages: list[dict],
+    tools: Optional[list[dict]], extra: dict, headers: dict, timeout: int,
+    on_delta: Optional[Callable[[str, str], None]],
+) -> AssistantTurn:
+    extra = dict(extra)
+    force_tool = extra.pop("force_tool", None)
+    body: dict[str, Any] = {
+        "model": model, "messages": messages,
+        "stream_options": {"include_usage": True},
+    }
+    if tools:
+        body["tools"] = tools
+    if force_tool and tools:
+        body["tool_choice"] = {"type": "function", "function": {"name": str(force_tool)}}
+    body.update(extra)
+    auth = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    response = _open_stream(
+        f"{base_url}/chat/completions",
+        headers={"User-Agent": "puppetmaster-agentic", **auth, **headers},
+        body=body, timeout=timeout,
+    )
+    text_parts: list[str] = []
+    tool_acc: dict[int, dict] = {}
+    finish = ""
+    usage: dict = {}
+    try:
+        for payload in _iter_sse_data(response):
+            if payload == "[DONE]":
+                break
+            try:
+                chunk = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if chunk.get("usage"):
+                usage = chunk["usage"]
+            for choice in chunk.get("choices") or []:
+                delta = choice.get("delta") or {}
+                piece = delta.get("content")
+                if piece:
+                    text_parts.append(piece)
+                    if on_delta:
+                        on_delta("text", piece)
+                reasoning = delta.get("reasoning") or delta.get("reasoning_content")
+                if reasoning and on_delta:
+                    on_delta("reasoning", str(reasoning))
+                for call in delta.get("tool_calls") or []:
+                    idx = int(call.get("index") or 0)
+                    slot = tool_acc.setdefault(idx, {"id": "", "name": "", "args": ""})
+                    if call.get("id"):
+                        slot["id"] = call["id"]
+                    fn = call.get("function") or {}
+                    if fn.get("name"):
+                        slot["name"] = fn["name"]
+                    if fn.get("arguments"):
+                        slot["args"] += fn["arguments"]
+                if choice.get("finish_reason"):
+                    finish = choice["finish_reason"]
+    finally:
+        response.close()
+    tool_calls: list[dict] = []
+    for idx in sorted(tool_acc):
+        slot = tool_acc[idx]
+        raw_args = slot["args"]
+        try:
+            args = json.loads(raw_args) if raw_args.strip() else {}
+        except json.JSONDecodeError:
+            args = {"__raw__": raw_args}
+        tool_calls.append({"id": slot["id"] or "", "name": slot["name"] or "", "arguments": args})
+    return AssistantTurn(
+        text="".join(text_parts).strip(),
+        tool_calls=tool_calls,
+        finish_reason=str(finish or ""),
+        usage={
+            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+            "completion_tokens": int(usage.get("completion_tokens") or 0),
+            "total_tokens": int(usage.get("total_tokens") or 0),
+        },
+        raw={},
+    )
+
+
+def _anthropic_chat_stream(
+    *, base_url: str, api_key: Optional[str], model: str, messages: list[dict],
+    tools: Optional[list[dict]], extra: dict, headers: dict, timeout: int,
+    on_delta: Optional[Callable[[str, str], None]],
+) -> AssistantTurn:
+    system_parts = [m["content"] for m in messages if m.get("role") == "system" and m.get("content")]
+    convo = [m for m in messages if m.get("role") != "system"]
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": _to_anthropic_messages(convo),
+        "max_tokens": int(extra.get("max_tokens") or extra.get("max_completion_tokens") or 4096),
+    }
+    if system_parts:
+        body["system"] = "\n\n".join(str(p) for p in system_parts)
+    if tools:
+        body["tools"] = [_to_anthropic_tool(t) for t in tools]
+    force_tool = extra.get("force_tool")
+    if force_tool and tools:
+        body["tool_choice"] = {"type": "tool", "name": str(force_tool)}
+    for key in ("temperature", "top_p", "stop_sequences"):
+        if key in extra:
+            body[key] = extra[key]
+    auth = {"x-api-key": api_key} if api_key else {}
+    response = _open_stream(
+        f"{base_url}/messages",
+        headers={"User-Agent": "puppetmaster-agentic", "anthropic-version": "2023-06-01", **auth, **headers},
+        body=body, timeout=timeout,
+    )
+    text_parts: list[str] = []
+    blocks: dict[int, dict] = {}
+    finish = ""
+    prompt_tokens = 0
+    completion_tokens = 0
+    try:
+        for payload in _iter_sse_data(response):
+            try:
+                event = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            etype = event.get("type")
+            if etype == "message_start":
+                prompt_tokens = int(((event.get("message") or {}).get("usage") or {}).get("input_tokens") or 0)
+            elif etype == "content_block_start":
+                idx = int(event.get("index") or 0)
+                block = event.get("content_block") or {}
+                blocks[idx] = {"type": block.get("type"), "id": block.get("id", ""),
+                               "name": block.get("name", ""), "args": ""}
+            elif etype == "content_block_delta":
+                idx = int(event.get("index") or 0)
+                delta = event.get("delta") or {}
+                if delta.get("type") == "text_delta":
+                    piece = delta.get("text") or ""
+                    if piece:
+                        text_parts.append(piece)
+                        if on_delta:
+                            on_delta("text", piece)
+                elif delta.get("type") == "thinking_delta":
+                    if on_delta and delta.get("thinking"):
+                        on_delta("reasoning", str(delta["thinking"]))
+                elif delta.get("type") == "input_json_delta":
+                    slot = blocks.setdefault(idx, {"type": "tool_use", "id": "", "name": "", "args": ""})
+                    slot["args"] += delta.get("partial_json") or ""
+            elif etype == "message_delta":
+                finish = str((event.get("delta") or {}).get("stop_reason") or finish)
+                completion_tokens = int((event.get("usage") or {}).get("output_tokens") or completion_tokens)
+            elif etype == "message_stop":
+                break
+    finally:
+        response.close()
+    tool_calls: list[dict] = []
+    for idx in sorted(blocks):
+        slot = blocks[idx]
+        if slot.get("type") != "tool_use":
+            continue
+        raw_args = slot.get("args") or ""
+        try:
+            args = json.loads(raw_args) if raw_args.strip() else {}
+        except json.JSONDecodeError:
+            args = {"__raw__": raw_args}
+        tool_calls.append({"id": slot.get("id") or "", "name": slot.get("name") or "", "arguments": args})
+    return AssistantTurn(
+        text="".join(text_parts).strip(),
+        tool_calls=tool_calls,
+        finish_reason=finish,
+        usage={
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+        raw={},
+    )
+
+
+def provider_chat_streaming(
+    *,
+    provider: str,
+    model: str,
+    messages: list[dict],
+    tools: Optional[list[dict]] = None,
+    extra: Optional[dict] = None,
+    on_delta: Optional[Callable[[str, str], None]] = None,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    timeout: int = 300,
+    env: Optional[Mapping[str, str]] = None,
+) -> AssistantTurn:
+    """Streaming twin of :func:`provider_chat`.
+
+    Streams the model turn over SSE, invoking ``on_delta(kind, text)`` for each
+    text/reasoning chunk (``kind`` is ``"text"`` or ``"reasoning"``), and returns
+    the same normalized :class:`AssistantTurn` once the turn completes -- so the
+    agent loop is identical whether or not a caller wants live tokens. Falls back
+    to the same provider resolution and error semantics as :func:`provider_chat`.
+    """
+    desc = get_provider(provider)
+    if desc is None:
+        raise ProviderError(f"unknown provider {provider!r}", reason="unknown_provider")
+    env = env if env is not None else os.environ
+    key = api_key if api_key is not None else resolve_api_key(desc, env)
+    if key is None and not desc.keyless:
+        raise ProviderError(
+            f"no API key for provider {desc.slug!r} "
+            f"(set one of {', '.join(desc.api_key_env_vars)})",
+            reason="not_authenticated",
+        )
+    url = (base_url or resolve_base_url(desc, env)).rstrip("/")
+    extra = dict(extra or {})
+    if desc.wire == "anthropic":
+        return _anthropic_chat_stream(
+            base_url=url, api_key=key, model=model, messages=messages,
+            tools=tools, extra=extra, headers=dict(desc.default_headers),
+            timeout=timeout, on_delta=on_delta,
+        )
+    return _openai_chat_stream(
+        base_url=url, api_key=key, model=model, messages=messages,
+        tools=tools, extra=extra, headers=dict(desc.default_headers),
+        timeout=timeout, on_delta=on_delta,
+    )
 
 
 def provider_chat(

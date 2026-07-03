@@ -42,16 +42,26 @@ _PUPPETMASTER_ARTIFACT_CONTRACT_LINES = (
 def build_structured_prompt(prompt: str, *, final_message_note: bool = False) -> str:
     lines = [prompt, ""]
     if final_message_note:
+        # Primary contract: finish by CALLING the submit_findings tool. The
+        # provider constrains the tool's arguments, so structure is reliable even
+        # on cheap models -- this is the parity mechanism that ends the "returned
+        # prose the parser couldn't structure" degrade. The JSON-object shape is
+        # kept as an explicit fallback for any model/provider without tool calls.
         lines.extend(
             [
                 _PUPPETMASTER_ARTIFACT_CONTRACT_LINES[0],
-                "When you are finished, emit ONLY a single JSON object as your final agent message "
-                "(no prose around it, no markdown fences), in this shape:",
-                _PUPPETMASTER_ARTIFACT_CONTRACT_LINES[2],
-                _PUPPETMASTER_ARTIFACT_CONTRACT_LINES[3],
+                "When your analysis is complete, finish by CALLING the "
+                "`submit_findings` tool exactly once. Pass an `artifacts` array of "
+                "finding/risk/decision objects grounded in concrete files or "
+                "symbols. If you genuinely found nothing for your role, call "
+                "`submit_findings` with an empty array -- never invent a finding.",
+                "Each artifact object takes:",
                 _PUPPETMASTER_ARTIFACT_CONTRACT_LINES[4],
                 _PUPPETMASTER_ARTIFACT_CONTRACT_LINES[5],
                 _PUPPETMASTER_ARTIFACT_CONTRACT_LINES[6],
+                "Fallback only if you cannot call tools: emit ONLY a single JSON "
+                'object {"artifacts":[...]} as your final message (no prose, no '
+                "markdown fences).",
             ]
         )
     else:
@@ -59,8 +69,8 @@ def build_structured_prompt(prompt: str, *, final_message_note: bool = False) ->
     lines.extend([_ARTIFACT_GROUNDING, _ARTIFACT_EMPTY_GUIDANCE])
     if final_message_note:
         lines.append(
-            "You may still use your tools to read files and inspect code along the way; just "
-            "make sure the FINAL agent message is the JSON object described above."
+            "You may use your read/search tools to inspect the code along the way; "
+            "just make sure you FINISH by calling `submit_findings`."
         )
     return "\n".join(lines)
 
@@ -77,17 +87,38 @@ def build_implement_prompt(prompt: str) -> str:
             "Keep the change focused on the task; run any obvious local checks you can. "
             "Puppetmaster captures the resulting git diff as a PATCH artifact, so leave "
             "the working tree containing your final intended changes.",
+            "When all edits are done, finish by CALLING the `submit_report` tool with a "
+            "short summary, the files you changed, and how you verified. If you cannot "
+            "call tools, end with the same report as your final message instead.",
             _IMPLEMENT_REPORT_CONTRACT,
         ]
     )
 
 
 _ANALYZE_JSON_ONLY_RETRY = (
-    "\n\nIMPORTANT: your previous response did not contain the required "
-    "structured output. Respond with ONLY a single JSON object of the form "
-    '{"artifacts": [...]} exactly as specified above — no prose, no explanation, '
-    "no markdown fences, nothing before or after the JSON. If you genuinely found "
-    'nothing for your role, return {"artifacts": []}.'
+    "\n\nIMPORTANT: your previous response did not submit the required structured "
+    "output. Finish now by CALLING the `submit_findings` tool with an `artifacts` "
+    "array (each item a finding/risk/decision grounded in concrete files or "
+    "symbols). If you genuinely found nothing for your role, call `submit_findings` "
+    'with an empty array. If you cannot call tools, respond with ONLY a single JSON '
+    'object {"artifacts": [...]} — no prose, no explanation, no markdown fences.'
+)
+
+
+# Injected once when a model returns an empty turn right after a tool result --
+# usually it just needs a nudge to keep going or to submit, not a degrade.
+_EMPTY_RESPONSE_NUDGE = (
+    "You returned an empty response. If your analysis is complete, call "
+    "`submit_findings` now with your artifacts (or an empty array if you found "
+    "nothing). Otherwise, continue using your tools to finish the task."
+)
+
+
+# Injected when a turn was truncated at the output-token cap, so a long final
+# report/tool batch is continued instead of lost mid-word.
+_LENGTH_CONTINUATION_NUDGE = (
+    "Your previous response was cut off at the output limit. Continue exactly "
+    "where you left off; when finished, call the appropriate submit tool."
 )
 
 
