@@ -4411,7 +4411,10 @@ class PuppetmasterTests(unittest.TestCase):
             # Still running -> not reaped yet.
             self.assertIn(launcher, mcp_server.ASYNC_PROCESSES)
             launcher.alive = False
-            deadline = time.time() + 1.0
+            # Generous deadline: the loop exits the instant the reaper sweeps, so
+            # extra slack is free and only guards against a starved reaper thread
+            # on a contended CI runner (the macOS leg once flaked at 1.0s).
+            deadline = time.time() + 5.0
             while launcher in mcp_server.ASYNC_PROCESSES and time.time() < deadline:
                 time.sleep(0.02)
             self.assertNotIn(launcher, mcp_server.ASYNC_PROCESSES)

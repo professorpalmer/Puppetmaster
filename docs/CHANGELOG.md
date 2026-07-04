@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.3.0
+
+**A dead, revoked, or wrong provider key no longer hides behind a generic degrade — the `agentic` adapter now fails loud on auth rejection, naming the provider and the exact env var to fix.** Before this, a 401/403 (or a pre-flight `not_authenticated`) got laundered into a vague "failed verification" / "completed without structured findings" result, sending everyone hunting for a weak-model or bad-prompt cause instead of the real one: the key.
+
+- **Loud auth-failure RISK.** When a `ProviderError` is an auth rejection — HTTP 401/403, or a pre-flight `not_authenticated` (key missing/blank, status `None`) — *after* key-pool rotation is exhausted, the adapter emits a dedicated high-confidence (`0.95`) `RISK` artifact stamped `failure="auth_failed:<status>"`. It names the provider and the precise env var to fix (`_PROVIDER_ENV_HINTS`), so the diagnosis is immediate instead of a scavenger hunt. Fires in both analyze and implement modes. Evidence tags: `adapter:agentic`, `provider:<name>`, `auth_failed:<status>`, `keys:exhausted`. Covered by two new tests; agentic suite green (58 passed).
+- **CI hygiene.** Hardened the flaky `test_reaper_thread_reaps_on_interval_and_final_sweep` timing test: its reaper-sweep deadline was 1.0s, which a starved background thread on a contended macOS runner could miss (it flaked red on the v1.2.0 *tag* run while the identical commit passed on `main` and every other OS/Python leg). Widened to 5.0s — the poll loop still exits the instant the reaper sweeps, so the slack is free and only guards against runner contention.
+- Full suites green under CI's isolated environment: **`unittest discover` 1101 (OK)**, dedicated **`test_agentic_standalone.py` 58 passed** and **`test_eval_harness.py` 6 passed**.
+
 ## v1.2.0
 
 **The `agentic` adapter closes the last gaps between "reliable" and "daily-driver": it now self-verifies before it dares call a run done, streams tokens durably to disk for subprocess/CLI swarms (not just in-process hosts), records a visible plan, and ships with an objective seeded-bug eval harness so quality is measured, not asserted.** v1.1.0 fixed the "empty findings" failure mode and reached reliability parity; this release pushes toward *feature* parity with Codex/Claude Code toolchains so Marionette — and anyone running the bare adapter — gets a harness worth reaching for every day.
