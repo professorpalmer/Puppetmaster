@@ -161,6 +161,21 @@ _SUBMIT_TOOLS = frozenset({_SUBMIT_FINDINGS_TOOL, _SUBMIT_REPORT_TOOL})
 _PLAN_TOOL = "update_plan"
 _PLAN_STATUSES = ("pending", "in_progress", "done")
 
+# Provider -> the env var whose key to fix, named in the auth-failure RISK so a
+# dead/revoked key is diagnosable at a glance instead of laundered into a
+# generic "no structured findings" degrade.
+_PROVIDER_ENV_HINTS = {
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "gemini": "GEMINI_API_KEY (or GOOGLE_API_KEY)",
+    "google": "GOOGLE_API_KEY (or GEMINI_API_KEY)",
+    "openrouter": "OPENROUTER_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "xai": "XAI_API_KEY",
+    "mistral": "MISTRAL_API_KEY",
+}
+
 # Headless destructive-command denylist (guardrail SHAPE lifted from Hermes'
 # tool_guardrails): there is no human to confirm a worker's shell command, so a
 # small conservative denylist of unambiguously catastrophic patterns is prudent.
@@ -308,9 +323,14 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 worker_id=worker_id, provider=provider, model=model,
             )
         except ProviderError as exc:
-            return [self._fail(task, worker_id, evidence_base, exc.reason,
-                               redact_secrets(exc.body or str(exc)) or str(exc),
-                               status=exc.status)]
+            detail = redact_secrets(exc.body or str(exc)) or str(exc)
+            arts = [self._fail(task, worker_id, evidence_base, exc.reason,
+                               detail, status=exc.status)]
+            auth_risk = self._auth_failure_risk(
+                task, worker_id, provider, exc.status or 0, detail, reason=exc.reason)
+            if auth_risk is not None:
+                arts.append(auth_risk)
+            return arts
         failed_over = (provider, model) != (primary_provider, primary_model)
 
         final_text, usage, turns, _mutated, stop_reason, submitted = loop
@@ -466,9 +486,13 @@ class AgenticAdapter(FullEditWorkerAdapter):
             )
         except ProviderError as exc:
             after = facade("git_snapshot")(cwd, base_tree=str(before.get("tree") or "") or None)
+            detail = redact_secrets(exc.body or str(exc)) or str(exc)
             arts = [self._fail(task, worker_id, evidence_base, exc.reason,
-                               redact_secrets(exc.body or str(exc)) or str(exc),
-                               status=exc.status)]
+                               detail, status=exc.status)]
+            auth_risk = self._auth_failure_risk(
+                task, worker_id, provider, exc.status or 0, detail, reason=exc.reason)
+            if auth_risk is not None:
+                arts.append(auth_risk)
             if _should_emit_patch_artifact(before, after):
                 arts.append(make_patch_artifact(
                     task, worker_id, before, after, adapter="agentic",
@@ -1295,6 +1319,57 @@ class AgenticAdapter(FullEditWorkerAdapter):
             check=task.instruction, result="failed", confidence=0.55,
             evidence=evidence + [reason],
             payload={"failure": reason, "returncode": status, "stderr": detail[:8000]},
+        )
+
+    def _auth_failure_risk(
+        self, task: Task, worker_id: str, provider: str, status: int, detail: str,
+        reason: str = "",
+    ) -> "Optional[Artifact]":
+        """Loud, unmistakable RISK artifact for a provider auth rejection.
+
+        A 401/403 after key-pool rotation is exhausted is a DEAD/REVOKED/WRONG
+        key -- not a weak model and not a bad prompt. Without this, the failure
+        was laundered into a generic verification-failed / "completed without
+        structured findings" artifact, sending everyone hunting for a model or
+        prompt problem instead of the real cause. We surface the provider and
+        the exact env var to fix so the diagnosis is immediate.
+        """
+        # An auth rejection reaches us three ways: an HTTP 401/403 (status set,
+        # or reason "http_status:401/403"), or a pre-flight "not_authenticated"
+        # (key missing/blank before any call, status None). Catch all of them --
+        # every one is a credential problem, not a model or prompt problem.
+        r = (reason or "").lower()
+        is_auth = (
+            status in (401, 403)
+            or r == "not_authenticated"
+            or r in ("http_status:401", "http_status:403")
+        )
+        if not is_auth:
+            return None
+        code = status if status in (401, 403) else (
+            401 if r in ("not_authenticated", "http_status:401") else 403)
+        status = code
+        env_var = _PROVIDER_ENV_HINTS.get((provider or "").lower(), f"the {provider} API key")
+        return Artifact(
+            job_id=task.job_id, task_id=task.id, type=ArtifactType.RISK,
+            created_by=worker_id, confidence=0.95,
+            evidence=["adapter:agentic", f"provider:{provider}",
+                      f"auth_failed:{status}", "keys:exhausted"],
+            payload={
+                "risk": (
+                    f"AUTH FAILURE: provider '{provider}' rejected the API key "
+                    f"(HTTP {status}) after trying every configured key. This is a "
+                    f"dead, revoked, or wrong key -- NOT a weak model or a bad "
+                    f"prompt. The worker never reached the model."
+                ),
+                "mitigation": (
+                    f"Fix or remove {env_var} (or disable the '{provider}' provider), "
+                    f"then retry. Verify the key with a direct provider API call."
+                ),
+                "failure": f"auth_failed:{status}",
+                "provider": provider,
+                "stderr_excerpt": redact_secrets(detail or "")[:2000],
+            },
         )
 
 

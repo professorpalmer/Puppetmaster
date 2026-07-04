@@ -451,8 +451,38 @@ class AgenticLoopTests(unittest.TestCase):
             side_effect=ProviderError("401", reason="http_status:401", status=401, body="bad key"),
         ):
             arts = self.adapter().run(task, task.instruction, "w1")
-        self.assertEqual(len(arts), 1)
-        self.assertEqual(arts[0].payload["result"], "failed")
+        # A 401 yields the failed verification PLUS a loud, dedicated auth-failure
+        # RISK so a dead/revoked key is diagnosable at a glance (not laundered into
+        # a generic "no structured findings" degrade).
+        self.assertEqual(len(arts), 2)
+        verif = next(a for a in arts if a.type == ArtifactType.VERIFICATION)
+        self.assertEqual(verif.payload["result"], "failed")
+        risk = next(a for a in arts if a.type == ArtifactType.RISK)
+        self.assertEqual(risk.payload["failure"], "auth_failed:401")
+        self.assertEqual(risk.payload["provider"], "anthropic")
+        self.assertIn("AUTH FAILURE", risk.payload["risk"])
+        self.assertIn("ANTHROPIC_API_KEY", risk.payload["mitigation"])
+
+    def test_preflight_not_authenticated_yields_auth_risk(self) -> None:
+        # A missing/blank key raises ProviderError(reason="not_authenticated")
+        # with status None (no HTTP call). The auth-failure RISK must still fire.
+        from puppetmaster.adapters import agentic
+        from puppetmaster.providers import ProviderError
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        task = Task(
+            job_id="j", role="explore", instruction="x",
+            payload={"cwd": tmp.name, "provider": "openai", "model": "m", "disable_codegraph": True},
+        )
+        with mock.patch.object(
+            agentic, "provider_chat",
+            side_effect=ProviderError("no key", reason="not_authenticated"),
+        ):
+            arts = self.adapter().run(task, task.instruction, "w1")
+        risk = next(a for a in arts if a.type == ArtifactType.RISK)
+        self.assertEqual(risk.payload["failure"], "auth_failed:401")
+        self.assertIn("OPENAI_API_KEY", risk.payload["mitigation"])
 
     def test_analyze_json_only_retry_recovers_a_prose_run(self) -> None:
         from puppetmaster.adapters import agentic
