@@ -202,6 +202,11 @@ _DESTRUCTIVE_COMMAND_PATTERNS = tuple(
 
 _BINARY_SNIFF_BYTES = 8000
 
+_BROWSER_TOOL_NAMES = frozenset((
+    "browser_navigate", "browser_snapshot", "browser_click", "browser_type",
+    "browser_scroll", "browser_back", "browser_get_text", "browser_screenshot",
+))
+
 
 class AgenticAdapter(FullEditWorkerAdapter):
     """Provider-agnostic direct-API worker with an in-process tool loop."""
@@ -982,6 +987,20 @@ class AgenticAdapter(FullEditWorkerAdapter):
         if bool(task.payload.get("allow_web", False)):
             tools.append(fn("web_fetch", "Fetch a URL and return its text content.",
                             {"url": {"type": "string"}}, ["url"]))
+        if self._browser_enabled(task):
+            tools.append(fn("browser_navigate", "Open a URL in a real headless browser. Call browser_snapshot next to see clickable elements.",
+                            {"url": {"type": "string"}}, ["url"]))
+            tools.append(fn("browser_snapshot", "Return the current page's interactable elements with @e1-style refs. Snapshot before clicking/typing so you have fresh refs.",
+                            {}, []))
+            tools.append(fn("browser_click", "Click the element with the given ref (from browser_snapshot, e.g. @e3).",
+                            {"ref": {"type": "string"}}, ["ref"]))
+            tools.append(fn("browser_type", "Type text into the input/textarea element with the given ref.",
+                            {"ref": {"type": "string"}, "text": {"type": "string"}}, ["ref", "text"]))
+            tools.append(fn("browser_scroll", "Scroll the page 'up' or 'down'.",
+                            {"direction": {"type": "string", "description": "up or down"}}, []))
+            tools.append(fn("browser_back", "Navigate the browser back one page.", {}, []))
+            tools.append(fn("browser_get_text", "Return the page's main readable text (document body innerText).", {}, []))
+            tools.append(fn("browser_screenshot", "Capture a PNG screenshot of the current page; returns a file path you can view_image.", {}, []))
         if bool(task.payload.get("plan_tool", True)):
             tools.append(fn(
                 _PLAN_TOOL,
@@ -1075,6 +1094,24 @@ class AgenticAdapter(FullEditWorkerAdapter):
         """
         return bool(task.payload.get("allow_terminal", True))
 
+    def _browser_enabled(self, task: Task) -> bool:
+        """Whether this worker gets the CDP browser toolset (navigate/snapshot/
+        click/type/scroll/back/get_text/screenshot).
+
+        Enabled when the spec opts in via ``payload.allow_browser`` OR lists
+        ``browser`` in its comma-separated ``payload.toolsets`` (the convention
+        PM's browser-swarm specs already use). This lets browser-capable swarms
+        run on the standalone ``agentic`` adapter + the user's own keys, without
+        the Hermes adapter / agent-browser CLI.
+        """
+        payload = task.payload or {}
+        if payload.get("allow_browser"):
+            return True
+        toolsets = payload.get("toolsets")
+        if isinstance(toolsets, str):
+            return "browser" in {p.strip() for p in toolsets.split(",")}
+        return False
+
     def _resolve_verify_command(self, task: Task, cwd: Path) -> Optional[str]:
         """The command that verifies an implement change (tests/typecheck/lint).
 
@@ -1138,6 +1175,17 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 return self._tool_run_terminal(args, cwd)
             if name == "web_fetch" and bool(task.payload.get("allow_web", False)):
                 return self._tool_web_fetch(args)
+            if name in _BROWSER_TOOL_NAMES and self._browser_enabled(task):
+                from puppetmaster import browser_cdp as _bcdp
+                out_dir = None
+                try:
+                    _cwd = task.payload.get("cwd")
+                    if _cwd:
+                        out_dir = str(_cwd)
+                except Exception:
+                    out_dir = None
+                result = _bcdp.dispatch(name, args, out_dir=out_dir)
+                return result if result is not None else f"error: unknown browser tool {name!r}"
             return f"error: tool {name!r} is not available in this mode"
         except Exception as exc:  # a tool failure must not kill the worker
             return f"error: {type(exc).__name__}: {exc}"
