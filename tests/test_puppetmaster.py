@@ -17384,6 +17384,153 @@ class ReviewGateTests(unittest.TestCase):
             self.assertEqual(payload.get("evaluator_slot"), "review-judge")
             self.assertEqual(payload.get("evaluator_version"), 4)
 
+    def _drafts_dir(self, tmp) -> str:
+        return str(Path(tmp) / ".puppetmaster")
+
+    def test_review_gate_records_draft_on_epoch_rejection(self) -> None:
+        from puppetmaster.evaluators import load_drafts
+        from puppetmaster.gates import ReviewVerdict
+
+        epoch = [
+            {
+                "slot_id": "review-judge",
+                "version": 2,
+                "role": "review",
+                "instruction": "Check scope.",
+                "criteria": {"scope": "complete"},
+            }
+        ]
+        with TemporaryDirectory() as tmp:
+            evald, _ = self._eval_review_capture_prompt(
+                tmp,
+                epoch=epoch,
+                judge_verdict=ReviewVerdict(
+                    available=True,
+                    passed=False,
+                    severity="major",
+                    reasons=["incorrect logic"],
+                    detail={"raw_verdict": {"pass": False}},
+                ),
+            )
+            self.assertFalse(evald.passed)
+            drafts = load_drafts(self._drafts_dir(tmp), "review-judge")
+            self.assertEqual(len(drafts), 1)
+            self.assertEqual(drafts[0]["reasons"], ["incorrect logic"])
+            payload = [a.payload for a in evald.artifacts if (a.payload or {}).get("kind") == "review"][0]
+            self.assertTrue(payload.get("draft_recorded"))
+
+    def test_review_gate_pass_does_not_record_draft(self) -> None:
+        from puppetmaster.evaluators import load_drafts
+        from puppetmaster.gates import ReviewVerdict
+
+        epoch = [
+            {
+                "slot_id": "review-judge",
+                "version": 1,
+                "role": "review",
+                "instruction": "x",
+                "criteria": {"y": 1},
+            }
+        ]
+        with TemporaryDirectory() as tmp:
+            self._eval_review_capture_prompt(
+                tmp,
+                epoch=epoch,
+                judge_verdict=ReviewVerdict(
+                    available=True,
+                    passed=True,
+                    detail={"raw_verdict": {"pass": True}},
+                ),
+            )
+            self.assertEqual(load_drafts(self._drafts_dir(tmp)), [])
+
+    def test_review_gate_spec_rubric_rejection_does_not_record_draft(self) -> None:
+        from puppetmaster.evaluators import load_drafts
+        from puppetmaster.gates import ReviewVerdict
+
+        epoch = [
+            {
+                "slot_id": "review-judge",
+                "version": 1,
+                "role": "review",
+                "instruction": "x",
+                "criteria": {"y": 1},
+            }
+        ]
+        with TemporaryDirectory() as tmp:
+            self._eval_review_capture_prompt(
+                tmp,
+                epoch=epoch,
+                spec_extra={"review": {"rubric": "SPEC ONLY"}},
+                judge_verdict=ReviewVerdict(
+                    available=True,
+                    passed=False,
+                    reasons=["bad"],
+                    detail={"raw_verdict": {"pass": False}},
+                ),
+            )
+            self.assertEqual(load_drafts(self._drafts_dir(tmp)), [])
+
+    def test_review_gate_unparseable_rejection_does_not_record_draft(self) -> None:
+        from puppetmaster.evaluators import load_drafts
+        from puppetmaster.gates import ReviewVerdict
+
+        epoch = [
+            {
+                "slot_id": "review-judge",
+                "version": 1,
+                "role": "review",
+                "instruction": "x",
+                "criteria": {"y": 1},
+            }
+        ]
+        with TemporaryDirectory() as tmp:
+            evald, _ = self._eval_review_capture_prompt(
+                tmp,
+                epoch=epoch,
+                judge_verdict=ReviewVerdict(
+                    available=True,
+                    passed=False,
+                    reasons=["judge produced no parseable verdict"],
+                    detail={"judge_artifacts": 1},
+                ),
+            )
+            self.assertFalse(evald.passed)
+            self.assertEqual(load_drafts(self._drafts_dir(tmp)), [])
+            payload = [a.payload for a in evald.artifacts if (a.payload or {}).get("kind") == "review"][0]
+            self.assertFalse(payload.get("draft_recorded"))
+
+    def test_review_gate_draft_store_error_does_not_change_verdict(self) -> None:
+        from puppetmaster.gates import ReviewVerdict
+
+        epoch = [
+            {
+                "slot_id": "review-judge",
+                "version": 1,
+                "role": "review",
+                "instruction": "x",
+                "criteria": {"y": 1},
+            }
+        ]
+        with TemporaryDirectory() as tmp:
+            with patch(
+                "puppetmaster.evaluators.record_draft_criteria",
+                side_effect=RuntimeError("boom"),
+            ):
+                evald, _ = self._eval_review_capture_prompt(
+                    tmp,
+                    epoch=epoch,
+                    judge_verdict=ReviewVerdict(
+                        available=True,
+                        passed=False,
+                        reasons=["bad"],
+                        detail={"raw_verdict": {"pass": False}},
+                    ),
+                )
+            self.assertFalse(evald.passed)
+            payload = [a.payload for a in evald.artifacts if (a.payload or {}).get("kind") == "review"][0]
+            self.assertFalse(payload.get("draft_recorded"))
+
     # ----- auto-attach wiring -----
 
     def test_review_auto_attached_for_implement_when_env_set(self) -> None:

@@ -739,6 +739,29 @@ def _gate_review(
     }
     if verdict.passed:
         return GateResult(name, "review", True, f"{judge.id} approved the diff", detail)
+    draft_recorded = False
+    try:
+        if (
+            rubric_meta.get("rubric_source") == "evaluator_epoch"
+            and verdict.reasons
+            and verdict.detail.get("raw_verdict") is not None
+        ):
+            root = getattr(store, "root", None)
+            state_dir = str(root) if root is not None else ""
+            if state_dir:
+                from puppetmaster.evaluators import record_draft_criteria
+
+                draft_recorded = record_draft_criteria(
+                    state_dir,
+                    slot_id=str(rubric_meta.get("evaluator_slot") or ""),
+                    source_job_id=task.job_id,
+                    source_task_id=task.id,
+                    reasons=verdict.reasons,
+                    severity=verdict.severity,
+                )
+    except Exception:
+        draft_recorded = False
+    detail["draft_recorded"] = draft_recorded
     summary = "; ".join(verdict.reasons) or verdict.severity or "rejected"
     return GateResult(name, "review", False, f"{judge.id} rejected the diff: {summary}", detail)
 
