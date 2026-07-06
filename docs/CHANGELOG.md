@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.6.0
+
+**RQGM Wave 7: evaluator-aware review gate and epoch lineage surfacing.**
+
+- **Full-fidelity epoch snapshot.** Job-start epoch artifacts now freeze each evaluator's `instruction` and `criteria` (not just slot/version/role), so mid-job registry edits cannot change what a running job's gates read.
+- **Review gate consumes frozen criteria.** `_gate_review` resolves rubric text as explicit gate-spec rubric, then frozen epoch criteria (review slot, then task role), then the default rubric. GATE artifacts record `rubric_source` plus evaluator slot/version when the epoch supplied the rubric.
+- **Lineage surfacing.** Dashboard job snapshots expose `evaluator_epoch` (slot/version/role only); job view renders compact `slot@vN (role)` chips. New read-only CLI: `python -m puppetmaster evaluators epoch <job_id>`.
+
 ## v1.5.1
 
 **Windows hardening + CodeGraph CLI compatibility.**
