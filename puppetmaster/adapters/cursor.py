@@ -491,7 +491,7 @@ def implement_report_artifacts(
 def cursor_result_artifacts(
     task: Task,
     worker_id: str,
-    result_text: str,
+    result_text: object,
     *,
     adapter: str = "cursor-sdk",
 ) -> list[Artifact]:
@@ -518,8 +518,9 @@ def cursor_result_artifacts(
     return artifacts
 
 
-def parse_cursor_artifact_payload(result_text: str) -> Optional[Any]:
-    text = result_text.strip()
+def parse_cursor_artifact_payload(result_text: object) -> Optional[Any]:
+    text = "" if result_text is None else str(result_text)
+    text = text.strip()
     if not text:
         return None
     for candidate in [text, _strip_json_fence(text), _json_object_slice(text)]:

@@ -20560,6 +20560,19 @@ class JsonPrefixDecodeTests(unittest.TestCase):
         )
         self.assertEqual(artifacts, [])
 
+    def test_null_result_text_yields_zero_artifacts(self) -> None:
+        from puppetmaster.adapters import cursor_result_artifacts
+
+        task = Task(
+            job_id="job",
+            role="cursor",
+            instruction="Inspect repo",
+            adapter="cursor",
+            payload={"prompt": "Inspect repo", "cwd": "."},
+        )
+        artifacts = cursor_result_artifacts(task, "worker-cursor", None)
+        self.assertEqual(artifacts, [])
+
 
 class AdapterProvenanceTests(unittest.TestCase):
     """Artifacts must record which adapter actually produced them.
