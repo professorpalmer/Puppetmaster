@@ -64,6 +64,9 @@ _FRESH_JUDGMENT_ROLES = frozenset(
 _MEMORY_MAX_AGE_DAYS = 14
 _MEMORY_MAX_AGE_ENV = "PUPPETMASTER_MEMORY_MAX_AGE_DAYS"
 
+_MEMORY_MIN_OVERLAP = 0.2
+_MEMORY_MIN_OVERLAP_ENV = "PUPPETMASTER_MEMORY_MIN_OVERLAP"
+
 
 def _memory_max_age_days() -> Optional[int]:
     raw = os.environ.get(_MEMORY_MAX_AGE_ENV)
@@ -75,6 +78,20 @@ def _memory_max_age_days() -> Optional[int]:
         return _MEMORY_MAX_AGE_DAYS
     if value <= 0:
         return None
+    return value
+
+
+def _memory_min_overlap() -> float:
+    """Relevance floor for memory injection; negative disables, invalid falls back."""
+    raw = os.environ.get(_MEMORY_MIN_OVERLAP_ENV)
+    if raw is None:
+        return _MEMORY_MIN_OVERLAP
+    try:
+        value = float(raw)
+    except ValueError:
+        return _MEMORY_MIN_OVERLAP
+    if value < 0:
+        return 0.0
     return value
 
 
@@ -1486,7 +1503,11 @@ class Orchestrator:
         return result, decisions
 
     def _with_retrieved_memory(self, specs: list[WorkerSpec], goal: str) -> list[WorkerSpec]:
-        memory = self.store.retrieve_memory(goal, max_age_days=_memory_max_age_days())
+        memory = self.store.retrieve_memory(
+            goal,
+            max_age_days=_memory_max_age_days(),
+            min_overlap=_memory_min_overlap(),
+        )
         if not memory:
             return specs
         result: list[WorkerSpec] = []

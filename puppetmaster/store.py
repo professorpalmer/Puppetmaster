@@ -124,7 +124,7 @@ def _memory_term_overlap(terms: set[str], haystack: str) -> float:
 def _memory_retrieval_score(
     memory: dict[str, Any],
     terms: set[str],
-) -> tuple[float, float, str]:
+) -> tuple[float, float, str, float]:
     haystack = _memory_haystack(memory)
     overlap = _memory_term_overlap(terms, haystack)
     scope_weight = _memory_scope_weight(memory)
@@ -135,7 +135,7 @@ def _memory_retrieval_score(
         score = scope_weight * recency
     confidence = _coerce_confidence(memory.get("confidence"))
     created_at_key = _memory_created_at_sort_key(memory)
-    return score, confidence, created_at_key
+    return score, confidence, created_at_key, overlap
 
 
 def _retry_on_windows_lock(operation):
@@ -896,6 +896,7 @@ class SwarmStore:
         role: Optional[str] = None,
         topic: Optional[str] = None,
         max_age_days: Optional[int] = None,
+        min_overlap: float = 0.0,
     ) -> list[dict[str, Any]]:
         terms = {term.lower() for term in query.split() if len(term) > 2}
         scored = []
@@ -904,7 +905,9 @@ class SwarmStore:
                 continue
             if not self._memory_matches_filters(memory, scope, adapter, role, topic):
                 continue
-            score, confidence, created_at_key = _memory_retrieval_score(memory, terms)
+            score, confidence, created_at_key, overlap = _memory_retrieval_score(memory, terms)
+            if terms and min_overlap > 0 and overlap < min_overlap:
+                continue
             scored.append((score, confidence, created_at_key, memory))
         scored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
         return [

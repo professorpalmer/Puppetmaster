@@ -899,6 +899,7 @@ class SQLiteSwarmStore(SwarmStore):
         role: Optional[str] = None,
         topic: Optional[str] = None,
         max_age_days: Optional[int] = None,
+        min_overlap: float = 0.0,
     ) -> list[dict[str, Any]]:
         self.init()
         terms = {term.lower() for term in query.split() if len(term) > 2}
@@ -930,7 +931,9 @@ class SQLiteSwarmStore(SwarmStore):
             memory = json.loads(row["data"])
             if not _memory_within_max_age(memory, max_age_days):
                 continue
-            score, confidence, created_at_key = _memory_retrieval_score(memory, terms)
+            score, confidence, created_at_key, overlap = _memory_retrieval_score(memory, terms)
+            if terms and min_overlap > 0 and overlap < min_overlap:
+                continue
             scored.append((score, confidence, created_at_key, memory))
         scored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
         return [

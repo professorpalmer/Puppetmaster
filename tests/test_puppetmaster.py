@@ -1351,6 +1351,108 @@ class PuppetmasterTests(unittest.TestCase):
                 matches = store.retrieve_memory("workers record", max_age_days=14)
                 self.assertEqual(len(matches), 1)
 
+    def test_retrieve_memory_min_overlap_excludes_weak_matches(self) -> None:
+        from puppetmaster.models import MemoryRecord
+
+        for backend in ("file", "sqlite"):
+            with self.subTest(backend=backend), TemporaryDirectory() as tmp:
+                store = self._store_for_backend(backend, Path(tmp) / ".puppetmaster")
+                store.init()
+                store.promote_memory(
+                    MemoryRecord(
+                        scope="swarm.findings",
+                        statement="workers dispatch through the orchestrator queue",
+                        evidence=["e"],
+                        source_artifacts=[],
+                        confidence=0.9,
+                    )
+                )
+                store.promote_memory(
+                    MemoryRecord(
+                        scope="swarm.findings",
+                        statement="workers only",
+                        evidence=["e"],
+                        source_artifacts=[],
+                        confidence=0.9,
+                    )
+                )
+                query = "workers dispatch orchestrator queue"
+                unfloored = store.retrieve_memory(query)
+                self.assertEqual(len(unfloored), 2)
+                floored = store.retrieve_memory(query, min_overlap=0.5)
+                statements = [item["statement"] for item in floored]
+                self.assertEqual(
+                    statements, ["workers dispatch through the orchestrator queue"]
+                )
+
+    def test_retrieve_memory_min_overlap_exempts_empty_query(self) -> None:
+        from puppetmaster.models import MemoryRecord
+
+        for backend in ("file", "sqlite"):
+            with self.subTest(backend=backend), TemporaryDirectory() as tmp:
+                store = self._store_for_backend(backend, Path(tmp) / ".puppetmaster")
+                store.init()
+                store.promote_memory(
+                    MemoryRecord(
+                        scope="swarm.findings",
+                        statement="anything at all",
+                        evidence=["e"],
+                        source_artifacts=[],
+                        confidence=0.9,
+                    )
+                )
+                matches = store.retrieve_memory("", min_overlap=0.9)
+                self.assertEqual(len(matches), 1)
+
+    def test_memory_injection_floor_drops_irrelevant_memory(self) -> None:
+        from puppetmaster.models import MemoryRecord
+
+        memory = MemoryRecord(
+            scope="swarm.findings",
+            statement="sqlite journal rotation details",
+            evidence=["e"],
+            source_artifacts=[],
+            confidence=0.9,
+        )
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            store.promote_memory(memory)
+            orch = Orchestrator(store)
+            spec = WorkerSpec(role="explore", instruction="explore")
+
+            routed = orch._with_retrieved_memory(
+                [spec], "refactor frontend component styling"
+            )
+            self.assertNotIn("retrieved_memory", routed[0].payload)
+
+            routed = orch._with_retrieved_memory(
+                [spec], "sqlite journal rotation details"
+            )
+            self.assertIn("retrieved_memory", routed[0].payload)
+
+    def test_memory_injection_floor_env_override(self) -> None:
+        from unittest import mock
+
+        from puppetmaster.orchestrator import _memory_min_overlap, _MEMORY_MIN_OVERLAP
+
+        with mock.patch.dict(
+            os.environ, {"PUPPETMASTER_MEMORY_MIN_OVERLAP": "0"}, clear=False
+        ):
+            self.assertEqual(_memory_min_overlap(), 0.0)
+        with mock.patch.dict(
+            os.environ, {"PUPPETMASTER_MEMORY_MIN_OVERLAP": "-1"}, clear=False
+        ):
+            self.assertEqual(_memory_min_overlap(), 0.0)
+        with mock.patch.dict(
+            os.environ, {"PUPPETMASTER_MEMORY_MIN_OVERLAP": "not-a-float"}, clear=False
+        ):
+            self.assertEqual(_memory_min_overlap(), _MEMORY_MIN_OVERLAP)
+        with mock.patch.dict(
+            os.environ, {"PUPPETMASTER_MEMORY_MIN_OVERLAP": "0.6"}, clear=False
+        ):
+            self.assertEqual(_memory_min_overlap(), 0.6)
+
     def test_prune_memory_by_scope_age_and_unfiltered(self) -> None:
         from datetime import datetime, timedelta, timezone
 
