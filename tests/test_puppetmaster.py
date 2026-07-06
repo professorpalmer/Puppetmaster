@@ -1239,6 +1239,207 @@ class PuppetmasterTests(unittest.TestCase):
             self.assertNotIn("retrieved_memory", routed[0].payload)
             self.assertIn("retrieved_memory", routed[1].payload)
 
+    def test_promote_memory_dedupes_identical_scope_and_statement(self) -> None:
+        from puppetmaster.models import MemoryRecord
+
+        memory_a = MemoryRecord(
+            scope="swarm.findings",
+            statement="found  duplicate",
+            evidence=["e"],
+            source_artifacts=["a1"],
+            confidence=0.9,
+        )
+        memory_b = MemoryRecord(
+            scope="swarm.findings",
+            statement="found duplicate",
+            evidence=["e"],
+            source_artifacts=["a2"],
+            confidence=0.9,
+        )
+        for backend in ("file", "sqlite"):
+            with self.subTest(backend=backend), TemporaryDirectory() as tmp:
+                store = self._store_for_backend(backend, Path(tmp) / ".puppetmaster")
+                store.init()
+                store.promote_memory(memory_a)
+                store.promote_memory(memory_b)
+                self.assertEqual(len(store.list_memory()), 1)
+
+    def test_promote_memory_cap_evicts_oldest(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        from puppetmaster.models import MemoryRecord
+        from puppetmaster.store import _MEMORY_CAP
+
+        base = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        for backend in ("file", "sqlite"):
+            with self.subTest(backend=backend), TemporaryDirectory() as tmp:
+                store = self._store_for_backend(backend, Path(tmp) / ".puppetmaster")
+                store.init()
+                for index in range(_MEMORY_CAP + 5):
+                    created_at = (base + timedelta(days=index)).isoformat(timespec="seconds")
+                    store.promote_memory(
+                        MemoryRecord(
+                            scope="swarm.findings",
+                            statement=f"record {index}",
+                            evidence=["e"],
+                            source_artifacts=[],
+                            confidence=0.9,
+                            created_at=created_at,
+                        )
+                    )
+                records = store.list_memory()
+                self.assertEqual(len(records), _MEMORY_CAP)
+                statements = {record["statement"] for record in records}
+                for index in range(5):
+                    self.assertNotIn(f"record {index}", statements)
+
+    def test_retrieve_memory_max_age_days_filters_stale_records(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        from puppetmaster.models import MemoryRecord
+
+        fresh_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        stale_at = (
+            datetime.now(timezone.utc) - timedelta(days=30)
+        ).isoformat(timespec="seconds")
+        for backend in ("file", "sqlite"):
+            with self.subTest(backend=backend), TemporaryDirectory() as tmp:
+                store = self._store_for_backend(backend, Path(tmp) / ".puppetmaster")
+                store.init()
+                store.promote_memory(
+                    MemoryRecord(
+                        scope="swarm.findings",
+                        statement="fresh finding about workers",
+                        evidence=["e"],
+                        source_artifacts=[],
+                        confidence=0.9,
+                        created_at=fresh_at,
+                    )
+                )
+                store.promote_memory(
+                    MemoryRecord(
+                        scope="swarm.findings",
+                        statement="stale finding about workers",
+                        evidence=["e"],
+                        source_artifacts=[],
+                        confidence=0.9,
+                        created_at=stale_at,
+                    )
+                )
+                matches = store.retrieve_memory("workers finding", max_age_days=14)
+                statements = {item["statement"] for item in matches}
+                self.assertIn("fresh finding about workers", statements)
+                self.assertNotIn("stale finding about workers", statements)
+
+    def test_retrieve_memory_malformed_created_at_is_not_excluded(self) -> None:
+        from puppetmaster.models import MemoryRecord
+
+        for backend in ("file", "sqlite"):
+            with self.subTest(backend=backend), TemporaryDirectory() as tmp:
+                store = self._store_for_backend(backend, Path(tmp) / ".puppetmaster")
+                store.init()
+                store.promote_memory(
+                    MemoryRecord(
+                        scope="swarm.findings",
+                        statement="malformed date workers record",
+                        evidence=["e"],
+                        source_artifacts=[],
+                        confidence=0.9,
+                        created_at="not-a-real-date",
+                    )
+                )
+                matches = store.retrieve_memory("workers record", max_age_days=14)
+                self.assertEqual(len(matches), 1)
+
+    def test_prune_memory_by_scope_age_and_unfiltered(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        from puppetmaster.models import MemoryRecord
+
+        now = datetime.now(timezone.utc)
+        fresh_at = now.isoformat(timespec="seconds")
+        stale_at = (now - timedelta(days=30)).isoformat(timespec="seconds")
+        for backend in ("file", "sqlite"):
+            with self.subTest(backend=backend), TemporaryDirectory() as tmp:
+                store = self._store_for_backend(backend, Path(tmp) / ".puppetmaster")
+                store.init()
+                store.promote_memory(
+                    MemoryRecord(
+                        scope="swarm.findings",
+                        statement="fresh findings scope",
+                        evidence=["e"],
+                        source_artifacts=[],
+                        confidence=0.9,
+                        created_at=fresh_at,
+                    )
+                )
+                store.promote_memory(
+                    MemoryRecord(
+                        scope="swarm.decisions",
+                        statement="stale decisions scope",
+                        evidence=["e"],
+                        source_artifacts=[],
+                        confidence=0.9,
+                        created_at=stale_at,
+                    )
+                )
+                self.assertEqual(store.prune_memory(scope="swarm.findings"), 1)
+                self.assertEqual(len(store.list_memory()), 1)
+                self.assertEqual(store.prune_memory(older_than_days=14), 1)
+                self.assertEqual(len(store.list_memory()), 0)
+
+                store.promote_memory(
+                    MemoryRecord(
+                        scope="swarm.general",
+                        statement="general memory",
+                        evidence=["e"],
+                        source_artifacts=[],
+                        confidence=0.9,
+                    )
+                )
+                self.assertEqual(store.prune_memory(), 1)
+
+    def test_orchestrator_injects_only_fresh_memory(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        from puppetmaster.models import MemoryRecord
+
+        goal = "workers coordination context"
+        fresh_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        stale_at = (
+            datetime.now(timezone.utc) - timedelta(days=30)
+        ).isoformat(timespec="seconds")
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            store.promote_memory(
+                MemoryRecord(
+                    scope="swarm.findings",
+                    statement="fresh workers coordination context",
+                    evidence=["e"],
+                    source_artifacts=["f1"],
+                    confidence=0.9,
+                    created_at=fresh_at,
+                )
+            )
+            store.promote_memory(
+                MemoryRecord(
+                    scope="swarm.findings",
+                    statement="stale workers coordination context",
+                    evidence=["e"],
+                    source_artifacts=["s1"],
+                    confidence=0.9,
+                    created_at=stale_at,
+                )
+            )
+            orch = Orchestrator(store)
+            spec = WorkerSpec(role="explore", instruction="map workers")
+            routed = orch._with_retrieved_memory([spec], goal)
+            injected = routed[0].payload.get("retrieved_memory") or []
+            statements = {item.get("statement") for item in injected}
+            self.assertIn("fresh workers coordination context", statements)
+            self.assertNotIn("stale workers coordination context", statements)
+
     def test_subprocess_swarm_emits_worker_process_events(self) -> None:
         with TemporaryDirectory() as tmp:
             store = SwarmStore(Path(tmp) / ".puppetmaster")
@@ -12818,6 +13019,94 @@ class StitcherAlertTests(unittest.TestCase):
         self.assertNotIn("## Alerts", summary)
 
 
+class StitcherMemoryPromotionGateTests(unittest.TestCase):
+    def _artifact(
+        self,
+        *,
+        artifact_type,
+        payload,
+        confidence=0.9,
+    ):
+        from puppetmaster.models import Artifact
+
+        return Artifact(
+            job_id="j",
+            task_id="t",
+            type=artifact_type,
+            created_by="w",
+            payload=payload,
+            confidence=confidence,
+            evidence=["e"],
+        )
+
+    def _promoted_statements(self, artifacts):
+        from puppetmaster.models import ArtifactType
+        from puppetmaster.stitcher import Stitcher
+
+        store = object()
+        return [
+            memory.statement
+            for memory in Stitcher(store)._promote_memories(artifacts)
+        ]
+
+    def test_prompt_echo_verification_is_not_promoted(self) -> None:
+        from puppetmaster.models import ArtifactType
+
+        echo = self._artifact(
+            artifact_type=ArtifactType.VERIFICATION,
+            payload={
+                "check": "Role: token-efficiency-reviewer\nReturn only Puppetmaster artifact JSON",
+                "result": "passed",
+            },
+        )
+        self.assertEqual(self._promoted_statements([echo]), [])
+
+    def test_genuine_short_verification_with_passed_is_promoted(self) -> None:
+        from puppetmaster.models import ArtifactType
+
+        genuine = self._artifact(
+            artifact_type=ArtifactType.VERIFICATION,
+            payload={"check": "pytest suite passed", "result": "passed"},
+        )
+        self.assertEqual(self._promoted_statements([genuine]), ["pytest suite passed"])
+
+    def test_failed_blocked_degraded_verifications_are_not_promoted(self) -> None:
+        from puppetmaster.models import ArtifactType
+
+        for result in ("failed", "blocked", "degraded"):
+            with self.subTest(result=result):
+                artifact = self._artifact(
+                    artifact_type=ArtifactType.VERIFICATION,
+                    payload={"check": "pytest suite passed", "result": result},
+                )
+                self.assertEqual(self._promoted_statements([artifact]), [])
+
+    def test_finding_and_decision_promotion_unaffected(self) -> None:
+        from puppetmaster.models import ArtifactType
+
+        finding = self._artifact(
+            artifact_type=ArtifactType.FINDING,
+            payload={"claim": "race in task claim path"},
+        )
+        decision = self._artifact(
+            artifact_type=ArtifactType.DECISION,
+            payload={"decision": "use sqlite for hot path"},
+        )
+        statements = self._promoted_statements([finding, decision])
+        self.assertIn("race in task claim path", statements)
+        self.assertIn("use sqlite for hot path", statements)
+
+    def test_six_hundred_char_guard_trips(self) -> None:
+        from puppetmaster.models import ArtifactType
+
+        long_check = "x" * 601
+        artifact = self._artifact(
+            artifact_type=ArtifactType.VERIFICATION,
+            payload={"check": long_check, "result": "passed"},
+        )
+        self.assertEqual(self._promoted_statements([artifact]), [])
+
+
 class DashboardTests(unittest.TestCase):
     def _seed_store(self, tmp):
         from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
@@ -23397,6 +23686,109 @@ class EvaluatorEpochSurfacingTests(unittest.TestCase):
                 rc = cli_main(["--state-dir", state_dir, "evaluators", "epoch", "missing-job"])
             self.assertEqual(rc, 0)
             self.assertIn("No evaluator epoch recorded.", buf.getvalue())
+
+
+class MemoryCliTests(unittest.TestCase):
+    def _seed_memory(self, state_dir: str) -> None:
+        from puppetmaster.models import MemoryRecord
+        from puppetmaster.store import SwarmStore
+
+        store = SwarmStore(state_dir)
+        store.init()
+        store.promote_memory(
+            MemoryRecord(
+                scope="swarm.findings",
+                statement="workers use the store",
+                evidence=["e"],
+                source_artifacts=["a1"],
+                confidence=0.9,
+            )
+        )
+        store.promote_memory(
+            MemoryRecord(
+                scope="swarm.decisions",
+                statement="prefer sqlite backend",
+                evidence=["e"],
+                source_artifacts=["a2"],
+                confidence=0.85,
+            )
+        )
+
+    def test_cli_memory_list_happy_path_and_empty(self) -> None:
+        import contextlib
+        import io
+
+        with TemporaryDirectory() as tmp:
+            state_dir = str(Path(tmp) / ".puppetmaster")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli_main(["--state-dir", state_dir, "--backend", "file", "memory"])
+            self.assertEqual(rc, 0)
+            self.assertIn("No promoted memory.", buf.getvalue())
+
+            self._seed_memory(state_dir)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli_main(["--state-dir", state_dir, "--backend", "file", "memory"])
+            self.assertEqual(rc, 0)
+            out = buf.getvalue()
+            self.assertIn("swarm.findings: 1 record(s)", out)
+            self.assertIn("swarm.decisions: 1 record(s)", out)
+            self.assertIn("workers use the store", out)
+
+    def test_cli_memory_json_matches_store(self) -> None:
+        import contextlib
+        import io
+
+        from puppetmaster.store import SwarmStore
+
+        with TemporaryDirectory() as tmp:
+            state_dir = str(Path(tmp) / ".puppetmaster")
+            self._seed_memory(state_dir)
+            store = SwarmStore(state_dir)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli_main(["--state-dir", state_dir, "--backend", "file", "memory", "--json"])
+            self.assertEqual(rc, 0)
+            payload = json.loads(buf.getvalue())
+            self.assertEqual(payload, store.list_memory())
+
+    def test_cli_memory_prune_scope_and_unfiltered_guard(self) -> None:
+        import contextlib
+        import io
+
+        from puppetmaster.store import SwarmStore
+
+        with TemporaryDirectory() as tmp:
+            state_dir = str(Path(tmp) / ".puppetmaster")
+            self._seed_memory(state_dir)
+            store = SwarmStore(state_dir)
+            self.assertEqual(len(store.list_memory()), 2)
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli_main(["--state-dir", state_dir, "--backend", "file", "memory", "--prune"])
+            self.assertEqual(rc, 2)
+            self.assertIn("Refusing to prune all promoted memory", buf.getvalue())
+            self.assertEqual(len(store.list_memory()), 2)
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli_main(
+                    ["--state-dir", state_dir, "--backend", "file", "memory", "--prune", "--scope", "swarm.findings"]
+                )
+            self.assertEqual(rc, 0)
+            self.assertIn("Pruned 1 memory record(s).", buf.getvalue())
+            remaining = store.list_memory()
+            self.assertEqual(len(remaining), 1)
+            self.assertEqual(remaining[0]["scope"], "swarm.decisions")
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli_main(["--state-dir", state_dir, "--backend", "file", "memory", "--prune", "--yes"])
+            self.assertEqual(rc, 0)
+            self.assertIn("Pruned 1 memory record(s).", buf.getvalue())
+            self.assertEqual(store.list_memory(), [])
 
 
 if __name__ == "__main__":

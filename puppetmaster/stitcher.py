@@ -8,6 +8,51 @@ from typing import Optional
 from puppetmaster.models import Artifact, ArtifactType, MemoryRecord
 from puppetmaster.store import SwarmStore, group_by_type
 
+# Worker-prompt boilerplate echoed into VERIFICATION.check by adapter error paths.
+_PROMPT_ECHO_MARKERS = (
+    "Return only Puppetmaster artifact JSON",
+    "Do not modify files unless",
+    "Return structured findings",
+)
+
+# Failed verification results are job telemetry, not reusable knowledge.
+_NON_PROMOTABLE_VERIFICATION_RESULTS = frozenset({"failed", "blocked", "degraded"})
+
+_PROMPT_ECHO_MAX_CHARS = 600
+
+
+def _normalize_statement_text(statement: str) -> str:
+    return " ".join(str(statement).split())
+
+
+def _is_instruction_echo(statement: str, artifact: Artifact) -> bool:
+    """True when ``statement`` looks like a worker prompt echo, not knowledge."""
+    normalized = _normalize_statement_text(statement)
+    if not normalized:
+        return False
+
+    payload = artifact.payload or {}
+    instruction = payload.get("instruction")
+    if isinstance(instruction, str) and instruction.strip():
+        instruction_norm = _normalize_statement_text(instruction)
+        if (
+            normalized == instruction_norm
+            or instruction_norm.startswith(normalized)
+            or normalized.startswith(instruction_norm)
+            or normalized in instruction_norm
+            or instruction_norm in normalized
+        ):
+            return True
+
+    if artifact.type != ArtifactType.VERIFICATION:
+        return False
+
+    if normalized.startswith("Role:"):
+        return True
+    if any(marker in normalized for marker in _PROMPT_ECHO_MARKERS):
+        return True
+    return len(normalized) > _PROMPT_ECHO_MAX_CHARS
+
 
 class Stitcher:
     """Turns worker artifacts into promoted memory and a replayable summary."""
@@ -40,6 +85,12 @@ class Stitcher:
             statement = self._statement_for(artifact)
             if not statement:
                 continue
+            if _is_instruction_echo(statement, artifact):
+                continue
+            if artifact.type == ArtifactType.VERIFICATION:
+                result = str((artifact.payload or {}).get("result") or "")
+                if result in _NON_PROMOTABLE_VERIFICATION_RESULTS:
+                    continue
             promoted.append(
                 MemoryRecord(
                     scope=self._scope_for(artifact),
