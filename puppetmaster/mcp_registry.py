@@ -416,13 +416,19 @@ def _coerce_optional_str(value: object) -> Optional[str]:
 
 
 def _pid_alive(pid: int) -> bool:
-    """POSIX-friendly liveness probe via signal 0.
+    """Liveness probe.
 
-    On Windows this falls back to a process-handle probe via ``os.kill``
-    which raises ``OSError`` for dead PIDs and is a no-op for live ones.
+    POSIX uses signal 0 (probes without delivering; EPERM means it exists).
+    Windows must NOT use ``os.kill(pid, 0)`` — signal value 0 is
+    ``CTRL_C_EVENT`` and delivers a real Ctrl+C to the target's console
+    group — so it probes via ``OpenProcess`` instead.
     """
     if pid <= 0:
         return False
+    if os.name == "nt":
+        from puppetmaster.liveness import _pid_alive_windows
+
+        return _pid_alive_windows(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:

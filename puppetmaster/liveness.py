@@ -89,10 +89,19 @@ def _read_record(store: SwarmStore, job_id: str) -> Optional[dict]:
 
 
 def _pid_alive(pid: int) -> bool:
-    """True if a process with ``pid`` exists. Signal 0 probes without delivering
-    anything; EPERM means it exists but we don't own it (still alive)."""
+    """True if a process with ``pid`` exists.
+
+    POSIX: signal 0 probes without delivering anything; EPERM means it exists
+    but we don't own it (still alive).
+
+    Windows: ``os.kill(pid, 0)`` is NOT safe — signal value 0 is
+    ``CTRL_C_EVENT``, which delivers a real Ctrl+C to the target's console
+    group (potentially our own console). Probe via ``OpenProcess`` instead.
+    """
     if pid <= 0:
         return False
+    if os.name == "nt":
+        return _pid_alive_windows(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -102,6 +111,28 @@ def _pid_alive(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+def _pid_alive_windows(pid: int) -> bool:
+    """Non-destructive Windows liveness probe (OpenProcess + exit code)."""
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    ERROR_ACCESS_DENIED = 5
+
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        return (ctypes.get_last_error() or kernel32.GetLastError()) == ERROR_ACCESS_DENIED
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return True
+        return exit_code.value == STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 @dataclass(frozen=True)

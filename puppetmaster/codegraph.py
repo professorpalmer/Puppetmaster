@@ -344,21 +344,18 @@ def codegraph_context(
     if not codegraph_ready(cwd):
         return None
     started = time.monotonic()
+    context_args = _modernize_cli_args(
+        ["context", task, "--max-nodes", str(max_nodes), "--format", "markdown"]
+    )
     try:
         completed = subprocess.run(
-            resolve_codegraph_invocation()
-            + [
-                "context",
-                task,
-                "--max-nodes",
-                str(max_nodes),
-                "--format",
-                "markdown",
-            ],
+            resolve_codegraph_invocation() + context_args,
             cwd=str(cwd),
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout_seconds,
             check=False,
         )
@@ -490,6 +487,48 @@ def enrich_prompt_with_codegraph(
     return enriched, True
 
 
+def _modernize_cli_args(cli_args: list[str]) -> list[str]:
+    """Map legacy subcommand spellings onto the current CodeGraph CLI.
+
+    Newer CodeGraph releases renamed ``search`` to ``query`` and replaced
+    ``context`` with ``explore`` (whose flags differ: ``--max-files`` instead
+    of ``--max-nodes``, and no ``--format``). Puppetmaster docs and older
+    agents still use the legacy spellings, so translate rather than fail
+    with "unknown command".
+    """
+    if not cli_args:
+        return cli_args
+    head = cli_args[0]
+    if head == "search":
+        return ["query"] + cli_args[1:]
+    if head != "context":
+        return cli_args
+    translated: list[str] = ["explore"]
+    index = 1
+    while index < len(cli_args):
+        token = cli_args[index]
+        if token in ("--max-nodes", "--max-files"):
+            if index + 1 < len(cli_args):
+                translated.extend(["--max-files", cli_args[index + 1]])
+                index += 2
+                continue
+            index += 1
+            continue
+        if token.startswith("--max-nodes=") or token.startswith("--max-files="):
+            translated.append("--max-files=" + token.split("=", 1)[1])
+            index += 1
+            continue
+        if token == "--format":
+            index += 2
+            continue
+        if token.startswith("--format="):
+            index += 1
+            continue
+        translated.append(token)
+        index += 1
+    return translated
+
+
 def run_codegraph_cli(
     cli_args: list[str],
     cwd: Union[Path, str, None],
@@ -503,6 +542,8 @@ def run_codegraph_cli(
     When the CLI cannot be invoked, ``error`` describes the issue. When it
     runs, ``returncode``, ``stdout``, and ``stderr`` are included.
     """
+    original_args = list(cli_args)
+    cli_args = _modernize_cli_args(original_args)
     rendered_command = "codegraph " + " ".join(cli_args)
     cwd_str = str(cwd) if cwd else ""
 
@@ -531,6 +572,19 @@ def run_codegraph_cli(
     result = _run_codegraph_once(
         cli_args, cwd_str, rendered_command, timeout_seconds
     )
+
+    # Older CodeGraph installs predate the query/explore rename; if the
+    # modernized spelling is unknown there, retry with the caller's original
+    # legacy arguments.
+    if (
+        not result.get("ok")
+        and cli_args != original_args
+        and "unknown command" in ((result.get("stderr") or "") + (result.get("error") or ""))
+    ):
+        legacy_command = "codegraph " + " ".join(original_args)
+        result = _run_codegraph_once(
+            original_args, cwd_str, legacy_command, timeout_seconds
+        )
 
     # Auto-heal: a non-zero exit whose output matches the better-sqlite3 Node
     # ABI failure means the native binding was built for a different Node than
@@ -584,6 +638,8 @@ def _run_codegraph_once(
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout_seconds,
             check=False,
             env=_nonpaging_env(),
