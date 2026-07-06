@@ -91,7 +91,69 @@ v1 does **not** use an LLM judge for promotion.
 | Worker runtime | Before saving artifacts, stamp `evaluator_slot` + `evaluator_version` on `VERIFICATION` payloads when task `role` matches an epoch entry |
 | Verification helper | `verification_artifact()` accepts optional slot/version kwargs |
 | CLI | `python -m puppetmaster evaluators list|promote` |
-| Review gate (future) | Read epoch `criteria` instead of hardcoded judge prompt — Wave 7+ |
+| Review gate | Wave 7: read frozen epoch `criteria` when gate spec has no explicit `rubric` |
+| Dashboard / CLI | Wave 7: `evaluator_epoch` snapshot field + `evaluators epoch <job_id>` |
+
+## Wave 7: consuming the epoch
+
+Wave 5 froze evaluator **lineage** (slot_id, version, role) at job start. That
+was enough for artifact stamping but not for quality gates: the review gate
+still judged diffs with a hardcoded rubric, and promoting a slot mid-registry
+could change what a *new* job sees while old jobs stayed on stale metadata
+only.
+
+Wave 7 makes the epoch **full-fidelity** and **consumes** it:
+
+### Full-fidelity epoch payloads
+
+Each entry in the frozen `evaluators` list now carries:
+
+```json
+{
+  "slot_id": "redteam-reviewer",
+  "version": 2,
+  "role": "review",
+  "instruction": "Adversarially review for real failure modes.",
+  "criteria": {"reject_partial": true, "min_confidence": 0.75}
+}
+```
+
+Mid-job registry edits still do not alter a job's stored epoch. Wave 5 epochs
+that lack `instruction`/`criteria` remain valid; callers treat missing
+criteria as "no frozen rubric" and fall back.
+
+### Review gate rubric resolution
+
+When `_gate_review` runs, rubric text is chosen in strict order:
+
+1. **Explicit gate spec** — `task.payload["review"]["rubric"]` or gate dict
+   `rubric` wins (unchanged).
+2. **Frozen epoch** — `evaluator_epoch_for_job(store, job_id)` then
+   `epoch_evaluator_for_role(epoch, "review")`, falling back to the task's
+   `role` when no `review` slot exists. Non-empty `criteria` render as one
+   line per key (`- key: value`, sorted) after the frozen `instruction`.
+3. **Default** — `_DEFAULT_REVIEW_RUBRIC` in `gates.py`.
+
+Rubric *selection* is best-effort (lookup errors fall back to default). Gate
+*execution* stays fail-closed. GATE artifact `detail` records
+`rubric_source` (`spec` | `evaluator_epoch` | `default`) plus slot/version
+when the epoch supplied the rubric.
+
+### Lineage surfacing
+
+- **Dashboard** — `build_job_snapshot` exposes `evaluator_epoch`: a list of
+  `{slot_id, version, role}` (no criteria bodies). The job view renders compact
+  `slot@vN (role)` chips alongside existing swarm metadata.
+- **CLI** — `python -m puppetmaster evaluators epoch <job_id>` prints the
+  frozen set (slot, version, role, criteria count) or
+  `No evaluator epoch recorded.`
+
+### Non-goals (Wave 7)
+
+- Per-task evaluator overrides (epoch is job-scoped only).
+- Automatic re-review when a slot is promoted mid-job (epoch freeze forbids it).
+- Registry backends beyond JSON (Redis/Postgres deferred again).
+- LLM-as-judge inside anchor promotion (stays deterministic).
 
 ## Non-goals (v1)
 
