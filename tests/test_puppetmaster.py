@@ -2161,7 +2161,14 @@ class PuppetmasterTests(unittest.TestCase):
 
             command = run.call_args.args[0]
             self.assertIn("streaming.py:42", context)
-            self.assertEqual(command[:2], ["codegraph", "context"])
+            # Legacy "context" args are modernized to the current CLI's
+            # "explore" subcommand (with --max-nodes mapped to --max-files).
+            # The invocation prefix varies by host (bare shim vs node + shim
+            # path), so assert on the subcommand tail rather than command[0].
+            self.assertIn("explore", command)
+            self.assertNotIn("context", command)
+            self.assertIn("--max-files", command)
+            self.assertNotIn("--format", command)
 
     def test_enrich_prompt_returns_unchanged_when_disabled(self) -> None:
         prompt, used = enrich_prompt_with_codegraph(
