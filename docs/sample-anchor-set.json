@@ -1,0 +1,12 @@
+[
+  {
+    "id": "test-verifier-smoke",
+    "goal": "verify artifact pipeline",
+    "expect": {"min_verification_confidence": 0.8}
+  },
+  {
+    "id": "test-verifier-floor",
+    "goal": "confirm verification confidence floor",
+    "expect": {"min_verification_confidence": 0.75}
+  }
+]

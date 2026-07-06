@@ -98,6 +98,7 @@ from puppetmaster.cli.commands_install import (
 from puppetmaster.cli.commands_mcp import _run_mcp_subcommand
 from puppetmaster.cli.commands_keys import run_keys_subcommand
 from puppetmaster.cli.commands_models import _run_models_subcommand
+from puppetmaster.cli.commands_evaluators import _run_evaluators_subcommand
 from puppetmaster.cli.commands_platform import _run_platform_subcommand, _run_skills_subcommand
 from puppetmaster.cli.commands_codegraph import _run_codegraph_passthrough, _run_repair_codegraph
 from puppetmaster.cli.commands_jobs import (
@@ -458,6 +459,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
 
     if args.command == "models":
         return _run_models_subcommand(args)
+
+    if args.command == "evaluators":
+        return _run_evaluators_subcommand(args)
 
     if args.command == "keys":
         return run_keys_subcommand(args)

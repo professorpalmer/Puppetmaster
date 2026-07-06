@@ -1642,6 +1642,52 @@ def build_parser() -> argparse.ArgumentParser:
     models_set.add_argument("model_id", help="Model id to update.")
     models_set.add_argument("assignments", nargs="+", help="key=value updates.")
 
+    evaluators_cmd = subcommands.add_parser(
+        "evaluators",
+        help="Manage RQGM evaluator slots (registry, promotion).",
+    )
+    evaluators_cmd.add_argument(
+        "--state-dir",
+        help="Puppetmaster state directory (default: resolved from env/cwd).",
+    )
+    evaluators_sub = evaluators_cmd.add_subparsers(dest="evaluators_command", required=True)
+    evaluators_list = evaluators_sub.add_parser(
+        "list",
+        help="Print active evaluator slots.",
+    )
+    evaluators_list.add_argument("--json", action="store_true", help="Emit JSON.")
+    evaluators_promote = evaluators_sub.add_parser(
+        "promote",
+        help="Promote an evaluator slot after passing the anchor battery.",
+    )
+    evaluators_promote.add_argument("--slot-id", required=True, help="Evaluator slot id.")
+    evaluators_promote.add_argument(
+        "--instruction",
+        required=True,
+        help="Instruction text for the promoted evaluator version.",
+    )
+    evaluators_promote.add_argument(
+        "--anchor-set",
+        help="Path to anchor battery JSON (default: docs/sample-anchor-set.json).",
+    )
+    evaluators_promote.add_argument(
+        "--min-pass-rate",
+        type=float,
+        default=1.0,
+        help="Minimum anchor pass rate required to promote (default: 1.0).",
+    )
+    evaluators_promote.add_argument(
+        "--parent-version",
+        type=int,
+        default=None,
+        help="Explicit parent version (default: current active version).",
+    )
+    evaluators_promote.add_argument(
+        "--criteria-json",
+        default="{}",
+        help='JSON object of criteria thresholds (default: "{}").',
+    )
+
     keys_cmd = subcommands.add_parser(
         "keys",
         help=(
