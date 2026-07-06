@@ -4,7 +4,13 @@ import json
 import os
 from pathlib import Path
 
-from puppetmaster.evaluators import active_evaluators, promote_evaluator
+from puppetmaster.evaluators import (
+    active_evaluators,
+    clear_drafts,
+    load_drafts,
+    merge_draft_notes_into_criteria,
+    promote_evaluator,
+)
 from puppetmaster.state import resolve_state_dir
 
 
@@ -57,6 +63,9 @@ def _run_evaluators_promote(args, state_dir=None) -> int:
     if not isinstance(criteria, dict):
         print("evaluators promote: --criteria-json must be a JSON object")
         return 2
+    folded = 0
+    if getattr(args, "from_drafts", False):
+        criteria, folded = merge_draft_notes_into_criteria(state_dir, args.slot_id, criteria)
     try:
         spec = promote_evaluator(
             state_dir,
@@ -70,10 +79,55 @@ def _run_evaluators_promote(args, state_dir=None) -> int:
     except ValueError as exc:
         print(f"evaluators promote: {exc}")
         return 1
+    if getattr(args, "from_drafts", False):
+        cleared = clear_drafts(state_dir, args.slot_id)
+        print(
+            f"Promoted {spec.slot_id} to v{spec.version} "
+            f"(role={spec.role}, parent={spec.parent_version}); "
+            f"folded {folded} draft note(s), cleared {cleared} draft(s)."
+        )
+        return 0
     print(
         f"Promoted {spec.slot_id} to v{spec.version} "
         f"(role={spec.role}, parent={spec.parent_version})"
     )
+    return 0
+
+
+def _run_evaluators_drafts(args, state_dir=None) -> int:
+    state_dir = _state_dir_from_args(args, state_dir)
+    clear_slot = getattr(args, "clear", None)
+    if clear_slot:
+        removed = clear_drafts(state_dir, clear_slot)
+        print(f"Cleared {removed} draft(s) for {clear_slot}.")
+        return 0
+
+    slot_filter = getattr(args, "slot_id", None)
+    drafts = load_drafts(state_dir, slot_filter)
+    if getattr(args, "json", False):
+        print(json.dumps(drafts, indent=2, sort_keys=True))
+        return 0
+    if not drafts:
+        print("No draft criteria recorded.")
+        return 0
+
+    if slot_filter:
+        grouped = {slot_filter: drafts}
+    else:
+        grouped: dict[str, list] = {}
+        for draft in drafts:
+            slot = str(draft.get("slot_id") or "")
+            grouped.setdefault(slot, []).append(draft)
+
+    for slot_id in sorted(grouped):
+        entries = grouped[slot_id]
+        print(f"{slot_id}: {len(entries)} draft(s)")
+        for entry in entries:
+            severity = entry.get("severity") or "none"
+            reasons = entry.get("reasons") or []
+            reason_text = "; ".join(str(reason) for reason in reasons)
+            job_id = entry.get("source_job_id") or ""
+            print(f"  [{severity}] {reason_text} (job {job_id})")
     return 0
 
 
@@ -117,6 +171,8 @@ def _run_evaluators_subcommand(args, state_dir=None) -> int:
         return _run_evaluators_list(args, state_dir=state_dir)
     if args.evaluators_command == "promote":
         return _run_evaluators_promote(args, state_dir=state_dir)
+    if args.evaluators_command == "drafts":
+        return _run_evaluators_drafts(args, state_dir=state_dir)
     if args.evaluators_command == "epoch":
         return _run_evaluators_epoch(args, state_dir=state_dir)
     raise SystemExit(f"unknown evaluators subcommand: {args.evaluators_command}")

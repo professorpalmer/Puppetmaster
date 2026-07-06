@@ -23135,6 +23135,181 @@ class EvaluatorDraftStoreTests(unittest.TestCase):
             self.assertEqual(load_drafts(tmp, "s"), [])
 
 
+class EvaluatorDraftsCliTests(unittest.TestCase):
+    def _seed_registry(self, state_dir: str) -> None:
+        import shutil
+
+        from puppetmaster.evaluators import registry_path
+
+        sample = Path(__file__).resolve().parents[1] / "docs" / "sample-evaluator-registry.json"
+        os.makedirs(os.path.dirname(registry_path(state_dir)), exist_ok=True)
+        shutil.copy(sample, registry_path(state_dir))
+
+    def _anchor_path(self) -> str:
+        return str(Path(__file__).resolve().parents[1] / "docs" / "sample-anchor-set.json")
+
+    def test_cli_drafts_list_and_json_and_clear(self) -> None:
+        import contextlib
+        import io
+
+        from puppetmaster.evaluators import record_draft_criteria
+
+        with TemporaryDirectory() as tmp:
+            state_dir = str(Path(tmp) / ".puppetmaster")
+            record_draft_criteria(
+                state_dir,
+                slot_id="test-verifier",
+                source_job_id="job_a",
+                source_task_id="task_a",
+                reasons=["missing tests"],
+                severity="major",
+            )
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli_main(["--state-dir", state_dir, "evaluators", "drafts"])
+            self.assertEqual(rc, 0)
+            out = buf.getvalue()
+            self.assertIn("test-verifier: 1 draft(s)", out)
+            self.assertIn("[major] missing tests (job job_a)", out)
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli_main(["--state-dir", state_dir, "evaluators", "drafts", "--json"])
+            self.assertEqual(rc, 0)
+            payload = json.loads(buf.getvalue())
+            self.assertEqual(len(payload), 1)
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli_main(
+                    ["--state-dir", state_dir, "evaluators", "drafts", "--clear", "test-verifier"]
+                )
+            self.assertEqual(rc, 0)
+            self.assertIn("Cleared 1 draft(s) for test-verifier.", buf.getvalue())
+
+    def test_cli_drafts_empty(self) -> None:
+        import contextlib
+        import io
+
+        with TemporaryDirectory() as tmp:
+            state_dir = str(Path(tmp) / ".puppetmaster")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli_main(["--state-dir", state_dir, "evaluators", "drafts"])
+            self.assertEqual(rc, 0)
+            self.assertIn("No draft criteria recorded.", buf.getvalue())
+
+    def test_promote_from_drafts_folds_and_clears(self) -> None:
+        import contextlib
+        import io
+
+        from puppetmaster.evaluators import active_evaluators, load_drafts, record_draft_criteria
+
+        with TemporaryDirectory() as tmp:
+            state_dir = str(Path(tmp) / ".puppetmaster")
+            self._seed_registry(state_dir)
+            record_draft_criteria(
+                state_dir,
+                slot_id="test-verifier",
+                source_job_id="job_1",
+                source_task_id="task_1",
+                reasons=["reject partial work"],
+                severity="major",
+            )
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli_main(
+                    [
+                        "--state-dir",
+                        state_dir,
+                        "evaluators",
+                        "promote",
+                        "--slot-id",
+                        "test-verifier",
+                        "--instruction",
+                        "promoted with drafts",
+                        "--anchor-set",
+                        self._anchor_path(),
+                        "--from-drafts",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            self.assertIn("folded 1 draft note(s)", buf.getvalue())
+            self.assertIn("cleared 1 draft(s)", buf.getvalue())
+            active = active_evaluators(state_dir)
+            self.assertEqual(active["test-verifier"].criteria.get("draft_note_1"), "reject partial work")
+            self.assertEqual(load_drafts(state_dir, "test-verifier"), [])
+
+    def test_promote_explicit_criteria_win_on_collision(self) -> None:
+        from puppetmaster.evaluators import active_evaluators, record_draft_criteria
+
+        with TemporaryDirectory() as tmp:
+            state_dir = str(Path(tmp) / ".puppetmaster")
+            self._seed_registry(state_dir)
+            record_draft_criteria(
+                state_dir,
+                slot_id="test-verifier",
+                source_job_id="job_1",
+                source_task_id="task_1",
+                reasons=["from draft"],
+                severity="minor",
+            )
+            rc = cli_main(
+                [
+                    "--state-dir",
+                    state_dir,
+                    "evaluators",
+                    "promote",
+                    "--slot-id",
+                    "test-verifier",
+                    "--instruction",
+                    "explicit wins",
+                    "--anchor-set",
+                    self._anchor_path(),
+                    "--from-drafts",
+                    "--criteria-json",
+                    '{"draft_note_1": "explicit wins"}',
+                ]
+            )
+            self.assertEqual(rc, 0)
+            active = active_evaluators(state_dir)
+            self.assertEqual(active["test-verifier"].criteria.get("draft_note_1"), "explicit wins")
+
+    def test_promote_from_drafts_not_cleared_when_battery_fails(self) -> None:
+        from puppetmaster.evaluators import load_drafts, record_draft_criteria
+
+        with TemporaryDirectory() as tmp:
+            state_dir = str(Path(tmp) / ".puppetmaster")
+            self._seed_registry(state_dir)
+            record_draft_criteria(
+                state_dir,
+                slot_id="test-verifier",
+                source_job_id="job_1",
+                source_task_id="task_1",
+                reasons=["keep me"],
+                severity="minor",
+            )
+            rc = cli_main(
+                [
+                    "--state-dir",
+                    state_dir,
+                    "evaluators",
+                    "promote",
+                    "--slot-id",
+                    "test-verifier",
+                    "--instruction",
+                    "should fail battery",
+                    "--anchor-set",
+                    self._anchor_path(),
+                    "--from-drafts",
+                    "--min-pass-rate",
+                    "1.1",
+                ]
+            )
+            self.assertEqual(rc, 1)
+            self.assertEqual(len(load_drafts(state_dir, "test-verifier")), 1)
+
+
 class EvaluatorEpochSurfacingTests(unittest.TestCase):
     def _save_epoch_artifact(self, store, job) -> None:
         from puppetmaster.models import Artifact, ArtifactType

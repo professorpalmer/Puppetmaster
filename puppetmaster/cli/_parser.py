@@ -1683,6 +1683,28 @@ def build_parser() -> argparse.ArgumentParser:
         default="{}",
         help='JSON object of criteria thresholds (default: "{}").',
     )
+    evaluators_promote.add_argument(
+        "--from-drafts",
+        action="store_true",
+        help="Fold draft criteria from failed reviews into the promoted version.",
+    )
+    evaluators_drafts = evaluators_sub.add_parser(
+        "drafts",
+        help="List draft criteria captured from failed epoch reviews.",
+    )
+    evaluators_drafts.add_argument(
+        "slot_id",
+        nargs="?",
+        default=None,
+        help="Optional slot id filter.",
+    )
+    drafts_output = evaluators_drafts.add_mutually_exclusive_group()
+    drafts_output.add_argument("--json", action="store_true", help="Emit JSON.")
+    drafts_output.add_argument(
+        "--clear",
+        metavar="SLOT_ID",
+        help="Clear all drafts for the given slot id.",
+    )
     evaluators_epoch = evaluators_sub.add_parser(
         "epoch",
         help="Show the evaluator epoch frozen for a job.",
