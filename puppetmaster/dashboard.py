@@ -379,6 +379,28 @@ def _adapters_from_tasks(tasks: list[Task]) -> tuple[list[str], Optional[str]]:
     return adapters, primary
 
 
+def _evaluator_epoch_lineage(store: SwarmStore, job_id: str) -> list[dict[str, Any]]:
+    """Slot/version/role only — criteria bodies stay out of the dashboard snapshot."""
+    try:
+        from puppetmaster.evaluators import evaluator_epoch_for_job
+
+        epoch = evaluator_epoch_for_job(store, job_id)
+        rows: list[dict[str, Any]] = []
+        for entry in epoch.get("evaluators") or []:
+            if not isinstance(entry, dict):
+                continue
+            rows.append(
+                {
+                    "slot_id": entry.get("slot_id"),
+                    "version": entry.get("version"),
+                    "role": entry.get("role"),
+                }
+            )
+        return rows
+    except Exception:
+        return []
+
+
 def _verification_score(artifacts: list[Artifact]) -> Optional[float]:
     confidences = [
         float(artifact.confidence)
@@ -557,6 +579,7 @@ def build_job_snapshot(store: SwarmStore, job_id: str) -> dict[str, Any]:
         "primary_adapter": primary_adapter,
         "verification_score": _verification_score(artifacts),
         "routing_rollup": _routing_rollup(tasks, artifacts),
+        "evaluator_epoch": _evaluator_epoch_lineage(store, job_id),
         "phase": _job_phase(job.status.value, task_rows, counts),
     }
 
@@ -1947,6 +1970,7 @@ async function loadJob() {
         ${d.primary_model ? `<span class="swarm-model-badge" title="Primary model">${esc(d.primary_model)}</span>` : ""}
         ${d.worker_count ? `<span class="swarm-chip">${d.worker_count} worker${d.worker_count !== 1 ? "s" : ""}</span>` : ""}
         ${d.primary_adapter ? `<span class="swarm-chip swarm-adapter">${esc(d.primary_adapter)}</span>` : ""}
+        ${(d.evaluator_epoch || []).map(e => `<span class="swarm-chip" title="Evaluator epoch">${esc(e.slot_id)}@v${e.version} (${esc(e.role)})</span>`).join("")}
       </div>
     </div>
     <div class="swarm-metrics">

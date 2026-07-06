@@ -461,7 +461,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
         return _run_models_subcommand(args)
 
     if args.command == "evaluators":
-        return _run_evaluators_subcommand(args)
+        return _run_evaluators_subcommand(args, state_dir=state_dir)
 
     if args.command == "keys":
         return run_keys_subcommand(args)

@@ -22858,5 +22858,94 @@ class EvaluatorVerificationStampTests(unittest.TestCase):
             self.assertEqual(payload.get("evaluator_version"), 1)
 
 
+class EvaluatorEpochSurfacingTests(unittest.TestCase):
+    def _save_epoch_artifact(self, store, job) -> None:
+        from puppetmaster.models import Artifact, ArtifactType
+
+        store.save_artifact(
+            Artifact(
+                job_id=job.id,
+                task_id=job.id,
+                type=ArtifactType.DECISION,
+                created_by="evaluator-registry",
+                confidence=1.0,
+                evidence=["evaluator:epoch"],
+                payload={
+                    "kind": "evaluator_epoch",
+                    "decision": "freeze evaluator epoch at job start",
+                    "why": "test",
+                    "evaluators": [
+                        {
+                            "slot_id": "test-verifier",
+                            "version": 2,
+                            "role": "test",
+                            "instruction": "hidden",
+                            "criteria": {"min_confidence": 0.8},
+                        }
+                    ],
+                },
+            )
+        )
+
+    def test_build_job_snapshot_includes_evaluator_epoch_lineage(self) -> None:
+        from puppetmaster.dashboard import build_job_snapshot
+        from puppetmaster.store import SwarmStore
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            job = store.create_job("epoch surfacing")
+            self._save_epoch_artifact(store, job)
+            snap = build_job_snapshot(store, job.id)
+            self.assertEqual(
+                snap["evaluator_epoch"],
+                [{"slot_id": "test-verifier", "version": 2, "role": "test"}],
+            )
+            for row in snap["evaluator_epoch"]:
+                self.assertNotIn("criteria", row)
+                self.assertNotIn("instruction", row)
+
+    def test_build_job_snapshot_empty_epoch_without_artifact(self) -> None:
+        from puppetmaster.dashboard import build_job_snapshot
+        from puppetmaster.store import SwarmStore
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            job = store.create_job("no epoch")
+            snap = build_job_snapshot(store, job.id)
+            self.assertEqual(snap["evaluator_epoch"], [])
+
+    def test_cli_evaluators_epoch_prints_frozen_set(self) -> None:
+        import contextlib
+        import io
+
+        from puppetmaster.store import SwarmStore
+
+        with TemporaryDirectory() as tmp:
+            state_dir = str(Path(tmp) / ".puppetmaster")
+            store = SwarmStore(state_dir)
+            store.init()
+            job = store.create_job("cli epoch")
+            self._save_epoch_artifact(store, job)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli_main(["--state-dir", state_dir, "evaluators", "epoch", job.id])
+            self.assertEqual(rc, 0)
+            self.assertIn("test-verifier v2 role=test criteria=1", buf.getvalue())
+
+    def test_cli_evaluators_epoch_missing_job(self) -> None:
+        import contextlib
+        import io
+
+        with TemporaryDirectory() as tmp:
+            state_dir = str(Path(tmp) / ".puppetmaster")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli_main(["--state-dir", state_dir, "evaluators", "epoch", "missing-job"])
+            self.assertEqual(rc, 0)
+            self.assertIn("No evaluator epoch recorded.", buf.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

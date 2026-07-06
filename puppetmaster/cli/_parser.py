@@ -1646,10 +1646,6 @@ def build_parser() -> argparse.ArgumentParser:
         "evaluators",
         help="Manage RQGM evaluator slots (registry, promotion).",
     )
-    evaluators_cmd.add_argument(
-        "--state-dir",
-        help="Puppetmaster state directory (default: resolved from env/cwd).",
-    )
     evaluators_sub = evaluators_cmd.add_subparsers(dest="evaluators_command", required=True)
     evaluators_list = evaluators_sub.add_parser(
         "list",
@@ -1687,6 +1683,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="{}",
         help='JSON object of criteria thresholds (default: "{}").',
     )
+    evaluators_epoch = evaluators_sub.add_parser(
+        "epoch",
+        help="Show the evaluator epoch frozen for a job.",
+    )
+    evaluators_epoch.add_argument("job_id", help="Job id.")
 
     keys_cmd = subcommands.add_parser(
         "keys",
