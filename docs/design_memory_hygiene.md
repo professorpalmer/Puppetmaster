@@ -91,9 +91,49 @@ Unfiltered `--prune` without `--yes` refuses with a clear message and exit code
 - No changes to `_FRESH_JUDGMENT_ROLES` or memory-injection enablement.
 - No evaluator registry, drafts, gates, or anchor changes from Waves 5-8.
 
-## After Wave 9 (roadmap)
+## Wave 10: retrieval ranking
 
-- Marionette Round 8: consume L0-L3 memory-layer snapshots from Round 7
-  (compaction advisor driven by layer pressure).
-- Puppetmaster Wave 10 candidate: retrieval quality — scope-aware weighting so
-  findings outrank verifications at injection time.
+Wave 9 stopped garbage from entering promoted memory. Wave 10 makes retrieval
+smart about what it **injects**. Before this wave, `retrieve_memory` ranked by
+naive term overlap with confidence as the only tiebreak. Three defects:
+
+1. **All scopes rank equally.** A `swarm.verification` record ("check X passed")
+   outranks a `swarm.findings` insight whenever it shares more words with the
+   goal — but verifications are job telemetry; findings and decisions are the
+   reusable knowledge.
+2. **Long statements win mechanically.** More words in the haystack means more
+   term hits. Score was unnormalized by statement length.
+3. **Recency is ignored inside the age window.** Wave 9's `max_age_days` filter
+   drops records older than the window, but within the window a six-month-old
+   decision ties with yesterday's on the same overlap.
+
+### Weighted score formula (Task B)
+
+Deterministic arithmetic only — no embeddings, no LLM calls.
+
+| Factor | Rule |
+|--------|------|
+| **Scope weight** | `_SCOPE_WEIGHTS`: `swarm.findings` 1.0, `swarm.decisions` 1.0, `swarm.general` 0.7, `swarm.verification` 0.4; unknown scopes 0.7. |
+| **Overlap** | `hits / max(1, len(query_terms))` — fraction of query terms matched in the haystack (`scope`, `statement`, `evidence`, `adapter`, `role`, `topic`); terms must be length > 2 (unchanged). |
+| **Recency** | 1.0 when record age <= 7 days (`_RECENCY_FULL_DAYS`); linear decay to 0.5 at 56 days (`_RECENCY_FLOOR_DAYS`, `_RECENCY_FLOOR`); flat 0.5 beyond. Malformed `created_at` counts as fresh (same defensive parsing as Wave 9). |
+| **Final score** | `overlap * scope_weight * recency` when the query has terms; `scope_weight * recency` when it does not. |
+| **Tiebreak** | confidence descending, then `created_at` descending (newest first). |
+
+Empty-query contract preserved: when the query yields no terms, return records
+(up to `limit`) ranked by `scope_weight * recency` and confidence, including
+zero-overlap records — the existing `if score > 0 or not terms` guard is unchanged.
+
+### Injection floor (Task C)
+
+The orchestrator passes `min_overlap=0.2` (`_MEMORY_MIN_OVERLAP`) to
+`retrieve_memory`. Records whose overlap fraction falls below the floor are
+excluded before ranking. Empty-term queries are exempt so the empty-query
+contract holds. Override via `PUPPETMASTER_MEMORY_MIN_OVERLAP`; invalid values
+fall back to the constant; negative values disable the floor.
+
+### Non-goals (Wave 10)
+
+- No embedding or vector search.
+- No LLM reranking.
+- No change to the retrieval `limit`, promotion rules, or Wave 9 hygiene.
+- No new memory schema fields.
