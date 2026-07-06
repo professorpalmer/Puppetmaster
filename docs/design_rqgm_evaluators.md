@@ -155,6 +155,58 @@ when the epoch supplied the rubric.
 - Registry backends beyond JSON (Redis/Postgres deferred again).
 - LLM-as-judge inside anchor promotion (stays deterministic).
 
+## Wave 8: the feedback loop
+
+Wave 7 made the review gate **consume** frozen evaluator criteria. Rejected
+diffs still discarded the judge's reasons when the task failed. Wave 8 closes
+the RQGM **improvement** half: rejections become draft criteria for the slot's
+next version — accumulated durably, reviewed by a human, promoted only through
+the existing anchor battery.
+
+### Draft criteria records
+
+Path: `{state_dir}/evaluators/drafts.json`. Root shape `{"drafts": [...]}`.
+Each record:
+
+```json
+{
+  "slot_id": "review-judge",
+  "reasons": ["incorrect logic", "missing tests"],
+  "severity": "major",
+  "source_job_id": "job_abc",
+  "source_task_id": "task_xyz",
+  "recorded_at": "2026-07-06T..."
+}
+```
+
+Rules: skip empty reasons; dedupe identical sorted reason lists per slot;
+cap 50 drafts per slot (oldest evicted); `record_draft_criteria` never raises.
+
+### Capture hook
+
+In `_gate_review`, when an epoch-rubric review **rejects** with parseable judge
+reasons (`rubric_source == "evaluator_epoch"` and `raw_verdict` present),
+`record_draft_criteria` appends a draft for `evaluator_slot`. Spec/default
+rubric rejections and unparseable verdicts do not feed the loop. Recording is
+best-effort; GATE artifact detail carries `draft_recorded`.
+
+### Human-in-the-loop promotion
+
+- **Inspect:** `python -m puppetmaster evaluators drafts [slot_id] [--json]`
+- **Clear:** `evaluators drafts --clear SLOT_ID`
+- **Adopt:** `evaluators promote --from-drafts` folds up to 10 verbatim judge
+  reasons into `draft_note_<n>` criteria keys (explicit `--criteria-json`
+  wins on collision), runs the anchor battery, clears drafts on success.
+
+No automatic promotion. No LLM synthesis of criteria text (verbatim reasons only).
+
+### Non-goals (Wave 8)
+
+- Automatic promotion (never).
+- LLM-driven rewriting of draft criteria.
+- Draft capture for spec-rubric or default-rubric rejections.
+- Registry backends beyond JSON.
+
 ## Non-goals (v1)
 
 - Full RQGM co-evolution or genetic evaluator search
