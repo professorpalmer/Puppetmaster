@@ -160,6 +160,155 @@ def epoch_evaluator_for_role(epoch: dict, role: str) -> dict:
     return {}
 
 
+_MAX_DRAFTS_PER_SLOT = 50
+
+
+def drafts_path(state_dir: str) -> str:
+    return os.path.join(state_dir, "evaluators", "drafts.json")
+
+
+def _load_drafts_raw(state_dir: str) -> list[dict]:
+    path = drafts_path(state_dir)
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (json.JSONDecodeError, OSError, TypeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    drafts = data.get("drafts") or []
+    if not isinstance(drafts, list):
+        return []
+    return [item for item in drafts if isinstance(item, dict)]
+
+
+def _save_drafts_raw(state_dir: str, drafts: list[dict]) -> None:
+    directory = _registry_dir(state_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = Path(drafts_path(state_dir))
+    payload = {"drafts": drafts}
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    write_private_text(tmp, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    os.replace(tmp, path)
+
+
+def _normalize_reasons(reasons: Any) -> list[str]:
+    if not isinstance(reasons, list):
+        return []
+    normalized: list[str] = []
+    for reason in reasons:
+        text = str(reason).strip()
+        if text:
+            normalized.append(text)
+    return normalized
+
+
+def record_draft_criteria(
+    state_dir: str,
+    *,
+    slot_id: str,
+    source_job_id: str,
+    source_task_id: str,
+    reasons: list[str],
+    severity: str,
+) -> bool:
+    """Append one draft record. Best-effort: returns False on skip or error."""
+    try:
+        slot = str(slot_id or "").strip()
+        if not slot:
+            return False
+        normalized = _normalize_reasons(reasons)
+        if not normalized:
+            return False
+        sorted_key = sorted(normalized)
+        drafts = _load_drafts_raw(state_dir)
+        for existing in drafts:
+            if existing.get("slot_id") != slot:
+                continue
+            existing_reasons = _normalize_reasons(existing.get("reasons"))
+            if sorted(existing_reasons) == sorted_key:
+                return False
+        slot_drafts = [item for item in drafts if item.get("slot_id") == slot]
+        other = [item for item in drafts if item.get("slot_id") != slot]
+        while len(slot_drafts) >= _MAX_DRAFTS_PER_SLOT:
+            slot_drafts.pop(0)
+        slot_drafts.append(
+            {
+                "slot_id": slot,
+                "reasons": normalized,
+                "severity": str(severity or "none"),
+                "source_job_id": str(source_job_id or ""),
+                "source_task_id": str(source_task_id or ""),
+                "recorded_at": now_iso(),
+            }
+        )
+        _save_drafts_raw(state_dir, other + slot_drafts)
+        return True
+    except Exception:
+        return False
+
+
+def load_drafts(state_dir: str, slot_id: Optional[str] = None) -> list[dict]:
+    try:
+        drafts = _load_drafts_raw(state_dir)
+        if slot_id is None:
+            return list(drafts)
+        target = str(slot_id).strip()
+        return [item for item in drafts if item.get("slot_id") == target]
+    except Exception:
+        return []
+
+
+def clear_drafts(state_dir: str, slot_id: str) -> int:
+    try:
+        target = str(slot_id or "").strip()
+        if not target:
+            return 0
+        drafts = _load_drafts_raw(state_dir)
+        kept = [item for item in drafts if item.get("slot_id") != target]
+        removed = len(drafts) - len(kept)
+        if removed:
+            _save_drafts_raw(state_dir, kept)
+        return removed
+    except Exception:
+        return 0
+
+
+def merge_draft_notes_into_criteria(
+    state_dir: str,
+    slot_id: str,
+    criteria: dict,
+    *,
+    max_notes: int = 10,
+) -> tuple[dict, int]:
+    """Fold draft reasons into criteria as draft_note_<n>; explicit keys win."""
+    base = dict(criteria) if isinstance(criteria, dict) else {}
+    drafts = load_drafts(state_dir, slot_id)
+    notes: dict[str, str] = {}
+    note_index = 1
+    for draft in drafts:
+        for reason in _normalize_reasons(draft.get("reasons")):
+            if note_index > max_notes:
+                break
+            key = f"draft_note_{note_index}"
+            while key in base:
+                note_index += 1
+                key = f"draft_note_{note_index}"
+                if note_index > max_notes:
+                    break
+            if note_index > max_notes:
+                break
+            notes[key] = reason
+            note_index += 1
+        if note_index > max_notes:
+            break
+    merged = dict(notes)
+    merged.update(base)
+    return merged, len(notes)
+
+
 def load_anchor_set(path: str) -> list[dict]:
     with open(path, "r", encoding="utf-8") as fh:
         data = json.load(fh)

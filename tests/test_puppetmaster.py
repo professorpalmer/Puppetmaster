@@ -22858,6 +22858,136 @@ class EvaluatorVerificationStampTests(unittest.TestCase):
             self.assertEqual(payload.get("evaluator_version"), 1)
 
 
+class EvaluatorDraftStoreTests(unittest.TestCase):
+    def test_record_and_load_round_trip(self) -> None:
+        from puppetmaster.evaluators import load_drafts, record_draft_criteria
+
+        with TemporaryDirectory() as tmp:
+            ok = record_draft_criteria(
+                tmp,
+                slot_id="review-judge",
+                source_job_id="job_1",
+                source_task_id="task_1",
+                reasons=["bad scope", "missing tests"],
+                severity="major",
+            )
+            self.assertTrue(ok)
+            drafts = load_drafts(tmp, "review-judge")
+            self.assertEqual(len(drafts), 1)
+            self.assertEqual(drafts[0]["reasons"], ["bad scope", "missing tests"])
+            self.assertEqual(drafts[0]["severity"], "major")
+
+    def test_dedupe_identical_reasons(self) -> None:
+        from puppetmaster.evaluators import load_drafts, record_draft_criteria
+
+        with TemporaryDirectory() as tmp:
+            self.assertTrue(
+                record_draft_criteria(
+                    tmp,
+                    slot_id="review-judge",
+                    source_job_id="job_1",
+                    source_task_id="task_1",
+                    reasons=["a", "b"],
+                    severity="minor",
+                )
+            )
+            self.assertFalse(
+                record_draft_criteria(
+                    tmp,
+                    slot_id="review-judge",
+                    source_job_id="job_2",
+                    source_task_id="task_2",
+                    reasons=["b", "a"],
+                    severity="minor",
+                )
+            )
+            self.assertEqual(len(load_drafts(tmp, "review-judge")), 1)
+
+    def test_cap_evicts_oldest_draft(self) -> None:
+        from puppetmaster import evaluators as ev
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(ev, "_MAX_DRAFTS_PER_SLOT", 2):
+                self.assertTrue(
+                    ev.record_draft_criteria(
+                        tmp,
+                        slot_id="s",
+                        source_job_id="j1",
+                        source_task_id="t1",
+                        reasons=["first"],
+                        severity="minor",
+                    )
+                )
+                self.assertTrue(
+                    ev.record_draft_criteria(
+                        tmp,
+                        slot_id="s",
+                        source_job_id="j2",
+                        source_task_id="t2",
+                        reasons=["second"],
+                        severity="minor",
+                    )
+                )
+                self.assertTrue(
+                    ev.record_draft_criteria(
+                        tmp,
+                        slot_id="s",
+                        source_job_id="j3",
+                        source_task_id="t3",
+                        reasons=["third"],
+                        severity="minor",
+                    )
+                )
+                drafts = ev.load_drafts(tmp, "s")
+                self.assertEqual(len(drafts), 2)
+                self.assertEqual(drafts[0]["reasons"], ["second"])
+                self.assertEqual(drafts[1]["reasons"], ["third"])
+
+    def test_corrupt_file_then_record(self) -> None:
+        from puppetmaster.evaluators import drafts_path, load_drafts, record_draft_criteria
+
+        with TemporaryDirectory() as tmp:
+            path = drafts_path(tmp)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("{not json")
+            self.assertEqual(load_drafts(tmp), [])
+            self.assertTrue(
+                record_draft_criteria(
+                    tmp,
+                    slot_id="s",
+                    source_job_id="j",
+                    source_task_id="t",
+                    reasons=["ok"],
+                    severity="none",
+                )
+            )
+            self.assertEqual(len(load_drafts(tmp, "s")), 1)
+
+    def test_clear_returns_removed_count(self) -> None:
+        from puppetmaster.evaluators import clear_drafts, load_drafts, record_draft_criteria
+
+        with TemporaryDirectory() as tmp:
+            record_draft_criteria(
+                tmp,
+                slot_id="s",
+                source_job_id="j1",
+                source_task_id="t1",
+                reasons=["a"],
+                severity="none",
+            )
+            record_draft_criteria(
+                tmp,
+                slot_id="s",
+                source_job_id="j2",
+                source_task_id="t2",
+                reasons=["b"],
+                severity="none",
+            )
+            self.assertEqual(clear_drafts(tmp, "s"), 2)
+            self.assertEqual(load_drafts(tmp, "s"), [])
+
+
 class EvaluatorEpochSurfacingTests(unittest.TestCase):
     def _save_epoch_artifact(self, store, job) -> None:
         from puppetmaster.models import Artifact, ArtifactType
