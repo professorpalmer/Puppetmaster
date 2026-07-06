@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.5.1
+
+**Windows hardening + CodeGraph CLI compatibility.**
+
+- **Windows self-interrupt fix.** `liveness._pid_alive` and `mcp_registry._pid_alive` used `os.kill(pid, 0)` as a liveness probe. On Windows, signal value 0 is `CTRL_C_EVENT`, which delivers a real Ctrl+C to the target's console group — a probe against a pid sharing the console interrupted the caller itself (test runs and long CLI sessions died with `KeyboardInterrupt` mid-flight). Both now use a non-destructive `OpenProcess`/`GetExitCodeProcess` probe on Windows, matching the existing probes in `codegraph.py` and `dashboard.py`.
+- **CodeGraph subcommand rename compatibility.** Newer CodeGraph releases renamed `search` to `query` and replaced `context` with `explore`. `run_codegraph_cli` now translates legacy spellings (including `--max-nodes`/`--format` flag mapping) and falls back to the original arguments on older CLIs, so `python -m puppetmaster codegraph search|context ...`, worker context injection, and the MCP context tool all work against any installed CodeGraph version.
+- **utf-8 subprocess decoding.** CodeGraph subprocess output is now decoded as utf-8 with replacement instead of the Windows cp1252 default, which crashed reader threads on emoji-bearing CLI output.
+
 ## v1.5.0
 
 **RQGM v1 evaluator lifts: durable evaluator slots, epoch freezing at job start, deterministic anchor-set promotion, and evaluator metadata stamped on VERIFICATION artifacts.**
