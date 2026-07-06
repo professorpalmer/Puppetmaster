@@ -17262,6 +17262,128 @@ class ReviewGateTests(unittest.TestCase):
         # Stable across calls for the same id.
         self.assertEqual(_review_sampled("t-123", 0.5), _review_sampled("t-123", 0.5))
 
+    def _save_epoch(self, store, job_id, evaluators) -> None:
+        from puppetmaster.models import Artifact, ArtifactType
+
+        store.save_artifact(
+            Artifact(
+                job_id=job_id,
+                task_id=job_id,
+                type=ArtifactType.DECISION,
+                created_by="test",
+                confidence=1.0,
+                evidence=["evaluator:epoch"],
+                payload={
+                    "kind": "evaluator_epoch",
+                    "decision": "freeze evaluator epoch at job start",
+                    "why": "test epoch",
+                    "evaluators": evaluators,
+                },
+            )
+        )
+
+    def _eval_review_capture_prompt(self, tmp, *, epoch=None, spec_extra=None, judge_verdict=None):
+        from unittest.mock import Mock
+
+        import puppetmaster.gates as gates
+        from puppetmaster.gates import ReviewVerdict, evaluate_task_gates
+
+        store = self._store(tmp)
+        repo = Path(tmp) / "repo"
+        self._git_repo(repo, with_change=True)
+        payload = {"review": True, "cwd": str(repo)}
+        payload.update(spec_extra or {})
+        task = self._task(**payload)
+        if epoch is not None:
+            self._save_epoch(store, task.job_id, epoch)
+        captured = {}
+
+        def fake_judge(**kwargs):
+            captured["prompt"] = kwargs.get("prompt")
+            return judge_verdict or ReviewVerdict(available=True, passed=True)
+
+        fake_model = Mock(id="cursor/gpt-5-5")
+        with patch.object(gates, "resolve_judge_model", return_value=fake_model), \
+             patch.object(gates, "_REVIEW_JUDGE", side_effect=fake_judge):
+            evald = evaluate_task_gates(task, [], store, worker_id="w1", cwd=repo)
+        return evald, captured
+
+    def test_review_gate_uses_epoch_criteria_in_prompt(self) -> None:
+        epoch = [
+            {
+                "slot_id": "review-judge",
+                "version": 3,
+                "role": "review",
+                "instruction": "Epoch review instruction.",
+                "criteria": {"reject_partial": True, "min_scope": "full"},
+            }
+        ]
+        with TemporaryDirectory() as tmp:
+            _, captured = self._eval_review_capture_prompt(tmp, epoch=epoch)
+            prompt = captured.get("prompt") or ""
+            self.assertIn("Epoch review instruction.", prompt)
+            self.assertIn("- min_scope: full", prompt)
+            self.assertIn("- reject_partial: True", prompt)
+
+    def test_review_gate_spec_rubric_wins_over_epoch(self) -> None:
+        epoch = [
+            {
+                "slot_id": "review-judge",
+                "version": 1,
+                "role": "review",
+                "instruction": "Epoch loses.",
+                "criteria": {"x": 1},
+            }
+        ]
+        with TemporaryDirectory() as tmp:
+            _, captured = self._eval_review_capture_prompt(
+                tmp,
+                epoch=epoch,
+                spec_extra={"review": {"rubric": "SPEC RUBRIC WINS"}},
+            )
+            prompt = captured.get("prompt") or ""
+            self.assertIn("SPEC RUBRIC WINS", prompt)
+            self.assertNotIn("Epoch loses.", prompt)
+
+    def test_review_gate_default_rubric_without_epoch(self) -> None:
+        from puppetmaster.gates import _DEFAULT_REVIEW_RUBRIC
+
+        with TemporaryDirectory() as tmp:
+            _, captured = self._eval_review_capture_prompt(tmp)
+            prompt = captured.get("prompt") or ""
+            self.assertIn(_DEFAULT_REVIEW_RUBRIC, prompt)
+
+    def test_review_gate_epoch_lookup_error_falls_back_to_default(self) -> None:
+        from puppetmaster.gates import _DEFAULT_REVIEW_RUBRIC
+
+        with TemporaryDirectory() as tmp:
+            with patch(
+                "puppetmaster.evaluators.evaluator_epoch_for_job",
+                side_effect=RuntimeError("boom"),
+            ):
+                evald, captured = self._eval_review_capture_prompt(tmp)
+            self.assertTrue(evald.passed)
+            self.assertIn(_DEFAULT_REVIEW_RUBRIC, captured.get("prompt") or "")
+
+    def test_review_gate_detail_records_epoch_provenance(self) -> None:
+        epoch = [
+            {
+                "slot_id": "review-judge",
+                "version": 4,
+                "role": "review",
+                "instruction": "Check scope.",
+                "criteria": {"scope": "complete"},
+            }
+        ]
+        with TemporaryDirectory() as tmp:
+            evald, _ = self._eval_review_capture_prompt(tmp, epoch=epoch)
+            gate_art = [a for a in evald.artifacts if (a.payload or {}).get("kind") == "review"]
+            self.assertEqual(len(gate_art), 1)
+            payload = gate_art[0].payload or {}
+            self.assertEqual(payload.get("rubric_source"), "evaluator_epoch")
+            self.assertEqual(payload.get("evaluator_slot"), "review-judge")
+            self.assertEqual(payload.get("evaluator_version"), 4)
+
     # ----- auto-attach wiring -----
 
     def test_review_auto_attached_for_implement_when_env_set(self) -> None:

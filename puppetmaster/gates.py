@@ -209,7 +209,7 @@ def _evaluate_one(
         if kind == "write_scope":
             return _gate_write_scope(name, spec, artifacts, cwd)
         if kind == "review":
-            return _gate_review(name, spec, task, artifacts, cwd)
+            return _gate_review(name, spec, task, artifacts, store, cwd)
         return GateResult(name, str(kind), False, f"unknown gate kind: {kind!r}")
     except Exception as exc:  # a gate that crashes must FAIL closed, never pass
         return GateResult(name, str(kind), False, f"gate raised: {exc}")
@@ -645,8 +645,54 @@ def _collect_diff(artifacts: list[Artifact], cwd: Path) -> str:
     return diff
 
 
+def _render_epoch_criteria_rubric(entry: dict) -> Optional[str]:
+    """Render frozen evaluator criteria as review rubric text."""
+    criteria = entry.get("criteria")
+    if not isinstance(criteria, dict) or not criteria:
+        return None
+    parts: list[str] = []
+    instruction = str(entry.get("instruction") or "").strip()
+    if instruction:
+        parts.append(instruction)
+    for key in sorted(criteria.keys()):
+        parts.append(f"- {key}: {criteria[key]}")
+    return "\n".join(parts)
+
+
+def _resolve_review_rubric(
+    spec: dict[str, Any], task: Task, store: "SwarmStore"
+) -> tuple[str, dict[str, Any]]:
+    """Choose rubric text for the review gate (selection is best-effort)."""
+    explicit = spec.get("rubric")
+    if explicit:
+        return str(explicit), {"rubric_source": "spec"}
+    try:
+        from puppetmaster.evaluators import evaluator_epoch_for_job, epoch_evaluator_for_role
+
+        epoch = evaluator_epoch_for_job(store, task.job_id)
+        entry = epoch_evaluator_for_role(epoch, "review")
+        if not entry:
+            entry = epoch_evaluator_for_role(epoch, task.role)
+        if entry:
+            rendered = _render_epoch_criteria_rubric(entry)
+            if rendered:
+                return rendered, {
+                    "rubric_source": "evaluator_epoch",
+                    "evaluator_slot": entry.get("slot_id"),
+                    "evaluator_version": entry.get("version"),
+                }
+    except Exception:
+        pass
+    return _DEFAULT_REVIEW_RUBRIC, {"rubric_source": "default"}
+
+
 def _gate_review(
-    name: str, spec: dict[str, Any], task: Task, artifacts: list[Artifact], cwd: Path
+    name: str,
+    spec: dict[str, Any],
+    task: Task,
+    artifacts: list[Artifact],
+    store: "SwarmStore",
+    cwd: Path,
 ) -> GateResult:
     diff = _collect_diff(artifacts, cwd)
     if not diff.strip():
@@ -673,7 +719,7 @@ def _gate_review(
         if len(diff) <= max_chars
         else diff[:max_chars] + "\n... (diff truncated for review) ..."
     )
-    rubric = str(spec.get("rubric") or _DEFAULT_REVIEW_RUBRIC)
+    rubric, rubric_meta = _resolve_review_rubric(spec, task, store)
     prompt = build_review_prompt(task, diff_for_judge, rubric)
     timeout = int(spec.get("timeout_seconds", _REVIEW_TIMEOUT))
 
@@ -681,7 +727,7 @@ def _gate_review(
     if not verdict.available:
         return GateResult(
             name, "review", True, "review skipped: judge unavailable",
-            {"judge": judge.id, **verdict.detail},
+            {"judge": judge.id, **rubric_meta, **verdict.detail},
         )
 
     detail = {
@@ -689,6 +735,7 @@ def _gate_review(
         "severity": verdict.severity,
         "reasons": verdict.reasons,
         "diff_chars": len(diff),
+        **rubric_meta,
     }
     if verdict.passed:
         return GateResult(name, "review", True, f"{judge.id} approved the diff", detail)
