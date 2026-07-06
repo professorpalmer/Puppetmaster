@@ -157,7 +157,7 @@ Puppetmaster does not bundle input-side context compressors (RTK, Headroom, cave
 
 ## Status
 
-Daily-driver beta, currently at v1.7.0. Real runtime contract, automated tests, SQLite backend, fail-closed jobs, a live Cursor Agent MCP, and validated full-edit adapters. Credible for supervised local engineering; not yet a hosted multi-user service. Full feature matrix in [FEATURES.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/FEATURES.md).
+Daily-driver beta, currently at v1.8.0. Real runtime contract, automated tests, SQLite backend, fail-closed jobs, a live Cursor Agent MCP, and validated full-edit adapters. Credible for supervised local engineering; not yet a hosted multi-user service. Full feature matrix in [FEATURES.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/FEATURES.md).
 
 PyPI lists the package as [`puppetmaster-ai`](https://pypi.org/project/puppetmaster-ai/); [PEP 503 normalization](https://peps.python.org/pep-0503/#normalized-names) collides `puppetmaster` with an abandoned 2019 package. The import name, CLI, repo, and brand stay `puppetmaster`.
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.8.0
+
+**RQGM Wave 9: promoted-memory hygiene.**
+
+- **Promotion quality gate:** the stitcher skips VERIFICATION artifacts that echo worker prompts (`Role:`, boilerplate markers, or >600 chars) and skips failed/blocked/degraded verification results.
+- **Store dedupe, cap, and expiry:** `promote_memory` dedupes by scope+statement, caps at 200 records (evict oldest), `retrieve_memory` accepts `max_age_days`, and `prune_memory` deletes by scope and/or age. Orchestrator retrieval defaults to 14-day freshness (`PUPPETMASTER_MEMORY_MAX_AGE_DAYS` override).
+- **Memory CLI:** `python -m puppetmaster memory` lists records grouped by scope; `--json` preserves the full dump; `--prune [--scope] [--older-than-days]` cleans promoted memory (unfiltered prune requires `--yes`).
+
 ## v1.7.0
 
 **RQGM Wave 8: evaluator feedback loop from failed review verdicts.**
