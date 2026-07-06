@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.7.0
+
+**RQGM Wave 8: evaluator feedback loop from failed review verdicts.**
+
+- **Draft criteria store** (`evaluators/drafts.json`): append-only journal with dedupe, 50-draft cap per slot, and best-effort recording helpers.
+- **Review gate capture:** epoch-rubric rejections with parseable judge reasons write drafts for the slot that judged them; GATE artifacts record `draft_recorded`.
+- **CLI:** `evaluators drafts [slot_id] [--json] [--clear SLOT_ID]` to inspect or clear accumulated drafts.
+- **Promote handoff:** `evaluators promote --from-drafts` folds up to 10 verbatim judge reasons into `draft_note_<n>` criteria keys (explicit `--criteria-json` wins on collision), still gated by the anchor battery; clears drafts on success.
+
 ## v1.6.0
 
 **RQGM Wave 7: evaluator-aware review gate and epoch lineage surfacing.**
