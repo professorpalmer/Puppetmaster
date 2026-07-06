@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.9.0
+
+**RQGM Wave 10: memory retrieval ranking.**
+
+- **Weighted retrieval scoring:** `retrieve_memory` ranks by query-term overlap fraction (long statements gain nothing mechanically) times a scope weight (findings/decisions 1.0, general 0.7, verification 0.4) times a recency factor (full weight within 7 days, decaying to a 0.5 floor at 56 days). Ties break by confidence then newest first, in both the file and SQLite stores.
+- **Relevance floor on injection:** the orchestrator passes `min_overlap=0.2` so weak matches are not injected just because the limit allows five (`PUPPETMASTER_MEMORY_MIN_OVERLAP` override; negative disables the floor). Empty-query retrieval is exempt.
+
 ## v1.8.0
 
 **RQGM Wave 9: promoted-memory hygiene.**
