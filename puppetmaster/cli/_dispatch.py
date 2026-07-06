@@ -1141,7 +1141,37 @@ def _main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     if args.command == "memory":
-        print(json.dumps(store.list_memory(), indent=2))
+        records = store.list_memory()
+        if getattr(args, "prune", False):
+            scope = getattr(args, "scope", None)
+            older_than_days = getattr(args, "older_than_days", None)
+            if scope is None and older_than_days is None and not getattr(args, "yes", False):
+                print(
+                    "Refusing to prune all promoted memory without --yes. "
+                    "Pass --scope, --older-than-days, or --yes to confirm."
+                )
+                return 2
+            deleted = store.prune_memory(scope=scope, older_than_days=older_than_days)
+            print(f"Pruned {deleted} memory record(s).")
+            return 0
+        if getattr(args, "json", False):
+            print(json.dumps(records, indent=2, sort_keys=True))
+            return 0
+        if not records:
+            print("No promoted memory.")
+            return 0
+        by_scope: dict[str, list[dict]] = {}
+        for record in records:
+            by_scope.setdefault(str(record.get("scope") or ""), []).append(record)
+        for scope_name in sorted(by_scope):
+            scoped = by_scope[scope_name]
+            print(f"{scope_name}: {len(scoped)} record(s)")
+            for record in scoped:
+                statement = str(record.get("statement") or "")
+                preview = statement[:120] + ("…" if len(statement) > 120 else "")
+                confidence = record.get("confidence", 0.0)
+                created_at = record.get("created_at") or "unknown"
+                print(f"  [{confidence}] {preview} ({created_at})")
         return 0
 
     if args.command == "diff":

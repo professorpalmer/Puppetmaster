@@ -922,7 +922,20 @@ def build_parser() -> argparse.ArgumentParser:
     artifacts = subcommands.add_parser("artifacts", help="Print artifacts for a job as JSON.")
     artifacts.add_argument("job_id")
 
-    subcommands.add_parser("memory", help="Print promoted memory as JSON.")
+    memory = subcommands.add_parser("memory", help="List or prune promoted memory.")
+    memory.add_argument("--json", action="store_true", help="Emit full JSON dump.")
+    memory.add_argument("--prune", action="store_true", help="Delete matching memory records.")
+    memory.add_argument("--scope", help="Filter by scope (list or prune).")
+    memory.add_argument(
+        "--older-than-days",
+        type=int,
+        help="Prune records older than N days.",
+    )
+    memory.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm unfiltered prune (delete all promoted memory).",
+    )
 
     diff = subcommands.add_parser("diff", help="Print patch/diff artifacts for a job.")
     diff.add_argument("job_id", nargs="?")
