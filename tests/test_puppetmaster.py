@@ -1399,6 +1399,233 @@ class PuppetmasterTests(unittest.TestCase):
                 )
                 self.assertEqual(store.prune_memory(), 1)
 
+    def test_retrieve_memory_findings_outrank_verification_with_equal_overlap(self) -> None:
+        from puppetmaster.models import MemoryRecord
+
+        shared = "alpha beta gamma delta"
+        finding = MemoryRecord(
+            scope="swarm.findings",
+            statement=f"insight about {shared}",
+            evidence=["e"],
+            source_artifacts=[],
+            confidence=0.9,
+        )
+        verification = MemoryRecord(
+            scope="swarm.verification",
+            statement=f"check passed for {shared}",
+            evidence=["e"],
+            source_artifacts=[],
+            confidence=0.9,
+        )
+        for backend in ("file", "sqlite"):
+            with self.subTest(backend=backend), TemporaryDirectory() as tmp:
+                store = self._store_for_backend(backend, Path(tmp) / ".puppetmaster")
+                store.init()
+                store.promote_memory(verification)
+                store.promote_memory(finding)
+                matches = store.retrieve_memory("alpha beta gamma", limit=2)
+                self.assertEqual(len(matches), 2)
+                self.assertEqual(matches[0]["scope"], "swarm.findings")
+
+    def test_retrieve_memory_overlap_normalization(self) -> None:
+        from puppetmaster.models import MemoryRecord
+
+        high_fraction = MemoryRecord(
+            scope="swarm.findings",
+            statement="alpha beta gamma",
+            evidence=["e"],
+            source_artifacts=[],
+            confidence=0.9,
+        )
+        low_fraction = MemoryRecord(
+            scope="swarm.findings",
+            statement="alpha beta only",
+            evidence=["e"],
+            source_artifacts=[],
+            confidence=0.9,
+        )
+        query = "alpha beta gamma delta epsilon zeta eta theta iota kappa"
+        for backend in ("file", "sqlite"):
+            with self.subTest(backend=backend), TemporaryDirectory() as tmp:
+                store = self._store_for_backend(backend, Path(tmp) / ".puppetmaster")
+                store.init()
+                store.promote_memory(low_fraction)
+                store.promote_memory(high_fraction)
+                matches = store.retrieve_memory(query, limit=2)
+                self.assertEqual(matches[0]["statement"], "alpha beta gamma")
+
+    def test_retrieve_memory_recency_ranks_fresh_above_stale(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        from puppetmaster.models import MemoryRecord
+
+        now = datetime.now(timezone.utc)
+        fresh_at = now.isoformat(timespec="seconds")
+        stale_at = (now - timedelta(days=30)).isoformat(timespec="seconds")
+        for backend in ("file", "sqlite"):
+            with self.subTest(backend=backend), TemporaryDirectory() as tmp:
+                store = self._store_for_backend(backend, Path(tmp) / ".puppetmaster")
+                store.init()
+                store.promote_memory(
+                    MemoryRecord(
+                        scope="swarm.findings",
+                        statement="workers coordination insight stale",
+                        evidence=["e"],
+                        source_artifacts=[],
+                        confidence=0.9,
+                        created_at=stale_at,
+                    )
+                )
+                store.promote_memory(
+                    MemoryRecord(
+                        scope="swarm.findings",
+                        statement="workers coordination insight fresh",
+                        evidence=["e"],
+                        source_artifacts=[],
+                        confidence=0.9,
+                        created_at=fresh_at,
+                    )
+                )
+                matches = store.retrieve_memory("workers coordination insight", limit=2)
+                self.assertEqual(len(matches), 2)
+                self.assertEqual(matches[0]["created_at"], fresh_at)
+
+    def test_retrieve_memory_malformed_created_at_ranks_as_fresh(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        from puppetmaster.models import MemoryRecord
+
+        now = datetime.now(timezone.utc)
+        stale_at = (now - timedelta(days=30)).isoformat(timespec="seconds")
+        for backend in ("file", "sqlite"):
+            with self.subTest(backend=backend), TemporaryDirectory() as tmp:
+                store = self._store_for_backend(backend, Path(tmp) / ".puppetmaster")
+                store.init()
+                store.promote_memory(
+                    MemoryRecord(
+                        scope="swarm.findings",
+                        statement="workers malformed date insight stale",
+                        evidence=["e"],
+                        source_artifacts=[],
+                        confidence=0.9,
+                        created_at=stale_at,
+                    )
+                )
+                store.promote_memory(
+                    MemoryRecord(
+                        scope="swarm.findings",
+                        statement="workers malformed date insight fresh",
+                        evidence=["e"],
+                        source_artifacts=[],
+                        confidence=0.9,
+                        created_at="not-a-real-date",
+                    )
+                )
+                matches = store.retrieve_memory("workers malformed insight", limit=2)
+                self.assertEqual(len(matches), 2)
+                self.assertEqual(matches[0]["created_at"], "not-a-real-date")
+
+    def test_retrieve_memory_empty_query_returns_records(self) -> None:
+        from puppetmaster.models import MemoryRecord
+
+        memory = MemoryRecord(
+            scope="swarm.general",
+            statement="background context",
+            evidence=["e"],
+            source_artifacts=[],
+            confidence=0.8,
+        )
+        for backend in ("file", "sqlite"):
+            with self.subTest(backend=backend), TemporaryDirectory() as tmp:
+                store = self._store_for_backend(backend, Path(tmp) / ".puppetmaster")
+                store.init()
+                store.promote_memory(memory)
+                matches = store.retrieve_memory("ab", limit=5)
+                self.assertEqual(len(matches), 1)
+                self.assertEqual(matches[0]["id"], memory.id)
+
+    def test_retrieve_memory_tiebreaks_by_confidence_then_created_at(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        from puppetmaster.models import MemoryRecord
+
+        now = datetime.now(timezone.utc)
+        older_at = (now - timedelta(hours=2)).isoformat(timespec="seconds")
+        newer_at = (now - timedelta(hours=1)).isoformat(timespec="seconds")
+        for backend in ("file", "sqlite"):
+            with self.subTest(backend=backend), TemporaryDirectory() as tmp:
+                store = self._store_for_backend(backend, Path(tmp) / ".puppetmaster")
+                store.init()
+                store.promote_memory(
+                    MemoryRecord(
+                        scope="swarm.findings",
+                        statement="workers tiebreak ranking low older",
+                        evidence=["e"],
+                        source_artifacts=[],
+                        confidence=0.7,
+                        created_at=older_at,
+                    )
+                )
+                store.promote_memory(
+                    MemoryRecord(
+                        scope="swarm.findings",
+                        statement="workers tiebreak ranking high older",
+                        evidence=["e"],
+                        source_artifacts=[],
+                        confidence=0.9,
+                        created_at=older_at,
+                    )
+                )
+                store.promote_memory(
+                    MemoryRecord(
+                        scope="swarm.findings",
+                        statement="workers tiebreak ranking low newer",
+                        evidence=["e"],
+                        source_artifacts=[],
+                        confidence=0.7,
+                        created_at=newer_at,
+                    )
+                )
+                matches = store.retrieve_memory("workers tiebreak ranking", limit=3)
+                self.assertEqual(matches[0]["confidence"], 0.9)
+                self.assertEqual(matches[1]["created_at"], newer_at)
+                self.assertEqual(matches[2]["created_at"], older_at)
+
+    def test_retrieve_memory_ranking_parity_across_backends(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        from puppetmaster.models import MemoryRecord
+
+        now = datetime.now(timezone.utc)
+        records = [
+            MemoryRecord(
+                scope="swarm.verification",
+                statement="alpha beta gamma check",
+                evidence=["e"],
+                source_artifacts=[],
+                confidence=0.9,
+                created_at=now.isoformat(timespec="seconds"),
+            ),
+            MemoryRecord(
+                scope="swarm.findings",
+                statement="alpha beta gamma insight",
+                evidence=["e"],
+                source_artifacts=[],
+                confidence=0.9,
+                created_at=(now - timedelta(days=1)).isoformat(timespec="seconds"),
+            ),
+        ]
+        rankings: dict[str, list[str]] = {}
+        for backend in ("file", "sqlite"):
+            with TemporaryDirectory() as tmp:
+                store = self._store_for_backend(backend, Path(tmp) / ".puppetmaster")
+                store.init()
+                for record in records:
+                    store.promote_memory(record)
+                matches = store.retrieve_memory("alpha beta gamma", limit=2)
+                rankings[backend] = [item["scope"] for item in matches]
+        self.assertEqual(rankings["file"], rankings["sqlite"])
+
     def test_orchestrator_injects_only_fresh_memory(self) -> None:
         from datetime import datetime, timedelta, timezone
 

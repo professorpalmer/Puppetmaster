@@ -35,6 +35,16 @@ from puppetmaster.state import ensure_state_dir, resolve_state_dir
 _WINDOWS_LOCK_RETRIES = 10
 _WINDOWS_LOCK_BACKOFF_SECONDS = 0.02
 _MEMORY_CAP = 200
+_SCOPE_WEIGHTS = {
+    "swarm.findings": 1.0,
+    "swarm.decisions": 1.0,
+    "swarm.general": 0.7,
+    "swarm.verification": 0.4,
+}
+_DEFAULT_SCOPE_WEIGHT = 0.7
+_RECENCY_FULL_DAYS = 7
+_RECENCY_FLOOR = 0.5
+_RECENCY_FLOOR_DAYS = 56
 
 
 def _normalize_memory_statement(statement: str) -> str:
@@ -67,6 +77,65 @@ def _memory_within_max_age(memory: dict[str, Any], max_age_days: Optional[int]) 
     if max_age_days is None:
         return True
     return not _memory_is_older_than_days(memory, max_age_days)
+
+
+def _memory_scope_weight(memory: dict[str, Any]) -> float:
+    scope = memory.get("scope")
+    if isinstance(scope, str):
+        return _SCOPE_WEIGHTS.get(scope, _DEFAULT_SCOPE_WEIGHT)
+    return _DEFAULT_SCOPE_WEIGHT
+
+
+def _memory_recency_factor(memory: dict[str, Any]) -> float:
+    """Freshness multiplier for retrieval ranking; malformed dates count as fresh."""
+    created_at = memory.get("created_at")
+    if not created_at:
+        return 1.0
+    try:
+        created = parse_iso(str(created_at))
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        age_days = (datetime.now(timezone.utc) - created).days
+    except (ValueError, TypeError, OSError):
+        return 1.0
+    if age_days <= _RECENCY_FULL_DAYS:
+        return 1.0
+    if age_days >= _RECENCY_FLOOR_DAYS:
+        return _RECENCY_FLOOR
+    span = _RECENCY_FLOOR_DAYS - _RECENCY_FULL_DAYS
+    progress = (age_days - _RECENCY_FULL_DAYS) / span
+    return 1.0 - progress * (1.0 - _RECENCY_FLOOR)
+
+
+def _memory_haystack(memory: dict[str, Any]) -> str:
+    return " ".join(
+        str(memory.get(key, ""))
+        for key in ["scope", "statement", "evidence", "adapter", "role", "topic"]
+    ).lower()
+
+
+def _memory_term_overlap(terms: set[str], haystack: str) -> float:
+    if not terms:
+        return 0.0
+    hits = sum(1 for term in terms if term in haystack)
+    return hits / max(1, len(terms))
+
+
+def _memory_retrieval_score(
+    memory: dict[str, Any],
+    terms: set[str],
+) -> tuple[float, float, str]:
+    haystack = _memory_haystack(memory)
+    overlap = _memory_term_overlap(terms, haystack)
+    scope_weight = _memory_scope_weight(memory)
+    recency = _memory_recency_factor(memory)
+    if terms:
+        score = overlap * scope_weight * recency
+    else:
+        score = scope_weight * recency
+    confidence = _coerce_confidence(memory.get("confidence"))
+    created_at_key = _memory_created_at_sort_key(memory)
+    return score, confidence, created_at_key
 
 
 def _retry_on_windows_lock(operation):
@@ -835,15 +904,14 @@ class SwarmStore:
                 continue
             if not self._memory_matches_filters(memory, scope, adapter, role, topic):
                 continue
-            haystack = " ".join(
-                str(memory.get(key, ""))
-                for key in ["scope", "statement", "evidence", "adapter", "role", "topic"]
-            ).lower()
-            score = sum(1 for term in terms if term in haystack)
-            confidence = _coerce_confidence(memory.get("confidence"))
-            scored.append((score, confidence, memory))
-        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        return [memory for score, _, memory in scored[:limit] if score > 0 or not terms]
+            score, confidence, created_at_key = _memory_retrieval_score(memory, terms)
+            scored.append((score, confidence, created_at_key, memory))
+        scored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+        return [
+            memory
+            for score, _, _, memory in scored[:limit]
+            if score > 0 or not terms
+        ]
 
     @staticmethod
     def _memory_matches_filters(

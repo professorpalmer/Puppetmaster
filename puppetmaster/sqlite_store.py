@@ -28,6 +28,7 @@ from puppetmaster.store import (
     _coerce_confidence,
     _memory_created_at_sort_key,
     _memory_is_older_than_days,
+    _memory_retrieval_score,
     _memory_within_max_age,
     _normalize_memory_statement,
 )
@@ -929,15 +930,14 @@ class SQLiteSwarmStore(SwarmStore):
             memory = json.loads(row["data"])
             if not _memory_within_max_age(memory, max_age_days):
                 continue
-            haystack = " ".join(
-                str(memory.get(key, ""))
-                for key in ["scope", "statement", "evidence", "adapter", "role", "topic"]
-            ).lower()
-            score = sum(1 for term in terms if term in haystack)
-            confidence = _coerce_confidence(memory.get("confidence"))
-            scored.append((score, confidence, memory))
-        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        return [memory for score, _, memory in scored[:limit] if score > 0 or not terms]
+            score, confidence, created_at_key = _memory_retrieval_score(memory, terms)
+            scored.append((score, confidence, created_at_key, memory))
+        scored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+        return [
+            memory
+            for score, _, _, memory in scored[:limit]
+            if score > 0 or not terms
+        ]
 
     def delete_job(self, job_id: str) -> None:
         self.init()
