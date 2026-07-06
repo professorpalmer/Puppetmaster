@@ -199,6 +199,8 @@ def _snapshot_evaluator_epoch(store: SwarmStore, job: Job) -> None:
                 "slot_id": spec.slot_id,
                 "version": spec.version,
                 "role": spec.role,
+                "instruction": spec.instruction,
+                "criteria": dict(spec.criteria),
             }
             for spec in sorted(active.values(), key=lambda item: item.slot_id)
         ]

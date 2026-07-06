@@ -22553,6 +22553,64 @@ class EvaluatorEpochTests(unittest.TestCase):
             )
             self.assertEqual(test_entry["version"], 2)
 
+    def test_epoch_carries_instruction_and_criteria(self) -> None:
+        from puppetmaster.evaluators import evaluator_epoch_for_job
+        from puppetmaster.orchestrator import Orchestrator
+        from puppetmaster.store import SwarmStore
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / ".puppetmaster"
+            store = SwarmStore(root)
+            self._seed_registry(str(root))
+            result = Orchestrator(store).run("full epoch", roles=["explore"], worker_mode="inline")
+            epoch = evaluator_epoch_for_job(store, result.job.id)
+            test_entry = next(
+                e for e in epoch["evaluators"] if e["slot_id"] == "test-verifier"
+            )
+            self.assertIn("instruction", test_entry)
+            self.assertTrue(str(test_entry["instruction"]).strip())
+            self.assertIn("criteria", test_entry)
+            self.assertIsInstance(test_entry["criteria"], dict)
+            self.assertGreaterEqual(len(test_entry["criteria"]), 1)
+
+    def test_epoch_evaluator_for_role_lookup(self) -> None:
+        from puppetmaster.evaluators import epoch_evaluator_for_role
+
+        epoch = {
+            "evaluators": [
+                {"slot_id": "a", "version": 1, "role": "test", "instruction": "t", "criteria": {}},
+                {"slot_id": "b", "version": 2, "role": "Review", "instruction": "r", "criteria": {"x": 1}},
+            ]
+        }
+        hit = epoch_evaluator_for_role(epoch, "review")
+        self.assertEqual(hit["slot_id"], "b")
+        self.assertEqual(hit["version"], 2)
+        self.assertEqual(epoch_evaluator_for_role(epoch, "missing"), {})
+
+    def test_wave5_epoch_shape_still_stamps(self) -> None:
+        from puppetmaster.evaluators import epoch_evaluator_for_role, stamp_verification_artifacts
+        from puppetmaster.models import Artifact, ArtifactType, Task
+
+        epoch = {
+            "evaluators": [
+                {"slot_id": "test-verifier", "version": 1, "role": "test"},
+            ]
+        }
+        self.assertEqual(epoch_evaluator_for_role(epoch, "test")["slot_id"], "test-verifier")
+        task = Task(job_id="j", role="test", instruction="verify")
+        art = Artifact(
+            job_id="j",
+            task_id="t",
+            type=ArtifactType.VERIFICATION,
+            created_by="local",
+            confidence=0.9,
+            evidence=["x"],
+            payload={"check": "c", "result": "passed"},
+        )
+        stamped = stamp_verification_artifacts(task, [art], epoch)
+        self.assertEqual(stamped[0].payload.get("evaluator_slot"), "test-verifier")
+        self.assertEqual(stamped[0].payload.get("evaluator_version"), 1)
+
 
 class EvaluatorAnchorPromotionTests(unittest.TestCase):
     def _seed_registry(self, state_dir: str) -> None:

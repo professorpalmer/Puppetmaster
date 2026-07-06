@@ -144,6 +144,22 @@ def evaluator_epoch_for_job(store, job_id: str) -> dict:
     return latest_payload
 
 
+def epoch_evaluator_for_role(epoch: dict, role: str) -> dict:
+    """Return the first epoch evaluator entry matching ``role`` (case-insensitive)."""
+    if not isinstance(epoch, dict):
+        return {}
+    target = str(role or "").strip().casefold()
+    if not target:
+        return {}
+    for entry in epoch.get("evaluators") or []:
+        if not isinstance(entry, dict):
+            continue
+        entry_role = str(entry.get("role") or "").strip().casefold()
+        if entry_role == target:
+            return dict(entry)
+    return {}
+
+
 def load_anchor_set(path: str) -> list[dict]:
     with open(path, "r", encoding="utf-8") as fh:
         data = json.load(fh)
@@ -261,15 +277,8 @@ def stamp_verification_artifacts(task, artifacts: list, epoch: dict) -> list:
 
     from puppetmaster.models import Artifact
 
-    evaluators = epoch.get("evaluators") or []
-    match = None
-    for entry in evaluators:
-        if not isinstance(entry, dict):
-            continue
-        if entry.get("role") == task.role:
-            match = entry
-            break
-    if match is None:
+    match = epoch_evaluator_for_role(epoch, task.role)
+    if not match:
         return artifacts
 
     slot_id = str(match.get("slot_id") or "")
