@@ -181,6 +181,46 @@ def _tag_job_effort(store: SwarmStore, job_id: str) -> None:
         pass
 
 
+def _snapshot_evaluator_epoch(store: SwarmStore, job: Job) -> None:
+    """Persist the active evaluator set at job start. Best-effort; never raises."""
+    try:
+        from puppetmaster.evaluators import active_evaluators
+        from puppetmaster.models import Artifact, ArtifactType
+
+        root = getattr(store, "root", None)
+        state_dir = str(root) if root is not None else ""
+        if not state_dir:
+            return
+        active = active_evaluators(state_dir)
+        if not active:
+            return
+        evaluators = [
+            {
+                "slot_id": spec.slot_id,
+                "version": spec.version,
+                "role": spec.role,
+            }
+            for spec in sorted(active.values(), key=lambda item: item.slot_id)
+        ]
+        artifact = Artifact(
+            job_id=job.id,
+            task_id=job.id,
+            type=ArtifactType.DECISION,
+            created_by="evaluator-registry",
+            confidence=1.0,
+            evidence=["evaluator:epoch"],
+            payload={
+                "kind": "evaluator_epoch",
+                "decision": "freeze evaluator epoch at job start",
+                "why": "RQGM epoch freezing v1",
+                "evaluators": evaluators,
+            },
+        )
+        store.save_artifact(artifact)
+    except Exception:
+        pass
+
+
 class Orchestrator:
     def __init__(self, store: SwarmStore) -> None:
         self.store = store
@@ -200,6 +240,7 @@ class Orchestrator:
     ) -> RunResult:
         job = self.store.create_job(goal, label=label)
         _tag_job_effort(self.store, job.id)
+        _snapshot_evaluator_epoch(self.store, job)
         if on_job_created is not None:
             on_job_created(job)
         record_orchestrator_heartbeat(self.store, job.id, started=True)
@@ -278,6 +319,7 @@ class Orchestrator:
     ) -> RunResult:
         job = self.store.create_job(goal)
         _tag_job_effort(self.store, job.id)
+        _snapshot_evaluator_epoch(self.store, job)
         self._begin_trace()
         try:
             specs = self._with_retrieved_memory(specs_for_roles(roles), goal)

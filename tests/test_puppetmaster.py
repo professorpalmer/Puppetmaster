@@ -22455,5 +22455,221 @@ class EvaluatorRegistryTests(unittest.TestCase):
                 load_registry(tmp)
 
 
+class EvaluatorEpochTests(unittest.TestCase):
+    def _seed_registry(self, state_dir: str) -> None:
+        import shutil
+
+        from puppetmaster.evaluators import registry_path
+
+        sample = Path(__file__).resolve().parents[1] / "docs" / "sample-evaluator-registry.json"
+        os.makedirs(os.path.dirname(registry_path(state_dir)), exist_ok=True)
+        shutil.copy(sample, registry_path(state_dir))
+
+    def test_job_creation_writes_epoch_artifact(self) -> None:
+        from puppetmaster.evaluators import evaluator_epoch_for_job
+        from puppetmaster.orchestrator import Orchestrator
+        from puppetmaster.store import SwarmStore
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / ".puppetmaster"
+            store = SwarmStore(root)
+            self._seed_registry(str(root))
+            result = Orchestrator(store).run("epoch snapshot goal", roles=["explore"], worker_mode="inline")
+            epoch = evaluator_epoch_for_job(store, result.job.id)
+            self.assertEqual(epoch.get("kind"), "evaluator_epoch")
+            self.assertGreaterEqual(len(epoch.get("evaluators") or []), 1)
+
+    def test_epoch_frozen_after_registry_update(self) -> None:
+        from puppetmaster.evaluators import (
+            EvaluatorSpec,
+            evaluator_epoch_for_job,
+            register_evaluator,
+        )
+        from puppetmaster.orchestrator import Orchestrator
+        from puppetmaster.store import SwarmStore
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / ".puppetmaster"
+            store = SwarmStore(root)
+            self._seed_registry(str(root))
+            result = Orchestrator(store).run("first job", roles=["explore"], worker_mode="inline")
+            epoch_v1 = evaluator_epoch_for_job(store, result.job.id)
+            v1_test = next(
+                e for e in epoch_v1["evaluators"] if e["slot_id"] == "test-verifier"
+            )
+
+            register_evaluator(
+                str(root),
+                EvaluatorSpec(
+                    slot_id="test-verifier",
+                    version=2,
+                    role="test",
+                    instruction="promoted",
+                    criteria={},
+                    active=True,
+                    parent_version=1,
+                ),
+            )
+
+            frozen = evaluator_epoch_for_job(store, result.job.id)
+            frozen_test = next(
+                e for e in frozen["evaluators"] if e["slot_id"] == "test-verifier"
+            )
+            self.assertEqual(frozen_test["version"], v1_test["version"])
+
+    def test_new_job_picks_up_updated_registry(self) -> None:
+        from puppetmaster.evaluators import EvaluatorSpec, evaluator_epoch_for_job, register_evaluator
+        from puppetmaster.orchestrator import Orchestrator
+        from puppetmaster.store import SwarmStore
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / ".puppetmaster"
+            store = SwarmStore(root)
+            self._seed_registry(str(root))
+            Orchestrator(store).run("warmup", roles=["explore"], worker_mode="inline")
+            register_evaluator(
+                str(root),
+                EvaluatorSpec(
+                    slot_id="test-verifier",
+                    version=2,
+                    role="test",
+                    instruction="promoted",
+                    criteria={},
+                    active=True,
+                    parent_version=1,
+                ),
+            )
+            result = Orchestrator(store).run("second job", roles=["explore"], worker_mode="inline")
+            epoch = evaluator_epoch_for_job(store, result.job.id)
+            test_entry = next(
+                e for e in epoch["evaluators"] if e["slot_id"] == "test-verifier"
+            )
+            self.assertEqual(test_entry["version"], 2)
+
+
+class EvaluatorAnchorPromotionTests(unittest.TestCase):
+    def _seed_registry(self, state_dir: str) -> None:
+        import shutil
+
+        from puppetmaster.evaluators import registry_path
+
+        sample = Path(__file__).resolve().parents[1] / "docs" / "sample-evaluator-registry.json"
+        os.makedirs(os.path.dirname(registry_path(state_dir)), exist_ok=True)
+        shutil.copy(sample, registry_path(state_dir))
+
+    def test_anchor_battery_passes_for_test_verifier(self) -> None:
+        from puppetmaster.evaluators import run_anchor_battery
+
+        anchor = Path(__file__).resolve().parents[1] / "docs" / "sample-anchor-set.json"
+        with TemporaryDirectory() as tmp:
+            self._seed_registry(tmp)
+            report = run_anchor_battery(tmp, str(anchor), slot_id="test-verifier")
+            self.assertEqual(report["total"], 2)
+            self.assertEqual(report["passed"], 2)
+            self.assertEqual(report["pass_rate"], 1.0)
+
+    def test_promote_writes_new_registry_version(self) -> None:
+        from puppetmaster.evaluators import active_evaluators, promote_evaluator
+
+        anchor = Path(__file__).resolve().parents[1] / "docs" / "sample-anchor-set.json"
+        with TemporaryDirectory() as tmp:
+            self._seed_registry(tmp)
+            spec = promote_evaluator(
+                tmp,
+                "test-verifier",
+                parent_version=1,
+                instruction="promoted verifier",
+                criteria={"min_confidence": 0.85},
+                anchor_path=str(anchor),
+            )
+            self.assertEqual(spec.version, 2)
+            active = active_evaluators(tmp)
+            self.assertEqual(active["test-verifier"].version, 2)
+
+    def test_promote_fails_below_threshold(self) -> None:
+        from puppetmaster.evaluators import promote_evaluator
+
+        anchor = Path(__file__).resolve().parents[1] / "docs" / "sample-anchor-set.json"
+        with TemporaryDirectory() as tmp:
+            self._seed_registry(tmp)
+            with self.assertRaises(ValueError):
+                promote_evaluator(
+                    tmp,
+                    "test-verifier",
+                    parent_version=1,
+                    instruction="should fail",
+                    criteria={},
+                    anchor_path=str(anchor),
+                    min_pass_rate=1.1,
+                )
+
+
+class EvaluatorVerificationStampTests(unittest.TestCase):
+    def test_verification_artifact_includes_evaluator_fields(self) -> None:
+        from puppetmaster.adapters import verification_artifact
+        from puppetmaster.models import ArtifactType, Task
+
+        task = Task(job_id="job_1", role="test", instruction="verify")
+        art = verification_artifact(
+            task=task,
+            worker_id="worker-test",
+            adapter="local",
+            check="smoke",
+            result="passed",
+            confidence=0.9,
+            evidence=["test:smoke"],
+            payload={"goal": "x"},
+            evaluator_slot="test-verifier",
+            evaluator_version=2,
+        )
+        self.assertEqual(art.payload["evaluator_slot"], "test-verifier")
+        self.assertEqual(art.payload["evaluator_version"], 2)
+
+    def test_worker_runtime_stamps_verification_from_epoch(self) -> None:
+        import shutil
+
+        from puppetmaster.evaluators import registry_path
+        from puppetmaster.models import ArtifactType, JobStatus, Task, TaskStatus
+        from puppetmaster.store import SwarmStore
+        from puppetmaster.worker_runtime import WorkerRuntime
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / ".puppetmaster"
+            store = SwarmStore(root)
+            sample = Path(__file__).resolve().parents[1] / "docs" / "sample-evaluator-registry.json"
+            os.makedirs(os.path.dirname(registry_path(str(root))), exist_ok=True)
+            shutil.copy(sample, registry_path(str(root)))
+
+            job = store.create_job("stamp test")
+            from puppetmaster.orchestrator import _snapshot_evaluator_epoch
+
+            _snapshot_evaluator_epoch(store, job)
+            store.update_job_status(job.id, JobStatus.RUNNING)
+            task = Task(
+                job_id=job.id,
+                role="test",
+                instruction="verify",
+                status=TaskStatus.QUEUED,
+                adapter="local",
+            )
+            store.save_task(task)
+
+            runtime = WorkerRuntime(
+                store,
+                job.id,
+                role="test",
+                worker_id="worker-test",
+                lease_seconds=5,
+                simulate_seconds=0.0,
+            )
+            runtime.run_once()
+            artifacts = store.list_artifacts(job.id)
+            verifications = [a for a in artifacts if a.type == ArtifactType.VERIFICATION]
+            self.assertTrue(verifications)
+            payload = verifications[0].payload
+            self.assertEqual(payload.get("evaluator_slot"), "test-verifier")
+            self.assertEqual(payload.get("evaluator_version"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
