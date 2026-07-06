@@ -34,6 +34,39 @@ from puppetmaster.state import ensure_state_dir, resolve_state_dir
 
 _WINDOWS_LOCK_RETRIES = 10
 _WINDOWS_LOCK_BACKOFF_SECONDS = 0.02
+_MEMORY_CAP = 200
+
+
+def _normalize_memory_statement(statement: str) -> str:
+    return " ".join(str(statement).split())
+
+
+def _memory_created_at_sort_key(memory: dict[str, Any]) -> str:
+    created_at = memory.get("created_at")
+    return str(created_at) if created_at else ""
+
+
+def _memory_is_older_than_days(memory: dict[str, Any], older_than_days: int) -> bool:
+    """True when ``memory`` is older than ``older_than_days``; malformed dates are fresh."""
+    if older_than_days is None:
+        return False
+    created_at = memory.get("created_at")
+    if not created_at:
+        return False
+    try:
+        created = parse_iso(str(created_at))
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        age = datetime.now(timezone.utc) - created
+        return age.days >= older_than_days
+    except (ValueError, TypeError, OSError):
+        return False
+
+
+def _memory_within_max_age(memory: dict[str, Any], max_age_days: Optional[int]) -> bool:
+    if max_age_days is None:
+        return True
+    return not _memory_is_older_than_days(memory, max_age_days)
 
 
 def _retry_on_windows_lock(operation):
@@ -522,8 +555,51 @@ class SwarmStore:
             self.save_artifact(artifact)
 
     def promote_memory(self, memory: MemoryRecord) -> None:
+        normalized = _normalize_memory_statement(memory.statement)
+        for existing in self.list_memory():
+            if existing.get("scope") != memory.scope:
+                continue
+            if _normalize_memory_statement(str(existing.get("statement") or "")) == normalized:
+                return
         path = self.memory_dir / f"{memory.id}.json"
         self.write_json(path, memory)
+        self._enforce_memory_cap(_MEMORY_CAP)
+
+    def _delete_memory_record(self, memory_id: str) -> None:
+        path = self.memory_dir / f"{memory_id}.json"
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+    def _enforce_memory_cap(self, cap: int) -> None:
+        records = self.list_memory()
+        if len(records) <= cap:
+            return
+        sorted_records = sorted(records, key=_memory_created_at_sort_key)
+        for memory in sorted_records[: len(records) - cap]:
+            self._delete_memory_record(str(memory.get("id") or ""))
+
+    def prune_memory(
+        self,
+        *,
+        scope: Optional[str] = None,
+        older_than_days: Optional[int] = None,
+    ) -> int:
+        deleted = 0
+        for memory in list(self.list_memory()):
+            if scope is not None and memory.get("scope") != scope:
+                continue
+            if older_than_days is not None and not _memory_is_older_than_days(
+                memory, older_than_days
+            ):
+                continue
+            memory_id = memory.get("id")
+            if not memory_id:
+                continue
+            self._delete_memory_record(str(memory_id))
+            deleted += 1
+        return deleted
 
     def promote_memories(self, records: Iterable[MemoryRecord]) -> None:
         for memory in records:
@@ -750,10 +826,13 @@ class SwarmStore:
         adapter: Optional[str] = None,
         role: Optional[str] = None,
         topic: Optional[str] = None,
+        max_age_days: Optional[int] = None,
     ) -> list[dict[str, Any]]:
         terms = {term.lower() for term in query.split() if len(term) > 2}
         scored = []
         for memory in self.list_memory():
+            if not _memory_within_max_age(memory, max_age_days):
+                continue
             if not self._memory_matches_filters(memory, scope, adapter, role, topic):
                 continue
             haystack = " ".join(

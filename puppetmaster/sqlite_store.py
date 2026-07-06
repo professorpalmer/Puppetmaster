@@ -22,7 +22,15 @@ from puppetmaster.models import (
     to_jsonable,
 )
 from puppetmaster.fs_permissions import chmod_private_file, mkdir_private
-from puppetmaster.store import SwarmStore, _coerce_confidence
+from puppetmaster.store import (
+    SwarmStore,
+    _MEMORY_CAP,
+    _coerce_confidence,
+    _memory_created_at_sort_key,
+    _memory_is_older_than_days,
+    _memory_within_max_age,
+    _normalize_memory_statement,
+)
 
 _SQLITE_IN_CHUNK = 900
 
@@ -659,6 +667,12 @@ class SQLiteSwarmStore(SwarmStore):
             )
 
     def promote_memory(self, memory: MemoryRecord) -> None:
+        normalized = _normalize_memory_statement(memory.statement)
+        for existing in self.list_memory():
+            if existing.get("scope") != memory.scope:
+                continue
+            if _normalize_memory_statement(str(existing.get("statement") or "")) == normalized:
+                return
         self.init()
         with self._session() as connection:
             connection.execute(
@@ -669,6 +683,43 @@ class SQLiteSwarmStore(SwarmStore):
                 """,
                 (memory.id, self._dumps(memory)),
             )
+        self._enforce_memory_cap(_MEMORY_CAP)
+
+    def _delete_memory_record(self, memory_id: str) -> None:
+        self.init()
+        with self._session() as connection:
+            connection.execute("DELETE FROM memory WHERE id = ?", (memory_id,))
+
+    def _enforce_memory_cap(self, cap: int) -> None:
+        records = self.list_memory()
+        if len(records) <= cap:
+            return
+        sorted_records = sorted(records, key=_memory_created_at_sort_key)
+        for memory in sorted_records[: len(records) - cap]:
+            memory_id = memory.get("id")
+            if memory_id:
+                self._delete_memory_record(str(memory_id))
+
+    def prune_memory(
+        self,
+        *,
+        scope: Optional[str] = None,
+        older_than_days: Optional[int] = None,
+    ) -> int:
+        deleted = 0
+        for memory in list(self.list_memory()):
+            if scope is not None and memory.get("scope") != scope:
+                continue
+            if older_than_days is not None and not _memory_is_older_than_days(
+                memory, older_than_days
+            ):
+                continue
+            memory_id = memory.get("id")
+            if not memory_id:
+                continue
+            self._delete_memory_record(str(memory_id))
+            deleted += 1
+        return deleted
 
     def promote_memories(self, records: Iterable[MemoryRecord]) -> None:
         memory_list = list(records)
@@ -846,6 +897,7 @@ class SQLiteSwarmStore(SwarmStore):
         adapter: Optional[str] = None,
         role: Optional[str] = None,
         topic: Optional[str] = None,
+        max_age_days: Optional[int] = None,
     ) -> list[dict[str, Any]]:
         self.init()
         terms = {term.lower() for term in query.split() if len(term) > 2}
@@ -875,6 +927,8 @@ class SQLiteSwarmStore(SwarmStore):
         scored = []
         for row in rows:
             memory = json.loads(row["data"])
+            if not _memory_within_max_age(memory, max_age_days):
+                continue
             haystack = " ".join(
                 str(memory.get(key, ""))
                 for key in ["scope", "statement", "evidence", "adapter", "role", "topic"]

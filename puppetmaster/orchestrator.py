@@ -61,6 +61,22 @@ _FRESH_JUDGMENT_ROLES = frozenset(
     }
 )
 
+_MEMORY_MAX_AGE_DAYS = 14
+_MEMORY_MAX_AGE_ENV = "PUPPETMASTER_MEMORY_MAX_AGE_DAYS"
+
+
+def _memory_max_age_days() -> Optional[int]:
+    raw = os.environ.get(_MEMORY_MAX_AGE_ENV)
+    if raw is None:
+        return _MEMORY_MAX_AGE_DAYS
+    try:
+        value = int(raw)
+    except ValueError:
+        return _MEMORY_MAX_AGE_DAYS
+    if value <= 0:
+        return None
+    return value
+
 
 def _memory_injection_enabled(spec: WorkerSpec) -> bool:
     override = spec.payload.get("disable_memory")
@@ -1470,7 +1486,7 @@ class Orchestrator:
         return result, decisions
 
     def _with_retrieved_memory(self, specs: list[WorkerSpec], goal: str) -> list[WorkerSpec]:
-        memory = self.store.retrieve_memory(goal)
+        memory = self.store.retrieve_memory(goal, max_age_days=_memory_max_age_days())
         if not memory:
             return specs
         result: list[WorkerSpec] = []
