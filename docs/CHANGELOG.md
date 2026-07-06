@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.5.0
+
+**RQGM v1 evaluator lifts: durable evaluator slots, epoch freezing at job start, deterministic anchor-set promotion, and evaluator metadata stamped on VERIFICATION artifacts.**
+
+- **Evaluator slot registry** (`puppetmaster/evaluators.py`): versioned specs under `{state_dir}/evaluators/registry.json`; `active_evaluators`, `register_evaluator`, sample registry in `docs/sample-evaluator-registry.json`.
+- **Epoch snapshot**: orchestrator persists a frozen evaluator set as a job-scoped `DECISION` artifact at creation; mid-job registry edits do not affect running jobs.
+- **Anchor promotion**: `docs/sample-anchor-set.json` battery; `python -m puppetmaster evaluators list|promote` CLI; promotion requires passing the anchor battery (local adapter, no LLM judge).
+- **Verification stamping**: `evaluator_slot` / `evaluator_version` on `VERIFICATION` payloads when task role matches the job epoch.
+
 ## v1.3.0
 
 **A dead, revoked, or wrong provider key no longer hides behind a generic degrade — the `agentic` adapter now fails loud on auth rejection, naming the provider and the exact env var to fix.** Before this, a 401/403 (or a pre-flight `not_authenticated`) got laundered into a vague "failed verification" / "completed without structured findings" result, sending everyone hunting for a weak-model or bad-prompt cause instead of the real one: the key.
