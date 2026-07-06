@@ -1,0 +1,24 @@
+{
+  "evaluators": [
+    {
+      "slot_id": "test-verifier",
+      "version": 1,
+      "role": "test",
+      "instruction": "Convert claims into checks and verification results.",
+      "criteria": {"min_confidence": 0.8},
+      "active": true,
+      "parent_version": null,
+      "promoted_at": null
+    },
+    {
+      "slot_id": "redteam-reviewer",
+      "version": 1,
+      "role": "redteam",
+      "instruction": "Adversarially review for real failure modes and missing verification.",
+      "criteria": {"min_confidence": 0.75},
+      "active": true,
+      "parent_version": null,
+      "promoted_at": null
+    }
+  ]
+}

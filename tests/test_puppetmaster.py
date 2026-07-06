@@ -22377,5 +22377,83 @@ class DashboardPhaseStripTests(unittest.TestCase):
         self.assertIn("phaseStrip(d.phase)", dash.INDEX_HTML)
 
 
+class EvaluatorRegistryTests(unittest.TestCase):
+    def test_missing_registry_returns_empty(self) -> None:
+        from puppetmaster.evaluators import load_registry
+
+        with TemporaryDirectory() as tmp:
+            self.assertEqual(load_registry(tmp), [])
+
+    def test_load_save_round_trip(self) -> None:
+        from puppetmaster.evaluators import EvaluatorSpec, load_registry, save_registry
+
+        spec = EvaluatorSpec(
+            slot_id="test-verifier",
+            version=1,
+            role="test",
+            instruction="verify claims",
+            criteria={"min_confidence": 0.8},
+            active=True,
+        )
+        with TemporaryDirectory() as tmp:
+            save_registry(tmp, [spec])
+            loaded = load_registry(tmp)
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(loaded[0].slot_id, "test-verifier")
+            self.assertEqual(loaded[0].role, "test")
+
+    def test_register_bumps_version_and_deactivates_parent(self) -> None:
+        from puppetmaster.evaluators import EvaluatorSpec, active_evaluators, register_evaluator
+
+        v1 = EvaluatorSpec(
+            slot_id="test-verifier",
+            version=1,
+            role="test",
+            instruction="v1",
+            criteria={},
+            active=True,
+        )
+        v2 = EvaluatorSpec(
+            slot_id="test-verifier",
+            version=2,
+            role="test",
+            instruction="v2",
+            criteria={},
+            active=True,
+            parent_version=1,
+        )
+        with TemporaryDirectory() as tmp:
+            register_evaluator(tmp, v1)
+            register_evaluator(tmp, v2)
+            active = active_evaluators(tmp)
+            self.assertEqual(len(active), 1)
+            self.assertEqual(active["test-verifier"].version, 2)
+
+    def test_active_evaluators_one_per_slot(self) -> None:
+        from puppetmaster.evaluators import EvaluatorSpec, active_evaluators, save_registry
+
+        specs = [
+            EvaluatorSpec("a", 1, "test", "a1", {}, active=True),
+            EvaluatorSpec("b", 1, "redteam", "b1", {}, active=True),
+            EvaluatorSpec("a", 2, "test", "a2", {}, active=False),
+        ]
+        with TemporaryDirectory() as tmp:
+            save_registry(tmp, specs)
+            active = active_evaluators(tmp)
+            self.assertEqual(set(active.keys()), {"a", "b"})
+            self.assertEqual(active["a"].version, 1)
+
+    def test_malformed_registry_raises(self) -> None:
+        from puppetmaster.evaluators import load_registry, registry_path
+
+        with TemporaryDirectory() as tmp:
+            path = registry_path(tmp)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("{not json")
+            with self.assertRaises(ValueError):
+                load_registry(tmp)
+
+
 if __name__ == "__main__":
     unittest.main()
