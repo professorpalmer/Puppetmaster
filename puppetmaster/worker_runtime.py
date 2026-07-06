@@ -106,6 +106,7 @@ class WorkerRuntime:
                     {"worker_id": self.worker_id, "task_id": task.id, "role": self.role},
                 )
                 return True
+            artifacts = self._stamp_evaluator_metadata(task, artifacts)
             for artifact in artifacts:
                 self.store.save_artifact(artifact)
         except Exception as exc:
@@ -212,6 +213,17 @@ class WorkerRuntime:
         )
         self._emit_live_task_span(updated, artifacts + gate_eval.artifacts)
         return True
+
+    def _stamp_evaluator_metadata(self, task, artifacts: list) -> list:
+        try:
+            from puppetmaster.evaluators import evaluator_epoch_for_job, stamp_verification_artifacts
+
+            epoch = evaluator_epoch_for_job(self.store, self.job_id)
+            if not epoch:
+                return artifacts
+            return stamp_verification_artifacts(task, artifacts, epoch)
+        except Exception:
+            return artifacts
 
     def _evaluate_gates(self, task, artifacts: list):
         """Evaluate this task's completion gates. Ungated tasks pass through;

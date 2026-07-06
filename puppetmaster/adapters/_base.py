@@ -463,7 +463,19 @@ def verification_artifact(
     confidence: float,
     evidence: list[str],
     payload: dict,
+    evaluator_slot: str = "",
+    evaluator_version: int = 0,
 ) -> Artifact:
+    body = {
+        "adapter": adapter,
+        "check": check,
+        "result": result,
+        **payload,
+    }
+    if evaluator_slot:
+        body["evaluator_slot"] = evaluator_slot
+    if evaluator_version:
+        body["evaluator_version"] = evaluator_version
     return Artifact(
         job_id=task.job_id,
         task_id=task.id,
@@ -471,12 +483,7 @@ def verification_artifact(
         created_by=worker_id,
         confidence=confidence,
         evidence=evidence,
-        payload={
-            "adapter": adapter,
-            "check": check,
-            "result": result,
-            **payload,
-        },
+        payload=body,
     )
 
 
