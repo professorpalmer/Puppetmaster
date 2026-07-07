@@ -1292,8 +1292,8 @@ class PuppetmasterTests(unittest.TestCase):
                     "nonexistent zzzqqq topic",
                     job_id="job_no_memory",
                 )
-            self.assertNotIn("retrieved_memory", routed[0].payload)
-            self.assertEqual(mcl.load_memory_cost(), [])
+                self.assertNotIn("retrieved_memory", routed[0].payload)
+                self.assertEqual(mcl.load_memory_cost(), [])
 
     def test_memory_injection_cost_log_failure_does_not_break_dispatch(self) -> None:
         from puppetmaster.models import MemoryRecord

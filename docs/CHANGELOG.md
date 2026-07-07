@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.10.0
+
+**RQGM Wave 11: retrieval diversity, injection cost accounting, degraded-run honesty.**
+
+- **MMR diversity rerank:** after Wave 10 scoring, `retrieve_memory` reranks the top `3 * limit` candidates with maximal marginal relevance (Jaccard word-set similarity) so injected memory stays relevant without near-duplicates. Toggle with `PUPPETMASTER_MEMORY_MMR`; tune with `PUPPETMASTER_MEMORY_MMR_LAMBDA`.
+- **Memory injection cost log:** every dispatch that injects promoted memory writes one numbers-only ledger entry (job id, record count, estimated tokens, estimated USD). Totals surface in `python -m puppetmaster savings` as labeled spend overhead. Disable with `PUPPETMASTER_MEMORY_COST_LOG=0`.
+- **Degraded agentic honesty:** `assess_run_quality` recognizes `empty_or_unstructured_agentic_result` and max-turns-with-no-findings patterns so empty agentic swarms classify as degraded instead of looking successful. Agentic degraded artifacts advise rerun with a higher-capability model or higher `max_turns`.
+
 ## v1.9.0
 
 **RQGM Wave 10: memory retrieval ranking.**
