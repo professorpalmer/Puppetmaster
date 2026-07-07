@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.10.1
+
+**Routing capability ceiling + Windows test portability.**
+
+- **`max_capability` routing ceiling:** new `payload.max_capability` (and `TaskSignals.explicit_max_capability`) clips the TOP of the classifier output without touching the bottom. Callers that used `min_capability` as a cost guardrail were forcing every task's capability need to one exact value, so the balanced policy pinned every worker to the single cheapest model that cleared it; with the ceiling, cheap roles still classify low and route to cheap models while hard roles stop at the cap. Exposed on the `puppetmaster_route_task` MCP tool as `max_capability`. When both are set, `min_capability` is clipped by the ceiling.
+- **Windows-clean test suite:** the suite now strips a developer's `PUPPETMASTER_CODEGRAPH_NODE`/`_JS` repair pins (they short-circuited invocation resolution and disabled auto-heal in a dozen tests), uses portable Python one-liners instead of `cat`/`true`/`false`, and skips the shim-symlink test when the host cannot create symlinks.
+
 ## v1.10.0
 
 **RQGM Wave 11: retrieval diversity, injection cost accounting, degraded-run honesty.**

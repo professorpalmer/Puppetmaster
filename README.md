@@ -159,7 +159,9 @@ Marionette (the harness that rides Puppetmaster) implements complementary input-
 
 ## Status
 
-Daily-driver beta, currently at v1.10.0. Real runtime contract, automated tests, SQLite backend, fail-closed jobs, a live Cursor Agent MCP, and validated full-edit adapters. Credible for supervised local engineering; not yet a hosted multi-user service. Full feature matrix in [FEATURES.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/FEATURES.md).
+Daily-driver beta, currently at v1.10.1. Real runtime contract, automated tests, SQLite backend, fail-closed jobs, a live Cursor Agent MCP, and validated full-edit adapters. Credible for supervised local engineering; not yet a hosted multi-user service. Full feature matrix in [FEATURES.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/FEATURES.md).
+
+**v1.10.1 highlights:** `payload.max_capability` routing ceiling so cost caps no longer flatten per-task capability scores (a `min_capability` guardrail pinned every worker to one model); fully Windows-portable test suite.
 
 **v1.10.0 highlights:** MMR diversity reranking for promoted memory; numbers-only memory injection cost ledger; honest degraded classification for empty agentic / max-turns runs; Windows child-process console suppression across every entry point.
 

@@ -45,6 +45,14 @@ def pytest_configure(config):
     _ENV_BEFORE[ONLY_ENV] = os.environ.get(ONLY_ENV)
     os.environ["PUPPETMASTER_MODELS_PATH"] = str(sentinel)
     os.environ[ONLY_ENV] = ",".join(KNOWN_ADAPTERS)
+    # A developer who has run `puppetmaster repair-codegraph` carries pinned
+    # Node/JS overrides in their environment. Those pins short-circuit
+    # resolve_codegraph_invocation() and disable auto-heal, flipping a dozen
+    # codegraph tests on that machine only. Strip them for the suite; tests
+    # that exercise the pin behavior set the vars themselves via patch.dict.
+    for _pin in ("PUPPETMASTER_CODEGRAPH_NODE", "PUPPETMASTER_CODEGRAPH_JS"):
+        _ENV_BEFORE[_pin] = os.environ.get(_pin)
+        os.environ.pop(_pin, None)
 
 
 def pytest_unconfigure(config):

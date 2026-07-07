@@ -3681,7 +3681,13 @@ class PuppetmasterTests(unittest.TestCase):
             # `codegraph` shim symlinks to the real JS entry point.
             shim = Path(tmp) / "bin" / "codegraph"
             shim.parent.mkdir(parents=True)
-            shim.symlink_to(real_js)
+            try:
+                shim.symlink_to(real_js)
+            except OSError as exc:
+                # Windows needs Developer Mode / admin for symlinks; the
+                # shim-follow path being tested is symlink-based, so there is
+                # nothing meaningful to assert without one.
+                self.skipTest(f"symlinks unavailable on this host: {exc}")
             # `npm root -g` returns a DIFFERENT prefix that lacks the package.
             empty_root = Path(tmp) / "other" / "node_modules"
             empty_root.mkdir(parents=True)
@@ -17892,9 +17898,13 @@ class PuppetmasterGateTests(unittest.TestCase):
             store = self._store(tmp)
             repo = Path(tmp) / "repo"
             self._git_repo(repo)
-            ok = self._task(gates=[{"kind": "command", "command": "true"}], cwd=str(repo))
+            # Portable exit-0 / exit-1 commands (`true`/`false` don't exist on
+            # Windows shells).
+            exit_zero = f'"{sys.executable}" -c "raise SystemExit(0)"'
+            exit_one = f'"{sys.executable}" -c "raise SystemExit(1)"'
+            ok = self._task(gates=[{"kind": "command", "command": exit_zero}], cwd=str(repo))
             self.assertTrue(evaluate_task_gates(ok, [], store, worker_id="w1", cwd=repo).passed)
-            bad = self._task(gates=[{"kind": "command", "command": "false"}], cwd=str(repo))
+            bad = self._task(gates=[{"kind": "command", "command": exit_one}], cwd=str(repo))
             self.assertFalse(evaluate_task_gates(bad, [], store, worker_id="w1", cwd=repo).passed)
 
     def test_committed_gate_fails_when_dirty_then_autocommits(self) -> None:
@@ -17968,7 +17978,15 @@ class PuppetmasterGateTests(unittest.TestCase):
         self.assertEqual(len(specs), len(set(specs)))
         self.assertEqual(affected_specs([], mapping), [])
         # Command strategy: receives changed files on stdin, prints specs.
-        self.assertEqual(affected_specs(["a.py", "b.py"], {"command": "cat"}), ["a.py", "b.py"])
+        # (A portable `cat`: Windows has no cat/POSIX coreutils.)
+        echo_stdin = (
+            f'"{sys.executable}" -c '
+            '"import sys; sys.stdout.write(sys.stdin.read())"'
+        )
+        self.assertEqual(
+            affected_specs(["a.py", "b.py"], {"command": echo_stdin}),
+            ["a.py", "b.py"],
+        )
         # A mapping with neither rules nor command is a usage error.
         with self.assertRaises(ValueError):
             affected_specs(["a.py"], {})
