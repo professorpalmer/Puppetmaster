@@ -935,12 +935,9 @@ class SQLiteSwarmStore(SwarmStore):
             if terms and min_overlap > 0 and overlap < min_overlap:
                 continue
             scored.append((score, confidence, created_at_key, memory))
-        scored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
-        return [
-            memory
-            for score, _, _, memory in scored[:limit]
-            if score > 0 or not terms
-        ]
+        from puppetmaster.mmr import finalize_memory_retrieval
+
+        return finalize_memory_retrieval(scored, terms, limit)
 
     def delete_job(self, job_id: str) -> None:
         self.init()

@@ -1728,6 +1728,184 @@ class PuppetmasterTests(unittest.TestCase):
                 rankings[backend] = [item["scope"] for item in matches]
         self.assertEqual(rankings["file"], rankings["sqlite"])
 
+    def test_retrieve_memory_mmr_prefers_distinct_over_near_duplicate(self) -> None:
+        from puppetmaster.models import MemoryRecord
+
+        query = "alpha beta gamma workers"
+        near_a = MemoryRecord(
+            scope="swarm.findings",
+            statement="finding alpha beta gamma workers coordination",
+            evidence=["e"],
+            source_artifacts=[],
+            confidence=0.9,
+        )
+        near_b = MemoryRecord(
+            scope="swarm.findings",
+            statement="finding alpha beta gamma workers coordination review",
+            evidence=["e"],
+            source_artifacts=[],
+            confidence=0.85,
+        )
+        distinct = MemoryRecord(
+            scope="swarm.findings",
+            statement="finding alpha beta gamma workers zeta unique insight",
+            evidence=["e"],
+            source_artifacts=[],
+            confidence=0.8,
+        )
+        for backend in ("file", "sqlite"):
+            with self.subTest(backend=backend), TemporaryDirectory() as tmp:
+                store = self._store_for_backend(backend, Path(tmp) / ".puppetmaster")
+                store.init()
+                store.promote_memory(distinct)
+                store.promote_memory(near_b)
+                store.promote_memory(near_a)
+                with patch.dict(os.environ, {"PUPPETMASTER_MEMORY_MMR": "1"}, clear=False):
+                    matches = store.retrieve_memory(query, limit=2)
+                statements = [item["statement"] for item in matches]
+                self.assertEqual(len(matches), 2)
+                self.assertIn(near_a.statement, statements)
+                self.assertIn(distinct.statement, statements)
+                self.assertNotIn(near_b.statement, statements)
+
+    def test_retrieve_memory_mmr_lambda_one_matches_score_order(self) -> None:
+        from puppetmaster.models import MemoryRecord
+
+        query = "alpha beta gamma delta epsilon workers"
+        records = [
+            MemoryRecord(
+                scope="swarm.findings",
+                statement="alpha beta gamma delta epsilon workers insight one",
+                evidence=["e"],
+                source_artifacts=[],
+                confidence=0.9,
+            ),
+            MemoryRecord(
+                scope="swarm.findings",
+                statement="alpha beta gamma delta epsilon workers insight two",
+                evidence=["e"],
+                source_artifacts=[],
+                confidence=0.85,
+            ),
+            MemoryRecord(
+                scope="swarm.findings",
+                statement="unique zeta theme about workers coordination",
+                evidence=["e"],
+                source_artifacts=[],
+                confidence=0.8,
+            ),
+        ]
+        for backend in ("file", "sqlite"):
+            with self.subTest(backend=backend), TemporaryDirectory() as tmp:
+                store = self._store_for_backend(backend, Path(tmp) / ".puppetmaster")
+                store.init()
+                for record in records:
+                    store.promote_memory(record)
+                with patch.dict(
+                    os.environ,
+                    {"PUPPETMASTER_MEMORY_MMR": "1", "PUPPETMASTER_MEMORY_MMR_LAMBDA": "1.0"},
+                    clear=False,
+                ):
+                    mmr_matches = store.retrieve_memory(query, limit=3)
+                with patch.dict(os.environ, {"PUPPETMASTER_MEMORY_MMR": "0"}, clear=False):
+                    score_matches = store.retrieve_memory(query, limit=3)
+                self.assertEqual(
+                    [item["statement"] for item in mmr_matches],
+                    [item["statement"] for item in score_matches],
+                )
+
+    def test_retrieve_memory_mmr_disabled_matches_wave10_ordering(self) -> None:
+        from puppetmaster.models import MemoryRecord
+
+        query = "alpha beta gamma delta epsilon workers"
+        records = [
+            MemoryRecord(
+                scope="swarm.findings",
+                statement="alpha beta gamma delta epsilon workers insight one",
+                evidence=["e"],
+                source_artifacts=[],
+                confidence=0.9,
+            ),
+            MemoryRecord(
+                scope="swarm.findings",
+                statement="alpha beta gamma delta epsilon workers insight two",
+                evidence=["e"],
+                source_artifacts=[],
+                confidence=0.85,
+            ),
+            MemoryRecord(
+                scope="swarm.findings",
+                statement="unique zeta theme about workers coordination",
+                evidence=["e"],
+                source_artifacts=[],
+                confidence=0.8,
+            ),
+        ]
+        for backend in ("file", "sqlite"):
+            with self.subTest(backend=backend), TemporaryDirectory() as tmp:
+                store = self._store_for_backend(backend, Path(tmp) / ".puppetmaster")
+                store.init()
+                for record in records:
+                    store.promote_memory(record)
+                baseline: list[str] = []
+                with patch.dict(os.environ, {"PUPPETMASTER_MEMORY_MMR": "0"}, clear=False):
+                    baseline = [item["statement"] for item in store.retrieve_memory(query, limit=3)]
+                with patch.dict(os.environ, {"PUPPETMASTER_MEMORY_MMR": "0"}, clear=False):
+                    disabled = [item["statement"] for item in store.retrieve_memory(query, limit=3)]
+                self.assertEqual(disabled, baseline)
+
+    def test_retrieve_memory_mmr_tiebreak_is_deterministic(self) -> None:
+        from puppetmaster.mmr import mmr_rerank
+
+        scored = [
+            ({"statement": "alpha beta tied one"}, 1.0),
+            ({"statement": "alpha beta tied two"}, 1.0),
+            ({"statement": "gamma delta distinct"}, 0.9),
+        ]
+        first = mmr_rerank(scored, lambda_param=0.7, top_k=2)
+        second = mmr_rerank(scored, lambda_param=0.7, top_k=2)
+        self.assertEqual(first, second)
+        self.assertEqual(first[0]["statement"], "alpha beta tied one")
+
+    def test_retrieve_memory_mmr_parity_across_backends(self) -> None:
+        from puppetmaster.models import MemoryRecord
+
+        query = "alpha beta gamma workers"
+        records = [
+            MemoryRecord(
+                scope="swarm.findings",
+                statement="finding alpha beta gamma workers coordination",
+                evidence=["e"],
+                source_artifacts=[],
+                confidence=0.9,
+            ),
+            MemoryRecord(
+                scope="swarm.findings",
+                statement="finding alpha beta gamma workers coordination review",
+                evidence=["e"],
+                source_artifacts=[],
+                confidence=0.85,
+            ),
+            MemoryRecord(
+                scope="swarm.findings",
+                statement="finding alpha beta gamma workers zeta unique insight",
+                evidence=["e"],
+                source_artifacts=[],
+                confidence=0.8,
+            ),
+        ]
+        rankings: dict[str, list[str]] = {}
+        for backend in ("file", "sqlite"):
+            with TemporaryDirectory() as tmp:
+                store = self._store_for_backend(backend, Path(tmp) / ".puppetmaster")
+                store.init()
+                for record in records:
+                    store.promote_memory(record)
+                with patch.dict(os.environ, {"PUPPETMASTER_MEMORY_MMR": "1"}, clear=False):
+                    matches = store.retrieve_memory(query, limit=2)
+                rankings[backend] = [item["statement"] for item in matches]
+        self.assertEqual(rankings["file"], rankings["sqlite"])
+
     def test_orchestrator_injects_only_fresh_memory(self) -> None:
         from datetime import datetime, timedelta, timezone
 
