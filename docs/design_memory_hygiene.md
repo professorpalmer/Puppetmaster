@@ -137,3 +137,57 @@ fall back to the constant; negative values disable the floor.
 - No LLM reranking.
 - No change to the retrieval `limit`, promotion rules, or Wave 9 hygiene.
 - No new memory schema fields.
+
+## Wave 11: diversity, cost accounting, degraded-run honesty
+
+Three lifts from the oh-my-pi audit plus one live defect:
+
+1. **Near-duplicate injection.** Wave 10's weighted ranking can still return
+   five near-duplicate memories — nothing penalizes similarity among the selected
+   set. OMP fixes this with MMR (maximal marginal relevance) reranking: Jaccard
+   word-set similarity plus a selection loop scoring
+   `lambda * relevance - (1 - lambda) * max_similarity_to_selected`.
+2. **Injection cost accounting.** Every worker prompt that gets promoted memory
+   injected carries extra tokens the savings ledger never sees. OMP logs each
+   injection (session, memory count, token count, estimated cost). Puppetmaster
+   records one `memory_injection` entry per dispatch via the savings/state
+   infrastructure and surfaces totals in `python -m puppetmaster savings`.
+3. **Degraded agentic runs reported honestly.** A swarm whose workers all stop
+   at `max_turns` with zero structured findings must classify as degraded, not
+   sail through as success. `quality.py` now recognizes the agentic failure
+   marker (`empty_or_unstructured_agentic_result`) and the max-turns-with-no-
+   findings pattern; stitched summaries and status/show surface the verdict.
+
+### MMR diversity rerank (Task B)
+
+After Wave 10 composite scoring and the injection floor, `retrieve_memory` reranks
+the top `3 * limit` candidates with MMR over each record's `statement` field,
+then returns `limit` records. Env toggles: `PUPPETMASTER_MEMORY_MMR` (default
+on); `PUPPETMASTER_MEMORY_MMR_LAMBDA` parsed defensively (invalid falls back to
+0.7; out of [0, 1] clamped). Toggle off reproduces Wave 10 ordering exactly.
+`lambda=1.0` reproduces pure score order.
+
+### Memory injection cost log (Task C)
+
+When `_with_retrieved_memory` injects records, one best-effort ledger entry is
+written: job id, task/role when available, record count, estimated tokens
+(chars/4 of the injected block), and estimated USD (counterfactual model input
+price when known, else 0.0). Disable with `PUPPETMASTER_MEMORY_COST_LOG=0`.
+Logging failures never affect dispatch.
+
+### Degraded agentic honesty (Task D)
+
+`assess_run_quality` treats agentic verification artifacts carrying
+`empty_or_unstructured_agentic_result` as degraded markers (alongside the
+existing Cursor marker). A verification with `stop_reason == "max_turns"` and no
+substantive sibling artifacts from the same worker is also degraded. Agentic
+degraded artifacts include mitigation text advising rerun with a higher-
+capability model or higher `max_turns`. Detection and honest reporting only —
+no automatic mid-job model escalation.
+
+### Non-goals (Wave 11)
+
+- No embeddings or vector similarity for retrieval.
+- No LLM reranking.
+- No automatic model escalation mid-job (detection and honest reporting only).
+- No new memory schema fields.
