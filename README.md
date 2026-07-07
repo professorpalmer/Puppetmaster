@@ -155,9 +155,13 @@ Workers can optionally write tighter prose. `PUPPETMASTER_OUTPUT_STYLE=terse` (o
 
 Puppetmaster does not bundle input-side context compressors (RTK, Headroom, caveman). We measured them: the net savings are small and the failure modes (a compressor dropping data the agent then re-reads) run the wrong way for a coding agent. [COMPRESSION.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/COMPRESSION.md) shows the evidence and how to wire one yourself if you want it.
 
+Marionette (the harness that rides Puppetmaster) implements complementary input-side savings: savings-gated tool-output offload, absolute-token compaction advice, append-only KV-cache context, and live OpenRouter pricing for swarm jobs the local registry does not know. See [Marionette's token economics docs](https://github.com/professorpalmer/marionette/blob/main/docs/session_decisions_v0_8_0_to_0_9_x.md).
+
 ## Status
 
 Daily-driver beta, currently at v1.10.0. Real runtime contract, automated tests, SQLite backend, fail-closed jobs, a live Cursor Agent MCP, and validated full-edit adapters. Credible for supervised local engineering; not yet a hosted multi-user service. Full feature matrix in [FEATURES.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/FEATURES.md).
+
+**v1.10.0 highlights:** MMR diversity reranking for promoted memory; numbers-only memory injection cost ledger; honest degraded classification for empty agentic / max-turns runs; Windows child-process console suppression across every entry point.
 
 PyPI lists the package as [`puppetmaster-ai`](https://pypi.org/project/puppetmaster-ai/); [PEP 503 normalization](https://peps.python.org/pep-0503/#normalized-names) collides `puppetmaster` with an abandoned 2019 package. The import name, CLI, repo, and brand stay `puppetmaster`.
 

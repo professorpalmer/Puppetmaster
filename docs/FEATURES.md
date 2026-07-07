@@ -33,7 +33,10 @@ Five production adapters live plus the keys-only `agentic` standalone worker; el
 | One-line rule installer (v0.7.3+) | `install-rules` — Cursor `.mdc` + cross-tool `AGENTS.md` + global Codex/Claude rules, merge-don't-overwrite |
 | `puppetmaster setup` (v0.7.3+) | One-shot wizard chaining doctor → models init → MCP installers → rules |
 | Cursor Agent MCP | Async start tools, status polling, logs, live artifacts, partial summaries, routing tools |
-| Memory | Promoted memory retrieval into later worker context and prompts |
+| Memory | Promoted memory retrieval into later worker context and prompts; Wave 10 weighted ranking (scope, query overlap, recency); Wave 11 MMR diversity rerank so injected memory stays relevant without near-duplicates |
+| Memory cost accounting (v1.10.0+) | Every memory injection logs estimated tokens and USD to the local savings ledger (`python -m puppetmaster savings`); disable with `PUPPETMASTER_MEMORY_COST_LOG=0` |
+| Degraded-run honesty (v1.10.0+) | Empty agentic swarms and max-turns-with-no-findings runs classify as degraded with mitigation advice instead of looking successful in stitched summaries |
+| Windows console hygiene (v1.10.0+) | Process-wide `CREATE_NO_WINDOW` default for child subprocesses under console-less hosts (Cursor MCP, workers, CodeGraph index). Escape hatch: `PUPPETMASTER_SHOW_CONSOLES=1` |
 | CodeGraph | Optional shared repo intelligence ([docs](CODEGRAPH.md)) |
 | Patch workflow | Patch artifacts, path locks, approval/rejection events, dirty-worktree guard |
 | Reproducible benchmarks | Six harnesses in [`bench/`](../bench/), each with markdown + JSON receipts under `bench/results/` |
