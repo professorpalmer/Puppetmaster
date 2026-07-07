@@ -33,6 +33,11 @@ _SUBSTANTIVE_TYPES = {
     ArtifactType.RISK,
 }
 
+_DEGRADED_FAILURE_MARKERS = frozenset({
+    "empty_or_unstructured_cursor_result",
+    "empty_or_unstructured_agentic_result",
+})
+
 
 def _payload(artifact: Artifact) -> dict[str, Any]:
     return getattr(artifact, "payload", None) or {}
@@ -51,9 +56,37 @@ def _is_degraded_marker(artifact: Artifact) -> bool:
     payload = _payload(artifact)
     if payload.get("result") == "degraded":
         return True
-    # The degraded RISK artifact the Cursor adapter emits carries this failure
-    # tag in its mitigation/risk text; key off the explicit failure when present.
-    return payload.get("failure") == "empty_or_unstructured_cursor_result"
+    failure = payload.get("failure")
+    if failure in _DEGRADED_FAILURE_MARKERS:
+        return True
+    if artifact.type == ArtifactType.RISK:
+        evidence = set(artifact.evidence or [])
+        if (
+            "result:empty-or-unstructured" in evidence
+            or "cursor-result:empty-or-unstructured" in evidence
+        ):
+            return True
+    return False
+
+
+def _worker_has_substantive_output(artifacts: list[Artifact], worker_id: str) -> bool:
+    for artifact in artifacts:
+        if artifact.created_by != worker_id:
+            continue
+        if artifact.type in _SUBSTANTIVE_TYPES and not _is_degraded_marker(artifact):
+            return True
+    return False
+
+
+def _is_max_turns_without_findings(
+    artifact: Artifact, artifacts: list[Artifact]
+) -> bool:
+    payload = _payload(artifact)
+    if artifact.type != ArtifactType.VERIFICATION:
+        return False
+    if payload.get("stop_reason") != "max_turns":
+        return False
+    return not _worker_has_substantive_output(artifacts, artifact.created_by)
 
 
 def assess_run_quality(artifacts: Iterable[Artifact]) -> dict[str, Any]:
@@ -91,7 +124,10 @@ def assess_run_quality(artifacts: Iterable[Artifact]) -> dict[str, Any]:
 
     substantive = [a for a in artifacts if a.type in _SUBSTANTIVE_TYPES and not _is_degraded_marker(a)]
     if not substantive:
-        if any(_is_degraded_marker(a) for a in artifacts):
+        if any(
+            _is_degraded_marker(a) or _is_max_turns_without_findings(a, artifacts)
+            for a in artifacts
+        ):
             reasons.append("only degraded/empty SDK results — no structured output")
         else:
             reasons.append("only verification artifacts — no findings/decisions/patches")

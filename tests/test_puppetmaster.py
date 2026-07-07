@@ -17500,6 +17500,102 @@ class PuppetmasterLoudFailureTests(unittest.TestCase):
         self.assertEqual(verdict["quality"], "ok")
         self.assertTrue(verdict["trustworthy"])
 
+    def test_quality_degraded_for_agentic_failure_marker(self) -> None:
+        from puppetmaster.adapters import verification_artifact
+        from puppetmaster.models import Artifact, ArtifactType, Task
+        from puppetmaster.quality import assess_run_quality
+
+        task = Task(job_id="job_x", role="explore", instruction="x")
+        verification = verification_artifact(
+            task=task,
+            worker_id="w1",
+            adapter="agentic",
+            check="x",
+            result="degraded",
+            confidence=0.65,
+            evidence=["adapter:agentic"],
+            payload={
+                "stop_reason": "model_stopped",
+                "failure": "empty_or_unstructured_agentic_result",
+            },
+        )
+        risk = Artifact(
+            job_id=task.job_id,
+            task_id=task.id,
+            type=ArtifactType.RISK,
+            created_by="w1",
+            confidence=0.85,
+            evidence=["adapter:agentic", "result:empty-or-unstructured"],
+            payload={"risk": "Agentic worker completed without structured findings."},
+        )
+        verdict = assess_run_quality([verification, risk])
+        self.assertEqual(verdict["quality"], "degraded")
+        self.assertFalse(verdict["trustworthy"])
+
+    def test_quality_ok_when_agentic_failure_marker_has_real_findings(self) -> None:
+        from puppetmaster.adapters import verification_artifact
+        from puppetmaster.models import Task
+        from puppetmaster.quality import assess_run_quality
+
+        task = Task(job_id="job_x", role="explore", instruction="x")
+        verification = verification_artifact(
+            task=task,
+            worker_id="w1",
+            adapter="agentic",
+            check="x",
+            result="degraded",
+            confidence=0.65,
+            evidence=["adapter:agentic"],
+            payload={"failure": "empty_or_unstructured_agentic_result"},
+        )
+        finding = self._finding_artifact()
+        from dataclasses import replace
+
+        finding = replace(finding, created_by="w2")
+        verdict = assess_run_quality([verification, finding])
+        self.assertEqual(verdict["quality"], "ok")
+
+    def test_quality_degraded_for_max_turns_without_findings(self) -> None:
+        from puppetmaster.adapters import verification_artifact
+        from puppetmaster.models import Task
+        from puppetmaster.quality import assess_run_quality
+
+        task = Task(job_id="job_x", role="explore", instruction="x")
+        verification = verification_artifact(
+            task=task,
+            worker_id="w1",
+            adapter="agentic",
+            check="x",
+            result="passed",
+            confidence=0.9,
+            evidence=["adapter:agentic"],
+            payload={"stop_reason": "max_turns", "turns": 14},
+        )
+        verdict = assess_run_quality([verification])
+        self.assertEqual(verdict["quality"], "degraded")
+        self.assertIn("degraded/empty SDK results", verdict["reasons"][0])
+
+    def test_quality_cursor_degraded_marker_unchanged(self) -> None:
+        from puppetmaster.adapters import cursor_degraded_artifact, verification_artifact
+        from puppetmaster.models import Task
+        from puppetmaster.quality import assess_run_quality
+
+        task = Task(job_id="job_x", role="cursor", instruction="x")
+        verification = verification_artifact(
+            task=task,
+            worker_id="w1",
+            adapter="cursor-sdk",
+            check="x",
+            result="degraded",
+            confidence=0.65,
+            evidence=["adapter:cursor-sdk"],
+            payload={"failure": "empty_or_unstructured_cursor_result"},
+        )
+        risk = cursor_degraded_artifact(task, "w1", "unstructured prose")
+        verdict = assess_run_quality([verification, risk])
+        self.assertEqual(verdict["quality"], "degraded")
+        self.assertFalse(verdict["trustworthy"])
+
     def test_warn_run_quality_treats_running_empty_job_as_in_progress(self) -> None:
         """A still-running job with no artifacts yet must not be warned as low-confidence."""
         from puppetmaster.cli import _warn_run_quality

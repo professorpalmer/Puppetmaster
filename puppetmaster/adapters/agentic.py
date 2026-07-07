@@ -389,7 +389,10 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 evidence=["adapter:agentic", "result:empty-or-unstructured"],
                 payload={
                     "risk": "Agentic worker completed without structured findings.",
-                    "mitigation": "Rerun with a stricter prompt or a higher-capability model.",
+                    "mitigation": (
+                        "Treat this swarm as degraded; rerun with a higher-capability model, "
+                        "a higher max_turns budget, or a stricter prompt."
+                    ),
                     "stdout_excerpt": redact_secrets(final_text or "")[:2000],
                 },
             ))
