@@ -7,6 +7,7 @@
 - **MMR diversity rerank:** after Wave 10 scoring, `retrieve_memory` reranks the top `3 * limit` candidates with maximal marginal relevance (Jaccard word-set similarity) so injected memory stays relevant without near-duplicates. Toggle with `PUPPETMASTER_MEMORY_MMR`; tune with `PUPPETMASTER_MEMORY_MMR_LAMBDA`.
 - **Memory injection cost log:** every dispatch that injects promoted memory writes one numbers-only ledger entry (job id, record count, estimated tokens, estimated USD). Totals surface in `python -m puppetmaster savings` as labeled spend overhead. Disable with `PUPPETMASTER_MEMORY_COST_LOG=0`.
 - **Degraded agentic honesty:** `assess_run_quality` recognizes `empty_or_unstructured_agentic_result` and max-turns-with-no-findings patterns so empty agentic swarms classify as degraded instead of looking successful. Agentic degraded artifacts advise rerun with a higher-capability model or higher `max_turns`.
+- **No more console flashes on Windows:** every Puppetmaster entry point (CLI, MCP server, worker runtime, codegraph index runner) installs a process-wide `CREATE_NO_WINDOW` default for child processes, so background work (workers, git, pytest, codegraph) never pops visible console windows under console-less hosts like Cursor. Escape hatch: `PUPPETMASTER_SHOW_CONSOLES=1`.
 
 ## v1.9.0
 

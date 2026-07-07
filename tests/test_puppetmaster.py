@@ -24516,5 +24516,63 @@ class MemoryCliTests(unittest.TestCase):
             self.assertEqual(store.list_memory(), [])
 
 
+class WinConsoleTests(unittest.TestCase):
+    """The Windows hidden-console default must cover every subprocess site
+    without clobbering deliberate console choices."""
+
+    def test_effective_creationflags_adds_no_window_by_default(self):
+        from puppetmaster import win_console
+
+        no_window = win_console._CREATE_NO_WINDOW
+        self.assertEqual(win_console.effective_creationflags(0), no_window)
+        self.assertEqual(win_console.effective_creationflags(None), no_window)
+        group = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
+        self.assertEqual(
+            win_console.effective_creationflags(group), group | no_window
+        )
+
+    def test_effective_creationflags_respects_explicit_console_choices(self):
+        from puppetmaster import win_console
+
+        for explicit in (
+            win_console._CREATE_NEW_CONSOLE,
+            win_console._DETACHED_PROCESS,
+            win_console._CREATE_NO_WINDOW,
+            win_console._DETACHED_PROCESS | win_console._CREATE_NO_WINDOW,
+        ):
+            self.assertEqual(win_console.effective_creationflags(explicit), explicit)
+
+    def test_hide_child_consoles_is_noop_off_windows_or_when_disabled(self):
+        from puppetmaster import win_console
+
+        if os.name != "nt":
+            self.assertFalse(win_console.hide_child_consoles())
+            return
+        original = os.environ.get("PUPPETMASTER_SHOW_CONSOLES")
+        os.environ["PUPPETMASTER_SHOW_CONSOLES"] = "1"
+        try:
+            self.assertFalse(win_console.hide_child_consoles())
+        finally:
+            if original is None:
+                os.environ.pop("PUPPETMASTER_SHOW_CONSOLES", None)
+            else:
+                os.environ["PUPPETMASTER_SHOW_CONSOLES"] = original
+
+    @unittest.skipUnless(os.name == "nt", "Windows console semantics")
+    def test_hide_child_consoles_installs_and_children_still_run(self):
+        from puppetmaster import win_console
+
+        self.assertTrue(win_console.hide_child_consoles())
+        self.assertIs(subprocess.Popen.__init__, win_console._hidden_popen_init)
+        proc = subprocess.run(
+            [sys.executable, "-c", "print('ok')"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("ok", proc.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -884,6 +884,12 @@ class McpTool:
 
 
 def main() -> int:
+    # Hide Windows console windows for every child we spawn (workers,
+    # git, codegraph) before any subprocess machinery runs.
+    from puppetmaster.win_console import hide_child_consoles
+
+    hide_child_consoles()
+
     # Claim fd 1 for JSON-RPC frames before anything else runs, so no
     # stray print — ours, a library's, or an fd-inheriting child's — can
     # corrupt the protocol stream (fatal and unrecoverable under Codex).

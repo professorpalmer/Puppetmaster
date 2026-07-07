@@ -125,6 +125,9 @@ from puppetmaster.cli.commands_gate import (
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    from puppetmaster.win_console import hide_child_consoles
+
+    hide_child_consoles()
     try:
         return _main(argv)
     except (FileNotFoundError, ValueError) as exc:

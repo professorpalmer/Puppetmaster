@@ -35,6 +35,9 @@ from puppetmaster.codegraph import (
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    from puppetmaster.win_console import hide_child_consoles
+
+    hide_child_consoles()
     args = list(argv if argv is not None else sys.argv[1:])
     if len(args) < 2:
         sys.stderr.write(

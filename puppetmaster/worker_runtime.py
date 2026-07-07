@@ -467,6 +467,9 @@ def _write_startup_error(state_dir, job_id: str, worker_id: str, exc: BaseExcept
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    from puppetmaster.win_console import hide_child_consoles
+
+    hide_child_consoles()
     args = build_parser().parse_args(argv)
     state_dir = resolve_state_dir(args.state_dir)
     # Export the resolved state dir so adapter subprocesses (e.g. CursorAdapter,
