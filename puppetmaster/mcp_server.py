@@ -2637,6 +2637,10 @@ def route_task_schema() -> JsonObject:
                 "type": "integer",
                 "description": "Force classifier output to this value (0..100).",
             },
+            "max_capability": {
+                "type": "integer",
+                "description": "Ceiling on classifier output (0..100); cheaper tasks still classify lower.",
+            },
             "max_cost_usd": {
                 "type": "number",
                 "description": "Hard cap on estimated per-call USD cost.",
@@ -2708,6 +2712,9 @@ def run_route_task(args: JsonObject) -> JsonObject:
         role=role,
         explicit_min_capability=(
             int(args["min_capability"]) if "min_capability" in args and args["min_capability"] is not None else None
+        ),
+        explicit_max_capability=(
+            int(args["max_capability"]) if "max_capability" in args and args["max_capability"] is not None else None
         ),
         explicit_max_cost_usd=(
             float(args["max_cost_usd"]) if "max_cost_usd" in args and args["max_cost_usd"] is not None else None

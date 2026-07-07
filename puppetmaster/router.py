@@ -84,6 +84,12 @@ class TaskSignals:
     role: str = "explore"
     payload_size_chars: int = 0
     explicit_min_capability: Optional[int] = None
+    # Ceiling on the classifier output (cost guardrail). Unlike
+    # ``explicit_min_capability`` -- which FORCES the need to an exact value and
+    # therefore flattens every task to the same score -- the ceiling lets the
+    # classifier differentiate tasks normally and only clips the top, so cheap
+    # tasks still route to cheap models while expensive ones stop at the cap.
+    explicit_max_capability: Optional[int] = None
     explicit_max_cost_usd: Optional[float] = None
     required_tags: list[str] = field(default_factory=list)
     estimated_tokens_in: Optional[int] = None
@@ -195,10 +201,14 @@ def classify_capability_needed(task: TaskSignals) -> int:
     """Return capability score 0..100 needed to handle ``task`` well.
 
     Pure function. Same input → same output. Users override via
-    ``task.explicit_min_capability`` (which we honor without modification).
+    ``task.explicit_min_capability`` (which we honor without modification)
+    or cap the classifier output with ``task.explicit_max_capability``.
     """
     if task.explicit_min_capability is not None:
-        return max(0, min(100, task.explicit_min_capability))
+        forced = max(0, min(100, task.explicit_min_capability))
+        if task.explicit_max_capability is not None:
+            forced = min(forced, max(0, min(100, task.explicit_max_capability)))
+        return forced
 
     role_base_score = _ROLE_BASE_SCORE.get(task.role, 50)
     overrides = _load_routing_overrides().get("overrides", {})
@@ -243,7 +253,10 @@ def classify_capability_needed(task: TaskSignals) -> int:
     # need at the top model's score means the absolute-hardest tasks demand
     # — and therefore route to — the flagship, instead of saturating one
     # notch below it. Bump this in lockstep when a stronger model lands.
-    return max(5, min(100, score))
+    score = max(5, min(100, score))
+    if task.explicit_max_capability is not None:
+        score = min(score, max(0, min(100, task.explicit_max_capability)))
+    return score
 
 
 def has_vision_signal(instruction: str) -> bool:
@@ -787,6 +800,7 @@ def signals_from_worker_spec(spec, *, instruction_override: Optional[str] = None
     Honors per-task overrides in ``spec.payload``:
 
     * ``min_capability`` — int 0..100, forces classifier output
+    * ``max_capability`` — int 0..100, ceiling on classifier output
     * ``max_cost_usd`` — float, hard cap
     * ``required_tags`` — list[str], all must be on the model's tags
     * ``estimated_tokens_in`` / ``estimated_tokens_out`` — override heuristic
@@ -814,6 +828,7 @@ def signals_from_worker_spec(spec, *, instruction_override: Optional[str] = None
         role=getattr(spec, "role", "explore") or "explore",
         payload_size_chars=len(payload_str),
         explicit_min_capability=payload.get("min_capability"),
+        explicit_max_capability=payload.get("max_capability"),
         explicit_max_cost_usd=payload.get("max_cost_usd"),
         required_tags=_coerce_str_list(payload.get("required_tags")),
         estimated_tokens_in=payload.get("estimated_tokens_in"),

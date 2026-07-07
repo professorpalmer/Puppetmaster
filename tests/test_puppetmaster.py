@@ -8080,6 +8080,54 @@ class ModelRouterTests(unittest.TestCase):
         )
         self.assertEqual(classify_capability_needed(signal), 80)
 
+    def test_classifier_max_capability_is_ceiling_not_floor(self) -> None:
+        from puppetmaster.router import TaskSignals, classify_capability_needed
+
+        # An easy task stays cheap under a ceiling -- the whole point of the
+        # ceiling vs min_capability (which would flatten it up to the cap and
+        # pin every task to the same mid-tier model).
+        easy = classify_capability_needed(
+            TaskSignals(
+                instruction="format this file",
+                role="verify-runtime",
+                explicit_max_capability=85,
+            )
+        )
+        self.assertLessEqual(easy, 35)
+
+        # A hard task that would classify above the ceiling is clipped to it.
+        hard = classify_capability_needed(
+            TaskSignals(
+                instruction="security audit of authentication across every endpoint",
+                role="security-review",
+                explicit_max_capability=85,
+            )
+        )
+        self.assertEqual(hard, 85)
+
+    def test_classifier_min_capability_clipped_by_max_capability(self) -> None:
+        from puppetmaster.router import TaskSignals, classify_capability_needed
+
+        signal = TaskSignals(
+            instruction="ignored",
+            role="explore",
+            explicit_min_capability=95,
+            explicit_max_capability=85,
+        )
+        self.assertEqual(classify_capability_needed(signal), 85)
+
+    def test_signals_from_worker_spec_reads_max_capability(self) -> None:
+        from puppetmaster.router import signals_from_worker_spec
+        from puppetmaster.workers import WorkerSpec
+
+        spec = WorkerSpec(
+            role="audit",
+            instruction="audit everything",
+            adapter="agentic",
+            payload={"max_capability": 85},
+        )
+        self.assertEqual(signals_from_worker_spec(spec).explicit_max_capability, 85)
+
     def test_classifier_ceiling_tracks_fable_5_frontier(self) -> None:
         from puppetmaster.router import TaskSignals, classify_capability_needed
 
