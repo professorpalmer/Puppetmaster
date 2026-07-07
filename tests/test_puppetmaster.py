@@ -1239,6 +1239,88 @@ class PuppetmasterTests(unittest.TestCase):
             self.assertNotIn("retrieved_memory", routed[0].payload)
             self.assertIn("retrieved_memory", routed[1].payload)
 
+    def test_memory_injection_cost_log_records_one_entry(self) -> None:
+        from puppetmaster import memory_cost_log as mcl
+        from puppetmaster.models import MemoryRecord
+
+        goal = "shared workers coordination context"
+        memory = MemoryRecord(
+            scope="swarm.findings",
+            statement="shared workers coordination context",
+            evidence=["e"],
+            source_artifacts=["artifact_z"],
+            confidence=0.85,
+        )
+        with TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "memory_cost.jsonl"
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            store.promote_memory(memory)
+            orch = Orchestrator(store)
+            with patch.dict(
+                os.environ,
+                {"PUPPETMASTER_MEMORY_COST_LOG_PATH": str(log_path)},
+                clear=False,
+            ):
+                routed = orch._with_retrieved_memory(
+                    [WorkerSpec(role="explore", instruction="map the repo")],
+                    goal,
+                    job_id="job_memory_cost",
+                )
+                self.assertIn("retrieved_memory", routed[0].payload)
+                entries = mcl.load_memory_cost()
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]["job_id"], "job_memory_cost")
+            self.assertEqual(entries[0]["record_count"], 1)
+            self.assertGreater(entries[0]["token_count"], 0)
+
+    def test_memory_injection_cost_log_noop_without_memory(self) -> None:
+        from puppetmaster import memory_cost_log as mcl
+
+        with TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "memory_cost.jsonl"
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            orch = Orchestrator(store)
+            with patch.dict(
+                os.environ,
+                {"PUPPETMASTER_MEMORY_COST_LOG_PATH": str(log_path)},
+                clear=False,
+            ):
+                routed = orch._with_retrieved_memory(
+                    [WorkerSpec(role="explore", instruction="map the repo")],
+                    "nonexistent zzzqqq topic",
+                    job_id="job_no_memory",
+                )
+            self.assertNotIn("retrieved_memory", routed[0].payload)
+            self.assertEqual(mcl.load_memory_cost(), [])
+
+    def test_memory_injection_cost_log_failure_does_not_break_dispatch(self) -> None:
+        from puppetmaster.models import MemoryRecord
+
+        memory = MemoryRecord(
+            scope="swarm.findings",
+            statement="workers coordination context",
+            evidence=["e"],
+            source_artifacts=["artifact_fail"],
+            confidence=0.85,
+        )
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            store.promote_memory(memory)
+            orch = Orchestrator(store)
+            with patch(
+                "puppetmaster.memory_cost_log.record_memory_injection",
+                side_effect=RuntimeError("disk full"),
+            ):
+                routed = orch._with_retrieved_memory(
+                    [WorkerSpec(role="explore", instruction="map the repo")],
+                    "workers coordination context",
+                    job_id="job_fail_safe",
+                )
+            self.assertIn("retrieved_memory", routed[0].payload)
+
     def test_promote_memory_dedupes_identical_scope_and_statement(self) -> None:
         from puppetmaster.models import MemoryRecord
 
@@ -15967,6 +16049,46 @@ class ReadsLogTests(unittest.TestCase):
             os.environ["PUPPETMASTER_READS_USAGE"] = "0"
             rl.record_read("show", caller="cli")
             self.assertEqual(rl.load_reads(), [])
+
+
+class MemoryCostLogTests(unittest.TestCase):
+    """Promoted-memory injection overhead accounting."""
+
+    def _with_log(self, tmp):
+        os.environ["PUPPETMASTER_MEMORY_COST_LOG_PATH"] = str(Path(tmp) / "memory_cost.jsonl")
+        os.environ.pop("PUPPETMASTER_MEMORY_COST_LOG", None)
+
+    def tearDown(self) -> None:
+        os.environ.pop("PUPPETMASTER_MEMORY_COST_LOG_PATH", None)
+        os.environ.pop("PUPPETMASTER_MEMORY_COST_LOG", None)
+
+    def test_savings_cli_includes_memory_injection_overhead(self) -> None:
+        from argparse import Namespace
+        from io import StringIO
+
+        from puppetmaster import memory_cost_log as mcl
+        from puppetmaster.cli.commands_gate import _run_savings_command
+
+        with TemporaryDirectory() as tmp:
+            self._with_log(tmp)
+            mcl.record_memory_injection(
+                job_id="job_cli",
+                record_count=2,
+                memory=[
+                    {"scope": "swarm.findings", "statement": "alpha beta workers"},
+                    {"scope": "swarm.decisions", "statement": "gamma delta workers"},
+                ],
+            )
+            out = StringIO()
+            with patch("sys.stdout", out):
+                code = _run_savings_command(
+                    Namespace(backend="file", window=None, json=False, all_projects=False),
+                    Path(tmp) / ".puppetmaster",
+                )
+            self.assertEqual(code, 0)
+            rendered = out.getvalue()
+            self.assertIn("Memory injection overhead (spend, not savings)", rendered)
+            self.assertIn("injection(s)", rendered)
 
 
 class EnsureCursorSdkTests(unittest.TestCase):

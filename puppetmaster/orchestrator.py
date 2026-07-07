@@ -281,7 +281,7 @@ class Orchestrator:
         record_orchestrator_heartbeat(self.store, job.id, started=True)
         self._begin_trace()
         try:
-            specs = self._with_retrieved_memory(specs or specs_for_roles(roles), goal)
+            specs = self._with_retrieved_memory(specs or specs_for_roles(roles), goal, job_id=job.id)
             specs = self._with_injected_skills(job, specs)
             specs = self._with_output_style(specs)
             self._announce_mode(job, specs)
@@ -357,7 +357,7 @@ class Orchestrator:
         _snapshot_evaluator_epoch(self.store, job)
         self._begin_trace()
         try:
-            specs = self._with_retrieved_memory(specs_for_roles(roles), goal)
+            specs = self._with_retrieved_memory(specs_for_roles(roles), goal, job_id=job.id)
             specs = self._with_injected_skills(job, specs)
             specs = self._with_output_style(specs)
             self.store.update_job_status(job.id, JobStatus.RUNNING)
@@ -1502,7 +1502,13 @@ class Orchestrator:
 
         return result, decisions
 
-    def _with_retrieved_memory(self, specs: list[WorkerSpec], goal: str) -> list[WorkerSpec]:
+    def _with_retrieved_memory(
+        self,
+        specs: list[WorkerSpec],
+        goal: str,
+        *,
+        job_id: Optional[str] = None,
+    ) -> list[WorkerSpec]:
         memory = self.store.retrieve_memory(
             goal,
             max_age_days=_memory_max_age_days(),
@@ -1510,6 +1516,23 @@ class Orchestrator:
         )
         if not memory:
             return specs
+        if job_id:
+            try:
+                from puppetmaster.memory_cost_log import record_memory_injection
+
+                injected_roles = [
+                    spec.role
+                    for spec in specs
+                    if _memory_injection_enabled(spec)
+                ]
+                record_memory_injection(
+                    job_id=job_id,
+                    record_count=len(memory),
+                    memory=memory,
+                    role=injected_roles[0] if len(injected_roles) == 1 else None,
+                )
+            except Exception:
+                pass
         result: list[WorkerSpec] = []
         for spec in specs:
             if not _memory_injection_enabled(spec):

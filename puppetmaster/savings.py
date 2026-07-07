@@ -322,6 +322,8 @@ def build_report(
     estimated) + reliability/reuse counts + derived rates. Pure aggregation
     over local data; emits nothing."""
     from puppetmaster import codegraph_usage, reads_log
+    from puppetmaster.memory_cost_log import aggregate as aggregate_memory_cost
+    from puppetmaster.memory_cost_log import load_memory_cost
 
     since: Optional[datetime] = None
     if window_days is not None:
@@ -331,6 +333,7 @@ def build_report(
     routing = summarize_routing(routing_records)
     codegraph = codegraph_usage.aggregate(codegraph_usage.load_usage(since=since))
     reads = reads_log.aggregate(reads_log.load_reads(since=since))
+    memory_cost = aggregate_memory_cost(load_memory_cost(since=since))
     metrics = build_metrics(routing_records, self_heal, codegraph, reads, jobs)
 
     counterfactual: Optional[Counterfactual] = None
@@ -349,6 +352,7 @@ def build_report(
         "self_heal": self_heal,
         "codegraph": codegraph,
         "reads": reads,
+        "memory_cost": memory_cost,
         "metrics": metrics,
         "counterfactual": counterfactual,
     }

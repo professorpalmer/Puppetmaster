@@ -398,6 +398,7 @@ def _run_savings_command(args, state_dir) -> int:
     cg = report["codegraph"]
     heal = report["self_heal"]
     reads = report["reads"]
+    memory_cost = report["memory_cost"]
     metrics = report["metrics"]
     cf = report["counterfactual"]
 
@@ -414,6 +415,7 @@ def _run_savings_command(args, state_dir) -> int:
                     "self_heal": asdict(heal),
                     "codegraph": cg,
                     "reads": reads,
+                    "memory_cost": memory_cost,
                     "metrics": metrics,
                     "counterfactual": asdict(cf) if cf is not None else None,
                 },
@@ -452,6 +454,14 @@ def _run_savings_command(args, state_dir) -> int:
         f"  $0 follow-up reads: {reads['reads']} result read(s) served from durable "
         f"state at zero model cost"
     )
+    if memory_cost["injections"]:
+        print(
+            f"  Memory injection overhead (spend, not savings): "
+            f"{memory_cost['injections']} injection(s), "
+            f"{memory_cost['records_injected']} record(s), "
+            f"~{memory_cost['token_count']:,} tokens, "
+            f"${memory_cost['estimated_cost_usd']:.4f} estimated"
+        )
     print()
     print(
         f"ESTIMATE (baseline: {cg['exploration_baseline_tokens']:,} tokens/query "
