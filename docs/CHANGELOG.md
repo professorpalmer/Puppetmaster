@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.11.0
 
 **Claude Code effort levels (issue #15).**
 
