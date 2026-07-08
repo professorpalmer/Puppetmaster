@@ -1262,6 +1262,7 @@ class Orchestrator:
 
     def _create_tasks(self, job: Job, specs: list[WorkerSpec]) -> list[Task]:
         specs, routing_decisions = self._apply_auto_routing(job, specs)
+        self._enforce_platform_lock(job, specs)
         tasks_by_role: dict[str, Task] = {}
         for spec in specs:
             task = Task(
@@ -1301,6 +1302,33 @@ class Orchestrator:
         self._emit_routing_artifacts(job, tasks_by_role, routing_decisions)
         self._emit_predicted_conflicts(job, tasks)
         return tasks
+
+    def _enforce_platform_lock(self, job: Job, specs: list[WorkerSpec]) -> None:
+        """Kernel-level platform lock: refuse to create tasks on disabled adapters.
+
+        Every dispatch path funnels through ``_create_tasks``, so this is the one
+        gate that guarantees a lock-disabled platform never runs work -- even when
+        a verb hardcodes its adapter or the router falls through without routing
+        (e.g. no eligible model). Failing the job loudly beats silently running on
+        a platform the user explicitly turned off (field report: an agentic-only
+        lock still ran a swarm on Cursor because only routing consulted the lock).
+        """
+        from puppetmaster.platform_lock import (
+            PlatformLockedError,
+            enabled_adapters,
+            is_adapter_enabled,
+        )
+
+        blocked = sorted({s.adapter for s in specs if not is_adapter_enabled(s.adapter)})
+        if not blocked:
+            return
+        enabled = enabled_adapters()
+        self.store.emit(
+            job.id,
+            "platform.locked",
+            {"adapters": blocked, "enabled": sorted(enabled)},
+        )
+        raise PlatformLockedError(set(blocked), enabled)
 
     def _emit_predicted_conflicts(self, job: Job, tasks: list[Task]) -> None:
         """Warn at planning time when two tasks declare overlapping write-scopes

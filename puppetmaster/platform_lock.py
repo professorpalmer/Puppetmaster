@@ -35,6 +35,24 @@ KNOWN_ADAPTERS: tuple[str, ...] = ("agentic", "cursor", "claude-code", "codex", 
 ONLY_ENV = "PUPPETMASTER_ONLY_ADAPTERS"
 
 
+class PlatformLockedError(RuntimeError):
+    """A task was about to run on a platform the lock disables.
+
+    Raised at task creation (the kernel-level gate) so a disabled adapter can
+    never execute work regardless of which entry point built the specs --
+    hardcoded verb adapters, workflow configs, or router fall-throughs.
+    """
+
+    def __init__(self, adapters: set[str], enabled: set[str]) -> None:
+        self.adapters = sorted(adapters)
+        self.enabled = sorted(enabled)
+        super().__init__(
+            f"platform lock: adapter(s) {', '.join(self.adapters)} are disabled "
+            f"(enabled: {', '.join(self.enabled) or 'none'}). Re-dispatch on an "
+            "enabled platform or run `puppetmaster platform enable <adapter>`."
+        )
+
+
 def platform_config_path(registry_path: Optional[Path] = None) -> Path:
     """Where the lock lives: ``platform.json`` beside the model registry."""
     base = (registry_path or default_registry_path()).parent

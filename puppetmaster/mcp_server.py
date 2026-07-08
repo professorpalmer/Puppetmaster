@@ -1955,9 +1955,36 @@ def codegraph_response(payload: JsonObject) -> JsonObject:
     }
 
 
+def _platform_lock_preflight(adapter: str) -> Optional[JsonObject]:
+    """Fail a platform-specific verb fast when its platform is lock-disabled.
+
+    The orchestrator's task-creation gate is the hard guarantee; this check
+    exists so the caller learns the remediation in the same turn instead of
+    spawning a launcher that fails a moment later.
+    """
+    from puppetmaster import platform_lock
+
+    if platform_lock.is_adapter_enabled(adapter):
+        return None
+    return tool_error(
+        f"the {adapter!r} platform is disabled by the platform lock.",
+        {
+            "enabled": sorted(platform_lock.enabled_adapters()),
+            "fix": f"puppetmaster platform enable {adapter}",
+            "alternative": (
+                "use puppetmaster_start_swarm / puppetmaster_start_implement, "
+                "which pick an enabled platform automatically"
+            ),
+        },
+    )
+
+
 def run_cursor(
     args: JsonObject, review: bool = False, plan: bool = False, implement: bool = False
 ) -> JsonObject:
+    locked = _platform_lock_preflight("cursor")
+    if locked is not None:
+        return locked
     if implement:
         blocked = _worktree_preflight(args)
         if blocked is not None:
@@ -1968,6 +1995,9 @@ def run_cursor(
 def start_cursor(
     args: JsonObject, review: bool = False, plan: bool = False, implement: bool = False
 ) -> JsonObject:
+    locked = _platform_lock_preflight("cursor")
+    if locked is not None:
+        return locked
     if implement:
         blocked = _worktree_preflight(args)
         if blocked is not None:
@@ -2253,6 +2283,9 @@ def start_browser_swarm(args: JsonObject) -> JsonObject:
 
 
 def run_claude(args: JsonObject) -> JsonObject:
+    locked = _platform_lock_preflight("claude-code")
+    if locked is not None:
+        return locked
     blocked = _worktree_preflight(args)
     if blocked is not None:
         return blocked
@@ -2260,6 +2293,9 @@ def run_claude(args: JsonObject) -> JsonObject:
 
 
 def start_claude(args: JsonObject) -> JsonObject:
+    locked = _platform_lock_preflight("claude-code")
+    if locked is not None:
+        return locked
     blocked = _worktree_preflight(args)
     if blocked is not None:
         return blocked
@@ -2276,6 +2312,9 @@ def _codex_is_write_capable(args: JsonObject) -> bool:
 
 
 def run_codex(args: JsonObject) -> JsonObject:
+    locked = _platform_lock_preflight("codex")
+    if locked is not None:
+        return locked
     if _codex_is_write_capable(args):
         blocked = _worktree_preflight(args)
         if blocked is not None:
@@ -2284,6 +2323,9 @@ def run_codex(args: JsonObject) -> JsonObject:
 
 
 def start_codex(args: JsonObject) -> JsonObject:
+    locked = _platform_lock_preflight("codex")
+    if locked is not None:
+        return locked
     if _codex_is_write_capable(args):
         blocked = _worktree_preflight(args)
         if blocked is not None:
@@ -2297,6 +2339,9 @@ def _agentic_is_write_capable(args: JsonObject) -> bool:
 
 
 def run_agentic(args: JsonObject) -> JsonObject:
+    locked = _platform_lock_preflight("agentic")
+    if locked is not None:
+        return locked
     if _agentic_is_write_capable(args):
         blocked = _worktree_preflight(args)
         if blocked is not None:
@@ -2305,6 +2350,9 @@ def run_agentic(args: JsonObject) -> JsonObject:
 
 
 def start_agentic(args: JsonObject) -> JsonObject:
+    locked = _platform_lock_preflight("agentic")
+    if locked is not None:
+        return locked
     if _agentic_is_write_capable(args):
         blocked = _worktree_preflight(args)
         if blocked is not None:
@@ -2378,10 +2426,16 @@ def claude_command(args: JsonObject) -> list[str]:
 
 
 def run_openai(args: JsonObject) -> JsonObject:
+    locked = _platform_lock_preflight("openai")
+    if locked is not None:
+        return locked
     return run_worker_cli(openai_command(args), args)
 
 
 def start_openai(args: JsonObject) -> JsonObject:
+    locked = _platform_lock_preflight("openai")
+    if locked is not None:
+        return locked
     return start_cli(openai_command(args), args)
 
 
@@ -2449,6 +2503,9 @@ def start_swarm(args: JsonObject) -> JsonObject:
                     ),
                 },
             )
+        locked = _platform_lock_preflight(str(adapter))
+        if locked is not None:
+            return locked
         config_path = write_generated_swarm_config(args, roles or ["explore"], str(adapter))
         command.extend(["--config", str(config_path)])
     elif roles:
@@ -2479,6 +2536,9 @@ def start_swarm(args: JsonObject) -> JsonObject:
 
 
 def start_cursor_swarm(args: JsonObject) -> JsonObject:
+    locked = _platform_lock_preflight("cursor")
+    if locked is not None:
+        return locked
     roles = normalized_roles(args) or [
         "pipeline-mapper",
         "decision-explainer",

@@ -15762,6 +15762,85 @@ class PlatformLockTests(unittest.TestCase):
             self.assertFalse(pl.is_adapter_enabled("openai", p))
             self.assertTrue(pl.is_adapter_enabled("cursor", p))
 
+    def test_task_creation_refuses_lock_disabled_adapter(self) -> None:
+        """The kernel gate: a spec hardcoded to a disabled platform must fail
+        the job at task creation, never run (field report: an agentic-only
+        lock still executed a swarm on Cursor because only routing checked
+        the lock and the router's no-eligible-model fall-through passed the
+        spec straight to dispatch)."""
+        from puppetmaster import platform_lock as pl
+        from puppetmaster.models import JobStatus
+        from puppetmaster.platform_lock import PlatformLockedError
+
+        specs = [WorkerSpec(role="audit", instruction="audit", adapter="cursor")]
+        with TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {pl.ONLY_ENV: "agentic"}
+        ):
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            with self.assertRaises(PlatformLockedError) as ctx:
+                Orchestrator(store).run("locked platform", specs=specs)
+            self.assertEqual(ctx.exception.adapters, ["cursor"])
+            self.assertEqual(ctx.exception.enabled, ["agentic"])
+            jobs = store.list_jobs()
+            self.assertEqual(len(jobs), 1)
+            self.assertEqual(jobs[0].status, JobStatus.FAILED)
+            events = store.read_events(jobs[0].id)
+            locked = [e for e in events if e["event"] == "platform.locked"]
+            self.assertEqual(len(locked), 1)
+            self.assertEqual(locked[0]["payload"]["adapters"], ["cursor"])
+
+    def test_task_creation_allows_internal_adapters_under_lock(self) -> None:
+        """``local``/``shell`` are never platform-billed, so a lock must not
+        block them — the deterministic demo backend keeps working."""
+        from puppetmaster import platform_lock as pl
+        from puppetmaster.models import JobStatus
+
+        specs = [WorkerSpec(role="explore", instruction="map", adapter="local")]
+        with TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {pl.ONLY_ENV: "agentic"}
+        ):
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            result = Orchestrator(store).run("lock spares local", specs=specs)
+            self.assertEqual(result.job.status, JobStatus.COMPLETE)
+
+    def test_mcp_platform_verbs_fail_fast_when_lock_disabled(self) -> None:
+        """Platform-specific MCP verbs must refuse before spawning a launcher
+        when their hardcoded platform is disabled by the lock."""
+        from puppetmaster import mcp_server
+        from puppetmaster import platform_lock as pl
+
+        args = {"goal": "audit the repo"}
+        with patch.dict(os.environ, {pl.ONLY_ENV: "agentic"}), patch.object(
+            mcp_server, "start_cli"
+        ) as spawn, patch.object(mcp_server, "run_worker_cli") as run_spawn:
+            blocked_calls = [
+                mcp_server.start_cursor_swarm(dict(args)),
+                mcp_server.start_cursor(dict(args)),
+                mcp_server.run_cursor(dict(args), review=True),
+                mcp_server.start_claude(dict(args)),
+                mcp_server.start_codex(dict(args)),
+                mcp_server.start_openai(dict(args)),
+                mcp_server.start_swarm({**args, "adapter": "cursor"}),
+            ]
+        for result in blocked_calls:
+            self.assertTrue(result.get("isError"), msg=result)
+            body = json.loads(result["content"][0]["text"])
+            self.assertIn("platform lock", body["error"])
+            self.assertEqual(body["enabled"], ["agentic"])
+        spawn.assert_not_called()
+        run_spawn.assert_not_called()
+
+    def test_mcp_platform_verb_passes_when_enabled(self) -> None:
+        from puppetmaster import mcp_server
+        from puppetmaster import platform_lock as pl
+
+        with patch.dict(os.environ, {pl.ONLY_ENV: "cursor"}), patch.object(
+            mcp_server, "start_cli", return_value={"ok": True}
+        ) as spawn:
+            result = mcp_server.start_cursor_swarm({"goal": "audit the repo"})
+        self.assertEqual(result, {"ok": True})
+        spawn.assert_called_once()
+
 
 class AutoEscalationTests(unittest.TestCase):
     """Confidence-based mid-run escalation: a COMPLETE task whose verification
