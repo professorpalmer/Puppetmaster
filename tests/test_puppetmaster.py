@@ -14843,6 +14843,73 @@ class WorkerRuntimeFailureStatusTests(unittest.TestCase):
                 runtime.run_once()
             self.assertEqual(store.get_task_by_id(task.id).status, TaskStatus.COMPLETE)
 
+    def test_no_model_fast_fail_marks_task_failed(self) -> None:
+        """An agentic worker dispatched without a routed model fast-fails with
+        a ``no_model`` verification artifact. That is a dispatch-config
+        failure, never a COMPLETE -- recording it green made a fully dead
+        swarm render as a healthy "done" run (field report)."""
+        from unittest.mock import patch
+
+        from puppetmaster.models import AgentRun, Artifact, ArtifactType, TaskStatus
+        from puppetmaster.worker_runtime import WorkerRuntime
+
+        with TemporaryDirectory() as tmp:
+            store, job, task = self._store_job_task(tmp, adapter="agentic")
+
+            class _FakeWorker:
+                def __init__(self, role, worker_id=None):
+                    self.role = role
+
+                def run(self, t, goal):
+                    run = AgentRun(job_id=t.job_id, task_id=t.id, role=t.role, worker_id="w", status=TaskStatus.COMPLETE)
+                    art = Artifact(
+                        job_id=t.job_id, task_id=t.id, type=ArtifactType.VERIFICATION,
+                        created_by="w",
+                        payload={"check": "x", "result": "failed", "failure": "no_model"},
+                        confidence=0.55,
+                        evidence=["adapter:agentic", "provider:openai", "model:None", "no_model"],
+                    )
+                    return run, [art]
+
+            runtime = WorkerRuntime(store=store, job_id=job.id, role="implement", worker_id="w")
+            with patch("puppetmaster.worker_runtime.LocalWorker", _FakeWorker):
+                runtime.run_once()
+            self.assertEqual(store.get_task_by_id(task.id).status, TaskStatus.FAILED)
+
+    def test_job_with_all_tasks_failed_reads_failed(self) -> None:
+        """A job whose every task failed must not stitch into COMPLETE."""
+        from puppetmaster.models import JobStatus, Task, TaskStatus
+        from puppetmaster.orchestrator import Orchestrator
+        from puppetmaster.store import SwarmStore
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("dead swarm")
+            for role in ("explore", "audit"):
+                store.save_task(Task(
+                    job_id=job.id, role=role, instruction="x",
+                    adapter="agentic", status=TaskStatus.FAILED,
+                ))
+            orch = Orchestrator(store)
+            self.assertEqual(orch._final_job_status(job), JobStatus.FAILED)
+            events = store.read_events(job.id)
+            self.assertTrue(any(e["event"] == "job.all_tasks_failed" for e in events))
+
+    def test_job_with_partial_failures_stays_complete(self) -> None:
+        from puppetmaster.models import JobStatus, Task, TaskStatus
+        from puppetmaster.orchestrator import Orchestrator
+        from puppetmaster.store import SwarmStore
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("partial swarm")
+            store.save_task(Task(job_id=job.id, role="explore", instruction="x",
+                                 adapter="agentic", status=TaskStatus.COMPLETE))
+            store.save_task(Task(job_id=job.id, role="audit", instruction="x",
+                                 adapter="agentic", status=TaskStatus.FAILED))
+            orch = Orchestrator(store)
+            self.assertEqual(orch._final_job_status(job), JobStatus.COMPLETE)
+
 
 class AutoFallbackTests(unittest.TestCase):
     def _setup(self, tmp):

@@ -29,6 +29,13 @@ RECOVERABLE_FAILURES = frozenset(
         "auth",
         "authentication",
         "model_unavailable",
+        # Dispatch-config failures: the task reached an adapter that cannot
+        # run it (no routed model / unknown provider slug). These are about
+        # the routing/config, never the task -- without them here a worker's
+        # instant no_model fast-fail was recorded COMPLETE and a fully dead
+        # swarm rendered as a healthy green "done" run at $0.
+        "no_model",
+        "unknown_provider",
     }
 )
 

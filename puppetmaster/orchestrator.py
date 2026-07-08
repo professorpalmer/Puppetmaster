@@ -298,7 +298,9 @@ class Orchestrator:
 
             self.store.update_job_status(job.id, JobStatus.STITCHING)
             summary = Stitcher(self.store).stitch(job.id)
-            completed = self.store.update_job_status(job.id, JobStatus.COMPLETE)
+            completed = self.store.update_job_status(
+                job.id, self._final_job_status(job)
+            )
             self._emit_hermes_spawn_tree(completed, artifacts, specs)
             summary_path = self.store.job_dir(job.id) / "summaries" / "stitched.md"
             self._emit_telemetry(completed, artifacts)
@@ -1302,6 +1304,24 @@ class Orchestrator:
         self._emit_routing_artifacts(job, tasks_by_role, routing_decisions)
         self._emit_predicted_conflicts(job, tasks)
         return tasks
+
+    def _final_job_status(self, job: Job) -> JobStatus:
+        """COMPLETE only when at least one task actually completed.
+
+        A swarm whose every worker failed (e.g. all fast-failed with
+        ``no_model`` because routing found nothing) used to stitch and read
+        COMPLETE -- a fully dead run rendered as green "done" at $0, the worst
+        failure mode because it looks like success. Partial failure stays
+        COMPLETE (the stitched summary carries the surviving findings)."""
+        tasks = self.store.list_tasks(job.id)
+        if tasks and all(t.status == TaskStatus.FAILED for t in tasks):
+            self.store.emit(
+                job.id,
+                "job.all_tasks_failed",
+                {"task_count": len(tasks)},
+            )
+            return JobStatus.FAILED
+        return JobStatus.COMPLETE
 
     def _enforce_platform_lock(self, job: Job, specs: list[WorkerSpec]) -> None:
         """Kernel-level platform lock: refuse to create tasks on disabled adapters.

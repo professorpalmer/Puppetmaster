@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.12.0
+
+**Platform lock enforced everywhere + truthful dead-swarm status.**
+
+- **Platform lock kernel gate:** `Orchestrator._create_tasks` now refuses to create tasks on a lock-disabled adapter — it emits a `platform.locked` event and raises `PlatformLockedError` naming the blocked adapters, the enabled set, and the fix. Previously only routing consulted the lock, so a verb with a hardcoded adapter (e.g. `start_cursor_swarm`) ran its workers on a disabled platform whenever the router fell through with no eligible model.
+- **MCP verb preflight:** the platform-specific verbs (cursor/claude/codex/agentic/openai run + start variants, `start_cursor_swarm`, `start_swarm` with an explicit adapter) fail fast with remediation before spawning a launcher when their platform is lock-disabled. Internal adapters (`local`, `shell`) remain exempt.
+- **Dead swarms read FAILED, not green:** `no_model` and `unknown_provider` fast-fails are now recoverable failure classes, so a worker dispatched without a routed model records a truthful FAILED task (and auto-fallback can re-route it). A job whose every task failed finishes FAILED with a `job.all_tasks_failed` event instead of stitching into a healthy-looking COMPLETE at $0.
+
 ## v1.11.1
 
 **Cancelled job status + poison-proof store reads.**
