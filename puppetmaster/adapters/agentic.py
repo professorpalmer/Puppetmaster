@@ -721,7 +721,10 @@ class AgenticAdapter(FullEditWorkerAdapter):
         token_budget = int(token_budget) if token_budget else None
         base_extra = self._extra_params(task)
         messages: list[dict] = [{"role": "user", "content": system_prompt}]
-        usage_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        usage_total = {
+            "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+            "cached_tokens": 0, "cost_usd": 0.0,
+        }
         final_text = ""
         mutated = False
         turns = 0
@@ -752,7 +755,10 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 max_retries=max_retries, key_pool=key_pool, on_delta=on_delta,
             )
             for key in usage_total:
-                usage_total[key] += int(turn.usage.get(key, 0))
+                if key == "cost_usd":
+                    usage_total[key] += float(turn.usage.get(key, 0.0) or 0.0)
+                else:
+                    usage_total[key] += int(turn.usage.get(key, 0) or 0)
             final_text = turn.text or final_text
 
             if not turn.tool_calls:
@@ -850,12 +856,16 @@ class AgenticAdapter(FullEditWorkerAdapter):
             if token_budget and usage_total["total_tokens"] >= token_budget:
                 stop_reason = "token_budget"
                 break
-        return final_text, {
+        usage_out = {
             "tokens_in": usage_total["prompt_tokens"],
             "tokens_out": usage_total["completion_tokens"],
             "tokens_total": usage_total["total_tokens"],
             "context_compressions": context_compressions,
-        }, turns, mutated, stop_reason, submitted
+            "tokens_cached": usage_total["cached_tokens"],
+        }
+        if usage_total["cost_usd"] > 0:
+            usage_out["real_cost_usd"] = round(usage_total["cost_usd"], 6)
+        return final_text, usage_out, turns, mutated, stop_reason, submitted
 
     def _loop_targets(
         self, task: Task, provider: str, model: str

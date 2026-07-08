@@ -9160,9 +9160,19 @@ class ModelRouterTests(unittest.TestCase):
             self.assertIn("actual_cost", data)
             self.assertEqual(data["actual_cost"]["total_marginal_cost_usd"], 0.0)
 
-    def _usage_verification(self, task_id, *, model, tokens_in, tokens_out, estimated, job_id="job_x"):
+    def _usage_verification(self, task_id, *, model, tokens_in, tokens_out, estimated, job_id="job_x", **extra):
         from puppetmaster.models import Artifact, ArtifactType
 
+        payload = {
+            "adapter": "test",
+            "check": "do the thing",
+            "result": "passed",
+            "model": model,
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+            "tokens_estimated": estimated,
+        }
+        payload.update(extra)
         return Artifact(
             job_id=job_id,
             task_id=task_id,
@@ -9170,15 +9180,7 @@ class ModelRouterTests(unittest.TestCase):
             created_by="worker-1",
             confidence=0.9,
             evidence=["adapter:test"],
-            payload={
-                "adapter": "test",
-                "check": "do the thing",
-                "result": "passed",
-                "model": model,
-                "tokens_in": tokens_in,
-                "tokens_out": tokens_out,
-                "tokens_estimated": estimated,
-            },
+            payload=payload,
         )
 
     def _routing_artifact(self, task_id, *, model_id):
@@ -9301,6 +9303,143 @@ class ModelRouterTests(unittest.TestCase):
         # 1M in @ $15 + 1M out @ $75 = $90 naive; actual $0 -> avoided $90.
         self.assertAlmostEqual(cf.naive_cost_usd, 90.0, places=6)
         self.assertAlmostEqual(cf.avoided_usd, 90.0, places=6)
+
+    def test_openai_usage_fields_surfaces_cached_tokens_and_cost_usd(self) -> None:
+        from puppetmaster.providers import _openai_usage_fields
+
+        usage = _openai_usage_fields({
+            "prompt_tokens": 1000,
+            "completion_tokens": 200,
+            "total_tokens": 1200,
+            "prompt_tokens_details": {"cached_tokens": 750},
+            "cost": 0.012345,
+        })
+        self.assertEqual(usage["cached_tokens"], 750)
+        self.assertAlmostEqual(usage["cost_usd"], 0.012345, places=6)
+        self.assertEqual(usage["prompt_tokens"], 1000)
+
+    def test_openai_chat_parses_cached_tokens_and_cost_from_response(self) -> None:
+        from puppetmaster import providers
+
+        canned = {
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 500,
+                "completion_tokens": 50,
+                "total_tokens": 550,
+                "prompt_tokens_details": {"cached_tokens": 400},
+                "cost": 0.05,
+            },
+        }
+        with patch.object(providers, "_post_json", return_value=canned):
+            turn = providers.provider_chat(
+                provider="openai", model="gpt-x", messages=[{"role": "user", "content": "go"}],
+                api_key="k",
+            )
+        self.assertEqual(turn.usage["cached_tokens"], 400)
+        self.assertAlmostEqual(turn.usage["cost_usd"], 0.05, places=6)
+
+    def test_price_job_applies_cache_read_discount(self) -> None:
+        from puppetmaster.cost import price_job
+        from puppetmaster.model_registry import ModelSpec
+
+        registry = [
+            ModelSpec(
+                id="cache-model",
+                adapter="agentic",
+                adapter_model_name="cache-v1",
+                capability_score=80,
+                input_per_mtok_usd=1.0,
+                output_per_mtok_usd=2.0,
+                billing="api",
+            ),
+        ]
+        artifacts = [
+            self._usage_verification(
+                "t1", model="cache-v1", tokens_in=1_000_000, tokens_out=0,
+                estimated=False, tokens_cached=800_000,
+            )
+        ]
+        cost = price_job(artifacts, registry)
+        # 0.2M uncached @ $1 + 0.8M cached @ $0.1 = $0.28
+        self.assertAlmostEqual(cost.total_marginal_cost_usd, 0.28, places=6)
+        self.assertEqual(cost.priced_tasks, 1)
+
+    def test_price_job_uses_real_cost_usd_when_reported(self) -> None:
+        from puppetmaster.cost import price_job
+        from puppetmaster.model_registry import ModelSpec
+
+        registry = [
+            ModelSpec(
+                id="api-model",
+                adapter="agentic",
+                adapter_model_name="api-v1",
+                capability_score=80,
+                input_per_mtok_usd=15.0,
+                output_per_mtok_usd=75.0,
+                billing="api",
+            ),
+        ]
+        artifacts = [
+            self._usage_verification(
+                "t1", model="api-v1", tokens_in=1_000_000, tokens_out=1_000_000,
+                estimated=False, real_cost_usd=0.05,
+            )
+        ]
+        cost = price_job(artifacts, registry)
+        self.assertAlmostEqual(cost.total_marginal_cost_usd, 0.05, places=6)
+        self.assertTrue(cost.tasks[0].priced)
+
+    def test_price_job_real_cost_usd_without_registry_spec_still_priced(self) -> None:
+        from puppetmaster.cost import price_job
+
+        artifacts = [
+            self._usage_verification(
+                "t1", model="ghost-model", tokens_in=500, tokens_out=500,
+                estimated=False, real_cost_usd=0.05,
+            )
+        ]
+        cost = price_job(artifacts, self._three_tier_registry())
+        self.assertAlmostEqual(cost.total_marginal_cost_usd, 0.05, places=6)
+        self.assertEqual(cost.priced_tasks, 1)
+        self.assertEqual(cost.unpriced_tasks, 0)
+        self.assertEqual(cost.tasks[0].billing, "reported")
+
+    def test_agentic_loop_usage_includes_cached_tokens_and_real_cost(self) -> None:
+        from puppetmaster.adapters import agentic
+        from puppetmaster.models import Task
+        from puppetmaster.providers import AssistantTurn
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        adapter = agentic.AgenticAdapter()
+        turns = [
+            AssistantTurn(
+                text="done", tool_calls=[],
+                usage={
+                    "prompt_tokens": 300, "completion_tokens": 150, "total_tokens": 450,
+                    "cached_tokens": 200, "cost_usd": 0.05,
+                },
+            ),
+        ]
+        seen = [0]
+
+        def fake_provider_call(**kwargs):
+            turn = turns[seen[0]]
+            seen[0] += 1
+            return turn
+
+        task = Task(
+            job_id="j", role="explore", instruction="x",
+            payload={"cwd": tmp.name, "provider": "openai", "model": "m", "max_turns": 1},
+        )
+        with patch.object(adapter, "_provider_call", side_effect=fake_provider_call):
+            _, usage, _, _, _, _ = adapter._agent_loop(
+                task, Path(tmp.name), "openai", "m", "system", [], implement=False,
+            )
+        self.assertEqual(usage["tokens_in"], 300)
+        self.assertEqual(usage["tokens_cached"], 200)
+        self.assertAlmostEqual(usage["real_cost_usd"], 0.05, places=6)
 
     def test_cost_command_prices_pinned_run_without_routing_artifacts(self) -> None:
         """End-to-end: a job with usage but no ROUTING artifacts no longer dead-ends

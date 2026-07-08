@@ -31,6 +31,9 @@ from puppetmaster.savings import (
     resolve_counterfactual_model,
 )
 
+# Published cache-read ratio; conservative vs provider-specific tiers.
+CACHE_READ_MULTIPLIER = 0.1
+
 
 @dataclass(frozen=True)
 class TaskCost:
@@ -119,6 +122,8 @@ def _usage_records(artifacts: Iterable[Artifact]) -> dict:
         records[task_id] = {
             "tokens_in": int(payload.get("tokens_in") or 0),
             "tokens_out": int(payload.get("tokens_out") or 0),
+            "tokens_cached": int(payload.get("tokens_cached") or 0),
+            "real_cost_usd": payload.get("real_cost_usd"),
             "tokens_estimated": bool(payload.get("tokens_estimated")),
             "model": payload.get("model"),
         }
@@ -143,6 +148,17 @@ def _resolve_spec(
     return None
 
 
+def _cost_with_cache_discount(spec, tokens_in: int, tokens_out: int, tokens_cached: int) -> float:
+    """Price input tokens with cache-read discount on the cached portion."""
+    uncached_in = max(0, tokens_in - tokens_cached)
+    scaled_tokens_out = tokens_out * getattr(spec, "output_token_multiplier", 1)
+    return (
+        (uncached_in / 1_000_000.0) * spec.input_per_mtok_usd
+        + (tokens_cached / 1_000_000.0) * spec.input_per_mtok_usd * CACHE_READ_MULTIPLIER
+        + (scaled_tokens_out / 1_000_000.0) * spec.output_per_mtok_usd
+    )
+
+
 def price_job(artifacts: Iterable[Artifact], registry: list) -> JobCost:
     """Price a job's measured/estimated token usage against the registry price
     of the model each task actually ran on. Independent of routing."""
@@ -158,16 +174,46 @@ def price_job(artifacts: Iterable[Artifact], registry: list) -> JobCost:
         )
         tokens_in = record["tokens_in"]
         tokens_out = record["tokens_out"]
+        tokens_cached = record["tokens_cached"]
+        real_cost = record["real_cost_usd"]
         estimated = record["tokens_estimated"]
-        if spec is not None:
+        try:
+            real_cost_f = float(real_cost) if real_cost is not None else 0.0
+        except (TypeError, ValueError):
+            real_cost_f = 0.0
+
+        plan_billed = spec is not None and getattr(spec, "billing", None) == "plan"
+
+        if plan_billed:
             model_id = spec.id
             billing = spec.billing
-            cost = spec.marginal_cost_usd(tokens_in, tokens_out)
+            cost = 0.0
+            priced = True
+            result.priced_tasks += 1
+        elif real_cost_f > 0:
+            cost = real_cost_f
+            priced = True
+            result.priced_tasks += 1
+            if spec is not None:
+                model_id = spec.id
+                billing = spec.billing
+            else:
+                model_id = routing_models.get(task_id) or record["model"] or "<unknown>"
+                billing = "reported"
+        elif spec is not None:
+            model_id = spec.id
+            billing = spec.billing
+            if tokens_cached > 0:
+                cost = _cost_with_cache_discount(spec, tokens_in, tokens_out, tokens_cached)
+            else:
+                cost = spec.marginal_cost_usd(tokens_in, tokens_out)
+            priced = True
             result.priced_tasks += 1
         else:
             model_id = routing_models.get(task_id) or record["model"] or "<unknown>"
             billing = "unknown"
             cost = 0.0
+            priced = False
             result.unpriced_tasks += 1
 
         result.total_marginal_cost_usd += cost
@@ -196,7 +242,7 @@ def price_job(artifacts: Iterable[Artifact], registry: list) -> JobCost:
                 tokens_out=tokens_out,
                 tokens_estimated=estimated,
                 marginal_cost_usd=round(cost, 6),
-                priced=spec is not None,
+                priced=priced,
             )
         )
 

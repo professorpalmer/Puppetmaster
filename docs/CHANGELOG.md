@@ -1,6 +1,11 @@
 # Changelog
 
-## v1.10.1
+## v1.10.2
+
+**Honest cost accounting: provider-reported spend, cache-aware pricing.**
+
+- **Ground-truth cost capture:** OpenAI-compatible calls to OpenRouter now request usage accounting (`usage.include`), and the provider layer records the provider-reported `cost_usd` plus `cached_tokens` on every turn (OpenAI-compatible and Anthropic, streaming included). The agentic loop accumulates both and stamps `tokens_cached` / `real_cost_usd` onto artifact payloads.
+- **`price_job` prefers reality over reconstruction:** a task carrying `real_cost_usd` is priced at exactly what the provider charged (cache discounts included) — even when no registry spec matches. Without a reported cost, cached prompt tokens are billed at a 0.1 cache-read multiplier instead of the full input rate. Previously every prompt token was priced as fresh input, overcounting input-heavy agentic work ~3-4x at typical cache hit rates.
 
 **Routing capability ceiling + Windows test portability.**
 

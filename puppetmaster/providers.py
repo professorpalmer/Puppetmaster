@@ -325,6 +325,22 @@ def _post_json(url: str, *, headers: dict, body: dict, timeout: int) -> dict:
         raise ProviderError("malformed response", reason="malformed_response", body=raw[:8000]) from exc
 
 
+def _openai_usage_fields(usage: dict) -> dict:
+    """Normalize OpenAI-compatible usage into AssistantTurn.usage keys."""
+    details = usage.get("prompt_tokens_details") or {}
+    cached = details.get("cached_tokens") if isinstance(details, dict) else None
+    out = {
+        "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+        "completion_tokens": int(usage.get("completion_tokens") or 0),
+        "total_tokens": int(usage.get("total_tokens") or 0),
+        "cached_tokens": int(cached or 0),
+    }
+    cost = usage.get("cost")
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+        out["cost_usd"] = float(cost)
+    return out
+
+
 def _openai_chat(
     *, base_url: str, api_key: Optional[str], model: str, messages: list[dict],
     tools: Optional[list[dict]], extra: dict, headers: dict, timeout: int,
@@ -337,6 +353,8 @@ def _openai_chat(
     body.update(extra)
     if force_tool and tools:
         body["tool_choice"] = {"type": "function", "function": {"name": str(force_tool)}}
+    if "openrouter.ai" in base_url:
+        body["usage"] = {"include": True}
     auth = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     data = _post_json(
         f"{base_url}/chat/completions",
@@ -361,11 +379,7 @@ def _openai_chat(
         text=str(message.get("content") or "").strip(),
         tool_calls=tool_calls,
         finish_reason=str(finish or ""),
-        usage={
-            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
-            "completion_tokens": int(usage.get("completion_tokens") or 0),
-            "total_tokens": int(usage.get("total_tokens") or 0),
-        },
+        usage=_openai_usage_fields(usage),
         raw=data,
     )
 
@@ -421,6 +435,7 @@ def _anthropic_chat(
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
+            "cached_tokens": int(usage.get("cache_read_input_tokens") or 0),
         },
         raw=data,
     )
@@ -533,6 +548,8 @@ def _openai_chat_stream(
     if force_tool and tools:
         body["tool_choice"] = {"type": "function", "function": {"name": str(force_tool)}}
     body.update(extra)
+    if "openrouter.ai" in base_url:
+        body["usage"] = {"include": True}
     auth = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     response = _open_stream(
         f"{base_url}/chat/completions",
@@ -590,11 +607,7 @@ def _openai_chat_stream(
         text="".join(text_parts).strip(),
         tool_calls=tool_calls,
         finish_reason=str(finish or ""),
-        usage={
-            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
-            "completion_tokens": int(usage.get("completion_tokens") or 0),
-            "total_tokens": int(usage.get("total_tokens") or 0),
-        },
+        usage=_openai_usage_fields(usage),
         raw={},
     )
 
@@ -632,6 +645,7 @@ def _anthropic_chat_stream(
     finish = ""
     prompt_tokens = 0
     completion_tokens = 0
+    cached_tokens = 0
     try:
         for payload in _iter_sse_data(response):
             try:
@@ -640,7 +654,9 @@ def _anthropic_chat_stream(
                 continue
             etype = event.get("type")
             if etype == "message_start":
-                prompt_tokens = int(((event.get("message") or {}).get("usage") or {}).get("input_tokens") or 0)
+                msg_usage = ((event.get("message") or {}).get("usage") or {})
+                prompt_tokens = int(msg_usage.get("input_tokens") or 0)
+                cached_tokens = int(msg_usage.get("cache_read_input_tokens") or 0)
             elif etype == "content_block_start":
                 idx = int(event.get("index") or 0)
                 block = event.get("content_block") or {}
@@ -687,6 +703,7 @@ def _anthropic_chat_stream(
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
+            "cached_tokens": cached_tokens,
         },
         raw={},
     )
