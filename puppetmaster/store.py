@@ -232,7 +232,13 @@ class SwarmStore:
             status=status,
             created_at=job.created_at,
             completed_at=now_iso()
-            if status in {JobStatus.COMPLETE, JobStatus.FAILED, JobStatus.STALLED}
+            if status
+            in {
+                JobStatus.COMPLETE,
+                JobStatus.FAILED,
+                JobStatus.STALLED,
+                JobStatus.CANCELLED,
+            }
             else job.completed_at,
         )
 

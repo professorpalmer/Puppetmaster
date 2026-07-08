@@ -86,7 +86,12 @@ def await_job_state(
     """
     from puppetmaster.models import JobStatus
 
-    terminal = {JobStatus.COMPLETE, JobStatus.FAILED, JobStatus.STALLED}
+    terminal = {
+        JobStatus.COMPLETE,
+        JobStatus.FAILED,
+        JobStatus.STALLED,
+        JobStatus.CANCELLED,
+    }
     poll = max(0.05, poll_interval_seconds)
     deadline = time.monotonic() + timeout_seconds if timeout_seconds > 0 else None
     cursor = 0

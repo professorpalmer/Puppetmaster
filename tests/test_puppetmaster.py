@@ -24333,6 +24333,71 @@ class EvaluatorVerificationStampTests(unittest.TestCase):
             self.assertEqual(payload.get("evaluator_version"), 1)
 
 
+class JobStatusToleranceTests(unittest.TestCase):
+    """A persisted status this build doesn't know must never poison every
+    list_jobs() reader into an exception/empty feed (that is exactly how the
+    Marionette swarm tracker went blank after a host wrote 'cancelled' into a
+    store read by an older puppetmaster)."""
+
+    def test_cancelled_is_a_valid_terminal_status(self) -> None:
+        from puppetmaster.models import JobStatus, job_from_dict
+
+        job = job_from_dict({
+            "id": "job_1", "goal": "g", "status": "cancelled",
+            "created_at": "2026-07-08T00:00:00+00:00",
+        })
+        self.assertEqual(job.status, JobStatus.CANCELLED)
+
+    def test_unknown_status_coerces_to_stalled_instead_of_raising(self) -> None:
+        from puppetmaster.models import JobStatus, job_from_dict
+
+        job = job_from_dict({
+            "id": "job_1", "goal": "g", "status": "some-future-status",
+            "created_at": "2026-07-08T00:00:00+00:00",
+        })
+        self.assertEqual(job.status, JobStatus.STALLED)
+
+    def test_sqlite_list_jobs_survives_poisoned_status_row(self) -> None:
+        import json as _json
+        import sqlite3 as _sqlite3
+
+        from puppetmaster.models import JobStatus
+        from puppetmaster.sqlite_store import SQLiteSwarmStore
+
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(tmp)
+            ok_job = store.create_job("fine")
+            store.update_job_status(ok_job.id, JobStatus.RUNNING)
+            con = _sqlite3.connect(str(Path(tmp) / "state.sqlite3"))
+            con.execute(
+                "INSERT INTO jobs (id, data) VALUES (?, ?)",
+                ("job_bad", _json.dumps({
+                    "id": "job_bad", "goal": "poison",
+                    "status": "not-a-real-status",
+                    "created_at": "2026-07-08T00:00:00+00:00",
+                })),
+            )
+            con.commit()
+            con.close()
+            jobs = store.list_jobs()
+            statuses = {j.id: j.status for j in jobs}
+            self.assertEqual(statuses[ok_job.id], JobStatus.RUNNING)
+            self.assertEqual(statuses["job_bad"], JobStatus.STALLED)
+
+    def test_cancelled_counts_as_terminal_for_await(self) -> None:
+        from puppetmaster.cli import await_job_state
+        from puppetmaster.models import JobStatus
+        from puppetmaster.sqlite_store import SQLiteSwarmStore
+
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(tmp)
+            job = store.create_job("g")
+            store.update_job_status(job.id, JobStatus.CANCELLED)
+            state = await_job_state(store, job.id, timeout_seconds=1)
+            self.assertTrue(state["terminal"])
+            self.assertEqual(state["status"], "cancelled")
+
+
 class EvaluatorDraftStoreTests(unittest.TestCase):
     def test_record_and_load_round_trip(self) -> None:
         from puppetmaster.evaluators import load_drafts, record_draft_criteria

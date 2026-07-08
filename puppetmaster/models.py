@@ -41,6 +41,9 @@ class JobStatus(StringEnum):
     # leasing tasks. Distinct from RUNNING so a dead job is never represented
     # as live, and distinct from FAILED so it stays recoverable.
     STALLED = "stalled"
+    # Deliberately stopped by an operator (cooperative cancellation or a host
+    # UI cancel). Terminal, distinct from FAILED: nothing went wrong.
+    CANCELLED = "cancelled"
 
 
 class TaskStatus(StringEnum):
@@ -170,12 +173,24 @@ def to_jsonable(value: Any) -> Any:
     return value
 
 
+def _job_status_or_stalled(raw: Any) -> JobStatus:
+    """Coerce an unknown persisted status to STALLED instead of raising.
+
+    Stores are written by multiple host versions (harness UIs, older CLIs);
+    one row with a status this build doesn't know must not poison every
+    ``list_jobs()`` reader into an empty feed."""
+    try:
+        return JobStatus(raw)
+    except ValueError:
+        return JobStatus.STALLED
+
+
 def job_from_dict(data: dict[str, Any]) -> Job:
     return Job(
         id=data["id"],
         goal=data["goal"],
         label=data.get("label"),
-        status=JobStatus(data["status"]),
+        status=_job_status_or_stalled(data["status"]),
         created_at=data["created_at"],
         completed_at=data.get("completed_at"),
     )

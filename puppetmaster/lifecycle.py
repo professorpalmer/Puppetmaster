@@ -24,7 +24,12 @@ from typing import Any, Iterable, Optional
 
 from puppetmaster.models import ArtifactType, JobStatus, now_iso, parse_iso
 
-_TERMINAL_STATUSES = {JobStatus.COMPLETE, JobStatus.FAILED, JobStatus.STALLED}
+_TERMINAL_STATUSES = {
+    JobStatus.COMPLETE,
+    JobStatus.FAILED,
+    JobStatus.STALLED,
+    JobStatus.CANCELLED,
+}
 _EFFORT_FILENAME = "effort.json"
 
 
