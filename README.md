@@ -7,8 +7,6 @@
 
 Puppetmaster turns the agent CLIs you already pay for — Cursor, Claude Code (Anthropic or AWS Bedrock), the OpenAI API, the Codex CLI, or Hermes — into an orchestrator. Or run it with no external CLI at all: point the built-in `agentic` adapter at any provider API key (OpenAI, Anthropic, Gemini, OpenRouter) and it runs the whole tool-use loop itself — ideal for CI, containers, and headless servers. Either way it routes each task to the cheapest model that can handle it, runs workers as independent processes, and stores their output as typed SQLite artifacts, so follow-up reads cost zero tokens.
 
-Community: join the Discord at https://discord.gg/VQmkmGtQnA
-
 <img src="https://raw.githubusercontent.com/professorpalmer/Puppetmaster/main/docs/demo.gif" alt="Puppetmaster 60-second demo: cost routing, swarm fan-out, stitched summary, and zero-token follow-ups" width="100%" />
 
 ## Contents
