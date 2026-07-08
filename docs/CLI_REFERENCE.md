@@ -135,6 +135,8 @@ PUPPETMASTER_ONLY_ADAPTERS=cursor python -m puppetmaster route "audit" --role au
 
 A disabled platform is never routed to, auto-discovered, or used for fallback. Default is everything-on. Lock state persists in `~/.puppetmaster/platform.json`.
 
+The lock is enforced at three layers (v1.12.0+): the router excludes disabled platforms; the platform-specific MCP verbs (`start_cursor_swarm`, `start_claude_implement`, ...) fail fast with remediation before spawning anything; and the orchestrator's task-creation gate raises `PlatformLockedError` for any spec that still carries a disabled adapter — so a hardcoded verb can never run work on a platform you turned off. Related honesty guarantee: a worker dispatched without a routed model records a FAILED task (`no_model`), and a job whose every task failed finishes FAILED with a `job.all_tasks_failed` event instead of stitching into a green COMPLETE.
+
 ## Inspection (read-only, auto-pivots across workspaces v0.5.4+)
 
 ```bash
