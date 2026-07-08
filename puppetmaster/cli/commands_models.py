@@ -68,6 +68,7 @@ from puppetmaster.worker_runtime import WorkerDaemon
 from puppetmaster.workers import WorkerSpec
 
 from puppetmaster.cli.guidance import (
+    _CLAUDE_CODE_EFFORT_LEVELS,
     _CODEX_EFFORT_LEVELS,
     _EFFORT_TOKEN_MULTIPLIERS,
     _HERMES_EFFORT_LEVELS,
@@ -104,9 +105,18 @@ def model_payload_defaults_for_effort(adapter: str, effort: str) -> dict[str, An
                 "agentic effort must be one of " + ", ".join(_OPENAI_EFFORT_LEVELS)
             )
         return {"reasoning_effort": normalized}
-    if adapter in ("claude-code", "cursor"):
+    if adapter == "claude-code":
+        # Claude Code >= 2.1.204 accepts `--effort <level>`; the adapter passes
+        # payload extra_args straight through to the CLI invocation.
+        if normalized not in _CLAUDE_CODE_EFFORT_LEVELS:
+            raise ValueError(
+                "claude-code effort must be one of "
+                + ", ".join(_CLAUDE_CODE_EFFORT_LEVELS)
+            )
+        return {"extra_args": ["--effort", normalized]}
+    if adapter == "cursor":
         raise ValueError(
-            f"{adapter} does not expose an effort knob through its CLI/SDK today."
+            "cursor does not expose an effort knob through its CLI/SDK today."
         )
     raise ValueError(f"adapter {adapter!r} does not have known effort support")
 
@@ -118,9 +128,11 @@ def _payload_defaults_summary(payload_defaults: dict[str, Any]) -> str:
         return f"effort={effort}"
     extra_args = payload_defaults.get("extra_args")
     if isinstance(extra_args, list):
-        for arg in extra_args:
+        for i, arg in enumerate(extra_args):
             if isinstance(arg, str) and arg.startswith("model_reasoning_effort="):
                 return "effort=" + arg.split("=", 1)[1]
+            if arg == "--effort" and i + 1 < len(extra_args):
+                return f"effort={extra_args[i + 1]}"
     return ",".join(sorted(payload_defaults))
 
 def _parse_bool_value(value: str) -> bool:
@@ -284,9 +296,9 @@ class ModelRegistryWizard:
         base = self._choose_spec("Base model number")
         if base is None:
             return
-        if base.adapter in ("claude-code", "cursor"):
+        if base.adapter == "cursor":
             self._write(
-                f"{base.adapter} does not expose an effort knob through its CLI/SDK today."
+                "cursor does not expose an effort knob through its CLI/SDK today."
             )
             return
         if base.adapter == "openai":
@@ -295,6 +307,8 @@ class ModelRegistryWizard:
             levels = _HERMES_EFFORT_LEVELS
         elif base.adapter == "agentic":
             levels = _OPENAI_EFFORT_LEVELS
+        elif base.adapter == "claude-code":
+            levels = _CLAUDE_CODE_EFFORT_LEVELS
         else:
             levels = _CODEX_EFFORT_LEVELS
         self._write("Supported efforts: " + ", ".join(levels))

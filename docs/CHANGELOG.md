@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+**Claude Code effort levels (issue #15).**
+
+- **`claude-code` effort support:** Claude Code >= 2.1.204 exposes `--effort low|medium|high|xhigh|max`; the registry now maps `effort=<level>` on claude-code entries to `payload_defaults.extra_args = ["--effort", <level>]` (wizard effort variants included), and `puppetmaster claude` gains a manual `--effort` flag. Verified end-to-end against the live CLI + API. `max` gets a conservative 4x output-token cost multiplier.
+- **Escalating effort = variants + existing policies:** documented in MODEL_ROUTING.md. Register effort variants of the same model and the `escalating` policy / confidence escalation / review-gate escalation walk up the ladder — no separate blind low-to-max retry policy (no reliable "failure was effort-related" signal to key on; a five-rung retry ladder multiplies worst-case cost).
+
 ## v1.10.3
 
 **Instant cooperative job cancellation.**

@@ -8555,6 +8555,115 @@ class ModelRouterTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             model_payload_defaults_for_effort("hermes", "none")
 
+    def test_model_payload_defaults_for_effort_claude_code(self) -> None:
+        """Claude Code >= 2.1.204 exposes --effort; effort maps to extra_args
+        the adapter passes straight through to the CLI (issue #15)."""
+        from puppetmaster.cli import model_payload_defaults_for_effort
+
+        for level in ("low", "medium", "high", "xhigh", "max"):
+            self.assertEqual(
+                model_payload_defaults_for_effort("claude-code", level),
+                {"extra_args": ["--effort", level]},
+            )
+        with self.assertRaises(ValueError):
+            model_payload_defaults_for_effort("claude-code", "ultra")
+        # Cursor still has no effort knob.
+        with self.assertRaises(ValueError):
+            model_payload_defaults_for_effort("cursor", "high")
+
+    def test_models_set_applies_claude_code_effort_payload_defaults(self) -> None:
+        from puppetmaster.model_registry import ModelSpec, load_registry, save_registry
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "models.json"
+            save_registry(
+                [
+                    ModelSpec(
+                        id="claude-code/fable-5",
+                        adapter="claude-code",
+                        adapter_model_name="claude-fable-5",
+                    )
+                ],
+                path,
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = cli_main(
+                    [
+                        "models",
+                        "set",
+                        "--registry-path",
+                        str(path),
+                        "claude-code/fable-5",
+                        "effort=low",
+                    ]
+                )
+            self.assertEqual(code, 0)
+            loaded = {spec.id: spec for spec in load_registry(path)}
+            self.assertEqual(
+                loaded["claude-code/fable-5"].payload_defaults,
+                {"extra_args": ["--effort", "low"]},
+            )
+            self.assertIn("effort:low", loaded["claude-code/fable-5"].tags)
+
+    def test_models_setup_wizard_adds_claude_code_effort_variant(self) -> None:
+        from puppetmaster.cli import ModelRegistryWizard
+        from puppetmaster.model_registry import ModelSpec, load_registry, save_registry
+
+        base = ModelSpec(
+            id="claude-code/fable-5",
+            adapter="claude-code",
+            adapter_model_name="claude-fable-5",
+            capability_score=100,
+            tags=["claude", "frontier"],
+        )
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "models.json"
+            save_registry([base], path)
+            stdin = io.StringIO("1\n1\nlow\n\n\n\n\nq\n\n")
+            stdout = io.StringIO()
+            code = ModelRegistryWizard(path, stdin, stdout).run()
+            self.assertEqual(code, 0)
+            loaded = {spec.id: spec for spec in load_registry(path)}
+            self.assertIn("claude-code/fable-5-low", loaded)
+            variant = loaded["claude-code/fable-5-low"]
+            self.assertEqual(
+                variant.payload_defaults, {"extra_args": ["--effort", "low"]}
+            )
+            self.assertIn("effort:low", variant.tags)
+
+    def test_payload_defaults_summary_renders_claude_code_effort(self) -> None:
+        from puppetmaster.cli import _payload_defaults_summary
+
+        self.assertEqual(
+            _payload_defaults_summary({"extra_args": ["--effort", "xhigh"]}),
+            "effort=xhigh",
+        )
+
+    def test_claude_verb_accepts_effort_flag(self) -> None:
+        """`puppetmaster claude --effort <level>` parses and rejects unknowns."""
+        from puppetmaster.cli._parser import build_parser
+
+        parser = build_parser()
+        args = parser.parse_args(["claude", "do it", "--effort", "xhigh"])
+        self.assertEqual(args.effort, "xhigh")
+        with self.assertRaises(SystemExit):
+            with contextlib.redirect_stderr(io.StringIO()):
+                parser.parse_args(["claude", "do it", "--effort", "ultra"])
+
+    def test_claude_code_effort_extra_args_reach_cli_command(self) -> None:
+        """End-to-end plumbing: effort payload defaults land on the claude CLI
+        invocation as `--effort <level>`."""
+        from puppetmaster.adapters.claude_code import build_claude_code_command
+
+        command = build_claude_code_command(
+            prompt="do the thing",
+            model="claude-fable-5",
+            extra_args=["--effort", "low"],
+        )
+        self.assertIn("--effort", command)
+        self.assertEqual(command[command.index("--effort") + 1], "low")
+
     def test_models_setup_wizard_adds_hermes_effort_variant(self) -> None:
         from puppetmaster.cli import ModelRegistryWizard
         from puppetmaster.model_registry import ModelSpec, load_registry, save_registry

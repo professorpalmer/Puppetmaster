@@ -16,6 +16,11 @@ _CODEX_EFFORT_LEVELS = ("low", "medium", "high")
 
 _HERMES_EFFORT_LEVELS = ("minimal", "low", "medium", "high", "xhigh")
 
+# Claude Code >= 2.1.204 exposes `--effort` with five levels (verified against
+# the CLI's --help; older versions reject the flag, so effort variants require
+# a current CLI).
+_CLAUDE_CODE_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
 _EFFORT_TOKEN_MULTIPLIERS = {
     "none": 0.7,
     "minimal": 0.7,
@@ -23,4 +28,7 @@ _EFFORT_TOKEN_MULTIPLIERS = {
     "medium": 1.0,
     "high": 2.0,
     "xhigh": 3.0,
+    # Anthropic documents max as unconstrained token spending; 4x is a
+    # deliberately conservative cost-estimate anchor, not a cap.
+    "max": 4.0,
 }

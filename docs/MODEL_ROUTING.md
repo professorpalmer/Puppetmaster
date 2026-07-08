@@ -194,6 +194,43 @@ python -m puppetmaster artifacts <job_id> | jq '.[] | select(.type=="routing") |
 | `payload.registry_path` (str)  | Use a different registry file for this task.                           |
 | `payload.min_confidence` (float) | Confidence floor for mid-run escalation (0..1). Below it, the task is re-run one capability tier up. Off unless set (or `$PUPPETMASTER_ESCALATE_CONFIDENCE`). |
 
+## Effort variants (and escalating effort)
+
+The same model at different reasoning effort has very different cost and
+capability, so effort variants are **plain registry rows** that compete in
+routing like any other model. Create them with the wizard
+(`puppetmaster models setup` → "effort variant") or one-shot:
+
+```bash
+python -m puppetmaster models set "claude-code/fable-5" effort=low
+```
+
+Adapters with an effort knob: `openai` / `agentic`
+(`reasoning_effort`), `codex` (`-c model_reasoning_effort=...`),
+`hermes` (config-level `reasoning_effort`), and `claude-code`
+(`--effort low|medium|high|xhigh|max`, requires Claude Code >= 2.1.204).
+`cursor` has no effort knob today. For a one-off manual run,
+`puppetmaster claude "<prompt>" --effort low` sets it without touching
+the registry.
+
+**Escalating effort is composition, not a separate policy.** Register
+two or three effort variants of the same model with honest capability
+scores and output-token multipliers (e.g. `claude-code/fable-5-low` at
+90 / 0.7x, `claude-code/fable-5` at 100 / 2x), and the existing
+machinery does the rest:
+
+- the `escalating` policy starts at the cheapest sufficient variant and
+  orders the rest as the retry chain;
+- confidence-based escalation (`payload.min_confidence`) and
+  review-gate escalation re-dispatch onto the stronger variant when the
+  low-effort run wasn't good enough.
+
+There is deliberately no automatic low → medium → high → xhigh → max
+ladder per task: "this failure was caused by too little effort" has no
+reliable signal to key on, and a five-rung blind retry ladder multiplies
+worst-case cost. Variants + the existing escalation triggers give the
+same outcome with an audit trail.
+
 ## Confidence-based mid-run escalation (opt-in)
 
 Upfront routing is a *prediction*: the classifier scores complexity from

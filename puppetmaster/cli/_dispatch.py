@@ -602,6 +602,8 @@ def _main(argv: Optional[list[str]] = None) -> int:
         }
         if args.disable_memory:
             payload["disable_memory"] = True
+        if getattr(args, "effort", None):
+            payload["extra_args"] = ["--effort", args.effort]
         payload.update(routing_payload_from_args(args, adapter="claude-code"))
         result = cli.Orchestrator(store).run(
             args.prompt,

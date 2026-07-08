@@ -1048,6 +1048,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     claude.add_argument("--allowed-tools", help="Comma-separated Claude Code allowed tools.")
     claude.add_argument("--disallowed-tools", help="Comma-separated Claude Code disallowed tools.")
+    claude.add_argument(
+        "--effort",
+        choices=["low", "medium", "high", "xhigh", "max"],
+        help="Reasoning effort level passed to the claude CLI (requires "
+        "Claude Code >= 2.1.204).",
+    )
     claude.add_argument("--executable", help="Claude Code executable or command.")
     claude.add_argument("--timeout-seconds", type=int, default=900)
     claude.add_argument(
