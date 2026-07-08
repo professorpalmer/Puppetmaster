@@ -14519,12 +14519,21 @@ class EnsurePlanCatalogTests(unittest.TestCase):
         )
 
     def _registry_path(self, tmp):
+        from puppetmaster.cursor_discovery import PLAN_FRONTIER_MIN_CAPABILITY
         from puppetmaster.model_registry import save_registry, starter_registry
 
         path = Path(tmp) / "models.json"
-        # Thin starter: drop the seeded plan-billed frontier so discovery tests
-        # still exercise the no-frontier first-run path.
-        thin = [s for s in starter_registry() if s.id != "cursor/fable-5"]
+        # Thin starter: drop every plan-billed model at/above the frontier
+        # floor so discovery tests still exercise the no-frontier first-run
+        # path. (Grok 4.5 at 97 and Fable 5 at 100 both clear the floor.)
+        thin = [
+            s
+            for s in starter_registry()
+            if not (
+                s.billing == "plan"
+                and s.capability_score >= PLAN_FRONTIER_MIN_CAPABILITY
+            )
+        ]
         save_registry(thin, path)
         return path
 
@@ -15511,10 +15520,20 @@ class SubscriptionPlanCatalogTests(unittest.TestCase):
         )
 
     def _registry_path(self, tmp):
+        from puppetmaster.cursor_discovery import PLAN_FRONTIER_MIN_CAPABILITY
         from puppetmaster.model_registry import save_registry, starter_registry
 
         path = Path(tmp) / "models.json"
-        thin = [s for s in starter_registry() if s.id != "cursor/fable-5"]
+        # Same thin-starter rule as EnsurePlanCatalogTests: strip every
+        # plan-billed model at/above the frontier floor (Grok 4.5 + Fable 5).
+        thin = [
+            s
+            for s in starter_registry()
+            if not (
+                s.billing == "plan"
+                and s.capability_score >= PLAN_FRONTIER_MIN_CAPABILITY
+            )
+        ]
         save_registry(thin, path)
         return path
 
