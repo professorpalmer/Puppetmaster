@@ -157,7 +157,9 @@ Marionette (the harness that rides Puppetmaster) implements complementary input-
 
 ## Status
 
-Daily-driver beta, currently at v1.11.0. Real runtime contract, automated tests, SQLite backend, fail-closed jobs, a live Cursor Agent MCP, and validated full-edit adapters. Credible for supervised local engineering; not yet a hosted multi-user service. Full feature matrix in [FEATURES.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/FEATURES.md).
+Daily-driver beta, currently at v1.11.1. Real runtime contract, automated tests, SQLite backend, fail-closed jobs, a live Cursor Agent MCP, and validated full-edit adapters. Credible for supervised local engineering; not yet a hosted multi-user service. Full feature matrix in [FEATURES.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/FEATURES.md).
+
+**v1.11.1 highlights:** `JobStatus.CANCELLED` as a first-class terminal status, and poison-proof store reads - an unknown persisted job status now coerces to `stalled` instead of raising, so one foreign-written row can never blank `list_jobs()` for every reader.
 
 **v1.11.0 highlights:** Claude Code effort levels — `effort=<level>` on claude-code registry entries maps to the CLI's `--effort low|medium|high|xhigh|max` (Claude Code >= 2.1.204), with wizard effort variants and a manual `puppetmaster claude --effort` flag; escalating effort composes from effort variants plus the existing `escalating` / confidence / review-gate escalation policies (see MODEL_ROUTING.md).
 

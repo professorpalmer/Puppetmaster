@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.11.1
+
+**Cancelled job status + poison-proof store reads.**
+
+- **`JobStatus.CANCELLED`:** deliberate operator stops (cooperative cancellation, host UI cancel buttons) are now a first-class terminal status instead of an unknown string. Terminal-status sets (`await`, gc/lifecycle, `completed_at` stamping) include it.
+- **Tolerant deserialization:** `job_from_dict` coerces an unknown persisted status to `stalled` instead of raising. Previously one row written by a newer or foreign host poisoned `list_jobs()` for the whole store with `ValueError` — every reader (including Marionette's swarm tracker) saw an empty feed until the row was hand-repaired.
+
 ## v1.11.0
 
 **Claude Code effort levels (issue #15).**
