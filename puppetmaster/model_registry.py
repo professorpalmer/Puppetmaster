@@ -186,15 +186,16 @@ def starter_registry() -> list[ModelSpec]:
     actually think in: fast/cheap, balanced, high-quality, frontier.
 
     Tier IDs (``cursor/composer-2-5``, ``cursor/gpt-5-5``,
-    ``claude-code/opus-4-6``, ``claude-code/opus-4-7``,
+    ``cursor/grok-4-5``, ``claude-code/opus-4-6``, ``claude-code/opus-4-7``,
     ``claude-code/opus-4-8``, ``cursor/fable-5``, ``claude-code/fable-5``)
     reflect a common mental model where the cheap tier is Cursor's house
-    model, the balanced tier is GPT, and the frontier tiers are Anthropic
-    Opus — with Claude Fable 5 as the current top-of-stack flagship above
-    Opus 4.8. ``adapter_model_name`` values are the literal strings each
-    adapter passes through to its SDK / CLI today (verified against
-    Cursor's runtime model catalog and Anthropic's claude CLI), so
-    the starter registry is callable end-to-end without edits.
+    model, the balanced tier is GPT, the Cursor workhorse is Grok 4.5
+    (Opus-class at plan-billed speed/cost), and the tip-of-stack frontier
+    is Anthropic Opus / Fable 5. ``adapter_model_name`` values are the
+    literal strings each adapter passes through to its SDK / CLI today
+    (verified against Cursor's runtime model catalog and Anthropic's
+    claude CLI), so the starter registry is callable end-to-end without
+    edits.
 
     Capability scores and prices are user-asserted starting points —
     edit them to match your subscriptions.
@@ -233,6 +234,40 @@ def starter_registry() -> list[ModelSpec]:
                 "Cursor plan (so $0 from the router's perspective). The "
                 "router prefers this over openai/gpt-5-5 under the "
                 "balanced policy whenever both qualify."
+            ),
+        ),
+        ModelSpec(
+            id="cursor/grok-4-5",
+            adapter="cursor",
+            adapter_model_name="grok-4.5",
+            capability_score=97,
+            input_per_mtok_usd=0.0,
+            output_per_mtok_usd=0.0,
+            context_window=0,
+            billing="plan",
+            tags=[
+                "cursor",
+                "xai",
+                "frontier",
+                "fast",
+                "code",
+                "reasoning",
+                "agentic",
+                "workhorse",
+            ],
+            notes=(
+                "Cursor workhorse (released 2026-07-08). SpaceXAI Grok 4.5 via "
+                "the Cursor SDK — trained alongside Cursor; ~80 TPS with ~2x "
+                "token efficiency vs Opus-class peers. CursorBench 3.2 High "
+                "scores 66.7% (above Opus 4.8 Max at 62.3%, below Fable 5 Max "
+                "at 70.5%) at ~$1.51/task vs Opus Max ~$5.77 and Fable Max "
+                "~$17.32; Cursor notes a training-data asterisk on that "
+                "leaderboard. API list price is $2/$6 per MTok, but this "
+                "entry is plan-billed ($0 marginal). capability_score=97 sits "
+                "just under Opus 4.7/4.8 so balanced routing prefers Grok for "
+                "most hard Cursor work while reserving Opus/Fable for the "
+                "tip-of-stack. Absorbs the prior Opus-class workhorse band on "
+                "Cursor when Fable is available for the absolute hardest tasks."
             ),
         ),
         ModelSpec(

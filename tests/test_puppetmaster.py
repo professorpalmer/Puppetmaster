@@ -8173,6 +8173,27 @@ class ModelRouterTests(unittest.TestCase):
         self.assertEqual(claude_fable.billing, "unknown")
         self.assertIn("2026-06-22", claude_fable.notes)
 
+    def test_starter_registry_includes_grok_4_5_cursor_workhorse(self) -> None:
+        """Grok 4.5 is the Cursor Opus-class workhorse under Fable/Opus tip."""
+        from puppetmaster.model_registry import starter_registry
+
+        registry = {spec.id: spec for spec in starter_registry()}
+        self.assertIn("cursor/grok-4-5", registry)
+        grok = registry["cursor/grok-4-5"]
+        self.assertEqual(grok.adapter, "cursor")
+        self.assertEqual(grok.adapter_model_name, "grok-4.5")
+        self.assertEqual(grok.capability_score, 97)
+        self.assertEqual(grok.billing, "plan")
+        self.assertEqual(grok.input_per_mtok_usd, 0.0)
+        self.assertIn("workhorse", grok.tags)
+        self.assertIn("xai", grok.tags)
+        # Sits under Opus 4.7/4.8 and Fable so tip-of-stack stays reserved,
+        # but above GPT-5.5 balanced so hard Cursor work prefers Grok.
+        self.assertGreater(grok.capability_score, registry["cursor/gpt-5-5"].capability_score)
+        self.assertLess(grok.capability_score, registry["claude-code/opus-4-7"].capability_score)
+        self.assertLess(grok.capability_score, registry["claude-code/opus-4-8"].capability_score)
+        self.assertLess(grok.capability_score, registry["cursor/fable-5"].capability_score)
+
     def test_balanced_policy_picks_cheapest_sufficient_model(self) -> None:
         from puppetmaster.router import TaskSignals, route_task
 
@@ -9046,6 +9067,7 @@ class ModelRouterTests(unittest.TestCase):
         ids = {s.id for s in specs}
         self.assertIn("cursor/composer-2-5", ids)
         self.assertIn("cursor/gpt-5-5", ids)
+        self.assertIn("cursor/grok-4-5", ids)
         self.assertIn("claude-code/opus-4-6", ids)
         self.assertIn("claude-code/opus-4-7", ids)
         # Capability scores are monotone across tiers.
@@ -9057,6 +9079,16 @@ class ModelRouterTests(unittest.TestCase):
         self.assertLess(
             by_id["cursor/gpt-5-5"].capability_score,
             by_id["claude-code/opus-4-6"].capability_score,
+        )
+        # Grok 4.5 is the Cursor Opus-class workhorse: above Opus 4.6 /
+        # GPT-5.5, under Opus 4.7+ and Fable tip-of-stack.
+        self.assertLess(
+            by_id["claude-code/opus-4-6"].capability_score,
+            by_id["cursor/grok-4-5"].capability_score,
+        )
+        self.assertLess(
+            by_id["cursor/grok-4-5"].capability_score,
+            by_id["claude-code/opus-4-7"].capability_score,
         )
         self.assertLess(
             by_id["claude-code/opus-4-6"].capability_score,
@@ -9118,6 +9150,29 @@ class ModelRouterTests(unittest.TestCase):
         # proving the flagship was preferred for the hardest tier.
         rejected_ids = {spec.id for spec, _ in decision.rejected}
         self.assertIn("claude-code/opus-4-8", rejected_ids)
+        self.assertIn("cursor/grok-4-5", rejected_ids)
+
+    def test_starter_registry_routes_hard_cursor_work_to_grok_4_5(self) -> None:
+        """Hard Cursor-eligible work should land on Grok 4.5, not burn Opus/Fable.
+
+        Balanced picks the lowest sufficient plan-billed model. With Grok at 97
+        and Opus/Fable above it, a need in the mid-90s prefers Grok — the
+        Opus-class workhorse replacement on Cursor.
+        """
+        from puppetmaster.model_registry import starter_registry
+        from puppetmaster.router import TaskSignals, route_task
+
+        # Cursor-only slice of the starter registry (plan lock often is).
+        cursor_only = [s for s in starter_registry() if s.adapter == "cursor"]
+        signal = TaskSignals(
+            instruction="Implement a multi-file refactor with careful tests",
+            role="implement",
+            explicit_min_capability=90,
+        )
+        decision = route_task(signal, cursor_only, policy="balanced")
+        self.assertEqual(decision.model.id, "cursor/grok-4-5")
+        rejected_ids = {spec.id for spec, _ in decision.rejected}
+        self.assertIn("cursor/fable-5", rejected_ids)
 
     def test_starter_registry_routes_easy_task_to_composer(self) -> None:
         from puppetmaster.model_registry import starter_registry
@@ -14868,6 +14923,40 @@ class WorkerRuntimeFailureStatusTests(unittest.TestCase):
                         payload={"check": "x", "result": "failed", "failure": "no_model"},
                         confidence=0.55,
                         evidence=["adapter:agentic", "provider:openai", "model:None", "no_model"],
+                    )
+                    return run, [art]
+
+            runtime = WorkerRuntime(store=store, job_id=job.id, role="implement", worker_id="w")
+            with patch("puppetmaster.worker_runtime.LocalWorker", _FakeWorker):
+                runtime.run_once()
+            self.assertEqual(store.get_task_by_id(task.id).status, TaskStatus.FAILED)
+
+    def test_sdk_not_installed_fast_fail_marks_task_failed(self) -> None:
+        """A cursor worker in an env without @cursor/sdk fast-fails with
+        ``sdk_not_installed``. Same dispatch-config class as ``no_model``:
+        the task never ran, so recording it COMPLETE renders a dead run as a
+        healthy green "done" (field report: wiki ingest job completed in 3s
+        having written nothing)."""
+        from unittest.mock import patch
+
+        from puppetmaster.models import AgentRun, Artifact, ArtifactType, TaskStatus
+        from puppetmaster.worker_runtime import WorkerRuntime
+
+        with TemporaryDirectory() as tmp:
+            store, job, task = self._store_job_task(tmp, adapter="cursor")
+
+            class _FakeWorker:
+                def __init__(self, role, worker_id=None):
+                    self.role = role
+
+                def run(self, t, goal):
+                    run = AgentRun(job_id=t.job_id, task_id=t.id, role=t.role, worker_id="w", status=TaskStatus.COMPLETE)
+                    art = Artifact(
+                        job_id=t.job_id, task_id=t.id, type=ArtifactType.VERIFICATION,
+                        created_by="w",
+                        payload={"check": "x", "result": "failed", "failure": "sdk_not_installed"},
+                        confidence=0.55,
+                        evidence=["adapter:cursor", "sdk_not_installed"],
                     )
                     return run, [art]
 

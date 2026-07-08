@@ -60,30 +60,32 @@ breaks.
 
 ## The four tiers in the starter registry
 
-`puppetmaster models init` writes **12 tiered model entries** that
+`puppetmaster models init` writes **13 tiered model entries** that
 map directly to the "easy / balanced / high / extra-high" mental
-model — 5 Cursor/Claude tiers, 4 OpenAI tiers, and 2 Codex tiers,
-covering every cheap → frontier pairing across all four production
-adapters. **The `adapter_model_name` values are the literal strings
-each adapter passes through to its SDK / CLI today** (verified
-against Cursor's runtime catalog, Anthropic's `claude` CLI, and
-OpenAI's `codex` CLI as of v0.7.0): `composer-2.5`, `gpt-5.5`,
-`claude-haiku-4-5`, `claude-opus-4-6`, `claude-opus-4-7`,
-`claude-opus-4-8` for the
-Cursor/Claude tier; `gpt-5.5` / `gpt-5.4` / `gpt-5.4-mini` /
-`gpt-5.4-nano` for the OpenAI tier; `gpt-5.5` / `gpt-5.4-mini`
-(routed through `codex exec --json`) for the Codex tier. When newer
-versions land, edit `adapter_model_name` in
+model — Cursor/Claude tiers (including Grok 4.5 as the Cursor
+workhorse), 4 OpenAI tiers, and 2 Codex tiers, covering every cheap
+→ frontier pairing across the production adapters. **The
+`adapter_model_name` values are the literal strings each adapter
+passes through to its SDK / CLI today** (verified against Cursor's
+runtime catalog, Anthropic's `claude` CLI, and OpenAI's `codex` CLI):
+`composer-2.5`, `gpt-5.5`, `grok-4.5`, `claude-haiku-4-5`,
+`claude-opus-4-6`, `claude-opus-4-7`, `claude-opus-4-8`, `fable-5` /
+`claude-fable-5` for the Cursor/Claude tier; `gpt-5.5` / `gpt-5.4` /
+`gpt-5.4-mini` / `gpt-5.4-nano` for the OpenAI tier; `gpt-5.5` /
+`gpt-5.4-mini` (routed through `codex exec --json`) for the Codex
+tier. When newer versions land, edit `adapter_model_name` in
 `~/.puppetmaster/models.json` and the tier ids stay stable:
 
 | Tier ID                  | Adapter       | Mental model                                       | Tags |
 | ------------------------ | ------------- | -------------------------------------------------- | ---- |
 | `cursor/composer-2-5`    | `cursor`      | fast / cheap / reading (\$0 — bundled in Cursor plan) | `cheap`, `fast`, `reading`, `code` |
 | `cursor/gpt-5-5`         | `cursor`      | balanced — \$0 via Cursor plan, GPT-5.5 quality     | `balanced`, `fast`, `vision` |
+| `cursor/grok-4-5`        | `cursor`      | **Cursor workhorse** — Opus-class at plan-billed speed/cost (capability 97; CursorBench High 66.7% above Opus 4.8 Max) | `frontier`, `fast`, `code`, `reasoning`, `workhorse`, `xai` |
 | `claude-code/haiku-4-5`  | `claude-code` | cheap on the Anthropic side (\$1 / \$5) — the cheap tier for Claude-Code-only users | `cheap`, `fast`, `vision`, `reading`, `code` |
 | `claude-code/opus-4-6`   | `claude-code` | high-quality — \$5 / \$25 per MTok                  | `quality`, `vision`, `reasoning` |
 | `claude-code/opus-4-7`   | `claude-code` | previous frontier — \$5 / \$25, superseded by 4.8  | `frontier`, `vision`, `detailed-vision`, `reasoning` |
-| `claude-code/opus-4-8`   | `claude-code` | **frontier flagship (router's top tier)** — \$5 / \$25, 1M context, best for the hardest reasoning + detailed vision | `frontier`, `vision`, `detailed-vision`, `reasoning`, `code` |
+| `claude-code/opus-4-8`   | `claude-code` | tip-of-stack Anthropic fallback — \$5 / \$25, 1M context | `frontier`, `vision`, `detailed-vision`, `reasoning`, `code` |
+| `cursor/fable-5` / `claude-code/fable-5` | `cursor` / `claude-code` | **frontier flagship** (capability 100) — hardest tasks only | `frontier`, `mythos-class`, … |
 | `openai/gpt-5-5`         | `openai`      | frontier via Responses API — \$5 / \$30 per MTok    | `frontier`, `vision`, `detailed-vision`, `reasoning`, `code` |
 | `openai/gpt-5-4`         | `openai`      | workhorse — \$2.50 / \$15 per MTok                  | `quality`, `fast`, `vision`, `code`, `reasoning` |
 | `openai/gpt-5-4-mini`    | `openai`      | balanced — \$0.75 / \$4.50 per MTok                 | `balanced`, `fast`, `vision`, `code` |
@@ -98,16 +100,17 @@ With the starter registry, balanced-policy routing lands roughly:
 | `format these files`                            | `cursor/composer-2-5` |
 | `map the auth module`                           | `cursor/composer-2-5` |
 | `add password reset endpoint`                   | `cursor/gpt-5-5` |
+| `implement a multi-file refactor with tests` (Cursor-only) | `cursor/grok-4-5` (workhorse — Opus-class, plan-billed) |
 | `decision: which caching strategy fits`         | `claude-code/opus-4-6` |
-| `security audit every endpoint`                 | `claude-code/opus-4-8` (frontier flagship — hardest tier) |
+| `security audit every endpoint`                 | `cursor/fable-5` (frontier flagship — hardest tier) |
 | `describe what you see in the screenshot`       | `cursor/gpt-5-5` (vision-tagged) |
 | `OCR every detail of the diagram`               | `claude-code/opus-4-7` (detailed-vision; right-sized below the flagship) |
-| `refactor every callsite of foo() and add tests` | `openai/gpt-5-4` (workhorse — cheaper than frontier, capable enough for cross-file refactor) |
+| `refactor every callsite of foo() and add tests` | `openai/gpt-5-4` (API workhorse — cheaper than frontier, capable enough for cross-file refactor) |
 
 ## Quick start
 
 ```bash
-# 1. Write the starter registry (6 Cursor/Claude tiers + 4 OpenAI tiers + 2 Codex tiers = 12)
+# 1. Write the starter registry (Cursor/Claude tiers incl. Grok 4.5 workhorse + OpenAI + Codex)
 python -m puppetmaster models init
 
 # 2. Inspect the registry

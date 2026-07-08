@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.12.1
+
+**Grok 4.5 Cursor workhorse + truthful `sdk_not_installed` failures.**
+
+- **`cursor/grok-4-5` in the starter registry:** SpaceXAI Grok 4.5 (Cursor catalog id `grok-4.5`, released 2026-07-08) lands as the plan-billed Cursor workhorse at `capability_score=97` — above Opus 4.6 / GPT-5.5, under Opus 4.7/4.8 and Fable 5. CursorBench 3.2 High is 66.7% (above Opus 4.8 Max 62.3%, below Fable 5 Max 70.5%) at ~1/10th Fable Max cost per task; balanced routing prefers Grok for most hard Cursor work and reserves Opus/Fable for tip-of-stack. Existing registries: `puppetmaster models discover --source cursor --write` (or re-init) plus set `capability_score=97` / tags if discover seeded the default 60.
+- **`sdk_not_installed` is recoverable:** a Cursor worker that fast-fails because `@cursor/sdk` is missing now records a FAILED task (same class as `no_model` / `unknown_provider`) instead of a green COMPLETE dead run.
+
 ## v1.12.0
 
 **Platform lock enforced everywhere + truthful dead-swarm status.**
