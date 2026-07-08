@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.10.3
+
+**Instant cooperative job cancellation.**
+
+- **`puppetmaster.cancellation`:** in-process kill switch keyed by job id. A host embedding the orchestrator (e.g. Marionette's backend running inline agentic workers) calls `request_cancel(job_id)`; every agentic worker on that job stops mid-stream (the delta sink aborts the in-flight provider stream within one chunk) and per-turn (checked before each provider call). Cancelled runs finish with `stop_reason: "cancelled"` in their verification artifact instead of burning turns to `max_turns`.
+
 ## v1.10.2
 
 **Honest cost accounting: provider-reported spend, cache-aware pricing.**

@@ -52,6 +52,7 @@ from puppetmaster.codegraph import (
     codegraph_ready,
     enrich_prompt_with_codegraph,
 )
+from puppetmaster.cancellation import JobCancelled, is_cancelled
 from puppetmaster.models import Artifact, ArtifactType, Task
 from puppetmaster.providers import (
     AssistantTurn,
@@ -734,7 +735,24 @@ class AgenticAdapter(FullEditWorkerAdapter):
         length_continuations = 0
         force_submit_next = False
 
+        # Cancellation points: a host that requested cancel (see
+        # puppetmaster.cancellation) stops this worker (a) mid-stream, by the
+        # wrapped delta sink raising out of the provider stream within one
+        # chunk, and (b) before each provider call. Threads can't be killed;
+        # these two checks make cancel land in seconds, not turns.
+        job_id = getattr(task, "job_id", "") or ""
+        if on_delta is not None and job_id:
+            _inner_delta = on_delta
+
+            def on_delta(kind: str, text: str) -> None:  # noqa: F811 - deliberate shadow
+                if is_cancelled(job_id):
+                    raise JobCancelled(job_id)
+                _inner_delta(kind, text)
+
         for turns in range(1, max_turns + 1):
+            if job_id and is_cancelled(job_id):
+                stop_reason = "cancelled"
+                break
             # Shed the oldest large tool outputs before the call if the running
             # conversation is nearing the context budget, so a long run degrades
             # gracefully instead of 413-ing mid-flight.
@@ -749,11 +767,15 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 call_extra["force_tool"] = _SUBMIT_FINDINGS_TOOL
             force_submit_next = False
 
-            turn: AssistantTurn = self._provider_call(
-                provider=provider, model=model, messages=messages,
-                tools=tools or None, extra=call_extra, timeout=timeout,
-                max_retries=max_retries, key_pool=key_pool, on_delta=on_delta,
-            )
+            try:
+                turn: AssistantTurn = self._provider_call(
+                    provider=provider, model=model, messages=messages,
+                    tools=tools or None, extra=call_extra, timeout=timeout,
+                    max_retries=max_retries, key_pool=key_pool, on_delta=on_delta,
+                )
+            except JobCancelled:
+                stop_reason = "cancelled"
+                break
             for key in usage_total:
                 if key == "cost_usd":
                     usage_total[key] += float(turn.usage.get(key, 0.0) or 0.0)

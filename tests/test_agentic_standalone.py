@@ -436,6 +436,49 @@ class AgenticLoopTests(unittest.TestCase):
         self.assertEqual(verif.payload["result"], "passed")
         self.assertEqual(verif.payload["turns"], 2)
 
+    def test_cancel_stops_loop_before_next_turn(self) -> None:
+        from puppetmaster import cancellation
+        from puppetmaster.adapters import agentic
+        from puppetmaster.providers import AssistantTurn
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        job_id = "job-cancel-test"
+        self.addCleanup(cancellation.clear_cancel, job_id)
+        calls = {"n": 0}
+
+        def fake_chat(*, provider, model, messages, tools, extra, timeout):
+            calls["n"] += 1
+            # Cancel lands after the first turn; the loop must not call again.
+            cancellation.request_cancel(job_id)
+            return AssistantTurn(
+                text="",
+                tool_calls=[{"id": "c1", "name": "list_dir", "arguments": {"path": "."}}],
+                usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            )
+
+        task = Task(
+            job_id=job_id, role="explore", instruction="x",
+            payload={"cwd": tmp.name, "provider": "anthropic", "model": "m", "disable_codegraph": True},
+        )
+        with mock.patch.object(agentic, "provider_chat", side_effect=fake_chat):
+            arts = self.adapter().run(task, task.instruction, "w1")
+
+        self.assertEqual(calls["n"], 1)
+        verif = next(a for a in arts if a.type == ArtifactType.VERIFICATION)
+        self.assertEqual(verif.payload["stop_reason"], "cancelled")
+
+    def test_cancelled_delta_sink_aborts_stream(self) -> None:
+        from puppetmaster import cancellation
+
+        job_id = "job-stream-cancel"
+        self.addCleanup(cancellation.clear_cancel, job_id)
+        self.assertFalse(cancellation.is_cancelled(job_id))
+        cancellation.request_cancel(job_id)
+        self.assertTrue(cancellation.is_cancelled(job_id))
+        cancellation.clear_cancel(job_id)
+        self.assertFalse(cancellation.is_cancelled(job_id))
+
     def test_provider_error_yields_failed_verification(self) -> None:
         from puppetmaster.adapters import agentic
         from puppetmaster.providers import ProviderError
