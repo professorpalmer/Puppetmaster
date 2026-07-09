@@ -103,7 +103,14 @@ class ProviderChatTests(unittest.TestCase):
                 tools=[{"type": "function", "function": {"name": "edit_file", "description": "d", "parameters": {"type": "object"}}}],
             )
         self.assertTrue(captured["url"].endswith("/messages"))
-        self.assertEqual(captured["body"]["system"], "be terse")
+        # Prompt-cache path wraps system as a text block with cache_control.
+        system = captured["body"]["system"]
+        if isinstance(system, list):
+            self.assertEqual(system[0]["type"], "text")
+            self.assertEqual(system[0]["text"], "be terse")
+            self.assertEqual(system[0].get("cache_control"), {"type": "ephemeral"})
+        else:
+            self.assertEqual(system, "be terse")
         self.assertEqual(captured["body"]["tools"][0]["name"], "edit_file")
         self.assertEqual(turn.text, "analysis")
         self.assertEqual(turn.tool_calls[0]["name"], "edit_file")
