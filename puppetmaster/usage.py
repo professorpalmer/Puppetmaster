@@ -107,29 +107,80 @@ def token_usage(
     }
 
 
-def aggregate_token_usage(artifacts: Iterable[Artifact]) -> dict[str, Any]:
-    """Roll per-run token records (stored on artifact payloads) into a job total.
+def usage_record_score(payload: dict) -> tuple:
+    """Rank usage-bearing artifacts so a failed first attempt loses to the
+    successful fallback run for the same task.
 
-    Splits measured from estimated so the surfaced number is honest. A run
-    contributes once: any artifact carrying ``tokens_in``/``tokens_out`` counts.
+    Order: non-failed result, reported real cost, measured (not estimated)
+    tokens, then token volume as a tiebreak.
     """
-    measured_in = measured_out = 0
-    estimated_in = estimated_out = 0
-    measured_runs = estimated_runs = 0
-    seen_tasks: set = set()
+    result = str(payload.get("result") or "").lower()
+    failed = result in ("failed", "blocked", "error", "cancelled")
+    try:
+        real_cost = float(payload.get("real_cost_usd") or 0.0)
+    except (TypeError, ValueError):
+        real_cost = 0.0
+    tin = int(payload.get("tokens_in") or 0)
+    tout = int(payload.get("tokens_out") or 0)
+    estimated = bool(payload.get("tokens_estimated"))
+    return (
+        0 if failed else 1,
+        1 if real_cost > 0 else 0,
+        0 if estimated else 1,
+        tin + tout,
+    )
 
+
+def select_usage_records(artifacts: Iterable[Artifact]) -> dict:
+    """task_id -> best usage-bearing artifact payload fields.
+
+    When a task retries after a failed first adapter (cursor -> agentic), both
+    attempts stamp tokens. Prefer the successful / measured / higher-volume
+    record so totals and pricing follow the run that actually did the work.
+    Untasked artifacts (no task_id) each contribute once under a unique key.
+    """
+    records: dict = {}
+    scores: dict = {}
+    untasked = 0
     for artifact in artifacts:
         payload = getattr(artifact, "payload", None) or {}
         if "tokens_in" not in payload and "tokens_out" not in payload:
             continue
         task_id = getattr(artifact, "task_id", None)
-        if task_id and task_id in seen_tasks:
+        if not task_id:
+            untasked += 1
+            task_id = f"__untasked_{untasked}"
+        score = usage_record_score(payload)
+        prev = scores.get(task_id)
+        if prev is not None and score <= prev:
             continue
-        if task_id:
-            seen_tasks.add(task_id)
-        tin = int(payload.get("tokens_in") or 0)
-        tout = int(payload.get("tokens_out") or 0)
-        if payload.get("tokens_estimated"):
+        scores[task_id] = score
+        records[task_id] = {
+            "tokens_in": int(payload.get("tokens_in") or 0),
+            "tokens_out": int(payload.get("tokens_out") or 0),
+            "tokens_cached": int(payload.get("tokens_cached") or 0),
+            "real_cost_usd": payload.get("real_cost_usd"),
+            "tokens_estimated": bool(payload.get("tokens_estimated")),
+            "model": payload.get("model"),
+        }
+    return records
+
+
+def aggregate_token_usage(artifacts: Iterable[Artifact]) -> dict[str, Any]:
+    """Roll per-run token records (stored on artifact payloads) into a job total.
+
+    Splits measured from estimated so the surfaced number is honest. A task
+    contributes once, preferring the successful fallback run over a failed
+    first attempt that also stamped tokens.
+    """
+    measured_in = measured_out = 0
+    estimated_in = estimated_out = 0
+    measured_runs = estimated_runs = 0
+
+    for record in select_usage_records(artifacts).values():
+        tin = record["tokens_in"]
+        tout = record["tokens_out"]
+        if record["tokens_estimated"]:
             estimated_in += tin
             estimated_out += tout
             estimated_runs += 1

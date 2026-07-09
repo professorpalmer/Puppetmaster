@@ -9397,6 +9397,53 @@ class ModelRouterTests(unittest.TestCase):
         self.assertAlmostEqual(cost.total_marginal_cost_usd, 90.0, places=6)
         self.assertIn("frontier-model", cost.by_model)
 
+    def test_price_job_prefers_fallback_routing_and_successful_usage(self) -> None:
+        """Failed plan-billed first pick must not zero a successful fallback run."""
+        from puppetmaster.cost import price_job
+        from puppetmaster.models import Artifact, ArtifactType
+
+        registry = self._three_tier_registry()
+        artifacts = [
+            Artifact(
+                job_id="job_x",
+                task_id="t1",
+                type=ArtifactType.ROUTING,
+                created_by="router",
+                confidence=0.9,
+                evidence=[],
+                payload={"model_id": "frontier-model", "billing": "plan"},
+            ),
+            Artifact(
+                job_id="job_x",
+                task_id="t1",
+                type=ArtifactType.ROUTING,
+                created_by="router-fallback",
+                confidence=0.9,
+                evidence=[],
+                payload={"model_id": "cheap-model"},
+            ),
+            self._usage_verification(
+                "t1",
+                model="frontier-v1",
+                tokens_in=1000,
+                tokens_out=0,
+                estimated=True,
+                result="failed",
+            ),
+            self._usage_verification(
+                "t1",
+                model="cheap-v1",
+                tokens_in=1_000_000,
+                tokens_out=0,
+                estimated=False,
+                real_cost_usd=0.11,
+            ),
+        ]
+        cost = price_job(artifacts, registry)
+        self.assertAlmostEqual(cost.total_marginal_cost_usd, 0.11, places=6)
+        self.assertIn("cheap-model", cost.by_model)
+        self.assertNotIn("frontier-model", cost.by_model)
+
     def test_price_job_estimated_tokens_route_to_estimated_bucket(self) -> None:
         from puppetmaster.cost import price_job
 
@@ -19628,12 +19675,13 @@ class PuppetmasterUsageTests(unittest.TestCase):
         roll = aggregate_token_usage(
             [va("t1", 100, 40, False), va("t2", 20, 10, True), va("t1", 999, 999, False)]
         )
-        # t1 counted once (dedup), measured; t2 estimated.
+        # t1 counted once (best-of: higher measured volume wins over the
+        # earlier 100/40 stamp); t2 estimated.
         self.assertEqual(roll["measured_runs"], 1)
-        self.assertEqual(roll["measured_tokens_in"], 100)
+        self.assertEqual(roll["measured_tokens_in"], 999)
         self.assertEqual(roll["estimated_runs"], 1)
         self.assertEqual(roll["estimated_tokens_in"], 20)
-        self.assertEqual(roll["total_tokens"], 100 + 40 + 20 + 10)
+        self.assertEqual(roll["total_tokens"], 999 + 999 + 20 + 10)
 
 
 class PuppetmasterGateReplayCliTests(unittest.TestCase):

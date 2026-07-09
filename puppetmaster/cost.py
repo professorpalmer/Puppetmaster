@@ -30,6 +30,7 @@ from puppetmaster.savings import (
     Counterfactual,
     resolve_counterfactual_model,
 )
+from puppetmaster.usage import select_usage_records
 
 # Published cache-read ratio; conservative vs provider-specific tiers.
 CACHE_READ_MULTIPLIER = 0.1
@@ -90,44 +91,57 @@ def _model_index(registry: list) -> tuple[dict, dict]:
     return by_id, by_adapter_name
 
 
+# Final routing wins: a task may emit router + router-fallback (+ escalation).
+# Pricing must follow the model that actually ran, not the initial pick that
+# failed over (e.g. plan-billed cursor -> agentic glm).
+_ROUTING_CREATED_BY_RANK = {
+    "router-escalation": 3,
+    "router-fallback": 2,
+    "router": 1,
+}
+
+
+def _routing_created_by_rank(created_by: Optional[str]) -> int:
+    return _ROUTING_CREATED_BY_RANK.get(created_by or "", 0)
+
+
 def _routing_model_ids(artifacts: Iterable[Artifact]) -> dict:
-    """task_id -> registry model id from the router's initial decision."""
-    out: dict = {}
+    """task_id -> registry model id from the FINAL routing decision.
+
+    Prefer escalation > fallback > initial router so a failed first pick
+    (plan-billed cursor with ``sdk_not_installed``) does not price the
+    successful fallback run as $0.
+    """
+    best: dict = {}  # task_id -> (rank, model_id)
     for artifact in artifacts:
-        if artifact.type != ArtifactType.ROUTING or artifact.created_by != "router":
+        if artifact.type != ArtifactType.ROUTING:
+            continue
+        rank = _routing_created_by_rank(getattr(artifact, "created_by", None))
+        if rank == 0:
             continue
         task_id = getattr(artifact, "task_id", None)
-        if not task_id or task_id in out:
+        if not task_id:
             continue
         model_id = (artifact.payload or {}).get("model_id")
-        if model_id:
-            out[task_id] = str(model_id)
-    return out
+        if not model_id:
+            continue
+        prev = best.get(task_id)
+        if prev is None or rank > prev[0]:
+            best[task_id] = (rank, str(model_id))
+    return {task_id: model_id for task_id, (_rank, model_id) in best.items()}
 
 
 def _usage_records(artifacts: Iterable[Artifact]) -> dict:
-    """task_id -> the first usage-bearing artifact's token record + model.
+    """task_id -> best usage-bearing artifact's token record + model.
 
-    Mirrors :func:`puppetmaster.usage.aggregate_token_usage` dedup: a task
-    contributes its first artifact carrying ``tokens_in``/``tokens_out``.
+    Delegates to :func:`puppetmaster.usage.select_usage_records` so pricing and
+    token totals agree on which attempt counts when a task falls back.
     """
-    records: dict = {}
-    for artifact in artifacts:
-        payload = getattr(artifact, "payload", None) or {}
-        if "tokens_in" not in payload and "tokens_out" not in payload:
-            continue
-        task_id = getattr(artifact, "task_id", None)
-        if not task_id or task_id in records:
-            continue
-        records[task_id] = {
-            "tokens_in": int(payload.get("tokens_in") or 0),
-            "tokens_out": int(payload.get("tokens_out") or 0),
-            "tokens_cached": int(payload.get("tokens_cached") or 0),
-            "real_cost_usd": payload.get("real_cost_usd"),
-            "tokens_estimated": bool(payload.get("tokens_estimated")),
-            "model": payload.get("model"),
-        }
-    return records
+    return {
+        task_id: record
+        for task_id, record in select_usage_records(artifacts).items()
+        if not str(task_id).startswith("__untasked_")
+    }
 
 
 def _resolve_spec(
@@ -136,8 +150,8 @@ def _resolve_spec(
     by_id: dict,
     by_adapter_name: dict,
 ):
-    """Pick the registry spec a task ran on: router decision first, then the
-    model the adapter recorded (matched by id, then by adapter_model_name)."""
+    """Pick the registry spec a task ran on: final routing decision first, then
+    the model the adapter recorded (matched by id, then by adapter_model_name)."""
     if routing_model_id and routing_model_id in by_id:
         return by_id[routing_model_id]
     if recorded_model:

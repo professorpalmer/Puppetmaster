@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.14.1
+
+**Price the run that actually worked after router fallback.**
+
+- **Final routing wins:** `price_job` prefers `router-escalation` / `router-fallback` over the initial `router` pick so a failed plan-billed Cursor attempt (`sdk_not_installed`) does not zero a successful agentic fallback.
+- **Best usage record:** token aggregation and pricing pick the successful / measured / higher-volume usage stamp per task instead of first-wins, so failed first attempts stop poisoning job totals.
+
 ## v1.14.0
 
 **Worker thrift: savings-gated tool offload, history compaction, shared job brief.**
