@@ -399,6 +399,9 @@ def _run_savings_command(args, state_dir) -> int:
     heal = report["self_heal"]
     reads = report["reads"]
     memory_cost = report["memory_cost"]
+    tool_offload = report.get("tool_offload") or {
+        "offloads": 0, "tokens_saved": 0, "chars_saved": 0,
+    }
     metrics = report["metrics"]
     cf = report["counterfactual"]
 
@@ -416,6 +419,7 @@ def _run_savings_command(args, state_dir) -> int:
                     "codegraph": cg,
                     "reads": reads,
                     "memory_cost": memory_cost,
+                    "tool_offload": tool_offload,
                     "metrics": metrics,
                     "counterfactual": asdict(cf) if cf is not None else None,
                 },
@@ -454,6 +458,12 @@ def _run_savings_command(args, state_dir) -> int:
         f"  $0 follow-up reads: {reads['reads']} result read(s) served from durable "
         f"state at zero model cost"
     )
+    if tool_offload.get("offloads"):
+        print(
+            f"  Tool-output offload: {tool_offload['offloads']} spill(s), "
+            f"~{tool_offload['tokens_saved']:,} tokens kept out of context "
+            f"({tool_offload['chars_saved']:,} chars measured, chars//4)"
+        )
     if memory_cost["injections"]:
         print(
             f"  Memory injection overhead (spend, not savings): "

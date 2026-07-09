@@ -63,6 +63,8 @@ from puppetmaster.providers import (
     provider_key_pool,
 )
 from puppetmaster.redaction import redact_secrets
+from puppetmaster.state import resolve_state_dir
+from puppetmaster.tool_offload import offload_tool_output
 
 from ._base import (
     FullEditWorkerAdapter,
@@ -74,6 +76,7 @@ from ._context_budget import compress_history
 from ._delta_bus import delta_sink_for
 from ._delta_stream import DurableDeltaWriter
 from ._facade import facade
+from ._streaming import _resolve_sidecar_state_dir
 from ._prompts import (
     _ANALYZE_JSON_ONLY_RETRY,
     _EMPTY_RESPONSE_NUDGE,
@@ -137,8 +140,7 @@ DEFAULT_CONTEXT_TOKEN_BUDGET = 120_000
 DEFAULT_MAX_TURNS = DEFAULT_ANALYZE_MAX_TURNS
 DEFAULT_TIMEOUT_SECONDS = DEFAULT_ANALYZE_TIMEOUT_SECONDS
 
-_TOOL_OUTPUT_LIMIT = 12000  # per tool result, chars, before truncation note
-_READ_FILE_LIMIT = 16000
+_TOOL_OUTPUT_LIMIT = 12000  # artifact stdout tail / excerpt cap (not model-facing)
 _SEARCH_FILE_CAP = 400  # files scanned per search_code call
 _SEARCH_HIT_CAP = 60
 _TERMINAL_TIMEOUT_SECONDS = 120
@@ -479,7 +481,7 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 return None  # budget exhausted -- accept, but stamp verify:failed
             return (
                 "Your change does not pass verification. The command "
-                f"`{verify_command}` failed:\n\n{_truncate(output, _TOOL_OUTPUT_LIMIT)}\n\n"
+                f"`{verify_command}` failed:\n\n{output}\n\n"
                 "Fix the cause of the failure, then call submit_report again. "
                 "Do not call submit_report until the command passes."
             )
@@ -857,7 +859,10 @@ class AgenticAdapter(FullEditWorkerAdapter):
                         if rejection is not None:
                             messages.append({
                                 "role": "tool", "tool_call_id": call["id"],
-                                "content": _truncate(rejection, _TOOL_OUTPUT_LIMIT),
+                                "content": self._model_facing_tool_result(
+                                    rejection, task=task, cwd=cwd,
+                                    tool_name=name, tool_call_id=call["id"],
+                                ),
                             })
                             continue
                         if report:
@@ -883,7 +888,11 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call["id"],
-                    "content": _truncate(redact_secrets(output) or "", _TOOL_OUTPUT_LIMIT),
+                    "content": self._model_facing_tool_result(
+                        redact_secrets(output) or "",
+                        task=task, cwd=cwd,
+                        tool_name=name, tool_call_id=call["id"],
+                    ),
                 })
             if submitted_this_turn:
                 stop_reason = "submitted"
@@ -1262,8 +1271,9 @@ class AgenticAdapter(FullEditWorkerAdapter):
         start = max(1, int(args["start_line"])) if args.get("start_line") else 1
         limit = int(args["limit"]) if args.get("limit") else len(lines)
         chunk = lines[start - 1:start - 1 + limit]
-        body = "\n".join(chunk)
-        return _truncate(body, _READ_FILE_LIMIT)
+        # Full body returns to the loop; model-facing offload/hard-cap happens
+        # in ``_model_facing_tool_result`` (savings-gated spill, not blunt truncate).
+        return "\n".join(chunk)
 
     def _tool_list_dir(self, args: dict, cwd: Path) -> str:
         path = self._confine(cwd, str(args.get("path", ".")))
@@ -1319,7 +1329,7 @@ class AgenticAdapter(FullEditWorkerAdapter):
         )
         if not result.get("ok"):
             return f"error: codegraph unavailable ({result.get('error') or result.get('stderr') or 'unknown'})"
-        return _truncate(str(result.get("stdout") or "(no matches)"), _TOOL_OUTPUT_LIMIT)
+        return str(result.get("stdout") or "(no matches)")
 
     def _tool_graph_context(self, args: dict, cwd: Path, task: Task) -> str:
         query = str(args.get("task", "")).strip()
@@ -1331,7 +1341,7 @@ class AgenticAdapter(FullEditWorkerAdapter):
         )
         if not context:
             return "(no codegraph context)"
-        return _truncate(context, _TOOL_OUTPUT_LIMIT)
+        return context
 
     def _tool_write_file(self, args: dict, cwd: Path) -> str:
         path = self._confine(cwd, str(args.get("path", "")))
@@ -1392,7 +1402,7 @@ class AgenticAdapter(FullEditWorkerAdapter):
         except subprocess.TimeoutExpired:
             return f"error: command timed out ({_TERMINAL_TIMEOUT_SECONDS}s)"
         out = (proc.stdout or "") + (("\n[stderr]\n" + proc.stderr) if proc.stderr else "")
-        return f"exit={proc.returncode}\n{_truncate(out, _TOOL_OUTPUT_LIMIT)}"
+        return f"exit={proc.returncode}\n{out}"
 
     def _tool_web_fetch(self, args: dict) -> str:
         import urllib.request
@@ -1402,7 +1412,33 @@ class AgenticAdapter(FullEditWorkerAdapter):
         req = urllib.request.Request(url, headers={"User-Agent": "puppetmaster-agentic"})
         with urllib.request.urlopen(req, timeout=30) as resp:
             body = resp.read().decode("utf-8", errors="replace")
-        return _truncate(body, _TOOL_OUTPUT_LIMIT)
+        return body
+
+    def _model_facing_tool_result(
+        self,
+        text: str,
+        *,
+        task: Task,
+        cwd: Path,
+        tool_name: str = "",
+        tool_call_id: str = "",
+    ) -> str:
+        """Savings-gated offload (or hard-cap) for a model-facing tool result."""
+        state_dir = _resolve_sidecar_state_dir()
+        if state_dir is None:
+            try:
+                state_dir = resolve_state_dir(cwd=cwd)
+            except Exception:
+                state_dir = None
+        model_text, _meta = offload_tool_output(
+            text or "",
+            state_dir=state_dir,
+            job_id=getattr(task, "job_id", "") or "",
+            task_id=getattr(task, "id", "") or "",
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+        )
+        return model_text
 
     # --- helpers -----------------------------------------------------------
 
@@ -1467,12 +1503,6 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 "stderr_excerpt": redact_secrets(detail or "")[:2000],
             },
         )
-
-
-def _truncate(text: str, limit: int) -> str:
-    if len(text) <= limit:
-        return text
-    return text[:limit] + f"\n... (truncated, {len(text) - limit} more chars)"
 
 
 def _rel(path: Path, cwd: Path) -> str:

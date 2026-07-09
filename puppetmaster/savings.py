@@ -12,7 +12,8 @@ Honesty rules baked in (learned the hard way from a probe that "lost money"):
   ``cheap``) count as savings. ``quality`` / ``escalating`` are *deliberate
   spend by request* — reported on their own line, never as a loss.
 * **Measured vs estimated.** Routing dollars and CodeGraph context-tokens-fed
-  are measured. "Avoided exploration" is an estimate with a stated baseline and
+  are measured. Tool-output offload tokens (chars//4 of spilled results) are
+  measured. "Avoided exploration" is an estimate with a stated baseline and
   is always presented as such.
 """
 from __future__ import annotations
@@ -324,6 +325,10 @@ def build_report(
     from puppetmaster import codegraph_usage, reads_log
     from puppetmaster.memory_cost_log import aggregate as aggregate_memory_cost
     from puppetmaster.memory_cost_log import load_memory_cost
+    from puppetmaster.tool_offload import (
+        aggregate_offload_savings,
+        load_offload_savings,
+    )
 
     since: Optional[datetime] = None
     if window_days is not None:
@@ -334,6 +339,14 @@ def build_report(
     codegraph = codegraph_usage.aggregate(codegraph_usage.load_usage(since=since))
     reads = reads_log.aggregate(reads_log.load_reads(since=since))
     memory_cost = aggregate_memory_cost(load_memory_cost(since=since))
+    state_dirs = []
+    for store in stores:
+        root = getattr(store, "root", None)
+        if root is not None:
+            state_dirs.append(root)
+    tool_offload = aggregate_offload_savings(
+        load_offload_savings(state_dirs, since=since)
+    )
     metrics = build_metrics(routing_records, self_heal, codegraph, reads, jobs)
 
     counterfactual: Optional[Counterfactual] = None
@@ -353,6 +366,7 @@ def build_report(
         "codegraph": codegraph,
         "reads": reads,
         "memory_cost": memory_cost,
+        "tool_offload": tool_offload,
         "metrics": metrics,
         "counterfactual": counterfactual,
     }
