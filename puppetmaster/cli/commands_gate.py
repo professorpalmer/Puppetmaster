@@ -832,3 +832,46 @@ def _run_cost_command(args, store) -> int:
     print()
     _print_token_usage(artifacts)
     return 0
+
+
+def _run_receipt_command(args, store) -> int:
+    from puppetmaster.receipt import build_job_receipt
+
+    receipt = build_job_receipt(store, args.job_id)
+    if args.json:
+        print(json.dumps(receipt, indent=2))
+        return 0
+    print(f"job {receipt['job_id']}: receipt")
+    if receipt.get("elapsed_seconds") is not None:
+        print(f"  elapsed: {receipt['elapsed_seconds']}s")
+    tasks = receipt["tasks"]
+    artifacts = receipt["artifacts"]
+    signals = receipt["signals"]
+    efficiency = receipt["efficiency"]
+    tokens = receipt["tokens"]
+    print(
+        "  tasks: "
+        f"{tasks['total']} total, {tasks['complete']} complete, "
+        f"{tasks['failed']} failed, {tasks['degraded']} degraded"
+    )
+    print(
+        "  artifacts: "
+        f"{artifacts['typed_total']} typed / {artifacts['total']} total "
+        f"{artifacts['by_type']}"
+    )
+    print(
+        "  signals: "
+        f"empty_or_unstructured={signals['empty_or_unstructured']}, "
+        f"stdout_salvage={signals['stdout_salvage']}"
+    )
+    print(
+        "  tokens: "
+        f"{tokens['total_tokens']:,} total "
+        f"({tokens['measured_tokens_in']:,} in / {tokens['measured_tokens_out']:,} out measured)"
+    )
+    print(
+        "  efficiency: "
+        f"tokens_per_typed_artifact={efficiency['tokens_per_typed_artifact']}, "
+        f"degraded_rate={efficiency['degraded_rate']}"
+    )
+    return 0

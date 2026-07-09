@@ -117,6 +117,7 @@ from puppetmaster.cli.commands_gate import (
     _run_invocation_gate_command,
     _run_preflight_command,
     _run_proxy_command,
+    _run_receipt_command,
     _run_rollup_command,
     _run_route_command,
     _run_savings_command,
@@ -374,6 +375,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
     # use the caller's workspace state.
     if args.command in {
         "show",
+        "receipt",
         "artifacts",
         "diff",
         "memory",
@@ -501,6 +503,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
 
     if args.command == "cost":
         return _run_cost_command(args, store)
+
+    if args.command == "receipt":
+        return _run_receipt_command(args, store)
 
     if args.command == "adapters":
         print(json.dumps(adapter_status(Path.cwd()), indent=2))

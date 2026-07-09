@@ -642,6 +642,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Render a live summary from current artifacts without waiting for final stitching.",
     )
 
+    receipt = subcommands.add_parser(
+        "receipt",
+        help="Show objective run-efficiency metrics for a job.",
+    )
+    receipt.add_argument("job_id")
+    receipt.add_argument("--json", action="store_true", help="Emit JSON.")
+
     finalize = subcommands.add_parser(
         "finalize",
         help=(

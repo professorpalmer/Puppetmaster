@@ -89,6 +89,7 @@ Also available as the `puppetmaster_start_browser_swarm` MCP tool (async; return
 ```bash
 python -m puppetmaster route "instruction" --role <role>     # dry-run, returns picked model + cost
 python -m puppetmaster cost <job_id>                          # sum spend across all routing artifacts
+python -m puppetmaster receipt <job_id>                       # objective run-efficiency metrics
 python -m puppetmaster models init                            # write starter registry
 python -m puppetmaster models list                            # show registered models
 python -m puppetmaster models discover --source agentic --write   # seed keys-only agentic catalog (filtered by visible provider keys)

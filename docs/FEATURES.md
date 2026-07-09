@@ -36,6 +36,7 @@ Five production adapters live plus the keys-only `agentic` standalone worker; el
 | Memory | Promoted memory retrieval into later worker context and prompts; Wave 10 weighted ranking (scope, query overlap, recency); Wave 11 MMR diversity rerank so injected memory stays relevant without near-duplicates |
 | Memory cost accounting (v1.10.0+) | Every memory injection logs estimated tokens and USD to the local savings ledger (`python -m puppetmaster savings`); disable with `PUPPETMASTER_MEMORY_COST_LOG=0` |
 | Degraded-run honesty (v1.10.0+) | Empty agentic swarms and max-turns-with-no-findings runs classify as degraded with mitigation advice instead of looking successful in stitched summaries |
+| Run receipts | `puppetmaster receipt <job_id>` / `puppetmaster_job_receipt` reports objective run-efficiency metrics: degraded tasks, typed artifacts (finding/risk/decision/patch), empty/unstructured signals, stdout-salvage markers, token totals, and tokens per typed artifact |
 | Windows console hygiene (v1.10.0+) | Process-wide `CREATE_NO_WINDOW` default for child subprocesses under console-less hosts (Cursor MCP, workers, CodeGraph index). Escape hatch: `PUPPETMASTER_SHOW_CONSOLES=1` |
 | CodeGraph | Optional shared repo intelligence ([docs](CODEGRAPH.md)) |
 | Patch workflow | Patch artifacts, path locks, approval/rejection events, dirty-worktree guard |
