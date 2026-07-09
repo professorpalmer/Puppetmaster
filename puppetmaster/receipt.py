@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 from collections import Counter
-from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 from puppetmaster.models import Artifact, ArtifactType, parse_iso
 from puppetmaster.usage import aggregate_token_usage
 
-_TYPED = {ArtifactType.FINDING, ArtifactType.RISK, ArtifactType.DECISION}
+# Useful operator-facing outputs (not transport/meta). PATCH counts so implement
+# jobs are not scored as zero-typed when they only shipped a diff.
+_TYPED = {
+    ArtifactType.FINDING,
+    ArtifactType.RISK,
+    ArtifactType.DECISION,
+    ArtifactType.PATCH,
+}
 _EMPTY_MARKER = "empty-or-unstructured"
 _EMPTY_FAILURE = "empty_or_unstructured"
 
@@ -94,7 +100,7 @@ def _stdout_salvage_count(artifacts: list[Artifact]) -> int:
     return count
 
 
-def _elapsed_seconds(created_at: str, completed_at: str | None) -> float | None:
+def _elapsed_seconds(created_at: str, completed_at: Optional[str]) -> Optional[float]:
     if not created_at or not completed_at:
         return None
     try:

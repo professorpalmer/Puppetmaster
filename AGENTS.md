@@ -116,7 +116,7 @@ Puppetmaster keeps a **read-only, local, numbers-only** ledger of what it saved,
 
 ## MCP surface (quick reference)
 
-Orchestration: `puppetmaster_doctor`, `puppetmaster_start_swarm`, `puppetmaster_start_cursor_swarm`, `puppetmaster_start_cursor_review`, `puppetmaster_start_cursor_plan`, `puppetmaster_start_claude_implement`, `puppetmaster_start_browser_swarm`, `puppetmaster_status`, `puppetmaster_logs`, `puppetmaster_live_artifacts`, `puppetmaster_live_artifacts_follow`, `puppetmaster_partial_summary`, `puppetmaster_artifacts`, `puppetmaster_show`, `puppetmaster_last_job`, `puppetmaster_dashboard`.
+Orchestration: `puppetmaster_doctor`, `puppetmaster_start_swarm`, `puppetmaster_start_cursor_swarm`, `puppetmaster_start_cursor_review`, `puppetmaster_start_cursor_plan`, `puppetmaster_start_claude_implement`, `puppetmaster_start_browser_swarm`, `puppetmaster_status`, `puppetmaster_logs`, `puppetmaster_live_artifacts`, `puppetmaster_live_artifacts_follow`, `puppetmaster_partial_summary`, `puppetmaster_artifacts`, `puppetmaster_show`, `puppetmaster_job_cost`, `puppetmaster_job_receipt`, `puppetmaster_last_job`, `puppetmaster_dashboard`.
 
 Bundled CodeGraph: `puppetmaster_codegraph_search`, `puppetmaster_codegraph_context`, `puppetmaster_codegraph_affected`, `puppetmaster_codegraph_files`, `puppetmaster_codegraph_status`, `puppetmaster_codegraph_init`.
 
@@ -134,6 +134,8 @@ If any `puppetmaster_*` MCP tool returns `Tool execution error. Not connected`, 
 | `puppetmaster_partial_summary` | `python -m puppetmaster show <job_id> --partial` |
 | `puppetmaster_artifacts` | `python -m puppetmaster artifacts <job_id>` |
 | `puppetmaster_show` | `python -m puppetmaster show <job_id>` |
+| `puppetmaster_job_cost` | `python -m puppetmaster cost <job_id>` |
+| `puppetmaster_job_receipt` | `python -m puppetmaster receipt <job_id>` |
 | `puppetmaster_last_job` | `python -m puppetmaster last` |
 | `puppetmaster_jobs` | `python -m puppetmaster jobs [--all-projects]` |
 | `puppetmaster_mcp_status` | `python -m puppetmaster mcp list` |

@@ -455,6 +455,15 @@ class PuppetmasterTests(unittest.TestCase):
                     ),
                     Artifact(
                         job_id=job.id,
+                        task_id="task_good",
+                        type=ArtifactType.PATCH,
+                        created_by="worker-good",
+                        payload={"change": "fix bug", "files": ["file.py"]},
+                        confidence=0.9,
+                        evidence=["file.py"],
+                    ),
+                    Artifact(
+                        job_id=job.id,
                         task_id="task_degraded",
                         type=ArtifactType.VERIFICATION,
                         created_by="worker-bad",
@@ -490,13 +499,14 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertEqual(receipt["job_id"], job.id)
         self.assertEqual(receipt["tasks"]["total"], 2)
         self.assertEqual(receipt["tasks"]["degraded"], 1)
-        self.assertEqual(receipt["artifacts"]["typed_total"], 2)
+        self.assertEqual(receipt["artifacts"]["typed_total"], 3)
         self.assertEqual(receipt["artifacts"]["by_type"]["finding"], 1)
+        self.assertEqual(receipt["artifacts"]["by_type"]["patch"], 1)
         self.assertEqual(receipt["artifacts"]["by_type"]["risk"], 1)
         self.assertEqual(receipt["signals"]["empty_or_unstructured"], 1)
         self.assertEqual(receipt["signals"]["stdout_salvage"], 1)
         self.assertEqual(receipt["tokens"]["total_tokens"], 460)
-        self.assertEqual(receipt["efficiency"]["tokens_per_typed_artifact"], 230)
+        self.assertEqual(receipt["efficiency"]["tokens_per_typed_artifact"], round(460 / 3, 3))
         self.assertEqual(receipt["efficiency"]["degraded_rate"], 0.5)
 
     def test_job_receipt_command_parses_explicit_json_flag(self) -> None:

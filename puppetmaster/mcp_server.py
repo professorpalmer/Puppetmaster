@@ -1250,6 +1250,21 @@ def _build_tools() -> list[McpTool]:
             ),
         ),
         McpTool(
+            name="puppetmaster_job_receipt",
+            description=(
+                "Objective run-efficiency receipt for a job: degraded tasks, "
+                "typed artifacts (finding/risk/decision/patch), empty/unstructured "
+                "and stdout-salvage signals, token totals, and tokens per typed "
+                "artifact. Use when asking 'was this run useful or mostly "
+                "transport/degrade tax?' — complements puppetmaster_job_cost "
+                "(dollars) with structural yield. No prose synthesis."
+            ),
+            input_schema=job_schema(required=True),
+            handler=lambda args: run_cli(
+                ["receipt", require_string(args, "job_id"), "--json"], args
+            ),
+        ),
+        McpTool(
             name="puppetmaster_cursor_review",
             description="Run a Cursor SDK review worker through Puppetmaster and wait for completion.",
             input_schema=goal_schema(
