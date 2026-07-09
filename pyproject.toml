@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "puppetmaster-ai"
-version = "1.14.2"
+version = "1.15.0"
 description = "Gunicorn-style agent swarms with Redis-like shared memory and artifact stitching. (Imported as `puppetmaster`; published as `puppetmaster-ai` because the bare PyPI name is held by an abandoned 2019 project, name-reassignment pending.)"
 readme = "README.md"
 requires-python = ">=3.9"

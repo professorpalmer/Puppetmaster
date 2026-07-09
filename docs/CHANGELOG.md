@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.15.0
+
+**Objective job receipts: was this run useful, or mostly transport tax?**
+
+- **`puppetmaster receipt <job_id>`:** compact run-efficiency telemetry — degraded tasks, typed artifacts (finding/risk/decision/patch), empty/unstructured + stdout-salvage signals, token totals, tokens per typed artifact. Complements `cost` (dollars) without prose synthesis. `--json` for machines.
+- **`puppetmaster_job_receipt` MCP tool:** same payload as CLI `--json`, next to `puppetmaster_job_cost`.
+- **PATCH counts as typed:** implement-only jobs are not scored as zero-yield when they shipped a reviewable diff.
+
 ## v1.14.2
 
 **GPT-5.6 Sol/Terra/Luna registry + safer nested artifact unwrap.**
