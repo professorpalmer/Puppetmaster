@@ -26,6 +26,7 @@ Both clients are normalized behind :func:`provider_chat`, which returns an
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import socket
@@ -33,6 +34,9 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional
+
+_ANTHROPIC_CACHE_CONTROL = {"type": "ephemeral"}
+_PROMPT_CACHE_OFF_VALUES = frozenset({"0", "false", "no", "off"})
 
 
 # --- provider descriptors ---------------------------------------------------
@@ -384,6 +388,80 @@ def _openai_chat(
     )
 
 
+def _prompt_cache_enabled() -> bool:
+    raw = (os.environ.get("PUPPETMASTER_PROMPT_CACHE") or "").strip().lower()
+    return raw not in _PROMPT_CACHE_OFF_VALUES
+
+
+def _mark_anthropic_cache_block(msg: dict) -> None:
+    """Attach an ephemeral cache_control marker to a conversation message.
+
+    Anthropic 400s on ``cache_control`` for empty text blocks, so only mark a
+    block that carries real content. Whitespace-only text is skipped entirely;
+    non-text blocks (tool_use / tool_result / image) may carry the marker.
+    """
+    content = msg.get("content")
+    if isinstance(content, list) and content:
+        last = content[-1]
+        if isinstance(last, dict):
+            if last.get("type") == "text" and not str(last.get("text") or "").strip():
+                return
+            content[-1] = {**last, "cache_control": dict(_ANTHROPIC_CACHE_CONTROL)}
+    elif isinstance(content, str):
+        if not content.strip():
+            return
+        msg["content"] = [{
+            "type": "text",
+            "text": content,
+            "cache_control": dict(_ANTHROPIC_CACHE_CONTROL),
+        }]
+
+
+def _apply_anthropic_cache_control(body: dict) -> dict:
+    """Opt into Anthropic prompt caching via cache_control breakpoints.
+
+    Marks up to four blocks (Anthropic's per-request cap): system, last tool,
+    second-to-last message, and last message. Never raises -- on any failure
+    the unmarked body is returned so a lost cache never fails the request.
+    """
+    if not _prompt_cache_enabled():
+        return body
+    try:
+        out = copy.deepcopy(body)
+        system = out.get("system")
+        if isinstance(system, str) and system.strip():
+            out["system"] = [{
+                "type": "text",
+                "text": system,
+                "cache_control": dict(_ANTHROPIC_CACHE_CONTROL),
+            }]
+        elif isinstance(system, list) and system:
+            last = system[-1]
+            if isinstance(last, dict):
+                if not (last.get("type") == "text" and not str(last.get("text") or "").strip()):
+                    system[-1] = {**last, "cache_control": dict(_ANTHROPIC_CACHE_CONTROL)}
+            elif isinstance(last, str) and last.strip():
+                system[-1] = {
+                    "type": "text",
+                    "text": last,
+                    "cache_control": dict(_ANTHROPIC_CACHE_CONTROL),
+                }
+
+        tools = out.get("tools")
+        if isinstance(tools, list) and tools and isinstance(tools[-1], dict):
+            tools[-1] = {**tools[-1], "cache_control": dict(_ANTHROPIC_CACHE_CONTROL)}
+
+        messages = out.get("messages")
+        if isinstance(messages, list) and messages:
+            if len(messages) >= 2 and isinstance(messages[-2], dict):
+                _mark_anthropic_cache_block(messages[-2])
+            if isinstance(messages[-1], dict):
+                _mark_anthropic_cache_block(messages[-1])
+        return out
+    except Exception:
+        return body
+
+
 def _anthropic_chat(
     *, base_url: str, api_key: Optional[str], model: str, messages: list[dict],
     tools: Optional[list[dict]], extra: dict, headers: dict, timeout: int,
@@ -406,6 +484,7 @@ def _anthropic_chat(
     for key in ("temperature", "top_p", "stop_sequences"):
         if key in extra:
             body[key] = extra[key]
+    body = _apply_anthropic_cache_control(body)
     auth = {"x-api-key": api_key} if api_key else {}
     data = _post_json(
         f"{base_url}/messages",
@@ -436,6 +515,7 @@ def _anthropic_chat(
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
             "cached_tokens": int(usage.get("cache_read_input_tokens") or 0),
+            "cache_write_tokens": int(usage.get("cache_creation_input_tokens") or 0),
         },
         raw=data,
     )
@@ -634,6 +714,7 @@ def _anthropic_chat_stream(
     for key in ("temperature", "top_p", "stop_sequences"):
         if key in extra:
             body[key] = extra[key]
+    body = _apply_anthropic_cache_control(body)
     auth = {"x-api-key": api_key} if api_key else {}
     response = _open_stream(
         f"{base_url}/messages",
@@ -646,6 +727,7 @@ def _anthropic_chat_stream(
     prompt_tokens = 0
     completion_tokens = 0
     cached_tokens = 0
+    cache_write_tokens = 0
     try:
         for payload in _iter_sse_data(response):
             try:
@@ -657,6 +739,7 @@ def _anthropic_chat_stream(
                 msg_usage = ((event.get("message") or {}).get("usage") or {})
                 prompt_tokens = int(msg_usage.get("input_tokens") or 0)
                 cached_tokens = int(msg_usage.get("cache_read_input_tokens") or 0)
+                cache_write_tokens = int(msg_usage.get("cache_creation_input_tokens") or 0)
             elif etype == "content_block_start":
                 idx = int(event.get("index") or 0)
                 block = event.get("content_block") or {}
@@ -704,6 +787,7 @@ def _anthropic_chat_stream(
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
             "cached_tokens": cached_tokens,
+            "cache_write_tokens": cache_write_tokens,
         },
         raw={},
     )
