@@ -408,6 +408,106 @@ class PuppetmasterTests(unittest.TestCase):
             self.assertGreaterEqual(len(memory), 4)
             self.assertTrue(all(artifact.sha256 for artifact in artifacts))
 
+    def test_job_receipt_summarizes_run_efficiency_metrics(self) -> None:
+        from puppetmaster.receipt import build_job_receipt
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("audit the repo")
+            tasks = [
+                Task(
+                    id="task_good",
+                    job_id=job.id,
+                    role="review",
+                    instruction="find issues",
+                    adapter="codex",
+                    status=TaskStatus.COMPLETE,
+                ),
+                Task(
+                    id="task_degraded",
+                    job_id=job.id,
+                    role="audit",
+                    instruction="find drift",
+                    adapter="codex",
+                    status=TaskStatus.COMPLETE,
+                ),
+            ]
+            store.save_tasks(tasks)
+            store.save_artifacts(
+                [
+                    Artifact(
+                        job_id=job.id,
+                        task_id="task_good",
+                        type=ArtifactType.VERIFICATION,
+                        created_by="worker-good",
+                        payload={"check": "find issues", "result": "passed", "tokens_in": 100, "tokens_out": 20},
+                        confidence=0.9,
+                        evidence=["adapter:codex"],
+                    ),
+                    Artifact(
+                        job_id=job.id,
+                        task_id="task_good",
+                        type=ArtifactType.FINDING,
+                        created_by="worker-good",
+                        payload={"claim": "real finding"},
+                        confidence=0.9,
+                        evidence=["file.py:1"],
+                    ),
+                    Artifact(
+                        job_id=job.id,
+                        task_id="task_degraded",
+                        type=ArtifactType.VERIFICATION,
+                        created_by="worker-bad",
+                        payload={
+                            "check": "find drift",
+                            "result": "degraded",
+                            "failure": "empty_or_unstructured_codex_result",
+                            "tokens_in": 300,
+                            "tokens_out": 40,
+                        },
+                        confidence=0.65,
+                        evidence=["adapter:codex"],
+                    ),
+                    Artifact(
+                        job_id=job.id,
+                        task_id="task_degraded",
+                        type=ArtifactType.RISK,
+                        created_by="worker-bad",
+                        payload={
+                            "risk": "Codex call completed without structured Puppetmaster findings.",
+                            "mitigation": "Inspect stdout.",
+                            "stdout_excerpt": "{...}",
+                        },
+                        confidence=0.85,
+                        evidence=["adapter:codex", "result:empty-or-unstructured"],
+                    ),
+                ]
+            )
+            store.update_job_status(job.id, JobStatus.COMPLETE)
+
+            receipt = build_job_receipt(store, job.id)
+
+        self.assertEqual(receipt["job_id"], job.id)
+        self.assertEqual(receipt["tasks"]["total"], 2)
+        self.assertEqual(receipt["tasks"]["degraded"], 1)
+        self.assertEqual(receipt["artifacts"]["typed_total"], 2)
+        self.assertEqual(receipt["artifacts"]["by_type"]["finding"], 1)
+        self.assertEqual(receipt["artifacts"]["by_type"]["risk"], 1)
+        self.assertEqual(receipt["signals"]["empty_or_unstructured"], 1)
+        self.assertEqual(receipt["signals"]["stdout_salvage"], 1)
+        self.assertEqual(receipt["tokens"]["total_tokens"], 460)
+        self.assertEqual(receipt["efficiency"]["tokens_per_typed_artifact"], 230)
+        self.assertEqual(receipt["efficiency"]["degraded_rate"], 0.5)
+
+    def test_job_receipt_command_parses_explicit_json_flag(self) -> None:
+        from puppetmaster.cli._parser import build_parser
+
+        args = build_parser().parse_args(["receipt", "job_123", "--json"])
+
+        self.assertEqual(args.command, "receipt")
+        self.assertEqual(args.job_id, "job_123")
+        self.assertTrue(args.json)
+
     def test_live_artifact_feed_and_partial_summary_are_available(self) -> None:
         with TemporaryDirectory() as tmp:
             store = SwarmStore(Path(tmp) / ".puppetmaster")
