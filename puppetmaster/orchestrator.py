@@ -286,6 +286,7 @@ class Orchestrator:
             specs = self._with_output_style(specs)
             self._announce_mode(job, specs)
             self._ensure_plan_catalog(job, specs)
+            self._ensure_job_brief(job, goal, specs)
             self.store.update_job_status(job.id, JobStatus.RUNNING)
             tasks = self._create_tasks(job, specs)
             self._run_workers(job, tasks, lease_seconds=lease_seconds, worker_mode=worker_mode)
@@ -348,6 +349,37 @@ class Orchestrator:
         )
         return mode
 
+    def _ensure_job_brief(
+        self, job: Job, goal: str, specs: Optional[list[WorkerSpec]] = None
+    ) -> None:
+        """Compute once and persist the shared job CodeGraph / repo brief.
+
+        Sibling workers read the same bytes from the job state dir and inject
+        them via ``with_job_brief`` / ``insert_before_task``. Best-effort; never
+        raises. Kill switch: ``PUPPETMASTER_JOB_BRIEF=0``.
+        """
+        try:
+            from puppetmaster.job_brief import write_job_brief
+
+            cwd: Optional[str] = None
+            for spec in specs or []:
+                payload = getattr(spec, "payload", None) or {}
+                candidate = payload.get("cwd")
+                if candidate:
+                    cwd = str(candidate)
+                    break
+            if not cwd:
+                cwd = os.getcwd()
+            path = write_job_brief(self.store.job_dir(job.id), goal, cwd)
+            if path is not None:
+                self.store.emit(
+                    job.id,
+                    "job.brief",
+                    {"path": str(path), "bytes": path.stat().st_size},
+                )
+        except Exception:
+            pass
+
     def run_crash_recovery_demo(
         self,
         goal: str,
@@ -362,6 +394,7 @@ class Orchestrator:
             specs = self._with_retrieved_memory(specs_for_roles(roles), goal, job_id=job.id)
             specs = self._with_injected_skills(job, specs)
             specs = self._with_output_style(specs)
+            self._ensure_job_brief(job, goal, specs)
             self.store.update_job_status(job.id, JobStatus.RUNNING)
             tasks = self._create_tasks(job, specs)
             self._run_prerequisites(job, tasks, crash_role, lease_seconds=2)

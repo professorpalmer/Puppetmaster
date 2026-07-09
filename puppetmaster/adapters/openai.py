@@ -21,6 +21,7 @@ from ._facade import facade
 from ._prompts import (
     build_structured_prompt,
     prompt_with_memory,
+    with_job_brief,
 )
 from ._streaming import (
     _STDOUT_HEAD_CHARS,
@@ -49,7 +50,10 @@ class OpenAIAdapter:
         model = task.payload.get("model") or DEFAULT_OPENAI_MODEL
         prompt, codegraph_used = facade("enrich_prompt_with_codegraph")(
             prompt_with_memory(
-                facade("with_repo_census")(build_structured_prompt(base_prompt), cwd),
+                facade("with_repo_census")(
+                    with_job_brief(build_structured_prompt(base_prompt), task),
+                    cwd,
+                ),
                 task,
             ),
             task_description=task.payload.get("codegraph_task") or task.instruction or goal,

@@ -83,6 +83,7 @@ from ._prompts import (
     build_structured_prompt,
     prompt_with_memory,
     prompt_with_skills,
+    with_job_brief,
     with_repo_census,
     with_report_contract,
 )
@@ -229,6 +230,7 @@ __all__ = [
     "tool_list",
     "validate_openai_base_url_for_task",
     "verification_artifact",
+    "with_job_brief",
     "with_repo_census",
     "with_report_contract",
     "worktree_guard",

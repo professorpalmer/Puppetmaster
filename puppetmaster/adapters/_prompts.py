@@ -254,9 +254,35 @@ def with_repo_census(prompt: str, cwd: Union[Path, str, None]) -> str:
     assert emptiness if its own tools can't). When nothing can be enumerated we
     add only a soft boundary — we never assert emptiness ourselves, since an
     enumeration miss is not proof of an empty tree.
+
+    No-op when a job-level brief is already present — that brief already carries
+    the census so sibling workers keep a single shared prefix segment.
     """
     try:
+        from puppetmaster.job_brief import JOB_BRIEF_SECTION_HEADER
+
+        if JOB_BRIEF_SECTION_HEADER in (prompt or ""):
+            return prompt
         return insert_before_task(prompt, _repo_census_section(cwd))
+    except Exception:
+        return prompt
+
+
+def with_job_brief(prompt: str, task: Task) -> str:
+    """Inject the job-stable shared CodeGraph / repo brief before the task.
+
+    Reads bytes persisted at job start (see ``puppetmaster.job_brief``) so every
+    sibling worker gets an identical prefix segment. Lands in the system prefix
+    via ``split_prompt_messages`` (distinct header from per-task CodeGraph).
+    Best-effort; never raises. Kill switch: ``PUPPETMASTER_JOB_BRIEF=0``.
+    """
+    try:
+        from puppetmaster.job_brief import resolve_job_brief_for_task
+
+        section = resolve_job_brief_for_task(task)
+        if not section:
+            return prompt
+        return insert_before_task(prompt, section.strip("\n"))
     except Exception:
         return prompt
 

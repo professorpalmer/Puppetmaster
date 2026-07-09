@@ -24,7 +24,12 @@ from ._base import (
 )
 from ._base import _should_emit_patch_artifact
 from ._facade import facade
-from ._prompts import TASK_INSTRUCTION_HEADER, prompt_with_memory, with_report_contract
+from ._prompts import (
+    TASK_INSTRUCTION_HEADER,
+    prompt_with_memory,
+    with_job_brief,
+    with_report_contract,
+)
 from ._streaming import (
     StreamedProcess,
     _STDOUT_TAIL_CHARS,
@@ -149,7 +154,7 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
             f"{TASK_INSTRUCTION_HEADER}\n{raw_instruction}"
         )
         prompt, codegraph_used = facade("enrich_prompt_with_codegraph")(
-            prompt_with_memory(base_prompt, task),
+            with_job_brief(prompt_with_memory(base_prompt, task), task),
             task_description=task.payload.get("codegraph_task") or task.instruction or goal,
             cwd=cwd,
             disabled=bool(task.payload.get("disable_codegraph", False)),

@@ -27,6 +27,7 @@ from ._prompts import (
     build_implement_prompt,
     build_structured_prompt,
     prompt_with_memory,
+    with_job_brief,
 )
 from ._streaming import (
     StreamedProcess,
@@ -99,7 +100,10 @@ class CursorAdapter(CliWorkerAdapter):
         base_prompt = task.payload.get("prompt") or task.instruction
         model = task.payload.get("model", "default")
         prompt, codegraph_used = facade("enrich_prompt_with_codegraph")(
-            prompt_with_memory(build_implement_prompt(base_prompt), task),
+            prompt_with_memory(
+                with_job_brief(build_implement_prompt(base_prompt), task),
+                task,
+            ),
             task_description=task.payload.get("codegraph_task") or task.instruction or goal,
             cwd=cwd,
             disabled=bool(task.payload.get("disable_codegraph", False)),
@@ -270,7 +274,10 @@ class CursorAdapter(CliWorkerAdapter):
         model = task.payload.get("model", "default")
         prompt, codegraph_used = facade("enrich_prompt_with_codegraph")(
             prompt_with_memory(
-                facade("with_repo_census")(build_structured_prompt(base_prompt), cwd),
+                facade("with_repo_census")(
+                    with_job_brief(build_structured_prompt(base_prompt), task),
+                    cwd,
+                ),
                 task,
             ),
             task_description=task.payload.get("codegraph_task") or task.instruction or goal,

@@ -35,6 +35,7 @@ from ._prompts import (
     build_structured_prompt,
     prompt_with_memory,
     prompt_with_skills,
+    with_job_brief,
     with_report_contract,
 )
 from ._streaming import (
@@ -406,7 +407,10 @@ class HermesAdapter(CliWorkerAdapter):
         base_prompt = with_report_contract(task.payload.get("prompt") or task.instruction)
         prompt, codegraph_used = facade("enrich_prompt_with_codegraph")(
             prompt_with_skills(
-                prompt_with_memory(build_implement_prompt(base_prompt), task),
+                prompt_with_memory(
+                    with_job_brief(build_implement_prompt(base_prompt), task),
+                    task,
+                ),
                 task,
             ),
             task_description=task.payload.get("codegraph_task") or task.instruction or goal,
@@ -615,7 +619,10 @@ class HermesAdapter(CliWorkerAdapter):
             prompt_with_skills(
                 prompt_with_memory(
                     facade("with_repo_census")(
-                        build_structured_prompt(base_prompt, final_message_note=True),
+                        with_job_brief(
+                            build_structured_prompt(base_prompt, final_message_note=True),
+                            task,
+                        ),
                         cwd,
                     ),
                     task,

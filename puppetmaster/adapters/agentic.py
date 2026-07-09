@@ -91,6 +91,7 @@ from ._prompts import (
     prompt_with_memory,
     prompt_with_skills,
     split_prompt_messages,
+    with_job_brief,
     with_report_contract,
 )
 from .cursor import (
@@ -294,7 +295,10 @@ class AgenticAdapter(FullEditWorkerAdapter):
             prompt_with_skills(
                 prompt_with_memory(
                     facade("with_repo_census")(
-                        build_structured_prompt(base_prompt, final_message_note=True),
+                        with_job_brief(
+                            build_structured_prompt(base_prompt, final_message_note=True),
+                            task,
+                        ),
                         str(cwd),
                     ),
                     task,
@@ -428,7 +432,10 @@ class AgenticAdapter(FullEditWorkerAdapter):
         base_prompt = with_report_contract(task.payload.get("prompt") or task.instruction)
         prompt, codegraph_used = facade("enrich_prompt_with_codegraph")(
             prompt_with_skills(
-                prompt_with_memory(build_implement_prompt(base_prompt), task),
+                prompt_with_memory(
+                    with_job_brief(build_implement_prompt(base_prompt), task),
+                    task,
+                ),
                 task,
             ),
             task_description=task.payload.get("codegraph_task") or task.instruction or goal,
