@@ -4,9 +4,9 @@
 
 **Worker thrift: savings-gated tool offload, history compaction, shared job brief.**
 
-- **Tool-output offload:** large agentic tool results spill to durable blobs with head/tail previews and measured ledger credit (puppetmaster/tool_offload.py); kill switch PUPPETMASTER_TOOL_OFFLOAD=0. Surfaces in puppetmaster savings as 	ool_offload.
-- **History compaction:** older tool results stub after N turns or over context budget while the static system prefix stays byte-stable for prompt cache (dapters/_context_budget.py); kill switch PUPPETMASTER_HISTORY_COMPACT=0.
-- **Per-job CodeGraph/repo brief:** one census + goal CodeGraph block computed at job start, persisted under the job dir, injected identically into sibling workers via insert_before_task; kill switch PUPPETMASTER_JOB_BRIEF=0.
+- **Tool-output offload:** large agentic tool results spill to durable blobs with head/tail previews and measured ledger credit (`puppetmaster/tool_offload.py`); kill switch `PUPPETMASTER_TOOL_OFFLOAD=0`. Surfaces in `puppetmaster savings` as `tool_offload`.
+- **History compaction:** older tool results stub after N turns or over context budget while the static system prefix stays byte-stable for prompt cache (`adapters/_context_budget.py`); kill switch `PUPPETMASTER_HISTORY_COMPACT=0`.
+- **Per-job CodeGraph/repo brief:** one census + goal CodeGraph block computed at job start, persisted under the job dir, injected identically into sibling workers via `insert_before_task`; kill switch `PUPPETMASTER_JOB_BRIEF=0`.
 
 ## v1.13.0
 
