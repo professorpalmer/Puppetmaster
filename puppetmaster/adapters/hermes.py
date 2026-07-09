@@ -35,7 +35,6 @@ from ._prompts import (
     build_structured_prompt,
     prompt_with_memory,
     prompt_with_skills,
-    with_repo_census,
     with_report_contract,
 )
 from ._streaming import (
@@ -614,14 +613,19 @@ class HermesAdapter(CliWorkerAdapter):
         cwd = Path(task.payload.get("cwd") or ".").resolve()
         prompt, codegraph_used = facade("enrich_prompt_with_codegraph")(
             prompt_with_skills(
-                prompt_with_memory(build_structured_prompt(base_prompt, final_message_note=True), task),
+                prompt_with_memory(
+                    facade("with_repo_census")(
+                        build_structured_prompt(base_prompt, final_message_note=True),
+                        cwd,
+                    ),
+                    task,
+                ),
                 task,
             ),
             task_description=task.payload.get("codegraph_task") or task.instruction or goal,
             cwd=cwd,
             disabled=bool(task.payload.get("disable_codegraph", False)),
         )
-        prompt = facade("with_repo_census")(prompt, cwd)
         timeout_seconds = int(task.payload.get("timeout_seconds", 600))
         executable = task.payload.get("executable") or os.environ.get("HERMES_COMMAND") or "hermes"
         command_base = command_parts(executable)

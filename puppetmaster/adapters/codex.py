@@ -25,7 +25,6 @@ from ._facade import facade
 from ._prompts import (
     build_structured_prompt,
     prompt_with_memory,
-    with_repo_census,
 )
 from ._streaming import (
     StreamedProcess,
@@ -104,12 +103,17 @@ class CodexAdapter(CliWorkerAdapter):
     ) -> Union[list[Artifact], CliInvocation]:
         base_prompt = task.payload.get("prompt") or task.instruction
         prompt, codegraph_used = facade("enrich_prompt_with_codegraph")(
-            prompt_with_memory(build_structured_prompt(base_prompt, final_message_note=True), task),
+            prompt_with_memory(
+                facade("with_repo_census")(
+                    build_structured_prompt(base_prompt, final_message_note=True),
+                    cwd,
+                ),
+                task,
+            ),
             task_description=task.payload.get("codegraph_task") or task.instruction or goal,
             cwd=cwd,
             disabled=bool(task.payload.get("disable_codegraph", False)),
         )
-        prompt = facade("with_repo_census")(prompt, cwd)
         executable = task.payload.get("executable") or os.environ.get("CODEX_COMMAND") or "codex"
         command_base = command_parts(executable)
         model = str(task.payload.get("model") or DEFAULT_CODEX_MODEL)

@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional, Union
 
@@ -333,16 +334,14 @@ def codegraph_ready(cwd: Union[Path, str, None]) -> bool:
     return codegraph_available() and codegraph_initialized(cwd)
 
 
-def codegraph_context(
+@lru_cache(maxsize=32)
+def _codegraph_context_cached(
     task: str,
-    cwd: Union[Path, str, None],
-    *,
-    max_nodes: int = 15,
-    timeout_seconds: int = DEFAULT_CONTEXT_TIMEOUT_SECONDS,
+    cwd_key: str,
+    max_nodes: int,
+    timeout_seconds: int,
 ) -> Optional[str]:
-    """Return task-relevant CodeGraph context for the workspace, or None."""
-    if not codegraph_ready(cwd):
-        return None
+    """Memoized CodeGraph CLI context lookup (cwd normalized to str)."""
     started = time.monotonic()
     context_args = _modernize_cli_args(
         ["context", task, "--max-nodes", str(max_nodes), "--format", "markdown"]
@@ -350,7 +349,7 @@ def codegraph_context(
     try:
         completed = subprocess.run(
             resolve_codegraph_invocation() + context_args,
-            cwd=str(cwd),
+            cwd=cwd_key or None,
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -369,13 +368,36 @@ def codegraph_context(
     output = output[:MAX_CONTEXT_CHARS]
     _record_codegraph_usage(
         cli_args=["context", task],
-        cwd=str(cwd or ""),
+        cwd=cwd_key,
         stdout=output,
         latency_ms=(time.monotonic() - started) * 1000.0,
         ok=True,
         caller="swarm",
     )
     return output
+
+
+def codegraph_context(
+    task: str,
+    cwd: Union[Path, str, None],
+    *,
+    max_nodes: int = 15,
+    timeout_seconds: int = DEFAULT_CONTEXT_TIMEOUT_SECONDS,
+) -> Optional[str]:
+    """Return task-relevant CodeGraph context for the workspace, or None.
+
+    Results are memoized per-process on ``(resolved cwd, task, max_nodes)`` so a
+    swarm dispatching several workers with the same job goal does not re-run the
+    CodeGraph CLI for each one. Readiness is checked before the cache lookup so
+    a missing index is never cached as a permanent miss.
+    """
+    if not codegraph_ready(cwd):
+        return None
+    try:
+        cwd_key = str(Path(cwd).resolve()) if cwd is not None else ""
+    except Exception:
+        cwd_key = str(cwd or "")
+    return _codegraph_context_cached(task, cwd_key, int(max_nodes), int(timeout_seconds))
 
 
 def puppetmaster_source_root() -> str:
@@ -460,17 +482,24 @@ def enrich_prompt_with_codegraph(
     disabled: bool = False,
     max_nodes: int = 15,
 ) -> tuple[str, bool]:
-    """Append CodeGraph context to a prompt when available.
+    """Inject CodeGraph context before the per-task instruction when available.
+
+    The CodeGraph section is per-task (derived from ``task_description``), so it
+    lands after job-stable sections but before ``Your task:``. When no instruction
+    marker is present, falls back to appending (legacy prompts).
 
     Returns the (possibly enriched) prompt and a flag indicating whether
     CodeGraph context was actually injected.
     """
     if disabled:
         return prompt, False
-    context = codegraph_context(task_description, cwd, max_nodes=max_nodes)
+    try:
+        context = codegraph_context(task_description, cwd, max_nodes=max_nodes)
+    except Exception:
+        return prompt, False
     if not context:
         return prompt, False
-    enriched = prompt + codegraph_prompt_section(context)
+    section = codegraph_prompt_section(context).strip("\n")
     # Staleness guard: a snapshot that no longer matches the tree is the worst
     # CodeGraph failure (the worker "can't find" code that exists). Tell the
     # worker the view may be behind, and kick a background refresh so the next
@@ -482,8 +511,19 @@ def enrich_prompt_with_codegraph(
     if freshness is not None and freshness.is_stale:
         warning = freshness.warning_text()
         if warning:
-            enriched += "\nNote: " + warning + "\n"
-        maybe_autosync_codegraph(cwd, freshness)
+            section = section + "\n\nNote: " + warning
+        try:
+            maybe_autosync_codegraph(cwd, freshness)
+        except Exception:
+            pass
+    # Lazy import avoids a circular dependency with adapters._prompts
+    # (which imports repo_file_census from this module).
+    try:
+        from puppetmaster.adapters._prompts import insert_before_task
+
+        enriched = insert_before_task(prompt, section)
+    except Exception:
+        enriched = prompt + "\n\n" + section
     return enriched, True
 
 

@@ -39,8 +39,90 @@ _PUPPETMASTER_ARTIFACT_CONTRACT_LINES = (
 )
 
 
+# Assembly seam for static-first / instruction-last prompts. Builders emit this
+# header immediately before the per-task instruction; job-stable helpers and
+# CodeGraph enrichment insert their sections before it so sibling workers share
+# a cacheable prefix. Keep the header text stable — adapters and tests key on it.
+TASK_INSTRUCTION_HEADER = "Your task:"
+
+# CodeGraph's prompt section title — also a per-task boundary for agentic
+# system/user splits (see split_prompt_messages).
+CODEGRAPH_SECTION_HEADER = "Shared CodeGraph context for this task:"
+
+
+def _task_instruction_index(prompt: str) -> int:
+    """Return the index of the task-instruction header, or -1 if absent."""
+    if not prompt:
+        return -1
+    needle = TASK_INSTRUCTION_HEADER + "\n"
+    if prompt.startswith(needle) or prompt == TASK_INSTRUCTION_HEADER:
+        return 0
+    embedded = "\n" + needle
+    idx = prompt.find(embedded)
+    if idx >= 0:
+        return idx + 1
+    if prompt.endswith("\n" + TASK_INSTRUCTION_HEADER):
+        return len(prompt) - len(TASK_INSTRUCTION_HEADER)
+    return -1
+
+
+def insert_before_task(prompt: str, section: str) -> str:
+    """Insert ``section`` before the task instruction (static-first seam).
+
+    When the prompt has no ``Your task:`` marker (legacy / unmarked strings),
+    append so isolated helper call sites keep their prior behavior. Never raises.
+    """
+    try:
+        if not section:
+            return prompt
+        section = section.strip("\n")
+        if not section:
+            return prompt
+        anchor = _task_instruction_index(prompt)
+        if anchor < 0:
+            if not prompt:
+                return section
+            if prompt.endswith("\n\n"):
+                return prompt + section
+            if prompt.endswith("\n"):
+                return prompt + "\n" + section
+            return prompt + "\n\n" + section
+        before = prompt[:anchor].rstrip("\n")
+        after = prompt[anchor:]
+        if before:
+            return before + "\n\n" + section + "\n\n" + after
+        return section + "\n\n" + after
+    except Exception:
+        return prompt
+
+
+def split_prompt_messages(prompt: str) -> tuple[str, str]:
+    """Split an assembled prompt into ``(system_prefix, user_suffix)``.
+
+    System carries static boilerplate + job-stable sections (census / memory /
+    skills). User carries per-task CodeGraph context (when present) plus the
+    ``Your task:`` instruction block. Falls back to ``("", prompt)`` when no
+    seam is found so callers can keep a single user message. Never raises.
+    """
+    try:
+        if not prompt:
+            return "", ""
+        split_at = -1
+        for header in (CODEGRAPH_SECTION_HEADER, TASK_INSTRUCTION_HEADER):
+            idx = prompt.find(header)
+            if idx >= 0 and (split_at < 0 or idx < split_at):
+                split_at = idx
+        if split_at < 0:
+            return "", prompt
+        system = prompt[:split_at].rstrip("\n")
+        user = prompt[split_at:].lstrip("\n")
+        return system, user
+    except Exception:
+        return "", prompt
+
+
 def build_structured_prompt(prompt: str, *, final_message_note: bool = False) -> str:
-    lines = [prompt, ""]
+    lines: list[str] = []
     if final_message_note:
         # Primary contract: finish by CALLING the submit_findings tool. The
         # provider constrains the tool's arguments, so structure is reliable even
@@ -72,14 +154,13 @@ def build_structured_prompt(prompt: str, *, final_message_note: bool = False) ->
             "You may use your read/search tools to inspect the code along the way; "
             "just make sure you FINISH by calling `submit_findings`."
         )
+    lines.extend(["", TASK_INSTRUCTION_HEADER, prompt])
     return "\n".join(lines)
 
 
 def build_implement_prompt(prompt: str) -> str:
     return "\n".join(
         [
-            prompt,
-            "",
             "Implement mode: you are running as a full-edit Puppetmaster worker "
             "inside the user's repository. Actually make the code changes — create, "
             "edit, and delete files as needed to complete the task end to end. Do not "
@@ -99,6 +180,9 @@ def build_implement_prompt(prompt: str) -> str:
             "you verified. If you cannot call tools, end with the same report as your "
             "final message instead.",
             _IMPLEMENT_REPORT_CONTRACT,
+            "",
+            TASK_INSTRUCTION_HEADER,
+            prompt,
         ]
     )
 
@@ -140,21 +224,12 @@ _IMPLEMENT_NOOP_NUDGE = (
 )
 
 
-def with_repo_census(prompt: str, cwd: Union[Path, str, None]) -> str:
-    """Append an authoritative repo file census so a worker can't hallucinate
-    an empty repository.
-
-    When files exist, the census states plainly that the repo is NOT empty and
-    tells the worker to read them (and to report a tooling failure rather than
-    assert emptiness if its own tools can't). When nothing can be enumerated we
-    add only a soft boundary — we never assert emptiness ourselves, since an
-    enumeration miss is not proof of an empty tree.
-    """
+def _repo_census_section(cwd: Union[Path, str, None]) -> str:
+    """Build the repo-census block (no prompt wrapping)."""
     sample, total = repo_file_census(cwd)
     if total <= 0:
         return (
-            prompt
-            + "\n\nRepository file census: none enumerated. Do not assert the "
+            "Repository file census: none enumerated. Do not assert the "
             "repository is empty unless your own tools also show no files — if "
             "they error, report a tooling failure, not an empty repository."
         )
@@ -162,14 +237,28 @@ def with_repo_census(prompt: str, cwd: Union[Path, str, None]) -> str:
     overflow = total - len(sample)
     more = f" (+{overflow} more)" if overflow > 0 else ""
     return (
-        prompt
-        + f"\n\nRepository file census (ground truth — {total} file(s) under the "
+        f"Repository file census (ground truth — {total} file(s) under the "
         f"working directory): {shown}{more}.\nThis census is authoritative: the "
         "repository is NOT empty. Read the relevant files before reporting. Never "
         "claim the repo is empty or 'starting from scratch' when files are listed "
         "here; if your own tools cannot read them, report a tooling failure, not "
         "an empty repository."
     )
+
+
+def with_repo_census(prompt: str, cwd: Union[Path, str, None]) -> str:
+    """Inject an authoritative repo file census before the task instruction.
+
+    When files exist, the census states plainly that the repo is NOT empty and
+    tells the worker to read them (and to report a tooling failure rather than
+    assert emptiness if its own tools can't). When nothing can be enumerated we
+    add only a soft boundary — we never assert emptiness ourselves, since an
+    enumeration miss is not proof of an empty tree.
+    """
+    try:
+        return insert_before_task(prompt, _repo_census_section(cwd))
+    except Exception:
+        return prompt
 
 
 _MEMORY_MAX_ITEMS = 5
@@ -207,26 +296,34 @@ def _distill_memory_lines(retrieved: list) -> list[str]:
     return lines
 
 
-def prompt_with_memory(prompt: str, task: Task) -> str:
+def _memory_section(task: Task) -> str:
     retrieved = task.payload.get("retrieved_memory") or []
     if not retrieved:
-        return prompt
+        return ""
     distilled = _distill_memory_lines(retrieved)
     if not distilled:
-        return prompt
+        return ""
     lines = [
-        prompt,
-        "",
         "Relevant promoted Puppetmaster memory (distilled facts/decisions):",
+        *distilled,
+        "",
+        "Use this as retrieved context, but verify claims before relying on them.",
     ]
-    lines.extend(distilled)
-    lines.append("")
-    lines.append("Use this as retrieved context, but verify claims before relying on them.")
     return "\n".join(lines)
 
 
+def prompt_with_memory(prompt: str, task: Task) -> str:
+    try:
+        section = _memory_section(task)
+        if not section:
+            return prompt
+        return insert_before_task(prompt, section)
+    except Exception:
+        return prompt
+
+
 def prompt_with_skills(prompt: str, task: Task) -> str:
-    """Append the orchestrator-selected live-skill packet to a worker prompt.
+    """Inject the orchestrator-selected live-skill packet before the task instruction.
 
     The mirror image of :func:`prompt_with_memory`: the trusted planner fills
     ``task.payload["injected_skills"]`` (a list of ``{"name", "body"}``) and the
@@ -235,21 +332,27 @@ def prompt_with_skills(prompt: str, task: Task) -> str:
     persona/rules layer, which ``--ignore-rules`` keeps suppressed — so the
     worker's access surface is unchanged. No-op when nothing was injected.
     """
-    injected = task.payload.get("injected_skills") or []
-    if not injected:
-        return prompt
-    from puppetmaster.skill_injection import render_skill_packet
+    try:
+        injected = task.payload.get("injected_skills") or []
+        if not injected:
+            return prompt
+        from puppetmaster.skill_injection import render_skill_packet
 
-    packet = render_skill_packet(injected)
-    if not packet:
+        packet = render_skill_packet(injected)
+        if not packet:
+            return prompt
+        return insert_before_task(prompt, packet)
+    except Exception:
         return prompt
-    return "\n".join([prompt, "", packet])
 
 
 def with_report_contract(prompt: str) -> str:
-    """Append the implement reporting contract unless the prompt already
-    carries a structured artifact contract (swarm review/plan prompts do)."""
+    """Inject the implement reporting contract before the task instruction.
+
+    No-op when the prompt already carries a structured artifact contract
+    (swarm review/plan prompts do) or the implement reporting contract.
+    Falls back to append when no ``Your task:`` marker is present.
+    """
     if "Puppetmaster artifact contract" in prompt or _IMPLEMENT_REPORT_CONTRACT in prompt:
         return prompt
-    return f"{prompt}\n\n{_IMPLEMENT_REPORT_CONTRACT}"
-
+    return insert_before_task(prompt, _IMPLEMENT_REPORT_CONTRACT)

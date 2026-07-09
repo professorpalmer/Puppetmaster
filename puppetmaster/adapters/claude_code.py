@@ -24,7 +24,7 @@ from ._base import (
 )
 from ._base import _should_emit_patch_artifact
 from ._facade import facade
-from ._prompts import prompt_with_memory, with_report_contract
+from ._prompts import TASK_INSTRUCTION_HEADER, prompt_with_memory, with_report_contract
 from ._streaming import (
     StreamedProcess,
     _STDOUT_TAIL_CHARS,
@@ -142,7 +142,12 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
         cwd: Path,
         resolved: str,
     ) -> Union[list[Artifact], CliInvocation]:
-        base_prompt = with_report_contract(task.payload.get("prompt") or task.instruction)
+        # Marker seam so memory / CodeGraph land before the per-task instruction
+        # (static-first prefix caching). Report contract injects before the marker.
+        raw_instruction = task.payload.get("prompt") or task.instruction
+        base_prompt = with_report_contract(
+            f"{TASK_INSTRUCTION_HEADER}\n{raw_instruction}"
+        )
         prompt, codegraph_used = facade("enrich_prompt_with_codegraph")(
             prompt_with_memory(base_prompt, task),
             task_description=task.payload.get("codegraph_task") or task.instruction or goal,

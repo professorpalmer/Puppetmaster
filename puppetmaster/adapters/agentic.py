@@ -83,7 +83,7 @@ from ._prompts import (
     build_structured_prompt,
     prompt_with_memory,
     prompt_with_skills,
-    with_repo_census,
+    split_prompt_messages,
     with_report_contract,
 )
 from .cursor import (
@@ -285,7 +285,11 @@ class AgenticAdapter(FullEditWorkerAdapter):
         prompt, codegraph_used = facade("enrich_prompt_with_codegraph")(
             prompt_with_skills(
                 prompt_with_memory(
-                    build_structured_prompt(base_prompt, final_message_note=True), task
+                    facade("with_repo_census")(
+                        build_structured_prompt(base_prompt, final_message_note=True),
+                        str(cwd),
+                    ),
+                    task,
                 ),
                 task,
             ),
@@ -293,7 +297,6 @@ class AgenticAdapter(FullEditWorkerAdapter):
             cwd=cwd,
             disabled=bool(task.payload.get("disable_codegraph", False)),
         )
-        prompt = facade("with_repo_census")(prompt, str(cwd))
         if codegraph_used:
             evidence_base = evidence_base + ["context:codegraph"]
 
@@ -721,7 +724,17 @@ class AgenticAdapter(FullEditWorkerAdapter):
         token_budget = task.payload.get("token_budget")
         token_budget = int(token_budget) if token_budget else None
         base_extra = self._extra_params(task)
-        messages: list[dict] = [{"role": "user", "content": system_prompt}]
+        # Static + job-stable prefix as a true system message; per-task CodeGraph
+        # + instruction as the first user message — enables provider prompt caches
+        # (OpenAI implicit prefix / Anthropic body['system'] breakpoints).
+        system_prefix, user_suffix = split_prompt_messages(system_prompt)
+        if system_prefix:
+            messages: list[dict] = [
+                {"role": "system", "content": system_prefix},
+                {"role": "user", "content": user_suffix or system_prompt},
+            ]
+        else:
+            messages = [{"role": "user", "content": system_prompt}]
         usage_total = {
             "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
             "cached_tokens": 0, "cost_usd": 0.0,
