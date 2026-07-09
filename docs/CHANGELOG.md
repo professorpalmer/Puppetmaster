@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.13.0
+
+**Shared platform.json with Marionette + swarm prompt-cache lifts.**
+
+- **Platform lock read-modify-write:** `_write_disabled` preserves foreign keys in `~/.puppetmaster/platform.json` (notably Marionette's `harness_initialized` marker) instead of replacing the whole document. Previously `platform enable` stripped unknown keys and the next Marionette boot re-applied agentic-only defaults, silently undoing the operator's enable. Defense-in-depth pair with Marionette v0.9.17's gentler `_init_platform_lock`.
+- **Anthropic prompt-cache breakpoints:** `provider_chat` marks system + tools + two rolling history blocks with `cache_control` (kill switch `PUPPETMASTER_PROMPT_CACHE=0`); usage parses `cache_write_tokens`.
+- **Static-first worker prompt assembly:** implement/structured prompts put invariant boilerplate first and the task instruction last so parallel swarm workers share a cacheable prefix; CodeGraph/memory/skills inject before the task section.
+
 ## v1.12.1
 
 **Grok 4.5 Cursor workhorse + truthful `sdk_not_installed` failures.**
