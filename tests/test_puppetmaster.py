@@ -10826,6 +10826,59 @@ class OpenAIAdapterTests(unittest.TestCase):
         self.assertIn("cheap", nano.tags)
         self.assertLess(nano.capability_score, 60)
 
+    def test_starter_registry_includes_gpt_5_6_family(self) -> None:
+        from puppetmaster.model_registry import starter_registry
+        from puppetmaster.static_catalog import CURATED_CATALOGS
+
+        registry = {spec.id: spec for spec in starter_registry()}
+        openai_ids = (
+            "openai/gpt-5-6-sol",
+            "openai/gpt-5-6",
+            "openai/gpt-5-6-terra",
+            "openai/gpt-5-6-luna",
+        )
+        codex_ids = (
+            "codex/gpt-5-6-sol",
+            "codex/gpt-5-6-terra",
+            "codex/gpt-5-6-luna",
+        )
+        for expected in (*openai_ids, *codex_ids, "openai/gpt-5-5"):
+            self.assertIn(expected, registry, f"missing {expected}")
+
+        sol = registry["openai/gpt-5-6-sol"]
+        self.assertEqual(sol.adapter, "openai")
+        self.assertEqual(sol.adapter_model_name, "gpt-5.6-sol")
+        self.assertEqual(sol.input_per_mtok_usd, 5.0)
+        self.assertEqual(sol.output_per_mtok_usd, 30.0)
+        self.assertEqual(sol.context_window, 1_050_000)
+        self.assertGreater(sol.capability_score, registry["openai/gpt-5-5"].capability_score)
+
+        alias = registry["openai/gpt-5-6"]
+        self.assertEqual(alias.adapter_model_name, "gpt-5.6")
+        self.assertEqual(alias.capability_score, sol.capability_score)
+        self.assertIn("Sol", alias.notes)
+
+        terra = registry["openai/gpt-5-6-terra"]
+        self.assertEqual(terra.adapter_model_name, "gpt-5.6-terra")
+        self.assertEqual(terra.input_per_mtok_usd, 2.5)
+        self.assertEqual(terra.output_per_mtok_usd, 15.0)
+        self.assertEqual(terra.capability_score, 97)
+
+        luna = registry["openai/gpt-5-6-luna"]
+        self.assertEqual(luna.adapter_model_name, "gpt-5.6-luna")
+        self.assertEqual(luna.input_per_mtok_usd, 1.0)
+        self.assertEqual(luna.output_per_mtok_usd, 6.0)
+        self.assertEqual(luna.capability_score, 90)
+
+        codex_sol = registry["codex/gpt-5-6-sol"]
+        self.assertEqual(codex_sol.adapter_model_name, "gpt-5.6-sol")
+        self.assertEqual(codex_sol.capability_score, sol.capability_score + 1)
+
+        for catalog_name in ("codex", "agentic", "hermes"):
+            models = {entry["model"] for entry in CURATED_CATALOGS[catalog_name]}
+            for model in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+                self.assertIn(model, models, f"{catalog_name} missing {model}")
+
 
 class InstallerTests(unittest.TestCase):
     """Tests for :mod:`puppetmaster.installers`.
@@ -22574,6 +22627,33 @@ class JsonPrefixDecodeTests(unittest.TestCase):
             [ArtifactType.FINDING, ArtifactType.RISK, ArtifactType.DECISION],
         )
         self.assertEqual([a.evidence for a in artifacts], [["a.py:1"], ["b.py:2"], ["c.py:3"]])
+
+    def test_typed_artifact_with_nested_wrapper_dict_is_not_clobbered(self) -> None:
+        """A typed item that also carries a nested finding/risk/decision dict
+        must keep its top-level fields — unwrap only when type is absent.
+        """
+        from puppetmaster.adapters import cursor_artifact_from_item
+
+        task = Task(
+            job_id="job",
+            role="codex-review",
+            instruction="inspect",
+            adapter="codex",
+            payload={},
+        )
+        item = {
+            "type": "finding",
+            "claim": "KEEP",
+            "evidence": ["a.py:1"],
+            "confidence": 0.9,
+            "finding": {"claim": "STEAL", "evidence": ["evil.py:1"]},
+        }
+        artifact = cursor_artifact_from_item(task, "worker-codex", item, adapter="codex")
+        self.assertIsNotNone(artifact)
+        assert artifact is not None
+        self.assertEqual(artifact.type, ArtifactType.FINDING)
+        self.assertEqual(artifact.payload["claim"], "KEEP")
+        self.assertEqual(artifact.evidence, ["a.py:1"])
 
     def test_prose_yields_zero_artifacts(self) -> None:
         from puppetmaster.adapters import cursor_result_artifacts

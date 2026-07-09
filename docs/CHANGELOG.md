@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.14.2
+
+**GPT-5.6 Sol/Terra/Luna registry + safer nested artifact unwrap.**
+
+- **GPT-5.6 family:** starter registry and curated codex/agentic/hermes catalogs gain `gpt-5.6-sol` (alias `gpt-5.6`), `gpt-5.6-terra`, and `gpt-5.6-luna` with public pricing ($5/$30, $2.50/$15, $1/$6). OpenAI CLI/MCP `--reasoning-effort` accepts `max`.
+- **Nested wrapper unwrap guard:** `cursor_artifact_from_item` only unwraps `{"finding":{...}}`-style wrappers when top-level `type` is absent, so a typed artifact that also carries a nested finding/risk/decision dict is not clobbered (follow-up to #16).
+
 ## v1.14.1
 
 **Price the run that actually worked after router fallback.**

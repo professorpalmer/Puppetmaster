@@ -424,7 +424,98 @@ def starter_registry() -> list[ModelSpec]:
         ),
         # OpenAI tier — uses the openai adapter directly with OPENAI_API_KEY,
         # bypassing Cursor's SDK entirely. Pricing and model IDs are
-        # the publicly-listed GPT-5.4 / GPT-5.5 catalog.
+        # the publicly-listed GPT-5.4 / GPT-5.5 / GPT-5.6 catalog.
+        ModelSpec(
+            id="openai/gpt-5-6-sol",
+            adapter="openai",
+            adapter_model_name="gpt-5.6-sol",
+            capability_score=99,
+            input_per_mtok_usd=5.0,
+            output_per_mtok_usd=30.0,
+            context_window=1_050_000,
+            billing="api",
+            tags=[
+                "openai",
+                "frontier",
+                "vision",
+                "detailed-vision",
+                "reasoning",
+                "code",
+                "long-context",
+            ],
+            notes=(
+                "OpenAI GPT-5.6 Sol — frontier coding/reasoning flagship "
+                "(API id gpt-5.6-sol, alias gpt-5.6). 1.05M context, 128K "
+                "max output. Some accounts still return limited-preview 404 "
+                "until rollout completes; the entry lights up when access "
+                "lands. Routes through the openai adapter (OPENAI_API_KEY)."
+            ),
+        ),
+        ModelSpec(
+            id="openai/gpt-5-6",
+            adapter="openai",
+            adapter_model_name="gpt-5.6",
+            capability_score=99,
+            input_per_mtok_usd=5.0,
+            output_per_mtok_usd=30.0,
+            context_window=1_050_000,
+            billing="api",
+            tags=[
+                "openai",
+                "frontier",
+                "vision",
+                "detailed-vision",
+                "reasoning",
+                "code",
+                "long-context",
+            ],
+            notes=(
+                "Alias for GPT-5.6 Sol (adapter_model_name gpt-5.6 routes to "
+                "the same flagship as openai/gpt-5-6-sol). Same pricing and "
+                "capability; use when your client or docs reference gpt-5.6."
+            ),
+        ),
+        ModelSpec(
+            id="openai/gpt-5-6-terra",
+            adapter="openai",
+            adapter_model_name="gpt-5.6-terra",
+            capability_score=97,
+            input_per_mtok_usd=2.5,
+            output_per_mtok_usd=15.0,
+            context_window=1_050_000,
+            billing="api",
+            tags=[
+                "openai",
+                "quality",
+                "vision",
+                "code",
+                "reasoning",
+                "long-context",
+            ],
+            notes=(
+                "OpenAI GPT-5.6 Terra — balanced tier. 1.05M context. "
+                "Competitive with GPT-5.5 at half the output cost. Some "
+                "accounts still return limited-preview 404 until rollout "
+                "completes."
+            ),
+        ),
+        ModelSpec(
+            id="openai/gpt-5-6-luna",
+            adapter="openai",
+            adapter_model_name="gpt-5.6-luna",
+            capability_score=90,
+            input_per_mtok_usd=1.0,
+            output_per_mtok_usd=6.0,
+            context_window=1_050_000,
+            billing="api",
+            tags=["openai", "balanced", "fast", "vision", "code", "long-context"],
+            notes=(
+                "OpenAI GPT-5.6 Luna — cheap/fast tier. 1.05M context. "
+                "Strong value for implementation and subagent work. Some "
+                "accounts still return limited-preview 404 until rollout "
+                "completes."
+            ),
+        ),
         ModelSpec(
             id="openai/gpt-5-5",
             adapter="openai",
@@ -503,6 +594,69 @@ def starter_registry() -> list[ModelSpec]:
                 "OpenAI nano tier. Cheapest member of the GPT-5 family for "
                 "high-throughput reading, classification, and trivial edits. "
                 "Pricing is an estimate; update once nano pricing is public."
+            ),
+        ),
+        ModelSpec(
+            id="codex/gpt-5-6-sol",
+            adapter="codex",
+            adapter_model_name="gpt-5.6-sol",
+            capability_score=100,
+            input_per_mtok_usd=5.0,
+            output_per_mtok_usd=30.0,
+            context_window=1_050_000,
+            tags=[
+                "codex",
+                "frontier",
+                "vision",
+                "reasoning",
+                "code",
+                "agent-loop",
+                "long-context",
+            ],
+            notes=(
+                "OpenAI Codex CLI driving gpt-5.6-sol. Same underlying model "
+                "and billing as openai/gpt-5-6-sol, but ships an in-CLI agent "
+                "loop. Capability_score is 1 higher than openai/gpt-5-6-sol to "
+                "reflect the agent-loop advantage on multi-file refactors."
+            ),
+        ),
+        ModelSpec(
+            id="codex/gpt-5-6-terra",
+            adapter="codex",
+            adapter_model_name="gpt-5.6-terra",
+            capability_score=98,
+            input_per_mtok_usd=2.5,
+            output_per_mtok_usd=15.0,
+            context_window=1_050_000,
+            tags=[
+                "codex",
+                "quality",
+                "vision",
+                "code",
+                "reasoning",
+                "agent-loop",
+                "long-context",
+            ],
+            notes=(
+                "Codex CLI driving gpt-5.6-terra. Balanced tier with the Codex "
+                "agent loop enabled. Capability_score is 1 higher than "
+                "openai/gpt-5-6-terra for the same agent-loop reason as "
+                "codex/gpt-5-6-sol."
+            ),
+        ),
+        ModelSpec(
+            id="codex/gpt-5-6-luna",
+            adapter="codex",
+            adapter_model_name="gpt-5.6-luna",
+            capability_score=91,
+            input_per_mtok_usd=1.0,
+            output_per_mtok_usd=6.0,
+            context_window=1_050_000,
+            tags=["codex", "balanced", "vision", "code", "agent-loop", "long-context"],
+            notes=(
+                "Codex CLI driving gpt-5.6-luna. Cheap/fast tier with the "
+                "Codex agent loop. Capability_score is 1 higher than "
+                "openai/gpt-5-6-luna."
             ),
         ),
         ModelSpec(

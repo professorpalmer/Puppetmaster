@@ -4238,7 +4238,7 @@ def agentic_schema() -> JsonObject:
             },
             "reasoning_effort": {
                 "type": "string",
-                "enum": ["none", "low", "medium", "high", "xhigh"],
+                "enum": ["none", "low", "medium", "high", "xhigh", "max"],
                 "description": "Reasoning effort level for OpenAI-style models.",
             },
             "allow_dirty": {
@@ -4323,7 +4323,7 @@ def openai_schema() -> JsonObject:
             },
             "reasoning_effort": {
                 "type": "string",
-                "enum": ["none", "low", "medium", "high", "xhigh"],
+                "enum": ["none", "low", "medium", "high", "xhigh", "max"],
                 "description": "Reasoning effort level for GPT-5+ models.",
             },
             "disable_codegraph": {

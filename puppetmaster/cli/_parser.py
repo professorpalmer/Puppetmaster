@@ -1093,7 +1093,10 @@ def build_parser() -> argparse.ArgumentParser:
     openai.add_argument(
         "--model",
         default="gpt-5.4-mini",
-        help="OpenAI model id (gpt-5.5, gpt-5.4, gpt-5.4-mini, gpt-5.4-nano, ...).",
+        help=(
+            "OpenAI model id (gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, "
+            "gpt-5.5, gpt-5.4, gpt-5.4-mini, gpt-5.4-nano, ...)."
+        ),
     )
     openai.add_argument(
         "--base-url",
@@ -1123,7 +1126,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     openai.add_argument(
         "--reasoning-effort",
-        choices=["none", "low", "medium", "high", "xhigh"],
+        choices=["none", "low", "medium", "high", "xhigh", "max"],
         help="Reasoning effort level for GPT-5+ models.",
     )
     openai.add_argument("--timeout-seconds", type=int, default=300)
@@ -1155,7 +1158,10 @@ def build_parser() -> argparse.ArgumentParser:
     codex.add_argument(
         "--model",
         default="gpt-5.4-mini",
-        help="Model passed to `codex exec -m` (gpt-5.5, gpt-5.4, gpt-5.4-mini, ...).",
+        help=(
+            "Model passed to `codex exec -m` (gpt-5.6-sol, gpt-5.6-terra, "
+            "gpt-5.6-luna, gpt-5.5, gpt-5.4, gpt-5.4-mini, ...)."
+        ),
     )
     codex.add_argument(
         "--sandbox",
@@ -1300,7 +1306,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     agentic.add_argument(
         "--reasoning-effort",
-        choices=["none", "low", "medium", "high", "xhigh"],
+        choices=["none", "low", "medium", "high", "xhigh", "max"],
         help="Reasoning effort level for OpenAI-style models.",
     )
     agentic.add_argument(

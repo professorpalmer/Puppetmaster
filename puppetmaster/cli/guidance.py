@@ -10,7 +10,7 @@ from puppetmaster.installers import (
 
 _NOISY_LOG_EVENTS = {"task.lease_renewed", "run.heartbeat", "task.saved"}
 
-_OPENAI_EFFORT_LEVELS = ("none", "low", "medium", "high", "xhigh")
+_OPENAI_EFFORT_LEVELS = ("none", "low", "medium", "high", "xhigh", "max")
 
 _CODEX_EFFORT_LEVELS = ("low", "medium", "high")
 
