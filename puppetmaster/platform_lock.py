@@ -86,7 +86,20 @@ def _read_disabled(registry_path: Optional[Path] = None) -> set[str]:
 
 def _write_disabled(disabled: set[str], registry_path: Optional[Path] = None) -> Path:
     path = platform_config_path(registry_path)
-    payload = {"disabled": sorted(a for a in disabled if a in KNOWN_ADAPTERS)}
+    # Read-modify-write: platform.json is shared with other harnesses (e.g.
+    # Marionette stamps a "harness_initialized" marker it keys its first-run
+    # defaults on). Replacing the whole document strips foreign keys and makes
+    # the next harness boot re-apply ITS defaults, silently undoing an
+    # operator's `platform enable`. Preserve everything we don't own.
+    payload: dict = {}
+    if path.is_file():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(existing, dict):
+                payload = existing
+        except (json.JSONDecodeError, OSError):
+            payload = {}
+    payload["disabled"] = sorted(a for a in disabled if a in KNOWN_ADAPTERS)
     write_private_text(path, json.dumps(payload, indent=2) + "\n")
     return path
 

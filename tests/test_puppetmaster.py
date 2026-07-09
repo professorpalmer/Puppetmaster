@@ -15830,6 +15830,28 @@ class PlatformLockTests(unittest.TestCase):
             self.assertEqual(pl.enabled_adapters(p), set(pl.KNOWN_ADAPTERS))
             self.assertFalse(pl.is_restricted(p))
 
+    def test_write_preserves_foreign_keys(self) -> None:
+        # platform.json is shared with other harnesses: Marionette stamps a
+        # "harness_initialized" marker and keys its first-run defaults on it.
+        # A full-document replace here strips that marker, so the next
+        # Marionette boot re-applies its defaults and silently undoes the
+        # operator's `platform enable`. Writes must read-modify-write.
+        from puppetmaster import platform_lock as pl
+
+        with TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(pl.ONLY_ENV, None)
+            p = self._path(tmp)
+            cfg = pl.platform_config_path(p)
+            cfg.parent.mkdir(parents=True, exist_ok=True)
+            cfg.write_text(
+                json.dumps({"disabled": ["cursor"], "harness_initialized": True}),
+                encoding="utf-8",
+            )
+            pl.enable({"cursor"}, p)
+            data = json.loads(cfg.read_text(encoding="utf-8"))
+            self.assertNotIn("cursor", data["disabled"])
+            self.assertIs(data.get("harness_initialized"), True)
+
     def test_env_override_wins_over_file(self) -> None:
         from puppetmaster import platform_lock as pl
 
