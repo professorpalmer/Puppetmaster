@@ -72,7 +72,11 @@ from ._base import (
     verification_artifact,
     _should_emit_patch_artifact,
 )
-from ._context_budget import compress_history
+from ._context_budget import (
+    DEFAULT_COMPACT_AFTER_TURNS,
+    DEFAULT_KEEP_RECENT,
+    compress_history,
+)
 from ._delta_bus import delta_sink_for
 from ._delta_stream import DurableDeltaWriter
 from ._facade import facade
@@ -134,6 +138,8 @@ _VERIFY_TIMEOUT_SECONDS = 300
 # Prompt-token budget before older tool outputs are elided (Hermes-style live
 # compression). Conservative default that fits common 128k-window models; the
 # caller can raise/lower it per model via payload['context_token_budget'].
+# Turn-count compaction (DEFAULT_COMPACT_AFTER_TURNS) also stubs older tool
+# results even under budget; kill with PUPPETMASTER_HISTORY_COMPACT=0.
 DEFAULT_CONTEXT_TOKEN_BUDGET = 120_000
 
 # Back-compat aliases (older callers/tests referenced the analyze-tier defaults).
@@ -768,10 +774,22 @@ class AgenticAdapter(FullEditWorkerAdapter):
             if job_id and is_cancelled(job_id):
                 stop_reason = "cancelled"
                 break
-            # Shed the oldest large tool outputs before the call if the running
-            # conversation is nearing the context budget, so a long run degrades
-            # gracefully instead of 413-ing mid-flight.
-            messages, compressed = compress_history(messages, budget_tokens=context_budget)
+            # Shed older tool outputs before the call when the running
+            # conversation is nearing the context budget *or* the turn count
+            # crosses the compaction threshold, so a long run degrades
+            # gracefully instead of 413-ing mid-flight. Static system prefix
+            # bytes stay untouched (prompt-cache invariant).
+            keep_recent = int(task.payload.get("history_keep_recent", DEFAULT_KEEP_RECENT))
+            compact_after = int(
+                task.payload.get("history_compact_after_turns", DEFAULT_COMPACT_AFTER_TURNS)
+            )
+            messages, compressed = compress_history(
+                messages,
+                budget_tokens=context_budget,
+                keep_recent=keep_recent,
+                turn_count=turns,
+                compact_after_turns=compact_after,
+            )
             if compressed:
                 context_compressions += 1
             call_extra = dict(base_extra)

@@ -220,7 +220,12 @@ class ContextCompressionTests(unittest.TestCase):
         self.assertLessEqual(estimate_message_tokens(out), before)
         # The most recent tool output is preserved verbatim; an old one is elided.
         self.assertEqual(out[-1]["content"], big)
-        self.assertTrue(any("elided" in (m.get("content") or "") for m in out))
+        self.assertTrue(
+            any(
+                "compacted" in (m.get("content") or "") or "elided" in (m.get("content") or "")
+                for m in out
+            )
+        )
         # Structure intact: still one tool message per assistant tool_call.
         self.assertEqual(sum(1 for m in out if m.get("role") == "tool"), 6)
 
