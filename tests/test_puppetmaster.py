@@ -6574,6 +6574,63 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
         self.assertIn("Patched cli.py", findings[0].payload["claim"])
         self.assertNotIn(ArtifactType.RISK, [a.type for a in artifacts])
 
+    def test_codex_read_only_nested_wrappers_promote_without_degrading(self) -> None:
+        """Regression for Codex JSON shaped as {"finding": {...}} wrappers:
+        promote it as structured artifacts, not empty-or-unstructured salvage.
+        """
+        agent_text = json.dumps(
+            {
+                "artifacts": [
+                    {"finding": {"claim": "x", "evidence": ["a.py:1"], "confidence": 0.9}},
+                    {
+                        "risk": {
+                            "risk": "boom",
+                            "mitigation": "check",
+                            "evidence": ["b.py:2"],
+                            "confidence": 0.8,
+                        }
+                    },
+                    {
+                        "decision": {
+                            "decision": "ship",
+                            "why": "tests pass",
+                            "evidence": ["c.py:3"],
+                            "confidence": 0.85,
+                        }
+                    },
+                ]
+            }
+        )
+        events_stdout = "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "th_test"}),
+                json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": agent_text}}),
+                json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}}),
+            ]
+        )
+        streamed = StreamedProcess(returncode=0, stdout=events_stdout, stderr="", timed_out=False, live_log_path=None)
+        task = Task(
+            id="t-codex-nested",
+            job_id="job-codex-nested",
+            role="codex-review",
+            adapter="codex",
+            instruction="Review the repo.",
+            payload={"cwd": str(Path.cwd()), "sandbox": "read-only", "disable_codegraph": True},
+        )
+        clean = {"sha": "s", "changed_files": [], "untracked_files": [], "diff": ""}
+        with patch("puppetmaster.adapters.resolve_command", return_value="/usr/bin/codex"), patch(
+            "puppetmaster.adapters.git_snapshot", side_effect=[clean, clean]
+        ), patch("puppetmaster.adapters.run_streamed_subprocess", return_value=streamed):
+            artifacts = CodexAdapter().run(task, "goal", "worker")
+
+        self.assertEqual(artifacts[0].payload["result"], "passed")
+        self.assertNotIn("empty_or_unstructured", str(artifacts[0].payload.get("failure")))
+        self.assertEqual(
+            [a.type for a in artifacts[1:]],
+            [ArtifactType.FINDING, ArtifactType.RISK, ArtifactType.DECISION],
+        )
+        self.assertFalse(any(a.type == ArtifactType.RISK and "without structured" in a.payload.get("risk", "") for a in artifacts))
+
     def test_codex_read_only_prose_still_degrades(self) -> None:
         """Read-only Codex (review-style) keeps strict semantics: prose without
         structured artifacts is degraded, with the RISK marker preserved."""
@@ -22472,6 +22529,51 @@ class JsonPrefixDecodeTests(unittest.TestCase):
         artifacts = cursor_result_artifacts(task, "worker-hermes", text)
         self.assertEqual(len(artifacts), 1)
         self.assertEqual(artifacts[0].type, ArtifactType.FINDING)
+
+    def test_nested_artifact_wrappers_parse_as_typed_artifacts(self) -> None:
+        """Codex sometimes emits {"finding": {...}} items. Treat them as
+        structured artifacts instead of degraded stdout salvage.
+        """
+        from puppetmaster.adapters import cursor_result_artifacts
+
+        task = Task(
+            job_id="job",
+            role="codex-review",
+            instruction="inspect",
+            adapter="codex",
+            payload={},
+        )
+        text = json.dumps(
+            {
+                "artifacts": [
+                    {"finding": {"claim": "x", "evidence": ["a.py:1"], "confidence": 0.9}},
+                    {
+                        "risk": {
+                            "risk": "boom",
+                            "mitigation": "check",
+                            "evidence": ["b.py:2"],
+                            "confidence": 0.8,
+                        }
+                    },
+                    {
+                        "decision": {
+                            "decision": "ship",
+                            "why": "tests pass",
+                            "evidence": ["c.py:3"],
+                            "confidence": 0.85,
+                        }
+                    },
+                ]
+            }
+        )
+
+        artifacts = cursor_result_artifacts(task, "worker-codex", text, adapter="codex")
+
+        self.assertEqual(
+            [a.type for a in artifacts],
+            [ArtifactType.FINDING, ArtifactType.RISK, ArtifactType.DECISION],
+        )
+        self.assertEqual([a.evidence for a in artifacts], [["a.py:1"], ["b.py:2"], ["c.py:3"]])
 
     def test_prose_yields_zero_artifacts(self) -> None:
         from puppetmaster.adapters import cursor_result_artifacts

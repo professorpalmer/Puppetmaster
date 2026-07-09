@@ -554,6 +554,13 @@ def cursor_artifact_from_item(
 ) -> Optional[Artifact]:
     if not isinstance(item, dict):
         return None
+    wrapped_type = next(
+        (kind for kind in ("finding", "risk", "decision") if isinstance(item.get(kind), dict)),
+        None,
+    )
+    if wrapped_type:
+        wrapped = item[wrapped_type]
+        item = {**wrapped, "type": wrapped.get("type", wrapped_type)}
     artifact_type = str(item.get("type") or "").lower().strip()
     if artifact_type in {"findings", "swarm.finding"}:
         artifact_type = "finding"
