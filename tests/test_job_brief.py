@@ -126,6 +126,26 @@ class JobBriefInjectionTests(unittest.TestCase):
         self.assertEqual(assembled, base)
         self.assertNotIn(JOB_BRIEF_SECTION_HEADER, assembled)
 
+    def test_resolve_skips_git_probe_without_sidecar(self) -> None:
+        """Hot prompt path must not call git when no brief is on disk."""
+        task = Task(
+            job_id="missing-job-xyz",
+            role="implement",
+            instruction="noop",
+            payload={"cwd": str(Path.cwd())},
+        )
+        with mock.patch(
+            "puppetmaster.adapters._streaming._resolve_sidecar_state_dir",
+            return_value=None,
+        ), mock.patch(
+            "puppetmaster.state.find_state_dir_for_job",
+            return_value=None,
+        ), mock.patch("subprocess.run") as run:
+            from puppetmaster.job_brief import resolve_job_brief_for_task
+
+            self.assertEqual(resolve_job_brief_for_task(task), "")
+            run.assert_not_called()
+
     def test_job_brief_suppresses_duplicate_census(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

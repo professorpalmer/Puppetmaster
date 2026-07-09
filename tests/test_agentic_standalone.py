@@ -1214,11 +1214,13 @@ class AgenticLoopTests(unittest.TestCase):
             seen.append(list(messages))
             return turns[min(len(seen) - 1, len(turns) - 1)]
 
+        # Portable existence check (POSIX `test -f` is not a Windows shell builtin).
+        verify = 'python -c "import sys; sys.exit(0 if __import__(\'pathlib\').Path(\'FIXED\').is_file() else 1)"'
         task = Task(
             job_id="j", role="build", instruction="create sentinel",
             payload={"cwd": str(cwd), "provider": "anthropic", "model": "m",
                      "mode": "implement", "disable_codegraph": True,
-                     "verify_command": "test -f FIXED", "verify_baseline": False},
+                     "verify_command": verify, "verify_baseline": False},
         )
         with mock.patch.object(agentic, "provider_chat", side_effect=fake_chat):
             arts = self.adapter().run(task, task.instruction, "w1")

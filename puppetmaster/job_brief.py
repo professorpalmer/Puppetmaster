@@ -126,7 +126,16 @@ def read_job_brief(job_dir: Union[Path, str, None]) -> str:
 
 
 def resolve_job_brief_for_task(task) -> str:
-    """Load the job brief for ``task`` from the active state dir (never raises)."""
+    """Load the job brief for ``task`` from the active state dir (never raises).
+
+    Resolution order avoids a git probe on the hot prompt path (adapter unit
+    tests patch ``subprocess.run`` and treat unexpected git as a regression):
+
+    1. ``payload['job_brief']`` override
+    2. sidecar state dir (worker subprocess)
+    3. ``find_state_dir_for_job`` (directory scan, no git)
+    4. ``PUPPETMASTER_STATE_DIR`` only (env path; still no git)
+    """
     if not job_brief_enabled():
         return ""
     try:
@@ -139,14 +148,15 @@ def resolve_job_brief_for_task(task) -> str:
         if isinstance(inline, str) and inline.strip():
             return inline.strip() + ("\n" if not inline.endswith("\n") else "")
         from puppetmaster.adapters._streaming import _resolve_sidecar_state_dir
+        from puppetmaster.state import STATE_DIR_ENV, find_state_dir_for_job, resolve_state_dir
 
         state_dir = _resolve_sidecar_state_dir()
         if state_dir is None:
-            from puppetmaster.state import resolve_state_dir
-
-            cwd = payload.get("cwd")
+            state_dir = find_state_dir_for_job(job_id)
+        if state_dir is None and os.environ.get(STATE_DIR_ENV):
+            # Explicit env pin — resolve_state_dir short-circuits before git.
             try:
-                state_dir = resolve_state_dir(cwd=Path(cwd) if cwd else None)
+                state_dir = resolve_state_dir()
             except Exception:
                 state_dir = None
         if state_dir is None:
