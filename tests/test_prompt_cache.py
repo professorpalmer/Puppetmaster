@@ -1,4 +1,4 @@
-"""Anthropic prompt-caching markers for agentic workers."""
+"""Prompt-caching markers for agentic workers (Anthropic + OpenAI-wire)."""
 from __future__ import annotations
 
 import json
@@ -364,6 +364,341 @@ class AnthropicChatCacheIntegrationTests(unittest.TestCase):
             captured["body"]["system"][0]["cache_control"],
             {"type": "ephemeral", "ttl": "1h"},
         )
+
+
+class OpenAIExplicitCacheKindTests(unittest.TestCase):
+    def test_claude_slugs(self) -> None:
+        for model in (
+            "anthropic/claude-sonnet-4",
+            "claude-3-5-sonnet",
+            "openrouter/anthropic/claude-3.5-sonnet",
+        ):
+            with self.subTest(model=model):
+                self.assertEqual(providers._openai_explicit_cache_kind(model), "claude")
+
+    def test_qwen_slugs(self) -> None:
+        for model in (
+            "qwen/qwen3-coder",
+            "alibaba/qwen-max",
+            "qwen-plus",
+            "qwen2.5-coder-32b",
+        ):
+            with self.subTest(model=model):
+                self.assertEqual(providers._openai_explicit_cache_kind(model), "qwen")
+
+    def test_automatic_providers_unmarked(self) -> None:
+        for model in (
+            "gpt-4o",
+            "openai/gpt-4.1",
+            "google/gemini-2.5-pro",
+            "deepseek/deepseek-chat",
+            "x-ai/grok-3",
+            "moonshotai/kimi-k2",
+        ):
+            with self.subTest(model=model):
+                self.assertEqual(providers._openai_explicit_cache_kind(model), "")
+
+
+class ApplyOpenAIExplicitCacheTests(unittest.TestCase):
+    def _claude_body(self) -> dict:
+        return {
+            "model": "anthropic/claude-sonnet-4",
+            "messages": [
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "second"},
+                {"role": "user", "content": "third"},
+            ],
+            "tools": [_tool("edit_file"), _tool("read_file")],
+        }
+
+    def test_claude_gets_stable_1h_and_moving_ephemeral(self) -> None:
+        body = self._claude_body()
+        out = providers._apply_openai_explicit_cache(
+            body,
+            model="anthropic/claude-sonnet-4",
+            base_url="https://openrouter.ai/api/v1",
+        )
+        sys_msg = out["messages"][0]
+        self.assertEqual(
+            sys_msg["content"][0]["cache_control"],
+            {"type": "ephemeral", "ttl": "1h"},
+        )
+        self.assertNotIn("cache_control", out["tools"][0])
+        self.assertEqual(
+            out["tools"][-1]["cache_control"],
+            {"type": "ephemeral", "ttl": "1h"},
+        )
+        # History markers omit ttl (default 5m write).
+        self.assertEqual(
+            out["messages"][-2]["content"][0]["cache_control"],
+            {"type": "ephemeral"},
+        )
+        self.assertNotIn("ttl", out["messages"][-2]["content"][0]["cache_control"])
+        self.assertEqual(
+            out["messages"][-1]["content"][0]["cache_control"],
+            {"type": "ephemeral"},
+        )
+        # Prefer per-block markers; do not set conflicting top-level cache_control.
+        self.assertNotIn("cache_control", out)
+        self.assertIn("session_id", out)
+        self.assertEqual(len(out["session_id"]), 32)
+        # Original body stays unmarked.
+        self.assertEqual(body["messages"][0]["content"], "be terse")
+
+    def test_gpt_model_is_not_marked(self) -> None:
+        body = {
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "go"},
+            ],
+            "tools": [_tool("edit_file")],
+        }
+        expected = json.dumps(body, sort_keys=True)
+        out = providers._apply_openai_explicit_cache(
+            body,
+            model="gpt-4o",
+            base_url="https://openrouter.ai/api/v1",
+        )
+        self.assertEqual(json.dumps(out, sort_keys=True), expected)
+        self.assertEqual(_count_cache_markers(out), 0)
+        self.assertNotIn("session_id", out)
+
+    def test_qwen_gets_ephemeral_without_ttl(self) -> None:
+        body = {
+            "model": "qwen/qwen3-coder",
+            "messages": [
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "second"},
+                {"role": "user", "content": "third"},
+            ],
+            "tools": [_tool("edit_file"), _tool("read_file")],
+        }
+        out = providers._apply_openai_explicit_cache(
+            body,
+            model="qwen/qwen3-coder",
+            base_url="https://openrouter.ai/api/v1",
+        )
+        for marker in (
+            out["messages"][0]["content"][0]["cache_control"],
+            out["tools"][-1]["cache_control"],
+            out["messages"][-2]["content"][0]["cache_control"],
+            out["messages"][-1]["content"][0]["cache_control"],
+        ):
+            self.assertEqual(marker, {"type": "ephemeral"})
+            self.assertNotIn("ttl", marker)
+        self.assertIn("session_id", out)
+
+    def test_kill_switch_leaves_openai_body_unmarked(self) -> None:
+        body = self._claude_body()
+        expected = json.dumps(body, sort_keys=True)
+        with mock.patch.dict("os.environ", {"PUPPETMASTER_PROMPT_CACHE": "0"}):
+            out = providers._apply_openai_explicit_cache(
+                body,
+                model="anthropic/claude-sonnet-4",
+                base_url="https://openrouter.ai/api/v1",
+            )
+        self.assertEqual(json.dumps(out, sort_keys=True), expected)
+        self.assertEqual(_count_cache_markers(out), 0)
+
+    def test_env_5m_forces_claude_stable_without_ttl(self) -> None:
+        body = self._claude_body()
+        with mock.patch.dict(
+            "os.environ",
+            {"PUPPETMASTER_ANTHROPIC_CACHE_TTL": "5m"},
+        ):
+            out = providers._apply_openai_explicit_cache(
+                body,
+                model="anthropic/claude-sonnet-4",
+                base_url="https://api.openai.com/v1",
+            )
+        self.assertEqual(
+            out["messages"][0]["content"][0]["cache_control"],
+            {"type": "ephemeral"},
+        )
+        self.assertNotIn("ttl", out["messages"][0]["content"][0]["cache_control"])
+        self.assertEqual(
+            out["tools"][-1]["cache_control"],
+            {"type": "ephemeral"},
+        )
+        # Non-OpenRouter hosts do not get session_id sticky routing.
+        self.assertNotIn("session_id", out)
+
+    def test_explicit_session_id_from_extra(self) -> None:
+        body = self._claude_body()
+        out = providers._apply_openai_explicit_cache(
+            body,
+            model="anthropic/claude-sonnet-4",
+            base_url="https://openrouter.ai/api/v1",
+            extra={"session_id": "sticky-loop-1"},
+        )
+        self.assertEqual(out["session_id"], "sticky-loop-1")
+
+
+class OpenAIChatCacheIntegrationTests(unittest.TestCase):
+    def test_openrouter_claude_sync_path_applies_markers(self) -> None:
+        canned = {
+            "choices": [{
+                "message": {"content": "ok", "tool_calls": []},
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 5,
+                "total_tokens": 105,
+                "prompt_tokens_details": {"cached_tokens": 40},
+            },
+        }
+        captured = {}
+
+        def _capture(url, *, headers, body, timeout):
+            captured["body"] = body
+            return canned
+
+        with mock.patch.object(providers, "_post_json", side_effect=_capture):
+            turn = providers.provider_chat(
+                provider="openrouter",
+                model="anthropic/claude-sonnet-4",
+                api_key="k",
+                messages=[
+                    {"role": "system", "content": "be terse"},
+                    {"role": "user", "content": "first"},
+                    {"role": "assistant", "content": "second"},
+                    {"role": "user", "content": "third"},
+                ],
+                tools=[_tool("edit_file"), _tool("read_file")],
+            )
+        body = captured["body"]
+        self.assertEqual(
+            body["messages"][0]["content"][0]["cache_control"],
+            {"type": "ephemeral", "ttl": "1h"},
+        )
+        self.assertEqual(
+            body["tools"][-1]["cache_control"],
+            {"type": "ephemeral", "ttl": "1h"},
+        )
+        self.assertEqual(
+            body["messages"][-1]["content"][0]["cache_control"],
+            {"type": "ephemeral"},
+        )
+        self.assertNotIn("cache_control", body)
+        self.assertIn("session_id", body)
+        self.assertEqual(turn.usage["cached_tokens"], 40)
+
+    def test_openrouter_gpt_sync_path_unmarked(self) -> None:
+        canned = {
+            "choices": [{
+                "message": {"content": "ok", "tool_calls": []},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+        captured = {}
+
+        def _capture(url, *, headers, body, timeout):
+            captured["body"] = body
+            return canned
+
+        with mock.patch.object(providers, "_post_json", side_effect=_capture):
+            providers.provider_chat(
+                provider="openrouter",
+                model="openai/gpt-4o",
+                api_key="k",
+                messages=[
+                    {"role": "system", "content": "be terse"},
+                    {"role": "user", "content": "go"},
+                ],
+                tools=[_tool("edit_file")],
+            )
+        body = captured["body"]
+        self.assertEqual(_count_cache_markers(body), 0)
+        self.assertIsInstance(body["messages"][0]["content"], str)
+        self.assertNotIn("session_id", body)
+
+    def test_openrouter_qwen_sync_path_ephemeral_only(self) -> None:
+        canned = {
+            "choices": [{
+                "message": {"content": "ok", "tool_calls": []},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+        captured = {}
+
+        def _capture(url, *, headers, body, timeout):
+            captured["body"] = body
+            return canned
+
+        with mock.patch.object(providers, "_post_json", side_effect=_capture):
+            providers.provider_chat(
+                provider="openrouter",
+                model="qwen/qwen3-coder",
+                api_key="k",
+                messages=[
+                    {"role": "system", "content": "be terse"},
+                    {"role": "user", "content": "go"},
+                ],
+                tools=[_tool("edit_file")],
+            )
+        body = captured["body"]
+        self.assertEqual(
+            body["messages"][0]["content"][0]["cache_control"],
+            {"type": "ephemeral"},
+        )
+        self.assertNotIn("ttl", body["messages"][0]["content"][0]["cache_control"])
+        self.assertEqual(
+            body["tools"][-1]["cache_control"],
+            {"type": "ephemeral"},
+        )
+        self.assertNotIn("ttl", body["tools"][-1]["cache_control"])
+        self.assertIn("session_id", body)
+
+    def test_stream_path_applies_markers_for_claude(self) -> None:
+        lines = [
+            (
+                b'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}\n'
+            ),
+            (
+                b'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+                b'"usage":{"prompt_tokens":10,"completion_tokens":1,'
+                b'"total_tokens":11,"prompt_tokens_details":{"cached_tokens":4}}}\n'
+            ),
+            b"data: [DONE]\n",
+        ]
+
+        class FakeResp:
+            def __iter__(self):
+                return iter(lines)
+
+            def close(self):
+                pass
+
+        captured = {}
+
+        def _capture(url, *, headers, body, timeout):
+            captured["body"] = body
+            return FakeResp()
+
+        with mock.patch.object(providers, "_open_stream", side_effect=_capture):
+            turn = providers.provider_chat_streaming(
+                provider="openrouter",
+                model="anthropic/claude-sonnet-4",
+                api_key="k",
+                messages=[
+                    {"role": "system", "content": "be terse"},
+                    {"role": "user", "content": "go"},
+                ],
+                tools=[_tool("edit_file")],
+            )
+        self.assertEqual(turn.text, "hi")
+        self.assertEqual(turn.usage["cached_tokens"], 4)
+        self.assertEqual(
+            captured["body"]["messages"][0]["content"][0]["cache_control"],
+            {"type": "ephemeral", "ttl": "1h"},
+        )
+        self.assertIn("session_id", captured["body"])
 
 
 if __name__ == "__main__":

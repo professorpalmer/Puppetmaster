@@ -27,6 +27,7 @@ Both clients are normalized behind :func:`provider_chat`, which returns an
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import socket
@@ -42,6 +43,15 @@ _PROMPT_CACHE_OFF_VALUES = frozenset({"0", "false", "no", "off"})
 _ANTHROPIC_CACHE_TTL_5M_VALUES = frozenset({
     "5m", "5", "off", "disabled", "0", "false", "no",
 })
+# OpenRouter Qwen/Alibaba slugs that require explicit ephemeral cache_control
+# (automatic providers — OpenAI, Gemini, DeepSeek, Grok, Moonshot — are omitted).
+_QWEN_EXPLICIT_CACHE_SLUG_FRAGMENTS = (
+    "qwen-coder",
+    "qwen-max",
+    "qwen-plus",
+    "qwen2.5-coder",
+    "qwen3-coder",
+)
 
 
 def _anthropic_stable_cache_uses_1h() -> bool:
@@ -61,6 +71,36 @@ def _anthropic_cache_control(*, stable: bool) -> dict:
     if stable and _anthropic_stable_cache_uses_1h():
         return {"type": "ephemeral", "ttl": "1h"}
     return {"type": "ephemeral"}
+
+
+def _openai_explicit_cache_kind(model: str) -> str:
+    """Return ``claude``, ``qwen``, or empty string for OpenAI-wire models.
+
+    OpenRouter auto-caches OpenAI/Gemini/DeepSeek/Grok/Moonshot — only Claude
+    and Qwen/Alibaba need explicit ``cache_control`` breakpoints stamped here.
+    """
+    slug = (model or "").strip().lower()
+    if not slug:
+        return ""
+    if slug.startswith("anthropic/") or "claude" in slug:
+        return "claude"
+    if slug.startswith("qwen/") or slug.startswith("alibaba/"):
+        return "qwen"
+    leaf = slug.rsplit("/", 1)[-1]
+    if any(fragment in leaf for fragment in _QWEN_EXPLICIT_CACHE_SLUG_FRAGMENTS):
+        return "qwen"
+    return ""
+
+
+def _openai_cache_control(kind: str, *, stable: bool) -> dict:
+    """Build a cache_control marker for OpenAI-wire Claude/Qwen requests.
+
+    Claude reuses the Anthropic stable/moving TTL policy (1h vs default 5m).
+    Qwen only accepts ``{"type": "ephemeral"}`` — never stamp a ``ttl``.
+    """
+    if kind == "qwen":
+        return {"type": "ephemeral"}
+    return _anthropic_cache_control(stable=stable)
 
 
 # --- provider descriptors ---------------------------------------------------
@@ -378,11 +418,19 @@ def _openai_chat(
         body["tools"] = tools
     extra = dict(extra)
     force_tool = extra.pop("force_tool", None)
+    # session_id is consumed by the OpenAI-wire cache helper for sticky routing;
+    # keep it out of the generic extra merge so callers can pass it without
+    # relying on the upstream accepting an unknown field on non-OpenRouter hosts.
+    session_id = extra.pop("session_id", None)
     body.update(extra)
     if force_tool and tools:
         body["tool_choice"] = {"type": "function", "function": {"name": str(force_tool)}}
     if "openrouter.ai" in base_url:
         body["usage"] = {"include": True}
+    cache_extra = {"session_id": session_id} if session_id is not None else {}
+    body = _apply_openai_explicit_cache(
+        body, model=model, base_url=base_url, extra=cache_extra,
+    )
     auth = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     data = _post_json(
         f"{base_url}/chat/completions",
@@ -488,6 +536,145 @@ def _apply_anthropic_cache_control(body: dict) -> dict:
                 _mark_anthropic_cache_block(messages[-2], stable=False)
             if isinstance(messages[-1], dict):
                 _mark_anthropic_cache_block(messages[-1], stable=False)
+        return out
+    except Exception:
+        return body
+
+
+def _mark_openai_cache_block(msg: dict, marker: dict) -> None:
+    """Attach ``cache_control`` to an OpenAI chat-completions message.
+
+    Content may be a string or a list of parts. Empty / whitespace-only text
+    is skipped (providers reject markers on empty blocks). Non-text parts
+    (e.g. tool_calls-only assistants) are left unmarked.
+    """
+    content = msg.get("content")
+    if isinstance(content, list) and content:
+        last = content[-1]
+        if isinstance(last, dict):
+            if last.get("type") == "text" and not str(last.get("text") or "").strip():
+                return
+            if last.get("type") not in (None, "text"):
+                # Prefer marking a trailing text part when present.
+                for idx in range(len(content) - 1, -1, -1):
+                    part = content[idx]
+                    if (
+                        isinstance(part, dict)
+                        and part.get("type") == "text"
+                        and str(part.get("text") or "").strip()
+                    ):
+                        content[idx] = {**part, "cache_control": marker}
+                        return
+                return
+            content[-1] = {**last, "cache_control": marker}
+        elif isinstance(last, str) and last.strip():
+            content[-1] = {
+                "type": "text",
+                "text": last,
+                "cache_control": marker,
+            }
+    elif isinstance(content, str):
+        if not content.strip():
+            return
+        msg["content"] = [{
+            "type": "text",
+            "text": content,
+            "cache_control": marker,
+        }]
+
+
+def _openai_session_id_from_messages(messages: list) -> str:
+    """Stable sticky-routing id from the early conversation prefix."""
+    digest = hashlib.sha256()
+    for msg in messages[:3]:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "")
+        content = msg.get("content")
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    parts.append(str(part.get("text") or ""))
+                elif isinstance(part, str):
+                    parts.append(part)
+            content_key = "\n".join(parts)
+        else:
+            content_key = str(content or "")
+        digest.update(role.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(content_key.encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()[:32]
+
+
+def _apply_openai_explicit_cache(
+    body: dict,
+    *,
+    model: str,
+    base_url: str,
+    extra: Optional[dict] = None,
+) -> dict:
+    """Stamp explicit cache_control breakpoints on OpenAI-wire Claude/Qwen.
+
+    Prefer per-block markers (Marionette parity / fine control) over OpenRouter's
+    top-level ``cache_control`` automatic mode — do not set a top-level marker
+    that would fight per-block TTL policy. On OpenRouter, also set ``session_id``
+    for best-effort sticky routing across turns.
+
+    Never raises — on any failure the unmarked body is returned.
+    """
+    if not _prompt_cache_enabled():
+        return body
+    kind = _openai_explicit_cache_kind(model)
+    if not kind:
+        return body
+    try:
+        out = copy.deepcopy(body)
+        messages = out.get("messages")
+        if not isinstance(messages, list):
+            messages = []
+
+        # Stable: last system message + last tool schema (Claude 1h / Qwen ephemeral).
+        # System lives inside ``messages`` on the OpenAI wire (unlike Anthropic's
+        # top-level ``system``), so history markers below skip role=system.
+        for msg in reversed(messages):
+            if isinstance(msg, dict) and msg.get("role") == "system":
+                _mark_openai_cache_block(
+                    msg, _openai_cache_control(kind, stable=True),
+                )
+                break
+
+        tools = out.get("tools")
+        if isinstance(tools, list) and tools and isinstance(tools[-1], dict):
+            tools[-1] = {
+                **tools[-1],
+                "cache_control": _openai_cache_control(kind, stable=True),
+            }
+
+        # Moving history: last two non-system messages (ephemeral; Claude omits
+        # ttl so the write stays on the default 5m path).
+        convo_idxs = [
+            i for i, m in enumerate(messages)
+            if isinstance(m, dict) and m.get("role") != "system"
+        ]
+        if convo_idxs:
+            history_marker = _openai_cache_control(kind, stable=False)
+            for idx in convo_idxs[-2:]:
+                _mark_openai_cache_block(messages[idx], history_marker)
+
+        if "openrouter.ai" in (base_url or ""):
+            # Sticky routing so cache hits land on the same upstream worker.
+            if "session_id" not in out:
+                sid = None
+                if isinstance(extra, dict):
+                    raw_sid = extra.get("session_id")
+                    if raw_sid is not None and str(raw_sid).strip():
+                        sid = str(raw_sid).strip()
+                if not sid:
+                    sid = _openai_session_id_from_messages(messages)
+                if sid:
+                    out["session_id"] = sid
         return out
     except Exception:
         return body
@@ -650,6 +837,7 @@ def _openai_chat_stream(
 ) -> AssistantTurn:
     extra = dict(extra)
     force_tool = extra.pop("force_tool", None)
+    session_id = extra.pop("session_id", None)
     body: dict[str, Any] = {
         "model": model, "messages": messages,
         "stream_options": {"include_usage": True},
@@ -661,6 +849,10 @@ def _openai_chat_stream(
     body.update(extra)
     if "openrouter.ai" in base_url:
         body["usage"] = {"include": True}
+    cache_extra = {"session_id": session_id} if session_id is not None else {}
+    body = _apply_openai_explicit_cache(
+        body, model=model, base_url=base_url, extra=cache_extra,
+    )
     auth = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     response = _open_stream(
         f"{base_url}/chat/completions",
