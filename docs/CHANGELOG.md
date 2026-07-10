@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.16.0
+
+**Anthropic prompt-cache: 1h stable breakpoints, 5m moving history.**
+
+- Stable markers (system + last tool) default to `{"type":"ephemeral","ttl":"1h"}` so long agent loops keep cheap cache reads.
+- Moving history markers omit `ttl` (Anthropic's implicit 5m write) so each turn does not pay 2x on content that shifts immediately.
+- Override dense loops with `PUPPETMASTER_ANTHROPIC_CACHE_TTL=5m|off`.
+
 ## v1.15.0
 
 **Objective job receipts: was this run useful, or mostly transport tax?**

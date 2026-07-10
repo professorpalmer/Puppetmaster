@@ -43,7 +43,8 @@ class ApplyAnthropicCacheControlTests(unittest.TestCase):
         block = out["system"][0]
         self.assertEqual(block["type"], "text")
         self.assertEqual(block["text"], "be terse")
-        self.assertEqual(block["cache_control"], {"type": "ephemeral"})
+        # Stable breakpoint: 1h TTL by default.
+        self.assertEqual(block["cache_control"], {"type": "ephemeral", "ttl": "1h"})
         # Original body must stay unmarked (helper deep-copies).
         self.assertEqual(body["system"], "be terse")
 
@@ -60,7 +61,10 @@ class ApplyAnthropicCacheControlTests(unittest.TestCase):
         }
         out = providers._apply_anthropic_cache_control(body)
         self.assertNotIn("cache_control", out["tools"][0])
-        self.assertEqual(out["tools"][1]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(
+            out["tools"][1]["cache_control"],
+            {"type": "ephemeral", "ttl": "1h"},
+        )
 
     def test_last_and_second_to_last_messages_marked(self) -> None:
         body = {
@@ -76,8 +80,16 @@ class ApplyAnthropicCacheControlTests(unittest.TestCase):
         out = providers._apply_anthropic_cache_control(body)
         msgs = out["messages"]
         self.assertNotIn("cache_control", str(msgs[0]))
+        # Moving history markers omit ttl (Anthropic default 5m write).
         self.assertEqual(msgs[1]["content"][0]["cache_control"], {"type": "ephemeral"})
+        self.assertNotIn("ttl", msgs[1]["content"][0]["cache_control"])
         self.assertEqual(msgs[2]["content"][0]["cache_control"], {"type": "ephemeral"})
+        self.assertNotIn("ttl", msgs[2]["content"][0]["cache_control"])
+        # System stays on the stable 1h path.
+        self.assertEqual(
+            out["system"][0]["cache_control"],
+            {"type": "ephemeral", "ttl": "1h"},
+        )
 
     def test_whitespace_only_last_text_block_is_not_marked(self) -> None:
         body = {
@@ -98,9 +110,48 @@ class ApplyAnthropicCacheControlTests(unittest.TestCase):
         out = providers._apply_anthropic_cache_control(body)
         last = out["messages"][-1]["content"][-1]
         self.assertNotIn("cache_control", last)
-        # Second-to-last still gets a marker.
+        # Second-to-last still gets a moving (no-ttl) marker.
         prev = out["messages"][-2]["content"][0]
         self.assertEqual(prev["cache_control"], {"type": "ephemeral"})
+        self.assertNotIn("ttl", prev["cache_control"])
+
+    def test_env_5m_forces_stable_markers_without_ttl(self) -> None:
+        body = {
+            "model": "claude",
+            "system": "sys",
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "second"},
+                {"role": "user", "content": "third"},
+            ],
+            "tools": [
+                {"name": "a", "description": "", "input_schema": {"type": "object"}},
+                {"name": "b", "description": "", "input_schema": {"type": "object"}},
+            ],
+            "max_tokens": 64,
+        }
+        for force in ("5m", "5", "off", "disabled", "0", "false", "no"):
+            with self.subTest(force=force):
+                with mock.patch.dict(
+                    "os.environ",
+                    {"PUPPETMASTER_ANTHROPIC_CACHE_TTL": force},
+                ):
+                    out = providers._apply_anthropic_cache_control(body)
+                self.assertEqual(
+                    out["system"][0]["cache_control"],
+                    {"type": "ephemeral"},
+                )
+                self.assertNotIn("ttl", out["system"][0]["cache_control"])
+                self.assertEqual(
+                    out["tools"][-1]["cache_control"],
+                    {"type": "ephemeral"},
+                )
+                self.assertNotIn("ttl", out["tools"][-1]["cache_control"])
+                self.assertEqual(
+                    out["messages"][-1]["content"][0]["cache_control"],
+                    {"type": "ephemeral"},
+                )
+                self.assertLessEqual(_count_cache_markers(out), 4)
 
     def test_at_most_four_markers(self) -> None:
         body = {
@@ -191,9 +242,21 @@ class AnthropicChatCacheIntegrationTests(unittest.TestCase):
             )
         body = captured["body"]
         self.assertIsInstance(body["system"], list)
-        self.assertEqual(body["system"][0]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(
+            body["system"][0]["cache_control"],
+            {"type": "ephemeral", "ttl": "1h"},
+        )
         self.assertNotIn("cache_control", body["tools"][0])
-        self.assertEqual(body["tools"][-1]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(
+            body["tools"][-1]["cache_control"],
+            {"type": "ephemeral", "ttl": "1h"},
+        )
+        # History markers stay on the default 5m path (no ttl field).
+        msgs = body["messages"]
+        self.assertEqual(msgs[-2]["content"][0]["cache_control"], {"type": "ephemeral"})
+        self.assertNotIn("ttl", msgs[-2]["content"][0]["cache_control"])
+        self.assertEqual(msgs[-1]["content"][0]["cache_control"], {"type": "ephemeral"})
+        self.assertNotIn("ttl", msgs[-1]["content"][0]["cache_control"])
         self.assertLessEqual(_count_cache_markers(body), 4)
         self.assertEqual(turn.usage["cached_tokens"], 40)
         self.assertEqual(turn.usage["cache_write_tokens"], 60)
@@ -297,7 +360,10 @@ class AnthropicChatCacheIntegrationTests(unittest.TestCase):
         self.assertEqual(turn.usage["cached_tokens"], 40)
         self.assertEqual(turn.usage["cache_write_tokens"], 60)
         self.assertIsInstance(captured["body"]["system"], list)
-        self.assertEqual(captured["body"]["system"][0]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(
+            captured["body"]["system"][0]["cache_control"],
+            {"type": "ephemeral", "ttl": "1h"},
+        )
 
 
 if __name__ == "__main__":

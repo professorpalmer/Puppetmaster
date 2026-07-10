@@ -35,8 +35,32 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional
 
-_ANTHROPIC_CACHE_CONTROL = {"type": "ephemeral"}
 _PROMPT_CACHE_OFF_VALUES = frozenset({"0", "false", "no", "off"})
+# Stable breakpoints (system + last tool) use 1h TTL by default; moving
+# history breakpoints keep Anthropic's implicit 5m write. Force all-5m via
+# PUPPETMASTER_ANTHROPIC_CACHE_TTL=5m (or off/disabled synonyms).
+_ANTHROPIC_CACHE_TTL_5M_VALUES = frozenset({
+    "5m", "5", "off", "disabled", "0", "false", "no",
+})
+
+
+def _anthropic_stable_cache_uses_1h() -> bool:
+    raw = (os.environ.get("PUPPETMASTER_ANTHROPIC_CACHE_TTL") or "1h").strip().lower()
+    return raw not in _ANTHROPIC_CACHE_TTL_5M_VALUES
+
+
+def _anthropic_cache_control(*, stable: bool) -> dict:
+    """Build an Anthropic cache_control marker.
+
+    Stable prefixes (system prompt, last tool schema) pay for a 1h write so
+    long agent loops reuse the same breakpoint. Moving history markers omit
+    ``ttl`` (Anthropic's default 5m write) so each turn doesn't pay 2x on
+    content that will change immediately. Dense loops can force all-5m via
+    ``PUPPETMASTER_ANTHROPIC_CACHE_TTL=5m``.
+    """
+    if stable and _anthropic_stable_cache_uses_1h():
+        return {"type": "ephemeral", "ttl": "1h"}
+    return {"type": "ephemeral"}
 
 
 # --- provider descriptors ---------------------------------------------------
@@ -393,36 +417,40 @@ def _prompt_cache_enabled() -> bool:
     return raw not in _PROMPT_CACHE_OFF_VALUES
 
 
-def _mark_anthropic_cache_block(msg: dict) -> None:
+def _mark_anthropic_cache_block(msg: dict, *, stable: bool = False) -> None:
     """Attach an ephemeral cache_control marker to a conversation message.
 
     Anthropic 400s on ``cache_control`` for empty text blocks, so only mark a
     block that carries real content. Whitespace-only text is skipped entirely;
     non-text blocks (tool_use / tool_result / image) may carry the marker.
+    History callers leave ``stable=False`` (default 5m write); only system /
+    tool breakpoints should pass ``stable=True``.
     """
+    marker = _anthropic_cache_control(stable=stable)
     content = msg.get("content")
     if isinstance(content, list) and content:
         last = content[-1]
         if isinstance(last, dict):
             if last.get("type") == "text" and not str(last.get("text") or "").strip():
                 return
-            content[-1] = {**last, "cache_control": dict(_ANTHROPIC_CACHE_CONTROL)}
+            content[-1] = {**last, "cache_control": marker}
     elif isinstance(content, str):
         if not content.strip():
             return
         msg["content"] = [{
             "type": "text",
             "text": content,
-            "cache_control": dict(_ANTHROPIC_CACHE_CONTROL),
+            "cache_control": marker,
         }]
 
 
 def _apply_anthropic_cache_control(body: dict) -> dict:
     """Opt into Anthropic prompt caching via cache_control breakpoints.
 
-    Marks up to four blocks (Anthropic's per-request cap): system, last tool,
-    second-to-last message, and last message. Never raises -- on any failure
-    the unmarked body is returned so a lost cache never fails the request.
+    Marks up to four blocks (Anthropic's per-request cap): system + last tool
+    as stable 1h breakpoints, and the second-to-last + last messages as moving
+    5m breakpoints. Never raises -- on any failure the unmarked body is
+    returned so a lost cache never fails the request.
     """
     if not _prompt_cache_enabled():
         return body
@@ -433,30 +461,33 @@ def _apply_anthropic_cache_control(body: dict) -> dict:
             out["system"] = [{
                 "type": "text",
                 "text": system,
-                "cache_control": dict(_ANTHROPIC_CACHE_CONTROL),
+                "cache_control": _anthropic_cache_control(stable=True),
             }]
         elif isinstance(system, list) and system:
             last = system[-1]
             if isinstance(last, dict):
                 if not (last.get("type") == "text" and not str(last.get("text") or "").strip()):
-                    system[-1] = {**last, "cache_control": dict(_ANTHROPIC_CACHE_CONTROL)}
+                    system[-1] = {**last, "cache_control": _anthropic_cache_control(stable=True)}
             elif isinstance(last, str) and last.strip():
                 system[-1] = {
                     "type": "text",
                     "text": last,
-                    "cache_control": dict(_ANTHROPIC_CACHE_CONTROL),
+                    "cache_control": _anthropic_cache_control(stable=True),
                 }
 
         tools = out.get("tools")
         if isinstance(tools, list) and tools and isinstance(tools[-1], dict):
-            tools[-1] = {**tools[-1], "cache_control": dict(_ANTHROPIC_CACHE_CONTROL)}
+            tools[-1] = {
+                **tools[-1],
+                "cache_control": _anthropic_cache_control(stable=True),
+            }
 
         messages = out.get("messages")
         if isinstance(messages, list) and messages:
             if len(messages) >= 2 and isinstance(messages[-2], dict):
-                _mark_anthropic_cache_block(messages[-2])
+                _mark_anthropic_cache_block(messages[-2], stable=False)
             if isinstance(messages[-1], dict):
-                _mark_anthropic_cache_block(messages[-1])
+                _mark_anthropic_cache_block(messages[-1], stable=False)
         return out
     except Exception:
         return body

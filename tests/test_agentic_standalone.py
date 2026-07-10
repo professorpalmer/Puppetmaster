@@ -108,7 +108,10 @@ class ProviderChatTests(unittest.TestCase):
         if isinstance(system, list):
             self.assertEqual(system[0]["type"], "text")
             self.assertEqual(system[0]["text"], "be terse")
-            self.assertEqual(system[0].get("cache_control"), {"type": "ephemeral"})
+            self.assertEqual(
+                system[0].get("cache_control"),
+                {"type": "ephemeral", "ttl": "1h"},
+            )
         else:
             self.assertEqual(system, "be terse")
         self.assertEqual(captured["body"]["tools"][0]["name"], "edit_file")
