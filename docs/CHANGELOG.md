@@ -1,5 +1,13 @@
 ﻿# Changelog
 
+## v1.18.0
+
+**AGNT-style all-1h Anthropic prompt cache (agentic BYOK).**
+
+- Claude breakpoints (system, last tool, and moving history) all default to `ttl:1h` — hybrid 1h-stable/5m-history double-wrote history each turn.
+- Qwen stays ephemeral-only (no ttl). Automatic providers (OpenAI/Gemini/DeepSeek/Grok/Moonshot) remain unmarked.
+- Override with `PUPPETMASTER_ANTHROPIC_CACHE_TTL=5m|off`. Paired with Marionette v0.9.29.
+
 ## v1.17.0
 
 **OpenAI-wire explicit prompt cache for Claude + Qwen (OpenRouter).**
@@ -1312,3 +1320,4 @@ Polish pass after v0.7.0 â€” diagnostics, doctor honesty, and README freshn
 - Broaden provider adapters beyond Cursor.
 - Improve patch artifact generation and isolated apply flows.
 - Add richer watch output and scripting-friendly JSON modes.
+

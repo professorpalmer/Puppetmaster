@@ -80,12 +80,15 @@ class ApplyAnthropicCacheControlTests(unittest.TestCase):
         out = providers._apply_anthropic_cache_control(body)
         msgs = out["messages"]
         self.assertNotIn("cache_control", str(msgs[0]))
-        # Moving history markers omit ttl (Anthropic default 5m write).
-        self.assertEqual(msgs[1]["content"][0]["cache_control"], {"type": "ephemeral"})
-        self.assertNotIn("ttl", msgs[1]["content"][0]["cache_control"])
-        self.assertEqual(msgs[2]["content"][0]["cache_control"], {"type": "ephemeral"})
-        self.assertNotIn("ttl", msgs[2]["content"][0]["cache_control"])
-        # System stays on the stable 1h path.
+        # All-1h policy: history markers get ttl:1h alongside system/tools.
+        self.assertEqual(
+            msgs[1]["content"][0]["cache_control"],
+            {"type": "ephemeral", "ttl": "1h"},
+        )
+        self.assertEqual(
+            msgs[2]["content"][0]["cache_control"],
+            {"type": "ephemeral", "ttl": "1h"},
+        )
         self.assertEqual(
             out["system"][0]["cache_control"],
             {"type": "ephemeral", "ttl": "1h"},
@@ -110,10 +113,9 @@ class ApplyAnthropicCacheControlTests(unittest.TestCase):
         out = providers._apply_anthropic_cache_control(body)
         last = out["messages"][-1]["content"][-1]
         self.assertNotIn("cache_control", last)
-        # Second-to-last still gets a moving (no-ttl) marker.
+        # Second-to-last still gets a history marker (all-1h).
         prev = out["messages"][-2]["content"][0]
-        self.assertEqual(prev["cache_control"], {"type": "ephemeral"})
-        self.assertNotIn("ttl", prev["cache_control"])
+        self.assertEqual(prev["cache_control"], {"type": "ephemeral", "ttl": "1h"})
 
     def test_env_5m_forces_stable_markers_without_ttl(self) -> None:
         body = {
@@ -251,12 +253,16 @@ class AnthropicChatCacheIntegrationTests(unittest.TestCase):
             body["tools"][-1]["cache_control"],
             {"type": "ephemeral", "ttl": "1h"},
         )
-        # History markers stay on the default 5m path (no ttl field).
+        # History markers follow all-1h (ttl:1h) alongside system/tools.
         msgs = body["messages"]
-        self.assertEqual(msgs[-2]["content"][0]["cache_control"], {"type": "ephemeral"})
-        self.assertNotIn("ttl", msgs[-2]["content"][0]["cache_control"])
-        self.assertEqual(msgs[-1]["content"][0]["cache_control"], {"type": "ephemeral"})
-        self.assertNotIn("ttl", msgs[-1]["content"][0]["cache_control"])
+        self.assertEqual(
+            msgs[-2]["content"][0]["cache_control"],
+            {"type": "ephemeral", "ttl": "1h"},
+        )
+        self.assertEqual(
+            msgs[-1]["content"][0]["cache_control"],
+            {"type": "ephemeral", "ttl": "1h"},
+        )
         self.assertLessEqual(_count_cache_markers(body), 4)
         self.assertEqual(turn.usage["cached_tokens"], 40)
         self.assertEqual(turn.usage["cache_write_tokens"], 60)
@@ -412,7 +418,7 @@ class ApplyOpenAIExplicitCacheTests(unittest.TestCase):
             "tools": [_tool("edit_file"), _tool("read_file")],
         }
 
-    def test_claude_gets_stable_1h_and_moving_ephemeral(self) -> None:
+    def test_claude_gets_all_1h_including_history(self) -> None:
         body = self._claude_body()
         out = providers._apply_openai_explicit_cache(
             body,
@@ -429,15 +435,14 @@ class ApplyOpenAIExplicitCacheTests(unittest.TestCase):
             out["tools"][-1]["cache_control"],
             {"type": "ephemeral", "ttl": "1h"},
         )
-        # History markers omit ttl (default 5m write).
+        # History markers also get ttl:1h (all-1h policy).
         self.assertEqual(
             out["messages"][-2]["content"][0]["cache_control"],
-            {"type": "ephemeral"},
+            {"type": "ephemeral", "ttl": "1h"},
         )
-        self.assertNotIn("ttl", out["messages"][-2]["content"][0]["cache_control"])
         self.assertEqual(
             out["messages"][-1]["content"][0]["cache_control"],
-            {"type": "ephemeral"},
+            {"type": "ephemeral", "ttl": "1h"},
         )
         # Prefer per-block markers; do not set conflicting top-level cache_control.
         self.assertNotIn("cache_control", out)
@@ -503,7 +508,7 @@ class ApplyOpenAIExplicitCacheTests(unittest.TestCase):
         self.assertEqual(json.dumps(out, sort_keys=True), expected)
         self.assertEqual(_count_cache_markers(out), 0)
 
-    def test_env_5m_forces_claude_stable_without_ttl(self) -> None:
+    def test_env_5m_forces_claude_all_markers_without_ttl(self) -> None:
         body = self._claude_body()
         with mock.patch.dict(
             "os.environ",
@@ -514,15 +519,14 @@ class ApplyOpenAIExplicitCacheTests(unittest.TestCase):
                 model="anthropic/claude-sonnet-4",
                 base_url="https://api.openai.com/v1",
             )
-        self.assertEqual(
+        for marker in (
             out["messages"][0]["content"][0]["cache_control"],
-            {"type": "ephemeral"},
-        )
-        self.assertNotIn("ttl", out["messages"][0]["content"][0]["cache_control"])
-        self.assertEqual(
             out["tools"][-1]["cache_control"],
-            {"type": "ephemeral"},
-        )
+            out["messages"][-2]["content"][0]["cache_control"],
+            out["messages"][-1]["content"][0]["cache_control"],
+        ):
+            self.assertEqual(marker, {"type": "ephemeral"})
+            self.assertNotIn("ttl", marker)
         # Non-OpenRouter hosts do not get session_id sticky routing.
         self.assertNotIn("session_id", out)
 
@@ -581,7 +585,7 @@ class OpenAIChatCacheIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(
             body["messages"][-1]["content"][0]["cache_control"],
-            {"type": "ephemeral"},
+            {"type": "ephemeral", "ttl": "1h"},
         )
         self.assertNotIn("cache_control", body)
         self.assertIn("session_id", body)

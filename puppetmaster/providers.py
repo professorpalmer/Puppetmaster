@@ -37,8 +37,9 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional
 
 _PROMPT_CACHE_OFF_VALUES = frozenset({"0", "false", "no", "off"})
-# Stable breakpoints (system + last tool) use 1h TTL by default; moving
-# history breakpoints keep Anthropic's implicit 5m write. Force all-5m via
+# All Claude breakpoints (system + last tool + moving history) use 1h TTL by
+# default — AGNT measured all-1h cheaper than hybrid 1h-stable + 5m-history
+# (which double-writes history). Force all-5m (no ttl) via
 # PUPPETMASTER_ANTHROPIC_CACHE_TTL=5m (or off/disabled synonyms).
 _ANTHROPIC_CACHE_TTL_5M_VALUES = frozenset({
     "5m", "5", "off", "disabled", "0", "false", "no",
@@ -62,13 +63,17 @@ def _anthropic_stable_cache_uses_1h() -> bool:
 def _anthropic_cache_control(*, stable: bool) -> dict:
     """Build an Anthropic cache_control marker.
 
-    Stable prefixes (system prompt, last tool schema) pay for a 1h write so
-    long agent loops reuse the same breakpoint. Moving history markers omit
-    ``ttl`` (Anthropic's default 5m write) so each turn doesn't pay 2x on
-    content that will change immediately. Dense loops can force all-5m via
+    All Claude breakpoints — system, last tool schema, and moving history —
+    get ``ttl:1h`` by default. Hybrid 1h-stable + 5m-history double-wrote
+    history each turn; all-1h is cheaper (AGNT / Marionette parity). Dense
+    loops can force all-5m (omit ``ttl``) via
     ``PUPPETMASTER_ANTHROPIC_CACHE_TTL=5m``.
+
+    ``stable`` is retained for call-site clarity (system/tools vs history) but
+    no longer gates TTL when 1h mode is on.
     """
-    if stable and _anthropic_stable_cache_uses_1h():
+    _ = stable  # all-1h policy; param kept for call-site intent
+    if _anthropic_stable_cache_uses_1h():
         return {"type": "ephemeral", "ttl": "1h"}
     return {"type": "ephemeral"}
 
@@ -95,7 +100,7 @@ def _openai_explicit_cache_kind(model: str) -> str:
 def _openai_cache_control(kind: str, *, stable: bool) -> dict:
     """Build a cache_control marker for OpenAI-wire Claude/Qwen requests.
 
-    Claude reuses the Anthropic stable/moving TTL policy (1h vs default 5m).
+    Claude reuses the Anthropic all-1h TTL policy (or all-5m when forced).
     Qwen only accepts ``{"type": "ephemeral"}`` — never stamp a ``ttl``.
     """
     if kind == "qwen":
@@ -471,8 +476,8 @@ def _mark_anthropic_cache_block(msg: dict, *, stable: bool = False) -> None:
     Anthropic 400s on ``cache_control`` for empty text blocks, so only mark a
     block that carries real content. Whitespace-only text is skipped entirely;
     non-text blocks (tool_use / tool_result / image) may carry the marker.
-    History callers leave ``stable=False`` (default 5m write); only system /
-    tool breakpoints should pass ``stable=True``.
+    History callers pass ``stable=False`` for call-site clarity; under the
+    default all-1h policy every Claude marker still gets ``ttl:1h``.
     """
     marker = _anthropic_cache_control(stable=stable)
     content = msg.get("content")
@@ -496,8 +501,9 @@ def _apply_anthropic_cache_control(body: dict) -> dict:
     """Opt into Anthropic prompt caching via cache_control breakpoints.
 
     Marks up to four blocks (Anthropic's per-request cap): system + last tool
-    as stable 1h breakpoints, and the second-to-last + last messages as moving
-    5m breakpoints. Never raises -- on any failure the unmarked body is
+    + the second-to-last and last messages. All Claude markers use ``ttl:1h``
+    by default (all-1h policy); ``PUPPETMASTER_ANTHROPIC_CACHE_TTL=5m`` forces
+    all-5m (no ttl). Never raises -- on any failure the unmarked body is
     returned so a lost cache never fails the request.
     """
     if not _prompt_cache_enabled():
@@ -619,8 +625,10 @@ def _apply_openai_explicit_cache(
 
     Prefer per-block markers (Marionette parity / fine control) over OpenRouter's
     top-level ``cache_control`` automatic mode — do not set a top-level marker
-    that would fight per-block TTL policy. On OpenRouter, also set ``session_id``
-    for best-effort sticky routing across turns.
+    that would fight per-block TTL policy. Claude markers follow the all-1h
+    Anthropic policy (or all-5m when forced); Qwen stays ephemeral-only.
+    On OpenRouter, also set ``session_id`` for best-effort sticky routing
+    across turns.
 
     Never raises — on any failure the unmarked body is returned.
     """
@@ -635,7 +643,7 @@ def _apply_openai_explicit_cache(
         if not isinstance(messages, list):
             messages = []
 
-        # Stable: last system message + last tool schema (Claude 1h / Qwen ephemeral).
+        # System + last tool schema (Claude all-1h / Qwen ephemeral).
         # System lives inside ``messages`` on the OpenAI wire (unlike Anthropic's
         # top-level ``system``), so history markers below skip role=system.
         for msg in reversed(messages):
@@ -652,8 +660,8 @@ def _apply_openai_explicit_cache(
                 "cache_control": _openai_cache_control(kind, stable=True),
             }
 
-        # Moving history: last two non-system messages (ephemeral; Claude omits
-        # ttl so the write stays on the default 5m path).
+        # Moving history: last two non-system messages (Claude all-1h by
+        # default; Qwen ephemeral-only).
         convo_idxs = [
             i for i, m in enumerate(messages)
             if isinstance(m, dict) and m.get("role") != "system"
