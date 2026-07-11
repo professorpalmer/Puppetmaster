@@ -82,6 +82,64 @@ def _npx_disabled() -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _windows_spawn_safe(argv: list[str]) -> list[str]:
+    """Make ``argv`` launchable via ``subprocess`` on Windows.
+
+    ``CreateProcess`` (``shell=False``) cannot run ``.cmd`` / ``.bat`` shims —
+    that is the classic WinError 2 for bare ``codegraph`` / ``npx`` on PATH.
+    Route those through ``COMSPEC /c``, matching ``diagnostics._resolve_probe_command``.
+
+    Non-shim names are left unchanged (``.exe`` still resolves via PATHEXT;
+    tests that assert bare ``codegraph`` keep working).
+    """
+    if os.name != "nt" or not argv:
+        return list(argv)
+    exe = str(argv[0] or "")
+    if not exe:
+        return list(argv)
+    base = Path(exe).name.lower()
+    if base in ("cmd.exe", "cmd"):
+        return list(argv)
+    resolved = exe
+    if not (os.path.isfile(exe) or ("/" in exe) or ("\\" in exe)):
+        found = shutil.which(exe)
+        if found:
+            resolved = found
+    if resolved.lower().endswith((".cmd", ".bat")):
+        comspec = os.environ.get("COMSPEC") or "cmd.exe"
+        return [comspec, "/c", resolved, *[str(a) for a in argv[1:]]]
+    return list(argv)
+
+
+def _codegraph_js_entry(install: Path) -> Optional[Path]:
+    """Return the JS entrypoint inside an installed ``@colbymchenry/codegraph`` tree.
+
+    Package layout evolved: older installs used ``dist/bin/codegraph.js``;
+    current npm packages expose ``npm-shim.js`` as the ``bin`` and ship the
+    real CLI under an optional platform package. Accept all known shapes.
+    """
+    candidates = (
+        install / "dist" / "bin" / "codegraph.js",
+        install / "bin" / "codegraph.js",
+        install / "npm-shim.js",
+    )
+    for path in candidates:
+        if path.is_file():
+            return path
+    try:
+        nm = install / "node_modules" / "@colbymchenry"
+        if nm.is_dir():
+            for child in nm.iterdir():
+                if not child.is_dir() or not child.name.startswith("codegraph-"):
+                    continue
+                nested = child / "lib" / "dist" / "bin" / "codegraph.js"
+                if nested.is_file():
+                    return nested
+    except OSError:
+        pass
+    return None
+
+
 def _npx_codegraph_invocation() -> Optional[list[str]]:
     """Return ``[npx, -y, @colbymchenry/codegraph]`` when npx is available.
 
@@ -97,7 +155,7 @@ def _npx_codegraph_invocation() -> Optional[list[str]]:
     npx = shutil.which("npx")
     if not npx:
         return None
-    return [npx, "-y", CODEGRAPH_PACKAGE]
+    return _windows_spawn_safe([npx, "-y", CODEGRAPH_PACKAGE])
 
 
 def codegraph_available() -> bool:
@@ -145,24 +203,43 @@ def resolve_codegraph_invocation() -> list[str]:
 
     Only when none of the above resolve (no Node at all) do we return the bare
     ``codegraph`` command, whose "not found" failure surfaces the install hint.
+
+    On Windows every returned argv is passed through :func:`_windows_spawn_safe`
+    so ``.cmd`` shims never hit CreateProcess WinError 2.
     """
     env_node = os.environ.get("PUPPETMASTER_CODEGRAPH_NODE")
     env_js = os.environ.get("PUPPETMASTER_CODEGRAPH_JS")
     if env_node and env_js and Path(env_node).is_file() and Path(env_js).is_file():
-        return [env_node, env_js]
+        return _windows_spawn_safe([env_node, env_js])
 
     cursor_invocation = _cursor_codegraph_invocation()
     if cursor_invocation is not None:
-        return cursor_invocation
+        return _windows_spawn_safe(cursor_invocation)
 
-    if shutil.which(CODEGRAPH_COMMAND) is not None:
-        return [CODEGRAPH_COMMAND]
+    which_cg = shutil.which(CODEGRAPH_COMMAND)
+    if which_cg is not None:
+        # Prefer node + JS entry over the .cmd shim when the install is
+        # discoverable — avoids WinError 2 and ABI surprises.
+        try:
+            from puppetmaster.codegraph_repair import (
+                find_codegraph_install,
+                find_cursor_node,
+            )
+
+            install = find_codegraph_install()
+            js = _codegraph_js_entry(install) if install is not None else None
+            node = find_cursor_node()
+            if node is not None and js is not None:
+                return _windows_spawn_safe([str(node), str(js)])
+        except Exception:
+            pass
+        return _windows_spawn_safe([CODEGRAPH_COMMAND])
 
     npx_invocation = _npx_codegraph_invocation()
     if npx_invocation is not None:
         return npx_invocation
 
-    return [CODEGRAPH_COMMAND]
+    return _windows_spawn_safe([CODEGRAPH_COMMAND])
 
 
 # Resolving the Cursor-Node invocation shells out (`npm root -g`, filesystem
@@ -190,7 +267,7 @@ def _cursor_codegraph_invocation() -> Optional[list[str]]:
 
 
 def _compute_cursor_codegraph_invocation() -> Optional[list[str]]:
-    """Return ``[cursor_node, codegraph.js]`` when both are discoverable."""
+    """Return ``[runtime_node, codegraph_js]`` when both are discoverable."""
     # Imports deferred to avoid module-import-time cost in code paths
     # that never actually invoke codegraph (e.g. pure Puppetmaster swarm runs).
     try:
@@ -206,10 +283,8 @@ def _compute_cursor_codegraph_invocation() -> Optional[list[str]]:
     install = find_codegraph_install()
     if install is None:
         return None
-    js = install / "dist" / "bin" / "codegraph.js"
-    if not js.is_file():
-        js = install / "bin" / "codegraph.js"
-    if not js.is_file():
+    js = _codegraph_js_entry(install)
+    if js is None:
         return None
     return [str(node), str(js)]
 

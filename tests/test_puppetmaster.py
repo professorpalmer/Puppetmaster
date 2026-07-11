@@ -5030,6 +5030,58 @@ class PuppetmasterTests(unittest.TestCase):
             # first run pays a cold download). Only explicit commands take it.
             self.assertFalse(codegraph_mod.codegraph_available())
 
+    def test_windows_spawn_safe_wraps_cmd_shims(self) -> None:
+        """Regression: bare codegraph.CMD must not hit CreateProcess WinError 2."""
+        from puppetmaster import codegraph as codegraph_mod
+
+        cmd_path = r"C:\Users\me\AppData\Roaming\npm\codegraph.CMD"
+        with patch("puppetmaster.codegraph.os.name", "nt"), patch.dict(
+            os.environ, {"COMSPEC": r"C:\Windows\System32\cmd.exe"}
+        ):
+            self.assertEqual(
+                codegraph_mod._windows_spawn_safe([cmd_path, "status"]),
+                [r"C:\Windows\System32\cmd.exe", "/c", cmd_path, "status"],
+            )
+            with patch("puppetmaster.codegraph.shutil.which", return_value=cmd_path):
+                self.assertEqual(
+                    codegraph_mod._windows_spawn_safe(["codegraph", "init", "--index"]),
+                    [r"C:\Windows\System32\cmd.exe", "/c", cmd_path, "init", "--index"],
+                )
+
+    def test_codegraph_js_entry_accepts_npm_shim_layout(self) -> None:
+        """Current @colbymchenry/codegraph ships npm-shim.js as the bin entry."""
+        from puppetmaster import codegraph as codegraph_mod
+
+        with TemporaryDirectory() as tmp:
+            install = Path(tmp) / "codegraph"
+            install.mkdir()
+            shim = install / "npm-shim.js"
+            shim.write_text("// shim", encoding="utf-8")
+            self.assertEqual(codegraph_mod._codegraph_js_entry(install), shim)
+
+    def test_resolve_codegraph_invocation_uses_npm_shim_when_legacy_js_missing(self) -> None:
+        from puppetmaster import codegraph as codegraph_mod
+        from puppetmaster import codegraph_repair
+
+        codegraph_mod.reset_cursor_codegraph_invocation_cache()
+        self.addCleanup(codegraph_mod.reset_cursor_codegraph_invocation_cache)
+
+        with TemporaryDirectory() as tmp:
+            node = Path(tmp) / "node.exe"
+            node.write_text("ok", encoding="utf-8")
+            install = Path(tmp) / "codegraph"
+            install.mkdir()
+            shim = install / "npm-shim.js"
+            shim.write_text("// shim", encoding="utf-8")
+
+            with patch.object(codegraph_repair, "find_cursor_node", return_value=node), patch.object(
+                codegraph_repair, "find_codegraph_install", return_value=install
+            ), patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("PUPPETMASTER_CODEGRAPH_NODE", None)
+                os.environ.pop("PUPPETMASTER_CODEGRAPH_JS", None)
+                argv = codegraph_mod.resolve_codegraph_invocation()
+            self.assertEqual(argv, [str(node), str(shim)])
+
     def test_npx_fallback_disabled_by_env(self) -> None:
         """PUPPETMASTER_CODEGRAPH_NO_NPX=1 removes the npx leg entirely."""
         from puppetmaster import codegraph as codegraph_mod

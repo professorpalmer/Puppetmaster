@@ -1,5 +1,13 @@
 ﻿# Changelog
 
+## v1.18.1
+
+**Windows CodeGraph WinError 2: spawn `.cmd` shims and new npm-shim layout.**
+
+- Route `codegraph.CMD` / `npx.CMD` through `COMSPEC /c` so `CreateProcess` no longer fails with WinError 2 on Windows (Marionette indexer + MCP).
+- Recognize current `@colbymchenry/codegraph` entrypoints (`npm-shim.js` and platform optionalDependency CLIs), not only legacy `dist/bin/codegraph.js`.
+- Prefer `node` + JS entry over the bare PATH shim when the install is discoverable.
+
 ## v1.18.0
 
 **AGNT-style all-1h Anthropic prompt cache (agentic BYOK).**
