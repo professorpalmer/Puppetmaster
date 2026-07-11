@@ -97,7 +97,9 @@ def _windows_spawn_safe(argv: list[str]) -> list[str]:
     exe = str(argv[0] or "")
     if not exe:
         return list(argv)
-    base = Path(exe).name.lower()
+    # Avoid pathlib.Path here: tests patch os.name to "nt" on POSIX CI, and
+    # Path() then tries to construct WindowsPath (NotImplementedError).
+    base = exe.replace("\\", "/").rsplit("/", 1)[-1].lower()
     if base in ("cmd.exe", "cmd"):
         return list(argv)
     resolved = exe
