@@ -250,9 +250,9 @@ PROVIDER_REGISTRY: dict[str, ProviderDescriptor] = {
         presence_env_vars=("LMSTUDIO_BASE_URL", "PUPPETMASTER_LMSTUDIO"),
         label="LM Studio (local)",
     ),
-    # AWS Bedrock: Anthropic message/tool shapes over bedrock-runtime InvokeModel
-    # (bearer token or SigV4). base_url is region-derived unless BEDROCK_BASE_URL
-    # overrides it — see resolve_base_url / puppetmaster.bedrock.
+    # AWS Bedrock: Converse API (multi-provider) with SigV4 or bearer auth.
+    # base_url is region-derived unless BEDROCK_BASE_URL overrides it —
+    # see resolve_base_url / puppetmaster.bedrock.list_chat_model_ids.
     "bedrock": ProviderDescriptor(
         slug="bedrock",
         wire="anthropic",
@@ -300,13 +300,28 @@ def provider_key_pool(
     preserving order. The adapter rotates through this pool on auth / rate-limit
     failures so one throttled or revoked key doesn't sink a worker that has
     another good key on hand. Empty for a keyless provider or an unknown slug.
+
+    Bedrock is special: only ``AWS_BEARER_TOKEN_BEDROCK`` (+ numbered siblings)
+    enter the pool. Access-key / ``~/.aws`` IAM auth is resolved inside
+    ``bedrock_chat`` via SigV4 — never put an access-key id here (the agentic
+    loop would pass it as ``api_key`` and Bedrock would treat it as a bearer).
     """
     desc = get_provider(provider)
     if desc is None:
         return []
     env = env if env is not None else os.environ
-    keys: list[str] = []
-    seen: set[str] = set()
+    if desc.slug == "bedrock":
+        keys: list[str] = []
+        seen: set[str] = set()
+        for base in desc.api_key_env_vars:
+            for name in _numbered_env_names(base):
+                value = env.get(name)
+                if value and value.strip() and value.strip() not in seen:
+                    seen.add(value.strip())
+                    keys.append(value.strip())
+        return keys
+    keys = []
+    seen = set()
     for base in desc.api_key_env_vars:
         for name in _numbered_env_names(base):
             value = env.get(name)
@@ -1134,7 +1149,7 @@ def provider_chat(
     dispatches on the provider's wire protocol, and normalizes the response so
     the caller never branches on provider. Raises :class:`ProviderError` on any
     HTTP/transport/parse failure. ``provider=bedrock`` uses the stdlib Bedrock
-    client (bearer or SigV4 InvokeModel) — never Anthropic ``x-api-key``.
+    Converse client (bearer or SigV4) — never Anthropic ``x-api-key``.
     """
     desc = get_provider(provider)
     if desc is None:

@@ -472,9 +472,11 @@ def route_task(
             after_keys.append(spec)
         if not after_keys:
             raise NoEligibleModelError(
-                "No standalone (agentic) model has a usable provider key. Set a "
-                "provider key (e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY, "
-                "GEMINI_API_KEY, OPENROUTER_API_KEY) or enable another platform."
+                "No standalone (agentic) model has a usable provider credential. "
+                "Set a provider key (e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY, "
+                "GEMINI_API_KEY, OPENROUTER_API_KEY) or AWS Bedrock auth "
+                "(aws configure / AWS_ACCESS_KEY_ID / AWS_BEARER_TOKEN_BEDROCK), "
+                "or enable another platform."
             )
         candidates = after_keys
 

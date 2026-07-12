@@ -210,7 +210,9 @@ When a Hermes implement worker edits tracked files, Puppetmaster records a `patc
 
 ### `agentic`
 
-Runs Puppetmaster's **standalone, provider-agnostic worker**: an in-process tool-use loop that calls provider HTTP APIs directly with your own API key. No external agent CLI (no Cursor, Claude Code, Codex, or Hermes binary required) — just a visible provider key such as `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or `OPENROUTER_API_KEY`.
+Runs Puppetmaster's **standalone, provider-agnostic worker**: an in-process tool-use loop that calls provider HTTP APIs directly with your own API key (or AWS IAM for Bedrock). No external agent CLI (no Cursor, Claude Code, Codex, or Hermes binary required) — just a visible provider credential such as `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `OPENROUTER_API_KEY`, or AWS Bedrock (`AWS_BEARER_TOKEN_BEDROCK` / `AWS_ACCESS_KEY_ID`+`AWS_SECRET_ACCESS_KEY` / `~/.aws`, with `provider=bedrock`).
+
+**AWS Bedrock (v1.19+).** First-class `provider=bedrock` uses the Bedrock **Converse** API (Claude, Nova, DeepSeek, Z.AI, Moonshot, Qwen, … — whatever your account allow-lists). Model ids are discovered at runtime via `ListFoundationModels` / `ListInferenceProfiles` and merged into the agentic registry (`models discover --source agentic`). Prompt caching stamps Converse `cachePoint`s (same `PUPPETMASTER_PROMPT_CACHE` kill switch as Anthropic); token and cost meters fold cache reads into `tokens_cached` / `price_job` / `puppetmaster savings` exactly like other providers.
 
 Two modes share one loop:
 

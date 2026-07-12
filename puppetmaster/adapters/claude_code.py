@@ -46,20 +46,33 @@ DEFAULT_CLAUDE_CODE_MODEL = "claude-opus-4-8"
 
 
 _BEDROCK_MODEL_ID = re.compile(
-    r"^(arn:aws[\w-]*:bedrock:|(?:[a-z]{2}(?:-[a-z]+)?\.)?anthropic\.)"
+    r"^(?:"
+    r"arn:aws[\w-]*:bedrock:"
+    # Foundation / Marketplace ids: provider.model (amazon., deepseek., zai., …)
+    r"|(?:amazon|anthropic|cohere|deepseek|meta|minimax|mistral|moonshot|"
+    r"moonshotai|openai|qwen|zai)\."
+    # Cross-region inference profiles: us.anthropic.… / eu.meta.…
+    r"|(?:[a-z]{2}(?:-[a-z0-9]+)*)\.[a-z0-9][a-z0-9.-]*\."
+    r")"
 )
 
 
 def is_bedrock_model_id(model: object) -> bool:
-    """True when ``model`` is a Bedrock model id / inference-profile ARN.
+    """True when ``model`` is a Bedrock foundation / inference-profile id or ARN.
 
-    Bedrock expects ``anthropic.claude-...-v1:0``, a region-prefixed inference
-    profile (``us.anthropic.claude-...``), or a full ``arn:aws:bedrock:...`` ARN
-    — never a short ``claude-opus-4-8`` name.
+    Accepts any provider-shaped id (``amazon.nova-…``, ``deepseek.v3.2``,
+    ``zai.glm-5``, ``us.anthropic.claude-…``) and ``arn:aws:bedrock:…`` ARNs.
+    Rejects short Claude Code names like ``claude-opus-4-8`` (no provider dot)
+    and OpenRouter-style ``org/model`` slugs.
     """
     if not model:
         return False
-    return bool(_BEDROCK_MODEL_ID.match(str(model).strip()))
+    text = str(model).strip()
+    if text.startswith("arn:aws") and ":bedrock:" in text:
+        return True
+    if "/" in text:
+        return False
+    return bool(_BEDROCK_MODEL_ID.match(text))
 
 
 def resolve_claude_code_model(

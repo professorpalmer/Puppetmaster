@@ -1,5 +1,19 @@
 ﻿# Changelog
 
+## v1.19.1
+
+**Bedrock Converse multi-model daily driver: account discovery, prompt cache, cost/token parity.**
+
+- Chat path uses Bedrock **Converse** (not Anthropic-only InvokeModel) so Claude, Nova, Llama, Mistral, DeepSeek, Z.AI GLM, Moonshot, Qwen, MiniMax, etc. share one native schema under `provider=bedrock`.
+- `list_chat_model_ids()` discovers the caller's allow-listed catalog via `ListFoundationModels` + `ListInferenceProfiles` (IAM auth — account-specific, not a hardcoded Claude list).
+- Agentic registry seeding / `models discover --source agentic` merges live Bedrock ids (diversified across providers) when AWS credentials are present.
+- Converse **prompt cache**: stamps `cachePoint` on system, `toolConfig`, and the last two messages (same kill switch as other providers: `PUPPETMASTER_PROMPT_CACHE=0`). Live-verified cache write/read on Claude Haiku + Nova.
+- Usage normalization folds Bedrock's uncached-only `inputTokens` + cache read/write into `prompt_tokens` so `tokens_cached` stays a subset of `tokens_in` — swarm cost, `price_job` cache-read discount (0.1x), and Marionette `cache_savings_usd` meter Bedrock like Anthropic/OpenRouter.
+- `provider_key_pool("bedrock")` only returns bearer tokens — access-key / `~/.aws` IAM never enters the rotation pool (would be misread as Bearer).
+- Model-id gate accepts any Bedrock provider-shaped id (`deepseek.v3.2`, `zai.glm-5`, `amazon.nova-…`), not only `anthropic.*`.
+- SigV4 canonical URI double-encodes path segments so inference-profile ids with `:` sign correctly (`%3A` -> `%253A`).
+- Content-Type for Bedrock Runtime JSON is `application/json`.
+
 ## v1.19.0
 
 **AWS Bedrock as a first-class agentic provider (BYOK).**

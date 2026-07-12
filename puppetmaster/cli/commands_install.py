@@ -309,8 +309,9 @@ def _seed_hermes_registry() -> None:
 def _seed_agentic_registry() -> None:
     """Seed credential-backed agentic models into the router registry.
 
-    Only models whose provider has a visible API key are added — agentic never
-    injects uncallable keyless entries.
+    Only models whose provider has a visible credential are added — agentic
+    never injects uncallable keyless entries. When AWS Bedrock is available,
+    also merges a live account-specific Converse catalog (not Claude-only).
     """
     try:
         from puppetmaster.model_registry import (
@@ -329,11 +330,25 @@ def _seed_agentic_registry() -> None:
         merged, report = merge_curated_into_registry(
             "agentic", "api", existing, allowed_providers=allowed
         )
+        if "bedrock" in allowed:
+            try:
+                from puppetmaster.bedrock import merge_bedrock_discovered_into_registry
+
+                merged, bedrock_report = merge_bedrock_discovered_into_registry(merged)
+                report["bedrock"] = bedrock_report
+            except Exception as exc:
+                report["bedrock"] = {"error": repr(exc)}
         save_registry(merged, registry_path)
         if report["added"] or report["refreshed"]:
             print(
                 f"  registry  seeded agentic models "
                 f"(added={report['added']}, refreshed={report['refreshed']})"
+            )
+        br = report.get("bedrock") or {}
+        if br.get("added"):
+            print(
+                f"  registry  seeded bedrock models from account catalog "
+                f"(added={br['added']}, discovered={br.get('discovered', 0)})"
             )
         for skip in report.get("skipped", []):
             print(
@@ -342,9 +357,10 @@ def _seed_agentic_registry() -> None:
             )
         if not allowed:
             print(
-                "  registry  note: no provider API keys visible for agentic "
+                "  registry  note: no provider credentials visible for agentic "
                 "(OPENAI_API_KEY / ANTHROPIC_API_KEY / GEMINI_API_KEY / "
-                "GOOGLE_API_KEY / OPENROUTER_API_KEY). Add a key and re-run "
+                "GOOGLE_API_KEY / OPENROUTER_API_KEY / AWS Bedrock). Add a key "
+                "or `aws configure` and re-run "
                 "`puppetmaster models discover --source agentic --write`."
             )
     except Exception as exc:  # never let registry seeding abort the wizard

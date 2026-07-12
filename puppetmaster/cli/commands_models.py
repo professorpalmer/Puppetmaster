@@ -826,6 +826,17 @@ def _discover_one_source(source: str, registry: list):
         merged, report = merge_curated_into_registry(
             "agentic", "api", registry, allowed_providers=allowed
         )
+        # Account-specific Bedrock catalog (IAM allow-list) — not in the static
+        # curated list, because every AWS account sees a different model set.
+        # Only merge when Bedrock is actually available (same gate as catalog).
+        if "bedrock" in allowed:
+            try:
+                from puppetmaster.bedrock import merge_bedrock_discovered_into_registry
+
+                merged, bedrock_report = merge_bedrock_discovered_into_registry(merged)
+                report["bedrock"] = bedrock_report
+            except Exception as exc:
+                report["bedrock"] = {"error": repr(exc)}
         report["source"] = "agentic"
         report["available_providers"] = sorted(allowed)
         catalog = [
@@ -833,6 +844,17 @@ def _discover_one_source(source: str, registry: list):
             for item in curated_catalog("agentic")
             if (item.get("payload_defaults") or {}).get("provider") in allowed
         ]
+        if "bedrock" in allowed:
+            try:
+                from puppetmaster.bedrock import (
+                    diversify_chat_model_ids,
+                    list_chat_model_ids,
+                )
+
+                for mid in diversify_chat_model_ids(list_chat_model_ids()):
+                    catalog.append({"id": mid})
+            except Exception:
+                pass
         return merged, report, catalog
 
     if source in ("claude", "codex"):

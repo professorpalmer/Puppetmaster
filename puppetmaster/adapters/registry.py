@@ -33,11 +33,15 @@ ADAPTER_INFO = [
         status="built-in",
         description=(
             "Standalone provider-agnostic worker: runs its own tool-use loop "
-            "against a provider API directly (OpenAI-compatible or Anthropic) "
-            "for analyze and full-edit implement modes. No external agent CLI "
-            "required -- just the user's provider key."
+            "against a provider API directly (OpenAI-compatible, Anthropic, or "
+            "AWS Bedrock Converse) for analyze and full-edit implement modes. "
+            "No external agent CLI required — provider keys or AWS IAM auth."
         ),
-        requires=["a provider API key (e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY)"],
+        requires=[
+            "a provider API key (e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY, "
+            "GEMINI_API_KEY, OPENROUTER_API_KEY) or AWS Bedrock credentials "
+            "(AWS_ACCESS_KEY_ID / ~/.aws / AWS_BEARER_TOKEN_BEDROCK)"
+        ],
     ),
     AdapterInfo(
         name="shell",

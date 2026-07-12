@@ -1,12 +1,15 @@
 """AWS Bedrock client for agentic workers (stdlib only — no boto3).
 
-Lets standalone agentic workers call Claude (and later other) models on
-Bedrock with the user's AWS auth: bearer token (``AWS_BEARER_TOKEN_BEDROCK``)
-or SigV4-signed ``InvokeModel`` with access keys. Reuses Anthropic message /
-tool shapes; model ids must be Bedrock-shaped (inference profile / ARN).
+IAM/SigV4 (or optional ``AWS_BEARER_TOKEN_BEDROCK``) against the caller's
+account — not a single Bedrock API-key catalog. Chat uses the unified
+**Converse** API so Anthropic, Amazon Nova, Meta, Mistral, DeepSeek, Z.AI,
+Moonshot, Qwen, MiniMax, etc. share one request/response shape. Model ids are
+account-specific; :func:`list_chat_model_ids` discovers what this credential
+can see via ``ListFoundationModels`` + ``ListInferenceProfiles``.
 """
 from __future__ import annotations
 
+import copy
 import datetime as _dt
 import hashlib
 import hmac
@@ -28,16 +31,40 @@ _MISSING_CREDS_MSG = (
 )
 
 _SHORT_MODEL_MSG = (
-    "is not a Bedrock model id. Set a Bedrock inference profile id "
-    "(e.g. us.anthropic.claude-sonnet-4-5-20250929-v1:0) or an "
+    "is not a Bedrock model id. Use a Bedrock foundation or inference profile id "
+    "(e.g. amazon.nova-micro-v1:0, deepseek.v3.2, "
+    "us.anthropic.claude-sonnet-4-5-20250929-v1:0) or an "
     "arn:aws:bedrock:... ARN — short names like claude-opus-4-8 are rejected."
 )
 
-_ANTHROPIC_BEDROCK_VERSION = "bedrock-2023-05-31"
-# Content type used by Bedrock Claude Messages / InvokeModel.
-_ANTHROPIC_MESSAGES_CONTENT_TYPE = (
-    "application/amazon.bedrock.anthropic.messages-v1+json"
+_NON_CHAT_MARKERS = (
+    "embedding",
+    "embed",
+    "rerank",
+    "canvas",
+    "reel",
+    "sonic",
+    "tts",
+    "whisper",
+    "transcribe",
+    "moderation",
+    "guard",
+    "image",
+    "video",
+    "speech",
+    "music",
+    "upscale",
+    "stable-diffusion",
+    "stability.",
+    "twelvelabs",
+    "pegasus",
+    "marengo",
 )
+
+_ANTHROPIC_BEDROCK_VERSION = "bedrock-2023-05-31"
+# InvokeModel requires application/json for Anthropic Claude (not the
+# amazon.bedrock.anthropic.messages-v1+json media type).
+_ANTHROPIC_MESSAGES_CONTENT_TYPE = "application/json"
 
 
 @dataclass(frozen=True)
@@ -254,7 +281,11 @@ def sigv4_sign_headers(
     """
     parsed = urllib.parse.urlparse(url)
     host = parsed.netloc
-    canonical_uri = parsed.path or "/"
+    # SigV4 canonical URI double-encodes path segments (``:`` -> ``%3A`` on the
+    # wire becomes ``%253A`` in the canonical request). ``quote(..., safe="/")``
+    # re-encodes any ``%`` already present from ``invoke_model_url``.
+    raw_path = parsed.path or "/"
+    canonical_uri = urllib.parse.quote(raw_path, safe="/")
     canonical_query = parsed.query or ""
 
     if amz_date is None:
@@ -312,9 +343,222 @@ def sigv4_sign_headers(
 
 
 def invoke_model_url(base_url: str, model_id: str) -> str:
-    """Bedrock Runtime ``InvokeModel`` URL for ``model_id``."""
+    """Bedrock Runtime ``InvokeModel`` URL for ``model_id`` (legacy Anthropic path)."""
     encoded = urllib.parse.quote(model_id, safe="")
     return f"{base_url.rstrip('/')}/model/{encoded}/invoke"
+
+
+def converse_model_url(base_url: str, model_id: str) -> str:
+    """Bedrock Runtime ``Converse`` URL for ``model_id``."""
+    encoded = urllib.parse.quote(model_id, safe="")
+    return f"{base_url.rstrip('/')}/model/{encoded}/converse"
+
+
+def bedrock_control_base_url(region: str) -> str:
+    """``https://bedrock.{region}.amazonaws.com`` (ListFoundationModels, etc.)."""
+    return f"https://bedrock.{region}.amazonaws.com"
+
+
+def _is_chat_capable_model_id(model_id: str) -> bool:
+    mid = (model_id or "").lower()
+    if not mid:
+        return False
+    return not any(marker in mid for marker in _NON_CHAT_MARKERS)
+
+
+def _content_to_converse_blocks(content: Any) -> list[dict]:
+    """Map OpenAI-ish message content to Converse content blocks."""
+    if content is None:
+        return []
+    if isinstance(content, str):
+        return [{"text": content}] if content else []
+    if isinstance(content, list):
+        blocks: list[dict] = []
+        for part in content:
+            if isinstance(part, str):
+                if part:
+                    blocks.append({"text": part})
+            elif isinstance(part, dict):
+                if "text" in part and part.get("text") is not None:
+                    blocks.append({"text": str(part["text"])})
+                elif part.get("type") == "text":
+                    blocks.append({"text": str(part.get("text") or "")})
+                elif "toolUse" in part or "toolResult" in part:
+                    blocks.append(part)
+        return blocks
+    return [{"text": str(content)}]
+
+
+def _openai_tools_to_converse(tools: Optional[list[dict]]) -> Optional[dict]:
+    """OpenAI function-tools → Converse ``toolConfig``."""
+    if not tools:
+        return None
+    specs: list[dict] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function") if tool.get("type") == "function" else tool
+        if not isinstance(fn, dict):
+            continue
+        name = (fn.get("name") or "").strip()
+        if not name:
+            continue
+        spec: dict[str, Any] = {
+            "toolSpec": {
+                "name": name,
+                "inputSchema": {"json": fn.get("parameters") or {"type": "object"}},
+            }
+        }
+        desc = (fn.get("description") or "").strip()
+        if desc:
+            spec["toolSpec"]["description"] = desc
+        specs.append(spec)
+    if not specs:
+        return None
+    return {"tools": specs}
+
+
+def _bedrock_cache_point() -> dict:
+    """Converse ``cachePoint`` block (default TTL; Bedrock stamps ttl in usage)."""
+    return {"cachePoint": {"type": "default"}}
+
+
+def apply_bedrock_converse_cache_points(body: dict) -> dict:
+    """Stamp Converse ``cachePoint`` breakpoints for prompt-cache reads.
+
+    Mirrors Anthropic ``cache_control`` placement (system + tools + last two
+    messages) on the Bedrock Converse schema so Claude/Nova/etc. write and hit
+    prompt caches. Honors ``PUPPETMASTER_PROMPT_CACHE`` (same kill switch as
+    Anthropic/OpenAI-wire). Never raises — a failed stamp returns ``body``.
+    """
+    try:
+        from puppetmaster.providers import _prompt_cache_enabled
+    except Exception:
+        return body
+    if not _prompt_cache_enabled():
+        return body
+    try:
+        out = copy.deepcopy(body)
+        system = out.get("system")
+        if isinstance(system, list) and system:
+            if not any(isinstance(b, dict) and "cachePoint" in b for b in system):
+                system.append(_bedrock_cache_point())
+
+        tool_config = out.get("toolConfig")
+        if isinstance(tool_config, dict) and tool_config.get("tools"):
+            tool_config["cachePoint"] = {"type": "default"}
+
+        messages = out.get("messages")
+        if isinstance(messages, list) and messages:
+            idxs = [len(messages) - 1]
+            if len(messages) > 1:
+                idxs.insert(0, len(messages) - 2)
+            for idx in idxs:
+                msg = messages[idx]
+                if not isinstance(msg, dict):
+                    continue
+                content = msg.get("content")
+                if not isinstance(content, list) or not content:
+                    continue
+                if any(isinstance(b, dict) and "cachePoint" in b for b in content):
+                    continue
+                content.append(_bedrock_cache_point())
+        return out
+    except Exception:
+        return body
+
+
+def build_converse_body(
+    *,
+    messages: list[dict],
+    tools: Optional[list[dict]],
+    extra: dict,
+) -> dict:
+    """Converse JSON body from OpenAI-shaped messages + tools."""
+    system_parts = [
+        str(m.get("content") or "")
+        for m in messages
+        if m.get("role") == "system" and m.get("content")
+    ]
+    convo: list[dict] = []
+    for msg in messages:
+        role = msg.get("role")
+        if role == "system":
+            continue
+        if role == "tool":
+            tool_use_id = str(msg.get("tool_call_id") or msg.get("id") or "")
+            result_content = _content_to_converse_blocks(msg.get("content"))
+            if not result_content:
+                result_content = [{"text": str(msg.get("content") or "")}]
+            convo.append({
+                "role": "user",
+                "content": [{
+                    "toolResult": {
+                        "toolUseId": tool_use_id,
+                        "content": result_content,
+                    }
+                }],
+            })
+            continue
+        if role == "assistant":
+            blocks = _content_to_converse_blocks(msg.get("content"))
+            for call in msg.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+                name = call.get("name") or fn.get("name") or ""
+                raw_args = call.get("arguments")
+                if raw_args is None:
+                    raw_args = fn.get("arguments")
+                if isinstance(raw_args, str):
+                    try:
+                        args_obj = json.loads(raw_args) if raw_args.strip() else {}
+                    except json.JSONDecodeError:
+                        args_obj = {"raw": raw_args}
+                elif isinstance(raw_args, dict):
+                    args_obj = raw_args
+                else:
+                    args_obj = {}
+                blocks.append({
+                    "toolUse": {
+                        "toolUseId": call.get("id") or "",
+                        "name": name,
+                        "input": args_obj,
+                    }
+                })
+            if not blocks:
+                blocks = [{"text": ""}]
+            convo.append({"role": "assistant", "content": blocks})
+            continue
+        # user (default)
+        blocks = _content_to_converse_blocks(msg.get("content"))
+        if not blocks:
+            blocks = [{"text": ""}]
+        convo.append({"role": "user", "content": blocks})
+
+    body: dict[str, Any] = {
+        "messages": convo,
+        "inferenceConfig": {
+            "maxTokens": int(
+                extra.get("max_tokens")
+                or extra.get("max_completion_tokens")
+                or 4096
+            ),
+        },
+    }
+    if system_parts:
+        body["system"] = [{"text": "\n\n".join(system_parts)}]
+    tool_config = _openai_tools_to_converse(tools)
+    if tool_config:
+        force_tool = extra.get("force_tool")
+        if force_tool:
+            tool_config["toolChoice"] = {"tool": {"name": str(force_tool)}}
+        body["toolConfig"] = tool_config
+    if "temperature" in extra:
+        body["inferenceConfig"]["temperature"] = float(extra["temperature"])
+    if "top_p" in extra:
+        body["inferenceConfig"]["topP"] = float(extra["top_p"])
+    return apply_bedrock_converse_cache_points(body)
 
 
 def build_anthropic_invoke_body(
@@ -393,6 +637,190 @@ def _post_bedrock(
         ) from exc
 
 
+def _get_bedrock(
+    url: str,
+    *,
+    headers: dict,
+    timeout: int,
+) -> dict:
+    from puppetmaster.providers import ProviderError
+
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        err_body = ""
+        try:
+            err_body = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            err_body = ""
+        raise ProviderError(
+            f"HTTP {exc.code}",
+            reason=f"http_status:{exc.code}",
+            status=exc.code,
+            body=err_body,
+        ) from exc
+    except (socket.timeout, TimeoutError) as exc:
+        raise ProviderError("request timed out", reason="timeout") from exc
+    except urllib.error.URLError as exc:
+        raise ProviderError(str(exc), reason="network_error") from exc
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ProviderError(
+            "malformed response", reason="malformed_response", body=raw[:8000]
+        ) from exc
+
+
+def _auth_headers_for_request(
+    *,
+    method: str,
+    url: str,
+    body_bytes: bytes,
+    region: str,
+    creds: BedrockCredentials,
+    content_type: Optional[str] = "application/json",
+    amz_date: Optional[str] = None,
+) -> dict:
+    """Bearer or SigV4 headers for a Bedrock control/runtime request."""
+    unsigned: dict[str, str] = {
+        "Accept": "application/json",
+        "User-Agent": "puppetmaster-agentic",
+    }
+    if content_type:
+        unsigned["Content-Type"] = content_type
+    if creds.kind == "bearer" and creds.bearer_token:
+        unsigned["Authorization"] = f"Bearer {creds.bearer_token}"
+        return unsigned
+    if creds.access_key_id and creds.secret_access_key:
+        return sigv4_sign_headers(
+            method=method,
+            url=url,
+            headers=unsigned,
+            body=body_bytes,
+            region=region,
+            service="bedrock",
+            access_key_id=creds.access_key_id,
+            secret_access_key=creds.secret_access_key,
+            session_token=creds.session_token,
+            amz_date=amz_date,
+        )
+    from puppetmaster.providers import ProviderError
+
+    raise ProviderError(
+        missing_bedrock_credentials_message()
+        + " (AWS_PROFILE / ~/.aws is present but has no static access keys "
+        "Puppetmaster can load without boto3 — export "
+        "AWS_BEARER_TOKEN_BEDROCK or AWS_ACCESS_KEY_ID.)",
+        reason="not_authenticated",
+    )
+
+
+def _resolve_call_credentials(
+    *,
+    api_key: Optional[str],
+    env: Mapping[str, str],
+) -> BedrockCredentials:
+    from puppetmaster.providers import ProviderError
+
+    if api_key and str(api_key).strip():
+        return BedrockCredentials(
+            kind="bearer",
+            bearer_token=str(api_key).strip(),
+            evidence=("aws_credentials:bearer_token",),
+        )
+    creds = resolve_bedrock_credentials(env)
+    if creds is None:
+        raise ProviderError(
+            missing_bedrock_credentials_message(),
+            reason="not_authenticated",
+        )
+    return creds
+
+
+def list_chat_model_ids(
+    *,
+    env: Optional[Mapping[str, str]] = None,
+    api_key: Optional[str] = None,
+    timeout: int = 30,
+    amz_date: Optional[str] = None,
+) -> list[str]:
+    """Discover chat-capable model ids visible to these AWS credentials.
+
+    Unions ``ListFoundationModels`` + ``ListInferenceProfiles`` for the
+    resolved region, filters out embed/image/video/speech-only ids, and
+    returns a sorted unique list. Account allow-lists and marketplace
+    entitlements make this set credential-specific — do not hardcode it.
+    """
+    env = env if env is not None else os.environ
+    region = resolve_bedrock_region(env)
+    creds = _resolve_call_credentials(api_key=api_key, env=env)
+    control = bedrock_control_base_url(region)
+    found: list[str] = []
+
+    foundation_url = f"{control}/foundation-models"
+    headers = _auth_headers_for_request(
+        method="GET",
+        url=foundation_url,
+        body_bytes=b"",
+        region=region,
+        creds=creds,
+        content_type=None,
+        amz_date=amz_date,
+    )
+    try:
+        data = _get_bedrock(foundation_url, headers=headers, timeout=timeout)
+        for row in data.get("modelSummaries") or []:
+            if not isinstance(row, dict):
+                continue
+            mid = (row.get("modelId") or "").strip()
+            if not mid or not _is_chat_capable_model_id(mid):
+                continue
+            outputs = [str(x).upper() for x in (row.get("outputModalities") or [])]
+            inputs = [str(x).upper() for x in (row.get("inputModalities") or [])]
+            if outputs and "TEXT" not in outputs:
+                continue
+            if inputs and "TEXT" not in inputs and "SPEECH" in inputs:
+                continue
+            found.append(mid)
+    except Exception:
+        pass
+
+    profiles_url = f"{control}/inference-profiles"
+    headers = _auth_headers_for_request(
+        method="GET",
+        url=profiles_url,
+        body_bytes=b"",
+        region=region,
+        creds=creds,
+        content_type=None,
+        amz_date=amz_date,
+    )
+    try:
+        data = _get_bedrock(profiles_url, headers=headers, timeout=timeout)
+        for row in data.get("inferenceProfileSummaries") or []:
+            if not isinstance(row, dict):
+                continue
+            mid = (
+                (row.get("inferenceProfileId") or row.get("modelId") or "")
+            ).strip()
+            if mid and _is_chat_capable_model_id(mid):
+                found.append(mid)
+    except Exception:
+        pass
+
+    # Stable unique order; prefer shorter foundation ids before duplicates.
+    seen: set[str] = set()
+    out: list[str] = []
+    for mid in sorted(found):
+        if mid in seen:
+            continue
+        seen.add(mid)
+        out.append(mid)
+    return out
+
+
 def _assistant_turn_from_anthropic(data: dict):
     from puppetmaster.providers import AssistantTurn
 
@@ -427,6 +855,61 @@ def _assistant_turn_from_anthropic(data: dict):
     )
 
 
+def _assistant_turn_from_converse(data: dict):
+    """Normalize a Converse ``Invoke`` JSON response to ``AssistantTurn``."""
+    from puppetmaster.providers import AssistantTurn
+
+    message = ((data.get("output") or {}).get("message") or {})
+    text_parts: list[str] = []
+    tool_calls: list[dict] = []
+    for block in message.get("content") or []:
+        if not isinstance(block, dict):
+            continue
+        if "text" in block and block.get("text") is not None:
+            text_parts.append(str(block.get("text") or ""))
+        tool_use = block.get("toolUse")
+        if isinstance(tool_use, dict):
+            tool_calls.append({
+                "id": tool_use.get("toolUseId") or "",
+                "name": tool_use.get("name") or "",
+                "arguments": tool_use.get("input") or {},
+            })
+    usage = data.get("usage") or {}
+    # Converse reports inputTokens as the uncached slice only. Cost meters and
+    # Marionette treat tokens_cached as a subset of tokens_in, so fold cache
+    # read/write into prompt_tokens (same shape as Anthropic Messages totals).
+    uncached_in = int(usage.get("inputTokens") or usage.get("input_tokens") or 0)
+    cache_read = int(
+        usage.get("cacheReadInputTokens")
+        or usage.get("cacheReadInputTokenCount")
+        or 0
+    )
+    cache_write = int(
+        usage.get("cacheWriteInputTokens")
+        or usage.get("cacheWriteInputTokenCount")
+        or 0
+    )
+    prompt_tokens = uncached_in + cache_read + cache_write
+    completion_tokens = int(
+        usage.get("outputTokens") or usage.get("output_tokens") or 0
+    )
+    return AssistantTurn(
+        text="".join(text_parts).strip(),
+        tool_calls=tool_calls,
+        finish_reason=str(data.get("stopReason") or data.get("stop_reason") or ""),
+        usage={
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": int(
+                usage.get("totalTokens") or (prompt_tokens + completion_tokens)
+            ),
+            "cached_tokens": cache_read,
+            "cache_write_tokens": cache_write,
+        },
+        raw=data,
+    )
+
+
 def bedrock_chat(
     *,
     model: str,
@@ -440,77 +923,208 @@ def bedrock_chat(
     on_delta: Optional[Callable[[str, str], None]] = None,
     amz_date: Optional[str] = None,
 ) -> Any:
-    """Call Bedrock ``InvokeModel`` and return a normalized ``AssistantTurn``.
+    """Call Bedrock ``Converse`` and return a normalized ``AssistantTurn``.
 
-    Bearer auth uses ``Authorization: Bearer`` (Claude Code Bedrock API-key
-    posture). Access-key auth uses minimal SigV4. Streaming callers still hit
-    this non-stream invoke (Bedrock event-stream is not SSE); ``on_delta`` is
-    invoked once with the final text when provided.
+    Works across providers on the caller's allow-list (Claude, Nova, Llama,
+    DeepSeek, GLM, Moonshot, …) via one schema. Auth is IAM SigV4 or optional
+    bearer. Streaming callers still hit non-stream Converse; ``on_delta`` fires
+    once with the final text when provided.
     """
-    from puppetmaster.providers import ProviderError
-
     env = env if env is not None else os.environ
     region = resolve_bedrock_region(env)
     url_base = (base_url or bedrock_runtime_base_url(region)).rstrip("/")
     model_id = require_bedrock_model_id(model)
     extra = dict(extra or {})
+    creds = _resolve_call_credentials(api_key=api_key, env=env)
 
-    creds = None
-    if api_key and str(api_key).strip():
-        creds = BedrockCredentials(
-            kind="bearer",
-            bearer_token=str(api_key).strip(),
-            evidence=("aws_credentials:bearer_token",),
-        )
-    else:
-        creds = resolve_bedrock_credentials(env)
-    if creds is None:
-        raise ProviderError(
-            missing_bedrock_credentials_message(),
-            reason="not_authenticated",
-        )
-
-    body = build_anthropic_invoke_body(messages=messages, tools=tools, extra=extra)
-    url = invoke_model_url(url_base, model_id)
+    body = build_converse_body(messages=messages, tools=tools, extra=extra)
+    url = converse_model_url(url_base, model_id)
     payload = json.dumps(body).encode("utf-8")
-
-    if creds.kind == "bearer" and creds.bearer_token:
-        headers = {
-            "Content-Type": _ANTHROPIC_MESSAGES_CONTENT_TYPE,
-            "Accept": "application/json",
-            "Authorization": f"Bearer {creds.bearer_token}",
-            "User-Agent": "puppetmaster-agentic",
-        }
-        data = _post_bedrock(url, headers=headers, body=body, timeout=timeout)
-    elif creds.access_key_id and creds.secret_access_key:
-        unsigned = {
-            "Content-Type": _ANTHROPIC_MESSAGES_CONTENT_TYPE,
-            "Accept": "application/json",
-            "User-Agent": "puppetmaster-agentic",
-        }
-        headers = sigv4_sign_headers(
-            method="POST",
-            url=url,
-            headers=unsigned,
-            body=payload,
-            region=region,
-            service="bedrock",
-            access_key_id=creds.access_key_id,
-            secret_access_key=creds.secret_access_key,
-            session_token=creds.session_token,
-            amz_date=amz_date,
-        )
-        data = _post_bedrock(url, headers=headers, body=body, timeout=timeout)
-    else:
-        raise ProviderError(
-            missing_bedrock_credentials_message()
-            + " (AWS_PROFILE / ~/.aws is present but has no static access keys "
-            "Puppetmaster can load without boto3 — export "
-            "AWS_BEARER_TOKEN_BEDROCK or AWS_ACCESS_KEY_ID.)",
-            reason="not_authenticated",
-        )
-
-    turn = _assistant_turn_from_anthropic(data)
+    headers = _auth_headers_for_request(
+        method="POST",
+        url=url,
+        body_bytes=payload,
+        region=region,
+        creds=creds,
+        content_type="application/json",
+        amz_date=amz_date,
+    )
+    data = _post_bedrock(url, headers=headers, body=body, timeout=timeout)
+    turn = _assistant_turn_from_converse(data)
     if on_delta and turn.text:
         on_delta("text", turn.text)
     return turn
+
+
+def diversify_chat_model_ids(
+    model_ids: list[str],
+    *,
+    max_per_family: int = 3,
+    max_total: int = 36,
+) -> list[str]:
+    """Pick a cross-provider subset of Bedrock chat ids for the agentic registry.
+
+    Account catalogs are large; the router needs a diversified daily-driver set
+    (Claude is not the only family). Prefers inference-profile ids when present.
+    """
+    prefer_prefix = ("us", "eu", "ap", "global")
+    priority = [
+        "anthropic",
+        "amazon",
+        "deepseek",
+        "zai",
+        "moonshotai",
+        "moonshot",
+        "qwen",
+        "meta",
+        "mistral",
+        "minimax",
+        "openai",
+        "cohere",
+        "ai21",
+    ]
+
+    def _family(model_id: str) -> str:
+        parts = model_id.split(".")
+        if len(parts) >= 3 and parts[0] in prefer_prefix:
+            return parts[1]
+        return parts[0] if parts else model_id
+
+    def _rank(mid: str) -> tuple:
+        head = mid.split(".", 1)[0]
+        return (0 if head in prefer_prefix else 1, mid)
+
+    by_family: dict[str, list[str]] = {}
+    for mid in model_ids:
+        if not mid or not _is_chat_capable_model_id(mid):
+            continue
+        # Drop context-window variants (…:24k) that duplicate the base id.
+        if mid.lower().rstrip().endswith("k") and ":" in mid.split(".")[-1]:
+            # e.g. amazon.nova-lite-v1:0:24k
+            tail = mid.rsplit(":", 1)[-1].lower()
+            if tail.endswith("k") and tail[:-1].isdigit():
+                continue
+        by_family.setdefault(_family(mid), []).append(mid)
+
+    fam_order = [f for f in priority if f in by_family] + sorted(
+        f for f in by_family if f not in priority
+    )
+    out: list[str] = []
+    seen: set[str] = set()
+    for fam in fam_order:
+        for mid in sorted(by_family[fam], key=_rank)[:max_per_family]:
+            if mid in seen:
+                continue
+            seen.add(mid)
+            out.append(mid)
+            if len(out) >= max_total:
+                return out
+    return out
+
+
+def _bedrock_tier_for_model(model_id: str) -> str:
+    n = model_id.lower()
+    if any(x in n for x in ("lite", "nano", "haiku", "-8b", "flash-lite", "micro")):
+        return "cheap"
+    if any(x in n for x in ("opus", "ultra", "premier", "glm-5", "v3.2")):
+        return "frontier"
+    if any(x in n for x in ("flash", "mini", "fast")):
+        return "cheap"
+    return "balanced"
+
+
+_BEDROCK_AGENTIC_TIERS = {
+    "frontier": (92, 3.0, 15.0, 200000, ["frontier", "reasoning", "analysis"]),
+    "balanced": (85, 3.0, 15.0, 200000, ["balanced", "fast", "vision"]),
+    "cheap": (70, 0.8, 4.0, 200000, ["cheap", "fast", "vision"]),
+}
+
+
+def bedrock_agentic_model_specs(
+    *,
+    env: Optional[Mapping[str, str]] = None,
+    timeout: int = 30,
+    model_ids: Optional[list[str]] = None,
+) -> list:
+    """Build agentic :class:`ModelSpec` entries from the account's Bedrock catalog.
+
+    When ``model_ids`` is omitted, discovers via :func:`list_chat_model_ids`.
+    """
+    from puppetmaster.model_registry import ModelSpec
+
+    env = env if env is not None else os.environ
+    ids = list(model_ids) if model_ids is not None else list_chat_model_ids(
+        env=env, timeout=timeout
+    )
+    specs = []
+    for mid in diversify_chat_model_ids(ids):
+        tier = _bedrock_tier_for_model(mid)
+        cap, inp, out, ctx, tags = _BEDROCK_AGENTIC_TIERS.get(
+            tier, _BEDROCK_AGENTIC_TIERS["balanced"]
+        )
+        family = mid.split(".")[1] if mid.startswith(
+            ("us.", "eu.", "ap.", "global.")
+        ) else mid.split(".")[0]
+        specs.append(
+            ModelSpec(
+                id=f"agentic/{mid}",
+                adapter="agentic",
+                adapter_model_name=mid,
+                capability_score=int(cap),
+                input_per_mtok_usd=float(inp),
+                output_per_mtok_usd=float(out),
+                context_window=int(ctx),
+                tags=["agentic", "bedrock", family] + list(tags),
+                payload_defaults={"provider": "bedrock"},
+                billing="api",
+                notes="Discovered from AWS Bedrock ListFoundationModels / ListInferenceProfiles",
+            )
+        )
+    return specs
+
+
+def merge_bedrock_discovered_into_registry(
+    existing: list,
+    *,
+    env: Optional[Mapping[str, str]] = None,
+    timeout: int = 30,
+) -> "tuple[list, dict]":
+    """Replace agentic Bedrock entries with a live account-specific catalog.
+
+    No-op (returns ``existing`` unchanged) when Bedrock credentials are absent
+    or discovery returns nothing. Non-Bedrock registry entries are preserved.
+    """
+    from puppetmaster.providers import get_provider, is_available
+
+    env = env if env is not None else os.environ
+    desc = get_provider("bedrock")
+    report: dict[str, Any] = {
+        "added": 0,
+        "removed": 0,
+        "available": False,
+        "discovered": 0,
+    }
+    if desc is None or not is_available(desc, env):
+        return existing, report
+    report["available"] = True
+    try:
+        live = list_chat_model_ids(env=env, timeout=timeout)
+    except Exception as exc:
+        report["error"] = repr(exc)
+        return existing, report
+    report["discovered"] = len(live)
+    if not live:
+        return existing, report
+
+    new_specs = bedrock_agentic_model_specs(env=env, model_ids=live, timeout=timeout)
+    kept = []
+    removed = 0
+    for spec in existing:
+        provider = (getattr(spec, "payload_defaults", None) or {}).get("provider")
+        if getattr(spec, "adapter", None) == "agentic" and provider == "bedrock":
+            removed += 1
+            continue
+        kept.append(spec)
+    report["removed"] = removed
+    report["added"] = len(new_specs)
+    return kept + new_specs, report

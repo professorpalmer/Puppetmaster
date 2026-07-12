@@ -14256,7 +14256,7 @@ class BedrockModelResolutionTests(unittest.TestCase):
 
 
 class BedrockProviderTests(unittest.TestCase):
-    """First-class agentic ``provider=bedrock`` (stdlib InvokeModel; no live AWS)."""
+    """First-class agentic ``provider=bedrock`` (stdlib Converse; no live AWS)."""
 
     def test_registry_has_bedrock(self) -> None:
         from puppetmaster import providers
@@ -14294,9 +14294,14 @@ class BedrockProviderTests(unittest.TestCase):
             captured["headers"] = headers
             captured["body"] = body
             return {
-                "content": [{"type": "text", "text": "ok"}],
-                "stop_reason": "end_turn",
-                "usage": {"input_tokens": 1, "output_tokens": 1},
+                "output": {
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"text": "ok"}],
+                    }
+                },
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
             }
 
         with patch.object(bedrock, "_post_bedrock", side_effect=_capture):
@@ -14314,14 +14319,60 @@ class BedrockProviderTests(unittest.TestCase):
             "bedrock-runtime.us-west-2.amazonaws.com/model/",
             captured["url"],
         )
-        self.assertTrue(captured["url"].endswith("/invoke"))
+        self.assertTrue(captured["url"].endswith("/converse"))
         self.assertEqual(
             captured["headers"].get("Authorization"), "Bearer bedrock-tok"
         )
-        self.assertIn("anthropic.messages-v1", captured["headers"].get("Content-Type", ""))
-        self.assertEqual(captured["body"]["anthropic_version"], "bedrock-2023-05-31")
+        self.assertEqual(
+            captured["headers"].get("Content-Type"), "application/json"
+        )
+        self.assertIn("messages", captured["body"])
+        self.assertIn("inferenceConfig", captured["body"])
+        self.assertNotIn("anthropic_version", captured["body"])
         self.assertNotIn("model", captured["body"])
         self.assertNotIn("x-api-key", {k.lower() for k in captured["headers"]})
+
+    def test_non_anthropic_model_ids_accepted(self) -> None:
+        from puppetmaster.adapters.claude_code import is_bedrock_model_id
+
+        for mid in (
+            "amazon.nova-micro-v1:0",
+            "deepseek.v3.2",
+            "zai.glm-5",
+            "moonshotai.kimi-k2.5",
+            "qwen.qwen3-coder-30b-a3b-v1:0",
+            "minimax.minimax-m2.5",
+            "us.meta.llama3-1-8b-instruct-v1:0",
+        ):
+            self.assertTrue(is_bedrock_model_id(mid), mid)
+        self.assertFalse(is_bedrock_model_id("claude-opus-4-8"))
+
+    def test_converse_parses_tool_use(self) -> None:
+        from puppetmaster import bedrock
+
+        turn = bedrock._assistant_turn_from_converse({
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"text": "calling"},
+                        {
+                            "toolUse": {
+                                "toolUseId": "tu1",
+                                "name": "echo",
+                                "input": {"text": "hi"},
+                            }
+                        },
+                    ],
+                }
+            },
+            "stopReason": "tool_use",
+            "usage": {"inputTokens": 3, "outputTokens": 2, "totalTokens": 5},
+        })
+        self.assertEqual(turn.text, "calling")
+        self.assertEqual(len(turn.tool_calls), 1)
+        self.assertEqual(turn.tool_calls[0]["name"], "echo")
+        self.assertEqual(turn.tool_calls[0]["arguments"], {"text": "hi"})
 
     def test_short_model_id_rejected_with_actionable_message(self) -> None:
         from puppetmaster import providers
@@ -14337,41 +14388,117 @@ class BedrockProviderTests(unittest.TestCase):
         self.assertIn("inference profile", str(ctx.exception).lower())
         self.assertIn("claude-opus-4-8", str(ctx.exception))
 
-    def test_missing_creds_fails_cleanly(self) -> None:
-        from puppetmaster import providers
-        from puppetmaster.bedrock import missing_bedrock_credentials_message
+    def test_provider_key_pool_bedrock_bearer_only_not_access_keys(self) -> None:
+        from puppetmaster.providers import provider_key_pool
 
-        with TemporaryDirectory() as tmp:
-            env = {"HOME": tmp, "USERPROFILE": tmp}
-            desc = providers.get_provider("bedrock")
-            self.assertFalse(providers.is_available(desc, env))
-            with self.assertRaises(providers.ProviderError) as ctx:
-                providers.provider_chat(
-                    provider="bedrock",
-                    model="us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-                    messages=[{"role": "user", "content": "hi"}],
-                    env=env,
-                )
-        self.assertEqual(ctx.exception.reason, "not_authenticated")
-        self.assertIn("AWS_BEARER_TOKEN_BEDROCK", str(ctx.exception))
-        self.assertIn("aws configure", str(ctx.exception))
-        self.assertEqual(str(ctx.exception), missing_bedrock_credentials_message())
+        env = {
+            "AWS_BEARER_TOKEN_BEDROCK": "bearer-1",
+            "AWS_BEARER_TOKEN_BEDROCK_2": "bearer-2",
+            "AWS_ACCESS_KEY_ID": "AKIATESTSHOULDNOTPOOL",
+            "AWS_SECRET_ACCESS_KEY": "secret",
+        }
+        self.assertEqual(
+            provider_key_pool("bedrock", env=env),
+            ["bearer-1", "bearer-2"],
+        )
+        # IAM-only: empty pool (agentic falls back to [None]; bedrock_chat
+        # resolves SigV4 itself).
+        self.assertEqual(
+            provider_key_pool(
+                "bedrock",
+                env={
+                    "AWS_ACCESS_KEY_ID": "AKIATEST",
+                    "AWS_SECRET_ACCESS_KEY": "secret",
+                },
+            ),
+            [],
+        )
+
+    def test_diversify_and_merge_bedrock_registry(self) -> None:
+        from puppetmaster.bedrock import (
+            diversify_chat_model_ids,
+            merge_bedrock_discovered_into_registry,
+        )
+        from puppetmaster.model_registry import ModelSpec
+        from puppetmaster.providers import is_available
+
+        ids = diversify_chat_model_ids([
+            "amazon.nova-micro-v1:0",
+            "amazon.nova-lite-v1:0:24k",
+            "deepseek.v3.2",
+            "zai.glm-4.7-flash",
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "anthropic.claude-haiku-4-5-20251001-v1:0",
+            "moonshotai.kimi-k2.5",
+        ])
+        self.assertIn("deepseek.v3.2", ids)
+        self.assertIn("zai.glm-4.7-flash", ids)
+        self.assertNotIn("amazon.nova-lite-v1:0:24k", ids)
+        # Prefer us. profile over bare anthropic when both present.
+        self.assertIn("us.anthropic.claude-haiku-4-5-20251001-v1:0", ids)
+
+        existing = [
+            ModelSpec(
+                id="agentic/keep-me",
+                adapter="agentic",
+                adapter_model_name="gpt-4o-mini",
+                payload_defaults={"provider": "openai-api"},
+                billing="api",
+            ),
+            ModelSpec(
+                id="agentic/old-bedrock",
+                adapter="agentic",
+                adapter_model_name="us.anthropic.claude-haiku-4-5-20251001-v1:0",
+                payload_defaults={"provider": "bedrock"},
+                billing="api",
+            ),
+        ]
+        with patch(
+            "puppetmaster.bedrock.list_chat_model_ids",
+            return_value=["deepseek.v3.2", "zai.glm-5"],
+        ), patch(
+            "puppetmaster.providers.is_available",
+            return_value=True,
+        ):
+            merged, report = merge_bedrock_discovered_into_registry(
+                existing, env={"AWS_ACCESS_KEY_ID": "A", "AWS_SECRET_ACCESS_KEY": "S"}
+            )
+        self.assertTrue(report["available"])
+        self.assertEqual(report["added"], 2)
+        self.assertEqual(report["removed"], 1)
+        providers = {
+            (s.payload_defaults or {}).get("provider") for s in merged
+        }
+        self.assertIn("openai-api", providers)
+        self.assertIn("bedrock", providers)
+        bedrock_ids = [
+            s.adapter_model_name
+            for s in merged
+            if (s.payload_defaults or {}).get("provider") == "bedrock"
+        ]
+        self.assertEqual(sorted(bedrock_ids), ["deepseek.v3.2", "zai.glm-5"])
 
     def test_happy_path_parses_assistant_turn_with_tool_use(self) -> None:
         from puppetmaster import bedrock, providers
 
         canned = {
-            "content": [
-                {"type": "text", "text": "analysis"},
-                {
-                    "type": "tool_use",
-                    "id": "toolu_1",
-                    "name": "edit_file",
-                    "input": {"path": "a.py"},
-                },
-            ],
-            "stop_reason": "tool_use",
-            "usage": {"input_tokens": 20, "output_tokens": 8},
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"text": "analysis"},
+                        {
+                            "toolUse": {
+                                "toolUseId": "toolu_1",
+                                "name": "edit_file",
+                                "input": {"path": "a.py"},
+                            }
+                        },
+                    ],
+                }
+            },
+            "stopReason": "tool_use",
+            "usage": {"inputTokens": 20, "outputTokens": 8, "totalTokens": 28},
         }
         with patch.object(bedrock, "_post_bedrock", return_value=canned):
             turn = providers.provider_chat(
@@ -14407,9 +14534,14 @@ class BedrockProviderTests(unittest.TestCase):
             captured["url"] = url
             captured["headers"] = headers
             return {
-                "content": [{"type": "text", "text": "signed"}],
-                "stop_reason": "end_turn",
-                "usage": {"input_tokens": 1, "output_tokens": 1},
+                "output": {
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"text": "signed"}],
+                    }
+                },
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
             }
 
         with patch.object(bedrock, "_post_bedrock", side_effect=_capture):
@@ -14429,6 +14561,80 @@ class BedrockProviderTests(unittest.TestCase):
         self.assertIn("bedrock/aws4_request", auth)
         self.assertIn("Signature=", auth)
         self.assertEqual(captured["headers"].get("X-Amz-Date"), "20260712T120000Z")
+        self.assertTrue(captured["url"].endswith("/converse"))
+
+    def test_converse_stamps_cache_points_when_prompt_cache_on(self) -> None:
+        from puppetmaster import bedrock
+
+        body = bedrock.build_converse_body(
+            messages=[
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "u1"},
+                {"role": "assistant", "content": "a1"},
+                {"role": "user", "content": "u2"},
+            ],
+            tools=[{
+                "type": "function",
+                "function": {
+                    "name": "edit_file",
+                    "description": "d",
+                    "parameters": {"type": "object"},
+                },
+            }],
+            extra={"max_tokens": 16},
+        )
+        self.assertTrue(
+            any(isinstance(b, dict) and "cachePoint" in b for b in body["system"])
+        )
+        self.assertEqual(body["toolConfig"].get("cachePoint"), {"type": "default"})
+        msgs = body["messages"]
+        self.assertTrue(
+            any(isinstance(b, dict) and "cachePoint" in b for b in msgs[-1]["content"])
+        )
+        self.assertTrue(
+            any(isinstance(b, dict) and "cachePoint" in b for b in msgs[-2]["content"])
+        )
+
+    def test_converse_skips_cache_points_when_prompt_cache_off(self) -> None:
+        from puppetmaster import bedrock
+
+        with patch.dict(os.environ, {"PUPPETMASTER_PROMPT_CACHE": "0"}, clear=False):
+            body = bedrock.build_converse_body(
+                messages=[
+                    {"role": "system", "content": "sys"},
+                    {"role": "user", "content": "hi"},
+                ],
+                tools=None,
+                extra={},
+            )
+        self.assertFalse(
+            any(isinstance(b, dict) and "cachePoint" in b for b in body.get("system") or [])
+        )
+        self.assertFalse(
+            any(
+                isinstance(b, dict) and "cachePoint" in b
+                for b in (body["messages"][-1].get("content") or [])
+            )
+        )
+
+    def test_converse_usage_folds_cache_into_prompt_tokens(self) -> None:
+        from puppetmaster import bedrock
+
+        turn = bedrock._assistant_turn_from_converse({
+            "output": {"message": {"role": "assistant", "content": [{"text": "ok"}]}},
+            "stopReason": "end_turn",
+            "usage": {
+                "inputTokens": 10,
+                "outputTokens": 4,
+                "totalTokens": 4425,
+                "cacheReadInputTokens": 4411,
+                "cacheWriteInputTokens": 0,
+            },
+        })
+        self.assertEqual(turn.usage["prompt_tokens"], 4421)
+        self.assertEqual(turn.usage["cached_tokens"], 4411)
+        self.assertEqual(turn.usage["cache_write_tokens"], 0)
+        self.assertEqual(turn.usage["completion_tokens"], 4)
 
 
 class StitcherAlertTests(unittest.TestCase):

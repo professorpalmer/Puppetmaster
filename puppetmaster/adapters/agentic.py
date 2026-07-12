@@ -674,7 +674,8 @@ class AgenticAdapter(FullEditWorkerAdapter):
             # The first attempt lets provider_chat resolve the key itself, so the
             # default single-credential path (and hermetic mocks that don't
             # accept api_key) is untouched. Only an explicit rotation to a later
-            # key passes api_key.
+            # key passes api_key. Bedrock's provider_key_pool only returns bearer
+            # tokens (never access-key ids); IAM/SigV4 stays inside bedrock_chat.
             if api_key is not None and key_index > 0:
                 kwargs["api_key"] = api_key
             try:

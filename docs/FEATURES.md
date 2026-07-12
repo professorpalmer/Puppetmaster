@@ -13,7 +13,7 @@ Five production adapters live plus the keys-only `agentic` standalone worker; el
 | `openai` | Direct Chat Completions (the most pricing-transparent path) | real `usage.prompt_tokens`/`completion_tokens` | `OPENAI_API_KEY` |
 | `codex` | Full-edit via the OpenAI Codex CLI agent loop | `input_tokens` + `output_tokens` + `cached_input_tokens` + `reasoning_output_tokens` per turn | `npm i -g @openai/codex` + `codex login` |
 | `hermes` | Analyze + full-edit via the NousResearch Hermes CLI (`hermes chat`); auto-injects CodeGraph context, parses typed artifacts | exit-code- and diff-based success (Hermes exit codes are unreliable) | `pipx install hermes-agent` (or any `hermes` on PATH) + `puppetmaster install-hermes-mcp` |
-| `agentic` | Keys-only analyze + full-edit via direct provider HTTP APIs (no external CLI) | tool-loop artifacts + PATCH on implement | any provider API key (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `OPENROUTER_API_KEY`) |
+| `agentic` | Keys-only analyze + full-edit via direct provider HTTP APIs (no external CLI) | tool-loop artifacts + PATCH on implement; tokens + cache reads + `price_job` / savings | any provider API key (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `OPENROUTER_API_KEY`) or AWS Bedrock IAM / `AWS_BEARER_TOKEN_BEDROCK` (`provider=bedrock`, Converse + live catalog) |
 | `shell` | Bounded verification commands | n/a | none |
 
 ## What works today
