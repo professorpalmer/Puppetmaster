@@ -250,6 +250,17 @@ PROVIDER_REGISTRY: dict[str, ProviderDescriptor] = {
         presence_env_vars=("LMSTUDIO_BASE_URL", "PUPPETMASTER_LMSTUDIO"),
         label="LM Studio (local)",
     ),
+    # AWS Bedrock: Anthropic message/tool shapes over bedrock-runtime InvokeModel
+    # (bearer token or SigV4). base_url is region-derived unless BEDROCK_BASE_URL
+    # overrides it — see resolve_base_url / puppetmaster.bedrock.
+    "bedrock": ProviderDescriptor(
+        slug="bedrock",
+        wire="anthropic",
+        base_url="https://bedrock-runtime.us-east-1.amazonaws.com",
+        base_url_env_var="BEDROCK_BASE_URL",
+        api_key_env_vars=("AWS_BEARER_TOKEN_BEDROCK",),
+        label="AWS Bedrock",
+    ),
 }
 
 
@@ -308,10 +319,24 @@ def provider_key_pool(
 def resolve_base_url(
     desc: ProviderDescriptor, env: Optional[Mapping[str, str]] = None
 ) -> str:
-    """The provider base URL, honoring its override env var, trailing-slash trimmed."""
+    """The provider base URL, honoring its override env var, trailing-slash trimmed.
+
+    Bedrock derives ``https://bedrock-runtime.{region}.amazonaws.com`` from
+    ``AWS_REGION`` / ``AWS_DEFAULT_REGION`` / ``BEDROCK_REGION`` (default
+    ``us-east-1``) unless ``BEDROCK_BASE_URL`` overrides it.
+    """
     env = env if env is not None else os.environ
     override = env.get(desc.base_url_env_var) if desc.base_url_env_var else None
-    return (override or desc.base_url).rstrip("/")
+    if override and str(override).strip():
+        return str(override).strip().rstrip("/")
+    if desc.slug == "bedrock":
+        from puppetmaster.bedrock import (
+            bedrock_runtime_base_url,
+            resolve_bedrock_region,
+        )
+
+        return bedrock_runtime_base_url(resolve_bedrock_region(env))
+    return desc.base_url.rstrip("/")
 
 
 def is_available(
@@ -321,9 +346,15 @@ def is_available(
 
     A keyed provider needs one of its API-key env vars set. A keyless local
     provider needs one of its presence env vars set (so we never route to a
-    local server the user hasn't opted into).
+    local server the user hasn't opted into). Bedrock accepts bearer token,
+    access-key pair, AWS_PROFILE, or a non-empty ``~/.aws`` credentials/config
+    file — matching Claude Code Bedrock credential health.
     """
     env = env if env is not None else os.environ
+    if desc.slug == "bedrock":
+        from puppetmaster.bedrock import resolve_bedrock_credentials
+
+        return resolve_bedrock_credentials(env) is not None
     if desc.keyless:
         return any(env.get(name, "").strip() for name in desc.presence_env_vars)
     return resolve_api_key(desc, env) is not None
@@ -1049,6 +1080,20 @@ def provider_chat_streaming(
     if desc is None:
         raise ProviderError(f"unknown provider {provider!r}", reason="unknown_provider")
     env = env if env is not None else os.environ
+    if desc.slug == "bedrock":
+        from puppetmaster.bedrock import bedrock_chat
+
+        return bedrock_chat(
+            model=model,
+            messages=messages,
+            tools=tools,
+            extra=dict(extra or {}),
+            api_key=api_key,
+            base_url=base_url or resolve_base_url(desc, env),
+            timeout=timeout,
+            env=env,
+            on_delta=on_delta,
+        )
     key = api_key if api_key is not None else resolve_api_key(desc, env)
     if key is None and not desc.keyless:
         raise ProviderError(
@@ -1088,12 +1133,26 @@ def provider_chat(
     Resolves the key/base URL from the provider descriptor (unless overridden),
     dispatches on the provider's wire protocol, and normalizes the response so
     the caller never branches on provider. Raises :class:`ProviderError` on any
-    HTTP/transport/parse failure.
+    HTTP/transport/parse failure. ``provider=bedrock`` uses the stdlib Bedrock
+    client (bearer or SigV4 InvokeModel) — never Anthropic ``x-api-key``.
     """
     desc = get_provider(provider)
     if desc is None:
         raise ProviderError(f"unknown provider {provider!r}", reason="unknown_provider")
     env = env if env is not None else os.environ
+    if desc.slug == "bedrock":
+        from puppetmaster.bedrock import bedrock_chat
+
+        return bedrock_chat(
+            model=model,
+            messages=messages,
+            tools=tools,
+            extra=dict(extra or {}),
+            api_key=api_key,
+            base_url=base_url or resolve_base_url(desc, env),
+            timeout=timeout,
+            env=env,
+        )
     key = api_key if api_key is not None else resolve_api_key(desc, env)
     if key is None and not desc.keyless:
         raise ProviderError(

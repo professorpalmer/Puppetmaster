@@ -219,7 +219,8 @@ def _detect_claude_bedrock(
         healthy=False,
         detail=(
             "CLAUDE_CODE_USE_BEDROCK is set but no AWS credentials were detected — "
-            "run `aws configure`, set AWS_PROFILE, or set AWS_ACCESS_KEY_ID."
+            "run `aws configure`, set AWS_BEARER_TOKEN_BEDROCK, or set "
+            "AWS_ACCESS_KEY_ID (and AWS_SECRET_ACCESS_KEY)."
         ),
         evidence=evidence,
     )

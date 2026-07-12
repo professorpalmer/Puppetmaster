@@ -225,12 +225,20 @@ def hermes_reasoning_effort_env(base_env: dict, effort: object):
             # gets its own throwaway empty dir instead.
             if entry.name in ("config.yaml", "sessions"):
                 continue
+            dest = tmp_home / entry.name
             try:
-                os.symlink(entry, tmp_home / entry.name)
+                os.symlink(entry, dest)
             except OSError:
-                # A single un-symlinkable entry shouldn't sink the run; the
-                # ones that matter (auth.json, .env) are simple files.
-                pass
+                # Windows without Developer Mode often cannot create symlinks.
+                # Fall back to a copy so auth.json / .env still reach the
+                # ephemeral home (effort runs must not drop credentials).
+                try:
+                    if entry.is_dir():
+                        shutil.copytree(entry, dest, symlinks=True)
+                    else:
+                        shutil.copy2(entry, dest)
+                except OSError:
+                    pass
 
         # Real empty sessions dir so Hermes has somewhere to write session
         # files without touching the user's personal session store.

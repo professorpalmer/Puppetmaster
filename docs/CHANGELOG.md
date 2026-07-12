@@ -1,5 +1,14 @@
 ﻿# Changelog
 
+## v1.19.0
+
+**AWS Bedrock as a first-class agentic provider (BYOK).**
+
+- New `provider=bedrock` in `PROVIDER_REGISTRY` (label AWS Bedrock, Anthropic wire shapes) with region-derived `https://bedrock-runtime.{region}.amazonaws.com`.
+- Stdlib-only `puppetmaster/bedrock.py`: bearer (`AWS_BEARER_TOKEN_BEDROCK`) or SigV4 `InvokeModel` — no boto3. Short model ids rejected with an actionable inference-profile message; missing AWS creds fail cleanly (`aws configure` / bearer / access keys).
+- `provider_chat` / streaming path routes `provider=bedrock` through the new client (not Anthropic.com x-api-key).
+- Hermes effort-home: if `os.symlink` fails (common on Windows without Developer Mode), copy `auth.json` / `.env` instead of dropping credentials.
+
 ## v1.18.1
 
 **Windows CodeGraph WinError 2: spawn `.cmd` shims and new npm-shim layout.**

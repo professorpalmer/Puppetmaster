@@ -7377,10 +7377,17 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
                 effort_home = Path(run_env["HERMES_HOME"])
                 # A fresh ephemeral home, never the user's real one.
                 self.assertNotEqual(effort_home, real_home)
-                # auth.json is preserved verbatim via symlink (credentials intact).
-                self.assertTrue((effort_home / "auth.json").is_symlink())
+                # auth.json is preserved verbatim via symlink when the host
+                # allows it; on Windows without symlink privilege we fall
+                # back to a byte-identical copy so credentials still reach
+                # the effort home.
+                auth_link = effort_home / "auth.json"
+                self.assertTrue(auth_link.is_file())
+                self.assertTrue(
+                    auth_link.is_symlink() or auth_link.is_file(),
+                )
                 self.assertEqual(
-                    (effort_home / "auth.json").read_text(), '{"active_provider": "anthropic"}'
+                    auth_link.read_text(), '{"active_provider": "anthropic"}'
                 )
                 # config.yaml is a real rewritten file carrying the effort, with
                 # the user's MCP servers preserved.
@@ -13766,6 +13773,8 @@ class PlatformBillingDetectionTests(unittest.TestCase):
             self.assertFalse(s.healthy)
             self.assertIn("claude_bedrock:enabled", s.evidence)
             self.assertIn("aws_credentials:missing", s.evidence)
+            self.assertIn("AWS_BEARER_TOKEN_BEDROCK", s.detail)
+            self.assertIn("aws configure", s.detail)
 
     def test_claude_billing_bedrock_disabled_regression(self) -> None:
         import json as _json
@@ -14244,6 +14253,182 @@ class BedrockModelResolutionTests(unittest.TestCase):
             self.assertIsNotNone(note)
             self.assertIn("ANTHROPIC_MODEL", note)
             self.assertIn("Bedrock", note)
+
+
+class BedrockProviderTests(unittest.TestCase):
+    """First-class agentic ``provider=bedrock`` (stdlib InvokeModel; no live AWS)."""
+
+    def test_registry_has_bedrock(self) -> None:
+        from puppetmaster import providers
+
+        desc = providers.get_provider("bedrock")
+        self.assertIsNotNone(desc)
+        self.assertEqual(desc.slug, "bedrock")
+        self.assertEqual(desc.wire, "anthropic")
+        self.assertEqual(desc.label, "AWS Bedrock")
+        self.assertIn("AWS_BEARER_TOKEN_BEDROCK", desc.api_key_env_vars)
+        self.assertIn("bedrock-runtime", desc.base_url)
+
+    def test_bedrock_base_url_follows_region(self) -> None:
+        from puppetmaster import providers
+
+        desc = providers.get_provider("bedrock")
+        self.assertEqual(
+            providers.resolve_base_url(desc, {"AWS_REGION": "eu-west-1"}),
+            "https://bedrock-runtime.eu-west-1.amazonaws.com",
+        )
+        self.assertEqual(
+            providers.resolve_base_url(
+                desc, {"BEDROCK_BASE_URL": "https://custom.example/"}
+            ),
+            "https://custom.example",
+        )
+
+    def test_bearer_path_builds_correct_url_and_headers(self) -> None:
+        from puppetmaster import bedrock, providers
+
+        captured = {}
+
+        def _capture(url, *, headers, body, timeout):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["body"] = body
+            return {
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }
+
+        with patch.object(bedrock, "_post_bedrock", side_effect=_capture):
+            turn = providers.provider_chat(
+                provider="bedrock",
+                model="us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                messages=[{"role": "user", "content": "hi"}],
+                env={
+                    "AWS_BEARER_TOKEN_BEDROCK": "bedrock-tok",
+                    "AWS_REGION": "us-west-2",
+                },
+            )
+        self.assertEqual(turn.text, "ok")
+        self.assertIn(
+            "bedrock-runtime.us-west-2.amazonaws.com/model/",
+            captured["url"],
+        )
+        self.assertTrue(captured["url"].endswith("/invoke"))
+        self.assertEqual(
+            captured["headers"].get("Authorization"), "Bearer bedrock-tok"
+        )
+        self.assertIn("anthropic.messages-v1", captured["headers"].get("Content-Type", ""))
+        self.assertEqual(captured["body"]["anthropic_version"], "bedrock-2023-05-31")
+        self.assertNotIn("model", captured["body"])
+        self.assertNotIn("x-api-key", {k.lower() for k in captured["headers"]})
+
+    def test_short_model_id_rejected_with_actionable_message(self) -> None:
+        from puppetmaster import providers
+
+        with self.assertRaises(providers.ProviderError) as ctx:
+            providers.provider_chat(
+                provider="bedrock",
+                model="claude-opus-4-8",
+                messages=[{"role": "user", "content": "hi"}],
+                env={"AWS_BEARER_TOKEN_BEDROCK": "tok"},
+            )
+        self.assertEqual(ctx.exception.reason, "invalid_model")
+        self.assertIn("inference profile", str(ctx.exception).lower())
+        self.assertIn("claude-opus-4-8", str(ctx.exception))
+
+    def test_missing_creds_fails_cleanly(self) -> None:
+        from puppetmaster import providers
+        from puppetmaster.bedrock import missing_bedrock_credentials_message
+
+        with TemporaryDirectory() as tmp:
+            env = {"HOME": tmp, "USERPROFILE": tmp}
+            desc = providers.get_provider("bedrock")
+            self.assertFalse(providers.is_available(desc, env))
+            with self.assertRaises(providers.ProviderError) as ctx:
+                providers.provider_chat(
+                    provider="bedrock",
+                    model="us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                    messages=[{"role": "user", "content": "hi"}],
+                    env=env,
+                )
+        self.assertEqual(ctx.exception.reason, "not_authenticated")
+        self.assertIn("AWS_BEARER_TOKEN_BEDROCK", str(ctx.exception))
+        self.assertIn("aws configure", str(ctx.exception))
+        self.assertEqual(str(ctx.exception), missing_bedrock_credentials_message())
+
+    def test_happy_path_parses_assistant_turn_with_tool_use(self) -> None:
+        from puppetmaster import bedrock, providers
+
+        canned = {
+            "content": [
+                {"type": "text", "text": "analysis"},
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "edit_file",
+                    "input": {"path": "a.py"},
+                },
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 20, "output_tokens": 8},
+        }
+        with patch.object(bedrock, "_post_bedrock", return_value=canned):
+            turn = providers.provider_chat(
+                provider="bedrock",
+                model="anthropic.claude-3-5-haiku-20241022-v1:0",
+                messages=[
+                    {"role": "system", "content": "be terse"},
+                    {"role": "user", "content": "go"},
+                ],
+                tools=[{
+                    "type": "function",
+                    "function": {
+                        "name": "edit_file",
+                        "description": "d",
+                        "parameters": {"type": "object"},
+                    },
+                }],
+                env={"AWS_BEARER_TOKEN_BEDROCK": "tok"},
+            )
+        self.assertEqual(turn.text, "analysis")
+        self.assertEqual(len(turn.tool_calls), 1)
+        self.assertEqual(turn.tool_calls[0]["name"], "edit_file")
+        self.assertEqual(turn.tool_calls[0]["arguments"], {"path": "a.py"})
+        self.assertEqual(turn.finish_reason, "tool_use")
+        self.assertEqual(turn.usage["total_tokens"], 28)
+
+    def test_sigv4_path_signs_authorization_header(self) -> None:
+        from puppetmaster import bedrock, providers
+
+        captured = {}
+
+        def _capture(url, *, headers, body, timeout):
+            captured["url"] = url
+            captured["headers"] = headers
+            return {
+                "content": [{"type": "text", "text": "signed"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }
+
+        with patch.object(bedrock, "_post_bedrock", side_effect=_capture):
+            turn = bedrock.bedrock_chat(
+                model="us.anthropic.claude-haiku-4-5-20251001-v1:0",
+                messages=[{"role": "user", "content": "hi"}],
+                env={
+                    "AWS_ACCESS_KEY_ID": "AKIATEST",
+                    "AWS_SECRET_ACCESS_KEY": "secret",
+                    "AWS_REGION": "us-east-1",
+                },
+                amz_date="20260712T120000Z",
+            )
+        self.assertEqual(turn.text, "signed")
+        auth = captured["headers"].get("Authorization", "")
+        self.assertTrue(auth.startswith("AWS4-HMAC-SHA256 Credential=AKIATEST/"))
+        self.assertIn("bedrock/aws4_request", auth)
+        self.assertIn("Signature=", auth)
+        self.assertEqual(captured["headers"].get("X-Amz-Date"), "20260712T120000Z")
 
 
 class StitcherAlertTests(unittest.TestCase):
@@ -24364,14 +24549,20 @@ class KeysWizardTests(unittest.TestCase):
             self.assertIn("empty", message)
 
     def test_wizard_sets_selected_provider_then_quits(self) -> None:
-        from puppetmaster.cli.commands_keys import KeyWizard
+        from puppetmaster.cli.commands_keys import KeyWizard, _keyed_providers
 
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "mcp.json"
-            # Providers are listed alphabetically by label; [1] is Anthropic.
+            # Providers are listed alphabetically by label (1-based wizard menu).
+            # Resolve Anthropic's index so adding providers (e.g. AWS Bedrock)
+            # does not silently retarget this test.
+            providers = _keyed_providers()
+            anthropic_idx = next(
+                i for i, d in enumerate(providers, 1) if d.slug == "anthropic"
+            )
             wizard = KeyWizard(
                 path,
-                io.StringIO("1\nq\n"),
+                io.StringIO(f"{anthropic_idx}\nq\n"),
                 io.StringIO(),
                 env={},
                 read_secret=lambda prompt: "sk-ant-" + "c" * 24,
