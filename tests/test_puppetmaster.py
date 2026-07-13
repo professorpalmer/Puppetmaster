@@ -18020,18 +18020,18 @@ class PuppetmasterFrictionFixTests(unittest.TestCase):
         ``puppetmaster_start_swarm`` preserves read-only intent through routing
         (a Claude-only lock auto-routing the ``implement`` planning role to
         claude-code must not become full-edit and trip the worktree guard)."""
-        from puppetmaster.workers import DEFAULT_WORKERS, swarm_mode
+        from puppetmaster.workers import (
+            ANALYSIS_NO_EDIT_PAYLOAD,
+            DEFAULT_WORKERS,
+            swarm_mode,
+        )
 
         self.assertEqual(swarm_mode(DEFAULT_WORKERS), "analysis")
         for spec in DEFAULT_WORKERS:
             with self.subTest(role=spec.role):
                 self.assertTrue(spec.payload.get("auto_route"))
-                self.assertTrue(spec.payload.get("read_only"))
-                self.assertEqual(spec.payload.get("sandbox"), "read-only")
-                self.assertIs(
-                    spec.payload.get("dangerously_bypass_approvals_and_sandbox"),
-                    False,
-                )
+                for key, value in ANALYSIS_NO_EDIT_PAYLOAD.items():
+                    self.assertEqual(spec.payload.get(key), value)
 
     def test_default_worker_routed_to_claude_code_plans_and_skips_guard(self) -> None:
         """A default worker (the ``implement`` planning role) auto-routed to

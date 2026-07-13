@@ -53,6 +53,18 @@ class WorkerSpec:
     depends_on_roles: list[str] = field(default_factory=list)
 
 
+# Shared by DEFAULT_WORKERS and write_generated_swarm_config so analysis
+# swarms keep read-only intent when auto_route lands on an edit-capable
+# adapter (claude-code → permission_mode=plan; codex → sandbox read-only).
+# Without these, a Claude-only lock routing the "implement" *planning*
+# role to claude-code incorrectly takes acceptEdits and trips worktree
+# / dirty-tree guards.
+ANALYSIS_NO_EDIT_PAYLOAD = {
+    "read_only": True,
+    "sandbox": "read-only",
+    "dangerously_bypass_approvals_and_sandbox": False,
+}
+
 # Built-in worker specs ship with ``auto_route: True`` so any swarm
 # started via the MCP ``puppetmaster_start_*`` tools or ``python -m
 # puppetmaster run`` consults the router and lets each role land on
@@ -60,21 +72,9 @@ class WorkerSpec:
 # frontier for redteam/audit). If the user has not run
 # ``puppetmaster models init``, the orchestrator quietly skips routing
 # and falls back to the spec's declared adapter — opting in is safe.
-#
-# They also carry the explicit no-edit fields the generated custom-swarm
-# path sets, so a *default* analysis role keeps its read-only intent through
-# routing. Without these, a Claude-only platform lock auto-routing the
-# "implement" planning role to claude-code lands it at acceptEdits/full-edit
-# and trips the Git worktree/dirty-tree guards. ``read_only`` keeps
-# ``spec_edits_files`` False (→ ``swarm_mode`` == analysis) and drives the
-# claude-code adapter to ``permission_mode=plan``; ``sandbox='read-only'`` and
-# ``dangerously_bypass_approvals_and_sandbox=False`` do the same for the
-# codex/sandbox-aware adapters.
 _DEFAULT_AUTO_ROUTE_PAYLOAD = {
     "auto_route": True,
-    "read_only": True,
-    "sandbox": "read-only",
-    "dangerously_bypass_approvals_and_sandbox": False,
+    **ANALYSIS_NO_EDIT_PAYLOAD,
 }
 
 
