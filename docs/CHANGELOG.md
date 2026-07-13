@@ -1,5 +1,13 @@
 ﻿# Changelog
 
+## v1.19.2
+
+**Keep default swarms read-only through adapter routing.**
+
+- `DEFAULT_WORKERS` now carry the same explicit no-edit payload fields as generated MCP swarms (`read_only`, `sandbox=read-only`, no sandbox bypass), so a bare `puppetmaster_start_swarm` / `puppetmaster run` stays analysis-mode when auto-route lands on Claude Code or Codex.
+- Shared `ANALYSIS_NO_EDIT_PAYLOAD` constant so `DEFAULT_WORKERS` and `write_generated_swarm_config` cannot drift.
+- Regression: default `implement` planning role routed to Claude Code uses `permission_mode=plan` and skips the write-capable worktree guard.
+
 ## v1.19.1
 
 **Bedrock Converse multi-model daily driver: account discovery, prompt cache, cost/token parity.**
