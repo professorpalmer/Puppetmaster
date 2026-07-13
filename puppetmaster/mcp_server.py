@@ -2626,6 +2626,8 @@ def write_generated_swarm_config(args: JsonObject, roles: list[str], adapter: st
     min_capability = args.get("min_capability")
     required_tags = args.get("required_tags")
     workers = []
+    from puppetmaster.workers import ANALYSIS_NO_EDIT_PAYLOAD
+
     for role in roles:
         prompt = (
             f"Role: {role}\n"
@@ -2642,9 +2644,7 @@ def write_generated_swarm_config(args: JsonObject, roles: list[str], adapter: st
             # artifacts and must be able to review the caller's dirty diff.
             # If routing lands on an edit-capable adapter such as Codex, keep
             # it on the adapter's existing read-only/no-edit path.
-            "read_only": True,
-            "sandbox": "read-only",
-            "dangerously_bypass_approvals_and_sandbox": False,
+            **ANALYSIS_NO_EDIT_PAYLOAD,
         }
         if adapter == "cursor":
             payload["model"] = model

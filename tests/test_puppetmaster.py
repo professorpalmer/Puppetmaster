@@ -18014,6 +18014,69 @@ class PuppetmasterFrictionFixTests(unittest.TestCase):
             )
         )
 
+    def test_default_workers_carry_no_edit_fields(self) -> None:
+        """Every built-in worker payload declares the same explicit no-edit
+        fields the generated custom-swarm path sets, so a bare
+        ``puppetmaster_start_swarm`` preserves read-only intent through routing
+        (a Claude-only lock auto-routing the ``implement`` planning role to
+        claude-code must not become full-edit and trip the worktree guard)."""
+        from puppetmaster.workers import (
+            ANALYSIS_NO_EDIT_PAYLOAD,
+            DEFAULT_WORKERS,
+            swarm_mode,
+        )
+
+        self.assertEqual(swarm_mode(DEFAULT_WORKERS), "analysis")
+        for spec in DEFAULT_WORKERS:
+            with self.subTest(role=spec.role):
+                self.assertTrue(spec.payload.get("auto_route"))
+                for key, value in ANALYSIS_NO_EDIT_PAYLOAD.items():
+                    self.assertEqual(spec.payload.get(key), value)
+
+    def test_default_worker_routed_to_claude_code_plans_and_skips_guard(self) -> None:
+        """A default worker (the ``implement`` planning role) auto-routed to
+        claude-code must run at ``permission_mode=plan`` and skip the
+        write-capable worktree guard — sourced from the real DEFAULT_WORKERS
+        payload, not a hand-written one."""
+        from puppetmaster.workers import DEFAULT_WORKERS
+
+        spec = next(s for s in DEFAULT_WORKERS if s.role == "implement")
+        streamed = StreamedProcess(
+            returncode=0,
+            stdout='{"result":"Produced an implementation plan; no edits."}',
+            stderr="",
+            timed_out=False,
+            live_log_path=None,
+        )
+        task = Task(
+            id="t-default-claude-plan",
+            job_id="job-default-claude-plan",
+            role=spec.role,
+            instruction=spec.instruction,
+            adapter="claude-code",
+            payload={**spec.payload, "cwd": ".", "disable_codegraph": True},
+        )
+        dirty = {
+            "sha": "s",
+            "tree": "t",
+            "changed_files": ["puppetmaster/workers.py"],
+            "untracked_files": [],
+            "diff": "diff --git a/puppetmaster/workers.py b/puppetmaster/workers.py",
+        }
+        with patch("puppetmaster.adapters.resolve_command", return_value="/usr/bin/claude"), patch(
+            "puppetmaster.adapters.git_snapshot", side_effect=[dirty, dirty]
+        ), patch("puppetmaster.adapters.worktree_guard") as guard, patch(
+            "puppetmaster.adapters.run_streamed_subprocess", return_value=streamed
+        ) as run:
+            artifacts = ClaudeCodeAdapter().run(task, "goal", "worker")
+
+        guard.assert_not_called()
+        command = run.call_args.kwargs["command"]
+        self.assertIn("--permission-mode", command)
+        self.assertIn("plan", command)
+        self.assertEqual(artifacts[0].payload["permission_mode"], "plan")
+        self.assertIn("permission_mode:plan", artifacts[0].evidence)
+
     # --- browser swarm (first-class browser-QA via Hermes) --------------
     def test_browser_spec_carries_browser_toolset_and_guardrails(self) -> None:
         from puppetmaster.browser import (
