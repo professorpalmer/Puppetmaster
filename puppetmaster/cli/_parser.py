@@ -1391,6 +1391,73 @@ def build_parser() -> argparse.ArgumentParser:
     edit.add_argument("--executable", help="Override the adapter executable / command.")
     _add_label_argument(edit)
 
+    prewalk = subcommands.add_parser(
+        "prewalk",
+        help=(
+            "Plan-then-cheap implement: quality-routed read-only plan worker, "
+            "then a cheap edit-capable implement worker that applies the plan "
+            "(OMP-style prewalk via depends_on_roles)."
+        ),
+    )
+    prewalk.add_argument("goal", help="What to plan and then implement.")
+    prewalk.add_argument("--cwd", default=str(Path.cwd()), help="Workspace to work in.")
+    prewalk.add_argument(
+        "--adapter",
+        help=(
+            "Force the implement adapter (cursor | claude-code | codex | hermes | "
+            "agentic). Default: highest-priority enabled implement adapter."
+        ),
+    )
+    prewalk.add_argument(
+        "--plan-adapter",
+        help=(
+            "Force the plan adapter (analysis-capable). Default: local + auto_route "
+            "so the router picks a quality model."
+        ),
+    )
+    prewalk.add_argument(
+        "--model",
+        help="Pin the implement model (overrides cheap auto-routing).",
+    )
+    prewalk.add_argument(
+        "--plan-model",
+        help="Pin the plan model (overrides quality auto-routing).",
+    )
+    prewalk.add_argument("--timeout-seconds", type=int, default=900)
+    prewalk.add_argument(
+        "--no-auto-route",
+        dest="auto_route_prewalk",
+        action="store_false",
+        help="Disable routing; use each adapter's default model.",
+    )
+    prewalk.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="Allow the implement worker to run in a dirty working tree.",
+    )
+    prewalk.add_argument(
+        "--allow-non-worktree",
+        action="store_true",
+        help="Allow implement outside a git work tree (no diff attribution).",
+    )
+    prewalk.add_argument(
+        "--disable-codegraph",
+        action="store_true",
+        help="Skip CodeGraph context injection.",
+    )
+    prewalk.add_argument(
+        "--disable-memory",
+        action="store_true",
+        help="Skip promoted shared-memory injection.",
+    )
+    prewalk.add_argument(
+        "--worker-mode",
+        choices=["subprocess", "inline", "daemon"],
+        default="subprocess",
+        help="subprocess (default) runs plan then implement as separate processes.",
+    )
+    _add_label_argument(prewalk)
+
     browser = subcommands.add_parser(
         "browser",
         help=(

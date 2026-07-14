@@ -834,6 +834,55 @@ def _main(argv: Optional[list[str]] = None) -> int:
         )
         return cli.finalize_cli_run(result)
 
+    if args.command == "prewalk":
+        from puppetmaster import platform_lock
+        from puppetmaster.prewalk import build_prewalk_specs
+        from puppetmaster.workers import (
+            NoImplementAdapterError,
+            pick_implement_adapter,
+        )
+
+        enabled = platform_lock.enabled_adapters()
+        try:
+            implement_adapter = pick_implement_adapter(enabled, args.adapter)
+        except NoImplementAdapterError as exc:
+            print(f"prewalk: {exc}", file=sys.stderr)
+            if exc.requested:
+                print(
+                    f"  enable it: puppetmaster platform enable {exc.requested}",
+                    file=sys.stderr,
+                )
+            print(
+                f"  enabled adapters: {', '.join(sorted(exc.enabled)) or '(none)'}",
+                file=sys.stderr,
+            )
+            return 2
+        plan_adapter = args.plan_adapter or "local"
+        specs = build_prewalk_specs(
+            args.goal,
+            args.cwd,
+            plan_adapter=plan_adapter,
+            implement_adapter=implement_adapter,
+            plan_model=args.plan_model,
+            implement_model=args.model,
+            plan_timeout_seconds=args.timeout_seconds,
+            implement_timeout_seconds=args.timeout_seconds,
+            auto_route=getattr(args, "auto_route_prewalk", True),
+            allow_dirty=args.allow_dirty,
+            allow_non_worktree=args.allow_non_worktree,
+            disable_codegraph=args.disable_codegraph,
+            disable_memory=args.disable_memory,
+        )
+        result = cli.Orchestrator(store).run(
+            args.goal,
+            specs=specs,
+            lease_seconds=10,
+            worker_mode=args.worker_mode,
+            on_job_created=on_job_created,
+            label=args.label,
+        )
+        return cli.finalize_cli_run(result)
+
     if args.command == "browser":
         from puppetmaster import platform_lock
         from puppetmaster.browser import BROWSER_ADAPTER, browser_swarm_specs

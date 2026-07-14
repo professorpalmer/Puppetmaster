@@ -67,6 +67,18 @@ python -m puppetmaster edit "tidy the imports in cli.py" --no-auto-route        
 
 Also available as the `puppetmaster_edit` MCP tool (synchronous; returns the diff).
 
+## Plan-then-cheap prewalk (OMP-style)
+
+`prewalk` runs a two-worker DAG on the existing orchestrator: a **quality**-routed read-only `plan` worker emits decision/plan artifacts, then a **cheap**-routed edit-capable `implement` worker (`depends_on_roles=["plan"]`) applies that plan. Each stage stamps its own ROUTING artifact so savings stay honest.
+
+```bash
+python -m puppetmaster prewalk "Add retry/backoff to the HTTP client"
+python -m puppetmaster prewalk "Wire the new flag through CLI + MCP" --adapter hermes
+python -m puppetmaster prewalk "Refactor paginate" --plan-model claude-opus --model gpt-5-nano
+```
+
+Also available as the async `puppetmaster_start_prewalk` MCP tool (returns `job_id`).
+
 ## Browser swarm (live-site QA)
 
 The `browser` verb runs N parallel **Hermes** workers, each driving a real browser against a live site to capture real network payloads — the QA that mock-backend tests and read-only repo analysis can't reach. It is Hermes-only: Hermes is the only adapter that exposes a `browser` toolset (`hermes chat -t browser`), so the verb pins the worker to it and fails fast if Hermes is disabled. Each task becomes its own parallel worker.

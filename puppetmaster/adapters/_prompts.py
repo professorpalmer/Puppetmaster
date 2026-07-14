@@ -275,14 +275,76 @@ def with_job_brief(prompt: str, task: Task) -> str:
     sibling worker gets an identical prefix segment. Lands in the system prefix
     via ``split_prompt_messages`` (distinct header from per-task CodeGraph).
     Best-effort; never raises. Kill switch: ``PUPPETMASTER_JOB_BRIEF=0``.
+
+    Also applies :func:`with_prewalk_plan` so every implement-mode adapter that
+    already funnels through this helper gets upstream plan injection for free.
     """
     try:
         from puppetmaster.job_brief import resolve_job_brief_for_task
 
         section = resolve_job_brief_for_task(task)
-        if not section:
+        if section:
+            prompt = insert_before_task(prompt, section.strip("\n"))
+    except Exception:
+        pass
+    return with_prewalk_plan(prompt, task)
+
+
+def _load_job_artifacts_for_task(task: Task) -> list:
+    """Best-effort load of job-scoped artifacts from the active store.
+
+    Mirrors :func:`puppetmaster.job_brief.resolve_job_brief_for_task` state-dir
+    resolution (sidecar env → find_state_dir_for_job → ``PUPPETMASTER_STATE_DIR``)
+    so worker subprocesses see the same store the orchestrator wrote into.
+    Returns an empty list on any miss or error.
+    """
+    import os
+
+    job_id = getattr(task, "job_id", None) or ""
+    if not job_id:
+        return []
+    from puppetmaster.adapters._streaming import _resolve_sidecar_state_dir
+    from puppetmaster.state import STATE_DIR_ENV, find_state_dir_for_job, resolve_state_dir
+    from puppetmaster.store_factory import create_store
+
+    state_dir = _resolve_sidecar_state_dir()
+    if state_dir is None:
+        state_dir = find_state_dir_for_job(job_id)
+    if state_dir is None and os.environ.get(STATE_DIR_ENV):
+        try:
+            state_dir = resolve_state_dir()
+        except Exception:
+            state_dir = None
+    if state_dir is None:
+        return []
+    backend = "sqlite" if (Path(state_dir) / "state.sqlite3").is_file() else "file"
+    store = create_store(backend, state_dir)
+    return list(store.list_artifacts(job_id))
+
+
+def with_prewalk_plan(prompt: str, task: Task) -> str:
+    """Inject upstream plan/decision artifacts for prewalk implement workers.
+
+    No-op unless ``task.payload["prewalk"]`` is truthy. Loads job artifacts from
+    the store (same state-dir resolution as the job brief) and replaces the
+    placeholder plan section via :func:`puppetmaster.prewalk.inject_plan_into_prompt`.
+    ``payload["prewalk_artifacts"]`` may supply an explicit list for tests.
+    Best-effort; never raises.
+    """
+    try:
+        payload = getattr(task, "payload", None) or {}
+        if not payload.get("prewalk"):
             return prompt
-        return insert_before_task(prompt, section.strip("\n"))
+        inline = payload.get("prewalk_artifacts")
+        if inline is not None:
+            artifacts = inline
+        else:
+            artifacts = _load_job_artifacts_for_task(task)
+        if not artifacts:
+            return prompt
+        from puppetmaster.prewalk import inject_plan_into_prompt
+
+        return inject_plan_into_prompt(prompt, artifacts)
     except Exception:
         return prompt
 

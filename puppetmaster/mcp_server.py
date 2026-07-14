@@ -1391,6 +1391,18 @@ def _build_tools() -> list[McpTool]:
             handler=start_browser_swarm,
         ),
         McpTool(
+            name="puppetmaster_start_prewalk",
+            description=(
+                "OMP-style plan-then-cheap implement: a quality-routed read-only plan "
+                "worker emits decision/plan artifacts, then a cheap edit-capable "
+                "implement worker (depends_on the plan) applies that plan. Prefer when "
+                "you want a strong plan + cheaper implementation with honest ROUTING "
+                "artifacts for both stages. Returns job_id immediately."
+            ),
+            input_schema=prewalk_schema(),
+            handler=start_prewalk,
+        ),
+        McpTool(
             name="puppetmaster_openai",
             description=(
                 "Run an OpenAI Chat Completions worker through Puppetmaster and wait for "
@@ -2295,6 +2307,61 @@ def start_browser_swarm(args: JsonObject) -> JsonObject:
     except ValueError as exc:
         return tool_error(str(exc))
     return start_cli(command, args)
+
+
+def prewalk_command(args: JsonObject) -> list[str]:
+    """Build the ``puppetmaster prewalk`` CLI invocation from MCP args."""
+    goal = require_string(args, "goal")
+    command = ["prewalk", goal, "--cwd", cwd(args)]
+    if args.get("adapter"):
+        command.extend(["--adapter", str(args["adapter"])])
+    if args.get("plan_adapter"):
+        command.extend(["--plan-adapter", str(args["plan_adapter"])])
+    if args.get("model"):
+        command.extend(["--model", str(args["model"])])
+    if args.get("plan_model"):
+        command.extend(["--plan-model", str(args["plan_model"])])
+    if args.get("timeout_seconds"):
+        command.extend(["--timeout-seconds", str(args["timeout_seconds"])])
+    if args.get("auto_route") is False:
+        command.append("--no-auto-route")
+    if args.get("allow_dirty"):
+        command.append("--allow-dirty")
+    if args.get("allow_non_worktree"):
+        command.append("--allow-non-worktree")
+    if args.get("disable_codegraph"):
+        command.append("--disable-codegraph")
+    if args.get("disable_memory"):
+        command.append("--disable-memory")
+    if args.get("worker_mode"):
+        command.extend(["--worker-mode", str(args["worker_mode"])])
+    return command
+
+
+def start_prewalk(args: JsonObject) -> JsonObject:
+    """Start a plan-then-cheap implement prewalk asynchronously.
+
+    Validates that an implement-capable adapter is available (same gate as
+    ``start_implement`` / ``edit``), optionally enforces the clean-tree
+    worktree preflight for the implement stage, then returns ``job_id``.
+    """
+    from puppetmaster import platform_lock
+    from puppetmaster.workers import NoImplementAdapterError, pick_implement_adapter
+
+    enabled = platform_lock.enabled_adapters()
+    try:
+        pick_implement_adapter(enabled, args.get("adapter"))
+    except NoImplementAdapterError as exc:
+        details: JsonObject = {"enabled": sorted(exc.enabled)}
+        if exc.requested is not None:
+            details["requested"] = exc.requested
+            details["fix"] = "puppetmaster platform enable " + exc.requested
+        return tool_error(str(exc), details)
+    if not args.get("allow_dirty") and not args.get("allow_non_worktree"):
+        blocked = _worktree_preflight(args)
+        if blocked is not None:
+            return blocked
+    return start_cli(prewalk_command(args), args)
 
 
 def run_claude(args: JsonObject) -> JsonObject:
@@ -4216,6 +4283,81 @@ def browser_swarm_schema() -> JsonObject:
             },
         },
         "required": ["tasks"],
+    }
+
+
+def prewalk_schema() -> JsonObject:
+    """Schema for the async plan-then-cheap ``prewalk`` verb."""
+    return {
+        "type": "object",
+        "properties": {
+            "goal": {
+                "type": "string",
+                "description": "What to plan (quality) and then implement (cheap).",
+            },
+            "cwd": {
+                "type": "string",
+                "description": "Workspace/repo to work in. Defaults to the server's cwd.",
+            },
+            "adapter": {
+                "type": "string",
+                "enum": ["cursor", "claude-code", "codex", "hermes", "agentic"],
+                "description": (
+                    "Force the implement adapter. Omit to use the highest-priority "
+                    "adapter the platform lock enables."
+                ),
+            },
+            "plan_adapter": {
+                "type": "string",
+                "description": (
+                    "Force the plan adapter. Default: local + auto_route so the "
+                    "router picks a quality model."
+                ),
+            },
+            "model": {
+                "type": "string",
+                "description": "Pin the implement model (overrides cheap auto-routing).",
+            },
+            "plan_model": {
+                "type": "string",
+                "description": "Pin the plan model (overrides quality auto-routing).",
+            },
+            "auto_route": {
+                "type": "boolean",
+                "default": True,
+                "description": (
+                    "Let the router pick models (quality for plan, cheap for "
+                    "implement). Set false to use each adapter's default."
+                ),
+            },
+            "timeout_seconds": {
+                "type": "integer",
+                "description": "Per-worker timeout (default 900).",
+            },
+            "allow_dirty": {
+                "type": "boolean",
+                "description": "Allow the implement worker in a dirty working tree.",
+            },
+            "allow_non_worktree": {
+                "type": "boolean",
+                "description": "Allow implement outside a git work tree.",
+            },
+            "disable_codegraph": {
+                "type": "boolean",
+                "description": "Skip CodeGraph context injection.",
+            },
+            "disable_memory": {
+                "type": "boolean",
+                "description": "Skip promoted shared-memory injection.",
+            },
+            "worker_mode": {
+                "type": "string",
+                "enum": ["subprocess", "inline", "daemon"],
+                "default": "subprocess",
+                "description": "Orchestration mode (default subprocess).",
+            },
+        },
+        "required": ["goal"],
     }
 
 
