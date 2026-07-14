@@ -672,28 +672,39 @@ class Orchestrator:
             if current_model_id:
                 tried_models.add(current_model_id)
             allow_same_adapter = reason in SAME_ADAPTER_MODEL_REROUTE
-            candidates = []
-            for spec in registry:
+
+            def _eligible(spec, *, same_adapter_ok: bool) -> bool:
                 if spec.id in tried_models:
-                    continue
-                if spec.adapter == failed_adapter and not allow_same_adapter:
-                    # Billing/auth: the account is the problem — need another platform.
-                    continue
+                    return False
+                if spec.adapter == failed_adapter and not same_adapter_ok:
+                    return False
                 if not is_adapter_enabled(spec.adapter):
-                    # Platform lock: never fall back onto a disabled platform.
-                    continue
+                    return False
                 status = _funded(spec.adapter)
                 if status is None or not getattr(status, "healthy", False):
-                    continue
+                    return False
                 if getattr(status, "billing", "unknown") == "api" and not allow_api:
-                    continue
+                    return False
                 if not adapter_cli_present(spec.adapter):
                     # Billing can read healthy off a stale auth file long after
                     # the CLI was uninstalled; never cascade into a missing
                     # binary (the failure Rishi hit when fallback chose an
                     # uninstalled Codex).
-                    continue
-                candidates.append(spec)
+                    return False
+                return True
+
+            # Prefer a different funded platform (billing/auth recovery). Only
+            # when none exist — and the failure is model-shaped — try another
+            # model on the same adapter (single-platform / OMP-style chains).
+            candidates = [
+                spec for spec in registry
+                if _eligible(spec, same_adapter_ok=False)
+            ]
+            if not candidates and allow_same_adapter:
+                candidates = [
+                    spec for spec in registry
+                    if _eligible(spec, same_adapter_ok=True)
+                ]
             if not candidates:
                 continue
             policy = payload.get("router_policy") or "balanced"
