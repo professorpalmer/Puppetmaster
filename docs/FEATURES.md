@@ -45,7 +45,7 @@ Five production adapters live plus the keys-only `agentic` standalone worker; el
 | Cross-platform CI | GitHub Actions matrix runs the full suite on Linux / macOS / Windows (Python 3.9 + 3.12), **all three required and green.** Getting Windows there fixed real defects: a leaked sqlite handle (Windows mandatory locks), POSIX-mode path splitting that mangled `C:\…` executables, a `fcntl`-only CodeGraph lock that was a no-op on Windows (now `msvcrt`), and a `doctor` that could crash on a bad CLI shim |
 | AWS Bedrock agentic (v1.19.0+) | First-class `provider=bedrock` via stdlib Converse API (IAM/BYOK); live account model discovery; prompt-cache and token/cost parity with other providers (v1.19.1+) |
 | Bedrock ConverseStream (v1.19.3+) | Live text/reasoning/toolUse deltas on the agentic streaming path; real eventstream parsing via stdlib — no boto3 |
-| Plan-then-cheap prewalk | `puppetmaster prewalk "<goal>"` / `puppetmaster_start_prewalk`: quality-routed read-only plan worker, then cheap edit-capable implement (`depends_on_roles`); honest ROUTING per stage |
+| Plan-then-cheap prewalk | `puppetmaster prewalk "<goal>"` / `puppetmaster_start_prewalk`: quality-routed read-only plan worker, then cheap edit-capable implement (`depends_on_roles`); honest ROUTING per stage — `puppetmaster savings` counts both legs (plan quality as deliberate spend, implement cheap as savings) without double-count |
 | Swarm role routing defaults | Built-in analysis roles stamp per-role `routing_policy` under `auto_route` (explore/test → cheap, architect/plan → balanced, redteam/review/audit → quality) — no frontier model pins; MCP-generated swarms share the same map |
 
 ## Status

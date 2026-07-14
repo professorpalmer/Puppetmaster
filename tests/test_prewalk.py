@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest import mock
 
 from puppetmaster.adapters._prompts import (
     build_implement_prompt,
     with_prewalk_plan,
 )
-from puppetmaster.models import Artifact, ArtifactType, Task
+from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
 from puppetmaster.prewalk import (
     IMPLEMENT_ROLE,
     PLAN_ROLE,
@@ -17,6 +19,8 @@ from puppetmaster.prewalk import (
     format_plan_artifacts_for_injection,
     inject_plan_into_prompt,
 )
+from puppetmaster.savings import collect_routing_records, summarize_routing
+from puppetmaster.store import SwarmStore
 from puppetmaster.workers import (
     ANALYSIS_NO_EDIT_PAYLOAD,
     spec_edits_files,
@@ -290,6 +294,127 @@ class PrewalkMcpCommandTests(unittest.TestCase):
         self.assertIn("--allow-dirty", command)
         self.assertIn("--timeout-seconds", command)
         self.assertIn("600", command)
+
+
+class PrewalkSavingsLedgerTests(unittest.TestCase):
+    """Prewalk jobs stamp one ROUTING artifact per leg; savings must attribute
+    quality plan spend and cheap implement savings without double-counting."""
+
+    def test_prewalk_routing_legs_attribute_without_double_count(self) -> None:
+        specs = build_prewalk_specs("Harden the retry path", cwd="/repo")
+        self.assertEqual(len(specs), 2)
+        plan_spec, implement_spec = specs
+        self.assertEqual(plan_spec.payload.get("routing_policy"), "quality")
+        self.assertEqual(implement_spec.payload.get("routing_policy"), "cheap")
+
+        # Distinct per-leg costs: plan deliberate spend must not offset or
+        # inflate implement savings (and vice versa).
+        plan_chosen = 0.12
+        implement_chosen = 0.02
+        implement_baseline = 0.10
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            job = store.create_job("prewalk: Harden the retry path")
+            plan_task = Task(
+                job_id=job.id,
+                role=PLAN_ROLE,
+                instruction=plan_spec.instruction,
+                adapter=plan_spec.adapter,
+                status=TaskStatus.COMPLETE,
+                payload=dict(plan_spec.payload),
+            )
+            implement_task = Task(
+                job_id=job.id,
+                role=IMPLEMENT_ROLE,
+                instruction=implement_spec.instruction,
+                adapter=implement_spec.adapter,
+                status=TaskStatus.COMPLETE,
+                payload=dict(implement_spec.payload),
+            )
+            store.save_task(plan_task)
+            store.save_task(implement_task)
+            store.save_artifact(
+                Artifact(
+                    job_id=job.id,
+                    task_id=plan_task.id,
+                    type=ArtifactType.ROUTING,
+                    created_by="router",
+                    payload={
+                        "model_id": "frontier/95",
+                        "adapter": "cursor",
+                        "policy": plan_spec.payload["routing_policy"],
+                        "estimated_cost_usd": plan_chosen,
+                        "baseline_cost_usd": plan_chosen,
+                        "baseline_model_id": "frontier/95",
+                    },
+                    confidence=0.9,
+                    evidence=["prewalk-plan"],
+                )
+            )
+            store.save_artifact(
+                Artifact(
+                    job_id=job.id,
+                    task_id=implement_task.id,
+                    type=ArtifactType.ROUTING,
+                    created_by="router",
+                    payload={
+                        "model_id": "cheap/40",
+                        "adapter": "cursor",
+                        "policy": implement_spec.payload["routing_policy"],
+                        "estimated_cost_usd": implement_chosen,
+                        "baseline_cost_usd": implement_baseline,
+                        "baseline_model_id": "frontier/95",
+                    },
+                    confidence=0.9,
+                    evidence=["prewalk-implement"],
+                )
+            )
+            # Re-dispatch noise on implement must not double-count savings.
+            store.save_artifact(
+                Artifact(
+                    job_id=job.id,
+                    task_id=implement_task.id,
+                    type=ArtifactType.ROUTING,
+                    created_by="router",
+                    payload={
+                        "model_id": "cheap/40",
+                        "adapter": "cursor",
+                        "policy": "cheap",
+                        "estimated_cost_usd": implement_chosen,
+                        "baseline_cost_usd": implement_baseline,
+                        "baseline_model_id": "frontier/95",
+                    },
+                    confidence=0.9,
+                    evidence=["prewalk-implement-redispatch"],
+                )
+            )
+
+            records, jobs, _heal = collect_routing_records([store])
+            self.assertEqual(jobs, 1)
+            self.assertEqual(len(records), 2)
+            policies = sorted(r.policy for r in records)
+            self.assertEqual(policies, ["cheap", "quality"])
+
+            summary = summarize_routing(records)
+            self.assertEqual(summary.tasks_total, 2)
+            self.assertEqual(summary.deliberate_tasks, 1)
+            self.assertAlmostEqual(
+                summary.deliberate_spend_usd, plan_chosen, places=6
+            )
+            self.assertEqual(summary.cost_optimizing_tasks, 1)
+            self.assertAlmostEqual(
+                summary.saved_usd, implement_baseline - implement_chosen, places=6
+            )
+            self.assertAlmostEqual(summary.baseline_usd, implement_baseline, places=6)
+            self.assertAlmostEqual(summary.chosen_usd, implement_chosen, places=6)
+            # Plan spend is reported separately — never subtracted from savings.
+            self.assertNotAlmostEqual(
+                summary.saved_usd,
+                (implement_baseline - implement_chosen) - plan_chosen,
+                places=6,
+            )
 
 
 if __name__ == "__main__":
