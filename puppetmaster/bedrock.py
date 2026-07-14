@@ -16,13 +16,14 @@ import hmac
 import json
 import os
 import socket
+import struct
 import urllib.error
 import urllib.parse
 import urllib.request
 from configparser import ConfigParser
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Iterator, Mapping, Optional
 
 
 _MISSING_CREDS_MSG = (
@@ -354,6 +355,12 @@ def converse_model_url(base_url: str, model_id: str) -> str:
     return f"{base_url.rstrip('/')}/model/{encoded}/converse"
 
 
+def converse_stream_model_url(base_url: str, model_id: str) -> str:
+    """Bedrock Runtime ``ConverseStream`` URL for ``model_id``."""
+    encoded = urllib.parse.quote(model_id, safe="")
+    return f"{base_url.rstrip('/')}/model/{encoded}/converse-stream"
+
+
 def bedrock_control_base_url(region: str) -> str:
     """``https://bedrock.{region}.amazonaws.com`` (ListFoundationModels, etc.)."""
     return f"https://bedrock.{region}.amazonaws.com"
@@ -681,11 +688,12 @@ def _auth_headers_for_request(
     region: str,
     creds: BedrockCredentials,
     content_type: Optional[str] = "application/json",
+    accept: str = "application/json",
     amz_date: Optional[str] = None,
 ) -> dict:
     """Bearer or SigV4 headers for a Bedrock control/runtime request."""
     unsigned: dict[str, str] = {
-        "Accept": "application/json",
+        "Accept": accept,
         "User-Agent": "puppetmaster-agentic",
     }
     if content_type:
@@ -910,6 +918,354 @@ def _assistant_turn_from_converse(data: dict):
     )
 
 
+# AWS Event Stream value type codes (botocore / Smithy binary framing).
+_EVENTSTREAM_BOOL_TRUE = 0
+_EVENTSTREAM_BOOL_FALSE = 1
+_EVENTSTREAM_BYTE = 2
+_EVENTSTREAM_SHORT = 3
+_EVENTSTREAM_INT = 4
+_EVENTSTREAM_LONG = 5
+_EVENTSTREAM_BYTES = 6
+_EVENTSTREAM_STRING = 7
+_EVENTSTREAM_TIMESTAMP = 8
+_EVENTSTREAM_UUID = 9
+
+
+def encode_eventstream_message(
+    headers: Mapping[str, Any],
+    payload: bytes = b"",
+) -> bytes:
+    """Encode one AWS Event Stream message (CRC fields left as zero).
+
+    Used by hermetic tests to build ConverseStream bodies without botocore.
+    Runtime decoding does not require valid CRC32C.
+    """
+    header_buf = bytearray()
+    for name, value in headers.items():
+        name_bytes = str(name).encode("utf-8")
+        if len(name_bytes) > 255:
+            raise ValueError(f"eventstream header name too long: {name!r}")
+        header_buf.append(len(name_bytes))
+        header_buf.extend(name_bytes)
+        if isinstance(value, bool):
+            header_buf.append(
+                _EVENTSTREAM_BOOL_TRUE if value else _EVENTSTREAM_BOOL_FALSE
+            )
+        elif isinstance(value, int) and not isinstance(value, bool):
+            header_buf.append(_EVENTSTREAM_INT)
+            header_buf.extend(struct.pack(">i", int(value)))
+        elif isinstance(value, (bytes, bytearray)):
+            raw = bytes(value)
+            header_buf.append(_EVENTSTREAM_BYTES)
+            header_buf.extend(struct.pack(">H", len(raw)))
+            header_buf.extend(raw)
+        else:
+            raw = str(value).encode("utf-8")
+            header_buf.append(_EVENTSTREAM_STRING)
+            header_buf.extend(struct.pack(">H", len(raw)))
+            header_buf.extend(raw)
+    headers_len = len(header_buf)
+    total_len = 16 + headers_len + len(payload)
+    return (
+        struct.pack(">II", total_len, headers_len)
+        + b"\x00\x00\x00\x00"
+        + bytes(header_buf)
+        + payload
+        + b"\x00\x00\x00\x00"
+    )
+
+
+def encode_converse_stream_event(event_type: str, body: dict) -> bytes:
+    """Encode a ConverseStream ``:event-type`` message with a JSON payload."""
+    return encode_eventstream_message(
+        {
+            ":message-type": "event",
+            ":event-type": event_type,
+            ":content-type": "application/json",
+        },
+        json.dumps(body).encode("utf-8"),
+    )
+
+
+def _parse_eventstream_headers(raw: bytes) -> dict[str, Any]:
+    """Parse the header block of one AWS Event Stream message."""
+    headers: dict[str, Any] = {}
+    offset = 0
+    length = len(raw)
+    while offset < length:
+        name_len = raw[offset]
+        offset += 1
+        name = raw[offset : offset + name_len].decode("utf-8", errors="replace")
+        offset += name_len
+        if offset >= length:
+            break
+        value_type = raw[offset]
+        offset += 1
+        if value_type in (_EVENTSTREAM_BOOL_TRUE, _EVENTSTREAM_BOOL_FALSE):
+            headers[name] = value_type == _EVENTSTREAM_BOOL_TRUE
+        elif value_type == _EVENTSTREAM_BYTE:
+            headers[name] = struct.unpack_from(">b", raw, offset)[0]
+            offset += 1
+        elif value_type == _EVENTSTREAM_SHORT:
+            headers[name] = struct.unpack_from(">h", raw, offset)[0]
+            offset += 2
+        elif value_type == _EVENTSTREAM_INT:
+            headers[name] = struct.unpack_from(">i", raw, offset)[0]
+            offset += 4
+        elif value_type == _EVENTSTREAM_LONG:
+            headers[name] = struct.unpack_from(">q", raw, offset)[0]
+            offset += 8
+        elif value_type == _EVENTSTREAM_BYTES:
+            n = struct.unpack_from(">H", raw, offset)[0]
+            offset += 2
+            headers[name] = bytes(raw[offset : offset + n])
+            offset += n
+        elif value_type == _EVENTSTREAM_STRING:
+            n = struct.unpack_from(">H", raw, offset)[0]
+            offset += 2
+            headers[name] = raw[offset : offset + n].decode("utf-8", errors="replace")
+            offset += n
+        elif value_type == _EVENTSTREAM_TIMESTAMP:
+            headers[name] = struct.unpack_from(">q", raw, offset)[0]
+            offset += 8
+        elif value_type == _EVENTSTREAM_UUID:
+            headers[name] = bytes(raw[offset : offset + 16])
+            offset += 16
+        else:
+            break
+    return headers
+
+
+def _iter_eventstream_messages(byte_source) -> Iterator[tuple[dict[str, Any], bytes]]:
+    """Yield ``(headers, payload)`` frames from an AWS Event Stream body.
+
+    CRC32C prelude/message checksums are not validated (stdlib has no CRC32C);
+    TLS already covers transport integrity for live calls.
+    """
+    pending = bytearray()
+
+    def _pull(n: int) -> Optional[bytes]:
+        while len(pending) < n:
+            chunk = byte_source.read(max(8192, n - len(pending)))
+            if not chunk:
+                return None
+            pending.extend(chunk)
+        out = bytes(pending[:n])
+        del pending[:n]
+        return out
+
+    while True:
+        prelude = _pull(12)
+        if prelude is None:
+            if pending:
+                from puppetmaster.providers import ProviderError
+
+                raise ProviderError(
+                    "truncated Bedrock event stream",
+                    reason="malformed_response",
+                )
+            return
+        total_len, headers_len = struct.unpack(">II", prelude[:8])
+        if total_len < 16 or headers_len < 0 or headers_len > total_len - 16:
+            from puppetmaster.providers import ProviderError
+
+            raise ProviderError(
+                "malformed Bedrock event stream framing",
+                reason="malformed_response",
+            )
+        rest = _pull(total_len - 12)
+        if rest is None:
+            from puppetmaster.providers import ProviderError
+
+            raise ProviderError(
+                "truncated Bedrock event stream",
+                reason="malformed_response",
+            )
+        headers_raw = rest[:headers_len]
+        payload = rest[headers_len : len(rest) - 4]
+        yield _parse_eventstream_headers(headers_raw), payload
+
+
+def _open_bedrock_event_stream(
+    url: str,
+    *,
+    headers: dict,
+    body: dict,
+    timeout: int,
+):
+    """POST ``body`` and return the raw streaming response for eventstream iteration."""
+    from puppetmaster.providers import ProviderError
+
+    payload = json.dumps(body).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=payload,
+        headers=headers,
+        method="POST",
+    )
+    try:
+        return urllib.request.urlopen(request, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        err_body = ""
+        try:
+            err_body = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            err_body = ""
+        raise ProviderError(
+            f"HTTP {exc.code}",
+            reason=f"http_status:{exc.code}",
+            status=exc.code,
+            body=err_body,
+        ) from exc
+    except (socket.timeout, TimeoutError) as exc:
+        raise ProviderError("request timed out", reason="timeout") from exc
+    except urllib.error.URLError as exc:
+        raise ProviderError(str(exc), reason="network_error") from exc
+
+
+def _iter_converse_stream_events(byte_source) -> Iterator[dict]:
+    """Yield ConverseStream events as ``{event_type: payload_dict}`` maps."""
+    from puppetmaster.providers import ProviderError
+
+    for headers, payload in _iter_eventstream_messages(byte_source):
+        message_type = str(headers.get(":message-type") or "event")
+        if message_type == "exception":
+            exc_type = str(headers.get(":exception-type") or "Exception")
+            detail = ""
+            if payload:
+                try:
+                    parsed = json.loads(payload.decode("utf-8", errors="replace"))
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    detail = str(parsed.get("message") or parsed.get("Message") or "")
+                if not detail:
+                    detail = payload.decode("utf-8", errors="replace")[:8000]
+            raise ProviderError(
+                detail or exc_type,
+                reason="provider_error",
+                body=detail[:8000] if detail else None,
+            )
+        if message_type != "event":
+            continue
+        event_type = str(headers.get(":event-type") or "")
+        if not event_type:
+            continue
+        if not payload:
+            yield {event_type: {}}
+            continue
+        try:
+            data = json.loads(payload.decode("utf-8", errors="replace"))
+        except json.JSONDecodeError as exc:
+            raise ProviderError(
+                "malformed ConverseStream event",
+                reason="malformed_response",
+                body=payload.decode("utf-8", errors="replace")[:8000],
+            ) from exc
+        if not isinstance(data, dict):
+            data = {}
+        yield {event_type: data}
+
+
+def _assistant_turn_from_converse_stream(
+    events: Iterator[dict],
+    *,
+    on_delta: Optional[Callable[[str, str], None]] = None,
+):
+    """Fold ConverseStream events into an ``AssistantTurn``, firing deltas live."""
+    blocks: dict[int, dict] = {}
+    stop_reason = ""
+    usage: dict = {}
+    raw_events: list[dict] = []
+
+    for event in events:
+        raw_events.append(event)
+        if "contentBlockStart" in event:
+            start_evt = event["contentBlockStart"] or {}
+            idx = int(start_evt.get("contentBlockIndex") or 0)
+            start = start_evt.get("start") or {}
+            tool_use = start.get("toolUse")
+            if isinstance(tool_use, dict):
+                blocks[idx] = {
+                    "kind": "tool",
+                    "id": str(tool_use.get("toolUseId") or ""),
+                    "name": str(tool_use.get("name") or ""),
+                    "args": "",
+                }
+            continue
+        if "contentBlockDelta" in event:
+            delta_evt = event["contentBlockDelta"] or {}
+            idx = int(delta_evt.get("contentBlockIndex") or 0)
+            delta = delta_evt.get("delta") or {}
+            if not isinstance(delta, dict):
+                continue
+            if "text" in delta and delta.get("text") is not None:
+                piece = str(delta.get("text") or "")
+                slot = blocks.setdefault(idx, {"kind": "text", "text": ""})
+                if slot.get("kind") != "text":
+                    slot = {"kind": "text", "text": ""}
+                    blocks[idx] = slot
+                slot["text"] = str(slot.get("text") or "") + piece
+                if on_delta and piece:
+                    on_delta("text", piece)
+            reasoning = delta.get("reasoningContent")
+            if isinstance(reasoning, dict):
+                thought = reasoning.get("text")
+                if thought and on_delta:
+                    on_delta("reasoning", str(thought))
+            tool_delta = delta.get("toolUse")
+            if isinstance(tool_delta, dict) and "input" in tool_delta:
+                slot = blocks.setdefault(
+                    idx, {"kind": "tool", "id": "", "name": "", "args": ""}
+                )
+                if slot.get("kind") != "tool":
+                    slot = {"kind": "tool", "id": "", "name": "", "args": ""}
+                    blocks[idx] = slot
+                slot["args"] = str(slot.get("args") or "") + str(
+                    tool_delta.get("input") or ""
+                )
+            continue
+        if "messageStop" in event:
+            stop_reason = str(
+                (event.get("messageStop") or {}).get("stopReason") or stop_reason
+            )
+            continue
+        if "metadata" in event:
+            meta = event.get("metadata") or {}
+            if isinstance(meta.get("usage"), dict):
+                usage = meta["usage"]
+            continue
+
+    content: list[dict] = []
+    for idx in sorted(blocks):
+        slot = blocks[idx]
+        if slot.get("kind") == "text":
+            content.append({"text": str(slot.get("text") or "")})
+            continue
+        if slot.get("kind") != "tool":
+            continue
+        raw_args = str(slot.get("args") or "")
+        try:
+            args_obj = json.loads(raw_args) if raw_args.strip() else {}
+        except json.JSONDecodeError:
+            args_obj = {"__raw__": raw_args}
+        content.append({
+            "toolUse": {
+                "toolUseId": slot.get("id") or "",
+                "name": slot.get("name") or "",
+                "input": args_obj,
+            }
+        })
+
+    data = {
+        "output": {"message": {"role": "assistant", "content": content}},
+        "stopReason": stop_reason,
+        "usage": usage,
+        "streamEvents": raw_events,
+    }
+    return _assistant_turn_from_converse(data)
+
+
 def bedrock_chat(
     *,
     model: str,
@@ -927,9 +1283,23 @@ def bedrock_chat(
 
     Works across providers on the caller's allow-list (Claude, Nova, Llama,
     DeepSeek, GLM, Moonshot, …) via one schema. Auth is IAM SigV4 or optional
-    bearer. Streaming callers still hit non-stream Converse; ``on_delta`` fires
-    once with the final text when provided.
+    bearer. When ``on_delta`` is provided, delegates to
+    :func:`bedrock_chat_stream` (``ConverseStream``) so text/reasoning deltas
+    fire incrementally; otherwise posts non-stream ``Converse``.
     """
+    if on_delta is not None:
+        return bedrock_chat_stream(
+            model=model,
+            messages=messages,
+            tools=tools,
+            extra=extra,
+            api_key=api_key,
+            base_url=base_url,
+            timeout=timeout,
+            env=env,
+            on_delta=on_delta,
+            amz_date=amz_date,
+        )
     env = env if env is not None else os.environ
     region = resolve_bedrock_region(env)
     url_base = (base_url or bedrock_runtime_base_url(region)).rstrip("/")
@@ -950,10 +1320,63 @@ def bedrock_chat(
         amz_date=amz_date,
     )
     data = _post_bedrock(url, headers=headers, body=body, timeout=timeout)
-    turn = _assistant_turn_from_converse(data)
-    if on_delta and turn.text:
-        on_delta("text", turn.text)
-    return turn
+    return _assistant_turn_from_converse(data)
+
+
+def bedrock_chat_stream(
+    *,
+    model: str,
+    messages: list[dict],
+    tools: Optional[list[dict]] = None,
+    extra: Optional[dict] = None,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    timeout: int = 300,
+    env: Optional[Mapping[str, str]] = None,
+    on_delta: Optional[Callable[[str, str], None]] = None,
+    amz_date: Optional[str] = None,
+) -> Any:
+    """Call Bedrock ``ConverseStream`` and return a normalized ``AssistantTurn``.
+
+    POSTs the same Converse body as :func:`bedrock_chat` to
+    ``.../converse-stream``, parses the AWS Event Stream response, and invokes
+    ``on_delta(kind, text)`` for each text/reasoning chunk (``kind`` is
+    ``"text"`` or ``"reasoning"``). Cache read/write usage is folded into
+    the final turn the same way as non-stream Converse.
+    """
+    env = env if env is not None else os.environ
+    region = resolve_bedrock_region(env)
+    url_base = (base_url or bedrock_runtime_base_url(region)).rstrip("/")
+    model_id = require_bedrock_model_id(model)
+    extra = dict(extra or {})
+    creds = _resolve_call_credentials(api_key=api_key, env=env)
+
+    body = build_converse_body(messages=messages, tools=tools, extra=extra)
+    url = converse_stream_model_url(url_base, model_id)
+    payload = json.dumps(body).encode("utf-8")
+    headers = _auth_headers_for_request(
+        method="POST",
+        url=url,
+        body_bytes=payload,
+        region=region,
+        creds=creds,
+        content_type="application/json",
+        accept="application/vnd.amazon.eventstream",
+        amz_date=amz_date,
+    )
+    response = _open_bedrock_event_stream(
+        url, headers=headers, body=body, timeout=timeout
+    )
+    try:
+        return _assistant_turn_from_converse_stream(
+            _iter_converse_stream_events(response),
+            on_delta=on_delta,
+        )
+    finally:
+        try:
+            response.close()
+        except Exception:
+            pass
 
 
 def diversify_chat_model_ids(

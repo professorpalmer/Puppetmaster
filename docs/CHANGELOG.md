@@ -1,4 +1,11 @@
-﻿# Changelog
+﻿## v1.19.3
+
+**Bedrock ConverseStream for live agentic chat deltas.**
+
+- Real `ConverseStream` eventstream parsing (text / reasoning / toolUse deltas) via stdlib — no boto3.
+- `bedrock_chat_stream` preferred over fake chunked non-SSE; `provider_chat` streaming routes Bedrock through it.
+- Hermetic tests cover event framing, delta fold, and usage normalization on the stream path.
+# Changelog
 
 ## v1.19.2
 
@@ -1359,4 +1366,5 @@ Polish pass after v0.7.0 â€” diagnostics, doctor honesty, and README freshn
 - Broaden provider adapters beyond Cursor.
 - Improve patch artifact generation and isolated apply flows.
 - Add richer watch output and scripting-friendly JSON modes.
+
 
