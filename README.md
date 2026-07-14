@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/professorpalmer/Puppetmaster/blob/main/LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://github.com/professorpalmer/Puppetmaster/blob/main/pyproject.toml)
 
-Puppetmaster turns the agent CLIs you already pay for — Cursor, Claude Code (Anthropic or AWS Bedrock), the OpenAI API, the Codex CLI, or Hermes — into an orchestrator. Or run it with no external CLI at all: point the built-in `agentic` adapter at any provider API key (OpenAI, Anthropic, Gemini, OpenRouter, **AWS Bedrock** IAM/BYOK) and it runs the whole tool-use loop itself — ideal for CI, containers, and headless servers. Bedrock uses the Converse API with live account model discovery and the same prompt-cache / token / cost metering as other providers. Either way it routes each task to the cheapest model that can handle it, runs workers as independent processes, and stores their output as typed SQLite artifacts, so follow-up reads cost zero tokens.
+Puppetmaster turns the agent CLIs you already pay for — Cursor, Claude Code (Anthropic or AWS Bedrock), the OpenAI API, the Codex CLI, or Hermes — into an orchestrator. Or run it with no external CLI at all: point the built-in `agentic` adapter at any provider API key (OpenAI, Anthropic, Gemini, OpenRouter, **AWS Bedrock** IAM/BYOK) and it runs the whole tool-use loop itself — ideal for CI, containers, and headless servers. Bedrock uses the Converse API (and ConverseStream for live text/reasoning/tool deltas) with live account model discovery and the same prompt-cache / token / cost metering as other providers. Either way it routes each task to the cheapest model that can handle it, runs workers as independent processes, and stores their output as typed SQLite artifacts, so follow-up reads cost zero tokens.
 
 <img src="https://raw.githubusercontent.com/professorpalmer/Puppetmaster/main/docs/demo.gif" alt="Puppetmaster 60-second demo: cost routing, swarm fan-out, stitched summary, and zero-token follow-ups" width="100%" />
 
@@ -153,23 +153,17 @@ Workers can optionally write tighter prose. `PUPPETMASTER_OUTPUT_STYLE=terse` (o
 
 Puppetmaster does not bundle input-side context compressors (RTK, Headroom, caveman). We measured them: the net savings are small and the failure modes (a compressor dropping data the agent then re-reads) run the wrong way for a coding agent. [COMPRESSION.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/COMPRESSION.md) shows the evidence and how to wire one yourself if you want it.
 
-Marionette (the harness that rides Puppetmaster) implements complementary input-side savings: savings-gated tool-output offload, absolute-token compaction advice, append-only KV-cache context, and live OpenRouter pricing for swarm jobs the local registry does not know. See [Marionette's token economics docs](https://github.com/professorpalmer/marionette/blob/main/docs/session_decisions_v0_8_0_to_0_9_x.md).
+Marionette (the harness that rides Puppetmaster) implements complementary input-side savings: savings-gated tool-output offload, absolute-token compaction advice, append-only KV-cache context, and live OpenRouter pricing for swarm jobs the local registry does not know. See [Marionette's token economics (README)](https://github.com/professorpalmer/marionette/blob/main/README.md#core-capabilities).
 
 ## Status
 
-Daily-driver beta, currently at v1.11.1. Real runtime contract, automated tests, SQLite backend, fail-closed jobs, a live Cursor Agent MCP, and validated full-edit adapters. Credible for supervised local engineering; not yet a hosted multi-user service. Full feature matrix in [FEATURES.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/FEATURES.md).
+Daily-driver beta, currently at v1.19.3. Real runtime contract, automated tests, SQLite backend, fail-closed jobs, a live Cursor Agent MCP, validated full-edit adapters, and AWS Bedrock as a first-class agentic provider (Converse + ConverseStream). Credible for supervised local engineering; not yet a hosted multi-user service. Full feature matrix in [FEATURES.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/FEATURES.md).
 
-**v1.11.1 highlights:** `JobStatus.CANCELLED` as a first-class terminal status, and poison-proof store reads - an unknown persisted job status now coerces to `stalled` instead of raising, so one foreign-written row can never blank `list_jobs()` for every reader.
+**v1.19.3 highlights:** Bedrock ConverseStream for live agentic chat deltas — real eventstream parsing for text, reasoning, and toolUse chunks via stdlib (no boto3); `bedrock_chat_stream` preferred over fake chunked non-SSE on the streaming path.
 
-**v1.11.0 highlights:** Claude Code effort levels — `effort=<level>` on claude-code registry entries maps to the CLI's `--effort low|medium|high|xhigh|max` (Claude Code >= 2.1.204), with wizard effort variants and a manual `puppetmaster claude --effort` flag; escalating effort composes from effort variants plus the existing `escalating` / confidence / review-gate escalation policies (see MODEL_ROUTING.md).
+**v1.19.1 highlights:** Bedrock Converse multi-model daily driver — account model discovery (`ListFoundationModels` + `ListInferenceProfiles`), Converse prompt-cache stamps, and token/cost parity with other providers (`price_job` cache-read discount, Marionette `cache_savings_usd`).
 
-**v1.10.3 highlights:** instant cooperative job cancellation — `puppetmaster.cancellation.request_cancel(job_id)` stops every inline agentic worker on a job mid-stream (aborting the in-flight provider call within one chunk) and per-turn, so embedding hosts can kill a swarm in seconds instead of waiting out `max_turns`.
-
-**v1.10.2 highlights:** honest cost accounting — OpenRouter calls request usage accounting and record the provider-reported real cost plus cached-token counts; `price_job` prices tasks at what the provider actually charged, with a cache-read discount fallback, instead of full-rate token reconstruction that overcounted input-heavy work.
-
-**v1.10.1 highlights:** `payload.max_capability` routing ceiling so cost caps no longer flatten per-task capability scores (a `min_capability` guardrail pinned every worker to one model); fully Windows-portable test suite.
-
-**v1.10.0 highlights:** MMR diversity reranking for promoted memory; numbers-only memory injection cost ledger; honest degraded classification for empty agentic / max-turns runs; Windows child-process console suppression across every entry point.
+**v1.19.0 highlights:** AWS Bedrock as a first-class agentic provider (BYOK) — `provider=bedrock` in the provider registry, stdlib-only `bedrock.py` (bearer or SigV4 IAM, no boto3), live model discovery merged into the agentic registry.
 
 PyPI lists the package as [`puppetmaster-ai`](https://pypi.org/project/puppetmaster-ai/); [PEP 503 normalization](https://peps.python.org/pep-0503/#normalized-names) collides `puppetmaster` with an abandoned 2019 package. The import name, CLI, repo, and brand stay `puppetmaster`.
 

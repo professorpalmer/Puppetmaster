@@ -13,7 +13,7 @@ Five production adapters live plus the keys-only `agentic` standalone worker; el
 | `openai` | Direct Chat Completions (the most pricing-transparent path) | real `usage.prompt_tokens`/`completion_tokens` | `OPENAI_API_KEY` |
 | `codex` | Full-edit via the OpenAI Codex CLI agent loop | `input_tokens` + `output_tokens` + `cached_input_tokens` + `reasoning_output_tokens` per turn | `npm i -g @openai/codex` + `codex login` |
 | `hermes` | Analyze + full-edit via the NousResearch Hermes CLI (`hermes chat`); auto-injects CodeGraph context, parses typed artifacts | exit-code- and diff-based success (Hermes exit codes are unreliable) | `pipx install hermes-agent` (or any `hermes` on PATH) + `puppetmaster install-hermes-mcp` |
-| `agentic` | Keys-only analyze + full-edit via direct provider HTTP APIs (no external CLI) | tool-loop artifacts + PATCH on implement; tokens + cache reads + `price_job` / savings | any provider API key (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `OPENROUTER_API_KEY`) or AWS Bedrock IAM / `AWS_BEARER_TOKEN_BEDROCK` (`provider=bedrock`, Converse + live catalog) |
+| `agentic` | Keys-only analyze + full-edit via direct provider HTTP APIs (no external CLI) | tool-loop artifacts + PATCH on implement; tokens + cache reads + `price_job` / savings | any provider API key (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `OPENROUTER_API_KEY`) or AWS Bedrock IAM / `AWS_BEARER_TOKEN_BEDROCK` (`provider=bedrock`, Converse + ConverseStream + live catalog) |
 | `shell` | Bounded verification commands | n/a | none |
 
 ## What works today
@@ -43,6 +43,8 @@ Five production adapters live plus the keys-only `agentic` standalone worker; el
 | Reproducible benchmarks | Six harnesses in [`bench/`](../bench/), each with markdown + JSON receipts under `bench/results/` |
 | Local dashboard (v0.9.0+) | `puppetmaster dashboard [<job_id>]` — zero-dependency live web board (task graph, typed artifacts, cost, auto-fallback reroutes, alerts) served from durable state; no OTLP collector required |
 | Cross-platform CI | GitHub Actions matrix runs the full suite on Linux / macOS / Windows (Python 3.9 + 3.12), **all three required and green.** Getting Windows there fixed real defects: a leaked sqlite handle (Windows mandatory locks), POSIX-mode path splitting that mangled `C:\…` executables, a `fcntl`-only CodeGraph lock that was a no-op on Windows (now `msvcrt`), and a `doctor` that could crash on a bad CLI shim |
+| AWS Bedrock agentic (v1.19.0+) | First-class `provider=bedrock` via stdlib Converse API (IAM/BYOK); live account model discovery; prompt-cache and token/cost parity with other providers (v1.19.1+) |
+| Bedrock ConverseStream (v1.19.3+) | Live text/reasoning/toolUse deltas on the agentic streaming path; real eventstream parsing via stdlib — no boto3 |
 
 ## Status
 

@@ -27,7 +27,14 @@ The Python package. This is an orientation map, not API docs — for the object 
 | `platform_billing.py` | Detects whether an adapter is plan-billed, API-billed, or unknown |
 | `cursor_discovery.py` / `api_discovery.py` | Enumerate Cursor / OpenAI / Anthropic model catalogs |
 | `preflight.py` | Static + live 1-token probe gating dispatch (catches `$0`-but-funded-looking accounts) |
-| `adapters.py` | The `cursor` / `claude-code` / `openai` / `codex` / `shell` adapters + command builders |
+| `providers.py` | Provider registry + unified `provider_chat` / streaming for direct-API (agentic) workers |
+| `bedrock.py` | AWS Bedrock Converse + ConverseStream client (stdlib SigV4 or bearer — no boto3) |
+
+## Adapters
+
+| Module | Role |
+|---|---|
+| `adapters/` | Worker adapter package — `registry.py`, per-platform subprocess runners, keys-only `agentic` tool loop |
 
 ## Storage & state
 
