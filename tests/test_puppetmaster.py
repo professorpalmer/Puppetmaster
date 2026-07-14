@@ -16013,7 +16013,9 @@ class AutoFallbackTests(unittest.TestCase):
             orch = Orchestrator(store)
             with patch("puppetmaster.model_registry.load_registry", return_value=registry), \
                  patch("puppetmaster.platform_billing.detect_adapter_billing", side_effect=_billing), \
-                 patch("puppetmaster.platform_billing.detect_adapter_billing_cached", side_effect=_billing):
+                 patch("puppetmaster.platform_billing.detect_adapter_billing_cached", side_effect=_billing), \
+                 patch("puppetmaster.preflight.adapter_cli_present", return_value=True), \
+                 patch("puppetmaster.platform_lock.is_adapter_enabled", return_value=True):
                 rerouted = orch._reroute_recoverable_failures(job)
             self.assertEqual(rerouted, 1)
             updated = store.get_task_by_id(task.id)
