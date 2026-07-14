@@ -1,3 +1,10 @@
+## v1.19.7
+
+**Hermes-style segmented tool-batch concurrency for agentic workers.**
+
+- Parallel-safe reads (`read_file` / `search_code` / graph / `web_fetch` / `list_dir`) in a mixed batch run concurrently; barrier tools stay sequential.
+- Preserves model emission order for tool results (submit/plan remain barriers).
+- Kill switch: `PUPPETMASTER_TOOL_BATCH_PARALLEL=0`.
 # Changelog
 
 ## Unreleased

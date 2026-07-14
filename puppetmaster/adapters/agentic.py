@@ -37,6 +37,7 @@ before they enter an artifact.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import random
@@ -64,6 +65,7 @@ from puppetmaster.providers import (
 )
 from puppetmaster.redaction import redact_secrets
 from puppetmaster.state import resolve_state_dir
+from puppetmaster.tool_batch import plan_tool_batch_segments
 from puppetmaster.tool_offload import offload_tool_output
 
 from ._base import (
@@ -867,39 +869,43 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 ],
             })
             submitted_this_turn = False
-            for call in turn.tool_calls:
-                name = call["name"]
-                if name in _SUBMIT_TOOLS:
-                    if name == _SUBMIT_FINDINGS_TOOL:
-                        items = _coerce_submit_findings(call.get("arguments"))
-                        if submitted is None:
-                            submitted = []
-                        submitted.extend(items)
-                        ack = f"Recorded {len(items)} artifact(s). Analysis complete."
-                    else:  # submit_report
-                        report = _coerce_submit_report(call.get("arguments"))
-                        # Gate the submission on verification when a hook is set:
-                        # a rejection is fed back as the tool result and the loop
-                        # keeps going so the model can fix and re-submit.
-                        rejection = on_submit(report) if on_submit else None
-                        if rejection is not None:
-                            messages.append({
-                                "role": "tool", "tool_call_id": call["id"],
-                                "content": self._model_facing_tool_result(
-                                    rejection, task=task, cwd=cwd,
-                                    tool_name=name, tool_call_id=call["id"],
-                                ),
-                            })
-                            continue
-                        if report:
-                            final_text = report
-                        ack = "Report recorded. Task complete."
-                    submitted_this_turn = True
-                    messages.append({
-                        "role": "tool", "tool_call_id": call["id"], "content": ack,
-                    })
-                    continue
-                if name == _PLAN_TOOL:
+            # Walk calls in emission order. Contiguous regular tools use
+            # Hermes-style segments (parallel-safe runs concurrent); submit/
+            # plan stay barriers so tool-result order matches the model turn.
+            idx = 0
+            n_calls = len(turn.tool_calls)
+            while idx < n_calls:
+                name = turn.tool_calls[idx]["name"]
+                if name in _SUBMIT_TOOLS or name == _PLAN_TOOL:
+                    call = turn.tool_calls[idx]
+                    idx += 1
+                    if name in _SUBMIT_TOOLS:
+                        if name == _SUBMIT_FINDINGS_TOOL:
+                            items = _coerce_submit_findings(call.get("arguments"))
+                            if submitted is None:
+                                submitted = []
+                            submitted.extend(items)
+                            ack = f"Recorded {len(items)} artifact(s). Analysis complete."
+                        else:  # submit_report
+                            report = _coerce_submit_report(call.get("arguments"))
+                            rejection = on_submit(report) if on_submit else None
+                            if rejection is not None:
+                                messages.append({
+                                    "role": "tool", "tool_call_id": call["id"],
+                                    "content": self._model_facing_tool_result(
+                                        rejection, task=task, cwd=cwd,
+                                        tool_name=name, tool_call_id=call["id"],
+                                    ),
+                                })
+                                continue
+                            if report:
+                                final_text = report
+                            ack = "Report recorded. Task complete."
+                        submitted_this_turn = True
+                        messages.append({
+                            "role": "tool", "tool_call_id": call["id"], "content": ack,
+                        })
+                        continue
                     steps = _coerce_plan_steps(call.get("arguments"))
                     if on_plan is not None:
                         on_plan(steps)
@@ -908,18 +914,37 @@ class AgenticAdapter(FullEditWorkerAdapter):
                         "content": "Plan updated.\n" + _render_plan(steps),
                     })
                     continue
-                output = self._execute_tool(name, call.get("arguments") or {}, cwd, implement, task)
-                if name in _MUTATING_TOOLS and not output.startswith("error"):
-                    mutated = True
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": call["id"],
-                    "content": self._model_facing_tool_result(
-                        redact_secrets(output) or "",
-                        task=task, cwd=cwd,
-                        tool_name=name, tool_call_id=call["id"],
-                    ),
-                })
+
+                regular_calls = []
+                while idx < n_calls:
+                    nxt = turn.tool_calls[idx]["name"]
+                    if nxt in _SUBMIT_TOOLS or nxt == _PLAN_TOOL:
+                        break
+                    regular_calls.append(turn.tool_calls[idx])
+                    idx += 1
+                segments = plan_tool_batch_segments(regular_calls)
+                for segment_kind, segment_calls in segments:
+                    if segment_kind == "parallel":
+                        results = self._execute_tool_segment_parallel(
+                            segment_calls, cwd, implement, task
+                        )
+                    else:
+                        results = self._execute_tool_segment_sequential(
+                            segment_calls, cwd, implement, task
+                        )
+                    for call, output in results:
+                        tname = call["name"]
+                        if tname in _MUTATING_TOOLS and not output.startswith("error"):
+                            mutated = True
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": call["id"],
+                            "content": self._model_facing_tool_result(
+                                redact_secrets(output) or "",
+                                task=task, cwd=cwd,
+                                tool_name=tname, tool_call_id=call["id"],
+                            ),
+                        })
             if submitted_this_turn:
                 stop_reason = "submitted"
                 break
@@ -1272,6 +1297,56 @@ class AgenticAdapter(FullEditWorkerAdapter):
             return f"error: tool {name!r} is not available in this mode"
         except Exception as exc:  # a tool failure must not kill the worker
             return f"error: {type(exc).__name__}: {exc}"
+
+    def _execute_tool_segment_parallel(
+        self, calls: list[dict], cwd: Path, implement: bool, task: Task
+    ) -> list[tuple[dict, str]]:
+        """Execute a segment of parallel-safe tool calls concurrently.
+        
+        Returns a list of (call, output) tuples in the original call order.
+        """
+        def _execute_one(call: dict) -> tuple[dict, str]:
+            try:
+                name = call["name"]
+                args = call.get("arguments") or {}
+                output = self._execute_tool(name, args, cwd, implement, task)
+                return (call, output)
+            except Exception as exc:
+                return (call, f"error: {type(exc).__name__}: {exc}")
+        
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(calls)) as executor:
+                futures = {executor.submit(_execute_one, call): idx for idx, call in enumerate(calls)}
+                results = [None] * len(calls)
+                for future in concurrent.futures.as_completed(futures):
+                    idx = futures[future]
+                    try:
+                        results[idx] = future.result()
+                    except Exception as exc:
+                        call = calls[idx]
+                        results[idx] = (call, f"error: {type(exc).__name__}: {exc}")
+            return results
+        except Exception as exc:
+            # Fall back to sequential execution on any threading error
+            return self._execute_tool_segment_sequential(calls, cwd, implement, task)
+
+    def _execute_tool_segment_sequential(
+        self, calls: list[dict], cwd: Path, implement: bool, task: Task
+    ) -> list[tuple[dict, str]]:
+        """Execute a segment of barrier tool calls sequentially.
+        
+        Returns a list of (call, output) tuples in the original call order.
+        """
+        results = []
+        for call in calls:
+            try:
+                name = call["name"]
+                args = call.get("arguments") or {}
+                output = self._execute_tool(name, args, cwd, implement, task)
+                results.append((call, output))
+            except Exception as exc:
+                results.append((call, f"error: {type(exc).__name__}: {exc}"))
+        return results
 
     # --- confined filesystem tools -----------------------------------------
 
