@@ -77,17 +77,51 @@ _DEFAULT_AUTO_ROUTE_PAYLOAD = {
     **ANALYSIS_NO_EDIT_PAYLOAD,
 }
 
+# Per-role routing hints for analysis swarms (OMP ``modelRoles.task``
+# analogue). Policies only — never pin frontier model ids. Unknown roles
+# get no stamp; the orchestrator then falls back to ``balanced``.
+DEFAULT_ROLE_ROUTING_POLICY: dict[str, str] = {
+    "explore": "cheap",
+    "test": "cheap",
+    "architect": "balanced",
+    "plan": "balanced",
+    "implement": "balanced",  # analysis *plan* role in DEFAULT_WORKERS
+    "redteam": "quality",
+    "review": "quality",
+    "audit": "quality",
+}
+
+
+def default_routing_policy_for_role(role: str) -> Optional[str]:
+    """Return the built-in ``routing_policy`` for an analysis swarm role, if any."""
+    return DEFAULT_ROLE_ROUTING_POLICY.get(role)
+
+
+def analysis_auto_route_payload(role: str) -> dict:
+    """Default auto-route payload for an analysis swarm role.
+
+    Always preserves ``auto_route=True`` and ``ANALYSIS_NO_EDIT_PAYLOAD``.
+    Stamps ``routing_policy`` from ``DEFAULT_ROLE_ROUTING_POLICY`` when the
+    role is known so explore/test stay cheap and review/redteam stay quality
+    without pinning models.
+    """
+    payload = dict(_DEFAULT_AUTO_ROUTE_PAYLOAD)
+    policy = default_routing_policy_for_role(role)
+    if policy:
+        payload["routing_policy"] = policy
+    return payload
+
 
 DEFAULT_WORKERS = [
     WorkerSpec(
         role="explore",
         instruction="Map the problem, extract constraints, and emit evidenced findings.",
-        payload=dict(_DEFAULT_AUTO_ROUTE_PAYLOAD),
+        payload=analysis_auto_route_payload("explore"),
     ),
     WorkerSpec(
         role="architect",
         instruction="Choose the smallest viable architecture and record explicit decisions.",
-        payload=dict(_DEFAULT_AUTO_ROUTE_PAYLOAD),
+        payload=analysis_auto_route_payload("architect"),
         depends_on_roles=["explore"],
     ),
     WorkerSpec(
@@ -101,7 +135,7 @@ DEFAULT_WORKERS = [
             "plan), not prose blobs. This is an analysis role: do not expect "
             "files to be edited."
         ),
-        payload=dict(_DEFAULT_AUTO_ROUTE_PAYLOAD),
+        payload=analysis_auto_route_payload("implement"),
         depends_on_roles=["architect"],
     ),
     WorkerSpec(
@@ -114,13 +148,13 @@ DEFAULT_WORKERS = [
             "codebase is small or sound and you find no real weakness, return an "
             "empty result rather than inventing one."
         ),
-        payload=dict(_DEFAULT_AUTO_ROUTE_PAYLOAD),
+        payload=analysis_auto_route_payload("redteam"),
         depends_on_roles=["implement"],
     ),
     WorkerSpec(
         role="test",
         instruction="Convert claims into checks and verification results.",
-        payload=dict(_DEFAULT_AUTO_ROUTE_PAYLOAD),
+        payload=analysis_auto_route_payload("test"),
         depends_on_roles=["implement"],
     ),
 ]

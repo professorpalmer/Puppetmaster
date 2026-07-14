@@ -2693,7 +2693,10 @@ def write_generated_swarm_config(args: JsonObject, roles: list[str], adapter: st
     min_capability = args.get("min_capability")
     required_tags = args.get("required_tags")
     workers = []
-    from puppetmaster.workers import ANALYSIS_NO_EDIT_PAYLOAD
+    from puppetmaster.workers import (
+        ANALYSIS_NO_EDIT_PAYLOAD,
+        default_routing_policy_for_role,
+    )
 
     for role in roles:
         prompt = (
@@ -2728,6 +2731,12 @@ def write_generated_swarm_config(args: JsonObject, roles: list[str], adapter: st
                 payload["allowed_adapters"] = [adapter]
             if isinstance(routing_policy, str) and routing_policy:
                 payload["routing_policy"] = routing_policy
+            else:
+                # Match DEFAULT_WORKERS: explore/test stay cheap, review/audit
+                # stay quality — without pinning models. Caller override wins.
+                role_policy = default_routing_policy_for_role(str(role))
+                if role_policy:
+                    payload["routing_policy"] = role_policy
             if isinstance(max_cost_usd, (int, float)):
                 payload["max_cost_usd"] = float(max_cost_usd)
             if isinstance(min_capability, int):
