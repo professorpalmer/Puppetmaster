@@ -40,6 +40,21 @@ RECOVERABLE_FAILURES = frozenset(
         "no_model",
         "unknown_provider",
         "sdk_not_installed",
+        # Transient provider pressure after in-adapter key retries; prefer a
+        # different model (often same adapter) before dying the task.
+        "rate_limit",
+    }
+)
+
+# Failures where the *model* (not the adapter account) is the problem — allow
+# same-adapter re-route to another registry model when no other platform is
+# funded. Billing/auth failures still require a different adapter.
+SAME_ADAPTER_MODEL_REROUTE = frozenset(
+    {
+        "model_unavailable",
+        "no_model",
+        "unknown_provider",
+        "rate_limit",
     }
 )
 

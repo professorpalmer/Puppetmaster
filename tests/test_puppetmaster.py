@@ -15942,6 +15942,87 @@ class AutoFallbackTests(unittest.TestCase):
             self.assertEqual(routing[0].payload["fallback_reason"], "model_unavailable")
             self.assertEqual(routing[0].payload["model_id"], "cursor/opus-4-8")
 
+    def test_model_unavailable_same_adapter_when_only_one_platform_funded(self) -> None:
+        """OMP-style: if the model is bad but the adapter is funded, try another model."""
+        from unittest.mock import patch
+
+        from puppetmaster.model_registry import ModelSpec
+        from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
+        from puppetmaster.orchestrator import Orchestrator
+        from puppetmaster.platform_billing import BillingStatus
+        from puppetmaster.store import SwarmStore
+
+        registry = [
+            ModelSpec(
+                id="claude-code/fable-5",
+                adapter="claude-code",
+                adapter_model_name="claude-fable-5",
+                capability_score=100,
+                input_per_mtok_usd=10.0,
+                output_per_mtok_usd=50.0,
+                billing="unknown",
+            ),
+            ModelSpec(
+                id="claude-code/opus-4-8",
+                adapter="claude-code",
+                adapter_model_name="claude-opus-4-8",
+                capability_score=99,
+                input_per_mtok_usd=5.0,
+                output_per_mtok_usd=25.0,
+                billing="unknown",
+            ),
+        ]
+
+        def _billing(adapter, **kw):
+            return BillingStatus(
+                adapter=adapter, billing="unknown", healthy=True, detail="ok", evidence=[]
+            )
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("frontier task")
+            task = Task(
+                job_id=job.id,
+                role="audit",
+                instruction="security audit across every module",
+                adapter="claude-code",
+                status=TaskStatus.FAILED,
+                payload={
+                    "auto_route": True,
+                    "model": "claude-fable-5",
+                    "router_model_id": "claude-code/fable-5",
+                },
+            )
+            store.save_task(task)
+            store.save_artifact(
+                Artifact(
+                    job_id=job.id,
+                    task_id=task.id,
+                    type=ArtifactType.VERIFICATION,
+                    created_by="w",
+                    payload={
+                        "check": "x",
+                        "result": "blocked",
+                        "failure": "model_unavailable",
+                        "adapter": "claude-code",
+                    },
+                    confidence=0.5,
+                    evidence=["adapter:claude-code"],
+                )
+            )
+            orch = Orchestrator(store)
+            with patch("puppetmaster.model_registry.load_registry", return_value=registry), \
+                 patch("puppetmaster.platform_billing.detect_adapter_billing", side_effect=_billing), \
+                 patch("puppetmaster.platform_billing.detect_adapter_billing_cached", side_effect=_billing):
+                rerouted = orch._reroute_recoverable_failures(job)
+            self.assertEqual(rerouted, 1)
+            updated = store.get_task_by_id(task.id)
+            self.assertEqual(updated.status, TaskStatus.QUEUED)
+            self.assertEqual(updated.adapter, "claude-code")
+            self.assertEqual(updated.payload["model"], "claude-opus-4-8")
+            self.assertEqual(updated.payload["router_model_id"], "claude-code/opus-4-8")
+            self.assertIn("claude-code/fable-5", updated.payload.get("tried_models") or [])
+
     def test_no_funded_alternate_means_no_reroute(self) -> None:
         from unittest.mock import patch
 

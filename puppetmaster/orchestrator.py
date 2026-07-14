@@ -19,6 +19,7 @@ from puppetmaster.store import SwarmStore
 from puppetmaster.worker_runtime import WorkerRuntime
 from puppetmaster.workers import (
     RECOVERABLE_FAILURES,
+    SAME_ADAPTER_MODEL_REROUTE,
     WorkerSpec,
     specs_for_roles,
     swarm_is_acting,
@@ -663,10 +664,20 @@ class Orchestrator:
         rerouted = 0
         for task in failed:
             failed_adapter = task.adapter
+            reason = failure_by_task[task.id]
             allow_api = bool((task.payload or {}).get("allow_api_billing", True))
+            payload = task.payload or {}
+            tried_models = set(payload.get("tried_models") or [])
+            current_model_id = str(payload.get("router_model_id") or "")
+            if current_model_id:
+                tried_models.add(current_model_id)
+            allow_same_adapter = reason in SAME_ADAPTER_MODEL_REROUTE
             candidates = []
             for spec in registry:
-                if spec.adapter == failed_adapter:
+                if spec.id in tried_models:
+                    continue
+                if spec.adapter == failed_adapter and not allow_same_adapter:
+                    # Billing/auth: the account is the problem — need another platform.
                     continue
                 if not is_adapter_enabled(spec.adapter):
                     # Platform lock: never fall back onto a disabled platform.
@@ -685,21 +696,26 @@ class Orchestrator:
                 candidates.append(spec)
             if not candidates:
                 continue
-            policy = (task.payload or {}).get("router_policy") or "balanced"
+            policy = payload.get("router_policy") or "balanced"
             try:
                 decision = route_task(
                     signals_from_worker_spec(task), candidates, policy=policy
                 )
             except NoEligibleModelError:
                 continue
+            if decision.model.id in tried_models:
+                continue
 
-            attempts = int((task.payload or {}).get("fallback_attempts", 0)) + 1
+            attempts = int(payload.get("fallback_attempts", 0)) + 1
+            tried_out = sorted(tried_models | {decision.model.id, current_model_id} - {""})
             new_payload = merge_routing_payload(
-                task.payload or {},
+                payload,
                 decision,
                 {
                     "fallback_attempts": attempts,
                     "fallback_from_adapter": failed_adapter,
+                    "fallback_from_model": current_model_id or None,
+                    "tried_models": tried_out,
                 },
             )
             requeued = replace(
@@ -718,7 +734,9 @@ class Orchestrator:
             artifact_payload = decision.to_artifact_payload()
             artifact_payload["role"] = task.role
             artifact_payload["fallback_from_adapter"] = failed_adapter
-            artifact_payload["fallback_reason"] = failure_by_task[task.id]
+            if current_model_id:
+                artifact_payload["fallback_from_model"] = current_model_id
+            artifact_payload["fallback_reason"] = reason
             artifact_payload["fallback_attempt"] = attempts
             self.store.save_artifact(
                 Artifact(
@@ -730,7 +748,7 @@ class Orchestrator:
                     confidence=0.9,
                     evidence=[
                         f"fallback_from:{failed_adapter}",
-                        f"reason:{failure_by_task[task.id]}",
+                        f"reason:{reason}",
                         f"to:{decision.model.id}",
                     ],
                 )
@@ -744,8 +762,9 @@ class Orchestrator:
                     "from_adapter": failed_adapter,
                     "to_adapter": decision.model.adapter,
                     "to_model": decision.model.adapter_model_name,
-                    "reason": failure_by_task[task.id],
+                    "reason": reason,
                     "attempt": attempts,
+                    "same_adapter": decision.model.adapter == failed_adapter,
                 },
             )
             rerouted += 1
