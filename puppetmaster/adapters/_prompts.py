@@ -158,6 +158,20 @@ def build_structured_prompt(prompt: str, *, final_message_note: bool = False) ->
     return "\n".join(lines)
 
 
+_HASHLINE_EDIT_RULES = (
+    "Prefer `apply_hashline` for surgical edits after a tagged `read_file` "
+    "(Hashline format inspired by Oh My Pi / @oh-my-pi/hashline). "
+    "`read_file` returns `[path#TAG]` plus `N:line` rows — use that TAG and those "
+    "ORIGINAL line numbers. Ops: `SWAP N.=M:` (body `+` rows), `DEL N.=M` / `DEL N`, "
+    "`INS.PRE`/`INS.POST`/`INS.HEAD`/`INS.TAIL`, `REM`, `MV`. "
+    "Body rows are only `+TEXT` (literal `+` alone = blank). Ranges are tight and "
+    "never shift as hunks apply. After every apply, re-ground on the new `#TAG` "
+    "(or a fresh read). On stale-tag rejection: STOP and re-read. "
+    "Block ops (`*.BLK`) are unsupported — use line ranges. "
+    "Keep `edit_file` / `write_file` for whole-file rewrites or when hashline is awkward."
+)
+
+
 def build_implement_prompt(prompt: str) -> str:
     return "\n".join(
         [
@@ -168,6 +182,7 @@ def build_implement_prompt(prompt: str) -> str:
             "For anything beyond a trivial one-line change, call the `update_plan` "
             "tool first with your ordered steps, then update it (in_progress/done) as "
             "you go — it keeps the work organized and shows the user your progress.",
+            _HASHLINE_EDIT_RULES,
             "Keep the change focused on the task; run any obvious local checks you can. "
             "Puppetmaster captures the resulting git diff as a PATCH artifact, so leave "
             "the working tree containing your final intended changes.",
@@ -217,10 +232,10 @@ _LENGTH_CONTINUATION_NUDGE = (
 _IMPLEMENT_NOOP_NUDGE = (
     "You ended the turn without changing any files. Your job is to IMPLEMENT the "
     "task, not describe it — actually create, edit, or delete files now with your "
-    "write_file / edit_file / delete_file tools, then run any focused checks you "
-    "can to verify the change. If the task is genuinely already satisfied by the "
-    "current code, do not invent an edit: say so explicitly and cite the exact "
-    "file and lines that already satisfy it."
+    "apply_hashline / write_file / edit_file / delete_file tools, then run any "
+    "focused checks you can to verify the change. If the task is genuinely already "
+    "satisfied by the current code, do not invent an edit: say so explicitly and "
+    "cite the exact file and lines that already satisfy it."
 )
 
 

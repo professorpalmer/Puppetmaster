@@ -65,6 +65,15 @@ from puppetmaster.providers import (
 )
 from puppetmaster.redaction import redact_secrets
 from puppetmaster.state import resolve_state_dir
+from puppetmaster.hashline import (
+    SnapshotStore,
+    apply_patch,
+    format_apply_success,
+    format_numbered_read,
+    fs_cache_enabled,
+    hashline_enabled,
+    normalize_text,
+)
 from puppetmaster.tool_batch import plan_tool_batch_segments
 from puppetmaster.tool_offload import offload_tool_output
 
@@ -153,7 +162,7 @@ _TOOL_OUTPUT_LIMIT = 12000  # artifact stdout tail / excerpt cap (not model-faci
 _SEARCH_FILE_CAP = 400  # files scanned per search_code call
 _SEARCH_HIT_CAP = 60
 _TERMINAL_TIMEOUT_SECONDS = 120
-_MUTATING_TOOLS = frozenset({"write_file", "edit_file", "delete_file"})
+_MUTATING_TOOLS = frozenset({"write_file", "edit_file", "delete_file", "apply_hashline"})
 
 # Terminal "submit" tools. The parity fix (v2 overhaul): structured output rides
 # the provider-native tool-calling channel -- the model calls ``submit_findings``
@@ -224,6 +233,20 @@ class AgenticAdapter(FullEditWorkerAdapter):
     """Provider-agnostic direct-API worker with an in-process tool loop."""
 
     name = "agentic"
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Per-run session state for Hashline tags + mtime read cache. Reset at
+        # the start of each agent loop so tags never leak across jobs.
+        self._hashline_store = SnapshotStore()
+        self._fs_cache: dict[str, tuple[int, int, str]] = {}
+
+    def _reset_session_caches(self) -> None:
+        self._hashline_store = SnapshotStore()
+        self._fs_cache = {}
+
+    def _invalidate_fs_cache(self, path: Path) -> None:
+        self._fs_cache.pop(str(path.resolve()), None)
 
     def run(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
         implement = bool(
@@ -725,6 +748,7 @@ class AgenticAdapter(FullEditWorkerAdapter):
         the next turn *forces* the submit tool via ``tool_choice`` so a compliant
         model can't wander back into prose.
         """
+        self._reset_session_caches()
         max_retries = int(task.payload.get("provider_max_retries", DEFAULT_PROVIDER_MAX_RETRIES))
         key_pool = provider_key_pool(provider)
         context_budget = int(
@@ -1087,6 +1111,17 @@ class AgenticAdapter(FullEditWorkerAdapter):
                              "new_string": {"type": "string"},
                              "replace_all": {"type": "boolean", "description": "replace all occurrences (default false)"}},
                             ["path", "old_string", "new_string"]))
+            if hashline_enabled():
+                tools.append(fn(
+                    "apply_hashline",
+                    "Apply a Hashline patch (content-hash-anchored line edits). Prefer this "
+                    "for surgical edits after a tagged read_file. Format: [path#TAG] then "
+                    "SWAP N.=M: / DEL N.=M / INS.PRE|POST|HEAD|TAIL / REM / MV. Body rows "
+                    "are +TEXT. Numbers refer to ORIGINAL lines; stale tags are rejected. "
+                    "Block ops (*.BLK) are unsupported — use line ranges.",
+                    {"patch": {"type": "string", "description": "Full hashline patch text"}},
+                    ["patch"],
+                ))
             tools.append(fn("delete_file", "Delete a file within the workspace.",
                             {"path": {"type": "string"}}, ["path"]))
             if self._terminal_enabled(task):
@@ -1277,6 +1312,8 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 return self._tool_write_file(args, cwd)
             if name == "edit_file" and implement:
                 return self._tool_edit_file(args, cwd)
+            if name == "apply_hashline" and implement and hashline_enabled():
+                return self._tool_apply_hashline(args, cwd)
             if name == "delete_file" and implement:
                 return self._tool_delete_file(args, cwd)
             if name == "run_terminal" and implement and self._terminal_enabled(task):
@@ -1367,14 +1404,36 @@ class AgenticAdapter(FullEditWorkerAdapter):
         path = self._confine(cwd, str(args.get("path", "")))
         if _looks_binary(path):
             return "error: refusing to read an apparent binary file as text"
-        text = path.read_text(encoding="utf-8", errors="replace")
+        text = self._read_text_cached(path)
         lines = text.splitlines()
         start = max(1, int(args["start_line"])) if args.get("start_line") else 1
         limit = int(args["limit"]) if args.get("limit") else len(lines)
         chunk = lines[start - 1:start - 1 + limit]
         # Full body returns to the loop; model-facing offload/hard-cap happens
         # in ``_model_facing_tool_result`` (savings-gated spill, not blunt truncate).
+        if hashline_enabled():
+            rel = _rel(path, cwd).replace("\\", "/")
+            tag = self._hashline_store.record(rel, normalize_text(text))
+            return format_numbered_read(rel, tag, chunk, start_line=start)
         return "\n".join(chunk)
+
+    def _read_text_cached(self, path: Path) -> str:
+        """Read UTF-8 text, optionally caching by (mtime_ns, size)."""
+        if not fs_cache_enabled():
+            return path.read_text(encoding="utf-8", errors="replace")
+        key = str(path.resolve())
+        try:
+            st = path.stat()
+            mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000)))
+            size = int(st.st_size)
+        except OSError:
+            return path.read_text(encoding="utf-8", errors="replace")
+        cached = self._fs_cache.get(key)
+        if cached is not None and cached[0] == mtime_ns and cached[1] == size:
+            return cached[2]
+        text = path.read_text(encoding="utf-8", errors="replace")
+        self._fs_cache[key] = (mtime_ns, size, text)
+        return text
 
     def _tool_list_dir(self, args: dict, cwd: Path) -> str:
         path = self._confine(cwd, str(args.get("path", ".")))
@@ -1453,7 +1512,12 @@ class AgenticAdapter(FullEditWorkerAdapter):
             return "error: refusing to overwrite an apparent binary file"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
-        return f"wrote {_rel(path, cwd)} ({len(content)} chars)"
+        self._invalidate_fs_cache(path)
+        rel = _rel(path, cwd).replace("\\", "/")
+        if hashline_enabled():
+            tag = self._hashline_store.record(rel, normalize_text(content))
+            return f"wrote {rel} ({len(content)} chars) [{rel}#{tag}]"
+        return f"wrote {rel} ({len(content)} chars)"
 
     def _tool_edit_file(self, args: dict, cwd: Path) -> str:
         path = self._confine(cwd, str(args.get("path", "")))
@@ -1471,8 +1535,28 @@ class AgenticAdapter(FullEditWorkerAdapter):
             )
         updated = text.replace(old, new) if replace_all else text.replace(old, new, 1)
         path.write_text(updated, encoding="utf-8")
+        self._invalidate_fs_cache(path)
         n = count if replace_all else 1
-        return f"edited {_rel(path, cwd)} ({n} replacement{'s' if n != 1 else ''})"
+        rel = _rel(path, cwd).replace("\\", "/")
+        if hashline_enabled():
+            tag = self._hashline_store.record(rel, normalize_text(updated))
+            return (
+                f"edited {rel} ({n} replacement{'s' if n != 1 else ''}) "
+                f"[{rel}#{tag}]"
+            )
+        return f"edited {rel} ({n} replacement{'s' if n != 1 else ''})"
+
+    def _tool_apply_hashline(self, args: dict, cwd: Path) -> str:
+        patch = str(args.get("patch", ""))
+        if not patch.strip():
+            return "error: empty hashline patch"
+        try:
+            result = apply_patch(cwd, patch, self._hashline_store)
+        except Exception as exc:  # surface parse/stale/bounds cleanly to the model
+            return f"error: {type(exc).__name__}: {exc}"
+        for path in result.touched:
+            self._invalidate_fs_cache(path)
+        return format_apply_success(result)
 
     def _tool_delete_file(self, args: dict, cwd: Path) -> str:
         path = self._confine(cwd, str(args.get("path", "")))
@@ -1480,8 +1564,10 @@ class AgenticAdapter(FullEditWorkerAdapter):
             return "error: file does not exist"
         if path.is_dir():
             return "error: path is a directory; delete_file only removes files"
-        rel = _rel(path, cwd)
+        rel = _rel(path, cwd).replace("\\", "/")
         path.unlink()
+        self._invalidate_fs_cache(path)
+        self._hashline_store.invalidate(rel)
         return f"deleted {rel}"
 
     def _tool_run_terminal(self, args: dict, cwd: Path) -> str:

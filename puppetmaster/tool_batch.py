@@ -36,7 +36,8 @@ _PARALLEL_SAFE_TOOLS = frozenset({
 })
 
 # File tools can run concurrently when they target independent paths.
-# Only read_file is truly parallel-safe; write/edit are barriers.
+# Only read_file is truly parallel-safe; write/edit/apply_hashline are barriers
+# (apply_hashline is mutating and not listed in _PARALLEL_SAFE_TOOLS).
 _PATH_SCOPED_TOOLS = frozenset({"read_file"})
 
 

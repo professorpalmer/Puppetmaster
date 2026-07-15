@@ -332,6 +332,35 @@ class AgenticToolTests(unittest.TestCase):
         escaped = self.adapter._execute_tool("read_file", {"path": "../../etc/hosts"}, self.cwd, False, _task())
         self.assertIn("escapes the workspace", escaped)
 
+    def test_read_file_hashline_tagged(self) -> None:
+        out = self.adapter._execute_tool("read_file", {"path": "a.py"}, self.cwd, False, _task())
+        self.assertRegex(out, r"^\[a\.py#[0-9A-F]{4}\]")
+        self.assertIn("1:line1", out)
+        self.assertIn("2:line2", out)
+
+    def test_apply_hashline_tool(self) -> None:
+        read_out = self.adapter._execute_tool("read_file", {"path": "a.py"}, self.cwd, True, _task())
+        import re
+        m = re.match(r"\[a\.py#([0-9A-F]{4})\]", read_out)
+        self.assertIsNotNone(m)
+        tag = m.group(1)
+        patch = f"[a.py#{tag}]\nSWAP 1.=1:\n+LINE_ONE\n"
+        out = self.adapter._execute_tool(
+            "apply_hashline", {"patch": patch}, self.cwd, True, _task(),
+        )
+        self.assertTrue(out.startswith("ok:"), out)
+        self.assertTrue((self.cwd / "a.py").read_text(encoding="utf-8").startswith("LINE_ONE"))
+
+    def test_apply_hashline_stale_rejected(self) -> None:
+        self.adapter._execute_tool("read_file", {"path": "a.py"}, self.cwd, True, _task())
+        out = self.adapter._execute_tool(
+            "apply_hashline",
+            {"patch": "[a.py#FFFF]\nDEL 1\n"},
+            self.cwd, True, _task(),
+        )
+        self.assertIn("error:", out)
+        self.assertIn("line1", (self.cwd / "a.py").read_text(encoding="utf-8"))
+
     def test_search_code(self) -> None:
         out = self.adapter._execute_tool("search_code", {"query": "SECRET_MATCH"}, self.cwd, False, _task())
         self.assertIn("a.py:3", out)

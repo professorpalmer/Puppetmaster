@@ -53,6 +53,24 @@ class ToolBatchSegmentationTests(unittest.TestCase):
         self.assertEqual(segments[0][0], "sequential")
         self.assertEqual(len(segments[0][1]), 3)
 
+    def test_apply_hashline_is_mutating_barrier(self):
+        """apply_hashline must not join a parallel read segment (like edit_file)."""
+        calls = [
+            self._make_tool_call("read_file", {"path": "a.py"}, "1"),
+            self._make_tool_call("read_file", {"path": "b.py"}, "2"),
+            self._make_tool_call("apply_hashline", {"patch": "[a.py#ABCD]\nDEL 1\n"}, "3"),
+            self._make_tool_call("search_code", {"query": "foo"}, "4"),
+            self._make_tool_call("list_dir", {"path": "."}, "5"),
+        ]
+        segments = plan_tool_batch_segments(calls)
+        self.assertEqual(len(segments), 3)
+        self.assertEqual(segments[0][0], "parallel")
+        self.assertEqual(len(segments[0][1]), 2)
+        self.assertEqual(segments[1][0], "sequential")
+        self.assertEqual(segments[1][1][0]["name"], "apply_hashline")
+        self.assertEqual(segments[2][0], "parallel")
+        self.assertEqual(len(segments[2][1]), 2)
+
     def test_mixed_batch_splits_correctly(self):
         """Mixed parallel-safe and barrier tools should split into segments."""
         calls = [
