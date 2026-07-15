@@ -1,3 +1,12 @@
+## v1.19.8
+
+**Hashline content-hash edits + mtime read cache for agentic workers (OMP-inspired).**
+
+- New `apply_hashline` tool: surgical line edits anchored to a 4-hex file tag; stale tags reject before write.
+- Tagged `read_file` output (`[path#TAG]` + `N:line`) feeds anchors; `edit_file` / `write_file` remain as fallback.
+- Per-run mtime/size `fs_cache` for repeated reads; invalidated on mutators.
+- Kill switches: `PUPPETMASTER_HASHLINE=0`, `PUPPETMASTER_FS_CACHE=0`. Block ops (`*.BLK`) deferred.
+
 ## v1.19.7
 
 **Hermes-style segmented tool-batch concurrency for agentic workers.**
