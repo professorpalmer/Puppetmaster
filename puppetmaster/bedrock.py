@@ -565,6 +565,10 @@ def build_converse_body(
         body["inferenceConfig"]["temperature"] = float(extra["temperature"])
     if "top_p" in extra:
         body["inferenceConfig"]["topP"] = float(extra["top_p"])
+    # Pass-through for Claude extended thinking / other vendor fields.
+    amrf = extra.get("additionalModelRequestFields")
+    if isinstance(amrf, dict) and amrf:
+        body["additionalModelRequestFields"] = dict(amrf)
     return apply_bedrock_converse_cache_points(body)
 
 
