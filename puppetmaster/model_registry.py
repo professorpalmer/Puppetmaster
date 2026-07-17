@@ -116,6 +116,16 @@ class ModelSpec:
             return 0.0
         return self.estimate_cost_usd(tokens_in, tokens_out)
 
+    def routing_cost_usd(self, tokens_in: int, tokens_out: int) -> float:
+        """Nominal usage cost used to rank models within a shared plan pool.
+
+        Plan-billed models have zero marginal USD, but Cursor still consumes
+        finite first-party usage at model-specific rates. Routing uses the
+        nominal rate for quality/cost decisions while accounting continues to
+        report the true marginal bill via :meth:`marginal_cost_usd`.
+        """
+        return self.estimate_cost_usd(tokens_in, tokens_out)
+
 
 def default_registry_path() -> Path:
     """Where the registry lives by default.
@@ -185,9 +195,12 @@ def starter_registry() -> list[ModelSpec]:
     """A starter registry organized into the four tiers most users
     actually think in: fast/cheap, balanced, high-quality, frontier.
 
-    Tier IDs (``cursor/composer-2-5``, ``cursor/gpt-5-5``,
-    ``cursor/grok-4-5``, ``claude-code/opus-4-6``, ``claude-code/opus-4-7``,
-    ``claude-code/opus-4-8``, ``cursor/fable-5``, ``claude-code/fable-5``)
+    Tier IDs (``cursor/composer-2-5``, ``cursor/grok-4-5``,
+    ``cursor/gpt-5-6-luna``,
+    ``cursor/gpt-5-6-terra``, ``cursor/gpt-5-6-sol``,
+    ``claude-code/opus-4-6``, ``claude-code/opus-4-7``,
+    ``claude-code/opus-4-8``, ``cursor/claude-fable-5``,
+    ``claude-code/fable-5``)
     reflect a common mental model where the cheap tier is Cursor's house
     model, the balanced tier is GPT, the Cursor workhorse is Grok 4.5
     (Opus-class at plan-billed speed/cost), and the tip-of-stack frontier
@@ -197,8 +210,9 @@ def starter_registry() -> list[ModelSpec]:
     claude CLI), so the starter registry is callable end-to-end without
     edits.
 
-    Capability scores and prices are user-asserted starting points —
-    edit them to match your subscriptions.
+    Capability scores are normalized routing scores informed by agentic coding
+    benchmarks; nominal prices mirror Cursor's public model-rate table. Edit
+    either to match a private plan, negotiated pool, or local measurements.
     """
     return [
         ModelSpec(
@@ -206,34 +220,65 @@ def starter_registry() -> list[ModelSpec]:
             adapter="cursor",
             adapter_model_name="composer-2.5",
             capability_score=55,
-            input_per_mtok_usd=0.0,
-            output_per_mtok_usd=0.0,
+            input_per_mtok_usd=0.5,
+            output_per_mtok_usd=2.5,
             context_window=0,
             billing="plan",
-            tags=["cursor", "cheap", "fast", "reading", "code"],
+            tags=["cursor", "cheapest", "cheap", "fast", "reading", "code", "workhorse"],
             notes=(
-                "Fast/cheap tier. Cursor's house Composer model — use "
-                "for verification, exploration, formatting, and other "
-                "low-stakes work. Pricing is $0 because Composer is "
-                "bundled with your Cursor plan."
+                "Cheapest Cursor tier and default workhorse for grunt work: "
+                "verification, exploration, formatting, cleanup, and other "
+                "low-stakes tasks. It is intentionally not the quality choice. "
+                "Cursor plan usage is subscription-covered; the 'cheapest' tag "
+                "captures relative plan/credit preference, not marginal USD."
             ),
         ),
         ModelSpec(
-            id="cursor/gpt-5-5",
+            id="cursor/gpt-5-6-luna",
             adapter="cursor",
-            adapter_model_name="gpt-5.5",
-            capability_score=78,
-            input_per_mtok_usd=0.0,
-            output_per_mtok_usd=0.0,
-            context_window=0,
+            adapter_model_name="gpt-5.6-luna",
+            capability_score=85,
+            input_per_mtok_usd=1.0,
+            output_per_mtok_usd=6.0,
+            context_window=1_050_000,
             billing="plan",
-            tags=["cursor", "balanced", "fast", "vision"],
+            tags=["cursor", "affordable", "balanced", "fast", "vision", "code"],
             notes=(
-                "Balanced tier. GPT-5.5 via the Cursor SDK — same model "
-                "as the openai/gpt-5-5 entry but billed through your "
-                "Cursor plan (so $0 from the router's perspective). The "
-                "router prefers this over openai/gpt-5-5 under the "
-                "balanced policy whenever both qualify."
+                "Affordable GPT-5.6 Cursor tier. Prefer for capable everyday "
+                "implementation and subagent work before Terra/Sol; plan-billed "
+                "with no marginal API USD."
+            ),
+        ),
+        ModelSpec(
+            id="cursor/gpt-5-6-terra",
+            adapter="cursor",
+            adapter_model_name="gpt-5.6-terra",
+            capability_score=94,
+            input_per_mtok_usd=2.5,
+            output_per_mtok_usd=15.0,
+            context_window=1_050_000,
+            billing="plan",
+            tags=["cursor", "expensive", "quality", "vision", "code", "reasoning"],
+            notes=(
+                "Pretty-expensive GPT-5.6 Cursor quality tier. Reserve for "
+                "difficult reviews and implementation where Luna/Grok are not "
+                "enough; plan-billed with no marginal API USD."
+            ),
+        ),
+        ModelSpec(
+            id="cursor/gpt-5-6-sol",
+            adapter="cursor",
+            adapter_model_name="gpt-5.6-sol",
+            capability_score=99,
+            input_per_mtok_usd=5.0,
+            output_per_mtok_usd=30.0,
+            context_window=1_050_000,
+            billing="plan",
+            tags=["cursor", "very-expensive", "frontier", "vision", "code", "reasoning"],
+            notes=(
+                "Very-expensive GPT-5.6 Sol Cursor frontier tier. Reserve for "
+                "the hardest reasoning and codebase-scale work; plan-billed with "
+                "no marginal API USD."
             ),
         ),
         ModelSpec(
@@ -241,8 +286,8 @@ def starter_registry() -> list[ModelSpec]:
             adapter="cursor",
             adapter_model_name="grok-4.5",
             capability_score=97,
-            input_per_mtok_usd=0.0,
-            output_per_mtok_usd=0.0,
+            input_per_mtok_usd=2.0,
+            output_per_mtok_usd=6.0,
             context_window=0,
             billing="plan",
             tags=[
@@ -367,12 +412,12 @@ def starter_registry() -> list[ModelSpec]:
             ),
         ),
         ModelSpec(
-            id="cursor/fable-5",
+            id="cursor/claude-fable-5",
             adapter="cursor",
-            adapter_model_name="fable-5",
+            adapter_model_name="claude-fable-5",
             capability_score=100,
-            input_per_mtok_usd=0.0,
-            output_per_mtok_usd=0.0,
+            input_per_mtok_usd=10.0,
+            output_per_mtok_usd=50.0,
             context_window=0,
             billing="plan",
             tags=[
@@ -388,9 +433,10 @@ def starter_registry() -> list[ModelSpec]:
             notes=(
                 "Frontier flagship on Cursor. Anthropic Claude Fable 5 via the "
                 "Cursor SDK (released 2026-06-09). Billed through your Cursor "
-                "plan ($0 marginal from the router's perspective). SOTA on "
-                "CursorBench; capability_score=100 makes it the default pick "
-                "for the hardest tasks when your plan exposes fable-5."
+                "plan, but it is the most expensive Cursor usage tier. "
+                "SOTA on CursorBench; capability_score=100 makes it the "
+                "default pick for the hardest tasks when your plan exposes "
+                "claude-fable-5."
             ),
         ),
         ModelSpec(
@@ -734,17 +780,64 @@ def write_discovery_meta(
     registry_path: Optional[Path] = None,
     *,
     now_iso: Optional[str] = None,
+    model_ids: Optional[Iterable[str]] = None,
 ) -> Path:
     """Record that ``source`` (e.g. ``cursor``/``openai``/``anthropic``) was
-    just discovered, with how many models it returned and when."""
+    just discovered, with how many models it returned and when.
+
+    ``model_ids`` is an optional membership snapshot. Keeping it beside the
+    timestamp lets diagnostics distinguish an old catalog from a registry
+    whose entries have drifted away from the last known live catalog.
+    """
     from datetime import datetime, timezone
 
     path = discovery_meta_path(registry_path)
     meta = read_discovery_meta(registry_path)
     stamp = now_iso or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    meta[source] = {"refreshed_at": stamp, "count": count}
+    entry: dict[str, Any] = {"refreshed_at": stamp, "count": count}
+    if model_ids is not None:
+        entry["model_ids"] = sorted({str(model_id) for model_id in model_ids if str(model_id)})
+    meta[source] = entry
     write_private_text(path, json.dumps(meta, indent=2) + "\n")
     return path
+
+
+def discovery_registry_drift(
+    registry_path: Optional[Path] = None,
+    *,
+    source: str = "cursor",
+) -> dict[str, Any]:
+    """Compare enabled registry entries with the last discovered catalog.
+
+    Returns ``status='unknown'`` when the discovery sidecar predates
+    membership snapshots, ``status='match'`` when the two sets agree, or
+    ``status='drift'`` with stale/new model names when they do not.
+    """
+    from puppetmaster.static_catalog import SOURCE_TO_ADAPTER
+
+    meta = read_discovery_meta(registry_path)
+    entry = meta.get(source)
+    if not isinstance(entry, dict) or not isinstance(entry.get("model_ids"), list):
+        return {"status": "unknown", "source": source}
+
+    adapter = "cursor" if source == "cursor" else SOURCE_TO_ADAPTER.get(source, source)
+    try:
+        registered = {
+            spec.adapter_model_name
+            for spec in load_registry(registry_path)
+            if spec.adapter == adapter and spec.enabled
+        }
+    except (RuntimeError, OSError):
+        return {"status": "unknown", "source": source}
+    discovered = {str(model_id) for model_id in entry["model_ids"]}
+    stale = sorted(registered - discovered)
+    unregistered = sorted(discovered - registered)
+    return {
+        "status": "drift" if stale or unregistered else "match",
+        "source": source,
+        "stale_registry_models": stale,
+        "unregistered_catalog_models": unregistered,
+    }
 
 
 def catalog_staleness_days(

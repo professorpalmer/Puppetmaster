@@ -8378,15 +8378,15 @@ class ModelRouterTests(unittest.TestCase):
         from puppetmaster.model_registry import starter_registry
 
         registry = {spec.id: spec for spec in starter_registry()}
-        self.assertIn("cursor/fable-5", registry)
+        self.assertIn("cursor/claude-fable-5", registry)
         self.assertIn("claude-code/fable-5", registry)
 
-        cursor_fable = registry["cursor/fable-5"]
+        cursor_fable = registry["cursor/claude-fable-5"]
         self.assertEqual(cursor_fable.adapter, "cursor")
-        self.assertEqual(cursor_fable.adapter_model_name, "fable-5")
+        self.assertEqual(cursor_fable.adapter_model_name, "claude-fable-5")
         self.assertEqual(cursor_fable.capability_score, 100)
         self.assertEqual(cursor_fable.billing, "plan")
-        self.assertEqual(cursor_fable.input_per_mtok_usd, 0.0)
+        self.assertEqual(cursor_fable.input_per_mtok_usd, 10.0)
         self.assertIn("mythos-class", cursor_fable.tags)
 
         claude_fable = registry["claude-code/fable-5"]
@@ -8410,15 +8410,35 @@ class ModelRouterTests(unittest.TestCase):
         self.assertEqual(grok.adapter_model_name, "grok-4.5")
         self.assertEqual(grok.capability_score, 97)
         self.assertEqual(grok.billing, "plan")
-        self.assertEqual(grok.input_per_mtok_usd, 0.0)
+        self.assertEqual(grok.input_per_mtok_usd, 2.0)
         self.assertIn("workhorse", grok.tags)
         self.assertIn("xai", grok.tags)
         # Sits under Opus 4.7/4.8 and Fable so tip-of-stack stays reserved,
-        # but above GPT-5.5 balanced so hard Cursor work prefers Grok.
-        self.assertGreater(grok.capability_score, registry["cursor/gpt-5-5"].capability_score)
+        # but below GPT-5.6 Sol frontier so hard Cursor work prefers Grok
+        # unless the task explicitly needs the top tier.
+        self.assertGreater(grok.capability_score, registry["cursor/gpt-5-6-luna"].capability_score)
         self.assertLess(grok.capability_score, registry["claude-code/opus-4-7"].capability_score)
         self.assertLess(grok.capability_score, registry["claude-code/opus-4-8"].capability_score)
-        self.assertLess(grok.capability_score, registry["cursor/fable-5"].capability_score)
+        self.assertLess(grok.capability_score, registry["cursor/claude-fable-5"].capability_score)
+
+    def test_cursor_plan_routing_uses_nominal_usage_rates(self) -> None:
+        from puppetmaster.model_registry import starter_registry
+        from puppetmaster.router import TaskSignals, route_task
+
+        cursor_only = [spec for spec in starter_registry() if spec.adapter == "cursor"]
+        signal = TaskSignals(
+            instruction="implement a normal multi-file feature",
+            role="implement",
+            explicit_min_capability=90,
+        )
+        decision = route_task(signal, cursor_only, policy="balanced")
+
+        # All Cursor entries are $0 marginally, but the shared pool still has
+        # model-specific nominal rates. Grok is the cheapest model clearing
+        # this capability bar, ahead of Terra/Sol/Fable.
+        self.assertEqual(decision.model.id, "cursor/grok-4-5")
+        self.assertEqual(decision.estimated_cost_usd, 0.0)
+        self.assertGreater(decision.nominal_cost_usd, 0.0)
 
     def test_balanced_policy_picks_cheapest_sufficient_model(self) -> None:
         from puppetmaster.router import TaskSignals, route_task
@@ -9278,13 +9298,13 @@ class ModelRouterTests(unittest.TestCase):
         # Non-detailed-vision models must show up in rejected with the tag reason.
         rejected_ids = {spec.id for spec, _ in decision.rejected}
         self.assertIn("cursor/composer-2-5", rejected_ids)
-        self.assertIn("cursor/gpt-5-5", rejected_ids)
+        self.assertIn("cursor/gpt-5-6-luna", rejected_ids)
         # And under quality policy, the plan-billed cursor/fable-5 (cap 100)
-        # wins over claude-code/fable-5, opus-4-8 (99), and gpt-5.5 (96).
+        # wins over claude-code/fable-5, opus-4-8 (99), and GPT-5.6 tiers.
         quality_decision = route_task(
             signal, starter_registry(), policy="quality"
         )
-        self.assertEqual(quality_decision.model.id, "cursor/fable-5")
+        self.assertEqual(quality_decision.model.id, "cursor/claude-fable-5")
 
     def test_starter_registry_encodes_four_tiers(self) -> None:
         from puppetmaster.model_registry import starter_registry
@@ -9292,7 +9312,10 @@ class ModelRouterTests(unittest.TestCase):
         specs = starter_registry()
         ids = {s.id for s in specs}
         self.assertIn("cursor/composer-2-5", ids)
-        self.assertIn("cursor/gpt-5-5", ids)
+        self.assertIn("cursor/gpt-5-6-luna", ids)
+        self.assertIn("cursor/gpt-5-6-terra", ids)
+        self.assertIn("cursor/gpt-5-6-sol", ids)
+        self.assertNotIn("cursor/gpt-5-5", ids)
         self.assertIn("cursor/grok-4-5", ids)
         self.assertIn("claude-code/opus-4-6", ids)
         self.assertIn("claude-code/opus-4-7", ids)
@@ -9300,14 +9323,14 @@ class ModelRouterTests(unittest.TestCase):
         by_id = {s.id: s for s in specs}
         self.assertLess(
             by_id["cursor/composer-2-5"].capability_score,
-            by_id["cursor/gpt-5-5"].capability_score,
+            by_id["cursor/gpt-5-6-luna"].capability_score,
         )
         self.assertLess(
-            by_id["cursor/gpt-5-5"].capability_score,
+            by_id["cursor/gpt-5-6-luna"].capability_score,
             by_id["claude-code/opus-4-6"].capability_score,
         )
         # Grok 4.5 is the Cursor Opus-class workhorse: above Opus 4.6 /
-        # GPT-5.5, under Opus 4.7+ and Fable tip-of-stack.
+        # GPT-5.6 Luna, under Opus 4.7+ and Fable tip-of-stack.
         self.assertLess(
             by_id["claude-code/opus-4-6"].capability_score,
             by_id["cursor/grok-4-5"].capability_score,
@@ -9323,7 +9346,7 @@ class ModelRouterTests(unittest.TestCase):
         # Fable 5 is the frontier flagship — strictly above Opus 4.8 and the
         # single highest-capability model in the starter registry.
         self.assertIn("claude-code/opus-4-8", ids)
-        self.assertIn("cursor/fable-5", ids)
+        self.assertIn("cursor/claude-fable-5", ids)
         self.assertIn("claude-code/fable-5", ids)
         self.assertLess(
             by_id["claude-code/opus-4-7"].capability_score,
@@ -9349,7 +9372,7 @@ class ModelRouterTests(unittest.TestCase):
         )
         # Vision tagging matches the user-stated preferences.
         self.assertNotIn("vision", by_id["cursor/composer-2-5"].tags)
-        self.assertIn("vision", by_id["cursor/gpt-5-5"].tags)
+        self.assertIn("vision", by_id["cursor/gpt-5-6-luna"].tags)
         self.assertIn("vision", by_id["claude-code/opus-4-6"].tags)
         self.assertIn("detailed-vision", by_id["claude-code/opus-4-7"].tags)
         self.assertIn("detailed-vision", by_id["claude-code/opus-4-8"].tags)
@@ -9371,7 +9394,7 @@ class ModelRouterTests(unittest.TestCase):
             role="security-review",
         )
         decision = route_task(signal, starter_registry(), policy="balanced")
-        self.assertEqual(decision.model.id, "cursor/fable-5")
+        self.assertEqual(decision.model.id, "cursor/claude-fable-5")
         # Opus 4.8 should be in the rejected set (sufficient-but-not-chosen),
         # proving the flagship was preferred for the hardest tier.
         rejected_ids = {spec.id for spec, _ in decision.rejected}
@@ -9393,12 +9416,12 @@ class ModelRouterTests(unittest.TestCase):
         signal = TaskSignals(
             instruction="Implement a multi-file refactor with careful tests",
             role="implement",
-            explicit_min_capability=90,
+            explicit_min_capability=95,
         )
         decision = route_task(signal, cursor_only, policy="balanced")
         self.assertEqual(decision.model.id, "cursor/grok-4-5")
         rejected_ids = {spec.id for spec, _ in decision.rejected}
-        self.assertIn("cursor/fable-5", rejected_ids)
+        self.assertIn("cursor/claude-fable-5", rejected_ids)
 
     def test_starter_registry_routes_easy_task_to_composer(self) -> None:
         from puppetmaster.model_registry import starter_registry
@@ -13242,20 +13265,20 @@ class MarginalCostRoutingTests(unittest.TestCase):
                 adapter="cursor",
                 adapter_model_name="composer",
                 capability_score=82,
-                input_per_mtok_usd=0.0,
-                output_per_mtok_usd=0.0,
+                input_per_mtok_usd=0.5,
+                output_per_mtok_usd=2.5,
                 billing="plan",
             ),
         ]
 
-    def test_plan_billed_priced_model_competes_as_zero_peer(self) -> None:
+    def test_plan_billed_models_rank_by_nominal_pool_rate(self) -> None:
         from puppetmaster.router import TaskSignals, route_task
 
         signal = TaskSignals(instruction="implement a feature", role="implement")
         decision = route_task(signal, self._plan_priced_registry(), policy="balanced")
-        self.assertEqual(decision.model.id, "claude-code/opus")
+        self.assertEqual(decision.model.id, "cursor/composer")
         for _, reason in decision.rejected:
-            self.assertNotIn("pricier", reason)
+            self.assertIn("pricier", reason)
 
     def test_explicit_max_cost_allows_plan_billed_priced_model(self) -> None:
         from puppetmaster.router import TaskSignals, route_task
@@ -13266,7 +13289,7 @@ class MarginalCostRoutingTests(unittest.TestCase):
             explicit_max_cost_usd=0.0005,
         )
         decision = route_task(signal, self._plan_priced_registry(), policy="balanced")
-        self.assertEqual(decision.model.id, "claude-code/opus")
+        self.assertEqual(decision.model.id, "cursor/composer")
 
     def test_routing_decision_records_marginal_and_nominal_costs(self) -> None:
         from puppetmaster.router import TaskSignals, route_task
@@ -16512,6 +16535,46 @@ class CatalogStalenessTests(unittest.TestCase):
             age = catalog_staleness_days(meta, "cursor", now=now)
             self.assertGreater(age, 30)
             self.assertIsNone(catalog_staleness_days(meta, "openai"))
+
+    def test_membership_snapshot_detects_registry_drift(self) -> None:
+        from puppetmaster.model_registry import (
+            ModelSpec,
+            discovery_registry_drift,
+            save_registry,
+            write_discovery_meta,
+        )
+
+        with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "models.json"
+            save_registry(
+                [
+                    ModelSpec(
+                        id="cursor/current",
+                        adapter="cursor",
+                        adapter_model_name="current",
+                        billing="plan",
+                    ),
+                    ModelSpec(
+                        id="cursor/retired",
+                        adapter="cursor",
+                        adapter_model_name="retired",
+                        billing="plan",
+                    ),
+                ],
+                registry_path,
+            )
+            write_discovery_meta(
+                "cursor",
+                2,
+                registry_path,
+                model_ids=["current", "new"],
+            )
+
+            drift = discovery_registry_drift(registry_path)
+
+            self.assertEqual(drift["status"], "drift")
+            self.assertEqual(drift["stale_registry_models"], ["retired"])
+            self.assertEqual(drift["unregistered_catalog_models"], ["new"])
 
 
 class TelemetryContextAndMetricsTests(unittest.TestCase):

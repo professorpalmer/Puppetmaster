@@ -498,7 +498,9 @@ def route_task(
             f"No model in registry has all required tags {sorted(effective_required_tags)}"
         )
 
-    # Cost budget filter.
+    # Cost budget filter. This is a hard marginal-spend cap; plan-billed
+    # models remain $0 here even though their nominal usage rate is used for
+    # ranking below.
     after_cost: list[ModelSpec] = []
     for spec in after_tags:
         est = spec.marginal_cost_usd(tokens_in, tokens_out)
@@ -569,18 +571,19 @@ def route_task(
         return 0 if spec.is_plan_billed else 1
 
     if policy == "cheap":
-        # Tie-break: plan-billed first (no marginal spend), then lower
-        # capability_score (reserve big models for tasks that need them;
-        # "cheap" implies "small").
+        # Rank by nominal usage cost, not marginal bill. Cursor plan models
+        # are all $0 marginally but consume a finite shared pool at different
+        # rates, so treating them as equal would route almost everything to
+        # the strongest model and exhaust the pool faster.
         pick = min(
             after_cost,
             key=lambda s: (
-                s.marginal_cost_usd(tokens_in, tokens_out),
+                s.routing_cost_usd(tokens_in, tokens_out),
                 _plan_rank(s),
                 s.capability_score,
             ),
         )
-        reason = "policy=cheap: lowest per-call estimated cost"
+        reason = "policy=cheap: lowest nominal per-call usage cost"
         for spec in after_cost:
             if spec.id != pick.id:
                 rejected.append(
@@ -614,11 +617,11 @@ def route_task(
         # by capability first would let a barely-sufficient but expensive model
         # win over a cheaper higher-capability one, contradicting "cheapest
         # sufficient". So filter to sufficient first, then order by
-        # (plan_rank, marginal_cost, capability_score).
+        # (plan_rank, nominal usage cost, capability_score).
         def _escalation_key(spec: ModelSpec):
             return (
                 _plan_rank(spec),
-                spec.marginal_cost_usd(tokens_in, tokens_out),
+                spec.routing_cost_usd(tokens_in, tokens_out),
                 spec.capability_score,
             )
 
@@ -653,15 +656,14 @@ def route_task(
     # balanced (default)
     sufficient = [s for s in after_cost if s.capability_score >= need]
     if sufficient:
-        # Tie-break: when several sufficient models cost the same
-        # (e.g. multiple $0 Cursor-plan models), pick the LOWEST
-        # capability_score among them — that's the right-sized model
-        # for the task. Picking the highest would waste capability.
+        # Pick the cheapest sufficient model using nominal usage rates. This
+        # keeps the router cost-aware even when Cursor reports every
+        # subscription-covered call as $0 marginal spend.
         pick = min(
             sufficient,
             key=lambda s: (
                 _plan_rank(s),
-                s.marginal_cost_usd(tokens_in, tokens_out),
+                s.routing_cost_usd(tokens_in, tokens_out),
                 s.capability_score,
             ),
         )
@@ -672,7 +674,7 @@ def route_task(
             f"policy=balanced: cheapest sufficient model whose capability_score "
             f"({pick.capability_score}) >= needed ({need}){plan_note}"
         )
-        pick_cost = pick.marginal_cost_usd(tokens_in, tokens_out)
+        pick_cost = pick.routing_cost_usd(tokens_in, tokens_out)
         for spec in after_cost:
             if spec.id != pick.id:
                 if spec.capability_score < need:
@@ -683,7 +685,7 @@ def route_task(
                         )
                     )
                 else:
-                    spec_cost = spec.marginal_cost_usd(tokens_in, tokens_out)
+                    spec_cost = spec.routing_cost_usd(tokens_in, tokens_out)
                     if spec_cost > pick_cost:
                         rejected.append(
                             (

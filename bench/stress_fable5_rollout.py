@@ -172,15 +172,15 @@ def stress_routing_matrix() -> None:
         )
 
     decision = frontier(None)
-    check("all platforms: picks cursor/fable-5 (plan-billed $0)",
-          decision.model.id == "cursor/fable-5" and decision.estimated_cost_usd == 0.0,
+    check("all platforms: picks cursor/claude-fable-5 (plan-billed $0)",
+          decision.model.id == "cursor/claude-fable-5" and decision.estimated_cost_usd == 0.0,
           f"got {decision.model.id} @ ${decision.estimated_cost_usd:.4f}")
     check("all platforms: demanded capability is 100",
           decision.capability_needed == 100, str(decision.capability_needed))
 
     decision = frontier(frozenset({"cursor"}))
-    check("cursor-only lock: picks cursor/fable-5",
-          decision.model.id == "cursor/fable-5", decision.model.id)
+    check("cursor-only lock: picks cursor/claude-fable-5",
+          decision.model.id == "cursor/claude-fable-5", decision.model.id)
 
     decision = frontier(frozenset({"claude-code"}))
     check("claude-code-only lock: picks claude-code/fable-5",
@@ -346,7 +346,7 @@ def stress_auto_fallback_matrix() -> None:
         ModelSpec(id="claude-code/opus-4-8", adapter="claude-code",
                   adapter_model_name="claude-opus-4-8", capability_score=99,
                   input_per_mtok_usd=5.0, output_per_mtok_usd=25.0, billing="unknown"),
-        ModelSpec(id="cursor/fable-5", adapter="cursor", adapter_model_name="fable-5",
+        ModelSpec(id="cursor/claude-fable-5", adapter="cursor", adapter_model_name="claude-fable-5",
                   capability_score=100, billing="plan", tags=["cursor"]),
         ModelSpec(id="codex/gpt-5-5", adapter="codex", adapter_model_name="gpt-5.5",
                   capability_score=97, input_per_mtok_usd=5.0,

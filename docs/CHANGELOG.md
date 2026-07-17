@@ -1,3 +1,14 @@
+## v1.19.10
+
+**Price-aware routing for Cursor's current model tiers.**
+
+- Remove retired GPT-5.5 Cursor defaults and keep GPT-5.6 Luna/Terra/Sol as
+  the supported GPT family.
+- Record public nominal usage rates for Composer 2.5, Grok 4.5, Fable 5, and
+  GPT-5.6 tiers while preserving $0 marginal billing for Cursor plans.
+- Route plan-covered models by nominal pool consumption, so balanced/cheap
+  policies do not treat every subscription model as equally costly.
+
 ## v1.19.8
 
 **Hashline content-hash edits + mtime read cache for agentic workers (OMP-inspired).**
@@ -6,6 +17,17 @@
 - Tagged `read_file` output (`[path#TAG]` + `N:line`) feeds anchors; `edit_file` / `write_file` remain as fallback.
 - Per-run mtime/size `fs_cache` for repeated reads; invalidated on mutators.
 - Kill switches: `PUPPETMASTER_HASHLINE=0`, `PUPPETMASTER_FS_CACHE=0`. Block ops (`*.BLK`) deferred.
+
+## v1.19.9
+
+**Cursor multiworker reliability and model-registry freshness.**
+
+- Isolate Cursor SDK SQLite state per worker so parallel Cursor swarms do not
+  contend on a shared workspace database.
+- Refresh Cursor defaults with the live plan tiers: Composer 2.5, GPT-5.6
+  Luna/Terra/Sol, Grok 4.5, and Claude Fable 5.
+- Record catalog membership snapshots and warn when a registry is older than
+  seven days or no longer matches its discovered catalog.
 
 ## v1.19.7
 

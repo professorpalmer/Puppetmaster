@@ -43,6 +43,17 @@ class GitSnapshot:
         return value
 
 
+def _git_text(value: object) -> str:
+    """Coerce subprocess stdout/stderr to str. On Windows without PYTHONUTF8,
+    ``text=True`` can leave ``stdout`` as None after a decode failure in the
+    reader thread — never call ``.strip()`` on the raw attribute."""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
 def _run_git(cwd: Path, args: list[str], *, strip: bool = True) -> str:
     try:
         completed = facade("subprocess").run(
@@ -50,12 +61,14 @@ def _run_git(cwd: Path, args: list[str], *, strip: bool = True) -> str:
             cwd=cwd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
             timeout=_GIT_SUBPROCESS_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
         return ""
-    stdout = completed.stdout if completed.stdout is not None else ""
+    stdout = _git_text(completed.stdout)
     if strip:
         return stdout.strip() if completed.returncode == 0 else ""
     return stdout if completed.returncode == 0 else ""
@@ -148,15 +161,16 @@ def git_worktree_tree(cwd: Path) -> str:
     os.close(fd)
     env = {**os.environ, "GIT_INDEX_FILE": index_path}
     try:
+        _utf8 = {"text": True, "encoding": "utf-8", "errors": "replace"}
         if sha:
             read = facade("subprocess").run(
                 ["git", "read-tree", sha],
                 cwd=cwd,
                 env=env,
                 capture_output=True,
-                text=True,
                 check=False,
                 timeout=_GIT_SUBPROCESS_TIMEOUT,
+                **_utf8,
             )
         else:
             read = facade("subprocess").run(
@@ -164,9 +178,9 @@ def git_worktree_tree(cwd: Path) -> str:
                 cwd=cwd,
                 env=env,
                 capture_output=True,
-                text=True,
                 check=False,
                 timeout=_GIT_SUBPROCESS_TIMEOUT,
+                **_utf8,
             )
         if read.returncode != 0:
             return ""
@@ -175,9 +189,9 @@ def git_worktree_tree(cwd: Path) -> str:
             cwd=cwd,
             env=env,
             capture_output=True,
-            text=True,
             check=False,
             timeout=_GIT_SUBPROCESS_TIMEOUT,
+            **_utf8,
         )
         if add.returncode != 0:
             return ""
@@ -186,11 +200,11 @@ def git_worktree_tree(cwd: Path) -> str:
             cwd=cwd,
             env=env,
             capture_output=True,
-            text=True,
             check=False,
             timeout=_GIT_SUBPROCESS_TIMEOUT,
+            **_utf8,
         )
-        return written.stdout.strip() if written.returncode == 0 else ""
+        return _git_text(written.stdout).strip() if written.returncode == 0 else ""
     except subprocess.TimeoutExpired:
         return ""
     finally:
@@ -235,14 +249,17 @@ def git_untracked_diff(cwd: Path, untracked: list[str]) -> str:
                 cwd=cwd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=False,
                 timeout=_GIT_SUBPROCESS_TIMEOUT,
             )
         except subprocess.TimeoutExpired:
             continue
         # 0 == identical (no output), 1 == differs (the diff we want), >1 == error.
-        if completed.returncode in (0, 1) and completed.stdout.strip():
-            chunks.append(completed.stdout)
+        stdout = _git_text(completed.stdout)
+        if completed.returncode in (0, 1) and stdout.strip():
+            chunks.append(stdout)
     return "".join(chunks)
 
 

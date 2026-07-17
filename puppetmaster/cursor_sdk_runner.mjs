@@ -1,5 +1,9 @@
 #!/usr/bin/env node
 import { Agent, Cursor, CursorAgentError } from "@cursor/sdk";
+import { SqliteLocalAgentStore } from "@cursor/sdk/sqlite";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const input = JSON.parse(process.env.PUPPETMASTER_CURSOR_INPUT || "{}");
 const apiKey = process.env.CURSOR_API_KEY;
@@ -42,15 +46,26 @@ try {
   // and the Python side silently fell back to a wild char/4 undercount. So we
   // run via Agent.create + agent.send({ onDelta }) and sum per-turn usage
   // across the whole agentic run (an implement task spans many turns).
-  const agent = await Agent.create({
-    apiKey,
-    model: { id: input.model || "default" },
-    local: { cwd: input.cwd || process.cwd(), settingSources: [] },
+  // Each Puppetmaster worker is a separate process. Give each process its own
+  // SDK SQLite root: the SDK's default root is workspace-scoped, so parallel
+  // workers otherwise all open the same index.db and can fail with SQLITE_BUSY /
+  // "database is locked" before the model run starts.
+  const workspaceRef = input.cwd || process.cwd();
+  const sdkStateRoot = await mkdtemp(join(tmpdir(), "puppetmaster-cursor-sdk-"));
+  const store = await SqliteLocalAgentStore.open({
+    workspaceRef,
+    stateRoot: sdkStateRoot,
   });
+  let agent;
 
   let exitCode = 1;
   let output = "";
   try {
+    agent = await Agent.create({
+      apiKey,
+      model: { id: input.model || "default" },
+      local: { cwd: workspaceRef, settingSources: [], store },
+    });
     const usage = {
       inputTokens: 0,
       outputTokens: 0,
@@ -82,11 +97,13 @@ try {
   } finally {
     // Always dispose before exiting — process.exit() would skip pending
     // finalizers, leaking the local executor + run watchers.
-    if (typeof agent[Symbol.asyncDispose] === "function") {
+    if (agent && typeof agent[Symbol.asyncDispose] === "function") {
       await agent[Symbol.asyncDispose]();
-    } else if (typeof agent.dispose === "function") {
+    } else if (agent && typeof agent.dispose === "function") {
       await agent.dispose();
     }
+    await store.dispose();
+    await rm(sdkStateRoot, { recursive: true, force: true });
   }
   if (output) process.stdout.write(output);
   process.exit(exitCode);

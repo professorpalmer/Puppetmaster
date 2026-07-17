@@ -764,7 +764,12 @@ def _run_models_discover(args, path: Path) -> int:
         save_registry(registry, path)
         for report in reports:
             src = report.get("source") or report.get("adapter")
-            write_discovery_meta(src, report["discovered_count"], path)
+            write_discovery_meta(
+                src,
+                report["discovered_count"],
+                path,
+                model_ids=[item["id"] for item in catalogs.get(src, []) if item.get("id")],
+            )
         if not args.json:
             print(f"Wrote merged registry to {path}")
     elif not args.json and reports:

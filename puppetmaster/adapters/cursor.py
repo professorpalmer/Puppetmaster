@@ -430,17 +430,18 @@ def sdk_usage_from_stdout(stdout: str) -> Any:
     return None
 
 
-def cursor_result_text(stdout: str) -> tuple[Optional[str], str]:
+def cursor_result_text(stdout: Optional[str]) -> tuple[Optional[str], str]:
+    text = "" if stdout is None else str(stdout)
     try:
-        payload = json.loads(stdout)
-    except json.JSONDecodeError:
-        return None, stdout.strip()
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return None, text.strip()
     if not isinstance(payload, dict):
-        return None, stdout.strip()
+        return None, text.strip()
     if "result" not in payload and (
         "artifacts" in payload or "findings" in payload or "risks" in payload or "decisions" in payload
     ):
-        return None, stdout.strip()
+        return None, text.strip()
     result = payload.get("result")
     return (
         str(payload.get("status")) if payload.get("status") is not None else None,

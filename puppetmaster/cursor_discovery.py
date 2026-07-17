@@ -44,6 +44,19 @@ _CURSOR_FRONTIER_KIN_ALIASES: dict[str, str] = {
     "fable-5": "claude-fable-5",
 }
 
+# Public Cursor nominal usage rates (USD per million tokens). These are not
+# marginal bills for subscription users; they are the relative first-party
+# pool prices used by the router to avoid treating every plan model as equal.
+_CURSOR_NOMINAL_RATES: dict[str, tuple[float, float]] = {
+    "composer-2.5": (0.5, 2.5),
+    "grok-4.5": (2.0, 6.0),
+    "claude-fable-5": (10.0, 50.0),
+    "fable-5": (10.0, 50.0),
+    "gpt-5.6-luna": (1.0, 6.0),
+    "gpt-5.6-terra": (2.5, 15.0),
+    "gpt-5.6-sol": (5.0, 30.0),
+}
+
 
 class CursorDiscoveryError(RuntimeError):
     """Raised when the Cursor catalog cannot be enumerated."""
@@ -137,6 +150,7 @@ def catalog_to_specs(
     for item in catalog:
         model_id = str(item["id"])
         overlay = by_model_name.get(model_id)
+        nominal_rate = _CURSOR_NOMINAL_RATES.get(model_id)
         if overlay is not None:
             specs.append(
                 ModelSpec(
@@ -144,8 +158,16 @@ def catalog_to_specs(
                     adapter="cursor",
                     adapter_model_name=model_id,
                     capability_score=overlay.capability_score,
-                    input_per_mtok_usd=overlay.input_per_mtok_usd,
-                    output_per_mtok_usd=overlay.output_per_mtok_usd,
+                    input_per_mtok_usd=(
+                        nominal_rate[0]
+                        if nominal_rate is not None
+                        else overlay.input_per_mtok_usd
+                    ),
+                    output_per_mtok_usd=(
+                        nominal_rate[1]
+                        if nominal_rate is not None
+                        else overlay.output_per_mtok_usd
+                    ),
                     context_window=overlay.context_window,
                     billing="plan",
                     tags=sorted(set(overlay.tags) | {"discovered"}),
@@ -185,8 +207,8 @@ def catalog_to_specs(
                     adapter="cursor",
                     adapter_model_name=model_id,
                     capability_score=capability,
-                    input_per_mtok_usd=0.0,
-                    output_per_mtok_usd=0.0,
+                    input_per_mtok_usd=nominal_rate[0] if nominal_rate else 0.0,
+                    output_per_mtok_usd=nominal_rate[1] if nominal_rate else 0.0,
                     context_window=context_window,
                     billing="plan",
                     tags=inherited_tags,
@@ -307,7 +329,12 @@ def ensure_cursor_plan_catalog(
         catalog = fetch()
         merged, report = merge_catalog_into_registry(registry, catalog)
         save_registry(merged, registry_path)
-        write_discovery_meta("cursor", report.get("discovered_count", 0), registry_path)
+        write_discovery_meta(
+            "cursor",
+            report.get("discovered_count", 0),
+            registry_path,
+            model_ids=[item["id"] for item in catalog],
+        )
         return {
             "action": "discovered",
             "discovered_count": report.get("discovered_count", 0),
