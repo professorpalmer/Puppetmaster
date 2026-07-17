@@ -1,3 +1,15 @@
+## v1.19.13
+
+**Non-interactive git in worker subprocess environments (Windows console-flood fix).**
+
+- `run_streamed_subprocess` now forces `GIT_PAGER=cat`, `PAGER=cat` (setdefault),
+  and `GIT_TERMINAL_PROMPT=0` into every worker environment. Any git spawned
+  down the chain by an agent CLI (cursor-agent, claude, codex) exits immediately
+  instead of launching an interactive pager or credential prompt.
+- Fixes the Windows terminal-window flood: console-less worker grandchildren
+  (git + less) each allocated a visible terminal stuck at "Press RETURN to
+  continue" while swarms ran.
+
 ## v1.19.12
 
 **Cross-adapter catalog freshness and safe model-registry updates.**
