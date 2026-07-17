@@ -204,6 +204,15 @@ def run_streamed_subprocess(
         except OSError:
             pass
 
+    # Workers run console-less; any git the agent CLI spawns down the chain
+    # must never launch an interactive pager or credential prompt. On Windows
+    # a console-less grandchild git + less allocates a visible terminal window
+    # per invocation ("Press RETURN to continue" flood).
+    env = dict(env) if env is not None else os.environ.copy()
+    env.setdefault("PAGER", "cat")
+    env["GIT_PAGER"] = "cat"
+    env.setdefault("GIT_TERMINAL_PROMPT", "0")
+
     popen_kwargs: dict[str, Any] = {}
     if start_new_session:
         # Hermes tears down its own process group on exit and has been observed
