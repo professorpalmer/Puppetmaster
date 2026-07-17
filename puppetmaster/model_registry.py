@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -41,6 +42,20 @@ from puppetmaster.fs_permissions import write_private_text
 
 
 REGISTRY_ENV = "PUPPETMASTER_MODELS_PATH"
+
+# Discovery names are user-facing source names, while registry entries use
+# adapter names. Keep this mapping in the shared registry layer so diagnostics,
+# CLI discovery, and preflight cannot silently disagree about which entries a
+# catalog describes.
+DISCOVERY_SOURCE_TO_ADAPTER: dict[str, str] = {
+    "cursor": "cursor",
+    "openai": "openai",
+    "anthropic": "claude-code",
+    "claude": "claude-code",
+    "codex": "codex",
+    "hermes": "hermes",
+    "agentic": "agentic",
+}
 
 
 @dataclass(frozen=True)
@@ -781,6 +796,9 @@ def write_discovery_meta(
     *,
     now_iso: Optional[str] = None,
     model_ids: Optional[Iterable[str]] = None,
+    catalog_hash: Optional[str] = None,
+    mode: str = "apply",
+    pending_diff: Optional[dict[str, Any]] = None,
 ) -> Path:
     """Record that ``source`` (e.g. ``cursor``/``openai``/``anthropic``) was
     just discovered, with how many models it returned and when.
@@ -791,15 +809,98 @@ def write_discovery_meta(
     """
     from datetime import datetime, timezone
 
+    if mode not in {"apply", "probe"}:
+        raise ValueError("discovery metadata mode must be 'apply' or 'probe'")
     path = discovery_meta_path(registry_path)
     meta = read_discovery_meta(registry_path)
     stamp = now_iso or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     entry: dict[str, Any] = {"refreshed_at": stamp, "count": count}
     if model_ids is not None:
-        entry["model_ids"] = sorted({str(model_id) for model_id in model_ids if str(model_id)})
+        normalized_ids = sorted(
+            {str(model_id) for model_id in model_ids if str(model_id)}
+        )
+        entry["model_ids"] = normalized_ids
+        entry["catalog_hash"] = catalog_hash or catalog_membership_hash(normalized_ids)
+        previous = meta.get(source)
+        previous_applied = (
+            previous.get("last_applied_hash")
+            if isinstance(previous, dict)
+            else None
+        )
+        if mode == "apply":
+            entry["last_applied_hash"] = entry["catalog_hash"]
+            entry["pending_diff"] = {}
+        else:
+            entry["last_applied_hash"] = (
+                previous_applied
+                or (previous.get("catalog_hash") if isinstance(previous, dict) else None)
+            )
+            entry["pending_diff"] = pending_diff or {}
+    if mode == "probe":
+        entry["probe_status"] = "ok"
+        entry["mode"] = "probe"
+    else:
+        entry["mode"] = "apply"
     meta[source] = entry
     write_private_text(path, json.dumps(meta, indent=2) + "\n")
     return path
+
+
+def catalog_membership_hash(model_ids: Iterable[str]) -> str:
+    """Return a stable hash for a source's normalized model membership."""
+    normalized = sorted({str(model_id) for model_id in model_ids if str(model_id)})
+    return "sha256:" + hashlib.sha256(
+        "\n".join(normalized).encode("utf-8")
+    ).hexdigest()
+
+
+def catalog_content_hash(catalog: Iterable[object]) -> str:
+    """Return a stable hash for full catalog records, including pricing metadata."""
+    normalized = json.dumps(
+        list(catalog),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "sha256:" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def discovery_registry_diff(
+    specs: Iterable[ModelSpec],
+    source: str,
+    model_ids: Iterable[str],
+) -> dict[str, Any]:
+    """Describe catalog membership not represented by enabled registry entries."""
+    adapter = DISCOVERY_SOURCE_TO_ADAPTER.get(source, source)
+    registered = {
+        spec.adapter_model_name
+        for spec in specs
+        if spec.adapter == adapter and spec.enabled
+    }
+    discovered = {str(model_id) for model_id in model_ids if str(model_id)}
+    added = sorted(discovered - registered)
+    removed = sorted(registered - discovered)
+    return {
+        "source": source,
+        "adapter": adapter,
+        "status": "drift" if added or removed else "match",
+        "added": added,
+        "removed": removed,
+    }
+
+
+def discovery_catalog_changed(
+    meta: dict[str, Any], source: str
+) -> bool:
+    """Whether a probe observed a catalog different from the last apply."""
+    entry = meta.get(source)
+    if not isinstance(entry, dict):
+        return False
+    current = entry.get("catalog_hash")
+    applied = entry.get("last_applied_hash")
+    if current and applied:
+        return current != applied
+    return bool(entry.get("pending_diff"))
 
 
 def discovery_registry_drift(
@@ -813,14 +914,12 @@ def discovery_registry_drift(
     membership snapshots, ``status='match'`` when the two sets agree, or
     ``status='drift'`` with stale/new model names when they do not.
     """
-    from puppetmaster.static_catalog import SOURCE_TO_ADAPTER
-
     meta = read_discovery_meta(registry_path)
     entry = meta.get(source)
     if not isinstance(entry, dict) or not isinstance(entry.get("model_ids"), list):
         return {"status": "unknown", "source": source}
 
-    adapter = "cursor" if source == "cursor" else SOURCE_TO_ADAPTER.get(source, source)
+    adapter = DISCOVERY_SOURCE_TO_ADAPTER.get(source, source)
     try:
         registered = {
             spec.adapter_model_name

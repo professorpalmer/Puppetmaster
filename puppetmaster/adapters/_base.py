@@ -5,7 +5,7 @@ import shlex
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional, Protocol, Union
+from typing import Any, ClassVar, Optional, Protocol, Union
 
 from puppetmaster.codegraph import inject_worker_cli_env
 from puppetmaster.fs_permissions import mkdir_private, write_private_text
@@ -263,6 +263,11 @@ class FullEditWorkerAdapter:
     """Shared git snapshot + worktree/dirty guards for full-edit adapter runs."""
 
     name: str
+    # Runtime safety is declared per adapter rather than assumed globally.
+    # "none" means the adapter owns no known mutable SDK/CLI state that
+    # Puppetmaster can safely isolate.
+    state_isolation: ClassVar[str] = "none"
+    catalog_source: ClassVar[Optional[str]] = None
 
     @staticmethod
     def guard_full_edit_run(
@@ -448,6 +453,8 @@ class AdapterInfo:
 
 class WorkerAdapter(Protocol):
     name: str
+    state_isolation: ClassVar[str]
+    catalog_source: ClassVar[Optional[str]]
 
     def run(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
         """Execute a task and return structured artifacts."""

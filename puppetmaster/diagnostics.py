@@ -107,6 +107,7 @@ def _catalog_freshness_check() -> Check:
     this surfaces a reminder before routing quietly uses an out-of-date view."""
     from puppetmaster.model_registry import (
         catalog_staleness_days,
+        discovery_catalog_changed,
         discovery_registry_drift,
         read_discovery_meta,
     )
@@ -116,8 +117,8 @@ def _catalog_freshness_check() -> Check:
         return Check(
             "catalog-freshness",
             "optional",
-            "no catalog discovery recorded yet — run `puppetmaster models discover --write` "
-            "to enumerate plan-billed models and keep routing current.",
+            "no catalog discovery recorded yet — run `puppetmaster models discover "
+            "--probe` to inspect reachable catalogs without changing routing.",
         )
     try:
         stale_threshold = float(os.environ.get("PUPPETMASTER_CATALOG_STALE_DAYS", "7"))
@@ -126,12 +127,15 @@ def _catalog_freshness_check() -> Check:
     stale: list[str] = []
     fresh: list[str] = []
     drift: list[str] = []
+    changed: list[str] = []
     for source in meta:
         age = catalog_staleness_days(meta, source)
         if age is None:
             continue
         label = f"{source} {age:.0f}d"
         (stale if age > stale_threshold else fresh).append(label)
+        if discovery_catalog_changed(meta, source):
+            changed.append(source)
         membership = discovery_registry_drift(source=source)
         if membership["status"] == "unknown":
             drift.append(f"{source} membership unverified")
@@ -141,17 +145,20 @@ def _catalog_freshness_check() -> Check:
                 f"{source} registry drift"
                 + (f" ({', '.join(stale_models[:3])})" if stale_models else "")
             )
-    if stale or drift:
+    if stale or drift or changed:
         details = []
         if stale:
             details.append(f"catalog stale (>{stale_threshold:.0f}d): {', '.join(stale)}")
         if drift:
             details.append("registry " + "; ".join(drift))
+        if changed:
+            details.append("catalog changed since last apply: " + ", ".join(changed))
         return Check(
             "catalog-freshness",
             "warn",
             ". ".join(details)
-            + ". Re-run `puppetmaster models discover --write` to refresh.",
+            + ". Run `puppetmaster models discover --probe` to review, then "
+            "`puppetmaster models discover --write` to apply.",
         )
     return Check(
         "catalog-freshness",

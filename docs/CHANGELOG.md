@@ -1,3 +1,18 @@
+## v1.19.11
+
+**Cross-adapter catalog freshness and safe model-registry updates.**
+
+- Add probe-only catalog snapshots with stable hashes and pending diffs; probing
+  never mutates `models.json`.
+- Extend freshness/drift awareness across live, API, curated, and Bedrock-backed
+  sources, including the Anthropic-to-Claude adapter mapping.
+- Keep nominal reference prices for subscription models so routing can respect
+  shared-pool consumption while marginal plan billing remains $0.
+- Add cached, TTL-bounded preflight membership checks for non-Cursor adapters;
+  stale snapshots fail open with explicit evidence.
+- Declare adapter state-isolation capabilities and keep Cursor's SQLite fix
+  scoped to the Cursor SDK until another harness proves the same requirement.
+
 ## v1.19.10
 
 **Price-aware routing for Cursor's current model tiers.**

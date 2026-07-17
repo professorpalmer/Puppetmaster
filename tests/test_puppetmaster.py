@@ -14154,6 +14154,54 @@ class PreflightTests(unittest.TestCase):
         self.assertTrue(r.ok)
         self.assertIn("catalog unverified", r.reason)
 
+    def test_recent_probe_snapshot_blocks_missing_non_cursor_model(self) -> None:
+        from puppetmaster.model_registry import ModelSpec, save_registry, write_discovery_meta
+        from puppetmaster.platform_billing import BillingStatus
+        from puppetmaster.preflight import preflight_check
+
+        with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "models.json"
+            save_registry(
+                [
+                    ModelSpec(
+                        id="openai/live",
+                        adapter="openai",
+                        adapter_model_name="retired-model",
+                        capability_score=80,
+                        billing="api",
+                    )
+                ],
+                registry_path,
+            )
+            write_discovery_meta(
+                "openai",
+                1,
+                registry_path,
+                model_ids=["current-model"],
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "PUPPETMASTER_MODELS_PATH": str(registry_path),
+                    "PUPPETMASTER_CATALOG_CACHE_TTL_SECONDS": "3600",
+                },
+                clear=False,
+            ):
+                result = preflight_check(
+                    "openai",
+                    "retired-model",
+                    billing_status=BillingStatus(
+                        adapter="openai",
+                        billing="api",
+                        healthy=True,
+                        detail="key",
+                        evidence=[],
+                    ),
+                )
+
+            self.assertFalse(result.ok)
+            self.assertIn("absent from the recent openai catalog", result.reason)
+
 
 class AdapterCliPresenceTests(unittest.TestCase):
     """`adapter_cli_present` closes the gap billing detection can't see: an
@@ -14175,12 +14223,23 @@ class AdapterCliPresenceTests(unittest.TestCase):
 
         self.assertEqual(adapter_cli_executable("claude-code"), "claude")
         self.assertEqual(adapter_cli_executable("codex"), "codex")
-
         present = lambda name: f"/usr/local/bin/{name}"
         absent = lambda _name: None
         for adapter in ("claude-code", "codex"):
             self.assertTrue(adapter_cli_present(adapter, resolver=present))
             self.assertFalse(adapter_cli_present(adapter, resolver=absent))
+
+    def test_runtime_capabilities_keep_cursor_isolation_opt_in(self) -> None:
+        from puppetmaster.adapters.registry import adapter_runtime_capabilities
+
+        self.assertEqual(
+            adapter_runtime_capabilities("cursor")["state_isolation"],
+            "per-worker-sdk-state",
+        )
+        self.assertEqual(
+            adapter_runtime_capabilities("codex")["state_isolation"],
+            "none",
+        )
 
     def test_executable_honors_env_override(self) -> None:
         from puppetmaster.preflight import adapter_cli_executable
@@ -16353,7 +16412,7 @@ class SubscriptionPlanCatalogTests(unittest.TestCase):
         save_registry(thin, path)
         return path
 
-    def test_plan_merge_zeroes_price_preserves_id_and_capability(self) -> None:
+    def test_plan_merge_keeps_nominal_price_and_zero_marginal_cost(self) -> None:
         from puppetmaster.model_registry import starter_registry
         from puppetmaster.static_catalog import merge_curated_into_registry
 
@@ -16363,8 +16422,10 @@ class SubscriptionPlanCatalogTests(unittest.TestCase):
         self.assertEqual(report["source"], "claude")
         opus = next(s for s in merged if s.adapter_model_name == "claude-opus-4-8")
         self.assertEqual(opus.billing, "plan")
-        self.assertEqual(opus.input_per_mtok_usd, 0.0)
-        self.assertEqual(opus.output_per_mtok_usd, 0.0)
+        self.assertEqual(opus.input_per_mtok_usd, 5.0)
+        self.assertEqual(opus.output_per_mtok_usd, 25.0)
+        self.assertEqual(opus.marginal_cost_usd(100_000, 10_000), 0.0)
+        self.assertGreater(opus.routing_cost_usd(100_000, 10_000), 0.0)
         # Existing id + (possibly user-tuned) capability are preserved.
         self.assertEqual(opus.id, "claude-code/opus-4-8")
         self.assertEqual(opus.capability_score, 99)
@@ -16403,7 +16464,9 @@ class SubscriptionPlanCatalogTests(unittest.TestCase):
             self.assertEqual(report["adapter"], "claude-code")
             merged = load_registry(path)
             self.assertTrue(has_plan_frontier(merged))
-            self.assertTrue(read_discovery_meta(path).get("claude"))
+            meta = read_discovery_meta(path)
+            self.assertTrue(meta.get("claude"))
+            self.assertTrue(meta["claude"].get("model_ids"))
 
     def test_skips_when_plan_frontier_present(self) -> None:
         from puppetmaster.model_registry import ModelSpec, save_registry
@@ -16575,6 +16638,97 @@ class CatalogStalenessTests(unittest.TestCase):
             self.assertEqual(drift["status"], "drift")
             self.assertEqual(drift["stale_registry_models"], ["retired"])
             self.assertEqual(drift["unregistered_catalog_models"], ["new"])
+
+    def test_probe_records_pending_diff_without_mutating_registry(self) -> None:
+        from puppetmaster.model_registry import (
+            ModelSpec,
+            catalog_content_hash,
+            catalog_membership_hash,
+            discovery_catalog_changed,
+            discovery_registry_diff,
+            load_registry,
+            read_discovery_meta,
+            save_registry,
+            write_discovery_meta,
+        )
+
+        with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "models.json"
+            specs = [
+                ModelSpec(
+                    id="claude-code/current",
+                    adapter="claude-code",
+                    adapter_model_name="current",
+                    capability_score=80,
+                    billing="plan",
+                )
+            ]
+            save_registry(specs, registry_path)
+            catalog = [{"id": "current"}, {"id": "new", "capability": 90}]
+            pending = discovery_registry_diff(
+                specs, "anthropic", [item["id"] for item in catalog]
+            )
+            write_discovery_meta(
+                "anthropic",
+                len(catalog),
+                registry_path,
+                model_ids=[item["id"] for item in catalog],
+                catalog_hash=catalog_content_hash(catalog),
+                mode="probe",
+                pending_diff=pending,
+            )
+
+            self.assertEqual(
+                read_discovery_meta(registry_path)["anthropic"]["pending_diff"]["added"],
+                ["new"],
+            )
+            self.assertTrue(discovery_catalog_changed(
+                read_discovery_meta(registry_path), "anthropic"
+            ))
+            self.assertEqual(
+                read_discovery_meta(registry_path)["anthropic"]["catalog_hash"],
+                catalog_content_hash(catalog),
+            )
+            self.assertEqual(
+                catalog_membership_hash(["new", "current"]),
+                catalog_membership_hash(["current", "new"]),
+            )
+            self.assertEqual(
+                [spec.adapter_model_name for spec in load_registry(registry_path)],
+                ["current"],
+            )
+
+    def test_anthropic_source_maps_to_claude_code_registry(self) -> None:
+        from puppetmaster.model_registry import (
+            ModelSpec,
+            discovery_registry_drift,
+            save_registry,
+            write_discovery_meta,
+        )
+
+        with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "models.json"
+            save_registry(
+                [
+                    ModelSpec(
+                        id="claude-code/current",
+                        adapter="claude-code",
+                        adapter_model_name="current",
+                        billing="api",
+                    )
+                ],
+                registry_path,
+            )
+            write_discovery_meta(
+                "anthropic",
+                1,
+                registry_path,
+                model_ids=["current"],
+            )
+            self.assertEqual(
+                discovery_registry_drift(registry_path, source="anthropic")["status"],
+                "match",
+            )
 
 
 class TelemetryContextAndMetricsTests(unittest.TestCase):
@@ -24576,6 +24730,47 @@ class CursorDecouplingTests(unittest.TestCase):
                     rc = cli._run_models_discover(args, Path(tmp) / "models.json")
             self.assertEqual(rc, 1)
             self.assertIn("hint:", err.getvalue())
+
+    def test_models_discover_probe_writes_sidecar_only(self):
+        from types import SimpleNamespace
+
+        from puppetmaster import cli
+        from puppetmaster.model_registry import ModelSpec, read_discovery_meta
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "models.json"
+            args = SimpleNamespace(
+                source="cursor",
+                json=False,
+                write=False,
+                probe=True,
+                registry_path=None,
+            )
+            discovered = [
+                ModelSpec(
+                    id="cursor/new",
+                    adapter="cursor",
+                    adapter_model_name="new",
+                    capability_score=80,
+                    billing="plan",
+                )
+            ]
+            with patch.object(
+                cli,
+                "_discover_one_source",
+                return_value=(
+                    discovered,
+                    {"source": "cursor", "discovered_count": 1, "added": ["new"]},
+                    [{"id": "new", "displayName": "New"}],
+                ),
+            ):
+                rc = cli._run_models_discover(args, path)
+
+            self.assertEqual(rc, 0)
+            self.assertFalse(path.exists())
+            meta = read_discovery_meta(path)
+            self.assertEqual(meta["cursor"]["mode"], "probe")
+            self.assertEqual(meta["cursor"]["pending_diff"]["added"], ["new"])
 
 
 class NPlusOneRegressionTests(unittest.TestCase):

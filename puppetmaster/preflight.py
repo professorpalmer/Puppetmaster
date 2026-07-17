@@ -13,8 +13,8 @@ It composes the two discovery primitives:
 
 * :mod:`puppetmaster.platform_billing` — is this adapter authenticated, and
   does it bill a subscription (plan) or a raw key (api)?
-* :mod:`puppetmaster.cursor_discovery` — for Cursor, is the routed model id
-  actually in the plan's live catalog?
+* discovery sidecar snapshots — for any source that has been probed recently,
+  is the routed model id represented in the last known catalog?
 
 Every dependency is injectable so the whole thing is unit-testable without
 real credentials or network.
@@ -64,6 +64,78 @@ CatalogFetcher = Callable[[], list]
 # stderr) from a minimal real call. Defaults to per-adapter 1-token probes;
 # tests pass a stub so no real credentials/network are touched.
 LiveProber = Callable[[str, Optional[str]], "tuple[int, str, str]"]
+
+
+def _cached_catalog_membership(
+    adapter: str,
+    model: str,
+    *,
+    ttl_seconds: Optional[float] = None,
+) -> Optional[tuple[bool, str, list[str]]]:
+    """Check a recent probe snapshot without performing network I/O.
+
+    ``None`` means there is no usable snapshot. A stale snapshot deliberately
+    fails open: it can make a warning less precise, but must not turn an
+    unavailable catalog into a false dispatch block.
+    """
+    from puppetmaster.model_registry import (
+        DISCOVERY_SOURCE_TO_ADAPTER,
+        catalog_staleness_days,
+        default_registry_path,
+        read_discovery_meta,
+    )
+
+    source_priority = {
+        "claude-code": ("anthropic", "claude"),
+        "cursor": ("cursor",),
+        "openai": ("openai",),
+        "codex": ("codex",),
+        "hermes": ("hermes",),
+        "agentic": ("agentic",),
+    }.get(adapter, ())
+    meta = read_discovery_meta(default_registry_path())
+    source = next(
+        (
+            candidate
+            for candidate in source_priority
+            if candidate in meta
+            and DISCOVERY_SOURCE_TO_ADAPTER.get(candidate, candidate) == adapter
+        ),
+        None,
+    )
+    if source is None:
+        return None
+    entry = meta.get(source)
+    if not isinstance(entry, dict) or not isinstance(entry.get("model_ids"), list):
+        return None
+    age = catalog_staleness_days(meta, source)
+    if age is None:
+        return None
+    if ttl_seconds is None:
+        try:
+            ttl_seconds = float(
+                os.environ.get("PUPPETMASTER_CATALOG_CACHE_TTL_SECONDS", "3600")
+            )
+        except ValueError:
+            ttl_seconds = 3600.0
+    if age * 86400.0 > max(0.0, ttl_seconds):
+        return (
+            True,
+            f"catalog unverified (cached {age:.1f}d old)",
+            ["preflight:cached_catalog_stale"],
+        )
+    available = {str(model_id) for model_id in entry["model_ids"]}
+    if model not in available:
+        return (
+            False,
+            f"model {model!r} is absent from the recent {source} catalog",
+            ["preflight:cached_model_not_in_catalog"],
+        )
+    return (
+        True,
+        f"model {model!r} present in recent {source} catalog",
+        ["preflight:cached_catalog_match"],
+    )
 
 
 # Substrings that mean "your account can't actually run this", regardless of
@@ -418,10 +490,10 @@ def preflight_check(
     """Return a :class:`PreflightResult` for ``adapter`` (and ``model``).
 
     Blocks when: the adapter has no usable credentials; it would bill an API
-    account but ``allow_api_billing`` is False; or (Cursor only) the routed
-    model isn't in the live plan catalog. Catalog lookup failures degrade to a
-    pass with a note — we never block a run just because discovery was
-    unavailable.
+    account but ``allow_api_billing`` is False; or a recent catalog snapshot
+    proves the routed model is absent. Catalog lookup failures and stale
+    snapshots degrade to a pass with a note — discovery never becomes a
+    single point of failure.
     """
     status = billing_status or detect_adapter_billing(
         adapter, env=env, home=home, run=run
@@ -449,6 +521,33 @@ def preflight_check(
             ),
             evidence=[*status.evidence, "preflight:api_blocked"],
         )
+
+    # A recent probe snapshot gives every discovery-capable adapter a cheap
+    # dispatch guard. It is intentionally bypassed when the caller supplied a
+    # live catalog fetcher or requested a live probe, because those paths have
+    # fresher evidence. Stale/unavailable snapshots fail open with evidence.
+    if model and catalog_fetcher is None and not live:
+        cached = _cached_catalog_membership(adapter, model)
+        if cached is not None:
+            cached_ok, cached_reason, cached_evidence = cached
+            if not cached_ok:
+                return PreflightResult(
+                    ok=False,
+                    adapter=adapter,
+                    model=model,
+                    billing=status.billing,
+                    reason=cached_reason,
+                    evidence=[*status.evidence, *cached_evidence],
+                )
+            if "preflight:cached_catalog_stale" in cached_evidence:
+                return PreflightResult(
+                    ok=True,
+                    adapter=adapter,
+                    model=model,
+                    billing=status.billing,
+                    reason=cached_reason,
+                    evidence=[*status.evidence, *cached_evidence],
+                )
 
     if adapter == "cursor" and model and catalog_fetcher is not None:
         from puppetmaster.cursor_discovery import (

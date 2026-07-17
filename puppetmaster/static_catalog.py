@@ -26,12 +26,17 @@ import re
 from pathlib import Path
 from typing import Callable, Optional
 
-from puppetmaster.model_registry import ModelSpec
+from puppetmaster.model_registry import (
+    DISCOVERY_SOURCE_TO_ADAPTER,
+    ModelSpec,
+    catalog_content_hash,
+)
 
 # Hand-maintained catalog of what each non-enumerable platform offers. The
-# ``input``/``output`` prices are the public per-token (API) reference rates,
-# used only when the adapter is API-billed; under a subscription the merge
-# zeroes them (no marginal spend). Update these when the platforms ship models.
+# ``input``/``output`` prices are the public per-token reference rates. They
+# remain populated for subscription entries so the router can rank finite
+# shared-plan usage by nominal consumption; ``ModelSpec.marginal_cost_usd``
+# still reports $0 for plan-billed calls.
 CURATED_CATALOGS: dict[str, list[dict]] = {
     "claude-code": [
         {
@@ -353,7 +358,7 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
 # --source` name). Kept distinct from the adapter id so `claude-code` reads as
 # `claude` on the CLI / in the sidecar, matching the existing `anthropic` style.
 ADAPTER_TO_SOURCE = {"claude-code": "claude", "codex": "codex"}
-SOURCE_TO_ADAPTER = {v: k for k, v in ADAPTER_TO_SOURCE.items()}
+SOURCE_TO_ADAPTER = dict(DISCOVERY_SOURCE_TO_ADAPTER)
 
 
 def curated_catalog(adapter: str) -> list[dict]:
@@ -435,8 +440,8 @@ def curated_to_specs(
                 adapter=adapter,
                 adapter_model_name=model,
                 capability_score=capability,
-                input_per_mtok_usd=0.0 if plan else float(item["input"]),
-                output_per_mtok_usd=0.0 if plan else float(item["output"]),
+                input_per_mtok_usd=float(item["input"]),
+                output_per_mtok_usd=float(item["output"]),
                 context_window=context,
                 billing=billing,
                 tags=sorted(tags),
@@ -565,7 +570,14 @@ def ensure_subscription_plan_catalog(
                 continue
             merged, report = merge_curated_into_registry(adapter, "plan", registry)
             save_registry(merged, registry_path)
-            write_discovery_meta(source, report["discovered_count"], registry_path)
+            catalog = curated_catalog(adapter)
+            write_discovery_meta(
+                source,
+                report["discovered_count"],
+                registry_path,
+                model_ids=[item["model"] for item in catalog if item.get("model")],
+                catalog_hash=catalog_content_hash(catalog),
+            )
             return {
                 "action": "discovered",
                 "adapter": adapter,

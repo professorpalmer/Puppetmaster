@@ -25,7 +25,7 @@ import subprocess
 from pathlib import Path
 from typing import Callable, Mapping, Optional
 
-from puppetmaster.model_registry import ModelSpec
+from puppetmaster.model_registry import ModelSpec, catalog_content_hash
 
 CURSOR_RUNNER = Path(__file__).with_name("cursor_sdk_runner.mjs")
 
@@ -334,6 +334,7 @@ def ensure_cursor_plan_catalog(
             report.get("discovered_count", 0),
             registry_path,
             model_ids=[item["id"] for item in catalog],
+            catalog_hash=catalog_content_hash(catalog),
         )
         return {
             "action": "discovered",

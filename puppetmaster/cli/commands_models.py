@@ -682,6 +682,8 @@ def _run_models_discover(args, path: Path) -> int:
     import json as _json
 
     from puppetmaster.model_registry import (
+        catalog_content_hash,
+        discovery_registry_diff,
         load_registry,
         save_registry,
         starter_registry,
@@ -693,7 +695,12 @@ def _run_models_discover(args, path: Path) -> int:
     except RuntimeError:
         registry = starter_registry()
 
+    probe = getattr(args, "probe", False) is True
+    if args.write and probe:
+        print("error: --write and --probe are mutually exclusive", file=sys.stderr)
+        return 2
     is_default = args.source is None
+    original_registry = list(registry)
     if args.source == "all":
         sources = _all_discover_sources()
     elif is_default:
@@ -741,6 +748,7 @@ def _run_models_discover(args, path: Path) -> int:
                     "errors": errors,
                     "catalogs": catalogs,
                     "written": bool(args.write),
+                    "probed": probe,
                     "registry_path": str(path),
                 },
                 indent=2,
@@ -769,9 +777,36 @@ def _run_models_discover(args, path: Path) -> int:
                 report["discovered_count"],
                 path,
                 model_ids=[item["id"] for item in catalogs.get(src, []) if item.get("id")],
+                catalog_hash=catalog_content_hash(catalogs.get(src, [])),
+                mode="apply",
             )
         if not args.json:
             print(f"Wrote merged registry to {path}")
+    elif probe and reports:
+        for report in reports:
+            src = report.get("source") or report.get("adapter")
+            model_ids = [
+                item["id"]
+                for item in catalogs.get(src, [])
+                if item.get("id")
+            ]
+            write_discovery_meta(
+                src,
+                report["discovered_count"],
+                path,
+                model_ids=model_ids,
+                catalog_hash=catalog_content_hash(catalogs.get(src, [])),
+                mode="probe",
+                pending_diff=discovery_registry_diff(
+                    original_registry, src, model_ids
+                ),
+            )
+        if not args.json:
+            print(
+                "Probe complete — catalog snapshots saved; models.json was not "
+                "changed. Review `puppetmaster doctor` and apply explicitly with "
+                "`--write`."
+            )
     elif not args.json and reports:
         print("Dry run — pass --write to persist.")
     return 0 if reports or not errors else 1

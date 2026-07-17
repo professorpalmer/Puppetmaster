@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 from ._base import AdapterInfo, WorkerAdapter
 from .agentic import AgenticAdapter
 from .claude_code import ClaudeCodeAdapter
@@ -102,3 +104,16 @@ def get_adapter(name: str) -> WorkerAdapter:
     if name not in ADAPTERS:
         raise ValueError(f"unsupported adapter: {name}")
     return ADAPTERS[name]
+
+
+def adapter_runtime_capabilities(name: str) -> dict[str, Optional[str]]:
+    """Expose conservative runtime/catalog capabilities for diagnostics.
+
+    Isolation is opt-in and descriptive: the registry must never infer that
+    one adapter's state workaround is safe for another harness.
+    """
+    adapter = get_adapter(name)
+    return {
+        "state_isolation": getattr(adapter, "state_isolation", "none"),
+        "catalog_source": getattr(adapter, "catalog_source", None),
+    }
