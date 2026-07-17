@@ -1735,6 +1735,15 @@ def build_parser() -> argparse.ArgumentParser:
             "models.json. Review with doctor, then use --write to apply."
         ),
     )
+    models_discover.add_argument(
+        "--prune",
+        action="store_true",
+        help=(
+            "Explicitly remove registry entries absent from a live catalog "
+            "(currently meaningful for Cursor); without this flag refreshes "
+            "preserve stale entries and only report drift."
+        ),
+    )
     models_discover.add_argument("--json", action="store_true", help="Emit JSON.")
     models_setup = models_sub.add_parser(
         "setup",

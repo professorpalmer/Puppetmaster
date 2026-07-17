@@ -721,7 +721,12 @@ def _run_models_discover(args, path: Path) -> int:
 
     for source in sources:
         try:
-            registry, report, catalog = cli._discover_one_source(source, registry)
+            if getattr(args, "prune", False) is True:
+                registry, report, catalog = cli._discover_one_source(
+                    source, registry, prune=True
+                )
+            else:
+                registry, report, catalog = cli._discover_one_source(source, registry)
         except cli._DiscoverSourceError as exc:
             errors[source] = str(exc)
             if not tolerate_source_errors:
@@ -814,7 +819,7 @@ def _run_models_discover(args, path: Path) -> int:
 class _DiscoverSourceError(RuntimeError):
     pass
 
-def _discover_one_source(source: str, registry: list):
+def _discover_one_source(source: str, registry: list, *, prune: bool = False):
     """Fetch + merge one catalog source; returns (registry, report, catalog)."""
     if source == "cursor":
         from puppetmaster.cursor_discovery import (
@@ -827,7 +832,9 @@ def _discover_one_source(source: str, registry: list):
             catalog = fetch_cursor_catalog()
         except CursorDiscoveryError as exc:
             raise _DiscoverSourceError(str(exc)) from exc
-        merged, report = merge_catalog_into_registry(registry, catalog)
+        merged, report = merge_catalog_into_registry(
+            registry, catalog, prune=prune
+        )
         report["source"] = "cursor"
         return merged, report, catalog
 

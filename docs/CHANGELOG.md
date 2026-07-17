@@ -1,4 +1,4 @@
-## v1.19.11
+## v1.19.12
 
 **Cross-adapter catalog freshness and safe model-registry updates.**
 
@@ -12,6 +12,8 @@
   stale snapshots fail open with explicit evidence.
 - Declare adapter state-isolation capabilities and keep Cursor's SQLite fix
   scoped to the Cursor SDK until another harness proves the same requirement.
+- Preserve stale entries on normal refresh; removing them requires explicit
+  `models discover --write --prune`.
 
 ## v1.19.10
 

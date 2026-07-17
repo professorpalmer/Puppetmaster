@@ -221,13 +221,15 @@ def catalog_to_specs(
 def merge_catalog_into_registry(
     existing: list[ModelSpec],
     catalog: list[dict],
+    *,
+    prune: bool = False,
 ) -> "tuple[list[ModelSpec], dict]":
     """Reconcile a discovered catalog with ``existing`` registry entries.
 
-    Cursor entries are replaced by their discovered, plan-billed counterparts;
-    cursor entries that are NOT in the live catalog are dropped (the plan no
-    longer exposes them); non-cursor entries pass through untouched. Returns the
-    merged registry plus a small report describing what changed.
+    Cursor entries are replaced by their discovered, plan-billed counterparts.
+    Entries absent from the live catalog are preserved by default so a normal
+    refresh cannot silently change routing. ``prune=True`` explicitly opts
+    into dropping stale Cursor entries.
     """
     discovered = catalog_to_specs(catalog, existing)
     discovered_model_names = {s.adapter_model_name for s in discovered}
@@ -239,11 +241,21 @@ def merge_catalog_into_registry(
     dropped = sorted(existing_cursor_names - discovered_model_names)
     added = sorted(discovered_model_names - existing_cursor_names)
 
-    merged = non_cursor + discovered
+    if prune:
+        merged = non_cursor + discovered
+    else:
+        preserved_cursor = [
+            spec
+            for spec in existing
+            if spec.adapter == "cursor"
+            and spec.adapter_model_name not in discovered_model_names
+        ]
+        merged = non_cursor + discovered + preserved_cursor
     report = {
         "discovered_count": len(discovered),
         "added": added,
-        "dropped_stale_cursor_models": dropped,
+        "dropped_stale_cursor_models": dropped if prune else [],
+        "stale_cursor_models": dropped,
         "non_cursor_preserved": len(non_cursor),
     }
     return merged, report

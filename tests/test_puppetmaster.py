@@ -14081,7 +14081,7 @@ class CursorDiscoveryTests(unittest.TestCase):
         self.assertEqual(spec.billing, "plan")
         self.assertIn("mythos-class", spec.tags)
 
-    def test_merge_drops_stale_and_preserves_non_cursor(self) -> None:
+    def test_merge_preserves_stale_by_default_and_prunes_explicitly(self) -> None:
         from puppetmaster.cursor_discovery import merge_catalog_into_registry
         from puppetmaster.model_registry import ModelSpec
 
@@ -14093,9 +14093,17 @@ class CursorDiscoveryTests(unittest.TestCase):
         merged, report = merge_catalog_into_registry(existing, catalog)
         ids = {s.id for s in merged}
         self.assertIn("claude/x", ids)  # non-cursor preserved
-        self.assertNotIn("cursor/old", ids)  # stale cursor dropped
-        self.assertIn("old-v1", report["dropped_stale_cursor_models"])
+        self.assertIn("cursor/old", ids)  # refresh does not silently prune
+        self.assertEqual(report["dropped_stale_cursor_models"], [])
+        self.assertIn("old-v1", report["stale_cursor_models"])
         self.assertIn("fresh-v1", report["added"])
+
+        pruned, prune_report = merge_catalog_into_registry(
+            existing, catalog, prune=True
+        )
+        pruned_ids = {s.id for s in pruned}
+        self.assertNotIn("cursor/old", pruned_ids)
+        self.assertIn("old-v1", prune_report["dropped_stale_cursor_models"])
 
     def test_model_in_catalog(self) -> None:
         from puppetmaster.cursor_discovery import model_in_catalog
