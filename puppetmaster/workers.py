@@ -43,6 +43,9 @@ RECOVERABLE_FAILURES = frozenset(
         # Transient provider pressure after in-adapter key retries; prefer a
         # different model (often same adapter) before dying the task.
         "rate_limit",
+        # Model (or endpoint) never emitted tool_calls — not a task bug; the
+        # next eligible tool-capable model may recover.
+        "no_tool_calls",
     }
 )
 
@@ -55,6 +58,7 @@ SAME_ADAPTER_MODEL_REROUTE = frozenset(
         "no_model",
         "unknown_provider",
         "rate_limit",
+        "no_tool_calls",
     }
 )
 

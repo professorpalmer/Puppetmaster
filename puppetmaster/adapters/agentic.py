@@ -136,6 +136,12 @@ _RETRYABLE_PROVIDER_REASONS = frozenset({"timeout", "network_error", "malformed_
 _MAX_EMPTY_RECOVERIES = 1
 _MAX_LENGTH_CONTINUATIONS = 3
 
+# Consecutive assistant turns that emit text/reasoning but zero tool_calls.
+# Pure reasoners (or endpoints that drop the tools schema) otherwise grind the
+# token budget on chain-of-thought without ever calling submit_findings /
+# submit_report. Fail fast with stop_reason=no_tool_calls instead.
+DEFAULT_NO_TOOL_CALLS_STREAK = 3
+
 # Verify-before-submit loop (Codex/Claude-Code parity): before accepting an
 # implement worker's submit_report, run the project's verification command
 # (tests / typecheck / lint) and, on failure, feed the output back so the model
@@ -387,7 +393,13 @@ class AgenticAdapter(FullEditWorkerAdapter):
         # model emitted a JSON blob as free-text (older/tool-less models). A run
         # is degraded ONLY when neither channel produced structure AND the model
         # actually said something -- an explicit empty submission is a clean pass.
-        if submitted is not None:
+        # no_tool_calls is a hard fail: the model never used the tool channel.
+        no_tools = stop_reason == "no_tool_calls"
+        if no_tools:
+            parsed = []
+            structured_ok = False
+            channel = "none"
+        elif submitted is not None:
             parsed = _items_to_artifacts(task, worker_id, submitted)
             structured_ok = True
             channel = "tool"
@@ -396,12 +408,17 @@ class AgenticAdapter(FullEditWorkerAdapter):
             structured_ok = bool(parsed) or parse_cursor_artifact_payload(final_text) is not None
             channel = "json"
         state["recovered"] = state["attempted"] and structured_ok
-        degraded = not structured_ok and bool(final_text)
-        result = "degraded" if degraded else "passed"
+        degraded = (not no_tools) and (not structured_ok) and bool(final_text)
+        if no_tools:
+            result = "failed"
+            failure: Optional[str] = "no_tool_calls"
+        else:
+            result = "degraded" if degraded else "passed"
+            failure = "empty_or_unstructured_agentic_result" if degraded else None
         evidence = evidence_base + [f"turns:{turns}", f"stop:{stop_reason}"]
         if failed_over:
             evidence.append("failover:used")
-        if not degraded:
+        if not degraded and not no_tools:
             evidence.append(f"submit:{channel}")
         if state["recovered"]:
             evidence.append("retry:recovered")
@@ -409,21 +426,41 @@ class AgenticAdapter(FullEditWorkerAdapter):
             evidence.append("retry:exhausted")
         if plan_holder["steps"]:
             evidence.append(f"plan:{len(plan_holder['steps'])}")
+        diagnosis = (
+            _no_tool_calls_diagnosis(provider, model, turns) if no_tools else None
+        )
         artifacts: list[Artifact] = [
             verification_artifact(
                 task=task, worker_id=worker_id, adapter="agentic",
                 check=task.instruction, result=result,
-                confidence=0.65 if degraded else 0.9,
+                confidence=0.55 if no_tools else (0.65 if degraded else 0.9),
                 evidence=evidence,
                 payload={
                     "model": model, "provider": provider, "cwd": str(cwd),
                     "turns": turns, "stop_reason": stop_reason, **usage,
-                    "failure": "empty_or_unstructured_agentic_result" if degraded else None,
+                    "failure": failure,
+                    "stderr": diagnosis,
                     "stdout": (final_text or "")[-_TOOL_OUTPUT_LIMIT:],
                 },
             )
         ]
-        if degraded:
+        if no_tools:
+            artifacts.append(Artifact(
+                job_id=task.job_id, task_id=task.id, type=ArtifactType.RISK,
+                created_by=worker_id, confidence=0.9,
+                evidence=["adapter:agentic", "result:no-tool-calls"],
+                payload={
+                    "risk": diagnosis,
+                    "mitigation": (
+                        "Route this role to a model whose registry entry carries "
+                        "the 'tools' tag (known tool-caller), or pin a provider/"
+                        "model that honors the tools schema on this endpoint."
+                    ),
+                    "failure": "no_tool_calls",
+                    "stdout_excerpt": redact_secrets(final_text or "")[:2000],
+                },
+            ))
+        elif degraded:
             artifacts.append(Artifact(
                 job_id=task.job_id, task_id=task.id, type=ArtifactType.RISK,
                 created_by=worker_id, confidence=0.85,
@@ -561,6 +598,7 @@ class AgenticAdapter(FullEditWorkerAdapter):
         # task. Surface it as degraded alongside the no-op case so neither a
         # no-diff run nor a red-tests run can masquerade as a success.
         verify_failed = verify_state["mode"] == "gating" and verify_state["passed"] is False
+        no_tools = stop_reason == "no_tool_calls"
         degraded = (not has_work) or verify_failed
         parsed = implement_report_artifacts(task, worker_id, final_text, adapter="agentic")
         evidence = evidence_base + [f"turns:{turns}", f"stop:{stop_reason}"]
@@ -571,17 +609,27 @@ class AgenticAdapter(FullEditWorkerAdapter):
         if plan_holder["steps"]:
             evidence.append(f"plan:{len(plan_holder['steps'])}")
         evidence.append(f"verify:{_verify_evidence_tag(verify_state)}")
-        failure = (
-            "no_diff_produced" if not has_work
-            else "verification_failed" if verify_failed
-            else None
+        diagnosis = (
+            _no_tool_calls_diagnosis(provider, model, turns) if no_tools else None
         )
+        if no_tools:
+            failure = "no_tool_calls"
+            result = "failed"
+            confidence = 0.55
+        else:
+            failure = (
+                "no_diff_produced" if not has_work
+                else "verification_failed" if verify_failed
+                else None
+            )
+            result = "degraded" if degraded else "passed"
+            confidence = 0.6 if degraded else 0.9
         artifacts: list[Artifact] = [
             verification_artifact(
                 task=task, worker_id=worker_id, adapter="agentic",
                 check=task.instruction,
-                result="degraded" if degraded else "passed",
-                confidence=0.6 if degraded else 0.9,
+                result=result,
+                confidence=confidence,
                 evidence=evidence,
                 payload={
                     "model": model, "provider": provider, "cwd": str(cwd),
@@ -594,11 +642,28 @@ class AgenticAdapter(FullEditWorkerAdapter):
                     "verification_passed": verify_state["passed"],
                     "verification_attempts": verify_state["attempts"],
                     "failure": failure,
+                    "stderr": diagnosis,
                     "stdout": (final_text or "")[-_TOOL_OUTPUT_LIMIT:],
                 },
             )
         ]
-        if not has_work:
+        if no_tools:
+            artifacts.append(Artifact(
+                job_id=task.job_id, task_id=task.id, type=ArtifactType.RISK,
+                created_by=worker_id, confidence=0.9,
+                evidence=["adapter:agentic", "result:no-tool-calls"],
+                payload={
+                    "risk": diagnosis,
+                    "mitigation": (
+                        "Route this role to a model whose registry entry carries "
+                        "the 'tools' tag (known tool-caller), or pin a provider/"
+                        "model that honors the tools schema on this endpoint."
+                    ),
+                    "failure": "no_tool_calls",
+                    "stdout_excerpt": redact_secrets(final_text or "")[:2000],
+                },
+            ))
+        elif not has_work:
             artifacts.append(Artifact(
                 job_id=task.job_id, task_id=task.id, type=ArtifactType.RISK,
                 created_by=worker_id, confidence=0.85,
@@ -635,7 +700,7 @@ class AgenticAdapter(FullEditWorkerAdapter):
         plan_artifact = self._plan_artifact(task, worker_id, plan_holder["steps"])
         if plan_artifact is not None:
             artifacts.append(plan_artifact)
-        if has_work:
+        if has_work and not no_tools:
             artifacts.append(make_patch_artifact(
                 task, worker_id, before, after, adapter="agentic",
                 status="applied", change="Agentic worker modified repository files.",
@@ -765,6 +830,11 @@ class AgenticAdapter(FullEditWorkerAdapter):
         ))
         token_budget = task.payload.get("token_budget")
         token_budget = int(token_budget) if token_budget else None
+        no_tool_streak_limit = int(
+            task.payload.get("no_tool_calls_streak", DEFAULT_NO_TOOL_CALLS_STREAK)
+        )
+        if no_tool_streak_limit < 1:
+            no_tool_streak_limit = DEFAULT_NO_TOOL_CALLS_STREAK
         base_extra = self._extra_params(task)
         # Static + job-stable prefix as a true system message; per-task CodeGraph
         # + instruction as the first user message — enables provider prompt caches
@@ -789,6 +859,7 @@ class AgenticAdapter(FullEditWorkerAdapter):
         empty_recoveries = 0
         length_continuations = 0
         force_submit_next = False
+        consecutive_no_tool_turns = 0
 
         # Cancellation points: a host that requested cancel (see
         # puppetmaster.cancellation) stops this worker (a) mid-stream, by the
@@ -871,6 +942,12 @@ class AgenticAdapter(FullEditWorkerAdapter):
                     length_continuations += 1
                     messages.append({"role": "user", "content": _LENGTH_CONTINUATION_NUDGE})
                     continue
+                # Prose/reasoning with zero tool_calls. Count consecutive misses
+                # so a pure reasoner fails fast instead of burning token_budget.
+                consecutive_no_tool_turns += 1
+                if consecutive_no_tool_turns >= no_tool_streak_limit:
+                    stop_reason = "no_tool_calls"
+                    break
                 follow_up = on_stop(final_text, mutated) if on_stop else None
                 if follow_up:
                     messages.append({"role": "user", "content": follow_up})
@@ -881,6 +958,11 @@ class AgenticAdapter(FullEditWorkerAdapter):
                     continue
                 stop_reason = "model_stopped"
                 break
+
+            # A tool-calling turn is progress on the wire; reset the prose streak.
+            # Implement-mode mutations also count as progress (mutated is set
+            # below when a mutating tool succeeds).
+            consecutive_no_tool_turns = 0
 
             # Record the assistant's tool-call turn, then each tool's result.
             messages.append({
@@ -1783,6 +1865,15 @@ def _verify_evidence_tag(verify_state: dict) -> str:
 def _last_message_role(messages: list[dict]) -> str:
     """The role of the most recent message, or '' when the log is empty."""
     return str(messages[-1].get("role") or "") if messages else ""
+
+
+def _no_tool_calls_diagnosis(provider: str, model: str, turns: int) -> str:
+    """Loud human-readable diagnosis when a model never emits tool_calls."""
+    return (
+        f"model {provider}/{model} produced {turns} turns of prose but never "
+        "called any tool -- it is not tool-calling on this endpoint; route "
+        "this role to a tool-capable model"
+    )
 
 
 def _is_retryable_provider_error(exc: ProviderError) -> bool:

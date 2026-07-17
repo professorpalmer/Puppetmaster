@@ -239,7 +239,7 @@ def starter_registry() -> list[ModelSpec]:
             output_per_mtok_usd=2.5,
             context_window=0,
             billing="plan",
-            tags=["cursor", "cheapest", "cheap", "fast", "reading", "code", "workhorse"],
+            tags=["tools", "cursor", "cheapest", "cheap", "fast", "reading", "code", "workhorse"],
             notes=(
                 "Cheapest Cursor tier and default workhorse for grunt work: "
                 "verification, exploration, formatting, cleanup, and other "
@@ -257,7 +257,7 @@ def starter_registry() -> list[ModelSpec]:
             output_per_mtok_usd=6.0,
             context_window=1_050_000,
             billing="plan",
-            tags=["cursor", "affordable", "balanced", "fast", "vision", "code"],
+            tags=["tools", "cursor", "affordable", "balanced", "fast", "vision", "code"],
             notes=(
                 "Affordable GPT-5.6 Cursor tier. Prefer for capable everyday "
                 "implementation and subagent work before Terra/Sol; plan-billed "
@@ -273,7 +273,7 @@ def starter_registry() -> list[ModelSpec]:
             output_per_mtok_usd=15.0,
             context_window=1_050_000,
             billing="plan",
-            tags=["cursor", "expensive", "quality", "vision", "code", "reasoning"],
+            tags=["tools", "cursor", "expensive", "quality", "vision", "code", "reasoning"],
             notes=(
                 "Pretty-expensive GPT-5.6 Cursor quality tier. Reserve for "
                 "difficult reviews and implementation where Luna/Grok are not "
@@ -289,7 +289,7 @@ def starter_registry() -> list[ModelSpec]:
             output_per_mtok_usd=30.0,
             context_window=1_050_000,
             billing="plan",
-            tags=["cursor", "very-expensive", "frontier", "vision", "code", "reasoning"],
+            tags=["tools", "cursor", "very-expensive", "frontier", "vision", "code", "reasoning"],
             notes=(
                 "Very-expensive GPT-5.6 Sol Cursor frontier tier. Reserve for "
                 "the hardest reasoning and codebase-scale work; plan-billed with "
@@ -305,7 +305,7 @@ def starter_registry() -> list[ModelSpec]:
             output_per_mtok_usd=6.0,
             context_window=0,
             billing="plan",
-            tags=[
+            tags=["tools", 
                 "cursor",
                 "xai",
                 "frontier",
@@ -338,7 +338,7 @@ def starter_registry() -> list[ModelSpec]:
             input_per_mtok_usd=1.0,
             output_per_mtok_usd=5.0,
             context_window=200_000,
-            tags=["claude", "cheap", "fast", "vision", "reading", "code"],
+            tags=["tools", "claude", "cheap", "fast", "vision", "reading", "code"],
             notes=(
                 "Cheap/fast tier. Anthropic Haiku 4.5 via the Claude Code "
                 "CLI — the Anthropic-side counterpart to Cursor's "
@@ -359,7 +359,7 @@ def starter_registry() -> list[ModelSpec]:
             input_per_mtok_usd=5.0,
             output_per_mtok_usd=25.0,
             context_window=200_000,
-            tags=["claude", "quality", "vision", "code", "reasoning"],
+            tags=["tools", "claude", "quality", "vision", "code", "reasoning"],
             notes=(
                 "High-quality tier. Anthropic Opus 4.6 via the Claude "
                 "Code CLI. Workhorse for implementation, refactoring, "
@@ -378,7 +378,7 @@ def starter_registry() -> list[ModelSpec]:
             input_per_mtok_usd=5.0,
             output_per_mtok_usd=25.0,
             context_window=200_000,
-            tags=[
+            tags=["tools", 
                 "claude",
                 "frontier",
                 "vision",
@@ -403,7 +403,7 @@ def starter_registry() -> list[ModelSpec]:
             input_per_mtok_usd=5.0,
             output_per_mtok_usd=25.0,
             context_window=1_000_000,
-            tags=[
+            tags=["tools", 
                 "claude",
                 "frontier",
                 "vision",
@@ -435,7 +435,7 @@ def starter_registry() -> list[ModelSpec]:
             output_per_mtok_usd=50.0,
             context_window=0,
             billing="plan",
-            tags=[
+            tags=["tools", 
                 "cursor",
                 "frontier",
                 "mythos-class",
@@ -463,7 +463,7 @@ def starter_registry() -> list[ModelSpec]:
             output_per_mtok_usd=50.0,
             context_window=1_000_000,
             billing="unknown",
-            tags=[
+            tags=["tools", 
                 "claude",
                 "frontier",
                 "mythos-class",
@@ -495,7 +495,7 @@ def starter_registry() -> list[ModelSpec]:
             output_per_mtok_usd=30.0,
             context_window=1_050_000,
             billing="api",
-            tags=[
+            tags=["tools", 
                 "openai",
                 "frontier",
                 "vision",
@@ -521,7 +521,7 @@ def starter_registry() -> list[ModelSpec]:
             output_per_mtok_usd=30.0,
             context_window=1_050_000,
             billing="api",
-            tags=[
+            tags=["tools", 
                 "openai",
                 "frontier",
                 "vision",
@@ -545,7 +545,7 @@ def starter_registry() -> list[ModelSpec]:
             output_per_mtok_usd=15.0,
             context_window=1_050_000,
             billing="api",
-            tags=[
+            tags=["tools", 
                 "openai",
                 "quality",
                 "vision",
@@ -569,7 +569,7 @@ def starter_registry() -> list[ModelSpec]:
             output_per_mtok_usd=6.0,
             context_window=1_050_000,
             billing="api",
-            tags=["openai", "balanced", "fast", "vision", "code", "long-context"],
+            tags=["tools", "openai", "balanced", "fast", "vision", "code", "long-context"],
             notes=(
                 "OpenAI GPT-5.6 Luna — cheap/fast tier. 1.05M context. "
                 "Strong value for implementation and subagent work. Some "
@@ -586,7 +586,7 @@ def starter_registry() -> list[ModelSpec]:
             output_per_mtok_usd=30.0,
             context_window=1_000_000,
             billing="api",
-            tags=[
+            tags=["tools", 
                 "openai",
                 "frontier",
                 "vision",
@@ -610,7 +610,7 @@ def starter_registry() -> list[ModelSpec]:
             output_per_mtok_usd=15.0,
             context_window=1_000_000,
             billing="api",
-            tags=[
+            tags=["tools", 
                 "openai",
                 "quality",
                 "fast",
@@ -634,7 +634,7 @@ def starter_registry() -> list[ModelSpec]:
             output_per_mtok_usd=4.5,
             context_window=400_000,
             billing="api",
-            tags=["openai", "balanced", "fast", "vision", "code"],
+            tags=["tools", "openai", "balanced", "fast", "vision", "code"],
             notes=(
                 "OpenAI mini for coding, computer use, and subagents. 400K "
                 "context. Cheap enough to run as a default for exploration "
@@ -650,7 +650,7 @@ def starter_registry() -> list[ModelSpec]:
             output_per_mtok_usd=0.9,
             context_window=400_000,
             billing="api",
-            tags=["openai", "cheap", "fast", "reading"],
+            tags=["tools", "openai", "cheap", "fast", "reading"],
             notes=(
                 "OpenAI nano tier. Cheapest member of the GPT-5 family for "
                 "high-throughput reading, classification, and trivial edits. "
@@ -665,7 +665,7 @@ def starter_registry() -> list[ModelSpec]:
             input_per_mtok_usd=5.0,
             output_per_mtok_usd=30.0,
             context_window=1_050_000,
-            tags=[
+            tags=["tools", 
                 "codex",
                 "frontier",
                 "vision",
@@ -689,7 +689,7 @@ def starter_registry() -> list[ModelSpec]:
             input_per_mtok_usd=2.5,
             output_per_mtok_usd=15.0,
             context_window=1_050_000,
-            tags=[
+            tags=["tools", 
                 "codex",
                 "quality",
                 "vision",
@@ -713,7 +713,7 @@ def starter_registry() -> list[ModelSpec]:
             input_per_mtok_usd=1.0,
             output_per_mtok_usd=6.0,
             context_window=1_050_000,
-            tags=["codex", "balanced", "vision", "code", "agent-loop", "long-context"],
+            tags=["tools", "codex", "balanced", "vision", "code", "agent-loop", "long-context"],
             notes=(
                 "Codex CLI driving gpt-5.6-luna. Cheap/fast tier with the "
                 "Codex agent loop. Capability_score is 1 higher than "
@@ -728,7 +728,7 @@ def starter_registry() -> list[ModelSpec]:
             input_per_mtok_usd=5.0,
             output_per_mtok_usd=30.0,
             context_window=1_000_000,
-            tags=[
+            tags=["tools", 
                 "codex",
                 "frontier",
                 "vision",
@@ -756,7 +756,7 @@ def starter_registry() -> list[ModelSpec]:
             input_per_mtok_usd=0.75,
             output_per_mtok_usd=4.5,
             context_window=400_000,
-            tags=["codex", "balanced", "vision", "code", "agent-loop"],
+            tags=["tools", "codex", "balanced", "vision", "code", "agent-loop"],
             notes=(
                 "Codex CLI driving gpt-5.4-mini. Mini-tier coding agent "
                 "with the same per-token cost as openai/gpt-5-4-mini, but "

@@ -1,3 +1,18 @@
+## v1.19.14
+
+**Fail fast on non-tool-calling models; route agentic work to tool-capable models.**
+
+- Agentic tool loop stops with `stop_reason=no_tool_calls` after 3 consecutive
+  prose-only turns instead of grinding the token budget on chain-of-thought;
+  the verification artifact carries `failure=no_tool_calls` with a diagnosis
+  naming the provider/model.
+- `no_tool_calls` is a hard fail (never "degraded"/"completed without
+  structured findings") and is classified recoverable so auto-fallback
+  rerouting retries on the next eligible model.
+- Router prefers models tagged tool-capable for agentic swarm/implement roles;
+  registries with no tagged models keep the previous behavior (fail-open).
+- Curated catalog entries known to tool-call now carry the capability tag.
+
 ## v1.19.13
 
 **Non-interactive git in worker subprocess environments (Windows console-flood fix).**

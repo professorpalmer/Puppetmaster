@@ -9901,6 +9901,201 @@ class ModelRouterTests(unittest.TestCase):
         self.assertEqual(usage["tokens_cached"], 200)
         self.assertAlmostEqual(usage["real_cost_usd"], 0.05, places=6)
 
+    def test_agentic_loop_stops_on_consecutive_prose_without_tools(self) -> None:
+        """Three prose-only turns fail fast with no_tool_calls before token_budget."""
+        from puppetmaster.adapters import agentic
+        from puppetmaster.models import ArtifactType, Task
+        from puppetmaster.providers import AssistantTurn
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        adapter = agentic.AgenticAdapter()
+        turns = [
+            AssistantTurn(
+                text=f"reasoning turn {i}", tool_calls=[],
+                usage={"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+            )
+            for i in range(3)
+        ]
+        seen = [0]
+
+        def fake_provider_call(**kwargs):
+            turn = turns[seen[0]]
+            seen[0] += 1
+            return turn
+
+        def keep_nudging(final_text: str, mutated: bool):
+            return "Please call submit_findings now."
+
+        task = Task(
+            job_id="j", role="explore", instruction="analyze",
+            payload={
+                "cwd": tmp.name, "provider": "openrouter",
+                "model": "deepseek/deepseek-v4-flash",
+                "max_turns": 10, "token_budget": 100_000, "disable_codegraph": True,
+            },
+        )
+        with patch.object(adapter, "_provider_call", side_effect=fake_provider_call):
+            _final, usage, turns_used, _mutated, stop_reason, submitted = adapter._agent_loop(
+                task, Path(tmp.name), "openrouter", "deepseek/deepseek-v4-flash",
+                "system", [], implement=False, on_stop=keep_nudging,
+            )
+        self.assertEqual(stop_reason, "no_tool_calls")
+        self.assertEqual(turns_used, 3)
+        self.assertIsNone(submitted)
+        self.assertLess(usage["tokens_total"], 100_000)
+        self.assertEqual(seen[0], 3)
+
+        # Analyze path with streak=2: default on_stop nudges once, then the
+        # second prose turn trips no_tool_calls and stamps the failure payload.
+        seen[0] = 0
+        run_turns = turns[:2]
+        run_seen = [0]
+
+        def fake_run_call(**kwargs):
+            turn = run_turns[run_seen[0]]
+            run_seen[0] += 1
+            return turn
+
+        run_task = Task(
+            job_id="j", role="explore", instruction="analyze",
+            payload={
+                "cwd": tmp.name, "provider": "openrouter",
+                "model": "deepseek/deepseek-v4-flash",
+                "max_turns": 10, "token_budget": 100_000,
+                "no_tool_calls_streak": 2, "disable_codegraph": True,
+            },
+        )
+        with patch.object(adapter, "_provider_call", side_effect=fake_run_call):
+            arts = adapter.run(run_task, run_task.instruction, "w1")
+        verif = next(a for a in arts if a.type == ArtifactType.VERIFICATION)
+        self.assertEqual(verif.payload["stop_reason"], "no_tool_calls")
+        self.assertEqual(verif.payload["failure"], "no_tool_calls")
+        self.assertEqual(verif.payload["result"], "failed")
+        self.assertIn("never called any tool", verif.payload.get("stderr") or "")
+        self.assertLess(verif.payload.get("tokens_total", 0), 100_000)
+
+    def test_agentic_loop_prose_then_tool_call_continues(self) -> None:
+        """A prose turn followed by a tool-call turn resets the streak and continues."""
+        from puppetmaster.adapters import agentic
+        from puppetmaster.models import Task
+        from puppetmaster.providers import AssistantTurn
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cwd = Path(tmp.name)
+        (cwd / "a.py").write_text("x = 1\n", encoding="utf-8")
+        adapter = agentic.AgenticAdapter()
+        turns = [
+            AssistantTurn(
+                text="Let me think...", tool_calls=[],
+                usage={"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10},
+            ),
+            AssistantTurn(
+                text="",
+                tool_calls=[{
+                    "id": "c1", "name": "read_file",
+                    "arguments": {"path": "a.py"},
+                }],
+                usage={"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10},
+            ),
+            AssistantTurn(
+                text="",
+                tool_calls=[{
+                    "id": "s1", "name": "submit_findings",
+                    "arguments": {
+                        "artifacts": [{
+                            "type": "finding", "claim": "ok",
+                            "evidence": ["a.py"], "confidence": 0.8,
+                        }],
+                    },
+                }],
+                usage={"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10},
+            ),
+        ]
+        seen = [0]
+
+        def fake_provider_call(**kwargs):
+            turn = turns[seen[0]]
+            seen[0] += 1
+            return turn
+
+        def nudge_once(final_text: str, mutated: bool):
+            return "Please use tools."
+
+        task = Task(
+            job_id="j", role="explore", instruction="analyze",
+            payload={
+                "cwd": str(cwd), "provider": "openai", "model": "m",
+                "max_turns": 10, "disable_codegraph": True,
+            },
+        )
+        with patch.object(adapter, "_provider_call", side_effect=fake_provider_call):
+            _text, _usage, turns_used, _mutated, stop_reason, submitted = adapter._agent_loop(
+                task, cwd, "openai", "m", "system",
+                adapter._tool_schema(implement=False, task=task, graph_on=False),
+                implement=False, on_stop=nudge_once,
+            )
+        self.assertEqual(stop_reason, "submitted")
+        self.assertEqual(turns_used, 3)
+        self.assertIsNotNone(submitted)
+        self.assertEqual(seen[0], 3)
+
+    def test_router_prefers_tools_tagged_model_for_agentic_role(self) -> None:
+        """Prefer a tools-tagged model over a cheaper untagged one for implement."""
+        from puppetmaster.model_registry import ModelSpec
+        from puppetmaster.router import TaskSignals, route_task
+
+        registry = [
+            ModelSpec(
+                id="cheap-reasoner",
+                adapter="claude-code",
+                adapter_model_name="deepseek-v4-flash",
+                capability_score=70,
+                input_per_mtok_usd=0.05,
+                output_per_mtok_usd=0.20,
+                tags=["cheap", "fast", "reasoning"],
+            ),
+            ModelSpec(
+                id="tools-model",
+                adapter="claude-code",
+                adapter_model_name="gpt-tool",
+                capability_score=70,
+                input_per_mtok_usd=1.0,
+                output_per_mtok_usd=5.0,
+                tags=["tools", "balanced", "code"],
+            ),
+        ]
+        signal = TaskSignals(instruction="implement the feature", role="implement")
+        decision = route_task(signal, registry, policy="cheap")
+        self.assertEqual(decision.model.id, "tools-model")
+        rejected_ids = {spec.id for spec, _ in decision.rejected}
+        self.assertIn("cheap-reasoner", rejected_ids)
+
+        # Fail-open: when nothing is tagged, prior behavior (cheapest) wins.
+        untagged = [
+            ModelSpec(
+                id="cheap-untagged",
+                adapter="claude-code",
+                adapter_model_name="a",
+                capability_score=70,
+                input_per_mtok_usd=0.05,
+                output_per_mtok_usd=0.20,
+                tags=["cheap"],
+            ),
+            ModelSpec(
+                id="pricey-untagged",
+                adapter="claude-code",
+                adapter_model_name="b",
+                capability_score=70,
+                input_per_mtok_usd=5.0,
+                output_per_mtok_usd=20.0,
+                tags=["quality"],
+            ),
+        ]
+        open_decision = route_task(signal, untagged, policy="cheap")
+        self.assertEqual(open_decision.model.id, "cheap-untagged")
+
     def test_cost_command_prices_pinned_run_without_routing_artifacts(self) -> None:
         """End-to-end: a job with usage but no ROUTING artifacts no longer dead-ends
         at '$0, didn't auto-route' — it reports actual measured spend."""

@@ -143,6 +143,31 @@ _ROLE_BASE_SCORE = {
     "pipeline-mapper": 65,
 }
 
+# Roles that run an agentic-style tool loop (search / edit / submit_*). When at
+# least one registry candidate carries the ``tools`` tag, prefer those models
+# and treat untagged (often reasoning-only) tiers as ineligible. Fail-open when
+# nothing is tagged so untagged user registries behave exactly as before.
+_TOOL_LOOP_ROLES = frozenset(
+    {
+        "explore",
+        "review",
+        "plan",
+        "implement",
+        "refactor",
+        "patch",
+        "fix",
+        "build",
+        "architect",
+        "audit",
+        "security-review",
+        "decision-explainer",
+        "conflict-auditor",
+        "pipeline-mapper",
+        "test-coverage-reviewer",
+    }
+)
+TOOLS_TAG = "tools"
+
 _HARD_SIGNAL_PATTERNS = [
     (re.compile(r"\baudit\b"), 10),
     (re.compile(r"\bsecurity\b"), 15),
@@ -279,6 +304,12 @@ def has_detailed_vision_signal(instruction: str) -> bool:
         if re.search(pattern, lower):
             return True
     return False
+
+
+def task_needs_tool_calling(task: TaskSignals) -> bool:
+    """True for roles that run an agentic-style tool loop (search/edit/submit)."""
+    role = (task.role or "explore").strip().lower()
+    return role in _TOOL_LOOP_ROLES
 
 
 # ----- Token estimation ----------------------------------------------------
@@ -521,6 +552,24 @@ def route_task(
         raise NoEligibleModelError(
             "No model in registry fits the cost budget for this task."
         )
+
+    # Soft tools preference for agentic tool-loop roles: when *any* eligible
+    # candidate carries the ``tools`` tag, require it and drop untagged
+    # (often reasoning-only) models. Fail-open when nothing is tagged so
+    # untagged registries keep prior behavior.
+    if task_needs_tool_calling(task):
+        tools_capable = [s for s in after_cost if TOOLS_TAG in set(s.tags)]
+        if tools_capable:
+            for spec in after_cost:
+                if TOOLS_TAG not in set(spec.tags):
+                    rejected.append(
+                        (
+                            spec,
+                            f"missing required tag {TOOLS_TAG!r} for "
+                            f"agentic tool-loop role {task.role!r}",
+                        )
+                    )
+            after_cost = tools_capable
 
     # Billing gate: when the caller forbids out-of-pocket API spend, drop every
     # model that isn't covered by a subscription the user already pays for.

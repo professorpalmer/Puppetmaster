@@ -45,7 +45,7 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "input": 1.0,
             "output": 5.0,
             "context": 200_000,
-            "tags": ["claude", "cheap", "fast", "vision", "reading", "code"],
+            "tags": ["tools", "claude", "cheap", "fast", "vision", "reading", "code"],
         },
         {
             "model": "claude-sonnet-4-5",
@@ -53,7 +53,7 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "input": 3.0,
             "output": 15.0,
             "context": 200_000,
-            "tags": ["claude", "balanced", "vision", "code", "reasoning"],
+            "tags": ["tools", "claude", "balanced", "vision", "code", "reasoning"],
         },
         {
             "model": "claude-opus-4-6",
@@ -61,7 +61,7 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "input": 5.0,
             "output": 25.0,
             "context": 200_000,
-            "tags": ["claude", "quality", "vision", "code", "reasoning"],
+            "tags": ["tools", "claude", "quality", "vision", "code", "reasoning"],
         },
         {
             "model": "claude-opus-4-7",
@@ -69,7 +69,7 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "input": 5.0,
             "output": 25.0,
             "context": 200_000,
-            "tags": ["claude", "frontier", "vision", "detailed-vision", "reasoning", "code"],
+            "tags": ["tools", "claude", "frontier", "vision", "detailed-vision", "reasoning", "code"],
         },
         {
             "model": "claude-opus-4-8",
@@ -77,7 +77,7 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "input": 5.0,
             "output": 25.0,
             "context": 1_000_000,
-            "tags": [
+            "tags": ["tools", 
                 "claude",
                 "frontier",
                 "vision",
@@ -95,7 +95,7 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "input": 0.75,
             "output": 4.5,
             "context": 400_000,
-            "tags": ["codex", "balanced", "vision", "code", "agent-loop"],
+            "tags": ["tools", "codex", "balanced", "vision", "code", "agent-loop"],
         },
         {
             "model": "gpt-5.4",
@@ -103,7 +103,7 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "input": 2.5,
             "output": 15.0,
             "context": 1_000_000,
-            "tags": ["codex", "quality", "vision", "code", "reasoning", "agent-loop", "long-context"],
+            "tags": ["tools", "codex", "quality", "vision", "code", "reasoning", "agent-loop", "long-context"],
         },
         {
             "model": "gpt-5.6-luna",
@@ -111,7 +111,7 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "input": 1.0,
             "output": 6.0,
             "context": 1_050_000,
-            "tags": ["codex", "balanced", "vision", "code", "agent-loop", "long-context"],
+            "tags": ["tools", "codex", "balanced", "vision", "code", "agent-loop", "long-context"],
         },
         {
             "model": "gpt-5.6-terra",
@@ -119,7 +119,7 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "input": 2.5,
             "output": 15.0,
             "context": 1_050_000,
-            "tags": [
+            "tags": ["tools", 
                 "codex",
                 "quality",
                 "vision",
@@ -135,7 +135,7 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "input": 5.0,
             "output": 30.0,
             "context": 1_050_000,
-            "tags": [
+            "tags": ["tools", 
                 "codex",
                 "frontier",
                 "vision",
@@ -151,7 +151,7 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "input": 5.0,
             "output": 30.0,
             "context": 1_000_000,
-            "tags": [
+            "tags": ["tools", 
                 "codex",
                 "frontier",
                 "vision",
@@ -182,7 +182,7 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "input": 0.30,
             "output": 2.5,
             "context": 1_000_000,
-            "tags": ["agentic", "gemini", "cheap", "fast", "vision", "code", "long-context"],
+            "tags": ["tools", "agentic", "gemini", "cheap", "fast", "vision", "code", "long-context"],
             "payload_defaults": {"provider": "gemini"},
         },
         {
@@ -191,7 +191,7 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "input": 1.25,
             "output": 10.0,
             "context": 1_000_000,
-            "tags": ["agentic", "gemini", "balanced", "vision", "code", "reasoning", "long-context"],
+            "tags": ["tools", "agentic", "gemini", "balanced", "vision", "code", "reasoning", "long-context"],
             "payload_defaults": {"provider": "gemini"},
         },
         {
@@ -200,7 +200,7 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "input": 1.0,
             "output": 5.0,
             "context": 200_000,
-            "tags": ["agentic", "anthropic", "cheap", "fast", "vision", "code"],
+            "tags": ["tools", "agentic", "anthropic", "cheap", "fast", "vision", "code"],
             "payload_defaults": {"provider": "anthropic"},
         },
         {
@@ -209,7 +209,7 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "input": 3.0,
             "output": 15.0,
             "context": 200_000,
-            "tags": ["agentic", "anthropic", "balanced", "vision", "code", "reasoning"],
+            "tags": ["tools", "agentic", "anthropic", "balanced", "vision", "code", "reasoning"],
             "payload_defaults": {"provider": "anthropic"},
         },
         {
@@ -218,7 +218,7 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "input": 15.0,
             "output": 75.0,
             "context": 200_000,
-            "tags": ["agentic", "anthropic", "frontier", "quality", "vision", "code", "reasoning"],
+            "tags": ["tools", "agentic", "anthropic", "frontier", "quality", "vision", "code", "reasoning"],
             "payload_defaults": {"provider": "anthropic"},
         },
         {
@@ -227,7 +227,7 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "input": 1.25,
             "output": 10.0,
             "context": 400_000,
-            "tags": ["agentic", "openai", "quality", "vision", "code", "reasoning", "long-context"],
+            "tags": ["tools", "agentic", "openai", "quality", "vision", "code", "reasoning", "long-context"],
             "payload_defaults": {"provider": "openai-api"},
         },
         {
@@ -236,7 +236,7 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "input": 1.0,
             "output": 6.0,
             "context": 1_050_000,
-            "tags": ["agentic", "openai", "balanced", "fast", "vision", "code", "long-context"],
+            "tags": ["tools", "agentic", "openai", "balanced", "fast", "vision", "code", "long-context"],
             "payload_defaults": {"provider": "openai-api"},
         },
         {
@@ -245,7 +245,7 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "input": 2.5,
             "output": 15.0,
             "context": 1_050_000,
-            "tags": ["agentic", "openai", "quality", "vision", "code", "reasoning", "long-context"],
+            "tags": ["tools", "agentic", "openai", "quality", "vision", "code", "reasoning", "long-context"],
             "payload_defaults": {"provider": "openai-api"},
         },
         {
@@ -254,7 +254,7 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "input": 5.0,
             "output": 30.0,
             "context": 1_050_000,
-            "tags": ["agentic", "openai", "frontier", "quality", "vision", "code", "reasoning", "long-context"],
+            "tags": ["tools", "agentic", "openai", "frontier", "quality", "vision", "code", "reasoning", "long-context"],
             "payload_defaults": {"provider": "openai-api"},
         },
         {
@@ -263,7 +263,7 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "input": 5.0,
             "output": 30.0,
             "context": 400_000,
-            "tags": ["agentic", "openai", "frontier", "quality", "vision", "code", "reasoning", "long-context"],
+            "tags": ["tools", "agentic", "openai", "frontier", "quality", "vision", "code", "reasoning", "long-context"],
             "payload_defaults": {"provider": "openai-api"},
         },
     ],
@@ -276,7 +276,7 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "input": 0.30,
             "output": 2.5,
             "context": 1_000_000,
-            "tags": ["hermes", "gemini", "cheap", "fast", "vision", "code", "long-context"],
+            "tags": ["tools", "hermes", "gemini", "cheap", "fast", "vision", "code", "long-context"],
             "payload_defaults": {"provider": "gemini"},
         },
         {
@@ -285,7 +285,7 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "input": 1.25,
             "output": 10.0,
             "context": 1_000_000,
-            "tags": ["hermes", "gemini", "balanced", "vision", "code", "reasoning", "long-context"],
+            "tags": ["tools", "hermes", "gemini", "balanced", "vision", "code", "reasoning", "long-context"],
             "payload_defaults": {"provider": "gemini"},
         },
         {
@@ -294,7 +294,7 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "input": 3.0,
             "output": 15.0,
             "context": 200_000,
-            "tags": ["hermes", "anthropic", "balanced", "vision", "code", "reasoning"],
+            "tags": ["tools", "hermes", "anthropic", "balanced", "vision", "code", "reasoning"],
             "payload_defaults": {"provider": "anthropic"},
         },
         {
@@ -303,7 +303,7 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "input": 1.25,
             "output": 10.0,
             "context": 400_000,
-            "tags": ["hermes", "openai", "quality", "vision", "code", "reasoning", "long-context"],
+            "tags": ["tools", "hermes", "openai", "quality", "vision", "code", "reasoning", "long-context"],
             "payload_defaults": {"provider": "openai-api"},
         },
         {
@@ -312,7 +312,7 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "input": 1.0,
             "output": 6.0,
             "context": 1_050_000,
-            "tags": ["hermes", "openai", "balanced", "fast", "vision", "code", "long-context"],
+            "tags": ["tools", "hermes", "openai", "balanced", "fast", "vision", "code", "long-context"],
             "payload_defaults": {"provider": "openai-api"},
         },
         {
@@ -321,7 +321,7 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "input": 2.5,
             "output": 15.0,
             "context": 1_050_000,
-            "tags": ["hermes", "openai", "quality", "vision", "code", "reasoning", "long-context"],
+            "tags": ["tools", "hermes", "openai", "quality", "vision", "code", "reasoning", "long-context"],
             "payload_defaults": {"provider": "openai-api"},
         },
         {
@@ -330,7 +330,7 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "input": 5.0,
             "output": 30.0,
             "context": 1_050_000,
-            "tags": ["hermes", "openai", "frontier", "quality", "vision", "code", "reasoning", "long-context"],
+            "tags": ["tools", "hermes", "openai", "frontier", "quality", "vision", "code", "reasoning", "long-context"],
             "payload_defaults": {"provider": "openai-api"},
         },
         {
@@ -339,7 +339,7 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "input": 5.0,
             "output": 30.0,
             "context": 400_000,
-            "tags": ["hermes", "openai", "frontier", "quality", "vision", "code", "reasoning", "long-context"],
+            "tags": ["tools", "hermes", "openai", "frontier", "quality", "vision", "code", "reasoning", "long-context"],
             "payload_defaults": {"provider": "openai-api"},
         },
         {
@@ -348,7 +348,7 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "input": 15.0,
             "output": 75.0,
             "context": 200_000,
-            "tags": ["hermes", "anthropic", "frontier", "quality", "vision", "code", "reasoning"],
+            "tags": ["tools", "hermes", "anthropic", "frontier", "quality", "vision", "code", "reasoning"],
             "payload_defaults": {"provider": "anthropic"},
         },
     ],
