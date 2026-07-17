@@ -10041,6 +10041,240 @@ class ModelRouterTests(unittest.TestCase):
         self.assertIsNotNone(submitted)
         self.assertEqual(seen[0], 3)
 
+    def test_agentic_budget_reserve_force_submit_passes(self) -> None:
+        """Crossing the submit-reserve threshold forces submit_findings and passes."""
+        from puppetmaster.adapters import agentic
+        from puppetmaster.models import ArtifactType, Task
+        from puppetmaster.providers import AssistantTurn
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cwd = Path(tmp.name)
+        (cwd / "a.py").write_text("x = 1\n", encoding="utf-8")
+        adapter = agentic.AgenticAdapter()
+        forced_extras = []
+        turns = [
+            AssistantTurn(
+                text="",
+                tool_calls=[{
+                    "id": "c1", "name": "read_file",
+                    "arguments": {"path": "a.py"},
+                }],
+                usage={
+                    "prompt_tokens": 400, "completion_tokens": 450, "total_tokens": 850,
+                },
+            ),
+            AssistantTurn(
+                text="",
+                tool_calls=[{
+                    "id": "s1", "name": "submit_findings",
+                    "arguments": {
+                        "artifacts": [{
+                            "type": "finding", "claim": "partial",
+                            "evidence": ["a.py"], "confidence": 0.5,
+                        }],
+                    },
+                }],
+                usage={
+                    "prompt_tokens": 50, "completion_tokens": 50, "total_tokens": 100,
+                },
+            ),
+        ]
+        seen = [0]
+
+        def fake_provider_call(**kwargs):
+            forced_extras.append(dict(kwargs.get("extra") or {}))
+            turn = turns[seen[0]]
+            seen[0] += 1
+            return turn
+
+        task = Task(
+            job_id="j", role="explore", instruction="analyze",
+            payload={
+                "cwd": str(cwd), "provider": "openrouter",
+                "model": "deepseek/deepseek-v4-flash",
+                "max_turns": 10, "token_budget": 1000,
+                "disable_codegraph": True, "analyze_retry": False,
+            },
+        )
+        with patch.object(adapter, "_provider_call", side_effect=fake_provider_call):
+            arts = adapter.run(task, task.instruction, "w1")
+        verif = next(a for a in arts if a.type == ArtifactType.VERIFICATION)
+        self.assertEqual(verif.payload["stop_reason"], "submitted")
+        self.assertEqual(verif.payload["result"], "passed")
+        self.assertIn("submit:forced_budget", verif.evidence)
+        self.assertTrue(verif.payload.get("submit_forced_budget"))
+        self.assertEqual(seen[0], 2)
+        self.assertNotIn("force_tool", forced_extras[0])
+        self.assertEqual(forced_extras[1].get("force_tool"), "submit_findings")
+
+    def test_agentic_budget_force_prose_falls_through(self) -> None:
+        """A budget-forced turn that still returns prose hits existing failure path."""
+        from puppetmaster.adapters import agentic
+        from puppetmaster.models import Task
+        from puppetmaster.providers import AssistantTurn
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cwd = Path(tmp.name)
+        (cwd / "a.py").write_text("x = 1\n", encoding="utf-8")
+        adapter = agentic.AgenticAdapter()
+        turns = [
+            AssistantTurn(
+                text="",
+                tool_calls=[{
+                    "id": "c1", "name": "read_file",
+                    "arguments": {"path": "a.py"},
+                }],
+                usage={
+                    "prompt_tokens": 400, "completion_tokens": 450, "total_tokens": 850,
+                },
+            ),
+            AssistantTurn(
+                text="still reasoning without tools",
+                tool_calls=[],
+                usage={
+                    "prompt_tokens": 100, "completion_tokens": 100, "total_tokens": 200,
+                },
+            ),
+        ]
+        seen = [0]
+        forced = []
+
+        def fake_provider_call(**kwargs):
+            forced.append(dict(kwargs.get("extra") or {}))
+            turn = turns[seen[0]]
+            seen[0] += 1
+            return turn
+
+        task = Task(
+            job_id="j", role="explore", instruction="analyze",
+            payload={
+                "cwd": str(cwd), "provider": "openrouter",
+                "model": "deepseek/deepseek-v4-flash",
+                "max_turns": 10, "token_budget": 1000,
+                "disable_codegraph": True, "analyze_retry": False,
+            },
+        )
+        with patch.object(adapter, "_provider_call", side_effect=fake_provider_call):
+            _text, usage, turns_used, _mut, stop_reason, submitted = adapter._agent_loop(
+                task, cwd, "openrouter", "deepseek/deepseek-v4-flash", "system",
+                adapter._tool_schema(implement=False, task=task, graph_on=False),
+                implement=False,
+            )
+        self.assertEqual(forced[1].get("force_tool"), "submit_findings")
+        self.assertEqual(stop_reason, "token_budget")
+        self.assertEqual(turns_used, 2)
+        self.assertIsNone(submitted)
+        self.assertFalse(usage.get("submit_forced_budget"))
+        self.assertGreaterEqual(usage["tokens_total"], 1000)
+
+    def test_agentic_submit_reserve_env_override(self) -> None:
+        """PUPPETMASTER_SUBMIT_RESERVE raises the force-submit threshold."""
+        from puppetmaster.adapters import agentic
+        from puppetmaster.models import Task
+        from puppetmaster.providers import AssistantTurn
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cwd = Path(tmp.name)
+        (cwd / "a.py").write_text("x = 1\n", encoding="utf-8")
+        adapter = agentic.AgenticAdapter()
+        with patch.dict(os.environ, {"PUPPETMASTER_SUBMIT_RESERVE": "0.5"}):
+            self.assertEqual(agentic._submit_reserve_fraction(), 0.5)
+            self.assertEqual(agentic._budget_force_threshold(1000, 0.5), 500.0)
+            forced = []
+            turns = [
+                AssistantTurn(
+                    text="",
+                    tool_calls=[{
+                        "id": "c1", "name": "read_file",
+                        "arguments": {"path": "a.py"},
+                    }],
+                    usage={
+                        "prompt_tokens": 300, "completion_tokens": 300,
+                        "total_tokens": 600,
+                    },
+                ),
+                AssistantTurn(
+                    text="",
+                    tool_calls=[{
+                        "id": "s1", "name": "submit_findings",
+                        "arguments": {"artifacts": []},
+                    }],
+                    usage={
+                        "prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20,
+                    },
+                ),
+            ]
+            seen = [0]
+
+            def fake_provider_call(**kwargs):
+                forced.append(dict(kwargs.get("extra") or {}))
+                turn = turns[seen[0]]
+                seen[0] += 1
+                return turn
+
+            task = Task(
+                job_id="j", role="explore", instruction="analyze",
+                payload={
+                    "cwd": str(cwd), "provider": "openai", "model": "m",
+                    "max_turns": 5, "token_budget": 1000,
+                    "disable_codegraph": True,
+                },
+            )
+            with patch.object(adapter, "_provider_call", side_effect=fake_provider_call):
+                _t, usage, _tu, _m, stop_reason, submitted = adapter._agent_loop(
+                    task, cwd, "openai", "m", "system",
+                    adapter._tool_schema(implement=False, task=task, graph_on=False),
+                    implement=False,
+                )
+        self.assertEqual(stop_reason, "submitted")
+        self.assertIsNotNone(submitted)
+        self.assertTrue(usage.get("submit_forced_budget"))
+        self.assertEqual(forced[1].get("force_tool"), "submit_findings")
+        # Default 0.2 reserve would NOT force at 600/1000; 0.5 reserve does.
+        self.assertGreaterEqual(600, agentic._budget_force_threshold(1000, 0.5))
+        self.assertLess(600, agentic._budget_force_threshold(1000, 0.2))
+
+    def test_agentic_default_reasoning_effort_when_unset(self) -> None:
+        """OpenAI-compatible workers get low reasoning_effort only when unset."""
+        from puppetmaster.adapters import agentic
+        from puppetmaster.models import Task
+
+        adapter = agentic.AgenticAdapter()
+        openrouter_task = Task(
+            job_id="j", role="explore", instruction="x",
+            payload={"provider": "openrouter", "model": "m"},
+        )
+        extra = adapter._extra_params(openrouter_task)
+        self.assertEqual(extra.get("reasoning_effort"), "low")
+
+        overridden = Task(
+            job_id="j", role="explore", instruction="x",
+            payload={
+                "provider": "openrouter", "model": "m",
+                "reasoning_effort": "high",
+            },
+        )
+        self.assertEqual(
+            adapter._extra_params(overridden).get("reasoning_effort"), "high"
+        )
+
+        anthropic_task = Task(
+            job_id="j", role="explore", instruction="x",
+            payload={"provider": "anthropic", "model": "m"},
+        )
+        self.assertNotIn("reasoning_effort", adapter._extra_params(anthropic_task))
+
+        openai_api_task = Task(
+            job_id="j", role="explore", instruction="x",
+            payload={"provider": "openai-api", "model": "m"},
+        )
+        self.assertEqual(
+            adapter._extra_params(openai_api_task).get("reasoning_effort"), "low"
+        )
+
     def test_router_prefers_tools_tagged_model_for_agentic_role(self) -> None:
         """Prefer a tools-tagged model over a cheaper untagged one for implement."""
         from puppetmaster.model_registry import ModelSpec

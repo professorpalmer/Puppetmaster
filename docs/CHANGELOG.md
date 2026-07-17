@@ -1,3 +1,18 @@
+## v1.19.15
+
+**Force-submit budget reserve: workers always come home with findings.**
+
+- When a worker's token usage crosses the reserve threshold (default 80% of
+  the budget, `PUPPETMASTER_SUBMIT_RESERVE` overridable), the loop forces the
+  next turn to call `submit_findings` / `submit_report` with partial findings
+  instead of dying at `stop:token_budget` with nothing. Surfaces as
+  `stop:submitted` + `submit:forced_budget` evidence, result passed.
+- Default reasoning-effort cap for swarm workers on OpenRouter/openai-style
+  providers so chain-of-thought cannot consume the whole budget
+  (payload-overridable).
+- First-turn tool nudge in the analysis brief: reasoning models must open
+  with a tool call, not prose.
+
 ## v1.19.14
 
 **Fail fast on non-tool-calling models; route agentic work to tool-capable models.**

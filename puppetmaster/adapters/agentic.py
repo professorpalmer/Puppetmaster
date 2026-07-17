@@ -142,6 +142,39 @@ _MAX_LENGTH_CONTINUATIONS = 3
 # submit_report. Fail fast with stop_reason=no_tool_calls instead.
 DEFAULT_NO_TOOL_CALLS_STREAK = 3
 
+# Reserve the final fraction of token_budget for a forced submit turn. When
+# cumulative usage crosses (1 - fraction) of the budget, the next turn is
+# compelled via tool_choice to call submit_findings / submit_report with
+# whatever partial findings exist -- so a CoT-heavy reasoner cannot burn the
+# entire budget without ever submitting. Override with PUPPETMASTER_SUBMIT_RESERVE.
+SUBMIT_RESERVE_FRACTION = 0.2
+
+# Default reasoning_effort for OpenRouter / OpenAI-compatible swarm workers when
+# the caller did not set one. Caps chain-of-thought so CoT cannot consume the
+# whole token budget; payload.reasoning_effort still wins when present.
+DEFAULT_SWARM_REASONING_EFFORT = "low"
+
+# Prompt-only first-turn nudge: deltas show turn 1 is often pure reasoning on
+# deep reasoners. Require a real tool call before analysis prose (no artificial
+# no-op force -- the model still chooses which tool).
+_FIRST_TURN_TOOL_NUDGE = (
+    "FIRST TURN REQUIREMENT: Your first response MUST include a tool call "
+    "(start with search_code, list_dir, read_file, or graph_search before any "
+    "analysis prose). Do not spend turn 1 on reasoning-only text."
+)
+
+_BUDGET_FORCE_SUBMIT_ANALYZE = (
+    "Token budget reserve reached. Call `submit_findings` NOW with whatever "
+    "partial findings you have (an empty array is fine if you found nothing). "
+    "Do not continue exploring or reasoning -- submit immediately."
+)
+
+_BUDGET_FORCE_SUBMIT_IMPLEMENT = (
+    "Token budget reserve reached. Call `submit_report` NOW with a short "
+    "summary of whatever work you completed (partial progress is acceptable). "
+    "Do not continue exploring -- submit immediately."
+)
+
 # Verify-before-submit loop (Codex/Claude-Code parity): before accepting an
 # implement worker's submit_report, run the project's verification command
 # (tests / typecheck / lint) and, on failure, feed the output back so the model
@@ -235,6 +268,42 @@ _BROWSER_TOOL_NAMES = frozenset((
 ))
 
 
+def _submit_reserve_fraction() -> float:
+    """Resolve the submit-reserve fraction (module default or env override)."""
+    raw = os.environ.get("PUPPETMASTER_SUBMIT_RESERVE")
+    if raw is None or str(raw).strip() == "":
+        return SUBMIT_RESERVE_FRACTION
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return SUBMIT_RESERVE_FRACTION
+    if value < 0.0 or value >= 1.0:
+        return SUBMIT_RESERVE_FRACTION
+    return value
+
+
+def _budget_force_threshold(token_budget: int, reserve: float) -> float:
+    """Usage at/above which the next turn must be a forced submit."""
+    return float(token_budget) * (1.0 - reserve)
+
+
+def _provider_is_openai_compatible(provider: str) -> bool:
+    """True for OpenRouter and other OpenAI-wire providers (reasoning_effort)."""
+    slug = (provider or "").strip().lower()
+    if slug == "openrouter":
+        return True
+    desc = get_provider(slug)
+    return bool(desc is not None and getattr(desc, "wire", None) == "openai")
+
+
+def _with_first_turn_tool_nudge(prompt: str) -> str:
+    """Append the first-turn tool-call requirement to a worker prompt."""
+    text = prompt or ""
+    if _FIRST_TURN_TOOL_NUDGE in text:
+        return text
+    return text + "\n\n" + _FIRST_TURN_TOOL_NUDGE
+
+
 class AgenticAdapter(FullEditWorkerAdapter):
     """Provider-agnostic direct-API worker with an in-process tool loop."""
 
@@ -299,6 +368,10 @@ class AgenticAdapter(FullEditWorkerAdapter):
             extra["temperature"] = float(task.payload["temperature"])
         if task.payload.get("reasoning_effort"):
             extra["reasoning_effort"] = str(task.payload["reasoning_effort"])
+        elif _provider_is_openai_compatible(self._resolve_provider(task)):
+            # Swarm workers on OpenRouter / OpenAI-compatible endpoints often
+            # default to unbounded CoT; pin a low effort unless the caller set one.
+            extra["reasoning_effort"] = DEFAULT_SWARM_REASONING_EFFORT
         return extra
 
     def _graph_enabled(self, task: Task, cwd: Path) -> bool:
@@ -343,6 +416,7 @@ class AgenticAdapter(FullEditWorkerAdapter):
         if codegraph_used:
             evidence_base = evidence_base + ["context:codegraph"]
 
+        prompt = _with_first_turn_tool_nudge(prompt)
         graph_on = self._graph_enabled(task, cwd)
         tools = self._tool_schema(implement=False, task=task, graph_on=graph_on)
 
@@ -418,8 +492,12 @@ class AgenticAdapter(FullEditWorkerAdapter):
         evidence = evidence_base + [f"turns:{turns}", f"stop:{stop_reason}"]
         if failed_over:
             evidence.append("failover:used")
+        submit_forced_budget = bool(usage.get("submit_forced_budget"))
         if not degraded and not no_tools:
-            evidence.append(f"submit:{channel}")
+            if submit_forced_budget:
+                evidence.append("submit:forced_budget")
+            else:
+                evidence.append(f"submit:{channel}")
         if state["recovered"]:
             evidence.append("retry:recovered")
         elif state["attempted"]:
@@ -507,6 +585,7 @@ class AgenticAdapter(FullEditWorkerAdapter):
         if codegraph_used:
             evidence_base = evidence_base + ["context:codegraph"]
 
+        prompt = _with_first_turn_tool_nudge(prompt)
         graph_on = self._graph_enabled(task, cwd)
         tools = self._tool_schema(implement=True, task=task, graph_on=graph_on)
 
@@ -606,6 +685,8 @@ class AgenticAdapter(FullEditWorkerAdapter):
             evidence.append("failover:used")
         if nudged["done"]:
             evidence.append("nudge:applied")
+        if usage.get("submit_forced_budget"):
+            evidence.append("submit:forced_budget")
         if plan_holder["steps"]:
             evidence.append(f"plan:{len(plan_holder['steps'])}")
         evidence.append(f"verify:{_verify_evidence_tag(verify_state)}")
@@ -809,9 +890,12 @@ class AgenticAdapter(FullEditWorkerAdapter):
         Robustness envelope (Hermes parity): transient wire failures are retried
         with backoff (:meth:`_provider_call`); a model that goes silent right
         after a tool result is nudged once to continue; a length-truncated turn
-        is continued a bounded number of times; and when the analyze retry fires
+        is continued a bounded number of times; when the analyze retry fires
         the next turn *forces* the submit tool via ``tool_choice`` so a compliant
-        model can't wander back into prose.
+        model can't wander back into prose; and when cumulative usage enters the
+        submit-reserve fraction of ``token_budget`` the next turn is similarly
+        forced to ``submit_findings`` / ``submit_report`` (tagged
+        ``submit:forced_budget`` on success).
         """
         self._reset_session_caches()
         max_retries = int(task.payload.get("provider_max_retries", DEFAULT_PROVIDER_MAX_RETRIES))
@@ -830,6 +914,11 @@ class AgenticAdapter(FullEditWorkerAdapter):
         ))
         token_budget = task.payload.get("token_budget")
         token_budget = int(token_budget) if token_budget else None
+        submit_reserve = _submit_reserve_fraction()
+        budget_force_threshold = (
+            _budget_force_threshold(token_budget, submit_reserve)
+            if token_budget else None
+        )
         no_tool_streak_limit = int(
             task.payload.get("no_tool_calls_streak", DEFAULT_NO_TOOL_CALLS_STREAK)
         )
@@ -859,6 +948,9 @@ class AgenticAdapter(FullEditWorkerAdapter):
         empty_recoveries = 0
         length_continuations = 0
         force_submit_next = False
+        budget_force_pending = False
+        budget_force_attempted = False
+        submit_forced_budget = False
         consecutive_no_tool_turns = 0
 
         # Cancellation points: a host that requested cancel (see
@@ -898,12 +990,19 @@ class AgenticAdapter(FullEditWorkerAdapter):
             if compressed:
                 context_compressions += 1
             call_extra = dict(base_extra)
-            # Force the submit tool on a turn that follows the structure retry, so
-            # a model that already ignored the JSON-only reprompt is compelled to
-            # emit the schema-constrained tool call instead of more prose.
-            if force_submit_next and not implement:
-                call_extra["force_tool"] = _SUBMIT_FINDINGS_TOOL
+            # Force the submit tool after a structure retry *or* when the token
+            # budget has entered the submit-reserve zone, so a CoT-heavy model
+            # is compelled to call submit_findings / submit_report instead of
+            # burning the rest of the budget on prose.
+            this_turn_budget_force = budget_force_pending
+            if force_submit_next or budget_force_pending:
+                call_extra["force_tool"] = (
+                    _SUBMIT_REPORT_TOOL if implement else _SUBMIT_FINDINGS_TOOL
+                )
+            if budget_force_pending:
+                budget_force_attempted = True
             force_submit_next = False
+            budget_force_pending = False
 
             try:
                 turn: AssistantTurn = self._provider_call(
@@ -944,6 +1043,8 @@ class AgenticAdapter(FullEditWorkerAdapter):
                     continue
                 # Prose/reasoning with zero tool_calls. Count consecutive misses
                 # so a pure reasoner fails fast instead of burning token_budget.
+                # A budget-forced turn that still returns prose falls through to
+                # the same no_tool_calls / token_budget handling below.
                 consecutive_no_tool_turns += 1
                 if consecutive_no_tool_turns >= no_tool_streak_limit:
                     stop_reason = "no_tool_calls"
@@ -955,6 +1056,36 @@ class AgenticAdapter(FullEditWorkerAdapter):
                     if token_budget and usage_total["total_tokens"] >= token_budget:
                         stop_reason = "token_budget"
                         break
+                    if (
+                        budget_force_threshold is not None
+                        and not budget_force_attempted
+                        and usage_total["total_tokens"] >= budget_force_threshold
+                    ):
+                        budget_force_pending = True
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                _BUDGET_FORCE_SUBMIT_IMPLEMENT if implement
+                                else _BUDGET_FORCE_SUBMIT_ANALYZE
+                            ),
+                        })
+                    continue
+                if token_budget and usage_total["total_tokens"] >= token_budget:
+                    stop_reason = "token_budget"
+                    break
+                if (
+                    budget_force_threshold is not None
+                    and not budget_force_attempted
+                    and usage_total["total_tokens"] >= budget_force_threshold
+                ):
+                    budget_force_pending = True
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            _BUDGET_FORCE_SUBMIT_IMPLEMENT if implement
+                            else _BUDGET_FORCE_SUBMIT_ANALYZE
+                        ),
+                    })
                     continue
                 stop_reason = "model_stopped"
                 break
@@ -1053,16 +1184,32 @@ class AgenticAdapter(FullEditWorkerAdapter):
                         })
             if submitted_this_turn:
                 stop_reason = "submitted"
+                if this_turn_budget_force:
+                    submit_forced_budget = True
                 break
             if token_budget and usage_total["total_tokens"] >= token_budget:
                 stop_reason = "token_budget"
                 break
+            if (
+                budget_force_threshold is not None
+                and not budget_force_attempted
+                and usage_total["total_tokens"] >= budget_force_threshold
+            ):
+                budget_force_pending = True
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        _BUDGET_FORCE_SUBMIT_IMPLEMENT if implement
+                        else _BUDGET_FORCE_SUBMIT_ANALYZE
+                    ),
+                })
         usage_out = {
             "tokens_in": usage_total["prompt_tokens"],
             "tokens_out": usage_total["completion_tokens"],
             "tokens_total": usage_total["total_tokens"],
             "context_compressions": context_compressions,
             "tokens_cached": usage_total["cached_tokens"],
+            "submit_forced_budget": submit_forced_budget,
         }
         if usage_total["cost_usd"] > 0:
             usage_out["real_cost_usd"] = round(usage_total["cost_usd"], 6)
