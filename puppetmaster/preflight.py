@@ -66,6 +66,38 @@ CatalogFetcher = Callable[[], list]
 LiveProber = Callable[[str, Optional[str]], "tuple[int, str, str]"]
 
 
+def _resolve_cursor_preflight_model(
+    model: Optional[str],
+) -> tuple[Optional[str], Optional["ResolvedModelPin"], list[str]]:
+    """Normalize a Cursor model pin to the adapter catalog id when possible.
+
+    :class:`~puppetmaster.model_registry.AmbiguousModelPinError` propagates so
+    integration paths fail closed instead of treating the pin as a raw string.
+    """
+    from puppetmaster.model_registry import load_registry, resolve_model_pin
+
+    if not model:
+        return model, None, []
+    pin = resolve_model_pin(model, load_registry(), adapter="cursor")
+    if pin is None:
+        return model, None, []
+    evidence = [f"preflight:resolved_pin:{pin.registry_id}"]
+    return pin.adapter_model_name, pin, evidence
+
+
+def _cursor_pin_catalog_fallback_reason(
+    pin: "ResolvedModelPin",
+    *,
+    exc: Optional[Exception] = None,
+) -> str:
+    detail = f"{exc}" if exc is not None else "catalog unavailable"
+    return (
+        f"plan-billed; catalog unverified ({detail}); "
+        f"attempting pinned registry model {pin.registry_id!r} "
+        f"({pin.adapter_model_name!r})"
+    )
+
+
 def _cached_catalog_membership(
     adapter: str,
     model: str,
@@ -277,13 +309,22 @@ def _probe_cursor(
     )
     node = base_env.get("PUPPETMASTER_NODE", "node")
     runner_path = runner or CURSOR_RUNNER
+    popen_kwargs: dict = {}
+    if os.name == "nt":
+        from puppetmaster.win_console import effective_creationflags
+
+        popen_kwargs["creationflags"] = effective_creationflags(0)
     try:
         completed = subprocess.run(
             [node, str(runner_path)],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=30,
             env=base_env,
+            **popen_kwargs,
         )
         return (completed.returncode, completed.stdout or "", completed.stderr or "")
     except FileNotFoundError:
@@ -431,34 +472,67 @@ def live_probe(
             model_in_catalog,
         )
 
+        catalog_model, pin, pin_evidence = _resolve_cursor_preflight_model(model)
         fetch = catalog_fetcher or (lambda: __import__(
             "puppetmaster.cursor_discovery", fromlist=["fetch_cursor_catalog"]
         ).fetch_cursor_catalog())
+        catalog_failed = False
         try:
             catalog = fetch()
         except CursorDiscoveryError as exc:
-            return PreflightResult(
-                ok=False, adapter=adapter, model=model, billing=billing,
-                reason=f"live probe failed: {exc}",
-                evidence=["live_probe:catalog_error"],
-            )
-        if model and not model_in_catalog(model, catalog):
-            return PreflightResult(
-                ok=False, adapter=adapter, model=model, billing=billing,
-                reason=f"live probe: model {model!r} not in Cursor plan catalog",
-                evidence=["live_probe:model_not_in_catalog"],
-            )
-        # Catalog cleared auth + model availability; now do a real 1-token
-        # generation so a plan that's out of monthly allowance / rate-limited /
-        # suspended is caught here, not mid-job (the plan-path equivalent of the
-        # OAuth-balance-$0 case that motivated all this).
-        if prober is not None:
-            returncode, stdout, stderr = prober(adapter, model)
+            # An enabled pin may continue past catalog refresh failure, but the
+            # bounded generation probe must still run so quota exhaustion stays
+            # visible. Without a pin, catalog failure is a hard live-probe miss.
+            if pin is None:
+                return PreflightResult(
+                    ok=False,
+                    adapter=adapter,
+                    model=catalog_model or model,
+                    billing=billing,
+                    reason=f"live probe failed: {exc}",
+                    evidence=["live_probe:catalog_error"],
+                )
+            catalog_failed = True
+            pin_evidence = [
+                *pin_evidence,
+                "live_probe:catalog_unavailable",
+                "live_probe:registry_pin_fallback",
+            ]
+            probe_model = pin.adapter_model_name
         else:
-            returncode, stdout, stderr = _probe_cursor(model, env)
-        return _verdict_from_probe(
-            adapter, model, billing, returncode, stdout, stderr,
-            ok_reason="live probe ok (Cursor plan served a token)",
+            if catalog_model and not model_in_catalog(catalog_model, catalog):
+                return PreflightResult(
+                    ok=False, adapter=adapter, model=catalog_model, billing=billing,
+                    reason=f"live probe: model {catalog_model!r} not in Cursor plan catalog",
+                    evidence=[*pin_evidence, "live_probe:model_not_in_catalog"],
+                )
+            # Catalog cleared auth + model availability; now do a real 1-token
+            # generation so a plan that's out of monthly allowance / rate-limited /
+            # suspended is caught here, not mid-job (the plan-path equivalent of the
+            # OAuth-balance-$0 case that motivated all this).
+            probe_model = catalog_model or model
+        if prober is not None:
+            returncode, stdout, stderr = prober(adapter, probe_model)
+        else:
+            returncode, stdout, stderr = _probe_cursor(probe_model, env)
+        ok_reason = (
+            "live probe ok (Cursor plan served a token; catalog unverified, registry pin)"
+            if catalog_failed
+            else "live probe ok (Cursor plan served a token)"
+        )
+        verdict = _verdict_from_probe(
+            adapter, probe_model, billing, returncode, stdout, stderr,
+            ok_reason=ok_reason,
+        )
+        if not pin_evidence:
+            return verdict
+        return PreflightResult(
+            ok=verdict.ok,
+            adapter=verdict.adapter,
+            model=verdict.model,
+            billing=verdict.billing,
+            reason=verdict.reason,
+            evidence=[*pin_evidence, *verdict.evidence],
         )
 
     if prober is not None:
@@ -526,30 +600,49 @@ def preflight_check(
     # dispatch guard. It is intentionally bypassed when the caller supplied a
     # live catalog fetcher or requested a live probe, because those paths have
     # fresher evidence. Stale/unavailable snapshots fail open with evidence.
-    if model and catalog_fetcher is None and not live:
-        cached = _cached_catalog_membership(adapter, model)
+    from puppetmaster.model_registry import AmbiguousModelPinError
+
+    catalog_model = model
+    pin = None
+    pin_evidence: list[str] = []
+    catalog_fallback_reason: Optional[str] = None
+    if adapter == "cursor" and model:
+        try:
+            catalog_model, pin, pin_evidence = _resolve_cursor_preflight_model(model)
+        except AmbiguousModelPinError as exc:
+            return PreflightResult(
+                ok=False,
+                adapter=adapter,
+                model=model,
+                billing=status.billing,
+                reason=f"ambiguous model pin: {exc}",
+                evidence=[*status.evidence, "preflight:ambiguous_model_pin"],
+            )
+
+    if catalog_model and catalog_fetcher is None and not live:
+        cached = _cached_catalog_membership(adapter, catalog_model)
         if cached is not None:
             cached_ok, cached_reason, cached_evidence = cached
             if not cached_ok:
                 return PreflightResult(
                     ok=False,
                     adapter=adapter,
-                    model=model,
+                    model=catalog_model,
                     billing=status.billing,
                     reason=cached_reason,
-                    evidence=[*status.evidence, *cached_evidence],
+                    evidence=[*status.evidence, *pin_evidence, *cached_evidence],
                 )
             if "preflight:cached_catalog_stale" in cached_evidence:
                 return PreflightResult(
                     ok=True,
                     adapter=adapter,
-                    model=model,
+                    model=catalog_model,
                     billing=status.billing,
                     reason=cached_reason,
-                    evidence=[*status.evidence, *cached_evidence],
+                    evidence=[*status.evidence, *pin_evidence, *cached_evidence],
                 )
 
-    if adapter == "cursor" and model and catalog_fetcher is not None:
+    if adapter == "cursor" and catalog_model and catalog_fetcher is not None:
         from puppetmaster.cursor_discovery import (
             CursorDiscoveryError,
             model_in_catalog,
@@ -558,67 +651,110 @@ def preflight_check(
         try:
             catalog = catalog_fetcher()
         except CursorDiscoveryError as exc:
-            return PreflightResult(
-                ok=True,
-                adapter=adapter,
-                model=model,
-                billing=status.billing,
-                reason=f"plan-billed; catalog unverified ({exc})",
-                evidence=[*status.evidence, "preflight:catalog_unavailable"],
-            )
-        if not model_in_catalog(model, catalog):
-            available = ", ".join(sorted(str(m.get("id")) for m in catalog)[:8])
-            return PreflightResult(
-                ok=False,
-                adapter=adapter,
-                model=model,
-                billing=status.billing,
-                reason=(
-                    f"model {model!r} is not in the Cursor plan catalog; "
-                    f"available: {available}"
-                ),
-                evidence=[*status.evidence, "preflight:model_not_in_catalog"],
-            )
+            if pin is not None:
+                # Record registry-pin fallback evidence, but do not return yet:
+                # when ``live`` is set the generation probe must still run.
+                catalog_fallback_reason = _cursor_pin_catalog_fallback_reason(
+                    pin, exc=exc
+                )
+                pin_evidence = [
+                    *pin_evidence,
+                    "preflight:catalog_unavailable",
+                    "preflight:registry_pin_fallback",
+                ]
+            elif live:
+                # Defer classification to live_probe (hard-fails without a pin).
+                pass
+            else:
+                return PreflightResult(
+                    ok=True,
+                    adapter=adapter,
+                    model=catalog_model,
+                    billing=status.billing,
+                    reason=f"plan-billed; catalog unverified ({exc})",
+                    evidence=[
+                        *status.evidence,
+                        *pin_evidence,
+                        "preflight:catalog_unavailable",
+                    ],
+                )
+        else:
+            if not model_in_catalog(catalog_model, catalog):
+                available = ", ".join(sorted(str(m.get("id")) for m in catalog)[:8])
+                return PreflightResult(
+                    ok=False,
+                    adapter=adapter,
+                    model=catalog_model,
+                    billing=status.billing,
+                    reason=(
+                        f"model {catalog_model!r} is not in the Cursor plan catalog; "
+                        f"available: {available}"
+                    ),
+                    evidence=[
+                        *status.evidence,
+                        *pin_evidence,
+                        "preflight:model_not_in_catalog",
+                    ],
+                )
 
     # Optional live 1-token probe: the only thing that catches a funded-looking
     # account whose balance is actually exhausted. Off by default (adds a real
     # call + latency); opt in per task via ``payload.live_preflight`` or the
     # ``--live`` CLI flag. A probe that itself can't run (e.g. missing optional
     # tooling) does not block — only an actual billing/auth/quota rejection does.
+    result_model = catalog_model if adapter == "cursor" else model
     if live:
-        probe = live_probe(
-            adapter,
-            model,
-            prober=prober,
-            catalog_fetcher=catalog_fetcher,
-            env=env,
-            billing=status.billing,
-        )
+        try:
+            probe = live_probe(
+                adapter,
+                result_model,
+                prober=prober,
+                catalog_fetcher=catalog_fetcher,
+                env=env,
+                billing=status.billing,
+            )
+        except AmbiguousModelPinError as exc:
+            return PreflightResult(
+                ok=False,
+                adapter=adapter,
+                model=result_model,
+                billing=status.billing,
+                reason=f"ambiguous model pin: {exc}",
+                evidence=[*status.evidence, *pin_evidence, "preflight:ambiguous_model_pin"],
+            )
         if not probe.ok:
             return PreflightResult(
                 ok=False,
                 adapter=adapter,
-                model=model,
+                model=result_model,
                 billing=status.billing,
                 reason=probe.reason,
-                evidence=[*status.evidence, *probe.evidence],
+                evidence=[*status.evidence, *pin_evidence, *probe.evidence],
             )
         return PreflightResult(
             ok=True,
             adapter=adapter,
-            model=model,
+            model=result_model,
             billing=status.billing,
             reason=f"ready ({status.billing}-billed, live-probed): {status.detail}",
-            evidence=[*status.evidence, *probe.evidence],
+            evidence=[*status.evidence, *pin_evidence, *probe.evidence],
         )
 
+    reason = (
+        catalog_fallback_reason
+        if catalog_fallback_reason is not None
+        else f"ready ({status.billing}-billed): {status.detail}"
+    )
+    evidence = [*status.evidence, *pin_evidence]
+    if catalog_fallback_reason is None:
+        evidence.append("preflight:ok")
     return PreflightResult(
         ok=True,
         adapter=adapter,
-        model=model,
+        model=result_model,
         billing=status.billing,
-        reason=f"ready ({status.billing}-billed): {status.detail}",
-        evidence=[*status.evidence, "preflight:ok"],
+        reason=reason,
+        evidence=evidence,
     )
 
 

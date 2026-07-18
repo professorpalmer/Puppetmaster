@@ -187,6 +187,14 @@ def merge_routing_payload(payload: dict, decision, extra_fields: Optional[dict] 
     return merged
 
 
+def _payload_has_explicit_model_pin(payload: dict) -> bool:
+    """True when the task carries a user pin that must not be re-routed."""
+    return bool(
+        payload.get("pinned_model")
+        or (payload.get("model") and not payload.get("auto_route"))
+    )
+
+
 @dataclass(frozen=True)
 class RunResult:
     job: Job
@@ -667,6 +675,10 @@ class Orchestrator:
             reason = failure_by_task[task.id]
             allow_api = bool((task.payload or {}).get("allow_api_billing", True))
             payload = task.payload or {}
+            # Never silently re-route an explicit hand pin. Router-placed work
+            # (auto_route + router_model_id) may still fall back to another model.
+            if _payload_has_explicit_model_pin(payload):
+                continue
             tried_models = set(payload.get("tried_models") or [])
             current_model_id = str(payload.get("router_model_id") or "")
             if current_model_id:
@@ -854,7 +866,10 @@ class Orchestrator:
             if int(payload.get("escalation_attempts", 0)) >= _MAX_ESCALATION_ATTEMPTS:
                 continue
             # Only escalate work the router placed — don't override a model the
-            # user pinned by hand.
+            # user pinned by hand (including stamped Cursor pins that also set
+            # router_model_id for cost/audit).
+            if _payload_has_explicit_model_pin(payload):
+                continue
             current_model_id = payload.get("router_model_id")
             current_spec = by_model_id.get(current_model_id) if current_model_id else None
             if current_spec is None:
@@ -1006,11 +1021,13 @@ class Orchestrator:
             return set()
         pending: set[str] = set()
         for task in self.store.list_tasks(job.id):
+            payload = task.payload or {}
             if (
                 task.id in rejected
                 and task.status == TaskStatus.FAILED
-                and (task.payload or {}).get("router_model_id")
-                and int((task.payload or {}).get("review_escalation_attempts", 0))
+                and payload.get("router_model_id")
+                and not _payload_has_explicit_model_pin(payload)
+                and int(payload.get("review_escalation_attempts", 0))
                 < _MAX_ESCALATION_ATTEMPTS
             ):
                 pending.add(task.id)
@@ -1073,6 +1090,8 @@ class Orchestrator:
                 continue
             # Only re-route work the router placed — never override a hand-pinned
             # model (the user chose it deliberately).
+            if _payload_has_explicit_model_pin(payload):
+                continue
             current_model_id = payload.get("router_model_id")
             current_spec = by_model_id.get(current_model_id) if current_model_id else None
             if current_spec is None:

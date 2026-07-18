@@ -14,13 +14,18 @@ from typing import Any, Iterable, Optional, Union
 from puppetmaster.models import (
     AgentRun,
     Artifact,
+    GraphEdge,
+    GraphEdgeType,
+    GraphNodeKind,
     Job,
     JobStatus,
     MemoryRecord,
     Task,
     TaskStatus,
     artifact_from_dict,
+    graph_edge_from_dict,
     job_from_dict,
+    make_graph_edge,
     new_id,
     now_iso,
     parse_iso,
@@ -42,6 +47,19 @@ _SCOPE_WEIGHTS = {
     "swarm.verification": 0.4,
 }
 _DEFAULT_SCOPE_WEIGHT = 0.7
+_GRAPH_EDGES_MARKER = ".graph_edges_materialized"
+_CONSUMES_JOURNAL_PREFIX = ".consumes_journal_"
+
+
+class ActiveTaskLeaseError(RuntimeError):
+    """Raised when ``reset_subgraph`` would clear a task with a live lease."""
+
+    def __init__(self, task_ids: Iterable[str]) -> None:
+        self.task_ids = sorted({task_id for task_id in task_ids if task_id})
+        joined = ", ".join(self.task_ids) or "(none)"
+        super().__init__(
+            f"reset_subgraph refused: active lease on task(s) {joined}"
+        )
 _RECENCY_FULL_DAYS = 7
 _RECENCY_FLOOR = 0.5
 _RECENCY_FLOOR_DAYS = 56
@@ -206,6 +224,7 @@ class SwarmStore:
             job_dir / "tasks",
             job_dir / "runs",
             job_dir / "artifacts",
+            job_dir / "edges",
             job_dir / "summaries",
         ]:
             mkdir_private(directory)
@@ -252,12 +271,15 @@ class SwarmStore:
         }
 
     def save_task(self, task: Task) -> None:
+        mkdir_private(self.job_dir(task.job_id) / "edges")
         self.write_json(self.job_dir(task.job_id) / "tasks" / f"{task.id}.json", task)
         self.emit(
             task.job_id,
             "task.saved",
             self._task_saved_payload(task),
         )
+        self._materialize_depends_on_edges(task)
+        self._mark_graph_edges_materialized(task.job_id)
 
     def save_tasks(self, tasks: Iterable[Task]) -> None:
         for task in tasks:
@@ -556,6 +578,9 @@ class SwarmStore:
 
     def refresh_blocked_tasks(self, job_id: str) -> list[Task]:
         ready: list[Task] = []
+        # Hard-failed upstreams cascade BLOCKED descendants to FAILED first so
+        # COMPLETE-only unblocking never promotes a permanently doomed child.
+        self.propagate_hard_dependency_failures(job_id)
         # Build the dependency lookup once and thread it through
         # dependencies_complete, mirroring claim_next_task — otherwise each
         # blocked task triggers one get_task_by_id() per dependency on every
@@ -593,6 +618,533 @@ class SwarmStore:
                 return False
         return True
 
+    def upsert_edge(self, edge: GraphEdge) -> GraphEdge:
+        """Persist a typed graph edge idempotently (identity is endpoint tuple)."""
+        if not edge.id:
+            edge = make_graph_edge(
+                job_id=edge.job_id,
+                type=edge.type,
+                from_kind=edge.from_kind,
+                from_id=edge.from_id,
+                to_kind=edge.to_kind,
+                to_id=edge.to_id,
+                created_at=edge.created_at,
+                meta=edge.meta,
+            )
+        edges_dir = self.job_dir(edge.job_id) / "edges"
+        mkdir_private(edges_dir)
+        path = edges_dir / f"{edge.id}.json"
+        existing: Optional[GraphEdge] = None
+        if path.exists():
+            try:
+                existing = graph_edge_from_dict(self.read_json(path))
+            except Exception:
+                existing = None
+        # Preserve the original created_at on idempotent re-upsert.
+        if existing is not None:
+            merged_meta = {**existing.meta, **(edge.meta or {})}
+            if merged_meta == existing.meta:
+                return existing
+            edge = GraphEdge(
+                id=existing.id,
+                job_id=existing.job_id,
+                type=existing.type,
+                from_kind=existing.from_kind,
+                from_id=existing.from_id,
+                to_kind=existing.to_kind,
+                to_id=existing.to_id,
+                created_at=existing.created_at,
+                meta=merged_meta,
+            )
+        self.write_json(path, edge)
+        self.emit(
+            edge.job_id,
+            "edge.upserted",
+            {
+                "edge_id": edge.id,
+                "type": str(edge.type),
+                "from_id": edge.from_id,
+                "to_id": edge.to_id,
+            },
+        )
+        return edge
+
+    def upsert_edges(self, edges: Iterable[GraphEdge]) -> list[GraphEdge]:
+        return [self.upsert_edge(edge) for edge in edges]
+
+    def delete_edge(self, job_id: str, edge_id: str) -> bool:
+        """Remove one persisted edge. Returns True when a file was deleted."""
+        path = self.job_dir(job_id) / "edges" / f"{edge_id}.json"
+        if not path.exists():
+            return False
+        # Stale depends_on reconcile unlinks edge files while workers may still
+        # hold them open on Windows — retry the sharing violation like write_json.
+        _retry_on_windows_lock(path.unlink)
+        self.emit(job_id, "edge.deleted", {"edge_id": edge_id})
+        return True
+
+    def get_edge(self, job_id: str, edge_id: str) -> Optional[GraphEdge]:
+        self.ensure_graph_edges(job_id)
+        path = self.job_dir(job_id) / "edges" / f"{edge_id}.json"
+        if not path.exists():
+            return None
+        return graph_edge_from_dict(self.read_json(path))
+
+    def list_edges(
+        self,
+        job_id: str,
+        *,
+        edge_type: Optional[Union[GraphEdgeType, str]] = None,
+        from_id: Optional[str] = None,
+        to_id: Optional[str] = None,
+        from_kind: Optional[Union[GraphNodeKind, str]] = None,
+        to_kind: Optional[Union[GraphNodeKind, str]] = None,
+    ) -> list[GraphEdge]:
+        self.ensure_graph_edges(job_id)
+        return self._list_edges_from_disk(
+            job_id,
+            edge_type=edge_type,
+            from_id=from_id,
+            to_id=to_id,
+            from_kind=from_kind,
+            to_kind=to_kind,
+        )
+
+    def _list_edges_from_disk(
+        self,
+        job_id: str,
+        *,
+        edge_type: Optional[Union[GraphEdgeType, str]] = None,
+        from_id: Optional[str] = None,
+        to_id: Optional[str] = None,
+        from_kind: Optional[Union[GraphNodeKind, str]] = None,
+        to_kind: Optional[Union[GraphNodeKind, str]] = None,
+    ) -> list[GraphEdge]:
+        edges_dir = self.job_dir(job_id) / "edges"
+        if not edges_dir.exists():
+            return []
+        wanted_type = str(edge_type) if edge_type is not None else None
+        wanted_from_kind = str(from_kind) if from_kind is not None else None
+        wanted_to_kind = str(to_kind) if to_kind is not None else None
+        edges: list[GraphEdge] = []
+        for path in sorted(edges_dir.glob("*.json")):
+            edge = graph_edge_from_dict(self.read_json(path))
+            if wanted_type is not None and str(edge.type) != wanted_type:
+                continue
+            if from_id is not None and edge.from_id != from_id:
+                continue
+            if to_id is not None and edge.to_id != to_id:
+                continue
+            if wanted_from_kind is not None and str(edge.from_kind) != wanted_from_kind:
+                continue
+            if wanted_to_kind is not None and str(edge.to_kind) != wanted_to_kind:
+                continue
+            edges.append(edge)
+        return edges
+
+    def _graph_edges_marker(self, job_id: str) -> Path:
+        return self.job_dir(job_id) / _GRAPH_EDGES_MARKER
+
+    def _mark_graph_edges_materialized(self, job_id: str) -> None:
+        marker = self._graph_edges_marker(job_id)
+        if marker.exists():
+            return
+        mkdir_private(self.job_dir(job_id))
+        marker.write_text("2\n", encoding="utf-8")
+        chmod_private_file(marker)
+
+    def ensure_graph_edges(self, job_id: str) -> None:
+        """Lazy-backfill depends_on/produces edges for pre-graph file jobs."""
+        job_dir = self.job_dir(job_id)
+        if not job_dir.exists():
+            return
+        # Always replay interrupted consumes journals (idempotent upserts).
+        self._replay_consumes_journals(job_id)
+        marker = self._graph_edges_marker(job_id)
+        if marker.exists():
+            return
+        mkdir_private(job_dir / "edges")
+        for task in self.list_tasks(job_id):
+            self._reconcile_depends_on_edges(task, list_edges=self._list_edges_from_disk)
+        for artifact in self.list_artifacts(job_id):
+            self._materialize_produces_edge(artifact)
+        self._mark_graph_edges_materialized(job_id)
+
+    def job_graph(self, job_id: str) -> dict[str, Any]:
+        """Read-only nodes+edges snapshot for CLI/MCP graph queries."""
+        self.ensure_graph_edges(job_id)
+        tasks = self.list_tasks(job_id)
+        artifacts = self.list_artifacts(job_id)
+        edges = self.list_edges(job_id)
+        nodes: list[dict[str, Any]] = []
+        for task in tasks:
+            nodes.append(
+                {
+                    "id": task.id,
+                    "kind": str(GraphNodeKind.TASK),
+                    "role": task.role,
+                    "status": str(task.status),
+                }
+            )
+        for artifact in artifacts:
+            nodes.append(
+                {
+                    "id": artifact.id,
+                    "kind": str(GraphNodeKind.ARTIFACT),
+                    "type": str(artifact.type),
+                    "task_id": artifact.task_id,
+                }
+            )
+        return {
+            "job_id": job_id,
+            "nodes": nodes,
+            "edges": [to_jsonable(edge) for edge in edges],
+        }
+
+    def _reconcile_depends_on_edges(
+        self,
+        task: Task,
+        *,
+        list_edges=None,
+    ) -> list[GraphEdge]:
+        """Upsert current depends_on edges and drop stale ones for ``task``."""
+        list_fn = list_edges or self.list_edges
+        desired_ids = {dependency_id for dependency_id in task.depends_on if dependency_id}
+        existing = list_fn(
+            task.job_id,
+            edge_type=GraphEdgeType.DEPENDS_ON,
+            from_id=task.id,
+            from_kind=GraphNodeKind.TASK,
+            to_kind=GraphNodeKind.TASK,
+        )
+        for edge in existing:
+            if edge.to_id not in desired_ids:
+                self.delete_edge(task.job_id, edge.id)
+        edges = [
+            make_graph_edge(
+                job_id=task.job_id,
+                type=GraphEdgeType.DEPENDS_ON,
+                from_kind=GraphNodeKind.TASK,
+                from_id=task.id,
+                to_kind=GraphNodeKind.TASK,
+                to_id=dependency_id,
+            )
+            for dependency_id in task.depends_on
+            if dependency_id
+        ]
+        return self.upsert_edges(edges)
+
+    def _materialize_depends_on_edges(self, task: Task) -> list[GraphEdge]:
+        return self._reconcile_depends_on_edges(
+            task, list_edges=self._list_edges_from_disk
+        )
+
+    def _materialize_produces_edge(self, artifact: Artifact) -> GraphEdge:
+        return self.upsert_edge(
+            make_graph_edge(
+                job_id=artifact.job_id,
+                type=GraphEdgeType.PRODUCES,
+                from_kind=GraphNodeKind.TASK,
+                from_id=artifact.task_id,
+                to_kind=GraphNodeKind.ARTIFACT,
+                to_id=artifact.id,
+            )
+        )
+
+    def _consumes_journal_path(self, job_id: str, task_id: str) -> Path:
+        safe_task = self._safe_key(task_id)
+        return self.job_dir(job_id) / f"{_CONSUMES_JOURNAL_PREFIX}{safe_task}.json"
+
+    def _replay_consumes_journals(self, job_id: str) -> None:
+        """Replay any crash-left consumes journals (idempotent upserts)."""
+        job_dir = self.job_dir(job_id)
+        if not job_dir.exists():
+            return
+        for path in sorted(job_dir.glob(f"{_CONSUMES_JOURNAL_PREFIX}*.json")):
+            try:
+                payload = self.read_json(path)
+            except Exception:
+                continue
+            raw_edges = payload.get("edges") if isinstance(payload, dict) else None
+            if not isinstance(raw_edges, list):
+                _retry_on_windows_lock(path.unlink)
+                continue
+            edges = [graph_edge_from_dict(item) for item in raw_edges if isinstance(item, dict)]
+            if edges:
+                self.upsert_edges(edges)
+            if path.exists():
+                _retry_on_windows_lock(path.unlink)
+
+    def record_consumes(
+        self,
+        job_id: str,
+        task_id: str,
+        artifact_ids: Iterable[str],
+        *,
+        meta: Optional[dict[str, Any]] = None,
+    ) -> list[GraphEdge]:
+        """Record task→artifact consumes edges (idempotent, crash-recoverable).
+
+        File backend: durable journal of intended edges is written first, then
+        each edge is upserted, then the journal is cleared. A crash mid-batch
+        leaves the journal for :meth:`_replay_consumes_journals` (called from
+        :meth:`ensure_graph_edges` / the next ``record_consumes``). Upserts are
+        identity-keyed, so replay is safe.
+        """
+        self._replay_consumes_journals(job_id)
+        edges = [
+            make_graph_edge(
+                job_id=job_id,
+                type=GraphEdgeType.CONSUMES,
+                from_kind=GraphNodeKind.TASK,
+                from_id=task_id,
+                to_kind=GraphNodeKind.ARTIFACT,
+                to_id=artifact_id,
+                meta=meta,
+            )
+            for artifact_id in dict.fromkeys(artifact_ids)
+            if artifact_id
+        ]
+        if not edges:
+            return []
+        journal_path = self._consumes_journal_path(job_id, task_id)
+        mkdir_private(self.job_dir(job_id))
+        self.write_json(
+            journal_path,
+            {
+                "job_id": job_id,
+                "task_id": task_id,
+                "edges": [to_jsonable(edge) for edge in edges],
+            },
+        )
+        try:
+            result = self.upsert_edges(edges)
+        except Exception:
+            # Leave the journal so the next open/replay can finish the batch.
+            raise
+        if journal_path.exists():
+            _retry_on_windows_lock(journal_path.unlink)
+        return result
+
+    def resolve_artifacts_via_edges(
+        self,
+        task: Task,
+        *,
+        record_consumes: bool = True,
+    ) -> list[Artifact]:
+        """Resolve artifacts produced by upstream ``depends_on`` tasks via edges.
+
+        Returns an empty list when no produces edges exist so callers can fall
+        back to the legacy whole-job artifact load.
+        """
+        if not task.depends_on:
+            return []
+        artifact_ids: list[str] = []
+        for dependency_id in task.depends_on:
+            for edge in self.list_edges(
+                task.job_id,
+                edge_type=GraphEdgeType.PRODUCES,
+                from_id=dependency_id,
+                from_kind=GraphNodeKind.TASK,
+                to_kind=GraphNodeKind.ARTIFACT,
+            ):
+                artifact_ids.append(edge.to_id)
+        if not artifact_ids:
+            return []
+        by_id = self.get_artifacts_by_ids(task.job_id, artifact_ids)
+        artifacts = [by_id[artifact_id] for artifact_id in artifact_ids if artifact_id in by_id]
+        if record_consumes and artifacts:
+            self.record_consumes(
+                task.job_id,
+                task.id,
+                [artifact.id for artifact in artifacts],
+            )
+        return artifacts
+
+    def _recoverable_failed_task_ids(
+        self,
+        job_id: str,
+        *,
+        artifacts: Optional[list[Artifact]] = None,
+    ) -> set[str]:
+        from puppetmaster.workers import RECOVERABLE_FAILURES
+
+        if artifacts is None:
+            artifacts = self.list_artifacts(job_id)
+        latest_at: dict[str, str] = {}
+        recoverable: set[str] = set()
+        for artifact in artifacts:
+            failure = (artifact.payload or {}).get("failure")
+            if failure not in RECOVERABLE_FAILURES:
+                continue
+            task_id = artifact.task_id
+            if task_id not in latest_at or artifact.created_at >= latest_at[task_id]:
+                latest_at[task_id] = artifact.created_at
+                recoverable.add(task_id)
+        # A later non-recoverable failure artifact for the same task should win.
+        for artifact in artifacts:
+            failure = (artifact.payload or {}).get("failure")
+            if failure in RECOVERABLE_FAILURES or failure is None:
+                continue
+            task_id = artifact.task_id
+            if task_id in latest_at and artifact.created_at >= latest_at[task_id]:
+                recoverable.discard(task_id)
+                latest_at[task_id] = artifact.created_at
+        return recoverable
+
+    def propagate_hard_dependency_failures(self, job_id: str) -> list[Task]:
+        """Cascade hard-FAILED deps onto BLOCKED descendants as terminal FAILED.
+
+        Recoverable adapter/billing failures leave dependents BLOCKED so the
+        existing auto-fallback path can requeue the upstream. COMPLETE-only
+        unblocking is unchanged.
+        """
+        tasks = self.list_tasks(job_id)
+        task_map = {task.id: task for task in tasks}
+        recoverable = self._recoverable_failed_task_ids(job_id)
+        changed: list[Task] = []
+        progress = True
+        while progress:
+            progress = False
+            for task in list(task_map.values()):
+                if task.status != TaskStatus.BLOCKED:
+                    continue
+                hard_failed = [
+                    dep_id
+                    for dep_id in task.depends_on
+                    if (dep := task_map.get(dep_id)) is not None
+                    and dep.status == TaskStatus.FAILED
+                    and dep.id not in recoverable
+                ]
+                if not hard_failed:
+                    continue
+                failed = replace(
+                    task,
+                    status=TaskStatus.FAILED,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    lease_id=None,
+                    updated_at=now_iso(),
+                )
+                self.save_task(failed)
+                self.emit(
+                    job_id,
+                    "task.dependency_failed",
+                    {
+                        "task_id": task.id,
+                        "role": task.role,
+                        "failed_dependencies": hard_failed,
+                    },
+                )
+                task_map[task.id] = failed
+                changed.append(failed)
+                progress = True
+        return changed
+
+    def consumer_closure(
+        self, job_id: str, task_ids: Iterable[str]
+    ) -> set[str]:
+        """Selected tasks plus transitive dependents (consumers via depends_on)."""
+        seeds = {task_id for task_id in task_ids if task_id}
+        if not seeds:
+            return set()
+        tasks = self.list_tasks(job_id)
+        dependents: dict[str, list[str]] = {}
+        for task in tasks:
+            for dependency_id in task.depends_on:
+                dependents.setdefault(dependency_id, []).append(task.id)
+        selected: set[str] = set()
+        stack = list(seeds)
+        while stack:
+            task_id = stack.pop()
+            if task_id in selected:
+                continue
+            selected.add(task_id)
+            for child_id in dependents.get(task_id, []):
+                if child_id not in selected:
+                    stack.append(child_id)
+        return selected
+
+    @staticmethod
+    def has_active_lease(task: Task) -> bool:
+        """True when a RUNNING task still holds a non-expired worker lease."""
+        if task.status != TaskStatus.RUNNING:
+            return False
+        if not task.lease_owner or not task.lease_expires_at:
+            return False
+        return not SwarmStore.is_task_stale(task)
+
+    def reset_subgraph(
+        self,
+        job_id: str,
+        task_ids: Iterable[str],
+        *,
+        include_descendants: bool = True,
+    ) -> list[Task]:
+        """Idempotent targeted rerun reset for selected (downstream) tasks.
+
+        Clears lease/completion state and ``attempts`` for the selected set
+        (and optionally their consumer closure), then re-derives QUEUED/BLOCKED
+        from ``depends_on``. Completed upstream tasks, artifacts, and edges are
+        retained.
+
+        Refuses the whole reset when any selected task still holds an active
+        (non-expired RUNNING) lease, so a live worker cannot be fenced into
+        emitting stale produces artifacts against a reset generation.
+        """
+        selected = (
+            self.consumer_closure(job_id, task_ids)
+            if include_descendants
+            else {task_id for task_id in task_ids if task_id}
+        )
+        if not selected:
+            return []
+        tasks = self.list_tasks(job_id)
+        task_map = {task.id: task for task in tasks}
+        active = [
+            task.id
+            for task in tasks
+            if task.id in selected and self.has_active_lease(task)
+        ]
+        if active:
+            raise ActiveTaskLeaseError(active)
+        reset: list[Task] = []
+        for task in tasks:
+            if task.id not in selected:
+                continue
+            cleared = replace(
+                task,
+                status=TaskStatus.BLOCKED,
+                attempts=0,
+                lease_owner=None,
+                lease_expires_at=None,
+                lease_id=None,
+                completed_at=None,
+                updated_at=now_iso(),
+            )
+            self.save_task(cleared)
+            task_map[task.id] = cleared
+            reset.append(cleared)
+        # Re-derive runnable status from dependencies (COMPLETE-only).
+        finalized: list[Task] = []
+        for task in reset:
+            current = task_map[task.id]
+            if self.dependencies_complete(current, task_map=task_map):
+                queued = replace(
+                    current, status=TaskStatus.QUEUED, updated_at=now_iso()
+                )
+                self.save_task(queued)
+                task_map[task.id] = queued
+                finalized.append(queued)
+            else:
+                finalized.append(current)
+        self.emit(
+            job_id,
+            "subgraph.reset",
+            {"task_ids": sorted(selected), "reset_count": len(finalized)},
+        )
+        return finalized
+
     def heartbeat_run(self, run: AgentRun) -> AgentRun:
         updated = replace(run, heartbeat_at=now_iso())
         self.save_run(updated)
@@ -611,6 +1163,7 @@ class SwarmStore:
         artifact.validate()
         if artifact.sha256 is None:
             artifact = replace(artifact, sha256=self.artifact_hash(artifact))
+        mkdir_private(self.job_dir(artifact.job_id) / "edges")
         path = self.job_dir(artifact.job_id) / "artifacts" / f"{artifact.id}.json"
         self.write_json(path, artifact)
         self.emit(
@@ -624,6 +1177,8 @@ class SwarmStore:
                 "sha256": artifact.sha256,
             },
         )
+        self._materialize_produces_edge(artifact)
+        self._mark_graph_edges_materialized(artifact.job_id)
 
     def save_artifacts(self, artifacts: Iterable[Artifact]) -> None:
         for artifact in artifacts:

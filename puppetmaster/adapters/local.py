@@ -17,7 +17,9 @@ class LocalAdapter:
         role_map = {
             "explore": self._explore,
             "architect": self._architect,
+            "plan": self._plan,
             "implement": self._implement,
+            "verify": self._verify,
             "redteam": self._redteam,
             "test": self._test,
         }
@@ -82,6 +84,33 @@ class LocalAdapter:
             ),
         ]
 
+    def _plan(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
+        """Hermetic prewalk plan role: emit formattable decision/plan artifacts."""
+        return [
+            Artifact(
+                job_id=task.job_id,
+                task_id=task.id,
+                type=ArtifactType.DECISION,
+                created_by=worker_id,
+                confidence=0.9,
+                evidence=["prewalk:local-plan", f"goal:{goal[:80]}"],
+                payload={
+                    "decision": f"Implement the goal with the smallest durable change: {goal}",
+                    "why": (
+                        "LocalAdapter plan role supplies a concrete decision/plan "
+                        "artifact so hermetic prewalk handoff can inject it."
+                    ),
+                    "plan": [
+                        "Inspect the relevant modules named by the goal",
+                        "Apply the minimal code change that satisfies the goal",
+                        "Run the focused verification implied by the goal",
+                    ],
+                    "files": [],
+                    "goal": goal,
+                },
+            )
+        ]
+
     def _implement(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
         return [
             Artifact(
@@ -99,6 +128,27 @@ class LocalAdapter:
                         "puppetmaster/stitcher.py",
                     ],
                     "goal": goal,
+                },
+            )
+        ]
+
+    def _verify(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
+        """Hermetic prewalk verify role: emit a verification artifact."""
+        return [
+            verification_artifact(
+                task=task,
+                worker_id=worker_id,
+                adapter="local",
+                check=f"Verify goal satisfaction for: {goal}",
+                result="designed",
+                confidence=0.85,
+                evidence=["prewalk:local-verify", "test:prewalk-handoff"],
+                payload={
+                    "goal": goal,
+                    "summary": (
+                        "LocalAdapter verify role confirms the implement stage "
+                        "produced inspectable artifacts for the goal."
+                    ),
                 },
             )
         ]

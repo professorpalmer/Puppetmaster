@@ -231,7 +231,12 @@ def run_streamed_subprocess(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            # Never decode Cursor/agent SDK output with the Windows ANSI code
+            # page (cp1252). UTF-8 with replace keeps reader threads alive when
+            # a line contains bytes that are not valid in the locale encoding.
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
             **popen_kwargs,
         )

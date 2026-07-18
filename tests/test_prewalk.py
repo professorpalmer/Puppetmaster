@@ -15,6 +15,7 @@ from puppetmaster.prewalk import (
     IMPLEMENT_ROLE,
     PLAN_ROLE,
     PREWALK_PLAN_SECTION_HEADER,
+    VERIFY_ROLE,
     build_prewalk_specs,
     format_plan_artifacts_for_injection,
     inject_plan_into_prompt,
@@ -32,15 +33,17 @@ from puppetmaster.workers import (
 class BuildPrewalkSpecsTests(unittest.TestCase):
     def test_plan_before_implement_with_depends_on(self) -> None:
         specs = build_prewalk_specs("Add retries to the client", cwd="/repo")
-        self.assertEqual(len(specs), 2)
+        self.assertEqual(len(specs), 3)
         self.assertEqual(specs[0].role, PLAN_ROLE)
         self.assertEqual(specs[1].role, IMPLEMENT_ROLE)
+        self.assertEqual(specs[2].role, VERIFY_ROLE)
         self.assertEqual(specs[1].depends_on_roles, [PLAN_ROLE])
+        self.assertEqual(specs[2].depends_on_roles, [IMPLEMENT_ROLE])
         self.assertEqual(specs[0].depends_on_roles, [])
 
     def test_plan_is_read_only_implement_is_edit(self) -> None:
         specs = build_prewalk_specs("Wire the flag", cwd="/repo")
-        plan, implement = specs
+        plan, implement, verify = specs
         self.assertTrue(spec_explicitly_no_edit(plan))
         self.assertFalse(spec_edits_files(plan))
         for key, value in ANALYSIS_NO_EDIT_PAYLOAD.items():
@@ -49,16 +52,20 @@ class BuildPrewalkSpecsTests(unittest.TestCase):
         self.assertTrue(spec_edits_files(implement))
         self.assertEqual(implement.payload.get("mode"), "implement")
         self.assertNotEqual(implement.payload.get("read_only"), True)
+        self.assertTrue(spec_explicitly_no_edit(verify))
+        self.assertFalse(spec_edits_files(verify))
         self.assertEqual(swarm_mode(specs), "edit")
 
     def test_routing_policies_quality_then_cheap(self) -> None:
         specs = build_prewalk_specs("Refactor paginate", cwd="/repo")
-        plan, implement = specs
+        plan, implement, verify = specs
         self.assertTrue(plan.payload.get("auto_route"))
         self.assertEqual(plan.payload.get("routing_policy"), "quality")
         self.assertTrue(implement.payload.get("auto_route"))
         self.assertEqual(implement.payload.get("routing_policy"), "cheap")
         self.assertTrue(implement.payload.get("prewalk"))
+        self.assertTrue(verify.payload.get("prewalk"))
+        self.assertEqual(verify.payload.get("prewalk_role"), VERIFY_ROLE)
 
     def test_implement_instruction_requires_applying_upstream_plan(self) -> None:
         specs = build_prewalk_specs("Ship the feature", cwd="/repo")
@@ -76,7 +83,7 @@ class BuildPrewalkSpecsTests(unittest.TestCase):
             implement_model="gpt-5-nano",
             implement_adapter="hermes",
         )
-        plan, implement = specs
+        plan, implement, _verify = specs
         self.assertEqual(plan.payload.get("model"), "claude-opus")
         self.assertNotIn("auto_route", plan.payload)
         self.assertEqual(implement.payload.get("model"), "gpt-5-nano")
@@ -281,7 +288,10 @@ class PrewalkMcpCommandTests(unittest.TestCase):
                 "cwd": "/repo",
                 "adapter": "hermes",
                 "plan_adapter": "cursor",
+                "verify_adapter": "local",
+                "verify_model": "composer-2",
                 "timeout_seconds": 600,
+                "verify_timeout_seconds": 300,
                 "allow_dirty": True,
             }
         )
@@ -291,9 +301,28 @@ class PrewalkMcpCommandTests(unittest.TestCase):
         self.assertIn("hermes", command)
         self.assertIn("--plan-adapter", command)
         self.assertIn("cursor", command)
+        self.assertIn("--verify-adapter", command)
+        self.assertIn("local", command)
+        self.assertIn("--verify-model", command)
+        self.assertIn("composer-2", command)
         self.assertIn("--allow-dirty", command)
         self.assertIn("--timeout-seconds", command)
         self.assertIn("600", command)
+        self.assertIn("--verify-timeout-seconds", command)
+        self.assertIn("300", command)
+
+    def test_build_prewalk_passes_verify_settings(self) -> None:
+        specs = build_prewalk_specs(
+            "x",
+            cwd="/repo",
+            verify_adapter="cursor",
+            verify_model="composer-2",
+            verify_timeout_seconds=321,
+        )
+        verify = specs[2]
+        self.assertEqual(verify.adapter, "cursor")
+        self.assertEqual(verify.payload.get("model"), "composer-2")
+        self.assertEqual(verify.payload.get("timeout_seconds"), 321)
 
 
 class PrewalkSavingsLedgerTests(unittest.TestCase):
@@ -302,8 +331,8 @@ class PrewalkSavingsLedgerTests(unittest.TestCase):
 
     def test_prewalk_routing_legs_attribute_without_double_count(self) -> None:
         specs = build_prewalk_specs("Harden the retry path", cwd="/repo")
-        self.assertEqual(len(specs), 2)
-        plan_spec, implement_spec = specs
+        self.assertEqual(len(specs), 3)
+        plan_spec, implement_spec, _verify_spec = specs
         self.assertEqual(plan_spec.payload.get("routing_policy"), "quality")
         self.assertEqual(implement_spec.payload.get("routing_policy"), "cheap")
 

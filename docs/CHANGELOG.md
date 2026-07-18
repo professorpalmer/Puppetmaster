@@ -1,3 +1,19 @@
+## v1.20.0
+
+**Durable execution graph with typed provenance edges.**
+
+- `Task.depends_on` remains the scheduling contract; stores persist typed
+  provenance edges (`depends_on` / `produces` / `consumes`) alongside tasks and
+  artifacts.
+- SQLite migrates schema v1→v2 with eager `graph_edges` backfill; the file store
+  lazy-materializes edges on first graph access.
+- Prewalk is plan→implement→verify with edge-based artifact handoff, hard-failure
+  cascade onto blocked descendants, and targeted subgraph reruns.
+- Read-only introspection via `puppetmaster graph` and `puppetmaster_job_graph`.
+- Graph reset refuses when any selected task still holds an active lease.
+- Explicit model pins reach non-Cursor adapters; Windows subprocess readers
+  decode agent output as UTF-8 with replace (not the ANSI code page).
+
 ## v1.19.16
 
 **Close the force-submit overshoot gap.**

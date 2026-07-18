@@ -377,6 +377,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
         "show",
         "receipt",
         "artifacts",
+        "graph",
         "diff",
         "memory",
         "feed",
@@ -565,9 +566,35 @@ def _main(argv: Optional[list[str]] = None) -> int:
         payload = {
             "prompt": prompt,
             "cwd": args.cwd,
-            "model": args.model,
             "timeout_seconds": args.timeout_seconds,
         }
+        if args.model and args.model != "default":
+            from puppetmaster.model_registry import (
+                AmbiguousModelPinError,
+                apply_cursor_model_pin,
+            )
+
+            try:
+                payload.update(apply_cursor_model_pin({}, args.model))
+            except AmbiguousModelPinError as exc:
+                # Structured preflight/blocked contract (never a raw traceback).
+                blocked = {
+                    "ok": False,
+                    "adapter": "cursor",
+                    "model": args.model,
+                    "billing": "unknown",
+                    "reason": f"ambiguous model pin: {exc}",
+                    "evidence": [
+                        "adapter:cursor",
+                        "preflight:ambiguous_model_pin",
+                    ],
+                    "failure": "preflight_blocked",
+                    "result": "blocked",
+                }
+                print(json.dumps(blocked, indent=2))
+                return 1
+        else:
+            payload["model"] = args.model
         if implement:
             payload["mode"] = "implement"
             payload["allow_dirty"] = getattr(args, "allow_dirty", False)
@@ -858,15 +885,21 @@ def _main(argv: Optional[list[str]] = None) -> int:
             )
             return 2
         plan_adapter = args.plan_adapter or "local"
+        verify_timeout = getattr(args, "verify_timeout_seconds", None)
+        if verify_timeout is None:
+            verify_timeout = args.timeout_seconds
         specs = build_prewalk_specs(
             args.goal,
             args.cwd,
             plan_adapter=plan_adapter,
             implement_adapter=implement_adapter,
+            verify_adapter=getattr(args, "verify_adapter", None),
             plan_model=args.plan_model,
             implement_model=args.model,
+            verify_model=getattr(args, "verify_model", None),
             plan_timeout_seconds=args.timeout_seconds,
             implement_timeout_seconds=args.timeout_seconds,
+            verify_timeout_seconds=verify_timeout,
             auto_route=getattr(args, "auto_route_prewalk", True),
             allow_dirty=args.allow_dirty,
             allow_non_worktree=args.allow_non_worktree,
@@ -1197,6 +1230,13 @@ def _main(argv: Optional[list[str]] = None) -> int:
         reads_log.record_read("artifacts", caller="cli")
         artifacts = [artifact.__dict__ for artifact in store.list_artifacts(args.job_id)]
         print(json.dumps(artifacts, indent=2, default=str))
+        return 0
+
+    if args.command == "graph":
+        from puppetmaster import reads_log
+
+        reads_log.record_read("graph", caller="cli")
+        print(json.dumps(store.job_graph(args.job_id), indent=2, default=str))
         return 0
 
     if args.command == "memory":

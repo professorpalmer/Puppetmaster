@@ -305,19 +305,19 @@ def with_job_brief(prompt: str, task: Task) -> str:
     return with_prewalk_plan(prompt, task)
 
 
-def _load_job_artifacts_for_task(task: Task) -> list:
-    """Best-effort load of job-scoped artifacts from the active store.
+def _open_store_for_task(task: Task):
+    """Best-effort open of the active store for ``task.job_id``.
 
     Mirrors :func:`puppetmaster.job_brief.resolve_job_brief_for_task` state-dir
     resolution (sidecar env → find_state_dir_for_job → ``PUPPETMASTER_STATE_DIR``)
     so worker subprocesses see the same store the orchestrator wrote into.
-    Returns an empty list on any miss or error.
+    Returns ``None`` on any miss or error.
     """
     import os
 
     job_id = getattr(task, "job_id", None) or ""
     if not job_id:
-        return []
+        return None
     from puppetmaster.adapters._streaming import _resolve_sidecar_state_dir
     from puppetmaster.state import STATE_DIR_ENV, find_state_dir_for_job, resolve_state_dir
     from puppetmaster.store_factory import create_store
@@ -331,18 +331,73 @@ def _load_job_artifacts_for_task(task: Task) -> list:
         except Exception:
             state_dir = None
     if state_dir is None:
-        return []
+        return None
     backend = "sqlite" if (Path(state_dir) / "state.sqlite3").is_file() else "file"
-    store = create_store(backend, state_dir)
+    return create_store(backend, state_dir)
+
+
+def _load_job_artifacts_for_task(task: Task) -> list:
+    """Best-effort load of job-scoped artifacts from the active store."""
+    store = _open_store_for_task(task)
+    if store is None:
+        return []
+    job_id = getattr(task, "job_id", None) or ""
     return list(store.list_artifacts(job_id))
 
 
-def with_prewalk_plan(prompt: str, task: Task) -> str:
-    """Inject upstream plan/decision artifacts for prewalk implement workers.
+def _load_upstream_artifacts_via_edges(task: Task, *, record_consumes: bool = False) -> list:
+    """Resolve only artifacts produced by upstream tasks through graph edges.
 
-    No-op unless ``task.payload["prewalk"]`` is truthy. Loads job artifacts from
-    the store (same state-dir resolution as the job brief) and replaces the
-    placeholder plan section via :func:`puppetmaster.prewalk.inject_plan_into_prompt`.
+    Returns an empty list when no produces edges exist (compatibility fallback
+    to whole-job artifact load). Consumes edges are recorded only when the
+    caller passes ``record_consumes=True`` for artifacts that will actually be
+    injected.
+    """
+    store = _open_store_for_task(task)
+    if store is None:
+        return []
+    return list(store.resolve_artifacts_via_edges(task, record_consumes=record_consumes))
+
+
+def _prewalk_injection_body(prompt: str, artifacts: list, *, verify_role: bool) -> str:
+    """Return the formattable injection body, or "" when nothing usable exists."""
+    from puppetmaster.prewalk import (
+        PREWALK_PLAN_SECTION_HEADER,
+        format_plan_artifacts_for_injection,
+        format_upstream_artifacts_for_injection,
+    )
+
+    if verify_role:
+        return format_upstream_artifacts_for_injection(artifacts)
+    if PREWALK_PLAN_SECTION_HEADER in (prompt or ""):
+        plan_text = format_plan_artifacts_for_injection(artifacts)
+        if plan_text:
+            return plan_text
+    return (
+        format_upstream_artifacts_for_injection(artifacts)
+        or format_plan_artifacts_for_injection(artifacts)
+    )
+
+
+def _artifacts_used_for_injection(
+    artifacts: list, *, verify_role: bool, prompt: str
+) -> list:
+    """Filter edge-resolved artifacts to those that contribute injection text."""
+    used: list = []
+    for artifact in artifacts:
+        if _prewalk_injection_body(prompt, [artifact], verify_role=verify_role):
+            used.append(artifact)
+    return used
+
+
+def with_prewalk_plan(prompt: str, task: Task) -> str:
+    """Inject upstream artifacts for prewalk implement/verify workers.
+
+    No-op unless ``task.payload["prewalk"]`` is truthy. Prefers provenance-edge
+    resolution (artifacts produced by ``depends_on`` tasks) and records
+    ``consumes`` edges only for formattable artifacts that are actually
+    injected. ROUTING-only / empty edge results fall back to the legacy
+    whole-job artifact load instead of leaving placeholders unchanged.
     ``payload["prewalk_artifacts"]`` may supply an explicit list for tests.
     Best-effort; never raises.
     """
@@ -350,15 +405,52 @@ def with_prewalk_plan(prompt: str, task: Task) -> str:
         payload = getattr(task, "payload", None) or {}
         if not payload.get("prewalk"):
             return prompt
+        from puppetmaster.prewalk import (
+            VERIFY_ROLE,
+            inject_plan_into_prompt,
+            inject_upstream_into_prompt,
+        )
+
+        role = str(payload.get("prewalk_role") or getattr(task, "role", "") or "")
+        verify_role = role == VERIFY_ROLE
         inline = payload.get("prewalk_artifacts")
         if inline is not None:
-            artifacts = inline
-        else:
-            artifacts = _load_job_artifacts_for_task(task)
+            artifacts = list(inline)
+            if not artifacts:
+                return prompt
+            if verify_role:
+                return inject_upstream_into_prompt(prompt, artifacts)
+            return inject_plan_into_prompt(prompt, artifacts)
+
+        store = _open_store_for_task(task)
+        edge_artifacts: list = []
+        if store is not None:
+            edge_artifacts = list(
+                store.resolve_artifacts_via_edges(task, record_consumes=False)
+            )
+        if edge_artifacts:
+            used = _artifacts_used_for_injection(
+                edge_artifacts, verify_role=verify_role, prompt=prompt
+            )
+            if used and _prewalk_injection_body(
+                prompt, used, verify_role=verify_role
+            ):
+                store.record_consumes(
+                    task.job_id,
+                    task.id,
+                    [
+                        getattr(artifact, "id", None)
+                        or (artifact.get("id") if isinstance(artifact, dict) else None)
+                        for artifact in used
+                    ],
+                )
+                return inject_upstream_into_prompt(prompt, used)
+
+        artifacts = _load_job_artifacts_for_task(task)
         if not artifacts:
             return prompt
-        from puppetmaster.prewalk import inject_plan_into_prompt
-
+        if verify_role:
+            return inject_upstream_into_prompt(prompt, artifacts)
         return inject_plan_into_prompt(prompt, artifacts)
     except Exception:
         return prompt

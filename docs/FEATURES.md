@@ -47,6 +47,25 @@ Five production adapters live plus the keys-only `agentic` standalone worker; el
 | Bedrock ConverseStream (v1.19.3+) | Live text/reasoning/toolUse deltas on the agentic streaming path; real eventstream parsing via stdlib — no boto3 |
 | Plan-then-cheap prewalk | `puppetmaster prewalk "<goal>"` / `puppetmaster_start_prewalk`: quality-routed read-only plan worker, then cheap edit-capable implement (`depends_on_roles`); honest ROUTING per stage — `puppetmaster savings` counts both legs (plan quality as deliberate spend, implement cheap as savings) without double-count |
 | Swarm role routing defaults | Built-in analysis roles stamp per-role `routing_policy` under `auto_route` (explore/test → cheap, architect/plan → balanced, redteam/review/audit → quality) — no frontier model pins; MCP-generated swarms share the same map |
+| Durable execution graph (v1.20.0+) | Typed provenance edges (`depends_on` / `produces` / `consumes`), SQLite v1→v2 migration + file-store lazy materialization, plan→implement→verify prewalk with edge handoff, hard-failure propagation, targeted reruns; read-only `puppetmaster graph` / `puppetmaster_job_graph` |
+| Cross-adapter model pins (v1.20.0+) | Explicit `--model` / MCP `model` pins apply on non-Cursor adapters (not Cursor-only); ambiguous Cursor pins return structured preflight/blocked errors |
+| Windows UTF-8 / console safety (v1.20.0+) | Agent subprocess stdout/stderr decoded as UTF-8 with replace (avoids cp1252 reader crashes); existing `CREATE_NO_WINDOW` child-console hygiene unchanged |
+
+## Durable execution graph
+
+Jobs remain a task DAG scheduled by `Task.depends_on`. Alongside that scheduling field, the store persists typed provenance edges so downstream stages can resolve what an upstream task produced without reloading every artifact in the job:
+
+| Edge | Meaning |
+| --- | --- |
+| `depends_on` | Task → task scheduling edge (kept in sync with `Task.depends_on`) |
+| `produces` | Task → artifact (emitted when an artifact is saved) |
+| `consumes` | Task → artifact (recorded when a worker resolves upstream outputs via edges) |
+
+**Persistence.** SQLite schema version 2 adds a `graph_edges` table and migrates v1 databases on open (eager backfill of `depends_on` + `produces`). The file store lazy-materializes the same edges on first `job_graph` / ensure pass, with a crash-recoverable journal for `consumes` batches.
+
+**Runtime.** Prewalk is plan → implement → verify: implement consumes plan artifacts via edges, verify consumes implement outputs the same way. Hard (non-recoverable) dependency failures cascade onto blocked descendants as terminal FAILED. Targeted subgraph reset clears selected tasks (and optionally their consumer closure) for rerun while retaining completed upstream work, artifacts, and edges — and refuses the whole reset if any selected task still holds an active (non-expired RUNNING) lease.
+
+**Introspection.** Read-only snapshots: CLI `puppetmaster graph <job_id>` and MCP `puppetmaster_job_graph`. No hosted or multi-user graph service is implied; this is local durable state for a single operator runtime.
 
 ## Status
 

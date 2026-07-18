@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Optional, Union
 from uuid import uuid4
 
 
@@ -161,6 +162,107 @@ class MemoryRecord:
     created_at: str = field(default_factory=now_iso)
 
 
+class GraphEdgeType(StringEnum):
+    """Typed provenance / scheduling relation between graph nodes."""
+
+    DEPENDS_ON = "depends_on"
+    PRODUCES = "produces"
+    CONSUMES = "consumes"
+    DERIVED_FROM = "derived_from"
+
+
+class GraphNodeKind(StringEnum):
+    TASK = "task"
+    ARTIFACT = "artifact"
+
+
+def graph_edge_identity(
+    job_id: str,
+    edge_type: Union[GraphEdgeType, str],
+    from_kind: Union[GraphNodeKind, str],
+    from_id: str,
+    to_kind: Union[GraphNodeKind, str],
+    to_id: str,
+) -> str:
+    """Stable, idempotent edge id from the typed endpoint tuple."""
+    raw = "|".join(
+        (
+            str(job_id),
+            str(edge_type),
+            str(from_kind),
+            str(from_id),
+            str(to_kind),
+            str(to_id),
+        )
+    )
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+    return f"edge_{digest}"
+
+
+@dataclass(frozen=True)
+class GraphEdge:
+    """Persisted typed edge for task/task and task/artifact provenance.
+
+    Identity is derived from ``(job_id, type, from_*, to_*)`` so upserts are
+    idempotent across file and SQLite backends.
+    """
+
+    job_id: str
+    type: GraphEdgeType
+    from_kind: GraphNodeKind
+    from_id: str
+    to_kind: GraphNodeKind
+    to_id: str
+    id: str = ""
+    created_at: str = field(default_factory=now_iso)
+    meta: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.id:
+            return
+        object.__setattr__(
+            self,
+            "id",
+            graph_edge_identity(
+                self.job_id,
+                self.type,
+                self.from_kind,
+                self.from_id,
+                self.to_kind,
+                self.to_id,
+            ),
+        )
+
+
+def make_graph_edge(
+    *,
+    job_id: str,
+    type: Union[GraphEdgeType, str],
+    from_kind: Union[GraphNodeKind, str],
+    from_id: str,
+    to_kind: Union[GraphNodeKind, str],
+    to_id: str,
+    created_at: Optional[str] = None,
+    meta: Optional[dict[str, Any]] = None,
+) -> GraphEdge:
+    edge_type = GraphEdgeType(str(type))
+    src_kind = GraphNodeKind(str(from_kind))
+    dst_kind = GraphNodeKind(str(to_kind))
+    return GraphEdge(
+        id=graph_edge_identity(
+            job_id, edge_type, src_kind, from_id, dst_kind, to_id
+        ),
+        job_id=job_id,
+        type=edge_type,
+        from_kind=src_kind,
+        from_id=from_id,
+        to_kind=dst_kind,
+        to_id=to_id,
+        created_at=created_at or now_iso(),
+        meta=dict(meta or {}),
+    )
+
+
 def to_jsonable(value: Any) -> Any:
     if isinstance(value, StringEnum):
         return str(value)
@@ -228,5 +330,27 @@ def artifact_from_dict(data: dict[str, Any]) -> Artifact:
         evidence=data["evidence"],
         created_at=data["created_at"],
         sha256=data.get("sha256"),
+    )
+
+
+def graph_edge_from_dict(data: dict[str, Any]) -> GraphEdge:
+    return GraphEdge(
+        id=data.get("id")
+        or graph_edge_identity(
+            data["job_id"],
+            data["type"],
+            data["from_kind"],
+            data["from_id"],
+            data["to_kind"],
+            data["to_id"],
+        ),
+        job_id=data["job_id"],
+        type=GraphEdgeType(data["type"]),
+        from_kind=GraphNodeKind(data["from_kind"]),
+        from_id=data["from_id"],
+        to_kind=GraphNodeKind(data["to_kind"]),
+        to_id=data["to_id"],
+        created_at=data.get("created_at") or now_iso(),
+        meta=data.get("meta") or {},
     )
 

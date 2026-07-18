@@ -929,6 +929,12 @@ def build_parser() -> argparse.ArgumentParser:
     artifacts = subcommands.add_parser("artifacts", help="Print artifacts for a job as JSON.")
     artifacts.add_argument("job_id")
 
+    graph = subcommands.add_parser(
+        "graph",
+        help="Print the read-only execution/provenance graph (nodes + edges) for a job as JSON.",
+    )
+    graph.add_argument("job_id")
+
     memory = subcommands.add_parser("memory", help="List or prune promoted memory.")
     memory.add_argument("--json", action="store_true", help="Emit full JSON dump.")
     memory.add_argument("--prune", action="store_true", help="Delete matching memory records.")
@@ -1394,12 +1400,15 @@ def build_parser() -> argparse.ArgumentParser:
     prewalk = subcommands.add_parser(
         "prewalk",
         help=(
-            "Plan-then-cheap implement: quality-routed read-only plan worker, "
-            "then a cheap edit-capable implement worker that applies the plan "
+            "Plan-then-cheap implement-then-verify: quality-routed read-only plan "
+            "worker, cheap edit-capable implement worker that applies the plan, "
+            "then a read-only verify worker that checks implement artifacts "
             "(OMP-style prewalk via depends_on_roles)."
         ),
     )
-    prewalk.add_argument("goal", help="What to plan and then implement.")
+    prewalk.add_argument(
+        "goal", help="What to plan, implement, and then verify."
+    )
     prewalk.add_argument("--cwd", default=str(Path.cwd()), help="Workspace to work in.")
     prewalk.add_argument(
         "--adapter",
@@ -1416,6 +1425,13 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     prewalk.add_argument(
+        "--verify-adapter",
+        help=(
+            "Force the verify adapter (read-only). Default: same as --plan-adapter "
+            "(or local)."
+        ),
+    )
+    prewalk.add_argument(
         "--model",
         help="Pin the implement model (overrides cheap auto-routing).",
     )
@@ -1423,7 +1439,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--plan-model",
         help="Pin the plan model (overrides quality auto-routing).",
     )
+    prewalk.add_argument(
+        "--verify-model",
+        help="Pin the verify model (overrides balanced auto-routing).",
+    )
     prewalk.add_argument("--timeout-seconds", type=int, default=900)
+    prewalk.add_argument(
+        "--verify-timeout-seconds",
+        type=int,
+        default=None,
+        help="Verify-stage timeout (default: --timeout-seconds or 600).",
+    )
     prewalk.add_argument(
         "--no-auto-route",
         dest="auto_route_prewalk",
@@ -1454,7 +1480,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--worker-mode",
         choices=["subprocess", "inline", "daemon"],
         default="subprocess",
-        help="subprocess (default) runs plan then implement as separate processes.",
+        help=(
+            "subprocess (default) runs plan, implement, then verify as separate "
+            "processes."
+        ),
     )
     _add_label_argument(prewalk)
 

@@ -1393,11 +1393,13 @@ def _build_tools() -> list[McpTool]:
         McpTool(
             name="puppetmaster_start_prewalk",
             description=(
-                "OMP-style plan-then-cheap implement: a quality-routed read-only plan "
-                "worker emits decision/plan artifacts, then a cheap edit-capable "
-                "implement worker (depends_on the plan) applies that plan. Prefer when "
-                "you want a strong plan + cheaper implementation with honest ROUTING "
-                "artifacts for both stages. Returns job_id immediately."
+                "OMP-style plan-then-cheap implement-then-verify: a quality-routed "
+                "read-only plan worker emits decision/plan artifacts, a cheap "
+                "edit-capable implement worker (depends_on the plan) applies that "
+                "plan, then a read-only verify worker (depends_on implement) checks "
+                "the result via provenance edges. Prefer when you want a strong plan "
+                "+ cheaper implementation + verify stage with honest ROUTING "
+                "artifacts. Returns job_id immediately."
             ),
             input_schema=prewalk_schema(),
             handler=start_prewalk,
@@ -1495,6 +1497,16 @@ def _build_tools() -> list[McpTool]:
             description="Return structured JSON artifacts for a Puppetmaster job.",
             input_schema=job_schema(required=True),
             handler=lambda args: run_cli(["artifacts", require_string(args, "job_id")], args),
+        ),
+        McpTool(
+            name="puppetmaster_job_graph",
+            description=(
+                "Return the read-only execution/provenance graph for a job as JSON "
+                "(task/artifact nodes plus depends_on/produces/consumes edges). "
+                "Does not mutate job state."
+            ),
+            input_schema=job_schema(required=True),
+            handler=lambda args: run_cli(["graph", require_string(args, "job_id")], args),
         ),
         McpTool(
             name="puppetmaster_show",
@@ -2317,12 +2329,20 @@ def prewalk_command(args: JsonObject) -> list[str]:
         command.extend(["--adapter", str(args["adapter"])])
     if args.get("plan_adapter"):
         command.extend(["--plan-adapter", str(args["plan_adapter"])])
+    if args.get("verify_adapter"):
+        command.extend(["--verify-adapter", str(args["verify_adapter"])])
     if args.get("model"):
         command.extend(["--model", str(args["model"])])
     if args.get("plan_model"):
         command.extend(["--plan-model", str(args["plan_model"])])
+    if args.get("verify_model"):
+        command.extend(["--verify-model", str(args["verify_model"])])
     if args.get("timeout_seconds"):
         command.extend(["--timeout-seconds", str(args["timeout_seconds"])])
+    if args.get("verify_timeout_seconds"):
+        command.extend(
+            ["--verify-timeout-seconds", str(args["verify_timeout_seconds"])]
+        )
     if args.get("auto_route") is False:
         command.append("--no-auto-route")
     if args.get("allow_dirty"):
@@ -2339,7 +2359,7 @@ def prewalk_command(args: JsonObject) -> list[str]:
 
 
 def start_prewalk(args: JsonObject) -> JsonObject:
-    """Start a plan-then-cheap implement prewalk asynchronously.
+    """Start a plan→implement→verify prewalk asynchronously.
 
     Validates that an implement-capable adapter is available (same gate as
     ``start_implement`` / ``edit``), optionally enforces the clean-tree
@@ -2588,7 +2608,15 @@ def start_swarm(args: JsonObject) -> JsonObject:
         locked = _platform_lock_preflight(str(adapter))
         if locked is not None:
             return locked
-        config_path = write_generated_swarm_config(args, roles or ["explore"], str(adapter))
+        try:
+            config_path = write_generated_swarm_config(
+                args, roles or ["explore"], str(adapter)
+            )
+        except Exception as exc:
+            blocked = _ambiguous_model_pin_tool_error(exc, args.get("model"))
+            if blocked is not None:
+                return blocked
+            raise
         command.extend(["--config", str(config_path)])
     elif roles:
         if not args.get("allow_local_demo"):
@@ -2627,7 +2655,13 @@ def start_cursor_swarm(args: JsonObject) -> JsonObject:
         "conflict-auditor",
         "test-coverage-reviewer",
     ]
-    config_path = write_generated_swarm_config(args, roles, "cursor")
+    try:
+        config_path = write_generated_swarm_config(args, roles, "cursor")
+    except Exception as exc:
+        blocked = _ambiguous_model_pin_tool_error(exc, args.get("model"))
+        if blocked is not None:
+            return blocked
+        raise
     command = ["run", require_string(args, "goal"), "--config", str(config_path)]
     worker_mode = args.get("worker_mode")
     if worker_mode:
@@ -2664,6 +2698,30 @@ SWARM_ANALYSIS_ADAPTERS: tuple[str, ...] = (
     "hermes",
     "openai",
 )
+
+
+def _ambiguous_model_pin_tool_error(
+    exc: BaseException, model: Any
+) -> Optional[JsonObject]:
+    """Map AmbiguousModelPinError to the structured preflight/blocked contract."""
+    from puppetmaster.model_registry import AmbiguousModelPinError
+
+    if not isinstance(exc, AmbiguousModelPinError):
+        return None
+    model_text = str(model) if model is not None else None
+    return tool_error(
+        f"ambiguous model pin: {exc}",
+        {
+            "ok": False,
+            "adapter": "cursor",
+            "model": model_text,
+            "billing": "unknown",
+            "reason": f"ambiguous model pin: {exc}",
+            "evidence": ["adapter:cursor", "preflight:ambiguous_model_pin"],
+            "failure": "preflight_blocked",
+            "result": "blocked",
+        },
+    )
 
 
 def write_generated_swarm_config(args: JsonObject, roles: list[str], adapter: str) -> Path:
@@ -2717,7 +2775,15 @@ def write_generated_swarm_config(args: JsonObject, roles: list[str], adapter: st
             **ANALYSIS_NO_EDIT_PAYLOAD,
         }
         if adapter == "cursor":
-            payload["model"] = model
+            if explicit_model:
+                from puppetmaster.model_registry import apply_cursor_model_pin
+
+                # AmbiguousModelPinError propagates to start_swarm /
+                # start_cursor_swarm for the structured preflight/blocked
+                # tool_error contract (never a raw traceback to the host).
+                payload.update(apply_cursor_model_pin({}, str(explicit_model)))
+            else:
+                payload["model"] = model
         elif explicit_model:
             # An explicit pin must reach non-cursor adapters too (cursor already
             # carries a "default" model; the others only set a model when pinned).
@@ -4296,13 +4362,16 @@ def browser_swarm_schema() -> JsonObject:
 
 
 def prewalk_schema() -> JsonObject:
-    """Schema for the async plan-then-cheap ``prewalk`` verb."""
+    """Schema for the async plan→implement→verify ``prewalk`` verb."""
     return {
         "type": "object",
         "properties": {
             "goal": {
                 "type": "string",
-                "description": "What to plan (quality) and then implement (cheap).",
+                "description": (
+                    "What to plan (quality), implement (cheap), and verify "
+                    "(balanced)."
+                ),
             },
             "cwd": {
                 "type": "string",
@@ -4323,6 +4392,13 @@ def prewalk_schema() -> JsonObject:
                     "router picks a quality model."
                 ),
             },
+            "verify_adapter": {
+                "type": "string",
+                "description": (
+                    "Force the verify adapter (read-only). Default: same as "
+                    "plan_adapter (or local)."
+                ),
+            },
             "model": {
                 "type": "string",
                 "description": "Pin the implement model (overrides cheap auto-routing).",
@@ -4331,17 +4407,30 @@ def prewalk_schema() -> JsonObject:
                 "type": "string",
                 "description": "Pin the plan model (overrides quality auto-routing).",
             },
+            "verify_model": {
+                "type": "string",
+                "description": (
+                    "Pin the verify model (overrides balanced auto-routing)."
+                ),
+            },
             "auto_route": {
                 "type": "boolean",
                 "default": True,
                 "description": (
                     "Let the router pick models (quality for plan, cheap for "
-                    "implement). Set false to use each adapter's default."
+                    "implement, balanced for verify). Set false to use each "
+                    "adapter's default."
                 ),
             },
             "timeout_seconds": {
                 "type": "integer",
-                "description": "Per-worker timeout (default 900).",
+                "description": "Plan/implement worker timeout (default 900).",
+            },
+            "verify_timeout_seconds": {
+                "type": "integer",
+                "description": (
+                    "Verify-stage timeout (default: timeout_seconds or 600)."
+                ),
             },
             "allow_dirty": {
                 "type": "boolean",
@@ -4363,7 +4452,10 @@ def prewalk_schema() -> JsonObject:
                 "type": "string",
                 "enum": ["subprocess", "inline", "daemon"],
                 "default": "subprocess",
-                "description": "Orchestration mode (default subprocess).",
+                "description": (
+                    "Orchestration mode (default subprocess: plan, implement, "
+                    "then verify)."
+                ),
             },
         },
         "required": ["goal"],

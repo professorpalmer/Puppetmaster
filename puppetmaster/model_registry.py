@@ -961,3 +961,103 @@ def catalog_staleness_days(
 
 def enabled_specs(specs: Iterable[ModelSpec]) -> list[ModelSpec]:
     return [s for s in specs if s.enabled]
+
+
+def _normalize_model_token(value: str) -> str:
+    import re
+
+    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+
+
+@dataclass(frozen=True)
+class ResolvedModelPin:
+    """A user model pin resolved to one enabled registry entry."""
+
+    registry_id: str
+    adapter_model_name: str
+    adapter: str
+    spec: ModelSpec
+
+
+class AmbiguousModelPinError(ValueError):
+    """Raised when a model pin matches more than one enabled registry entry."""
+
+
+def resolve_model_pin(
+    model: str,
+    registry: Iterable[ModelSpec],
+    *,
+    adapter: Optional[str] = None,
+) -> Optional[ResolvedModelPin]:
+    """Resolve a durable registry id or adapter model name to one registry entry.
+
+    Accepts both ``cursor/grok-4-5`` and ``grok-4.5`` (and slug-equivalent
+    forms such as ``grok-4-5``) and returns the canonical registry id plus the
+    adapter/provider model name to pass through to the underlying SDK/CLI.
+    """
+    needle = (model or "").strip()
+    if not needle:
+        return None
+
+    token = _normalize_model_token(needle.split("/")[-1])
+    candidates: list[ModelSpec] = []
+    for spec in enabled_specs(registry):
+        if adapter is not None and spec.adapter != adapter:
+            continue
+        if spec.id == needle or spec.adapter_model_name == needle:
+            candidates.append(spec)
+            continue
+        if token and (
+            _normalize_model_token(spec.adapter_model_name) == token
+            or _normalize_model_token(spec.id.split("/")[-1]) == token
+        ):
+            candidates.append(spec)
+
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        ids = ", ".join(sorted(spec.id for spec in candidates))
+        raise AmbiguousModelPinError(
+            f"model pin {model!r} is ambiguous across enabled registry entries: {ids}"
+        )
+    spec = candidates[0]
+    return ResolvedModelPin(
+        registry_id=spec.id,
+        adapter_model_name=spec.adapter_model_name,
+        adapter=spec.adapter,
+        spec=spec,
+    )
+
+
+def stamp_resolved_model_pin(payload: dict, pin: ResolvedModelPin) -> dict:
+    """Persist both the canonical registry id and adapter model name."""
+    return {
+        **payload,
+        "model": pin.adapter_model_name,
+        "router_model_id": pin.registry_id,
+        "pinned_model": pin.registry_id,
+        "pinned_adapter_model_name": pin.adapter_model_name,
+    }
+
+
+def apply_cursor_model_pin(
+    payload: dict,
+    model: str,
+    *,
+    registry: Optional[Iterable[ModelSpec]] = None,
+) -> dict:
+    """Stamp an explicit Cursor pin into a durable task payload.
+
+    Adapter dispatch receives ``grok-4.5`` while ``pinned_model`` /
+    ``router_model_id`` keep the canonical registry id for cost and audit.
+    Ambiguous pins raise :class:`AmbiguousModelPinError` (fail closed) rather
+    than being forwarded as a raw model string.
+    """
+    pin = resolve_model_pin(
+        model,
+        registry if registry is not None else load_registry(),
+        adapter="cursor",
+    )
+    if pin is None:
+        return {**payload, "model": model}
+    return stamp_resolved_model_pin(payload, pin)

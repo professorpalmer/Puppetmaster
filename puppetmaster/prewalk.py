@@ -1,8 +1,10 @@
 """OMP-style plan-then-cheap ``prewalk`` handoff.
 
-A *prewalk* is a two-worker DAG: a quality-routed read-only ``plan`` worker
-emits durable decision/plan artifacts, then a cheap-routed edit-capable
-``implement`` worker (``depends_on_roles=["plan"]``) applies that plan.
+A *prewalk* is a three-worker DAG: a quality-routed read-only ``plan`` worker
+emits durable decision/plan artifacts, a cheap-routed edit-capable
+``implement`` worker (``depends_on_roles=["plan"]``) applies that plan, then a
+read-only ``verify`` worker (``depends_on_roles=["implement"]``) checks the
+result.
 
 This reuses the existing orchestrator DAG (``depends_on_roles``) and auto_route
 policies — no new scheduler. Routing/savings stay honest: plan stamps a
@@ -19,11 +21,14 @@ from puppetmaster.workers import ANALYSIS_NO_EDIT_PAYLOAD, WorkerSpec
 
 PLAN_ROLE = "plan"
 IMPLEMENT_ROLE = "implement"
+VERIFY_ROLE = "verify"
 
 DEFAULT_PLAN_TIMEOUT_SECONDS = 900
 DEFAULT_IMPLEMENT_TIMEOUT_SECONDS = 900
+DEFAULT_VERIFY_TIMEOUT_SECONDS = 600
 
 PREWALK_PLAN_SECTION_HEADER = "Upstream plan from the plan worker (APPLY THIS):"
+PREWALK_UPSTREAM_SECTION_HEADER = "Upstream artifacts from dependency workers:"
 
 _PLAN_ARTIFACT_TYPES = frozenset({"decision", "plan"})
 
@@ -60,6 +65,26 @@ def format_plan_artifacts_for_injection(
     return "\n\n".join(blocks)
 
 
+def format_upstream_artifacts_for_injection(
+    artifacts: Iterable[Any],
+) -> str:
+    """Format edge-resolved upstream artifacts for implement/verify injection."""
+    blocks: list[str] = []
+    for artifact in artifacts:
+        kind, payload = _artifact_type_and_payload(artifact)
+        if not isinstance(payload, dict):
+            continue
+        if kind in _PLAN_ARTIFACT_TYPES or payload.get("decision") or payload.get("plan"):
+            block = _format_one_plan_payload(payload)
+        else:
+            block = _format_one_upstream_payload(kind, payload)
+        if block:
+            blocks.append(block)
+    if not blocks:
+        return ""
+    return "\n\n".join(blocks)
+
+
 def inject_plan_into_prompt(prompt: str, artifacts: Iterable[Any]) -> str:
     """Inject formatted plan/decision artifact text into ``prompt``.
 
@@ -72,17 +97,46 @@ def inject_plan_into_prompt(prompt: str, artifacts: Iterable[Any]) -> str:
     plan_text = format_plan_artifacts_for_injection(artifacts)
     if not plan_text:
         return prompt
+    return _inject_section(prompt, PREWALK_PLAN_SECTION_HEADER, plan_text)
+
+
+def inject_upstream_into_prompt(prompt: str, artifacts: Iterable[Any]) -> str:
+    """Inject edge-resolved upstream artifact text (plan/patch/verification)."""
+    body_text = format_upstream_artifacts_for_injection(artifacts)
+    if not body_text:
+        return prompt
+    # Prefer the plan header when the prompt was built for implement.
+    if PREWALK_PLAN_SECTION_HEADER in (prompt or ""):
+        plan_text = format_plan_artifacts_for_injection(artifacts)
+        if plan_text:
+            return _inject_section(prompt, PREWALK_PLAN_SECTION_HEADER, plan_text)
+    return _inject_section(prompt, PREWALK_UPSTREAM_SECTION_HEADER, body_text)
+
+
+def _inject_section(prompt: str, header: str, section_body: str) -> str:
     body = (prompt or "").strip()
-    section = f"{PREWALK_PLAN_SECTION_HEADER}\n{plan_text}"
+    section = f"{header}\n{section_body}"
     if not body:
         return section
-    idx = body.find(PREWALK_PLAN_SECTION_HEADER)
+    idx = body.find(header)
     if idx < 0:
         return f"{section}\n\n{body}"
-    after_header = body[idx + len(PREWALK_PLAN_SECTION_HEADER) :].lstrip("\n")
+    after_header = body[idx + len(header) :].lstrip("\n")
     first_line = after_header.split("\n", 1)[0].strip() if after_header else ""
     if first_line.startswith(
-        ("Decision:", "Why:", "Plan:", "Plan steps:", "Files:", "Constraints:", "Notes:")
+        (
+            "Decision:",
+            "Why:",
+            "Plan:",
+            "Plan steps:",
+            "Files:",
+            "Constraints:",
+            "Notes:",
+            "Patch:",
+            "Check:",
+            "Result:",
+            "Change:",
+        )
     ):
         return body
     before = body[:idx]
@@ -105,30 +159,37 @@ def build_prewalk_specs(
     *,
     plan_adapter: str = "local",
     implement_adapter: str = "local",
+    verify_adapter: Optional[str] = None,
     plan_model: Optional[str] = None,
     implement_model: Optional[str] = None,
+    verify_model: Optional[str] = None,
     plan_timeout_seconds: int = DEFAULT_PLAN_TIMEOUT_SECONDS,
     implement_timeout_seconds: int = DEFAULT_IMPLEMENT_TIMEOUT_SECONDS,
+    verify_timeout_seconds: int = DEFAULT_VERIFY_TIMEOUT_SECONDS,
     plan_routing_policy: str = "quality",
     implement_routing_policy: str = "cheap",
+    verify_routing_policy: str = "balanced",
     auto_route: bool = True,
     allow_dirty: bool = False,
     allow_non_worktree: bool = False,
     disable_codegraph: bool = False,
     disable_memory: bool = False,
 ) -> list[WorkerSpec]:
-    """Build the plan → implement WorkerSpec DAG for a prewalk job.
+    """Build the plan → implement → verify WorkerSpec DAG for a prewalk job.
 
     * ``plan`` — auto_route + quality (or pinned model), read-only analysis
       payload (``ANALYSIS_NO_EDIT_PAYLOAD``). Emits decision/plan artifacts.
     * ``implement`` — ``depends_on_roles=["plan"]``, auto_route + cheap (or
       pinned model), edit-capable (``mode=implement``, NOT analysis-no-edit).
       Instruction requires applying the upstream plan artifacts.
+    * ``verify`` — ``depends_on_roles=["implement"]``, read-only; resolves
+      implement-produced artifacts via persisted provenance edges.
     """
     goal_text = (goal or "").strip()
     if not goal_text:
         raise ValueError("build_prewalk_specs: goal must be non-empty")
     cwd_text = (cwd or "").strip() or "."
+    verify_adapter_name = (verify_adapter or plan_adapter or "local").strip() or "local"
 
     plan_instruction = (
         "Produce a concrete implementation plan as durable decision/plan "
@@ -158,7 +219,9 @@ def build_prewalk_specs(
         model=plan_model,
         routing_policy=plan_routing_policy,
         auto_route=auto_route,
-        pin_adapter=False,
+        # Keep plan on the chosen non-local adapter under auto-route (same as
+        # implement) so quality routing cannot hop off Hermes/Claude/etc.
+        pin_adapter=plan_adapter not in ("", "local"),
     )
 
     implement_instruction = (
@@ -198,6 +261,41 @@ def build_prewalk_specs(
         pin_adapter=implement_adapter not in ("", "local"),
     )
 
+    verify_instruction = (
+        "Verify mode: inspect only the artifacts produced by the upstream "
+        "implement worker (via provenance edges). Confirm the goal was met, "
+        "emit verification/risk artifacts, and do not edit files."
+    )
+    verify_prompt = (
+        f"{verify_instruction}\n\n"
+        f"Goal:\n{goal_text}\n\n"
+        f"{PREWALK_UPSTREAM_SECTION_HEADER}\n"
+        "(Resolve implement-produced artifacts through persisted graph edges "
+        "and report whether the change satisfies the goal.)"
+    )
+    verify_payload: dict[str, Any] = {
+        "prompt": verify_prompt,
+        "cwd": cwd_text,
+        "timeout_seconds": int(verify_timeout_seconds),
+        "prewalk": True,
+        "prewalk_role": VERIFY_ROLE,
+        **ANALYSIS_NO_EDIT_PAYLOAD,
+    }
+    if disable_codegraph:
+        verify_payload["disable_codegraph"] = True
+    if disable_memory:
+        verify_payload["disable_memory"] = True
+    _apply_routing(
+        verify_payload,
+        adapter=verify_adapter_name,
+        model=verify_model,
+        routing_policy=verify_routing_policy,
+        auto_route=auto_route,
+        # Keep verify on the chosen non-local adapter under auto-route (same as
+        # implement) so balanced routing cannot hop off Hermes/Claude/etc.
+        pin_adapter=verify_adapter_name not in ("", "local"),
+    )
+
     return [
         WorkerSpec(
             role=PLAN_ROLE,
@@ -212,6 +310,13 @@ def build_prewalk_specs(
             payload=implement_payload,
             depends_on_roles=[PLAN_ROLE],
         ),
+        WorkerSpec(
+            role=VERIFY_ROLE,
+            instruction=verify_instruction,
+            adapter=verify_adapter_name,
+            payload=verify_payload,
+            depends_on_roles=[IMPLEMENT_ROLE],
+        ),
     ]
 
 
@@ -225,7 +330,12 @@ def _apply_routing(
     pin_adapter: bool,
 ) -> None:
     if model:
-        payload["model"] = model
+        if adapter == "cursor":
+            from puppetmaster.model_registry import apply_cursor_model_pin
+
+            payload.update(apply_cursor_model_pin({}, model))
+        else:
+            payload["model"] = model
         return
     if not auto_route:
         return
@@ -278,6 +388,48 @@ def _format_one_plan_payload(payload: dict[str, Any]) -> str:
             if rendered:
                 lines.append(f"{key.capitalize()}: {rendered}")
         else:
+            lines.append(f"{key.capitalize()}: {str(value).strip()}")
+    return "\n".join(lines).strip()
+
+
+def _format_one_upstream_payload(kind: str, payload: dict[str, Any]) -> str:
+    lines: list[str] = []
+    if kind == "patch":
+        change = payload.get("change")
+        files = payload.get("files")
+        if change:
+            lines.append(f"Change: {str(change).strip()}")
+        if files:
+            if isinstance(files, (list, tuple)):
+                rendered = ", ".join(str(item) for item in files)
+            else:
+                rendered = str(files)
+            if rendered.strip():
+                lines.append(f"Files: {rendered.strip()}")
+    elif kind == "verification":
+        check = payload.get("check")
+        result = payload.get("result")
+        if check:
+            lines.append(f"Check: {str(check).strip()}")
+        if result is not None:
+            lines.append(f"Result: {str(result).strip()}")
+    elif kind == "finding":
+        claim = payload.get("claim")
+        if claim:
+            lines.append(f"Finding: {str(claim).strip()}")
+    elif kind == "risk":
+        risk = payload.get("risk")
+        mitigation = payload.get("mitigation")
+        if risk:
+            lines.append(f"Risk: {str(risk).strip()}")
+        if mitigation:
+            lines.append(f"Mitigation: {str(mitigation).strip()}")
+    else:
+        # Generic fallback: surface a few common keys without dumping secrets.
+        for key in ("summary", "decision", "why", "claim", "check", "result", "change"):
+            value = payload.get(key)
+            if value is None or value == "":
+                continue
             lines.append(f"{key.capitalize()}: {str(value).strip()}")
     return "\n".join(lines).strip()
 

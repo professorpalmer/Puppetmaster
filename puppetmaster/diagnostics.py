@@ -729,15 +729,25 @@ def _sqlite_state_check(path: Path) -> Check:
             connection.close()
     except sqlite3.Error as exc:
         return Check("sqlite-state", "warn", str(exc))
+    from puppetmaster.sqlite_store import SQLiteSwarmStore
+
     version = row[0] if row else "unknown"
+    expected = str(SQLiteSwarmStore.schema_version)
     integrity_status = integrity[0] if integrity else "unknown"
     journal_mode = journal[0] if journal else "unknown"
-    status = "ok" if integrity_status == "ok" and journal_mode == "wal" else "warn"
-    return Check(
-        "sqlite-state",
-        status,
-        f"schema={version}; journal={journal_mode}; integrity={integrity_status}",
+    schema_mismatch = version != "unknown" and version != expected
+    healthy = integrity_status == "ok" and journal_mode == "wal" and not schema_mismatch
+    status = "ok" if healthy else "warn"
+    detail = (
+        f"schema={version}; expected={expected}; "
+        f"journal={journal_mode}; integrity={integrity_status}"
     )
+    if schema_mismatch:
+        detail += (
+            f"; persisted schema version differs from SQLiteSwarmStore "
+            f"expected version {expected}"
+        )
+    return Check("sqlite-state", status, detail)
 
 
 def _git_clean_check(root: Path) -> Check:

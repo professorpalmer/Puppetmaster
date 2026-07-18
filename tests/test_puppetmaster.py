@@ -7054,6 +7054,63 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
         self.assertEqual(result.returncode, 0)
         self.assertIn("EOF", result.stdout)
 
+    def test_run_streamed_subprocess_decodes_stdout_as_utf8(self) -> None:
+        """Windows locale encoding (cp1252) must not decode Cursor SDK bytes.
+
+        A reader thread that dies on UnicodeDecodeError leaves the job in a
+        corrupted terminal state; force UTF-8 with a safe error policy.
+        """
+        import subprocess
+        from unittest.mock import MagicMock, patch
+
+        from puppetmaster.adapters import run_streamed_subprocess
+        from puppetmaster.adapters._streaming import StreamedProcess
+
+        task = Task(
+            id="t-utf8",
+            job_id="job-utf8",
+            role="cursor",
+            adapter="cursor",
+            instruction="x",
+            payload={},
+        )
+        captured: dict = {}
+
+        class FakeProcess:
+            def __init__(self) -> None:
+                self.returncode = 0
+                self.stdout = MagicMock()
+                self.stderr = MagicMock()
+                self.stdout.readline = MagicMock(side_effect=["ok\n", ""])
+                self.stderr.readline = MagicMock(side_effect=[""])
+                self.pid = 1
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                return None
+
+        def fake_popen(*args, **kwargs):
+            captured.update(kwargs)
+            return FakeProcess()
+
+        with patch("subprocess.Popen", side_effect=fake_popen):
+            result = run_streamed_subprocess(
+                command=[sys.executable, "-c", "print('ok')"],
+                env={},
+                task=task,
+                sidecar_name="utf8_probe",
+                timeout_seconds=5,
+            )
+
+        self.assertIsInstance(result, StreamedProcess)
+        self.assertEqual(captured.get("encoding"), "utf-8")
+        self.assertEqual(captured.get("errors"), "replace")
+        self.assertTrue(captured.get("text"))
+        self.assertIs(captured.get("stdin"), subprocess.DEVNULL)
+        self.assertIn("ok", result.stdout)
+
     def test_build_codex_exec_command_emits_expected_flags(self) -> None:
         """The Codex command builder must produce the non-interactive
         flag soup that v0.7.0 ships by default: `exec --json`,
@@ -8133,8 +8190,8 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
             status = store.schema_status()
             checks = {check.name: check for check in run_doctor(root, root / ".puppetmaster")}
 
-            self.assertEqual(status["schema_version"], "1")
-            self.assertEqual(status["expected_schema_version"], "1")
+            self.assertEqual(status["schema_version"], "2")
+            self.assertEqual(status["expected_schema_version"], "2")
             self.assertEqual(checks["sqlite-state"].status, "ok")
 
     def test_cli_last_and_clean_support_daily_run_management(self) -> None:
@@ -10622,20 +10679,53 @@ class ModelRouterTests(unittest.TestCase):
         user's pin is honored.
         """
         from puppetmaster.mcp_server import write_generated_swarm_config
+        from puppetmaster.model_registry import ModelSpec, save_registry
 
         with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "models.json"
+            save_registry(
+                [
+                    ModelSpec(
+                        id="cursor/grok-4-5",
+                        adapter="cursor",
+                        adapter_model_name="grok-4.5",
+                        capability_score=97,
+                        billing="plan",
+                        enabled=True,
+                    )
+                ],
+                registry_path,
+            )
             args = {
                 "goal": "pin check",
                 "cwd": tmp,
                 "state_dir": str(Path(tmp) / "state"),
                 "model": "opus-4-7",
             }
-            config_path = write_generated_swarm_config(args, ["audit"], "cursor")
+            with patch.dict(
+                os.environ,
+                {"PUPPETMASTER_MODELS_PATH": str(registry_path)},
+                clear=False,
+            ):
+                config_path = write_generated_swarm_config(args, ["audit"], "cursor")
             cfg = json.loads(Path(config_path).read_text())
 
             payload = cfg["workers"][0]["payload"]
             self.assertEqual(payload["model"], "opus-4-7")
             self.assertNotIn("auto_route", payload)
+
+            for raw in ("grok-4.5", "cursor/grok-4-5"):
+                args["model"] = raw
+                with patch.dict(
+                    os.environ,
+                    {"PUPPETMASTER_MODELS_PATH": str(registry_path)},
+                    clear=False,
+                ):
+                    stamped_path = write_generated_swarm_config(args, ["audit"], "cursor")
+                stamped = json.loads(Path(stamped_path).read_text())["workers"][0]["payload"]
+                self.assertEqual(stamped["model"], "grok-4.5", msg=raw)
+                self.assertEqual(stamped["pinned_model"], "cursor/grok-4-5", msg=raw)
+                self.assertNotIn("auto_route", stamped)
 
     def test_mcp_swarm_config_writer_force_route_with_pinned_model(self) -> None:
         """Caller can force auto_route=True even with a pinned model; routing knobs
@@ -14612,6 +14702,159 @@ class CursorDiscoveryTests(unittest.TestCase):
         self.assertTrue(model_in_catalog("a", catalog))
         self.assertFalse(model_in_catalog("zzz", catalog))
 
+    def test_default_runner_uses_devnull_utf8_and_hidden_console(self) -> None:
+        import subprocess
+        from unittest.mock import patch
+
+        from puppetmaster.cursor_discovery import _default_runner
+
+        captured: dict = {}
+
+        def fake_run(*args, **kwargs):
+            captured.update(kwargs)
+            return subprocess.CompletedProcess(args[0], 0, stdout='{"ok": true}', stderr="")
+
+        with patch("puppetmaster.cursor_discovery.subprocess.run", side_effect=fake_run):
+            rc, out, err = _default_runner(["node", "runner.mjs"], {"CURSOR_API_KEY": "k"})
+
+        self.assertEqual(rc, 0)
+        self.assertIs(captured.get("stdin"), subprocess.DEVNULL)
+        self.assertEqual(captured.get("encoding"), "utf-8")
+        self.assertEqual(captured.get("errors"), "replace")
+        if os.name == "nt":
+            self.assertIn("creationflags", captured)
+
+    def test_fetch_catalog_surfaces_node_libuv_failure(self) -> None:
+        from puppetmaster.cursor_discovery import (
+            CursorDiscoveryError,
+            fetch_cursor_catalog,
+        )
+
+        def broken_node(_command, _env):
+            return (
+                1,
+                "",
+                "Error: Could not initialize libuv. Node discovery failed.",
+            )
+
+        with self.assertRaises(CursorDiscoveryError) as ctx:
+            fetch_cursor_catalog(env={"CURSOR_API_KEY": "k"}, run=broken_node)
+        self.assertIn("libuv", str(ctx.exception).lower())
+
+
+class CursorModelPinTests(unittest.TestCase):
+    def _grok_registry(self):
+        from puppetmaster.model_registry import ModelSpec
+
+        return [
+            ModelSpec(
+                id="cursor/grok-4-5",
+                adapter="cursor",
+                adapter_model_name="grok-4.5",
+                capability_score=97,
+                billing="plan",
+                enabled=True,
+            )
+        ]
+
+    def test_resolve_accepts_registry_id_and_adapter_name(self) -> None:
+        from puppetmaster.model_registry import resolve_model_pin
+
+        registry = self._grok_registry()
+        for raw in ("cursor/grok-4-5", "grok-4.5", "grok-4-5"):
+            pin = resolve_model_pin(raw, registry, adapter="cursor")
+            self.assertIsNotNone(pin)
+            assert pin is not None
+            self.assertEqual(pin.registry_id, "cursor/grok-4-5")
+            self.assertEqual(pin.adapter_model_name, "grok-4.5")
+
+    def test_resolve_rejects_ambiguous_pin(self) -> None:
+        from puppetmaster.model_registry import AmbiguousModelPinError, ModelSpec, resolve_model_pin
+
+        registry = [
+            ModelSpec(
+                id="cursor/grok-a",
+                adapter="cursor",
+                adapter_model_name="grok-a",
+                enabled=True,
+            ),
+            ModelSpec(
+                id="cursor/grok-a-alt",
+                adapter="cursor",
+                adapter_model_name="grok-a",
+                enabled=True,
+            ),
+        ]
+        with self.assertRaises(AmbiguousModelPinError):
+            resolve_model_pin("grok-a", registry, adapter="cursor")
+
+    def test_stamp_persists_canonical_id_and_provider_name(self) -> None:
+        from puppetmaster.model_registry import resolve_model_pin, stamp_resolved_model_pin
+
+        pin = resolve_model_pin("grok-4.5", self._grok_registry(), adapter="cursor")
+        self.assertIsNotNone(pin)
+        stamped = stamp_resolved_model_pin({"mode": "implement"}, pin)
+        self.assertEqual(stamped["model"], "grok-4.5")
+        self.assertEqual(stamped["router_model_id"], "cursor/grok-4-5")
+        self.assertEqual(stamped["pinned_adapter_model_name"], "grok-4.5")
+
+    def test_apply_cursor_model_pin_stamps_both_forms(self) -> None:
+        from puppetmaster.model_registry import apply_cursor_model_pin
+
+        registry = self._grok_registry()
+        for raw in ("grok-4.5", "cursor/grok-4-5"):
+            stamped = apply_cursor_model_pin({"mode": "implement"}, raw, registry=registry)
+            self.assertEqual(stamped["model"], "grok-4.5")
+            self.assertEqual(stamped["pinned_model"], "cursor/grok-4-5")
+            self.assertEqual(stamped["router_model_id"], "cursor/grok-4-5")
+
+    def test_apply_cursor_model_pin_fails_closed_on_ambiguous(self) -> None:
+        from puppetmaster.model_registry import (
+            AmbiguousModelPinError,
+            ModelSpec,
+            apply_cursor_model_pin,
+        )
+
+        registry = [
+            ModelSpec(
+                id="cursor/grok-a",
+                adapter="cursor",
+                adapter_model_name="grok-a",
+                enabled=True,
+            ),
+            ModelSpec(
+                id="cursor/grok-a-alt",
+                adapter="cursor",
+                adapter_model_name="grok-a",
+                enabled=True,
+            ),
+        ]
+        with self.assertRaises(AmbiguousModelPinError):
+            apply_cursor_model_pin({}, "grok-a", registry=registry)
+
+    def test_build_edit_payload_stamps_cursor_pin(self) -> None:
+        from puppetmaster.model_registry import save_registry
+        from puppetmaster.workers import build_edit_payload
+
+        with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "models.json"
+            save_registry(self._grok_registry(), registry_path)
+            with patch.dict(
+                os.environ,
+                {"PUPPETMASTER_MODELS_PATH": str(registry_path)},
+                clear=False,
+            ):
+                for raw in ("grok-4.5", "cursor/grok-4-5"):
+                    payload = build_edit_payload(
+                        instruction="x",
+                        cwd="/repo",
+                        adapter="cursor",
+                        model=raw,
+                    )
+                    self.assertEqual(payload["model"], "grok-4.5", msg=raw)
+                    self.assertEqual(payload["pinned_model"], "cursor/grok-4-5", msg=raw)
+                    self.assertNotIn("auto_route", payload)
+
 
 class PreflightTests(unittest.TestCase):
     def test_ready_for_plan_billed_adapter(self) -> None:
@@ -14661,6 +14904,235 @@ class PreflightTests(unittest.TestCase):
         )
         self.assertTrue(r.ok)
         self.assertIn("catalog unverified", r.reason)
+
+    def test_cursor_registry_pin_survives_catalog_refresh_failure(self) -> None:
+        from puppetmaster.cursor_discovery import CursorDiscoveryError
+        from puppetmaster.model_registry import ModelSpec, save_registry
+        from puppetmaster.preflight import preflight_check
+
+        with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "models.json"
+            save_registry(
+                [
+                    ModelSpec(
+                        id="cursor/grok-4-5",
+                        adapter="cursor",
+                        adapter_model_name="grok-4.5",
+                        capability_score=97,
+                        billing="plan",
+                        enabled=True,
+                    )
+                ],
+                registry_path,
+            )
+
+            def boom():
+                raise CursorDiscoveryError("node/libuv discovery failed")
+
+            with patch.dict(
+                os.environ,
+                {"PUPPETMASTER_MODELS_PATH": str(registry_path)},
+                clear=False,
+            ):
+                for raw_pin in ("cursor/grok-4-5", "grok-4.5"):
+                    result = preflight_check(
+                        "cursor",
+                        raw_pin,
+                        env={"CURSOR_API_KEY": "k"},
+                        catalog_fetcher=boom,
+                    )
+                    self.assertTrue(result.ok, msg=raw_pin)
+                    self.assertEqual(result.model, "grok-4.5")
+                    self.assertIn("preflight:registry_pin_fallback", result.evidence)
+                    self.assertIn("preflight:resolved_pin:cursor/grok-4-5", result.evidence)
+
+    def test_cursor_registry_id_normalizes_for_live_catalog_check(self) -> None:
+        from puppetmaster.model_registry import ModelSpec, save_registry
+        from puppetmaster.preflight import preflight_check
+
+        with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "models.json"
+            save_registry(
+                [
+                    ModelSpec(
+                        id="cursor/grok-4-5",
+                        adapter="cursor",
+                        adapter_model_name="grok-4.5",
+                        capability_score=97,
+                        billing="plan",
+                        enabled=True,
+                    )
+                ],
+                registry_path,
+            )
+            with patch.dict(
+                os.environ,
+                {"PUPPETMASTER_MODELS_PATH": str(registry_path)},
+                clear=False,
+            ):
+                result = preflight_check(
+                    "cursor",
+                    "cursor/grok-4-5",
+                    env={"CURSOR_API_KEY": "k"},
+                    catalog_fetcher=lambda: [{"id": "grok-4.5"}],
+                )
+            self.assertTrue(result.ok)
+            self.assertIn("preflight:resolved_pin:cursor/grok-4-5", result.evidence)
+
+    def test_live_probe_registry_pin_fallback_on_catalog_failure(self) -> None:
+        from puppetmaster.cursor_discovery import CursorDiscoveryError
+        from puppetmaster.model_registry import ModelSpec, save_registry
+        from puppetmaster.preflight import live_probe
+
+        with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "models.json"
+            save_registry(
+                [
+                    ModelSpec(
+                        id="cursor/grok-4-5",
+                        adapter="cursor",
+                        adapter_model_name="grok-4.5",
+                        capability_score=97,
+                        billing="plan",
+                        enabled=True,
+                    )
+                ],
+                registry_path,
+            )
+
+            def boom():
+                raise CursorDiscoveryError("node/libuv discovery failed")
+
+            probed: list[tuple[str, Optional[str]]] = []
+
+            def prober(adapter: str, model: Optional[str]):
+                probed.append((adapter, model))
+                return (0, "ok", "")
+
+            with patch.dict(
+                os.environ,
+                {"PUPPETMASTER_MODELS_PATH": str(registry_path)},
+                clear=False,
+            ):
+                result = live_probe(
+                    "cursor",
+                    "cursor/grok-4-5",
+                    catalog_fetcher=boom,
+                    prober=prober,
+                )
+            self.assertTrue(result.ok)
+            self.assertEqual(result.model, "grok-4.5")
+            self.assertIn("live_probe:registry_pin_fallback", result.evidence)
+            self.assertEqual(probed, [("cursor", "grok-4.5")])
+
+    def test_live_probe_pin_catalog_fallback_still_surfaces_quota(self) -> None:
+        """Catalog refresh may fall back to a registry pin, but the generation
+        probe must still run so plan/credit exhaustion stays visible."""
+        from puppetmaster.cursor_discovery import CursorDiscoveryError
+        from puppetmaster.model_registry import ModelSpec, save_registry
+        from puppetmaster.preflight import live_probe
+
+        with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "models.json"
+            save_registry(
+                [
+                    ModelSpec(
+                        id="cursor/grok-4-5",
+                        adapter="cursor",
+                        adapter_model_name="grok-4.5",
+                        capability_score=97,
+                        billing="plan",
+                        enabled=True,
+                    )
+                ],
+                registry_path,
+            )
+
+            def boom():
+                raise CursorDiscoveryError("node/libuv discovery failed")
+
+            with patch.dict(
+                os.environ,
+                {"PUPPETMASTER_MODELS_PATH": str(registry_path)},
+                clear=False,
+            ):
+                result = live_probe(
+                    "cursor",
+                    "grok-4.5",
+                    catalog_fetcher=boom,
+                    prober=lambda _a, _m: (
+                        1,
+                        "",
+                        "Error: You've hit your usage limit for this plan.",
+                    ),
+                )
+            self.assertFalse(result.ok)
+            self.assertEqual(result.model, "grok-4.5")
+            self.assertIn("live_probe:registry_pin_fallback", result.evidence)
+            self.assertIn("live_probe:billing_or_quota", result.evidence)
+
+    def test_ambiguous_model_pin_fails_closed_in_preflight(self) -> None:
+        from puppetmaster.model_registry import ModelSpec, save_registry
+        from puppetmaster.preflight import preflight_check
+
+        with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "models.json"
+            save_registry(
+                [
+                    ModelSpec(
+                        id="cursor/grok-a",
+                        adapter="cursor",
+                        adapter_model_name="grok-a",
+                        enabled=True,
+                    ),
+                    ModelSpec(
+                        id="cursor/grok-a-alt",
+                        adapter="cursor",
+                        adapter_model_name="grok-a",
+                        enabled=True,
+                    ),
+                ],
+                registry_path,
+            )
+            with patch.dict(
+                os.environ,
+                {"PUPPETMASTER_MODELS_PATH": str(registry_path)},
+                clear=False,
+            ):
+                result = preflight_check(
+                    "cursor",
+                    "grok-a",
+                    env={"CURSOR_API_KEY": "k"},
+                    catalog_fetcher=lambda: [{"id": "grok-a"}],
+                )
+            self.assertFalse(result.ok)
+            self.assertIn("ambiguous model pin", result.reason)
+            self.assertIn("preflight:ambiguous_model_pin", result.evidence)
+
+    def test_probe_cursor_uses_devnull_utf8_and_hidden_console(self) -> None:
+        import subprocess
+        from unittest.mock import patch
+
+        from puppetmaster.preflight import _probe_cursor
+
+        captured: dict = {}
+
+        def fake_run(*args, **kwargs):
+            captured.update(kwargs)
+            return subprocess.CompletedProcess(args[0], 0, stdout="ok", stderr="")
+
+        with patch("subprocess.run", side_effect=fake_run):
+            rc, out, err = _probe_cursor(
+                "grok-4.5",
+                {"CURSOR_API_KEY": "k", "PUPPETMASTER_NODE": "node"},
+            )
+
+        self.assertEqual(rc, 0)
+        self.assertIs(captured.get("stdin"), subprocess.DEVNULL)
+        self.assertEqual(captured.get("encoding"), "utf-8")
+        self.assertEqual(captured.get("errors"), "replace")
+        if os.name == "nt":
+            self.assertIn("creationflags", captured)
 
     def test_recent_probe_snapshot_blocks_missing_non_cursor_model(self) -> None:
         from puppetmaster.model_registry import ModelSpec, save_registry, write_discovery_meta
@@ -16359,6 +16831,156 @@ class AutoFallbackTests(unittest.TestCase):
             self.assertEqual(updated.adapter, "cursor")
             self.assertEqual(updated.payload["fallback_attempts"], 1)
             self.assertEqual(updated.payload["fallback_from_adapter"], "claude-code")
+
+    def test_fallback_skips_explicit_model_pin(self) -> None:
+        from unittest.mock import patch
+
+        from puppetmaster.model_registry import ModelSpec
+        from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
+        from puppetmaster.orchestrator import Orchestrator
+        from puppetmaster.platform_billing import BillingStatus
+        from puppetmaster.store import SwarmStore
+
+        registry = [
+            ModelSpec(
+                id="cursor/gpt-5-5",
+                adapter="cursor",
+                adapter_model_name="gpt-5.5",
+                capability_score=90,
+                billing="plan",
+            ),
+            ModelSpec(
+                id="claude-code/opus-4-8",
+                adapter="claude-code",
+                adapter_model_name="claude-opus-4-8",
+                capability_score=99,
+                billing="plan",
+            ),
+        ]
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("pinned cursor run")
+            task = Task(
+                job_id=job.id,
+                role="implement",
+                instruction="implement the fix",
+                adapter="cursor",
+                status=TaskStatus.FAILED,
+                payload={"model": "grok-4.5"},
+            )
+            store.save_task(task)
+            store.save_artifact(
+                Artifact(
+                    job_id=job.id,
+                    task_id=task.id,
+                    type=ArtifactType.VERIFICATION,
+                    created_by="w",
+                    payload={
+                        "check": "x",
+                        "result": "blocked",
+                        "failure": "billing_or_quota",
+                        "adapter": "cursor",
+                    },
+                    confidence=0.5,
+                    evidence=["adapter:cursor"],
+                )
+            )
+            orch = Orchestrator(store)
+            with patch("puppetmaster.model_registry.load_registry", return_value=registry), \
+                 patch(
+                     "puppetmaster.platform_billing.detect_adapter_billing",
+                     return_value=BillingStatus(
+                         adapter="claude-code",
+                         billing="plan",
+                         healthy=True,
+                         detail="ok",
+                         evidence=[],
+                     ),
+                 ), \
+                 patch("puppetmaster.platform_lock.is_adapter_enabled", return_value=True), \
+                 patch("puppetmaster.preflight.adapter_cli_present", return_value=True):
+                rerouted = orch._reroute_recoverable_failures(job)
+            self.assertEqual(rerouted, 0)
+            updated = store.get_task_by_id(task.id)
+            self.assertEqual(updated.adapter, "cursor")
+            self.assertEqual(updated.payload.get("model"), "grok-4.5")
+
+    def test_escalation_skips_stamped_cursor_pin(self) -> None:
+        """Stamped pins set router_model_id for audit; escalation must not move them."""
+        from unittest.mock import patch
+
+        from puppetmaster.model_registry import ModelSpec
+        from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
+        from puppetmaster.orchestrator import Orchestrator
+        from puppetmaster.platform_billing import BillingStatus
+        from puppetmaster.store import SwarmStore
+
+        registry = [
+            ModelSpec(
+                id="cursor/grok-4-5",
+                adapter="cursor",
+                adapter_model_name="grok-4.5",
+                capability_score=90,
+                billing="plan",
+            ),
+            ModelSpec(
+                id="cursor/gpt-5-5",
+                adapter="cursor",
+                adapter_model_name="gpt-5.5",
+                capability_score=99,
+                billing="plan",
+            ),
+        ]
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("stamped pin must hold")
+            task = Task(
+                job_id=job.id,
+                role="implement",
+                instruction="implement the fix",
+                adapter="cursor",
+                status=TaskStatus.COMPLETE,
+                payload={
+                    "model": "grok-4.5",
+                    "pinned_model": "cursor/grok-4-5",
+                    "router_model_id": "cursor/grok-4-5",
+                    "pinned_adapter_model_name": "grok-4.5",
+                    "min_confidence": 0.9,
+                },
+            )
+            store.save_task(task)
+            store.save_artifact(
+                Artifact(
+                    job_id=job.id,
+                    task_id=task.id,
+                    type=ArtifactType.VERIFICATION,
+                    created_by="w",
+                    payload={"check": "x", "result": "pass"},
+                    confidence=0.2,
+                    evidence=["adapter:cursor"],
+                )
+            )
+            orch = Orchestrator(store)
+            with patch("puppetmaster.model_registry.load_registry", return_value=registry), \
+                 patch(
+                     "puppetmaster.platform_billing.detect_adapter_billing",
+                     return_value=BillingStatus(
+                         adapter="cursor",
+                         billing="plan",
+                         healthy=True,
+                         detail="ok",
+                         evidence=[],
+                     ),
+                 ), \
+                 patch("puppetmaster.platform_lock.is_adapter_enabled", return_value=True), \
+                 patch("puppetmaster.preflight.adapter_cli_present", return_value=True):
+                rerouted = orch._reroute_low_confidence(job)
+            self.assertEqual(rerouted, 0)
+            updated = store.get_task_by_id(task.id)
+            self.assertEqual(updated.payload.get("model"), "grok-4.5")
+            self.assertEqual(updated.payload.get("pinned_model"), "cursor/grok-4-5")
 
     def test_fallback_skips_adapter_with_missing_cli(self) -> None:
         """Regression (Rishi): a stale auth file keeps claude-code/codex reading

@@ -10,19 +10,25 @@ from typing import Any, Iterable, Iterator, Optional, Union
 from puppetmaster.models import (
     AgentRun,
     Artifact,
+    GraphEdge,
+    GraphEdgeType,
+    GraphNodeKind,
     Job,
     JobStatus,
     MemoryRecord,
     Task,
     TaskStatus,
     artifact_from_dict,
+    graph_edge_from_dict,
     job_from_dict,
+    make_graph_edge,
     now_iso,
     task_from_dict,
     to_jsonable,
 )
 from puppetmaster.fs_permissions import chmod_private_file, mkdir_private
 from puppetmaster.store import (
+    ActiveTaskLeaseError,
     SwarmStore,
     _MEMORY_CAP,
     _coerce_confidence,
@@ -45,7 +51,7 @@ class SQLiteSwarmStore(SwarmStore):
     """SQLite-backed coordination store for multi-process worker coordination."""
 
     backend_name = "sqlite"
-    schema_version = 1
+    schema_version = 2
 
     def __init__(self, root: Optional[Union[Path, str]] = None) -> None:
         super().__init__(root)
@@ -121,13 +127,27 @@ class SQLiteSwarmStore(SwarmStore):
                   key TEXT PRIMARY KEY,
                   value TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS graph_edges (
+                  id TEXT PRIMARY KEY,
+                  job_id TEXT NOT NULL,
+                  type TEXT NOT NULL,
+                  from_kind TEXT NOT NULL,
+                  from_id TEXT NOT NULL,
+                  to_kind TEXT NOT NULL,
+                  to_id TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  data TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_graph_edges_job
+                  ON graph_edges(job_id, type);
+                CREATE INDEX IF NOT EXISTS idx_graph_edges_from
+                  ON graph_edges(job_id, from_id, type);
+                CREATE INDEX IF NOT EXISTS idx_graph_edges_to
+                  ON graph_edges(job_id, to_id, type);
                 """
             )
-            # Record the schema version only when absent. Blindly overwriting it
-            # on every init would mask a database written by a newer (or
-            # incompatible) Puppetmaster: the metadata would silently claim our
-            # version even though the on-disk schema is something else. Leaving
-            # an existing value intact lets schema_status() surface the mismatch.
+            # Fresh DBs get the current schema_version. Existing DBs keep their
+            # recorded version so _migrate_schema can detect v1 and backfill.
             connection.execute(
                 """
                 INSERT INTO metadata(key, value)
@@ -136,8 +156,177 @@ class SQLiteSwarmStore(SwarmStore):
                 """,
                 (str(self.schema_version),),
             )
+            self._migrate_schema(connection)
         chmod_private_file(self.db_path)
         self._initialized = True
+
+    def _migrate_schema(self, connection: sqlite3.Connection) -> None:
+        """Upgrade older state.sqlite3 files to the current schema_version."""
+        row = connection.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone()
+        try:
+            current = int(row["value"]) if row is not None else 0
+        except (TypeError, ValueError):
+            current = 0
+        if current < 2:
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS graph_edges (
+                  id TEXT PRIMARY KEY,
+                  job_id TEXT NOT NULL,
+                  type TEXT NOT NULL,
+                  from_kind TEXT NOT NULL,
+                  from_id TEXT NOT NULL,
+                  to_kind TEXT NOT NULL,
+                  to_id TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  data TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_graph_edges_job
+                  ON graph_edges(job_id, type);
+                CREATE INDEX IF NOT EXISTS idx_graph_edges_from
+                  ON graph_edges(job_id, from_id, type);
+                CREATE INDEX IF NOT EXISTS idx_graph_edges_to
+                  ON graph_edges(job_id, to_id, type);
+                """
+            )
+            self._backfill_graph_edges(connection)
+            connection.execute(
+                """
+                INSERT INTO metadata(key, value)
+                VALUES('schema_version', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (str(self.schema_version),),
+            )
+
+    def _backfill_graph_edges(self, connection: sqlite3.Connection) -> None:
+        """Materialize depends_on / produces edges from existing v1 rows."""
+        existing = {
+            row["id"]
+            for row in connection.execute("SELECT id FROM graph_edges").fetchall()
+        }
+        for row in connection.execute("SELECT data FROM tasks").fetchall():
+            task = task_from_dict(json.loads(row["data"]))
+            for dependency_id in task.depends_on:
+                if not dependency_id:
+                    continue
+                edge = make_graph_edge(
+                    job_id=task.job_id,
+                    type=GraphEdgeType.DEPENDS_ON,
+                    from_kind=GraphNodeKind.TASK,
+                    from_id=task.id,
+                    to_kind=GraphNodeKind.TASK,
+                    to_id=dependency_id,
+                )
+                if edge.id in existing:
+                    continue
+                self._insert_edge_row(connection, edge, emit_event=False)
+                existing.add(edge.id)
+        for row in connection.execute("SELECT data FROM artifacts").fetchall():
+            artifact = artifact_from_dict(json.loads(row["data"]))
+            edge = make_graph_edge(
+                job_id=artifact.job_id,
+                type=GraphEdgeType.PRODUCES,
+                from_kind=GraphNodeKind.TASK,
+                from_id=artifact.task_id,
+                to_kind=GraphNodeKind.ARTIFACT,
+                to_id=artifact.id,
+            )
+            if edge.id in existing:
+                continue
+            self._insert_edge_row(connection, edge, emit_event=False)
+            existing.add(edge.id)
+
+    def _insert_edge_row(
+        self,
+        connection: sqlite3.Connection,
+        edge: GraphEdge,
+        *,
+        emit_event: bool,
+    ) -> GraphEdge:
+        return self._upsert_edge_connection(
+            connection, edge, emit_event=emit_event
+        )
+
+    def _upsert_edge_connection(
+        self,
+        connection: sqlite3.Connection,
+        edge: GraphEdge,
+        *,
+        emit_event: bool = True,
+    ) -> GraphEdge:
+        if not edge.id:
+            edge = make_graph_edge(
+                job_id=edge.job_id,
+                type=edge.type,
+                from_kind=edge.from_kind,
+                from_id=edge.from_id,
+                to_kind=edge.to_kind,
+                to_id=edge.to_id,
+                created_at=edge.created_at,
+                meta=edge.meta,
+            )
+        row = connection.execute(
+            "SELECT data FROM graph_edges WHERE id = ?", (edge.id,)
+        ).fetchone()
+        if row is not None:
+            existing = graph_edge_from_dict(json.loads(row["data"]))
+            merged_meta = {**existing.meta, **(edge.meta or {})}
+            if merged_meta == existing.meta:
+                return existing
+            edge = GraphEdge(
+                id=existing.id,
+                job_id=existing.job_id,
+                type=existing.type,
+                from_kind=existing.from_kind,
+                from_id=existing.from_id,
+                to_kind=existing.to_kind,
+                to_id=existing.to_id,
+                created_at=existing.created_at,
+                meta=merged_meta,
+            )
+        connection.execute(
+            """
+            INSERT INTO graph_edges(
+              id, job_id, type, from_kind, from_id, to_kind, to_id, created_at, data
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              job_id = excluded.job_id,
+              type = excluded.type,
+              from_kind = excluded.from_kind,
+              from_id = excluded.from_id,
+              to_kind = excluded.to_kind,
+              to_id = excluded.to_id,
+              data = excluded.data
+            """,
+            (
+                edge.id,
+                edge.job_id,
+                str(edge.type),
+                str(edge.from_kind),
+                edge.from_id,
+                str(edge.to_kind),
+                edge.to_id,
+                edge.created_at,
+                self._dumps(edge),
+            ),
+        )
+        if emit_event:
+            self._emit(
+                connection,
+                edge.job_id,
+                "edge.upserted",
+                {
+                    "edge_id": edge.id,
+                    "type": str(edge.type),
+                    "from_id": edge.from_id,
+                    "to_id": edge.to_id,
+                },
+            )
+        return edge
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path, timeout=5)
@@ -205,6 +394,21 @@ class SQLiteSwarmStore(SwarmStore):
         # produce state with no corresponding event (a torn write that breaks
         # event-cursor consumers).
         payload = self._task_saved_payload(task)
+        desired_ids = {
+            dependency_id for dependency_id in task.depends_on if dependency_id
+        }
+        depends_edges = [
+            make_graph_edge(
+                job_id=task.job_id,
+                type=GraphEdgeType.DEPENDS_ON,
+                from_kind=GraphNodeKind.TASK,
+                from_id=task.id,
+                to_kind=GraphNodeKind.TASK,
+                to_id=dependency_id,
+            )
+            for dependency_id in task.depends_on
+            if dependency_id
+        ]
         with self._session() as connection:
             connection.execute(
                 """
@@ -219,6 +423,9 @@ class SQLiteSwarmStore(SwarmStore):
                 (task.id, task.job_id, task.role, str(task.status), self._dumps(task)),
             )
             self._emit(connection, task.job_id, "task.saved", payload)
+            self._reconcile_depends_on_edges_connection(
+                connection, task, desired_ids, depends_edges
+            )
 
     def save_tasks(self, tasks: Iterable[Task]) -> None:
         task_list = list(tasks)
@@ -227,12 +434,29 @@ class SQLiteSwarmStore(SwarmStore):
         self.init()
         rows: list[tuple[Any, ...]] = []
         event_rows: list[tuple[Any, ...]] = []
+        reconcile_rows: list[tuple[Task, set[str], list[GraphEdge]]] = []
         for task in task_list:
             payload = self._task_saved_payload(task)
             rows.append(
                 (task.id, task.job_id, task.role, str(task.status), self._dumps(task))
             )
             event_rows.append((task.job_id, payload))
+            desired_ids = {
+                dependency_id for dependency_id in task.depends_on if dependency_id
+            }
+            depends_edges = [
+                make_graph_edge(
+                    job_id=task.job_id,
+                    type=GraphEdgeType.DEPENDS_ON,
+                    from_kind=GraphNodeKind.TASK,
+                    from_id=task.id,
+                    to_kind=GraphNodeKind.TASK,
+                    to_id=dependency_id,
+                )
+                for dependency_id in task.depends_on
+                if dependency_id
+            ]
+            reconcile_rows.append((task, desired_ids, depends_edges))
         with self._session() as connection:
             connection.executemany(
                 """
@@ -248,6 +472,10 @@ class SQLiteSwarmStore(SwarmStore):
             )
             for job_id, payload in event_rows:
                 self._emit(connection, job_id, "task.saved", payload)
+            for task, desired_ids, depends_edges in reconcile_rows:
+                self._reconcile_depends_on_edges_connection(
+                    connection, task, desired_ids, depends_edges
+                )
 
     def update_task_status(
         self,
@@ -580,6 +808,14 @@ class SQLiteSwarmStore(SwarmStore):
             "confidence": artifact.confidence,
             "sha256": artifact.sha256,
         }
+        produces = make_graph_edge(
+            job_id=artifact.job_id,
+            type=GraphEdgeType.PRODUCES,
+            from_kind=GraphNodeKind.TASK,
+            from_id=artifact.task_id,
+            to_kind=GraphNodeKind.ARTIFACT,
+            to_id=artifact.id,
+        )
         with self._session() as connection:
             connection.execute(
                 """
@@ -608,6 +844,7 @@ class SQLiteSwarmStore(SwarmStore):
                     json.dumps(event_payload, sort_keys=True),
                 ),
             )
+            self._upsert_edge_connection(connection, produces)
 
     def save_artifacts(self, artifacts: Iterable[Artifact]) -> None:
         artifact_list = list(artifacts)
@@ -649,6 +886,17 @@ class SQLiteSwarmStore(SwarmStore):
                     ),
                 )
             )
+        produces_edges = [
+            make_graph_edge(
+                job_id=artifact.job_id,
+                type=GraphEdgeType.PRODUCES,
+                from_kind=GraphNodeKind.TASK,
+                from_id=artifact.task_id,
+                to_kind=GraphNodeKind.ARTIFACT,
+                to_id=artifact.id,
+            )
+            for artifact in prepared
+        ]
         with self._session() as connection:
             connection.executemany(
                 """
@@ -666,6 +914,269 @@ class SQLiteSwarmStore(SwarmStore):
                 "INSERT INTO events(job_id, at, event, payload) VALUES(?, ?, ?, ?)",
                 event_rows,
             )
+            for edge in produces_edges:
+                self._upsert_edge_connection(connection, edge)
+
+    def upsert_edge(self, edge: GraphEdge) -> GraphEdge:
+        self.init()
+        with self._session() as connection:
+            return self._upsert_edge_connection(connection, edge)
+
+    def upsert_edges(self, edges: Iterable[GraphEdge]) -> list[GraphEdge]:
+        """Batch-upsert edges in a single SQLite transaction."""
+        edge_list = list(edges)
+        if not edge_list:
+            return []
+        self.init()
+        with self._session() as connection:
+            return [
+                self._upsert_edge_connection(connection, edge) for edge in edge_list
+            ]
+
+    def record_consumes(
+        self,
+        job_id: str,
+        task_id: str,
+        artifact_ids: Iterable[str],
+        *,
+        meta: Optional[dict[str, Any]] = None,
+    ) -> list[GraphEdge]:
+        """Record consumes edges in one SQLite transaction (no file journal)."""
+        edges = [
+            make_graph_edge(
+                job_id=job_id,
+                type=GraphEdgeType.CONSUMES,
+                from_kind=GraphNodeKind.TASK,
+                from_id=task_id,
+                to_kind=GraphNodeKind.ARTIFACT,
+                to_id=artifact_id,
+                meta=meta,
+            )
+            for artifact_id in dict.fromkeys(artifact_ids)
+            if artifact_id
+        ]
+        return self.upsert_edges(edges)
+
+    def reset_subgraph(
+        self,
+        job_id: str,
+        task_ids: Iterable[str],
+        *,
+        include_descendants: bool = True,
+    ) -> list[Task]:
+        """Idempotent subgraph reset in a single SQLite transaction/batch.
+
+        Unlike the file backend (per-task writes), all selected task clears,
+        QUEUED/BLOCKED re-derivation, and the ``subgraph.reset`` event commit
+        together so a busy/crash mid-reset cannot leave a partial subgraph.
+        """
+        selected = (
+            self.consumer_closure(job_id, task_ids)
+            if include_descendants
+            else {task_id for task_id in task_ids if task_id}
+        )
+        if not selected:
+            return []
+        tasks = self.list_tasks(job_id)
+        task_map = {task.id: task for task in tasks}
+        active = [
+            task.id
+            for task in tasks
+            if task.id in selected and self.has_active_lease(task)
+        ]
+        if active:
+            raise ActiveTaskLeaseError(active)
+
+        cleared: list[Task] = []
+        for task in tasks:
+            if task.id not in selected:
+                continue
+            cleared_task = replace(
+                task,
+                status=TaskStatus.BLOCKED,
+                attempts=0,
+                lease_owner=None,
+                lease_expires_at=None,
+                lease_id=None,
+                completed_at=None,
+                updated_at=now_iso(),
+            )
+            task_map[task.id] = cleared_task
+            cleared.append(cleared_task)
+
+        finalized: list[Task] = []
+        for task in cleared:
+            current = task_map[task.id]
+            if self.dependencies_complete(current, task_map=task_map):
+                queued = replace(
+                    current, status=TaskStatus.QUEUED, updated_at=now_iso()
+                )
+                task_map[task.id] = queued
+                finalized.append(queued)
+            else:
+                finalized.append(current)
+
+        self.init()
+        rows: list[tuple[Any, ...]] = []
+        event_rows: list[tuple[Any, ...]] = []
+        reconcile_rows: list[tuple[Task, set[str], list[GraphEdge]]] = []
+        for task in finalized:
+            payload = self._task_saved_payload(task)
+            rows.append(
+                (task.id, task.job_id, task.role, str(task.status), self._dumps(task))
+            )
+            event_rows.append((task.job_id, payload))
+            desired_ids = {
+                dependency_id for dependency_id in task.depends_on if dependency_id
+            }
+            depends_edges = [
+                make_graph_edge(
+                    job_id=task.job_id,
+                    type=GraphEdgeType.DEPENDS_ON,
+                    from_kind=GraphNodeKind.TASK,
+                    from_id=task.id,
+                    to_kind=GraphNodeKind.TASK,
+                    to_id=dependency_id,
+                )
+                for dependency_id in task.depends_on
+                if dependency_id
+            ]
+            reconcile_rows.append((task, desired_ids, depends_edges))
+
+        with self._session() as connection:
+            connection.executemany(
+                """
+                INSERT INTO tasks(id, job_id, role, status, data)
+                VALUES(?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  job_id = excluded.job_id,
+                  role = excluded.role,
+                  status = excluded.status,
+                  data = excluded.data
+                """,
+                rows,
+            )
+            for event_job_id, payload in event_rows:
+                self._emit(connection, event_job_id, "task.saved", payload)
+            for task, desired_ids, depends_edges in reconcile_rows:
+                self._reconcile_depends_on_edges_connection(
+                    connection, task, desired_ids, depends_edges
+                )
+            self._emit(
+                connection,
+                job_id,
+                "subgraph.reset",
+                {"task_ids": sorted(selected), "reset_count": len(finalized)},
+            )
+        return finalized
+
+    def delete_edge(self, job_id: str, edge_id: str) -> bool:
+        self.init()
+        with self._session() as connection:
+            row = connection.execute(
+                "SELECT id FROM graph_edges WHERE id = ? AND job_id = ?",
+                (edge_id, job_id),
+            ).fetchone()
+            if row is None:
+                return False
+            connection.execute(
+                "DELETE FROM graph_edges WHERE id = ? AND job_id = ?",
+                (edge_id, job_id),
+            )
+            self._emit(
+                connection,
+                job_id,
+                "edge.deleted",
+                {"edge_id": edge_id},
+            )
+            return True
+
+    def _reconcile_depends_on_edges_connection(
+        self,
+        connection: sqlite3.Connection,
+        task: Task,
+        desired_ids: set[str],
+        depends_edges: list[GraphEdge],
+    ) -> None:
+        rows = connection.execute(
+            """
+            SELECT id, to_id FROM graph_edges
+            WHERE job_id = ?
+              AND type = ?
+              AND from_id = ?
+              AND from_kind = ?
+              AND to_kind = ?
+            """,
+            (
+                task.job_id,
+                str(GraphEdgeType.DEPENDS_ON),
+                task.id,
+                str(GraphNodeKind.TASK),
+                str(GraphNodeKind.TASK),
+            ),
+        ).fetchall()
+        for row in rows:
+            if row["to_id"] not in desired_ids:
+                connection.execute(
+                    "DELETE FROM graph_edges WHERE id = ?", (row["id"],)
+                )
+                self._emit(
+                    connection,
+                    task.job_id,
+                    "edge.deleted",
+                    {"edge_id": row["id"]},
+                )
+        for edge in depends_edges:
+            self._upsert_edge_connection(connection, edge)
+
+    def get_edge(self, job_id: str, edge_id: str) -> Optional[GraphEdge]:
+        self.init()
+        row = self._one(
+            "SELECT data FROM graph_edges WHERE id = ? AND job_id = ?",
+            (edge_id, job_id),
+        )
+        if row is None:
+            return None
+        return graph_edge_from_dict(json.loads(row["data"]))
+
+    def list_edges(
+        self,
+        job_id: str,
+        *,
+        edge_type: Optional[Union[GraphEdgeType, str]] = None,
+        from_id: Optional[str] = None,
+        to_id: Optional[str] = None,
+        from_kind: Optional[Union[GraphNodeKind, str]] = None,
+        to_kind: Optional[Union[GraphNodeKind, str]] = None,
+    ) -> list[GraphEdge]:
+        self.init()
+        clauses = ["job_id = ?"]
+        params: list[Any] = [job_id]
+        if edge_type is not None:
+            clauses.append("type = ?")
+            params.append(str(edge_type))
+        if from_id is not None:
+            clauses.append("from_id = ?")
+            params.append(from_id)
+        if to_id is not None:
+            clauses.append("to_id = ?")
+            params.append(to_id)
+        if from_kind is not None:
+            clauses.append("from_kind = ?")
+            params.append(str(from_kind))
+        if to_kind is not None:
+            clauses.append("to_kind = ?")
+            params.append(str(to_kind))
+        where = " AND ".join(clauses)
+        rows = self._all(
+            f"SELECT data FROM graph_edges WHERE {where} ORDER BY id",
+            tuple(params),
+        )
+        return [graph_edge_from_dict(json.loads(row["data"])) for row in rows]
+
+    def ensure_graph_edges(self, job_id: str) -> None:
+        """SQLite edges are migrated eagerly; no file-store lazy backfill."""
+        return None
 
     def promote_memory(self, memory: MemoryRecord) -> None:
         normalized = _normalize_memory_statement(memory.statement)
@@ -945,7 +1456,7 @@ class SQLiteSwarmStore(SwarmStore):
         # absolute) can neither wipe rows nor rglob-unlink outside the jobs tree.
         job_dir = self._assert_safe_job_dir(job_id)
         with self._session() as connection:
-            for table in ["events", "artifacts", "runs", "tasks"]:
+            for table in ["events", "artifacts", "runs", "tasks", "graph_edges"]:
                 connection.execute(f"DELETE FROM {table} WHERE job_id = ?", (job_id,))
             connection.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
         if job_dir.exists():

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import AbstractSet, Callable, Mapping, Optional
 
 from puppetmaster.adapters import get_adapter, verification_artifact
@@ -187,6 +187,35 @@ class LocalWorker:
         self.worker_id = worker_id or f"local-{role}"
 
     def run(self, task: Task, goal: str) -> tuple[AgentRun, list[Artifact]]:
+        from puppetmaster.model_registry import AmbiguousModelPinError
+
+        try:
+            task = self._normalize_cursor_pin(task)
+        except AmbiguousModelPinError as exc:
+            run = AgentRun(
+                job_id=task.job_id,
+                task_id=task.id,
+                role=task.role,
+                worker_id=self.worker_id,
+                status=TaskStatus.FAILED,
+                completed_at=now_iso(),
+            )
+            blocked = verification_artifact(
+                task=task,
+                worker_id=self.worker_id,
+                adapter=task.adapter,
+                check=f"preflight: can {task.adapter} run this task?",
+                result="blocked",
+                confidence=0.95,
+                evidence=[f"adapter:{task.adapter}", "preflight:ambiguous_model_pin"],
+                payload={
+                    "failure": "preflight_blocked",
+                    "reason": f"ambiguous model pin: {exc}",
+                    "model": (task.payload or {}).get("model"),
+                },
+            )
+            return run, [blocked]
+
         blocked = self._preflight(task)
         if blocked is not None:
             run = AgentRun(
@@ -213,6 +242,16 @@ class LocalWorker:
             return run, get_adapter("shell").run(task, goal, self.worker_id)
         return run, get_adapter(task.adapter).run(task, goal, self.worker_id)
 
+    def _normalize_cursor_pin(self, task: Task) -> Task:
+        """Stamp an explicit Cursor pin before preflight and adapter dispatch."""
+        payload = task.payload or {}
+        model = payload.get("model")
+        if task.adapter != "cursor" or not model or payload.get("pinned_model"):
+            return task
+        from puppetmaster.model_registry import apply_cursor_model_pin
+
+        return replace(task, payload=apply_cursor_model_pin(dict(payload), str(model)))
+
     def _preflight(self, task: Task) -> Optional[Artifact]:
         """Fast, no-network auth/billing gate before dispatching a paid worker.
 
@@ -228,23 +267,41 @@ class LocalWorker:
         if task.adapter not in _PREFLIGHTABLE_ADAPTERS:
             return None
 
+        from puppetmaster.model_registry import AmbiguousModelPinError
         from puppetmaster.preflight import preflight_check
 
-        model = task.payload.get("model")
+        payload = task.payload or {}
+        model = payload.get("model")
         catalog_fetcher = None
         if task.adapter == "cursor" and (
-            model or task.payload.get("live_preflight")
+            model or payload.get("live_preflight")
         ):
             from puppetmaster.cursor_discovery import fetch_cursor_catalog
 
             catalog_fetcher = fetch_cursor_catalog
-        result = preflight_check(
-            task.adapter,
-            model,
-            allow_api_billing=bool(task.payload.get("allow_api_billing", True)),
-            live=bool(task.payload.get("live_preflight")),
-            catalog_fetcher=catalog_fetcher,
-        )
+        try:
+            result = preflight_check(
+                task.adapter,
+                model,
+                allow_api_billing=bool(payload.get("allow_api_billing", True)),
+                live=bool(payload.get("live_preflight")),
+                catalog_fetcher=catalog_fetcher,
+            )
+        except AmbiguousModelPinError as exc:
+            return verification_artifact(
+                task=task,
+                worker_id=self.worker_id,
+                adapter=task.adapter,
+                check=f"preflight: can {task.adapter} run this task?",
+                result="blocked",
+                confidence=0.95,
+                evidence=[f"adapter:{task.adapter}", "preflight:ambiguous_model_pin"],
+                payload={
+                    "failure": "preflight_blocked",
+                    "reason": f"ambiguous model pin: {exc}",
+                    "model": model,
+                },
+            )
         if result.ok:
             return None
         return verification_artifact(
@@ -505,7 +562,12 @@ def build_edit_payload(
         payload["disable_codegraph"] = True
     if model:
         # An explicit model pin wins over routing — don't auto-route around it.
-        payload["model"] = model
+        if adapter == "cursor":
+            from puppetmaster.model_registry import apply_cursor_model_pin
+
+            payload = apply_cursor_model_pin(payload, model)
+        else:
+            payload["model"] = model
     elif auto_route:
         payload["auto_route"] = True
         payload["allowed_adapters"] = [adapter]

@@ -63,13 +63,22 @@ class CursorDiscoveryError(RuntimeError):
 
 
 def _default_runner(command: list[str], env: Mapping[str, str]) -> "tuple[int, str, str]":
+    from puppetmaster.win_console import effective_creationflags
+
+    popen_kwargs: dict = {}
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = effective_creationflags(0)
     try:
         completed = subprocess.run(
             command,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=30,
             env=dict(env),
+            **popen_kwargs,
         )
     except FileNotFoundError:
         return (127, "", "node not found")
