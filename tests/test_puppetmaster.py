@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+import os
+import sys
+
+_HERMETIC_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HERMETIC_DIR not in sys.path:
+    sys.path.insert(0, _HERMETIC_DIR)
+import hermetic_env  # noqa: F401  # process-wide host-env isolation
+
 import argparse
 import contextlib
 import io
@@ -88,7 +96,6 @@ from puppetmaster.worker_runtime import WorkerDaemon
 from puppetmaster.workers import WorkerSpec
 from typing import Optional
 
-
 class _ContextManagerFakeProcess:
     """Drop-in fake for ``subprocess.Popen`` that supports ``with`` blocks.
 
@@ -128,7 +135,6 @@ class _ContextManagerFakeProcess:
     def terminate(self) -> None:
         return None
 
-
 def _find_indexer_launches(popen_mock) -> list[list[str]]:
     """Return the calls to ``subprocess.Popen`` that launched our background
     indexer runner. Other paths (notably ``git rev-parse`` from state
@@ -143,7 +149,6 @@ def _find_indexer_launches(popen_mock) -> list[list[str]]:
         if any("codegraph_index_runner" in str(part) for part in argv):
             launches.append(list(argv))
     return launches
-
 
 def _wait_for_spawned_or_kill(test, spawned, *, timeout: float) -> None:
     """Wait for spawned subprocesses to finish, killing on timeout.
@@ -179,7 +184,6 @@ def _wait_for_spawned_or_kill(test, spawned, *, timeout: float) -> None:
                 f"(pid={process.pid}, args={process.args!r}); killed to prevent "
                 "leaking a long-lived child process"
             )
-
 
 class PuppetmasterTests(unittest.TestCase):
     """Hermetic suite: pins ``PUPPETMASTER_MODELS_PATH`` to an empty
@@ -8301,7 +8305,6 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
             self.assertEqual(code, 1)
             self.assertIn("missing.json", stderr.getvalue())
 
-
 class ModelRouterTests(unittest.TestCase):
     """Tests for the user-owned LLM model registry and routing engine.
 
@@ -8470,6 +8473,15 @@ class ModelRouterTests(unittest.TestCase):
         self.assertEqual(grok.input_per_mtok_usd, 2.0)
         self.assertIn("workhorse", grok.tags)
         self.assertIn("xai", grok.tags)
+        self.assertEqual(
+            grok.payload_defaults.get("params"),
+            [
+                {"id": "effort", "value": "high"},
+                {"id": "fast", "value": "true"},
+            ],
+        )
+        self.assertIn("effort:high", grok.tags)
+        self.assertIn("param:fast", grok.tags)
         # Sits under Opus 4.7/4.8 and Fable so tip-of-stack stays reserved,
         # but below GPT-5.6 Sol frontier so hard Cursor work prefers Grok
         # unless the task explicitly needs the top tier.
@@ -11221,7 +11233,6 @@ class ModelRouterTests(unittest.TestCase):
             {"reasoning_effort": "high"},
         )
 
-
 class _FakeUrlopenResponse:
     """Stand-in for a urlopen() context manager returning a fixed body + status."""
 
@@ -11240,7 +11251,6 @@ class _FakeUrlopenResponse:
 
     def read(self) -> bytes:
         return self._body
-
 
 class OpenAIAdapterTests(unittest.TestCase):
     """Covers the OpenAI adapter end-to-end: happy path, error paths, env handling.
@@ -11660,7 +11670,6 @@ class OpenAIAdapterTests(unittest.TestCase):
             models = {entry["model"] for entry in CURATED_CATALOGS[catalog_name]}
             for model in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
                 self.assertIn(model, models, f"{catalog_name} missing {model}")
-
 
 class InstallerTests(unittest.TestCase):
     """Tests for :mod:`puppetmaster.installers`.
@@ -12308,7 +12317,6 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(resolved[1:], ["-m", "something"])
         self.assertIsNone(resolve_claude_command("/nonexistent/claude-nope"))
 
-
 class InstallHermesMcpTests(unittest.TestCase):
     """Tests for :func:`install_hermes_mcp` / :func:`uninstall_hermes_mcp`.
 
@@ -12564,7 +12572,6 @@ class InstallHermesMcpTests(unittest.TestCase):
             result = uninstall_hermes_mcp(target_path=Path(tmp) / "config.yaml")
             self.assertEqual(result.status, "unchanged")
 
-
 class SetHermesMcpEnvTests(unittest.TestCase):
     """Tests for :func:`set_hermes_mcp_env` — merging env toggles into Hermes config."""
 
@@ -12647,7 +12654,6 @@ class SetHermesMcpEnvTests(unittest.TestCase):
             self.assertEqual(result.status, "would_install")
             self.assertEqual(target.read_text(encoding="utf-8"), before)
 
-
 class HermesNextStepsGuidanceTests(unittest.TestCase):
     def test_guidance_covers_learn_promote_and_injection(self):
         from puppetmaster.installers import HERMES_NEXT_STEPS_GUIDANCE
@@ -12656,7 +12662,6 @@ class HermesNextStepsGuidanceTests(unittest.TestCase):
         self.assertIn("promote-candidate", HERMES_NEXT_STEPS_GUIDANCE)
         self.assertIn("PUPPETMASTER_INJECT_HERMES_SKILLS", HERMES_NEXT_STEPS_GUIDANCE)
         self.assertIn("PUPPETMASTER_SKILL_TOKEN_BUDGET", HERMES_NEXT_STEPS_GUIDANCE)
-
 
 class InstallHermesSkillTests(unittest.TestCase):
     """Tests for :func:`install_hermes_skill` — shipping the bundled Puppetmaster
@@ -12725,7 +12730,6 @@ class InstallHermesSkillTests(unittest.TestCase):
             self.assertFalse(
                 (skills / "autonomous-ai-agents" / "puppetmaster").exists()
             )
-
 
 class PromoteSkillCandidateTests(unittest.TestCase):
     """Tests for the candidate→live-skill promotion half of the learn flywheel.
@@ -12847,7 +12851,6 @@ class PromoteSkillCandidateTests(unittest.TestCase):
             )
             self.assertEqual(out.status, "would_promote")
             self.assertFalse((skills / "thing").exists())
-
 
 class HermesSkillInjectionTests(unittest.TestCase):
     """Tests for the skill -> worker return leg of the learn flywheel.
@@ -13047,7 +13050,6 @@ class HermesSkillInjectionTests(unittest.TestCase):
             events = {e["event"] for e in store.read_events(job.id)}
             self.assertIn("skills.none_discovered", events)
 
-
 class InstallHermesPluginTests(unittest.TestCase):
     """Tests for :func:`install_hermes_plugin` — shipping the bundled
     puppetmaster-learn plugin into Hermes' plugins dir so the auto-/learn
@@ -13098,7 +13100,6 @@ class InstallHermesPluginTests(unittest.TestCase):
             out = install_hermes_plugin(plugins_dir=plugins, dry_run=True)
             self.assertEqual(out.status, "would_install")
             self.assertFalse((plugins / "puppetmaster-learn").exists())
-
 
 class PuppetmasterLearnPluginTests(unittest.TestCase):
     """Tests for the bundled plugin's pure helpers. The plugin is not importable
@@ -13218,7 +13219,6 @@ class PuppetmasterLearnPluginTests(unittest.TestCase):
         self.assertEqual(mod._goal_from_summary(""), "")
         self.assertEqual(mod._goal_from_summary("no goal here"), "")
 
-
 class HermesRegistryCredentialTests(unittest.TestCase):
     """Credential-aware filtering of the curated Hermes catalog.
 
@@ -13331,7 +13331,6 @@ class HermesRegistryCredentialTests(unittest.TestCase):
 
         _, report = merge_curated_into_registry("hermes", "api", [])
         self.assertEqual(report["skipped"], [])
-
 
 class InstallRulesTests(unittest.TestCase):
     """Tests for :mod:`puppetmaster.rules`.
@@ -13694,7 +13693,6 @@ class InstallRulesTests(unittest.TestCase):
             check = _agent_rules_check(cwd)
             self.assertEqual(check.status, "ok")
 
-
 class ModelBillingFieldTests(unittest.TestCase):
     def test_billing_defaults_to_unknown_and_validates(self) -> None:
         from puppetmaster.model_registry import ModelSpec
@@ -13743,7 +13741,6 @@ class ModelBillingFieldTests(unittest.TestCase):
         self.assertTrue(all(s.billing == "plan" for s in cursor_specs))
         openai_specs = [s for s in specs.values() if s.adapter == "openai"]
         self.assertTrue(all(s.billing == "api" for s in openai_specs))
-
 
 class BillingAwareRoutingTests(unittest.TestCase):
     def _mixed_registry(self):
@@ -13835,7 +13832,6 @@ class BillingAwareRoutingTests(unittest.TestCase):
         self.assertIn("api-mid", rejected)
         self.assertIn("api billing disabled", rejected["api-mid"])
 
-
 class MarginalCostRoutingTests(unittest.TestCase):
     def _plan_priced_registry(self):
         from puppetmaster.model_registry import ModelSpec
@@ -13892,7 +13888,6 @@ class MarginalCostRoutingTests(unittest.TestCase):
         self.assertEqual(payload["estimated_cost_usd"], 0.0)
         self.assertGreater(payload["nominal_cost_usd"], 0.0)
         self.assertIn("baseline_nominal_cost_usd", payload)
-
 
 class RegistryReconciliationTests(unittest.TestCase):
     def test_reconcile_upgrades_unknown_billing(self) -> None:
@@ -14048,7 +14043,6 @@ class RegistryReconciliationTests(unittest.TestCase):
         self.assertTrue(all(s.billing == "plan" for s in result.specs))
         self.assertEqual(len(result.dropped), 2)
 
-
 class BillingCacheTests(unittest.TestCase):
     def test_detect_adapter_billing_cached_respects_ttl(self) -> None:
         from puppetmaster.platform_billing import (
@@ -14113,7 +14107,6 @@ class BillingCacheTests(unittest.TestCase):
             detect_adapter_billing_cached("cursor", ttl_seconds=0)
             detect_adapter_billing_cached("cursor", ttl_seconds=0)
         self.assertEqual(calls, ["cursor", "cursor"])
-
 
 class AutoRoutingReconciliationTests(unittest.TestCase):
     def test_apply_auto_routing_reconciles_registry_and_audits_drops(self) -> None:
@@ -14207,7 +14200,6 @@ class AutoRoutingReconciliationTests(unittest.TestCase):
             self.assertEqual(len(routing), 1)
             rejected_ids = {entry["id"] for entry in routing[0].payload["rejected"]}
             self.assertIn("cursor/composer", rejected_ids)
-
 
 class PlatformBillingDetectionTests(unittest.TestCase):
     def test_cursor_billing_keyed_is_plan(self) -> None:
@@ -14556,7 +14548,6 @@ class PlatformBillingDetectionTests(unittest.TestCase):
         self.assertTrue(u.healthy)
         self.assertEqual(u.billing, "unknown")
 
-
 class CursorDiscoveryTests(unittest.TestCase):
     def _ok_run(self, models):
         import json as _json
@@ -14671,6 +14662,115 @@ class CursorDiscoveryTests(unittest.TestCase):
         self.assertEqual(spec.billing, "plan")
         self.assertIn("mythos-class", spec.tags)
 
+    def test_catalog_preserves_grok_identity_and_default_high_fast(self) -> None:
+        """Live SDK id is grok-4.5; High+Fast is params, not an expanded alias."""
+        from puppetmaster.cursor_discovery import catalog_to_specs, default_variant_params
+        from puppetmaster.model_registry import ModelSpec
+
+        catalog_item = {
+            "id": "grok-4.5",
+            "displayName": "Cursor Grok 4.5",
+            "parameters": [
+                {
+                    "id": "effort",
+                    "values": [
+                        {"value": "low"},
+                        {"value": "medium"},
+                        {"value": "high"},
+                    ],
+                },
+                {
+                    "id": "fast",
+                    "values": [{"value": "false"}, {"value": "true"}],
+                },
+            ],
+            "variants": [
+                {
+                    "params": [
+                        {"id": "effort", "value": "low"},
+                        {"id": "fast", "value": "false"},
+                    ],
+                    "displayName": "Cursor Grok 4.5",
+                },
+                {
+                    "params": [
+                        {"id": "effort", "value": "high"},
+                        {"id": "fast", "value": "true"},
+                    ],
+                    "displayName": "Cursor Grok 4.5",
+                    "isDefault": True,
+                },
+            ],
+        }
+        self.assertEqual(
+            default_variant_params(catalog_item),
+            [
+                {"id": "effort", "value": "high"},
+                {"id": "fast", "value": "true"},
+            ],
+        )
+
+        existing = [
+            ModelSpec(
+                id="cursor/grok-4-5",
+                adapter="cursor",
+                adapter_model_name="grok-4.5",
+                capability_score=97,
+                billing="plan",
+                tags=["cursor", "frontier", "workhorse"],
+                payload_defaults={"keep": "me"},
+            )
+        ]
+        specs = catalog_to_specs([catalog_item], existing)
+        self.assertEqual(len(specs), 1)
+        spec = specs[0]
+        self.assertEqual(spec.id, "cursor/grok-4-5")
+        self.assertEqual(spec.adapter_model_name, "grok-4.5")
+        self.assertNotIn("high-fast", spec.id)
+        self.assertNotIn("high-fast", spec.adapter_model_name)
+        self.assertEqual(
+            spec.payload_defaults["params"],
+            [
+                {"id": "effort", "value": "high"},
+                {"id": "fast", "value": "true"},
+            ],
+        )
+        self.assertEqual(spec.payload_defaults.get("keep"), "me")
+        self.assertIn("effort:high", spec.tags)
+        self.assertIn("param:fast", spec.tags)
+        self.assertIn("discovered", spec.tags)
+
+    def test_catalog_does_not_expand_variants_into_alias_rows(self) -> None:
+        from puppetmaster.cursor_discovery import catalog_to_specs
+
+        catalog = [
+            {
+                "id": "grok-4.5",
+                "displayName": "Cursor Grok 4.5",
+                "variants": [
+                    {
+                        "params": [
+                            {"id": "effort", "value": "high"},
+                            {"id": "fast", "value": "true"},
+                        ],
+                        "isDefault": True,
+                    },
+                    {
+                        "params": [
+                            {"id": "effort", "value": "low"},
+                            {"id": "fast", "value": "false"},
+                        ],
+                    },
+                ],
+            }
+        ]
+        specs = catalog_to_specs(catalog, [])
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0].adapter_model_name, "grok-4.5")
+        self.assertEqual(specs[0].id, "cursor/grok-4-5")
+        ids = {s.id for s in specs} | {s.adapter_model_name for s in specs}
+        self.assertFalse(any("high-fast" in value for value in ids))
+
     def test_merge_preserves_stale_by_default_and_prunes_explicitly(self) -> None:
         from puppetmaster.cursor_discovery import merge_catalog_into_registry
         from puppetmaster.model_registry import ModelSpec
@@ -14740,7 +14840,6 @@ class CursorDiscoveryTests(unittest.TestCase):
         with self.assertRaises(CursorDiscoveryError) as ctx:
             fetch_cursor_catalog(env={"CURSOR_API_KEY": "k"}, run=broken_node)
         self.assertIn("libuv", str(ctx.exception).lower())
-
 
 class CursorModelPinTests(unittest.TestCase):
     def _grok_registry(self):
@@ -14854,7 +14953,6 @@ class CursorModelPinTests(unittest.TestCase):
                     self.assertEqual(payload["model"], "grok-4.5", msg=raw)
                     self.assertEqual(payload["pinned_model"], "cursor/grok-4-5", msg=raw)
                     self.assertNotIn("auto_route", payload)
-
 
 class PreflightTests(unittest.TestCase):
     def test_ready_for_plan_billed_adapter(self) -> None:
@@ -15182,7 +15280,6 @@ class PreflightTests(unittest.TestCase):
             self.assertFalse(result.ok)
             self.assertIn("absent from the recent openai catalog", result.reason)
 
-
 class AdapterCliPresenceTests(unittest.TestCase):
     """`adapter_cli_present` closes the gap billing detection can't see: an
     adapter that reads billing-healthy off a stale auth file but whose CLI
@@ -15234,7 +15331,6 @@ class AdapterCliPresenceTests(unittest.TestCase):
             adapter_cli_executable("codex", env={"CODEX_COMMAND": "codex-next"}),
             "codex-next",
         )
-
 
 class BedrockModelResolutionTests(unittest.TestCase):
     """Claude Code on Bedrock rejects short Cursor-style model names; resolution
@@ -15315,7 +15411,6 @@ class BedrockModelResolutionTests(unittest.TestCase):
             self.assertIsNotNone(note)
             self.assertIn("ANTHROPIC_MODEL", note)
             self.assertIn("Bedrock", note)
-
 
 class BedrockProviderTests(unittest.TestCase):
     """First-class agentic ``provider=bedrock`` (stdlib Converse; no live AWS)."""
@@ -15698,7 +15793,6 @@ class BedrockProviderTests(unittest.TestCase):
         self.assertEqual(turn.usage["cache_write_tokens"], 0)
         self.assertEqual(turn.usage["completion_tokens"], 4)
 
-
 class StitcherAlertTests(unittest.TestCase):
     def _verification(self, *, failure=None, result="passed"):
         from puppetmaster.models import Artifact, ArtifactType
@@ -15735,7 +15829,6 @@ class StitcherAlertTests(unittest.TestCase):
             "T", "goal", [self._verification(result="passed")], []
         )
         self.assertNotIn("## Alerts", summary)
-
 
 class StitcherMemoryPromotionGateTests(unittest.TestCase):
     def _artifact(
@@ -15823,7 +15916,6 @@ class StitcherMemoryPromotionGateTests(unittest.TestCase):
             payload={"check": long_check, "result": "passed"},
         )
         self.assertEqual(self._promoted_statements([artifact]), [])
-
 
 class DashboardTests(unittest.TestCase):
     def _seed_store(self, tmp):
@@ -16278,7 +16370,6 @@ console.log("renderer-ok");
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("renderer-ok", completed.stdout)
 
-
 class EnsurePlanCatalogTests(unittest.TestCase):
     """First-run guarantee: auto-routed work always has a plan-billed frontier
     to land on, so it never falls off to a per-token / depleted account."""
@@ -16410,7 +16501,6 @@ class EnsurePlanCatalogTests(unittest.TestCase):
             self.assertEqual(report["action"], "unavailable")
             self.assertIn("offline", report["error"])
 
-
 class AwaitJobTests(unittest.TestCase):
     def test_await_returns_when_already_terminal(self) -> None:
         from puppetmaster.cli import await_job_state
@@ -16438,7 +16528,6 @@ class AwaitJobTests(unittest.TestCase):
             state = await_job_state(store, job.id, timeout_seconds=0.3, poll_interval_seconds=0.05)
             self.assertFalse(state["terminal"])
             self.assertTrue(state["timed_out"])
-
 
 class PreflightDispatchGateTests(unittest.TestCase):
     def _task(self, adapter="cursor", payload=None):
@@ -16543,7 +16632,6 @@ class PreflightDispatchGateTests(unittest.TestCase):
         self.assertEqual(run.status, TaskStatus.COMPLETE)
         self.assertIs(artifacts, sentinel)
 
-
 class TelemetryTests(unittest.TestCase):
     def test_disabled_by_default(self) -> None:
         from puppetmaster.telemetry import telemetry_enabled
@@ -16609,7 +16697,6 @@ class TelemetryTests(unittest.TestCase):
         # attributes render without the OTel SDK.
         self.assertIn("puppetmaster.job.id", trace.attributes())
         self.assertIn("gen_ai.system", spans[t_ok.id].attributes())
-
 
 class WorkerRuntimeFailureStatusTests(unittest.TestCase):
     """The fix for the defect: a recoverable adapter failure (or a preflight
@@ -16779,7 +16866,6 @@ class WorkerRuntimeFailureStatusTests(unittest.TestCase):
                                  adapter="agentic", status=TaskStatus.FAILED))
             orch = Orchestrator(store)
             self.assertEqual(orch._final_job_status(job), JobStatus.COMPLETE)
-
 
 class AutoFallbackTests(unittest.TestCase):
     def _setup(self, tmp):
@@ -17286,7 +17372,6 @@ class AutoFallbackTests(unittest.TestCase):
             self.assertFalse(orch._has_hard_failure(job, allowed))
             self.assertFalse(orch._should_fail_closed(job, allowed))
 
-
 class CommandProbeResolutionTests(unittest.TestCase):
     """`_resolve_probe_command` must launch Windows .cmd shims correctly.
 
@@ -17329,7 +17414,6 @@ class CommandProbeResolutionTests(unittest.TestCase):
 
         with patch("puppetmaster.diagnostics.shutil.which", return_value=None):
             self.assertIsNone(_resolve_probe_command(["npm", "--version"]))
-
 
 class LiveProbeTests(unittest.TestCase):
     def test_classify_billing_and_auth_and_ok(self) -> None:
@@ -17512,7 +17596,6 @@ class LiveProbeTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(sent_params, ["max_completion_tokens", "max_tokens"])
 
-
 class SubscriptionPlanCatalogTests(unittest.TestCase):
     """Curated catalogs + first-run auto-merge for the CLI agent loops
     (Claude Code OAuth, Codex/ChatGPT) that can't self-enumerate models."""
@@ -17661,7 +17744,6 @@ class SubscriptionPlanCatalogTests(unittest.TestCase):
             self.assertEqual(report["action"], "unavailable")
             self.assertIn("billing probe crashed", report["error"])
 
-
 class ApiDiscoveryTests(unittest.TestCase):
     def test_fetch_openai_models_parses_data(self) -> None:
         import json as _json
@@ -17707,7 +17789,6 @@ class ApiDiscoveryTests(unittest.TestCase):
         self.assertIn(("openai", "gpt-5.5"), names)  # added
         self.assertIn(("cursor", "composer-2.5"), names)  # preserved
         self.assertIn("gpt-5.5", report["added"])
-
 
 class CatalogStalenessTests(unittest.TestCase):
     def test_write_read_and_staleness(self) -> None:
@@ -17860,7 +17941,6 @@ class CatalogStalenessTests(unittest.TestCase):
                 "match",
             )
 
-
 class TelemetryContextAndMetricsTests(unittest.TestCase):
     def test_traceparent_roundtrip(self) -> None:
         import re
@@ -17919,7 +17999,6 @@ class TelemetryContextAndMetricsTests(unittest.TestCase):
         self.assertFalse(
             record_job_trace(Job(goal="g"), [], [], env={}, traceparent="00-" + "a" * 32 + "-" + "b" * 16 + "-01")
         )
-
 
 class PlatformLockTests(unittest.TestCase):
     """The platform lock restricts which adapters Puppetmaster may use,
@@ -18178,7 +18257,6 @@ class PlatformLockTests(unittest.TestCase):
         self.assertEqual(result, {"ok": True})
         spawn.assert_called_once()
 
-
 class AutoEscalationTests(unittest.TestCase):
     """Confidence-based mid-run escalation: a COMPLETE task whose verification
     confidence is below threshold gets re-dispatched one capability tier up."""
@@ -18328,7 +18406,6 @@ class AutoEscalationTests(unittest.TestCase):
                 evidence=["e"], created_at="2026-01-02T00:00:00Z",
             ))
             self.assertEqual(orch._latest_verification_confidence(job, "task_x"), 0.85)
-
 
 class RoutingAuditTests(unittest.TestCase):
     """The read-only self-audit recommender: aggregation + conservative
@@ -18660,7 +18737,6 @@ class RoutingAuditTests(unittest.TestCase):
             self.assertLess(after["weak/55"], 55)  # lowered
             self.assertEqual(after["strong/80"], 80)  # untouched
 
-
 class CodegraphUsageTests(unittest.TestCase):
     """The local, numbers-only codegraph usage log + its aggregation."""
 
@@ -18721,7 +18797,6 @@ class CodegraphUsageTests(unittest.TestCase):
                             latency_ms=1.0, ok=True)
             self.assertEqual(cu.load_usage(), [])
 
-
 class ReadsLogTests(unittest.TestCase):
     """The $0 follow-up reads counter — user-facing result reads only."""
 
@@ -18768,7 +18843,6 @@ class ReadsLogTests(unittest.TestCase):
             rl.record_read("show", caller="cli")
             self.assertEqual(rl.load_reads(), [])
 
-
 class MemoryCostLogTests(unittest.TestCase):
     """Promoted-memory injection overhead accounting."""
 
@@ -18807,7 +18881,6 @@ class MemoryCostLogTests(unittest.TestCase):
             rendered = out.getvalue()
             self.assertIn("Memory injection overhead (spend, not savings)", rendered)
             self.assertIn("injection(s)", rendered)
-
 
 class EnsureCursorSdkTests(unittest.TestCase):
     """Bootstrap @cursor/sdk for pip/pipx installs (wheels can't ship node_modules)."""
@@ -18883,7 +18956,6 @@ class EnsureCursorSdkTests(unittest.TestCase):
         self.assertTrue(status.healthy)
         self.assertNotIn("SDK authenticated", status.detail)
         self.assertIn("CURSOR_API_KEY is set", status.detail)
-
 
 class SetupPlatformStepTests(unittest.TestCase):
     """The `setup` wizard's platform-lock step (non-interactive paths)."""
@@ -18975,7 +19047,8 @@ class SetupPlatformStepTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             self._isolated(tmp)
             detected = {"cursor": False, "claude-code": True, "codex": True, "openai": False, "hermes": False}
-            with patch("puppetmaster.cli._detected_platforms", return_value=detected):
+            with patch("puppetmaster.cli._detected_platforms", return_value=detected), \
+                    patch("sys.stdin.isatty", return_value=False):
                 rc = _setup_platform_step(self._args())
             self.assertEqual(rc, 1)
             self.assertFalse(pl.is_configured())
@@ -18989,7 +19062,8 @@ class SetupPlatformStepTests(unittest.TestCase):
             self._isolated(tmp)
             pl.set_enabled({"cursor"})
             detected = {"cursor": False, "claude-code": True, "codex": False, "openai": False, "hermes": False}
-            with patch("puppetmaster.cli._detected_platforms", return_value=detected):
+            with patch("puppetmaster.cli._detected_platforms", return_value=detected), \
+                    patch("sys.stdin.isatty", return_value=False):
                 rc = _setup_platform_step(self._args())
             self.assertEqual(rc, 0)
             self.assertEqual(pl.enabled_adapters(), {"cursor"})
@@ -19002,7 +19076,8 @@ class SetupPlatformStepTests(unittest.TestCase):
             self._isolated(tmp)
             detected = {a: False for a in pl.KNOWN_ADAPTERS}
             buf = io.StringIO()
-            with patch("puppetmaster.cli._detected_platforms", return_value=detected):
+            with patch("puppetmaster.cli._detected_platforms", return_value=detected), \
+                    patch("sys.stdin.isatty", return_value=False):
                 with contextlib.redirect_stdout(buf):
                     rc = _setup_platform_step(self._args())
             self.assertEqual(rc, 1)
@@ -19081,7 +19156,6 @@ class SetupPlatformStepTests(unittest.TestCase):
             self.assertIn("not detected on this machine", output)
             self.assertIn("enabled anyway (explicit --platforms)", output)
 
-
 class RoutingBaselineSnapshotTests(unittest.TestCase):
     """The router stamps a decision-time savings baseline onto every decision."""
 
@@ -19159,7 +19233,6 @@ class RoutingBaselineSnapshotTests(unittest.TestCase):
         # baseline must be the plan model, and savings must be zero (no overclaim).
         self.assertEqual(p["baseline_model_id"], "plan/only")
         self.assertEqual(p["baseline_cost_usd"], 0.0)
-
 
 class SavingsLedgerTests(unittest.TestCase):
     """Policy-aware savings aggregation with the two honesty rules."""
@@ -19364,7 +19437,6 @@ class SavingsLedgerTests(unittest.TestCase):
                     confidence=0.9, evidence=["r"]))
             records, _, _ = collect_routing_records([store])
             self.assertEqual(len(records), 1)
-
 
 class PuppetmasterFrictionFixTests(unittest.TestCase):
     """Coverage for the JAD-migration friction-log fixes (stalled reaper, mode
@@ -20205,7 +20277,6 @@ class PuppetmasterFrictionFixTests(unittest.TestCase):
             self.assertTrue(result["isError"])
             self.assertEqual(payload["status"], "stalled")
 
-
 class PuppetmasterLoudFailureTests(unittest.TestCase):
     """Tier-1 reliability: a run that did zero work must never look like success.
 
@@ -20498,7 +20569,6 @@ class PuppetmasterLoudFailureTests(unittest.TestCase):
                     orch._wait_for_worker(WedgedProc(), job, [task])
             events = [e["event"] for e in store.read_events(job.id)]
             self.assertIn("worker.timed_out", events)
-
 
 class PuppetmasterGateTests(unittest.TestCase):
     """Non-bypassable completion gates (#2 commit, #11 drift ratchet)."""
@@ -20825,7 +20895,6 @@ class PuppetmasterGateTests(unittest.TestCase):
             verdict = assess_run_quality(evald.artifacts)
             self.assertEqual(verdict["quality"], "blocked")
             self.assertFalse(verdict["trustworthy"])
-
 
 class ReviewGateTests(unittest.TestCase):
     """The ``review`` gate: a strictly-stronger model judges the diff before a
@@ -21367,7 +21436,6 @@ class ReviewGateTests(unittest.TestCase):
                 [s["kind"] for s in task_gate_specs(self._task(mode="implement", review=True))],
             )
 
-
 class ReviewEscalationTests(unittest.TestCase):
     """Objective escalation: a task a review gate rejected is re-routed one
     capability tier up (vs. the self-reported-confidence escalation)."""
@@ -21492,7 +21560,6 @@ class ReviewEscalationTests(unittest.TestCase):
             )
             self.assertTrue(orch._should_fail_closed(job, {task.id}))
 
-
 class PuppetmasterSalvageAndLivenessTests(unittest.TestCase):
     """#3 salvage structured content from raw stdout; #9 loud liveness."""
 
@@ -21578,7 +21645,6 @@ class PuppetmasterSalvageAndLivenessTests(unittest.TestCase):
             summary = liveness_summary(store, store.get_job(job.id))
             self.assertFalse(summary["pid_alive"])
             self.assertIn("dead", summary["verdict"])
-
 
 class PuppetmasterLifecycleTests(unittest.TestCase):
     """Durable-state GC (#8) and effort rollup (#7)."""
@@ -21734,7 +21800,6 @@ class PuppetmasterLifecycleTests(unittest.TestCase):
             self.assertEqual(everything["jobs"], 2)
             self.assertIn("EFF", everything["efforts_seen"])
 
-
 class PuppetmasterUsageTests(unittest.TestCase):
     """Token-consumption capture & rollup (#5 metering, #6 estimate labeling)."""
 
@@ -21839,7 +21904,6 @@ class PuppetmasterUsageTests(unittest.TestCase):
         self.assertEqual(roll["estimated_tokens_in"], 20)
         self.assertEqual(roll["total_tokens"], 999 + 999 + 20 + 10)
 
-
 class PuppetmasterGateReplayCliTests(unittest.TestCase):
     """`puppetmaster gate` replays the runtime's completion gates outside a
     worker run, so a parent agent or CI can enforce the same post-conditions."""
@@ -21925,7 +21989,6 @@ class PuppetmasterGateReplayCliTests(unittest.TestCase):
             store = self._store(tmp)
             repo = self._git_repo(Path(tmp))
             self.assertEqual(_run_gate_command(self._args(store, repo), store), 2)
-
 
 class PuppetmasterMcpVerbTests(unittest.TestCase):
     """gc / rollup / gate are first-class MCP verbs that shell to the CLI."""
@@ -22128,7 +22191,6 @@ class PuppetmasterMcpVerbTests(unittest.TestCase):
         from puppetmaster.rules import RULE_BODY
 
         self.assertIn("puppetmaster_dashboard", RULE_BODY)
-
 
 class InvocationGateTests(unittest.TestCase):
     """Tests for the classifier-gated auto-invocation decision."""
@@ -22357,7 +22419,6 @@ class InvocationGateTests(unittest.TestCase):
         self.assertIn("puppetmaster_edit", directive)
         self.assertIn("uncommitted", directive.lower())
         self.assertNotIn("fan it out to a swarm", directive)
-
 
 class HookRunnerTests(unittest.TestCase):
     """Tests for host hook payload → response translation."""
@@ -22623,7 +22684,6 @@ class HookRunnerTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(stdout.getvalue())["permission"], "allow")
 
-
 class ProviderProxyTests(unittest.TestCase):
     """Tests for the OpenAI-compatible enforcement proxy (pure logic)."""
 
@@ -22672,7 +22732,6 @@ class ProviderProxyTests(unittest.TestCase):
         resp = build_advice_response(decision)
         self.assertEqual(resp["object"], "chat.completion")
         self.assertIn("Puppetmaster", resp["choices"][0]["message"]["content"])
-
 
 class HookInstallerTests(unittest.TestCase):
     """Tests for the deterministic hook installer (idempotent + non-destructive)."""
@@ -22832,7 +22891,6 @@ class HookInstallerTests(unittest.TestCase):
             command.startswith("/usr/local/bin/python3 -m puppetmaster invocation-gate")
         )
 
-
 class HermesHookInstallerTests(unittest.TestCase):
     """Tests for the Hermes YAML hooks installer (idempotent + non-destructive)."""
 
@@ -22949,7 +23007,6 @@ class HermesHookInstallerTests(unittest.TestCase):
             self.assertEqual(outcome.status, "would_install")
             self.assertFalse(target.exists())
 
-
 class HostGatedIdleReapTests(unittest.TestCase):
     """Idle reaping only fires on hosts that transparently respawn (Cursor).
 
@@ -23064,7 +23121,6 @@ class HostGatedIdleReapTests(unittest.TestCase):
             del os.environ["PUPPETMASTER_MCP_INPUT_STALE_FORCED"]
         self.assertFalse(_input_staleness_forced())
 
-
 class WorktreePreflightTests(unittest.TestCase):
     """Full-edit MCP verbs refuse non-git cwds at the verb, not after spawn."""
 
@@ -23103,7 +23159,6 @@ class WorktreePreflightTests(unittest.TestCase):
                 {"sandbox": "read-only", "dangerously_bypass_approvals_and_sandbox": True}
             )
         )
-
 
 class InvocationGateCliTests(unittest.TestCase):
     """The should-delegate / install-hooks CLI surface."""
@@ -23152,7 +23207,6 @@ class InvocationGateCliTests(unittest.TestCase):
                 self.assertFalse((Path(proj) / ".claude" / "settings.json").exists())
             finally:
                 os.chdir(cwd)
-
 
 class SetupHooksStepTests(unittest.TestCase):
     """The `setup` wizard installs auto-invocation hooks as step 7."""
@@ -23306,7 +23360,6 @@ class SetupHooksStepTests(unittest.TestCase):
                 self.assertEqual(captured["hermes_hooks"], 0)
             finally:
                 os.chdir(cwd0)
-
 
 class UninstallTests(unittest.TestCase):
     """Tests for ``puppetmaster uninstall`` and its removal helpers."""
@@ -23480,7 +23533,6 @@ class UninstallTests(unittest.TestCase):
             self.assertEqual((cwd / "AGENTS.md").read_text("utf-8"), agents_before)
             self.assertEqual(target.read_text("utf-8"), mcp_before)
             self.assertTrue((cwd / ".cursor" / "rules" / "puppetmaster.mdc").is_file())
-
 
 class AuditFixTests(unittest.TestCase):
     def _concurrent_claim_race(
@@ -24147,7 +24199,6 @@ class AuditFixTests(unittest.TestCase):
             self.assertIsNone(second)
             self.assertEqual(store.get_task_by_id(task.id).lease_owner, "worker-a")
 
-
 class SecurityHardeningTests(unittest.TestCase):
     """Privacy/security defaults from the cross-cutting hardening pass."""
 
@@ -24339,7 +24390,6 @@ class SecurityHardeningTests(unittest.TestCase):
             state_dir = ensure_state_dir(Path(tmp) / "nested" / "state")
             mode = state_dir.stat().st_mode & 0o777
             self.assertEqual(mode, 0o700)
-
 
 class CodegraphFreshnessTests(unittest.TestCase):
     """Index-freshness detection, surfacing, and background self-heal."""
@@ -24552,7 +24602,6 @@ class CodegraphFreshnessTests(unittest.TestCase):
         self.assertEqual(check.status, "warn")
         self.assertIn("STALE", check.detail)
 
-
 class JsonPrefixDecodeTests(unittest.TestCase):
     """Trailing-brace trailers must not falsely degrade a good analyze run.
 
@@ -24729,7 +24778,6 @@ class JsonPrefixDecodeTests(unittest.TestCase):
         artifacts = cursor_result_artifacts(task, "worker-cursor", None)
         self.assertEqual(artifacts, [])
 
-
 class AdapterProvenanceTests(unittest.TestCase):
     """Artifacts must record which adapter actually produced them.
 
@@ -24802,7 +24850,6 @@ class AdapterProvenanceTests(unittest.TestCase):
         )
         self.assertNotIn("Cursor", artifact.payload["why"])
 
-
 class DirtyWorktreePathsNoteTests(unittest.TestCase):
     """The clean-tree block should name the offending paths, not just say 'dirty'."""
 
@@ -24854,7 +24901,6 @@ class DirtyWorktreePathsNoteTests(unittest.TestCase):
         self.assertEqual(artifacts[0].payload["failure"], "dirty_worktree")
         self.assertIn("a.py (modified)", msg)
         self.assertIn("junk/__pycache__/x.pyc (untracked)", msg)
-
 
 class McpServerCodeStalenessTests(unittest.TestCase):
     """A long-lived MCP server on pre-upgrade code must be detectable."""
@@ -24914,7 +24960,6 @@ class McpServerCodeStalenessTests(unittest.TestCase):
         text = json.dumps(resp)
         self.assertIn("pre-upgrade code", text)
 
-
 class ArtifactContractGroundingTests(unittest.TestCase):
     """Analyze contracts must anchor on the repo, not the prompt scaffolding.
 
@@ -24961,7 +25006,6 @@ class ArtifactContractGroundingTests(unittest.TestCase):
         self.assertIn("repository's code", redteam.instruction)
         self.assertIn("never treat your own instructions", redteam.instruction)
         self.assertIn("empty result", redteam.instruction)
-
 
 class RepoFileCensusTests(unittest.TestCase):
     """A worker must not be able to hallucinate an empty repo at conf 1.00.
@@ -25065,7 +25109,6 @@ class RepoFileCensusTests(unittest.TestCase):
                 adapters.HermesAdapter()._run_analyze(task, "goal", "w")
         self.assertTrue(seen.get("called"))
 
-
 class HermesAnalyzeRetryTests(unittest.TestCase):
     """A clean Hermes analyze run that returns prose the parser can't structure
     (the minimal-effort flicker) gets one stricter JSON-only reprompt before it
@@ -25151,7 +25194,6 @@ class HermesAnalyzeRetryTests(unittest.TestCase):
         # Hermes is a CLI with no SDK usage object -> honestly flagged estimate.
         self.assertTrue(verification.payload["tokens_estimated"])
         self.assertGreater(verification.payload["tokens_out"], 0)
-
 
 class StitcherDedupTests(unittest.TestCase):
     """N workers finding the same thing collapses to one bullet, not N near-dupes.
@@ -25280,7 +25322,6 @@ class StitcherDedupTests(unittest.TestCase):
             )
         )
 
-
 class McpServerUpdateNudgeTests(unittest.TestCase):
     """A long-lived stdio MCP server can't hot-reload; surface newer on-disk
     code as a one-line nudge in every tool response instead of a silent gap."""
@@ -25355,7 +25396,6 @@ class McpServerUpdateNudgeTests(unittest.TestCase):
         ):
             result = self.mcp.call_tool("x", {})
         self.assertNotIn("server_update_available", result)
-
 
 class PypiUpdateCheckTests(unittest.TestCase):
     """Opt-in PyPI update awareness: informational only, never auto-installs."""
@@ -25487,7 +25527,6 @@ class PypiUpdateCheckTests(unittest.TestCase):
         self.assertIn("pypi_update_available", result)
         self.assertIn("v9.0.0", result["pypi_update_available"])
 
-
 class SelfUpdateCommandTests(unittest.TestCase):
     def test_dry_run_prints_pip_command_without_invoking_pip(self) -> None:
         from puppetmaster.cli import _run_self_update
@@ -25503,7 +25542,6 @@ class SelfUpdateCommandTests(unittest.TestCase):
         printed.assert_called_once_with(
             "/usr/bin/python3 -m pip install -U puppetmaster-ai"
         )
-
 
 class HermesToolSessionPruneTests(unittest.TestCase):
     """Puppetmaster prunes throwaway Hermes worker sessions (--source tool) after
@@ -25594,7 +25632,6 @@ class HermesToolSessionPruneTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 HermesAdapter().run(task, "goal", "worker")
         prune.assert_called_once()
-
 
 class JobLabelTests(unittest.TestCase):
     def test_label_round_trips_through_create_job_and_get_job(self) -> None:
@@ -25688,7 +25725,6 @@ class JobLabelTests(unittest.TestCase):
             snap = build_job_snapshot(store, job.id)
             self.assertEqual(snap["job"]["label"], "flaky test audit")
             self.assertEqual(snap["job"]["title"], "for flaky tests")
-
 
 class CursorDecouplingTests(unittest.TestCase):
     """Standalone install / doctor / discover paths must not assume Cursor.
@@ -25902,7 +25938,6 @@ class CursorDecouplingTests(unittest.TestCase):
             self.assertEqual(meta["cursor"]["mode"], "probe")
             self.assertEqual(meta["cursor"]["pending_diff"]["added"], ["new"])
 
-
 class NPlusOneRegressionTests(unittest.TestCase):
     """Guards for the N+1 / repeated-scan patterns the data-layer audit found."""
 
@@ -26014,7 +26049,6 @@ class NPlusOneRegressionTests(unittest.TestCase):
                 store, "read_events", side_effect=AssertionError("read_events called")
             ):
                 self.assertGreaterEqual(orch._job_progress_cursor(job.id), after)
-
 
 class OutputStyleTests(unittest.TestCase):
     def test_normalize_accepts_valid_and_rejects_junk(self) -> None:
@@ -26213,7 +26247,6 @@ class OutputStyleTests(unittest.TestCase):
             self.assertTrue(out[0].instruction.startswith("House style: short sentences."))
             self.assertIn("OUTPUT STYLE (terse)", out[1].instruction)
 
-
 class KeysWizardTests(unittest.TestCase):
     """`puppetmaster keys` — writes provider keys into an MCP config env block."""
 
@@ -26356,7 +26389,6 @@ class KeysWizardTests(unittest.TestCase):
             self.assertIn("OpenAI", text)
             self.assertIn("Anthropic", text)
 
-
 class DashboardMobileTests(unittest.TestCase):
     """`dashboard --mobile` host resolution + the responsive CSS pass."""
 
@@ -26461,7 +26493,6 @@ class DashboardMobileTests(unittest.TestCase):
             "os.path.exists", side_effect=lambda p: p == bundle
         ), patch("os.access", return_value=True):
             self.assertEqual(dash._tailscale_binary(), bundle)
-
 
 class DashboardPhaseStripTests(unittest.TestCase):
     """The job-detail PhaseStrip: server-side phase derivation + inlined markup."""
@@ -26579,7 +26610,6 @@ class DashboardPhaseStripTests(unittest.TestCase):
         self.assertIn("function phaseStrip(", dash.INDEX_HTML)
         self.assertIn("phaseStrip(d.phase)", dash.INDEX_HTML)
 
-
 class EvaluatorRegistryTests(unittest.TestCase):
     def test_missing_registry_returns_empty(self) -> None:
         from puppetmaster.evaluators import load_registry
@@ -26656,7 +26686,6 @@ class EvaluatorRegistryTests(unittest.TestCase):
                 fh.write("{not json")
             with self.assertRaises(ValueError):
                 load_registry(tmp)
-
 
 class EvaluatorEpochTests(unittest.TestCase):
     def _seed_registry(self, state_dir: str) -> None:
@@ -26807,7 +26836,6 @@ class EvaluatorEpochTests(unittest.TestCase):
         self.assertEqual(stamped[0].payload.get("evaluator_slot"), "test-verifier")
         self.assertEqual(stamped[0].payload.get("evaluator_version"), 1)
 
-
 class EvaluatorAnchorPromotionTests(unittest.TestCase):
     def _seed_registry(self, state_dir: str) -> None:
         import shutil
@@ -26863,7 +26891,6 @@ class EvaluatorAnchorPromotionTests(unittest.TestCase):
                     anchor_path=str(anchor),
                     min_pass_rate=1.1,
                 )
-
 
 class EvaluatorVerificationStampTests(unittest.TestCase):
     def test_verification_artifact_includes_evaluator_fields(self) -> None:
@@ -26931,7 +26958,6 @@ class EvaluatorVerificationStampTests(unittest.TestCase):
             self.assertEqual(payload.get("evaluator_slot"), "test-verifier")
             self.assertEqual(payload.get("evaluator_version"), 1)
 
-
 class JobStatusToleranceTests(unittest.TestCase):
     """A persisted status this build doesn't know must never poison every
     list_jobs() reader into an exception/empty feed (that is exactly how the
@@ -26995,7 +27021,6 @@ class JobStatusToleranceTests(unittest.TestCase):
             state = await_job_state(store, job.id, timeout_seconds=1)
             self.assertTrue(state["terminal"])
             self.assertEqual(state["status"], "cancelled")
-
 
 class EvaluatorDraftStoreTests(unittest.TestCase):
     def test_record_and_load_round_trip(self) -> None:
@@ -27125,7 +27150,6 @@ class EvaluatorDraftStoreTests(unittest.TestCase):
             )
             self.assertEqual(clear_drafts(tmp, "s"), 2)
             self.assertEqual(load_drafts(tmp, "s"), [])
-
 
 class EvaluatorDraftsCliTests(unittest.TestCase):
     def _seed_registry(self, state_dir: str) -> None:
@@ -27301,7 +27325,6 @@ class EvaluatorDraftsCliTests(unittest.TestCase):
             self.assertEqual(rc, 1)
             self.assertEqual(len(load_drafts(state_dir, "test-verifier")), 1)
 
-
 class EvaluatorEpochSurfacingTests(unittest.TestCase):
     def _save_epoch_artifact(self, store, job) -> None:
         from puppetmaster.models import Artifact, ArtifactType
@@ -27389,7 +27412,6 @@ class EvaluatorEpochSurfacingTests(unittest.TestCase):
                 rc = cli_main(["--state-dir", state_dir, "evaluators", "epoch", "missing-job"])
             self.assertEqual(rc, 0)
             self.assertIn("No evaluator epoch recorded.", buf.getvalue())
-
 
 class MemoryCliTests(unittest.TestCase):
     def _seed_memory(self, state_dir: str) -> None:
@@ -27493,7 +27515,6 @@ class MemoryCliTests(unittest.TestCase):
             self.assertIn("Pruned 1 memory record(s).", buf.getvalue())
             self.assertEqual(store.list_memory(), [])
 
-
 class WinConsoleTests(unittest.TestCase):
     """The Windows hidden-console default must cover every subprocess site
     without clobbering deliberate console choices."""
@@ -27550,7 +27571,6 @@ class WinConsoleTests(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0)
         self.assertIn("ok", proc.stdout)
-
 
 if __name__ == "__main__":
     unittest.main()

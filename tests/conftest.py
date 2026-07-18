@@ -9,14 +9,8 @@ want for users, but it means a developer who has run
 tests start invoking the real ``claude-code`` / ``cursor`` adapters
 during ``pytest`` — tests must be hermetic.
 
-This conftest forces the registry path to a nonexistent temp file
-and enables every platform for the duration of the suite. ``load_registry``
-returns ``[]`` for a missing file, and ``_apply_auto_routing`` is a clean
-no-op when the registry is empty (one ``router.registry_empty`` event, then
-the original spec passes through unchanged). Net effect: tests run
-identically on every machine regardless of the developer's home directory
-state or personal platform lock.
-
+Isolation lives in :mod:`hermetic_env` so the same pins apply under
+``python -m unittest discover`` (which does not load this conftest).
 Individual tests that exercise the router directly (e.g. the cost +
 auto-route end-to-end test) still write their own registry into a
 ``TemporaryDirectory`` and pass ``payload.registry_path`` explicitly,
@@ -25,41 +19,31 @@ so this fixture does not interfere with them.
 from __future__ import annotations
 
 import os
-import shutil
-import tempfile
-from pathlib import Path
+import sys
 
-from puppetmaster.platform_lock import KNOWN_ADAPTERS, ONLY_ENV
+_HERMETIC_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HERMETIC_DIR not in sys.path:
+    sys.path.insert(0, _HERMETIC_DIR)
 
-
-_ENV_BEFORE: dict[str, str | None] = {}
-_ISOLATION_TMP: str | None = None
+import hermetic_env
 
 
 def pytest_configure(config):
     """Force routing/platform tests away from the developer's real config."""
-    global _ISOLATION_TMP
-    _ISOLATION_TMP = tempfile.mkdtemp(prefix="pm-test-empty-")
-    sentinel = Path(_ISOLATION_TMP) / "models-does-not-exist.json"
-    _ENV_BEFORE["PUPPETMASTER_MODELS_PATH"] = os.environ.get("PUPPETMASTER_MODELS_PATH")
-    _ENV_BEFORE[ONLY_ENV] = os.environ.get(ONLY_ENV)
-    os.environ["PUPPETMASTER_MODELS_PATH"] = str(sentinel)
-    os.environ[ONLY_ENV] = ",".join(KNOWN_ADAPTERS)
-    # A developer who has run `puppetmaster repair-codegraph` carries pinned
-    # Node/JS overrides in their environment. Those pins short-circuit
-    # resolve_codegraph_invocation() and disable auto-heal, flipping a dozen
-    # codegraph tests on that machine only. Strip them for the suite; tests
-    # that exercise the pin behavior set the vars themselves via patch.dict.
-    for _pin in ("PUPPETMASTER_CODEGRAPH_NODE", "PUPPETMASTER_CODEGRAPH_JS"):
-        _ENV_BEFORE[_pin] = os.environ.get(_pin)
-        os.environ.pop(_pin, None)
+    # register_atexit=False: pytest_unconfigure restores explicitly.
+    hermetic_env.apply_hermetic_isolation(register_atexit=False)
 
 
 def pytest_unconfigure(config):
-    for key, value in _ENV_BEFORE.items():
-        if value is None:
-            os.environ.pop(key, None)
-        else:
-            os.environ[key] = value
-    if _ISOLATION_TMP is not None:
-        shutil.rmtree(_ISOLATION_TMP, ignore_errors=True)
+    hermetic_env.restore_hermetic_isolation()
+
+
+def pytest_runtest_setup(item):
+    """Keep process-local caches/breakers from leaking across tests."""
+    from puppetmaster.codegraph import reset_cursor_codegraph_invocation_cache
+    from puppetmaster.platform_billing import clear_billing_cache
+    from puppetmaster.provider_circuit import reset_provider_circuit_breaker
+
+    reset_provider_circuit_breaker()
+    clear_billing_cache()
+    reset_cursor_codegraph_invocation_cache()

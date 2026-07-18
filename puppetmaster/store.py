@@ -1159,10 +1159,18 @@ class SwarmStore:
         self.write_json(self.job_dir(run.job_id) / "runs" / f"{run.id}.json", run)
         self.emit(run.job_id, "run.saved", {"run_id": run.id, "role": run.role})
 
+    def _prepare_artifact_for_save(self, artifact: Artifact) -> Artifact:
+        """Bound oversized payloads, validate schema, then stamp content hash."""
+        from puppetmaster.artifact_bounds import prepare_artifact_for_persist
+
+        prepared = prepare_artifact_for_persist(artifact, state_dir=self.root)
+        prepared.validate()
+        if prepared.sha256 is None:
+            prepared = replace(prepared, sha256=self.artifact_hash(prepared))
+        return prepared
+
     def save_artifact(self, artifact: Artifact) -> None:
-        artifact.validate()
-        if artifact.sha256 is None:
-            artifact = replace(artifact, sha256=self.artifact_hash(artifact))
+        artifact = self._prepare_artifact_for_save(artifact)
         mkdir_private(self.job_dir(artifact.job_id) / "edges")
         path = self.job_dir(artifact.job_id) / "artifacts" / f"{artifact.id}.json"
         self.write_json(path, artifact)

@@ -7,6 +7,14 @@ is exercised without a key or a socket.
 """
 from __future__ import annotations
 
+import os
+import sys
+
+_HERMETIC_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HERMETIC_DIR not in sys.path:
+    sys.path.insert(0, _HERMETIC_DIR)
+import hermetic_env  # noqa: F401  # process-wide host-env isolation
+
 import json
 import subprocess
 import tempfile
@@ -50,6 +58,88 @@ class ProviderRegistryTests(unittest.TestCase):
     def test_unknown_provider_is_none(self) -> None:
         self.assertIsNone(providers.get_provider("nope"))
 
+class ProviderErrorPolicyTests(unittest.TestCase):
+    def test_errors_keep_raw_details_and_expose_canonical_failures(self) -> None:
+        from puppetmaster.failure import (
+            MALFORMED_RESPONSE,
+            NOT_AUTHENTICATED,
+            RATE_LIMIT,
+            SERVER_ERROR,
+        )
+
+        cases = (
+            ("http_status:429", 429, RATE_LIMIT, True),
+            ("http_status:503", 503, SERVER_ERROR, True),
+            ("http_status:401", 401, NOT_AUTHENTICATED, False),
+            ("malformed_response", None, MALFORMED_RESPONSE, False),
+        )
+        for reason, status, expected_failure, expected_retryable in cases:
+            with self.subTest(reason=reason):
+                error = providers.ProviderError(
+                    "provider failed",
+                    reason=reason,
+                    status=status,
+                    body="raw response",
+                )
+                self.assertEqual(error.reason, reason)
+                self.assertEqual(error.status, status)
+                self.assertEqual(error.body, "raw response")
+                self.assertEqual(error.failure, expected_failure)
+                self.assertEqual(
+                    providers.is_retryable_provider_error(error),
+                    expected_retryable,
+                )
+
+    def test_canonical_categories_preserve_fallback_contract(self) -> None:
+        from puppetmaster.failure import NOT_AUTHENTICATED, RATE_LIMIT, SERVER_ERROR
+        from puppetmaster.workers import (
+            RECOVERABLE_FAILURES,
+            SAME_ADAPTER_MODEL_REROUTE,
+        )
+
+        self.assertIn(RATE_LIMIT, RECOVERABLE_FAILURES)
+        self.assertIn(RATE_LIMIT, SAME_ADAPTER_MODEL_REROUTE)
+        self.assertIn(NOT_AUTHENTICATED, RECOVERABLE_FAILURES)
+        self.assertNotIn(NOT_AUTHENTICATED, SAME_ADAPTER_MODEL_REROUTE)
+        self.assertNotIn(SERVER_ERROR, RECOVERABLE_FAILURES)
+        self.assertNotIn(SERVER_ERROR, SAME_ADAPTER_MODEL_REROUTE)
+
+    def test_openai_server_error_literal_preserved_for_observability(self) -> None:
+        """Legacy ``openai_server_error`` stays on OpenAI artifacts; retry is canonical."""
+        from puppetmaster.failure import (
+            OPENAI_SERVER_ERROR,
+            SERVER_ERROR,
+            classify_openai_failure,
+            classify_provider_failure,
+            is_server_error_failure,
+        )
+
+        self.assertEqual(OPENAI_SERVER_ERROR, "openai_server_error")
+        self.assertEqual(SERVER_ERROR, "server_error")
+        self.assertNotEqual(OPENAI_SERVER_ERROR, SERVER_ERROR)
+
+        # OpenAI adapter classification keeps the historical literal.
+        self.assertEqual(classify_openai_failure("", 503), OPENAI_SERVER_ERROR)
+        self.assertEqual(classify_openai_failure("", 500), "openai_server_error")
+
+        # Direct-provider path stays on the canonical retry category.
+        self.assertEqual(classify_provider_failure("http_status:503", 503), SERVER_ERROR)
+        self.assertEqual(
+            classify_provider_failure("openai_server_error", None), SERVER_ERROR
+        )
+        self.assertTrue(is_server_error_failure(OPENAI_SERVER_ERROR))
+        self.assertTrue(is_server_error_failure(SERVER_ERROR))
+
+        # Both literals remain retryable under provider policy.
+        canonical = providers.ProviderError("503", reason="http_status:503", status=503)
+        self.assertEqual(canonical.failure, SERVER_ERROR)
+        self.assertTrue(providers.is_retryable_provider_error(canonical))
+        legacy = providers.ProviderError("legacy", reason="openai_server_error")
+        self.assertEqual(legacy.failure, SERVER_ERROR)
+        self.assertTrue(providers.is_retryable_provider_error(legacy))
+        # Even if failure were somehow the raw legacy string, retry policy matches.
+        legacy.failure = OPENAI_SERVER_ERROR
+        self.assertTrue(providers.is_retryable_provider_error(legacy))
 
 class ProviderChatTests(unittest.TestCase):
     def test_openai_wire_normalizes_text_and_tools(self) -> None:
@@ -135,7 +225,6 @@ class ProviderChatTests(unittest.TestCase):
             )
         self.assertEqual(ctx.exception.reason, "not_authenticated")
 
-
 class KeyAwareRoutingTests(unittest.TestCase):
     def _agentic_registry(self):
         from puppetmaster.static_catalog import curated_to_specs
@@ -201,7 +290,6 @@ class KeyAwareRoutingTests(unittest.TestCase):
             high = route_task(pinned, self._agentic_registry(), policy="balanced")
         self.assertGreaterEqual(high.model.capability_score, low.model.capability_score)
 
-
 class ContextCompressionTests(unittest.TestCase):
     def test_compress_history_elides_old_tool_output_keeps_recent(self) -> None:
         from puppetmaster.adapters._context_budget import compress_history, estimate_message_tokens
@@ -240,7 +328,6 @@ class ContextCompressionTests(unittest.TestCase):
         self.assertFalse(changed)
         self.assertEqual(out[-1]["content"], "small")
 
-
 class ProviderKeyPoolTests(unittest.TestCase):
     def test_provider_key_pool_unions_and_numbers(self) -> None:
         from puppetmaster.providers import provider_key_pool
@@ -256,7 +343,6 @@ class ProviderKeyPoolTests(unittest.TestCase):
         env = {"OPENAI_API_KEY": "dup", "OPENAI_API_KEY_2": "dup"}
         self.assertEqual(provider_key_pool("openai", env=env), ["dup"])
         self.assertEqual(provider_key_pool("ollama", env={}), [])
-
 
 class ProviderStreamingTests(unittest.TestCase):
     def test_openai_streaming_assembles_text_and_usage(self) -> None:
@@ -313,7 +399,6 @@ class ProviderStreamingTests(unittest.TestCase):
         self.assertEqual(turn.tool_calls[0]["name"], "submit_findings")
         self.assertEqual(turn.tool_calls[0]["arguments"], {"artifacts": []})
 
-
 class AgenticToolTests(unittest.TestCase):
     def setUp(self) -> None:
         from puppetmaster.adapters.agentic import AgenticAdapter
@@ -331,6 +416,64 @@ class AgenticToolTests(unittest.TestCase):
         self.assertIn("line1", out)
         escaped = self.adapter._execute_tool("read_file", {"path": "../../etc/hosts"}, self.cwd, False, _task())
         self.assertIn("escapes the workspace", escaped)
+
+    def test_read_offload_self_blob_and_refusal(self) -> None:
+        """Agentic read_offload serves only self-created confined offload blobs."""
+        from puppetmaster.tool_offload import mark_offload_blob
+
+        state = tempfile.TemporaryDirectory()
+        try:
+            state_dir = Path(state.name)
+            offload_dir = state_dir / "tool_offload"
+            offload_dir.mkdir(parents=True)
+            blob = offload_dir / "agent-blob.txt"
+            blob.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+            mark_offload_blob(blob)
+            planted = offload_dir / "planted.txt"
+            planted.write_text("secret-planted\n", encoding="utf-8")
+            with mock.patch(
+                "puppetmaster.adapters.agentic._resolve_sidecar_state_dir",
+                return_value=state_dir,
+            ):
+                ok = self.adapter._execute_tool(
+                    "read_offload",
+                    {"path": str(blob.resolve()), "start_line": 1, "limit": 2},
+                    self.cwd,
+                    False,
+                    _task(),
+                )
+                self.assertEqual(ok, "alpha\nbeta")
+                refused_planted = self.adapter._execute_tool(
+                    "read_offload",
+                    {"path": "planted.txt"},
+                    self.cwd,
+                    False,
+                    _task(),
+                )
+                self.assertTrue(refused_planted.startswith("error:"), refused_planted)
+                self.assertIn("self-created", refused_planted.lower())
+                self.assertNotIn("secret-planted", refused_planted)
+                foreign = self.adapter._execute_tool(
+                    "read_offload",
+                    {"path": str((self.cwd / "a.py").resolve())},
+                    self.cwd,
+                    False,
+                    _task(),
+                )
+                self.assertTrue(foreign.startswith("error:"), foreign)
+                traversed = self.adapter._execute_tool(
+                    "read_offload",
+                    {"path": "../a.py"},
+                    self.cwd,
+                    False,
+                    _task(),
+                )
+                self.assertTrue(traversed.startswith("error:"), traversed)
+            schema = self.adapter._tool_schema(implement=False, task=_task(), graph_on=False)
+            names = [t["function"]["name"] for t in schema]
+            self.assertIn("read_offload", names)
+        finally:
+            state.cleanup()
 
     def test_read_file_hashline_tagged(self) -> None:
         out = self.adapter._execute_tool("read_file", {"path": "a.py"}, self.cwd, False, _task())
@@ -400,6 +543,94 @@ class AgenticToolTests(unittest.TestCase):
         self.assertIn("2 replacements", out)
         self.assertEqual((self.cwd / "dup.py").read_text(), "y\ny\n")
 
+    def test_edit_file_expected_tag_match(self) -> None:
+        from puppetmaster.hashline import content_tag
+
+        text = (self.cwd / "a.py").read_text(encoding="utf-8")
+        tag = content_tag(text)
+        out = self.adapter._execute_tool(
+            "edit_file",
+            {
+                "path": "a.py",
+                "old_string": "line1",
+                "new_string": "LINE1",
+                "expected_tag": tag.lower(),
+            },
+            self.cwd,
+            True,
+            _task(),
+        )
+        self.assertTrue(out.startswith("edited "), out)
+        self.assertTrue(
+            (self.cwd / "a.py").read_text(encoding="utf-8").startswith("LINE1")
+        )
+
+    def test_edit_file_expected_tag_stale_refuses(self) -> None:
+        original = (self.cwd / "a.py").read_text(encoding="utf-8")
+        out = self.adapter._execute_tool(
+            "edit_file",
+            {
+                "path": "a.py",
+                "old_string": "line1",
+                "new_string": "LINE1",
+                "expected_tag": "FFFF",
+            },
+            self.cwd,
+            True,
+            _task(),
+        )
+        self.assertIn("error:", out)
+        self.assertIn("StaleTagError", out)
+        self.assertIn("stale expected_tag", out)
+        self.assertEqual((self.cwd / "a.py").read_text(encoding="utf-8"), original)
+
+    def test_edit_file_absent_expected_tag_backward_compat(self) -> None:
+        out = self.adapter._execute_tool(
+            "edit_file",
+            {"path": "a.py", "old_string": "line1", "new_string": "LINE1"},
+            self.cwd,
+            True,
+            _task(),
+        )
+        self.assertTrue(out.startswith("edited "), out)
+        self.assertTrue(
+            (self.cwd / "a.py").read_text(encoding="utf-8").startswith("LINE1")
+        )
+
+    def test_edit_file_expected_tag_normalization_consistency(self) -> None:
+        from puppetmaster.hashline import content_tag
+
+        (self.cwd / "crlf.py").write_bytes(b"alpha\r\nbeta\r\n")
+        tag = content_tag("alpha\nbeta\n")
+        out = self.adapter._execute_tool(
+            "edit_file",
+            {
+                "path": "crlf.py",
+                "old_string": "alpha",
+                "new_string": "ALPHA",
+                "expected_tag": tag,
+            },
+            self.cwd,
+            True,
+            _task(),
+        )
+        self.assertTrue(out.startswith("edited "), out)
+        self.assertIn("ALPHA", (self.cwd / "crlf.py").read_text(encoding="utf-8"))
+
+    def test_edit_file_schema_exposes_expected_tag(self) -> None:
+        schema = self.adapter._tool_schema(
+            implement=True, task=_task(), graph_on=False
+        )
+        by_name = {t["function"]["name"]: t["function"] for t in schema}
+        self.assertIn("edit_file", by_name)
+        edit = by_name["edit_file"]
+        props = edit["parameters"]["properties"]
+        self.assertIn("expected_tag", props)
+        self.assertNotIn("expected_tag", edit["parameters"]["required"])
+        self.assertIn("expected_tag", edit["description"])
+        self.assertIn("expected_tag", by_name["read_file"]["description"])
+        self.assertNotIn("expected_tag", by_name["write_file"]["parameters"]["properties"])
+
     def test_delete_file(self) -> None:
         (self.cwd / "gone.py").write_text("bye", encoding="utf-8")
         out = self.adapter._execute_tool(
@@ -436,7 +667,6 @@ class AgenticToolTests(unittest.TestCase):
         )
         self.assertIn("NUL", out)
         self.assertFalse((self.cwd / "b.bin").exists())
-
 
 class AgenticLoopTests(unittest.TestCase):
     def test_analyze_loop_feeds_tool_results_then_parses_artifacts(self) -> None:
@@ -531,7 +761,13 @@ class AgenticLoopTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         task = Task(
             job_id="j", role="explore", instruction="x",
-            payload={"cwd": tmp.name, "provider": "anthropic", "model": "m", "disable_codegraph": True},
+            payload={
+                "cwd": tmp.name,
+                "provider": "anthropic",
+                "model": "m",
+                "disable_codegraph": True,
+                "stream_deltas": False,
+            },
         )
         with mock.patch.object(
             agentic, "provider_chat",
@@ -560,7 +796,15 @@ class AgenticLoopTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         task = Task(
             job_id="j", role="explore", instruction="x",
-            payload={"cwd": tmp.name, "provider": "openai", "model": "m", "disable_codegraph": True},
+            payload={
+                "cwd": tmp.name,
+                "provider": "openai",
+                "model": "m",
+                "disable_codegraph": True,
+                # Keep the hermetic provider_chat stub on the non-streaming path
+                # even when a host state dir would otherwise enable durable deltas.
+                "stream_deltas": False,
+            },
         )
         with mock.patch.object(
             agentic, "provider_chat",
@@ -569,6 +813,36 @@ class AgenticLoopTests(unittest.TestCase):
             arts = self.adapter().run(task, task.instruction, "w1")
         risk = next(a for a in arts if a.type == ArtifactType.RISK)
         self.assertEqual(risk.payload["failure"], "auth_failed:401")
+        self.assertIn("OPENAI_API_KEY", risk.payload["mitigation"])
+
+    def test_canonical_forbidden_without_status_yields_auth_risk(self) -> None:
+        # classify_provider_failure maps http_status:403 -> "forbidden". When the
+        # numeric status is absent, the auth RISK must still fire as 403.
+        from puppetmaster.adapters import agentic
+        from puppetmaster.providers import ProviderError
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        task = Task(
+            job_id="j", role="explore", instruction="x",
+            payload={
+                "cwd": tmp.name,
+                "provider": "openai",
+                "model": "m",
+                "disable_codegraph": True,
+                "stream_deltas": False,
+            },
+        )
+        err = ProviderError(
+            "HTTP 403", reason="http_status:403", status=None, body="forbidden"
+        )
+        self.assertEqual(err.failure, "forbidden")
+        self.assertIsNone(err.status)
+        with mock.patch.object(agentic, "provider_chat", side_effect=err):
+            arts = self.adapter().run(task, task.instruction, "w1")
+        risk = next(a for a in arts if a.type == ArtifactType.RISK)
+        self.assertEqual(risk.payload["failure"], "auth_failed:403")
+        self.assertIn("AUTH FAILURE", risk.payload["risk"])
         self.assertIn("OPENAI_API_KEY", risk.payload["mitigation"])
 
     def test_analyze_json_only_retry_recovers_a_prose_run(self) -> None:
@@ -837,7 +1111,10 @@ class AgenticLoopTests(unittest.TestCase):
 
         task = Task(
             job_id="j", role="explore", instruction="analyze",
-            payload={"cwd": str(cwd), "provider": "anthropic", "model": "m", "disable_codegraph": True},
+            payload={
+                "cwd": str(cwd), "provider": "anthropic", "model": "m",
+                "disable_codegraph": True, "stream_deltas": False,
+            },
         )
         with mock.patch.object(agentic, "provider_chat", side_effect=flaky), \
                 mock.patch("time.sleep", lambda *_: None):
@@ -846,6 +1123,37 @@ class AgenticLoopTests(unittest.TestCase):
         self.assertEqual(calls["n"], 2)  # one transient failure, one success
         verif = next(a for a in arts if a.type == ArtifactType.VERIFICATION)
         self.assertEqual(verif.payload["result"], "passed")
+
+    def test_provider_call_retries_server_error_then_succeeds(self) -> None:
+        from puppetmaster.adapters import agentic
+        from puppetmaster.providers import AssistantTurn, ProviderError
+
+        calls = {"n": 0}
+
+        def flaky(*, provider, model, messages, tools, extra, timeout):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ProviderError(
+                    "unavailable",
+                    reason="http_status:503",
+                    status=503,
+                )
+            return AssistantTurn(text="recovered")
+
+        with mock.patch.object(agentic, "provider_chat", side_effect=flaky), \
+                mock.patch("time.sleep", lambda *_: None):
+            turn = self.adapter()._provider_call(
+                provider="anthropic",
+                model="m",
+                messages=[],
+                tools=None,
+                extra={},
+                timeout=30,
+                max_retries=1,
+            )
+
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(turn.text, "recovered")
 
     def test_provider_call_does_not_retry_terminal_auth_error(self) -> None:
         from puppetmaster.adapters import agentic
@@ -862,7 +1170,10 @@ class AgenticLoopTests(unittest.TestCase):
 
         task = Task(
             job_id="j", role="explore", instruction="analyze",
-            payload={"cwd": str(cwd), "provider": "anthropic", "model": "m", "disable_codegraph": True},
+            payload={
+                "cwd": str(cwd), "provider": "anthropic", "model": "m",
+                "disable_codegraph": True, "stream_deltas": False,
+            },
         )
         with mock.patch.object(agentic, "provider_chat", side_effect=auth_fail), \
                 mock.patch("time.sleep", lambda *_: None):
@@ -870,6 +1181,38 @@ class AgenticLoopTests(unittest.TestCase):
 
         self.assertEqual(calls["n"], 1)  # terminal: no retry
         self.assertEqual(arts[0].payload["result"], "failed")
+        self.assertEqual(arts[0].payload["failure"], "not_authenticated")
+        self.assertEqual(arts[0].payload["provider_reason"], "http_status:401")
+
+    def test_provider_call_does_not_retry_malformed_response(self) -> None:
+        from puppetmaster.adapters import agentic
+        from puppetmaster.providers import ProviderError
+
+        calls = {"n": 0}
+
+        def malformed(*, provider, model, messages, tools, extra, timeout):
+            calls["n"] += 1
+            raise ProviderError(
+                "malformed response",
+                reason="malformed_response",
+                body="<html>",
+            )
+
+        with mock.patch.object(agentic, "provider_chat", side_effect=malformed), \
+                mock.patch("time.sleep", lambda *_: None):
+            with self.assertRaises(ProviderError) as raised:
+                self.adapter()._provider_call(
+                    provider="anthropic",
+                    model="m",
+                    messages=[],
+                    tools=None,
+                    extra={},
+                    timeout=30,
+                    max_retries=2,
+                )
+
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(raised.exception.body, "<html>")
 
     def test_implement_submit_report_records_report_and_patches(self) -> None:
         from puppetmaster.adapters import agentic
@@ -1344,7 +1687,6 @@ class AgenticLoopTests(unittest.TestCase):
         from puppetmaster.adapters.agentic import AgenticAdapter
         return AgenticAdapter()
 
-
 def _git_repo(test) -> Path:
     tmp = tempfile.TemporaryDirectory()
     test.addCleanup(tmp.cleanup)
@@ -1358,10 +1700,8 @@ def _git_repo(test) -> Path:
     subprocess.run(["git", "commit", "-m", "seed"], cwd=str(cwd), env=env, capture_output=True, check=False)
     return cwd
 
-
 def _task(payload: dict = None) -> Task:
     return Task(job_id="j", role="explore", instruction="i", payload=payload or {})
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -40,7 +40,6 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import os
-import random
 import re
 import subprocess
 import time
@@ -55,27 +54,37 @@ from puppetmaster.codegraph import (
 )
 from puppetmaster.cancellation import JobCancelled, is_cancelled
 from puppetmaster.models import Artifact, ArtifactType, Task
+from puppetmaster.provider_circuit import (
+    get_provider_circuit_breaker,
+    resolve_circuit_key,
+)
 from puppetmaster.providers import (
     AssistantTurn,
     ProviderError,
     get_provider,
+    is_retryable_provider_error,
     provider_chat,
     provider_chat_streaming,
     provider_key_pool,
+    provider_retry_backoff_seconds,
 )
 from puppetmaster.redaction import redact_secrets
 from puppetmaster.state import resolve_state_dir
 from puppetmaster.hashline import (
     SnapshotStore,
     apply_patch,
+    content_tag,
     format_apply_success,
     format_numbered_read,
     fs_cache_enabled,
     hashline_enabled,
     normalize_text,
 )
-from puppetmaster.tool_batch import plan_tool_batch_segments
-from puppetmaster.tool_offload import offload_tool_output
+from puppetmaster.tool_batch import (
+    parallel_executor_max_workers,
+    plan_tool_batch_segments,
+)
+from puppetmaster.tool_offload import offload_tool_output, read_offload_blob
 
 from ._base import (
     FullEditWorkerAdapter,
@@ -127,9 +136,6 @@ DEFAULT_IMPLEMENT_TIMEOUT_SECONDS = 900
 # with jittered exponential backoff on classifiably-transient failures only;
 # auth/quota/4xx (except 429) surface immediately, unretried.
 DEFAULT_PROVIDER_MAX_RETRIES = 2
-_PROVIDER_BACKOFF_BASE_SECONDS = 1.5
-_PROVIDER_BACKOFF_MAX_SECONDS = 30.0
-_RETRYABLE_PROVIDER_REASONS = frozenset({"timeout", "network_error", "malformed_response"})
 
 # Bounded recovery counts so a pathological model can't loop forever on the
 # empty-response nudge or the length-continuation retry.
@@ -450,10 +456,10 @@ class AgenticAdapter(FullEditWorkerAdapter):
             )
         except ProviderError as exc:
             detail = redact_secrets(exc.body or str(exc)) or str(exc)
-            arts = [self._fail(task, worker_id, evidence_base, exc.reason,
-                               detail, status=exc.status)]
+            arts = [self._fail(task, worker_id, evidence_base, exc.failure,
+                               detail, status=exc.status, provider_reason=exc.reason)]
             auth_risk = self._auth_failure_risk(
-                task, worker_id, provider, exc.status or 0, detail, reason=exc.reason)
+                task, worker_id, provider, exc.status or 0, detail, reason=exc.failure)
             if auth_risk is not None:
                 arts.append(auth_risk)
             return arts
@@ -655,10 +661,10 @@ class AgenticAdapter(FullEditWorkerAdapter):
         except ProviderError as exc:
             after = facade("git_snapshot")(cwd, base_tree=str(before.get("tree") or "") or None)
             detail = redact_secrets(exc.body or str(exc)) or str(exc)
-            arts = [self._fail(task, worker_id, evidence_base, exc.reason,
-                               detail, status=exc.status)]
+            arts = [self._fail(task, worker_id, evidence_base, exc.failure,
+                               detail, status=exc.status, provider_reason=exc.reason)]
             auth_risk = self._auth_failure_risk(
-                task, worker_id, provider, exc.status or 0, detail, reason=exc.reason)
+                task, worker_id, provider, exc.status or 0, detail, reason=exc.failure)
             if auth_risk is not None:
                 arts.append(auth_risk)
             if _should_emit_patch_artifact(before, after):
@@ -831,12 +837,22 @@ class AgenticAdapter(FullEditWorkerAdapter):
           jittered exponential backoff. Terminal failures propagate immediately.
 
         When ``on_delta`` is set, tokens stream to it as they arrive.
+
+        Admission is gated by the process-local provider circuit breaker: after a
+        streak of consecutive retryable failures the same provider/model/base-URL
+        key is refused with a recoverable :class:`ProviderError` so failover can
+        still run. Auth / malformed / other non-retryable errors never trip it.
         """
         keys: list[Optional[str]] = list(key_pool) if key_pool else [None]
         key_index = 0
         attempt = 0
         last: Optional[ProviderError] = None
+        breaker = get_provider_circuit_breaker()
+        admission_key = resolve_circuit_key(provider, model)
         while True:
+            # Refuse before dialing when the breaker is open (recoverable error).
+            breaker.before_call(admission_key)
+            recorded = False
             api_key = keys[key_index]
             kwargs: dict = dict(
                 provider=provider, model=model, messages=messages,
@@ -850,18 +866,28 @@ class AgenticAdapter(FullEditWorkerAdapter):
             if api_key is not None and key_index > 0:
                 kwargs["api_key"] = api_key
             try:
-                if on_delta is not None:
-                    return provider_chat_streaming(on_delta=on_delta, **kwargs)
-                return provider_chat(**kwargs)
-            except ProviderError as exc:
-                last = exc
-                if exc.status in (401, 403, 429) and key_index + 1 < len(keys):
-                    key_index += 1
-                    continue
-                if attempt >= max_retries or not _is_retryable_provider_error(exc):
-                    raise
-                time.sleep(_provider_backoff_seconds(attempt))
-                attempt += 1
+                try:
+                    if on_delta is not None:
+                        turn = provider_chat_streaming(on_delta=on_delta, **kwargs)
+                    else:
+                        turn = provider_chat(**kwargs)
+                    breaker.record_success(admission_key)
+                    recorded = True
+                    return turn
+                except ProviderError as exc:
+                    last = exc
+                    breaker.record_failure(admission_key, exc)
+                    recorded = True
+                    if exc.status in (401, 403, 429) and key_index + 1 < len(keys):
+                        key_index += 1
+                        continue
+                    if attempt >= max_retries or not is_retryable_provider_error(exc):
+                        raise
+                    time.sleep(provider_retry_backoff_seconds(attempt))
+                    attempt += 1
+            finally:
+                if not recorded:
+                    breaker.release_admission(admission_key)
         assert last is not None
         raise last
 
@@ -1312,9 +1338,26 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 "parameters": {"type": "object", "properties": props, "required": required},
             }}
 
+        read_file_desc = "Read a UTF-8 text file within the workspace."
+        if hashline_enabled():
+            read_file_desc = (
+                "Read a UTF-8 text file within the workspace. Returns `[path#TAG]` "
+                "plus `N:line` rows — use that TAG with `apply_hashline` or "
+                "`edit_file.expected_tag` for safe mutations."
+            )
         tools = [
-            fn("read_file", "Read a UTF-8 text file within the workspace.",
+            fn("read_file", read_file_desc,
                {"path": {"type": "string"},
+                "start_line": {"type": "integer", "description": "1-indexed start line (optional)"},
+                "limit": {"type": "integer", "description": "max lines to read (optional)"}},
+               ["path"]),
+            fn("read_offload",
+               "Read a previously offloaded tool-output blob from this worker's "
+               "state_dir/tool_offload directory. Use the path from an "
+               "[tool output offloaded] stub. Refuses workspace escapes and "
+               "foreign paths — only self-offload blobs are readable.",
+               {"path": {"type": "string",
+                         "description": "Absolute or blob-relative path under state_dir/tool_offload"},
                 "start_line": {"type": "integer", "description": "1-indexed start line (optional)"},
                 "limit": {"type": "integer", "description": "max lines to read (optional)"}},
                ["path"]),
@@ -1343,11 +1386,40 @@ class AgenticAdapter(FullEditWorkerAdapter):
             tools.append(fn("write_file", "Create or overwrite a text file within the workspace.",
                             {"path": {"type": "string"}, "content": {"type": "string"}},
                             ["path", "content"]))
-            tools.append(fn("edit_file", "Replace an exact occurrence of old_string with new_string in a file. Set replace_all=true to replace every occurrence.",
-                            {"path": {"type": "string"}, "old_string": {"type": "string"},
-                             "new_string": {"type": "string"},
-                             "replace_all": {"type": "boolean", "description": "replace all occurrences (default false)"}},
-                            ["path", "old_string", "new_string"]))
+            edit_props = {
+                "path": {"type": "string"},
+                "old_string": {"type": "string"},
+                "new_string": {"type": "string"},
+                "replace_all": {
+                    "type": "boolean",
+                    "description": "replace all occurrences (default false)",
+                },
+            }
+            edit_desc = (
+                "Replace an exact occurrence of old_string with new_string in a file. "
+                "Set replace_all=true to replace every occurrence."
+            )
+            if hashline_enabled():
+                edit_props["expected_tag"] = {
+                    "type": "string",
+                    "description": (
+                        "Optional 4-hex content tag from a prior tagged read_file "
+                        "([path#TAG]). When set, the edit is refused if the live "
+                        "normalized file no longer matches — re-read and retry. "
+                        "Prefer apply_hashline for surgical line edits."
+                    ),
+                }
+                edit_desc = (
+                    "Replace an exact occurrence of old_string with new_string in a "
+                    "file. Set replace_all=true to replace every occurrence. After a "
+                    "tagged read_file, pass expected_tag from that read's #TAG for "
+                    "optimistic concurrency (or prefer apply_hashline for surgical "
+                    "line edits)."
+                )
+            tools.append(fn(
+                "edit_file", edit_desc, edit_props,
+                ["path", "old_string", "new_string"],
+            ))
             if hashline_enabled():
                 tools.append(fn(
                     "apply_hashline",
@@ -1537,6 +1609,8 @@ class AgenticAdapter(FullEditWorkerAdapter):
         try:
             if name == "read_file":
                 return self._tool_read_file(args, cwd)
+            if name == "read_offload":
+                return self._tool_read_offload(args, cwd)
             if name == "list_dir":
                 return self._tool_list_dir(args, cwd)
             if name == "search_code":
@@ -1589,7 +1663,10 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 return (call, f"error: {type(exc).__name__}: {exc}")
         
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(calls)) as executor:
+            # Cap threads so large safe-read batches cannot unbounded-thread.
+            # Segmentation / barrier rules are unchanged; only pool size is bounded.
+            worker_count = parallel_executor_max_workers(len(calls))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
                 futures = {executor.submit(_execute_one, call): idx for idx, call in enumerate(calls)}
                 results = [None] * len(calls)
                 for future in concurrent.futures.as_completed(futures):
@@ -1653,6 +1730,25 @@ class AgenticAdapter(FullEditWorkerAdapter):
             tag = self._hashline_store.record(rel, normalize_text(text))
             return format_numbered_read(rel, tag, chunk, start_line=start)
         return "\n".join(chunk)
+
+    def _tool_read_offload(self, args: dict, cwd: Path) -> str:
+        """Read a durable self-offload blob; confined to state_dir/tool_offload."""
+        state_dir = _resolve_sidecar_state_dir()
+        if state_dir is None:
+            try:
+                state_dir = resolve_state_dir(cwd=cwd)
+            except Exception:
+                state_dir = None
+        if state_dir is None:
+            return "error: no state_dir available to read offload blobs"
+        start = args.get("start_line", 1)
+        limit = args.get("limit")
+        return read_offload_blob(
+            str(args.get("path", "")),
+            state_dir=state_dir,
+            start_line=start if start is not None else 1,
+            limit=limit,
+        )
 
     def _read_text_cached(self, path: Path) -> str:
         """Read UTF-8 text, optionally caching by (mtime_ns, size)."""
@@ -1762,6 +1858,20 @@ class AgenticAdapter(FullEditWorkerAdapter):
         new = str(args.get("new_string", ""))
         replace_all = bool(args.get("replace_all", False))
         text = path.read_text(encoding="utf-8", errors="replace")
+        rel = _rel(path, cwd).replace("\\", "/")
+        expected_raw = args.get("expected_tag")
+        if (
+            hashline_enabled()
+            and expected_raw is not None
+            and str(expected_raw).strip()
+        ):
+            expected = str(expected_raw).strip().upper()
+            live_tag = content_tag(text)
+            if live_tag != expected:
+                return (
+                    f"error: StaleTagError: {rel}#{expected}: stale expected_tag — "
+                    f"live file is #{live_tag}; re-read before editing"
+                )
         count = text.count(old)
         if count == 0:
             return "error: old_string not found (must match exactly)" + _near_miss_hint(text, old)
@@ -1774,7 +1884,6 @@ class AgenticAdapter(FullEditWorkerAdapter):
         path.write_text(updated, encoding="utf-8")
         self._invalidate_fs_cache(path)
         n = count if replace_all else 1
-        rel = _rel(path, cwd).replace("\\", "/")
         if hashline_enabled():
             tag = self._hashline_store.record(rel, normalize_text(updated))
             return (
@@ -1869,12 +1978,20 @@ class AgenticAdapter(FullEditWorkerAdapter):
     def _fail(
         self, task: Task, worker_id: str, evidence: list[str], reason: str,
         detail: str, *, status: Optional[int] = None,
+        provider_reason: Optional[str] = None,
     ) -> Artifact:
+        payload = {
+            "failure": reason,
+            "returncode": status,
+            "stderr": detail[:8000],
+        }
+        if provider_reason is not None:
+            payload["provider_reason"] = provider_reason
         return verification_artifact(
             task=task, worker_id=worker_id, adapter="agentic",
             check=task.instruction, result="failed", confidence=0.55,
             evidence=evidence + [reason],
-            payload={"failure": reason, "returncode": status, "stderr": detail[:8000]},
+            payload=payload,
         )
 
     def _auth_failure_risk(
@@ -1890,14 +2007,17 @@ class AgenticAdapter(FullEditWorkerAdapter):
         prompt problem instead of the real cause. We surface the provider and
         the exact env var to fix so the diagnosis is immediate.
         """
-        # An auth rejection reaches us three ways: an HTTP 401/403 (status set,
-        # or reason "http_status:401/403"), or a pre-flight "not_authenticated"
-        # (key missing/blank before any call, status None). Catch all of them --
-        # every one is a credential problem, not a model or prompt problem.
+        # An auth rejection reaches us several ways: an HTTP 401/403 (status
+        # set, or reason "http_status:401/403"), a pre-flight
+        # "not_authenticated" (key missing/blank before any call, status None),
+        # or the canonical classifier category "forbidden" when status was lost
+        # after a 403. Catch all of them -- every one is a credential problem,
+        # not a model or prompt problem.
         r = (reason or "").lower()
         is_auth = (
             status in (401, 403)
             or r == "not_authenticated"
+            or r == "forbidden"
             or r in ("http_status:401", "http_status:403")
         )
         if not is_auth:
@@ -2029,29 +2149,6 @@ def _no_tool_calls_diagnosis(provider: str, model: str, turns: int) -> str:
         "called any tool -- it is not tool-calling on this endpoint; route "
         "this role to a tool-capable model"
     )
-
-
-def _is_retryable_provider_error(exc: ProviderError) -> bool:
-    """A provider failure is worth retrying only when it is classifiably
-    transient -- a timeout, a network blip, a malformed body, a 429 rate-limit,
-    or a 5xx. Auth (401/403), bad-request (400), and not-found (404) are
-    terminal: retrying just burns time and money.
-    """
-    if exc.reason in _RETRYABLE_PROVIDER_REASONS:
-        return True
-    status = exc.status
-    if status is not None and (status == 429 or 500 <= status < 600):
-        return True
-    return False
-
-
-def _provider_backoff_seconds(attempt: int) -> float:
-    """Jittered exponential backoff for provider retries (attempt is 0-indexed)."""
-    ceiling = min(
-        _PROVIDER_BACKOFF_MAX_SECONDS,
-        _PROVIDER_BACKOFF_BASE_SECONDS * (2 ** attempt),
-    )
-    return random.uniform(_PROVIDER_BACKOFF_BASE_SECONDS, ceiling)
 
 
 def _coerce_submit_findings(args: object) -> list[dict]:

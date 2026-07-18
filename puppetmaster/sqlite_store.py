@@ -41,6 +41,22 @@ from puppetmaster.store import (
 
 _SQLITE_IN_CHUNK = 900
 
+# Per-connection durability policy. journal_mode persists on the DB file once
+# set; busy_timeout / foreign_keys / synchronous are connection-local and must
+# be reapplied on every fresh connect().
+_SQLITE_BUSY_TIMEOUT_MS = 5000
+_SQLITE_SYNCHRONOUS = "NORMAL"
+
+# Bounded diagnostic / backup surface (reliability Slice 10). quick_check is the
+# default integrity probe — faster than full integrity_check and safe to run
+# from doctor. Cap how much failure text we surface.
+_QUICK_CHECK_ROW_LIMIT = 8
+_QUICK_CHECK_DETAIL_CHARS = 500
+
+
+class SqliteBackupError(ValueError):
+    """Raised when an opt-in SQLite backup is refused for safety."""
+
 
 def _chunked(values: Iterable[str], size: int = _SQLITE_IN_CHUNK) -> list[list[str]]:
     unique = list(dict.fromkeys(values))
@@ -52,6 +68,8 @@ class SQLiteSwarmStore(SwarmStore):
 
     backend_name = "sqlite"
     schema_version = 2
+    busy_timeout_ms = _SQLITE_BUSY_TIMEOUT_MS
+    synchronous_policy = _SQLITE_SYNCHRONOUS
 
     def __init__(self, root: Optional[Union[Path, str]] = None) -> None:
         super().__init__(root)
@@ -77,7 +95,6 @@ class SQLiteSwarmStore(SwarmStore):
             connection.executescript(
                 """
                 PRAGMA journal_mode = WAL;
-                PRAGMA busy_timeout = 5000;
                 CREATE TABLE IF NOT EXISTS jobs (
                   id TEXT PRIMARY KEY,
                   data TEXT NOT NULL
@@ -329,10 +346,23 @@ class SQLiteSwarmStore(SwarmStore):
         return edge
 
     def connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path, timeout=5)
+        # timeout= seconds for the Python sqlite3 client; busy_timeout= ms for
+        # SQLite's own lock wait — keep them aligned at 5s.
+        connection = sqlite3.connect(
+            self.db_path, timeout=self.busy_timeout_ms / 1000.0
+        )
         connection.row_factory = sqlite3.Row
+        self._apply_connection_pragmas(connection)
         chmod_private_file(self.db_path)
         return connection
+
+    def _apply_connection_pragmas(self, connection: sqlite3.Connection) -> None:
+        """Apply the durable connection policy to a freshly opened handle."""
+        # Fetch journal_mode so the result row does not linger unread.
+        connection.execute("PRAGMA journal_mode = WAL").fetchone()
+        connection.execute(f"PRAGMA busy_timeout = {int(self.busy_timeout_ms)}")
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute(f"PRAGMA synchronous = {self.synchronous_policy}")
 
     @contextmanager
     def _session(self) -> "Iterator[sqlite3.Connection]":
@@ -797,9 +827,7 @@ class SQLiteSwarmStore(SwarmStore):
             )
 
     def save_artifact(self, artifact: Artifact) -> None:
-        artifact.validate()
-        if artifact.sha256 is None:
-            artifact = replace(artifact, sha256=self.artifact_hash(artifact))
+        artifact = self._prepare_artifact_for_save(artifact)
         self.init()
         event_payload = {
             "artifact_id": artifact.id,
@@ -852,10 +880,7 @@ class SQLiteSwarmStore(SwarmStore):
             return
         prepared: list[Artifact] = []
         for artifact in artifact_list:
-            artifact.validate()
-            if artifact.sha256 is None:
-                artifact = replace(artifact, sha256=self.artifact_hash(artifact))
-            prepared.append(artifact)
+            prepared.append(self._prepare_artifact_for_save(artifact))
         self.init()
         rows: list[tuple[Any, ...]] = []
         event_rows: list[tuple[Any, ...]] = []
@@ -1469,13 +1494,192 @@ class SQLiteSwarmStore(SwarmStore):
 
     def schema_status(self) -> dict[str, str]:
         self.init()
-        row = self._one("SELECT value FROM metadata WHERE key = 'schema_version'")
-        journal = self._one("PRAGMA journal_mode")
-        return {
+        with self._session() as connection:
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key = 'schema_version'"
+            ).fetchone()
+            journal = connection.execute("PRAGMA journal_mode").fetchone()
+            busy_timeout = connection.execute("PRAGMA busy_timeout").fetchone()
+            foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()
+            synchronous = connection.execute("PRAGMA synchronous").fetchone()
+        status = {
             "schema_version": row["value"] if row else "unknown",
             "expected_schema_version": str(self.schema_version),
-            "journal_mode": journal[0] if journal else "unknown",
+            "journal_mode": str(journal[0]) if journal else "unknown",
+            "busy_timeout": str(busy_timeout[0]) if busy_timeout else "unknown",
+            "foreign_keys": str(foreign_keys[0]) if foreign_keys else "unknown",
+            "synchronous": str(synchronous[0]) if synchronous else "unknown",
+            "expected_busy_timeout": str(self.busy_timeout_ms),
+            "expected_foreign_keys": "1",
+            "expected_synchronous": str(self._synchronous_pragma_value()),
         }
+        # Integrity is a separate read-only probe so a locked/corrupt store still
+        # reports through doctor/schema_status without raising.
+        status.update(self.integrity_status())
+        return status
+
+    def integrity_status(self) -> dict[str, str]:
+        """Bounded read-only ``PRAGMA quick_check``; never creates or migrates.
+
+        Returns ``integrity_status`` of ``ok`` / ``warn`` / ``unavailable`` plus
+        the raw ``quick_check`` text. Locked, missing, and corrupt stores yield
+        a dict — they do not raise.
+        """
+        if not self.db_path.exists():
+            return {
+                "integrity_status": "unavailable",
+                "quick_check": "missing",
+                "check_kind": "quick_check",
+            }
+        connection: Optional[sqlite3.Connection] = None
+        try:
+            connection = self._connect_readonly()
+            rows = connection.execute("PRAGMA quick_check").fetchmany(
+                _QUICK_CHECK_ROW_LIMIT
+            )
+        except sqlite3.OperationalError as exc:
+            message = str(exc).strip() or type(exc).__name__
+            lowered = message.lower()
+            if "locked" in lowered or "busy" in lowered:
+                detail = f"locked: {message}"
+            else:
+                detail = message
+            return {
+                "integrity_status": "unavailable",
+                "quick_check": detail[:_QUICK_CHECK_DETAIL_CHARS],
+                "check_kind": "quick_check",
+            }
+        except (sqlite3.Error, OSError) as exc:
+            message = str(exc).strip() or type(exc).__name__
+            return {
+                "integrity_status": "warn",
+                "quick_check": message[:_QUICK_CHECK_DETAIL_CHARS],
+                "check_kind": "quick_check",
+            }
+        finally:
+            if connection is not None:
+                connection.close()
+
+        if not rows:
+            return {
+                "integrity_status": "warn",
+                "quick_check": "empty",
+                "check_kind": "quick_check",
+            }
+        parts = [str(row[0]) for row in rows if row and row[0] is not None]
+        detail = "; ".join(parts) if parts else "unknown"
+        if len(detail) > _QUICK_CHECK_DETAIL_CHARS:
+            detail = detail[: _QUICK_CHECK_DETAIL_CHARS - 3] + "..."
+        healthy = len(parts) == 1 and parts[0].lower() == "ok"
+        return {
+            "integrity_status": "ok" if healthy else "warn",
+            "quick_check": detail,
+            "check_kind": "quick_check",
+        }
+
+    def _connect_readonly(self) -> sqlite3.Connection:
+        """Open the DB read-only without applying write-side durability PRAGMAs."""
+        uri = self.db_path.resolve().as_uri() + "?mode=ro"
+        connection = sqlite3.connect(
+            uri, uri=True, timeout=self.busy_timeout_ms / 1000.0
+        )
+        connection.row_factory = sqlite3.Row
+        # busy_timeout is connection-local and read-safe; keeps the probe bounded.
+        connection.execute(f"PRAGMA busy_timeout = {int(self.busy_timeout_ms)}")
+        return connection
+
+    def backup_to(
+        self,
+        destination: "Union[Path, str]",
+        *,
+        confine_under: "Optional[Union[Path, str]]" = None,
+    ) -> Path:
+        """Opt-in consistent local backup of ``state.sqlite3`` (WAL-aware).
+
+        Uses the sqlite3 online backup API so WAL frames are included. Never
+        overwrites an existing destination. Paths must resolve under
+        ``confine_under`` (default: ``{state_root}/backups``). Relative
+        destinations are resolved inside that confine root.
+        """
+        confine_root = Path(confine_under) if confine_under is not None else (
+            self.root / "backups"
+        )
+        try:
+            confine_resolved = confine_root.expanduser().resolve()
+        except OSError as exc:
+            raise SqliteBackupError(
+                f"refusing backup: unresolvable confine root {confine_root!s}: {exc}"
+            ) from exc
+
+        dest = Path(destination).expanduser()
+        if not dest.is_absolute():
+            dest = confine_resolved / dest
+        try:
+            dest_resolved = dest.resolve()
+        except OSError as exc:
+            raise SqliteBackupError(
+                f"refusing backup: unresolvable destination {dest!s}: {exc}"
+            ) from exc
+
+        if not self._path_is_under(dest_resolved, confine_resolved):
+            raise SqliteBackupError(
+                f"refusing backup: destination escapes confine root "
+                f"{confine_resolved}: {dest_resolved}"
+            )
+        if dest_resolved.exists():
+            raise SqliteBackupError(
+                f"refusing backup: destination already exists: {dest_resolved}"
+            )
+        if not self.db_path.exists():
+            raise SqliteBackupError(
+                f"refusing backup: source database missing: {self.db_path}"
+            )
+        try:
+            source_resolved = self.db_path.resolve()
+        except OSError as exc:
+            raise SqliteBackupError(
+                f"refusing backup: unresolvable source {self.db_path!s}: {exc}"
+            ) from exc
+        if dest_resolved == source_resolved:
+            raise SqliteBackupError(
+                f"refusing backup: destination is the live database: {dest_resolved}"
+            )
+
+        mkdir_private(dest_resolved.parent)
+        source: Optional[sqlite3.Connection] = None
+        target: Optional[sqlite3.Connection] = None
+        try:
+            source = sqlite3.connect(
+                source_resolved, timeout=self.busy_timeout_ms / 1000.0
+            )
+            target = sqlite3.connect(dest_resolved)
+            source.backup(target)
+        except (sqlite3.Error, OSError) as exc:
+            if dest_resolved.exists():
+                try:
+                    dest_resolved.unlink()
+                except OSError:
+                    pass
+            raise SqliteBackupError(f"backup failed: {exc}") from exc
+        finally:
+            if target is not None:
+                target.close()
+            if source is not None:
+                source.close()
+        chmod_private_file(dest_resolved)
+        return dest_resolved
+
+    @staticmethod
+    def _path_is_under(path: Path, root: Path) -> bool:
+        """True when ``path`` is ``root`` or a descendant (Python 3.9-safe)."""
+        if path == root:
+            return True
+        return root in path.parents
+
+    def _synchronous_pragma_value(self) -> int:
+        """Map the named synchronous policy to SQLite's integer PRAGMA value."""
+        mapping = {"OFF": 0, "NORMAL": 1, "FULL": 2, "EXTRA": 3}
+        return mapping[self.synchronous_policy.upper()]
 
     def emit(self, job_id: str, event: str, payload: dict[str, Any]) -> None:
         self.init()

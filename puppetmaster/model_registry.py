@@ -305,7 +305,16 @@ def starter_registry() -> list[ModelSpec]:
             output_per_mtok_usd=6.0,
             context_window=0,
             billing="plan",
-            tags=["tools", 
+            # Live SDK identity is grok-4.5; High+Fast is the catalog default
+            # variant (params), not an expanded alias like cursor-grok-4.5-high-fast.
+            payload_defaults={
+                "params": [
+                    {"id": "effort", "value": "high"},
+                    {"id": "fast", "value": "true"},
+                ]
+            },
+            tags=[
+                "tools",
                 "cursor",
                 "xai",
                 "frontier",
@@ -314,6 +323,8 @@ def starter_registry() -> list[ModelSpec]:
                 "reasoning",
                 "agentic",
                 "workhorse",
+                "effort:high",
+                "param:fast",
             ],
             notes=(
                 "Cursor workhorse (released 2026-07-08). SpaceXAI Grok 4.5 via "
@@ -327,7 +338,8 @@ def starter_registry() -> list[ModelSpec]:
                 "just under Opus 4.7/4.8 so balanced routing prefers Grok for "
                 "most hard Cursor work while reserving Opus/Fable for the "
                 "tip-of-stack. Absorbs the prior Opus-class workhorse band on "
-                "Cursor when Fable is available for the absolute hardest tasks."
+                "Cursor when Fable is available for the absolute hardest tasks. "
+                "Default variant is High+Fast via payload_defaults.params."
             ),
         ),
         ModelSpec(

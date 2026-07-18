@@ -168,7 +168,11 @@ _HASHLINE_EDIT_RULES = (
     "never shift as hunks apply. After every apply, re-ground on the new `#TAG` "
     "(or a fresh read). On stale-tag rejection: STOP and re-read. "
     "Block ops (`*.BLK`) are unsupported — use line ranges. "
-    "Keep `edit_file` / `write_file` for whole-file rewrites or when hashline is awkward."
+    "When using `edit_file` after a tagged read, pass `expected_tag` from that "
+    "read's `#TAG` so a concurrent change is refused cleanly; omit it only when "
+    "you intentionally skip optimistic concurrency. "
+    "Keep untagged `edit_file` / `write_file` for whole-file rewrites or when "
+    "hashline is awkward."
 )
 
 

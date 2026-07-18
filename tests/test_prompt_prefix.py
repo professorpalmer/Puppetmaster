@@ -1,6 +1,14 @@
 """Static-first worker prompt assembly (cross-worker prompt-cache prefix)."""
 from __future__ import annotations
 
+import os
+import sys
+
+_HERMETIC_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HERMETIC_DIR not in sys.path:
+    sys.path.insert(0, _HERMETIC_DIR)
+import hermetic_env  # noqa: F401  # process-wide host-env isolation
+
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,14 +25,12 @@ from puppetmaster.adapters._prompts import (
 )
 from puppetmaster.models import Task
 
-
 def _common_prefix_len(a: str, b: str) -> int:
     n = min(len(a), len(b))
     i = 0
     while i < n and a[i] == b[i]:
         i += 1
     return i
-
 
 class BuildPromptOrderTests(unittest.TestCase):
     def test_build_implement_prompt_puts_boilerplate_before_instruction(self) -> None:
@@ -55,7 +61,6 @@ class BuildPromptOrderTests(unittest.TestCase):
         self.assertTrue(note.rstrip().endswith(instruction))
         self.assertIn("submit_findings", note)
         self.assertLess(note.index("submit_findings"), note.index(TASK_INSTRUCTION_HEADER))
-
 
 class JobStableSectionOrderTests(unittest.TestCase):
     def test_memory_skills_census_appear_before_instruction(self) -> None:
@@ -88,7 +93,6 @@ class JobStableSectionOrderTests(unittest.TestCase):
         )
         self.assertLess(assembled.index("ship-checks"), marker)
         self.assertTrue(assembled.rstrip().endswith(instruction))
-
 
 class SharedPrefixPropertyTests(unittest.TestCase):
     def test_sibling_tasks_share_long_static_prefix(self) -> None:
@@ -137,7 +141,6 @@ class SharedPrefixPropertyTests(unittest.TestCase):
         self.assertTrue(prompt_b.rstrip().endswith(task_b))
         self.assertNotEqual(prompt_a, prompt_b)
 
-
 class CodegraphMemoizationTests(unittest.TestCase):
     def test_identical_context_calls_invoke_cli_once(self) -> None:
         from puppetmaster import codegraph
@@ -161,7 +164,6 @@ class CodegraphMemoizationTests(unittest.TestCase):
             self.assertEqual(first, "auth.py:1 -> login()")
             self.assertEqual(run.call_count, 1)
         codegraph._codegraph_context_cached.cache_clear()
-
 
 class AgenticMessageSplitTests(unittest.TestCase):
     def test_agent_loop_uses_system_prefix_and_user_instruction(self) -> None:
@@ -220,7 +222,6 @@ class AgenticMessageSplitTests(unittest.TestCase):
         self.assertEqual(first[1]["role"], "user")
         self.assertEqual(first[1]["content"], user_suffix)
 
-
 class EnrichCodegraphOrderTests(unittest.TestCase):
     def test_codegraph_section_lands_before_task_instruction(self) -> None:
         from puppetmaster.codegraph import enrich_prompt_with_codegraph
@@ -244,7 +245,6 @@ class EnrichCodegraphOrderTests(unittest.TestCase):
         task = enriched.index(TASK_INSTRUCTION_HEADER)
         self.assertLess(cg, task)
         self.assertTrue(enriched.rstrip().endswith(instruction))
-
 
 if __name__ == "__main__":
     unittest.main()

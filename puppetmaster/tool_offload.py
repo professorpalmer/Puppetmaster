@@ -5,6 +5,13 @@ Large tool results are spilled to a durable blob under
 head/tail preview plus a path pointer. Offload only happens when the
 savings gate says the replacement is worth it (token floor + margin).
 
+Agents retrieve spilled blobs via ``read_offload`` / ``read_offload_blob``,
+which is strictly confined to ``{state_dir}/tool_offload/`` (no workspace
+escapes or foreign paths), requires a self-created ``.pm-offload`` sidecar,
+and streams line slices under a char cap (never whole-file ``read_text``).
+History compaction treats offload stubs as already compacted so those
+durable path pointers survive.
+
 Policy (never raises from the hot path):
 
 * Kill switch: ``PUPPETMASTER_TOOL_OFFLOAD=0`` disables spill entirely.
@@ -40,9 +47,18 @@ SAVINGS_MARGIN = 0.9
 DEFAULT_HEAD_CHARS = 2000
 DEFAULT_TAIL_CHARS = 2000
 HARD_CAP_CHARS = 48000
+# Soft cap for agent-facing read_offload output (bytes≈chars for UTF-8 text).
+DEFAULT_READ_MAX_CHARS = HARD_CAP_CHARS
 OFFLOAD_SUBDIR = "tool_offload"
 SAVINGS_JSONL = "tool_output_savings.jsonl"
 ENTRY_KIND = "tool_output_offload"
+# Sidecar written next to every spilled blob so read_offload only serves
+# self-created spills — not arbitrary files planted under tool_offload/.
+OFFLOAD_MARKER_SUFFIX = ".pm-offload"
+OFFLOAD_MARKER_PAYLOAD = "puppetmaster-tool-offload-v1\n"
+# Model-facing stub header. History compaction must treat messages that start
+# with this as already compacted so durable path pointers survive.
+OFFLOAD_MARKER = "[tool output offloaded]"
 
 PathLike = Union[str, Path]
 
@@ -109,6 +125,10 @@ def _tail_chars() -> int:
 
 def _hard_cap() -> int:
     return max(0, _env_int("PUPPETMASTER_OFFLOAD_HARD_CAP_CHARS", HARD_CAP_CHARS))
+
+
+def _read_max_chars() -> int:
+    return max(0, _env_int("PUPPETMASTER_OFFLOAD_READ_MAX_CHARS", DEFAULT_READ_MAX_CHARS))
 
 
 def _safe_chars(value: object) -> int:
@@ -186,6 +206,236 @@ def soft_truncate(text: str, limit: int) -> str:
     return body[:cap] + "\n... (truncated, {0} more chars)".format(len(body) - cap)
 
 
+def is_offload_stub(content: str) -> bool:
+    """True when ``content`` is a model-facing tool-output offload stub."""
+    if not content or not isinstance(content, str):
+        return False
+    return content.startswith(OFFLOAD_MARKER)
+
+
+def offload_root(state_dir: PathLike) -> Path:
+    """Return ``{state_dir}/tool_offload`` (unresolved; caller may mkdir)."""
+    return Path(state_dir) / OFFLOAD_SUBDIR
+
+
+def confine_offload_path(path: PathLike, *, state_dir: PathLike) -> Path:
+    """Resolve ``path`` only if it is a file under ``{state_dir}/tool_offload``.
+
+    Accepts absolute paths that already point into the offload dir, or relative
+    names (``blob.txt`` / ``subdir/blob.txt``) resolved against that dir.
+    Rejects workspace escapes, foreign absolute paths, and missing files.
+    """
+    if state_dir is None or not str(state_dir).strip():
+        raise ValueError("state_dir is required to read an offload blob")
+    root = offload_root(state_dir).resolve()
+    raw = Path(str(path).strip() if path is not None else "")
+    if not str(raw):
+        raise ValueError("empty offload path")
+    if raw.is_absolute():
+        candidate = raw.resolve()
+    else:
+        # Refuse raw traversal segments before resolve softens them.
+        if ".." in raw.parts:
+            raise ValueError(f"path {path!r} escapes tool_offload")
+        candidate = (root / raw).resolve()
+    if root != candidate and root not in candidate.parents:
+        raise ValueError(f"path {path!r} is outside tool_offload")
+    if not candidate.is_file():
+        raise FileNotFoundError(f"offload blob not found: {path}")
+    return candidate
+
+
+def offload_marker_path(blob_path: PathLike) -> Path:
+    """Return the sidecar path that marks ``blob_path`` as self-created."""
+    return Path(blob_path).with_name(Path(blob_path).name + OFFLOAD_MARKER_SUFFIX)
+
+
+def mark_offload_blob(blob_path: PathLike) -> None:
+    """Write the durable self-created sidecar for a just-spilled blob."""
+    marker = offload_marker_path(blob_path)
+    marker.write_text(OFFLOAD_MARKER_PAYLOAD, encoding="utf-8")
+
+
+def is_self_created_offload_blob(blob_path: PathLike) -> bool:
+    """True when ``blob_path`` has a valid sidecar written by ``offload_tool_output``."""
+    marker = offload_marker_path(blob_path)
+    if not marker.is_file():
+        return False
+    try:
+        payload = marker.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return payload.startswith("puppetmaster-tool-offload-v1")
+
+
+def _skip_binary_lines(handle: Any, count: int, *, chunk_size: int = 65536) -> None:
+    """Advance a binary file handle past ``count`` newline-terminated lines."""
+    remaining = max(0, int(count))
+    while remaining > 0:
+        chunk = handle.read(chunk_size)
+        if not chunk:
+            return
+        offset = 0
+        while remaining > 0:
+            idx = chunk.find(b"\n", offset)
+            if idx < 0:
+                break
+            remaining -= 1
+            offset = idx + 1
+        if remaining == 0 and offset < len(chunk):
+            handle.seek(handle.tell() - (len(chunk) - offset))
+            return
+
+
+def _read_capped_binary_line(
+    handle: Any,
+    *,
+    max_bytes: int,
+    chunk_size: int = 65536,
+) -> Tuple[Optional[bytes], bool]:
+    """Read one line without trailing ``\\n``, capping retained bytes.
+
+    Returns ``(line_or_none, truncated)``. ``line_or_none`` is ``None`` on
+    immediate EOF. When the line exceeds ``max_bytes``, returns a capped
+    prefix and discards the remainder through the next newline.
+    """
+    buf = bytearray()
+    truncated = False
+    saw_any = False
+    while True:
+        chunk = handle.read(chunk_size)
+        if not chunk:
+            if not saw_any and not buf:
+                return None, False
+            return bytes(buf), truncated
+        saw_any = True
+        idx = chunk.find(b"\n")
+        if idx < 0:
+            if not truncated:
+                room = max_bytes - len(buf)
+                if room > 0:
+                    if len(chunk) <= room:
+                        buf.extend(chunk)
+                    else:
+                        buf.extend(chunk[:room])
+                        truncated = True
+                else:
+                    truncated = True
+            continue
+        if not truncated:
+            room = max_bytes - len(buf)
+            piece = chunk[:idx]
+            if room > 0:
+                if len(piece) <= room:
+                    buf.extend(piece)
+                else:
+                    buf.extend(piece[:room])
+                    truncated = True
+            else:
+                truncated = True
+        handle.seek(handle.tell() - (len(chunk) - idx - 1))
+        return bytes(buf), truncated
+
+
+def _stream_offload_slice(
+    target: Path,
+    *,
+    start_line: int,
+    limit: Optional[int],
+    max_chars: int,
+) -> str:
+    """Read a line slice without loading the whole file into memory.
+
+    Honors ``start_line`` / ``limit`` (1-based, ``splitlines``-compatible) and
+    clamps the returned text to ``max_chars``. Skips leading lines in binary
+    chunks and never materializes the full blob.
+    """
+    try:
+        start = max(1, int(start_line)) if start_line else 1
+    except (TypeError, ValueError):
+        start = 1
+    max_lines: Optional[int]
+    if limit is None or limit == "":
+        max_lines = None
+    else:
+        try:
+            max_lines = max(0, int(limit))
+        except (TypeError, ValueError):
+            max_lines = None
+
+    if max_chars <= 0:
+        return ""
+    if max_lines is not None and max_lines <= 0:
+        return ""
+
+    out_lines: list = []
+    chars = 0
+    truncated = False
+    with target.open("rb") as handle:
+        if start > 1:
+            _skip_binary_lines(handle, start - 1)
+        while True:
+            if max_lines is not None and len(out_lines) >= max_lines:
+                break
+            sep = 1 if out_lines else 0
+            budget = max_chars - chars - sep
+            if budget <= 0:
+                truncated = True
+                break
+            raw, line_truncated = _read_capped_binary_line(handle, max_bytes=budget)
+            if raw is None:
+                break
+            line = raw.decode("utf-8", errors="replace")
+            if line.endswith("\r"):
+                line = line[:-1]
+            if len(line) > budget:
+                line = line[:budget]
+                line_truncated = True
+            out_lines.append(line)
+            chars += sep + len(line)
+            if line_truncated:
+                truncated = True
+                break
+
+    body = "\n".join(out_lines)
+    if truncated:
+        note = "\n... (truncated, offload read capped at {0} chars)".format(max_chars)
+        if len(body) + len(note) > max_chars and max_chars > len(note):
+            body = body[: max_chars - len(note)].rstrip()
+        return body + note
+    return body
+
+
+def read_offload_blob(
+    path: PathLike,
+    *,
+    state_dir: PathLike,
+    start_line: int = 1,
+    limit: Optional[int] = None,
+) -> str:
+    """Read a confined self-offload blob for the agent. Never raises.
+
+    Returns file text (optionally line-sliced) or an ``error: ...`` string when
+    the path escapes ``{state_dir}/tool_offload``, is missing, is not a
+    self-created spill, or is unreadable. Streaming + char clamp avoid loading
+    large blobs wholly into memory. Does not grant arbitrary filesystem reads.
+    """
+    try:
+        target = confine_offload_path(path, state_dir=state_dir)
+        if not is_self_created_offload_blob(target):
+            return "error: path {0!r} is not a self-created offload blob".format(path)
+        return _stream_offload_slice(
+            target,
+            start_line=start_line,
+            limit=limit,
+            max_chars=_read_max_chars(),
+        )
+    except (ValueError, FileNotFoundError, OSError) as exc:
+        return "error: {0}".format(exc)
+    except Exception as exc:  # noqa: BLE001 - never break the tool loop
+        return "error: {0}: {1}".format(type(exc).__name__, exc)
+
+
 def _sanitize_id(value: str, fallback: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", (value or "").strip())[:80]
     return cleaned.strip("-._") or fallback
@@ -205,12 +455,12 @@ def _build_preview_message(
         size_str = "{0:.1f} KB".format(size_kb)
     tool_bit = " from {0}".format(tool_name) if tool_name else ""
     lines = [
-        "[tool output offloaded]",
+        OFFLOAD_MARKER,
         "This tool result{0} was too large ({1:,} characters, {2}).".format(
             tool_bit, original_chars, size_str
         ),
         "Full output saved to: {0}".format(file_path),
-        "Use read_file with start_line and limit to read specific sections.",
+        "Use read_offload with start_line and limit to read specific sections.",
         "",
         "Preview (head and tail):",
         preview,
@@ -425,6 +675,7 @@ def offload_tool_output(
                 blob_id = "{0}-{1}".format(blob_id, uuid.uuid4().hex[:8])
                 target = offload_dir / "{0}.txt".format(blob_id)
             target.write_text(body, encoding="utf-8")
+            mark_offload_blob(target)
             file_path = str(target.resolve())
         except OSError as exc:
             meta["reason"] = "write failed: {0}".format(type(exc).__name__)

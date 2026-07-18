@@ -5,6 +5,14 @@ with fake ``apply_fn`` callables, so no model or network is involved. The
 verification commands use ``sys.executable`` rather than a bare ``python`` so
 they run regardless of how the CI host names its interpreter.
 """
+import os
+import sys
+
+_HERMETIC_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HERMETIC_DIR not in sys.path:
+    sys.path.insert(0, _HERMETIC_DIR)
+import hermetic_env  # noqa: F401  # process-wide host-env isolation
+
 import shutil
 import sys
 import tempfile
@@ -20,7 +28,6 @@ from puppetmaster.eval_harness import (
     score_case,
 )
 
-
 def _case() -> EvalCase:
     verify = (
         f'{sys.executable} -c "import calc; assert calc.add(2, 3) == 5; '
@@ -34,9 +41,7 @@ def _case() -> EvalCase:
         intended_files=["calc.py"],
     )
 
-
 _FIXED = "def add(a, b):\n    return a + b\n"
-
 
 class EvalHarnessTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -104,7 +109,6 @@ class EvalHarnessTests(unittest.TestCase):
         self.assertEqual(report.passed, 0)
         self.assertIsNotNone(report.results[0].error)
         self.assertIn("adapter blew up", report.results[0].error)
-
 
 if __name__ == "__main__":
     unittest.main()

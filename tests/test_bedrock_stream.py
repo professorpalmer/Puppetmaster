@@ -1,15 +1,21 @@
 """Hermetic unit tests for Bedrock ConverseStream (no live AWS)."""
 from __future__ import annotations
 
+import os
+import sys
+
+_HERMETIC_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HERMETIC_DIR not in sys.path:
+    sys.path.insert(0, _HERMETIC_DIR)
+import hermetic_env  # noqa: F401  # process-wide host-env isolation
+
 import io
 import json
 import unittest
 from unittest.mock import patch
 
-
 def _stream_body(*events: bytes) -> bytes:
     return b"".join(events)
-
 
 class BedrockEventStreamCodecTests(unittest.TestCase):
     def test_round_trip_headers_and_json_payload(self) -> None:
@@ -44,7 +50,6 @@ class BedrockEventStreamCodecTests(unittest.TestCase):
         )
         events = list(bedrock._iter_converse_stream_events(io.BytesIO(framed)))
         self.assertEqual(events, [{"messageStop": {"stopReason": "end_turn"}}])
-
 
 class BedrockConverseStreamTests(unittest.TestCase):
     def test_converse_stream_url(self) -> None:
@@ -313,7 +318,6 @@ class BedrockConverseStreamTests(unittest.TestCase):
                     env={"AWS_BEARER_TOKEN_BEDROCK": "tok"},
                 )
         self.assertIn("bad model", str(ctx.exception))
-
 
 if __name__ == "__main__":
     unittest.main()

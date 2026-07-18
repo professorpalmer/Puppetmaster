@@ -1,14 +1,23 @@
 """Tests for tool-batch segmentation and parallel execution."""
-import json
+import os
+import sys
+
+_HERMETIC_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HERMETIC_DIR not in sys.path:
+    sys.path.insert(0, _HERMETIC_DIR)
+import hermetic_env  # noqa: F401  # process-wide host-env isolation
+
 import os
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, patch
 
 from puppetmaster.tool_batch import (
+    DEFAULT_TOOL_BATCH_MAX_WORKERS,
     is_parallel_enabled,
+    parallel_executor_max_workers,
+    parallel_worker_cap,
     plan_tool_batch_segments,
 )
-
 
 class ToolBatchSegmentationTests(unittest.TestCase):
     """Unit tests for plan_tool_batch_segments."""
@@ -16,10 +25,12 @@ class ToolBatchSegmentationTests(unittest.TestCase):
     def setUp(self):
         # Ensure parallel execution is enabled for tests
         os.environ["PUPPETMASTER_TOOL_BATCH_PARALLEL"] = "1"
+        os.environ.pop("PUPPETMASTER_TOOL_BATCH_MAX_WORKERS", None)
 
     def tearDown(self):
         # Clean up environment
         os.environ.pop("PUPPETMASTER_TOOL_BATCH_PARALLEL", None)
+        os.environ.pop("PUPPETMASTER_TOOL_BATCH_MAX_WORKERS", None)
 
     def _make_tool_call(self, name: str, args: dict, call_id: str = "test-id"):
         """Helper to create a tool call dict."""
@@ -200,6 +211,123 @@ class ToolBatchSegmentationTests(unittest.TestCase):
         self.assertEqual(flattened[2]["id"], "3")
         self.assertEqual(flattened[3]["id"], "4")
 
+    def test_large_safe_batch_stays_one_parallel_segment(self):
+        """Worker cap bounds the executor, not segmentation — one parallel run."""
+        calls = [
+            self._make_tool_call("read_file", {"path": f"f{i}.py"}, str(i))
+            for i in range(20)
+        ]
+        os.environ["PUPPETMASTER_TOOL_BATCH_MAX_WORKERS"] = "4"
+        segments = plan_tool_batch_segments(calls)
+        self.assertEqual(len(segments), 1)
+        self.assertEqual(segments[0][0], "parallel")
+        self.assertEqual(len(segments[0][1]), 20)
+
+class ToolBatchWorkerCapTests(unittest.TestCase):
+    """Unit tests for the Wave 5 parallel worker cap."""
+
+    def setUp(self):
+        os.environ["PUPPETMASTER_TOOL_BATCH_PARALLEL"] = "1"
+        os.environ.pop("PUPPETMASTER_TOOL_BATCH_MAX_WORKERS", None)
+
+    def tearDown(self):
+        os.environ.pop("PUPPETMASTER_TOOL_BATCH_PARALLEL", None)
+        os.environ.pop("PUPPETMASTER_TOOL_BATCH_MAX_WORKERS", None)
+
+    def test_default_cap(self):
+        self.assertEqual(parallel_worker_cap(), DEFAULT_TOOL_BATCH_MAX_WORKERS)
+
+    def test_cap_parsing_valid_override(self):
+        os.environ["PUPPETMASTER_TOOL_BATCH_MAX_WORKERS"] = "4"
+        self.assertEqual(parallel_worker_cap(), 4)
+
+    def test_cap_parsing_invalid_falls_back(self):
+        os.environ["PUPPETMASTER_TOOL_BATCH_MAX_WORKERS"] = "not-a-number"
+        self.assertEqual(parallel_worker_cap(), DEFAULT_TOOL_BATCH_MAX_WORKERS)
+
+    def test_cap_parsing_clamps_low_and_high(self):
+        os.environ["PUPPETMASTER_TOOL_BATCH_MAX_WORKERS"] = "0"
+        self.assertEqual(parallel_worker_cap(), 1)
+        os.environ["PUPPETMASTER_TOOL_BATCH_MAX_WORKERS"] = "-3"
+        self.assertEqual(parallel_worker_cap(), 1)
+        os.environ["PUPPETMASTER_TOOL_BATCH_MAX_WORKERS"] = "999"
+        self.assertEqual(parallel_worker_cap(), 64)
+
+    def test_executor_max_workers_bounded_by_cap(self):
+        os.environ["PUPPETMASTER_TOOL_BATCH_MAX_WORKERS"] = "4"
+        self.assertEqual(parallel_executor_max_workers(20), 4)
+        self.assertEqual(parallel_executor_max_workers(3), 3)
+        self.assertEqual(parallel_executor_max_workers(0), 1)
+
+    def test_kill_switch_still_forces_sequential_segments(self):
+        """PUPPETMASTER_TOOL_BATCH_PARALLEL=0 remains the disable path."""
+        os.environ["PUPPETMASTER_TOOL_BATCH_PARALLEL"] = "0"
+        os.environ["PUPPETMASTER_TOOL_BATCH_MAX_WORKERS"] = "8"
+        calls = [
+            {"id": "1", "name": "read_file", "arguments": {"path": "a.py"}},
+            {"id": "2", "name": "read_file", "arguments": {"path": "b.py"}},
+            {"id": "3", "name": "search_code", "arguments": {"query": "foo"}},
+        ]
+        segments = plan_tool_batch_segments(calls)
+        self.assertEqual(segments, [("sequential", calls)])
+        self.assertFalse(is_parallel_enabled())
+
+class ToolBatchExecutorBoundTests(unittest.TestCase):
+    """Agentic parallel segment uses the capped ThreadPoolExecutor size."""
+
+    def setUp(self):
+        os.environ["PUPPETMASTER_TOOL_BATCH_PARALLEL"] = "1"
+        os.environ["PUPPETMASTER_TOOL_BATCH_MAX_WORKERS"] = "3"
+
+    def tearDown(self):
+        os.environ.pop("PUPPETMASTER_TOOL_BATCH_PARALLEL", None)
+        os.environ.pop("PUPPETMASTER_TOOL_BATCH_MAX_WORKERS", None)
+
+    def test_parallel_executor_uses_capped_max_workers(self):
+        from puppetmaster.adapters.agentic import AgenticAdapter
+
+        adapter = AgenticAdapter()
+        calls = [
+            {"id": str(i), "name": "list_dir", "arguments": {"path": "."}}
+            for i in range(10)
+        ]
+        captured = {}
+
+        class _FakeFuture:
+            def __init__(self, value):
+                self._value = value
+
+            def result(self):
+                return self._value
+
+        def _fake_executor(*, max_workers):
+            captured["max_workers"] = max_workers
+            pool = MagicMock()
+
+            def _submit(fn, call):
+                return _FakeFuture(fn(call))
+
+            pool.submit.side_effect = _submit
+            pool.__enter__.return_value = pool
+            pool.__exit__.return_value = False
+            return pool
+
+        with patch(
+            "puppetmaster.adapters.agentic.concurrent.futures.ThreadPoolExecutor",
+            side_effect=_fake_executor,
+        ), patch(
+            "puppetmaster.adapters.agentic.concurrent.futures.as_completed",
+            side_effect=lambda futures: list(futures),
+        ), patch.object(
+            adapter, "_execute_tool", return_value="ok"
+        ):
+            results = adapter._execute_tool_segment_parallel(
+                calls, cwd=MagicMock(), implement=False, task=MagicMock()
+            )
+
+        self.assertEqual(captured["max_workers"], 3)
+        self.assertEqual(len(results), 10)
+        self.assertTrue(all(output == "ok" for _call, output in results))
 
 if __name__ == "__main__":
     unittest.main()

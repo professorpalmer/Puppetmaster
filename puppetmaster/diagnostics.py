@@ -714,38 +714,90 @@ def _mcp_env_check(name: str) -> Check:
 def _sqlite_state_check(path: Path) -> Check:
     if not path.exists():
         return Check("sqlite-state", "optional", "no local sqlite state yet")
+    from puppetmaster.sqlite_store import SQLiteSwarmStore
+
+    store = SQLiteSwarmStore(path.parent)
+    # Bounded read-only quick_check first — locked/corrupt/unavailable stores
+    # must warn, never crash doctor.
     try:
-        # ``with sqlite3.connect(...)`` only commits — it does not close the
-        # handle. On Windows a lingering handle locks the file and breaks a
-        # later unlink (WinError 32), so close it explicitly.
-        connection = sqlite3.connect(path)
+        integrity = store.integrity_status()
+    except Exception as exc:  # noqa: BLE001 — doctor surface stays non-fatal
+        return Check(
+            "sqlite-state",
+            "warn",
+            f"unavailable; quick_check={type(exc).__name__}: {exc}",
+        )
+    integrity_flag = integrity.get("integrity_status", "warn")
+    quick_check = integrity.get("quick_check", "unknown")
+    if integrity_flag == "unavailable":
+        return Check(
+            "sqlite-state",
+            "warn",
+            f"unavailable; quick_check={quick_check}",
+        )
+    if integrity_flag != "ok":
+        return Check(
+            "sqlite-state",
+            "warn",
+            f"quick_check={quick_check}",
+        )
+
+    try:
+        # Open through the store so doctor sees the same per-connection PRAGMA
+        # policy applied on every fresh connect(). Close explicitly — Windows
+        # holds a mandatory lock on an open DB handle (WinError 32 on unlink).
+        connection = store.connect()
         try:
             row = connection.execute(
                 "SELECT value FROM metadata WHERE key = 'schema_version'"
             ).fetchone()
-            integrity = connection.execute("PRAGMA integrity_check").fetchone()
             journal = connection.execute("PRAGMA journal_mode").fetchone()
+            busy_timeout = connection.execute("PRAGMA busy_timeout").fetchone()
+            foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()
+            synchronous = connection.execute("PRAGMA synchronous").fetchone()
         finally:
             connection.close()
-    except sqlite3.Error as exc:
-        return Check("sqlite-state", "warn", str(exc))
-    from puppetmaster.sqlite_store import SQLiteSwarmStore
+    except (sqlite3.Error, OSError) as exc:
+        return Check(
+            "sqlite-state",
+            "warn",
+            f"unavailable; quick_check={quick_check}; error={exc}",
+        )
 
     version = row[0] if row else "unknown"
     expected = str(SQLiteSwarmStore.schema_version)
-    integrity_status = integrity[0] if integrity else "unknown"
-    journal_mode = journal[0] if journal else "unknown"
+    journal_mode = str(journal[0]).lower() if journal else "unknown"
+    busy_timeout_value = str(busy_timeout[0]) if busy_timeout else "unknown"
+    foreign_keys_value = str(foreign_keys[0]) if foreign_keys else "unknown"
+    synchronous_value = str(synchronous[0]) if synchronous else "unknown"
+    expected_busy = str(store.busy_timeout_ms)
+    expected_foreign_keys = "1"
+    expected_synchronous = str(store._synchronous_pragma_value())
     schema_mismatch = version != "unknown" and version != expected
-    healthy = integrity_status == "ok" and journal_mode == "wal" and not schema_mismatch
-    status = "ok" if healthy else "warn"
+    pragma_mismatch = (
+        journal_mode != "wal"
+        or busy_timeout_value != expected_busy
+        or foreign_keys_value != expected_foreign_keys
+        or synchronous_value != expected_synchronous
+    )
+    status = "ok" if not schema_mismatch and not pragma_mismatch else "warn"
     detail = (
         f"schema={version}; expected={expected}; "
-        f"journal={journal_mode}; integrity={integrity_status}"
+        f"journal={journal_mode}; busy_timeout={busy_timeout_value}; "
+        f"foreign_keys={foreign_keys_value}; synchronous={synchronous_value}; "
+        f"quick_check={quick_check}"
     )
     if schema_mismatch:
         detail += (
             f"; persisted schema version differs from SQLiteSwarmStore "
             f"expected version {expected}"
+        )
+    if pragma_mismatch:
+        detail += (
+            f"; connection PRAGMA policy mismatch "
+            f"(expected journal=wal busy_timeout={expected_busy} "
+            f"foreign_keys={expected_foreign_keys} "
+            f"synchronous={expected_synchronous})"
         )
     return Check("sqlite-state", status, detail)
 

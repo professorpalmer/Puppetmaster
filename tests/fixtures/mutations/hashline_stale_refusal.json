@@ -1,0 +1,15 @@
+{
+  "name": "hashline_stale_refusal",
+  "engine": "hashline",
+  "source_path": "pkg/sample.py",
+  "source_text": "line1\nline2\nline3\n",
+  "hashline": {
+    "tag": "stale",
+    "ops": "DEL 1\n"
+  },
+  "expect": {
+    "status": "stale",
+    "text": "line1\nline2\nline3\n",
+    "assert_result_tag": false
+  }
+}

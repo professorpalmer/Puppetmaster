@@ -6,13 +6,20 @@ navigate/snapshot/click/type/dispatch return deterministic strings, and unsafe
 or internal URLs are asserted refused. No pytest fixtures (monkeypatch/tmp_path)
 are used, since unittest discovery does not provide them.
 """
+import os
+import sys
+
+_HERMETIC_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HERMETIC_DIR not in sys.path:
+    sys.path.insert(0, _HERMETIC_DIR)
+import hermetic_env  # noqa: F401  # process-wide host-env isolation
+
 import base64
 import os
 import tempfile
 import unittest
 
 import puppetmaster.browser_cdp as b
-
 
 class _FakeSession:
     def __init__(self):
@@ -48,7 +55,6 @@ class _FakeSession:
 
     def shutdown(self):
         pass
-
 
 class BrowserCdpTest(unittest.TestCase):
     def setUp(self):
@@ -108,7 +114,6 @@ class BrowserCdpTest(unittest.TestCase):
             self.assertIn("Chrome/Chromium not found", out)
         finally:
             b._find_chrome = saved_find
-
 
 if __name__ == "__main__":
     unittest.main()

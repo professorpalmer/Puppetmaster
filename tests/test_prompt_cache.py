@@ -1,12 +1,19 @@
 """Prompt-caching markers for agentic workers (Anthropic + OpenAI-wire)."""
 from __future__ import annotations
 
+import os
+import sys
+
+_HERMETIC_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HERMETIC_DIR not in sys.path:
+    sys.path.insert(0, _HERMETIC_DIR)
+import hermetic_env  # noqa: F401  # process-wide host-env isolation
+
 import json
 import unittest
 from unittest import mock
 
 from puppetmaster import providers
-
 
 def _count_cache_markers(obj) -> int:
     """Count cache_control dicts anywhere in a request body."""
@@ -17,7 +24,6 @@ def _count_cache_markers(obj) -> int:
         return sum(_count_cache_markers(v) for v in obj)
     return 0
 
-
 def _tool(name: str) -> dict:
     return {
         "type": "function",
@@ -27,7 +33,6 @@ def _tool(name: str) -> dict:
             "parameters": {"type": "object", "properties": {}},
         },
     }
-
 
 class ApplyAnthropicCacheControlTests(unittest.TestCase):
     def test_system_string_becomes_marked_block_list(self) -> None:
@@ -210,7 +215,6 @@ class ApplyAnthropicCacheControlTests(unittest.TestCase):
         self.assertEqual(out["system"], "sys")
         self.assertEqual(_count_cache_markers(out), 0)
 
-
 class AnthropicChatCacheIntegrationTests(unittest.TestCase):
     def test_sync_path_applies_markers_and_parses_cache_write(self) -> None:
         canned = {
@@ -371,7 +375,6 @@ class AnthropicChatCacheIntegrationTests(unittest.TestCase):
             {"type": "ephemeral", "ttl": "1h"},
         )
 
-
 class OpenAIExplicitCacheKindTests(unittest.TestCase):
     def test_claude_slugs(self) -> None:
         for model in (
@@ -403,7 +406,6 @@ class OpenAIExplicitCacheKindTests(unittest.TestCase):
         ):
             with self.subTest(model=model):
                 self.assertEqual(providers._openai_explicit_cache_kind(model), "")
-
 
 class ApplyOpenAIExplicitCacheTests(unittest.TestCase):
     def _claude_body(self) -> dict:
@@ -539,7 +541,6 @@ class ApplyOpenAIExplicitCacheTests(unittest.TestCase):
             extra={"session_id": "sticky-loop-1"},
         )
         self.assertEqual(out["session_id"], "sticky-loop-1")
-
 
 class OpenAIChatCacheIntegrationTests(unittest.TestCase):
     def test_openrouter_claude_sync_path_applies_markers(self) -> None:
@@ -703,7 +704,6 @@ class OpenAIChatCacheIntegrationTests(unittest.TestCase):
             {"type": "ephemeral", "ttl": "1h"},
         )
         self.assertIn("session_id", captured["body"])
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,16 @@
+{
+  "name": "edit_stale_tag_refusal",
+  "engine": "edit_file",
+  "source_path": "pkg/sample.py",
+  "source_text": "def greet(name):\n    msg = \"Hello, \" + name\n    return msg\n",
+  "edit_file": {
+    "old_string": "Hello, ",
+    "new_string": "Hi, ",
+    "expected_tag": "stale"
+  },
+  "expect": {
+    "status": "stale",
+    "text": "def greet(name):\n    msg = \"Hello, \" + name\n    return msg\n",
+    "assert_result_tag": false
+  }
+}

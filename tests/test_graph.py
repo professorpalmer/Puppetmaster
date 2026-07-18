@@ -1,6 +1,14 @@
 """Focused tests for the durable execution/provenance graph vertical slice."""
 from __future__ import annotations
 
+import os
+import sys
+
+_HERMETIC_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HERMETIC_DIR not in sys.path:
+    sys.path.insert(0, _HERMETIC_DIR)
+import hermetic_env  # noqa: F401  # process-wide host-env isolation
+
 import io
 import json
 import os
@@ -48,7 +56,6 @@ _NON_LOCAL_ADAPTERS = (
     "cursor",
 )
 
-
 def _decision_artifact(job_id: str, task_id: str, decision: str) -> Artifact:
     return Artifact(
         job_id=job_id,
@@ -59,7 +66,6 @@ def _decision_artifact(job_id: str, task_id: str, decision: str) -> Artifact:
         confidence=0.9,
         evidence=["test"],
     )
-
 
 def _failure_artifact(
     job_id: str, task_id: str, failure: str
@@ -78,7 +84,6 @@ def _failure_artifact(
         evidence=["test"],
     )
 
-
 class GraphEdgeIdentityTests(unittest.TestCase):
     def test_identity_is_stable_and_idempotent(self) -> None:
         first = graph_edge_identity(
@@ -93,7 +98,6 @@ class GraphEdgeIdentityTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertNotEqual(first, third)
         self.assertTrue(first.startswith("edge_"))
-
 
 class GraphStoreParityTests(unittest.TestCase):
     def _backends(self, root: Path):
@@ -379,7 +383,6 @@ class GraphStoreParityTests(unittest.TestCase):
             self.assertEqual(produces[0].to_id, artifact.id)
             self.assertTrue(marker.exists())
 
-
 class FailurePropagationTests(unittest.TestCase):
     def test_hard_failed_dependency_cascades_blocked_child(self) -> None:
         for backend in ("file", "sqlite"):
@@ -472,7 +475,6 @@ class FailurePropagationTests(unittest.TestCase):
             self.assertEqual(len(ready), 1)
             self.assertEqual(ready[0].id, child.id)
             self.assertEqual(ready[0].status, TaskStatus.QUEUED)
-
 
 class PrewalkEdgeResolutionTests(unittest.TestCase):
     def test_build_prewalk_includes_verify_on_implement(self) -> None:
@@ -719,7 +721,6 @@ class PrewalkEdgeResolutionTests(unittest.TestCase):
             any(art.type == ArtifactType.VERIFICATION for art in verify_arts)
         )
 
-
 class SubgraphResetTests(unittest.TestCase):
     def _seed_chain(self, store: SwarmStore):
         job = store.create_job("subgraph reset")
@@ -859,7 +860,6 @@ class SubgraphResetTests(unittest.TestCase):
             with self.assertRaises(ActiveTaskLeaseError):
                 store.reset_subgraph(job.id, [implement.id])
 
-
 class PrewalkAdapterPinTests(unittest.TestCase):
     def test_non_local_plan_and_verify_pin_allowed_adapters(self) -> None:
         for plan_adapter, implement_adapter, verify_adapter in (
@@ -901,7 +901,6 @@ class PrewalkAdapterPinTests(unittest.TestCase):
             self.assertEqual(spec.adapter, "local")
             self.assertNotIn("allowed_adapters", spec.payload)
             self.assertTrue(spec.payload.get("auto_route"))
-
 
 class SharedPrewalkPromptPathTests(unittest.TestCase):
     """Every non-local adapter funnels through with_job_brief → with_prewalk_plan."""
@@ -1050,7 +1049,6 @@ class SharedPrewalkPromptPathTests(unittest.TestCase):
                         )
                     self.assertIn("Decision: Broad fallback", result)
 
-
 class AmbiguousModelPinBoundaryTests(unittest.TestCase):
     def _ambiguous_registry(self, path: Path):
         from puppetmaster.model_registry import ModelSpec, save_registry
@@ -1133,7 +1131,6 @@ class AmbiguousModelPinBoundaryTests(unittest.TestCase):
                         self.assertIn("preflight:ambiguous_model_pin", blob)
                         self.assertNotIn("Traceback", blob)
 
-
 class FileConsumesJournalTests(unittest.TestCase):
     def test_record_consumes_journal_replays_after_crash(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1207,7 +1204,6 @@ class FileConsumesJournalTests(unittest.TestCase):
                 self.assertTrue(store.delete_edge(job.id, edge.id))
             retry.assert_called()
             self.assertFalse(path.exists())
-
 
 class SqliteAtomicResetAndDoctorTests(unittest.TestCase):
     def test_sqlite_reset_subgraph_is_single_transaction(self) -> None:
@@ -1321,7 +1317,6 @@ class SqliteAtomicResetAndDoctorTests(unittest.TestCase):
             self.assertIn("expected=2", sqlite_check.detail)
             self.assertIn("999", sqlite_check.detail)
             self.assertIn("differs", sqlite_check.detail)
-
 
 class GraphCliMcpTests(unittest.TestCase):
     def test_cli_graph_outputs_nodes_and_edges(self) -> None:
@@ -1540,7 +1535,6 @@ class GraphCliMcpTests(unittest.TestCase):
             self.assertIn("produces", edge_types)
             status = SQLiteSwarmStore(root).schema_status()
             self.assertEqual(status["schema_version"], "2")
-
 
 if __name__ == "__main__":
     unittest.main()

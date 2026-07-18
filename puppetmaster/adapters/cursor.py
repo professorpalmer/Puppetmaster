@@ -114,6 +114,7 @@ class CursorAdapter(CliWorkerAdapter):
             disabled=bool(task.payload.get("disable_codegraph", False)),
         )
         runner = _CURSOR_RUNNER
+        params = task.payload.get("params")
         return CliInvocation(
             command=[resolved, str(runner)],
             sidecar_name="cursor_implement",
@@ -121,6 +122,7 @@ class CursorAdapter(CliWorkerAdapter):
                 "prompt": prompt,
                 "codegraph_used": codegraph_used,
                 "model": model,
+                "params": params if isinstance(params, list) else None,
                 "cwd": str(cwd),
             },
         )
@@ -134,12 +136,16 @@ class CursorAdapter(CliWorkerAdapter):
     ) -> StreamedProcess:
         environment = inject_worker_cli_env(os.environ.copy())
         apply_worktree_ports(environment, cwd)
+        cursor_input: dict[str, Any] = {
+            "prompt": prepared.extras["prompt"],
+            "cwd": prepared.extras["cwd"],
+            "model": prepared.extras["model"],
+        }
+        params = prepared.extras.get("params")
+        if isinstance(params, list) and params:
+            cursor_input["params"] = params
         environment["PUPPETMASTER_CURSOR_INPUT"] = json.dumps(
-            {
-                "prompt": prepared.extras["prompt"],
-                "cwd": prepared.extras["cwd"],
-                "model": prepared.extras["model"],
-            },
+            cursor_input,
             sort_keys=True,
         )
         return facade("run_streamed_subprocess")(
@@ -292,8 +298,12 @@ class CursorAdapter(CliWorkerAdapter):
         runner = _CURSOR_RUNNER
         environment = inject_worker_cli_env(os.environ.copy())
         apply_worktree_ports(environment, cwd)
+        cursor_input: dict[str, Any] = {"prompt": prompt, "cwd": cwd, "model": model}
+        params = task.payload.get("params")
+        if isinstance(params, list) and params:
+            cursor_input["params"] = params
         environment["PUPPETMASTER_CURSOR_INPUT"] = json.dumps(
-            {"prompt": prompt, "cwd": cwd, "model": model},
+            cursor_input,
             sort_keys=True,
         )
         timeout_seconds = int(task.payload.get("timeout_seconds", 300))

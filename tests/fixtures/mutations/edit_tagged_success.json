@@ -1,0 +1,16 @@
+{
+  "name": "edit_tagged_success",
+  "engine": "edit_file",
+  "source_path": "pkg/sample.py",
+  "source_text": "def greet(name):\n    msg = \"Hello, \" + name\n    return msg\n",
+  "edit_file": {
+    "old_string": "Hello, ",
+    "new_string": "Hi, ",
+    "expected_tag": "live"
+  },
+  "expect": {
+    "status": "ok",
+    "text": "def greet(name):\n    msg = \"Hi, \" + name\n    return msg\n",
+    "assert_result_tag": true
+  }
+}

@@ -1,6 +1,14 @@
 """Unit tests for OMP-style plan-then-cheap prewalk (no subprocess)."""
 from __future__ import annotations
 
+import os
+import sys
+
+_HERMETIC_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HERMETIC_DIR not in sys.path:
+    sys.path.insert(0, _HERMETIC_DIR)
+import hermetic_env  # noqa: F401  # process-wide host-env isolation
+
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -28,7 +36,6 @@ from puppetmaster.workers import (
     spec_explicitly_no_edit,
     swarm_mode,
 )
-
 
 class BuildPrewalkSpecsTests(unittest.TestCase):
     def test_plan_before_implement_with_depends_on(self) -> None:
@@ -100,7 +107,6 @@ class BuildPrewalkSpecsTests(unittest.TestCase):
     def test_rejects_empty_goal(self) -> None:
         with self.assertRaises(ValueError):
             build_prewalk_specs("  ", cwd="/repo")
-
 
 class FormatPlanInjectionTests(unittest.TestCase):
     def test_formats_decision_artifact_objects(self) -> None:
@@ -198,7 +204,6 @@ class FormatPlanInjectionTests(unittest.TestCase):
         prompt = inject_plan_into_prompt("Keep me", [{"type": "risk", "payload": {"risk": "x", "mitigation": "y"}}])
         self.assertEqual(prompt, "Keep me")
 
-
 class WithPrewalkPlanTests(unittest.TestCase):
     def test_with_prewalk_plan_injects_decision_from_payload_artifacts(self) -> None:
         artifacts = [
@@ -277,7 +282,6 @@ class WithPrewalkPlanTests(unittest.TestCase):
         prompt = "plain implement prompt"
         self.assertEqual(with_prewalk_plan(prompt, task), prompt)
 
-
 class PrewalkMcpCommandTests(unittest.TestCase):
     def test_prewalk_command_builds_cli_argv(self) -> None:
         from puppetmaster.mcp_server import prewalk_command
@@ -323,7 +327,6 @@ class PrewalkMcpCommandTests(unittest.TestCase):
         self.assertEqual(verify.adapter, "cursor")
         self.assertEqual(verify.payload.get("model"), "composer-2")
         self.assertEqual(verify.payload.get("timeout_seconds"), 321)
-
 
 class PrewalkSavingsLedgerTests(unittest.TestCase):
     """Prewalk jobs stamp one ROUTING artifact per leg; savings must attribute
@@ -444,7 +447,6 @@ class PrewalkSavingsLedgerTests(unittest.TestCase):
                 (implement_baseline - implement_chosen) - plan_chosen,
                 places=6,
             )
-
 
 if __name__ == "__main__":
     unittest.main()

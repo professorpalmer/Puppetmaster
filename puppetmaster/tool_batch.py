@@ -6,6 +6,11 @@ planner splits the batch into ordered segments — maximal contiguous runs of
 parallel-safe calls, separated by sequential barrier calls — so the agentic
 loop can run the safe segments concurrently while preserving emission order and
 side-effect boundaries.
+
+Parallel segments are also *bounded*: the executor never spins more threads than
+``PUPPETMASTER_TOOL_BATCH_MAX_WORKERS`` (default 8). Segmentation / barrier
+correctness is independent of that cap — large safe batches stay one parallel
+segment, they just run with a fixed worker pool.
 """
 from __future__ import annotations
 
@@ -28,6 +33,7 @@ _NEVER_PARALLEL_TOOLS = frozenset({
 # Read-only tools with no shared mutable session state.
 _PARALLEL_SAFE_TOOLS = frozenset({
     "read_file",
+    "read_offload",
     "list_dir",
     "search_code",
     "graph_search",
@@ -40,6 +46,11 @@ _PARALLEL_SAFE_TOOLS = frozenset({
 # (apply_hashline is mutating and not listed in _PARALLEL_SAFE_TOOLS).
 _PATH_SCOPED_TOOLS = frozenset({"read_file"})
 
+# Conservative default — enough for a typical multi-read turn without
+# unbounded threading on a 50-file batch. Env-overridable; hard-capped.
+DEFAULT_TOOL_BATCH_MAX_WORKERS = 8
+_ABSOLUTE_MAX_TOOL_BATCH_WORKERS = 64
+
 
 def is_parallel_enabled() -> bool:
     """Check if tool-batch parallelization is enabled via environment variable.
@@ -48,6 +59,35 @@ def is_parallel_enabled() -> bool:
     """
     val = os.environ.get("PUPPETMASTER_TOOL_BATCH_PARALLEL", "1").strip().lower()
     return val not in ("0", "false", "off", "no")
+
+
+def parallel_worker_cap() -> int:
+    """Return the env-overridable cap on concurrent tool-batch workers.
+
+    ``PUPPETMASTER_TOOL_BATCH_MAX_WORKERS`` defaults to
+    :data:`DEFAULT_TOOL_BATCH_MAX_WORKERS`. Invalid / empty values fall back to
+    the default; values are clamped to ``[1, 64]``.
+    """
+    raw = os.environ.get("PUPPETMASTER_TOOL_BATCH_MAX_WORKERS", "").strip()
+    if not raw:
+        return DEFAULT_TOOL_BATCH_MAX_WORKERS
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_TOOL_BATCH_MAX_WORKERS
+    return max(1, min(value, _ABSOLUTE_MAX_TOOL_BATCH_WORKERS))
+
+
+def parallel_executor_max_workers(call_count: int) -> int:
+    """ThreadPoolExecutor size for a parallel segment of ``call_count`` calls.
+
+    Always at least 1 and never larger than the configured cap or the call
+    count (no idle threads for tiny segments).
+    """
+    n = max(0, int(call_count))
+    if n <= 0:
+        return 1
+    return max(1, min(n, parallel_worker_cap()))
 
 
 def plan_tool_batch_segments(tool_calls: list) -> list[tuple[str, list]]:

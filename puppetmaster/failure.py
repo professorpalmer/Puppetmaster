@@ -18,9 +18,14 @@ APPROVAL_DENIED = "approval_denied"
 SANDBOX_DENIED = "sandbox_denied"
 TIMEOUT = "timeout"
 NETWORK_ERROR = "network_error"
+MALFORMED_RESPONSE = "malformed_response"
+SERVER_ERROR = "server_error"
 CONTEXT_LENGTH_EXCEEDED = "context_length_exceeded"
 PERMISSION_DENIED = "permission_denied"
 FORBIDDEN = "forbidden"
+# Legacy OpenAI adapter literal. Kept as its own string so persisted
+# artifacts / dashboards matching ``openai_server_error`` keep working.
+# Canonical retry / provider policy uses :data:`SERVER_ERROR`.
 OPENAI_SERVER_ERROR = "openai_server_error"
 SDK_NOT_INSTALLED = "sdk_not_installed"
 RUN_STATUS_ERROR = "run_status_error"
@@ -142,5 +147,48 @@ def classify_openai_failure(body: str, http_status: Optional[int] = None) -> str
     if http_status == 429:
         return RATE_LIMIT
     if http_status is not None and 500 <= http_status < 600:
+        # Preserve the historical observability literal for OpenAI adapter
+        # verification artifacts; provider retry uses SERVER_ERROR instead.
         return OPENAI_SERVER_ERROR
     return classify_adapter_failure("openai", body)
+
+
+def is_server_error_failure(failure: str) -> bool:
+    """True for canonical ``server_error`` or legacy ``openai_server_error``."""
+    return failure in (SERVER_ERROR, OPENAI_SERVER_ERROR)
+
+
+def classify_provider_failure(
+    reason: str,
+    http_status: Optional[int] = None,
+) -> str:
+    """Bridge raw direct-provider errors into the canonical failure taxonomy.
+
+    ``reason`` remains provider diagnostic data; callers use this normalized
+    result for retry and routing decisions.
+    """
+    if http_status is None and reason.startswith("http_status:"):
+        try:
+            http_status = int(reason.partition(":")[2])
+        except ValueError:
+            pass
+
+    if http_status == 401:
+        return NOT_AUTHENTICATED
+    if http_status == 403:
+        return FORBIDDEN
+    if http_status == 429:
+        return RATE_LIMIT
+    if http_status is not None and 500 <= http_status < 600:
+        return SERVER_ERROR
+
+    category_by_reason = {
+        "not_authenticated": NOT_AUTHENTICATED,
+        "timeout": TIMEOUT,
+        "network_error": NETWORK_ERROR,
+        "malformed_response": MALFORMED_RESPONSE,
+        # Legacy artifact / dashboard literal still maps to canonical retry.
+        "openai_server_error": SERVER_ERROR,
+        "server_error": SERVER_ERROR,
+    }
+    return category_by_reason.get(reason, reason or UNKNOWN)

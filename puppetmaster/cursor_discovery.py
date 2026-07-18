@@ -127,6 +127,72 @@ def _slug(model_id: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", model_id.lower()).strip("-")
 
 
+def default_variant_params(item: Mapping) -> list[dict[str, str]]:
+    """Return the SDK default variant's ``params`` for a catalog item.
+
+    Cursor models keep a single live identity (e.g. ``grok-4.5``) and expose
+    effort/fast knobs as ``parameters`` / ``variants`` — not as expanded ids
+    like ``cursor-grok-4.5-high-fast``. Prefer the variant marked
+    ``isDefault`` (UI High+Fast for Grok 4.5); otherwise the first variant.
+    """
+    variants = item.get("variants") or []
+    if not isinstance(variants, list):
+        return []
+    chosen: Optional[Mapping] = None
+    for variant in variants:
+        if isinstance(variant, Mapping) and variant.get("isDefault"):
+            chosen = variant
+            break
+    if chosen is None:
+        for variant in variants:
+            if isinstance(variant, Mapping):
+                chosen = variant
+                break
+    if chosen is None:
+        return []
+    raw_params = chosen.get("params") or []
+    if not isinstance(raw_params, list):
+        return []
+    params: list[dict[str, str]] = []
+    for entry in raw_params:
+        if not isinstance(entry, Mapping):
+            continue
+        param_id = entry.get("id")
+        value = entry.get("value")
+        if param_id is None or value is None:
+            continue
+        params.append({"id": str(param_id), "value": str(value)})
+    return params
+
+
+def _payload_defaults_for_catalog_item(
+    item: Mapping,
+    prior: Optional[ModelSpec] = None,
+) -> dict:
+    """Merge live default variant params into registry payload_defaults.
+
+    Preserves any prior non-param defaults the user tuned; live catalog
+    ``params`` win so rediscovery keeps the UI default (High+Fast) current.
+    """
+    defaults = dict(prior.payload_defaults) if prior and prior.payload_defaults else {}
+    params = default_variant_params(item)
+    if params:
+        defaults["params"] = params
+    return defaults
+
+
+def _tags_for_cursor_params(tags: list[str], params: list[dict[str, str]]) -> list[str]:
+    """Annotate registry tags from discovered Cursor params without expanding ids."""
+    updated = [tag for tag in tags if not tag.startswith("effort:") and tag != "param:fast"]
+    by_id = {p["id"]: p["value"] for p in params}
+    effort = by_id.get("effort")
+    if effort:
+        updated.append(f"effort:{effort}")
+    if by_id.get("fast") == "true":
+        updated.append("param:fast")
+    return sorted(set(updated))
+
+
 def catalog_to_specs(
     catalog: list[dict],
     existing: list[ModelSpec],
@@ -138,6 +204,10 @@ def catalog_to_specs(
     overlay); unmatched models get a conservative mid-tier seed the user can
     edit. Every returned spec is ``billing="plan"`` — by definition it's in the
     plan catalog.
+
+    One registry row per live SDK id. Variant knobs (effort/fast) land in
+    ``payload_defaults.params`` from the default variant — never as fabricated
+    expanded aliases such as ``cursor-grok-4.5-high-fast``.
     """
     by_model_name = {
         spec.adapter_model_name: spec
@@ -160,6 +230,8 @@ def catalog_to_specs(
         model_id = str(item["id"])
         overlay = by_model_name.get(model_id)
         nominal_rate = _CURSOR_NOMINAL_RATES.get(model_id)
+        payload_defaults = _payload_defaults_for_catalog_item(item, overlay)
+        default_params = list(payload_defaults.get("params") or [])
         if overlay is not None:
             specs.append(
                 ModelSpec(
@@ -179,9 +251,14 @@ def catalog_to_specs(
                     ),
                     context_window=overlay.context_window,
                     billing="plan",
-                    tags=sorted(set(overlay.tags) | {"discovered"}),
+                    tags=_tags_for_cursor_params(
+                        sorted(set(overlay.tags) | {"discovered"}),
+                        default_params,
+                    ),
                     notes=overlay.notes,
                     enabled=overlay.enabled,
+                    payload_defaults=payload_defaults,
+                    output_token_multiplier=overlay.output_token_multiplier,
                 )
             )
         else:
@@ -220,8 +297,9 @@ def catalog_to_specs(
                     output_per_mtok_usd=nominal_rate[1] if nominal_rate else 0.0,
                     context_window=context_window,
                     billing="plan",
-                    tags=inherited_tags,
+                    tags=_tags_for_cursor_params(inherited_tags, default_params),
                     notes=note,
+                    payload_defaults=payload_defaults,
                 )
             )
     return specs

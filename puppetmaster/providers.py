@@ -30,11 +30,21 @@ import copy
 import hashlib
 import json
 import os
+import random
 import socket
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional
+
+from puppetmaster.failure import (
+    NETWORK_ERROR,
+    OPENAI_SERVER_ERROR,
+    RATE_LIMIT,
+    SERVER_ERROR,
+    TIMEOUT,
+    classify_provider_failure,
+)
 
 _PROMPT_CACHE_OFF_VALUES = frozenset({"0", "false", "no", "off"})
 # All Claude breakpoints (system + last tool + moving history) use 1h TTL by
@@ -406,13 +416,41 @@ class AssistantTurn:
 
 
 class ProviderError(Exception):
-    """A provider HTTP/transport failure, carrying a classifiable reason."""
+    """A provider failure with both raw diagnostics and a canonical category."""
 
     def __init__(self, message: str, *, reason: str, status: Optional[int] = None, body: str = ""):
         super().__init__(message)
         self.reason = reason
         self.status = status
         self.body = body
+        self.failure = classify_provider_failure(reason, status)
+
+
+_RETRYABLE_PROVIDER_FAILURES = frozenset({
+    NETWORK_ERROR,
+    RATE_LIMIT,
+    SERVER_ERROR,
+    # Legacy observability literal must remain retryable when present on
+    # ProviderError.failure (or when bridging older persisted classifications).
+    OPENAI_SERVER_ERROR,
+    TIMEOUT,
+})
+_PROVIDER_BACKOFF_BASE_SECONDS = 1.5
+_PROVIDER_BACKOFF_MAX_SECONDS = 30.0
+
+
+def is_retryable_provider_error(error: ProviderError) -> bool:
+    """Return whether the canonical provider failure is transient."""
+    return error.failure in _RETRYABLE_PROVIDER_FAILURES
+
+
+def provider_retry_backoff_seconds(attempt: int) -> float:
+    """Jittered exponential backoff for a zero-indexed provider retry."""
+    ceiling = min(
+        _PROVIDER_BACKOFF_MAX_SECONDS,
+        _PROVIDER_BACKOFF_BASE_SECONDS * (2 ** max(0, attempt)),
+    )
+    return random.uniform(_PROVIDER_BACKOFF_BASE_SECONDS, ceiling)
 
 
 def _post_json(url: str, *, headers: dict, body: dict, timeout: int) -> dict:

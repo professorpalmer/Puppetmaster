@@ -1,6 +1,14 @@
 """Per-role routing_policy defaults for analysis swarms (WAVE G)."""
 from __future__ import annotations
 
+import os
+import sys
+
+_HERMETIC_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HERMETIC_DIR not in sys.path:
+    sys.path.insert(0, _HERMETIC_DIR)
+import hermetic_env  # noqa: F401  # process-wide host-env isolation
+
 import json
 import unittest
 from pathlib import Path
@@ -14,7 +22,6 @@ from puppetmaster.workers import (
     default_routing_policy_for_role,
 )
 
-
 # Expected role → policy map for built-in analysis roles (OMP modelRoles.task
 # analogue). Policies only — never pin frontier model ids.
 _EXPECTED_DEFAULT_WORKER_POLICIES = {
@@ -24,7 +31,6 @@ _EXPECTED_DEFAULT_WORKER_POLICIES = {
     "redteam": "quality",
     "test": "cheap",
 }
-
 
 class DefaultRoleRoutingPolicyTests(unittest.TestCase):
     def test_role_to_policy_map(self) -> None:
@@ -73,7 +79,6 @@ class DefaultRoleRoutingPolicyTests(unittest.TestCase):
             self.assertIn(policy, allowed, role)
             self.assertNotIn("model", policy)
 
-
 class GeneratedSwarmRoleRoutingTests(unittest.TestCase):
     def test_writer_stamps_per_role_defaults_when_policy_omitted(self) -> None:
         from puppetmaster.mcp_server import write_generated_swarm_config
@@ -115,7 +120,6 @@ class GeneratedSwarmRoleRoutingTests(unittest.TestCase):
             cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))
             for worker in cfg["workers"]:
                 self.assertEqual(worker["payload"].get("routing_policy"), "quality")
-
 
 if __name__ == "__main__":
     unittest.main()

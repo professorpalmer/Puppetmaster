@@ -133,8 +133,14 @@ def _kill_process_tree(process: "subprocess.Popen", started_new_session: bool) -
     Adapters that launch with ``start_new_session=True`` (e.g. Hermes) put the
     child in its own process group; grandchildren survive a bare
     ``process.kill()`` of the direct child. On POSIX we signal the whole group
-    so nothing is orphaned. ``os.killpg`` / ``os.getpgid`` only exist on POSIX,
-    so non-POSIX falls back to killing the direct child.
+    only when we created that session — otherwise a conservative direct kill
+    avoids touching unrelated processes that share the worker's group.
+
+    On Windows there is no ``killpg`` equivalent and Cursor/Node grandchildren
+    are routinely spawned without ``start_new_session``. Always attempt a
+    tree-kill via ``taskkill /T`` (or a Toolhelp snapshot) — see
+    ``puppetmaster.win_process``. Direct-child ``process.kill()`` remains the
+    final fallback on every platform.
     """
     if started_new_session and os.name == "posix":
         try:
@@ -142,6 +148,15 @@ def _kill_process_tree(process: "subprocess.Popen", started_new_session: bool) -
             return
         except (ProcessLookupError, PermissionError, OSError):
             # Group already gone or unkillable — fall through to the direct kill.
+            pass
+    elif os.name == "nt":
+        try:
+            from puppetmaster.win_process import kill_process_tree
+
+            if process.pid and kill_process_tree(process.pid):
+                return
+        except Exception:
+            # Tree kill unavailable or failed — fall through to the direct kill.
             pass
     try:
         process.kill()

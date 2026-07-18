@@ -1,0 +1,15 @@
+{
+  "name": "hashline_tagged_success",
+  "engine": "hashline",
+  "source_path": "pkg/sample.py",
+  "source_text": "line1\nline2\nline3\n",
+  "hashline": {
+    "tag": "live",
+    "ops": "SWAP 1.=1:\n+LINE_ONE\nDEL 3\n"
+  },
+  "expect": {
+    "status": "ok",
+    "text": "LINE_ONE\nline2\n",
+    "assert_result_tag": true
+  }
+}

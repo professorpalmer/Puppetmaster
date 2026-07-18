@@ -2,6 +2,14 @@
 from __future__ import annotations
 
 import os
+import sys
+
+_HERMETIC_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HERMETIC_DIR not in sys.path:
+    sys.path.insert(0, _HERMETIC_DIR)
+import hermetic_env  # noqa: F401  # process-wide host-env isolation
+
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,7 +30,6 @@ from puppetmaster.job_brief import (
     write_job_brief,
 )
 from puppetmaster.models import Task
-
 
 class JobBriefBuildTests(unittest.TestCase):
     def test_missing_codegraph_still_produces_census_brief(self) -> None:
@@ -49,7 +56,6 @@ class JobBriefBuildTests(unittest.TestCase):
                 path = write_job_brief(job_dir, "goal", root)
             self.assertIsNone(path)
             self.assertFalse((job_dir / "repo_brief.md").exists())
-
 
 class JobBriefInjectionTests(unittest.TestCase):
     def test_sibling_tasks_receive_identical_brief_bytes(self) -> None:
@@ -166,7 +172,6 @@ class JobBriefInjectionTests(unittest.TestCase):
                 root,
             )
         self.assertEqual(prompt.count("Repository file census"), 1)
-
 
 if __name__ == "__main__":
     unittest.main()

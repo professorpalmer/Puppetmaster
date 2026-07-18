@@ -2,6 +2,14 @@
 from __future__ import annotations
 
 import os
+import sys
+
+_HERMETIC_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HERMETIC_DIR not in sys.path:
+    sys.path.insert(0, _HERMETIC_DIR)
+import hermetic_env  # noqa: F401  # process-wide host-env isolation
+
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,7 +26,6 @@ from puppetmaster.hashline import (
     parse_patch,
 )
 
-
 class ContentTagTests(unittest.TestCase):
     def test_tag_stability_and_normalization(self) -> None:
         a = "hello\nworld\n"
@@ -32,14 +39,12 @@ class ContentTagTests(unittest.TestCase):
     def test_trailing_whitespace_trimmed_for_hash(self) -> None:
         self.assertEqual(content_tag("hi  \n"), content_tag("hi\n"))
 
-
 class SnapshotStoreTests(unittest.TestCase):
     def test_record_resolve_roundtrip(self) -> None:
         store = SnapshotStore()
         tag = store.record("a.py", "one\ntwo\n")
         self.assertEqual(store.resolve("a.py", tag), normalize_text("one\ntwo\n"))
         self.assertIsNone(store.resolve("a.py", "0000"))
-
 
 class ParseAndApplyTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -147,7 +152,6 @@ SWAP 2.=2:
         self.assertIn('msg = "Hi"', text)
         self.assertNotIn('greet("world")', text)
 
-
 class KillSwitchTests(unittest.TestCase):
     def test_hashline_enabled_default_on(self) -> None:
         prev = os.environ.pop("PUPPETMASTER_HASHLINE", None)
@@ -160,7 +164,6 @@ class KillSwitchTests(unittest.TestCase):
                 os.environ.pop("PUPPETMASTER_HASHLINE", None)
             else:
                 os.environ["PUPPETMASTER_HASHLINE"] = prev
-
 
 if __name__ == "__main__":
     unittest.main()
