@@ -1,3 +1,15 @@
+## v1.19.16
+
+**Close the force-submit overshoot gap.**
+
+- A single turn that leaps past the entire token budget in one go (heavy
+  chain-of-thought before the reserve zone was ever sampled) previously died
+  at `stop:token_budget` with no findings. The force-submit check now runs
+  before the hard budget break at every governor site, so budget exhaustion
+  without a prior forced attempt always earns exactly one final forced
+  `submit_findings` / `submit_report` turn. Bounded: after that one attempt
+  the loop still terminates on `token_budget` if the model refuses.
+
 ## v1.19.15
 
 **Force-submit budget reserve: workers always come home with findings.**

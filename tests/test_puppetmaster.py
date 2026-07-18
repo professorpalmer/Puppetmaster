@@ -10169,6 +10169,77 @@ class ModelRouterTests(unittest.TestCase):
         self.assertFalse(usage.get("submit_forced_budget"))
         self.assertGreaterEqual(usage["tokens_total"], 1000)
 
+    def test_agentic_budget_overshoot_still_gets_forced_submit(self) -> None:
+        """A single turn that leaps PAST the whole budget (skipping the reserve
+        zone) still earns exactly one forced submit turn instead of dying with
+        stop:token_budget and no findings."""
+        from puppetmaster.adapters import agentic
+        from puppetmaster.models import Task
+        from puppetmaster.providers import AssistantTurn
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cwd = Path(tmp.name)
+        (cwd / "a.py").write_text("x = 1\n", encoding="utf-8")
+        adapter = agentic.AgenticAdapter()
+        forced = []
+        turns = [
+            # One giant reasoning-heavy turn: overshoots the 1000 budget in one go.
+            AssistantTurn(
+                text="",
+                tool_calls=[{
+                    "id": "c1", "name": "read_file",
+                    "arguments": {"path": "a.py"},
+                }],
+                usage={
+                    "prompt_tokens": 600, "completion_tokens": 600,
+                    "total_tokens": 1200,
+                },
+            ),
+            AssistantTurn(
+                text="",
+                tool_calls=[{
+                    "id": "s1", "name": "submit_findings",
+                    "arguments": {
+                        "artifacts": [{
+                            "type": "finding", "claim": "partial",
+                            "evidence": ["a.py"], "confidence": 0.4,
+                        }],
+                    },
+                }],
+                usage={
+                    "prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20,
+                },
+            ),
+        ]
+        seen = [0]
+
+        def fake_provider_call(**kwargs):
+            forced.append(dict(kwargs.get("extra") or {}))
+            turn = turns[seen[0]]
+            seen[0] += 1
+            return turn
+
+        task = Task(
+            job_id="j", role="explore", instruction="analyze",
+            payload={
+                "cwd": str(cwd), "provider": "openai", "model": "m",
+                "max_turns": 5, "token_budget": 1000,
+                "disable_codegraph": True, "analyze_retry": False,
+            },
+        )
+        with patch.object(adapter, "_provider_call", side_effect=fake_provider_call):
+            _t, usage, turns_used, _m, stop_reason, submitted = adapter._agent_loop(
+                task, cwd, "openai", "m", "system",
+                adapter._tool_schema(implement=False, task=task, graph_on=False),
+                implement=False,
+            )
+        self.assertEqual(stop_reason, "submitted")
+        self.assertEqual(turns_used, 2)
+        self.assertIsNotNone(submitted)
+        self.assertTrue(usage.get("submit_forced_budget"))
+        self.assertEqual(forced[1].get("force_tool"), "submit_findings")
+
     def test_agentic_submit_reserve_env_override(self) -> None:
         """PUPPETMASTER_SUBMIT_RESERVE raises the force-submit threshold."""
         from puppetmaster.adapters import agentic

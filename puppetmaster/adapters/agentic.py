@@ -1053,9 +1053,9 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 if follow_up:
                     messages.append({"role": "user", "content": follow_up})
                     force_submit_next = not implement
-                    if token_budget and usage_total["total_tokens"] >= token_budget:
-                        stop_reason = "token_budget"
-                        break
+                    # Force-submit check runs BEFORE the hard budget break so a
+                    # single huge turn that leaps past the whole budget still
+                    # gets one final forced submit instead of dying silently.
                     if (
                         budget_force_threshold is not None
                         and not budget_force_attempted
@@ -1069,10 +1069,11 @@ class AgenticAdapter(FullEditWorkerAdapter):
                                 else _BUDGET_FORCE_SUBMIT_ANALYZE
                             ),
                         })
+                        continue
+                    if token_budget and usage_total["total_tokens"] >= token_budget:
+                        stop_reason = "token_budget"
+                        break
                     continue
-                if token_budget and usage_total["total_tokens"] >= token_budget:
-                    stop_reason = "token_budget"
-                    break
                 if (
                     budget_force_threshold is not None
                     and not budget_force_attempted
@@ -1087,6 +1088,9 @@ class AgenticAdapter(FullEditWorkerAdapter):
                         ),
                     })
                     continue
+                if token_budget and usage_total["total_tokens"] >= token_budget:
+                    stop_reason = "token_budget"
+                    break
                 stop_reason = "model_stopped"
                 break
 
@@ -1187,9 +1191,9 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 if this_turn_budget_force:
                     submit_forced_budget = True
                 break
-            if token_budget and usage_total["total_tokens"] >= token_budget:
-                stop_reason = "token_budget"
-                break
+            # Force-submit check runs BEFORE the hard budget break (same
+            # rationale as above): exhaustion without a prior forced attempt
+            # still earns exactly one forced submit turn.
             if (
                 budget_force_threshold is not None
                 and not budget_force_attempted
@@ -1203,6 +1207,10 @@ class AgenticAdapter(FullEditWorkerAdapter):
                         else _BUDGET_FORCE_SUBMIT_ANALYZE
                     ),
                 })
+                continue
+            if token_budget and usage_total["total_tokens"] >= token_budget:
+                stop_reason = "token_budget"
+                break
         usage_out = {
             "tokens_in": usage_total["prompt_tokens"],
             "tokens_out": usage_total["completion_tokens"],
