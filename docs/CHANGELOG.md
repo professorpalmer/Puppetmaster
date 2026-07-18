@@ -1,3 +1,19 @@
+## v1.20.1
+
+**Reliability hardening for durable agent execution and recovery.**
+
+- Provider failure taxonomy with retry/backoff and circuit control so
+  flaky or overloaded backends fail closed instead of thrashing.
+- Bounded, retrievable tool and artifact output with sidecar offload and
+  safe compaction promotion that preserves system prefix and recent turns.
+- Optimistic edits and mutation fixtures (tagged hashline / edit refusal
+  paths) for concurrent-safe worker writes.
+- SQLite operational checks: WAL, busy_timeout, foreign_keys, and
+  synchronous=NORMAL surfaced via doctor/schema status.
+- Stronger Windows process-tree cleanup for worker grandchildren.
+- Hermetic test isolation across platforms so local registries and homes
+  cannot leak into the suite.
+
 ## v1.20.0
 
 **Durable execution graph with typed provenance edges.**
