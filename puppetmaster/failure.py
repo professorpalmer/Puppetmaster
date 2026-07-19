@@ -97,7 +97,11 @@ _ADAPTER_EXTRA_RULES: dict[str, Tuple[Rule, ...]] = {
         (_all("@cursor/sdk", "not found"), SDK_NOT_INSTALLED),
         (_any("forbidden-model"), MODEL_UNAVAILABLE),
         (_all("forbidden", "model"), MODEL_UNAVAILABLE),
+        (_all("not permitted", "model"), MODEL_UNAVAILABLE),
+        (_all("not allowed", "model"), MODEL_UNAVAILABLE),
+        (_all("unavailable", "model"), MODEL_UNAVAILABLE),
         (_all("unknown", "model"), MODEL_UNAVAILABLE),
+        # Generic Cursor SDK terminal status after more specific model rules.
         (_all("status", "error"), RUN_STATUS_ERROR),
     ),
     "claude-code": (

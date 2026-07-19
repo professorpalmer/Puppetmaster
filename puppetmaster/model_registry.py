@@ -981,6 +981,49 @@ def _normalize_model_token(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
 
 
+def normalize_model_token(value: str) -> str:
+    """Public slug form of a model id / adapter name (``grok-4.5`` → ``grok-4-5``)."""
+    return _normalize_model_token(value)
+
+
+def model_identity_tokens(value: str) -> set[str]:
+    """Expand a model pin into comparable identity tokens.
+
+    Accepts registry ids (``cursor/grok-4-5``), adapter names (``grok-4.5``),
+    and slug-equivalent forms (``grok-4-5``).
+    """
+    text = (value or "").strip()
+    if not text:
+        return set()
+    tokens = {text, _normalize_model_token(text)}
+    if "/" in text:
+        tail = text.rsplit("/", 1)[-1]
+        tokens.add(tail)
+        tokens.add(_normalize_model_token(tail))
+    return {token for token in tokens if token}
+
+
+def model_id_allowed(spec: ModelSpec, allowed: Optional[Iterable[str]]) -> bool:
+    """True when ``spec`` matches any entry in an explicit allowed-model set.
+
+    An empty/None allowlist means "no restriction". Matching is deliberately
+    loose across registry id, adapter model name, and slug-normalized forms so
+    callers can pass either ``grok-4.5`` or ``cursor/grok-4-5``.
+    """
+    if allowed is None:
+        return True
+    allowed_list = [str(item).strip() for item in allowed if str(item).strip()]
+    if not allowed_list:
+        return True
+    spec_tokens: set[str] = set()
+    for value in (spec.id, spec.adapter_model_name):
+        spec_tokens |= model_identity_tokens(value)
+    for raw in allowed_list:
+        if model_identity_tokens(raw) & spec_tokens:
+            return True
+    return False
+
+
 @dataclass(frozen=True)
 class ResolvedModelPin:
     """A user model pin resolved to one enabled registry entry."""

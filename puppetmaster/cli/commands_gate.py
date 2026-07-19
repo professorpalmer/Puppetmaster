@@ -570,6 +570,11 @@ def _run_route_command(args) -> int:
 
     from puppetmaster.platform_lock import active_allowlist
 
+    allowed_models = [
+        str(item).strip()
+        for item in (getattr(args, "allowed_models", None) or [])
+        if str(item).strip()
+    ]
     signals = TaskSignals(
         instruction=args.instruction,
         role=args.role,
@@ -577,6 +582,7 @@ def _run_route_command(args) -> int:
         explicit_max_cost_usd=args.max_cost_usd,
         required_tags=list(args.required_tag),
         allowed_adapters=active_allowlist(),
+        allowed_model_ids=frozenset(allowed_models) if allowed_models else None,
     )
     try:
         decision = route_task(signals, specs, policy=args.policy)

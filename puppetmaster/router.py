@@ -26,7 +26,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
-from puppetmaster.model_registry import ModelSpec, enabled_specs
+from puppetmaster.model_registry import ModelSpec, enabled_specs, model_id_allowed
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +106,12 @@ class TaskSignals:
     # is the default for unlocked users. Populated from ``platform_lock`` by
     # the signal builders so the restriction applies everywhere routing runs.
     allowed_adapters: Optional[frozenset[str]] = None
+    # Explicit allowlist of model identities for auto-routing. Accepts registry
+    # ids (``cursor/grok-4-5``), adapter model names (``grok-4.5``), and
+    # slug-equivalent forms. ``None`` means unrestricted; an explicit empty
+    # set (``frozenset()``) fails closed; a non-empty set restricts selection
+    # and same-adapter reroute to those identities only.
+    allowed_model_ids: Optional[frozenset[str]] = None
 
 
 # ----- Classifier ----------------------------------------------------------
@@ -373,6 +379,7 @@ class RoutingDecision:
     baseline_cost_usd: float = 0.0
     baseline_nominal_cost_usd: float = 0.0
     baseline_model_id: str = ""
+    allowed_model_ids: Optional[list[str]] = None
 
     def to_artifact_payload(self) -> dict:
         payload = {
@@ -395,6 +402,8 @@ class RoutingDecision:
                 {"id": spec.id, "reason": why} for spec, why in self.rejected
             ],
         }
+        if self.allowed_model_ids:
+            payload["allowed_model_ids"] = list(self.allowed_model_ids)
         if self.model.payload_defaults:
             payload["payload_defaults"] = self.model.payload_defaults
         return payload
@@ -457,6 +466,44 @@ def route_task(
         effective_required_tags.add("detailed-vision")
 
     rejected: list[tuple[ModelSpec, str]] = []
+
+    # Explicit model allowlist: when the caller (or ~/.pmharness/routing.json)
+    # constrains auto-routing to a set of model identities, drop everything
+    # else before platform/cost filters so disallowed models can never win
+    # selection or same-adapter reroute.
+    effective_allowed_models = _effective_allowed_model_ids(task)
+    if effective_allowed_models is not None:
+        if not effective_allowed_models:
+            raise NoEligibleModelError(
+                "allowed_model_ids is explicitly empty — no model may be "
+                "selected. Add at least one model identity to allowed_model_ids "
+                "/ allowed_models, or omit the key to allow unrestricted routing."
+            )
+        after_allowlist: list[ModelSpec] = []
+        allowed_sorted = sorted(effective_allowed_models)
+        for spec in candidates:
+            if model_id_allowed(spec, effective_allowed_models):
+                after_allowlist.append(spec)
+            else:
+                rejected.append(
+                    (
+                        spec,
+                        f"model not in allowed_model_ids {allowed_sorted}",
+                    )
+                )
+        if not after_allowlist:
+            raise NoEligibleModelError(
+                "No enabled model matches allowed_model_ids "
+                f"{allowed_sorted}. Enable at least one listed model in "
+                "`~/.puppetmaster/models.json`, widen the allowlist, or clear "
+                "allowed_model_ids / allowed_models."
+            )
+        candidates = after_allowlist
+    _allowed_for_artifact = (
+        sorted(effective_allowed_models)
+        if effective_allowed_models is not None
+        else None
+    )
 
     # Platform lock first: a disabled platform must never be selected, so drop
     # its models before any other consideration with a clear reason.
@@ -641,6 +688,7 @@ def route_task(
         return _decision(
             pick, policy, need, tokens_in, tokens_out, reason, rejected,
             _baseline_cost, _baseline_id, _baseline_nominal,
+            allowed_model_ids=_allowed_for_artifact,
         )
 
     if policy == "quality":
@@ -657,6 +705,7 @@ def route_task(
         return _decision(
             pick, policy, need, tokens_in, tokens_out, reason, rejected,
             _baseline_cost, _baseline_id, _baseline_nominal,
+            allowed_model_ids=_allowed_for_artifact,
         )
 
     if policy == "escalating":
@@ -700,6 +749,7 @@ def route_task(
         return _decision(
             pick, policy, need, tokens_in, tokens_out, reason, rejected,
             _baseline_cost, _baseline_id, _baseline_nominal,
+            allowed_model_ids=_allowed_for_artifact,
         )
 
     # balanced (default)
@@ -774,6 +824,32 @@ def route_task(
     return _decision(
         pick, policy, need, tokens_in, tokens_out, reason, rejected,
         _baseline_cost, _baseline_id, _baseline_nominal,
+        allowed_model_ids=_allowed_for_artifact,
+    )
+
+
+def _effective_allowed_model_ids(task: TaskSignals) -> Optional[frozenset[str]]:
+    """Resolve the effective model allowlist for a routing decision.
+
+    Per-task ``TaskSignals.allowed_model_ids`` wins. When unset, honor a
+    global ``allowed_model_ids`` / ``allowed_models`` list from
+    ``~/.pmharness/routing.json`` so operators can constrain every auto-route
+    without threading the flag on every worker payload.
+    """
+    if task.allowed_model_ids is not None:
+        return frozenset(
+            str(item).strip()
+            for item in task.allowed_model_ids
+            if str(item).strip()
+        )
+    saved = _load_routing_overrides()
+    raw = saved.get("allowed_model_ids")
+    if raw is None:
+        raw = saved.get("allowed_models")
+    if raw is None:
+        return None
+    return frozenset(
+        item.strip() for item in _coerce_str_list(raw) if item.strip()
     )
 
 
@@ -788,6 +864,7 @@ def _decision(
     baseline_cost_usd: float = 0.0,
     baseline_model_id: str = "",
     baseline_nominal_cost_usd: float = 0.0,
+    allowed_model_ids: Optional[list[str]] = None,
 ) -> RoutingDecision:
     return RoutingDecision(
         model=pick,
@@ -802,6 +879,7 @@ def _decision(
         baseline_cost_usd=baseline_cost_usd,
         baseline_nominal_cost_usd=baseline_nominal_cost_usd,
         baseline_model_id=baseline_model_id,
+        allowed_model_ids=allowed_model_ids,
     )
 
 
@@ -856,6 +934,8 @@ def signals_from_worker_spec(spec, *, instruction_override: Optional[str] = None
     * ``max_capability`` — int 0..100, ceiling on classifier output
     * ``max_cost_usd`` — float, hard cap
     * ``required_tags`` — list[str], all must be on the model's tags
+    * ``allowed_model_ids`` / ``allowed_models`` — list[str], explicit model
+      allowlist (registry ids or adapter model names)
     * ``estimated_tokens_in`` / ``estimated_tokens_out`` — override heuristic
     """
     payload = getattr(spec, "payload", {}) or {}
@@ -876,6 +956,19 @@ def signals_from_worker_spec(spec, *, instruction_override: Optional[str] = None
 
         allowed_adapters = active_allowlist()
 
+    raw_allowed_models = payload.get("allowed_model_ids")
+    if raw_allowed_models is None:
+        raw_allowed_models = payload.get("allowed_models")
+    allowed_model_ids: Optional[frozenset[str]]
+    if raw_allowed_models is not None:
+        allowed_model_ids = frozenset(
+            item.strip()
+            for item in _coerce_str_list(raw_allowed_models)
+            if item.strip()
+        )
+    else:
+        allowed_model_ids = None
+
     return TaskSignals(
         instruction=instruction,
         role=getattr(spec, "role", "explore") or "explore",
@@ -889,4 +982,5 @@ def signals_from_worker_spec(spec, *, instruction_override: Optional[str] = None
         prefer_plan_billed=_coerce_bool(payload.get("prefer_plan_billed"), True),
         allow_api_billing=_coerce_bool(payload.get("allow_api_billing"), True),
         allowed_adapters=allowed_adapters,
+        allowed_model_ids=allowed_model_ids,
     )

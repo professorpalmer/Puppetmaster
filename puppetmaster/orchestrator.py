@@ -182,6 +182,10 @@ def merge_routing_payload(payload: dict, decision, extra_fields: Optional[dict] 
         "router_capability_needed": decision.capability_needed,
         "router_estimated_cost_usd": decision.estimated_cost_usd,
     }
+    # Snapshot the effective allowlist at selection time so reroutes cannot
+    # drift if ~/.pmharness/routing.json changes mid-job.
+    if decision.allowed_model_ids is not None:
+        merged["allowed_model_ids"] = list(decision.allowed_model_ids)
     if extra_fields:
         merged.update(extra_fields)
     return merged
@@ -666,6 +670,7 @@ class Orchestrator:
                     billing_cache[adapter] = None
             return billing_cache[adapter]
 
+        from puppetmaster.failure import RUN_STATUS_ERROR
         from puppetmaster.platform_lock import is_adapter_enabled
         from puppetmaster.preflight import adapter_cli_present
 
@@ -683,7 +688,12 @@ class Orchestrator:
             current_model_id = str(payload.get("router_model_id") or "")
             if current_model_id:
                 tried_models.add(current_model_id)
+            run_status_same_adapter_reroutes = int(
+                payload.get("run_status_error_same_adapter_reroutes", 0)
+            )
             allow_same_adapter = reason in SAME_ADAPTER_MODEL_REROUTE
+            if reason == RUN_STATUS_ERROR and run_status_same_adapter_reroutes >= 1:
+                allow_same_adapter = False
 
             def _eligible(spec, *, same_adapter_ok: bool) -> bool:
                 if spec.id in tried_models:
@@ -731,15 +741,23 @@ class Orchestrator:
 
             attempts = int(payload.get("fallback_attempts", 0)) + 1
             tried_out = sorted(tried_models | {decision.model.id, current_model_id} - {""})
+            fallback_extra = {
+                "fallback_attempts": attempts,
+                "fallback_from_adapter": failed_adapter,
+                "fallback_from_model": current_model_id or None,
+                "tried_models": tried_out,
+            }
+            if (
+                reason == RUN_STATUS_ERROR
+                and decision.model.adapter == failed_adapter
+            ):
+                fallback_extra["run_status_error_same_adapter_reroutes"] = (
+                    run_status_same_adapter_reroutes + 1
+                )
             new_payload = merge_routing_payload(
                 payload,
                 decision,
-                {
-                    "fallback_attempts": attempts,
-                    "fallback_from_adapter": failed_adapter,
-                    "fallback_from_model": current_model_id or None,
-                    "tried_models": tried_out,
-                },
+                fallback_extra,
             )
             requeued = replace(
                 task,

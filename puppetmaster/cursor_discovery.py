@@ -25,7 +25,11 @@ import subprocess
 from pathlib import Path
 from typing import Callable, Mapping, Optional
 
-from puppetmaster.model_registry import ModelSpec, catalog_content_hash
+from puppetmaster.model_registry import (
+    ModelSpec,
+    catalog_content_hash,
+    normalize_model_token,
+)
 
 CURSOR_RUNNER = Path(__file__).with_name("cursor_sdk_runner.mjs")
 
@@ -214,6 +218,14 @@ def catalog_to_specs(
         for spec in existing
         if spec.adapter == "cursor"
     }
+    # Slug-equivalent overlay lookup so a disabled ``grok-4-5`` entry still
+    # gates a catalog refresh that returns ``grok-4.5`` (and vice versa).
+    # Without this, discover --write could insert a fresh enabled twin.
+    by_normalized_name = {
+        normalize_model_token(spec.adapter_model_name): spec
+        for spec in existing
+        if spec.adapter == "cursor" and normalize_model_token(spec.adapter_model_name)
+    }
     # Cross-adapter capability inheritance: a model exposed by the Cursor plan
     # (e.g. "claude-opus-4-8") usually has a known capability from its native
     # adapter entry (claude-code/opus-4-8). Inherit the highest known
@@ -228,7 +240,9 @@ def catalog_to_specs(
     specs: list[ModelSpec] = []
     for item in catalog:
         model_id = str(item["id"])
-        overlay = by_model_name.get(model_id)
+        overlay = by_model_name.get(model_id) or by_normalized_name.get(
+            normalize_model_token(model_id)
+        )
         nominal_rate = _CURSOR_NOMINAL_RATES.get(model_id)
         payload_defaults = _payload_defaults_for_catalog_item(item, overlay)
         default_params = list(payload_defaults.get("params") or [])

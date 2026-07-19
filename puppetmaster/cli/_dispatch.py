@@ -69,6 +69,7 @@ from puppetmaster.workers import WorkerSpec
 from puppetmaster.cli._parser import build_parser
 from puppetmaster.cli.guidance import _NOISY_LOG_EVENTS
 from puppetmaster.cli.helpers import (
+    allowed_models_cli_list,
     approve_target,
     artifact_feed_since,
     cursor_prompt,
@@ -848,6 +849,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
             routing_policy=args.routing_policy,
             auto_route=getattr(args, "auto_route_edit", True),
             disable_codegraph=args.disable_codegraph,
+            allowed_model_ids=allowed_models_cli_list(args) or None,
         )
         if args.executable:
             spec.payload["executable"] = args.executable
@@ -888,6 +890,11 @@ def _main(argv: Optional[list[str]] = None) -> int:
         verify_timeout = getattr(args, "verify_timeout_seconds", None)
         if verify_timeout is None:
             verify_timeout = args.timeout_seconds
+        allowed_models = [
+            str(item).strip()
+            for item in (getattr(args, "allowed_models", None) or [])
+            if str(item).strip()
+        ]
         specs = build_prewalk_specs(
             args.goal,
             args.cwd,
@@ -905,6 +912,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
             allow_non_worktree=args.allow_non_worktree,
             disable_codegraph=args.disable_codegraph,
             disable_memory=args.disable_memory,
+            allowed_model_ids=allowed_models or None,
         )
         result = cli.Orchestrator(store).run(
             args.goal,

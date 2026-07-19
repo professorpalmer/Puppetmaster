@@ -127,6 +127,16 @@ def build_parser() -> argparse.ArgumentParser:
             type=int,
             help="Force the routing capability floor (0..100).",
         )
+        group.add_argument(
+            "--allowed-models",
+            dest="allowed_models",
+            action="append",
+            default=[],
+            help=(
+                "Restrict auto-routing to these model identities (registry id "
+                "or adapter name, e.g. grok-4.5). Repeatable."
+            ),
+        )
 
     def _add_label_argument(job_parser: argparse.ArgumentParser) -> None:
         job_parser.add_argument(
@@ -1395,6 +1405,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip CodeGraph context injection (e.g. for non-repo edits).",
     )
     edit.add_argument("--executable", help="Override the adapter executable / command.")
+    edit.add_argument(
+        "--allowed-models",
+        dest="allowed_models",
+        action="append",
+        default=[],
+        help=(
+            "Restrict auto-routing to these model identities (registry id or "
+            "adapter name). Repeatable."
+        ),
+    )
     _add_label_argument(edit)
 
     prewalk = subcommands.add_parser(
@@ -1455,6 +1475,16 @@ def build_parser() -> argparse.ArgumentParser:
         dest="auto_route_prewalk",
         action="store_false",
         help="Disable routing; use each adapter's default model.",
+    )
+    prewalk.add_argument(
+        "--allowed-models",
+        dest="allowed_models",
+        action="append",
+        default=[],
+        help=(
+            "Restrict auto-routing to these model identities (registry id or "
+            "adapter name). Repeatable."
+        ),
     )
     prewalk.add_argument(
         "--allow-dirty",
@@ -2065,6 +2095,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help="Filter to models whose tags include this. Repeat for multiple.",
+    )
+    route_cmd.add_argument(
+        "--allowed-models",
+        dest="allowed_models",
+        action="append",
+        default=[],
+        help=(
+            "Restrict routing to these model identities (registry id or "
+            "adapter name, e.g. grok-4.5 / composer-2.5). Repeatable."
+        ),
     )
     route_cmd.add_argument(
         "--registry-path",

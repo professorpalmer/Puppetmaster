@@ -44,6 +44,11 @@ from puppetmaster.mcp_registry import (
 from puppetmaster.state import resolve_state_dir
 from puppetmaster.store_factory import create_store
 from puppetmaster.update_check import pypi_update_note, version_is_newer
+from puppetmaster.cli.helpers import (
+    allowed_model_ids_from_mapping,
+    allowed_model_ids_list_from_mapping,
+    append_allowed_models_cli_flags,
+)
 
 # Snapshot the version this server process loaded at startup. A long-lived stdio
 # MCP server keeps these modules in memory; an in-place `pip install -U` changes
@@ -2072,6 +2077,7 @@ def cursor_command(
     disable_memory = args.get("disable_memory")
     if disable_memory is True or (disable_memory is None and (review or plan)):
         command.append("--disable-memory")
+    _append_routing_cli_flags(command, args)
     return command
 
 
@@ -2157,6 +2163,7 @@ def codex_command(args: JsonObject) -> list[str]:
         command.append("--disable-codegraph")
     if args.get("disable_memory"):
         command.append("--disable-memory")
+    _append_routing_cli_flags(command, args)
     return command
 
 
@@ -2184,6 +2191,7 @@ def hermes_command(args: JsonObject, implement: bool = True) -> list[str]:
         command.append("--use-hermes-rules")
     if args.get("disable_codegraph"):
         command.append("--disable-codegraph")
+    _append_routing_cli_flags(command, args)
     return command
 
 
@@ -2228,10 +2236,15 @@ def edit_command(args: JsonObject) -> list[str]:
         command.extend(["--routing-policy", str(args["routing_policy"])])
     if args.get("auto_route") is False:
         command.append("--no-auto-route")
+    elif args.get("auto_route") is True:
+        command.append("--auto-route")
     if args.get("disable_codegraph"):
         command.append("--disable-codegraph")
     if args.get("executable"):
         command.extend(["--executable", str(args["executable"])])
+    append_allowed_models_cli_flags(
+        command, allowed_model_ids_list_from_mapping(args)
+    )
     return command
 
 
@@ -2345,6 +2358,9 @@ def prewalk_command(args: JsonObject) -> list[str]:
         )
     if args.get("auto_route") is False:
         command.append("--no-auto-route")
+    append_allowed_models_cli_flags(
+        command, allowed_model_ids_list_from_mapping(args)
+    )
     if args.get("allow_dirty"):
         command.append("--allow-dirty")
     if args.get("allow_non_worktree"):
@@ -2502,6 +2518,9 @@ def _append_routing_cli_flags(command: list[str], args: JsonObject) -> None:
         command.extend(["--max-cost-usd", str(args["max_cost_usd"])])
     if args.get("min_capability") is not None:
         command.extend(["--min-capability", str(args["min_capability"])])
+    append_allowed_models_cli_flags(
+        command, allowed_model_ids_list_from_mapping(args)
+    )
 
 
 def claude_command(args: JsonObject) -> list[str]:
@@ -2524,6 +2543,7 @@ def claude_command(args: JsonObject) -> list[str]:
         command.append("--allow-non-worktree")
     if args.get("disable_memory"):
         command.append("--disable-memory")
+    _append_routing_cli_flags(command, args)
     return command
 
 
@@ -2750,6 +2770,7 @@ def write_generated_swarm_config(args: JsonObject, roles: list[str], adapter: st
     max_cost_usd = args.get("max_cost_usd")
     min_capability = args.get("min_capability")
     required_tags = args.get("required_tags")
+    allowed_model_ids = allowed_model_ids_list_from_mapping(args)
     workers = []
     from puppetmaster.workers import (
         ANALYSIS_NO_EDIT_PAYLOAD,
@@ -2809,6 +2830,8 @@ def write_generated_swarm_config(args: JsonObject, roles: list[str], adapter: st
                 payload["min_capability"] = int(min_capability)
             if isinstance(required_tags, list) and required_tags:
                 payload["required_tags"] = [str(tag) for tag in required_tags if str(tag).strip()]
+            if allowed_model_ids is not None:
+                payload["allowed_model_ids"] = list(allowed_model_ids)
         if args.get("disable_memory") is False:
             payload["disable_memory"] = False
         else:
@@ -2867,6 +2890,14 @@ def route_task_schema() -> JsonObject:
                 "items": {"type": "string"},
                 "description": "Only consider models whose tags include ALL of these.",
             },
+            "allowed_model_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Explicit allowlist of model identities (registry ids or "
+                    "adapter model names such as grok-4.5 / composer-2.5)."
+                ),
+            },
             "registry_path": {
                 "type": "string",
                 "description": (
@@ -2924,6 +2955,11 @@ def run_route_task(args: JsonObject) -> JsonObject:
 
     from puppetmaster.platform_lock import active_allowlist
 
+    raw_allowed_models = args.get("allowed_model_ids")
+    if raw_allowed_models is None:
+        raw_allowed_models = args.get("allowed_models")
+    allowed_model_ids = allowed_model_ids_from_mapping(args)
+
     signals = TaskSignals(
         instruction=instruction,
         role=role,
@@ -2938,6 +2974,7 @@ def run_route_task(args: JsonObject) -> JsonObject:
         ),
         required_tags=list(args.get("required_tags") or []),
         allowed_adapters=active_allowlist(),
+        allowed_model_ids=allowed_model_ids,
     )
 
     try:
@@ -3804,6 +3841,52 @@ def await_schema() -> JsonObject:
     return schema
 
 
+def _allowed_model_ids_schema_property() -> JsonObject:
+    return {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": (
+            "Explicit allowlist of model identities for auto-routing "
+            "(registry ids like cursor/grok-4-5 or adapter names like "
+            "grok-4.5 / composer-2.5). An empty array fails closed; omit "
+            "to allow unrestricted routing."
+        ),
+    }
+
+
+def _auto_route_schema_properties(*, include_required_tags: bool = True) -> JsonObject:
+    props: JsonObject = {
+        "auto_route": {
+            "type": "boolean",
+            "description": (
+                "Enable per-task model routing. Defaults to true when no `model` "
+                "is pinned, false otherwise."
+            ),
+        },
+        "routing_policy": {
+            "type": "string",
+            "enum": ["balanced", "cheap", "quality", "escalating"],
+            "description": "Routing policy for auto-routed workers.",
+        },
+        "max_cost_usd": {
+            "type": "number",
+            "description": "Hard cap on estimated per-call USD cost for auto-routed workers.",
+        },
+        "min_capability": {
+            "type": "integer",
+            "description": "Force classifier output to this value (0..100) for auto-routed workers.",
+        },
+        "allowed_model_ids": _allowed_model_ids_schema_property(),
+    }
+    if include_required_tags:
+        props["required_tags"] = {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Only consider models whose tags include ALL of these for auto-routed workers.",
+        }
+    return props
+
+
 def goal_schema(default_goal: str) -> JsonObject:
     schema = base_schema()
     schema["properties"].update(
@@ -3894,6 +3977,16 @@ def swarm_schema() -> JsonObject:
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "Only consider models whose tags include ALL of these for auto-routed workers.",
+            },
+            "allowed_model_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Explicit allowlist of model identities for auto-routing "
+                    "(registry ids like cursor/grok-4-5 or adapter names like "
+                    "grok-4.5 / composer-2.5). When set, no other model may be "
+                    "selected or used for reroute."
+                ),
             },
         }
     )
@@ -4148,6 +4241,7 @@ def codex_schema() -> JsonObject:
                 "type": "string",
                 "description": "Optional Codex CLI command override (e.g. path to codex binary).",
             },
+            **_auto_route_schema_properties(include_required_tags=False),
         }
     )
     return schema
@@ -4191,6 +4285,7 @@ def claude_schema() -> JsonObject:
                 "type": "string",
                 "description": "Optional Claude Code command, such as npx -y @anthropic-ai/claude-code.",
             },
+            **_auto_route_schema_properties(include_required_tags=False),
         }
     )
     return schema
@@ -4213,6 +4308,7 @@ def cursor_implement_schema() -> JsonObject:
                     "(no diff attribution; `git init` is usually better)."
                 ),
             },
+            **_auto_route_schema_properties(include_required_tags=False),
         }
     )
     return schema
@@ -4297,6 +4393,7 @@ def edit_schema() -> JsonObject:
                 "type": "string",
                 "description": "Override the adapter executable / command.",
             },
+            "allowed_model_ids": _allowed_model_ids_schema_property(),
         },
         "required": ["instruction"],
     }
@@ -4457,6 +4554,14 @@ def prewalk_schema() -> JsonObject:
                     "then verify)."
                 ),
             },
+            "allowed_model_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Explicit allowlist of model identities for auto-routing "
+                    "(registry ids or adapter names such as grok-4.5 / composer-2.5)."
+                ),
+            },
         },
         "required": ["goal"],
     }
@@ -4517,31 +4622,7 @@ def agentic_schema() -> JsonObject:
                 "default": False,
                 "description": "Skip CodeGraph context injection.",
             },
-            "auto_route": {
-                "type": "boolean",
-                "description": (
-                    "Enable per-task model routing. Defaults to true when no `model` "
-                    "is pinned, false otherwise."
-                ),
-            },
-            "routing_policy": {
-                "type": "string",
-                "enum": ["balanced", "cheap", "quality", "escalating"],
-                "description": "Routing policy for auto-routed workers.",
-            },
-            "max_cost_usd": {
-                "type": "number",
-                "description": "Hard cap on estimated per-call USD cost for auto-routed workers.",
-            },
-            "min_capability": {
-                "type": "integer",
-                "description": "Force classifier output to this value (0..100) for auto-routed workers.",
-            },
-            "required_tags": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Only consider models whose tags include ALL of these for auto-routed workers.",
-            },
+            **_auto_route_schema_properties(),
         }
     )
     return schema

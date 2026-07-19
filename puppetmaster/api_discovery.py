@@ -26,7 +26,7 @@ import urllib.error
 import urllib.request
 from typing import Callable, Mapping, Optional
 
-from puppetmaster.model_registry import ModelSpec
+from puppetmaster.model_registry import ModelSpec, normalize_model_token
 from puppetmaster.openai_security import DEFAULT_OPENAI_BASE_URL, validate_openai_base_url
 
 # Injectable HTTP getter: (url, headers) -> (status, body_text). Defaults to a
@@ -140,6 +140,11 @@ def catalog_to_specs(
     same_adapter = {
         spec.adapter_model_name: spec for spec in existing if spec.adapter == adapter
     }
+    same_adapter_normalized = {
+        normalize_model_token(spec.adapter_model_name): spec
+        for spec in existing
+        if spec.adapter == adapter and normalize_model_token(spec.adapter_model_name)
+    }
     cap_by_name: dict[str, ModelSpec] = {}
     for spec in existing:
         current = cap_by_name.get(spec.adapter_model_name)
@@ -149,7 +154,9 @@ def catalog_to_specs(
     specs: list[ModelSpec] = []
     for item in catalog:
         model_id = str(item["id"])
-        overlay = same_adapter.get(model_id)
+        overlay = same_adapter.get(model_id) or same_adapter_normalized.get(
+            normalize_model_token(model_id)
+        )
         if overlay is not None:
             specs.append(
                 ModelSpec(

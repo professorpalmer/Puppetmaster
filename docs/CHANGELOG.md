@@ -1,3 +1,14 @@
+## v1.20.2
+
+**Constrained, recoverable model routing.**
+
+- Explicit model allowlists now flow through CLI, MCP, swarm, prewalk, and
+  in-place edit paths, with empty allowlists failing closed.
+- Auto-routed Cursor workers may recover once from a generic terminal
+  `status:error` by selecting another permitted same-adapter model.
+- Catalog refreshes preserve disabled model overlays across equivalent model
+  slugs so operator choices cannot silently re-enable.
+
 ## v1.20.1
 
 **Reliability hardening for durable agent execution and recovery.**

@@ -1544,6 +1544,23 @@ def merge_bedrock_discovered_into_registry(
         return existing, report
 
     new_specs = bedrock_agentic_model_specs(env=env, model_ids=live, timeout=timeout)
+    # Preserve enabled (and other overlay knobs) from prior Bedrock rows so a
+    # catalog refresh cannot silently re-enable models the operator disabled.
+    prior_by_name = {
+        getattr(spec, "adapter_model_name", ""): spec
+        for spec in existing
+        if getattr(spec, "adapter", None) == "agentic"
+        and (getattr(spec, "payload_defaults", None) or {}).get("provider") == "bedrock"
+    }
+    from dataclasses import replace
+
+    preserved_new = []
+    for spec in new_specs:
+        prior = prior_by_name.get(spec.adapter_model_name)
+        if prior is None:
+            preserved_new.append(spec)
+            continue
+        preserved_new.append(replace(spec, enabled=prior.enabled))
     kept = []
     removed = 0
     for spec in existing:
@@ -1553,5 +1570,5 @@ def merge_bedrock_discovered_into_registry(
             continue
         kept.append(spec)
     report["removed"] = removed
-    report["added"] = len(new_specs)
-    return kept + new_specs, report
+    report["added"] = len(preserved_new)
+    return kept + preserved_new, report

@@ -244,6 +244,58 @@ def print_mode_banner(mode: str, acting: bool = False) -> None:
             file=sys.stderr,
         )
 
+
+def allowed_models_cli_list(args) -> list[str]:
+    """Non-empty model identities from repeated ``--allowed-models`` CLI flags."""
+    return [
+        str(item).strip()
+        for item in (getattr(args, "allowed_models", None) or [])
+        if str(item).strip()
+    ]
+
+
+def append_allowed_models_cli_flags(
+    command: list[str], allowed_models: Optional[list[str]]
+) -> None:
+    """Append repeatable ``--allowed-models`` flags to a CLI argv list."""
+    if not allowed_models:
+        return
+    for item in allowed_models:
+        text = str(item).strip()
+        if text:
+            command.extend(["--allowed-models", text])
+
+
+def allowed_model_ids_from_mapping(mapping) -> Optional[frozenset[str]]:
+    """Parse ``allowed_model_ids`` / ``allowed_models`` from a JSON-like mapping.
+
+    Returns ``None`` when both keys are absent (unrestricted routing). Returns
+    ``frozenset()`` when the key is present but empty (fail closed). Returns a
+    non-empty frozenset otherwise.
+    """
+    if "allowed_model_ids" in mapping:
+        raw = mapping["allowed_model_ids"]
+    elif "allowed_models" in mapping:
+        raw = mapping["allowed_models"]
+    else:
+        return None
+    if isinstance(raw, str):
+        text = raw.strip()
+        return frozenset([text]) if text else frozenset()
+    if isinstance(raw, (list, tuple)):
+        values = [str(item).strip() for item in raw if str(item).strip()]
+        return frozenset(values)
+    return frozenset()
+
+
+def allowed_model_ids_list_from_mapping(mapping) -> Optional[list[str]]:
+    """List form of :func:`allowed_model_ids_from_mapping` for payloads/CLI."""
+    parsed = allowed_model_ids_from_mapping(mapping)
+    if parsed is None:
+        return None
+    return sorted(parsed)
+
+
 def routing_payload_from_args(args, *, adapter: str) -> dict:
     """Translate the shared ``--auto-route`` routing flags into payload keys the
     orchestrator's router understands. Empty unless ``--auto-route`` is set, so
@@ -261,6 +313,9 @@ def routing_payload_from_args(args, *, adapter: str) -> dict:
         payload["max_cost_usd"] = args.max_cost_usd
     if getattr(args, "min_capability", None) is not None:
         payload["min_capability"] = args.min_capability
+    allowed_models = allowed_models_cli_list(args)
+    if allowed_models:
+        payload["allowed_model_ids"] = allowed_models
     return payload
 
 def artifact_feed(store, job_id: str, limit: Optional[int] = None) -> list[dict]:

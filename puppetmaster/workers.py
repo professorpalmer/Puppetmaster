@@ -29,6 +29,10 @@ RECOVERABLE_FAILURES = frozenset(
         "auth",
         "authentication",
         "model_unavailable",
+        # Cursor SDK terminal status:error — often a model/plan rejection that
+        # surfaces without a clearer taxonomy. Treat as recoverable so one
+        # same-adapter alternate can be tried for auto-routed work.
+        "run_status_error",
         # Dispatch-config failures: the task reached an adapter that cannot
         # run it (no routed model / unknown provider slug / missing SDK
         # package). These are about the routing/config, never the task --
@@ -55,6 +59,7 @@ RECOVERABLE_FAILURES = frozenset(
 SAME_ADAPTER_MODEL_REROUTE = frozenset(
     {
         "model_unavailable",
+        "run_status_error",
         "no_model",
         "unknown_provider",
         "rate_limit",
@@ -533,6 +538,7 @@ def build_edit_payload(
     routing_policy: str = "cheap",
     auto_route: bool = True,
     disable_codegraph: bool = False,
+    allowed_model_ids: Optional[list[str]] = None,
 ) -> dict:
     """Build the worker payload for a lightweight, in-place single edit.
 
@@ -573,6 +579,8 @@ def build_edit_payload(
         payload["allowed_adapters"] = [adapter]
         if routing_policy:
             payload["routing_policy"] = routing_policy
+    if allowed_model_ids is not None:
+        payload["allowed_model_ids"] = list(allowed_model_ids)
     if provider:
         payload["provider"] = provider
     return payload
@@ -589,6 +597,7 @@ def build_edit_spec(
     routing_policy: str = "cheap",
     auto_route: bool = True,
     disable_codegraph: bool = False,
+    allowed_model_ids: Optional[list[str]] = None,
 ) -> WorkerSpec:
     """A single full-edit worker spec tuned for snappy in-place single edits."""
     payload = build_edit_payload(
@@ -601,6 +610,7 @@ def build_edit_spec(
         routing_policy=routing_policy,
         auto_route=auto_route,
         disable_codegraph=disable_codegraph,
+        allowed_model_ids=allowed_model_ids,
     )
     return WorkerSpec(
         role=f"edit-{adapter}",

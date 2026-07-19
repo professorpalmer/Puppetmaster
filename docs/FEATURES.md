@@ -49,6 +49,7 @@ Five production adapters live plus the keys-only `agentic` standalone worker; el
 | Swarm role routing defaults | Built-in analysis roles stamp per-role `routing_policy` under `auto_route` (explore/test → cheap, architect/plan → balanced, redteam/review/audit → quality) — no frontier model pins; MCP-generated swarms share the same map |
 | Durable execution graph (v1.20.0+) | Typed provenance edges (`depends_on` / `produces` / `consumes`), SQLite v1→v2 migration + file-store lazy materialization, plan→implement→verify prewalk with edge handoff, hard-failure propagation, targeted reruns; read-only `puppetmaster graph` / `puppetmaster_job_graph` |
 | Cross-adapter model pins (v1.20.0+) | Explicit `--model` / MCP `model` pins apply on non-Cursor adapters (not Cursor-only); ambiguous Cursor pins return structured preflight/blocked errors |
+| Model allowlists + bounded reroute (v1.20.2+) | CLI/MCP jobs can constrain routing to explicit model identities; empty allowlists fail closed, disabled catalog overlays remain disabled, and generic Cursor `status:error` gets at most one permitted same-adapter alternate |
 | Windows UTF-8 / console safety (v1.20.0+) | Agent subprocess stdout/stderr decoded as UTF-8 with replace (avoids cp1252 reader crashes); existing `CREATE_NO_WINDOW` child-console hygiene unchanged |
 
 ## Durable execution graph

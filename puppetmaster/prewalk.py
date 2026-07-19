@@ -174,6 +174,7 @@ def build_prewalk_specs(
     allow_non_worktree: bool = False,
     disable_codegraph: bool = False,
     disable_memory: bool = False,
+    allowed_model_ids: Optional[list[str]] = None,
 ) -> list[WorkerSpec]:
     """Build the plan → implement → verify WorkerSpec DAG for a prewalk job.
 
@@ -222,6 +223,7 @@ def build_prewalk_specs(
         # Keep plan on the chosen non-local adapter under auto-route (same as
         # implement) so quality routing cannot hop off Hermes/Claude/etc.
         pin_adapter=plan_adapter not in ("", "local"),
+        allowed_model_ids=allowed_model_ids,
     )
 
     implement_instruction = (
@@ -259,6 +261,7 @@ def build_prewalk_specs(
         auto_route=auto_route,
         # Keep implement on an edit-capable adapter when one was chosen.
         pin_adapter=implement_adapter not in ("", "local"),
+        allowed_model_ids=allowed_model_ids,
     )
 
     verify_instruction = (
@@ -294,6 +297,7 @@ def build_prewalk_specs(
         # Keep verify on the chosen non-local adapter under auto-route (same as
         # implement) so balanced routing cannot hop off Hermes/Claude/etc.
         pin_adapter=verify_adapter_name not in ("", "local"),
+        allowed_model_ids=allowed_model_ids,
     )
 
     return [
@@ -328,6 +332,7 @@ def _apply_routing(
     routing_policy: str,
     auto_route: bool,
     pin_adapter: bool,
+    allowed_model_ids: Optional[list[str]] = None,
 ) -> None:
     if model:
         if adapter == "cursor":
@@ -344,6 +349,8 @@ def _apply_routing(
         payload["routing_policy"] = routing_policy
     if pin_adapter and adapter:
         payload["allowed_adapters"] = [adapter]
+    if allowed_model_ids is not None:
+        payload["allowed_model_ids"] = list(allowed_model_ids)
 
 
 def _artifact_type_and_payload(artifact: Any) -> tuple[str, Any]:
