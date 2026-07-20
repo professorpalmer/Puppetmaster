@@ -317,3 +317,17 @@ Core objects:
 - `Artifact`: structured output with payload, evidence, confidence,
   and `sha256`
 - `MemoryRecord`: promoted fact retrieved by later workers
+
+## Windows: blank console flashes beside browser / login
+
+Owned Puppetmaster worker and helper subprocesses pass `CREATE_NO_WINDOW`
+via `puppetmaster/win_console.py` so they do not allocate a visible console
+when the parent is a console-less Electron/backend process.
+
+If a **blank terminal still flashes** during Cursor Agent login or MCP tool
+use, it is usually a **Cursor Node grandchild** (MCP server spawned by the
+Agent CLI). That spawn path must set `windowsHide` / `CREATE_NO_WINDOW` inside
+Cursor's Node runtime — Python `creationflags` on the top-level `agent`
+process cannot reach those grandchildren. Marionette's own `agent login`
+path uses `CREATE_NO_WINDOW` + direct `node`/`index.js` exec (not
+`CREATE_NEW_CONSOLE`).

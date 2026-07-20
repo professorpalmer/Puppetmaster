@@ -1,3 +1,12 @@
+## v1.20.4
+
+**Docs freshness for the 1.20.x line.**
+
+- README Status was still advertising v1.19.3; align Status, docs index, and
+  Windows console ownership notes with the shipping 1.20.x contract.
+- Point operators at CHANGELOG for verified Bedrock routing and constrained
+  model allowlists instead of stale Bedrock-stream highlights.
+
 ## v1.20.3
 
 **Verified Bedrock routing that stays healthy across worker processes.**

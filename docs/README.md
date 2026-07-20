@@ -2,6 +2,8 @@
 
 The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
 
+**Current release:** [v1.20.4](CHANGELOG.md#v1204) — see [CHANGELOG.md](CHANGELOG.md) for the full 1.20.x line (Bedrock verified routing, constrained allowlists, durable execution graph).
+
 ## Start here
 
 | Doc | What's in it |

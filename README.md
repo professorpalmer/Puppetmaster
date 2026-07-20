@@ -157,13 +157,15 @@ Marionette (the harness that rides Puppetmaster) implements complementary input-
 
 ## Status
 
-Daily-driver beta, currently at v1.19.3. Real runtime contract, automated tests, SQLite backend, fail-closed jobs, a live Cursor Agent MCP, validated full-edit adapters, and AWS Bedrock as a first-class agentic provider (Converse + ConverseStream). Credible for supervised local engineering; not yet a hosted multi-user service. Full feature matrix in [FEATURES.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/FEATURES.md).
+Daily-driver beta, currently at **v1.20.4**. Real runtime contract, automated tests, SQLite backend, fail-closed jobs, a live Cursor Agent MCP, validated full-edit adapters, constrained same-adapter model routing, and AWS Bedrock as a first-class agentic provider (Converse + ConverseStream) with verified-invoke routing health. Credible for supervised local engineering; not yet a hosted multi-user service. Full feature matrix in [FEATURES.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/FEATURES.md). Versioned history in [CHANGELOG.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/CHANGELOG.md).
 
-**v1.19.3 highlights:** Bedrock ConverseStream for live agentic chat deltas — real eventstream parsing for text, reasoning, and toolUse chunks via stdlib (no boto3); `bedrock_chat_stream` preferred over fake chunked non-SSE on the streaming path.
+**v1.20.4 highlights:** Docs freshness — Status/index alignment with the 1.20.x line (verified Bedrock routing, constrained allowlists, durable execution graph).
 
-**v1.19.1 highlights:** Bedrock Converse multi-model daily driver — account model discovery (`ListFoundationModels` + `ListInferenceProfiles`), Converse prompt-cache stamps, and token/cost parity with other providers (`price_job` cache-read discount, Marionette `cache_savings_usd`).
+**v1.20.3 highlights:** Verified Bedrock routing — runtime invoke health before auto-route; credential-scoped WAL; auth failures reroute across providers.
 
-**v1.19.0 highlights:** AWS Bedrock as a first-class agentic provider (BYOK) — `provider=bedrock` in the provider registry, stdlib-only `bedrock.py` (bearer or SigV4 IAM, no boto3), live model discovery merged into the agentic registry.
+**v1.20.2 highlights:** Constrained, recoverable model routing — empty allowlists fail closed; Cursor workers may recover once within the same-adapter allowlist.
+
+**Windows note:** Puppetmaster hides owned worker consoles via `win_console.py` (`CREATE_NO_WINDOW`). Cursor Agent Node MCP grandchildren that still flash a console are upstream Cursor responsibility (`windowsHide` / `CREATE_NO_WINDOW` on Node spawns) — see [TROUBLESHOOTING.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/TROUBLESHOOTING.md).
 
 PyPI lists the package as [`puppetmaster-ai`](https://pypi.org/project/puppetmaster-ai/); [PEP 503 normalization](https://peps.python.org/pep-0503/#normalized-names) collides `puppetmaster` with an abandoned 2019 package. The import name, CLI, repo, and brand stay `puppetmaster`.
 
