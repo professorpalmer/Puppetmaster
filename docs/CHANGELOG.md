@@ -1,3 +1,13 @@
+## v1.20.6
+
+**Cursor swarm stays on Cursor — pin `allowed_adapters` for every launch adapter.**
+
+- `build_analysis_swarm_specs` always sets `payload.allowed_adapters = [adapter]`,
+  including `cursor` (previously skipped for cursor/local).
+- Stops `start_cursor_swarm` from hopping onto agentic/minimax when vision tags
+  or cursor-cli keys fail, which produced empty unstructured findings on an
+  adapter the user never asked for.
+
 ## v1.20.5
 
 **One-command CLI swarm fallback — stop the config archaeology.**
