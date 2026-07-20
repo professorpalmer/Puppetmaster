@@ -27,8 +27,9 @@ from typing import Any, Callable, Iterator, Mapping, Optional
 
 
 _MISSING_CREDS_MSG = (
-    "AWS Bedrock credentials not found — run `aws configure`, set "
-    "AWS_BEARER_TOKEN_BEDROCK, or set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY."
+    "AWS Bedrock credentials not found — set AWS_PROFILE (or use the default "
+    "profile in ~/.aws), AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or "
+    "AWS_BEARER_TOKEN_BEDROCK."
 )
 
 _SHORT_MODEL_MSG = (
@@ -103,6 +104,15 @@ def bedrock_runtime_base_url(region: str) -> str:
 def missing_bedrock_credentials_message() -> str:
     """Actionable remediation when no AWS creds are visible."""
     return _MISSING_CREDS_MSG
+
+
+def bedrock_credentials_present(
+    env: Optional[Mapping[str, str]] = None,
+    *,
+    home: Optional[Path] = None,
+) -> bool:
+    """True when Bedrock credential *presence* is visible (not invoke-verified)."""
+    return resolve_bedrock_credentials(env, home=home) is not None
 
 
 def short_bedrock_model_message(model: object) -> str:
@@ -1135,6 +1145,7 @@ def _iter_converse_stream_events(byte_source) -> Iterator[dict]:
         message_type = str(headers.get(":message-type") or "event")
         if message_type == "exception":
             exc_type = str(headers.get(":exception-type") or "Exception")
+            normalized_type = exc_type.replace("_", "").replace("-", "").lower()
             detail = ""
             if payload:
                 try:
@@ -1145,9 +1156,23 @@ def _iter_converse_stream_events(byte_source) -> Iterator[dict]:
                     detail = str(parsed.get("message") or parsed.get("Message") or "")
                 if not detail:
                     detail = payload.decode("utf-8", errors="replace")[:8000]
+            if "accessdenied" in normalized_type or "unauthorized" in normalized_type:
+                status = 403
+            elif "throttl" in normalized_type:
+                status = 429
+            elif any(
+                marker in normalized_type
+                for marker in ("internalserver", "serviceunavailable", "modelstreamerror")
+            ):
+                status = 503
+            elif "validation" in normalized_type:
+                status = 400
+            else:
+                status = None
             raise ProviderError(
                 detail or exc_type,
-                reason="provider_error",
+                reason=f"http_status:{status}" if status is not None else "provider_error",
+                status=status,
                 body=detail[:8000] if detail else None,
             )
         if message_type != "event":
@@ -1270,6 +1295,27 @@ def _assistant_turn_from_converse_stream(
     return _assistant_turn_from_converse(data)
 
 
+def _note_bedrock_invoke_outcome(
+    env: Mapping[str, str],
+    creds: BedrockCredentials,
+    *,
+    error: Optional[BaseException] = None,
+) -> None:
+    """Best-effort invoke-health update; never masks the caller error."""
+    try:
+        from puppetmaster.provider_health import (
+            record_bedrock_invoke_failure,
+            record_bedrock_invoke_success,
+        )
+
+        if error is None:
+            record_bedrock_invoke_success(env, creds=creds)
+            return
+        record_bedrock_invoke_failure(env, creds=creds, error=error)
+    except Exception:
+        return
+
+
 def bedrock_chat(
     *,
     model: str,
@@ -1290,6 +1336,10 @@ def bedrock_chat(
     bearer. When ``on_delta`` is provided, delegates to
     :func:`bedrock_chat_stream` (``ConverseStream``) so text/reasoning deltas
     fire incrementally; otherwise posts non-stream ``Converse``.
+
+    Successful runtime invokes mark Bedrock invoke-health verified; terminal
+    auth failures (401 / auth-signal 403) mark it denied for the credential
+    fingerprint. Catalog list calls never go through this path.
     """
     if on_delta is not None:
         return bedrock_chat_stream(
@@ -1323,8 +1373,14 @@ def bedrock_chat(
         content_type="application/json",
         amz_date=amz_date,
     )
-    data = _post_bedrock(url, headers=headers, body=body, timeout=timeout)
-    return _assistant_turn_from_converse(data)
+    try:
+        data = _post_bedrock(url, headers=headers, body=body, timeout=timeout)
+        turn = _assistant_turn_from_converse(data)
+    except Exception as exc:
+        _note_bedrock_invoke_outcome(env, creds, error=exc)
+        raise
+    _note_bedrock_invoke_outcome(env, creds)
+    return turn
 
 
 def bedrock_chat_stream(
@@ -1368,19 +1424,26 @@ def bedrock_chat_stream(
         accept="application/vnd.amazon.eventstream",
         amz_date=amz_date,
     )
-    response = _open_bedrock_event_stream(
-        url, headers=headers, body=body, timeout=timeout
-    )
+    response = None
     try:
-        return _assistant_turn_from_converse_stream(
+        response = _open_bedrock_event_stream(
+            url, headers=headers, body=body, timeout=timeout
+        )
+        turn = _assistant_turn_from_converse_stream(
             _iter_converse_stream_events(response),
             on_delta=on_delta,
         )
+    except Exception as exc:
+        _note_bedrock_invoke_outcome(env, creds, error=exc)
+        raise
     finally:
-        try:
-            response.close()
-        except Exception:
-            pass
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+    _note_bedrock_invoke_outcome(env, creds)
+    return turn
 
 
 def diversify_chat_model_ids(
@@ -1515,25 +1578,45 @@ def merge_bedrock_discovered_into_registry(
     *,
     env: Optional[Mapping[str, str]] = None,
     timeout: int = 30,
+    allow_unverified_catalog: bool = False,
 ) -> "tuple[list, dict]":
     """Replace agentic Bedrock entries with a live account-specific catalog.
 
-    No-op (returns ``existing`` unchanged) when Bedrock credentials are absent
-    or discovery returns nothing. Non-Bedrock registry entries are preserved.
+    ListFoundationModels / ListInferenceProfiles are catalog shape only: they
+    never mark Bedrock auto-routable. Registry rows are rewritten only when
+    invoke-health is currently verified (so ``--write`` cannot re-enable
+    Bedrock from a stale default profile). Denied / unverified credentials
+    preserve existing registry rows and disabled overlays unchanged.
     """
-    from puppetmaster.providers import get_provider, is_available
+    from puppetmaster.provider_health import (
+        STATUS_VERIFIED,
+        bedrock_health_report,
+        read_bedrock_invoke_health,
+    )
+    from puppetmaster.providers import get_provider
 
     env = env if env is not None else os.environ
     desc = get_provider("bedrock")
+    health = bedrock_health_report(env)
     report: dict[str, Any] = {
         "added": 0,
         "removed": 0,
         "available": False,
         "discovered": 0,
+        "credentials_present": bool(health.get("credentials_present")),
+        "invoke_health": health.get("invoke_health") or "unknown",
     }
-    if desc is None or not is_available(desc, env):
+    if desc is None or not health.get("credentials_present"):
         return existing, report
-    report["available"] = True
+
+    invoke_health = read_bedrock_invoke_health(env)
+    report["invoke_health"] = invoke_health
+    verified = invoke_health == STATUS_VERIFIED
+    report["available"] = verified
+    if not verified and not allow_unverified_catalog:
+        # Preserve overlays / disabled rows; catalog list alone must not write.
+        return existing, report
+
     try:
         live = list_chat_model_ids(env=env, timeout=timeout)
     except Exception as exc:
@@ -1541,6 +1624,9 @@ def merge_bedrock_discovered_into_registry(
         return existing, report
     report["discovered"] = len(live)
     if not live:
+        return existing, report
+    if not verified:
+        # Probe/dry-run catalog shape without mutating registry enablement.
         return existing, report
 
     new_specs = bedrock_agentic_model_specs(env=env, model_ids=live, timeout=timeout)

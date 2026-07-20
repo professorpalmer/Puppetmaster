@@ -694,6 +694,15 @@ class Orchestrator:
             allow_same_adapter = reason in SAME_ADAPTER_MODEL_REROUTE
             if reason == RUN_STATUS_ERROR and run_status_same_adapter_reroutes >= 1:
                 allow_same_adapter = False
+            # Agentic hosts many providers behind one adapter. A Bedrock (or
+            # other provider) auth denial must be able to recover onto another
+            # auto-routable provider without requiring a different CLI adapter.
+            # route_task's available_providers gate drops the denied provider.
+            if (
+                reason == "not_authenticated"
+                and failed_adapter == "agentic"
+            ):
+                allow_same_adapter = True
 
             def _eligible(spec, *, same_adapter_ok: bool) -> bool:
                 if spec.id in tried_models:
@@ -718,6 +727,8 @@ class Orchestrator:
             # Prefer a different funded platform (billing/auth recovery). Only
             # when none exist — and the failure is model-shaped — try another
             # model on the same adapter (single-platform / OMP-style chains).
+            # Agentic auth recovery also uses the same-adapter path so a denied
+            # Bedrock fingerprint can fall through to OpenAI/Anthropic/etc.
             candidates = [
                 spec for spec in registry
                 if _eligible(spec, same_adapter_ok=False)

@@ -563,26 +563,46 @@ def detect_agentic_billing(
 
     Unlike Hermes/Codex there is no external CLI or OAuth file to probe — the
     standalone worker calls provider HTTP APIs directly, so readiness reduces to
-    ``available_providers()`` from :mod:`puppetmaster.providers`.
+    ``available_providers()`` from :mod:`puppetmaster.providers`. Bedrock is
+    reported as present-but-unverified / denied when credentials exist without
+    a current verified invoke-health record (never "ready" on presence alone).
     """
-    del home  # agentic never reads provider keys from Puppetmaster-owned files
+    from puppetmaster.provider_health import bedrock_health_report
     from puppetmaster.providers import available_providers
 
     env = env if env is not None else os.environ
     providers = sorted(available_providers(env))
+    bedrock = bedrock_health_report(env, home=home)
     healthy = bool(providers)
+    evidence = [f"agentic_provider:{slug}" for slug in providers]
+    if bedrock.get("credentials_present"):
+        evidence.append(f"bedrock_invoke_health:{bedrock.get('invoke_health')}")
+        evidence.append(
+            "bedrock_auto_routable:"
+            + ("yes" if bedrock.get("auto_routable") else "no")
+        )
     if healthy:
         detail = (
             "Agentic adapter bills per-token to your provider API key(s) "
             f"(out-of-pocket). Ready providers: {', '.join(providers)}."
         )
-        evidence = [f"agentic_provider:{slug}" for slug in providers]
+        if bedrock.get("credentials_present") and not bedrock.get("auto_routable"):
+            detail += f" Bedrock: {bedrock.get('detail')}."
     else:
         detail = (
-            "No provider API key visible — set OPENAI_API_KEY, ANTHROPIC_API_KEY, "
-            "GEMINI_API_KEY, GOOGLE_API_KEY, or OPENROUTER_API_KEY (no external CLI)."
+            "No auto-routable provider credential — set OPENAI_API_KEY, "
+            "ANTHROPIC_API_KEY, GEMINI_API_KEY, GOOGLE_API_KEY, or "
+            "OPENROUTER_API_KEY (no external CLI)."
         )
-        evidence = ["agentic_providers:none"]
+        if bedrock.get("credentials_present"):
+            detail = (
+                f"Bedrock: {bedrock.get('detail')}. Other providers: set "
+                "OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, "
+                "GOOGLE_API_KEY, or OPENROUTER_API_KEY."
+            )
+            evidence.append("agentic_providers:none_auto_routable")
+        else:
+            evidence.append("agentic_providers:none")
     return BillingStatus(
         adapter="agentic",
         billing="api",

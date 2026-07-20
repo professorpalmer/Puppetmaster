@@ -330,7 +330,11 @@ def _seed_agentic_registry() -> None:
         merged, report = merge_curated_into_registry(
             "agentic", "api", existing, allowed_providers=allowed
         )
-        if "bedrock" in allowed:
+        # Bedrock merge only rewrites rows when invoke-health is verified;
+        # credential presence alone must not seed/re-enable auto-routes.
+        from puppetmaster.bedrock import bedrock_credentials_present
+
+        if "bedrock" in allowed or bedrock_credentials_present():
             try:
                 from puppetmaster.bedrock import merge_bedrock_discovered_into_registry
 

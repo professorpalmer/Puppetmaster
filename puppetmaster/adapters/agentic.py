@@ -240,6 +240,10 @@ _PROVIDER_ENV_HINTS = {
     "deepseek": "DEEPSEEK_API_KEY",
     "xai": "XAI_API_KEY",
     "mistral": "MISTRAL_API_KEY",
+    "bedrock": (
+        "AWS_PROFILE / default ~/.aws profile, AWS_ACCESS_KEY_ID + "
+        "AWS_SECRET_ACCESS_KEY, or AWS_BEARER_TOKEN_BEDROCK"
+    ),
 }
 
 # Headless destructive-command denylist (guardrail SHAPE lifted from Hermes'
@@ -456,10 +460,15 @@ class AgenticAdapter(FullEditWorkerAdapter):
             )
         except ProviderError as exc:
             detail = redact_secrets(exc.body or str(exc)) or str(exc)
-            arts = [self._fail(task, worker_id, evidence_base, exc.failure,
+            failure = exc.failure
+            if (provider or "").lower() == "bedrock":
+                from puppetmaster.provider_health import bedrock_failure_for_recovery
+
+                failure = bedrock_failure_for_recovery(exc)
+            arts = [self._fail(task, worker_id, evidence_base, failure,
                                detail, status=exc.status, provider_reason=exc.reason)]
             auth_risk = self._auth_failure_risk(
-                task, worker_id, provider, exc.status or 0, detail, reason=exc.failure)
+                task, worker_id, provider, exc.status or 0, detail, reason=failure)
             if auth_risk is not None:
                 arts.append(auth_risk)
             return arts
@@ -661,10 +670,15 @@ class AgenticAdapter(FullEditWorkerAdapter):
         except ProviderError as exc:
             after = facade("git_snapshot")(cwd, base_tree=str(before.get("tree") or "") or None)
             detail = redact_secrets(exc.body or str(exc)) or str(exc)
-            arts = [self._fail(task, worker_id, evidence_base, exc.failure,
+            failure = exc.failure
+            if (provider or "").lower() == "bedrock":
+                from puppetmaster.provider_health import bedrock_failure_for_recovery
+
+                failure = bedrock_failure_for_recovery(exc)
+            arts = [self._fail(task, worker_id, evidence_base, failure,
                                detail, status=exc.status, provider_reason=exc.reason)]
             auth_risk = self._auth_failure_risk(
-                task, worker_id, provider, exc.status or 0, detail, reason=exc.failure)
+                task, worker_id, provider, exc.status or 0, detail, reason=failure)
             if auth_risk is not None:
                 arts.append(auth_risk)
             if _should_emit_patch_artifact(before, after):

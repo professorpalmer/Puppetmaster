@@ -364,34 +364,53 @@ def resolve_base_url(
     return desc.base_url.rstrip("/")
 
 
-def is_available(
+def credentials_present(
     desc: ProviderDescriptor, env: Optional[Mapping[str, str]] = None
 ) -> bool:
-    """True when this provider can actually be called with the current env.
+    """True when credential *presence* is visible for ``desc`` (not invoke-probed).
 
-    A keyed provider needs one of its API-key env vars set. A keyless local
-    provider needs one of its presence env vars set (so we never route to a
-    local server the user hasn't opted into). Bedrock accepts bearer token,
-    access-key pair, AWS_PROFILE, or a non-empty ``~/.aws`` credentials/config
-    file — matching Claude Code Bedrock credential health.
+    For most providers this matches :func:`is_available`. Bedrock is special:
+    a stale ``~/.aws/default`` profile counts as present but is not auto-routable
+    until invoke-health is verified (see :func:`is_available`).
     """
     env = env if env is not None else os.environ
     if desc.slug == "bedrock":
-        from puppetmaster.bedrock import resolve_bedrock_credentials
+        from puppetmaster.bedrock import bedrock_credentials_present
 
-        return resolve_bedrock_credentials(env) is not None
+        return bedrock_credentials_present(env)
     if desc.keyless:
         return any(env.get(name, "").strip() for name in desc.presence_env_vars)
     return resolve_api_key(desc, env) is not None
 
 
+def is_available(
+    desc: ProviderDescriptor, env: Optional[Mapping[str, str]] = None
+) -> bool:
+    """True when this provider is safe to *auto-route* with the current env.
+
+    A keyed provider needs one of its API-key env vars set. A keyless local
+    provider needs one of its presence env vars set (so we never route to a
+    local server the user hasn't opted into). Bedrock requires both visible
+    credentials *and* a current verified invoke-health record — presence of
+    ``~/.aws/default`` / env keys alone is not enough. Explicit/pinned Bedrock
+    calls still go through :func:`provider_chat` without this gate.
+    """
+    env = env if env is not None else os.environ
+    if desc.slug == "bedrock":
+        from puppetmaster.provider_health import is_bedrock_auto_routable
+
+        return is_bedrock_auto_routable(env)
+    return credentials_present(desc, env)
+
+
 def available_providers(env: Optional[Mapping[str, str]] = None) -> set[str]:
-    """The set of provider slugs that have a usable credential/endpoint now.
+    """The set of provider slugs that are auto-routable with current credentials.
 
     This is the standalone analogue of Hermes's ``available_hermes_providers``:
     the router uses it to drop any direct-API model whose provider can't be
     reached, so a fresh install offers exactly the providers the user's keys
-    unlock -- nothing more.
+    unlock -- nothing more. Bedrock is included only when invoke-health is
+    currently verified (not merely present, not denied).
     """
     env = env if env is not None else os.environ
     return {slug for slug, desc in PROVIDER_REGISTRY.items() if is_available(desc, env)}

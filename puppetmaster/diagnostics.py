@@ -172,6 +172,7 @@ def _billing_checks() -> list[Check]:
     (out-of-pocket) vs unknown/unauthenticated. This is the at-a-glance answer
     to "will this cost me extra, and can it even run?"."""
     from puppetmaster.platform_billing import detect_adapter_billing
+    from puppetmaster.provider_health import bedrock_health_report
 
     checks: list[Check] = []
     for adapter in ("agentic", "cursor", "claude-code", "codex", "hermes", "openai"):
@@ -189,6 +190,43 @@ def _billing_checks() -> list[Check]:
                 evidence=list(status.evidence),
             )
         )
+    try:
+        bedrock = bedrock_health_report()
+    except Exception as exc:  # pragma: no cover - defensive
+        checks.append(Check("billing:bedrock", "warn", f"probe failed: {exc}"))
+    else:
+        if bedrock.get("credentials_present"):
+            if bedrock.get("auto_routable"):
+                checks.append(
+                    Check(
+                        "billing:bedrock",
+                        "ok",
+                        f"api — {bedrock.get('detail')}",
+                        evidence=list(bedrock.get("evidence") or [])
+                        + [f"invoke_health:{bedrock.get('invoke_health')}"],
+                    )
+                )
+            else:
+                checks.append(
+                    Check(
+                        "billing:bedrock",
+                        "warn",
+                        f"api — {bedrock.get('detail')}",
+                        evidence=list(bedrock.get("evidence") or [])
+                        + [f"invoke_health:{bedrock.get('invoke_health')}"],
+                    )
+                )
+        else:
+            checks.append(
+                Check(
+                    "billing:bedrock",
+                    "optional",
+                    "api — no AWS Bedrock credentials visible "
+                    "(AWS_PROFILE/default ~/.aws, AWS_ACCESS_KEY_ID/"
+                    "AWS_SECRET_ACCESS_KEY, or AWS_BEARER_TOKEN_BEDROCK)",
+                    evidence=["bedrock_credentials:absent"],
+                )
+            )
     return checks
 
 

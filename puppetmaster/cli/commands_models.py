@@ -745,21 +745,7 @@ def _run_models_discover(args, path: Path) -> int:
         reports.append(report)
         catalogs[source] = catalog
 
-    if args.json:
-        print(
-            _json.dumps(
-                {
-                    "reports": reports,
-                    "errors": errors,
-                    "catalogs": catalogs,
-                    "written": bool(args.write),
-                    "probed": probe,
-                    "registry_path": str(path),
-                },
-                indent=2,
-            )
-        )
-    else:
+    if not args.json:
         for report in reports:
             src = report.get("source") or report.get("adapter") or "cursor"
             print(f"[{src}] discovered {report['discovered_count']} model(s).")
@@ -790,6 +776,48 @@ def _run_models_discover(args, path: Path) -> int:
     elif probe and reports:
         for report in reports:
             src = report.get("source") or report.get("adapter")
+            # Off-hot-path Bedrock runtime verification (never inside route_task).
+            if src == "agentic":
+                try:
+                    from puppetmaster.bedrock import bedrock_credentials_present
+                    from puppetmaster.provider_health import probe_bedrock_runtime
+
+                    if bedrock_credentials_present():
+                        candidate = None
+                        for item in catalogs.get(src, []) or []:
+                            mid = str(item.get("id") or "")
+                            if mid and (
+                                "." in mid
+                                or mid.startswith("arn:aws:bedrock")
+                            ):
+                                candidate = mid
+                                break
+                        probe_report = probe_bedrock_runtime(model_id=candidate)
+                        report["bedrock_probe"] = probe_report
+                        bedrock_meta = report.get("bedrock")
+                        if not isinstance(bedrock_meta, dict):
+                            bedrock_meta = {}
+                            report["bedrock"] = bedrock_meta
+                        bedrock_meta["invoke_health"] = probe_report.get(
+                            "invoke_health"
+                        )
+                        bedrock_meta["available"] = bool(probe_report.get("ok"))
+                        bedrock_meta["probe"] = probe_report
+                        if not args.json:
+                            if probe_report.get("ok"):
+                                print(
+                                    "[agentic] Bedrock runtime probe ok "
+                                    f"(model={probe_report.get('model_id')}; "
+                                    "invoke-health=verified)."
+                                )
+                            else:
+                                print(
+                                    "[agentic] Bedrock runtime probe failed "
+                                    f"({probe_report.get('error') or 'denied'}); "
+                                    f"invoke-health={probe_report.get('invoke_health')}."
+                                )
+                except Exception as exc:
+                    report["bedrock_probe"] = {"ok": False, "error": repr(exc)}
             model_ids = [
                 item["id"]
                 for item in catalogs.get(src, [])
@@ -814,6 +842,23 @@ def _run_models_discover(args, path: Path) -> int:
             )
     elif not args.json and reports:
         print("Dry run — pass --write to persist.")
+    if args.json:
+        # Probe mutates the in-memory report with runtime invoke-health. Emit
+        # JSON only after that work so machine consumers never see the stale
+        # pre-probe presence-only result.
+        print(
+            _json.dumps(
+                {
+                    "reports": reports,
+                    "errors": errors,
+                    "catalogs": catalogs,
+                    "written": bool(args.write),
+                    "probed": probe,
+                    "registry_path": str(path),
+                },
+                indent=2,
+            )
+        )
     return 0 if reports or not errors else 1
 
 class _DiscoverSourceError(RuntimeError):
@@ -863,6 +908,7 @@ def _discover_one_source(source: str, registry: list, *, prune: bool = False):
         return merged, report, catalog
 
     if source == "agentic":
+        from puppetmaster.bedrock import bedrock_credentials_present
         from puppetmaster.providers import available_providers
         from puppetmaster.static_catalog import (
             curated_catalog,
@@ -870,27 +916,38 @@ def _discover_one_source(source: str, registry: list, *, prune: bool = False):
         )
 
         allowed = available_providers()
+        # Curated merge uses auto-routable providers only. Bedrock catalog
+        # listing may still run on credential presence (shape only) without
+        # marking available=true or rewriting registry rows.
         merged, report = merge_curated_into_registry(
             "agentic", "api", registry, allowed_providers=allowed
         )
-        # Account-specific Bedrock catalog (IAM allow-list) — not in the static
-        # curated list, because every AWS account sees a different model set.
-        # Only merge when Bedrock is actually available (same gate as catalog).
-        if "bedrock" in allowed:
+        bedrock_present = bedrock_credentials_present()
+        if bedrock_present:
             try:
                 from puppetmaster.bedrock import merge_bedrock_discovered_into_registry
 
+                # Merge is a no-op unless invoke-health is verified; still
+                # records credentials_present / invoke_health on the report.
                 merged, bedrock_report = merge_bedrock_discovered_into_registry(merged)
                 report["bedrock"] = bedrock_report
             except Exception as exc:
                 report["bedrock"] = {"error": repr(exc)}
         report["source"] = "agentic"
         report["available_providers"] = sorted(allowed)
+        if bedrock_present and "bedrock" not in allowed:
+            report.setdefault("bedrock", {})
+            if isinstance(report["bedrock"], dict):
+                report["bedrock"].setdefault("credentials_present", True)
+                report["bedrock"].setdefault("available", False)
         catalog = [
             {"id": item["model"]}
             for item in curated_catalog("agentic")
             if (item.get("payload_defaults") or {}).get("provider") in allowed
         ]
+        # Only surface Bedrock catalog ids when auto-routable (verified).
+        # Probe finds its own candidate via probe_bedrock_runtime; listing here
+        # must not inject account models merely because ~/.aws exists.
         if "bedrock" in allowed:
             try:
                 from puppetmaster.bedrock import (

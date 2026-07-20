@@ -47,13 +47,18 @@ def apply_hermetic_isolation(*, register_atexit: bool = True) -> None:
 
     _ISOLATION_TMP = tempfile.mkdtemp(prefix="pm-test-empty-")
     sentinel = Path(_ISOLATION_TMP) / "models-does-not-exist.json"
+    health_db = Path(_ISOLATION_TMP) / "provider_health.sqlite3"
 
     _ENV_BEFORE["PUPPETMASTER_MODELS_PATH"] = os.environ.get("PUPPETMASTER_MODELS_PATH")
+    _ENV_BEFORE["PUPPETMASTER_PROVIDER_HEALTH_PATH"] = os.environ.get(
+        "PUPPETMASTER_PROVIDER_HEALTH_PATH"
+    )
     _ENV_BEFORE[ONLY_ENV] = os.environ.get(ONLY_ENV)
     for key in _PIN_KEYS_TO_CLEAR:
         _ENV_BEFORE[key] = os.environ.get(key)
 
     os.environ["PUPPETMASTER_MODELS_PATH"] = str(sentinel)
+    os.environ["PUPPETMASTER_PROVIDER_HEALTH_PATH"] = str(health_db)
     os.environ[ONLY_ENV] = ",".join(KNOWN_ADAPTERS)
     for key in _PIN_KEYS_TO_CLEAR:
         os.environ.pop(key, None)
@@ -77,6 +82,12 @@ def apply_hermetic_isolation(*, register_atexit: bool = True) -> None:
             from puppetmaster.platform_billing import clear_billing_cache
 
             clear_billing_cache()
+        except Exception:
+            pass
+        try:
+            from puppetmaster.provider_health import reset_provider_health_store_cache
+
+            reset_provider_health_store_cache()
         except Exception:
             pass
         try:

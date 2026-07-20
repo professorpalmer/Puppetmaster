@@ -552,8 +552,10 @@ def route_task(
             raise NoEligibleModelError(
                 "No standalone (agentic) model has a usable provider credential. "
                 "Set a provider key (e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY, "
-                "GEMINI_API_KEY, OPENROUTER_API_KEY) or AWS Bedrock auth "
-                "(aws configure / AWS_ACCESS_KEY_ID / AWS_BEARER_TOKEN_BEDROCK), "
+                "GEMINI_API_KEY, OPENROUTER_API_KEY) or verify AWS Bedrock "
+                "(AWS_PROFILE/default ~/.aws, AWS_ACCESS_KEY_ID/"
+                "AWS_SECRET_ACCESS_KEY, or AWS_BEARER_TOKEN_BEDROCK — then "
+                "`puppetmaster models discover --source agentic --probe`), "
                 "or enable another platform."
             )
         candidates = after_keys

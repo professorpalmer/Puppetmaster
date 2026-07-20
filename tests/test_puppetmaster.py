@@ -15614,8 +15614,17 @@ class BedrockProviderTests(unittest.TestCase):
             "puppetmaster.bedrock.list_chat_model_ids",
             return_value=["deepseek.v3.2", "zai.glm-5"],
         ), patch(
-            "puppetmaster.providers.is_available",
-            return_value=True,
+            "puppetmaster.provider_health.read_bedrock_invoke_health",
+            return_value="verified",
+        ), patch(
+            "puppetmaster.provider_health.bedrock_health_report",
+            return_value={
+                "credentials_present": True,
+                "invoke_health": "verified",
+                "auto_routable": True,
+                "region": "us-east-1",
+                "detail": "verified",
+            },
         ):
             merged, report = merge_bedrock_discovered_into_registry(
                 existing, env={"AWS_ACCESS_KEY_ID": "A", "AWS_SECRET_ACCESS_KEY": "S"}
