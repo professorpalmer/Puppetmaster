@@ -10,7 +10,15 @@ with that output attached.
 
 This is Cursor's MCP client telling you it lost the stdio transport
 to the Puppetmaster MCP server — **not** that your swarm or jobs
-died. Common triggers:
+died. **Do not invent a JSON workflow config.** Start the analysis
+swarm with one CLI line and keep working:
+
+```bash
+python -m puppetmaster swarm "your goal here"
+python -m puppetmaster feed <job_id> --follow
+```
+
+Common triggers:
 
 - Heavy concurrent load (parallel Cursor SDK swarm + CodeGraph index
   + large status payloads in the same window).

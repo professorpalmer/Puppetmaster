@@ -43,6 +43,7 @@ from puppetmaster.mcp_registry import (
 )
 from puppetmaster.state import resolve_state_dir
 from puppetmaster.store_factory import create_store
+from puppetmaster.swarm_launch import SWARM_ANALYSIS_ADAPTERS, wait_for_job_id
 from puppetmaster.update_check import pypi_update_note, version_is_newer
 from puppetmaster.cli.helpers import (
     allowed_model_ids_from_mapping,
@@ -2704,22 +2705,6 @@ def normalized_roles(args: JsonObject) -> list[str]:
     return [str(role) for role in roles if str(role).strip()]
 
 
-# Adapters that can back a generated *analysis* swarm: every adapter that can
-# run a worker and emit artifacts. ``local`` is the deterministic demo backend;
-# the rest run a real model in read-only/analyze mode. Edit-only concerns don't
-# apply here — the generated workers are marked read_only — so any runnable
-# adapter qualifies, not just cursor.
-SWARM_ANALYSIS_ADAPTERS: tuple[str, ...] = (
-    "agentic",
-    "cursor",
-    "local",
-    "claude-code",
-    "codex",
-    "hermes",
-    "openai",
-)
-
-
 def _ambiguous_model_pin_tool_error(
     exc: BaseException, model: Any
 ) -> Optional[JsonObject]:
@@ -2745,107 +2730,42 @@ def _ambiguous_model_pin_tool_error(
 
 
 def write_generated_swarm_config(args: JsonObject, roles: list[str], adapter: str) -> Path:
-    if adapter not in SWARM_ANALYSIS_ADAPTERS:
-        raise ValueError(
-            f"adapter {adapter!r} cannot run an analysis swarm. Supported: "
-            f"{', '.join(SWARM_ANALYSIS_ADAPTERS)}."
-        )
-    root = mcp_state_dir(args)
-    config_dir = root / "mcp-configs"
-    config_dir.mkdir(parents=True, exist_ok=True)
-    config_path = config_dir / f"swarm_{int(time.time() * 1000)}_{os.getpid()}.json"
+    """MCP entry: persist the same analysis-swarm config the CLI ``swarm`` verb uses."""
+    from puppetmaster.swarm_launch import write_analysis_swarm_config
+
     goal = require_string(args, "goal")
-    timeout_seconds = int(args.get("timeout_seconds") or 900)
-    explicit_model = args.get("model")
-    model = str(explicit_model or "default")
-    # Auto-routing is ON by default for MCP swarms (matches DEFAULT_WORKERS and the
-    # v0.6.0 docs). It is suppressed only if the caller (a) pinned a specific model
-    # via the `model` arg, or (b) explicitly passed auto_route=false.
     auto_route_arg = args.get("auto_route")
+    auto_route: Optional[bool]
     if auto_route_arg is not None:
-        auto_route_enabled = bool(auto_route_arg)
+        auto_route = bool(auto_route_arg)
     else:
-        auto_route_enabled = not bool(explicit_model)
-    routing_policy = args.get("routing_policy")
-    max_cost_usd = args.get("max_cost_usd")
-    min_capability = args.get("min_capability")
+        auto_route = None
     required_tags = args.get("required_tags")
-    allowed_model_ids = allowed_model_ids_list_from_mapping(args)
-    workers = []
-    from puppetmaster.workers import (
-        ANALYSIS_NO_EDIT_PAYLOAD,
-        default_routing_policy_for_role,
+    tags_list = (
+        [str(tag) for tag in required_tags if str(tag).strip()]
+        if isinstance(required_tags, list)
+        else None
     )
-
-    for role in roles:
-        prompt = (
-            f"Role: {role}\n"
-            f"Goal: {goal}\n\n"
-            "Return structured findings with concrete file/function evidence. "
-            "Do not modify files unless the user explicitly requested implementation. "
-            "Return only Puppetmaster artifact JSON with an artifacts array."
-        )
-        payload: JsonObject = {
-            "prompt": prompt,
-            "cwd": cwd(args),
-            "timeout_seconds": timeout_seconds,
-            # Generated MCP swarms are analysis workers: they emit structured
-            # artifacts and must be able to review the caller's dirty diff.
-            # If routing lands on an edit-capable adapter such as Codex, keep
-            # it on the adapter's existing read-only/no-edit path.
-            **ANALYSIS_NO_EDIT_PAYLOAD,
-        }
-        if adapter == "cursor":
-            if explicit_model:
-                from puppetmaster.model_registry import apply_cursor_model_pin
-
-                # AmbiguousModelPinError propagates to start_swarm /
-                # start_cursor_swarm for the structured preflight/blocked
-                # tool_error contract (never a raw traceback to the host).
-                payload.update(apply_cursor_model_pin({}, str(explicit_model)))
-            else:
-                payload["model"] = model
-        elif explicit_model:
-            # An explicit pin must reach non-cursor adapters too (cursor already
-            # carries a "default" model; the others only set a model when pinned).
-            payload["model"] = str(explicit_model)
-        if auto_route_enabled:
-            payload["auto_route"] = True
-            # An explicitly chosen non-cursor adapter must actually be dispatched
-            # to: constrain routing to it so the router can't hop off the user's
-            # pick. Cursor/local keep their historical unconstrained routing.
-            if adapter not in ("cursor", "local"):
-                payload["allowed_adapters"] = [adapter]
-            if isinstance(routing_policy, str) and routing_policy:
-                payload["routing_policy"] = routing_policy
-            else:
-                # Match DEFAULT_WORKERS: explore/test stay cheap, review/audit
-                # stay quality — without pinning models. Caller override wins.
-                role_policy = default_routing_policy_for_role(str(role))
-                if role_policy:
-                    payload["routing_policy"] = role_policy
-            if isinstance(max_cost_usd, (int, float)):
-                payload["max_cost_usd"] = float(max_cost_usd)
-            if isinstance(min_capability, int):
-                payload["min_capability"] = int(min_capability)
-            if isinstance(required_tags, list) and required_tags:
-                payload["required_tags"] = [str(tag) for tag in required_tags if str(tag).strip()]
-            if allowed_model_ids is not None:
-                payload["allowed_model_ids"] = list(allowed_model_ids)
-        if args.get("disable_memory") is False:
-            payload["disable_memory"] = False
-        else:
-            payload["disable_memory"] = True
-        workers.append(
-            {
-                "role": role,
-                "instruction": prompt,
-                "adapter": adapter,
-                "payload": payload,
-            }
-        )
-    config_path.write_text(json.dumps({"lease_seconds": 10, "workers": workers}, indent=2), encoding="utf-8")
-    return config_path
+    max_cost = args.get("max_cost_usd")
+    min_cap = args.get("min_capability")
+    return write_analysis_swarm_config(
+        goal=goal,
+        roles=roles,
+        adapter=adapter,
+        state_dir=mcp_state_dir(args),
+        cwd=cwd(args),
+        timeout_seconds=int(args.get("timeout_seconds") or 900),
+        model=str(args["model"]) if args.get("model") else None,
+        auto_route=auto_route,
+        routing_policy=str(args["routing_policy"])
+        if isinstance(args.get("routing_policy"), str)
+        else None,
+        max_cost_usd=float(max_cost) if isinstance(max_cost, (int, float)) else None,
+        min_capability=int(min_cap) if isinstance(min_cap, int) else None,
+        required_tags=tags_list,
+        allowed_model_ids=allowed_model_ids_list_from_mapping(args),
+        disable_memory=args.get("disable_memory") is not False,
+    )
 
 
 def route_task_schema() -> JsonObject:
@@ -3517,42 +3437,6 @@ def start_cli(command: list[str], args: JsonObject) -> JsonObject:
         ],
     }
     return {"content": [{"type": "text", "text": json.dumps(body, indent=2)}], "isError": False}
-
-
-def wait_for_job_id(
-    stdout_path: Path,
-    stderr_path: Path,
-    process: subprocess.Popen,
-    timeout_seconds: float,
-) -> str:
-    deadline = time.monotonic() + timeout_seconds
-    pattern = re.compile(r"job_id:\s*(job_[A-Za-z0-9]+)")
-    # Read the log incrementally from a tracked byte offset instead of
-    # re-reading the entire file every 50ms. Re-reading was O(n) per poll
-    # (O(n^2) overall) once startup wrote a lot of output before the job id.
-    offset = 0
-    buffer = ""
-    while time.monotonic() < deadline:
-        if process.poll() is not None and not stdout_path.exists():
-            break
-        if stdout_path.exists():
-            with stdout_path.open("r", encoding="utf-8") as handle:
-                handle.seek(offset)
-                chunk = handle.read()
-                offset = handle.tell()
-            if chunk:
-                buffer += chunk
-                match = pattern.search(buffer)
-                if match:
-                    return match.group(1)
-            if process.poll() is not None:
-                break
-        time.sleep(0.05)
-    stderr = stderr_path.read_text(encoding="utf-8")[-1000:] if stderr_path.exists() else ""
-    raise RuntimeError(
-        f"started Puppetmaster process but did not receive early job_id; "
-        f"pid={process.pid}; returncode={process.poll()}; stderr={stderr}"
-    )
 
 
 def launcher_environment(args: JsonObject) -> dict[str, str]:

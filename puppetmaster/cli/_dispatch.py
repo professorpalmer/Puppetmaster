@@ -924,6 +924,90 @@ def _main(argv: Optional[list[str]] = None) -> int:
         )
         return cli.finalize_cli_run(result)
 
+    if args.command == "swarm":
+        from dataclasses import replace
+
+        from puppetmaster import platform_lock
+        from puppetmaster.swarm_launch import (
+            DEFAULT_SWARM_ROLES,
+            build_analysis_swarm_specs,
+            detach_analysis_swarm,
+        )
+
+        adapter = str(getattr(args, "adapter", None) or "cursor")
+        if adapter != "local" and not platform_lock.is_adapter_enabled(adapter):
+            print(
+                f"swarm: adapter {adapter!r} is disabled by the platform lock.",
+                file=sys.stderr,
+            )
+            print(f"  enable it: puppetmaster platform enable {adapter}", file=sys.stderr)
+            return 2
+
+        roles = list(args.roles) if getattr(args, "roles", None) else list(DEFAULT_SWARM_ROLES)
+        disable_memory = not bool(getattr(args, "enable_memory", False))
+        auto_route = None
+        if getattr(args, "no_auto_route", False):
+            auto_route = False
+        elif getattr(args, "auto_route", None):
+            auto_route = True
+
+        if getattr(args, "wait", False):
+            specs = build_analysis_swarm_specs(
+                args.goal,
+                roles,
+                adapter=adapter,
+                cwd=args.cwd,
+                timeout_seconds=int(args.timeout_seconds),
+                model=args.model,
+                auto_route=auto_route,
+                routing_policy=getattr(args, "routing_policy", None),
+                disable_memory=disable_memory,
+            )
+            if args.enable_memory:
+                specs = [
+                    replace(spec, payload={**spec.payload, "disable_memory": False})
+                    for spec in specs
+                ]
+            result = cli.Orchestrator(store).run(
+                args.goal,
+                specs=specs,
+                lease_seconds=10,
+                worker_mode=args.worker_mode,
+                on_job_created=on_job_created or early_job_printer,
+                label=args.label,
+            )
+            return cli.finalize_cli_run(result)
+
+        try:
+            body = detach_analysis_swarm(
+                goal=args.goal,
+                roles=roles,
+                adapter=adapter,
+                state_dir=state_dir,
+                cwd=args.cwd,
+                timeout_seconds=int(args.timeout_seconds),
+                model=args.model,
+                auto_route=auto_route,
+                routing_policy=getattr(args, "routing_policy", None),
+                disable_memory=disable_memory,
+                label=args.label,
+                worker_mode=args.worker_mode,
+                backend=args.backend,
+            )
+        except Exception as exc:
+            print(f"swarm: failed to start: {exc}", file=sys.stderr)
+            return 1
+        if getattr(args, "json", False):
+            print(json.dumps(body, indent=2))
+        else:
+            print(body["job_id"])
+            print(
+                f"# detached launcher_pid={body['launcher_pid']}  "
+                f"next: python -m puppetmaster feed {body['job_id']} --follow",
+                file=sys.stderr,
+            )
+        return 0
+
     if args.command == "browser":
         from puppetmaster import platform_lock
         from puppetmaster.browser import BROWSER_ADAPTER, browser_swarm_specs

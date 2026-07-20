@@ -42,6 +42,13 @@ instead of renaming your shell environment.
 ## Running swarms
 
 ```bash
+# Daily-driver multi-role analysis (CLI twin of puppetmaster_start_cursor_swarm).
+# Detaches by default, prints job_id — the MCP Not-connected fallback.
+python -m puppetmaster swarm "Audit the MCP surface"
+python -m puppetmaster swarm "Goal" --roles explore audit review --label "MCP peel"
+python -m puppetmaster swarm "Goal" --wait          # block until complete
+python -m puppetmaster swarm "Goal" --adapter agentic
+
 python -m puppetmaster run "Goal" --config examples/enterprise-workflow.json
 python -m puppetmaster daemon --roles explore architect implement redteam test
 python -m puppetmaster cursor "Goal" --review --dry-run

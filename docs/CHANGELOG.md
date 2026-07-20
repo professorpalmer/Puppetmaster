@@ -1,3 +1,16 @@
+## v1.20.5
+
+**One-command CLI swarm fallback — stop the config archaeology.**
+
+- New `python -m puppetmaster swarm "<goal>"` is the CLI twin of
+  `puppetmaster_start_cursor_swarm`: same analysis worker contract, detaches by
+  default, prints `job_id` immediately. Agents that hit MCP `Not connected` run
+  this one line — no hand-written JSON configs, no `run --help` dig.
+- Shared builder in `puppetmaster/swarm_launch.py`; MCP
+  `write_generated_swarm_config` delegates to it so CLI and MCP cannot drift.
+- AGENTS.md / workflow rule / CLI_REFERENCE document the one-command fallback
+  explicitly (anti token-spend).
+
 ## v1.20.4
 
 **Docs freshness for the 1.20.x line.**

@@ -127,6 +127,8 @@ If any `puppetmaster_*` MCP tool returns `Tool execution error. Not connected`, 
 | MCP | CLI |
 | --- | --- |
 | `puppetmaster_doctor` | `python -m puppetmaster doctor` |
+| `puppetmaster_start_cursor_swarm` | `python -m puppetmaster swarm "<goal>"` |
+| `puppetmaster_start_swarm` | `python -m puppetmaster swarm "<goal>" --adapter <name>` |
 | `puppetmaster_status` | `python -m puppetmaster status <job_id>` |
 | `puppetmaster_logs` | `python -m puppetmaster logs <job_id>` |
 | `puppetmaster_live_artifacts` | `python -m puppetmaster feed <job_id>` |
@@ -145,6 +147,13 @@ If any `puppetmaster_*` MCP tool returns `Tool execution error. Not connected`, 
 | `puppetmaster_codegraph_search` | `python -m puppetmaster codegraph search '<query>'` |
 | `puppetmaster_codegraph_context` | `python -m puppetmaster codegraph context '<task>' --max-nodes 15 --format markdown` |
 | `puppetmaster_codegraph_init` | `python -m puppetmaster codegraph init --index` |
+
+**Swarm fallback is one command.** On `Not connected`, run
+`python -m puppetmaster swarm "<goal>"` (optional `--roles explore audit review`,
+`--cwd`, `--label`). It detaches, prints `job_id`, and uses the same worker
+contract as MCP. Do **not** invent a JSON config, dig through `run --help`, or
+spend a turn on MCP reconnect archaeology — that is the token waste Puppetmaster
+exists to prevent. Then `feed <job_id> --follow` / `show <job_id>`.
 
 Read-only commands (`show`/`artifacts`/`logs`/`feed`/`status`) auto-pivot to whichever project state dir owns the job — no need to export `PUPPETMASTER_STATE_DIR`. Only ask the user to restart MCP in Cursor Settings when `python -m puppetmaster mcp list` shows zero alive servers.
 

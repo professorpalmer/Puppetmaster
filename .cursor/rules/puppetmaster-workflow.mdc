@@ -76,6 +76,8 @@ If a `puppetmaster_*` MCP call returns **`Tool execution error. Not connected`**
 | MCP tool | CLI equivalent |
 | --- | --- |
 | `puppetmaster_doctor` | `python -m puppetmaster doctor` |
+| `puppetmaster_start_cursor_swarm` | `python -m puppetmaster swarm "<goal>"` |
+| `puppetmaster_start_swarm` | `python -m puppetmaster swarm "<goal>" --adapter <name>` |
 | `puppetmaster_status` | `python -m puppetmaster status <job_id>` |
 | `puppetmaster_logs` | `python -m puppetmaster logs <job_id>` |
 | `puppetmaster_live_artifacts` | `python -m puppetmaster feed <job_id>` |
@@ -92,6 +94,11 @@ If a `puppetmaster_*` MCP call returns **`Tool execution error. Not connected`**
 | `puppetmaster_codegraph_search` | `python -m puppetmaster codegraph search '<query>'` |
 | `puppetmaster_codegraph_context` | `python -m puppetmaster codegraph context '<task>' --max-nodes 15 --format markdown` |
 | `puppetmaster_codegraph_init` | `python -m puppetmaster codegraph init --index` |
+
+**Swarm fallback is one command.** On `Not connected`, run
+`python -m puppetmaster swarm "<goal>"` immediately (optional `--roles`, `--cwd`,
+`--label`). It detaches and prints `job_id`. Do **not** invent a JSON config,
+explore `run --help`, or spend the turn on MCP reconnect archaeology.
 
 > Always invoke CodeGraph via `python -m puppetmaster codegraph …`, never a bare `codegraph …` from the shell. The bare shim runs under your shell's Node, whose ABI usually differs from Cursor's bundled Node that compiled better-sqlite3, so it dies with `NODE_MODULE_VERSION`. The passthrough runs under Cursor's Node and auto-rebuilds the binding on a mismatch.
 

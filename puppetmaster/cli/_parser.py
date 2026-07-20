@@ -1517,6 +1517,87 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_label_argument(prewalk)
 
+    swarm = subcommands.add_parser(
+        "swarm",
+        help=(
+            "One-shot multi-role analysis swarm (CLI twin of "
+            "puppetmaster_start_cursor_swarm). Detaches by default and prints "
+            "job_id immediately — use this when MCP returns Not connected. "
+            "Do not hand-author a JSON config."
+        ),
+    )
+    swarm.add_argument("goal", help="Swarm goal / audit prompt.")
+    swarm.add_argument(
+        "--cwd",
+        default=str(Path.cwd()),
+        help="Workspace for worker cwd + CodeGraph context.",
+    )
+    swarm.add_argument(
+        "--adapter",
+        default="cursor",
+        choices=[
+            "cursor",
+            "agentic",
+            "local",
+            "claude-code",
+            "codex",
+            "hermes",
+            "openai",
+        ],
+        help="Analysis adapter (default: cursor).",
+    )
+    swarm.add_argument(
+        "--roles",
+        nargs="+",
+        help="Worker roles (default: explore audit review).",
+    )
+    swarm.add_argument("--model", help="Optional model pin (disables auto-route unless --auto-route).")
+    swarm.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=900,
+        help="Per-worker timeout (default 900).",
+    )
+    swarm.add_argument(
+        "--worker-mode",
+        choices=["subprocess", "inline", "daemon"],
+        default="subprocess",
+    )
+    swarm.add_argument(
+        "--auto-route",
+        action="store_true",
+        default=None,
+        help="Force auto-route even when --model is pinned.",
+    )
+    swarm.add_argument(
+        "--no-auto-route",
+        action="store_true",
+        help="Disable auto-route (use adapter default / pinned model).",
+    )
+    swarm.add_argument(
+        "--routing-policy",
+        choices=["balanced", "cheap", "quality", "escalating"],
+        help="Override per-role routing policy for all workers.",
+    )
+    swarm.add_argument(
+        "--wait",
+        action="store_true",
+        help="Block until the swarm finishes (default: detach and print job_id).",
+    )
+    swarm.add_argument(
+        "--disable-memory",
+        action="store_true",
+        default=True,
+        help="Skip promoted memory injection (default: on).",
+    )
+    swarm.add_argument(
+        "--enable-memory",
+        action="store_true",
+        help="Force promoted memory injection.",
+    )
+    swarm.add_argument("--json", action="store_true", help="Emit the start receipt as JSON.")
+    _add_label_argument(swarm)
+
     browser = subcommands.add_parser(
         "browser",
         help=(
