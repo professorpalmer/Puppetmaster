@@ -1,3 +1,19 @@
+## v1.20.3
+
+**Verified Bedrock routing that stays healthy across worker processes.**
+
+- Bedrock enters automatic routing only after a successful runtime invoke;
+  stale default AWS profiles no longer make the provider look ready.
+- Credential-scoped invoke health persists in a private WAL SQLite store, so
+  terminal authentication failures immediately remove Bedrock from every
+  worker process while credential rotation recovers safely.
+- Runtime probes, model discovery, billing diagnostics, and JSON output now
+  distinguish credential presence from verified availability without probing
+  on the routing hot path.
+- Bedrock authentication failures reroute across providers; ConverseStream
+  exception frames carry canonical status classes, and generic proxy 403 pages
+  cannot poison provider health.
+
 ## v1.20.2
 
 **Constrained, recoverable model routing.**
