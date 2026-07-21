@@ -186,11 +186,18 @@ def write_analysis_swarm_config(
     return config_path
 
 
+# MCP / detach launchers poll for the early ``job_id:`` line. Five seconds was
+# enough on unloaded Linux CI but flake-failed on Windows after a long suite
+# (import + SQLite job create > 5s while the child was still healthy). Keep this
+# generous — callers return as soon as the line appears.
+EARLY_JOB_ID_TIMEOUT_SECONDS = 30.0
+
+
 def wait_for_job_id(
     stdout_path: Path,
     stderr_path: Path,
     process: subprocess.Popen,
-    timeout_seconds: float,
+    timeout_seconds: float = EARLY_JOB_ID_TIMEOUT_SECONDS,
 ) -> str:
     """Poll a launcher stdout log for an early ``job_id:`` line (O(n) total)."""
     deadline = time.monotonic() + timeout_seconds
@@ -214,9 +221,13 @@ def wait_for_job_id(
                 break
         time.sleep(0.05)
     stderr = stderr_path.read_text(encoding="utf-8")[-1000:] if stderr_path.exists() else ""
+    stdout_tail = buffer[-500:] if buffer else (
+        stdout_path.read_text(encoding="utf-8")[-500:] if stdout_path.exists() else ""
+    )
     raise RuntimeError(
         f"started Puppetmaster process but did not receive early job_id; "
-        f"pid={process.pid}; returncode={process.poll()}; stderr={stderr}"
+        f"pid={process.pid}; returncode={process.poll()}; "
+        f"stderr={stderr}; stdout_tail={stdout_tail!r}"
     )
 
 
@@ -239,7 +250,7 @@ def detach_analysis_swarm(
     label: Optional[str] = None,
     worker_mode: str = "subprocess",
     backend: str = "sqlite",
-    job_id_timeout_seconds: float = 5.0,
+    job_id_timeout_seconds: float = EARLY_JOB_ID_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     """Write config, spawn ``run --config`` detached, return ``{job_id, ...}``."""
     config_path = write_analysis_swarm_config(
@@ -265,6 +276,7 @@ def detach_analysis_swarm(
     stderr_path = run_dir / f"{run_id}.stderr.log"
     full_command = [
         sys.executable,
+        "-u",
         "-m",
         "puppetmaster",
         "--state-dir",
@@ -287,6 +299,7 @@ def detach_analysis_swarm(
         full_command.extend(["--label", label])
 
     env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
     source_root = str(Path(__file__).resolve().parents[1])
     env["PYTHONPATH"] = (
         f"{source_root}{os.pathsep}{env['PYTHONPATH']}"

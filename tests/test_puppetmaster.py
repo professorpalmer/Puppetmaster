@@ -185,6 +185,43 @@ def _wait_for_spawned_or_kill(test, spawned, *, timeout: float) -> None:
                 "leaking a long-lived child process"
             )
 
+class WaitForJobIdTests(unittest.TestCase):
+    """Early ``job_id:`` polling must tolerate slow Windows cold starts."""
+
+    def test_wait_for_job_id_accepts_late_line_within_timeout(self) -> None:
+        from puppetmaster.swarm_launch import wait_for_job_id
+
+        with TemporaryDirectory() as tmp:
+            stdout_path = Path(tmp) / "out.log"
+            stderr_path = Path(tmp) / "err.log"
+            stderr_path.write_text("", encoding="utf-8")
+            stdout_path.write_text("", encoding="utf-8")
+
+            class _Alive:
+                pid = 4242
+
+                def poll(self):
+                    return None
+
+            def _write_late() -> None:
+                time.sleep(0.35)
+                with stdout_path.open("a", encoding="utf-8") as handle:
+                    handle.write("job_id: job_latearrival99\n")
+                    handle.flush()
+
+            threading.Thread(target=_write_late, daemon=True).start()
+            job_id = wait_for_job_id(
+                stdout_path, stderr_path, _Alive(), timeout_seconds=2.0
+            )
+            self.assertEqual(job_id, "job_latearrival99")
+
+    def test_early_job_id_timeout_floor_is_above_legacy_five_seconds(self) -> None:
+        from puppetmaster.swarm_launch import EARLY_JOB_ID_TIMEOUT_SECONDS
+
+        # Regression guard for the v1.20.6 Windows tag flake (5s too tight).
+        self.assertGreaterEqual(EARLY_JOB_ID_TIMEOUT_SECONDS, 30.0)
+
+
 class PuppetmasterTests(unittest.TestCase):
     """Hermetic suite: pins ``PUPPETMASTER_MODELS_PATH`` to an empty
     location for every test so the developer's real

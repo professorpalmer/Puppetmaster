@@ -1,3 +1,16 @@
+## v1.20.7
+
+**Harden MCP early job_id wait - stop Windows detach flakes.**
+
+- Raise the early `job_id:` poll timeout from 5s to 30s (shared constant);
+  Windows CI after a long suite was timing out while the child was still healthy.
+- Spawn detached launchers with `python -u` + `PYTHONUNBUFFERED=1` so the
+  early line flushes promptly into the MCP stdout log.
+- Richer timeout error includes stdout tail for diagnosis.
+
+No yank of v1.20.6 on PyPI - same product SHA that passed main CI; this is a
+forward reliability fix for the detach handshake only.
+
 ## v1.20.6
 
 **Cursor swarm stays on Cursor — pin `allowed_adapters` for every launch adapter.**

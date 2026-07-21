@@ -43,7 +43,11 @@ from puppetmaster.mcp_registry import (
 )
 from puppetmaster.state import resolve_state_dir
 from puppetmaster.store_factory import create_store
-from puppetmaster.swarm_launch import SWARM_ANALYSIS_ADAPTERS, wait_for_job_id
+from puppetmaster.swarm_launch import (
+    EARLY_JOB_ID_TIMEOUT_SECONDS,
+    SWARM_ANALYSIS_ADAPTERS,
+    wait_for_job_id,
+)
 from puppetmaster.update_check import pypi_update_note, version_is_newer
 from puppetmaster.cli.helpers import (
     allowed_model_ids_from_mapping,
@@ -3367,6 +3371,7 @@ def start_cli(command: list[str], args: JsonObject) -> JsonObject:
     stderr_path = run_dir / f"{run_id}.stderr.log"
     full_command = [
         sys.executable,
+        "-u",
         "-m",
         "puppetmaster",
         "--state-dir",
@@ -3399,7 +3404,12 @@ def start_cli(command: list[str], args: JsonObject) -> JsonObject:
     stdout_handle.close()
     stderr_handle.close()
     try:
-        job_id = wait_for_job_id(stdout_path, stderr_path, process, timeout_seconds=5)
+        job_id = wait_for_job_id(
+            stdout_path,
+            stderr_path,
+            process,
+            timeout_seconds=EARLY_JOB_ID_TIMEOUT_SECONDS,
+        )
     except BaseException:
         # The child was spawned but never reported a job id (startup crash or
         # parse timeout). Don't leave a detached full-edit agent running.
@@ -3441,6 +3451,9 @@ def start_cli(command: list[str], args: JsonObject) -> JsonObject:
 
 def launcher_environment(args: JsonObject) -> dict[str, str]:
     env = environment(args)
+    # Detached launchers must flush the early ``job_id:`` line promptly so
+    # wait_for_job_id cannot time out on a healthy but slow Windows import.
+    env["PYTHONUNBUFFERED"] = "1"
     source_root = str(Path(__file__).resolve().parents[1])
     env["PYTHONPATH"] = (
         f"{source_root}{os.pathsep}{env['PYTHONPATH']}"
