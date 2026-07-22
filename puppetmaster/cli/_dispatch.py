@@ -787,10 +787,20 @@ def _main(argv: Optional[list[str]] = None) -> int:
             "allow_dirty": args.allow_dirty,
             "allow_non_worktree": args.allow_non_worktree,
         }
+        if args.model:
+            from puppetmaster.model_registry import (
+                AmbiguousModelPinError,
+                apply_agentic_model_pin,
+            )
+
+            try:
+                payload.update(apply_agentic_model_pin({}, args.model))
+            except AmbiguousModelPinError as exc:
+                print(f"agentic: {exc}", file=sys.stderr)
+                return 2
+        # Explicit --provider wins over registry payload_defaults.provider.
         if args.provider:
             payload["provider"] = args.provider
-        if args.model:
-            payload["model"] = args.model
         if args.max_turns is not None:
             payload["max_turns"] = args.max_turns
         if args.temperature is not None:

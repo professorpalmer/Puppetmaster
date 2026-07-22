@@ -96,6 +96,10 @@ def build_analysis_swarm_specs(
                 payload.update(apply_cursor_model_pin({}, str(explicit_model)))
             else:
                 payload["model"] = model_name
+        elif adapter == "agentic" and explicit_model:
+            from puppetmaster.model_registry import apply_agentic_model_pin
+
+            payload.update(apply_agentic_model_pin({}, str(explicit_model)))
         elif explicit_model:
             payload["model"] = str(explicit_model)
         if auto_route_enabled:

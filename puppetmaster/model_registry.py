@@ -1085,14 +1085,47 @@ def resolve_model_pin(
 
 
 def stamp_resolved_model_pin(payload: dict, pin: ResolvedModelPin) -> dict:
-    """Persist both the canonical registry id and adapter model name."""
+    """Persist both the canonical registry id and adapter model name.
+
+    Registry ``payload_defaults`` (e.g. agentic ``provider=openrouter``) merge
+    under the caller's explicit payload keys — same precedence as
+    :func:`puppetmaster.orchestrator.merge_routing_payload` — so a bare
+    ``--model`` pin still gets catalog wire defaults without clobbering
+    caller overrides such as an explicit ``--provider``.
+    """
+    defaults = dict(pin.spec.payload_defaults or {})
     return {
-        **payload,
+        **defaults,
+        **(payload or {}),
         "model": pin.adapter_model_name,
         "router_model_id": pin.registry_id,
         "pinned_model": pin.registry_id,
         "pinned_adapter_model_name": pin.adapter_model_name,
     }
+
+
+def apply_model_pin(
+    payload: dict,
+    model: str,
+    *,
+    adapter: str,
+    registry: Optional[Iterable[ModelSpec]] = None,
+) -> dict:
+    """Stamp an explicit pin for ``adapter`` into a durable task payload.
+
+    Adapter dispatch receives the provider/SDK model name while
+    ``pinned_model`` / ``router_model_id`` keep the canonical registry id for
+    cost and audit. Ambiguous pins raise :class:`AmbiguousModelPinError`
+    (fail closed) rather than being forwarded as a raw model string.
+    """
+    pin = resolve_model_pin(
+        model,
+        registry if registry is not None else load_registry(),
+        adapter=adapter,
+    )
+    if pin is None:
+        return {**(payload or {}), "model": model}
+    return stamp_resolved_model_pin(payload, pin)
 
 
 def apply_cursor_model_pin(
@@ -1108,11 +1141,23 @@ def apply_cursor_model_pin(
     Ambiguous pins raise :class:`AmbiguousModelPinError` (fail closed) rather
     than being forwarded as a raw model string.
     """
-    pin = resolve_model_pin(
-        model,
-        registry if registry is not None else load_registry(),
-        adapter="cursor",
+    return apply_model_pin(
+        payload, model, adapter="cursor", registry=registry
     )
-    if pin is None:
-        return {**payload, "model": model}
-    return stamp_resolved_model_pin(payload, pin)
+
+
+def apply_agentic_model_pin(
+    payload: dict,
+    model: str,
+    *,
+    registry: Optional[Iterable[ModelSpec]] = None,
+) -> dict:
+    """Stamp an explicit agentic pin (merges registry ``payload_defaults``).
+
+    Bare ``--model meta/muse-spark-1.1`` must carry ``provider=openrouter``
+    from the catalog when present; without that, ``AgenticAdapter`` falls
+    back to ``openai`` and OpenRouter-only models 400.
+    """
+    return apply_model_pin(
+        payload, model, adapter="agentic", registry=registry
+    )

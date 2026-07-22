@@ -14934,6 +14934,90 @@ class CursorModelPinTests(unittest.TestCase):
         self.assertEqual(stamped["router_model_id"], "cursor/grok-4-5")
         self.assertEqual(stamped["pinned_adapter_model_name"], "grok-4.5")
 
+    def test_stamp_merges_payload_defaults_under_caller(self) -> None:
+        from puppetmaster.model_registry import (
+            ModelSpec,
+            resolve_model_pin,
+            stamp_resolved_model_pin,
+        )
+
+        registry = [
+            ModelSpec(
+                id="agentic/meta/muse-spark-1.1",
+                adapter="agentic",
+                adapter_model_name="meta/muse-spark-1.1",
+                enabled=True,
+                payload_defaults={"provider": "openrouter", "temperature": 0.2},
+            )
+        ]
+        pin = resolve_model_pin(
+            "meta/muse-spark-1.1", registry, adapter="agentic"
+        )
+        self.assertIsNotNone(pin)
+        stamped = stamp_resolved_model_pin(
+            {"mode": "analyze", "temperature": 0.7}, pin
+        )
+        self.assertEqual(stamped["provider"], "openrouter")
+        self.assertEqual(stamped["temperature"], 0.7)
+        self.assertEqual(stamped["model"], "meta/muse-spark-1.1")
+        self.assertEqual(stamped["pinned_model"], "agentic/meta/muse-spark-1.1")
+
+    def test_apply_agentic_model_pin_stamps_provider(self) -> None:
+        from puppetmaster.model_registry import ModelSpec, apply_agentic_model_pin
+
+        registry = [
+            ModelSpec(
+                id="agentic/meta/muse-spark-1.1",
+                adapter="agentic",
+                adapter_model_name="meta/muse-spark-1.1",
+                enabled=True,
+                payload_defaults={"provider": "openrouter"},
+            )
+        ]
+        stamped = apply_agentic_model_pin(
+            {"mode": "analyze"},
+            "meta/muse-spark-1.1",
+            registry=registry,
+        )
+        self.assertEqual(stamped["provider"], "openrouter")
+        self.assertEqual(stamped["model"], "meta/muse-spark-1.1")
+        self.assertEqual(stamped["pinned_model"], "agentic/meta/muse-spark-1.1")
+
+    def test_agentic_swarm_pin_stamps_provider(self) -> None:
+        from puppetmaster.model_registry import ModelSpec, save_registry
+        from puppetmaster.swarm_launch import build_analysis_swarm_specs
+
+        with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "models.json"
+            save_registry(
+                [
+                    ModelSpec(
+                        id="agentic/meta/muse-spark-1.1",
+                        adapter="agentic",
+                        adapter_model_name="meta/muse-spark-1.1",
+                        enabled=True,
+                        payload_defaults={"provider": "openrouter"},
+                        tags=["tools"],
+                        capability_score=96,
+                    )
+                ],
+                registry_path,
+            )
+            with patch.dict(
+                os.environ, {"PUPPETMASTER_MODELS_PATH": str(registry_path)}
+            ):
+                specs = build_analysis_swarm_specs(
+                    "audit finalize scoring",
+                    ["explore"],
+                    adapter="agentic",
+                    cwd=tmp,
+                    model="meta/muse-spark-1.1",
+                    auto_route=False,
+                )
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0].payload.get("provider"), "openrouter")
+        self.assertEqual(specs[0].payload.get("model"), "meta/muse-spark-1.1")
+
     def test_apply_cursor_model_pin_stamps_both_forms(self) -> None:
         from puppetmaster.model_registry import apply_cursor_model_pin
 

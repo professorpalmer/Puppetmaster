@@ -1,3 +1,18 @@
+## v1.20.8
+
+**Agentic model pins carry registry defaults; max-turns analyze forces submit_findings.**
+
+- `stamp_resolved_model_pin` merges `payload_defaults` under caller keys so a bare
+  `--model meta/muse-spark-1.1` stamps `provider=openrouter` from the catalog
+  (no more silent openai fallback → HTTP 400).
+- New `apply_agentic_model_pin` / shared `apply_model_pin`; agentic CLI and
+  agentic analysis swarms use it when `--model` is set.
+- Analyze agent loop grants one last-chance forced `submit_findings` turn after
+  `max_turns` with no submit (`submit:forced_max_turns`); retries without
+  `tool_choice` when the provider rejects force_tool.
+- Empty/silent analyze runs no longer mark verification `passed` when there are
+  zero typed artifacts (fixes false-green degraded Muse/OpenRouter smokes).
+
 ## v1.20.7
 
 **Harden MCP early job_id wait - stop Windows detach flakes.**

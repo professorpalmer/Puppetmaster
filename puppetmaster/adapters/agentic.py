@@ -494,10 +494,17 @@ class AgenticAdapter(FullEditWorkerAdapter):
             channel = "tool"
         else:
             parsed = cursor_result_artifacts(task, worker_id, final_text, adapter="agentic")
-            structured_ok = bool(parsed) or parse_cursor_artifact_payload(final_text) is not None
+            # JSON fallback counts only when it produced typed artifacts. An
+            # empty ``{"artifacts":[]}`` shell must not mark the run passed —
+            # that path previously hid max_turns / no-submit degrades.
+            structured_ok = bool(parsed)
             channel = "json"
         state["recovered"] = state["attempted"] and structured_ok
-        degraded = (not no_tools) and (not structured_ok) and bool(final_text)
+        # Tool-channel empty submit (submitted is not None) is an honest pass.
+        # JSON/no-submit with zero typed artifacts is always degraded — including
+        # silent max_turns runs where final_text is empty (previously those
+        # incorrectly passed because degraded required bool(final_text)).
+        degraded = (not no_tools) and (not structured_ok)
         if no_tools:
             result = "failed"
             failure: Optional[str] = "no_tool_calls"
@@ -508,9 +515,12 @@ class AgenticAdapter(FullEditWorkerAdapter):
         if failed_over:
             evidence.append("failover:used")
         submit_forced_budget = bool(usage.get("submit_forced_budget"))
+        submit_forced_max_turns = bool(usage.get("submit_forced_max_turns"))
         if not degraded and not no_tools:
             if submit_forced_budget:
                 evidence.append("submit:forced_budget")
+            elif submit_forced_max_turns:
+                evidence.append("submit:forced_max_turns")
             else:
                 evidence.append(f"submit:{channel}")
         if state["recovered"]:
@@ -1251,6 +1261,61 @@ class AgenticAdapter(FullEditWorkerAdapter):
             if token_budget and usage_total["total_tokens"] >= token_budget:
                 stop_reason = "token_budget"
                 break
+
+        # Last-chance forced submit: models that keep calling tools until
+        # max_turns never hit the prose/budget force paths and leave
+        # stop:max_turns with zero findings. Grant analyze mode exactly one
+        # extra submit_findings turn. Prefer tool_choice force; if the
+        # provider rejects force_tool (some OpenRouter models 400), retry
+        # once with the nudge alone.
+        submit_forced_max_turns = False
+        if (
+            not implement
+            and submitted is None
+            and stop_reason == "max_turns"
+            and tools
+        ):
+            messages.append({
+                "role": "user",
+                "content": _BUDGET_FORCE_SUBMIT_ANALYZE,
+            })
+            force_attempts: list[dict] = [
+                {**dict(base_extra), "force_tool": _SUBMIT_FINDINGS_TOOL},
+                dict(base_extra),
+            ]
+            for call_extra in force_attempts:
+                try:
+                    turn = self._provider_call(
+                        provider=provider, model=model, messages=messages,
+                        tools=tools or None, extra=call_extra, timeout=timeout,
+                        max_retries=max_retries, key_pool=key_pool, on_delta=on_delta,
+                    )
+                except JobCancelled:
+                    stop_reason = "cancelled"
+                    break
+                except ProviderError:
+                    continue
+                turns += 1
+                for key in usage_total:
+                    if key == "cost_usd":
+                        usage_total[key] += float(turn.usage.get(key, 0.0) or 0.0)
+                    else:
+                        usage_total[key] += int(turn.usage.get(key, 0) or 0)
+                final_text = turn.text or final_text
+                for call in turn.tool_calls or []:
+                    if call.get("name") == _SUBMIT_FINDINGS_TOOL:
+                        items = _coerce_submit_findings(call.get("arguments"))
+                        if submitted is None:
+                            submitted = []
+                        submitted.extend(items)
+                        stop_reason = "submitted"
+                        submit_forced_max_turns = True
+                        break
+                if submit_forced_max_turns or stop_reason == "cancelled":
+                    break
+                # Model returned prose/tools without submit — stop retrying.
+                break
+
         usage_out = {
             "tokens_in": usage_total["prompt_tokens"],
             "tokens_out": usage_total["completion_tokens"],
@@ -1258,6 +1323,7 @@ class AgenticAdapter(FullEditWorkerAdapter):
             "context_compressions": context_compressions,
             "tokens_cached": usage_total["cached_tokens"],
             "submit_forced_budget": submit_forced_budget,
+            "submit_forced_max_turns": submit_forced_max_turns,
         }
         if usage_total["cost_usd"] > 0:
             usage_out["real_cost_usd"] = round(usage_total["cost_usd"], 6)
