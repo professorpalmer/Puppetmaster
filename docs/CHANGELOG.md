@@ -1,3 +1,18 @@
+## v1.20.9
+
+**Muse Spark agentic hardening: auto-only tool_choice, reasoning replay, pin ROUTING.**
+
+- Meta Muse Spark rejects named/`required`/`none` `tool_choice` (HTTP 400). Agentic
+  workers detect Muse (and peer auto-only models) and never send `force_tool`;
+  submit paths stay nudge-only. Generic recovery: a 400 that mentions
+  `tool_choice` strips `force_tool` and retries the turn once.
+- OpenAI-wire turns preserve `reasoning` / `reasoning_details` (including
+  encrypted Muse blocks) across tool loops; streaming accumulates
+  `delta.reasoning_details`.
+- Explicit pins (`pinned_model` / `router_model_id` with `auto_route=false`) emit
+  a durable ROUTING artifact (`policy=explicit_pin`) so Marionette/PM can prove
+  the resolved model without auto-route.
+
 ## v1.20.8
 
 **Agentic model pins carry registry defaults; max-turns analyze forces submit_findings.**

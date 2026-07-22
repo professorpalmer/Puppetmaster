@@ -425,6 +425,10 @@ class AssistantTurn:
     ``tool_calls`` is a list of ``{"id", "name", "arguments"}`` where
     ``arguments`` is a parsed dict. ``text`` is the assistant's prose (may be
     empty when the turn is purely tool calls).
+
+    ``reasoning`` / ``reasoning_details`` carry provider reasoning blocks that
+    some models (notably Meta Muse Spark) require echoed back on later turns so
+    encrypted chain-of-thought continuity is preserved across tool loops.
     """
 
     text: str = ""
@@ -432,6 +436,8 @@ class AssistantTurn:
     finish_reason: str = ""
     usage: dict = field(default_factory=dict)
     raw: dict = field(default_factory=dict)
+    reasoning: str = ""
+    reasoning_details: Optional[list] = None
 
 
 class ProviderError(Exception):
@@ -559,12 +565,21 @@ def _openai_chat(
             args = {"__raw__": raw_args}
         tool_calls.append({"id": call.get("id") or "", "name": fn.get("name") or "", "arguments": args})
     usage = data.get("usage") or {}
+    reasoning_raw = message.get("reasoning")
+    if reasoning_raw is None:
+        reasoning_raw = message.get("reasoning_content")
+    reasoning_text = str(reasoning_raw or "").strip()
+    details = message.get("reasoning_details")
+    if details is not None and not isinstance(details, list):
+        details = [details]
     return AssistantTurn(
         text=str(message.get("content") or "").strip(),
         tool_calls=tool_calls,
         finish_reason=str(finish or ""),
         usage=_openai_usage_fields(usage),
         raw=data,
+        reasoning=reasoning_text,
+        reasoning_details=details if isinstance(details, list) else None,
     )
 
 
@@ -971,6 +986,8 @@ def _openai_chat_stream(
         body=body, timeout=timeout,
     )
     text_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    reasoning_details_acc: list = []
     tool_acc: dict[int, dict] = {}
     finish = ""
     usage: dict = {}
@@ -992,8 +1009,15 @@ def _openai_chat_stream(
                     if on_delta:
                         on_delta("text", piece)
                 reasoning = delta.get("reasoning") or delta.get("reasoning_content")
-                if reasoning and on_delta:
-                    on_delta("reasoning", str(reasoning))
+                if reasoning:
+                    reasoning_parts.append(str(reasoning))
+                    if on_delta:
+                        on_delta("reasoning", str(reasoning))
+                details = delta.get("reasoning_details")
+                if isinstance(details, list):
+                    reasoning_details_acc.extend(details)
+                elif details is not None:
+                    reasoning_details_acc.append(details)
                 for call in delta.get("tool_calls") or []:
                     idx = int(call.get("index") or 0)
                     slot = tool_acc.setdefault(idx, {"id": "", "name": "", "args": ""})
@@ -1023,6 +1047,8 @@ def _openai_chat_stream(
         finish_reason=str(finish or ""),
         usage=_openai_usage_fields(usage),
         raw={},
+        reasoning="".join(reasoning_parts).strip(),
+        reasoning_details=reasoning_details_acc or None,
     )
 
 

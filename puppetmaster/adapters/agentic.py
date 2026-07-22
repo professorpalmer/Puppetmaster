@@ -306,6 +306,36 @@ def _provider_is_openai_compatible(provider: str) -> bool:
     return bool(desc is not None and getattr(desc, "wire", None) == "openai")
 
 
+def tool_choice_force_supported(provider: str, model: str) -> bool:
+    """False when the model rejects named/required ``tool_choice``.
+
+    Meta Muse Spark (direct Meta API and OpenRouter) only accepts
+    ``tool_choice="auto"``. Named force / ``required`` / ``none`` return HTTP
+    400. Detect by model slug so OpenRouter's Meta provider still matches.
+    """
+    del provider  # reserved for future provider-specific overrides
+    slug = (model or "").strip().lower()
+    if not slug:
+        return True
+    if "muse-spark" in slug or "muse/spark" in slug:
+        return False
+    if slug.startswith("meta/") and "muse" in slug:
+        return False
+    return True
+
+
+def _provider_rejects_tool_choice_force(exc: ProviderError) -> bool:
+    """True when a 400 body indicates only ``tool_choice=auto`` is allowed."""
+    blob = f"{exc} {getattr(exc, 'body', '') or ''}".lower()
+    if "tool_choice" not in blob:
+        return False
+    return (
+        ("only" in blob and "auto" in blob)
+        or "not currently supported" in blob
+        or "named function" in blob
+    )
+
+
 def _with_first_turn_tool_nudge(prompt: str) -> str:
     """Append the first-turn tool-call requirement to a worker prompt."""
     text = prompt or ""
@@ -383,6 +413,57 @@ class AgenticAdapter(FullEditWorkerAdapter):
             # default to unbounded CoT; pin a low effort unless the caller set one.
             extra["reasoning_effort"] = DEFAULT_SWARM_REASONING_EFFORT
         return extra
+
+    def _pin_routing_artifact(
+        self,
+        task: Task,
+        worker_id: str,
+        provider: str,
+        model: str,
+    ) -> Optional[Artifact]:
+        """Durable ROUTING record for explicit pins (auto_route off).
+
+        Auto-routed tasks already get ROUTING from the orchestrator. Explicit
+        pins previously only appeared as verification evidence strings, which
+        made Muse/other pin smokes hard to prove from ``artifacts`` alone.
+        """
+        if bool(task.payload.get("auto_route")):
+            return None
+        pinned = task.payload.get("pinned_model") or task.payload.get("router_model_id")
+        if not pinned:
+            return None
+        model_id = str(pinned)
+        adapter_model = str(
+            task.payload.get("pinned_adapter_model_name")
+            or task.payload.get("model")
+            or model
+            or ""
+        )
+        return Artifact(
+            job_id=task.job_id,
+            task_id=task.id,
+            type=ArtifactType.ROUTING,
+            created_by=worker_id,
+            confidence=1.0,
+            evidence=[
+                f"pinned_model:{model_id}",
+                f"model:{adapter_model}",
+                f"provider:{provider}",
+                "policy:explicit_pin",
+            ],
+            payload={
+                "model_id": model_id,
+                "adapter": "agentic",
+                "adapter_model_name": adapter_model,
+                "policy": "explicit_pin",
+                "decision": "explicit_pin",
+                "provider": provider,
+                "pinned_model": task.payload.get("pinned_model"),
+                "router_model_id": task.payload.get("router_model_id"),
+                "auto_route": False,
+                "reason": "Caller pinned model; auto_route disabled.",
+            },
+        )
 
     def _graph_enabled(self, task: Task, cwd: Path) -> bool:
         """True when CodeGraph is indexed for ``cwd`` and not disabled.
@@ -467,6 +548,9 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 failure = bedrock_failure_for_recovery(exc)
             arts = [self._fail(task, worker_id, evidence_base, failure,
                                detail, status=exc.status, provider_reason=exc.reason)]
+            pin = self._pin_routing_artifact(task, worker_id, provider, model)
+            if pin is not None:
+                arts.insert(0, pin)
             auth_risk = self._auth_failure_risk(
                 task, worker_id, provider, exc.status or 0, detail, reason=failure)
             if auth_risk is not None:
@@ -581,6 +665,9 @@ class AgenticAdapter(FullEditWorkerAdapter):
         plan_artifact = self._plan_artifact(task, worker_id, plan_holder["steps"])
         if plan_artifact is not None:
             artifacts.append(plan_artifact)
+        pin = self._pin_routing_artifact(task, worker_id, provider, model)
+        if pin is not None:
+            artifacts.insert(0, pin)
         return artifacts
 
     # --- implement mode ----------------------------------------------------
@@ -687,6 +774,9 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 failure = bedrock_failure_for_recovery(exc)
             arts = [self._fail(task, worker_id, evidence_base, failure,
                                detail, status=exc.status, provider_reason=exc.reason)]
+            pin = self._pin_routing_artifact(task, worker_id, provider, model)
+            if pin is not None:
+                arts.insert(0, pin)
             auth_risk = self._auth_failure_risk(
                 task, worker_id, provider, exc.status or 0, detail, reason=failure)
             if auth_risk is not None:
@@ -817,6 +907,9 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 status="applied", change="Agentic worker modified repository files.",
                 sidecar_name="agentic_implement",
             ))
+        pin = self._pin_routing_artifact(task, worker_id, provider, model)
+        if pin is not None:
+            artifacts.insert(0, pin)
         return artifacts
 
     @staticmethod
@@ -873,6 +966,8 @@ class AgenticAdapter(FullEditWorkerAdapter):
         last: Optional[ProviderError] = None
         breaker = get_provider_circuit_breaker()
         admission_key = resolve_circuit_key(provider, model)
+        call_extra = dict(extra)
+        tool_choice_stripped = False
         while True:
             # Refuse before dialing when the breaker is open (recoverable error).
             breaker.before_call(admission_key)
@@ -880,7 +975,7 @@ class AgenticAdapter(FullEditWorkerAdapter):
             api_key = keys[key_index]
             kwargs: dict = dict(
                 provider=provider, model=model, messages=messages,
-                tools=tools or None, extra=extra, timeout=timeout,
+                tools=tools or None, extra=call_extra, timeout=timeout,
             )
             # The first attempt lets provider_chat resolve the key itself, so the
             # default single-credential path (and hermetic mocks that don't
@@ -902,6 +997,19 @@ class AgenticAdapter(FullEditWorkerAdapter):
                     last = exc
                     breaker.record_failure(admission_key, exc)
                     recorded = True
+                    # Muse / Meta (and any future auto-only model) reject named
+                    # tool_choice with HTTP 400. Strip force_tool once and retry
+                    # the same turn with nudge-only extras.
+                    if (
+                        not tool_choice_stripped
+                        and exc.status == 400
+                        and call_extra.get("force_tool")
+                        and _provider_rejects_tool_choice_force(exc)
+                    ):
+                        tool_choice_stripped = True
+                        call_extra = dict(call_extra)
+                        call_extra.pop("force_tool", None)
+                        continue
                     if exc.status in (401, 403, 429) and key_index + 1 < len(keys):
                         key_index += 1
                         continue
@@ -1043,9 +1151,13 @@ class AgenticAdapter(FullEditWorkerAdapter):
             # Force the submit tool after a structure retry *or* when the token
             # budget has entered the submit-reserve zone, so a CoT-heavy model
             # is compelled to call submit_findings / submit_report instead of
-            # burning the rest of the budget on prose.
+            # burning the rest of the budget on prose. Muse Spark (and peers)
+            # reject named tool_choice — keep the nudge message, skip force.
             this_turn_budget_force = budget_force_pending
-            if force_submit_next or budget_force_pending:
+            if (
+                (force_submit_next or budget_force_pending)
+                and tool_choice_force_supported(provider, model)
+            ):
                 call_extra["force_tool"] = (
                     _SUBMIT_REPORT_TOOL if implement else _SUBMIT_FINDINGS_TOOL
                 )
@@ -1150,7 +1262,10 @@ class AgenticAdapter(FullEditWorkerAdapter):
             consecutive_no_tool_turns = 0
 
             # Record the assistant's tool-call turn, then each tool's result.
-            messages.append({
+            # Preserve reasoning_details / reasoning when present so Muse Spark
+            # (and other encrypted-reasoning models) keep continuity across
+            # tool loops on Chat Completions.
+            assistant_msg: dict[str, Any] = {
                 "role": "assistant",
                 "content": turn.text or "",
                 "tool_calls": [
@@ -1158,7 +1273,12 @@ class AgenticAdapter(FullEditWorkerAdapter):
                      "function": {"name": c["name"], "arguments": json.dumps(c["arguments"])}}
                     for c in turn.tool_calls
                 ],
-            })
+            }
+            if turn.reasoning_details:
+                assistant_msg["reasoning_details"] = turn.reasoning_details
+            if turn.reasoning:
+                assistant_msg["reasoning"] = turn.reasoning
+            messages.append(assistant_msg)
             submitted_this_turn = False
             # Walk calls in emission order. Contiguous regular tools use
             # Hermes-style segments (parallel-safe runs concurrent); submit/
@@ -1265,9 +1385,9 @@ class AgenticAdapter(FullEditWorkerAdapter):
         # Last-chance forced submit: models that keep calling tools until
         # max_turns never hit the prose/budget force paths and leave
         # stop:max_turns with zero findings. Grant analyze mode exactly one
-        # extra submit_findings turn. Prefer tool_choice force; if the
-        # provider rejects force_tool (some OpenRouter models 400), retry
-        # once with the nudge alone.
+        # extra submit_findings turn. Prefer tool_choice force when supported;
+        # Muse Spark is nudge-only. Other models that 400 on force_tool still
+        # get the without-force retry via force_attempts / _provider_call.
         submit_forced_max_turns = False
         if (
             not implement
@@ -1279,10 +1399,13 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 "role": "user",
                 "content": _BUDGET_FORCE_SUBMIT_ANALYZE,
             })
-            force_attempts: list[dict] = [
-                {**dict(base_extra), "force_tool": _SUBMIT_FINDINGS_TOOL},
-                dict(base_extra),
-            ]
+            if tool_choice_force_supported(provider, model):
+                force_attempts: list[dict] = [
+                    {**dict(base_extra), "force_tool": _SUBMIT_FINDINGS_TOOL},
+                    dict(base_extra),
+                ]
+            else:
+                force_attempts = [dict(base_extra)]
             for call_extra in force_attempts:
                 try:
                     turn = self._provider_call(

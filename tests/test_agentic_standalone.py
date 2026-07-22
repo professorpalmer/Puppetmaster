@@ -1683,6 +1683,185 @@ class AgenticLoopTests(unittest.TestCase):
         self.assertEqual(verif.payload["verification_mode"], "advisory")
         self.assertIn("verify:advisory-failed", verif.evidence)
 
+    def test_tool_choice_force_unsupported_for_muse(self) -> None:
+        from puppetmaster.adapters.agentic import tool_choice_force_supported
+
+        self.assertFalse(
+            tool_choice_force_supported("openrouter", "meta/muse-spark-1.1")
+        )
+        self.assertFalse(
+            tool_choice_force_supported("openrouter", "agentic/meta/muse-spark-1.1")
+        )
+        self.assertTrue(tool_choice_force_supported("openrouter", "deepseek/deepseek-v4-pro"))
+
+    def test_muse_analyze_never_sends_force_tool(self) -> None:
+        from puppetmaster.adapters import agentic
+        from puppetmaster.providers import AssistantTurn
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cwd = Path(tmp.name)
+        seen_extra = []
+
+        def fake_chat(*, provider, model, messages, tools, extra, timeout):
+            seen_extra.append(dict(extra))
+            # First turn: prose so analyze_retry would normally force submit.
+            if len(seen_extra) == 1:
+                return AssistantTurn(
+                    text="prose without structure",
+                    tool_calls=[],
+                    finish_reason="stop",
+                    usage={"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+                )
+            return AssistantTurn(
+                text="",
+                tool_calls=[{
+                    "id": "s1",
+                    "name": "submit_findings",
+                    "arguments": {
+                        "artifacts": [{
+                            "type": "finding",
+                            "claim": "ok",
+                            "evidence": ["a.py"],
+                            "confidence": 0.8,
+                        }],
+                    },
+                }],
+                usage={"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
+            )
+
+        task = Task(
+            job_id="j",
+            role="explore",
+            instruction="analyze",
+            payload={
+                "cwd": str(cwd),
+                "provider": "openrouter",
+                "model": "meta/muse-spark-1.1",
+                "disable_codegraph": True,
+                "pinned_model": "agentic/meta/muse-spark-1.1",
+                "auto_route": False,
+            },
+        )
+        with mock.patch.object(agentic, "provider_chat", side_effect=fake_chat):
+            arts = self.adapter().run(task, task.instruction, "w1")
+
+        self.assertTrue(seen_extra)
+        self.assertTrue(all(e.get("force_tool") is None for e in seen_extra))
+        routing = [a for a in arts if a.type == ArtifactType.ROUTING]
+        self.assertEqual(len(routing), 1)
+        self.assertEqual(routing[0].payload["policy"], "explicit_pin")
+        self.assertEqual(routing[0].payload["model_id"], "agentic/meta/muse-spark-1.1")
+        self.assertEqual(routing[0].payload["adapter_model_name"], "meta/muse-spark-1.1")
+
+    def test_provider_call_strips_force_tool_on_tool_choice_400(self) -> None:
+        from puppetmaster.adapters.agentic import AgenticAdapter
+        from puppetmaster.providers import AssistantTurn, ProviderError
+
+        calls = {"n": 0, "extras": []}
+
+        def fake_chat(*, provider, model, messages, tools, extra, timeout):
+            calls["n"] += 1
+            calls["extras"].append(dict(extra))
+            if calls["n"] == 1:
+                raise ProviderError(
+                    "HTTP 400",
+                    reason="http_status:400",
+                    status=400,
+                    body=(
+                        'only `"auto"` is supported for `tool_choice`. '
+                        '`"none"`, `"required"`, and named function choices '
+                        "are not currently supported"
+                    ),
+                )
+            return AssistantTurn(
+                text="ok",
+                tool_calls=[],
+                usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            )
+
+        adapter = AgenticAdapter()
+        with mock.patch(
+            "puppetmaster.adapters.agentic.provider_chat", side_effect=fake_chat
+        ):
+            turn = adapter._provider_call(
+                provider="openrouter",
+                model="some-other-model",
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[{"type": "function", "function": {"name": "submit_findings"}}],
+                extra={"force_tool": "submit_findings", "max_tokens": 32},
+                timeout=30,
+                max_retries=0,
+            )
+        self.assertEqual(turn.text, "ok")
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(calls["extras"][0].get("force_tool"), "submit_findings")
+        self.assertNotIn("force_tool", calls["extras"][1])
+
+    def test_reasoning_details_preserved_on_tool_turn_messages(self) -> None:
+        from puppetmaster.adapters import agentic
+        from puppetmaster.providers import AssistantTurn
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cwd = Path(tmp.name)
+        (cwd / "a.py").write_text("x = 1\n", encoding="utf-8")
+        captured_messages = []
+
+        details = [{
+            "type": "reasoning.encrypted",
+            "data": "abc",
+            "format": "meta-responses-v1",
+            "id": "rs_1",
+            "index": "0",
+        }]
+
+        def fake_chat(*, provider, model, messages, tools, extra, timeout):
+            captured_messages.append([dict(m) for m in messages])
+            if len(captured_messages) == 1:
+                return AssistantTurn(
+                    text="",
+                    tool_calls=[{
+                        "id": "c1",
+                        "name": "read_file",
+                        "arguments": {"path": "a.py"},
+                    }],
+                    reasoning="think",
+                    reasoning_details=details,
+                    usage={"prompt_tokens": 2, "completion_tokens": 2, "total_tokens": 4},
+                )
+            return AssistantTurn(
+                text="",
+                tool_calls=[{
+                    "id": "s1",
+                    "name": "submit_findings",
+                    "arguments": {"artifacts": []},
+                }],
+                usage={"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+            )
+
+        task = Task(
+            job_id="j",
+            role="explore",
+            instruction="analyze",
+            payload={
+                "cwd": str(cwd),
+                "provider": "openrouter",
+                "model": "meta/muse-spark-1.1",
+                "disable_codegraph": True,
+            },
+        )
+        with mock.patch.object(agentic, "provider_chat", side_effect=fake_chat):
+            self.adapter().run(task, task.instruction, "w1")
+
+        self.assertGreaterEqual(len(captured_messages), 2)
+        assistant = next(
+            m for m in captured_messages[1]
+            if m.get("role") == "assistant" and m.get("tool_calls")
+        )
+        self.assertEqual(assistant.get("reasoning_details"), details)
+        self.assertEqual(assistant.get("reasoning"), "think")
+
     def adapter(self):
         from puppetmaster.adapters.agentic import AgenticAdapter
         return AgenticAdapter()
