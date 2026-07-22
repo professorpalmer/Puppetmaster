@@ -217,6 +217,8 @@ def find_codegraph_install(npm_command: str = "npm") -> Optional[Path]:
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=10,
                 check=False,
             )
@@ -248,6 +250,8 @@ def detect_node_version(node_path: Path, timeout_seconds: int = 5) -> Optional[s
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout_seconds,
             check=False,
         )
@@ -354,6 +358,8 @@ def repair_codegraph_sqlite(
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=rebuild_timeout_seconds,
             check=False,
         )
@@ -463,6 +469,8 @@ def _verify_native_backend(
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout_seconds,
             check=False,
         )
@@ -492,8 +500,5 @@ def _decode_stream(stream) -> str:
     if stream is None:
         return ""
     if isinstance(stream, bytes):
-        try:
-            return stream.decode()
-        except UnicodeDecodeError:
-            return stream.decode(errors="replace")
+        return stream.decode("utf-8", errors="replace")
     return str(stream)

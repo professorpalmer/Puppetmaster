@@ -164,6 +164,39 @@ def _hoist_global_codegraph_flags(
         index += 1
     return cwd, timeout, remaining
 
+def _write_console_text(stream, text: str) -> None:
+    """Write ``text`` to a console stream without raising on legacy encodings.
+
+    CodeGraph markdown often includes Unicode (e.g. U+26A0 ⚠). On Windows
+    consoles still defaulting to cp1252, a bare ``stream.write`` raises
+    ``UnicodeEncodeError``. Prefer the binary buffer with UTF-8/replace; fall
+    back to reconfigure + write so mocked TextIO streams stay testable.
+    """
+    if not text:
+        return
+    buffer = getattr(stream, "buffer", None)
+    if buffer is not None:
+        try:
+            buffer.write(text.encode("utf-8", errors="replace"))
+            flush = getattr(buffer, "flush", None)
+            if callable(flush):
+                flush()
+            return
+        except Exception:
+            pass
+    reconfigure = getattr(stream, "reconfigure", None)
+    if callable(reconfigure):
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    try:
+        stream.write(text)
+    except UnicodeEncodeError:
+        encoding = getattr(stream, "encoding", None) or "ascii"
+        stream.write(text.encode(encoding, errors="replace").decode(encoding))
+
+
 def _run_codegraph_passthrough(args) -> int:
     """CLI entrypoint for `python -m puppetmaster codegraph <args>`.
 
@@ -228,13 +261,13 @@ def _run_codegraph_passthrough(args) -> int:
         if error:
             print(error, file=sys.stderr)
         if result.get("stdout"):
-            sys.stdout.write(result["stdout"])
+            _write_console_text(sys.stdout, result["stdout"])
         if result.get("stderr"):
-            sys.stderr.write(result["stderr"])
+            _write_console_text(sys.stderr, result["stderr"])
         return int(result.get("returncode") or 1)
 
     if result.get("stdout"):
-        sys.stdout.write(result["stdout"])
+        _write_console_text(sys.stdout, result["stdout"])
     if result.get("stderr"):
-        sys.stderr.write(result["stderr"])
+        _write_console_text(sys.stderr, result["stderr"])
     return 0

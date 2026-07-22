@@ -372,6 +372,8 @@ def ensure_codegraph_provisioned() -> bool:
                         stdin=subprocess.DEVNULL,
                         capture_output=True,
                         text=True,
+                        encoding="utf-8",
+                        errors="replace",
                         timeout=_provision_timeout_seconds(),
                         check=False,
                     )
@@ -392,6 +394,8 @@ def ensure_codegraph_provisioned() -> bool:
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=_provision_timeout_seconds(),
                 check=False,
             )
@@ -726,8 +730,14 @@ def _nonpaging_env() -> dict[str, str]:
     A pager (git/codegraph spawning ``less``) blocks forever in a
     non-interactive shell waiting for a keypress that never comes. Forcing
     ``PAGER``/``GIT_PAGER`` to ``cat`` keeps output flowing. A TTY caller is left
-    alone so interactive use still pages."""
+    alone so interactive use still pages.
+
+    Also pins UTF-8 I/O for child Python processes so CodeGraph markdown with
+    non-cp1252 glyphs survives Windows consoles that still default to legacy
+    code pages."""
     env = dict(os.environ)
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
     forced = os.environ.get("PUPPETMASTER_NO_PAGER", "").strip().lower() in (
         "1",
         "true",
@@ -1086,10 +1096,7 @@ def _decode_stream(stream: Any) -> str:
     if stream is None:
         return ""
     if isinstance(stream, bytes):
-        try:
-            return stream.decode()
-        except UnicodeDecodeError:
-            return stream.decode(errors="replace")
+        return stream.decode("utf-8", errors="replace")
     return str(stream)
 
 
