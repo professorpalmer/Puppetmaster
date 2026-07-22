@@ -1,3 +1,11 @@
+## v1.20.10
+
+**Windows CodeGraph UTF-8 console hardening.**
+
+- CLI CodeGraph passthrough writes Unicode markdown via UTF-8/replace so cp1252 consoles no longer raise `UnicodeEncodeError` on glyphs like U+26A0.
+- `_decode_stream` and provision/repair `subprocess.run(..., text=True)` paths force `encoding=utf-8`, `errors=replace`.
+- `_nonpaging_env` setdefaults `PYTHONUTF8=1` and `PYTHONIOENCODING=utf-8` for child CLIs.
+- Focused regression coverage in `tests/test_codegraph_utf8.py`.
 ## v1.20.9
 
 **Muse Spark agentic hardening: auto-only tool_choice, reasoning replay, pin ROUTING.**
