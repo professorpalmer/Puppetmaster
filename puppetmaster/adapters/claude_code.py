@@ -42,7 +42,7 @@ from .cursor import (
     sdk_usage_from_stdout,
 )
 
-DEFAULT_CLAUDE_CODE_MODEL = "claude-opus-4-8"
+DEFAULT_CLAUDE_CODE_MODEL = "claude-opus-5"
 
 
 _BEDROCK_MODEL_ID = re.compile(

@@ -5940,12 +5940,12 @@ class PuppetmasterTests(unittest.TestCase):
             "model_unavailable",
         )
 
-    def test_claude_code_adapter_defaults_to_opus_4_8(self) -> None:
+    def test_claude_code_adapter_defaults_to_opus_5(self) -> None:
         """With no model pinned (and no router stamp), the claude-code adapter
-        must default to claude-opus-4-8 rather than the CLI's own default."""
+        must default to claude-opus-5 rather than the CLI's own default."""
         from puppetmaster.adapters import DEFAULT_CLAUDE_CODE_MODEL
 
-        self.assertEqual(DEFAULT_CLAUDE_CODE_MODEL, "claude-opus-4-8")
+        self.assertEqual(DEFAULT_CLAUDE_CODE_MODEL, "claude-opus-5")
 
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -5980,7 +5980,7 @@ print('{"result":"ok"}')
                 "puppetmaster.adapters.build_claude_code_command", side_effect=fake_build
             ):
                 ClaudeCodeAdapter().run(task, "goal", "worker")
-            self.assertEqual(captured["model"], "claude-opus-4-8")
+            self.assertEqual(captured["model"], "claude-opus-5")
 
             # Explicit model still wins over the default.
             captured.clear()
@@ -8471,12 +8471,33 @@ class ModelRouterTests(unittest.TestCase):
         )
         self.assertEqual(classify_capability_needed(signal), 100)
 
-    def test_starter_registry_includes_fable_5_entries(self) -> None:
+    def test_starter_registry_includes_opus_5_and_fable_5_entries(self) -> None:
         from puppetmaster.model_registry import starter_registry
 
         registry = {spec.id: spec for spec in starter_registry()}
+        self.assertIn("cursor/claude-opus-5", registry)
+        self.assertIn("claude-code/opus-5", registry)
         self.assertIn("cursor/claude-fable-5", registry)
         self.assertIn("claude-code/fable-5", registry)
+
+        cursor_opus = registry["cursor/claude-opus-5"]
+        self.assertEqual(cursor_opus.adapter, "cursor")
+        self.assertEqual(cursor_opus.adapter_model_name, "claude-opus-5")
+        self.assertEqual(cursor_opus.capability_score, 100)
+        self.assertEqual(cursor_opus.billing, "plan")
+        self.assertEqual(cursor_opus.input_per_mtok_usd, 5.0)
+        self.assertEqual(cursor_opus.output_per_mtok_usd, 25.0)
+        self.assertNotIn("mythos-class", cursor_opus.tags)
+
+        claude_opus = registry["claude-code/opus-5"]
+        self.assertEqual(claude_opus.adapter, "claude-code")
+        self.assertEqual(claude_opus.adapter_model_name, "claude-opus-5")
+        self.assertEqual(claude_opus.capability_score, 100)
+        self.assertEqual(claude_opus.input_per_mtok_usd, 5.0)
+        self.assertEqual(claude_opus.output_per_mtok_usd, 25.0)
+        self.assertEqual(claude_opus.context_window, 1_000_000)
+        self.assertEqual(claude_opus.billing, "unknown")
+        self.assertIn("2026-07-24", claude_opus.notes)
 
         cursor_fable = registry["cursor/claude-fable-5"]
         self.assertEqual(cursor_fable.adapter, "cursor")
@@ -8494,7 +8515,7 @@ class ModelRouterTests(unittest.TestCase):
         self.assertEqual(claude_fable.output_per_mtok_usd, 50.0)
         self.assertEqual(claude_fable.context_window, 1_000_000)
         self.assertEqual(claude_fable.billing, "unknown")
-        self.assertIn("2026-06-22", claude_fable.notes)
+        self.assertIn("opus-5", claude_fable.notes)
 
     def test_starter_registry_includes_grok_4_5_cursor_workhorse(self) -> None:
         """Grok 4.5 is the Cursor Opus-class workhorse under Fable/Opus tip."""
@@ -9405,12 +9426,13 @@ class ModelRouterTests(unittest.TestCase):
         rejected_ids = {spec.id for spec, _ in decision.rejected}
         self.assertIn("cursor/composer-2-5", rejected_ids)
         self.assertIn("cursor/gpt-5-6-luna", rejected_ids)
-        # And under quality policy, the plan-billed cursor/fable-5 (cap 100)
-        # wins over claude-code/fable-5, opus-4-8 (99), and GPT-5.6 tiers.
+        # And under quality policy, the plan-billed tip ceiling (cap 100)
+        # wins. Opus 5 shares the ceiling with Fable and is listed first, so
+        # it beats claude-code peers, opus-4-8 (99), and GPT-5.6 tiers.
         quality_decision = route_task(
             signal, starter_registry(), policy="quality"
         )
-        self.assertEqual(quality_decision.model.id, "cursor/claude-fable-5")
+        self.assertEqual(quality_decision.model.id, "cursor/claude-opus-5")
 
     def test_starter_registry_encodes_four_tiers(self) -> None:
         from puppetmaster.model_registry import starter_registry
@@ -9449,9 +9471,12 @@ class ModelRouterTests(unittest.TestCase):
             by_id["claude-code/opus-4-6"].capability_score,
             by_id["claude-code/opus-4-7"].capability_score,
         )
-        # Fable 5 is the frontier flagship — strictly above Opus 4.8 and the
-        # single highest-capability model in the starter registry.
+        # Opus 5 is the everyday frontier (near-Fable at half price); Fable
+        # remains the absolute tip. Both share capability 100, strictly
+        # above Opus 4.8.
         self.assertIn("claude-code/opus-4-8", ids)
+        self.assertIn("cursor/claude-opus-5", ids)
+        self.assertIn("claude-code/opus-5", ids)
         self.assertIn("cursor/claude-fable-5", ids)
         self.assertIn("claude-code/fable-5", ids)
         self.assertLess(
@@ -9460,11 +9485,23 @@ class ModelRouterTests(unittest.TestCase):
         )
         self.assertLess(
             by_id["claude-code/opus-4-8"].capability_score,
+            by_id["claude-code/opus-5"].capability_score,
+        )
+        self.assertEqual(
+            by_id["claude-code/opus-5"].capability_score,
             by_id["claude-code/fable-5"].capability_score,
         )
         self.assertEqual(
-            by_id["claude-code/fable-5"].capability_score,
+            by_id["claude-code/opus-5"].capability_score,
             max(s.capability_score for s in specs),
+        )
+        self.assertEqual(
+            by_id["claude-code/opus-5"].input_per_mtok_usd,
+            by_id["claude-code/opus-4-8"].input_per_mtok_usd,
+        )
+        self.assertLess(
+            by_id["claude-code/opus-5"].input_per_mtok_usd,
+            by_id["claude-code/fable-5"].input_per_mtok_usd,
         )
         # Same per-token price as 4.7 (it strictly dominates) with a far
         # larger context window.
@@ -9486,9 +9523,9 @@ class ModelRouterTests(unittest.TestCase):
             "detailed-vision", by_id["claude-code/opus-4-6"].tags
         )
 
-    def test_starter_registry_routes_hardest_task_to_fable_5(self) -> None:
-        """The absolute-hardest tasks must route to the frontier flagship
-        (Fable 5), not saturate one notch below it on Opus 4.8."""
+    def test_starter_registry_routes_hardest_task_to_opus_5(self) -> None:
+        """The absolute-hardest tasks must route to everyday frontier Opus 5
+        (near-Fable at half price), not saturate on Opus 4.8 or burn Fable."""
         from puppetmaster.model_registry import starter_registry
         from puppetmaster.router import TaskSignals, route_task
 
@@ -9500,11 +9537,12 @@ class ModelRouterTests(unittest.TestCase):
             role="security-review",
         )
         decision = route_task(signal, starter_registry(), policy="balanced")
-        self.assertEqual(decision.model.id, "cursor/claude-fable-5")
-        # Opus 4.8 should be in the rejected set (sufficient-but-not-chosen),
-        # proving the flagship was preferred for the hardest tier.
+        self.assertEqual(decision.model.id, "cursor/claude-opus-5")
+        # Opus 4.8 and pricier Fable should be rejected: flagship preferred,
+        # cost-aware tip prefers Opus 5 over Fable at equal capability.
         rejected_ids = {spec.id for spec, _ in decision.rejected}
         self.assertIn("claude-code/opus-4-8", rejected_ids)
+        self.assertIn("cursor/claude-fable-5", rejected_ids)
         self.assertIn("cursor/grok-4-5", rejected_ids)
 
     def test_starter_registry_routes_hard_cursor_work_to_grok_4_5(self) -> None:
@@ -14698,6 +14736,29 @@ class CursorDiscoveryTests(unittest.TestCase):
         self.assertEqual(spec.adapter_model_name, "fable-5")
         self.assertEqual(spec.billing, "plan")
         self.assertIn("mythos-class", spec.tags)
+
+    def test_catalog_inherits_opus_5_frontier_kin(self) -> None:
+        from puppetmaster.cursor_discovery import catalog_to_specs
+        from puppetmaster.model_registry import ModelSpec
+
+        existing = [
+            ModelSpec(
+                id="claude-code/opus-5",
+                adapter="claude-code",
+                adapter_model_name="claude-opus-5",
+                capability_score=100,
+                context_window=1_000_000,
+                tags=["frontier", "long-context", "detailed-vision"],
+            )
+        ]
+        catalog = [{"id": "opus-5", "displayName": "Claude Opus 5"}]
+        spec = catalog_to_specs(catalog, existing)[0]
+        self.assertEqual(spec.capability_score, 100)
+        self.assertEqual(spec.adapter_model_name, "opus-5")
+        self.assertEqual(spec.billing, "plan")
+        self.assertIn("frontier", spec.tags)
+        self.assertEqual(spec.input_per_mtok_usd, 5.0)
+        self.assertEqual(spec.output_per_mtok_usd, 25.0)
 
     def test_catalog_preserves_grok_identity_and_default_high_fast(self) -> None:
         """Live SDK id is grok-4.5; High+Fast is params, not an expanded alias."""

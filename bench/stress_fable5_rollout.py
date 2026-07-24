@@ -172,19 +172,19 @@ def stress_routing_matrix() -> None:
         )
 
     decision = frontier(None)
-    check("all platforms: picks cursor/claude-fable-5 (plan-billed $0)",
-          decision.model.id == "cursor/claude-fable-5" and decision.estimated_cost_usd == 0.0,
+    check("all platforms: picks cursor/claude-opus-5 (plan-billed $0 tip)",
+          decision.model.id == "cursor/claude-opus-5" and decision.estimated_cost_usd == 0.0,
           f"got {decision.model.id} @ ${decision.estimated_cost_usd:.4f}")
     check("all platforms: demanded capability is 100",
           decision.capability_needed == 100, str(decision.capability_needed))
 
     decision = frontier(frozenset({"cursor"}))
-    check("cursor-only lock: picks cursor/claude-fable-5",
-          decision.model.id == "cursor/claude-fable-5", decision.model.id)
+    check("cursor-only lock: picks cursor/claude-opus-5",
+          decision.model.id == "cursor/claude-opus-5", decision.model.id)
 
     decision = frontier(frozenset({"claude-code"}))
-    check("claude-code-only lock: picks claude-code/fable-5",
-          decision.model.id == "claude-code/fable-5", decision.model.id)
+    check("claude-code-only lock: picks claude-code/opus-5",
+          decision.model.id == "claude-code/opus-5", decision.model.id)
 
     decision = frontier(frozenset({"codex"}))
     check("codex-only lock: degrades to strongest available (codex/gpt-5-5)",
@@ -199,8 +199,9 @@ def stress_routing_matrix() -> None:
     trivial = route_task(
         TaskSignals(instruction=TRIVIAL_INSTRUCTION, role="shell"), registry
     )
-    check("trivial task never reaches Fable 5",
-          "fable" not in trivial.model.id, trivial.model.id)
+    check("trivial task never reaches Opus 5 / Fable 5",
+          "fable" not in trivial.model.id and "opus-5" not in trivial.model.id,
+          trivial.model.id)
 
 
 # ---------------------------------------------------------------------------

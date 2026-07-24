@@ -46,6 +46,7 @@ _DEFAULT_DISCOVERED_CAPABILITY = 60
 # seed so plan-discovered frontier models rank at their true capability.
 _CURSOR_FRONTIER_KIN_ALIASES: dict[str, str] = {
     "fable-5": "claude-fable-5",
+    "opus-5": "claude-opus-5",
 }
 
 # Public Cursor nominal usage rates (USD per million tokens). These are not
@@ -54,6 +55,8 @@ _CURSOR_FRONTIER_KIN_ALIASES: dict[str, str] = {
 _CURSOR_NOMINAL_RATES: dict[str, tuple[float, float]] = {
     "composer-2.5": (0.5, 2.5),
     "grok-4.5": (2.0, 6.0),
+    "claude-opus-5": (5.0, 25.0),
+    "opus-5": (5.0, 25.0),
     "claude-fable-5": (10.0, 50.0),
     "fable-5": (10.0, 50.0),
     "gpt-5.6-luna": (1.0, 6.0),

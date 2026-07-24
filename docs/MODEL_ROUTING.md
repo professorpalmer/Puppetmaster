@@ -89,7 +89,8 @@ tier. When newer versions land, edit `adapter_model_name` in
 | `claude-code/opus-4-6`   | `claude-code` | high-quality — \$5 / \$25 per MTok                  | `quality`, `vision`, `reasoning` |
 | `claude-code/opus-4-7`   | `claude-code` | previous frontier — \$5 / \$25, superseded by 4.8  | `frontier`, `vision`, `detailed-vision`, `reasoning` |
 | `claude-code/opus-4-8`   | `claude-code` | tip-of-stack Anthropic fallback — \$5 / \$25, 1M context | `frontier`, `vision`, `detailed-vision`, `reasoning`, `code` |
-| `cursor/claude-fable-5` / `claude-code/fable-5` | `cursor` / `claude-code` | **frontier flagship** — nominal \$10 / \$50; hardest tasks only | `frontier`, `mythos-class`, … |
+| `cursor/claude-opus-5` / `claude-code/opus-5` | `cursor` / `claude-code` | **everyday frontier** — near-Fable at \$5 / \$25 (half Fable); default tip | `frontier`, `vision`, `detailed-vision`, … |
+| `cursor/claude-fable-5` / `claude-code/fable-5` | `cursor` / `claude-code` | **absolute tip** — nominal \$10 / \$50; reserve for the most ambitious work | `frontier`, `mythos-class`, … |
 | `openai/gpt-5-5`         | `openai`      | frontier via Responses API — \$5 / \$30 per MTok    | `frontier`, `vision`, `detailed-vision`, `reasoning`, `code` |
 | `openai/gpt-5-4`         | `openai`      | workhorse — \$2.50 / \$15 per MTok                  | `quality`, `fast`, `vision`, `code`, `reasoning` |
 | `openai/gpt-5-4-mini`    | `openai`      | balanced — \$0.75 / \$4.50 per MTok                 | `balanced`, `fast`, `vision`, `code` |
@@ -106,7 +107,7 @@ With the starter registry, balanced-policy routing lands roughly:
 | `add password reset endpoint`                   | `cursor/gpt-5-6-luna` |
 | `implement a multi-file refactor with tests` (Cursor-only) | `cursor/grok-4-5` (workhorse — Opus-class, plan-billed) |
 | `decision: which caching strategy fits`         | `claude-code/opus-4-6` |
-| `security audit every endpoint`                 | `cursor/claude-fable-5` (frontier flagship — hardest tier) |
+| `security audit every endpoint`                 | `cursor/claude-opus-5` (everyday frontier — near-Fable at half price) |
 | `describe what you see in the screenshot`       | `cursor/gpt-5-6-luna` (vision-tagged) |
 | `OCR every detail of the diagram`               | `claude-code/opus-4-7` (detailed-vision; right-sized below the flagship) |
 | `refactor every callsite of foo() and add tests` | `openai/gpt-5-4` (API workhorse — cheaper than frontier, capable enough for cross-file refactor) |

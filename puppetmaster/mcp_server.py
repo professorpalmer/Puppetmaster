@@ -4151,9 +4151,9 @@ def claude_schema() -> JsonObject:
             "model": {
                 "type": "string",
                 "description": (
-                    "Optional Claude model name. Defaults to claude-opus-4-8 "
-                    "(the frontier flagship) when omitted and no router model "
-                    "is stamped."
+                    "Optional Claude model name. Defaults to claude-opus-5 "
+                    "(the everyday frontier flagship) when omitted and no "
+                    "router model is stamped."
                 ),
             },
             "permission_mode": {

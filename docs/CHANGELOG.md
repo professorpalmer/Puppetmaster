@@ -1,3 +1,28 @@
+## v1.21.0
+
+**Claude Opus 5 is the everyday frontier — near-Fable 5 at half the price.**
+
+Anthropic shipped Claude Opus 5 (API id `claude-opus-5`, 2026-07-24): near-Fable
+intelligence on coding/knowledge work at Opus 4.8's `$5/$25` per-MTok (half of
+Fable's `$10/$50`), no 30-day retention requirement for general access, and the
+new default on Claude Max. Puppetmaster routes tip-of-stack work to Opus 5 by
+default and keeps Fable as the absolute tip when you want it.
+
+- **Registry seeds.** `cursor/claude-opus-5` (cap 100, plan-billed, `$5/$25`
+  nominal) and `claude-code/opus-5` (cap 100, `$5/$25`, 1M context). Shares the
+  tip ceiling with Fable; cost-aware policies prefer Opus 5. Opus 4.8 stays at
+  99 as the declared fallback when Opus 5 / Fable are unavailable.
+- **Defaults.** `DEFAULT_CLAUDE_CODE_MODEL` and the Claude Code MCP model hint
+  now point at `claude-opus-5`.
+- **Discovery.** Cursor frontier-kin alias `opus-5` → `claude-opus-5` with
+  matching nominal rates; curated `claude-code` / `agentic` / `hermes` catalogs
+  include Opus 5 (and Fable on the Claude Code curated list for parity).
+- **Routing.** Hardest balanced tasks land on `cursor/claude-opus-5` (cheaper
+  tip than Fable at equal capability). Fable remains available for explicit pin
+  / absolute tip.
+- **Docs.** `docs/sample-models.json` aligned. Focused registry/router/default
+  tests updated for the Opus 5 ceiling.
+
 ## v1.20.10
 
 **Windows CodeGraph UTF-8 console hardening.**
