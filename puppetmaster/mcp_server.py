@@ -1174,10 +1174,65 @@ def _attach_update_nudges(result: dict) -> None:
             result.setdefault("pypi_update_available", pypi_note)
 
 
+# Marionette Cursor-CLI / host pilots set MARIONETTE_TRACKABLE_SWARMS=1 so Agent
+# MCP grandchildren cannot create jobs that skip the Swarm Tracker. Soft kernel
+# prompt bans are not enough — Agent calls these tools directly.
+_TRACKABLE_SWARM_BLOCKED_TOOLS = frozenset(
+    {
+        "puppetmaster_start_cursor_swarm",
+        "puppetmaster_start_swarm",
+        "puppetmaster_start_implement",
+        "puppetmaster_start_cursor_implement",
+        "puppetmaster_start_claude_implement",
+        "puppetmaster_start_codex",
+        "puppetmaster_start_agentic",
+        "puppetmaster_start_browser_swarm",
+        "puppetmaster_start_openai",
+        "puppetmaster_start_prewalk",
+        # Sync wait verbs also write jobs outside Marionette swarm_pending.
+        "puppetmaster_cursor_implement",
+        "puppetmaster_claude_implement",
+        "puppetmaster_codex",
+        "puppetmaster_agentic",
+        "puppetmaster_openai",
+        "puppetmaster_cursor_swarm",
+    }
+)
+
+
+def _truthy_env(name: str) -> bool:
+    raw = (os.environ.get(name) or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def trackable_swarm_mcp_blocked(tool_name: str) -> Optional[JsonObject]:
+    """Refuse job-creating MCP verbs when Marionette requires tracker-visible swarms."""
+    if not _truthy_env("MARIONETTE_TRACKABLE_SWARMS"):
+        return None
+    name = (tool_name or "").strip()
+    if name not in _TRACKABLE_SWARM_BLOCKED_TOOLS:
+        return None
+    return tool_error(
+        "Untracked swarm/implement: Marionette requires tracker-visible jobs. "
+        "Do not call Puppetmaster MCP start_*/implement verbs from Cursor Agent. "
+        'Use shell: python -m puppetmaster swarm "<goal>" --cwd "<workspace>" '
+        "(or run_swarm / run_implement on host pilots). "
+        "CodeGraph and wiki MCP tools remain allowed.",
+        {
+            "code": "marionette_trackable_swarm",
+            "tool": name,
+            "fix": 'python -m puppetmaster swarm "<goal>" --cwd "<workspace>"',
+        },
+    )
+
+
 def call_tool(name: str, arguments: JsonObject) -> JsonObject:
     tool = _tool_registry().get(name)
     if tool is None:
         raise ValueError(f"Unknown Puppetmaster tool: {name}")
+    blocked = trackable_swarm_mcp_blocked(name)
+    if blocked is not None:
+        return blocked
     result = tool.handler(arguments)
     # Push-style staleness nudge: every tool response carries a one-line warning
     # when a newer puppetmaster-ai is installed than this server is running, so a

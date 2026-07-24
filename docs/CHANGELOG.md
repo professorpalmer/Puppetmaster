@@ -1,3 +1,18 @@
+## v1.21.1
+
+**Hard-refuse untracked MCP start_*/implement when Marionette requires tracker-visible swarms.**
+
+Marionette Cursor-CLI pilots set `MARIONETTE_TRACKABLE_SWARMS=1` on the Agent
+child so Puppetmaster MCP grandchildren cannot create jobs that skip the Swarm
+Tracker. Soft prompt bans were not enough — Agent calls MCP tools directly.
+
+- **`trackable_swarm_mcp_blocked` / `call_tool`.** When the env flag is truthy,
+  refuse `puppetmaster_start_*` and sync job verbs (`cursor_implement`,
+  `claude_implement`, `codex`, `agentic`, `openai`, `cursor_swarm`) with a clear
+  shell-swarm fix hint. CodeGraph and wiki tools stay allowed. Off by default
+  so plain Cursor IDE MCP is unchanged.
+- **Tests.** `tests/test_trackable_swarm_mcp.py`.
+
 ## v1.21.0
 
 **Claude Opus 5 is the everyday frontier — near-Fable 5 at half the price.**
