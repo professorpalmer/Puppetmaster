@@ -661,6 +661,71 @@ class AgenticToolTests(unittest.TestCase):
         )
         self.assertIn("hello", out)
 
+    def test_analyze_schema_includes_readonly_git_terminal(self) -> None:
+        schema = self.adapter._tool_schema(
+            implement=False, task=_task(), graph_on=False
+        )
+        names = [t["function"]["name"] for t in schema]
+        self.assertIn("run_terminal", names)
+        desc = next(
+            t["function"]["description"]
+            for t in schema
+            if t["function"]["name"] == "run_terminal"
+        )
+        self.assertIn("read-only git", desc.lower())
+
+    def test_analyze_run_terminal_allows_git_show(self) -> None:
+        import subprocess
+
+        subprocess.run(
+            ["git", "init"], cwd=self.cwd, check=True, capture_output=True
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "t@example.com"],
+            cwd=self.cwd, check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "t"],
+            cwd=self.cwd, check=True, capture_output=True,
+        )
+        (self.cwd / "a.py").write_text("x = 1\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "a.py"], cwd=self.cwd, check=True, capture_output=True
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "init"],
+            cwd=self.cwd, check=True, capture_output=True,
+        )
+        out = self.adapter._execute_tool(
+            "run_terminal",
+            {"command": "git show HEAD:a.py"},
+            self.cwd,
+            False,
+            _task(),
+        )
+        self.assertIn("exit=0", out)
+        self.assertIn("x = 1", out)
+
+    def test_analyze_run_terminal_refuses_non_git(self) -> None:
+        out = self.adapter._execute_tool(
+            "run_terminal",
+            {"command": "echo hello"},
+            self.cwd,
+            False,
+            _task(),
+        )
+        self.assertIn("read-only git", out.lower())
+
+    def test_analyze_run_terminal_refuses_mutating_git(self) -> None:
+        out = self.adapter._execute_tool(
+            "run_terminal",
+            {"command": "git checkout -b evil"},
+            self.cwd,
+            False,
+            _task(),
+        )
+        self.assertIn("read-only git", out.lower())
+
     def test_binary_write_refused(self) -> None:
         out = self.adapter._execute_tool(
             "write_file", {"path": "b.bin", "content": "a\x00b"}, self.cwd, True, _task()

@@ -1,3 +1,17 @@
+## v1.21.2
+
+**Analyze workers can inspect origin/* when the checkout trails upstream.**
+
+Read-only agentic analysis had no shell, so workers could only see stale HEAD
+files and falsely failed "is this fix present?" checks. ``git show`` against
+already-fetched tips also crashed on Windows when stdout hit cp1252.
+
+- **Analyze ``run_terminal``.** Git-read-only allowlist (``show`` / ``log`` /
+  ``status`` / ``diff`` / ``rev-parse`` / …). Mutating git and non-git shell
+  stay refused.
+- **UTF-8 terminal capture.** ``encoding=utf-8`` + ``errors=replace``, plus
+  non-interactive git pager env, so ``git show`` never dies on Unicode.
+- **Tests.** Analyze schema + allow/refuse cases in ``test_agentic_standalone``.
 ## v1.21.1
 
 **Hard-refuse untracked MCP start_*/implement when Marionette requires tracker-visible swarms.**

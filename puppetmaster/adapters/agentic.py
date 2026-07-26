@@ -14,9 +14,12 @@ Two modes, one loop:
 * ``analyze`` (read-only): the worker may read files, list directories, and
   search the tree -- including CodeGraph symbol search when the repo is graphed
   -- to ground its answer, then emits the same structured finding/risk/decision
-  artifacts the rest of Puppetmaster reasons over. A single JSON-only reprompt
-  recovers a clean run that returned unstructured prose before it is accepted as
-  degraded.
+  artifacts the rest of Puppetmaster reasons over. Analyze also gets a
+  ``run_terminal`` gated to read-only ``git`` subcommands (``show`` / ``log`` /
+  ``status`` / …) so workers can inspect ``origin/*`` tips when the working
+  tree trails upstream -- without write/shell side effects. A single JSON-only
+  reprompt recovers a clean run that returned unstructured prose before it is
+  accepted as degraded.
 * ``implement`` (full-edit): the worker additionally gets ``write_file`` /
   ``edit_file`` / ``delete_file`` and, to self-verify, a guarded
   ``run_terminal`` (on by default in implement mode). Edits are attributed via
@@ -269,6 +272,31 @@ _DESTRUCTIVE_COMMAND_PATTERNS = tuple(
         r"\bsudo\b",
     )
 )
+
+# Analyze-mode terminal is git-read-only. Workers verifying a fix on a checkout
+# that trails origin/* need ``git show`` / ``git log`` against already-fetched
+# tips; opening a general shell in analyze would erase the read-only contract.
+_ANALYZE_READONLY_GIT_RE = re.compile(
+    r"^\s*git(?:\s+-C\s+\S+)*\s+"
+    r"(?:"
+    r"show|log|status|diff|blame|describe|shortlog|reflog|"
+    r"rev-parse|rev-list|cat-file|merge-base|name-rev|for-each-ref|"
+    r"symbolic-ref|ls-files|ls-tree|branch|remote|tag|"
+    r"config\s+--get(?:-regexp)?"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _is_analyze_readonly_git_command(command: str) -> bool:
+    """True when ``command`` is a single read-only git invocation (no pipes)."""
+    text = (command or "").strip()
+    if not text:
+        return False
+    # Refuse shell metacharacters that would chain writeable side effects.
+    if any(ch in text for ch in ("|", ";", "&", "\n", "`", "$(", ">", "<")):
+        return False
+    return bool(_ANALYZE_READONLY_GIT_RE.match(text))
 
 _BINARY_SNIFF_BYTES = 8000
 
@@ -1639,6 +1667,18 @@ class AgenticAdapter(FullEditWorkerAdapter):
             if self._terminal_enabled(task):
                 tools.append(fn("run_terminal", "Run a bounded shell command in the workspace (e.g. to run focused tests) and return its output. Destructive commands are refused.",
                                 {"command": {"type": "string"}}, ["command"]))
+        elif self._analyze_terminal_enabled(task):
+            # Read-only git only -- so verify-against-origin works when HEAD
+            # trails upstream without granting a general shell.
+            tools.append(fn(
+                "run_terminal",
+                "Run a read-only git command in the workspace "
+                "(git show / log / status / diff / rev-parse / …). "
+                "Use this to inspect origin/* tips when the working branch "
+                "trails upstream. Non-git and mutating git commands are refused.",
+                {"command": {"type": "string"}},
+                ["command"],
+            ))
         if bool(task.payload.get("allow_web", False)):
             tools.append(fn("web_fetch", "Fetch a URL and return its text content.",
                             {"url": {"type": "string"}}, ["url"]))
@@ -1749,6 +1789,14 @@ class AgenticAdapter(FullEditWorkerAdapter):
         """
         return bool(task.payload.get("allow_terminal", True))
 
+    def _analyze_terminal_enabled(self, task: Task) -> bool:
+        """Whether analyze-mode workers get read-only ``git`` via ``run_terminal``.
+
+        On by default so verification against ``origin/*`` works when the live
+        checkout trails upstream. ``allow_terminal=false`` still kills it.
+        """
+        return bool(task.payload.get("allow_terminal", True))
+
     def _browser_enabled(self, task: Task) -> bool:
         """Whether this worker gets the CDP browser toolset (navigate/snapshot/
         click/type/scroll/back/get_text/screenshot).
@@ -1830,8 +1878,11 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 return self._tool_apply_hashline(args, cwd)
             if name == "delete_file" and implement:
                 return self._tool_delete_file(args, cwd)
-            if name == "run_terminal" and implement and self._terminal_enabled(task):
-                return self._tool_run_terminal(args, cwd)
+            if name == "run_terminal":
+                if implement and self._terminal_enabled(task):
+                    return self._tool_run_terminal(args, cwd, analyze_readonly=False)
+                if (not implement) and self._analyze_terminal_enabled(task):
+                    return self._tool_run_terminal(args, cwd, analyze_readonly=True)
             if name == "web_fetch" and bool(task.payload.get("allow_web", False)):
                 return self._tool_web_fetch(args)
             if name in _BROWSER_TOOL_NAMES and self._browser_enabled(task):
@@ -2119,10 +2170,18 @@ class AgenticAdapter(FullEditWorkerAdapter):
         self._hashline_store.invalidate(rel)
         return f"deleted {rel}"
 
-    def _tool_run_terminal(self, args: dict, cwd: Path) -> str:
+    def _tool_run_terminal(
+        self, args: dict, cwd: Path, *, analyze_readonly: bool = False
+    ) -> str:
         command = str(args.get("command", ""))
         if not command.strip():
             return "error: empty command"
+        if analyze_readonly and not _is_analyze_readonly_git_command(command):
+            return (
+                "error: analyze-mode terminal is read-only git only "
+                "(git show / log / status / diff / rev-parse / …). "
+                "Mutating git and non-git shell commands are refused."
+            )
         blocked = _destructive_command_match(command)
         if blocked is not None:
             return (
@@ -2131,9 +2190,25 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 "specific, reversible action."
             )
         try:
+            # UTF-8 always: Windows locale (cp1252) otherwise UnicodeDecodeError
+            # on perfectly valid ``git show`` output and the worker reports
+            # "could not execute" for a command that actually ran.
             proc = subprocess.run(
-                command, shell=True, cwd=str(cwd), capture_output=True,
-                text=True, timeout=_TERMINAL_TIMEOUT_SECONDS,
+                command,
+                shell=True,
+                cwd=str(cwd),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=_TERMINAL_TIMEOUT_SECONDS,
+                env={
+                    **os.environ,
+                    "GIT_PAGER": "cat",
+                    "PAGER": "cat",
+                    "GIT_TERMINAL_PROMPT": "0",
+                    "PYTHONUTF8": "1",
+                },
             )
         except subprocess.TimeoutExpired:
             return f"error: command timed out ({_TERMINAL_TIMEOUT_SECONDS}s)"
