@@ -587,6 +587,18 @@ def cursor_artifact_from_item(
         if wrapped_type:
             wrapped = item[wrapped_type]
             item = {**wrapped, "type": wrapped.get("type", wrapped_type)}
+        elif adapter == "codex":
+            semantic_types = [
+                kind
+                for kind, field in (
+                    ("finding", "claim"),
+                    ("risk", "risk"),
+                    ("decision", "decision"),
+                )
+                if field in item
+            ]
+            if len(semantic_types) == 1:
+                item = {**item, "type": semantic_types[0]}
     artifact_type = str(item.get("type") or "").lower().strip()
     if artifact_type in {"findings", "swarm.finding"}:
         artifact_type = "finding"

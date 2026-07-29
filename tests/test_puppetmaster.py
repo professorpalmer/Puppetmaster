@@ -6834,6 +6834,91 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
         )
         self.assertFalse(any(a.type == ArtifactType.RISK and "without structured" in a.payload.get("risk", "") for a in artifacts))
 
+    def test_codex_read_only_flat_artifacts_promote_without_degrading(self) -> None:
+        agent_text = json.dumps(
+            {
+                "artifacts": [
+                    {
+                        "decision": "first",
+                        "why": "one",
+                        "evidence": ["a.py:1"],
+                        "confidence": 0.9,
+                    },
+                    {
+                        "decision": "second",
+                        "why": "two",
+                        "evidence": ["b.py:2"],
+                        "confidence": 0.8,
+                    },
+                    {
+                        "risk": "breakage",
+                        "mitigation": "test",
+                        "evidence": ["c.py:3"],
+                        "confidence": 0.7,
+                    },
+                ]
+            }
+        )
+        events_stdout = "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "th_test"}),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {"type": "agent_message", "text": agent_text},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "turn.completed",
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                    }
+                ),
+            ]
+        )
+        streamed = StreamedProcess(
+            returncode=0,
+            stdout=events_stdout,
+            stderr="",
+            timed_out=False,
+            live_log_path=None,
+        )
+        task = Task(
+            id="t-codex-flat",
+            job_id="job-codex-flat",
+            role="codex-review",
+            adapter="codex",
+            instruction="Review the repo.",
+            payload={
+                "cwd": str(Path.cwd()),
+                "sandbox": "read-only",
+                "disable_codegraph": True,
+            },
+        )
+        clean = {"sha": "s", "changed_files": [], "untracked_files": [], "diff": ""}
+        with patch(
+            "puppetmaster.adapters.resolve_command", return_value="/usr/bin/codex"
+        ), patch(
+            "puppetmaster.adapters.git_snapshot", side_effect=[clean, clean]
+        ), patch(
+            "puppetmaster.adapters.run_streamed_subprocess", return_value=streamed
+        ):
+            artifacts = CodexAdapter().run(task, "goal", "worker")
+
+        self.assertEqual(artifacts[0].payload["result"], "passed")
+        self.assertIsNone(artifacts[0].payload["failure"])
+        self.assertEqual(
+            [artifact.type for artifact in artifacts[1:]],
+            [ArtifactType.DECISION, ArtifactType.DECISION, ArtifactType.RISK],
+        )
+        self.assertFalse(
+            any(
+                artifact.type == ArtifactType.RISK
+                and "without structured" in artifact.payload.get("risk", "")
+                for artifact in artifacts
+            )
+        )
+
     def test_codex_read_only_prose_still_degrades(self) -> None:
         """Read-only Codex (review-style) keeps strict semantics: prose without
         structured artifacts is degraded, with the RISK marker preserved."""
@@ -24913,6 +24998,172 @@ class JsonPrefixDecodeTests(unittest.TestCase):
             [ArtifactType.FINDING, ArtifactType.RISK, ArtifactType.DECISION],
         )
         self.assertEqual([a.evidence for a in artifacts], [["a.py:1"], ["b.py:2"], ["c.py:3"]])
+
+    def test_flat_semantic_artifacts_parse_when_unambiguous(self) -> None:
+        from puppetmaster.adapters import cursor_result_artifacts
+
+        task = Task(
+            job_id="job",
+            role="codex-review",
+            instruction="inspect",
+            adapter="codex",
+            payload={},
+        )
+        text = json.dumps(
+            {
+                "artifacts": [
+                    {
+                        "decision": "first",
+                        "why": "one",
+                        "evidence": ["a.py:1"],
+                        "confidence": 0.9,
+                    },
+                    {
+                        "decision": "second",
+                        "why": "two",
+                        "evidence": ["b.py:2"],
+                        "confidence": 0.8,
+                    },
+                    {
+                        "risk": "breakage",
+                        "mitigation": "test",
+                        "evidence": ["c.py:3"],
+                        "confidence": 0.7,
+                    },
+                ]
+            }
+        )
+
+        artifacts = cursor_result_artifacts(task, "worker-codex", text, adapter="codex")
+
+        self.assertEqual(
+            [artifact.type for artifact in artifacts],
+            [ArtifactType.DECISION, ArtifactType.DECISION, ArtifactType.RISK],
+        )
+        self.assertEqual(
+            [artifact.payload.get("decision") or artifact.payload.get("risk") for artifact in artifacts],
+            ["first", "second", "breakage"],
+        )
+
+    def test_flat_finding_parses_when_unambiguous(self) -> None:
+        from puppetmaster.adapters import cursor_result_artifacts
+
+        task = Task(
+            job_id="job",
+            role="codex-review",
+            instruction="inspect",
+            adapter="codex",
+            payload={},
+        )
+        text = json.dumps(
+            {
+                "artifacts": [
+                    {
+                        "claim": "behavior",
+                        "evidence": ["a.py:1"],
+                        "confidence": 0.9,
+                    }
+                ]
+            }
+        )
+
+        artifacts = cursor_result_artifacts(task, "worker-codex", text, adapter="codex")
+
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(artifacts[0].type, ArtifactType.FINDING)
+        self.assertEqual(artifacts[0].payload["claim"], "behavior")
+
+    def test_ambiguous_flat_semantic_artifact_is_rejected(self) -> None:
+        from puppetmaster.adapters import cursor_result_artifacts
+
+        task = Task(
+            job_id="job",
+            role="codex-review",
+            instruction="inspect",
+            adapter="codex",
+            payload={},
+        )
+        text = json.dumps(
+            {
+                "artifacts": [
+                    {
+                        "risk": "breakage",
+                        "decision": "ship",
+                        "evidence": ["a.py:1"],
+                        "confidence": 0.9,
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(
+            cursor_result_artifacts(task, "worker-codex", text, adapter="codex"),
+            [],
+        )
+
+    def test_flat_semantic_inference_is_codex_scoped(self) -> None:
+        from puppetmaster.adapters import (
+            cursor_artifact_from_item,
+            cursor_result_artifacts,
+        )
+
+        task = Task(
+            job_id="job",
+            role="review",
+            instruction="inspect",
+            adapter="codex",
+            payload={},
+        )
+        item = {
+            "claim": "behavior",
+            "evidence": ["a.py:1"],
+            "confidence": 0.9,
+        }
+        text = json.dumps({"artifacts": [item]})
+
+        for adapter in ("cursor-sdk", "hermes", "openai"):
+            with self.subTest(adapter=adapter):
+                self.assertEqual(
+                    cursor_result_artifacts(
+                        task,
+                        f"worker-{adapter}",
+                        text,
+                        adapter=adapter,
+                    ),
+                    [],
+                )
+        self.assertIsNone(
+            cursor_artifact_from_item(
+                task,
+                "worker-agentic",
+                item,
+                adapter="agentic",
+            )
+        )
+
+    def test_codex_flat_semantic_item_requires_artifact_container(self) -> None:
+        from puppetmaster.adapters import cursor_result_artifacts
+
+        task = Task(
+            job_id="job",
+            role="codex-review",
+            instruction="inspect",
+            adapter="codex",
+            payload={},
+        )
+        text = json.dumps(
+            {
+                "decision": "ship",
+                "why": "tested",
+                "evidence": ["a.py:1"],
+                "confidence": 0.9,
+            }
+        )
+
+        self.assertEqual(
+            cursor_result_artifacts(task, "worker-codex", text, adapter="codex"),
+            [],
+        )
 
     def test_typed_artifact_with_nested_wrapper_dict_is_not_clobbered(self) -> None:
         """A typed item that also carries a nested finding/risk/decision dict
