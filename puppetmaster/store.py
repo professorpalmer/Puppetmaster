@@ -1361,8 +1361,14 @@ class SwarmStore:
     def _prepare_artifact_for_save(self, artifact: Artifact) -> Artifact:
         """Bound oversized payloads, validate schema, then stamp content hash."""
         from puppetmaster.artifact_bounds import prepare_artifact_for_persist
+        from puppetmaster.execution_provenance import (
+            stamp_execution_provenance_for_store,
+        )
 
-        prepared = prepare_artifact_for_persist(artifact, state_dir=self.root)
+        # Central save seam: truthful execution provenance on typed peer
+        # artifacts (all adapters). Additive / optional; never fabricates zeros.
+        stamped = stamp_execution_provenance_for_store(artifact, self)
+        prepared = prepare_artifact_for_persist(stamped, state_dir=self.root)
         prepared.validate()
         if prepared.sha256 is None:
             prepared = replace(prepared, sha256=self.artifact_hash(prepared))

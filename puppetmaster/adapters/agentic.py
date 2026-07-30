@@ -110,10 +110,10 @@ from ._prompts import (
     _IMPLEMENT_NOOP_NUDGE,
     _LENGTH_CONTINUATION_NUDGE,
     build_implement_prompt,
-    build_structured_prompt,
     prompt_with_memory,
     prompt_with_skills,
     split_prompt_messages,
+    structured_prompt_for_task,
     with_job_brief,
     with_report_contract,
 )
@@ -519,7 +519,11 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 prompt_with_memory(
                     facade("with_repo_census")(
                         with_job_brief(
-                            build_structured_prompt(base_prompt, final_message_note=True),
+                            structured_prompt_for_task(
+                                task,
+                                prompt=base_prompt,
+                                final_message_note=True,
+                            ),
                             task,
                         ),
                         str(cwd),

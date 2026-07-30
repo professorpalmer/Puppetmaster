@@ -32,9 +32,9 @@ from ._facade import facade
 from ._prompts import (
     _ANALYZE_JSON_ONLY_RETRY,
     build_implement_prompt,
-    build_structured_prompt,
     prompt_with_memory,
     prompt_with_skills,
+    structured_prompt_for_task,
     with_job_brief,
     with_report_contract,
 )
@@ -628,7 +628,11 @@ class HermesAdapter(CliWorkerAdapter):
                 prompt_with_memory(
                     facade("with_repo_census")(
                         with_job_brief(
-                            build_structured_prompt(base_prompt, final_message_note=True),
+                            structured_prompt_for_task(
+                                task,
+                                prompt=base_prompt,
+                                final_message_note=True,
+                            ),
                             task,
                         ),
                         cwd,

@@ -182,6 +182,13 @@ def merge_routing_payload(payload: dict, decision, extra_fields: Optional[dict] 
         "router_capability_needed": decision.capability_needed,
         "router_estimated_cost_usd": decision.estimated_cost_usd,
     }
+    # Billing is needed for truthful per-artifact cost provenance (plan →
+    # known $0 marginal; metered without a price stays unpriced/unknown).
+    billing = getattr(decision.model, "billing", None) or (payload or {}).get(
+        "billing"
+    )
+    if billing:
+        merged["billing"] = billing
     # Snapshot the effective allowlist at selection time so reroutes cannot
     # drift if ~/.pmharness/routing.json changes mid-job.
     if decision.allowed_model_ids is not None:
@@ -1378,12 +1385,33 @@ class Orchestrator:
         self._enforce_platform_lock(job, specs)
         tasks_by_role: dict[str, Task] = {}
         for spec in specs:
+            payload = dict(spec.payload or {})
+            # Optional acceptance_criteria: structured field wins; else parse an
+            # explicit "Acceptance criteria:" block. Instruction text is unchanged.
+            if "acceptance_criteria" not in payload:
+                try:
+                    from puppetmaster.acceptance_criteria import (
+                        normalize_acceptance_criteria,
+                        parse_acceptance_criteria_block,
+                    )
+
+                    structured = normalize_acceptance_criteria(
+                        payload.get("acceptance_criteria")
+                    )
+                    if not structured:
+                        structured = parse_acceptance_criteria_block(
+                            spec.instruction or ""
+                        )
+                    if structured:
+                        payload["acceptance_criteria"] = structured
+                except Exception:
+                    pass
             task = Task(
                 job_id=job.id,
                 role=spec.role,
                 instruction=spec.instruction,
                 adapter=spec.adapter,
-                payload=spec.payload,
+                payload=payload,
             )
             tasks_by_role[spec.role] = task
 

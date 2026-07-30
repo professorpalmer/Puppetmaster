@@ -41,13 +41,25 @@ SWARM_ANALYSIS_ADAPTERS: tuple[str, ...] = (
 
 
 def analysis_swarm_prompt(*, role: str, goal: str) -> str:
-    return (
+    """Build the analysis worker instruction.
+
+    Preserves an explicit ``Acceptance criteria:`` block from ``goal`` so
+    harness validation requirements survive Role/Goal wrapping.
+    """
+    from puppetmaster.acceptance_criteria import (
+        ensure_acceptance_criteria_in_text,
+        parse_acceptance_criteria_block,
+    )
+
+    criteria = parse_acceptance_criteria_block(goal or "")
+    body = (
         f"Role: {role}\n"
         f"Goal: {goal}\n\n"
         "Return structured findings with concrete file/function evidence. "
         "Do not modify files unless the user explicitly requested implementation. "
         "Return only Puppetmaster artifact JSON with an artifacts array."
     )
+    return ensure_acceptance_criteria_in_text(body, criteria)
 
 
 def build_analysis_swarm_specs(
@@ -90,6 +102,14 @@ def build_analysis_swarm_specs(
             "timeout_seconds": int(timeout_seconds),
             **ANALYSIS_NO_EDIT_PAYLOAD,
         }
+        try:
+            from puppetmaster.acceptance_criteria import parse_acceptance_criteria_block
+
+            criteria = parse_acceptance_criteria_block(goal or "")
+            if criteria:
+                payload["acceptance_criteria"] = criteria
+        except Exception:
+            pass
         if adapter == "cursor":
             if explicit_model:
                 from puppetmaster.model_registry import apply_cursor_model_pin

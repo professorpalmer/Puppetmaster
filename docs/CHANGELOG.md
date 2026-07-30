@@ -1,3 +1,28 @@
+## v1.21.5
+
+**Deterministic quality control: contradiction conflicts, execution provenance, and acceptance criteria.**
+
+Stitched summaries and stored artifacts now surface honest disagreements, per-artifact
+execution truth, and explicit acceptance-criteria status without breaking existing
+file, SQLite, or MCP contracts.
+
+- **Contradiction conflicts.** Stitch-time detection removes high-confidence
+  contradictory peers from ordinary Findings and surfaces them as visible
+  Conflicts with artifact ids, claims, evidence, downgraded confidence, and
+  source-verification status. Path:line evidence is checked only under the
+  resolved repo root (source-safe; escapes fail closed).
+- **Execution provenance.** FINDING / RISK / DECISION / VERIFICATION artifacts
+  carry additive ``payload.execution_provenance`` (adapter, router model,
+  tokens/cost when known). Missing usage or cost stays explicitly unknown ?
+  never a fabricated zero.
+- **Acceptance criteria.** Explicit ``Acceptance criteria:`` blocks (or structured
+  task fields) are preserved through adapter prompt assembly and re-anchored after
+  job-brief / memory / CodeGraph inserts. Verification artifacts report
+  per-criterion status; omitted criteria stay ``unknown`` / ``not_reported``.
+- **Backwards compatibility.** Additive payload fields only; file + SQLite stores
+  and MCP tool shapes unchanged. ROUTING / PATCH / GATE artifacts untouched.
+- **Tests.** ``tests/test_quality_control.py``.
+
 ## v1.21.4
 
 **Collision-proof centralized run IDs for detached MCP launches.**

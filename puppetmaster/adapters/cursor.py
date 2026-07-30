@@ -25,8 +25,8 @@ from ._base import (
 from ._facade import facade
 from ._prompts import (
     build_implement_prompt,
-    build_structured_prompt,
     prompt_with_memory,
+    structured_prompt_for_task,
     with_job_brief,
 )
 from ._streaming import (
@@ -286,7 +286,10 @@ class CursorAdapter(CliWorkerAdapter):
         prompt, codegraph_used = facade("enrich_prompt_with_codegraph")(
             prompt_with_memory(
                 facade("with_repo_census")(
-                    with_job_brief(build_structured_prompt(base_prompt), task),
+                    with_job_brief(
+                        structured_prompt_for_task(task, prompt=base_prompt),
+                        task,
+                    ),
                     cwd,
                 ),
                 task,

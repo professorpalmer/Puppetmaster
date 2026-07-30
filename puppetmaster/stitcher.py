@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from pathlib import Path
 from textwrap import indent
 from typing import Optional
 
+from puppetmaster.claim_conflicts import (
+    conflicting_artifact_ids,
+    detect_contradictory_peers,
+)
 from puppetmaster.models import Artifact, ArtifactType, MemoryRecord
 from puppetmaster.store import SwarmStore, group_by_type
 
@@ -66,7 +71,13 @@ class Stitcher:
         memories = self._promote_memories(artifacts)
         self.store.promote_memories(memories)
 
-        summary = self._render_summary("Puppetmaster Stitched Summary", job.goal, artifacts, memories)
+        summary = self._render_summary(
+            "Puppetmaster Stitched Summary",
+            job.goal,
+            artifacts,
+            memories,
+            cwd=self._cwd_for_job(job_id),
+        )
         self.store.write_summary(job_id, "stitched.md", summary)
         return summary
 
@@ -75,7 +86,27 @@ class Stitcher:
         job = self.store.get_job(job_id)
         artifacts = self.store.list_artifacts(job_id)
         memories = self._promote_memories(artifacts)
-        return self._render_summary("Puppetmaster Live Summary", job.goal, artifacts, memories)
+        return self._render_summary(
+            "Puppetmaster Live Summary",
+            job.goal,
+            artifacts,
+            memories,
+            cwd=self._cwd_for_job(job_id),
+        )
+
+    def _cwd_for_job(self, job_id: str) -> Optional[Path]:
+        """Best-effort workspace root from task payloads (path:line resolve only)."""
+        try:
+            for task in self.store.list_tasks(job_id):
+                payload = getattr(task, "payload", None) or {}
+                cwd = payload.get("cwd")
+                if cwd:
+                    path = Path(str(cwd))
+                    if path.is_dir():
+                        return path
+        except Exception:
+            return None
+        return None
 
     def _promote_memories(self, artifacts: list[Artifact]) -> list[MemoryRecord]:
         promoted: list[MemoryRecord] = []
@@ -108,9 +139,22 @@ class Stitcher:
         goal: str,
         artifacts: list[Artifact],
         memories: list[MemoryRecord],
+        *,
+        cwd: Optional[Path] = None,
     ) -> str:
         grouped = group_by_type(artifacts)
         counts = Counter(str(artifact.type) for artifact in artifacts)
+
+        # Contradictory peers are detected before dedupe/render so incompatible
+        # high-confidence findings leave ordinary Findings and surface under
+        # Conflicts with downgraded confidence + source-verification status.
+        conflicts = detect_contradictory_peers(artifacts, cwd=cwd)
+        conflict_ids = conflicting_artifact_ids(conflicts)
+        ordinary_findings = [
+            artifact
+            for artifact in grouped.get(str(ArtifactType.FINDING), [])
+            if artifact.id not in conflict_ids
+        ]
 
         lines = [
             f"# {title}",
@@ -133,10 +177,15 @@ class Stitcher:
 
         lines.extend(["", "## Findings"])
         lines.extend(
-            self._bullet_payloads(
-                grouped.get(str(ArtifactType.FINDING), []), "claim", dedupe=True
-            )
+            self._bullet_payloads(ordinary_findings, "claim", dedupe=True)
         )
+
+        lines.extend(["", "## Conflicts"])
+        if conflicts:
+            for conflict in conflicts:
+                lines.extend(conflict.to_summary_lines())
+        else:
+            lines.append("- None")
 
         lines.extend(["", "## Decisions"])
         lines.extend(

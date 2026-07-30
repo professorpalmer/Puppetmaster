@@ -121,7 +121,27 @@ def split_prompt_messages(prompt: str) -> tuple[str, str]:
         return "", prompt
 
 
-def build_structured_prompt(prompt: str, *, final_message_note: bool = False) -> str:
+def build_structured_prompt(
+    prompt: str,
+    *,
+    final_message_note: bool = False,
+    acceptance_criteria: object = None,
+) -> str:
+    from puppetmaster.acceptance_criteria import (
+        ensure_acceptance_criteria_in_text,
+        normalize_acceptance_criteria,
+        parse_acceptance_criteria_block,
+    )
+
+    criteria = normalize_acceptance_criteria(acceptance_criteria)
+    if not criteria:
+        criteria = parse_acceptance_criteria_block(prompt or "")
+    task_body = (
+        ensure_acceptance_criteria_in_text(prompt or "", criteria)
+        if criteria
+        else (prompt or "")
+    )
+
     lines: list[str] = []
     if final_message_note:
         # Primary contract: finish by CALLING the submit_findings tool. The
@@ -154,8 +174,33 @@ def build_structured_prompt(prompt: str, *, final_message_note: bool = False) ->
             "You may use your read/search tools to inspect the code along the way; "
             "just make sure you FINISH by calling `submit_findings`."
         )
-    lines.extend(["", TASK_INSTRUCTION_HEADER, prompt])
+    lines.extend(["", TASK_INSTRUCTION_HEADER, task_body])
     return "\n".join(lines)
+
+
+def structured_prompt_for_task(
+    task: Task,
+    *,
+    final_message_note: bool = False,
+    prompt: object = None,
+) -> str:
+    """Build the analyze artifact-contract prompt with canonical criteria.
+
+    Threads ``task.payload["acceptance_criteria"]`` (or the instruction block)
+    into :func:`build_structured_prompt` so no adapter path depends only on a
+    later re-anchor pass.
+    """
+    from puppetmaster.acceptance_criteria import acceptance_criteria_for_task
+
+    if prompt is None:
+        base = task.payload.get("prompt") or task.instruction
+    else:
+        base = prompt
+    return build_structured_prompt(
+        str(base or ""),
+        final_message_note=final_message_note,
+        acceptance_criteria=acceptance_criteria_for_task(task),
+    )
 
 
 _HASHLINE_EDIT_RULES = (
@@ -287,6 +332,38 @@ def with_repo_census(prompt: str, cwd: Union[Path, str, None]) -> str:
         return prompt
 
 
+def _reanchor_acceptance_criteria(prompt: str, task: Task) -> str:
+    """Keep explicit acceptance criteria after ``Your task:`` through enrichment."""
+    try:
+        from puppetmaster.acceptance_criteria import (
+            acceptance_criteria_for_task,
+            ensure_acceptance_criteria_in_text,
+            format_acceptance_criteria_block,
+        )
+
+        criteria = acceptance_criteria_for_task(task)
+        if not criteria:
+            return prompt
+        anchor = _task_instruction_index(prompt)
+        if anchor < 0:
+            return ensure_acceptance_criteria_in_text(prompt, criteria)
+        before = prompt[:anchor]
+        after = prompt[anchor:]
+        header = TASK_INSTRUCTION_HEADER
+        body = after[len(header) :]
+        if body.startswith("\n"):
+            body = body[1:]
+        body = ensure_acceptance_criteria_in_text(body, criteria)
+        # If structured criteria exist but the free-text block used different
+        # wording, still guarantee the canonical block is present.
+        block = format_acceptance_criteria_block(criteria)
+        if block and block not in body:
+            body = ensure_acceptance_criteria_in_text(body, criteria)
+        return before + header + "\n" + body
+    except Exception:
+        return prompt
+
+
 def with_job_brief(prompt: str, task: Task) -> str:
     """Inject the job-stable shared CodeGraph / repo brief before the task.
 
@@ -306,7 +383,8 @@ def with_job_brief(prompt: str, task: Task) -> str:
             prompt = insert_before_task(prompt, section.strip("\n"))
     except Exception:
         pass
-    return with_prewalk_plan(prompt, task)
+    prompt = with_prewalk_plan(prompt, task)
+    return _reanchor_acceptance_criteria(prompt, task)
 
 
 def _open_store_for_task(task: Task):
@@ -514,9 +592,9 @@ def _memory_section(task: Task) -> str:
 def prompt_with_memory(prompt: str, task: Task) -> str:
     try:
         section = _memory_section(task)
-        if not section:
-            return prompt
-        return insert_before_task(prompt, section)
+        if section:
+            prompt = insert_before_task(prompt, section)
+        return _reanchor_acceptance_criteria(prompt, task)
     except Exception:
         return prompt
 

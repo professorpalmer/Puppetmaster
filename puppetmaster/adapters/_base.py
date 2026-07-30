@@ -483,7 +483,7 @@ def verification_artifact(
         body["evaluator_slot"] = evaluator_slot
     if evaluator_version:
         body["evaluator_version"] = evaluator_version
-    return Artifact(
+    artifact = Artifact(
         job_id=task.job_id,
         task_id=task.id,
         type=ArtifactType.VERIFICATION,
@@ -492,6 +492,33 @@ def verification_artifact(
         evidence=evidence,
         payload=body,
     )
+    # Stamp provenance and criteria separately so a criteria failure cannot
+    # silently hide a provenance failure on the chat hot path.
+    try:
+        from puppetmaster.execution_provenance import stamp_execution_provenance
+
+        artifact = stamp_execution_provenance(artifact, task=task)
+    except Exception as exc:
+        from dataclasses import replace as _replace
+
+        from puppetmaster.execution_provenance import (
+            PROVENANCE_KEY,
+            unknown_provenance_error,
+        )
+
+        fail_closed = dict(artifact.payload or {})
+        fail_closed[PROVENANCE_KEY] = unknown_provenance_error(exc)
+        artifact = _replace(artifact, payload=fail_closed, sha256=None)
+    try:
+        from puppetmaster.acceptance_criteria import (
+            stamp_verification_acceptance_criteria,
+        )
+
+        artifact = stamp_verification_acceptance_criteria(artifact, task)
+    except Exception:
+        # Criteria stamping must never block a verification row.
+        pass
+    return artifact
 
 
 def command_parts(command: object) -> list[str]:

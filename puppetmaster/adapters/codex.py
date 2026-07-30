@@ -23,8 +23,8 @@ from ._base import (
 from ._git import git_snapshot
 from ._facade import facade
 from ._prompts import (
-    build_structured_prompt,
     prompt_with_memory,
+    structured_prompt_for_task,
     with_job_brief,
 )
 from ._streaming import (
@@ -107,7 +107,11 @@ class CodexAdapter(CliWorkerAdapter):
             prompt_with_memory(
                 facade("with_repo_census")(
                     with_job_brief(
-                        build_structured_prompt(base_prompt, final_message_note=True),
+                        structured_prompt_for_task(
+                            task,
+                            prompt=base_prompt,
+                            final_message_note=True,
+                        ),
                         task,
                     ),
                     cwd,
