@@ -938,12 +938,45 @@ def build_parser() -> argparse.ArgumentParser:
 
     artifacts = subcommands.add_parser("artifacts", help="Print artifacts for a job as JSON.")
     artifacts.add_argument("job_id")
+    artifacts.add_argument(
+        "--refs",
+        action="store_true",
+        help=(
+            "Emit compact artifact refs (id/type/task_id/sha256/confidence/"
+            "created_at, concise claim/check/decision, evidence summary, "
+            "validation metadata) instead of full payloads. Default remains "
+            "full artifact JSON for backward compatibility."
+        ),
+    )
 
     graph = subcommands.add_parser(
         "graph",
         help="Print the read-only execution/provenance graph (nodes + edges) for a job as JSON.",
     )
     graph.add_argument("job_id")
+
+    reset_subgraph = subcommands.add_parser(
+        "reset-subgraph",
+        help=(
+            "Lease-safe selective rerun: reset selected tasks (and their consumer "
+            "closure) to QUEUED/BLOCKED while retaining upstream work and all "
+            "artifacts. Prior produced outputs are labeled superseded (not deleted)."
+        ),
+    )
+    reset_subgraph.add_argument("job_id")
+    reset_subgraph.add_argument(
+        "--task",
+        action="append",
+        dest="task_ids",
+        required=True,
+        metavar="TASK_ID",
+        help="Task id to reset (repeatable). Downstream consumers are included by default.",
+    )
+    reset_subgraph.add_argument(
+        "--no-descendants",
+        action="store_true",
+        help="Reset only the named tasks; do not include the consumer closure.",
+    )
 
     memory = subcommands.add_parser("memory", help="List or prune promoted memory.")
     memory.add_argument("--json", action="store_true", help="Emit full JSON dump.")

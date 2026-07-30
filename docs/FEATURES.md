@@ -49,6 +49,7 @@ Five production adapters live plus the keys-only `agentic` standalone worker; el
 | Plan-then-cheap prewalk | `puppetmaster prewalk "<goal>"` / `puppetmaster_start_prewalk`: quality-routed read-only plan worker, then cheap edit-capable implement (`depends_on_roles`); honest ROUTING per stage — `puppetmaster savings` counts both legs (plan quality as deliberate spend, implement cheap as savings) without double-count |
 | Swarm role routing defaults | Built-in analysis roles stamp per-role `routing_policy` under `auto_route` (explore/test → cheap, architect/plan → balanced, redteam/review/audit → quality) — no frontier model pins; MCP-generated swarms share the same map |
 | Durable execution graph (v1.20.0+) | Typed provenance edges (`depends_on` / `produces` / `consumes`), SQLite v1→v2 migration + file-store lazy materialization, plan→implement→verify prewalk with edge handoff, hard-failure propagation, targeted reruns; read-only `puppetmaster graph` / `puppetmaster_job_graph` |
+| Dependency-aware reusable validation (Unreleased) | Deterministic validation fingerprint (HEAD + scoped source bytes + rules/evaluator digest); additive `payload.validation` (`fresh`/`reused`/`stale`/`superseded`); fingerprint lookup + `record_derived_from`; CLI/MCP `reset-subgraph` with superseded labeling; `artifacts --refs` / MCP `refs=true` compact refs |
 | Cross-adapter model pins (v1.20.0+) | Explicit `--model` / MCP `model` pins apply on non-Cursor adapters (not Cursor-only); ambiguous Cursor pins return structured preflight/blocked errors |
 | Agentic pin defaults + max-turns submit (v1.20.8+) | Bare agentic `--model` merges registry `payload_defaults` (e.g. `provider=openrouter`); analyze grants one forced `submit_findings` after max_turns; empty silent runs stay degraded |
 | Model allowlists + bounded reroute (v1.20.2+) | CLI/MCP jobs can constrain routing to explicit model identities; empty allowlists fail closed, disabled catalog overlays remain disabled, and generic Cursor `status:error` gets at most one permitted same-adapter alternate |
@@ -63,12 +64,15 @@ Jobs remain a task DAG scheduled by `Task.depends_on`. Alongside that scheduling
 | `depends_on` | Task → task scheduling edge (kept in sync with `Task.depends_on`) |
 | `produces` | Task → artifact (emitted when an artifact is saved) |
 | `consumes` | Task → artifact (recorded when a worker resolves upstream outputs via edges) |
+| `derived_from` | Artifact → artifact lineage when a finding/decision/verification is reused (`record_derived_from`) |
 
 **Persistence.** SQLite schema version 2 adds a `graph_edges` table and migrates v1 databases on open (eager backfill of `depends_on` + `produces`). The file store lazy-materializes the same edges on first `job_graph` / ensure pass, with a crash-recoverable journal for `consumes` batches.
 
-**Runtime.** Prewalk is plan → implement → verify: implement consumes plan artifacts via edges, verify consumes implement outputs the same way. Hard (non-recoverable) dependency failures cascade onto blocked descendants as terminal FAILED. Targeted subgraph reset clears selected tasks (and optionally their consumer closure) for rerun while retaining completed upstream work, artifacts, and edges — and refuses the whole reset if any selected task still holds an active (non-expired RUNNING) lease.
+**Runtime.** Prewalk is plan → implement → verify: implement consumes plan artifacts via edges, verify consumes implement outputs the same way. Hard (non-recoverable) dependency failures cascade onto blocked descendants as terminal FAILED. Targeted subgraph reset clears selected tasks (and optionally their consumer closure) for rerun while retaining completed upstream work, artifacts, and edges — and refuses the whole reset if any selected task still holds an active (non-expired RUNNING) lease. Reset also stamps prior produced outputs with additive `payload.validation.status=superseded` so they are not presented as fresh.
 
-**Introspection.** Read-only snapshots: CLI `puppetmaster graph <job_id>` and MCP `puppetmaster_job_graph`. No hosted or multi-user graph service is implied; this is local durable state for a single operator runtime.
+**Reusable validation.** `puppetmaster.validation.compute_validation_fingerprint` builds a reuse key from HEAD + scoped working-tree bytes + rules/evaluator digests (separate from `Artifact.sha256`). Stores look up reusable FINDING/VERIFICATION/DECISION artifacts via `lookup_artifacts_by_validation_fingerprint` (bounded; excludes stale/superseded).
+
+**Introspection.** Read-only snapshots: CLI `puppetmaster graph <job_id>` and MCP `puppetmaster_job_graph`. Mutating selective reset: CLI `puppetmaster reset-subgraph <job_id> --task <id>...` and MCP `puppetmaster_reset_subgraph`. Compact artifact listing: CLI `artifacts --refs` / MCP `refs=true`. No hosted or multi-user graph service is implied; this is local durable state for a single operator runtime.
 
 ## Status
 

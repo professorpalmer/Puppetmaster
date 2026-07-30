@@ -1,3 +1,39 @@
+## v1.21.3
+
+**Dependency-aware reusable validation protocol (additive core).**
+
+Minimal shared contract so hosts (e.g. Marionette) can reuse completed findings
+honestly without overloading ``Artifact.sha256`` or inventing a parallel store.
+
+- **Validation fingerprint.** ``puppetmaster.validation.compute_validation_fingerprint``
+  binds repo ``HEAD``, scoped working-tree source bytes (dirty/untracked included
+  when scoped), and evaluator/rules digests. Scoped/rules paths are confined to
+  the resolved repo root (absolute / ``..`` / symlink escapes fail closed; outside
+  bytes are never hashed). Missing/unreadable inputs fail closed with explicit
+  path lists. ``Artifact.sha256`` remains content integrity only.
+- **``payload.validation`` convention.** Optional additive block:
+  ``fingerprint``, ``status`` (``fresh``|``reused``|``stale``|``superseded``),
+  repo/head/scope metadata, and ``source_artifact_ids`` when reused. Older
+  artifacts without the block still load.
+- **Store helpers.** ``lookup_artifacts_by_validation_fingerprint`` (bounded scan;
+  excludes stale/superseded/non-substantive) and idempotent
+  ``record_derived_from`` materializing ``GraphEdgeType.DERIVED_FROM`` with
+  same-job ownership checks. File + SQLite parity; no schema-breaking migration.
+- **Selective reset surface.** CLI ``reset-subgraph`` and MCP
+  ``puppetmaster_reset_subgraph`` expose lease-safe ``reset_subgraph``. Active
+  leases refuse with ``ActiveTaskLeaseError`` / ``isError``. Prior produced
+  outputs are labeled ``superseded`` (audit history retained; nothing deleted).
+  File + SQLite emit one canonical ``subgraph.reset`` including
+  ``superseded_artifact_ids``; SQLite supersession commits in the same
+  transaction as the task reset. CLI/MCP return surfaces share
+  ``superseded_artifact_ids``.
+- **Compact artifact refs.** CLI ``artifacts --refs`` and MCP
+  ``puppetmaster_artifacts`` ``refs=true`` return small stable records
+  (id/type/task_id/sha256/confidence/created_at, concise claim/check/decision,
+  evidence summary with bounded/truncated items, validation metadata without
+  absolute ``repo_root``). Default full output unchanged.
+- **Tests.** ``tests/test_validation_protocol.py``.
+
 ## v1.21.2
 
 **Analyze workers can inspect origin/* when the checkout trails upstream.**

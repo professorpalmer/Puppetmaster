@@ -1328,10 +1328,15 @@ def _main(argv: Optional[list[str]] = None) -> int:
 
     if args.command == "artifacts":
         from puppetmaster import reads_log
+        from puppetmaster.validation import compact_artifact_ref
 
         reads_log.record_read("artifacts", caller="cli")
-        artifacts = [artifact.__dict__ for artifact in store.list_artifacts(args.job_id)]
-        print(json.dumps(artifacts, indent=2, default=str))
+        artifacts = store.list_artifacts(args.job_id)
+        if getattr(args, "refs", False):
+            payload = [compact_artifact_ref(artifact) for artifact in artifacts]
+        else:
+            payload = [artifact.__dict__ for artifact in artifacts]
+        print(json.dumps(payload, indent=2, default=str))
         return 0
 
     if args.command == "graph":
@@ -1339,6 +1344,41 @@ def _main(argv: Optional[list[str]] = None) -> int:
 
         reads_log.record_read("graph", caller="cli")
         print(json.dumps(store.job_graph(args.job_id), indent=2, default=str))
+        return 0
+
+    if args.command == "reset-subgraph":
+        from puppetmaster.store import ActiveTaskLeaseError
+
+        task_ids = list(getattr(args, "task_ids", None) or [])
+        if not task_ids:
+            print("error: pass at least one --task", file=sys.stderr)
+            return 1
+        try:
+            reset = store.reset_subgraph(
+                args.job_id,
+                task_ids,
+                include_descendants=not getattr(args, "no_descendants", False),
+            )
+        except ActiveTaskLeaseError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        body = {
+            "job_id": args.job_id,
+            "reset_count": len(reset),
+            "tasks": [
+                {
+                    "id": task.id,
+                    "role": task.role,
+                    "status": str(task.status),
+                    "attempts": task.attempts,
+                }
+                for task in reset
+            ],
+            "superseded_artifact_ids": list(
+                getattr(reset, "superseded_artifact_ids", []) or []
+            ),
+        }
+        print(json.dumps(body, indent=2))
         return 0
 
     if args.command == "memory":

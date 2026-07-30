@@ -1296,6 +1296,81 @@ class SqliteAtomicResetAndDoctorTests(unittest.TestCase):
             )
             self.assertEqual(store.get_task_by_id(verify.id).attempts, 5)
 
+    def test_sqlite_reset_supersession_atomic_with_canonical_event(self) -> None:
+        from puppetmaster.validation import validation_status_of
+
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            job = store.create_job("atomic supersede")
+            implement = Task(
+                job_id=job.id,
+                role=IMPLEMENT_ROLE,
+                instruction="implement",
+                status=TaskStatus.COMPLETE,
+                attempts=2,
+            )
+            store.save_task(implement)
+            artifact = Artifact(
+                job_id=job.id,
+                task_id=implement.id,
+                type=ArtifactType.FINDING,
+                created_by="test",
+                payload={
+                    "claim": "fresh",
+                    "validation": {"fingerprint": "fp", "status": "fresh"},
+                },
+                confidence=0.9,
+                evidence=["src/a.py"],
+            )
+            store.save_artifact(artifact)
+
+            real_session = store._session
+            from contextlib import contextmanager
+
+            @contextmanager
+            def boom_after_writes():
+                with real_session() as connection:
+                    yield connection
+                    raise sqlite3.OperationalError("simulated busy/crash")
+
+            with mock.patch.object(store, "_session", boom_after_writes):
+                with self.assertRaises(sqlite3.OperationalError):
+                    store.reset_subgraph(job.id, [implement.id])
+            # Task + supersession must roll back together.
+            self.assertEqual(
+                store.get_task_by_id(implement.id).status, TaskStatus.COMPLETE
+            )
+            self.assertEqual(
+                validation_status_of(
+                    store.get_artifacts_by_ids(job.id, [artifact.id])[artifact.id]
+                ),
+                "fresh",
+            )
+
+            result = store.reset_subgraph(job.id, [implement.id])
+            self.assertEqual(result.superseded_artifact_ids, [artifact.id])
+            self.assertEqual(
+                validation_status_of(
+                    store.get_artifacts_by_ids(job.id, [artifact.id])[artifact.id]
+                ),
+                "superseded",
+            )
+            events = [
+                event
+                for event in store.read_events(job.id)
+                if event.get("event") == "subgraph.reset"
+            ]
+            self.assertTrue(events)
+            self.assertEqual(
+                events[-1].get("payload", {}).get("superseded_artifact_ids"),
+                [artifact.id],
+            )
+            self.assertNotIn(
+                "subgraph.reset.superseded",
+                {event.get("event") for event in store.read_events(job.id)},
+            )
+
     def test_doctor_warns_on_schema_version_mismatch(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

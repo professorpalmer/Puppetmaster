@@ -14,6 +14,7 @@ from typing import Any, Iterable, Optional, Union
 from puppetmaster.models import (
     AgentRun,
     Artifact,
+    ArtifactType,
     GraphEdge,
     GraphEdgeType,
     GraphNodeKind,
@@ -60,6 +61,27 @@ class ActiveTaskLeaseError(RuntimeError):
         super().__init__(
             f"reset_subgraph refused: active lease on task(s) {joined}"
         )
+
+
+class ResetSubgraphResult(list):
+    """Task list from ``reset_subgraph`` plus superseded artifact ids.
+
+    Subclasses ``list`` so existing callers that iterate / index the return
+    value keep working; ``superseded_artifact_ids`` carries the canonical
+    ids stamped in the same reset (also on the ``subgraph.reset`` event).
+    """
+
+    def __init__(
+        self,
+        tasks: Iterable[Task],
+        superseded_artifact_ids: Optional[Iterable[str]] = None,
+    ) -> None:
+        super().__init__(list(tasks))
+        self.superseded_artifact_ids = [
+            str(artifact_id)
+            for artifact_id in list(superseded_artifact_ids or [])
+            if artifact_id
+        ]
 _RECENCY_FULL_DAYS = 7
 _RECENCY_FLOOR = 0.5
 _RECENCY_FLOOR_DAYS = 56
@@ -926,6 +948,175 @@ class SwarmStore:
             _retry_on_windows_lock(journal_path.unlink)
         return result
 
+    def record_derived_from(
+        self,
+        job_id: str,
+        source_artifact_id: str,
+        derived_artifact_id: str,
+        *,
+        meta: Optional[dict[str, Any]] = None,
+    ) -> GraphEdge:
+        """Idempotent artifact→artifact ``DERIVED_FROM`` edge (same-job only).
+
+        ``derived`` is modeled as *from* and ``source`` as *to*, matching
+        ``make_graph_edge`` identity tests: the derived artifact is derived from
+        the source. Both artifacts must already belong to ``job_id``.
+        """
+        if not source_artifact_id or not derived_artifact_id:
+            raise ValueError("source_artifact_id and derived_artifact_id are required")
+        if source_artifact_id == derived_artifact_id:
+            raise ValueError("derived artifact cannot be derived from itself")
+        by_id = self.get_artifacts_by_ids(
+            job_id, [source_artifact_id, derived_artifact_id]
+        )
+        if source_artifact_id not in by_id:
+            raise ValueError(
+                f"source artifact {source_artifact_id!r} not found in job {job_id!r}"
+            )
+        if derived_artifact_id not in by_id:
+            raise ValueError(
+                f"derived artifact {derived_artifact_id!r} not found in job {job_id!r}"
+            )
+        return self.upsert_edge(
+            make_graph_edge(
+                job_id=job_id,
+                type=GraphEdgeType.DERIVED_FROM,
+                from_kind=GraphNodeKind.ARTIFACT,
+                from_id=derived_artifact_id,
+                to_kind=GraphNodeKind.ARTIFACT,
+                to_id=source_artifact_id,
+                meta=meta,
+            )
+        )
+
+    def prepare_superseded_artifacts(
+        self, job_id: str, task_ids: Iterable[str]
+    ) -> list[Artifact]:
+        """Return artifact copies stamped ``superseded`` (not persisted).
+
+        Preserves audit history (no artifact deletion). Additive when a
+        validation block was absent. Idempotent for already-stale/superseded
+        artifacts (those are omitted from the returned list).
+        """
+        from puppetmaster.validation import (
+            validation_status_of,
+            with_validation_status,
+        )
+
+        selected = {task_id for task_id in task_ids if task_id}
+        if not selected:
+            return []
+        artifact_ids: list[str] = []
+        for task_id in selected:
+            for edge in self.list_edges(
+                job_id,
+                edge_type=GraphEdgeType.PRODUCES,
+                from_id=task_id,
+                from_kind=GraphNodeKind.TASK,
+                to_kind=GraphNodeKind.ARTIFACT,
+            ):
+                artifact_ids.append(edge.to_id)
+        if not artifact_ids:
+            for artifact in self.list_artifacts(job_id):
+                if artifact.task_id in selected:
+                    artifact_ids.append(artifact.id)
+        by_id = self.get_artifacts_by_ids(job_id, artifact_ids)
+        prepared: list[Artifact] = []
+        for artifact_id in dict.fromkeys(artifact_ids):
+            artifact = by_id.get(artifact_id)
+            if artifact is None:
+                continue
+            status = validation_status_of(artifact)
+            if status in {"stale", "superseded"}:
+                continue
+            validation = (getattr(artifact, "payload", None) or {}).get("validation")
+            if isinstance(validation, dict) and validation.get("generation") is not None:
+                try:
+                    generation = int(validation["generation"]) + 1
+                except (TypeError, ValueError):
+                    generation = 1
+            else:
+                generation = 1
+            prepared.append(
+                with_validation_status(
+                    artifact, "superseded", generation=generation
+                )
+            )
+        return prepared
+
+    def mark_produced_artifacts_superseded(
+        self, job_id: str, task_ids: Iterable[str]
+    ) -> list[str]:
+        """Persist ``payload.validation.status=superseded`` on produced artifacts.
+
+        Returns the artifact ids that were updated.
+        """
+        prepared = self.prepare_superseded_artifacts(job_id, task_ids)
+        for artifact in prepared:
+            self.save_artifact(artifact)
+        return [artifact.id for artifact in prepared]
+
+    def lookup_artifacts_by_validation_fingerprint(
+        self,
+        fingerprint: str,
+        *,
+        types: Optional[Iterable[Union[ArtifactType, str]]] = None,
+        job_ids: Optional[Iterable[str]] = None,
+        include_statuses: Optional[Iterable[str]] = None,
+        limit: int = 256,
+    ) -> list[Artifact]:
+        """Fingerprint-aware lookup of reusable substantive artifacts.
+
+        Scans completed FINDING/VERIFICATION/DECISION artifacts (by default)
+        for a matching ``payload.validation.fingerprint`` with status
+        ``fresh`` or ``reused``. Excludes ``stale`` / ``superseded`` and
+        unlabeled legacy artifacts. Bounded by ``limit`` (default 256); no
+        schema migration — walks typed indexes / job artifacts.
+        """
+        from puppetmaster.validation import (
+            DEFAULT_LOOKUP_LIMIT,
+            SUBSTANTIVE_VALIDATION_TYPES,
+            filter_artifacts_by_validation_fingerprint,
+        )
+
+        wanted = str(fingerprint or "").strip()
+        if not wanted:
+            return []
+        bound = DEFAULT_LOOKUP_LIMIT if limit is None else max(0, int(limit))
+        if bound == 0:
+            return []
+        type_list = (
+            [str(item) for item in types]
+            if types is not None
+            else [str(item) for item in SUBSTANTIVE_VALIDATION_TYPES]
+        )
+        if job_ids is not None:
+            jobs_to_scan = [job_id for job_id in dict.fromkeys(job_ids) if job_id]
+        else:
+            jobs = self.list_jobs()
+            jobs_to_scan = [
+                job.id
+                for job in sorted(jobs, key=lambda item: item.created_at, reverse=True)
+            ]
+        collected: list[Artifact] = []
+        for job_id in jobs_to_scan:
+            if len(collected) >= bound:
+                break
+            batch: list[Artifact] = []
+            for artifact_type in type_list:
+                batch.extend(
+                    self.list_artifacts_by_type(artifact_type, job_ids=[job_id])
+                )
+            matched = filter_artifacts_by_validation_fingerprint(
+                batch,
+                wanted,
+                types=type_list,
+                include_statuses=include_statuses,
+                limit=bound - len(collected),
+            )
+            collected.extend(matched)
+        return collected[:bound]
+
     def resolve_artifacts_via_edges(
         self,
         task: Task,
@@ -1080,13 +1271,16 @@ class SwarmStore:
         task_ids: Iterable[str],
         *,
         include_descendants: bool = True,
-    ) -> list[Task]:
+    ) -> ResetSubgraphResult:
         """Idempotent targeted rerun reset for selected (downstream) tasks.
 
         Clears lease/completion state and ``attempts`` for the selected set
         (and optionally their consumer closure), then re-derives QUEUED/BLOCKED
         from ``depends_on``. Completed upstream tasks, artifacts, and edges are
-        retained.
+        retained. Produced outputs are labeled ``superseded`` (audit retained).
+
+        Emits one canonical ``subgraph.reset`` event whose payload includes
+        ``superseded_artifact_ids``.
 
         Refuses the whole reset when any selected task still holds an active
         (non-expired RUNNING) lease, so a live worker cannot be fenced into
@@ -1098,7 +1292,7 @@ class SwarmStore:
             else {task_id for task_id in task_ids if task_id}
         )
         if not selected:
-            return []
+            return ResetSubgraphResult([], [])
         tasks = self.list_tasks(job_id)
         task_map = {task.id: task for task in tasks}
         active = [
@@ -1138,12 +1332,17 @@ class SwarmStore:
                 finalized.append(queued)
             else:
                 finalized.append(current)
+        superseded = self.mark_produced_artifacts_superseded(job_id, selected)
         self.emit(
             job_id,
             "subgraph.reset",
-            {"task_ids": sorted(selected), "reset_count": len(finalized)},
+            {
+                "task_ids": sorted(selected),
+                "reset_count": len(finalized),
+                "superseded_artifact_ids": superseded,
+            },
         )
-        return finalized
+        return ResetSubgraphResult(finalized, superseded)
 
     def heartbeat_run(self, run: AgentRun) -> AgentRun:
         updated = replace(run, heartbeat_at=now_iso())

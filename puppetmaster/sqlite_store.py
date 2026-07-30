@@ -29,6 +29,7 @@ from puppetmaster.models import (
 from puppetmaster.fs_permissions import chmod_private_file, mkdir_private
 from puppetmaster.store import (
     ActiveTaskLeaseError,
+    ResetSubgraphResult,
     SwarmStore,
     _MEMORY_CAP,
     _coerce_confidence,
@@ -988,12 +989,14 @@ class SQLiteSwarmStore(SwarmStore):
         task_ids: Iterable[str],
         *,
         include_descendants: bool = True,
-    ) -> list[Task]:
+    ) -> ResetSubgraphResult:
         """Idempotent subgraph reset in a single SQLite transaction/batch.
 
         Unlike the file backend (per-task writes), all selected task clears,
-        QUEUED/BLOCKED re-derivation, and the ``subgraph.reset`` event commit
-        together so a busy/crash mid-reset cannot leave a partial subgraph.
+        QUEUED/BLOCKED re-derivation, superseded artifact labeling, and the
+        canonical ``subgraph.reset`` event (including
+        ``superseded_artifact_ids``) commit together so a busy/crash mid-reset
+        cannot leave a partial subgraph.
         """
         selected = (
             self.consumer_closure(job_id, task_ids)
@@ -1001,7 +1004,7 @@ class SQLiteSwarmStore(SwarmStore):
             else {task_id for task_id in task_ids if task_id}
         )
         if not selected:
-            return []
+            return ResetSubgraphResult([], [])
         tasks = self.list_tasks(job_id)
         task_map = {task.id: task for task in tasks}
         active = [
@@ -1041,6 +1044,14 @@ class SQLiteSwarmStore(SwarmStore):
             else:
                 finalized.append(current)
 
+        # Prepare superseded copies before the write session so labeling lands
+        # in the same transaction as task reset (no post-commit gap).
+        superseded_artifacts = [
+            self._prepare_artifact_for_save(artifact)
+            for artifact in self.prepare_superseded_artifacts(job_id, selected)
+        ]
+        superseded_ids = [artifact.id for artifact in superseded_artifacts]
+
         self.init()
         rows: list[tuple[Any, ...]] = []
         event_rows: list[tuple[Any, ...]] = []
@@ -1068,6 +1079,31 @@ class SQLiteSwarmStore(SwarmStore):
             ]
             reconcile_rows.append((task, desired_ids, depends_edges))
 
+        artifact_rows: list[tuple[Any, ...]] = []
+        artifact_event_rows: list[tuple[Any, ...]] = []
+        for artifact in superseded_artifacts:
+            artifact_rows.append(
+                (
+                    artifact.id,
+                    artifact.job_id,
+                    artifact.task_id,
+                    str(artifact.type),
+                    self._dumps(artifact),
+                )
+            )
+            artifact_event_rows.append(
+                (
+                    artifact.job_id,
+                    {
+                        "artifact_id": artifact.id,
+                        "task_id": artifact.task_id,
+                        "type": str(artifact.type),
+                        "confidence": artifact.confidence,
+                        "sha256": artifact.sha256,
+                    },
+                )
+            )
+
         with self._session() as connection:
             connection.executemany(
                 """
@@ -1087,13 +1123,32 @@ class SQLiteSwarmStore(SwarmStore):
                 self._reconcile_depends_on_edges_connection(
                     connection, task, desired_ids, depends_edges
                 )
+            if artifact_rows:
+                connection.executemany(
+                    """
+                    INSERT INTO artifacts(id, job_id, task_id, type, data)
+                    VALUES(?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                      job_id = excluded.job_id,
+                      task_id = excluded.task_id,
+                      type = excluded.type,
+                      data = excluded.data
+                    """,
+                    artifact_rows,
+                )
+                for event_job_id, payload in artifact_event_rows:
+                    self._emit(connection, event_job_id, "artifact.saved", payload)
             self._emit(
                 connection,
                 job_id,
                 "subgraph.reset",
-                {"task_ids": sorted(selected), "reset_count": len(finalized)},
+                {
+                    "task_ids": sorted(selected),
+                    "reset_count": len(finalized),
+                    "superseded_artifact_ids": superseded_ids,
+                },
             )
-        return finalized
+        return ResetSubgraphResult(finalized, superseded_ids)
 
     def delete_edge(self, job_id: str, edge_id: str) -> bool:
         self.init()

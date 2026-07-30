@@ -1559,9 +1559,14 @@ def _build_tools() -> list[McpTool]:
         ),
         McpTool(
             name="puppetmaster_artifacts",
-            description="Return structured JSON artifacts for a Puppetmaster job.",
-            input_schema=job_schema(required=True),
-            handler=lambda args: run_cli(["artifacts", require_string(args, "job_id")], args),
+            description=(
+                "Return structured JSON artifacts for a Puppetmaster job. "
+                "Pass refs=true for compact artifact refs (id/type/sha256/"
+                "confidence/claim|check|decision/evidence summary/validation) "
+                "without large payload bodies. Default is full artifacts."
+            ),
+            input_schema=artifacts_schema(),
+            handler=run_artifacts,
         ),
         McpTool(
             name="puppetmaster_job_graph",
@@ -1572,6 +1577,19 @@ def _build_tools() -> list[McpTool]:
             ),
             input_schema=job_schema(required=True),
             handler=lambda args: run_cli(["graph", require_string(args, "job_id")], args),
+        ),
+        McpTool(
+            name="puppetmaster_reset_subgraph",
+            description=(
+                "Lease-safe selective rerun: reset the named task_ids (and their "
+                "consumer closure by default) to QUEUED/BLOCKED while retaining "
+                "upstream completed work and all artifacts. Prior produced outputs "
+                "are labeled superseded (not deleted). Refuses with isError when "
+                "any selected task still holds an active lease "
+                "(ActiveTaskLeaseError)."
+            ),
+            input_schema=reset_subgraph_schema(),
+            handler=run_reset_subgraph,
         ),
         McpTool(
             name="puppetmaster_show",
@@ -2978,6 +2996,88 @@ def run_status(args: JsonObject) -> JsonObject:
     return run_cli(command, args)
 
 
+def run_artifacts(args: JsonObject) -> JsonObject:
+    command = ["artifacts", require_string(args, "job_id")]
+    if args.get("refs"):
+        command.append("--refs")
+    return run_cli(command, args)
+
+
+def run_reset_subgraph(args: JsonObject) -> JsonObject:
+    """Lease-safe subgraph reset with honest ActiveTaskLeaseError mapping."""
+    from puppetmaster.store import ActiveTaskLeaseError
+    from puppetmaster.store_factory import create_store
+
+    job_id = require_string(args, "job_id")
+    raw_task_ids = args.get("task_ids")
+    if raw_task_ids is None and args.get("task_id") is not None:
+        raw_task_ids = [args.get("task_id")]
+    if not isinstance(raw_task_ids, list) or not raw_task_ids:
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": "task_ids is required (non-empty list of task ids)",
+                }
+            ],
+            "isError": True,
+        }
+    task_ids = [str(item) for item in raw_task_ids if item]
+    if not task_ids:
+        return {
+            "content": [
+                {"type": "text", "text": "task_ids must contain at least one task id"}
+            ],
+            "isError": True,
+        }
+    include_descendants = True
+    if "include_descendants" in args and args.get("include_descendants") is not None:
+        include_descendants = bool(args.get("include_descendants"))
+    backend = str(args.get("backend") or "sqlite")
+    state_dir = mcp_state_dir(args)
+    store = create_store(backend, state_dir)
+    try:
+        reset = store.reset_subgraph(
+            job_id, task_ids, include_descendants=include_descendants
+        )
+    except ActiveTaskLeaseError as exc:
+        body = {
+            "error": "ActiveTaskLeaseError",
+            "message": str(exc),
+            "task_ids": list(exc.task_ids),
+            "job_id": job_id,
+        }
+        return {
+            "content": [{"type": "text", "text": json.dumps(body, indent=2)}],
+            "isError": True,
+        }
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        return {
+            "content": [{"type": "text", "text": str(exc)}],
+            "isError": True,
+        }
+    body = {
+        "job_id": job_id,
+        "reset_count": len(reset),
+        "tasks": [
+            {
+                "id": task.id,
+                "role": task.role,
+                "status": str(task.status),
+                "attempts": task.attempts,
+            }
+            for task in reset
+        ],
+        "superseded_artifact_ids": list(
+            getattr(reset, "superseded_artifact_ids", []) or []
+        ),
+    }
+    return {
+        "content": [{"type": "text", "text": json.dumps(body, indent=2, default=str)}],
+        "isError": False,
+    }
+
+
 def run_list_models(args: JsonObject) -> JsonObject:
     """Return the registry as JSON. Mirrors `puppetmaster models list --json`."""
     from dataclasses import asdict
@@ -3603,6 +3703,44 @@ def status_schema() -> JsonObject:
             "with deterministic char-count/SHA-256 refs."
         ),
     }
+    return schema
+
+
+def artifacts_schema() -> JsonObject:
+    schema = job_schema(required=True)
+    schema["properties"]["refs"] = {
+        "type": "boolean",
+        "description": (
+            "When true, return compact artifact refs instead of full payloads "
+            "(id/type/task_id/sha256/confidence/created_at, concise "
+            "claim/check/decision, evidence summary, validation metadata)."
+        ),
+    }
+    return schema
+
+
+def reset_subgraph_schema() -> JsonObject:
+    schema = job_schema(required=True)
+    schema["properties"]["task_ids"] = {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": (
+            "Task ids to reset. Downstream consumer closure is included unless "
+            "include_descendants=false."
+        ),
+    }
+    schema["properties"]["task_id"] = {
+        "type": "string",
+        "description": "Single task id convenience alias for task_ids=[task_id].",
+    }
+    schema["properties"]["include_descendants"] = {
+        "type": "boolean",
+        "default": True,
+        "description": (
+            "When true (default), also reset the consumer closure of the named tasks."
+        ),
+    }
+    schema["required"] = ["job_id"]
     return schema
 
 
