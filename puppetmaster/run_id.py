@@ -103,9 +103,12 @@ def write_exclusive_run_text(
     try:
         handle.write(text)
     except BaseException:
+        # Windows refuses to unlink an open file. Close before cleanup so
+        # partial config files never survive a failed write.
+        handle.close()
         _unlink_quiet(path)
         raise
-    finally:
+    else:
         handle.close()
     return run_id, path
 
