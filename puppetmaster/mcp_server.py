@@ -41,6 +41,7 @@ from puppetmaster.mcp_registry import (
     register as registry_register,
     summarize as registry_summarize,
 )
+from puppetmaster.run_id import reserve_run_logs
 from puppetmaster.state import resolve_state_dir
 from puppetmaster.store_factory import create_store
 from puppetmaster.swarm_launch import (
@@ -2018,10 +2019,9 @@ def _spawn_codegraph_indexer(args: JsonObject, target_cwd: str) -> JsonObject:
 
     state_dir = str(mcp_state_dir(args))
     run_dir = Path(state_dir) / "mcp-runs"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    run_id = f"codegraph_index_{int(time.time() * 1000)}_{os.getpid()}"
-    stdout_path = run_dir / f"{run_id}.stdout.log"
-    stderr_path = run_dir / f"{run_id}.stderr.log"
+    run_id, stdout_path, stderr_path, stdout_handle, stderr_handle = reserve_run_logs(
+        run_dir, "codegraph_index"
+    )
     launcher = [
         sys.executable,
         "-m",
@@ -2029,12 +2029,6 @@ def _spawn_codegraph_indexer(args: JsonObject, target_cwd: str) -> JsonObject:
         target_cwd,
         str(lock_path),
     ]
-    stdout_handle = stdout_path.open("w", encoding="utf-8")
-    try:
-        stderr_handle = stderr_path.open("w", encoding="utf-8")
-    except OSError:
-        stdout_handle.close()
-        raise
     try:
         process = subprocess.Popen(
             launcher,
@@ -3520,10 +3514,9 @@ def start_cli(command: list[str], args: JsonObject) -> JsonObject:
         _append_label_flag(command, args)
     state_dir = str(mcp_state_dir(args))
     run_dir = Path(state_dir) / "mcp-runs"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    run_id = f"mcp_{int(time.time() * 1000)}_{os.getpid()}"
-    stdout_path = run_dir / f"{run_id}.stdout.log"
-    stderr_path = run_dir / f"{run_id}.stderr.log"
+    run_id, stdout_path, stderr_path, stdout_handle, stderr_handle = reserve_run_logs(
+        run_dir, "mcp"
+    )
     full_command = [
         sys.executable,
         "-u",
@@ -3533,12 +3526,6 @@ def start_cli(command: list[str], args: JsonObject) -> JsonObject:
         state_dir,
         "--emit-job-id-early",
     ] + command
-    stdout_handle = stdout_path.open("w", encoding="utf-8")
-    try:
-        stderr_handle = stderr_path.open("w", encoding="utf-8")
-    except OSError:
-        stdout_handle.close()
-        raise
     try:
         process = subprocess.Popen(
             full_command,

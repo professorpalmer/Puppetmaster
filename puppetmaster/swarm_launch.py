@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from puppetmaster.run_id import reserve_run_logs, write_exclusive_run_text
 from puppetmaster.workers import (
     ANALYSIS_NO_EDIT_PAYLOAD,
     WorkerSpec,
@@ -172,8 +173,6 @@ def write_analysis_swarm_config(
         disable_memory=disable_memory,
     )
     config_dir = Path(state_dir) / "mcp-configs"
-    config_dir.mkdir(parents=True, exist_ok=True)
-    config_path = config_dir / f"swarm_{int(time.time() * 1000)}_{os.getpid()}.json"
     workers = [
         {
             "role": spec.role,
@@ -183,9 +182,11 @@ def write_analysis_swarm_config(
         }
         for spec in specs
     ]
-    config_path.write_text(
+    _, config_path = write_exclusive_run_text(
+        config_dir,
+        "swarm_config",
         json.dumps({"lease_seconds": lease_seconds, "workers": workers}, indent=2),
-        encoding="utf-8",
+        suffix=".json",
     )
     return config_path
 
@@ -274,10 +275,9 @@ def detach_analysis_swarm(
         disable_memory=disable_memory,
     )
     run_dir = Path(state_dir) / "mcp-runs"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    run_id = f"swarm_{int(time.time() * 1000)}_{os.getpid()}"
-    stdout_path = run_dir / f"{run_id}.stdout.log"
-    stderr_path = run_dir / f"{run_id}.stderr.log"
+    run_id, stdout_path, stderr_path, stdout_handle, stderr_handle = reserve_run_logs(
+        run_dir, "swarm"
+    )
     full_command = [
         sys.executable,
         "-u",
@@ -311,12 +311,6 @@ def detach_analysis_swarm(
         else source_root
     )
 
-    stdout_handle = stdout_path.open("w", encoding="utf-8")
-    try:
-        stderr_handle = stderr_path.open("w", encoding="utf-8")
-    except OSError:
-        stdout_handle.close()
-        raise
     try:
         process = subprocess.Popen(
             full_command,

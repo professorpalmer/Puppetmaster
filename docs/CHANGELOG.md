@@ -1,3 +1,18 @@
+## v1.21.4
+
+**Collision-proof centralized run IDs for detached MCP launches.**
+
+Same-millisecond MCP / CodeGraph / swarm starts could collide on run IDs and
+overwrite each other's detached log or config paths. Run identity is now
+centralized and reserved exclusively before launch.
+
+- **Centralized run IDs.** Shared allocator covers MCP ``start_*``, CodeGraph
+  index jobs, and ``swarm_launch``, with uniqueness across threads and
+  processes in the same millisecond.
+- **Exclusive path reservation.** Detached log and config paths are claimed
+  exclusively so concurrent launches cannot clobber each other.
+- **Regressions.** Same-ms thread/process collision cases covered in tests.
+
 ## v1.21.3
 
 **Dependency-aware reusable validation protocol (additive core).**
