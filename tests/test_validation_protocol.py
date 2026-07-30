@@ -1,6 +1,7 @@
 """Focused tests for dependency-aware reusable validation protocol."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -113,9 +114,7 @@ class ValidationFingerprintTests(unittest.TestCase):
             self.assertTrue(dirty.dirty_scoped)
             self.assertEqual(
                 dirty.source_digests["src/a.py"],
-                __import__("hashlib")
-                .sha256(b"alpha-dirty\n")
-                .hexdigest(),
+                hashlib.sha256((root / "src/a.py").read_bytes()).hexdigest(),
             )
 
     def test_fingerprint_changes_on_rules_and_evaluator(self) -> None:
