@@ -1,3 +1,18 @@
+## v1.21.7
+
+**Codex flat artifact normalization and stricter structured-result validation.**
+
+Codex read-only workers now retain useful flat JSON artifacts without weakening
+the typed and nested-wrapper contracts used by other adapters.
+
+- **Flat Codex artifacts.** Infer finding, risk, and decision types from
+  meaningful semantic values while preserving metadata-bearing findings.
+- **Ambiguity and malformed-result guards.** Ignore empty companions and reject
+  ambiguous or non-string primary values so invalid responses cannot appear as
+  successful structured analysis.
+- **Tests.** Added parser and Codex lifecycle regressions covering normalization,
+  adapter scoping, metadata collisions, and malformed responses.
+
 ## v1.21.6
 
 **Agentic acceptance-criterion reporting, fail-closed evidence normalization, and honest catalog preflight.**
