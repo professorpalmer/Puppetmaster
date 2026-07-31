@@ -149,14 +149,31 @@ def build_structured_prompt(
         # on cheap models -- this is the parity mechanism that ends the "returned
         # prose the parser couldn't structure" degrade. The JSON-object shape is
         # kept as an explicit fallback for any model/provider without tool calls.
-        lines.extend(
+        submit_lines = [
+            _PUPPETMASTER_ARTIFACT_CONTRACT_LINES[0],
+            "When your analysis is complete, finish by CALLING the "
+            "`submit_findings` tool exactly once. Pass an `artifacts` array of "
+            "finding/risk/decision objects grounded in concrete files or "
+            "symbols. If you genuinely found nothing for your role, call "
+            "`submit_findings` with an empty array -- never invent a finding.",
+        ]
+        if criteria:
+            submit_lines.extend(
+                [
+                    "When the task lists Acceptance criteria, also pass an "
+                    "`acceptance_criteria` array on `submit_findings`: one record "
+                    "per criterion you observed, each with `criterion` (exact task "
+                    "text), `status` (`passed`, `failed`, or `unknown`), and "
+                    "`evidence` (current-dispatch proof for passed/failed).",
+                    "Acceptance criteria define what you must prove — report them "
+                    "structurally, not as prose on every finding. Do not copy the "
+                    "whole checklist onto each artifact and do not infer criterion "
+                    "status from narrative text. Criteria you did not observe stay "
+                    "unknown (omit them or set status unknown).",
+                ]
+            )
+        submit_lines.extend(
             [
-                _PUPPETMASTER_ARTIFACT_CONTRACT_LINES[0],
-                "When your analysis is complete, finish by CALLING the "
-                "`submit_findings` tool exactly once. Pass an `artifacts` array of "
-                "finding/risk/decision objects grounded in concrete files or "
-                "symbols. If you genuinely found nothing for your role, call "
-                "`submit_findings` with an empty array -- never invent a finding.",
                 "Each artifact object takes:",
                 _PUPPETMASTER_ARTIFACT_CONTRACT_LINES[4],
                 _PUPPETMASTER_ARTIFACT_CONTRACT_LINES[5],
@@ -166,8 +183,19 @@ def build_structured_prompt(
                 "markdown fences).",
             ]
         )
+        lines.extend(submit_lines)
     else:
         lines.extend(_PUPPETMASTER_ARTIFACT_CONTRACT_LINES)
+        if criteria:
+            lines.extend(
+                [
+                    "When the task lists Acceptance criteria, finish with "
+                    "`submit_findings` and include an `acceptance_criteria` array: "
+                    "one record per observed criterion (`criterion`, `status`, "
+                    "`evidence`). passed/failed require current-dispatch evidence; "
+                    "unobserved criteria stay unknown.",
+                ]
+            )
     lines.extend([_ARTIFACT_GROUNDING, _ARTIFACT_EMPTY_GUIDANCE])
     if final_message_note:
         lines.append(

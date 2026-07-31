@@ -509,15 +509,33 @@ def verification_artifact(
         fail_closed = dict(artifact.payload or {})
         fail_closed[PROVENANCE_KEY] = unknown_provenance_error(exc)
         artifact = _replace(artifact, payload=fail_closed, sha256=None)
+    resolved_criteria: Optional[list[str]] = None
     try:
         from puppetmaster.acceptance_criteria import (
+            acceptance_criteria_for_task,
             stamp_verification_acceptance_criteria,
         )
 
+        resolved_criteria = acceptance_criteria_for_task(task)
         artifact = stamp_verification_acceptance_criteria(artifact, task)
     except Exception:
-        # Criteria stamping must never block a verification row.
-        pass
+        from dataclasses import replace as _replace
+
+        from puppetmaster.acceptance_criteria import (
+            unknown_criterion_status_records,
+        )
+
+        # Fail closed: never leak raw worker-supplied criterion rows when
+        # canonical task-scoped stamping raises. Do not re-call the resolver
+        # here — it may be the same failing seam.
+        safe = dict(artifact.payload or {})
+        if resolved_criteria:
+            safe["acceptance_criteria"] = unknown_criterion_status_records(
+                resolved_criteria
+            )
+        else:
+            safe.pop("acceptance_criteria", None)
+        artifact = _replace(artifact, payload=safe, sha256=None)
     return artifact
 
 

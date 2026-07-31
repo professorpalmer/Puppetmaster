@@ -106,9 +106,14 @@ def _cached_catalog_membership(
 ) -> Optional[tuple[bool, str, list[str]]]:
     """Check a recent probe snapshot without performing network I/O.
 
-    ``None`` means there is no usable snapshot. A stale snapshot deliberately
-    fails open: it can make a warning less precise, but must not turn an
+    ``None`` means there is no usable snapshot. Stale snapshots deliberately
+    fail open: they can make a warning less precise, but must not turn an
     unavailable catalog into a false dispatch block.
+
+    A fresh *empty* snapshot fails open only for ``agentic``, where manually
+    configured provider models may validly coexist with an empty curated
+    discovery snapshot. Other sources treat an empty fresh catalog as
+    authoritative and block absent models.
     """
     from puppetmaster.model_registry import (
         DISCOVERY_SOURCE_TO_ADAPTER,
@@ -157,6 +162,18 @@ def _cached_catalog_membership(
             ["preflight:cached_catalog_stale"],
         )
     available = {str(model_id) for model_id in entry["model_ids"]}
+    if not available:
+        if source == "agentic":
+            return (
+                True,
+                f"catalog unverified (empty {source} snapshot)",
+                ["preflight:cached_catalog_empty"],
+            )
+        return (
+            False,
+            f"model {model!r} is absent from the recent {source} catalog",
+            ["preflight:cached_model_not_in_catalog"],
+        )
     if model not in available:
         return (
             False,
@@ -632,7 +649,13 @@ def preflight_check(
                     reason=cached_reason,
                     evidence=[*status.evidence, *pin_evidence, *cached_evidence],
                 )
-            if "preflight:cached_catalog_stale" in cached_evidence:
+            if any(
+                tag in cached_evidence
+                for tag in (
+                    "preflight:cached_catalog_stale",
+                    "preflight:cached_catalog_empty",
+                )
+            ):
                 return PreflightResult(
                     ok=True,
                     adapter=adapter,

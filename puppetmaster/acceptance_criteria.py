@@ -232,6 +232,83 @@ def attach_acceptance_criteria_to_task_payload(task: Any) -> Any:
     return replace(task, payload=payload)
 
 
+_UNKNOWN_EVIDENCE_SENTINELS = frozenset(
+    {
+        "",
+        "not_reported",
+        "unknown",
+        "n/a",
+        "na",
+        "none",
+        "null",
+        "missing",
+        "unset",
+    }
+)
+
+
+def _normalize_criterion_evidence(value: Any) -> str:
+    """Normalize a criterion evidence field to a bounded string.
+
+    Fail closed: accept only a non-empty string or a list/tuple of non-empty
+    strings. Reject dicts, numbers, objects, None, nested structures, and
+    mixed lists — never stringify arbitrary values.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (list, tuple)):
+        parts: list[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                return ""
+            stripped = item.strip()
+            if not stripped:
+                return ""
+            parts.append(stripped)
+        return "; ".join(parts)
+    return ""
+
+
+def _is_concrete_evidence(evidence: str) -> bool:
+    """Return True when evidence can settle a passed/failed criterion."""
+    normalized = evidence.strip().lower()
+    if not normalized:
+        return False
+    return normalized not in _UNKNOWN_EVIDENCE_SENTINELS
+
+
+def _normalize_reported_criterion(entry: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Normalize one worker-reported criterion row."""
+    key = str(entry.get("criterion") or entry.get("text") or "").strip()
+    if not key:
+        return None
+    status = str(entry.get("status") or "unknown").strip().lower()
+    if status not in {"passed", "failed", "unknown", "not_reported"}:
+        status = "unknown"
+    if status == "not_reported":
+        status = "unknown"
+    evidence = _normalize_criterion_evidence(entry.get("evidence"))
+    if status in {"passed", "failed"} and not _is_concrete_evidence(evidence):
+        status = "unknown"
+        evidence = "not_reported"
+    elif not evidence:
+        evidence = "not_reported"
+    return {"criterion": key, "status": status, "evidence": evidence}
+
+
+def unknown_criterion_status_records(
+    criteria: Sequence[str],
+) -> list[dict[str, Any]]:
+    """Return task-scoped rows with every criterion unknown (fail-closed)."""
+    items = normalize_acceptance_criteria(list(criteria))
+    return [
+        {"criterion": item, "status": "unknown", "evidence": "not_reported"}
+        for item in items
+    ]
+
+
 def criterion_status_records(
     criteria: Sequence[str],
     reported: Optional[Iterable[Any]] = None,
@@ -239,7 +316,9 @@ def criterion_status_records(
     """Build verification criterion rows.
 
     Omitted / unmatched criteria are ``status=unknown`` with
-    ``evidence=not_reported`` — never ``passed``.
+    ``evidence=not_reported`` — never ``passed``. Foreign or malformed rows
+    cannot settle the checklist; ``passed`` / ``failed`` without evidence become
+    ``unknown``.
     """
     items = normalize_acceptance_criteria(list(criteria))
     reported_map: dict[str, dict[str, Any]] = {}
@@ -247,20 +326,10 @@ def criterion_status_records(
         for entry in reported:
             if not isinstance(entry, dict):
                 continue
-            key = str(entry.get("criterion") or entry.get("text") or "").strip()
-            if not key:
+            normalized = _normalize_reported_criterion(entry)
+            if normalized is None:
                 continue
-            status = str(entry.get("status") or "unknown").strip().lower()
-            if status not in {"passed", "failed", "unknown", "not_reported"}:
-                status = "unknown"
-            evidence = entry.get("evidence")
-            if evidence is None or evidence == "":
-                evidence = "not_reported" if status in {"unknown", "not_reported"} else ""
-            reported_map[key] = {
-                "criterion": key,
-                "status": "unknown" if status == "not_reported" else status,
-                "evidence": evidence if evidence != "" else "not_reported",
-            }
+            reported_map[normalized["criterion"]] = normalized
 
     rows: list[dict[str, Any]] = []
     for item in items:

@@ -1048,6 +1048,117 @@ class AgenticLoopTests(unittest.TestCase):
         self.assertIn("submit:tool", verif.evidence)
         self.assertIn(ArtifactType.FINDING, [a.type for a in arts])
 
+    def test_analyze_submit_findings_carries_acceptance_criteria_to_verification(self) -> None:
+        from puppetmaster.adapters import agentic
+        from puppetmaster.providers import AssistantTurn
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cwd = Path(tmp.name)
+        turns = [
+            AssistantTurn(
+                text="",
+                tool_calls=[{"id": "s1", "name": "submit_findings", "arguments": {
+                    "artifacts": [{"type": "finding", "claim": "model id present",
+                                   "evidence": ["routing.py"], "confidence": 0.8}],
+                    "acceptance_criteria": [
+                        {
+                            "criterion": "ROUTING exposes model_id",
+                            "status": "passed",
+                            "evidence": "routing.py:12 model_id field",
+                        },
+                        {
+                            "criterion": "adapter_model_name is present",
+                            "status": "unknown",
+                        },
+                    ],
+                }}],
+                usage={"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+            ),
+        ]
+        seen = []
+
+        def fake_chat(*, provider, model, messages, tools, extra, timeout):
+            seen.append(1)
+            return turns[len(seen) - 1]
+
+        task = Task(
+            job_id="j", role="explore",
+            instruction="check\n\nAcceptance criteria:\n- ROUTING exposes model_id\n- adapter_model_name is present\n",
+            payload={
+                "cwd": str(cwd),
+                "provider": "anthropic",
+                "model": "m",
+                "disable_codegraph": True,
+                "acceptance_criteria": [
+                    "ROUTING exposes model_id",
+                    "adapter_model_name is present",
+                ],
+            },
+        )
+        with mock.patch.object(agentic, "provider_chat", side_effect=fake_chat):
+            arts = self.adapter().run(task, task.instruction, "w1")
+
+        verif = next(a for a in arts if a.type == ArtifactType.VERIFICATION)
+        rows = verif.payload["acceptance_criteria"]
+        self.assertEqual(rows[0]["criterion"], "ROUTING exposes model_id")
+        self.assertEqual(rows[0]["status"], "passed")
+        self.assertIn("routing.py:12", rows[0]["evidence"])
+        self.assertEqual(rows[1]["criterion"], "adapter_model_name is present")
+        self.assertEqual(rows[1]["status"], "unknown")
+        self.assertEqual(rows[1]["evidence"], "not_reported")
+
+    def test_analyze_foreign_criteria_do_not_false_green_verification(self) -> None:
+        from puppetmaster.adapters import agentic
+        from puppetmaster.providers import AssistantTurn
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cwd = Path(tmp.name)
+        turns = [
+            AssistantTurn(
+                text="",
+                tool_calls=[{"id": "s1", "name": "submit_findings", "arguments": {
+                    "artifacts": [],
+                    "acceptance_criteria": [
+                        {
+                            "criterion": "not on the task checklist",
+                            "status": "passed",
+                            "evidence": "fake.py:1",
+                        }
+                    ],
+                }}],
+                usage={"prompt_tokens": 4, "completion_tokens": 1, "total_tokens": 5},
+            ),
+        ]
+        seen = []
+
+        def fake_chat(*, provider, model, messages, tools, extra, timeout):
+            seen.append(1)
+            return turns[len(seen) - 1]
+
+        task = Task(
+            job_id="j", role="explore",
+            instruction="check\n\nAcceptance criteria:\n- real criterion\n",
+            payload={
+                "cwd": str(cwd),
+                "provider": "anthropic",
+                "model": "m",
+                "disable_codegraph": True,
+                "acceptance_criteria": ["real criterion"],
+            },
+        )
+        with mock.patch.object(agentic, "provider_chat", side_effect=fake_chat):
+            arts = self.adapter().run(task, task.instruction, "w1")
+
+        verif = next(a for a in arts if a.type == ArtifactType.VERIFICATION)
+        rows = verif.payload["acceptance_criteria"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["criterion"], "real criterion")
+        self.assertEqual(rows[0]["status"], "unknown")
+        self.assertEqual(rows[0]["evidence"], "not_reported")
+        self.assertEqual(verif.payload["result"], "passed")
+
     def test_analyze_empty_submission_is_clean_pass_not_degraded(self) -> None:
         # An explicit empty submission ("I found nothing") is an honest pass, not
         # a degrade -- this is the core false-degrade fix.

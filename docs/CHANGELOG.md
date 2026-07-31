@@ -1,3 +1,28 @@
+## v1.21.6
+
+**Agentic acceptance-criterion reporting, fail-closed evidence normalization, and honest catalog preflight.**
+
+Structured agentic workers can report per-criterion status through ``submit_findings``;
+verification stamping normalizes task-scoped evidence fail-closed with a non-raising
+fallback; agentic preflight treats empty cached discovery as unverified while
+authoritative absence and credential failures still block.
+
+- **Structured agentic criterion status.** Agentic analyze/implement workers may
+  return an ``acceptance_criteria`` array on ``submit_findings`` (criterion,
+  status, evidence); rows carry through to verification artifacts.
+- **Fail-closed evidence normalization.** Task-scoped rows reject malformed
+  evidence, downgrade ``passed`` / ``failed`` without concrete evidence to
+  ``unknown``, and leave omitted criteria ``unknown`` / ``not_reported`` � never
+  silently ``passed``.
+- **Non-raising verification fallback.** When canonical criterion stamping
+  raises, verification payloads fall back to all-``unknown`` task-scoped rows
+  instead of leaking raw worker output or aborting artifact save.
+- **Agentic empty-catalog unverified fallback.** Preflight treats a fresh empty
+  agentic discovery snapshot as catalog-unverified (allow dispatch with warning);
+  other adapters still treat empty fresh catalogs as authoritative absence blocks.
+  Credential and authoritative catalog failures still block.
+- **Tests.** ``tests/test_quality_control.py``, ``tests/test_agentic_standalone.py``.
+
 ## v1.21.5
 
 **Deterministic quality control: contradiction conflicts, execution provenance, and acceptance criteria.**
@@ -1498,7 +1523,7 @@ No code, API, or behavior changes.
 
 - **Platform lock â restrict Puppetmaster to the platforms you actually pay for** (`puppetmaster/platform_lock.py`, `puppetmaster platform â¦`). Single-platform users (e.g. a Cursor plan and nothing else) can now hard-lock routing to one adapter so a stray Claude Code / Codex login can never be picked, auto-discovered, or used for fallback â even if its CLI is installed and funded. Free-tier bouncers can flip several on and rotate across them. New CLI: `platform status` (shows each platform on/off + source), `platform only cursor`, `platform enable claude-code codex`, `platform disable openai`, `platform reset`. State is a tiny denylist persisted next to the model registry (`~/.puppetmaster/platform.json`); default is everything-on (no file, zero behavior change for existing users). Env override `PUPPETMASTER_ONLY_ADAPTERS=cursor,openai` wins for CI/ephemeral use. The lock is enforced at **all three** decision points â routing (`TaskSignals.allowed_adapters` rejects disabled adapters with a clear reason), first-run plan-catalog auto-discovery (disabled platforms are never enumerated), and auto-fallback (a failed run never reroutes onto a disabled platform) â and surfaced in `doctor` (`platform-lock` check). Per-task escape hatch via `payload.allowed_adapters`. +11 tests; full suite **303** green.
 - **Security & threat model doc** ([docs/SECURITY.md](SECURITY.md)). The "is it safe to hand it my repo and my plan?" answer a skeptical first user looks for before installing: what Puppetmaster can do (spawn agent subprocesses, edit files, run shell, read local auth), how credentials are handled (uses existing auth; keys never inlined/stored â evidence records presence like `cursor_api_key:set`, never values), the exact edit-permission/sandbox model per adapter with dirty-tree guards, the complete network-egress list (only the providers your workers use; telemetry off by default; no phone-home/analytics), data-at-rest (local SQLite only), hardening recommendations, and honest limitations (it orchestrates autonomous agents â auditable and reversible, not risk-free; no independent audit yet). Linked from both indexes.
-- **Launch packaging: positioning + a self-healing hero.** Added [docs/COMPARISON.md](COMPARISON.md) â an honest, calibrated side-by-side answering "why this over LangGraph / CrewAI / Claude Agent SDK / native subagents," with an explicit "pick X instead ifâ¦" section (Puppetmaster orchestrates the agent CLIs you already pay for; it isn't a framework for authoring an agent from primitives). Rebuilt the README hero around **two receipts** â ð¸ cheaper (98.8% live OpenAI A/B) and ð self-healing (the live `job_d82715bebc5d` auto-fallback: a `$0` Claude balance â rerouted to `cursor/gpt-5.5` â completed) â so the differentiated, shareable moment is above the fold. Docs index updated; all internal links verified.
+- **Launch packaging: positioning + a self-healing hero.** Added [docs/COMPARISON.md](COMPARISON.md) â an honest, calibrated side-by-side answering "why this over LangGraph / CrewAI / Claude Agent SDK / native subagents," with an explicit "pick X instead ifâ¦" section (Puppetmaster orchestrates the agent CLIs you already pay for; it isn't a framework for authoring an agent from primitives). Rebuilt the README hero around **two receipts** â ð¸ cheaper (98.8% live OpenAI A/B) and ð self-healing (the live `job_d82715bebc5d` auto-fallback: a `$0` Claude balance â rerouted to `cursor/gpt-5.5` â completed) â so the differentiated, shareable moment is above the fold. Docs index updated; all internal links verified.
 
 ## v0.9.1
 

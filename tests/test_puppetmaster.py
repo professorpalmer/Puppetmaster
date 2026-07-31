@@ -10038,7 +10038,7 @@ class ModelRouterTests(unittest.TestCase):
             payload={"cwd": tmp.name, "provider": "openai", "model": "m", "max_turns": 1},
         )
         with patch.object(adapter, "_provider_call", side_effect=fake_provider_call):
-            _, usage, _, _, _, _ = adapter._agent_loop(
+            _, usage, _, _, _, _, _ = adapter._agent_loop(
                 task, Path(tmp.name), "openai", "m", "system", [], implement=False,
             )
         self.assertEqual(usage["tokens_in"], 300)
@@ -10080,7 +10080,7 @@ class ModelRouterTests(unittest.TestCase):
             },
         )
         with patch.object(adapter, "_provider_call", side_effect=fake_provider_call):
-            _final, usage, turns_used, _mutated, stop_reason, submitted = adapter._agent_loop(
+            _final, usage, turns_used, _mutated, stop_reason, submitted, _criteria = adapter._agent_loop(
                 task, Path(tmp.name), "openrouter", "deepseek/deepseek-v4-flash",
                 "system", [], implement=False, on_stop=keep_nudging,
             )
@@ -10175,7 +10175,7 @@ class ModelRouterTests(unittest.TestCase):
             },
         )
         with patch.object(adapter, "_provider_call", side_effect=fake_provider_call):
-            _text, _usage, turns_used, _mutated, stop_reason, submitted = adapter._agent_loop(
+            _text, _usage, turns_used, _mutated, stop_reason, submitted, _criteria = adapter._agent_loop(
                 task, cwd, "openai", "m", "system",
                 adapter._tool_schema(implement=False, task=task, graph_on=False),
                 implement=False, on_stop=nudge_once,
@@ -10301,7 +10301,7 @@ class ModelRouterTests(unittest.TestCase):
             },
         )
         with patch.object(adapter, "_provider_call", side_effect=fake_provider_call):
-            _text, usage, turns_used, _mut, stop_reason, submitted = adapter._agent_loop(
+            _text, usage, turns_used, _mut, stop_reason, submitted, _criteria = adapter._agent_loop(
                 task, cwd, "openrouter", "deepseek/deepseek-v4-flash", "system",
                 adapter._tool_schema(implement=False, task=task, graph_on=False),
                 implement=False,
@@ -10373,7 +10373,7 @@ class ModelRouterTests(unittest.TestCase):
             },
         )
         with patch.object(adapter, "_provider_call", side_effect=fake_provider_call):
-            _t, usage, turns_used, _m, stop_reason, submitted = adapter._agent_loop(
+            _t, usage, turns_used, _m, stop_reason, submitted, _criteria = adapter._agent_loop(
                 task, cwd, "openai", "m", "system",
                 adapter._tool_schema(implement=False, task=task, graph_on=False),
                 implement=False,
@@ -10439,7 +10439,7 @@ class ModelRouterTests(unittest.TestCase):
                 },
             )
             with patch.object(adapter, "_provider_call", side_effect=fake_provider_call):
-                _t, usage, _tu, _m, stop_reason, submitted = adapter._agent_loop(
+                _t, usage, _tu, _m, stop_reason, submitted, _criteria = adapter._agent_loop(
                     task, cwd, "openai", "m", "system",
                     adapter._tool_schema(implement=False, task=task, graph_on=False),
                     implement=False,
@@ -15461,6 +15461,254 @@ class PreflightTests(unittest.TestCase):
 
             self.assertFalse(result.ok)
             self.assertIn("absent from the recent openai catalog", result.reason)
+
+    def test_fresh_empty_non_agentic_catalog_blocks(self) -> None:
+        from puppetmaster.model_registry import ModelSpec, save_registry, write_discovery_meta
+        from puppetmaster.platform_billing import BillingStatus
+        from puppetmaster.preflight import preflight_check
+
+        with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "models.json"
+            save_registry(
+                [
+                    ModelSpec(
+                        id="openai/live",
+                        adapter="openai",
+                        adapter_model_name="gpt-5",
+                        capability_score=80,
+                        billing="api",
+                    )
+                ],
+                registry_path,
+            )
+            write_discovery_meta(
+                "openai",
+                0,
+                registry_path,
+                model_ids=[],
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "PUPPETMASTER_MODELS_PATH": str(registry_path),
+                    "PUPPETMASTER_CATALOG_CACHE_TTL_SECONDS": "3600",
+                },
+                clear=False,
+            ):
+                result = preflight_check(
+                    "openai",
+                    "gpt-5",
+                    billing_status=BillingStatus(
+                        adapter="openai",
+                        billing="api",
+                        healthy=True,
+                        detail="key",
+                        evidence=[],
+                    ),
+                )
+
+            self.assertFalse(result.ok)
+            self.assertIn("absent from the recent openai catalog", result.reason)
+            self.assertIn("preflight:cached_model_not_in_catalog", result.evidence)
+            self.assertNotIn("preflight:cached_catalog_empty", result.evidence)
+
+    def test_fresh_empty_agentic_catalog_fails_open_unverified(self) -> None:
+        from puppetmaster.model_registry import ModelSpec, save_registry, write_discovery_meta
+        from puppetmaster.platform_billing import BillingStatus
+        from puppetmaster.preflight import preflight_check
+
+        with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "models.json"
+            save_registry(
+                [
+                    ModelSpec(
+                        id="agentic/gpt-5",
+                        adapter="agentic",
+                        adapter_model_name="gpt-5",
+                        capability_score=90,
+                        billing="api",
+                    )
+                ],
+                registry_path,
+            )
+            write_discovery_meta(
+                "agentic",
+                0,
+                registry_path,
+                model_ids=[],
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "PUPPETMASTER_MODELS_PATH": str(registry_path),
+                    "PUPPETMASTER_CATALOG_CACHE_TTL_SECONDS": "3600",
+                },
+                clear=False,
+            ):
+                result = preflight_check(
+                    "agentic",
+                    "gpt-5",
+                    billing_status=BillingStatus(
+                        adapter="agentic",
+                        billing="api",
+                        healthy=True,
+                        detail="openai key",
+                        evidence=[],
+                    ),
+                )
+
+            self.assertTrue(result.ok)
+            self.assertIn("catalog unverified", result.reason)
+            self.assertIn("preflight:cached_catalog_empty", result.evidence)
+            self.assertNotIn("preflight:cached_model_not_in_catalog", result.evidence)
+
+    def test_fresh_nonempty_agentic_catalog_blocks_absent_model(self) -> None:
+        from puppetmaster.model_registry import ModelSpec, save_registry, write_discovery_meta
+        from puppetmaster.platform_billing import BillingStatus
+        from puppetmaster.preflight import preflight_check
+
+        with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "models.json"
+            save_registry(
+                [
+                    ModelSpec(
+                        id="agentic/gpt-5",
+                        adapter="agentic",
+                        adapter_model_name="gpt-5",
+                        capability_score=90,
+                        billing="api",
+                    )
+                ],
+                registry_path,
+            )
+            write_discovery_meta(
+                "agentic",
+                1,
+                registry_path,
+                model_ids=["other-model"],
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "PUPPETMASTER_MODELS_PATH": str(registry_path),
+                    "PUPPETMASTER_CATALOG_CACHE_TTL_SECONDS": "3600",
+                },
+                clear=False,
+            ):
+                result = preflight_check(
+                    "agentic",
+                    "gpt-5",
+                    billing_status=BillingStatus(
+                        adapter="agentic",
+                        billing="api",
+                        healthy=True,
+                        detail="openai key",
+                        evidence=[],
+                    ),
+                )
+
+            self.assertFalse(result.ok)
+            self.assertIn("absent from the recent agentic catalog", result.reason)
+            self.assertIn("preflight:cached_model_not_in_catalog", result.evidence)
+
+    def test_fresh_nonempty_agentic_catalog_allows_present_model(self) -> None:
+        from puppetmaster.model_registry import ModelSpec, save_registry, write_discovery_meta
+        from puppetmaster.platform_billing import BillingStatus
+        from puppetmaster.preflight import preflight_check
+
+        with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "models.json"
+            save_registry(
+                [
+                    ModelSpec(
+                        id="agentic/gpt-5",
+                        adapter="agentic",
+                        adapter_model_name="gpt-5",
+                        capability_score=90,
+                        billing="api",
+                    )
+                ],
+                registry_path,
+            )
+            write_discovery_meta(
+                "agentic",
+                1,
+                registry_path,
+                model_ids=["gpt-5"],
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "PUPPETMASTER_MODELS_PATH": str(registry_path),
+                    "PUPPETMASTER_CATALOG_CACHE_TTL_SECONDS": "3600",
+                },
+                clear=False,
+            ):
+                result = preflight_check(
+                    "agentic",
+                    "gpt-5",
+                    billing_status=BillingStatus(
+                        adapter="agentic",
+                        billing="api",
+                        healthy=True,
+                        detail="openai key",
+                        evidence=[],
+                    ),
+                )
+
+            self.assertTrue(result.ok)
+            self.assertNotIn("preflight:cached_model_not_in_catalog", result.evidence)
+
+    def test_stale_agentic_catalog_fails_open_even_when_model_absent(self) -> None:
+        from puppetmaster.model_registry import ModelSpec, save_registry, write_discovery_meta
+        from puppetmaster.platform_billing import BillingStatus
+        from puppetmaster.preflight import preflight_check
+
+        with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "models.json"
+            save_registry(
+                [
+                    ModelSpec(
+                        id="agentic/gpt-5",
+                        adapter="agentic",
+                        adapter_model_name="gpt-5",
+                        capability_score=90,
+                        billing="api",
+                    )
+                ],
+                registry_path,
+            )
+            write_discovery_meta(
+                "agentic",
+                1,
+                registry_path,
+                model_ids=["other-model"],
+                now_iso="2020-01-01T00:00:00Z",
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "PUPPETMASTER_MODELS_PATH": str(registry_path),
+                    "PUPPETMASTER_CATALOG_CACHE_TTL_SECONDS": "3600",
+                },
+                clear=False,
+            ):
+                result = preflight_check(
+                    "agentic",
+                    "gpt-5",
+                    billing_status=BillingStatus(
+                        adapter="agentic",
+                        billing="api",
+                        healthy=True,
+                        detail="openai key",
+                        evidence=[],
+                    ),
+                )
+
+            self.assertTrue(result.ok)
+            self.assertIn("catalog unverified", result.reason)
+            self.assertIn("preflight:cached_catalog_stale", result.evidence)
+            self.assertNotIn("preflight:cached_model_not_in_catalog", result.evidence)
 
 class AdapterCliPresenceTests(unittest.TestCase):
     """`adapter_cli_present` closes the gap billing detection can't see: an

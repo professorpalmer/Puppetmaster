@@ -590,7 +590,7 @@ class AgenticAdapter(FullEditWorkerAdapter):
             return arts
         failed_over = (provider, model) != (primary_provider, primary_model)
 
-        final_text, usage, turns, _mutated, stop_reason, submitted = loop
+        final_text, usage, turns, _mutated, stop_reason, submitted, submitted_criteria = loop
 
         # Structured output has two channels. Preferred: the model called
         # submit_findings (native, schema-constrained) -- ``submitted`` is the
@@ -648,19 +648,22 @@ class AgenticAdapter(FullEditWorkerAdapter):
         diagnosis = (
             _no_tool_calls_diagnosis(provider, model, turns) if no_tools else None
         )
+        verify_payload: dict[str, Any] = {
+            "model": model, "provider": provider, "cwd": str(cwd),
+            "turns": turns, "stop_reason": stop_reason, **usage,
+            "failure": failure,
+            "stderr": diagnosis,
+            "stdout": (final_text or "")[-_TOOL_OUTPUT_LIMIT:],
+        }
+        if submitted_criteria:
+            verify_payload["acceptance_criteria"] = submitted_criteria
         artifacts: list[Artifact] = [
             verification_artifact(
                 task=task, worker_id=worker_id, adapter="agentic",
                 check=task.instruction, result=result,
                 confidence=0.55 if no_tools else (0.65 if degraded else 0.9),
                 evidence=evidence,
-                payload={
-                    "model": model, "provider": provider, "cwd": str(cwd),
-                    "turns": turns, "stop_reason": stop_reason, **usage,
-                    "failure": failure,
-                    "stderr": diagnosis,
-                    "stdout": (final_text or "")[-_TOOL_OUTPUT_LIMIT:],
-                },
+                payload=verify_payload,
             )
         ]
         if no_tools:
@@ -821,7 +824,7 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 ))
             return arts
 
-        final_text, usage, turns, mutated, stop_reason, _submitted = loop
+        final_text, usage, turns, mutated, stop_reason, _submitted, _submitted_criteria = loop
         after = facade("git_snapshot")(cwd, base_tree=str(before.get("tree") or "") or None)
         has_work = _should_emit_patch_artifact(before, after)
         # A change that fails the repo's own verification (in gating mode) is not
@@ -1062,14 +1065,16 @@ class AgenticAdapter(FullEditWorkerAdapter):
         on_delta: Optional[Callable[[str, str], None]] = None,
         on_submit: Optional[Callable[[str], Optional[str]]] = None,
         on_plan: Optional[Callable[[list], None]] = None,
-    ) -> tuple[str, dict, int, bool, str, Optional[list[dict]]]:
+    ) -> tuple[str, dict, int, bool, str, Optional[list[dict]], Optional[list[dict]]]:
         """Run the provider tool-use loop until the model finishes.
 
         Returns ``(final_text, usage_totals, turns, mutated, stop_reason,
-        submitted)``. ``submitted`` is ``None`` when the model never called
-        ``submit_findings``; otherwise it is the (possibly empty) list of
-        submitted artifact items -- so an explicit empty submission ("I found
-        nothing") is distinguishable from a model that just went silent.
+        submitted, submitted_criteria)``. ``submitted`` is ``None`` when the model
+        never called ``submit_findings``; otherwise it is the (possibly empty)
+        list of submitted artifact items -- so an explicit empty submission ("I
+        found nothing") is distinguishable from a model that just went silent.
+        ``submitted_criteria`` carries optional acceptance-criterion status rows
+        from the same ``submit_findings`` call(s).
 
         Each turn: send the conversation, execute any tool calls, append their
         results, repeat. Structured output rides the native tool channel: a
@@ -1135,6 +1140,7 @@ class AgenticAdapter(FullEditWorkerAdapter):
         turns = 0
         stop_reason = "max_turns"
         submitted: Optional[list[dict]] = None
+        submitted_criteria: Optional[list[dict]] = None
         empty_recoveries = 0
         length_continuations = 0
         force_submit_next = False
@@ -1324,10 +1330,14 @@ class AgenticAdapter(FullEditWorkerAdapter):
                     idx += 1
                     if name in _SUBMIT_TOOLS:
                         if name == _SUBMIT_FINDINGS_TOOL:
-                            items = _coerce_submit_findings(call.get("arguments"))
+                            items, criteria = _coerce_submit_findings(call.get("arguments"))
                             if submitted is None:
                                 submitted = []
                             submitted.extend(items)
+                            if criteria:
+                                if submitted_criteria is None:
+                                    submitted_criteria = []
+                                submitted_criteria.extend(criteria)
                             ack = f"Recorded {len(items)} artifact(s). Analysis complete."
                         else:  # submit_report
                             report = _coerce_submit_report(call.get("arguments"))
@@ -1459,10 +1469,14 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 final_text = turn.text or final_text
                 for call in turn.tool_calls or []:
                     if call.get("name") == _SUBMIT_FINDINGS_TOOL:
-                        items = _coerce_submit_findings(call.get("arguments"))
+                        items, criteria = _coerce_submit_findings(call.get("arguments"))
                         if submitted is None:
                             submitted = []
                         submitted.extend(items)
+                        if criteria:
+                            if submitted_criteria is None:
+                                submitted_criteria = []
+                            submitted_criteria.extend(criteria)
                         stop_reason = "submitted"
                         submit_forced_max_turns = True
                         break
@@ -1482,7 +1496,7 @@ class AgenticAdapter(FullEditWorkerAdapter):
         }
         if usage_total["cost_usd"] > 0:
             usage_out["real_cost_usd"] = round(usage_total["cost_usd"], 6)
-        return final_text, usage_out, turns, mutated, stop_reason, submitted
+        return final_text, usage_out, turns, mutated, stop_reason, submitted, submitted_criteria
 
     def _loop_targets(
         self, task: Task, provider: str, model: str
@@ -1748,8 +1762,12 @@ class AgenticAdapter(FullEditWorkerAdapter):
             _SUBMIT_FINDINGS_TOOL,
             "Submit your final structured findings and finish the task. Call this "
             "EXACTLY ONCE when your analysis is complete. Pass an 'artifacts' "
-            "array. If you genuinely found nothing for your role, submit an empty "
-            "array -- do not invent a finding.",
+            "array. When the task lists Acceptance criteria, also pass "
+            "'acceptance_criteria': one record per observed criterion with "
+            "criterion (exact task text), status (passed/failed/unknown), and "
+            "evidence (required for passed/failed). If you genuinely found "
+            "nothing for your role, submit an empty artifacts array -- do not "
+            "invent a finding.",
             {
                 "artifacts": {
                     "type": "array",
@@ -1778,7 +1796,35 @@ class AgenticAdapter(FullEditWorkerAdapter):
                         },
                         "required": ["type", "evidence"],
                     },
-                }
+                },
+                "acceptance_criteria": {
+                    "type": "array",
+                    "description": (
+                        "Optional per-criterion status for task-supplied acceptance "
+                        "criteria only. Report only criteria you observed."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "criterion": {
+                                "type": "string",
+                                "description": "Exact acceptance criterion text from the task.",
+                            },
+                            "status": {
+                                "type": "string",
+                                "enum": ["passed", "failed", "unknown"],
+                                "description": "Outcome for this criterion in the current dispatch.",
+                            },
+                            "evidence": {
+                                "type": "string",
+                                "description": (
+                                    "Current-dispatch evidence grounding passed/failed."
+                                ),
+                            },
+                        },
+                        "required": ["criterion", "status"],
+                    },
+                },
             },
             ["artifacts"],
         )
@@ -2433,15 +2479,17 @@ def _no_tool_calls_diagnosis(provider: str, model: str, turns: int) -> str:
     )
 
 
-def _coerce_submit_findings(args: object) -> list[dict]:
-    """Normalize a ``submit_findings`` tool payload into artifact-item dicts.
+def _coerce_submit_findings(args: object) -> tuple[list[dict], list[dict]]:
+    """Normalize a ``submit_findings`` tool payload into artifact items and
+    optional acceptance-criterion status rows.
 
-    Tolerant on purpose: the canonical shape is ``{"artifacts": [ ... ]}``, but a
-    model may pass a single finding at the top level or a lone dict. Anything
-    that clearly isn't an artifact item is dropped rather than fabricated.
+    Tolerant on purpose: the canonical shape is ``{"artifacts": [ ... ],
+    "acceptance_criteria": [ ... ]}``, but a model may pass a single finding at
+    the top level or a lone dict. Anything that clearly isn't an artifact item
+    is dropped rather than fabricated.
     """
     if not isinstance(args, dict):
-        return []
+        return [], []
     items = args.get("artifacts")
     if items is None:
         if any(key in args for key in ("claim", "risk", "decision", "finding", "summary")):
@@ -2451,12 +2499,20 @@ def _coerce_submit_findings(args: object) -> list[dict]:
     if isinstance(items, dict):
         items = [items]
     if not isinstance(items, list):
-        return []
+        items = []
     normalized: list[dict] = []
     for item in items:
         if isinstance(item, dict):
             normalized.append({**item, "type": item.get("type") or "finding"})
-    return normalized
+    criteria_raw = args.get("acceptance_criteria")
+    criteria: list[dict] = []
+    if isinstance(criteria_raw, list):
+        for entry in criteria_raw:
+            if isinstance(entry, dict):
+                criteria.append(dict(entry))
+    elif isinstance(criteria_raw, dict):
+        criteria.append(dict(criteria_raw))
+    return normalized, criteria
 
 
 def _items_to_artifacts(task: Task, worker_id: str, items: list[dict]) -> list[Artifact]:

@@ -97,12 +97,143 @@ class AcceptanceCriteriaTests(unittest.TestCase):
     def test_omitted_criterion_is_unknown_not_passed(self) -> None:
         rows = criterion_status_records(
             ["must check routing ledger", "must check model id"],
-            reported=[{"criterion": "must check routing ledger", "status": "passed"}],
+            reported=[{"criterion": "must check routing ledger", "status": "passed", "evidence": "routing.py:42"}],
         )
         self.assertEqual(rows[0]["status"], "passed")
+        self.assertEqual(rows[0]["evidence"], "routing.py:42")
         self.assertEqual(rows[1]["status"], "unknown")
         self.assertEqual(rows[1]["evidence"], "not_reported")
         self.assertNotEqual(rows[1]["status"], "passed")
+
+    def test_passed_without_evidence_becomes_unknown(self) -> None:
+        rows = criterion_status_records(
+            ["ledger matches"],
+            reported=[{"criterion": "ledger matches", "status": "passed"}],
+        )
+        self.assertEqual(rows[0]["status"], "unknown")
+        self.assertEqual(rows[0]["evidence"], "not_reported")
+
+    def test_passed_with_sentinel_evidence_becomes_unknown(self) -> None:
+        for sentinel in ("not_reported", "unknown", "n/a", ""):
+            with self.subTest(sentinel=sentinel):
+                rows = criterion_status_records(
+                    ["ledger matches"],
+                    reported=[
+                        {
+                            "criterion": "ledger matches",
+                            "status": "passed",
+                            "evidence": sentinel,
+                        }
+                    ],
+                )
+                self.assertEqual(rows[0]["status"], "unknown")
+                self.assertEqual(rows[0]["evidence"], "not_reported")
+
+    def test_failed_with_not_reported_evidence_becomes_unknown(self) -> None:
+        rows = criterion_status_records(
+            ["must fail cleanly"],
+            reported=[
+                {
+                    "criterion": "must fail cleanly",
+                    "status": "failed",
+                    "evidence": "not_reported",
+                }
+            ],
+        )
+        self.assertEqual(rows[0]["status"], "unknown")
+        self.assertEqual(rows[0]["evidence"], "not_reported")
+
+    def test_foreign_criterion_cannot_settle_checklist(self) -> None:
+        rows = criterion_status_records(
+            ["task criterion A", "task criterion B"],
+            reported=[
+                {
+                    "criterion": "foreign criterion not on task",
+                    "status": "passed",
+                    "evidence": "fake.py:1",
+                }
+            ],
+        )
+        self.assertEqual(rows[0]["status"], "unknown")
+        self.assertEqual(rows[1]["status"], "unknown")
+
+    def test_malformed_criterion_rows_are_ignored(self) -> None:
+        rows = criterion_status_records(
+            ["must pass"],
+            reported=[
+                "not a dict",
+                {"status": "passed", "evidence": "x.py:1"},
+                {"criterion": "must pass", "status": "passed"},
+            ],
+        )
+        self.assertEqual(rows[0]["status"], "unknown")
+        self.assertEqual(rows[0]["evidence"], "not_reported")
+
+    def test_valid_string_and_list_evidence_preserved(self) -> None:
+        rows = criterion_status_records(
+            ["single evidence", "list evidence"],
+            reported=[
+                {
+                    "criterion": "single evidence",
+                    "status": "passed",
+                    "evidence": "routing.py:42",
+                },
+                {
+                    "criterion": "list evidence",
+                    "status": "failed",
+                    "evidence": ["routing.py:42", "ledger.py:10"],
+                },
+            ],
+        )
+        self.assertEqual(rows[0]["status"], "passed")
+        self.assertEqual(rows[0]["evidence"], "routing.py:42")
+        self.assertEqual(rows[1]["status"], "failed")
+        self.assertEqual(rows[1]["evidence"], "routing.py:42; ledger.py:10")
+
+    def test_malformed_evidence_downgrades_passed_to_unknown(self) -> None:
+        class _EvidenceObject:
+            def __str__(self) -> str:
+                return "object-evidence.py:1"
+
+        malformed_cases = (
+            {"evidence": {"file": "routing.py", "line": 42}},
+            {"evidence": 42},
+            {"evidence": 3.14},
+            {"evidence": True},
+            {"evidence": _EvidenceObject()},
+            {"evidence": [None, "routing.py:42"]},
+            {"evidence": ["routing.py:42", 99]},
+            {"evidence": [["routing.py:42"]]},
+            {"evidence": ["routing.py:42", ""]},
+            {"evidence": ["", "routing.py:42"]},
+        )
+        for case in malformed_cases:
+            with self.subTest(evidence=case["evidence"]):
+                rows = criterion_status_records(
+                    ["ledger matches"],
+                    reported=[
+                        {
+                            "criterion": "ledger matches",
+                            "status": "passed",
+                            **case,
+                        }
+                    ],
+                )
+                self.assertEqual(rows[0]["status"], "unknown")
+                self.assertEqual(rows[0]["evidence"], "not_reported")
+
+    def test_structured_prompt_includes_criterion_reporting_contract(self) -> None:
+        instruction = (
+            "Audit routing.\n\nAcceptance criteria:\n- ROUTING exposes model_id\n"
+        )
+        prompt = build_structured_prompt(
+            instruction,
+            final_message_note=True,
+            acceptance_criteria=["ROUTING exposes model_id"],
+        )
+        self.assertIn("acceptance_criteria", prompt)
+        self.assertIn("current-dispatch", prompt)
+        self.assertIn("Do not copy the whole checklist", prompt)
 
     def test_criteria_survive_prompt_layers(self) -> None:
         instruction = (
@@ -168,6 +299,128 @@ class AcceptanceCriteriaTests(unittest.TestCase):
         self.assertEqual(rows[0]["criterion"], "ledger matches")
         self.assertEqual(rows[0]["status"], "unknown")
         self.assertEqual(rows[0]["evidence"], "not_reported")
+
+    def test_verification_criteria_stamp_failure_strips_raw_rows(self) -> None:
+        from unittest.mock import patch
+
+        task = Task(
+            job_id="job_qc",
+            role="audit",
+            instruction="check\n\nAcceptance criteria:\n- real criterion\n",
+            adapter="cursor",
+            payload={"acceptance_criteria": ["real criterion"]},
+        )
+        with patch(
+            "puppetmaster.acceptance_criteria.criterion_status_records",
+            side_effect=RuntimeError("stamp boom"),
+        ):
+            art = verification_artifact(
+                task=task,
+                worker_id="w1",
+                adapter="cursor",
+                check="check",
+                result="passed",
+                confidence=0.9,
+                evidence=["adapter:cursor"],
+                payload={
+                    "acceptance_criteria": [
+                        {
+                            "criterion": "foreign criterion",
+                            "status": "passed",
+                            "evidence": "fake.py:1",
+                        },
+                        {
+                            "criterion": "real criterion",
+                            "status": "passed",
+                            "evidence": "not_reported",
+                        },
+                    ],
+                },
+            )
+        rows = art.payload["acceptance_criteria"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["criterion"], "real criterion")
+        self.assertEqual(rows[0]["status"], "unknown")
+        self.assertEqual(rows[0]["evidence"], "not_reported")
+        self.assertNotEqual(
+            rows[0]["status"],
+            "passed",
+            msg="raw passed rows must not survive stamp failure",
+        )
+
+    def test_verification_criteria_stamp_function_failure_strips_raw_rows(
+        self,
+    ) -> None:
+        from unittest.mock import patch
+
+        task = Task(
+            job_id="job_qc",
+            role="audit",
+            instruction="check\n\nAcceptance criteria:\n- real criterion\n",
+            adapter="cursor",
+            payload={"acceptance_criteria": ["real criterion"]},
+        )
+        with patch(
+            "puppetmaster.acceptance_criteria.stamp_verification_acceptance_criteria",
+            side_effect=RuntimeError("stamp boom"),
+        ):
+            art = verification_artifact(
+                task=task,
+                worker_id="w1",
+                adapter="cursor",
+                check="check",
+                result="passed",
+                confidence=0.9,
+                evidence=["adapter:cursor"],
+                payload={
+                    "acceptance_criteria": [
+                        {
+                            "criterion": "foreign criterion",
+                            "status": "passed",
+                            "evidence": "fake.py:1",
+                        },
+                    ],
+                },
+            )
+        rows = art.payload["acceptance_criteria"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["criterion"], "real criterion")
+        self.assertEqual(rows[0]["status"], "unknown")
+        self.assertEqual(rows[0]["evidence"], "not_reported")
+
+    def test_verification_criteria_resolver_failure_removes_raw_rows(self) -> None:
+        from unittest.mock import patch
+
+        task = Task(
+            job_id="job_qc",
+            role="audit",
+            instruction="check\n\nAcceptance criteria:\n- real criterion\n",
+            adapter="cursor",
+            payload={"acceptance_criteria": ["real criterion"]},
+        )
+        with patch(
+            "puppetmaster.acceptance_criteria.acceptance_criteria_for_task",
+            side_effect=RuntimeError("resolver boom"),
+        ):
+            art = verification_artifact(
+                task=task,
+                worker_id="w1",
+                adapter="cursor",
+                check="check",
+                result="passed",
+                confidence=0.9,
+                evidence=["adapter:cursor"],
+                payload={
+                    "acceptance_criteria": [
+                        {
+                            "criterion": "foreign criterion",
+                            "status": "passed",
+                            "evidence": "fake.py:1",
+                        },
+                    ],
+                },
+            )
+        self.assertNotIn("acceptance_criteria", art.payload)
 
 
 class ExecutionProvenanceTests(unittest.TestCase):
