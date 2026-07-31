@@ -588,17 +588,9 @@ def cursor_artifact_from_item(
             wrapped = item[wrapped_type]
             item = {**wrapped, "type": wrapped.get("type", wrapped_type)}
         elif adapter == "codex":
-            semantic_types = [
-                kind
-                for kind, field in (
-                    ("finding", "claim"),
-                    ("risk", "risk"),
-                    ("decision", "decision"),
-                )
-                if field in item
-            ]
-            if len(semantic_types) == 1:
-                item = {**item, "type": semantic_types[0]}
+            inferred = _infer_codex_flat_semantic_type(item)
+            if inferred:
+                item = {**item, "type": inferred}
     artifact_type = str(item.get("type") or "").lower().strip()
     if artifact_type in {"findings", "swarm.finding"}:
         artifact_type = "finding"
@@ -717,6 +709,63 @@ def _json_prefix_decode(text: str) -> Optional[Any]:
             continue
         if isinstance(decoded, (dict, list)):
             return decoded
+    return None
+
+
+def _meaningful_semantic_string(value: object) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def _codex_semantic_field_state(item: dict[str, Any], field: str) -> str:
+    """Classify a flat semantic field as absent, meaningful, or malformed."""
+    if field not in item:
+        return "absent"
+    value = item[field]
+    if value is None:
+        return "absent"
+    if _meaningful_semantic_string(value) is not None:
+        return "meaningful"
+    if isinstance(value, str):
+        return "absent"
+    return "malformed"
+
+
+def _infer_codex_flat_semantic_type(item: dict[str, Any]) -> Optional[str]:
+    """Infer artifact type from flat Codex items using semantic values, not keys.
+
+    Finding accepts ``summary`` as a fallback (consistent with typed parsing).
+    Priority is finding > risk > decision so findings that carry risk/severity
+    metadata are not treated as ambiguous.
+    """
+    for field in ("claim", "risk", "decision"):
+        if _codex_semantic_field_state(item, field) == "malformed":
+            return None
+
+    finding_state = _codex_semantic_field_state(item, "claim")
+    if finding_state == "absent" and "summary" in item:
+        summary = item["summary"]
+        if summary is None:
+            pass
+        elif _meaningful_semantic_string(summary) is not None:
+            finding_state = "meaningful"
+        elif not isinstance(summary, str):
+            return None
+
+    has_finding = finding_state == "meaningful"
+    has_risk = _codex_semantic_field_state(item, "risk") == "meaningful"
+    has_decision = _codex_semantic_field_state(item, "decision") == "meaningful"
+
+    if has_finding:
+        return "finding"
+    if has_risk and has_decision:
+        return None
+    if has_risk:
+        return "risk"
+    if has_decision:
+        return "decision"
     return None
 
 

@@ -25165,6 +25165,214 @@ class JsonPrefixDecodeTests(unittest.TestCase):
             [],
         )
 
+    def test_flat_finding_with_risk_metadata_is_not_ambiguous(self) -> None:
+        """A finding that carries risk/severity metadata must stay a finding."""
+        from puppetmaster.adapters import cursor_result_artifacts
+
+        task = Task(
+            job_id="job",
+            role="codex-review",
+            instruction="inspect",
+            adapter="codex",
+            payload={},
+        )
+        text = json.dumps(
+            {
+                "artifacts": [
+                    {
+                        "claim": "behavior",
+                        "risk": "high",
+                        "severity": "critical",
+                        "evidence": ["a.py:1"],
+                        "confidence": 0.9,
+                    }
+                ]
+            }
+        )
+
+        artifacts = cursor_result_artifacts(task, "worker-codex", text, adapter="codex")
+
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(artifacts[0].type, ArtifactType.FINDING)
+        self.assertEqual(artifacts[0].payload["claim"], "behavior")
+        self.assertEqual(artifacts[0].payload["risk"], "high")
+        self.assertEqual(artifacts[0].payload["severity"], "critical")
+
+    def test_flat_semantic_null_and_empty_companions_are_ignored(self) -> None:
+        from puppetmaster.adapters import cursor_result_artifacts
+
+        task = Task(
+            job_id="job",
+            role="codex-review",
+            instruction="inspect",
+            adapter="codex",
+            payload={},
+        )
+        text = json.dumps(
+            {
+                "artifacts": [
+                    {
+                        "claim": "behavior",
+                        "risk": None,
+                        "decision": "",
+                        "evidence": ["a.py:1"],
+                        "confidence": 0.9,
+                    }
+                ]
+            }
+        )
+
+        artifacts = cursor_result_artifacts(task, "worker-codex", text, adapter="codex")
+
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(artifacts[0].type, ArtifactType.FINDING)
+
+    def test_flat_semantic_malformed_non_string_primary_is_rejected(self) -> None:
+        from puppetmaster.adapters import cursor_result_artifacts
+
+        task = Task(
+            job_id="job",
+            role="codex-review",
+            instruction="inspect",
+            adapter="codex",
+            payload={},
+        )
+        for item in (
+            {"claim": 123, "evidence": ["a.py:1"], "confidence": 0.9},
+            {"risk": {"detail": "nested"}, "evidence": ["a.py:1"], "confidence": 0.9},
+            {"decision": ["ship"], "evidence": ["a.py:1"], "confidence": 0.9},
+        ):
+            with self.subTest(item=item):
+                text = json.dumps({"artifacts": [item]})
+                self.assertEqual(
+                    cursor_result_artifacts(task, "worker-codex", text, adapter="codex"),
+                    [],
+                )
+
+    def test_flat_semantic_empty_primary_values_are_rejected(self) -> None:
+        from puppetmaster.adapters import cursor_result_artifacts
+
+        task = Task(
+            job_id="job",
+            role="codex-review",
+            instruction="inspect",
+            adapter="codex",
+            payload={},
+        )
+        text = json.dumps(
+            {
+                "artifacts": [
+                    {
+                        "claim": "",
+                        "risk": "   ",
+                        "decision": None,
+                        "evidence": ["a.py:1"],
+                        "confidence": 0.9,
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(
+            cursor_result_artifacts(task, "worker-codex", text, adapter="codex"),
+            [],
+        )
+
+    def test_flat_finding_summary_fallback_matches_typed_behavior(self) -> None:
+        from puppetmaster.adapters import cursor_result_artifacts
+
+        task = Task(
+            job_id="job",
+            role="codex-review",
+            instruction="inspect",
+            adapter="codex",
+            payload={},
+        )
+        text = json.dumps(
+            {
+                "artifacts": [
+                    {
+                        "summary": "behavior",
+                        "evidence": ["a.py:1"],
+                        "confidence": 0.9,
+                    }
+                ]
+            }
+        )
+
+        artifacts = cursor_result_artifacts(task, "worker-codex", text, adapter="codex")
+
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(artifacts[0].type, ArtifactType.FINDING)
+        self.assertEqual(artifacts[0].payload["claim"], "behavior")
+
+    def test_codex_flat_lifecycle_promotion_preserves_metadata(self) -> None:
+        """End-to-end: flat finding with risk metadata promotes without degrading."""
+        agent_text = json.dumps(
+            {
+                "artifacts": [
+                    {
+                        "claim": "behavior",
+                        "risk": "high",
+                        "evidence": ["a.py:1"],
+                        "confidence": 0.9,
+                    }
+                ]
+            }
+        )
+        events_stdout = "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "th_test"}),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {"type": "agent_message", "text": agent_text},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "turn.completed",
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                    }
+                ),
+            ]
+        )
+        streamed = StreamedProcess(
+            returncode=0,
+            stdout=events_stdout,
+            stderr="",
+            timed_out=False,
+            live_log_path=None,
+        )
+        task = Task(
+            id="t-codex-flat-meta",
+            job_id="job-codex-flat-meta",
+            role="codex-review",
+            adapter="codex",
+            instruction="Review the repo.",
+            payload={
+                "cwd": str(Path.cwd()),
+                "sandbox": "read-only",
+                "disable_codegraph": True,
+            },
+        )
+        clean = {"sha": "s", "changed_files": [], "untracked_files": [], "diff": ""}
+        with patch(
+            "puppetmaster.adapters.resolve_command", return_value="/usr/bin/codex"
+        ), patch(
+            "puppetmaster.adapters.git_snapshot", side_effect=[clean, clean]
+        ), patch(
+            "puppetmaster.adapters.run_streamed_subprocess", return_value=streamed
+        ):
+            artifacts = CodexAdapter().run(task, "goal", "worker")
+
+        self.assertEqual(artifacts[0].payload["result"], "passed")
+        self.assertIsNone(artifacts[0].payload["failure"])
+        self.assertEqual(len(artifacts), 2)
+        self.assertEqual(artifacts[1].type, ArtifactType.FINDING)
+        self.assertEqual(artifacts[1].payload["claim"], "behavior")
+        self.assertEqual(artifacts[1].payload["risk"], "high")
+
     def test_typed_artifact_with_nested_wrapper_dict_is_not_clobbered(self) -> None:
         """A typed item that also carries a nested finding/risk/decision dict
         must keep its top-level fields — unwrap only when type is absent.
