@@ -2,7 +2,7 @@
 
 The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
 
-**Current release:** [v1.20.6](CHANGELOG.md#v1206) — cursor swarm `allowed_adapters` pin; see [CHANGELOG.md](CHANGELOG.md) for the full 1.20.x line.
+**Current release:** [v1.21.8](CHANGELOG.md#v1218) — public release documentation aligned with the current package; see [CHANGELOG.md](CHANGELOG.md) for the full 1.21.x line.
 
 ## Start here
 

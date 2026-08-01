@@ -157,7 +157,11 @@ Marionette (the harness that rides Puppetmaster) implements complementary input-
 
 ## Status
 
-Daily-driver beta, currently at **v1.21.6**. Real runtime contract, automated tests, SQLite backend, fail-closed jobs, a live Cursor Agent MCP, validated full-edit adapters, constrained same-adapter model routing, and AWS Bedrock as a first-class agentic provider (Converse + ConverseStream) with verified-invoke routing health. Credible for supervised local engineering; not yet a hosted multi-user service. Full feature matrix in [FEATURES.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/FEATURES.md). Versioned history in [CHANGELOG.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/CHANGELOG.md).
+Daily-driver beta, currently at **v1.21.8**. Real runtime contract, automated tests, SQLite backend, fail-closed jobs, a live Cursor Agent MCP, validated full-edit adapters, constrained same-adapter model routing, and AWS Bedrock as a first-class agentic provider (Converse + ConverseStream) with verified-invoke routing health. Credible for supervised local engineering; not yet a hosted multi-user service. Full feature matrix in [FEATURES.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/FEATURES.md). Versioned history in [CHANGELOG.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/CHANGELOG.md).
+
+**v1.21.8 highlights:** Public version markers and release documentation are synchronized with the current package release.
+
+**v1.21.7 highlights:** Codex read-only workers retain flat finding, risk, and decision artifacts while rejecting ambiguous or malformed responses.
 
 **v1.21.6 highlights:** Structured agentic `submit_findings` acceptance-criterion status; fail-closed task-scoped evidence normalization with non-raising verification fallback; agentic-only empty cached catalog unverified preflight while authoritative/credential failures still block.
 

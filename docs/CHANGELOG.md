@@ -1,3 +1,12 @@
+## v1.21.8
+
+**Synchronize public release documentation with the current package version.**
+
+- **Release markers.** Align README, feature-matrix, docs-index, and package
+  metadata references with v1.21.8.
+- **Historical notes.** Preserve the v1.21.7 Codex normalization and v1.21.6
+  quality-control entries as versioned release history.
+
 ## v1.21.7
 
 **Codex flat artifact normalization and stricter structured-result validation.**
