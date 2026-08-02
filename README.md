@@ -7,6 +7,11 @@
 
 Puppetmaster runs multi-step engineering work through the agent tools you already use: Cursor, Claude Code, Codex, Hermes, or a provider API. It starts independent workers, routes tasks to an available model, and stores their typed results in SQLite so jobs can be inspected and resumed. It is aimed at developers who want durable state and reviewable output for repository investigations, audits, refactors, and implementations.
 
+## Measured results
+
+- **SWE-bench Lite:** 29% lower actual spend with cost routing and durable retries; 47–48% token-matched savings. This is a single-seed study and does not establish quality parity. [Study](https://github.com/professorpalmer/swebench-pm).
+- **NL2Repo-Bench:** 91.1% mean pass rate, about 2.28× the published ~40% baseline. [Benchmark and methodology](https://professorpalmer.github.io/durable-state-vs-context/).
+
 <img src="https://raw.githubusercontent.com/professorpalmer/Puppetmaster/main/docs/demo.gif" alt="Puppetmaster demo showing routing, worker fan-out, and a stitched summary" width="100%" />
 
 ## Contents
