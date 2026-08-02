@@ -9,6 +9,17 @@ Puppetmaster runs multi-step engineering work through the agent tools you alread
 
 <img src="https://raw.githubusercontent.com/professorpalmer/Puppetmaster/main/docs/demo.gif" alt="Puppetmaster demo showing routing, worker fan-out, and a stitched summary" width="100%" />
 
+## Contents
+
+- [Install](#install)
+- [Quickstart](#quickstart)
+- [How it works](#how-it-works)
+- [Evidence](#evidence)
+- [More documentation](#more-documentation)
+- [Uninstall](#uninstall)
+- [Status](#status)
+- [License](#license)
+
 ## Install
 
 ```bash
