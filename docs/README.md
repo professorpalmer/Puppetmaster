@@ -2,7 +2,7 @@
 
 The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
 
-**Current release:** [v1.21.9](CHANGELOG.md#v1219) — OpenCode Go agentic support; see [CHANGELOG.md](CHANGELOG.md) for the full 1.21.x line.
+**Current release:** [v1.21.10](CHANGELOG.md#v12110) — fail-fast model-backed auto-routing; see [CHANGELOG.md](CHANGELOG.md) for the full 1.21.x line.
 
 ## Start here
 

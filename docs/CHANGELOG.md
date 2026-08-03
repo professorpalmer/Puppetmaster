@@ -1,3 +1,19 @@
+## v1.21.10
+
+**Fail fast when model-backed auto-routing cannot resolve a model.**
+
+Auto-routed worker specs for model-backed adapters now reject an empty or
+ineligible model registry before task creation, with a role-, adapter-, and
+next-step-specific error instead of reaching the adapter as ``model=None``.
+
+- **Early routing guard.** Empty registries and no-eligible-model decisions
+  raise ``NoEligibleModelError`` before dispatch, preventing opaque
+  ``no_model`` worker failures.
+- **Safe pass-through.** Local adapters and explicitly pinned models retain
+  their existing pass-through behavior when no registry is available.
+- **Regression coverage.** Added lifecycle tests for empty registries,
+  ineligible routing, local auto-route, explicit pins, and zero task creation.
+
 ## v1.21.9
 
 **First-class OpenCode Go support for agentic workers.**

@@ -206,6 +206,44 @@ def _payload_has_explicit_model_pin(payload: dict) -> bool:
     )
 
 
+_MODEL_BACKED_ADAPTERS = frozenset(
+    {"agentic", "openai", "cursor", "codex", "claude-code", "hermes"}
+)
+
+
+def _auto_route_must_resolve_model(spec: WorkerSpec) -> bool:
+    """True when auto_route must pick a model before dispatch can succeed."""
+    payload = spec.payload or {}
+    if not payload.get("auto_route"):
+        return False
+    if spec.adapter not in _MODEL_BACKED_ADAPTERS:
+        return False
+    if payload.get("pinned_model"):
+        return False
+    model = payload.get("model")
+    if model is not None and str(model).strip():
+        return False
+    return True
+
+
+def _auto_route_failure_message(
+    spec: WorkerSpec,
+    *,
+    registry_path: Optional[Path],
+    reason: str,
+) -> str:
+    path_hint = f" at {registry_path}" if registry_path else ""
+    next_step = (
+        "Run `python -m puppetmaster models init` to enable per-task model routing."
+        if reason == "model registry is empty"
+        else "Review the routing constraints and configured model registry."
+    )
+    return (
+        f"auto-route failed for role={spec.role!r} adapter={spec.adapter!r}: "
+        f"{reason}{path_hint}. {next_step}"
+    )
+
+
 @dataclass(frozen=True)
 class RunResult:
     job: Job
@@ -1560,7 +1598,10 @@ class Orchestrator:
 
         Specs that don't opt in are passed through unchanged. The
         router never silently overrides an explicit choice — opt-in
-        only.
+        only. Model-backed specs that opt in without an explicit model
+        pin fail the job when the registry is empty or no model qualifies,
+        instead of passing through to dispatch and surfacing ``no_model``
+        later.
         """
         from puppetmaster.model_registry import default_registry_path, load_registry
         from puppetmaster.platform_billing import RegistryReconciliation, reconcile_registry
@@ -1630,9 +1671,8 @@ class Orchestrator:
                         registry_cache = installed
             if not registry_cache:
                 # No registry on disk yet (user hasn't run `models init`).
-                # Don't fail the run — pass the spec through unmodified.
-                # Emit one diagnostic event per run so the user can spot
-                # the opportunity to opt in, without spamming.
+                # Local/shell adapters and explicit model pins may pass through;
+                # model-backed auto-route specs must fail before dispatch.
                 if not empty_registry_announced:
                     self.store.emit(
                         job.id,
@@ -1648,6 +1688,14 @@ class Orchestrator:
                         },
                     )
                     empty_registry_announced = True
+                if _auto_route_must_resolve_model(spec):
+                    raise NoEligibleModelError(
+                        _auto_route_failure_message(
+                            spec,
+                            registry_path=registry_path,
+                            reason="model registry is empty",
+                        )
+                    )
                 result.append(spec)
                 continue
             policy = payload.get("routing_policy") or "balanced"
@@ -1665,6 +1713,14 @@ class Orchestrator:
                         "registry_path": str(registry_path) if registry_path else None,
                     },
                 )
+                if _auto_route_must_resolve_model(spec):
+                    raise NoEligibleModelError(
+                        _auto_route_failure_message(
+                            spec,
+                            registry_path=registry_path,
+                            reason="no eligible model in registry",
+                        )
+                    ) from exc
                 result.append(spec)
                 continue
 
