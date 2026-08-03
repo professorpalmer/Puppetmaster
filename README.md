@@ -127,7 +127,7 @@ pip uninstall puppetmaster-ai   # or: pipx uninstall puppetmaster-ai
 
 ## Status
 
-Puppetmaster is a daily-driver beta at **v1.21.8**, suitable for supervised local engineering rather than hosted multi-user use. The current release includes SQLite-backed jobs, Cursor Agent MCP support, full-edit adapters, constrained model routing, and AWS Bedrock support through the agentic adapter. See the [feature matrix](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/FEATURES.md) and [CHANGELOG.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/CHANGELOG.md) for the current details.
+Puppetmaster is a daily-driver beta at **v1.21.9**, suitable for supervised local engineering rather than hosted multi-user use. The current release includes SQLite-backed jobs, Cursor Agent MCP support, full-edit adapters, constrained model routing, AWS Bedrock, and OpenCode Go subscription support through the agentic adapter. See the [feature matrix](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/FEATURES.md) and [CHANGELOG.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/CHANGELOG.md) for the current details.
 
 PyPI uses the package name [`puppetmaster-ai`](https://pypi.org/project/puppetmaster-ai/); the import name, CLI, and repository use `puppetmaster`.
 

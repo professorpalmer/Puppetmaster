@@ -1,3 +1,31 @@
+## v1.21.9
+
+**First-class OpenCode Go support for agentic workers.**
+
+Marionette's ``OPENCODE_GO_API_KEY`` subscription credential now drives
+Puppetmaster agentic workers against ``https://opencode.ai/zen/go/v1`` (not
+OpenRouter billing), with flat model ids and the published per-model endpoint
+table.
+
+- **Provider descriptor.** ``opencode-go`` in ``PROVIDER_REGISTRY`` with
+  ``OPENCODE_GO_API_KEY``, numbered key-pool rotation, base-URL override, and
+  CLI ``keys`` wizard support.
+- **Per-model wire routing.** Chat models (DeepSeek V4, Kimi, GLM, MiMo, Hy3,
+  Grok, â€¦) use ``/chat/completions``; MiniMax/Qwen use ``/messages``; GPT 5.6
+  Luna uses the stdlib OpenAI Responses transport (``/responses``, Bearer
+  auth, no ChatGPT-only headers/metadata) â€” never silently posted to
+  chat/completions.
+- **Go quirks.** Flat-namespace normalization, reasoning dialects, and the
+  MiMo Pro output ceiling â€” stdlib-only, no Marionette transport duplication.
+- **Upstream 401 blocks.** ``Request blocked by upstream provider`` is
+  classified as retryable (not a dead key), so health/retry state does not
+  disconnect a valid subscription credential. Useful error bodies are preserved;
+  secrets are not logged.
+- **Catalog + tests.** Plan-billed Go entries (including GPT 5.6 Luna) in the
+  agentic curated catalog; hermetic coverage for descriptor, routing, Responses
+  conversion/parse/SSE/tool round-trip, request construction, and error
+  classification.
+
 ## v1.21.8
 
 **Synchronize public release documentation with the current package version.**
@@ -36,7 +64,7 @@ authoritative absence and credential failures still block.
   status, evidence); rows carry through to verification artifacts.
 - **Fail-closed evidence normalization.** Task-scoped rows reject malformed
   evidence, downgrade ``passed`` / ``failed`` without concrete evidence to
-  ``unknown``, and leave omitted criteria ``unknown`` / ``not_reported`` — never
+  ``unknown``, and leave omitted criteria ``unknown`` / ``not_reported`` ï¿½ never
   silently ``passed``.
 - **Non-raising verification fallback.** When canonical criterion stamping
   raises, verification payloads fall back to all-``unknown`` task-scoped rows
@@ -132,7 +160,7 @@ files and falsely failed "is this fix present?" checks. ``git show`` against
 already-fetched tips also crashed on Windows when stdout hit cp1252.
 
 - **Analyze ``run_terminal``.** Git-read-only allowlist (``show`` / ``log`` /
-  ``status`` / ``diff`` / ``rev-parse`` / …). Mutating git and non-git shell
+  ``status`` / ``diff`` / ``rev-parse`` / ï¿½). Mutating git and non-git shell
   stay refused.
 - **UTF-8 terminal capture.** ``encoding=utf-8`` + ``errors=replace``, plus
   non-interactive git pager env, so ``git show`` never dies on Unicode.

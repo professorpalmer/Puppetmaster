@@ -162,20 +162,43 @@ def is_server_error_failure(failure: str) -> bool:
     return failure in (SERVER_ERROR, OPENAI_SERVER_ERROR)
 
 
+# OpenCode Go (and similar relays) can return HTTP 401 AuthError when the
+# upstream vendor blocks a request even though GET /models and the local key
+# are fine. Treat as transient — not a dead/revoked key.
+_UPSTREAM_BLOCK_PATTERNS = (
+    "blocked by upstream provider",
+    "request blocked by upstream",
+)
+
+
+def is_upstream_provider_block(message: Optional[str] = None) -> bool:
+    """True when the body describes an upstream-vendor block, not a bad key."""
+    msg = (message or "").lower()
+    return any(pattern in msg for pattern in _UPSTREAM_BLOCK_PATTERNS)
+
+
 def classify_provider_failure(
     reason: str,
     http_status: Optional[int] = None,
+    body: str = "",
 ) -> str:
     """Bridge raw direct-provider errors into the canonical failure taxonomy.
 
     ``reason`` remains provider diagnostic data; callers use this normalized
-    result for retry and routing decisions.
+    result for retry and routing decisions. ``body`` is consulted so OpenCode
+    Go-style upstream blocks are not misclassified as ``not_authenticated``.
     """
     if http_status is None and reason.startswith("http_status:"):
         try:
             http_status = int(reason.partition(":")[2])
         except ValueError:
             pass
+
+    # Relay 401 "blocked by upstream" is not a rejected local key — classify
+    # as a retryable server/upstream failure so health state does not
+    # disconnect a valid subscription credential.
+    if is_upstream_provider_block(body) or is_upstream_provider_block(reason):
+        return SERVER_ERROR
 
     if http_status == 401:
         return NOT_AUTHENTICATED
@@ -194,5 +217,6 @@ def classify_provider_failure(
         # Legacy artifact / dashboard literal still maps to canonical retry.
         "openai_server_error": SERVER_ERROR,
         "server_error": SERVER_ERROR,
+        "unsupported_model": MODEL_UNAVAILABLE,
     }
     return category_by_reason.get(reason, reason or UNKNOWN)

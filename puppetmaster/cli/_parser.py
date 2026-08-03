@@ -1343,7 +1343,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     agentic.add_argument(
         "--provider",
-        help="Provider slug (openai, anthropic, gemini, openrouter, ...). Routes credentials/wire protocol.",
+        help="Provider slug (openai, anthropic, gemini, openrouter, opencode-go, ...). Routes credentials/wire protocol.",
     )
     agentic.add_argument(
         "--model",

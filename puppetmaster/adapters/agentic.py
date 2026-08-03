@@ -61,6 +61,7 @@ from puppetmaster.provider_circuit import (
     get_provider_circuit_breaker,
     resolve_circuit_key,
 )
+from puppetmaster.failure import is_upstream_provider_block
 from puppetmaster.providers import (
     AssistantTurn,
     ProviderError,
@@ -239,6 +240,7 @@ _PROVIDER_ENV_HINTS = {
     "gemini": "GEMINI_API_KEY (or GOOGLE_API_KEY)",
     "google": "GOOGLE_API_KEY (or GEMINI_API_KEY)",
     "openrouter": "OPENROUTER_API_KEY",
+    "opencode-go": "OPENCODE_GO_API_KEY",
     "groq": "GROQ_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
     "xai": "XAI_API_KEY",
@@ -330,6 +332,10 @@ def _provider_is_openai_compatible(provider: str) -> bool:
     slug = (provider or "").strip().lower()
     if slug == "openrouter":
         return True
+    # OpenCode Go speaks per-model reasoning dialects; do not inject a generic
+    # OpenAI reasoning_effort default — provider_chat maps effort when set.
+    if slug == "opencode-go":
+        return False
     desc = get_provider(slug)
     return bool(desc is not None and getattr(desc, "wire", None) == "openai")
 
@@ -1045,7 +1051,17 @@ class AgenticAdapter(FullEditWorkerAdapter):
                         call_extra = dict(call_extra)
                         call_extra.pop("force_tool", None)
                         continue
-                    if exc.status in (401, 403, 429) and key_index + 1 < len(keys):
+                    # OpenCode Go (and similar relays) can 401 with an upstream
+                    # vendor block while the subscription key is still valid —
+                    # rotate neither the key nor the auth-failure path.
+                    upstream_block = is_upstream_provider_block(
+                        f"{exc} {getattr(exc, 'body', '') or ''}"
+                    )
+                    if (
+                        exc.status in (401, 403, 429)
+                        and key_index + 1 < len(keys)
+                        and not upstream_block
+                    ):
                         key_index += 1
                         continue
                     if attempt >= max_retries or not is_retryable_provider_error(exc):
@@ -2341,6 +2357,10 @@ class AgenticAdapter(FullEditWorkerAdapter):
         # or the canonical classifier category "forbidden" when status was lost
         # after a 403. Catch all of them -- every one is a credential problem,
         # not a model or prompt problem.
+        # Upstream vendor blocks arrive as HTTP 401 AuthError but the local
+        # subscription key is still valid — do not emit a dead-key RISK.
+        if is_upstream_provider_block(f"{detail or ''} {reason or ''}"):
+            return None
         r = (reason or "").lower()
         is_auth = (
             status in (401, 403)

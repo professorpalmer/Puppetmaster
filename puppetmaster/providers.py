@@ -14,15 +14,19 @@ has no usable credential is never offered to the router, so a fresh install
 Two wire protocols cover the entire set:
 
 * ``"openai"`` -- the OpenAI Chat Completions shape. Covers OpenAI itself plus
-  every OpenAI-compatible endpoint (OpenRouter, xAI, DeepSeek, Groq, Mistral,
-  Together, Nous, and local Ollama / LM Studio), and Google Gemini via its
-  OpenAI-compatible endpoint -- each is just a different ``base_url`` + key.
+  every OpenAI-compatible endpoint (OpenRouter, OpenCode Go chat models, xAI,
+  DeepSeek, Groq, Mistral, Together, Nous, and local Ollama / LM Studio), and
+  Google Gemini via its OpenAI-compatible endpoint -- each is just a different
+  ``base_url`` + key.
 * ``"anthropic"`` -- Anthropic's native ``/v1/messages`` shape (``tool_use``
   content blocks), which is different enough on the wire to warrant its own
-  client.
+  client. OpenCode Go MiniMax/Qwen models also use this path via the Go
+  subscription base URL.
 
 Both clients are normalized behind :func:`provider_chat`, which returns an
 :class:`AssistantTurn`, so the agentic worker loop never branches on provider.
+``provider=opencode-go`` additionally selects the wire per model — Chat
+Completions, Anthropic Messages, or OpenAI Responses (GPT 5.6 Luna).
 """
 from __future__ import annotations
 
@@ -194,6 +198,18 @@ PROVIDER_REGISTRY: dict[str, ProviderDescriptor] = {
         api_key_env_vars=("OPENROUTER_API_KEY",),
         label="OpenRouter",
     ),
+    # OpenCode Go subscription: flat model ids + per-model wire protocol
+    # (chat/completions vs /messages vs /responses). Wire on the descriptor is
+    # the chat/completions default; provider_chat selects the real path via
+    # puppetmaster.opencode_go. Same OPENCODE_GO_API_KEY as Marionette.
+    "opencode-go": ProviderDescriptor(
+        slug="opencode-go",
+        wire="openai",
+        base_url="https://opencode.ai/zen/go/v1",
+        base_url_env_var="OPENCODE_GO_BASE_URL",
+        api_key_env_vars=("OPENCODE_GO_API_KEY",),
+        label="OpenCode Go",
+    ),
     "xai": ProviderDescriptor(
         slug="xai",
         wire="openai",
@@ -353,7 +369,12 @@ def resolve_base_url(
     env = env if env is not None else os.environ
     override = env.get(desc.base_url_env_var) if desc.base_url_env_var else None
     if override and str(override).strip():
-        return str(override).strip().rstrip("/")
+        url = str(override).strip().rstrip("/")
+        if desc.slug == "opencode-go":
+            from puppetmaster.opencode_go import driver_base_url
+
+            return driver_base_url(url)
+        return url
     if desc.slug == "bedrock":
         from puppetmaster.bedrock import (
             bedrock_runtime_base_url,
@@ -361,6 +382,10 @@ def resolve_base_url(
         )
 
         return bedrock_runtime_base_url(resolve_bedrock_region(env))
+    if desc.slug == "opencode-go":
+        from puppetmaster.opencode_go import driver_base_url
+
+        return driver_base_url(desc.base_url)
     return desc.base_url.rstrip("/")
 
 
@@ -448,7 +473,7 @@ class ProviderError(Exception):
         self.reason = reason
         self.status = status
         self.body = body
-        self.failure = classify_provider_failure(reason, status)
+        self.failure = classify_provider_failure(reason, status, body=body)
 
 
 _RETRYABLE_PROVIDER_FAILURES = frozenset({
@@ -495,7 +520,10 @@ def _post_json(url: str, *, headers: dict, body: dict, timeout: int) -> dict:
         except Exception:
             err_body = ""
         raise ProviderError(
-            f"HTTP {exc.code}", reason=f"http_status:{exc.code}", status=exc.code, body=err_body
+            _http_error_message(exc.code, err_body),
+            reason=f"http_status:{exc.code}",
+            status=exc.code,
+            body=err_body,
         ) from exc
     except (socket.timeout, TimeoutError) as exc:
         raise ProviderError("request timed out", reason="timeout") from exc
@@ -505,6 +533,38 @@ def _post_json(url: str, *, headers: dict, body: dict, timeout: int) -> dict:
         return json.loads(raw)
     except json.JSONDecodeError as exc:
         raise ProviderError("malformed response", reason="malformed_response", body=raw[:8000]) from exc
+
+
+def _http_error_message(status: int, body: str) -> str:
+    """Human-readable HTTP error that preserves useful upstream detail.
+
+    Keeps phrases like OpenCode's ``Request blocked by upstream provider`` in
+    the exception message so classifiers and RISK artifacts can distinguish a
+    vendor-side block from a genuinely invalid API key. Truncates and never
+    echoes obvious secret-bearing query fragments.
+    """
+    text = (body or "").strip()
+    if not text:
+        return f"HTTP {status}"
+    # Prefer a nested error.message when the body is JSON.
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        parsed = None
+    detail = ""
+    if isinstance(parsed, dict):
+        err = parsed.get("error")
+        if isinstance(err, dict):
+            detail = str(err.get("message") or err.get("type") or "").strip()
+        elif isinstance(err, str):
+            detail = err.strip()
+        if not detail:
+            detail = str(parsed.get("message") or "").strip()
+    if not detail:
+        detail = text.replace("\n", " ").strip()
+    if len(detail) > 400:
+        detail = detail[:400] + "…"
+    return f"HTTP {status}: {detail}"
 
 
 def _openai_usage_fields(usage: dict) -> dict:
@@ -939,7 +999,10 @@ def _open_stream(url: str, *, headers: dict, body: dict, timeout: int):
         except Exception:
             err_body = ""
         raise ProviderError(
-            f"HTTP {exc.code}", reason=f"http_status:{exc.code}", status=exc.code, body=err_body
+            _http_error_message(exc.code, err_body),
+            reason=f"http_status:{exc.code}",
+            status=exc.code,
+            body=err_body,
         ) from exc
     except (socket.timeout, TimeoutError) as exc:
         raise ProviderError("request timed out", reason="timeout") from exc
@@ -1153,6 +1216,691 @@ def _anthropic_chat_stream(
     )
 
 
+# --- OpenAI Responses (stdlib) -----------------------------------------------
+
+def _flatten_message_text(content: Any) -> str:
+    """Coerce chat-message content (string or text-part list) to a plain string."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str) and part:
+                parts.append(part)
+            elif isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str) and text:
+                    parts.append(text)
+        return "".join(parts)
+    return str(content)
+
+
+def _messages_to_responses_input(messages: list[dict]) -> tuple[str, list[dict]]:
+    """Convert OpenAI chat messages to Responses ``(instructions, input)``.
+
+    System messages become top-level ``instructions``. Assistant tool-call turns
+    expand into ``function_call`` items; tool results become
+    ``function_call_output``. User/assistant prose stays as message items with
+    the role-correct text part type.
+    """
+    instructions_parts: list[str] = []
+    input_items: list[dict] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "user")
+        content = msg.get("content")
+        if role == "system":
+            text = _flatten_message_text(content).strip()
+            if text:
+                instructions_parts.append(text)
+            continue
+        if role == "tool":
+            output = content if isinstance(content, str) else (
+                json.dumps(content) if content is not None else ""
+            )
+            input_items.append({
+                "type": "function_call_output",
+                "call_id": str(msg.get("tool_call_id") or msg.get("id") or ""),
+                "output": output,
+            })
+            continue
+        if role == "assistant" and msg.get("tool_calls"):
+            text = _flatten_message_text(content)
+            if text:
+                input_items.append({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": text}],
+                })
+            for call in msg.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                fn = call.get("function") or {}
+                raw_args = fn.get("arguments")
+                if isinstance(raw_args, str):
+                    args_text = raw_args
+                else:
+                    args_text = json.dumps(raw_args or {})
+                input_items.append({
+                    "type": "function_call",
+                    "call_id": str(call.get("id") or ""),
+                    "name": str(fn.get("name") or ""),
+                    "arguments": args_text or "{}",
+                })
+            continue
+        text = _flatten_message_text(content)
+        part_type = "output_text" if role == "assistant" else "input_text"
+        wire_role = "user" if role == "user" else role
+        input_items.append({
+            "type": "message",
+            "role": wire_role,
+            "content": [{"type": part_type, "text": text}],
+        })
+    return "\n\n".join(instructions_parts), input_items
+
+
+def _tools_to_responses(tools: Optional[list[dict]]) -> Optional[list[dict]]:
+    """Translate OpenAI chat function-tool specs to Responses flat tools."""
+    if not tools:
+        return None
+    out: list[dict] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("type") == "function" or "function" in tool:
+            fn = tool.get("function") or {}
+            out.append({
+                "type": "function",
+                "name": fn.get("name") or "",
+                "description": fn.get("description") or "",
+                "parameters": fn.get("parameters") or {"type": "object", "properties": {}},
+            })
+        elif tool.get("name"):
+            out.append({
+                "type": "function",
+                "name": tool.get("name") or "",
+                "description": tool.get("description") or "",
+                "parameters": tool.get("parameters") or {"type": "object", "properties": {}},
+            })
+    return out or None
+
+
+def _responses_usage_fields(usage: dict) -> dict:
+    """Normalize Responses (or chat-shaped) usage into AssistantTurn.usage keys."""
+    if not isinstance(usage, dict):
+        usage = {}
+    prompt = usage.get("input_tokens")
+    if prompt is None:
+        prompt = usage.get("prompt_tokens")
+    completion = usage.get("output_tokens")
+    if completion is None:
+        completion = usage.get("completion_tokens")
+    total = usage.get("total_tokens")
+    prompt_i = int(prompt or 0)
+    completion_i = int(completion or 0)
+    if total is None:
+        total_i = prompt_i + completion_i
+    else:
+        total_i = int(total or 0)
+    details = usage.get("input_tokens_details") or usage.get("prompt_tokens_details") or {}
+    cached = 0
+    if isinstance(details, dict):
+        cached = int(details.get("cached_tokens") or 0)
+    out = {
+        "prompt_tokens": prompt_i,
+        "completion_tokens": completion_i,
+        "total_tokens": total_i,
+        "cached_tokens": cached,
+    }
+    cost = usage.get("cost")
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+        out["cost_usd"] = float(cost)
+    return out
+
+
+def _parse_function_call_arguments(raw_args: Any) -> dict:
+    if isinstance(raw_args, dict):
+        return raw_args
+    if isinstance(raw_args, str):
+        text = raw_args.strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return {"__raw__": raw_args}
+        return parsed if isinstance(parsed, dict) else {"__raw__": raw_args}
+    if raw_args is None:
+        return {}
+    return {"__raw__": raw_args}
+
+
+def _reasoning_text_from_responses_item(item: dict) -> str:
+    """Extract visible reasoning summary text from a Responses reasoning item."""
+    parts: list[str] = []
+    summary = item.get("summary")
+    if isinstance(summary, list):
+        for part in summary:
+            if isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str) and text:
+                    parts.append(text)
+            elif isinstance(part, str) and part:
+                parts.append(part)
+    elif isinstance(summary, str) and summary:
+        parts.append(summary)
+    content = item.get("content")
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and part.get("type") in (
+                "reasoning_text", "summary_text", "output_text", "text",
+            ):
+                text = part.get("text")
+                if isinstance(text, str) and text:
+                    parts.append(text)
+    return "".join(parts)
+
+
+def _assistant_turn_from_responses(data: dict) -> AssistantTurn:
+    """Parse a non-stream (or assembled) Responses body into AssistantTurn."""
+    if not isinstance(data, dict):
+        raise ProviderError(
+            "malformed responses body",
+            reason="malformed_response",
+            body=str(data)[:8000],
+        )
+    status = str(data.get("status") or "")
+    err = data.get("error")
+    if status == "failed" or err:
+        if isinstance(err, dict):
+            detail = str(err.get("message") or err.get("code") or err)[:800]
+        elif err:
+            detail = str(err)[:800]
+        else:
+            detail = "responses request failed"
+        raise ProviderError(
+            detail,
+            reason="provider_error",
+            body=json.dumps(data)[:8000] if data else detail,
+        )
+
+    text_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    tool_calls: list[dict] = []
+    saw_message = False
+    for item in data.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        itype = str(item.get("type") or "")
+        if itype == "message":
+            # Skip commentary/analysis phases so progress/reasoning never
+            # contaminates the final answer text.
+            phase = item.get("phase")
+            if isinstance(phase, str) and phase.strip().lower() in (
+                "commentary", "analysis",
+            ):
+                if phase.strip().lower() == "analysis":
+                    for part in item.get("content") or []:
+                        if isinstance(part, dict) and part.get("type") in (
+                            "output_text", "text",
+                        ):
+                            piece = part.get("text")
+                            if isinstance(piece, str) and piece:
+                                reasoning_parts.append(piece)
+                continue
+            saw_message = True
+            for part in item.get("content") or []:
+                if isinstance(part, dict) and part.get("type") in (
+                    "output_text", "text",
+                ):
+                    piece = part.get("text")
+                    if isinstance(piece, str) and piece:
+                        text_parts.append(piece)
+        elif itype == "function_call":
+            tool_calls.append({
+                "id": str(item.get("call_id") or item.get("id") or ""),
+                "name": str(item.get("name") or ""),
+                "arguments": _parse_function_call_arguments(item.get("arguments")),
+            })
+        elif itype == "reasoning" or itype.startswith("reasoning"):
+            piece = _reasoning_text_from_responses_item(item)
+            if piece:
+                reasoning_parts.append(piece)
+
+    if not text_parts and not saw_message and isinstance(data.get("output_text"), str):
+        text_parts.append(data["output_text"])
+
+    if tool_calls:
+        finish = "tool_calls"
+    elif status == "incomplete":
+        finish = "length"
+    elif status:
+        finish = status
+    else:
+        finish = "stop"
+
+    reasoning = "".join(reasoning_parts).strip()
+    if not reasoning and isinstance(data.get("reasoning"), str):
+        reasoning = data["reasoning"].strip()
+
+    return AssistantTurn(
+        text="".join(text_parts).strip(),
+        tool_calls=tool_calls,
+        finish_reason=finish,
+        usage=_responses_usage_fields(data.get("usage") or {}),
+        raw=data,
+        reasoning=reasoning,
+    )
+
+
+def _build_responses_body(
+    *,
+    model: str,
+    messages: list[dict],
+    tools: Optional[list[dict]],
+    extra: dict,
+) -> dict:
+    """Build a Responses create body (no ChatGPT-only metadata)."""
+    extra = dict(extra)
+    force_tool = extra.pop("force_tool", None)
+    # Chat Completions leftovers that Responses does not accept.
+    extra.pop("session_id", None)
+    extra.pop("stream_options", None)
+    max_tokens = extra.pop("max_tokens", None)
+    max_completion = extra.pop("max_completion_tokens", None)
+    instructions, input_items = _messages_to_responses_input(messages)
+    body: dict[str, Any] = {
+        "model": model,
+        "input": input_items,
+        "store": False,
+    }
+    if instructions:
+        body["instructions"] = instructions
+    resp_tools = _tools_to_responses(tools)
+    if resp_tools:
+        body["tools"] = resp_tools
+        if force_tool:
+            body["tool_choice"] = {"type": "function", "name": str(force_tool)}
+        else:
+            body["tool_choice"] = "auto"
+    ceiling = max_tokens if max_tokens is not None else max_completion
+    if ceiling is not None:
+        try:
+            value = int(ceiling)
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            body["max_output_tokens"] = value
+    # Forward only known-safe extras (e.g. temperature). Never invent
+    # ChatGPT client_metadata / session affinity fields.
+    for key in ("temperature", "top_p", "metadata", "reasoning", "reasoning_effort"):
+        if key in extra:
+            body[key] = extra[key]
+    return body
+
+
+def _openai_responses_chat(
+    *, base_url: str, api_key: Optional[str], model: str, messages: list[dict],
+    tools: Optional[list[dict]], extra: dict, headers: dict, timeout: int,
+) -> AssistantTurn:
+    body = _build_responses_body(
+        model=model, messages=messages, tools=tools, extra=extra,
+    )
+    auth = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    data = _post_json(
+        f"{base_url.rstrip('/')}/responses",
+        headers={"User-Agent": "puppetmaster-agentic", **auth, **headers},
+        body=body,
+        timeout=timeout,
+    )
+    return _assistant_turn_from_responses(data)
+
+
+def _openai_responses_chat_stream(
+    *, base_url: str, api_key: Optional[str], model: str, messages: list[dict],
+    tools: Optional[list[dict]], extra: dict, headers: dict, timeout: int,
+    on_delta: Optional[Callable[[str, str], None]],
+) -> AssistantTurn:
+    body = _build_responses_body(
+        model=model, messages=messages, tools=tools, extra=extra,
+    )
+    body["stream"] = True
+    auth = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    response = _open_stream(
+        f"{base_url.rstrip('/')}/responses",
+        headers={"User-Agent": "puppetmaster-agentic", **auth, **headers},
+        body=body,
+        timeout=timeout,
+    )
+    text_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    # output_index -> accumulating function_call slot
+    tool_slots: dict[int, dict] = {}
+    collected_items: list[dict] = []
+    usage: dict = {}
+    status = ""
+    stream_error: Optional[str] = None
+    try:
+        for payload in _iter_sse_data(response):
+            if payload == "[DONE]":
+                break
+            try:
+                event = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            etype = str(event.get("type") or "")
+
+            if etype == "error":
+                stream_error = str(
+                    event.get("message") or event.get("error") or "stream error"
+                )[:800]
+                break
+
+            if etype in (
+                "response.output_text.delta",
+                "response.content_part.delta",
+            ) or etype.endswith("output_text.delta"):
+                # Content-part deltas may carry nested delta objects; prefer
+                # the string form used by standard Responses SSE.
+                delta = event.get("delta")
+                piece = ""
+                if isinstance(delta, str):
+                    piece = delta
+                elif isinstance(delta, dict):
+                    piece = str(delta.get("text") or delta.get("delta") or "")
+                if piece:
+                    text_parts.append(piece)
+                    if on_delta:
+                        on_delta("text", piece)
+                continue
+
+            if (
+                "reasoning" in etype
+                and "delta" in etype
+            ) or etype in (
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_text.delta",
+            ):
+                delta = event.get("delta")
+                piece = delta if isinstance(delta, str) else ""
+                if piece:
+                    reasoning_parts.append(piece)
+                    if on_delta:
+                        on_delta("reasoning", piece)
+                continue
+
+            if etype == "response.output_item.added":
+                item = event.get("item") or {}
+                if not isinstance(item, dict):
+                    continue
+                idx = int(event.get("output_index") or 0)
+                if str(item.get("type") or "") == "function_call":
+                    slot = tool_slots.setdefault(
+                        idx, {"id": "", "name": "", "args": ""},
+                    )
+                    if item.get("call_id") or item.get("id"):
+                        slot["id"] = str(item.get("call_id") or item.get("id") or "")
+                    if item.get("name"):
+                        slot["name"] = str(item.get("name") or "")
+                    if isinstance(item.get("arguments"), str) and item["arguments"]:
+                        slot["args"] = item["arguments"]
+                continue
+
+            if etype == "response.function_call_arguments.delta" or (
+                "function_call_arguments" in etype and etype.endswith(".delta")
+            ):
+                idx = int(event.get("output_index") or 0)
+                slot = tool_slots.setdefault(idx, {"id": "", "name": "", "args": ""})
+                piece = event.get("delta")
+                if isinstance(piece, str) and piece:
+                    slot["args"] += piece
+                # Some relays stamp call_id/name on the delta event itself.
+                if event.get("call_id"):
+                    slot["id"] = str(event["call_id"])
+                if event.get("name"):
+                    slot["name"] = str(event["name"])
+                continue
+
+            if etype == "response.function_call_arguments.done":
+                idx = int(event.get("output_index") or 0)
+                slot = tool_slots.setdefault(idx, {"id": "", "name": "", "args": ""})
+                args = event.get("arguments")
+                if isinstance(args, str) and args:
+                    slot["args"] = args
+                if event.get("call_id"):
+                    slot["id"] = str(event["call_id"])
+                if event.get("name"):
+                    slot["name"] = str(event["name"])
+                continue
+
+            if etype == "response.output_item.done":
+                item = event.get("item")
+                if isinstance(item, dict):
+                    collected_items.append(item)
+                    idx = int(event.get("output_index") or 0)
+                    if str(item.get("type") or "") == "function_call":
+                        slot = tool_slots.setdefault(
+                            idx, {"id": "", "name": "", "args": ""},
+                        )
+                        if item.get("call_id") or item.get("id"):
+                            slot["id"] = str(
+                                item.get("call_id") or item.get("id") or ""
+                            )
+                        if item.get("name"):
+                            slot["name"] = str(item.get("name") or "")
+                        if isinstance(item.get("arguments"), str):
+                            slot["args"] = item["arguments"]
+                continue
+
+            if etype in (
+                "response.completed",
+                "response.incomplete",
+                "response.failed",
+            ):
+                resp_obj = event.get("response")
+                if isinstance(resp_obj, dict):
+                    if resp_obj.get("usage"):
+                        usage = resp_obj["usage"]
+                    status = str(resp_obj.get("status") or status)
+                    if etype == "response.failed":
+                        err = resp_obj.get("error") or resp_obj
+                        if isinstance(err, dict):
+                            stream_error = str(
+                                err.get("message") or err.get("code") or err
+                            )[:800]
+                        else:
+                            stream_error = str(err)[:800]
+                    # Prefer terminal output items when present (complete
+                    # function_call / message payloads).
+                    terminal_output = resp_obj.get("output")
+                    if isinstance(terminal_output, list) and terminal_output:
+                        collected_items = [
+                            i for i in terminal_output if isinstance(i, dict)
+                        ]
+                if not status:
+                    status = etype.rsplit(".", 1)[-1]
+                break
+
+            if etype == "response.completed" or etype.endswith(".completed"):
+                break
+    finally:
+        response.close()
+
+    if stream_error:
+        raise ProviderError(stream_error, reason="provider_error", body=stream_error)
+
+    if collected_items:
+        assembled = {
+            "status": status or "completed",
+            "output": collected_items,
+            "usage": usage,
+            "reasoning": "".join(reasoning_parts),
+        }
+        # Prefer delta-assembled answer text when output items omit it (some
+        # relays only stream text via deltas and leave message content empty).
+        turn = _assistant_turn_from_responses(assembled)
+        if not turn.text and text_parts:
+            turn.text = "".join(text_parts).strip()
+        if not turn.reasoning and reasoning_parts:
+            turn.reasoning = "".join(reasoning_parts).strip()
+        if not turn.tool_calls and tool_slots:
+            for idx in sorted(tool_slots):
+                slot = tool_slots[idx]
+                turn.tool_calls.append({
+                    "id": slot.get("id") or "",
+                    "name": slot.get("name") or "",
+                    "arguments": _parse_function_call_arguments(slot.get("args")),
+                })
+            if turn.tool_calls and turn.finish_reason not in ("length", "incomplete"):
+                turn.finish_reason = "tool_calls"
+        if usage and not turn.usage.get("total_tokens"):
+            turn.usage = _responses_usage_fields(usage)
+        return turn
+
+    tool_calls: list[dict] = []
+    for idx in sorted(tool_slots):
+        slot = tool_slots[idx]
+        tool_calls.append({
+            "id": slot.get("id") or "",
+            "name": slot.get("name") or "",
+            "arguments": _parse_function_call_arguments(slot.get("args")),
+        })
+    finish = "tool_calls" if tool_calls else (status or "completed")
+    if finish == "incomplete":
+        finish = "length"
+    return AssistantTurn(
+        text="".join(text_parts).strip(),
+        tool_calls=tool_calls,
+        finish_reason=finish,
+        usage=_responses_usage_fields(usage),
+        raw={},
+        reasoning="".join(reasoning_parts).strip(),
+    )
+
+
+def _prepare_opencode_go_call(
+    *,
+    model: str,
+    extra: dict,
+    base_url: str,
+) -> tuple[str, str, dict, str]:
+    """Normalize a Go model and select wire extras; fail closed when unsupported.
+
+    Returns ``(bare_model, api_mode, prepared_extra, healed_base_url)``.
+    """
+    from puppetmaster.opencode_go import (
+        ANTHROPIC_MESSAGES,
+        CHAT_COMPLETIONS,
+        OPENAI_RESPONSES,
+        api_mode_for_model,
+        driver_base_url,
+        is_retired_deepseek_go_model,
+        max_tokens_for_model,
+        normalize_model_id,
+        reasoning_body_extras,
+        unsupported_model_message,
+    )
+
+    bare = normalize_model_id(model)
+    if not bare:
+        raise ProviderError(
+            unsupported_model_message(model),
+            reason="unsupported_model",
+        )
+    if is_retired_deepseek_go_model(bare):
+        raise ProviderError(
+            unsupported_model_message(bare),
+            reason="unsupported_model",
+        )
+    mode = api_mode_for_model(bare)
+    prepared = dict(extra)
+    # Go families speak distinct reasoning dialects; never forward a bare
+    # OpenAI-style reasoning_effort that would 400 on thinking-only models.
+    effort = prepared.pop("reasoning_effort", None)
+    prepared.pop("thinking", None)
+    extras = reasoning_body_extras(bare, effort)
+    prepared.update(extras)
+    requested = prepared.get("max_tokens") or prepared.get("max_completion_tokens")
+    try:
+        requested_int = int(requested) if requested is not None else 0
+    except (TypeError, ValueError):
+        requested_int = 0
+    ceiling = max_tokens_for_model(bare, requested_int or None)
+    if ceiling:
+        prepared["max_tokens"] = ceiling
+        prepared.pop("max_completion_tokens", None)
+    url = driver_base_url(base_url)
+    if mode not in (CHAT_COMPLETIONS, ANTHROPIC_MESSAGES, OPENAI_RESPONSES):
+        raise ProviderError(
+            unsupported_model_message(bare),
+            reason="unsupported_model",
+        )
+    return bare, mode, prepared, url
+
+
+def _opencode_go_chat(
+    *,
+    base_url: str,
+    api_key: Optional[str],
+    model: str,
+    messages: list[dict],
+    tools: Optional[list[dict]],
+    extra: dict,
+    headers: dict,
+    timeout: int,
+    on_delta: Optional[Callable[[str, str], None]] = None,
+    stream: bool = False,
+) -> AssistantTurn:
+    """Dispatch an OpenCode Go call on the model's published endpoint.
+
+    ``stream=True`` (used by :func:`provider_chat_streaming`) always takes the
+    SSE client even when ``on_delta`` is omitted, matching non-Go providers.
+    """
+    from puppetmaster.opencode_go import ANTHROPIC_MESSAGES, OPENAI_RESPONSES
+
+    bare, mode, prepared, url = _prepare_opencode_go_call(
+        model=model, extra=extra, base_url=base_url,
+    )
+    use_stream = stream or on_delta is not None
+    if mode == OPENAI_RESPONSES:
+        if use_stream:
+            return _openai_responses_chat_stream(
+                base_url=url, api_key=api_key, model=bare, messages=messages,
+                tools=tools, extra=prepared, headers=headers, timeout=timeout,
+                on_delta=on_delta,
+            )
+        return _openai_responses_chat(
+            base_url=url, api_key=api_key, model=bare, messages=messages,
+            tools=tools, extra=prepared, headers=headers, timeout=timeout,
+        )
+    if mode == ANTHROPIC_MESSAGES:
+        if use_stream:
+            return _anthropic_chat_stream(
+                base_url=url, api_key=api_key, model=bare, messages=messages,
+                tools=tools, extra=prepared, headers=headers, timeout=timeout,
+                on_delta=on_delta,
+            )
+        return _anthropic_chat(
+            base_url=url, api_key=api_key, model=bare, messages=messages,
+            tools=tools, extra=prepared, headers=headers, timeout=timeout,
+        )
+    if use_stream:
+        return _openai_chat_stream(
+            base_url=url, api_key=api_key, model=bare, messages=messages,
+            tools=tools, extra=prepared, headers=headers, timeout=timeout,
+            on_delta=on_delta,
+        )
+    return _openai_chat(
+        base_url=url, api_key=api_key, model=bare, messages=messages,
+        tools=tools, extra=prepared, headers=headers, timeout=timeout,
+    )
+
+
 def provider_chat_streaming(
     *,
     provider: str,
@@ -1201,6 +1949,12 @@ def provider_chat_streaming(
         )
     url = (base_url or resolve_base_url(desc, env)).rstrip("/")
     extra = dict(extra or {})
+    if desc.slug == "opencode-go":
+        return _opencode_go_chat(
+            base_url=url, api_key=key, model=model, messages=messages,
+            tools=tools, extra=extra, headers=dict(desc.default_headers),
+            timeout=timeout, on_delta=on_delta, stream=True,
+        )
     if desc.wire == "anthropic":
         return _anthropic_chat_stream(
             base_url=url, api_key=key, model=model, messages=messages,
@@ -1233,6 +1987,8 @@ def provider_chat(
     the caller never branches on provider. Raises :class:`ProviderError` on any
     HTTP/transport/parse failure. ``provider=bedrock`` uses the stdlib Bedrock
     Converse client (bearer or SigV4) — never Anthropic ``x-api-key``.
+    ``provider=opencode-go`` selects chat/completions, /messages, or
+    /responses per the published Go endpoint table for the model.
     """
     desc = get_provider(provider)
     if desc is None:
@@ -1260,6 +2016,12 @@ def provider_chat(
         )
     url = (base_url or resolve_base_url(desc, env)).rstrip("/")
     extra = dict(extra or {})
+    if desc.slug == "opencode-go":
+        return _opencode_go_chat(
+            base_url=url, api_key=key, model=model, messages=messages,
+            tools=tools, extra=extra, headers=dict(desc.default_headers),
+            timeout=timeout,
+        )
     if desc.wire == "anthropic":
         return _anthropic_chat(
             base_url=url, api_key=key, model=model, messages=messages,

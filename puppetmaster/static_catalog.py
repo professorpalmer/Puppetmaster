@@ -319,6 +319,111 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "tags": ["tools", "agentic", "openai", "frontier", "quality", "vision", "code", "reasoning", "long-context"],
             "payload_defaults": {"provider": "openai-api"},
         },
+        # OpenCode Go subscription (OPENCODE_GO_API_KEY). Flat model ids; wire
+        # protocol is selected per model in puppetmaster.opencode_go.
+        {
+            "model": "gpt-5.6-luna",
+            "capability": 91,
+            "input": 1.0,
+            "output": 6.0,
+            "context": 1_050_000,
+            "billing": "plan",
+            "tags": [
+                "tools", "agentic", "opencode-go", "balanced", "code",
+                "reasoning", "long-context",
+            ],
+            "payload_defaults": {"provider": "opencode-go"},
+        },
+        {
+            "model": "deepseek-v4-flash",
+            "capability": 72,
+            "input": 0.14,
+            "output": 0.28,
+            "context": 128_000,
+            "billing": "plan",
+            "tags": ["tools", "agentic", "opencode-go", "cheap", "fast", "code"],
+            "payload_defaults": {"provider": "opencode-go"},
+        },
+        {
+            "model": "deepseek-v4-pro",
+            "capability": 84,
+            "input": 0.435,
+            "output": 0.87,
+            "context": 128_000,
+            "billing": "plan",
+            "tags": ["tools", "agentic", "opencode-go", "balanced", "code", "reasoning"],
+            "payload_defaults": {"provider": "opencode-go"},
+        },
+        {
+            "model": "kimi-k3",
+            "capability": 88,
+            "input": 3.0,
+            "output": 15.0,
+            "context": 256_000,
+            "billing": "plan",
+            "tags": ["tools", "agentic", "opencode-go", "quality", "code", "reasoning"],
+            "payload_defaults": {"provider": "opencode-go"},
+        },
+        {
+            "model": "kimi-k2.7-code",
+            "capability": 80,
+            "input": 0.95,
+            "output": 4.0,
+            "context": 256_000,
+            "billing": "plan",
+            "tags": ["tools", "agentic", "opencode-go", "balanced", "code", "fast"],
+            "payload_defaults": {"provider": "opencode-go"},
+        },
+        {
+            "model": "glm-5.2",
+            "capability": 86,
+            "input": 1.4,
+            "output": 4.4,
+            "context": 200_000,
+            "billing": "plan",
+            "tags": ["tools", "agentic", "opencode-go", "quality", "code", "reasoning"],
+            "payload_defaults": {"provider": "opencode-go"},
+        },
+        {
+            "model": "mimo-v2.5-pro",
+            "capability": 78,
+            "input": 0.435,
+            "output": 0.87,
+            "context": 128_000,
+            "billing": "plan",
+            "tags": ["tools", "agentic", "opencode-go", "balanced", "code"],
+            "payload_defaults": {"provider": "opencode-go"},
+        },
+        {
+            "model": "hy3",
+            "capability": 70,
+            "input": 0.14,
+            "output": 0.58,
+            "context": 128_000,
+            "billing": "plan",
+            "tags": ["tools", "agentic", "opencode-go", "cheap", "fast", "code"],
+            "payload_defaults": {"provider": "opencode-go"},
+        },
+        {
+            "model": "minimax-m3",
+            "capability": 76,
+            "input": 0.30,
+            "output": 1.20,
+            "context": 200_000,
+            "billing": "plan",
+            "tags": ["tools", "agentic", "opencode-go", "balanced", "code"],
+            "payload_defaults": {"provider": "opencode-go"},
+        },
+        {
+            "model": "qwen3.7-plus",
+            "capability": 74,
+            "input": 0.40,
+            "output": 1.60,
+            "context": 256_000,
+            "billing": "plan",
+            "tags": ["tools", "agentic", "opencode-go", "balanced", "code", "fast"],
+            "payload_defaults": {"provider": "opencode-go"},
+        },
     ],
     # Hermes is API-billed via the external hermes CLI (kept for users who have
     # it installed). Prefer the ``agentic`` catalog above for standalone runs.
@@ -466,7 +571,6 @@ def curated_to_specs(
     catalogs like Cursor/Claude that don't stamp one). ``None`` disables
     filtering entirely (the default — preserves every existing caller).
     """
-    plan = billing == "plan"
     by_name = {s.adapter_model_name: s for s in existing if s.adapter == adapter}
     specs: list[ModelSpec] = []
     for item in curated_catalog(adapter):
@@ -474,6 +578,10 @@ def curated_to_specs(
             provider = (item.get("payload_defaults") or {}).get("provider")
             if provider is not None and provider not in allowed_providers:
                 continue
+        # Per-entry billing override (e.g. OpenCode Go subscription models
+        # inside the otherwise API-billed agentic catalog).
+        entry_billing = str(item.get("billing") or billing).strip().lower() or billing
+        plan = entry_billing == "plan"
         model = str(item["model"])
         prior = by_name.get(model)
         capability = prior.capability_score if prior else int(item["capability"])
@@ -516,7 +624,7 @@ def curated_to_specs(
                 input_per_mtok_usd=float(item["input"]),
                 output_per_mtok_usd=float(item["output"]),
                 context_window=context,
-                billing=billing,
+                billing=entry_billing,
                 tags=sorted(tags),
                 notes=note,
                 enabled=prior.enabled if prior else True,

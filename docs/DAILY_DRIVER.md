@@ -41,7 +41,7 @@ Use `puppetmaster claude` when you intentionally want Claude Code to make real e
 When you have provider API keys but no Cursor/Claude/Codex/Hermes CLI installed, enable the `agentic` platform and drive work directly:
 
 ```bash
-export OPENAI_API_KEY=sk-...   # or ANTHROPIC_API_KEY / GEMINI_API_KEY / GOOGLE_API_KEY / OPENROUTER_API_KEY
+export OPENAI_API_KEY=sk-...   # or ANTHROPIC_API_KEY / GEMINI_API_KEY / GOOGLE_API_KEY / OPENROUTER_API_KEY / OPENCODE_GO_API_KEY
 python -m puppetmaster platform enable agentic
 python -m puppetmaster models discover --source agentic --write
 python -m puppetmaster agentic "Audit the auth module for risks" --mode analyze --provider openai --model gpt-5.4-mini
