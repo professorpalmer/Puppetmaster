@@ -246,6 +246,9 @@ _PROVIDER_ENV_HINTS = {
     "deepseek": "DEEPSEEK_API_KEY",
     "xai": "XAI_API_KEY",
     "mistral": "MISTRAL_API_KEY",
+    "zai": "ZAI_API_KEY (or GLM_API_KEY / Z_AI_API_KEY)",
+    "minimax": "MINIMAX_API_KEY",
+    "nvidia": "NVIDIA_API_KEY",
     "bedrock": (
         "AWS_PROFILE / default ~/.aws profile, AWS_ACCESS_KEY_ID + "
         "AWS_SECRET_ACCESS_KEY, or AWS_BEARER_TOKEN_BEDROCK"

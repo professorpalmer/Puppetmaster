@@ -268,6 +268,35 @@ PROVIDER_REGISTRY: dict[str, ProviderDescriptor] = {
         api_key_env_vars=("NOUS_API_KEY", "HERMES_API_KEY"),
         label="Nous Research",
     ),
+    # Z.AI (GLM) OpenAI-compatible PaaS — same keys Marionette keyed pilots use.
+    "zai": ProviderDescriptor(
+        slug="zai",
+        wire="openai",
+        base_url="https://api.z.ai/api/paas/v4",
+        base_url_env_var="ZAI_BASE_URL",
+        api_key_env_vars=("ZAI_API_KEY", "GLM_API_KEY", "Z_AI_API_KEY"),
+        label="Z.AI",
+    ),
+    # MiniMax Anthropic-compatible API (same base Marionette/SDK docs use).
+    # resolve_base_url appends /v1 so _anthropic_chat's /messages suffix lands
+    # on /anthropic/v1/messages like the Anthropic peer.
+    "minimax": ProviderDescriptor(
+        slug="minimax",
+        wire="anthropic",
+        base_url="https://api.minimax.io/anthropic",
+        base_url_env_var="MINIMAX_BASE_URL",
+        api_key_env_vars=("MINIMAX_API_KEY",),
+        label="MiniMax",
+    ),
+    # NVIDIA NIM OpenAI-compatible integrate endpoint.
+    "nvidia": ProviderDescriptor(
+        slug="nvidia",
+        wire="openai",
+        base_url="https://integrate.api.nvidia.com/v1",
+        base_url_env_var="NVIDIA_BASE_URL",
+        api_key_env_vars=("NVIDIA_API_KEY",),
+        label="NVIDIA NIM",
+    ),
     # Keyless local endpoints: only "available" when the user points us at them
     # via a presence env var, so routing never assumes a local server is up.
     "ollama": ProviderDescriptor(
@@ -367,6 +396,22 @@ def provider_key_pool(
     return keys
 
 
+def _minimax_driver_base_url(base_url: str) -> str:
+    """Ensure MiniMax's Anthropic-compat root ends with ``/v1``.
+
+    Descriptor / SDK docs use ``https://api.minimax.io/anthropic``; the
+    Anthropic SDK appends ``/v1/messages``. Our driver only appends
+    ``/messages``, so callers (and ``MINIMAX_BASE_URL`` overrides) get a
+    trailing ``/v1`` when missing.
+    """
+    url = str(base_url or "").strip().rstrip("/")
+    if not url:
+        return "https://api.minimax.io/anthropic/v1"
+    if url.endswith("/v1"):
+        return url
+    return f"{url}/v1"
+
+
 def resolve_base_url(
     desc: ProviderDescriptor, env: Optional[Mapping[str, str]] = None
 ) -> str:
@@ -388,6 +433,8 @@ def resolve_base_url(
             from puppetmaster.openai_codex import driver_base_url
 
             return driver_base_url(url)
+        if desc.slug == "minimax":
+            return _minimax_driver_base_url(url)
         return url
     if desc.slug == "bedrock":
         from puppetmaster.bedrock import (
@@ -404,6 +451,8 @@ def resolve_base_url(
         from puppetmaster.openai_codex import driver_base_url
 
         return driver_base_url(desc.base_url)
+    if desc.slug == "minimax":
+        return _minimax_driver_base_url(desc.base_url)
     return desc.base_url.rstrip("/")
 
 

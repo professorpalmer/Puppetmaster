@@ -1,3 +1,20 @@
+## v1.21.12
+
+**Z.AI, MiniMax, and NVIDIA NIM as agentic worker providers.**
+
+Marionette-keyed pilots can drive Puppetmaster agentic workers through the
+same provider credentials: ``ZAI_API_KEY`` / ``GLM_API_KEY`` / ``Z_AI_API_KEY``,
+``MINIMAX_API_KEY``, and ``NVIDIA_API_KEY``.
+
+- **Provider descriptors.** ``zai`` (OpenAI wire → ``https://api.z.ai/api/paas/v4``),
+  ``minimax`` (Anthropic wire → ``https://api.minimax.io/anthropic``, with
+  ``/v1`` normalized for ``/messages``), and ``nvidia`` (OpenAI wire →
+  ``https://integrate.api.nvidia.com/v1``) in ``PROVIDER_REGISTRY``.
+- **Agentic wiring.** ``_PROVIDER_ENV_HINTS`` plus small curated agentic catalog
+  rows so discover/auto-route unlock these providers when keys are present.
+- **Regression coverage.** Hermetic ``tests/test_marionette_keyed_providers.py``
+  for ``get_provider``, ``available_providers``, wire dispatch, and catalog stamps.
+
 ## v1.21.11
 
 **ChatGPT Codex OAuth as a first-class agentic worker provider.**
