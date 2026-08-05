@@ -1,3 +1,21 @@
+## v1.21.11
+
+**ChatGPT Codex OAuth as a first-class agentic worker provider.**
+
+The same ``OPENAI_CODEX_TOKEN`` Marionette pilots use now drives agentic
+swarm/implement workers against ``https://chatgpt.com/backend-api/codex``
+(Responses SSE; stream-required). Codex-only installs no longer need a second
+HTTP key for workers.
+
+- **Provider descriptor.** ``openai-codex`` in ``PROVIDER_REGISTRY`` with
+  ``OPENAI_CODEX_TOKEN``, originator/Cloudflare headers, and optional
+  ``ChatGPT-Account-ID`` from JWT claims.
+- **Always-stream Responses.** Non-stream creates are rejected by the Codex
+  backend; ``provider_chat`` and ``provider_chat_streaming`` both take SSE.
+- **Model id normalization.** Strips ``openai-codex:`` / ``cursor/`` prefixes
+  and maps ``gpt-5-6-*`` registry hyphens to ``gpt-5.6-*``.
+- **Regression coverage.** Hermetic ``tests/test_openai_codex.py``.
+
 ## v1.21.10
 
 **Fail fast when model-backed auto-routing cannot resolve a model.**

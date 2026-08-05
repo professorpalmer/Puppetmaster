@@ -241,6 +241,7 @@ _PROVIDER_ENV_HINTS = {
     "google": "GOOGLE_API_KEY (or GEMINI_API_KEY)",
     "openrouter": "OPENROUTER_API_KEY",
     "opencode-go": "OPENCODE_GO_API_KEY",
+    "openai-codex": "OPENAI_CODEX_TOKEN",
     "groq": "GROQ_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
     "xai": "XAI_API_KEY",

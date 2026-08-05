@@ -58,6 +58,176 @@ class ProviderRegistryTests(unittest.TestCase):
     def test_unknown_provider_is_none(self) -> None:
         self.assertIsNone(providers.get_provider("nope"))
 
+    def test_disabled_providers_excluded_from_available_providers(self) -> None:
+        env = {
+            "ANTHROPIC_API_KEY": "sk-a",
+            "GEMINI_API_KEY": "g",
+            "PUPPETMASTER_DISABLED_PROVIDERS": "anthropic, gemini",
+        }
+        available = providers.available_providers(env)
+        self.assertNotIn("anthropic", available)
+        self.assertNotIn("gemini", available)
+
+    def test_disabled_providers_unset_does_not_filter(self) -> None:
+        env = {"ANTHROPIC_API_KEY": "sk-a"}
+        available = providers.available_providers(env)
+        self.assertIn("anthropic", available)
+
+class AgenticCatalogReconciliationTests(unittest.TestCase):
+    def test_reconcile_adds_opencode_go_specs_for_available_provider(self) -> None:
+        from puppetmaster.model_registry import ModelSpec
+        from puppetmaster.static_catalog import reconcile_agentic_catalog
+
+        openrouter_only = [
+            ModelSpec(
+                id="agentic/deepseek-v4-flash",
+                adapter="agentic",
+                adapter_model_name="deepseek/deepseek-v4-flash",
+                capability_score=72,
+                billing="api",
+                payload_defaults={"provider": "openrouter"},
+            )
+        ]
+        with mock.patch(
+            "puppetmaster.providers.available_providers",
+            return_value={"opencode-go", "openrouter"},
+        ):
+            merged, report = reconcile_agentic_catalog(openrouter_only)
+
+        self.assertEqual(report["action"], "merged")
+        names = {spec.adapter_model_name for spec in merged if spec.adapter == "agentic"}
+        self.assertIn("deepseek-v4-flash", names)
+        self.assertIn("deepseek/deepseek-v4-flash", names)
+        providers_by_name = {
+            spec.adapter_model_name: (spec.payload_defaults or {}).get("provider")
+            for spec in merged
+            if spec.adapter == "agentic"
+        }
+        self.assertEqual(providers_by_name["deepseek-v4-flash"], "opencode-go")
+        self.assertEqual(providers_by_name["deepseek/deepseek-v4-flash"], "openrouter")
+
+    def test_reconcile_skips_when_no_provider_available(self) -> None:
+        from puppetmaster.model_registry import ModelSpec
+        from puppetmaster.static_catalog import reconcile_agentic_catalog
+
+        registry = [
+            ModelSpec(
+                id="agentic/or",
+                adapter="agentic",
+                adapter_model_name="deepseek/deepseek-v4-flash",
+                capability_score=72,
+                billing="api",
+                payload_defaults={"provider": "openrouter"},
+            )
+        ]
+        with mock.patch("puppetmaster.providers.available_providers", return_value=set()):
+            merged, report = reconcile_agentic_catalog(registry)
+
+        self.assertEqual(merged, registry)
+        self.assertEqual(report["action"], "skip")
+        self.assertEqual(report["reason"], "no_provider_available")
+
+    def test_reconcile_preserves_disabled_flags_and_other_adapters(self) -> None:
+        from puppetmaster.model_registry import ModelSpec
+        from puppetmaster.static_catalog import reconcile_agentic_catalog
+
+        registry = [
+            ModelSpec(
+                id="cursor/composer",
+                adapter="cursor",
+                adapter_model_name="composer",
+                capability_score=82,
+                billing="plan",
+            ),
+            ModelSpec(
+                id="agentic/claude-haiku-4-5",
+                adapter="agentic",
+                adapter_model_name="claude-haiku-4-5",
+                capability_score=55,
+                billing="api",
+                enabled=False,
+                payload_defaults={"provider": "anthropic"},
+            ),
+            ModelSpec(
+                id="agentic/or-flash",
+                adapter="agentic",
+                adapter_model_name="deepseek/deepseek-v4-flash",
+                capability_score=72,
+                billing="api",
+                payload_defaults={"provider": "openrouter"},
+            ),
+        ]
+        with mock.patch(
+            "puppetmaster.providers.available_providers",
+            return_value={"anthropic", "openrouter", "opencode-go"},
+        ):
+            merged, report = reconcile_agentic_catalog(registry)
+
+        self.assertEqual(report["action"], "merged")
+        by_id = {spec.id: spec for spec in merged}
+        self.assertEqual(by_id["cursor/composer"].adapter, "cursor")
+        self.assertFalse(by_id["agentic/claude-haiku-4-5"].enabled)
+        self.assertEqual(
+            by_id["agentic/or-flash"].payload_defaults.get("provider"),
+            "openrouter",
+        )
+        go_names = {
+            spec.adapter_model_name
+            for spec in merged
+            if spec.adapter == "agentic"
+            and (spec.payload_defaults or {}).get("provider") == "opencode-go"
+        }
+        self.assertIn("deepseek-v4-flash", go_names)
+
+    def test_auto_route_merges_opencode_go_and_routes_deepseek(self) -> None:
+        from puppetmaster.model_registry import ModelSpec, save_registry
+        from puppetmaster.orchestrator import Orchestrator
+        from puppetmaster.store import SwarmStore
+        from puppetmaster.workers import WorkerSpec
+
+        with tempfile.TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "models.json"
+            save_registry(
+                [
+                    ModelSpec(
+                        id="agentic/or-flash",
+                        adapter="agentic",
+                        adapter_model_name="deepseek/deepseek-v4-flash",
+                        capability_score=72,
+                        billing="api",
+                        payload_defaults={"provider": "openrouter"},
+                    )
+                ],
+                registry_path,
+            )
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("agentic auto-route")
+            orchestrator = Orchestrator(store)
+            spec = WorkerSpec(
+                role="implement",
+                instruction="fix a typo",
+                adapter="agentic",
+                payload={"auto_route": True, "allowed_adapters": ["agentic"]},
+            )
+            with mock.patch(
+                "puppetmaster.model_registry.default_registry_path",
+                return_value=registry_path,
+            ), mock.patch(
+                "puppetmaster.providers.available_providers",
+                return_value={"opencode-go"},
+            ), mock.patch(
+                "puppetmaster.preflight.adapter_cli_present",
+                return_value=True,
+            ):
+                routed, decisions = orchestrator._apply_auto_routing(job, [spec])
+
+            events = [event["event"] for event in store.read_events(job.id)]
+            self.assertIn("router.agentic_catalog_merged", events)
+            self.assertEqual(routed[0].adapter, "agentic")
+            self.assertEqual(routed[0].payload.get("provider"), "opencode-go")
+            self.assertEqual(routed[0].payload.get("model"), "deepseek-v4-flash")
+            self.assertEqual(decisions[0][1]["model_id"], "agentic/deepseek-v4-flash")
+
 class ProviderErrorPolicyTests(unittest.TestCase):
     def test_errors_keep_raw_details_and_expose_canonical_failures(self) -> None:
         from puppetmaster.failure import (

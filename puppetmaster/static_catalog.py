@@ -424,6 +424,74 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "tags": ["tools", "agentic", "opencode-go", "balanced", "code", "fast"],
             "payload_defaults": {"provider": "opencode-go"},
         },
+        # ChatGPT Codex OAuth (OPENAI_CODEX_TOKEN). Same Responses wire as
+        # Marionette's pilot; plan-billed so Codex-only installs can auto-route.
+        {
+            "model": "gpt-5.6-luna",
+            "capability": 90,
+            "input": 1.25,
+            "output": 5.0,
+            "context": 200_000,
+            "billing": "plan",
+            "tags": [
+                "tools", "agentic", "openai-codex", "balanced", "fast", "code",
+            ],
+            "payload_defaults": {"provider": "openai-codex"},
+        },
+        {
+            "model": "gpt-5.6-terra",
+            "capability": 92,
+            "input": 2.5,
+            "output": 10.0,
+            "context": 200_000,
+            "billing": "plan",
+            "tags": [
+                "tools", "agentic", "openai-codex", "frontier", "code", "reasoning",
+            ],
+            "payload_defaults": {"provider": "openai-codex"},
+        },
+        {
+            "model": "gpt-5.6-sol",
+            "capability": 94,
+            "input": 2.5,
+            "output": 10.0,
+            "context": 200_000,
+            "billing": "plan",
+            "tags": [
+                "tools", "agentic", "openai-codex", "frontier", "code", "reasoning",
+            ],
+            "payload_defaults": {"provider": "openai-codex"},
+        },
+        {
+            "model": "gpt-5.4",
+            "capability": 88,
+            "input": 1.25,
+            "output": 5.0,
+            "context": 200_000,
+            "billing": "plan",
+            "tags": ["tools", "agentic", "openai-codex", "balanced", "code"],
+            "payload_defaults": {"provider": "openai-codex"},
+        },
+        {
+            "model": "gpt-5.4-mini",
+            "capability": 75,
+            "input": 0.3,
+            "output": 1.2,
+            "context": 128_000,
+            "billing": "plan",
+            "tags": ["tools", "agentic", "openai-codex", "cheap", "fast", "code"],
+            "payload_defaults": {"provider": "openai-codex"},
+        },
+        {
+            "model": "gpt-5.3-codex",
+            "capability": 86,
+            "input": 1.25,
+            "output": 5.0,
+            "context": 200_000,
+            "billing": "plan",
+            "tags": ["tools", "agentic", "openai-codex", "balanced", "code"],
+            "payload_defaults": {"provider": "openai-codex"},
+        },
     ],
     # Hermes is API-billed via the external hermes CLI (kept for users who have
     # it installed). Prefer the ``agentic`` catalog above for standalone runs.
@@ -688,6 +756,40 @@ def merge_curated_into_registry(
         "billing": billing,
     }
     return merged, report
+
+
+def reconcile_agentic_catalog(
+    existing: list[ModelSpec],
+) -> "tuple[list[ModelSpec], dict]":
+    """Merge provider-matching curated agentic entries into ``existing``.
+
+    Runs on the auto-route path when at least one direct-API provider is
+    auto-routable: only curated entries whose ``payload_defaults.provider`` is
+    in that set are merged (same filter as ``models discover --source agentic``).
+    Preserves other adapters, user ``enabled`` flags, and tuned entries.
+    Never raises — failures return ``existing`` with ``action=unavailable``.
+    """
+    try:
+        from puppetmaster.providers import available_providers
+
+        allowed = available_providers()
+        if not allowed:
+            return existing, {"action": "skip", "reason": "no_provider_available"}
+
+        merged, report = merge_curated_into_registry(
+            "agentic", "api", existing, allowed_providers=allowed
+        )
+        added = list(report.get("added") or [])
+        base = {
+            "available_providers": sorted(allowed),
+            "discovered_count": report.get("discovered_count"),
+            "skipped": report.get("skipped") or [],
+        }
+        if added:
+            return merged, {"action": "merged", "added": added, **base}
+        return merged, {"action": "skip", "reason": "agentic_catalog_current", **base}
+    except Exception as exc:  # never block a run on catalog reconciliation
+        return existing, {"action": "unavailable", "error": str(exc)}
 
 
 def ensure_subscription_plan_catalog(

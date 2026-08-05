@@ -602,6 +602,54 @@ class Orchestrator:
                 },
             )
 
+    def _emit_agentic_catalog_event(self, job: Job, report: dict) -> None:
+        """Emit a loud event describing agentic catalog auto-reconciliation."""
+        action = report.get("action")
+        if action == "merged":
+            self.store.emit(
+                job.id,
+                "router.agentic_catalog_merged",
+                {
+                    "added": report.get("added"),
+                    "discovered_count": report.get("discovered_count"),
+                    "available_providers": report.get("available_providers"),
+                    "detail": (
+                        "Merged curated agentic models for available providers "
+                        "so auto-route can pick direct-API models without a "
+                        "manual `models discover --source agentic`."
+                    ),
+                },
+            )
+        elif action == "unavailable":
+            self.store.emit(
+                job.id,
+                "router.agentic_catalog_unavailable",
+                {
+                    "error": report.get("error"),
+                    "hint": (
+                        "Could not reconcile the agentic catalog; routing uses "
+                        "the existing registry. Run `python -m puppetmaster "
+                        "models discover --source agentic --write` to seed "
+                        "standalone models explicitly."
+                    ),
+                },
+            )
+        elif action == "skip" and report.get("reason") == "no_provider_available":
+            self.store.emit(
+                job.id,
+                "router.agentic_catalog_unavailable",
+                {
+                    "reason": "no_provider_available",
+                    "hint": (
+                        "No direct-API provider credentials are available, so "
+                        "the agentic catalog was not seeded. Set a provider key "
+                        "(e.g. OPENCODE_GO_API_KEY, ANTHROPIC_API_KEY) or run "
+                        "`python -m puppetmaster models discover --source agentic "
+                        "--write` once keys are configured."
+                    ),
+                },
+            )
+
     def _begin_trace(self) -> None:
         """Mint a W3C traceparent for this job when telemetry is enabled.
 
@@ -1603,7 +1651,11 @@ class Orchestrator:
         instead of passing through to dispatch and surfacing ``no_model``
         later.
         """
-        from puppetmaster.model_registry import default_registry_path, load_registry
+        from puppetmaster.model_registry import (
+            default_registry_path,
+            load_registry,
+            save_registry,
+        )
         from puppetmaster.platform_billing import RegistryReconciliation, reconcile_registry
         from puppetmaster.router import (
             NoEligibleModelError,
@@ -1630,6 +1682,20 @@ class Orchestrator:
                     else default_registry_path()
                 )
                 registry_cache = load_registry(registry_path)
+                from puppetmaster.static_catalog import reconcile_agentic_catalog
+
+                registry_cache, agentic_report = reconcile_agentic_catalog(
+                    registry_cache
+                )
+                if agentic_report.get("action") == "merged":
+                    # Persist the merged catalog so the next run (and CLI
+                    # inspect) sees the added agentic models. Best-effort —
+                    # a write failure must never block routing.
+                    try:
+                        save_registry(registry_cache, registry_path)
+                    except Exception:
+                        pass
+                self._emit_agentic_catalog_event(job, agentic_report)
                 if registry_cache:
                     registry_reconciliation = reconcile_registry(registry_cache)
                     registry_cache = registry_reconciliation.specs

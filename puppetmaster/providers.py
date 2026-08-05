@@ -210,6 +210,16 @@ PROVIDER_REGISTRY: dict[str, ProviderDescriptor] = {
         api_key_env_vars=("OPENCODE_GO_API_KEY",),
         label="OpenCode Go",
     ),
+    # ChatGPT Codex OAuth (OPENAI_CODEX_TOKEN). Same plan credential Marionette
+    # pilots use — agentic workers call chatgpt.com Responses (stream-required).
+    "openai-codex": ProviderDescriptor(
+        slug="openai-codex",
+        wire="openai",
+        base_url="https://chatgpt.com/backend-api/codex",
+        base_url_env_var="OPENAI_CODEX_BASE_URL",
+        api_key_env_vars=("OPENAI_CODEX_TOKEN",),
+        label="ChatGPT Codex (OAuth)",
+    ),
     "xai": ProviderDescriptor(
         slug="xai",
         wire="openai",
@@ -374,6 +384,10 @@ def resolve_base_url(
             from puppetmaster.opencode_go import driver_base_url
 
             return driver_base_url(url)
+        if desc.slug == "openai-codex":
+            from puppetmaster.openai_codex import driver_base_url
+
+            return driver_base_url(url)
         return url
     if desc.slug == "bedrock":
         from puppetmaster.bedrock import (
@@ -384,6 +398,10 @@ def resolve_base_url(
         return bedrock_runtime_base_url(resolve_bedrock_region(env))
     if desc.slug == "opencode-go":
         from puppetmaster.opencode_go import driver_base_url
+
+        return driver_base_url(desc.base_url)
+    if desc.slug == "openai-codex":
+        from puppetmaster.openai_codex import driver_base_url
 
         return driver_base_url(desc.base_url)
     return desc.base_url.rstrip("/")
@@ -428,6 +446,19 @@ def is_available(
     return credentials_present(desc, env)
 
 
+def disabled_providers(env: Optional[Mapping[str, str]] = None) -> set[str]:
+    """Provider slugs explicitly disconnected via ``PUPPETMASTER_DISABLED_PROVIDERS``.
+
+    Marionette uses this to preserve Settings disconnect state even when a stale
+    shell env key is still present. Unset or empty → no providers disabled.
+    """
+    env = env if env is not None else os.environ
+    raw = env.get("PUPPETMASTER_DISABLED_PROVIDERS", "").strip()
+    if not raw:
+        return set()
+    return {slug.strip() for slug in raw.split(",") if slug.strip()}
+
+
 def available_providers(env: Optional[Mapping[str, str]] = None) -> set[str]:
     """The set of provider slugs that are auto-routable with current credentials.
 
@@ -436,9 +467,17 @@ def available_providers(env: Optional[Mapping[str, str]] = None) -> set[str]:
     reached, so a fresh install offers exactly the providers the user's keys
     unlock -- nothing more. Bedrock is included only when invoke-health is
     currently verified (not merely present, not denied).
+
+    ``PUPPETMASTER_DISABLED_PROVIDERS`` (comma-separated slugs) excludes
+    providers that have credentials but were disconnected in Marionette Settings.
     """
     env = env if env is not None else os.environ
-    return {slug for slug, desc in PROVIDER_REGISTRY.items() if is_available(desc, env)}
+    blocked = disabled_providers(env)
+    return {
+        slug
+        for slug, desc in PROVIDER_REGISTRY.items()
+        if slug not in blocked and is_available(desc, env)
+    }
 
 
 # --- normalized chat client -------------------------------------------------
@@ -1843,6 +1882,51 @@ def _prepare_opencode_go_call(
     return bare, mode, prepared, url
 
 
+def _openai_codex_chat(
+    *,
+    base_url: str,
+    api_key: Optional[str],
+    model: str,
+    messages: list[dict],
+    tools: Optional[list[dict]],
+    extra: dict,
+    headers: dict,
+    timeout: int,
+    on_delta: Optional[Callable[[str, str], None]] = None,
+) -> AssistantTurn:
+    """ChatGPT Codex Responses call — always SSE (backend rejects non-stream)."""
+    from puppetmaster.openai_codex import (
+        driver_base_url,
+        merge_request_headers,
+        normalize_model_id,
+    )
+
+    if not api_key:
+        raise ProviderError(
+            "no OPENAI_CODEX_TOKEN for openai-codex",
+            reason="not_authenticated",
+        )
+    bare = normalize_model_id(model)
+    if not bare:
+        raise ProviderError(
+            f"empty openai-codex model id from {model!r}",
+            reason="unsupported_model",
+        )
+    url = driver_base_url(base_url)
+    req_headers = merge_request_headers(api_key, headers)
+    return _openai_responses_chat_stream(
+        base_url=url,
+        api_key=api_key,
+        model=bare,
+        messages=messages,
+        tools=tools,
+        extra=dict(extra or {}),
+        headers=req_headers,
+        timeout=timeout,
+        on_delta=on_delta,
+    )
+
+
 def _opencode_go_chat(
     *,
     base_url: str,
@@ -1955,6 +2039,12 @@ def provider_chat_streaming(
             tools=tools, extra=extra, headers=dict(desc.default_headers),
             timeout=timeout, on_delta=on_delta, stream=True,
         )
+    if desc.slug == "openai-codex":
+        return _openai_codex_chat(
+            base_url=url, api_key=key, model=model, messages=messages,
+            tools=tools, extra=extra, headers=dict(desc.default_headers),
+            timeout=timeout, on_delta=on_delta,
+        )
     if desc.wire == "anthropic":
         return _anthropic_chat_stream(
             base_url=url, api_key=key, model=model, messages=messages,
@@ -1989,6 +2079,8 @@ def provider_chat(
     Converse client (bearer or SigV4) — never Anthropic ``x-api-key``.
     ``provider=opencode-go`` selects chat/completions, /messages, or
     /responses per the published Go endpoint table for the model.
+    ``provider=openai-codex`` always uses ChatGPT Codex Responses SSE
+    (``OPENAI_CODEX_TOKEN``; non-stream creates are rejected by the backend).
     """
     desc = get_provider(provider)
     if desc is None:
@@ -2018,6 +2110,12 @@ def provider_chat(
     extra = dict(extra or {})
     if desc.slug == "opencode-go":
         return _opencode_go_chat(
+            base_url=url, api_key=key, model=model, messages=messages,
+            tools=tools, extra=extra, headers=dict(desc.default_headers),
+            timeout=timeout,
+        )
+    if desc.slug == "openai-codex":
+        return _openai_codex_chat(
             base_url=url, api_key=key, model=model, messages=messages,
             tools=tools, extra=extra, headers=dict(desc.default_headers),
             timeout=timeout,
