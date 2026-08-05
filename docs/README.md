@@ -2,7 +2,7 @@
 
 The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
 
-**Current release:** [v1.21.12](CHANGELOG.md#v12112) — Z.AI / MiniMax / NVIDIA NIM agentic providers for Marionette-keyed pilots; see [CHANGELOG.md](CHANGELOG.md) for the full 1.21.x line.
+**Current release:** [v1.21.13](CHANGELOG.md#v12113) — passive provider rate-limit harvest with preemptive admission; see [CHANGELOG.md](CHANGELOG.md) for the full 1.21.x line.
 
 ## Start here
 

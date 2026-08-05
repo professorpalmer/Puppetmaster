@@ -1,3 +1,28 @@
+## v1.21.13
+
+**Passive provider rate-limit harvest with preemptive admission.**
+
+Agentic workers now read OpenAI/Anthropic ``x-ratelimit-*`` headers from every
+provider response, persist remaining/reset under ``~/.puppetmaster``, and fail
+over *before* a hard 429 when a harvested window already reports
+``remaining=0``. Lifted from the codex-router harvest pattern; Puppetmaster
+keeps task-aware routing as the brain.
+
+- **Parse + store.** ``rate_limit_headers.py`` / ``rate_limit_state.py``
+  (WAL SQLite, no secrets). Kill switches:
+  ``PUPPETMASTER_RATE_LIMIT_HARVEST=0``,
+  ``PUPPETMASTER_RATE_LIMIT_ADMISSION=0``.
+- **Admission.** ``admit_or_raise`` in the agentic call path; only
+  ``remaining=0`` quota windows preempt (``Retry-After`` is diagnostic so
+  multi-key rotation still works). Partial upserts coalesce so a bare 429
+  cannot wipe an active token window.
+- **Doctor.** ``rate-limit-harvest`` warns when exhausted windows are still
+  blocking.
+- **Keys UX.** ``puppetmaster keys`` rejects doubled pastes into the hidden
+  prompt and reports character count without echoing the value.
+- **Tests.** Hermetic ``tests/test_rate_limit_harvest.py``; hermetic env
+  isolates ``PUPPETMASTER_RATE_LIMIT_PATH``.
+
 ## v1.21.12
 
 **Z.AI, MiniMax, and NVIDIA NIM as agentic worker providers.**
