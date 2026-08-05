@@ -591,6 +591,16 @@ def provider_retry_backoff_seconds(attempt: int) -> float:
     return random.uniform(_PROVIDER_BACKOFF_BASE_SECONDS, ceiling)
 
 
+def _harvest_response_headers(headers: Any, *, http_status: Optional[int] = None) -> None:
+    """Best-effort passive rate-limit harvest; never raises."""
+    try:
+        from puppetmaster.rate_limit_state import record_from_headers
+
+        record_from_headers(headers, http_status=http_status)
+    except Exception:
+        return
+
+
 def _post_json(url: str, *, headers: dict, body: dict, timeout: int) -> dict:
     request = urllib.request.Request(
         url,
@@ -600,8 +610,10 @@ def _post_json(url: str, *, headers: dict, body: dict, timeout: int) -> dict:
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
+            _harvest_response_headers(getattr(response, "headers", None), http_status=200)
             raw = response.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
+        _harvest_response_headers(getattr(exc, "headers", None), http_status=exc.code)
         err_body = ""
         try:
             err_body = exc.read().decode("utf-8", errors="replace")
@@ -1079,8 +1091,11 @@ def _open_stream(url: str, *, headers: dict, body: dict, timeout: int):
         method="POST",
     )
     try:
-        return urllib.request.urlopen(request, timeout=timeout)
+        response = urllib.request.urlopen(request, timeout=timeout)
+        _harvest_response_headers(getattr(response, "headers", None), http_status=200)
+        return response
     except urllib.error.HTTPError as exc:
+        _harvest_response_headers(getattr(exc, "headers", None), http_status=exc.code)
         err_body = ""
         try:
             err_body = exc.read().decode("utf-8", errors="replace")
@@ -2055,6 +2070,41 @@ def provider_chat_streaming(
     agent loop is identical whether or not a caller wants live tokens. Falls back
     to the same provider resolution and error semantics as :func:`provider_chat`.
     """
+    from puppetmaster.provider_circuit import resolve_circuit_key
+    from puppetmaster.rate_limit_state import harvesting_rate_limits
+
+    with harvesting_rate_limits(
+        resolve_circuit_key(provider, model),
+        provider=provider,
+        model=model,
+    ):
+        return _provider_chat_streaming_inner(
+            provider=provider,
+            model=model,
+            messages=messages,
+            tools=tools,
+            extra=extra,
+            on_delta=on_delta,
+            api_key=api_key,
+            base_url=base_url,
+            timeout=timeout,
+            env=env,
+        )
+
+
+def _provider_chat_streaming_inner(
+    *,
+    provider: str,
+    model: str,
+    messages: list[dict],
+    tools: Optional[list[dict]] = None,
+    extra: Optional[dict] = None,
+    on_delta: Optional[Callable[[str, str], None]] = None,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    timeout: int = 300,
+    env: Optional[Mapping[str, str]] = None,
+) -> AssistantTurn:
     desc = get_provider(provider)
     if desc is None:
         raise ProviderError(f"unknown provider {provider!r}", reason="unknown_provider")
@@ -2131,6 +2181,39 @@ def provider_chat(
     ``provider=openai-codex`` always uses ChatGPT Codex Responses SSE
     (``OPENAI_CODEX_TOKEN``; non-stream creates are rejected by the backend).
     """
+    from puppetmaster.provider_circuit import resolve_circuit_key
+    from puppetmaster.rate_limit_state import harvesting_rate_limits
+
+    with harvesting_rate_limits(
+        resolve_circuit_key(provider, model),
+        provider=provider,
+        model=model,
+    ):
+        return _provider_chat_inner(
+            provider=provider,
+            model=model,
+            messages=messages,
+            tools=tools,
+            extra=extra,
+            api_key=api_key,
+            base_url=base_url,
+            timeout=timeout,
+            env=env,
+        )
+
+
+def _provider_chat_inner(
+    *,
+    provider: str,
+    model: str,
+    messages: list[dict],
+    tools: Optional[list[dict]] = None,
+    extra: Optional[dict] = None,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    timeout: int = 300,
+    env: Optional[Mapping[str, str]] = None,
+) -> AssistantTurn:
     desc = get_provider(provider)
     if desc is None:
         raise ProviderError(f"unknown provider {provider!r}", reason="unknown_provider")

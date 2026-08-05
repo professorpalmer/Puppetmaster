@@ -128,12 +128,21 @@ def admission_blocked_error(key: str) -> ProviderError:
     )
 
 
+# Bodies for preemptive admissions that must not trip the breaker and must
+# stay recoverable for failover. Includes harvested-quota exhaustion from
+# :mod:`puppetmaster.rate_limit_state`.
+_ADMISSION_BODIES = frozenset({
+    "circuit_breaker_open",
+    "rate_limit_quota_exhausted",
+})
+
+
 def is_admission_blocked_error(error: ProviderError) -> bool:
-    """True when ``error`` was raised by circuit admission (not a live provider 429)."""
+    """True when ``error`` was raised by admission (not a live provider 429)."""
     return (
         error.reason == RATE_LIMIT
         and error.status == 429
-        and (error.body or "") == "circuit_breaker_open"
+        and (error.body or "") in _ADMISSION_BODIES
     )
 
 

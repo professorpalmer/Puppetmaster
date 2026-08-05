@@ -1014,7 +1014,11 @@ class AgenticAdapter(FullEditWorkerAdapter):
         call_extra = dict(extra)
         tool_choice_stripped = False
         while True:
-            # Refuse before dialing when the breaker is open (recoverable error).
+            # Refuse before dialing when harvested remaining is 0 or the
+            # process-local breaker is open (both raise recoverable 429s).
+            from puppetmaster.rate_limit_state import admit_or_raise
+
+            admit_or_raise(admission_key)
             breaker.before_call(admission_key)
             recorded = False
             api_key = keys[key_index]
