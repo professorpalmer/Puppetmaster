@@ -75,7 +75,22 @@ def run_doctor(root: Path, state_dir: Optional[Path] = None) -> list[Check]:
     checks.extend(_guard_many(_billing_checks))
     checks.append(_guard("catalog-freshness", _catalog_freshness_check))
     checks.append(_guard("platform-lock", _platform_lock_check))
+    checks.append(_guard("rate-limit-harvest", _rate_limit_harvest_check))
     return checks
+
+
+def _rate_limit_harvest_check() -> Check:
+    """Surface exhausted harvested provider windows (passive x-ratelimit-*)."""
+    from puppetmaster.rate_limit_state import doctor_rate_limit_summary, harvest_enabled
+
+    detail = doctor_rate_limit_summary()
+    if not harvest_enabled():
+        return Check("rate-limit-harvest", "ok", detail)
+    if detail.startswith("exhausted"):
+        return Check("rate-limit-harvest", "warn", detail)
+    if detail.startswith("unavailable"):
+        return Check("rate-limit-harvest", "warn", detail)
+    return Check("rate-limit-harvest", "ok", detail)
 
 
 def _platform_lock_check() -> Check:
