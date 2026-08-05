@@ -49,7 +49,14 @@ class RateLimitSnapshot:
         return self.is_exhausted()
 
     def blocking_reset_at(self, *, now: Optional[float] = None) -> Optional[float]:
-        """Earliest future reset among exhausted windows, or ``None``."""
+        """Earliest future reset among exhausted *quota windows*, or ``None``.
+
+        Only ``remaining == 0`` request/token windows admit-block. ``Retry-After``
+        is recorded for diagnostics but never alone preempts a call — a bare
+        429 Retry-After is often per-key, and treating it as account-wide would
+        defeat multi-key rotation. Healthy remaining with a spurious
+        ``Retry-After`` on HTTP 200 also must not block.
+        """
         clock = time.time() if now is None else float(now)
         candidates: list[float] = []
         for window in (self.tokens, self.requests):
@@ -61,8 +68,6 @@ class RateLimitSnapshot:
                 and window.reset_at > clock
             ):
                 candidates.append(float(window.reset_at))
-        if self.retry_after_at is not None and self.retry_after_at > clock:
-            candidates.append(float(self.retry_after_at))
         return min(candidates) if candidates else None
 
 
@@ -235,11 +240,13 @@ def parse_rate_limit_headers(
     )
 
     retry_after_at = None
-    if http_status == 429 or _read(normalized, ["retry-after"]) is not None:
-        retry_after_at = reset_at(_read(normalized, ["retry-after"]), now=clock)
-        # Bare Retry-After with no other signal still counts on 429.
-        if http_status == 429 and retry_after_at is None:
-            retry_after_at = clock + 30.0
+    raw_retry = _read(normalized, ["retry-after"])
+    if raw_retry is not None:
+        retry_after_at = reset_at(raw_retry, now=clock)
+    # On bare 429 with no window headers, synthesize a short Retry-After for
+    # diagnostics only (admission ignores retry_after_at — see blocking_reset_at).
+    if http_status == 429 and retry_after_at is None and requests is None and tokens is None:
+        retry_after_at = clock + 30.0
 
     if requests is None and tokens is None and retry_after_at is None:
         return None

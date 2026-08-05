@@ -78,7 +78,7 @@ class RateLimitHeaderParseTests(unittest.TestCase):
         self.assertAlmostEqual(snap.requests.reset_at or 0, now + 150, places=3)
         self.assertFalse(snap.is_exhausted(now=now))
 
-    def test_retry_after_on_429(self) -> None:
+    def test_retry_after_on_429_is_diagnostic_only(self) -> None:
         now = 1_700_000_000.0
         snap = parse_rate_limit_headers(
             {"retry-after": "45"},
@@ -88,7 +88,24 @@ class RateLimitHeaderParseTests(unittest.TestCase):
         self.assertIsNotNone(snap)
         assert snap is not None
         self.assertEqual(snap.retry_after_at, now + 45)
-        self.assertTrue(snap.is_exhausted(now=now))
+        # Retry-After alone must not admit-block (per-key 429 vs account quota).
+        self.assertFalse(snap.is_exhausted(now=now))
+
+    def test_retry_after_with_healthy_remaining_does_not_block(self) -> None:
+        now = 1_700_000_000.0
+        snap = parse_rate_limit_headers(
+            {
+                "x-ratelimit-remaining-requests": "100",
+                "x-ratelimit-limit-requests": "500",
+                "x-ratelimit-reset-requests": "60",
+                "retry-after": "30",
+            },
+            now=now,
+            http_status=200,
+        )
+        self.assertIsNotNone(snap)
+        assert snap is not None
+        self.assertFalse(snap.is_exhausted(now=now))
 
     def test_reset_at_duration_and_epoch(self) -> None:
         now = 1_700_000_000.0
@@ -168,6 +185,38 @@ class RateLimitStoreAdmissionTests(unittest.TestCase):
         breaker.record_failure(key, err)
         breaker.record_failure(key, err)
         self.assertEqual(breaker.state_for(key), "closed")
+
+    def test_upsert_coalesces_windows(self) -> None:
+        now = 1_700_000_000.0
+        store = get_rate_limit_store()
+        from puppetmaster.rate_limit_headers import RateLimitSnapshot, RateLimitWindow
+
+        key = "openrouter\x1fy\x1fhttps://x"
+        store.upsert(
+            admission_key=key,
+            provider="openrouter",
+            model="y",
+            snapshot=RateLimitSnapshot(
+                tokens=RateLimitWindow(
+                    kind="tokens", limit=1, remaining=0, reset_at=now + 300
+                )
+            ),
+            now=now,
+        )
+        store.upsert(
+            admission_key=key,
+            provider="openrouter",
+            model="y",
+            snapshot=RateLimitSnapshot(retry_after_at=now + 30),
+            http_status=429,
+            now=now + 1,
+        )
+        record = store.get(key)
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.tokens_remaining, 0)
+        self.assertEqual(record.tokens_reset_at, now + 300)
+        self.assertTrue(record.is_blocking(now=now + 2))
 
     def test_doctor_summary(self) -> None:
         now = 1_700_000_000.0

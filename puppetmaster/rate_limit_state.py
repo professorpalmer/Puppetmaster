@@ -220,8 +220,40 @@ class RateLimitStore:
         if not key:
             raise ValueError("admission_key is required")
         clock = time.time() if now is None else float(now)
+        # Coalesce with the prior row so a Retry-After-only 429 does not wipe a
+        # still-active tokens/requests window, and an older response cannot
+        # clobber a newer one (updated_at guard).
+        prior = self.get(key)
+        if prior is not None and prior.updated_at > clock:
+            return prior
         req = snapshot.requests
         tok = snapshot.tokens
+        if prior is not None:
+            if req is None and (
+                prior.requests_limit is not None
+                or prior.requests_remaining is not None
+                or prior.requests_reset_at is not None
+            ):
+                req = RateLimitWindow(
+                    kind="requests",
+                    limit=prior.requests_limit,
+                    remaining=prior.requests_remaining,
+                    reset_at=prior.requests_reset_at,
+                )
+            if tok is None and (
+                prior.tokens_limit is not None
+                or prior.tokens_remaining is not None
+                or prior.tokens_reset_at is not None
+            ):
+                tok = RateLimitWindow(
+                    kind="tokens",
+                    limit=prior.tokens_limit,
+                    remaining=prior.tokens_remaining,
+                    reset_at=prior.tokens_reset_at,
+                )
+        retry_after = snapshot.retry_after_at
+        if retry_after is None and prior is not None:
+            retry_after = prior.retry_after_at
         with self._session() as connection:
             connection.execute(
                 """
@@ -243,6 +275,7 @@ class RateLimitStore:
                     retry_after_at=excluded.retry_after_at,
                     updated_at=excluded.updated_at,
                     http_status=excluded.http_status
+                WHERE excluded.updated_at >= rate_limits.updated_at
                 """,
                 (
                     key,
@@ -254,7 +287,7 @@ class RateLimitStore:
                     None if tok is None else tok.limit,
                     None if tok is None else tok.remaining,
                     None if tok is None else tok.reset_at,
-                    snapshot.retry_after_at,
+                    retry_after,
                     clock,
                     http_status,
                 ),
