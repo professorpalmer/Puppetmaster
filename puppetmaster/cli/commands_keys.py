@@ -139,17 +139,31 @@ def _apply_key(
 
     The value is registered as a secret immediately and never returned in the
     message, so callers can print the result without leaking the credential.
+    Rejects empty input and doubled pastes (same secret pasted twice into a
+    no-echo prompt) before writing.
     """
+    from puppetmaster.secret_entry import secret_entry_feedback, secret_entry_problem
+
     value = (value or "").strip()
-    if not value:
+    problem = secret_entry_problem(value)
+    if problem == "empty":
         return False, f"{desc.label}: empty value — nothing written."
+    if problem == "doubled":
+        return (
+            False,
+            f"{desc.label}: value looks like the same key pasted twice "
+            f"({secret_entry_feedback(value)}) — nothing written. Try again.",
+        )
     register_secret_value(value)
     env_var = desc.api_key_env_vars[0]
     try:
         _write_env_key(path, env_var, value)
     except (OSError, ValueError) as exc:
         return False, f"{desc.label}: could not write {path}: {exc}"
-    return True, f"{desc.label}: set {env_var} in {path}"
+    return (
+        True,
+        f"{desc.label}: set {env_var} in {path} ({secret_entry_feedback(value)})",
+    )
 
 
 # --- status -----------------------------------------------------------------
