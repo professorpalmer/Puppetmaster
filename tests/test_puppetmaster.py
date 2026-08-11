@@ -10575,6 +10575,16 @@ class ModelRouterTests(unittest.TestCase):
             adapter._extra_params(openai_api_task).get("reasoning_effort"), "low"
         )
 
+        # openai-codex still gets the Chat Completions key; provider_chat maps
+        # it to nested Responses ``reasoning`` (bare key would HTTP 400).
+        openai_codex_task = Task(
+            job_id="j", role="explore", instruction="x",
+            payload={"provider": "openai-codex", "model": "gpt-5.6-luna"},
+        )
+        self.assertEqual(
+            adapter._extra_params(openai_codex_task).get("reasoning_effort"), "low"
+        )
+
     def test_router_prefers_tools_tagged_model_for_agentic_role(self) -> None:
         """Prefer a tools-tagged model over a cheaper untagged one for implement."""
         from puppetmaster.model_registry import ModelSpec

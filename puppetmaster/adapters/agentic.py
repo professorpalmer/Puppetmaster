@@ -340,6 +340,9 @@ def _provider_is_openai_compatible(provider: str) -> bool:
     # OpenAI reasoning_effort default — provider_chat maps effort when set.
     if slug == "opencode-go":
         return False
+    # openai-codex is OpenAI-wire but Responses rejects top-level
+    # reasoning_effort. Still inject the Chat Completions key here;
+    # provider_chat / _build_responses_body maps it to nested ``reasoning``.
     desc = get_provider(slug)
     return bool(desc is not None and getattr(desc, "wire", None) == "openai")
 
@@ -360,6 +363,39 @@ def tool_choice_force_supported(provider: str, model: str) -> bool:
     if slug.startswith("meta/") and "muse" in slug:
         return False
     return True
+
+
+# Models known to reject a tools schema entirely (not merely tool_choice force).
+# Opt out per-task with payload.tool_less=true; otherwise every analyze model
+# gets submit_findings registered so new registry entries need no special cases.
+_TOOL_LESS_MODEL_MARKERS = frozenset({
+    # Reserved for endpoints that 400 on any tools array. Prefer payload.tool_less.
+})
+
+
+def model_is_tool_less(
+    provider: str,
+    model: str,
+    *,
+    task: Optional[Task] = None,
+) -> bool:
+    """True when the model cannot accept a tools schema at all.
+
+    Analyze mode registers ``submit_findings`` for every other model. Muse Spark
+    still gets the tool schema (and last-chance submit nudge) — it only rejects
+    named ``tool_choice``, which :func:`tool_choice_force_supported` handles.
+    """
+    del provider  # reserved for future provider-specific overrides
+    payload = getattr(task, "payload", None) or {}
+    if bool(payload.get("tool_less")) or bool(payload.get("disable_tools")):
+        return True
+    slug = (model or "").strip().lower()
+    if not slug:
+        return False
+    for marker in _TOOL_LESS_MODEL_MARKERS:
+        if marker in slug:
+            return True
+    return False
 
 
 def _provider_rejects_tool_choice_force(exc: ProviderError) -> bool:
@@ -551,7 +587,13 @@ class AgenticAdapter(FullEditWorkerAdapter):
 
         prompt = _with_first_turn_tool_nudge(prompt)
         graph_on = self._graph_enabled(task, cwd)
-        tools = self._tool_schema(implement=False, task=task, graph_on=graph_on)
+        # Product bar: every analyze model gets submit_findings registered unless
+        # it is a known tool-less endpoint. Muse Spark still receives the schema;
+        # only tool_choice force is skipped for that family.
+        if model_is_tool_less(provider, model, task=task):
+            tools: list[dict] = []
+        else:
+            tools = self._tool_schema(implement=False, task=task, graph_on=graph_on)
 
         # One stricter JSON-only reprompt before accepting a degrade: a clean run
         # that returned prose the parser couldn't structure usually recovers on a
@@ -625,6 +667,16 @@ class AgenticAdapter(FullEditWorkerAdapter):
             # that path previously hid max_turns / no-submit degrades.
             structured_ok = bool(parsed)
             channel = "json"
+        # When the tool/JSON channels miss, still promote substantive analysis
+        # prose into typed FINDING/RISK/DECISION so the Marionette quality gate
+        # sees signal. Verification stays degraded — promotion is not a pass.
+        promoted: list[Artifact] = []
+        if submitted is None and not structured_ok:
+            promoted = _promote_unstructured_analysis(
+                task, worker_id, final_text or "", goal=goal,
+            )
+            if promoted:
+                parsed = list(parsed) + promoted
         state["recovered"] = state["attempted"] and structured_ok
         # Tool-channel empty submit (submitted is not None) is an honest pass.
         # JSON/no-submit with zero typed artifacts is always degraded — including
@@ -653,6 +705,8 @@ class AgenticAdapter(FullEditWorkerAdapter):
             evidence.append("retry:recovered")
         elif state["attempted"]:
             evidence.append("retry:exhausted")
+        if promoted:
+            evidence.append("promote:unstructured")
         if plan_holder["steps"]:
             evidence.append(f"plan:{len(plan_holder['steps'])}")
         diagnosis = (
@@ -1751,6 +1805,9 @@ class AgenticAdapter(FullEditWorkerAdapter):
                                "status": {"type": "string",
                                           "description": "one of pending, in_progress, done"}}}}},
                 ["steps"]))
+        # Always register the terminal submit tool last. Analyze mode must expose
+        # submit_findings for every provider/model that accepts a tools schema
+        # (callers skip _tool_schema entirely for known tool-less models).
         tools.append(self._submit_tool(implement=implement, fn=fn))
         return tools
 
@@ -2505,6 +2562,211 @@ def _no_tool_calls_diagnosis(provider: str, model: str, turns: int) -> str:
         "called any tool -- it is not tool-calling on this endpoint; route "
         "this role to a tool-capable model"
     )
+
+
+# Labeled prose salvage: models that skip submit_findings sometimes still emit
+# FINDING:/RISK:/DECISION: lines (or grounded analysis with file cites). Promote
+# those into typed artifacts so quality gates see signal without marking a pass.
+_LABELED_ARTIFACT_LINE_RE = re.compile(
+    r"^(FINDING|RISK|DECISION)\s*:\s*(.*)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_FILE_CITE_RE = re.compile(
+    r"(?<![A-Za-z0-9_./-])("
+    r"(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.[A-Za-z0-9]+"
+    r"|[A-Za-z0-9_.-]+\.(?:py|ts|tsx|js|jsx|go|rs|java|kt|rb|md|json|ya?ml|toml|sh)"
+    r")(?::\d+(?:-\d+)?)?"
+)
+_REASONING_FRAGMENT_RE = re.compile(
+    r"^(?:"
+    r"let me (?:think|see|check|look|analyze|inspect|explore)|"
+    r"i (?:need|should|will|am going|'m going) to|"
+    r"(?:okay|ok|alright|hmm|uh)[,.]?\s|"
+    r"(?:thinking|reasoning|analysis)\s*:"
+    r")",
+    re.IGNORECASE,
+)
+_MIN_SUBSTANTIVE_CHARS = 80
+_MIN_WRAP_CHARS = 160
+
+
+def _normalize_compare_text(text: str) -> str:
+    return " ".join((text or "").split()).strip().lower()
+
+
+def _extract_file_cites(text: str) -> list[str]:
+    """Return unique path[:line] cites from analysis prose."""
+    cites: list[str] = []
+    seen = set()
+    for match in _FILE_CITE_RE.finditer(text or ""):
+        cite = match.group(0)
+        if cite and cite not in seen:
+            seen.add(cite)
+            cites.append(cite)
+    return cites
+
+
+def _is_goal_echo(text: str, task: Task, *, goal: str = "") -> bool:
+    """True when ``text`` merely repeats the task goal/instruction."""
+    normalized = _normalize_compare_text(text)
+    if not normalized:
+        return False
+    candidates = [
+        task.instruction,
+        goal,
+        (task.payload or {}).get("prompt"),
+        (task.payload or {}).get("codegraph_task"),
+    ]
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+        other = _normalize_compare_text(candidate)
+        if not other:
+            continue
+        if normalized == other:
+            return True
+        # Near-echo: one contains the other and lengths are close.
+        shorter, longer = sorted((normalized, other), key=len)
+        if shorter in longer and len(longer) <= max(len(shorter) * 1.35, len(shorter) + 40):
+            return True
+    return False
+
+
+def _has_labeled_artifact_lines(text: str) -> bool:
+    """True when any line is a FINDING:/RISK:/DECISION: label."""
+    return bool(_LABELED_ARTIFACT_LINE_RE.search(text or ""))
+
+
+def _is_reasoning_fragment(text: str) -> bool:
+    """True for short CoT / planning fragments that are not analysis output."""
+    stripped = (text or "").strip()
+    if not stripped:
+        return True
+    if _has_labeled_artifact_lines(stripped):
+        return False
+    if _extract_file_cites(stripped):
+        return False
+    # Bare planning crumbs with no grounding.
+    if len(stripped) < 40:
+        return True
+    return bool(
+        len(stripped) < _MIN_SUBSTANTIVE_CHARS
+        and _REASONING_FRAGMENT_RE.match(stripped)
+    )
+
+
+def _is_substantive_analysis(text: str, task: Task, *, goal: str = "") -> bool:
+    """True when prose looks like real analysis, not a goal echo or CoT crumb."""
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    if _is_goal_echo(stripped, task, goal=goal):
+        return False
+    # Labeled blocks are substantive even when short (e.g. "FINDING: …").
+    if _has_labeled_artifact_lines(stripped):
+        return True
+    if _is_reasoning_fragment(stripped):
+        return False
+    cites = _extract_file_cites(stripped)
+    if cites and len(stripped) >= _MIN_SUBSTANTIVE_CHARS:
+        return True
+    return len(stripped) >= _MIN_WRAP_CHARS
+
+
+def _parse_labeled_analysis_items(text: str) -> list[dict]:
+    """Parse FINDING:/RISK:/DECISION: blocks into submit_findings-shaped items."""
+    items: list[dict] = []
+    current_kind: Optional[str] = None
+    current_lines: list[str] = []
+
+    def _flush() -> None:
+        nonlocal current_kind, current_lines
+        if not current_kind:
+            current_lines = []
+            return
+        body = "\n".join(current_lines).strip()
+        current_lines = []
+        if not body:
+            current_kind = None
+            return
+        cites = _extract_file_cites(body)
+        evidence = list(cites) if cites else ["adapter:agentic"]
+        if "promote:unstructured" not in evidence:
+            evidence.append("promote:unstructured")
+        kind = current_kind.lower()
+        current_kind = None
+        if kind == "finding":
+            items.append({
+                "type": "finding",
+                "claim": body,
+                "evidence": evidence,
+                "confidence": 0.6,
+            })
+        elif kind == "risk":
+            items.append({
+                "type": "risk",
+                "risk": body,
+                "mitigation": "Review and verify before implementation.",
+                "evidence": evidence,
+                "confidence": 0.6,
+            })
+        else:
+            items.append({
+                "type": "decision",
+                "decision": body,
+                "why": "Recommended by automated analysis.",
+                "evidence": evidence,
+                "confidence": 0.6,
+            })
+
+    for raw_line in (text or "").splitlines():
+        match = _LABELED_ARTIFACT_LINE_RE.match(raw_line.strip())
+        if match:
+            _flush()
+            current_kind = match.group(1)
+            rest = match.group(2).strip()
+            current_lines = [rest] if rest else []
+            continue
+        if current_kind is not None:
+            current_lines.append(raw_line.rstrip())
+    _flush()
+    return items
+
+
+def _promote_unstructured_analysis(
+    task: Task,
+    worker_id: str,
+    final_text: str,
+    *,
+    goal: str = "",
+) -> list[Artifact]:
+    """Turn substantive unstructured analyze prose into typed artifacts.
+
+    Prefer labeled FINDING:/RISK:/DECISION: lines; otherwise wrap grounded prose
+    as a single FINDING (file cites become evidence when present). Empty text,
+    reasoning fragments, and goal echoes yield nothing — those stay degraded.
+    """
+    text = redact_secrets(final_text or "").strip()
+    if not _is_substantive_analysis(text, task, goal=goal):
+        return []
+    items = _parse_labeled_analysis_items(text)
+    if not items:
+        cites = _extract_file_cites(text)
+        evidence = list(cites) if cites else ["adapter:agentic"]
+        if "promote:unstructured" not in evidence:
+            evidence.append("promote:unstructured")
+        headline = next(
+            (line.strip() for line in text.splitlines() if line.strip()),
+            text,
+        )
+        items = [{
+            "type": "finding",
+            "claim": headline[:500],
+            "report": text[:8000],
+            "evidence": evidence,
+            "confidence": 0.55,
+        }]
+    return _items_to_artifacts(task, worker_id, items)
 
 
 def _coerce_submit_findings(args: object) -> tuple[list[dict], list[dict]]:

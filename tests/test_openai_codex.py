@@ -131,6 +131,80 @@ class OpenAICodexChatTests(unittest.TestCase):
         )
         self.assertEqual(turn.text, "hello")
 
+    def test_reasoning_effort_maps_to_nested_reasoning(self) -> None:
+        """Agentic default reasoning_effort must not 400 Codex Responses."""
+        events = [
+            {
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "usage": {
+                        "input_tokens": 2,
+                        "output_tokens": 1,
+                        "total_tokens": 3,
+                    },
+                    "output": [{
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "ok"}],
+                    }],
+                },
+            },
+        ]
+        captured: dict = {}
+
+        def fake_open_stream(url, *, headers, body, timeout):
+            captured.update(body=body)
+            return _sse_response(events)
+
+        with mock.patch.object(providers, "_open_stream", side_effect=fake_open_stream):
+            providers.provider_chat(
+                provider="openai-codex",
+                model="gpt-5.6-luna",
+                messages=[{"role": "user", "content": "hi"}],
+                api_key="tok",
+                extra={"reasoning_effort": "low"},
+            )
+        self.assertNotIn("reasoning_effort", captured["body"])
+        self.assertEqual(
+            captured["body"]["reasoning"],
+            {"effort": "low", "summary": "auto"},
+        )
+
+    def test_reasoning_effort_none_omits_reasoning_block(self) -> None:
+        events = [
+            {
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                    "output": [{
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "ok"}],
+                    }],
+                },
+            },
+        ]
+        captured: dict = {}
+
+        def fake_open_stream(url, *, headers, body, timeout):
+            captured.update(body=body)
+            return _sse_response(events)
+
+        with mock.patch.object(providers, "_open_stream", side_effect=fake_open_stream):
+            providers.provider_chat(
+                provider="openai-codex",
+                model="gpt-5.6-luna",
+                messages=[{"role": "user", "content": "hi"}],
+                api_key="tok",
+                extra={"reasoning_effort": "none"},
+            )
+        self.assertNotIn("reasoning_effort", captured["body"])
+        self.assertNotIn("reasoning", captured["body"])
+
     def test_tool_call_turn(self) -> None:
         events = [
             {

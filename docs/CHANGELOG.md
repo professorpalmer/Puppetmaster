@@ -1,3 +1,22 @@
+## v1.21.14
+
+**ChatGPT Codex agentic swarms: map ``reasoning_effort``; salvage unlabeled FINDINGs.**
+
+Agentic openai-codex workers were HTTP 400ing with
+``Unsupported parameter: reasoning_effort`` because swarm defaults inject the
+Chat Completions key and Responses/Codex reject it. Map that key into nested
+``reasoning`` (Marionette pilot shape) and promote labeled/file-cited analysis
+prose into typed FINDING/RISK/DECISION when ``submit_findings`` is skipped.
+
+- **Responses body.** ``_build_responses_body`` pops top-level
+  ``reasoning_effort`` and, when non-``none``, emits
+  ``reasoning: {effort, summary: "auto"}``. Bare key is never forwarded.
+- **Unstructured promote.** Analyze mode that returns FINDING:/RISK:/DECISION:
+  lines or file-cited prose still degrades verification, but typed artifacts
+  land so Marionette quality gates see signal (``promote:unstructured``).
+- **Tests.** ``tests/test_openai_codex.py`` covers the effort map; agentic
+  standalone covers promote / no-promote crumbs.
+
 ## v1.21.13
 
 **Passive provider rate-limit harvest with preemptive admission.**

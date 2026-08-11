@@ -1396,6 +1396,216 @@ class AgenticLoopTests(unittest.TestCase):
         self.assertEqual(verif.payload["failure"], "empty_or_unstructured_agentic_result")
         self.assertIn("retry:exhausted", verif.evidence)
         self.assertTrue(any(a.type == ArtifactType.RISK for a in arts))
+        # Short reasoning/prose crumbs must not be promoted into findings.
+        self.assertFalse(any(a.type == ArtifactType.FINDING for a in arts))
+        self.assertNotIn("promote:unstructured", verif.evidence)
+
+    def test_analyze_promotes_labeled_unstructured_final_text(self) -> None:
+        from puppetmaster.adapters import agentic
+        from puppetmaster.providers import AssistantTurn
+        from puppetmaster.quality import assess_run_quality
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cwd = Path(tmp.name)
+        labeled = (
+            "FINDING: Shared state in puppetmaster/workers.py:88 races under "
+            "concurrent dispatch without a lock.\n"
+            "RISK: Lost updates can drop completed worker receipts.\n"
+            "DECISION: Prefer an asyncio.Lock around the receipt write path."
+        )
+
+        def fake_chat(*, provider, model, messages, tools, extra, timeout):
+            return AssistantTurn(
+                text=labeled,
+                tool_calls=[],
+                finish_reason="stop",
+                usage={"prompt_tokens": 8, "completion_tokens": 40, "total_tokens": 48},
+            )
+
+        task = Task(
+            job_id="j", role="explore", instruction="audit concurrency",
+            payload={
+                "cwd": str(cwd), "provider": "anthropic", "model": "m",
+                "disable_codegraph": True, "analyze_retry": False,
+            },
+        )
+        with mock.patch.object(agentic, "provider_chat", side_effect=fake_chat):
+            arts = self.adapter().run(task, task.instruction, "w1")
+
+        verif = next(a for a in arts if a.type == ArtifactType.VERIFICATION)
+        self.assertEqual(verif.payload["result"], "degraded")
+        self.assertEqual(verif.payload["failure"], "empty_or_unstructured_agentic_result")
+        self.assertIn("promote:unstructured", verif.evidence)
+        findings = [a for a in arts if a.type == ArtifactType.FINDING]
+        risks = [
+            a for a in arts
+            if a.type == ArtifactType.RISK
+            and "result:empty-or-unstructured" not in (a.evidence or [])
+        ]
+        decisions = [a for a in arts if a.type == ArtifactType.DECISION]
+        self.assertEqual(len(findings), 1)
+        self.assertIn("workers.py:88", findings[0].payload["claim"])
+        self.assertEqual(len(risks), 1)
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(assess_run_quality(arts)["quality"], "ok")
+
+    def test_analyze_promotes_file_cited_prose_as_finding(self) -> None:
+        from puppetmaster.adapters import agentic
+        from puppetmaster.providers import AssistantTurn
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cwd = Path(tmp.name)
+        prose = (
+            "The receipt writer in puppetmaster/store.py:210 drops reused "
+            "fingerprints when mtime is unchanged, so follow-up swarms re-run "
+            "identical explore work instead of reusing memory."
+        )
+
+        def fake_chat(*, provider, model, messages, tools, extra, timeout):
+            return AssistantTurn(
+                text=prose,
+                tool_calls=[],
+                finish_reason="stop",
+                usage={"prompt_tokens": 6, "completion_tokens": 30, "total_tokens": 36},
+            )
+
+        task = Task(
+            job_id="j", role="explore", instruction="find reuse bugs",
+            payload={
+                "cwd": str(cwd), "provider": "anthropic", "model": "m",
+                "disable_codegraph": True, "analyze_retry": False,
+            },
+        )
+        with mock.patch.object(agentic, "provider_chat", side_effect=fake_chat):
+            arts = self.adapter().run(task, task.instruction, "w1")
+
+        verif = next(a for a in arts if a.type == ArtifactType.VERIFICATION)
+        self.assertEqual(verif.payload["result"], "degraded")
+        findings = [a for a in arts if a.type == ArtifactType.FINDING]
+        self.assertEqual(len(findings), 1)
+        self.assertTrue(
+            any("store.py:210" in e for e in (findings[0].evidence or [])),
+            findings[0].evidence,
+        )
+
+    def test_analyze_empty_and_reasoning_only_do_not_promote(self) -> None:
+        from puppetmaster.adapters import agentic
+        from puppetmaster.providers import AssistantTurn
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cwd = Path(tmp.name)
+
+        cases = [
+            "",
+            "Let me think about how to approach this problem carefully.",
+            "find reuse bugs",  # goal/instruction echo
+        ]
+        for final_text in cases:
+            with self.subTest(final_text=final_text):
+                def fake_chat(*, provider, model, messages, tools, extra, timeout,
+                              _text=final_text):
+                    return AssistantTurn(
+                        text=_text,
+                        tool_calls=[],
+                        finish_reason="stop",
+                        usage={"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+                    )
+
+                task = Task(
+                    job_id="j", role="explore", instruction="find reuse bugs",
+                    payload={
+                        "cwd": str(cwd), "provider": "anthropic", "model": "m",
+                        "disable_codegraph": True, "analyze_retry": False,
+                    },
+                )
+                with mock.patch.object(agentic, "provider_chat", side_effect=fake_chat):
+                    arts = self.adapter().run(task, task.instruction, "w1")
+                verif = next(a for a in arts if a.type == ArtifactType.VERIFICATION)
+                self.assertEqual(verif.payload["result"], "degraded")
+                self.assertFalse(any(a.type == ArtifactType.FINDING for a in arts))
+                self.assertFalse(any(a.type == ArtifactType.DECISION for a in arts))
+                self.assertNotIn("promote:unstructured", verif.evidence)
+
+    def test_analyze_schema_always_registers_submit_findings(self) -> None:
+        from puppetmaster.adapters.agentic import model_is_tool_less
+
+        task = Task(
+            job_id="j", role="explore", instruction="analyze",
+            payload={"provider": "openrouter", "model": "deepseek/deepseek-v4-pro"},
+        )
+        schema = self.adapter()._tool_schema(implement=False, task=task, graph_on=False)
+        names = [t["function"]["name"] for t in schema]
+        self.assertIn("submit_findings", names)
+        self.assertEqual(names[-1], "submit_findings")
+        self.assertFalse(model_is_tool_less("openrouter", "deepseek/deepseek-v4-pro", task=task))
+        self.assertFalse(
+            model_is_tool_less("openrouter", "meta/muse-spark-1.1", task=task)
+        )
+
+        tool_less = Task(
+            job_id="j", role="explore", instruction="analyze",
+            payload={"provider": "openai", "model": "o1-pro", "tool_less": True},
+        )
+        self.assertTrue(model_is_tool_less("openai", "o1-pro", task=tool_less))
+
+    def test_analyze_max_turns_last_chance_forces_submit_for_non_muse(self) -> None:
+        from puppetmaster.adapters import agentic
+        from puppetmaster.providers import AssistantTurn
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cwd = Path(tmp.name)
+        seen_extra = []
+
+        def fake_chat(*, provider, model, messages, tools, extra, timeout):
+            seen_extra.append(dict(extra))
+            if len(seen_extra) <= 2:
+                # Burn max_turns with tool calls that never submit.
+                return AssistantTurn(
+                    text="",
+                    tool_calls=[{
+                        "id": f"r{len(seen_extra)}",
+                        "name": "list_dir",
+                        "arguments": {"path": "."},
+                    }],
+                    usage={"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
+                )
+            return AssistantTurn(
+                text="",
+                tool_calls=[{
+                    "id": "s1",
+                    "name": "submit_findings",
+                    "arguments": {
+                        "artifacts": [{
+                            "type": "finding",
+                            "claim": "last chance",
+                            "evidence": ["a.py"],
+                            "confidence": 0.7,
+                        }],
+                    },
+                }],
+                usage={"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+            )
+
+        task = Task(
+            job_id="j", role="explore", instruction="analyze",
+            payload={
+                "cwd": str(cwd), "provider": "anthropic", "model": "claude-sonnet",
+                "disable_codegraph": True, "max_turns": 2, "analyze_retry": False,
+            },
+        )
+        with mock.patch.object(agentic, "provider_chat", side_effect=fake_chat):
+            arts = self.adapter().run(task, task.instruction, "w1")
+
+        self.assertGreaterEqual(len(seen_extra), 3)
+        self.assertEqual(seen_extra[2].get("force_tool"), "submit_findings")
+        verif = next(a for a in arts if a.type == ArtifactType.VERIFICATION)
+        self.assertEqual(verif.payload["result"], "passed")
+        self.assertIn("submit:forced_max_turns", verif.evidence)
+        self.assertTrue(any(a.type == ArtifactType.FINDING for a in arts))
 
     def test_analyze_retry_forces_submit_tool(self) -> None:
         # After the structure retry, the next turn must FORCE the submit tool via

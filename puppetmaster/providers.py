@@ -1637,9 +1637,17 @@ def _build_responses_body(
             value = 0
         if value > 0:
             body["max_output_tokens"] = value
+    # Chat Completions leftover: ChatGPT Codex (and Responses generally) reject
+    # top-level ``reasoning_effort``. Map to nested ``reasoning`` when set.
+    # ``none`` / empty omits the block entirely (same as Marionette pilots).
+    effort = extra.pop("reasoning_effort", None)
+    if "reasoning" not in extra and effort is not None:
+        level = str(effort).strip().lower()
+        if level and level != "none":
+            extra["reasoning"] = {"effort": level, "summary": "auto"}
     # Forward only known-safe extras (e.g. temperature). Never invent
     # ChatGPT client_metadata / session affinity fields.
-    for key in ("temperature", "top_p", "metadata", "reasoning", "reasoning_effort"):
+    for key in ("temperature", "top_p", "metadata", "reasoning"):
         if key in extra:
             body[key] = extra[key]
     return body
