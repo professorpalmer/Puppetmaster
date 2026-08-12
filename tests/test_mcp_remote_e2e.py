@@ -364,6 +364,7 @@ class GrokBotHandshakeRegressionTests(unittest.TestCase):
             rate_limit_per_minute=0,
         )
         with _RemoteServer(config) as server:
+            # Dual Accept: Grok Bot sends both but parses initialize as JSON.
             client = _HttpMcpClient(
                 server.port,
                 TOKEN,
@@ -385,7 +386,8 @@ class GrokBotHandshakeRegressionTests(unittest.TestCase):
                 },
             )
             self.assertEqual(status, 200)
-            self.assertIn("text/event-stream", headers.get("content-type", ""))
+            self.assertIn("application/json", headers.get("content-type", ""))
+            self.assertNotIn("text/event-stream", headers.get("content-type", ""))
             self.assertIn("mcp-session-id", headers)
             # Browser clients need this to read the session header.
             exposed = headers.get("access-control-expose-headers", "").lower()
@@ -415,11 +417,37 @@ class GrokBotHandshakeRegressionTests(unittest.TestCase):
                 body={"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
             )
             self.assertEqual(status, 200)
+            self.assertIn("application/json", headers.get("content-type", ""))
             self.assertIn("result", listed)
             names = {tool["name"] for tool in listed["result"]["tools"]}
             self.assertIn("puppetmaster_doctor", names)
             self.assertIn("puppetmaster_start_implement", names)
             self.assertGreaterEqual(len(names), 45)
+
+    def test_sse_only_accept_returns_event_stream(self) -> None:
+        config = RemoteMcpConfig(token=TOKEN, scope="supervise", rate_limit_per_minute=0)
+        with _RemoteServer(config) as server:
+            client = _HttpMcpClient(server.port, TOKEN, accept="text/event-stream")
+            status, headers, init = client.request(
+                "POST",
+                body={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "clientInfo": {"name": "sse-only", "version": "0"},
+                    },
+                },
+            )
+            self.assertEqual(status, 200)
+            self.assertIn("text/event-stream", headers.get("content-type", ""))
+            self.assertEqual(init["result"]["protocolVersion"], "2025-03-26")
+            self.assertEqual(
+                init["result"]["capabilities"]["tools"],
+                {"listChanged": False},
+            )
 
     def test_json_only_accept_still_works(self) -> None:
         config = RemoteMcpConfig(token=TOKEN, scope="supervise", rate_limit_per_minute=0)

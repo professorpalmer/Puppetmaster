@@ -83,6 +83,17 @@ class TokenAndScopeUnitTests(unittest.TestCase):
         self.assertIn("puppetmaster_doctor", names)
         self.assertIn("puppetmaster_status", names)
 
+    def test_prefer_sse_only_when_json_absent(self) -> None:
+        from puppetmaster.mcp_remote import prefer_sse_response
+
+        self.assertFalse(prefer_sse_response("application/json, text/event-stream"))
+        self.assertFalse(prefer_sse_response("text/event-stream, application/json"))
+        self.assertFalse(prefer_sse_response("application/json"))
+        self.assertFalse(prefer_sse_response(""))
+        self.assertFalse(prefer_sse_response(None))
+        self.assertFalse(prefer_sse_response("*/*"))
+        self.assertTrue(prefer_sse_response("text/event-stream"))
+
     def test_origin_allowlist(self) -> None:
         self.assertTrue(origin_allowed(None, ()))
         self.assertTrue(origin_allowed("http://127.0.0.1:3000", ()))

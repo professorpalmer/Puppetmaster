@@ -374,18 +374,23 @@ def build_remote_initialize_result(
 
 
 def prefer_sse_response(accept_header: Optional[str]) -> bool:
-    """Prefer SSE frames when the client advertises text/event-stream.
+    """Return True only when the client wants SSE and not JSON.
 
-    Streamable HTTP clients (including Cursor's remote MCP / Grok Bot path)
-    typically send ``Accept: application/json, text/event-stream``. The
-    reference SDK defaults to SSE unless JSON-only mode is forced. Returning
-    bare JSON while SSE is advertised has been observed to leave Grok Bot
-    stuck after initialize (HTTP 200, tools=0, no tools/list).
+    Grok Bot Plugins (and many MCP HTTP clients) send
+    ``Accept: application/json, text/event-stream`` but parse initialize as
+    plain JSON. Preferring SSE whenever event-stream appears causes
+    "Failed to load MCP server" despite a correct protocolVersion body.
+
+    Rule: JSON when Accept includes ``application/json``, is empty, or
+    includes ``*/*``; SSE only when ``text/event-stream`` is listed and
+    ``application/json`` is not (and Accept is not empty/``*/*``).
     """
-    accept = (accept_header or "").lower()
-    if "text/event-stream" in accept:
-        return True
-    return False
+    accept = (accept_header or "").strip().lower()
+    if not accept or "*/*" in accept:
+        return False
+    if "application/json" in accept:
+        return False
+    return "text/event-stream" in accept
 
 
 class RemoteMcpState:
@@ -921,7 +926,8 @@ def make_handler(state: RemoteMcpState) -> type:
                         f"protocolVersion={result_obj.get('protocolVersion')};"
                         f"tools_cap={result_obj.get('capabilities', {}).get('tools')}"
                     )
-                # Prefer SSE when the client advertises it (SDK / Grok Bot default).
+                # Prefer JSON for dual-Accept clients (Grok Bot); SSE only if
+                # Accept is event-stream without application/json.
                 if prefer_sse_response(self.headers.get("Accept")):
                     self._audit(
                         event="rpc_sse",

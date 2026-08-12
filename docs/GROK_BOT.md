@@ -100,7 +100,9 @@ Equivalent connector JSON:
 
 **Handshake notes (why curl worked but Grok Bot showed tools=0):** the remote
 server now (1) echoes the client’s `protocolVersion` (e.g. `2025-03-26`),
-(2) returns SSE frames when `Accept` lists `text/event-stream`, (3) exposes
+(2) returns `application/json` when Accept lists JSON (including the common
+dual `application/json, text/event-stream` — Grok Bot parses initialize as
+JSON; SSE only if Accept is event-stream without JSON), (3) exposes
 `Mcp-Session-Id` via CORS `Access-Control-Expose-Headers`, and (4) advertises a
 non-empty `capabilities.tools` object. CI locks that sequence in
 `tests/test_mcp_remote_e2e.py` (`GrokBotHandshakeRegressionTests`).

@@ -36,8 +36,9 @@ not a leased worker adapter (no fake `grok-bot` adapter).
   inventory (no ``grok-bot``).
 - **Grok Bot handshake fix.** Live tunnel PoC showed initialize 200s but
   ``tools=0`` / no ``tools/list``. Remote initialize now echoes the client's
-  ``protocolVersion`` (``2025-03-26`` etc.), prefers SSE when Accept lists
-  ``text/event-stream``, exposes ``Mcp-Session-Id`` via CORS
+  ``protocolVersion`` (``2025-03-26`` etc.), returns JSON when Accept lists
+  ``application/json`` (dual Accept is common; SSE only when event-stream is
+  listed without JSON), exposes ``Mcp-Session-Id`` via CORS
   ``Access-Control-Expose-Headers``, and advertises
   ``capabilities.tools.listChanged``. Regression:
   ``GrokBotHandshakeRegressionTests``.
