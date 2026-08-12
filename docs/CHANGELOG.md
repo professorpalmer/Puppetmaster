@@ -34,15 +34,17 @@ not a leased worker adapter (no fake `grok-bot` adapter).
   ephemeral port with no tunnel. ``tests/test_harness_regression_guards.py``
   locks the stdio tool floor (doctor + implement present) and the adapter
   inventory (no ``grok-bot``).
-- **Grok Bot handshake fix.** Live tunnel PoC showed initialize 200s but
-  ``tools=0`` / no ``tools/list``. Remote initialize now echoes the client's
-  ``protocolVersion`` (``2025-03-26`` etc.), returns JSON when Accept lists
-  ``application/json`` (dual Accept is common; SSE only when event-stream is
-  listed without JSON), exposes ``Mcp-Session-Id`` via CORS
-  ``Access-Control-Expose-Headers``, advertises
-  ``capabilities.tools.listChanged``, and holds **GET ``/mcp``** as a
-  long-lived SSE stream with keepalives (instant close caused re-init loops).
-  Regression: ``GrokBotHandshakeRegressionTests``.
+- **Grok Bot handshake (live-proven: Plugins connected / tools=50).** Echo
+  any non-empty client ``protocolVersion`` (no allowlist; default only if
+  missing). Minimal capabilities
+  ``{"tools":{"listChanged":false},"logging":{}}`` — no ``experimental``, no
+  ``instructions``. Dual Accept → ``application/json``; SSE only when
+  event-stream is present without JSON. CORS-expose ``Mcp-Session-Id``.
+  Long-lived GET ``/mcp`` SSE keepalives. Compact ``tools/list`` via
+  ``remote_tool_to_json`` (desc ≤280 / prop desc ≤120 / simple schema /
+  ``additionalProperties: false`` / required ⊆ properties). Stdio tool
+  surface and worker adapters untouched. Regression:
+  ``GrokBotHandshakeRegressionTests``.
 
 ## v1.21.14
 

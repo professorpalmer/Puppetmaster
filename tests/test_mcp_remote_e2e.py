@@ -241,10 +241,11 @@ class RemoteMcpE2ETests(unittest.TestCase):
                 self.assertEqual(init["result"]["serverInfo"]["name"], "puppetmaster-remote")
                 self.assertEqual(init["result"]["protocolVersion"], "2025-03-26")
                 self.assertEqual(
-                    init["result"]["capabilities"]["experimental"]["puppetmasterRemoteScope"],
-                    "supervise",
+                    init["result"]["capabilities"],
+                    {"tools": {"listChanged": False}, "logging": {}},
                 )
-                self.assertIn("listChanged", init["result"]["capabilities"]["tools"])
+                self.assertNotIn("instructions", init["result"])
+                self.assertNotIn("experimental", init["result"]["capabilities"])
                 self.assertTrue(client.session_id)
 
                 # notifications/initialized → 202
@@ -352,9 +353,10 @@ class GrokBotHandshakeRegressionTests(unittest.TestCase):
     """Cursor/Grok remote client handshake that was failing in live tunnel PoC.
 
     Live symptom: initialize HTTP 200 (repeated), tools=0, no tools/list in
-    audit. Root causes addressed here: protocolVersion echo, SSE when Accept
-    lists text/event-stream, CORS Expose-Headers for Mcp-Session-Id, richer
-    tools capability, then initialized → tools/list.
+    audit. Root causes addressed here: protocolVersion echo (no allowlist),
+    dual-Accept → JSON, minimal capabilities (no experimental/instructions),
+    compact tools/list schemas, GET /mcp keepalives, CORS Expose-Headers for
+    Mcp-Session-Id, then initialized → tools/list.
     """
 
     def test_cursor_grok_streamable_handshake_reaches_tools_list(self) -> None:
@@ -400,10 +402,12 @@ class GrokBotHandshakeRegressionTests(unittest.TestCase):
             self.assertIn("result", init)
             self.assertEqual(init["result"]["protocolVersion"], "2025-03-26")
             self.assertNotEqual(init["result"]["protocolVersion"], "2024-11-05")
-            tools_cap = init["result"]["capabilities"]["tools"]
-            self.assertIsInstance(tools_cap, dict)
-            self.assertTrue(tools_cap, "capabilities.tools must be non-empty")
-            self.assertEqual(tools_cap.get("listChanged"), False)
+            self.assertEqual(
+                init["result"]["capabilities"],
+                {"tools": {"listChanged": False}, "logging": {}},
+            )
+            self.assertNotIn("instructions", init["result"])
+            self.assertNotIn("experimental", init["result"]["capabilities"])
             self.assertEqual(init["result"]["serverInfo"]["name"], "puppetmaster-remote")
             self.assertTrue(client.session_id)
 
@@ -420,10 +424,14 @@ class GrokBotHandshakeRegressionTests(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertIn("application/json", headers.get("content-type", ""))
             self.assertIn("result", listed)
-            names = {tool["name"] for tool in listed["result"]["tools"]}
+            tools_listed = listed["result"]["tools"]
+            names = {tool["name"] for tool in tools_listed}
             self.assertIn("puppetmaster_doctor", names)
             self.assertIn("puppetmaster_start_implement", names)
             self.assertGreaterEqual(len(names), 45)
+            for tool in tools_listed:
+                self.assertEqual(tool["inputSchema"].get("additionalProperties"), False)
+                self.assertLessEqual(len(tool.get("description") or ""), 280)
 
     def test_sse_only_accept_returns_event_stream(self) -> None:
         config = RemoteMcpConfig(token=TOKEN, scope="supervise", rate_limit_per_minute=0)
@@ -446,9 +454,10 @@ class GrokBotHandshakeRegressionTests(unittest.TestCase):
             self.assertIn("text/event-stream", headers.get("content-type", ""))
             self.assertEqual(init["result"]["protocolVersion"], "2025-03-26")
             self.assertEqual(
-                init["result"]["capabilities"]["tools"],
-                {"listChanged": False},
+                init["result"]["capabilities"],
+                {"tools": {"listChanged": False}, "logging": {}},
             )
+            self.assertNotIn("instructions", init["result"])
 
     def test_json_only_accept_still_works(self) -> None:
         config = RemoteMcpConfig(token=TOKEN, scope="supervise", rate_limit_per_minute=0)
@@ -509,9 +518,10 @@ class GrokBotHandshakeRegressionTests(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertEqual(init["result"]["protocolVersion"], "2025-03-26")
             self.assertEqual(
-                init["result"]["capabilities"]["tools"],
-                {"listChanged": False},
+                init["result"]["capabilities"],
+                {"tools": {"listChanged": False}, "logging": {}},
             )
+            self.assertNotIn("instructions", init["result"])
             session_id = headers.get("mcp-session-id")
             self.assertTrue(session_id)
 

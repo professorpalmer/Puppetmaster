@@ -39,7 +39,6 @@ from puppetmaster.mcp_server import (
     error_response,
     handle_message,
     tool_error,
-    tool_to_json,
     tools,
 )
 
@@ -57,17 +56,41 @@ SCOPE_ENV = "PUPPETMASTER_MCP_REMOTE_SCOPE"
 HOST_ENV = "PUPPETMASTER_MCP_REMOTE_HOST"
 PORT_ENV = "PUPPETMASTER_MCP_REMOTE_PORT"
 
-# Protocol versions this remote transport can speak. When the client requests
-# one of these we MUST echo it (lifecycle version negotiation). Returning a
-# different version (e.g. hardcoding 2024-11-05 while the client asked for
-# 2025-03-26) makes strict remote clients disconnect after initialize — which
-# is exactly the Grok Bot "Failed to load MCP server / tools=0" failure mode.
-SUPPORTED_PROTOCOL_VERSIONS = (
-    "2025-03-26",
-    "2025-06-18",
-    "2024-11-05",
-)
+# Default only when the client omits protocolVersion. Echo any non-empty
+# requested version verbatim — do not allowlist-gate. Returning a different
+# version (e.g. hardcoding 2024-11-05 while the client asked for 2025-03-26)
+# makes strict remote clients disconnect after initialize — the Grok Bot
+# "Failed to load MCP server / tools=0" failure mode.
 DEFAULT_PROTOCOL_VERSION = "2025-03-26"
+
+# Remote tools/list payload hygiene for Plugins / Grok Bot. Oversized
+# descriptions and loose schemas have been observed to flap the connector
+# after a green initialize; keep the listed surface compact and strict.
+REMOTE_TOOL_DESCRIPTION_MAX = 280
+REMOTE_PROPERTY_DESCRIPTION_MAX = 120
+_SIMPLE_SCHEMA_KEYS = frozenset(
+    {
+        "type",
+        "properties",
+        "required",
+        "description",
+        "enum",
+        "items",
+        "default",
+        "additionalProperties",
+        "title",
+        "const",
+        "minimum",
+        "maximum",
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+        "uniqueItems",
+        "format",
+        "pattern",
+    }
+)
 
 # Tools that start workers which may edit the tree or act externally.
 # Supervise-first remote surface omits these unless scope=implement.
@@ -311,22 +334,101 @@ def connector_snippet(*, base_url: str, token: str) -> JsonObject:
 
 
 def negotiate_protocol_version(requested: Optional[str]) -> str:
-    """Echo a supported client version; otherwise offer our streamable default."""
+    """Echo any non-empty client protocolVersion; default only if missing."""
     version = (requested or "").strip()
-    if version in SUPPORTED_PROTOCOL_VERSIONS:
+    if version:
         return version
     return DEFAULT_PROTOCOL_VERSION
 
 
-def remote_initialize_capabilities(scope: str) -> JsonObject:
-    """Capabilities advertised on the remote transport initialize result."""
+def remote_initialize_capabilities() -> JsonObject:
+    """Minimal capabilities proven to load Grok Bot Plugins (tools=50)."""
     return {
         # Non-empty tools object: some remote clients treat bare `{}` as
         # "no tool support". listChanged=false is honest — we don't push
         # tools/list_changed notifications on this transport.
         "tools": {"listChanged": False},
         "logging": {},
-        "experimental": {"puppetmasterRemoteScope": scope},
+    }
+
+
+def _truncate_text(text: str, limit: int) -> str:
+    cleaned = (text or "").strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    if limit <= 3:
+        return cleaned[:limit]
+    return cleaned[: limit - 3].rstrip() + "..."
+
+
+def _simplify_json_schema(node: Any, *, property_description_max: int) -> Any:
+    """Keep only simple JSON Schema fields; truncate nested descriptions."""
+    if isinstance(node, list):
+        return [
+            _simplify_json_schema(item, property_description_max=property_description_max)
+            for item in node
+        ]
+    if not isinstance(node, dict):
+        return node
+    simplified: JsonObject = {}
+    for key, value in node.items():
+        if key not in _SIMPLE_SCHEMA_KEYS:
+            continue
+        if key == "description" and isinstance(value, str):
+            simplified[key] = _truncate_text(value, property_description_max)
+        elif key == "properties" and isinstance(value, dict):
+            simplified[key] = {
+                name: _simplify_json_schema(
+                    prop, property_description_max=property_description_max
+                )
+                for name, prop in value.items()
+                if isinstance(name, str) and isinstance(prop, dict)
+            }
+        elif key == "items":
+            simplified[key] = _simplify_json_schema(
+                value, property_description_max=property_description_max
+            )
+        elif key == "required" and isinstance(value, list):
+            simplified[key] = [str(item) for item in value if isinstance(item, str)]
+        else:
+            simplified[key] = value
+    return simplified
+
+
+def remote_tool_to_json(tool: Any) -> JsonObject:
+    """Compact, Plugins-safe tool descriptor for remote ``tools/list``.
+
+    Truncates descriptions, strips exotic schema keys, forces
+    ``additionalProperties: false``, and drops required names that are not
+    present in properties. Stdio ``tool_to_json`` is intentionally untouched.
+    """
+    raw_schema = getattr(tool, "input_schema", None)
+    schema_src = dict(raw_schema) if isinstance(raw_schema, dict) else {}
+    schema = _simplify_json_schema(
+        schema_src, property_description_max=REMOTE_PROPERTY_DESCRIPTION_MAX
+    )
+    if not isinstance(schema, dict):
+        schema = {"type": "object", "properties": {}}
+    schema.setdefault("type", "object")
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        properties = {}
+        schema["properties"] = properties
+    required = schema.get("required")
+    if isinstance(required, list):
+        schema["required"] = [name for name in required if name in properties]
+        if not schema["required"]:
+            schema.pop("required", None)
+    elif "required" in schema:
+        schema.pop("required", None)
+    schema["additionalProperties"] = False
+    return {
+        "name": str(getattr(tool, "name", "") or ""),
+        "description": _truncate_text(
+            str(getattr(tool, "description", "") or ""),
+            REMOTE_TOOL_DESCRIPTION_MAX,
+        ),
+        "inputSchema": schema,
     }
 
 
@@ -341,23 +443,23 @@ def build_remote_initialize_result(
     Intentionally does **not** call ``mcp_server.handle_message``: the stdio
     handler hardcodes ``protocolVersion: 2024-11-05`` and ``tools: {}``, which
     makes Grok Bot / Cursor remote clients abort after initialize (tools=0).
+
+    Live-proven shape: echo protocolVersion, minimal capabilities
+    (tools.listChanged + logging), no ``experimental`` / ``instructions``.
+    ``scope`` is accepted for call-site stability but is not embedded here.
     """
+    del scope  # advertised via filtered tools/list, not initialize fluff
     requested = params.get("protocolVersion")
     negotiated = negotiate_protocol_version(
         str(requested) if requested is not None else None
     )
     result: JsonObject = {
         "protocolVersion": negotiated,
-        "capabilities": remote_initialize_capabilities(scope),
+        "capabilities": remote_initialize_capabilities(),
         "serverInfo": {
             "name": "puppetmaster-remote",
             "version": _PACKAGE_VERSION,
         },
-        "instructions": (
-            "Grok Bot / remote pilot: use start_* tools, poll status/logs/"
-            "live_artifacts/show. Default remote scope may omit implement/edit — "
-            "see docs/GROK_BOT.md."
-        ),
     }
     # Belt-and-suspenders: never ship the stdio defaults even if a future
     # edit merges another result dict in.
@@ -372,6 +474,10 @@ def build_remote_initialize_result(
     else:
         caps["tools"] = dict(tools_cap)
         caps["tools"].setdefault("listChanged", False)
+    caps.setdefault("logging", {})
+    # Never advertise experimental / instructions on this transport.
+    result.pop("instructions", None)
+    caps.pop("experimental", None)
     return {
         "jsonrpc": "2.0",
         "id": request_id,
@@ -485,7 +591,9 @@ def handle_remote_message(
         return {
             "jsonrpc": "2.0",
             "id": request_id,
-            "result": {"tools": [tool_to_json(tool) for tool in filtered_tools(scope)]},
+            "result": {
+                "tools": [remote_tool_to_json(tool) for tool in filtered_tools(scope)]
+            },
         }
 
     if method == "tools/call":

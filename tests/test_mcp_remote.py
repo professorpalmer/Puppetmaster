@@ -183,15 +183,18 @@ class HandleRemoteMessageTests(unittest.TestCase):
         self.assertEqual(response["result"]["serverInfo"]["name"], "puppetmaster-remote")
         self.assertEqual(response["result"]["protocolVersion"], "2025-03-26")
         self.assertEqual(
-            response["result"]["capabilities"]["experimental"]["puppetmasterRemoteScope"],
-            "supervise",
+            response["result"]["capabilities"],
+            {"tools": {"listChanged": False}, "logging": {}},
         )
-        self.assertIn("listChanged", response["result"]["capabilities"]["tools"])
+        self.assertNotIn("experimental", response["result"]["capabilities"])
+        self.assertNotIn("instructions", response["result"])
 
     def test_initialize_echoes_requested_protocol_version(self) -> None:
         from puppetmaster.mcp_server import handle_message
 
-        for requested in ("2025-03-26", "2024-11-05", "2025-06-18"):
+        # Echo any non-empty protocolVersion (no allowlist). Include a
+        # future/unknown version to prove we do not gate.
+        for requested in ("2025-03-26", "2024-11-05", "2025-06-18", "2099-01-01"):
             response = handle_remote_message(
                 {
                     "jsonrpc": "2.0",
@@ -204,9 +207,11 @@ class HandleRemoteMessageTests(unittest.TestCase):
             assert response is not None
             self.assertEqual(response["result"]["protocolVersion"], requested)
             self.assertEqual(
-                response["result"]["capabilities"]["tools"],
-                {"listChanged": False},
+                response["result"]["capabilities"],
+                {"tools": {"listChanged": False}, "logging": {}},
             )
+            self.assertNotIn("instructions", response["result"])
+            self.assertNotIn("experimental", response["result"]["capabilities"])
             # Prove we did not return the stdio handler's hardcoded defaults
             # when the client asked for a streamable-HTTP version.
             if requested != "2024-11-05":
@@ -228,6 +233,84 @@ class HandleRemoteMessageTests(unittest.TestCase):
                     response["result"]["capabilities"]["tools"],
                     stdio["result"]["capabilities"]["tools"],
                 )
+
+    def test_initialize_defaults_protocol_when_missing(self) -> None:
+        from puppetmaster.mcp_remote import DEFAULT_PROTOCOL_VERSION
+
+        response = handle_remote_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"capabilities": {}},
+            },
+            scope="supervise",
+        )
+        assert response is not None
+        self.assertEqual(response["result"]["protocolVersion"], DEFAULT_PROTOCOL_VERSION)
+
+    def test_remote_tool_to_json_compacts_schema(self) -> None:
+        from types import SimpleNamespace
+
+        from puppetmaster.mcp_remote import (
+            REMOTE_PROPERTY_DESCRIPTION_MAX,
+            REMOTE_TOOL_DESCRIPTION_MAX,
+            remote_tool_to_json,
+        )
+
+        long_tool_desc = "T" * (REMOTE_TOOL_DESCRIPTION_MAX + 40)
+        long_prop_desc = "P" * (REMOTE_PROPERTY_DESCRIPTION_MAX + 40)
+        tool = SimpleNamespace(
+            name="demo_tool",
+            description=long_tool_desc,
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "goal": {
+                        "type": "string",
+                        "description": long_prop_desc,
+                        "$comment": "strip me",
+                    },
+                    "cwd": {"type": "string", "description": "ok"},
+                },
+                "required": ["goal", "missing_required"],
+                "$defs": {"x": {"type": "string"}},
+                "examples": [{"goal": "x"}],
+            },
+        )
+        listed = remote_tool_to_json(tool)
+        self.assertEqual(listed["name"], "demo_tool")
+        self.assertLessEqual(len(listed["description"]), REMOTE_TOOL_DESCRIPTION_MAX)
+        self.assertTrue(listed["description"].endswith("..."))
+        schema = listed["inputSchema"]
+        self.assertEqual(schema.get("additionalProperties"), False)
+        self.assertNotIn("$defs", schema)
+        self.assertNotIn("examples", schema)
+        self.assertEqual(schema["required"], ["goal"])
+        self.assertNotIn("$comment", schema["properties"]["goal"])
+        self.assertLessEqual(
+            len(schema["properties"]["goal"]["description"]),
+            REMOTE_PROPERTY_DESCRIPTION_MAX,
+        )
+
+    def test_tools_list_schemas_force_additional_properties_false(self) -> None:
+        response = handle_remote_message(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            scope="implement",
+        )
+        assert response is not None
+        tools_listed = response["result"]["tools"]
+        self.assertGreaterEqual(len(tools_listed), 45)
+        for tool in tools_listed:
+            schema = tool["inputSchema"]
+            self.assertEqual(schema.get("additionalProperties"), False)
+            self.assertLessEqual(len(tool.get("description") or ""), 280)
+            props = schema.get("properties") or {}
+            for name in schema.get("required") or []:
+                self.assertIn(name, props)
+            for prop in props.values():
+                if isinstance(prop, dict) and isinstance(prop.get("description"), str):
+                    self.assertLessEqual(len(prop["description"]), 120)
 
 
 class _RemoteServerHarness:
