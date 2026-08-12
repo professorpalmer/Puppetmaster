@@ -188,7 +188,8 @@ def resolve_token(
     if explicit and explicit.strip():
         return explicit.strip()
     if token_file:
-        raw = open(token_file, encoding="utf-8").read().strip()
+        with open(token_file, encoding="utf-8") as handle:
+            raw = handle.read().strip()
         if not raw:
             raise ValueError(f"Token file {token_file!r} is empty")
         return raw

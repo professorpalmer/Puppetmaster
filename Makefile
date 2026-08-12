@@ -1,4 +1,4 @@
-.PHONY: test demo doctor adapters clean
+.PHONY: test demo doctor adapters clean grok-bot-poc
 
 test:
 	python -m unittest discover -s tests -v
@@ -11,6 +11,10 @@ doctor:
 
 adapters:
 	python -m puppetmaster adapters
+
+# Local-only Grok Bot remote MCP PoC (loopback + optional cloudflared). Not CI.
+grok-bot-poc:
+	./scripts/grok-bot-remote-poc.sh
 
 clean:
 	rm -rf .puppetmaster .pytest_cache

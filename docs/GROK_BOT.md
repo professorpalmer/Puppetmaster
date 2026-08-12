@@ -29,6 +29,8 @@ export PUPPETMASTER_MCP_TOKEN="$(python -c 'import secrets; print(secrets.token_
 python -m puppetmaster mcp serve-remote --scope supervise
 # equivalent console script:
 # puppetmaster-mcp-remote --scope supervise
+# one-shot helper (prints connector + starts server):
+# ./scripts/grok-bot-remote-poc.sh   # or: make grok-bot-poc
 ```
 
 The process prints a connector JSON on stderr:
@@ -50,21 +52,47 @@ Print the connector without serving:
 python -m puppetmaster mcp serve-remote --token "$PUPPETMASTER_MCP_TOKEN" --print-connector
 ```
 
-### Reach Grok Bot from your laptop
+### AddMcpServer steps (Grok Bot)
 
-Grok Bot needs a **reachable URL**. For a PoC, put a secure tunnel in front of loopback:
+Grok Bot only accepts a **remote** MCP URL (not a local `command`/`args` stdio block).
 
-```bash
-# terminal 1 — bind loopback only (default)
-python -m puppetmaster mcp serve-remote --host 127.0.0.1 --port 8743
+1. Start the remote server on loopback (supervise = default; no implement/edit):
+   ```bash
+   export PUPPETMASTER_MCP_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+   python -m puppetmaster mcp serve-remote --host 127.0.0.1 --port 8743 --scope supervise
+   ```
+2. Make it reachable (laptop PoC — TLS tunnel in a second terminal):
+   ```bash
+   cloudflared tunnel --url http://127.0.0.1:8743
+   # note the https://….trycloudflare.com hostname
+   ```
+3. In Grok Bot → **Add MCP server** / connector, set:
+   - **URL:** `https://<tunnel-host>/mcp`  
+     (path **must** end in `/mcp` — that is the Streamable HTTP endpoint)
+   - **Headers:** `Authorization: Bearer <same PUPPETMASTER_MCP_TOKEN>`
+   - **Transport:** streamable HTTP (or “SSE/HTTP” if the UI offers a single remote option — POST to `/mcp` is what matters)
+4. Confirm with a short pilot loop in chat:
+   - `puppetmaster_doctor`
+   - `puppetmaster_start_cursor_swarm` (or `_review` / `_plan`) → expect `{job_id}` immediately
+   - `puppetmaster_status` / `puppetmaster_live_artifacts_follow` / `puppetmaster_show`
+5. Keep implement off the remote surface until you intentionally restart with `--scope implement`.
 
-# terminal 2 — example with cloudflared (or ngrok)
-cloudflared tunnel --url http://127.0.0.1:8743
+Equivalent connector JSON (paste/adapt to whatever AddMcpServer accepts):
+
+```json
+{
+  "name": "puppetmaster",
+  "url": "https://<tunnel-host>/mcp",
+  "transport": "streamable-http",
+  "headers": {
+    "Authorization": "Bearer <PUPPETMASTER_MCP_TOKEN>"
+  }
+}
 ```
 
-Then point the Grok Bot connector at `https://<tunnel-host>/mcp` with the same bearer token. Prefer tunnels that terminate TLS. Do **not** bind `0.0.0.0` on a public interface without TLS and a strong token.
+Do **not** bind `0.0.0.0` on a public interface without TLS and a strong token. Toward a proper HTTPS service: terminate TLS on Caddy/nginx/Traefik and forward to `127.0.0.1:8743`. No Puppetmaster-hosted cloud is required or implied by this release.
 
-Toward a proper HTTPS service: run the same process behind any reverse proxy (Caddy, nginx, Traefik) that terminates TLS and forwards to `127.0.0.1:8743`. No Puppetmaster-hosted cloud is required or implied by this release.
+CI covers the HTTP loop without a tunnel (`tests/test_mcp_remote_e2e.py`).
 
 ## Auth model
 

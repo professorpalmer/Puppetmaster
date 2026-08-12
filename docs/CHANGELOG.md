@@ -29,6 +29,11 @@ not a leased worker adapter (no fake `grok-bot` adapter).
   deploy, marketplace packaging, implement-by-default later).
 - **Tests.** ``tests/test_mcp_remote.py`` covers auth, scope filtering,
   streamable initialize/tools/list/call, health, and rate limiting.
+  ``tests/test_mcp_remote_e2e.py`` drives a full HTTP loop (initialize →
+  tools/list → doctor → start_* → status/show → 401 + scope deny) on an
+  ephemeral port with no tunnel. ``tests/test_harness_regression_guards.py``
+  locks the stdio tool floor (doctor + implement present) and the adapter
+  inventory (no ``grok-bot``).
 
 ## v1.21.14
 
