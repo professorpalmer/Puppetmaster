@@ -6,6 +6,20 @@ Most of these are MCP-transport edge cases or environment quirks
 here, `puppetmaster doctor` should flag it directly — open an issue
 with that output attached.
 
+## Grok Bot cannot see Puppetmaster MCP
+
+Grok Bot only attaches **remote** HTTP/SSE MCP connectors. The stdio
+server (`python -m puppetmaster.mcp_server` / Cursor's local
+`mcp.json`) is invisible to it. Run the remote transport instead:
+
+```bash
+export PUPPETMASTER_MCP_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+python -m puppetmaster mcp serve-remote --scope supervise
+```
+
+Point Grok Bot at the printed `/mcp` URL (use a TLS tunnel for
+off-box access). Details: [GROK_BOT.md](GROK_BOT.md).
+
 ## `Tool execution error. Not connected` from Cursor
 
 This is Cursor's MCP client telling you it lost the stdio transport

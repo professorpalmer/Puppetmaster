@@ -76,7 +76,62 @@ def _run_mcp_subcommand(args) -> int:
         return _run_mcp_doctor(args)
     if args.mcp_command == "cleanup":
         return _run_mcp_cleanup(args)
+    if args.mcp_command == "serve-remote":
+        return _run_mcp_serve_remote(args)
     raise SystemExit(f"unknown mcp subcommand: {args.mcp_command}")
+
+
+def _run_mcp_serve_remote(args) -> int:
+    """Serve (or print) the remote streamable-HTTP MCP endpoint for Grok Bot."""
+    from puppetmaster.mcp_remote import (
+        DEFAULT_HOST,
+        DEFAULT_PORT,
+        MCP_ENDPOINT_PATH,
+        config_from_env_and_args,
+        connector_snippet,
+        serve_remote,
+    )
+
+    print_connector = bool(getattr(args, "print_connector", False))
+    try:
+        config, generated = config_from_env_and_args(
+            host=getattr(args, "host", None),
+            port=getattr(args, "port", None),
+            token=getattr(args, "token", None),
+            token_file=getattr(args, "token_file", None),
+            scope=getattr(args, "scope", None),
+            allow_origins=getattr(args, "allow_origins", None),
+            rate_limit_per_minute=getattr(args, "rate_limit", None),
+            audit_log=getattr(args, "audit_log", None),
+            generate_if_missing=not print_connector,
+        )
+        config.validate()
+    except (ValueError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if print_connector:
+        host = config.host or DEFAULT_HOST
+        port = config.port or DEFAULT_PORT
+        base = f"http://{host}:{port}"
+        print(json.dumps(connector_snippet(base_url=base, token=config.token), indent=2))
+        return 0
+
+    if generated:
+        print(
+            "Generated bearer token (also in connector JSON on stderr). "
+            "Persist it via PUPPETMASTER_MCP_TOKEN or --token-file for stable reconnects.",
+            file=sys.stderr,
+        )
+    if getattr(args, "print_token", False):
+        print(config.token)
+    # Reminder of the MCP endpoint path for operators skimming stdout.
+    print(
+        f"Starting remote MCP at http://{config.host}:{config.port}{MCP_ENDPOINT_PATH} "
+        f"(scope={config.scope})",
+        file=sys.stderr,
+    )
+    return serve_remote(config)
 
 def _run_mcp_doctor(args) -> int:
     """Diagnose a `Tool execution error. Not connected`.

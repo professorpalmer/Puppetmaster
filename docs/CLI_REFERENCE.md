@@ -221,6 +221,22 @@ python -m puppetmaster mcp list               # show every tracked MCP server PI
 python -m puppetmaster mcp cleanup --kill-stale
 ```
 
+## Remote MCP for Grok Bot (v1.22.0+)
+
+Grok Bot cannot attach local stdio MCP servers. Serve the same tool surface over
+streamable HTTP (supervise scope by default — no implement/edit):
+
+```bash
+export PUPPETMASTER_MCP_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+python -m puppetmaster mcp serve-remote --scope supervise
+python -m puppetmaster mcp serve-remote --token "$PUPPETMASTER_MCP_TOKEN" --print-connector
+# console script: puppetmaster-mcp-remote
+```
+
+Flags: `--host`, `--port`, `--token` / `--token-file`, `--scope supervise|implement`,
+`--allow-origin`, `--rate-limit`, `--audit-log`, `--print-token`, `--print-connector`.
+Full pilot loop and security notes: [GROK_BOT.md](GROK_BOT.md).
+
 ## Workflow config schema
 
 A workflow config is JSON describing the worker DAG for one swarm:
