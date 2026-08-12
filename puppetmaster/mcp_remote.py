@@ -112,6 +112,9 @@ class RemoteMcpConfig:
     # How long legacy GET /sse holds the stream open to flush /message replies.
     # Primary Grok Bot path is streamable HTTP /mcp; this is for older clients.
     legacy_sse_hold_seconds: float = 30.0
+    # Streamable HTTP GET /mcp long-lived SSE stream (post-initialize).
+    get_stream_keepalive_seconds: float = 15.0
+    get_stream_max_seconds: float = 300.0
 
     def validate(self) -> None:
         if self.scope not in VALID_SCOPES:
@@ -128,6 +131,10 @@ class RemoteMcpConfig:
             raise ValueError("rate_limit_per_minute must be >= 0")
         if self.legacy_sse_hold_seconds < 0:
             raise ValueError("legacy_sse_hold_seconds must be >= 0")
+        if self.get_stream_keepalive_seconds <= 0:
+            raise ValueError("get_stream_keepalive_seconds must be > 0")
+        if self.get_stream_max_seconds <= 0:
+            raise ValueError("get_stream_max_seconds must be > 0")
 
 
 @dataclass
@@ -751,8 +758,9 @@ def make_handler(state: RemoteMcpState) -> type:
             if path == MCP_ENDPOINT_PATH:
                 if not self._check_guards():
                     return
-                # Optional GET SSE stream — idle keepalive comment then close.
-                # Clients that need server-push use this; we keep it minimal.
+                # Streamable HTTP: clients open GET /mcp as a long-lived SSE
+                # stream after initialize. Closing immediately looks like a
+                # dead server (Grok Bot "Failed to load MCP server" loop).
                 accept = (self.headers.get("Accept") or "").lower()
                 if "text/event-stream" not in accept:
                     self._send_json(
@@ -763,14 +771,17 @@ def make_handler(state: RemoteMcpState) -> type:
                         },
                     )
                     return
-                body = b": puppetmaster-remote-mcp idle stream\n\n"
-                self._send(
-                    200,
-                    body,
-                    content_type="text/event-stream",
-                    extra_headers={"Connection": "close"},
-                )
-                self._audit(event="mcp_get_stream", status=200)
+                session_id = (self.headers.get("Mcp-Session-Id") or "").strip() or None
+                if session_id and state.get_session(session_id) is None:
+                    self._send_json(
+                        404,
+                        {
+                            "error": "session_not_found",
+                            "detail": "Unknown Mcp-Session-Id; re-initialize",
+                        },
+                    )
+                    return
+                self._serve_mcp_get_stream(session_id=session_id)
                 return
 
             if path == LEGACY_SSE_PATH:
@@ -811,6 +822,45 @@ def make_handler(state: RemoteMcpState) -> type:
                 return
 
             self._send_json(404, {"error": "not_found", "path": path})
+
+        def _serve_mcp_get_stream(self, *, session_id: Optional[str]) -> None:
+            """Hold GET /mcp open with SSE comment keepalives until disconnect/timeout."""
+            keepalive = float(state.config.get_stream_keepalive_seconds)
+            max_hold = float(state.config.get_stream_max_seconds)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            # Long-lived stream: do not force Connection: close on open.
+            for key, value in self._cors_headers().items():
+                self.send_header(key, value)
+            if session_id:
+                self.send_header("Mcp-Session-Id", session_id)
+            self.end_headers()
+            self._audit(
+                event="mcp_get_stream_open",
+                status=200,
+                detail=f"session={session_id or '-'};keepalive={keepalive};max={max_hold}",
+            )
+            closed_reason = "max_hold"
+            try:
+                self.wfile.write(b": puppetmaster-remote-mcp stream open\n\n")
+                self.wfile.flush()
+                deadline = time.time() + max_hold
+                next_ping = time.time() + keepalive
+                while time.time() < deadline:
+                    now = time.time()
+                    if now >= next_ping:
+                        self.wfile.write(b": keepalive\n\n")
+                        self.wfile.flush()
+                        next_ping = now + keepalive
+                    time.sleep(min(0.25, max(0.05, next_ping - time.time())))
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                closed_reason = "client_disconnect"
+            self._audit(
+                event="mcp_get_stream_close",
+                status=200,
+                detail=f"session={session_id or '-'};reason={closed_reason}",
+            )
 
         def do_DELETE(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)

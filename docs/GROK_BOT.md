@@ -103,9 +103,14 @@ server now (1) echoes the client’s `protocolVersion` (e.g. `2025-03-26`),
 (2) returns `application/json` when Accept lists JSON (including the common
 dual `application/json, text/event-stream` — Grok Bot parses initialize as
 JSON; SSE only if Accept is event-stream without JSON), (3) exposes
-`Mcp-Session-Id` via CORS `Access-Control-Expose-Headers`, and (4) advertises a
-non-empty `capabilities.tools` object. CI locks that sequence in
+`Mcp-Session-Id` via CORS `Access-Control-Expose-Headers`, (4) advertises a
+non-empty `capabilities.tools` object, and (5) holds **GET `/mcp`** open as a
+long-lived SSE stream with keepalive comments (instant close looked like a
+dead server after a successful tools/list). CI locks that sequence in
 `tests/test_mcp_remote_e2e.py` (`GrokBotHandshakeRegressionTests`).
+
+If Plugins still flaps after a green tools/list, try `--scope supervise` first
+(~32 tools, smaller payload) before `--scope implement` (50).
 
 Do **not** bind `0.0.0.0` on a public interface without TLS and a strong token.
 Toward a proper HTTPS service: terminate TLS on Caddy/nginx/Traefik and forward

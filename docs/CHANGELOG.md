@@ -39,9 +39,10 @@ not a leased worker adapter (no fake `grok-bot` adapter).
   ``protocolVersion`` (``2025-03-26`` etc.), returns JSON when Accept lists
   ``application/json`` (dual Accept is common; SSE only when event-stream is
   listed without JSON), exposes ``Mcp-Session-Id`` via CORS
-  ``Access-Control-Expose-Headers``, and advertises
-  ``capabilities.tools.listChanged``. Regression:
-  ``GrokBotHandshakeRegressionTests``.
+  ``Access-Control-Expose-Headers``, advertises
+  ``capabilities.tools.listChanged``, and holds **GET ``/mcp``** as a
+  long-lived SSE stream with keepalives (instant close caused re-init loops).
+  Regression: ``GrokBotHandshakeRegressionTests``.
 
 ## v1.21.14
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import unittest
 from http.client import HTTPConnection
 from pathlib import Path
@@ -480,6 +481,75 @@ class GrokBotHandshakeRegressionTests(unittest.TestCase):
             )
             self.assertEqual(status, 200)
             self.assertGreater(len(listed["result"]["tools"]), 0)
+
+    def test_get_mcp_stream_stays_open_with_keepalive(self) -> None:
+        """GET /mcp must not 405 or instant-close; emit keepalive comments."""
+        config = RemoteMcpConfig(
+            token=TOKEN,
+            scope="supervise",
+            rate_limit_per_minute=0,
+            get_stream_keepalive_seconds=0.15,
+            get_stream_max_seconds=0.6,
+        )
+        with _RemoteServer(config) as server:
+            client = _HttpMcpClient(server.port, TOKEN, accept="application/json")
+            status, headers, init = client.request(
+                "POST",
+                body={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "clientInfo": {"name": "stream-client", "version": "0"},
+                    },
+                },
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(init["result"]["protocolVersion"], "2025-03-26")
+            self.assertEqual(
+                init["result"]["capabilities"]["tools"],
+                {"listChanged": False},
+            )
+            session_id = headers.get("mcp-session-id")
+            self.assertTrue(session_id)
+
+            # Read the long-lived GET stream until we see a keepalive comment.
+            conn = HTTPConnection("127.0.0.1", server.port, timeout=5)
+            conn.request(
+                "GET",
+                MCP_ENDPOINT_PATH,
+                headers={
+                    "Accept": "text/event-stream",
+                    "Authorization": f"Bearer {TOKEN}",
+                    "Mcp-Session-Id": session_id,
+                },
+            )
+            response = conn.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertIn("text/event-stream", (response.getheader("Content-Type") or ""))
+            # Must not advertise an immediate close on a successful stream open.
+            connection_hdr = (response.getheader("Connection") or "").lower()
+            self.assertNotEqual(connection_hdr, "close")
+
+            chunks: list[bytes] = []
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                piece = response.read(64)
+                if not piece:
+                    break
+                chunks.append(piece)
+                joined = b"".join(chunks)
+                if b"keepalive" in joined or b"stream open" in joined:
+                    # After first signal, drain briefly then stop (server will
+                    # hit max_hold and close).
+                    if b"keepalive" in joined:
+                        break
+            conn.close()
+            body = b"".join(chunks).decode("utf-8", errors="replace")
+            self.assertIn("stream open", body)
+            self.assertIn("keepalive", body)
 
 
 if __name__ == "__main__":
