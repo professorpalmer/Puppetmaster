@@ -55,8 +55,17 @@ That's the complete list. No usage analytics, no license check, no background ca
 
 - No hosted service, no account, no login to "Puppetmaster."
 - No phone-home, telemetry, or analytics by default.
-- No remote control — the MCP server is a **local stdio** process owned by your editor; it does not open a network port.
+- No anonymous remote control — the daily-driver MCP server is still a **local stdio** process owned by your editor. An **optional**, authenticated remote MCP transport (`python -m puppetmaster mcp serve-remote`) exists for pilots that cannot speak stdio (notably Grok Bot); it requires a bearer token, defaults to loopback + supervise scope, and is off until you start it. See [GROK_BOT.md](GROK_BOT.md).
 - It does not exfiltrate keys, and it doesn't run workers you didn't start.
+
+## Remote MCP (opt-in)
+
+When you run `mcp serve-remote` you deliberately open a network endpoint that can start jobs and read artifacts for whoever holds the token:
+
+1. Prefer `127.0.0.1` + a TLS tunnel/reverse proxy over binding `0.0.0.0`.
+2. Keep `PUPPETMASTER_MCP_TOKEN` (or `--token-file`) out of git; rotate on leak.
+3. Stay on `--scope supervise` unless you intentionally want remote implement/edit.
+4. Use `--rate-limit` / `--audit-log` when the endpoint is reachable beyond your laptop.
 
 ## Hardening recommendations
 
@@ -66,6 +75,7 @@ That's the complete list. No usage analytics, no license check, no background ca
 4. **Only use `--dangerously-bypass...` inside a container/VM** you already trust to be sandboxed.
 5. **Keep `.cursor/` and `.puppetmaster/` out of git** (default gitignored — leave it).
 6. **Review the stitched Alerts section** — billing/auth/permission failures are surfaced there, not buried.
+7. **If you expose remote MCP**, treat the bearer token like a shell credential: loopback by default, TLS in front, supervise scope until you need implement.
 
 ## Reporting a vulnerability
 

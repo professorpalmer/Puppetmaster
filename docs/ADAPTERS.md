@@ -2,6 +2,12 @@
 
 Puppetmaster adapters let different agent/tool providers plug into the same worker runtime.
 
+> **Pilots vs adapters.** A *pilot* (Cursor Agent chat, Claude Desktop, Hermes,
+> Grok Bot) calls MCP tools to start and supervise jobs. An *adapter* is a
+> leased subprocess worker that claims tasks. Grok Bot is a pilot that needs
+> remote MCP — see [GROK_BOT.md](GROK_BOT.md). There is no `grok-bot` worker
+> adapter until Grok Bot ships a real task-dispatch API.
+
 Every adapter receives:
 
 - `Task`

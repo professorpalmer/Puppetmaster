@@ -1841,6 +1841,76 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print the before/after registry payload as JSON.",
     )
 
+    mcp_serve_remote = mcp_sub.add_parser(
+        "serve-remote",
+        help=(
+            "Serve the Puppetmaster MCP tool surface over streamable HTTP "
+            "(and legacy SSE) for remote pilots such as Grok Bot. Stdio MCP "
+            "is unchanged. Default scope is supervise (no implement/edit)."
+        ),
+    )
+    mcp_serve_remote.add_argument(
+        "--host",
+        default=None,
+        help="Bind host (default 127.0.0.1; override with PUPPETMASTER_MCP_REMOTE_HOST).",
+    )
+    mcp_serve_remote.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Bind port (default 8743; override with PUPPETMASTER_MCP_REMOTE_PORT).",
+    )
+    mcp_serve_remote.add_argument(
+        "--token",
+        default=None,
+        help="Bearer token (or set PUPPETMASTER_MCP_TOKEN). Generated if omitted.",
+    )
+    mcp_serve_remote.add_argument(
+        "--token-file",
+        default=None,
+        help="Read bearer token from a file (chmod 600 recommended).",
+    )
+    mcp_serve_remote.add_argument(
+        "--scope",
+        choices=["supervise", "implement"],
+        default=None,
+        help=(
+            "Tool scope: supervise (default) omits implement/edit; implement "
+            "exposes the full stdio surface. Or set PUPPETMASTER_MCP_REMOTE_SCOPE."
+        ),
+    )
+    mcp_serve_remote.add_argument(
+        "--allow-origin",
+        action="append",
+        default=None,
+        dest="allow_origins",
+        help="Allowed Origin header (repeatable). Use * for tunnel/browser PoCs.",
+    )
+    mcp_serve_remote.add_argument(
+        "--rate-limit",
+        type=int,
+        default=None,
+        help="Max requests per client IP per minute (default 120; 0 disables).",
+    )
+    mcp_serve_remote.add_argument(
+        "--audit-log",
+        default=None,
+        help="Append JSONL audit records to this path (also logged on stderr).",
+    )
+    mcp_serve_remote.add_argument(
+        "--print-token",
+        action="store_true",
+        help="Print the bearer token on stdout once at startup (for scripting).",
+    )
+    mcp_serve_remote.add_argument(
+        "--print-connector",
+        action="store_true",
+        help=(
+            "Print the Grok Bot connector JSON and exit without serving "
+            "(requires --token or PUPPETMASTER_MCP_TOKEN)."
+        ),
+    )
+
     models_cmd = subcommands.add_parser(
         "models",
         help=(

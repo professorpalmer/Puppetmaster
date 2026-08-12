@@ -1,0 +1,1014 @@
+"""Remote (HTTP) MCP transport for non-stdio pilots such as Grok Bot.
+
+Grok Bot can only consume remote HTTP/SSE (or streamable HTTP) MCP connectors.
+This module wraps the existing ``mcp_server.handle_message`` / tool handlers so
+the durable job/artifact contracts stay identical — only the transport changes.
+
+This is **not** a ``grok-bot`` worker adapter. Grok Bot is the pilot/client;
+Puppetmaster remains the leased worker runtime. Do not invent a worker adapter
+named ``grok-bot`` until Grok Bot publishes a real task-dispatch API.
+
+Design notes:
+- Zero new dependencies — stdlib ``http.server`` only (matches the dashboard /
+  provider_proxy pattern and keeps the core package dependency-free).
+- Streamable HTTP (MCP 2025-03-26) at ``/mcp`` is the primary path.
+- Legacy HTTP+SSE (2024-11-05) at ``/sse`` + ``/message`` for older clients.
+- Bearer auth is mandatory — anonymous remote job control is refused.
+- Default tool scope is ``supervise`` (doctor / start review|plan|swarm /
+  status|logs|artifacts|show). Full-edit / implement tools require
+  ``--scope implement`` (or ``PUPPETMASTER_MCP_REMOTE_SCOPE=implement``).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import secrets
+import sys
+import threading
+import time
+import uuid
+from collections import deque
+from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Callable, Deque, Optional
+from urllib.parse import parse_qs, urlparse
+
+from puppetmaster import __version__ as _PACKAGE_VERSION
+from puppetmaster.mcp_server import (
+    error_response,
+    handle_message,
+    tool_error,
+    tool_to_json,
+    tools,
+)
+
+JsonObject = dict[str, Any]
+
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8743
+DEFAULT_SCOPE = "supervise"
+MCP_ENDPOINT_PATH = "/mcp"
+LEGACY_SSE_PATH = "/sse"
+LEGACY_MESSAGE_PATH = "/message"
+HEALTH_PATH = "/health"
+TOKEN_ENV = "PUPPETMASTER_MCP_TOKEN"
+SCOPE_ENV = "PUPPETMASTER_MCP_REMOTE_SCOPE"
+HOST_ENV = "PUPPETMASTER_MCP_REMOTE_HOST"
+PORT_ENV = "PUPPETMASTER_MCP_REMOTE_PORT"
+
+# Tools that start workers which may edit the tree or act externally.
+# Supervise-first remote surface omits these unless scope=implement.
+IMPLEMENT_TOOL_NAMES = frozenset(
+    {
+        "puppetmaster_claude_implement",
+        "puppetmaster_start_claude_implement",
+        "puppetmaster_cursor_implement",
+        "puppetmaster_start_cursor_implement",
+        "puppetmaster_start_implement",
+        "puppetmaster_edit",
+        "puppetmaster_codex",
+        "puppetmaster_start_codex",
+        "puppetmaster_agentic",
+        "puppetmaster_start_agentic",
+        "puppetmaster_openai",
+        "puppetmaster_start_openai",
+        "puppetmaster_start_browser_swarm",
+        "puppetmaster_reset_subgraph",
+        "puppetmaster_gc",
+        "puppetmaster_codegraph_init",
+        "puppetmaster_codegraph_index",
+        "puppetmaster_repair_codegraph",
+    }
+)
+
+VALID_SCOPES = frozenset({"supervise", "implement"})
+
+
+@dataclass
+class RemoteMcpConfig:
+    """Runtime knobs for the remote MCP server."""
+
+    host: str = DEFAULT_HOST
+    port: int = DEFAULT_PORT
+    token: str = ""
+    scope: str = DEFAULT_SCOPE
+    allow_origins: tuple[str, ...] = ()
+    rate_limit_per_minute: int = 120
+    audit_log_path: Optional[str] = None
+    require_auth: bool = True
+
+    def validate(self) -> None:
+        if self.scope not in VALID_SCOPES:
+            raise ValueError(
+                f"Unknown remote MCP scope {self.scope!r}; "
+                f"expected one of {sorted(VALID_SCOPES)}"
+            )
+        if self.require_auth and not (self.token or "").strip():
+            raise ValueError(
+                "Remote MCP refuses to start without a bearer token. "
+                f"Pass --token / --token-file, or set {TOKEN_ENV}."
+            )
+        if self.rate_limit_per_minute < 0:
+            raise ValueError("rate_limit_per_minute must be >= 0")
+
+
+@dataclass
+class _Session:
+    session_id: str
+    created_at: float = field(default_factory=time.time)
+    protocol_version: str = "2025-03-26"
+
+
+@dataclass
+class _LegacySseClient:
+    session_id: str
+    queue: "deque[JsonObject]" = field(default_factory=deque)
+    closed: bool = False
+
+
+class RateLimiter:
+    """Sliding-window request limiter keyed by client identity."""
+
+    def __init__(self, limit_per_minute: int) -> None:
+        self.limit_per_minute = int(limit_per_minute)
+        self._hits: dict[str, Deque[float]] = {}
+        self._lock = threading.Lock()
+
+    def allow(self, key: str, *, now: Optional[float] = None) -> bool:
+        if self.limit_per_minute <= 0:
+            return True
+        moment = time.time() if now is None else now
+        window_start = moment - 60.0
+        with self._lock:
+            bucket = self._hits.setdefault(key, deque())
+            while bucket and bucket[0] < window_start:
+                bucket.popleft()
+            if len(bucket) >= self.limit_per_minute:
+                return False
+            bucket.append(moment)
+            return True
+
+
+class AuditLogger:
+    """Append-only JSONL audit of remote MCP requests (no secrets)."""
+
+    def __init__(self, path: Optional[str] = None) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+
+    def write(self, record: JsonObject) -> None:
+        line = json.dumps(record, sort_keys=True, default=str)
+        with self._lock:
+            print(f"[puppetmaster-mcp-remote] {line}", file=sys.stderr)
+            if not self.path:
+                return
+            try:
+                with open(self.path, "a", encoding="utf-8") as handle:
+                    handle.write(line + "\n")
+            except OSError as exc:
+                print(
+                    f"[puppetmaster-mcp-remote] audit write failed: {exc}",
+                    file=sys.stderr,
+                )
+
+
+def generate_token() -> str:
+    """Cryptographically strong bearer token suitable for clipboard paste."""
+    return secrets.token_urlsafe(32)
+
+
+def resolve_token(
+    *,
+    explicit: Optional[str] = None,
+    token_file: Optional[str] = None,
+    env: Optional[dict[str, str]] = None,
+) -> str:
+    """Resolve a bearer token from flag, file, or environment (in that order)."""
+    if explicit and explicit.strip():
+        return explicit.strip()
+    if token_file:
+        raw = open(token_file, encoding="utf-8").read().strip()
+        if not raw:
+            raise ValueError(f"Token file {token_file!r} is empty")
+        return raw
+    environ = env if env is not None else os.environ
+    from_env = (environ.get(TOKEN_ENV) or "").strip()
+    if from_env:
+        return from_env
+    return ""
+
+
+def resolve_scope(
+    *,
+    explicit: Optional[str] = None,
+    env: Optional[dict[str, str]] = None,
+) -> str:
+    if explicit and explicit.strip():
+        return explicit.strip().lower()
+    environ = env if env is not None else os.environ
+    return (environ.get(SCOPE_ENV) or DEFAULT_SCOPE).strip().lower() or DEFAULT_SCOPE
+
+
+def tool_allowed(name: str, scope: str) -> bool:
+    """Return True when *name* is visible/callable under *scope*."""
+    if scope == "implement":
+        return True
+    return name not in IMPLEMENT_TOOL_NAMES
+
+
+def filtered_tools(scope: str) -> list:
+    return [tool for tool in tools() if tool_allowed(tool.name, scope)]
+
+
+def extract_bearer_token(authorization: Optional[str]) -> Optional[str]:
+    """Parse ``Authorization: Bearer <token>`` (case-insensitive scheme)."""
+    if not authorization:
+        return None
+    parts = authorization.strip().split(None, 1)
+    if len(parts) != 2:
+        return None
+    scheme, value = parts
+    if scheme.lower() != "bearer":
+        return None
+    value = value.strip()
+    return value or None
+
+
+def token_matches(provided: Optional[str], expected: str) -> bool:
+    if not expected:
+        return False
+    if provided is None:
+        return False
+    return secrets.compare_digest(provided, expected)
+
+
+def origin_allowed(origin: Optional[str], allow_origins: tuple[str, ...]) -> bool:
+    """DNS-rebinding guard.
+
+    Non-browser MCP clients typically omit Origin — those are allowed.
+    When Origin is present it must match an allowlist entry, ``*``, or a
+    localhost origin when the allowlist is empty (local PoC default).
+    """
+    if not origin:
+        return True
+    if "*" in allow_origins:
+        return True
+    if origin in allow_origins:
+        return True
+    if allow_origins:
+        return False
+    # Empty allowlist: only permit loopback browser origins.
+    lowered = origin.lower()
+    return (
+        lowered.startswith("http://127.0.0.1")
+        or lowered.startswith("http://localhost")
+        or lowered.startswith("https://127.0.0.1")
+        or lowered.startswith("https://localhost")
+    )
+
+
+def connector_snippet(*, base_url: str, token: str) -> JsonObject:
+    """JSON a Grok Bot / remote MCP client can paste as a connector config."""
+    mcp_url = base_url.rstrip("/") + MCP_ENDPOINT_PATH
+    return {
+        "name": "puppetmaster",
+        "url": mcp_url,
+        "transport": "streamable-http",
+        "headers": {"Authorization": f"Bearer {token}"},
+        "notes": (
+            "Grok Bot is the pilot; Puppetmaster is the durable worker runtime. "
+            "v1 remote surface defaults to supervise scope (no implement/edit)."
+        ),
+    }
+
+
+class RemoteMcpState:
+    """Shared mutable state for one listening remote MCP process."""
+
+    def __init__(self, config: RemoteMcpConfig) -> None:
+        config.validate()
+        self.config = config
+        self.sessions: dict[str, _Session] = {}
+        self.legacy_clients: dict[str, _LegacySseClient] = {}
+        self.rate_limiter = RateLimiter(config.rate_limit_per_minute)
+        self.audit = AuditLogger(config.audit_log_path)
+        self._lock = threading.Lock()
+
+    def create_session(self, protocol_version: str = "2025-03-26") -> _Session:
+        session = _Session(session_id=secrets.token_urlsafe(24), protocol_version=protocol_version)
+        with self._lock:
+            self.sessions[session.session_id] = session
+        return session
+
+    def get_session(self, session_id: Optional[str]) -> Optional[_Session]:
+        if not session_id:
+            return None
+        with self._lock:
+            return self.sessions.get(session_id)
+
+    def drop_session(self, session_id: str) -> bool:
+        with self._lock:
+            return self.sessions.pop(session_id, None) is not None
+
+    def create_legacy_client(self) -> _LegacySseClient:
+        client = _LegacySseClient(session_id=str(uuid.uuid4()))
+        with self._lock:
+            self.legacy_clients[client.session_id] = client
+        return client
+
+    def get_legacy_client(self, session_id: Optional[str]) -> Optional[_LegacySseClient]:
+        if not session_id:
+            return None
+        with self._lock:
+            return self.legacy_clients.get(session_id)
+
+
+def handle_remote_message(
+    message: JsonObject,
+    *,
+    scope: str,
+    state: Optional[RemoteMcpState] = None,
+) -> Optional[JsonObject]:
+    """JSON-RPC dispatch with remote scope filtering applied.
+
+    Reuses the stdio server's handlers so job/artifact semantics stay identical.
+    """
+    method = message.get("method")
+    request_id = message.get("id")
+
+    if method == "notifications/initialized":
+        return None
+
+    if method == "initialize":
+        response = handle_message(message)
+        if state is not None and isinstance(response, dict) and "result" in response:
+            params = message.get("params") if isinstance(message.get("params"), dict) else {}
+            protocol = str(params.get("protocolVersion") or "2025-03-26")
+            session = state.create_session(protocol_version=protocol)
+            # Stash for the HTTP layer to put on the response header.
+            response["_puppetmaster_session_id"] = session.session_id
+            result = response.get("result")
+            if isinstance(result, dict):
+                info = result.setdefault("serverInfo", {})
+                if isinstance(info, dict):
+                    info["name"] = "puppetmaster-remote"
+                    info["version"] = _PACKAGE_VERSION
+                # Advertise that this endpoint is scope-gated.
+                caps = result.setdefault("capabilities", {})
+                if isinstance(caps, dict):
+                    caps.setdefault("experimental", {})
+                    if isinstance(caps["experimental"], dict):
+                        caps["experimental"]["puppetmasterRemoteScope"] = scope
+        return response
+
+    if method == "tools/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {"tools": [tool_to_json(tool) for tool in filtered_tools(scope)]},
+        }
+
+    if method == "tools/call":
+        params = message.get("params") if isinstance(message.get("params"), dict) else {}
+        name = str(params.get("name") or "")
+        if not tool_allowed(name, scope):
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": tool_error(
+                    (
+                        f"Tool {name!r} is outside the remote MCP scope "
+                        f"{scope!r}. Restart with --scope implement (or set "
+                        f"{SCOPE_ENV}=implement) to expose full-edit verbs. "
+                        "See docs/GROK_BOT.md."
+                    ),
+                    {
+                        "code": "remote_scope_denied",
+                        "tool": name,
+                        "scope": scope,
+                        "fix": f"python -m puppetmaster mcp serve-remote --scope implement",
+                    },
+                ),
+            }
+        return handle_message(message)
+
+    # Unknown / other methods — defer to the shared handler.
+    return handle_message(message)
+
+
+def make_handler(state: RemoteMcpState) -> type:
+    """Build a ``BaseHTTPRequestHandler`` bound to *state*."""
+
+    class RemoteMcpHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003
+            # Quiet by default; structured audit covers the security trail.
+            return
+
+        def _peer_key(self) -> str:
+            return self.client_address[0] if self.client_address else "unknown"
+
+        def _audit(
+            self,
+            *,
+            event: str,
+            status: int,
+            method: Optional[str] = None,
+            tool: Optional[str] = None,
+            detail: Optional[str] = None,
+        ) -> None:
+            state.audit.write(
+                {
+                    "ts": time.time(),
+                    "event": event,
+                    "status": status,
+                    "peer": self._peer_key(),
+                    "path": self.path,
+                    "http_method": self.command,
+                    "rpc_method": method,
+                    "tool": tool,
+                    "detail": detail,
+                    "scope": state.config.scope,
+                }
+            )
+
+        def _read_json_body(self) -> Any:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            raw = self.rfile.read(length) if length else b""
+            if not raw:
+                return None
+            return json.loads(raw.decode("utf-8"))
+
+        def _send(
+            self,
+            code: int,
+            body: bytes,
+            *,
+            content_type: str = "application/json",
+            extra_headers: Optional[dict[str, str]] = None,
+        ) -> None:
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            if extra_headers:
+                for key, value in extra_headers.items():
+                    self.send_header(key, value)
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
+
+        def _send_json(
+            self,
+            code: int,
+            payload: Any,
+            *,
+            extra_headers: Optional[dict[str, str]] = None,
+        ) -> None:
+            data = json.dumps(payload).encode("utf-8")
+            self._send(code, data, content_type="application/json", extra_headers=extra_headers)
+
+        def _send_sse_json(
+            self,
+            payload: Any,
+            *,
+            extra_headers: Optional[dict[str, str]] = None,
+            event_id: Optional[str] = None,
+        ) -> None:
+            frame = f"event: message\ndata: {json.dumps(payload)}\n"
+            if event_id:
+                frame = f"id: {event_id}\n" + frame
+            frame += "\n"
+            body = frame.encode("utf-8")
+            headers = {"Connection": "close"}
+            if extra_headers:
+                headers.update(extra_headers)
+            self._send(
+                200,
+                body,
+                content_type="text/event-stream",
+                extra_headers=headers,
+            )
+
+        def _unauthorized(self, detail: str = "missing or invalid bearer token") -> None:
+            self._audit(event="auth_denied", status=401, detail=detail)
+            self._send_json(
+                401,
+                {
+                    "error": "unauthorized",
+                    "detail": detail,
+                    "hint": (
+                        "Send Authorization: Bearer <token>. "
+                        f"Token comes from {TOKEN_ENV} or `mcp serve-remote --token`."
+                    ),
+                },
+                extra_headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        def _forbidden_origin(self) -> None:
+            self._audit(event="origin_denied", status=403, detail=self.headers.get("Origin"))
+            self._send_json(
+                403,
+                {
+                    "error": "origin_denied",
+                    "detail": "Origin header is not on the allowlist",
+                    "hint": "Pass --allow-origin <origin> (or --allow-origin *) for tunnels/browsers.",
+                },
+            )
+
+        def _rate_limited(self) -> None:
+            self._audit(event="rate_limited", status=429)
+            self._send_json(
+                429,
+                {
+                    "error": "rate_limited",
+                    "detail": (
+                        f"Exceeded {state.config.rate_limit_per_minute} "
+                        "requests/minute for this client"
+                    ),
+                },
+                extra_headers={"Retry-After": "60"},
+            )
+
+        def _check_guards(self, *, require_auth: bool = True) -> bool:
+            origin = self.headers.get("Origin")
+            if not origin_allowed(origin, state.config.allow_origins):
+                self._forbidden_origin()
+                return False
+            client_key = self._peer_key()
+            if not state.rate_limiter.allow(client_key):
+                self._rate_limited()
+                return False
+            if require_auth and state.config.require_auth:
+                provided = extract_bearer_token(self.headers.get("Authorization"))
+                if provided is None:
+                    # Also accept X-Puppetmaster-Token for clients that can't set Authorization.
+                    alt = (self.headers.get("X-Puppetmaster-Token") or "").strip()
+                    provided = alt or None
+                if not token_matches(provided, state.config.token):
+                    self._unauthorized()
+                    return False
+            return True
+
+        def do_OPTIONS(self) -> None:  # noqa: N802
+            # Minimal CORS preflight for browser-based MCP clients / tunnels.
+            if not origin_allowed(self.headers.get("Origin"), state.config.allow_origins):
+                self._forbidden_origin()
+                return
+            origin = self.headers.get("Origin") or "*"
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+            self.send_header(
+                "Access-Control-Allow-Headers",
+                "Authorization, Content-Type, Accept, Mcp-Session-Id, "
+                "MCP-Protocol-Version, X-Puppetmaster-Token, Last-Event-ID",
+            )
+            self.send_header("Access-Control-Max-Age", "600")
+            self.end_headers()
+
+        def do_GET(self) -> None:  # noqa: N802
+            parsed = urlparse(self.path)
+            path = parsed.path.rstrip("/") or "/"
+
+            if path == HEALTH_PATH:
+                # Unauthenticated liveness — no job data, no token echo.
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "service": "puppetmaster-remote-mcp",
+                        "version": _PACKAGE_VERSION,
+                        "scope": state.config.scope,
+                        "mcp": MCP_ENDPOINT_PATH,
+                        "legacy_sse": LEGACY_SSE_PATH,
+                    },
+                )
+                return
+
+            if path == "/":
+                self._send_json(
+                    200,
+                    {
+                        "service": "puppetmaster-remote-mcp",
+                        "version": _PACKAGE_VERSION,
+                        "scope": state.config.scope,
+                        "endpoints": {
+                            "mcp": MCP_ENDPOINT_PATH,
+                            "health": HEALTH_PATH,
+                            "legacy_sse": LEGACY_SSE_PATH,
+                            "legacy_message": LEGACY_MESSAGE_PATH,
+                        },
+                        "docs": "docs/GROK_BOT.md",
+                        "auth": "Bearer token required on MCP endpoints",
+                    },
+                )
+                return
+
+            if path == MCP_ENDPOINT_PATH:
+                if not self._check_guards():
+                    return
+                # Optional GET SSE stream — idle keepalive comment then close.
+                # Clients that need server-push use this; we keep it minimal.
+                accept = (self.headers.get("Accept") or "").lower()
+                if "text/event-stream" not in accept:
+                    self._send_json(
+                        405,
+                        {
+                            "error": "method_not_allowed",
+                            "detail": "GET /mcp requires Accept: text/event-stream",
+                        },
+                    )
+                    return
+                body = b": puppetmaster-remote-mcp idle stream\n\n"
+                self._send(
+                    200,
+                    body,
+                    content_type="text/event-stream",
+                    extra_headers={"Connection": "close"},
+                )
+                self._audit(event="mcp_get_stream", status=200)
+                return
+
+            if path == LEGACY_SSE_PATH:
+                if not self._check_guards():
+                    return
+                client = state.create_legacy_client()
+                endpoint = f"{LEGACY_MESSAGE_PATH}?sessionId={client.session_id}"
+                frame = (
+                    f"event: endpoint\ndata: {endpoint}\n\n"
+                    f": session {client.session_id}\n\n"
+                ).encode("utf-8")
+                self._send(
+                    200,
+                    frame,
+                    content_type="text/event-stream",
+                    extra_headers={"Connection": "close"},
+                )
+                self._audit(event="legacy_sse_open", status=200, detail=client.session_id)
+                return
+
+            self._send_json(404, {"error": "not_found", "path": path})
+
+        def do_DELETE(self) -> None:  # noqa: N802
+            parsed = urlparse(self.path)
+            path = parsed.path.rstrip("/") or "/"
+            if path != MCP_ENDPOINT_PATH:
+                self._send_json(404, {"error": "not_found", "path": path})
+                return
+            if not self._check_guards():
+                return
+            session_id = self.headers.get("Mcp-Session-Id")
+            if not session_id:
+                self._send_json(400, {"error": "missing_session", "detail": "Mcp-Session-Id required"})
+                return
+            dropped = state.drop_session(session_id)
+            self._audit(
+                event="session_delete",
+                status=200 if dropped else 404,
+                detail=session_id,
+            )
+            if not dropped:
+                self._send_json(404, {"error": "session_not_found"})
+                return
+            self._send(200, b"", content_type="text/plain")
+
+        def do_POST(self) -> None:  # noqa: N802
+            parsed = urlparse(self.path)
+            path = parsed.path.rstrip("/") or "/"
+
+            if path == MCP_ENDPOINT_PATH:
+                self._handle_streamable_post()
+                return
+            if path == LEGACY_MESSAGE_PATH:
+                self._handle_legacy_message(parsed)
+                return
+            self._send_json(404, {"error": "not_found", "path": path})
+
+        def _handle_streamable_post(self) -> None:
+            if not self._check_guards():
+                return
+            try:
+                payload = self._read_json_body()
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                self._audit(event="bad_json", status=400, detail=str(exc))
+                self._send_json(400, {"error": "invalid_json", "detail": str(exc)})
+                return
+
+            messages: list[JsonObject]
+            if isinstance(payload, list):
+                messages = [m for m in payload if isinstance(m, dict)]
+            elif isinstance(payload, dict):
+                messages = [payload]
+            else:
+                self._send_json(400, {"error": "invalid_body", "detail": "expected JSON object or array"})
+                return
+
+            # Notifications / responses only → 202.
+            has_request = any("method" in m and "id" in m for m in messages)
+            notification_only = all(
+                ("method" in m and "id" not in m) or ("result" in m or "error" in m)
+                for m in messages
+            ) and not has_request
+
+            if notification_only:
+                for message in messages:
+                    if "method" in message:
+                        handle_remote_message(
+                            message, scope=state.config.scope, state=state
+                        )
+                self._audit(event="notification", status=202)
+                self._send(202, b"", content_type="text/plain")
+                return
+
+            # Single-request happy path: application/json response.
+            # (SSE upgrade is optional; JSON is enough for Grok Bot tool loops.)
+            if len(messages) == 1:
+                message = messages[0]
+                rpc_method = str(message.get("method") or "")
+                tool_name = None
+                if rpc_method == "tools/call":
+                    params = message.get("params") if isinstance(message.get("params"), dict) else {}
+                    tool_name = str(params.get("name") or "") or None
+                try:
+                    response = handle_remote_message(
+                        message, scope=state.config.scope, state=state
+                    )
+                except Exception as exc:  # pragma: no cover - defensive
+                    response = error_response(message.get("id"), -32000, str(exc))
+                if response is None:
+                    self._audit(
+                        event="rpc",
+                        status=202,
+                        method=rpc_method,
+                        tool=tool_name,
+                    )
+                    self._send(202, b"", content_type="text/plain")
+                    return
+                session_id = response.pop("_puppetmaster_session_id", None)
+                headers: dict[str, str] = {}
+                if session_id:
+                    headers["Mcp-Session-Id"] = str(session_id)
+                # Prefer JSON; honor Accept: text/event-stream when JSON not listed.
+                accept = (self.headers.get("Accept") or "").lower()
+                wants_json = "application/json" in accept or accept == "" or "*/*" in accept
+                if wants_json or "text/event-stream" not in accept:
+                    self._audit(
+                        event="rpc",
+                        status=200,
+                        method=rpc_method,
+                        tool=tool_name,
+                    )
+                    self._send_json(200, response, extra_headers=headers or None)
+                    return
+                self._audit(
+                    event="rpc_sse",
+                    status=200,
+                    method=rpc_method,
+                    tool=tool_name,
+                )
+                self._send_sse_json(response, extra_headers=headers or None, event_id="1")
+                return
+
+            # Batch: return a JSON array of responses.
+            responses: list[JsonObject] = []
+            session_header: Optional[str] = None
+            for message in messages:
+                if "id" not in message and "method" in message:
+                    handle_remote_message(message, scope=state.config.scope, state=state)
+                    continue
+                try:
+                    response = handle_remote_message(
+                        message, scope=state.config.scope, state=state
+                    )
+                except Exception as exc:  # pragma: no cover
+                    response = error_response(message.get("id"), -32000, str(exc))
+                if response is None:
+                    continue
+                sid = response.pop("_puppetmaster_session_id", None)
+                if sid and not session_header:
+                    session_header = str(sid)
+                responses.append(response)
+            headers = {"Mcp-Session-Id": session_header} if session_header else None
+            self._audit(event="rpc_batch", status=200, detail=str(len(responses)))
+            self._send_json(200, responses, extra_headers=headers)
+
+        def _handle_legacy_message(self, parsed) -> None:
+            if not self._check_guards():
+                return
+            query = parse_qs(parsed.query or "")
+            session_id = (query.get("sessionId") or [None])[0]
+            client = state.get_legacy_client(session_id)
+            if client is None:
+                self._send_json(
+                    404,
+                    {
+                        "error": "unknown_session",
+                        "detail": "Open GET /sse first to obtain a sessionId",
+                    },
+                )
+                return
+            try:
+                payload = self._read_json_body()
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                self._send_json(400, {"error": "invalid_json", "detail": str(exc)})
+                return
+            if not isinstance(payload, dict):
+                self._send_json(400, {"error": "invalid_body"})
+                return
+            try:
+                response = handle_remote_message(
+                    payload, scope=state.config.scope, state=state
+                )
+            except Exception as exc:  # pragma: no cover
+                response = error_response(payload.get("id"), -32000, str(exc))
+            if response is not None:
+                response.pop("_puppetmaster_session_id", None)
+                client.queue.append(response)
+            # Legacy transport acknowledges the POST; response rides the SSE.
+            # For PoC clients that only POST, also return the JSON body.
+            self._audit(
+                event="legacy_message",
+                status=200,
+                method=str(payload.get("method") or ""),
+            )
+            if response is None:
+                self._send(202, b"", content_type="text/plain")
+            else:
+                self._send_json(200, response)
+
+    return RemoteMcpHandler
+
+
+def build_server(config: RemoteMcpConfig) -> tuple[ThreadingHTTPServer, RemoteMcpState]:
+    """Construct (but do not serve) a bound remote MCP server."""
+    state = RemoteMcpState(config)
+    handler = make_handler(state)
+    server = ThreadingHTTPServer((config.host, config.port), handler)
+    return server, state
+
+
+def serve_remote(config: RemoteMcpConfig) -> int:
+    """Run the remote MCP server until interrupted. Returns a process exit code."""
+    server, _state = build_server(config)
+    base = f"http://{config.host}:{server.server_address[1]}"
+    snippet = connector_snippet(base_url=base, token=config.token)
+    print(f"puppetmaster remote MCP listening on {base}{MCP_ENDPOINT_PATH}", file=sys.stderr)
+    print(f"  scope: {config.scope}", file=sys.stderr)
+    print(f"  health: {base}{HEALTH_PATH}", file=sys.stderr)
+    print(f"  legacy SSE: {base}{LEGACY_SSE_PATH}", file=sys.stderr)
+    if config.host in ("0.0.0.0", "::"):
+        print(
+            "  WARNING: bound on all interfaces. Prefer 127.0.0.1 + a secure "
+            "tunnel (cloudflared/ngrok) unless you terminate TLS yourself.",
+            file=sys.stderr,
+        )
+    print("  connector (redact before sharing):", file=sys.stderr)
+    print(json.dumps(snippet, indent=2), file=sys.stderr)
+    print(
+        "  Docs: docs/GROK_BOT.md — Grok Bot is the pilot; Puppetmaster is the runtime.",
+        file=sys.stderr,
+    )
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\npuppetmaster remote MCP stopped.", file=sys.stderr)
+    finally:
+        server.server_close()
+    return 0
+
+
+def config_from_env_and_args(
+    *,
+    host: Optional[str] = None,
+    port: Optional[int] = None,
+    token: Optional[str] = None,
+    token_file: Optional[str] = None,
+    scope: Optional[str] = None,
+    allow_origins: Optional[list[str]] = None,
+    rate_limit_per_minute: Optional[int] = None,
+    audit_log: Optional[str] = None,
+    generate_if_missing: bool = True,
+    env: Optional[dict[str, str]] = None,
+) -> tuple[RemoteMcpConfig, bool]:
+    """Build a config; returns ``(config, token_was_generated)``."""
+    environ = env if env is not None else os.environ
+    resolved_token = resolve_token(explicit=token, token_file=token_file, env=environ)
+    generated = False
+    if not resolved_token and generate_if_missing:
+        resolved_token = generate_token()
+        generated = True
+    resolved_scope = resolve_scope(explicit=scope, env=environ)
+    resolved_host = host or (environ.get(HOST_ENV) or DEFAULT_HOST)
+    if port is not None:
+        resolved_port = int(port)
+    else:
+        raw_port = (environ.get(PORT_ENV) or "").strip()
+        resolved_port = int(raw_port) if raw_port else DEFAULT_PORT
+    config = RemoteMcpConfig(
+        host=resolved_host,
+        port=resolved_port,
+        token=resolved_token,
+        scope=resolved_scope,
+        allow_origins=tuple(allow_origins or ()),
+        rate_limit_per_minute=(
+            120 if rate_limit_per_minute is None else int(rate_limit_per_minute)
+        ),
+        audit_log_path=audit_log,
+    )
+    return config, generated
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    """CLI entry for ``python -m puppetmaster.mcp_remote`` / console script."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="puppetmaster-mcp-remote",
+        description=(
+            "Serve Puppetmaster MCP tools over streamable HTTP for remote pilots "
+            "(Grok Bot). Stdio MCP is unchanged."
+        ),
+    )
+    parser.add_argument("--host", default=None, help=f"Bind host (default {DEFAULT_HOST}).")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help=f"Bind port (default {DEFAULT_PORT}).",
+    )
+    parser.add_argument(
+        "--token",
+        default=None,
+        help=f"Bearer token (or set {TOKEN_ENV}). Generated if omitted.",
+    )
+    parser.add_argument(
+        "--token-file",
+        default=None,
+        help="Read bearer token from a file (chmod 600 recommended).",
+    )
+    parser.add_argument(
+        "--scope",
+        choices=sorted(VALID_SCOPES),
+        default=None,
+        help=(
+            "Tool scope: supervise (default, no implement/edit) or implement "
+            f"(full surface). Or set {SCOPE_ENV}."
+        ),
+    )
+    parser.add_argument(
+        "--allow-origin",
+        action="append",
+        default=None,
+        dest="allow_origins",
+        help="Allowed Origin header (repeatable). Use * for any (tunnel PoCs).",
+    )
+    parser.add_argument(
+        "--rate-limit",
+        type=int,
+        default=None,
+        help="Max authenticated requests per client IP per minute (default 120; 0=off).",
+    )
+    parser.add_argument(
+        "--audit-log",
+        default=None,
+        help="Append JSONL audit records to this path (also printed on stderr).",
+    )
+    parser.add_argument(
+        "--print-token",
+        action="store_true",
+        help="Print the bearer token on stdout once at startup (for scripting).",
+    )
+    args = parser.parse_args(argv)
+
+    try:
+        config, generated = config_from_env_and_args(
+            host=args.host,
+            port=args.port,
+            token=args.token,
+            token_file=args.token_file,
+            scope=args.scope,
+            allow_origins=args.allow_origins,
+            rate_limit_per_minute=args.rate_limit,
+            audit_log=args.audit_log,
+        )
+        config.validate()
+    except (ValueError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if generated:
+        print(
+            "Generated bearer token (also in connector JSON below). "
+            f"Persist it via {TOKEN_ENV} or --token-file for stable reconnects.",
+            file=sys.stderr,
+        )
+    if args.print_token:
+        print(config.token)
+    return serve_remote(config)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -168,3 +168,14 @@ Use Puppetmaster to start Claude Code implementation for the approved fix in a c
 ## Current Boundary
 
 Cursor does not expose the internal Agent model picker or composer controls as a public extension API. MCP is the supported tool surface for Agent-chat integration.
+
+## Grok Bot (remote MCP)
+
+Grok Bot cannot attach this stdio server. Use the additive remote transport
+instead — same tools, bearer auth, supervise-first scope by default:
+
+```bash
+python -m puppetmaster mcp serve-remote
+```
+
+See [GROK_BOT.md](GROK_BOT.md).

@@ -2,7 +2,7 @@
 
 The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
 
-**Current release:** [v1.21.13](CHANGELOG.md#v12113) — passive provider rate-limit harvest with preemptive admission; see [CHANGELOG.md](CHANGELOG.md) for the full 1.21.x line.
+**Current release:** [v1.22.0](CHANGELOG.md#v1220) — Grok Bot remote MCP harness (streamable HTTP pilot); see [CHANGELOG.md](CHANGELOG.md) for the full line.
 
 ## Start here
 
@@ -36,6 +36,7 @@ Reproducible evidence behind the durable-state thesis, including an independent 
 | [ADAPTERS.md](ADAPTERS.md) | All production adapters (cursor, claude-code, openai, codex, hermes, agentic) + shell + how to add a new one |
 | [CLI_REFERENCE.md](CLI_REFERENCE.md) | Every CLI subcommand, workflow config schema, daemon mode |
 | [CURSOR_AGENT_MCP.md](CURSOR_AGENT_MCP.md) | The MCP tool surface in detail |
+| [GROK_BOT.md](GROK_BOT.md) | Grok Bot as remote MCP pilot (streamable HTTP; supervise-first; not a worker adapter) |
 | [CODEGRAPH.md](CODEGRAPH.md) | CodeGraph integration, bundled MCP tools, cost comparison |
 | [OUTPUT_STYLE.md](OUTPUT_STYLE.md) | Optional Signal-maximizer worker output tiers (`terse` / `lithic`) |
 | [COMPRESSION.md](COMPRESSION.md) | Why input-side compression isn't bundled + a bring-your-own recipe |

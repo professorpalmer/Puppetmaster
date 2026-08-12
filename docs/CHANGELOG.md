@@ -1,3 +1,35 @@
+## v1.22.0
+
+**Grok Bot harness: authenticated remote MCP (streamable HTTP) as a pilot path.**
+
+Grok Bot can only attach remote HTTP/SSE MCP connectors — not local stdio
+(`python -m puppetmaster.mcp_server`). This release adds an additive remote
+transport over the existing tool handlers so Grok Bot can supervise the same
+durable jobs/artifacts Cursor Agent already uses. Grok Bot remains a *pilot*,
+not a leased worker adapter (no fake `grok-bot` adapter).
+
+- **Remote transport.** New ``puppetmaster/mcp_remote.py`` serves Streamable
+  HTTP at ``/mcp`` (MCP 2025-03-26) plus legacy ``/sse`` + ``/message``, with
+  unauthenticated ``/health``. Zero new dependencies (stdlib
+  ``ThreadingHTTPServer``). Stdio MCP is unchanged.
+- **Auth + guards.** Mandatory bearer token
+  (``Authorization: Bearer`` / ``X-Puppetmaster-Token``, from ``--token``,
+  ``--token-file``, or ``PUPPETMASTER_MCP_TOKEN``; auto-generated if omitted).
+  Origin allowlist (DNS-rebinding guard), per-IP rate limit (default 120/min),
+  JSONL audit on stderr / ``--audit-log``.
+- **Supervise-first scope.** Default ``--scope supervise`` exposes doctor,
+  start review/plan/swarm, status/logs/live artifacts/show, and CodeGraph
+  reads. Implement/edit/browser/mutating tools stay off until
+  ``--scope implement`` / ``PUPPETMASTER_MCP_REMOTE_SCOPE=implement``.
+- **CLI.** ``python -m puppetmaster mcp serve-remote`` and console script
+  ``puppetmaster-mcp-remote``; ``--print-connector`` emits Grok Bot connector
+  JSON for tunnels / reverse proxies.
+- **Docs.** New [docs/GROK_BOT.md](GROK_BOT.md); SECURITY / FEATURES /
+  CLI_REFERENCE / docs index updated. Honest about v1 follow-ups (hosted
+  deploy, marketplace packaging, implement-by-default later).
+- **Tests.** ``tests/test_mcp_remote.py`` covers auth, scope filtering,
+  streamable initialize/tools/list/call, health, and rate limiting.
+
 ## v1.21.14
 
 **ChatGPT Codex agentic swarms: map ``reasoning_effort``; salvage unlabeled FINDINGs.**
