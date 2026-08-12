@@ -178,6 +178,8 @@ class HandleRemoteMessageTests(unittest.TestCase):
         self.assertIn("listChanged", response["result"]["capabilities"]["tools"])
 
     def test_initialize_echoes_requested_protocol_version(self) -> None:
+        from puppetmaster.mcp_server import handle_message
+
         for requested in ("2025-03-26", "2024-11-05", "2025-06-18"):
             response = handle_remote_message(
                 {
@@ -190,6 +192,31 @@ class HandleRemoteMessageTests(unittest.TestCase):
             )
             assert response is not None
             self.assertEqual(response["result"]["protocolVersion"], requested)
+            self.assertEqual(
+                response["result"]["capabilities"]["tools"],
+                {"listChanged": False},
+            )
+            # Prove we did not return the stdio handler's hardcoded defaults
+            # when the client asked for a streamable-HTTP version.
+            if requested != "2024-11-05":
+                stdio = handle_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {"protocolVersion": requested, "capabilities": {}},
+                    }
+                )
+                self.assertEqual(stdio["result"]["protocolVersion"], "2024-11-05")
+                self.assertNotEqual(
+                    response["result"]["protocolVersion"],
+                    stdio["result"]["protocolVersion"],
+                )
+                self.assertEqual(stdio["result"]["capabilities"]["tools"], {})
+                self.assertNotEqual(
+                    response["result"]["capabilities"]["tools"],
+                    stdio["result"]["capabilities"]["tools"],
+                )
 
 
 class _RemoteServerHarness:

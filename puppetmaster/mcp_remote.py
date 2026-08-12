@@ -323,6 +323,56 @@ def remote_initialize_capabilities(scope: str) -> JsonObject:
     }
 
 
+def build_remote_initialize_result(
+    *,
+    request_id: Any,
+    params: JsonObject,
+    scope: str,
+) -> JsonObject:
+    """Build the initialize JSON-RPC response for the remote transport.
+
+    Intentionally does **not** call ``mcp_server.handle_message``: the stdio
+    handler hardcodes ``protocolVersion: 2024-11-05`` and ``tools: {}``, which
+    makes Grok Bot / Cursor remote clients abort after initialize (tools=0).
+    """
+    requested = params.get("protocolVersion")
+    negotiated = negotiate_protocol_version(
+        str(requested) if requested is not None else None
+    )
+    result: JsonObject = {
+        "protocolVersion": negotiated,
+        "capabilities": remote_initialize_capabilities(scope),
+        "serverInfo": {
+            "name": "puppetmaster-remote",
+            "version": _PACKAGE_VERSION,
+        },
+        "instructions": (
+            "Grok Bot / remote pilot: use start_* tools, poll status/logs/"
+            "live_artifacts/show. Default remote scope may omit implement/edit — "
+            "see docs/GROK_BOT.md."
+        ),
+    }
+    # Belt-and-suspenders: never ship the stdio defaults even if a future
+    # edit merges another result dict in.
+    result["protocolVersion"] = negotiated
+    caps = result.setdefault("capabilities", {})
+    if not isinstance(caps, dict):
+        caps = {}
+        result["capabilities"] = caps
+    tools_cap = caps.get("tools")
+    if not isinstance(tools_cap, dict) or not tools_cap:
+        caps["tools"] = {"listChanged": False}
+    else:
+        caps["tools"] = dict(tools_cap)
+        caps["tools"].setdefault("listChanged", False)
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": result,
+        "_puppetmaster_protocol_version": negotiated,
+    }
+
+
 def prefer_sse_response(accept_header: Optional[str]) -> bool:
     """Prefer SSE frames when the client advertises text/event-stream.
 
@@ -396,8 +446,8 @@ def handle_remote_message(
         return None
 
     if method == "initialize":
-        # Build the initialize result here so remote negotiation is not tied
-        # to the stdio server's hardcoded 2024-11-05 protocolVersion.
+        # NEVER route initialize through mcp_server.handle_message — that path
+        # hardcodes protocolVersion 2024-11-05 and capabilities.tools {}.
         params = message.get("params") if isinstance(message.get("params"), dict) else {}
         client_info = params.get("clientInfo")
         if isinstance(client_info, dict):
@@ -408,28 +458,15 @@ def handle_remote_message(
                 mcp_server._CLIENT_INFO = client_info
             except Exception:
                 pass
-        requested = params.get("protocolVersion")
-        negotiated = negotiate_protocol_version(
-            str(requested) if requested is not None else None
+        response = build_remote_initialize_result(
+            request_id=request_id,
+            params=params,
+            scope=scope,
         )
-        result: JsonObject = {
-            "protocolVersion": negotiated,
-            "capabilities": remote_initialize_capabilities(scope),
-            "serverInfo": {
-                "name": "puppetmaster-remote",
-                "version": _PACKAGE_VERSION,
-            },
-            "instructions": (
-                "Grok Bot / remote pilot: use start_* tools, poll status/logs/"
-                "live_artifacts/show. Default remote scope may omit implement/edit — "
-                "see docs/GROK_BOT.md."
-            ),
-        }
-        response = {"jsonrpc": "2.0", "id": request_id, "result": result}
+        negotiated = str(response.get("_puppetmaster_protocol_version") or DEFAULT_PROTOCOL_VERSION)
         if state is not None:
             session = state.create_session(protocol_version=negotiated)
             response["_puppetmaster_session_id"] = session.session_id
-            response["_puppetmaster_protocol_version"] = negotiated
         return response
 
     if method == "tools/list":
@@ -867,11 +904,23 @@ def make_handler(state: RemoteMcpState) -> type:
                     return
                 session_id = response.pop("_puppetmaster_session_id", None)
                 protocol_version = response.pop("_puppetmaster_protocol_version", None)
+                if protocol_version is None and rpc_method == "initialize":
+                    # Never let a refactor silently reintroduce stdio defaults.
+                    result_obj = response.get("result") if isinstance(response, dict) else None
+                    if isinstance(result_obj, dict):
+                        protocol_version = result_obj.get("protocolVersion")
                 headers: dict[str, str] = {}
                 if session_id:
                     headers["Mcp-Session-Id"] = str(session_id)
                 if protocol_version:
                     headers["MCP-Protocol-Version"] = str(protocol_version)
+                audit_detail = None
+                if rpc_method == "initialize" and isinstance(response.get("result"), dict):
+                    result_obj = response["result"]
+                    audit_detail = (
+                        f"protocolVersion={result_obj.get('protocolVersion')};"
+                        f"tools_cap={result_obj.get('capabilities', {}).get('tools')}"
+                    )
                 # Prefer SSE when the client advertises it (SDK / Grok Bot default).
                 if prefer_sse_response(self.headers.get("Accept")):
                     self._audit(
@@ -879,6 +928,7 @@ def make_handler(state: RemoteMcpState) -> type:
                         status=200,
                         method=rpc_method,
                         tool=tool_name,
+                        detail=audit_detail,
                     )
                     self._send_sse_json(response, extra_headers=headers or None, event_id="1")
                     return
@@ -887,6 +937,7 @@ def make_handler(state: RemoteMcpState) -> type:
                     status=200,
                     method=rpc_method,
                     tool=tool_name,
+                    detail=audit_detail,
                 )
                 self._send_json(200, response, extra_headers=headers or None)
                 return

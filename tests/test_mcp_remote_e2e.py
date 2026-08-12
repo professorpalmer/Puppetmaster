@@ -391,9 +391,17 @@ class GrokBotHandshakeRegressionTests(unittest.TestCase):
             exposed = headers.get("access-control-expose-headers", "").lower()
             self.assertIn("mcp-session-id", exposed)
             self.assertEqual(headers.get("access-control-allow-origin"), "https://grok.example")
+            # Result *body* (not just headers) — the live failure mode returned
+            # stdio defaults: protocolVersion 2024-11-05 and tools: {}.
+            self.assertIsInstance(init, dict)
+            self.assertIn("result", init)
             self.assertEqual(init["result"]["protocolVersion"], "2025-03-26")
-            self.assertIsInstance(init["result"]["capabilities"].get("tools"), dict)
-            self.assertIn("listChanged", init["result"]["capabilities"]["tools"])
+            self.assertNotEqual(init["result"]["protocolVersion"], "2024-11-05")
+            tools_cap = init["result"]["capabilities"]["tools"]
+            self.assertIsInstance(tools_cap, dict)
+            self.assertTrue(tools_cap, "capabilities.tools must be non-empty")
+            self.assertEqual(tools_cap.get("listChanged"), False)
+            self.assertEqual(init["result"]["serverInfo"]["name"], "puppetmaster-remote")
             self.assertTrue(client.session_id)
 
             status, _, _ = client.request(
