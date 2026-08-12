@@ -37,12 +37,42 @@ from puppetmaster.store_factory import create_store
 TOKEN = "e2e-known-token-not-a-secret"
 
 
+def _parse_mcp_http_body(content_type: str, raw: bytes) -> Any:
+    """Parse application/json or text/event-stream MCP response bodies."""
+    if not raw:
+        return None
+    ctype = (content_type or "").lower()
+    text = raw.decode("utf-8", errors="replace")
+    if "text/event-stream" in ctype:
+        data_lines = []
+        for line in text.splitlines():
+            if line.startswith("data:"):
+                data_lines.append(line[5:].lstrip())
+        if not data_lines:
+            return text
+        # Last data payload is the JSON-RPC response for one-shot streams.
+        return json.loads(data_lines[-1])
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+
 class _HttpMcpClient:
     """Tiny streamable-HTTP MCP client against a running remote server."""
 
-    def __init__(self, port: int, token: str) -> None:
+    def __init__(
+        self,
+        port: int,
+        token: str,
+        *,
+        accept: str = "application/json, text/event-stream",
+        origin: Optional[str] = None,
+    ) -> None:
         self.port = port
         self.token = token
+        self.accept = accept
+        self.origin = origin
         self.session_id: Optional[str] = None
         self._next_id = 1
 
@@ -57,7 +87,9 @@ class _HttpMcpClient:
     ) -> tuple[int, dict[str, str], Any]:
         conn = HTTPConnection("127.0.0.1", self.port, timeout=30)
         payload = None if body is None else json.dumps(body).encode("utf-8")
-        headers = {"Accept": "application/json, text/event-stream"}
+        headers = {"Accept": self.accept}
+        if self.origin:
+            headers["Origin"] = self.origin
         if auth:
             headers["Authorization"] = f"Bearer {token if token is not None else self.token}"
         if self.session_id:
@@ -73,14 +105,7 @@ class _HttpMcpClient:
         conn.close()
         if "mcp-session-id" in resp_headers:
             self.session_id = resp_headers["mcp-session-id"]
-        parsed: Any
-        if not raw:
-            parsed = None
-        else:
-            try:
-                parsed = json.loads(raw.decode("utf-8"))
-            except json.JSONDecodeError:
-                parsed = raw.decode("utf-8", errors="replace")
+        parsed = _parse_mcp_http_body(resp_headers.get("content-type", ""), raw)
         return status, resp_headers, parsed
 
     def rpc(self, method: str, params: Optional[dict] = None) -> Any:
@@ -213,10 +238,12 @@ class RemoteMcpE2ETests(unittest.TestCase):
                     },
                 )
                 self.assertEqual(init["result"]["serverInfo"]["name"], "puppetmaster-remote")
+                self.assertEqual(init["result"]["protocolVersion"], "2025-03-26")
                 self.assertEqual(
                     init["result"]["capabilities"]["experimental"]["puppetmasterRemoteScope"],
                     "supervise",
                 )
+                self.assertIn("listChanged", init["result"]["capabilities"]["tools"])
                 self.assertTrue(client.session_id)
 
                 # notifications/initialized → 202
@@ -318,6 +345,105 @@ class RemoteMcpE2ETests(unittest.TestCase):
                 denied_body = client.tool_payload(denied)
                 self.assertEqual(denied_body.get("code"), "remote_scope_denied")
                 self.assertEqual(denied_body.get("tool"), "puppetmaster_start_implement")
+
+
+class GrokBotHandshakeRegressionTests(unittest.TestCase):
+    """Cursor/Grok remote client handshake that was failing in live tunnel PoC.
+
+    Live symptom: initialize HTTP 200 (repeated), tools=0, no tools/list in
+    audit. Root causes addressed here: protocolVersion echo, SSE when Accept
+    lists text/event-stream, CORS Expose-Headers for Mcp-Session-Id, richer
+    tools capability, then initialized → tools/list.
+    """
+
+    def test_cursor_grok_streamable_handshake_reaches_tools_list(self) -> None:
+        config = RemoteMcpConfig(
+            token=TOKEN,
+            scope="implement",
+            allow_origins=("*",),
+            rate_limit_per_minute=0,
+        )
+        with _RemoteServer(config) as server:
+            client = _HttpMcpClient(
+                server.port,
+                TOKEN,
+                accept="application/json, text/event-stream",
+                origin="https://grok.example",
+            )
+
+            status, headers, init = client.request(
+                "POST",
+                body={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {"roots": {"listChanged": True}},
+                        "clientInfo": {"name": "cursor-grok-bot", "version": "1.0.0"},
+                    },
+                },
+            )
+            self.assertEqual(status, 200)
+            self.assertIn("text/event-stream", headers.get("content-type", ""))
+            self.assertIn("mcp-session-id", headers)
+            # Browser clients need this to read the session header.
+            exposed = headers.get("access-control-expose-headers", "").lower()
+            self.assertIn("mcp-session-id", exposed)
+            self.assertEqual(headers.get("access-control-allow-origin"), "https://grok.example")
+            self.assertEqual(init["result"]["protocolVersion"], "2025-03-26")
+            self.assertIsInstance(init["result"]["capabilities"].get("tools"), dict)
+            self.assertIn("listChanged", init["result"]["capabilities"]["tools"])
+            self.assertTrue(client.session_id)
+
+            status, _, _ = client.request(
+                "POST",
+                body={"jsonrpc": "2.0", "method": "notifications/initialized"},
+            )
+            self.assertEqual(status, 202)
+
+            status, headers, listed = client.request(
+                "POST",
+                body={"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            )
+            self.assertEqual(status, 200)
+            self.assertIn("result", listed)
+            names = {tool["name"] for tool in listed["result"]["tools"]}
+            self.assertIn("puppetmaster_doctor", names)
+            self.assertIn("puppetmaster_start_implement", names)
+            self.assertGreaterEqual(len(names), 45)
+
+    def test_json_only_accept_still_works(self) -> None:
+        config = RemoteMcpConfig(token=TOKEN, scope="supervise", rate_limit_per_minute=0)
+        with _RemoteServer(config) as server:
+            client = _HttpMcpClient(server.port, TOKEN, accept="application/json")
+            status, headers, init = client.request(
+                "POST",
+                body={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "clientInfo": {"name": "curl", "version": "0"},
+                    },
+                },
+            )
+            self.assertEqual(status, 200)
+            self.assertIn("application/json", headers.get("content-type", ""))
+            self.assertEqual(init["result"]["protocolVersion"], "2025-03-26")
+            status, _, _ = client.request(
+                "POST",
+                body={"jsonrpc": "2.0", "method": "notifications/initialized"},
+            )
+            self.assertEqual(status, 202)
+            status, _, listed = client.request(
+                "POST",
+                body={"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            )
+            self.assertEqual(status, 200)
+            self.assertGreater(len(listed["result"]["tools"]), 0)
 
 
 if __name__ == "__main__":

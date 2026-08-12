@@ -57,6 +57,18 @@ SCOPE_ENV = "PUPPETMASTER_MCP_REMOTE_SCOPE"
 HOST_ENV = "PUPPETMASTER_MCP_REMOTE_HOST"
 PORT_ENV = "PUPPETMASTER_MCP_REMOTE_PORT"
 
+# Protocol versions this remote transport can speak. When the client requests
+# one of these we MUST echo it (lifecycle version negotiation). Returning a
+# different version (e.g. hardcoding 2024-11-05 while the client asked for
+# 2025-03-26) makes strict remote clients disconnect after initialize — which
+# is exactly the Grok Bot "Failed to load MCP server / tools=0" failure mode.
+SUPPORTED_PROTOCOL_VERSIONS = (
+    "2025-03-26",
+    "2025-06-18",
+    "2024-11-05",
+)
+DEFAULT_PROTOCOL_VERSION = "2025-03-26"
+
 # Tools that start workers which may edit the tree or act externally.
 # Supervise-first remote surface omits these unless scope=implement.
 IMPLEMENT_TOOL_NAMES = frozenset(
@@ -97,6 +109,9 @@ class RemoteMcpConfig:
     rate_limit_per_minute: int = 120
     audit_log_path: Optional[str] = None
     require_auth: bool = True
+    # How long legacy GET /sse holds the stream open to flush /message replies.
+    # Primary Grok Bot path is streamable HTTP /mcp; this is for older clients.
+    legacy_sse_hold_seconds: float = 30.0
 
     def validate(self) -> None:
         if self.scope not in VALID_SCOPES:
@@ -111,6 +126,8 @@ class RemoteMcpConfig:
             )
         if self.rate_limit_per_minute < 0:
             raise ValueError("rate_limit_per_minute must be >= 0")
+        if self.legacy_sse_hold_seconds < 0:
+            raise ValueError("legacy_sse_hold_seconds must be >= 0")
 
 
 @dataclass
@@ -279,9 +296,46 @@ def connector_snippet(*, base_url: str, token: str) -> JsonObject:
         "headers": {"Authorization": f"Bearer {token}"},
         "notes": (
             "Grok Bot is the pilot; Puppetmaster is the durable worker runtime. "
-            "v1 remote surface defaults to supervise scope (no implement/edit)."
+            "v1 remote surface defaults to supervise scope (no implement/edit). "
+            "Paste the /mcp URL (streamable HTTP), not /sse, unless your client "
+            "only speaks legacy HTTP+SSE."
         ),
     }
+
+
+def negotiate_protocol_version(requested: Optional[str]) -> str:
+    """Echo a supported client version; otherwise offer our streamable default."""
+    version = (requested or "").strip()
+    if version in SUPPORTED_PROTOCOL_VERSIONS:
+        return version
+    return DEFAULT_PROTOCOL_VERSION
+
+
+def remote_initialize_capabilities(scope: str) -> JsonObject:
+    """Capabilities advertised on the remote transport initialize result."""
+    return {
+        # Non-empty tools object: some remote clients treat bare `{}` as
+        # "no tool support". listChanged=false is honest — we don't push
+        # tools/list_changed notifications on this transport.
+        "tools": {"listChanged": False},
+        "logging": {},
+        "experimental": {"puppetmasterRemoteScope": scope},
+    }
+
+
+def prefer_sse_response(accept_header: Optional[str]) -> bool:
+    """Prefer SSE frames when the client advertises text/event-stream.
+
+    Streamable HTTP clients (including Cursor's remote MCP / Grok Bot path)
+    typically send ``Accept: application/json, text/event-stream``. The
+    reference SDK defaults to SSE unless JSON-only mode is forced. Returning
+    bare JSON while SSE is advertised has been observed to leave Grok Bot
+    stuck after initialize (HTTP 200, tools=0, no tools/list).
+    """
+    accept = (accept_header or "").lower()
+    if "text/event-stream" in accept:
+        return True
+    return False
 
 
 class RemoteMcpState:
@@ -342,25 +396,40 @@ def handle_remote_message(
         return None
 
     if method == "initialize":
-        response = handle_message(message)
-        if state is not None and isinstance(response, dict) and "result" in response:
-            params = message.get("params") if isinstance(message.get("params"), dict) else {}
-            protocol = str(params.get("protocolVersion") or "2025-03-26")
-            session = state.create_session(protocol_version=protocol)
-            # Stash for the HTTP layer to put on the response header.
+        # Build the initialize result here so remote negotiation is not tied
+        # to the stdio server's hardcoded 2024-11-05 protocolVersion.
+        params = message.get("params") if isinstance(message.get("params"), dict) else {}
+        client_info = params.get("clientInfo")
+        if isinstance(client_info, dict):
+            # Keep stdio-side client sniffers consistent when remote is used.
+            try:
+                import puppetmaster.mcp_server as mcp_server
+
+                mcp_server._CLIENT_INFO = client_info
+            except Exception:
+                pass
+        requested = params.get("protocolVersion")
+        negotiated = negotiate_protocol_version(
+            str(requested) if requested is not None else None
+        )
+        result: JsonObject = {
+            "protocolVersion": negotiated,
+            "capabilities": remote_initialize_capabilities(scope),
+            "serverInfo": {
+                "name": "puppetmaster-remote",
+                "version": _PACKAGE_VERSION,
+            },
+            "instructions": (
+                "Grok Bot / remote pilot: use start_* tools, poll status/logs/"
+                "live_artifacts/show. Default remote scope may omit implement/edit — "
+                "see docs/GROK_BOT.md."
+            ),
+        }
+        response = {"jsonrpc": "2.0", "id": request_id, "result": result}
+        if state is not None:
+            session = state.create_session(protocol_version=negotiated)
             response["_puppetmaster_session_id"] = session.session_id
-            result = response.get("result")
-            if isinstance(result, dict):
-                info = result.setdefault("serverInfo", {})
-                if isinstance(info, dict):
-                    info["name"] = "puppetmaster-remote"
-                    info["version"] = _PACKAGE_VERSION
-                # Advertise that this endpoint is scope-gated.
-                caps = result.setdefault("capabilities", {})
-                if isinstance(caps, dict):
-                    caps.setdefault("experimental", {})
-                    if isinstance(caps["experimental"], dict):
-                        caps["experimental"]["puppetmasterRemoteScope"] = scope
+            response["_puppetmaster_protocol_version"] = negotiated
         return response
 
     if method == "tools/list":
@@ -442,6 +511,37 @@ def make_handler(state: RemoteMcpState) -> type:
                 return None
             return json.loads(raw.decode("utf-8"))
 
+        def _cors_headers(self) -> dict[str, str]:
+            """CORS headers for browser-hosted MCP clients (Grok Bot / tunnels).
+
+            ``Mcp-Session-Id`` MUST be exposed — without
+            Access-Control-Expose-Headers the browser cannot read the session
+            id from initialize, so the client re-initializes forever and never
+            reaches tools/list (tools=0).
+            """
+            origin = self.headers.get("Origin")
+            if not origin_allowed(origin, state.config.allow_origins):
+                return {}
+            if origin:
+                allow_origin = origin
+            elif "*" in state.config.allow_origins:
+                allow_origin = "*"
+            else:
+                # No Origin header (non-browser MCP client) — nothing to add.
+                return {}
+            return {
+                "Access-Control-Allow-Origin": allow_origin,
+                "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+                "Access-Control-Allow-Headers": (
+                    "Authorization, Content-Type, Accept, Mcp-Session-Id, "
+                    "MCP-Protocol-Version, X-Puppetmaster-Token, Last-Event-ID"
+                ),
+                "Access-Control-Expose-Headers": (
+                    "Mcp-Session-Id, MCP-Protocol-Version, WWW-Authenticate, Retry-After"
+                ),
+                "Vary": "Origin",
+            }
+
         def _send(
             self,
             code: int,
@@ -454,9 +554,12 @@ def make_handler(state: RemoteMcpState) -> type:
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            headers: dict[str, str] = {}
+            headers.update(self._cors_headers())
             if extra_headers:
-                for key, value in extra_headers.items():
-                    self.send_header(key, value)
+                headers.update(extra_headers)
+            for key, value in headers.items():
+                self.send_header(key, value)
             self.end_headers()
             if body:
                 self.wfile.write(body)
@@ -558,15 +661,10 @@ def make_handler(state: RemoteMcpState) -> type:
             if not origin_allowed(self.headers.get("Origin"), state.config.allow_origins):
                 self._forbidden_origin()
                 return
-            origin = self.headers.get("Origin") or "*"
+            cors = self._cors_headers()
             self.send_response(204)
-            self.send_header("Access-Control-Allow-Origin", origin)
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-            self.send_header(
-                "Access-Control-Allow-Headers",
-                "Authorization, Content-Type, Accept, Mcp-Session-Id, "
-                "MCP-Protocol-Version, X-Puppetmaster-Token, Last-Event-ID",
-            )
+            for key, value in cors.items():
+                self.send_header(key, value)
             self.send_header("Access-Control-Max-Age", "600")
             self.end_headers()
 
@@ -638,16 +736,35 @@ def make_handler(state: RemoteMcpState) -> type:
                     return
                 client = state.create_legacy_client()
                 endpoint = f"{LEGACY_MESSAGE_PATH}?sessionId={client.session_id}"
-                frame = (
-                    f"event: endpoint\ndata: {endpoint}\n\n"
-                    f": session {client.session_id}\n\n"
-                ).encode("utf-8")
-                self._send(
-                    200,
-                    frame,
-                    content_type="text/event-stream",
-                    extra_headers={"Connection": "close"},
-                )
+                # Legacy HTTP+SSE: hold the stream open and flush any responses
+                # queued by POST /message. Primary Grok Bot path remains /mcp.
+                self.close_connection = True
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Connection", "close")
+                for key, value in self._cors_headers().items():
+                    self.send_header(key, value)
+                self.end_headers()
+                try:
+                    self.wfile.write(
+                        f"event: endpoint\ndata: {endpoint}\n\n".encode("utf-8")
+                    )
+                    self.wfile.flush()
+                    deadline = time.time() + float(state.config.legacy_sse_hold_seconds)
+                    while time.time() < deadline and not client.closed:
+                        while client.queue:
+                            payload = client.queue.popleft()
+                            frame = (
+                                f"event: message\ndata: {json.dumps(payload)}\n\n"
+                            ).encode("utf-8")
+                            self.wfile.write(frame)
+                            self.wfile.flush()
+                        time.sleep(0.05)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+                finally:
+                    client.closed = True
                 self._audit(event="legacy_sse_open", status=200, detail=client.session_id)
                 return
 
@@ -749,28 +866,29 @@ def make_handler(state: RemoteMcpState) -> type:
                     self._send(202, b"", content_type="text/plain")
                     return
                 session_id = response.pop("_puppetmaster_session_id", None)
+                protocol_version = response.pop("_puppetmaster_protocol_version", None)
                 headers: dict[str, str] = {}
                 if session_id:
                     headers["Mcp-Session-Id"] = str(session_id)
-                # Prefer JSON; honor Accept: text/event-stream when JSON not listed.
-                accept = (self.headers.get("Accept") or "").lower()
-                wants_json = "application/json" in accept or accept == "" or "*/*" in accept
-                if wants_json or "text/event-stream" not in accept:
+                if protocol_version:
+                    headers["MCP-Protocol-Version"] = str(protocol_version)
+                # Prefer SSE when the client advertises it (SDK / Grok Bot default).
+                if prefer_sse_response(self.headers.get("Accept")):
                     self._audit(
-                        event="rpc",
+                        event="rpc_sse",
                         status=200,
                         method=rpc_method,
                         tool=tool_name,
                     )
-                    self._send_json(200, response, extra_headers=headers or None)
+                    self._send_sse_json(response, extra_headers=headers or None, event_id="1")
                     return
                 self._audit(
-                    event="rpc_sse",
+                    event="rpc",
                     status=200,
                     method=rpc_method,
                     tool=tool_name,
                 )
-                self._send_sse_json(response, extra_headers=headers or None, event_id="1")
+                self._send_json(200, response, extra_headers=headers or None)
                 return
 
             # Batch: return a JSON array of responses.

@@ -170,10 +170,26 @@ class HandleRemoteMessageTests(unittest.TestCase):
         assert response is not None
         self.assertIn("_puppetmaster_session_id", response)
         self.assertEqual(response["result"]["serverInfo"]["name"], "puppetmaster-remote")
+        self.assertEqual(response["result"]["protocolVersion"], "2025-03-26")
         self.assertEqual(
             response["result"]["capabilities"]["experimental"]["puppetmasterRemoteScope"],
             "supervise",
         )
+        self.assertIn("listChanged", response["result"]["capabilities"]["tools"])
+
+    def test_initialize_echoes_requested_protocol_version(self) -> None:
+        for requested in ("2025-03-26", "2024-11-05", "2025-06-18"):
+            response = handle_remote_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {"protocolVersion": requested, "capabilities": {}},
+                },
+                scope="supervise",
+            )
+            assert response is not None
+            self.assertEqual(response["result"]["protocolVersion"], requested)
 
 
 class _RemoteServerHarness:
@@ -205,7 +221,8 @@ class _RemoteServerHarness:
     ) -> tuple[int, dict[str, str], bytes]:
         conn = HTTPConnection("127.0.0.1", self.port, timeout=5)
         payload = None if body is None else json.dumps(body).encode("utf-8")
-        hdrs = {"Accept": "application/json, text/event-stream"}
+        # Prefer JSON in unit tests that assert on raw JSON bodies; e2e covers SSE.
+        hdrs = {"Accept": "application/json"}
         if headers:
             hdrs.update(headers)
         if token is not None:
@@ -371,7 +388,7 @@ class RemoteHttpTransportTests(unittest.TestCase):
 
     def test_legacy_sse_endpoint_event(self) -> None:
         token = "secret-token"
-        config = RemoteMcpConfig(token=token)
+        config = RemoteMcpConfig(token=token, legacy_sse_hold_seconds=0.2)
         with _RemoteServerHarness(config) as harness:
             status, headers, raw = harness.request("GET", "/sse", token=token)
             self.assertEqual(status, 200)

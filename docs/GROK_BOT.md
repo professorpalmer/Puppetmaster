@@ -56,28 +56,36 @@ python -m puppetmaster mcp serve-remote --token "$PUPPETMASTER_MCP_TOKEN" --prin
 
 Grok Bot only accepts a **remote** MCP URL (not a local `command`/`args` stdio block).
 
-1. Start the remote server on loopback (supervise = default; no implement/edit):
+1. Start the remote server on loopback. For a first live PoC that matches curl’s
+   full tool list, use implement + open Origin (tighten later):
    ```bash
    export PUPPETMASTER_MCP_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
-   python -m puppetmaster mcp serve-remote --host 127.0.0.1 --port 8743 --scope supervise
+   python -m puppetmaster mcp serve-remote \
+     --host 127.0.0.1 --port 8743 \
+     --scope implement \
+     --allow-origin '*'
    ```
+   Daily-driver default remains `--scope supervise` (no implement/edit).
 2. Make it reachable (laptop PoC — TLS tunnel in a second terminal):
    ```bash
    cloudflared tunnel --url http://127.0.0.1:8743
    # note the https://….trycloudflare.com hostname
    ```
-3. In Grok Bot → **Add MCP server** / connector, set:
+3. In Grok Bot → **Add MCP server** / connector, set **exactly**:
    - **URL:** `https://<tunnel-host>/mcp`  
-     (path **must** end in `/mcp` — that is the Streamable HTTP endpoint)
+     Path **must** be `/mcp` (Streamable HTTP). Do **not** paste `/sse`,
+     `/health`, or the bare tunnel host — those are not the MCP endpoint.
    - **Headers:** `Authorization: Bearer <same PUPPETMASTER_MCP_TOKEN>`
-   - **Transport:** streamable HTTP (or “SSE/HTTP” if the UI offers a single remote option — POST to `/mcp` is what matters)
-4. Confirm with a short pilot loop in chat:
+   - **Transport:** streamable HTTP (if the UI only says “SSE/HTTP”, still use
+     the `/mcp` URL — the server speaks Streamable HTTP there and keeps legacy
+     `/sse` only for older clients)
+4. Confirm load: Grok Bot should show tools > 0 (50 with `--scope implement`,
+   ~32 with supervise). Then in chat:
    - `puppetmaster_doctor`
-   - `puppetmaster_start_cursor_swarm` (or `_review` / `_plan`) → expect `{job_id}` immediately
+   - `puppetmaster_start_cursor_swarm` (or `_review` / `_plan`) → `{job_id}`
    - `puppetmaster_status` / `puppetmaster_live_artifacts_follow` / `puppetmaster_show`
-5. Keep implement off the remote surface until you intentionally restart with `--scope implement`.
 
-Equivalent connector JSON (paste/adapt to whatever AddMcpServer accepts):
+Equivalent connector JSON:
 
 ```json
 {
@@ -90,7 +98,16 @@ Equivalent connector JSON (paste/adapt to whatever AddMcpServer accepts):
 }
 ```
 
-Do **not** bind `0.0.0.0` on a public interface without TLS and a strong token. Toward a proper HTTPS service: terminate TLS on Caddy/nginx/Traefik and forward to `127.0.0.1:8743`. No Puppetmaster-hosted cloud is required or implied by this release.
+**Handshake notes (why curl worked but Grok Bot showed tools=0):** the remote
+server now (1) echoes the client’s `protocolVersion` (e.g. `2025-03-26`),
+(2) returns SSE frames when `Accept` lists `text/event-stream`, (3) exposes
+`Mcp-Session-Id` via CORS `Access-Control-Expose-Headers`, and (4) advertises a
+non-empty `capabilities.tools` object. CI locks that sequence in
+`tests/test_mcp_remote_e2e.py` (`GrokBotHandshakeRegressionTests`).
+
+Do **not** bind `0.0.0.0` on a public interface without TLS and a strong token.
+Toward a proper HTTPS service: terminate TLS on Caddy/nginx/Traefik and forward
+to `127.0.0.1:8743`. No Puppetmaster-hosted cloud is required or implied.
 
 CI covers the HTTP loop without a tunnel (`tests/test_mcp_remote_e2e.py`).
 

@@ -34,6 +34,13 @@ not a leased worker adapter (no fake `grok-bot` adapter).
   ephemeral port with no tunnel. ``tests/test_harness_regression_guards.py``
   locks the stdio tool floor (doctor + implement present) and the adapter
   inventory (no ``grok-bot``).
+- **Grok Bot handshake fix.** Live tunnel PoC showed initialize 200s but
+  ``tools=0`` / no ``tools/list``. Remote initialize now echoes the client's
+  ``protocolVersion`` (``2025-03-26`` etc.), prefers SSE when Accept lists
+  ``text/event-stream``, exposes ``Mcp-Session-Id`` via CORS
+  ``Access-Control-Expose-Headers``, and advertises
+  ``capabilities.tools.listChanged``. Regression:
+  ``GrokBotHandshakeRegressionTests``.
 
 ## v1.21.14
 
