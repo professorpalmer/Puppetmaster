@@ -1,3 +1,13 @@
+## v1.22.4
+
+**Rebuild v1.22.3 from a clean tree so untracked research WIP is not on PyPI.**
+
+The v1.22.3 sdist/wheel was built from a dirty working tree and accidentally
+included uncommitted `puppetmaster/research.py`,
+`puppetmaster/cli/commands_research.py`, and `tests/test_research.py`. Those
+files are not part of the Grok 4.6 overlay and are not wired into the CLI.
+This release is otherwise identical to v1.22.3.
+
 ## v1.22.3
 
 **Grok 4.6 lands as the Cursor workhorse for ambitious and agentic work.**
