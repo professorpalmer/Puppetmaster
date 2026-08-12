@@ -42,8 +42,10 @@ def format_plan_artifacts_for_injection(
     decision and plan payloads are included; other artifact types are skipped.
     Returns an empty string when nothing usable is present.
     """
+    from puppetmaster.gist_admission import filter_shared_context_artifacts
+
     blocks: list[str] = []
-    for artifact in artifacts:
+    for artifact in filter_shared_context_artifacts(artifacts):
         kind, payload = _artifact_type_and_payload(artifact)
         if kind not in _PLAN_ARTIFACT_TYPES:
             # Some decision-shaped payloads ride on other types; still accept
@@ -69,8 +71,10 @@ def format_upstream_artifacts_for_injection(
     artifacts: Iterable[Any],
 ) -> str:
     """Format edge-resolved upstream artifacts for implement/verify injection."""
+    from puppetmaster.gist_admission import filter_shared_context_artifacts
+
     blocks: list[str] = []
-    for artifact in artifacts:
+    for artifact in filter_shared_context_artifacts(artifacts):
         kind, payload = _artifact_type_and_payload(artifact)
         if not isinstance(payload, dict):
             continue
@@ -424,6 +428,10 @@ def _format_one_upstream_payload(kind: str, payload: dict[str, Any]) -> str:
         claim = payload.get("claim")
         if claim:
             lines.append(f"Finding: {str(claim).strip()}")
+    elif kind == "gist":
+        claim = payload.get("claim")
+        if claim:
+            lines.append(f"Gist: {str(claim).strip()}")
     elif kind == "risk":
         risk = payload.get("risk")
         mitigation = payload.get("mitigation")

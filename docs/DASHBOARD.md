@@ -116,13 +116,18 @@ Top to bottom:
   models (hover for the rejection reason). The alternatives come straight from
   each `ROUTING` artifact's audited `rejected` list.
 - **Summary + cost by model** — task counts and per-model estimated spend.
+- **Frontier** (v1.22.2+) — shared-context sidecar: queue depth
+  (queued/running/blocked), follow-ups enqueued from a parent task, and gist
+  admission counts (admitted/pending/rejected), plus the gist claim lines
+  themselves so you can read what peers are allowed to see without digging.
 - **Alerts** — the same failure→remediation alerts the stitched summary surfaces.
 - **Reroutes** — fallback and escalation decisions the router made mid-run.
 - **Tasks** — per-worker cards (role, status, adapter, model, attempts) with an
   expandable "Thinking & Output" timeline: the worker's message, model/cost/token
   chips, the routing rationale, evidence, and any code diff.
-- **Findings / Risks / Decisions / Verifications** — the typed artifacts,
-  grouped and collapsible.
+- **Gists / Findings / Risks / Decisions / Verifications** — typed artifacts,
+  grouped and collapsible. The **Gists** section auto-opens when present and
+  shows admission status + claim + source artifact ids.
 - A sticky **job-total footer** — cost, tokens, and primary model, always in view.
 
 The board polls every ~1.5 s, so a running swarm updates live and a finished one

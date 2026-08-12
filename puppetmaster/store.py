@@ -307,6 +307,209 @@ class SwarmStore:
         for task in tasks:
             self.save_task(task)
 
+    # Defaults for DeLM-inspired adaptive enqueue (Wave 3). Override per call.
+    max_enqueue_depth = 3
+    max_enqueue_children_per_parent = 8
+    max_enqueue_job_tasks = 64
+
+    def _task_ancestry_depth(self, task: Task, task_map: dict[str, Task]) -> int:
+        """Count depends_on hops from ``task`` toward roots (cycle-safe)."""
+        depth = 0
+        seen: set[str] = set()
+        current: Optional[Task] = task
+        while current is not None and current.depends_on:
+            parent_id = current.depends_on[0]
+            if not parent_id or parent_id in seen:
+                break
+            seen.add(parent_id)
+            depth += 1
+            current = task_map.get(parent_id)
+        return depth
+
+    def enqueue_subtask(
+        self,
+        job_id: str,
+        *,
+        parent_task_id: str,
+        role: str,
+        instruction: str,
+        adapter: Optional[str] = None,
+        payload: Optional[dict[str, Any]] = None,
+        max_depth: Optional[int] = None,
+        max_children_per_parent: Optional[int] = None,
+        max_job_tasks: Optional[int] = None,
+        created_by: Optional[str] = None,
+    ) -> Optional[Task]:
+        """Durably enqueue a follow-up task linked to ``parent_task_id``.
+
+        Lease-safe adaptive expansion (DeLM-inspired): workers/orchestrator may
+        propose bounded follow-ups without removing the coordinator. Returns
+        None when depth/count/idempotency gates refuse the enqueue.
+        """
+        parent = self.get_task_by_id(parent_task_id)
+        if parent.job_id != job_id:
+            raise ValueError(
+                f"parent task {parent_task_id} belongs to job {parent.job_id}, not {job_id}"
+            )
+        role_text = str(role or "").strip()
+        instruction_text = str(instruction or "").strip()
+        if not role_text or not instruction_text:
+            raise ValueError("enqueue_subtask requires non-empty role and instruction")
+
+        depth_limit = (
+            self.max_enqueue_depth if max_depth is None else max(0, int(max_depth))
+        )
+        child_limit = (
+            self.max_enqueue_children_per_parent
+            if max_children_per_parent is None
+            else max(0, int(max_children_per_parent))
+        )
+        job_limit = (
+            self.max_enqueue_job_tasks
+            if max_job_tasks is None
+            else max(1, int(max_job_tasks))
+        )
+
+        tasks = self.list_tasks(job_id)
+        task_map = {task.id: task for task in tasks}
+        if parent.id not in task_map:
+            task_map[parent.id] = parent
+        parent_depth = self._task_ancestry_depth(parent, task_map)
+        child_depth = parent_depth + 1
+        if child_depth > depth_limit:
+            self.emit(
+                job_id,
+                "task.enqueue_refused",
+                {
+                    "reason": "max_depth",
+                    "parent_task_id": parent_task_id,
+                    "depth": child_depth,
+                    "max_depth": depth_limit,
+                },
+            )
+            return None
+        if len(tasks) >= job_limit:
+            self.emit(
+                job_id,
+                "task.enqueue_refused",
+                {
+                    "reason": "max_job_tasks",
+                    "parent_task_id": parent_task_id,
+                    "task_count": len(tasks),
+                    "max_job_tasks": job_limit,
+                },
+            )
+            return None
+        existing_children = [
+            task
+            for task in tasks
+            if parent_task_id in (task.depends_on or [])
+            and bool((task.payload or {}).get("enqueued_from_parent"))
+        ]
+        if len(existing_children) >= child_limit:
+            self.emit(
+                job_id,
+                "task.enqueue_refused",
+                {
+                    "reason": "max_children_per_parent",
+                    "parent_task_id": parent_task_id,
+                    "child_count": len(existing_children),
+                    "max_children_per_parent": child_limit,
+                },
+            )
+            return None
+
+        fingerprint_src = f"{parent_task_id}\n{role_text}\n{instruction_text}"
+        fingerprint = hashlib.sha256(fingerprint_src.encode("utf-8")).hexdigest()[:16]
+        for task in existing_children:
+            if (task.payload or {}).get("enqueue_fingerprint") == fingerprint:
+                self.emit(
+                    job_id,
+                    "task.enqueue_deduped",
+                    {
+                        "parent_task_id": parent_task_id,
+                        "task_id": task.id,
+                        "enqueue_fingerprint": fingerprint,
+                    },
+                )
+                return task
+
+        child_payload = dict(payload or {})
+        child_payload["enqueued_from_parent"] = True
+        child_payload["parent_task_id"] = parent_task_id
+        child_payload["enqueue_fingerprint"] = fingerprint
+        child_payload["enqueue_depth"] = child_depth
+        if created_by:
+            child_payload["enqueued_by"] = created_by
+        child = Task(
+            job_id=job_id,
+            role=role_text,
+            instruction=instruction_text,
+            adapter=adapter or parent.adapter or "local",
+            payload=child_payload,
+            depends_on=[parent_task_id],
+            status=TaskStatus.QUEUED,
+        )
+        self.save_task(child)
+        self.emit(
+            job_id,
+            "task.enqueued",
+            {
+                "task_id": child.id,
+                "parent_task_id": parent_task_id,
+                "role": child.role,
+                "adapter": child.adapter,
+                "enqueue_depth": child_depth,
+                "enqueue_fingerprint": fingerprint,
+                "created_by": created_by,
+            },
+        )
+        return child
+
+    def maybe_enqueue_follow_ups_from_artifact(
+        self,
+        artifact: Artifact,
+        *,
+        parent_task_id: Optional[str] = None,
+        created_by: Optional[str] = None,
+        limit: int = 4,
+    ) -> list[Task]:
+        """Enqueue follow-ups declared on ``artifact.payload['enqueue_subtasks']``.
+
+        Each entry is ``{"role": "...", "instruction": "..."}`` (optional
+        ``adapter``). Best-effort: refusals/dedupes are skipped; never raises
+        into the worker hot path.
+        """
+        parent_id = parent_task_id or artifact.task_id
+        payload = artifact.payload or {}
+        proposals = payload.get("enqueue_subtasks")
+        if not isinstance(proposals, list) or not proposals:
+            return []
+        created: list[Task] = []
+        for proposal in proposals[: max(0, int(limit))]:
+            if not isinstance(proposal, dict):
+                continue
+            role = str(proposal.get("role") or "").strip()
+            instruction = str(
+                proposal.get("instruction") or proposal.get("goal") or ""
+            ).strip()
+            if not role or not instruction:
+                continue
+            try:
+                child = self.enqueue_subtask(
+                    artifact.job_id,
+                    parent_task_id=parent_id,
+                    role=role,
+                    instruction=instruction,
+                    adapter=proposal.get("adapter"),
+                    created_by=created_by or artifact.created_by,
+                )
+            except Exception:
+                continue
+            if child is not None:
+                created.append(child)
+        return created
+
     def update_task_status(
         self,
         task: Task,
@@ -1144,6 +1347,12 @@ class SwarmStore:
             return []
         by_id = self.get_artifacts_by_ids(task.job_id, artifact_ids)
         artifacts = [by_id[artifact_id] for artifact_id in artifact_ids if artifact_id in by_id]
+        from puppetmaster.gist_admission import filter_shared_context_artifacts
+
+        # Admission filter at the edge-resolution boundary so pending/rejected
+        # gists never enter peer prompts. Raw list_artifacts remains unfiltered
+        # for tooling/MCP.
+        artifacts = filter_shared_context_artifacts(artifacts)
         if record_consumes and artifacts:
             self.record_consumes(
                 task.job_id,
@@ -1614,6 +1823,59 @@ class SwarmStore:
             # nothing (no diff/commit, only verification, or refused outright) is
             # legible in status/completion instead of looking like success.
             "outcome": self._outcome_signals(artifacts),
+            # Wave 4: DeLM-inspired frontier observability (compact, numbers-only).
+            "frontier": self._frontier_signals(tasks, artifacts),
+        }
+
+    @staticmethod
+    def _frontier_signals(
+        tasks: list[Task], artifacts: list[Any]
+    ) -> dict[str, Any]:
+        """Queue + admitted-gist frontier counts for status/dashboard."""
+        from puppetmaster.models import ArtifactType
+
+        queued = 0
+        running = 0
+        blocked = 0
+        enqueued_from_parent = 0
+        for task in tasks:
+            status = task.status
+            if status == TaskStatus.QUEUED:
+                queued += 1
+            elif status == TaskStatus.RUNNING:
+                running += 1
+            elif status == TaskStatus.BLOCKED:
+                blocked += 1
+            if (task.payload or {}).get("enqueued_from_parent"):
+                enqueued_from_parent += 1
+        gist_total = 0
+        gist_admitted = 0
+        gist_pending = 0
+        gist_rejected = 0
+        for artifact in artifacts:
+            if getattr(artifact, "type", None) != ArtifactType.GIST:
+                continue
+            gist_total += 1
+            admission = str(
+                (getattr(artifact, "payload", None) or {}).get("admission") or ""
+            ).strip().lower()
+            if admission == "admitted":
+                gist_admitted += 1
+            elif admission == "pending":
+                gist_pending += 1
+            elif admission == "rejected":
+                gist_rejected += 1
+        return {
+            "queued": queued,
+            "running": running,
+            "blocked": blocked,
+            "enqueued_from_parent": enqueued_from_parent,
+            "gists": {
+                "total": gist_total,
+                "admitted": gist_admitted,
+                "pending": gist_pending,
+                "rejected": gist_rejected,
+            },
         }
 
     @staticmethod

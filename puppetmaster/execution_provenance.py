@@ -1,7 +1,7 @@
 """Truthful per-artifact execution provenance.
 
-Stamped onto FINDING / RISK / DECISION / VERIFICATION artifacts at the
-central store save seam so every adapter path is covered. Fields are
+Stamped onto FINDING / RISK / DECISION / VERIFICATION / GIST artifacts at
+the central store save seam so every adapter path is covered. Fields are
 optional and additive: unknown stays null/absent with explicit
 ``usage_known`` / ``cost_known`` / ``priced`` flags — never a fabricated
 numeric zero for missing data.
@@ -24,6 +24,7 @@ _PROVENANCE_TYPES = frozenset(
         ArtifactType.RISK,
         ArtifactType.DECISION,
         ArtifactType.VERIFICATION,
+        ArtifactType.GIST,
     }
 )
 

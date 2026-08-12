@@ -40,6 +40,7 @@ SUBSTANTIVE_VALIDATION_TYPES = frozenset(
         ArtifactType.FINDING,
         ArtifactType.VERIFICATION,
         ArtifactType.DECISION,
+        ArtifactType.GIST,
     }
 )
 DEFAULT_LOOKUP_LIMIT = 256
@@ -488,7 +489,7 @@ def compact_artifact_ref(
     if not isinstance(payload, dict):
         payload = {}
     concise: dict[str, Any] = {}
-    for key in ("claim", "check", "decision", "result", "why"):
+    for key in ("claim", "check", "decision", "result", "why", "admission"):
         if key in payload and payload[key] is not None:
             concise[key] = _truncate_text(payload[key], _CONCISE_FIELD_MAX_CHARS)
     evidence = list(getattr(artifact, "evidence", None) or [])

@@ -109,6 +109,23 @@ class WorkerRuntime:
             artifacts = self._stamp_evaluator_metadata(task, artifacts)
             for artifact in artifacts:
                 self.store.save_artifact(artifact)
+                # Auto-materialize admitted gists from high-confidence findings
+                # so swarm peers share verified compact discoveries without
+                # extra API churn.
+                try:
+                    from puppetmaster.gist_admission import maybe_admit_finding_as_gist
+
+                    maybe_admit_finding_as_gist(self.store, artifact)
+                except Exception:
+                    pass
+                try:
+                    self.store.maybe_enqueue_follow_ups_from_artifact(
+                        artifact,
+                        parent_task_id=task.id,
+                        created_by=self.worker_id,
+                    )
+                except Exception:
+                    pass
         except Exception as exc:
             failed_run = replace(
                 run,

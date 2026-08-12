@@ -31,6 +31,7 @@ _SUBSTANTIVE_TYPES = {
     ArtifactType.DECISION,
     ArtifactType.PATCH,
     ArtifactType.RISK,
+    ArtifactType.GIST,
 }
 
 _DEGRADED_FAILURE_MARKERS = frozenset({

@@ -59,6 +59,7 @@ _REQUIRED_PAYLOAD_KEYS = {
     ArtifactType.MEMORY_SUMMARY: ("summary",),
     ArtifactType.ROUTING: ("model_id", "adapter", "policy"),
     ArtifactType.GATE: ("gate", "passed"),
+    ArtifactType.GIST: ("claim", "source_artifact_ids", "admission"),
 }
 
 

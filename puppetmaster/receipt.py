@@ -13,6 +13,7 @@ _TYPED = {
     ArtifactType.RISK,
     ArtifactType.DECISION,
     ArtifactType.PATCH,
+    ArtifactType.GIST,
 }
 _EMPTY_MARKER = "empty-or-unstructured"
 _EMPTY_FAILURE = "empty_or_unstructured"

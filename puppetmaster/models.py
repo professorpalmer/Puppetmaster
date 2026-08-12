@@ -68,6 +68,10 @@ class ArtifactType(StringEnum):
     # agent can never report COMPLETE over work that regressed a baseline or
     # left its output uncommitted.
     GATE = "gate"
+    # Compact verified discovery admitted for peer shared-context injection.
+    # Peers see only admission=admitted gists; pending/rejected stay in the
+    # store for tooling/MCP but are filtered at injection boundaries.
+    GIST = "gist"
 
 
 @dataclass(frozen=True)
@@ -144,10 +148,23 @@ class Artifact:
             ArtifactType.MEMORY_SUMMARY: ["summary"],
             ArtifactType.ROUTING: ["model_id", "adapter", "policy"],
             ArtifactType.GATE: ["gate", "passed"],
+            ArtifactType.GIST: ["claim", "source_artifact_ids", "admission"],
         }
         for key in required_keys.get(self.type, []):
             if key not in self.payload:
                 raise ValueError(f"{self.type} artifacts require payload.{key}")
+        if self.type == ArtifactType.GIST:
+            admission = self.payload.get("admission")
+            if admission not in ("pending", "admitted", "rejected"):
+                raise ValueError(
+                    "gist artifacts require payload.admission in "
+                    "{pending, admitted, rejected}"
+                )
+            source_ids = self.payload.get("source_artifact_ids")
+            if not isinstance(source_ids, list):
+                raise ValueError(
+                    "gist artifacts require payload.source_artifact_ids as a list"
+                )
 
 
 @dataclass(frozen=True)

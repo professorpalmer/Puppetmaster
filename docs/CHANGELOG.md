@@ -1,3 +1,32 @@
+## v1.22.2
+
+**Shared verified context (DeLM-inspired): admitted gists, selective unfold, adaptive enqueue, dashboard Frontier.**
+
+Peers coordinate through durable compact discoveries instead of prompt-routing
+every update through a central merge step — without removing the orchestrator.
+Inspired by Decentralized Language Models (arXiv:2606.10662); compounds with
+Puppetmaster's State-Not-Tokens durable-artifact thesis.
+
+- **Gist admission.** New `ArtifactType.GIST` with
+  `admission` ∈ `{pending, admitted, rejected}`.
+  `puppetmaster/gist_admission.py` filters pending/rejected gists at
+  `resolve_artifacts_via_edges` and prewalk injection; high-confidence FINDINGs
+  auto-materialize admitted gists from `WorkerRuntime`. Events:
+  `gist.admitted` / `gist.rejected`.
+- **Selective unfold.** `unfold_shared_context(..., level=gist|summary|raw)`
+  expands compact claims on demand (summary_ref / source_artifact_ids).
+- **Bounded adaptive enqueue.** `SwarmStore.enqueue_subtask` +
+  `maybe_enqueue_follow_ups_from_artifact` (`payload.enqueue_subtasks`) with
+  depth / children / job caps and fingerprint dedupe. Events:
+  `task.enqueued` / `task.enqueue_refused` / `task.enqueue_deduped`.
+- **Dashboard Frontier.** Job view shows queue + gist-admission chips, lists
+  gist claims inline, and adds an auto-open **Gists** artifact section.
+  `status_snapshot()["frontier"]` / `build_job_snapshot()["frontier"]` carry
+  the numbers.
+- **Tests.** `tests/test_gist_admission.py`,
+  `tests/test_shared_context_waves.py`, `tests/test_dashboard_frontier.py`,
+  `tests/test_delm_shared_context_e2e.py` (SQLite + live HTTP).
+
 ## v1.22.1
 
 **Add a reproducible remote MCP e2e fixture.**

@@ -58,6 +58,7 @@ _ARTIFACT_STATEMENT_KEYS = {
     ArtifactType.RISK: "risk",
     ArtifactType.DECISION: "decision",
     ArtifactType.VERIFICATION: "check",
+    ArtifactType.GIST: "claim",
 }
 
 
@@ -244,6 +245,15 @@ def _build_task_activity(task_id: str, artifacts: list[Artifact]) -> list[dict[s
             item["text"] = _artifact_statement(artifact)
             item["evidence"] = artifact.evidence
             item["message"] = _artifact_statement(artifact)
+        elif artifact.type == ArtifactType.GIST:
+            claim = _artifact_statement(artifact)
+            admission = payload.get("admission")
+            text = f"Gist: {claim}"
+            if isinstance(admission, str) and admission.strip():
+                text = f"{text} ({admission.strip()})"
+            item["text"] = text
+            item["evidence"] = artifact.evidence
+            item["message"] = text
         else:
             item["text"] = payload.get("reason") or payload.get("result") or payload.get("message") or ""
             item["message"] = item["text"]
@@ -500,6 +510,7 @@ def build_job_snapshot(store: SwarmStore, job_id: str) -> dict[str, Any]:
         "verification": [],
         "routing": [],
         "patch": [],
+        "gist": [],
     }
     reroutes: list[dict[str, Any]] = []
     for artifact in artifacts:
@@ -513,6 +524,15 @@ def build_job_snapshot(store: SwarmStore, job_id: str) -> dict[str, Any]:
             "failure": (artifact.payload or {}).get("failure"),
             "result": (artifact.payload or {}).get("result"),
         }
+        if kind == "gist":
+            admission = (artifact.payload or {}).get("admission")
+            if isinstance(admission, str) and admission.strip():
+                row["admission"] = admission.strip()
+            source_ids = (artifact.payload or {}).get("source_artifact_ids")
+            if isinstance(source_ids, list):
+                row["source_artifact_ids"] = [
+                    str(item) for item in source_ids if item is not None
+                ]
         if kind in grouped:
             grouped[kind].append(row)
         if artifact.type == ArtifactType.ROUTING and str(artifact.created_by).startswith(
@@ -555,6 +575,9 @@ def build_job_snapshot(store: SwarmStore, job_id: str) -> dict[str, Any]:
 
     adapters, primary_adapter = _adapters_from_tasks(tasks)
     token_usage = aggregate_token_usage(artifacts)
+    frontier = store.status_snapshot(job_id).get("frontier")
+    if frontier is None:
+        frontier = SwarmStore._frontier_signals(tasks, artifacts)
 
     return {
         "job": {
@@ -581,6 +604,7 @@ def build_job_snapshot(store: SwarmStore, job_id: str) -> dict[str, Any]:
         "routing_rollup": _routing_rollup(tasks, artifacts),
         "evaluator_epoch": _evaluator_epoch_lineage(store, job_id),
         "phase": _job_phase(job.status.value, task_rows, counts),
+        "frontier": frontier,
     }
 
 
@@ -828,6 +852,55 @@ _PAGE_HEAD = r"""<!doctype html>
   .summary-chip.highlight {
     background: #1f6f3f;
     color: #d3f9d8;
+  }
+  .frontier-sidecar {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-bottom: 16px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    background: #161b22;
+    border: 1px solid #30363d;
+  }
+  .frontier-sidecar-label {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    color: #8b949e;
+    margin-right: 4px;
+  }
+  .frontier-gist-list {
+    width: 100%;
+    margin-top: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .frontier-gist-row {
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+    font-size: 13px;
+    color: #c9d1d9;
+  }
+  .frontier-gist-claim {
+    flex: 1;
+    min-width: 0;
+  }
+  .summary-chip.gist-admitted {
+    background: #1f6f3f;
+    color: #d3f9d8;
+  }
+  .summary-chip.gist-pending {
+    background: #3d2f00;
+    color: #f0c674;
+  }
+  .summary-chip.gist-rejected {
+    background: #5a1d1d;
+    color: #ffb4b4;
   }
   .progress-bar {
     width: 100%;
@@ -1101,6 +1174,7 @@ _PAGE_HEAD = r"""<!doctype html>
   .activity-item.verification { border-left-color: #58a6ff; }
   .activity-item.routing { border-left-color: #9e6a03; }
   .activity-item.finding { border-left-color: #1f6f3f; }
+  .activity-item.gist { border-left-color: #388bfd; }
   .activity-item.risk { border-left-color: #8b2c2c; }
   .activity-item.decision { border-left-color: #6e4a9e; }
   .activity-text {
@@ -1721,6 +1795,67 @@ function renderDiff(diff) {
   return html;
 }
 
+function renderFrontierSidecar(frontier, gists) {
+  if (!frontier) return '';
+  const g = frontier.gists || {};
+  const chips = [];
+  if (frontier.queued > 0) chips.push(`<span class="summary-chip s-queued">${frontier.queued} queued</span>`);
+  if (frontier.running > 0) chips.push(`<span class="summary-chip s-running">${frontier.running} running</span>`);
+  if (frontier.blocked > 0) chips.push(`<span class="summary-chip s-blocked">${frontier.blocked} blocked</span>`);
+  if (frontier.enqueued_from_parent > 0) {
+    chips.push(`<span class="summary-chip">${frontier.enqueued_from_parent} from parent</span>`);
+  }
+  if (g.admitted > 0) chips.push(`<span class="summary-chip">${g.admitted} gists admitted</span>`);
+  if (g.pending > 0) chips.push(`<span class="summary-chip">${g.pending} gists pending</span>`);
+  if (g.rejected > 0) chips.push(`<span class="summary-chip s-failed">${g.rejected} gists rejected</span>`);
+  if (!chips.length) return '';
+  let html = `<div class="frontier-sidecar"><span class="frontier-sidecar-label">Frontier</span>${chips.join('')}</div>`;
+  const items = Array.isArray(gists) ? gists : [];
+  if (items.length) {
+    html += '<div class="frontier-gist-list">';
+    for (const item of items.slice(0, 8)) {
+      const admission = item.admission || 'pending';
+      const statement = item.statement || '';
+      html += `<div class="frontier-gist-row"><span class="summary-chip gist-${esc(admission)}">${esc(admission)}</span> <span class="frontier-gist-claim">${md(statement)}</span></div>`;
+    }
+    if (items.length > 8) {
+      html += `<div class="muted">+${items.length - 8} more in Gists below</div>`;
+    }
+    html += '</div>';
+  }
+  return html;
+}
+
+function renderGistSection(items) {
+  const list = Array.isArray(items) ? items : [];
+  const id = 'gists';
+  // Auto-open when gists exist so shared-context content is visible without digging.
+  if (list.length) expandedSections.add(id);
+  const isExpanded = expandedSections.has(id);
+  let html = `<div class="collapsible-section">
+    <div class="section-toggle" onclick="toggleSection('${id}')">
+      ${isExpanded ? '▼' : '▶'} Gists (${list.length})
+    </div>
+    <div class="section-content ${isExpanded ? 'open' : ''}" id="section-${id}">`;
+  if (list.length) {
+    html += '<table><tr><th>Admission</th><th>Claim</th><th>Confidence</th><th>Sources</th></tr>';
+    html += rows(list, [
+      it => {
+        const admission = it.admission || 'pending';
+        return `<span class="summary-chip gist-${esc(admission)}">${esc(admission)}</span>`;
+      },
+      it => md(it.statement),
+      it => '<span class="conf">' + (it.confidence != null ? it.confidence.toFixed(2) : '') + '</span>',
+      it => '<span class="ev">' + esc((it.source_artifact_ids || []).join(', ')) + '</span>'
+    ]);
+    html += '</table>';
+  } else {
+    html += '<p class="muted">None — admitted gists are the compact shared-context peers can read.</p>';
+  }
+  html += '</div></div>';
+  return html;
+}
+
 function renderTask(task) {
   const isExpanded = expandedTasks.has(task.id);
   const goalExpanded = expandedGoals.has(task.id);
@@ -1994,6 +2129,7 @@ async function loadJob() {
       ${queuedTasks > 0 ? `<span class="summary-chip s-queued">${queuedTasks} queued</span>` : ''}
       <span class="summary-chip">$${(d.cost.total_estimated_cost_usd || 0).toFixed(6)}</span>
     </div>
+    ${renderFrontierSidecar(d.frontier, (d.artifacts && d.artifacts.gist) || [])}
     <div class="progress-bar"><div class="progress-fill" style="width: ${progressPct}%"></div></div>
     <div class="progress-text">${completeTasks} / ${totalTasks} complete</div>`;
 
@@ -2038,6 +2174,7 @@ async function loadJob() {
   }
 
   html += '<div class="card">';
+  html += renderGistSection((d.artifacts && d.artifacts.gist) || []);
   html += renderCollapsibleSection('Findings', 'findings', d.artifacts.finding);
   html += renderCollapsibleSection('Risks', 'risks', d.artifacts.risk);
   html += renderCollapsibleSection('Decisions', 'decisions', d.artifacts.decision);
