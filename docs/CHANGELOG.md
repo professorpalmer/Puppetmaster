@@ -1,3 +1,14 @@
+## v1.22.1
+
+**Add a reproducible remote MCP e2e fixture.**
+
+- Added `examples/grok-bot-remote-e2e/` as a shippable fixture workspace for
+  remote MCP review and implement validation.
+- Added ignore rules and tracked validation markers so dependency installs,
+  local state, logs, and implement results do not pollute the repository.
+- Added a green `npm test` path and linked the fixture from the example and
+  remote MCP documentation.
+
 ## v1.22.0
 
 **Grok Bot harness: authenticated remote MCP (streamable HTTP) as a pilot path.**
