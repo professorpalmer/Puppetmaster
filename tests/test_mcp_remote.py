@@ -16,6 +16,7 @@ from puppetmaster.mcp_remote import (
     MCP_ENDPOINT_PATH,
     RateLimiter,
     RemoteMcpConfig,
+    SUPERVISE_TOOL_NAMES,
     build_server,
     config_from_env_and_args,
     connector_snippet,
@@ -77,7 +78,13 @@ class TokenAndScopeUnitTests(unittest.TestCase):
         self.assertTrue(tool_allowed("puppetmaster_start_implement", "implement"))
         self.assertTrue(tool_allowed("puppetmaster_doctor", "supervise"))
         self.assertTrue(tool_allowed("puppetmaster_start_cursor_swarm", "supervise"))
+        self.assertFalse(tool_allowed("puppetmaster_start_prewalk", "supervise"))
+        self.assertFalse(tool_allowed("puppetmaster_dashboard", "supervise"))
+        self.assertFalse(tool_allowed("puppetmaster_mcp_cleanup", "supervise"))
+        self.assertFalse(tool_allowed("puppetmaster_gate", "supervise"))
+        self.assertFalse(tool_allowed("puppetmaster_new_unreviewed_tool", "supervise"))
         names = {tool.name for tool in filtered_tools("supervise")}
+        self.assertEqual(names, SUPERVISE_TOOL_NAMES)
         for blocked in IMPLEMENT_TOOL_NAMES:
             self.assertNotIn(blocked, names)
         self.assertIn("puppetmaster_doctor", names)
@@ -97,6 +104,11 @@ class TokenAndScopeUnitTests(unittest.TestCase):
     def test_origin_allowlist(self) -> None:
         self.assertTrue(origin_allowed(None, ()))
         self.assertTrue(origin_allowed("http://127.0.0.1:3000", ()))
+        self.assertTrue(origin_allowed("https://localhost:5173", ()))
+        self.assertTrue(origin_allowed("http://[::1]:3000", ()))
+        self.assertFalse(origin_allowed("http://127.0.0.1.evil.com", ()))
+        self.assertFalse(origin_allowed("https://localhost.evil.com", ()))
+        self.assertFalse(origin_allowed("https://localhostfoo", ()))
         self.assertFalse(origin_allowed("https://evil.example", ()))
         self.assertTrue(origin_allowed("https://evil.example", ("*",)))
         self.assertTrue(origin_allowed("https://app.example", ("https://app.example",)))
@@ -142,23 +154,31 @@ class HandleRemoteMessageTests(unittest.TestCase):
         self.assertNotIn("puppetmaster_start_implement", names)
 
     def test_tools_call_denied_outside_scope(self) -> None:
-        response = handle_remote_message(
-            {
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "tools/call",
-                "params": {
-                    "name": "puppetmaster_start_implement",
-                    "arguments": {"goal": "nope"},
+        for blocked_name in (
+            "puppetmaster_start_implement",
+            "puppetmaster_start_prewalk",
+            "puppetmaster_dashboard",
+            "puppetmaster_mcp_cleanup",
+            "puppetmaster_gate",
+        ):
+            response = handle_remote_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": blocked_name,
+                        "arguments": {"goal": "nope"},
+                    },
                 },
-            },
-            scope="supervise",
-        )
-        assert response is not None
-        result = response["result"]
-        self.assertTrue(result.get("isError"))
-        body = json.loads(result["content"][0]["text"])
-        self.assertEqual(body["code"], "remote_scope_denied")
+                scope="supervise",
+            )
+            assert response is not None
+            result = response["result"]
+            self.assertTrue(result.get("isError"))
+            body = json.loads(result["content"][0]["text"])
+            self.assertEqual(body["code"], "remote_scope_denied")
+            self.assertEqual(body["tool"], blocked_name)
 
     def test_initialize_stamps_remote_server_info(self) -> None:
         from puppetmaster.mcp_remote import RemoteMcpState
@@ -425,11 +445,26 @@ class RemoteHttpTransportTests(unittest.TestCase):
         token = "alt-header-token"
         config = RemoteMcpConfig(token=token)
         with _RemoteServerHarness(config) as harness:
-            status, _, raw = harness.request(
+            status, init_headers, _ = harness.request(
                 "POST",
                 "/mcp",
                 headers={"X-Puppetmaster-Token": token},
-                body={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                body={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {"protocolVersion": "2025-03-26", "capabilities": {}},
+                },
+            )
+            self.assertEqual(status, 200)
+            status, _, raw = harness.request(
+                "POST",
+                "/mcp",
+                headers={
+                    "X-Puppetmaster-Token": token,
+                    "Mcp-Session-Id": init_headers["mcp-session-id"],
+                },
+                body={"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
             )
             self.assertEqual(status, 200)
             self.assertIn("result", json.loads(raw.decode("utf-8")))
@@ -450,13 +485,27 @@ class RemoteHttpTransportTests(unittest.TestCase):
 
     def test_rate_limit_returns_429(self) -> None:
         token = "secret-token"
-        config = RemoteMcpConfig(token=token, rate_limit_per_minute=2)
+        config = RemoteMcpConfig(token=token, rate_limit_per_minute=3)
         with _RemoteServerHarness(config) as harness:
+            status, init_headers, _ = harness.request(
+                "POST",
+                "/mcp",
+                token=token,
+                body={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {"protocolVersion": "2025-03-26", "capabilities": {}},
+                },
+            )
+            self.assertEqual(status, 200)
+            session_headers = {"Mcp-Session-Id": init_headers["mcp-session-id"]}
             for _ in range(2):
                 status, _, _ = harness.request(
                     "POST",
                     "/mcp",
                     token=token,
+                    headers=session_headers,
                     body={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
                 )
                 self.assertEqual(status, 200)
@@ -464,6 +513,7 @@ class RemoteHttpTransportTests(unittest.TestCase):
                 "POST",
                 "/mcp",
                 token=token,
+                headers=session_headers,
                 body={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
             )
             self.assertEqual(status, 429)
@@ -474,10 +524,23 @@ class RemoteHttpTransportTests(unittest.TestCase):
         token = "secret-token"
         config = RemoteMcpConfig(token=token)
         with _RemoteServerHarness(config) as harness:
+            status, init_headers, _ = harness.request(
+                "POST",
+                "/mcp",
+                token=token,
+                body={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {"protocolVersion": "2025-03-26", "capabilities": {}},
+                },
+            )
+            self.assertEqual(status, 200)
             status, _, raw = harness.request(
                 "POST",
                 "/mcp",
                 token=token,
+                headers={"Mcp-Session-Id": init_headers["mcp-session-id"]},
                 body={"jsonrpc": "2.0", "method": "notifications/initialized"},
             )
             self.assertEqual(status, 202)
@@ -490,11 +553,24 @@ class RemoteHttpTransportTests(unittest.TestCase):
             "content": [{"type": "text", "text": json.dumps({"ok": True})}],
         }
         with _RemoteServerHarness(config) as harness:
+            status, init_headers, _ = harness.request(
+                "POST",
+                "/mcp",
+                token=token,
+                body={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {"protocolVersion": "2025-03-26", "capabilities": {}},
+                },
+            )
+            self.assertEqual(status, 200)
             with patch("puppetmaster.mcp_server.call_tool", return_value=fake_doctor):
                 status, _, raw = harness.request(
                     "POST",
                     "/mcp",
                     token=token,
+                    headers={"Mcp-Session-Id": init_headers["mcp-session-id"]},
                     body={
                         "jsonrpc": "2.0",
                         "id": 9,

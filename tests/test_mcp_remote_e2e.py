@@ -196,6 +196,29 @@ def _seed_job(state_dir: Path, goal: str = "e2e remote mcp supervise loop") -> s
 
 
 class RemoteMcpE2ETests(unittest.TestCase):
+    def test_streamable_requests_require_a_known_session(self) -> None:
+        config = RemoteMcpConfig(
+            token=TOKEN,
+            scope="supervise",
+            rate_limit_per_minute=0,
+        )
+        with _RemoteServer(config) as server:
+            client = _HttpMcpClient(server.port, TOKEN)
+            status, _, body = client.request(
+                "POST",
+                body={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            )
+            self.assertEqual(status, 400)
+            self.assertEqual(body["error"], "missing_session")
+
+            client.session_id = "not-a-real-session"
+            status, _, body = client.request(
+                "POST",
+                body={"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            )
+            self.assertEqual(status, 404)
+            self.assertEqual(body["error"], "session_not_found")
+
     def test_full_supervise_http_loop(self) -> None:
         with TemporaryDirectory() as tmp:
             state_dir = Path(tmp) / "pm-state"

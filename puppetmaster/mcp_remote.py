@@ -109,13 +109,59 @@ IMPLEMENT_TOOL_NAMES = frozenset(
         "puppetmaster_openai",
         "puppetmaster_start_openai",
         "puppetmaster_start_browser_swarm",
+        "puppetmaster_start_prewalk",
+        "puppetmaster_dashboard",
         "puppetmaster_reset_subgraph",
         "puppetmaster_gc",
         "puppetmaster_codegraph_init",
         "puppetmaster_codegraph_index",
         "puppetmaster_repair_codegraph",
+        "puppetmaster_mcp_cleanup",
+        "puppetmaster_gate",
     }
 )
+
+# Fail closed for the default remote scope. New tools are not remotely
+# callable until they have been reviewed as safe for a read-only pilot.
+SUPERVISE_TOOL_NAMES = frozenset(
+    {
+        "puppetmaster_doctor",
+        "puppetmaster_route_task",
+        "puppetmaster_list_models",
+        "puppetmaster_job_cost",
+        "puppetmaster_job_receipt",
+        "puppetmaster_cursor_review",
+        "puppetmaster_start_cursor_review",
+        "puppetmaster_cursor_plan",
+        "puppetmaster_start_cursor_plan",
+        "puppetmaster_start_swarm",
+        "puppetmaster_start_cursor_swarm",
+        "puppetmaster_last_job",
+        "puppetmaster_status",
+        "puppetmaster_logs",
+        "puppetmaster_live_artifacts",
+        "puppetmaster_live_artifacts_follow",
+        "puppetmaster_partial_summary",
+        "puppetmaster_await_job",
+        "puppetmaster_artifacts",
+        "puppetmaster_job_graph",
+        "puppetmaster_show",
+        "puppetmaster_codegraph_search",
+        "puppetmaster_codegraph_context",
+        "puppetmaster_codegraph_affected",
+        "puppetmaster_codegraph_files",
+        "puppetmaster_codegraph_status",
+        "puppetmaster_mcp_status",
+        "puppetmaster_rollup",
+    }
+)
+
+MAX_REMOTE_REQUEST_BYTES = 1024 * 1024
+
+
+class RequestBodyTooLarge(ValueError):
+    """Raised before reading a remote request body above the safety limit."""
+
 
 VALID_SCOPES = frozenset({"supervise", "implement"})
 
@@ -262,7 +308,7 @@ def tool_allowed(name: str, scope: str) -> bool:
     """Return True when *name* is visible/callable under *scope*."""
     if scope == "implement":
         return True
-    return name not in IMPLEMENT_TOOL_NAMES
+    return name in SUPERVISE_TOOL_NAMES
 
 
 def filtered_tools(scope: str) -> list:
@@ -306,14 +352,16 @@ def origin_allowed(origin: Optional[str], allow_origins: tuple[str, ...]) -> boo
         return True
     if allow_origins:
         return False
-    # Empty allowlist: only permit loopback browser origins.
-    lowered = origin.lower()
-    return (
-        lowered.startswith("http://127.0.0.1")
-        or lowered.startswith("http://localhost")
-        or lowered.startswith("https://127.0.0.1")
-        or lowered.startswith("https://localhost")
-    )
+    # Empty allowlist: only permit loopback browser origins. Parse the
+    # hostname instead of using a prefix check, which would admit
+    # ``127.0.0.1.evil.com`` and ``localhost.evil.com``.
+    try:
+        parsed = urlparse(origin)
+    except ValueError:
+        return False
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        return False
+    return parsed.hostname.lower() in {"127.0.0.1", "localhost", "::1"}
 
 
 def connector_snippet(*, base_url: str, token: str) -> JsonObject:
@@ -567,15 +615,6 @@ def handle_remote_message(
         # NEVER route initialize through mcp_server.handle_message — that path
         # hardcodes protocolVersion 2024-11-05 and capabilities.tools {}.
         params = message.get("params") if isinstance(message.get("params"), dict) else {}
-        client_info = params.get("clientInfo")
-        if isinstance(client_info, dict):
-            # Keep stdio-side client sniffers consistent when remote is used.
-            try:
-                import puppetmaster.mcp_server as mcp_server
-
-                mcp_server._CLIENT_INFO = client_info
-            except Exception:
-                pass
         response = build_remote_initialize_result(
             request_id=request_id,
             params=params,
@@ -662,11 +701,56 @@ def make_handler(state: RemoteMcpState) -> type:
             )
 
         def _read_json_body(self) -> Any:
-            length = int(self.headers.get("Content-Length", 0) or 0)
+            raw_length = self.headers.get("Content-Length", "0") or "0"
+            try:
+                length = int(raw_length)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Content-Length must be an integer") from exc
+            if length < 0:
+                raise ValueError("Content-Length must be non-negative")
+            if length > MAX_REMOTE_REQUEST_BYTES:
+                raise RequestBodyTooLarge(
+                    f"request body exceeds {MAX_REMOTE_REQUEST_BYTES} bytes"
+                )
             raw = self.rfile.read(length) if length else b""
             if not raw:
                 return None
             return json.loads(raw.decode("utf-8"))
+
+        def _require_streamable_session(self, messages: list[JsonObject]) -> bool:
+            """Require an existing session for every non-initialize request."""
+            if all(message.get("method") == "initialize" for message in messages):
+                return True
+            session_id = (self.headers.get("Mcp-Session-Id") or "").strip()
+            if not session_id:
+                self._audit(
+                    event="session_denied",
+                    status=400,
+                    detail="missing Mcp-Session-Id",
+                )
+                self._send_json(
+                    400,
+                    {
+                        "error": "missing_session",
+                        "detail": "Mcp-Session-Id is required after initialize",
+                    },
+                )
+                return False
+            if state.get_session(session_id) is None:
+                self._audit(
+                    event="session_denied",
+                    status=404,
+                    detail="unknown Mcp-Session-Id",
+                )
+                self._send_json(
+                    404,
+                    {
+                        "error": "session_not_found",
+                        "detail": "Unknown Mcp-Session-Id; re-initialize",
+                    },
+                )
+                return False
+            return True
 
         def _cors_headers(self) -> dict[str, str]:
             """CORS headers for browser-hosted MCP clients (Grok Bot / tunnels).
@@ -880,7 +964,21 @@ def make_handler(state: RemoteMcpState) -> type:
                     )
                     return
                 session_id = (self.headers.get("Mcp-Session-Id") or "").strip() or None
-                if session_id and state.get_session(session_id) is None:
+                if not session_id:
+                    self._audit(
+                        event="session_denied",
+                        status=400,
+                        detail="missing Mcp-Session-Id",
+                    )
+                    self._send_json(
+                        400,
+                        {
+                            "error": "missing_session",
+                            "detail": "Mcp-Session-Id is required after initialize",
+                        },
+                    )
+                    return
+                if state.get_session(session_id) is None:
                     self._send_json(
                         404,
                         {
@@ -1010,7 +1108,15 @@ def make_handler(state: RemoteMcpState) -> type:
                 return
             try:
                 payload = self._read_json_body()
-            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            except RequestBodyTooLarge as exc:
+                self.close_connection = True
+                self._audit(event="body_too_large", status=413, detail=str(exc))
+                self._send_json(
+                    413,
+                    {"error": "request_too_large", "detail": str(exc)},
+                )
+                return
+            except (ValueError, UnicodeDecodeError) as exc:
                 self._audit(event="bad_json", status=400, detail=str(exc))
                 self._send_json(400, {"error": "invalid_json", "detail": str(exc)})
                 return
@@ -1022,6 +1128,9 @@ def make_handler(state: RemoteMcpState) -> type:
                 messages = [payload]
             else:
                 self._send_json(400, {"error": "invalid_body", "detail": "expected JSON object or array"})
+                return
+
+            if not self._require_streamable_session(messages):
                 return
 
             # Notifications / responses only → 202.
@@ -1146,7 +1255,15 @@ def make_handler(state: RemoteMcpState) -> type:
                 return
             try:
                 payload = self._read_json_body()
-            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            except RequestBodyTooLarge as exc:
+                self.close_connection = True
+                self._audit(event="body_too_large", status=413, detail=str(exc))
+                self._send_json(
+                    413,
+                    {"error": "request_too_large", "detail": str(exc)},
+                )
+                return
+            except (ValueError, UnicodeDecodeError) as exc:
                 self._send_json(400, {"error": "invalid_json", "detail": str(exc)})
                 return
             if not isinstance(payload, dict):

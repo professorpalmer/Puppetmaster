@@ -72,7 +72,7 @@ Grok Bot only accepts a **remote** MCP URL (not a local `command`/`args` stdio b
    # note the https://….trycloudflare.com hostname
    ```
 3. In Grok Bot → **Add MCP server** / connector, set **exactly**:
-   - **URL:** `https://<tunnel-host>/mcp`  
+   - **URL:** `https://<tunnel-host>/mcp`
      Path **must** be `/mcp` (Streamable HTTP). Do **not** paste `/sse`,
      `/health`, or the bare tunnel host — those are not the MCP endpoint.
    - **Headers:** `Authorization: Bearer <same PUPPETMASTER_MCP_TOKEN>`
@@ -80,7 +80,7 @@ Grok Bot only accepts a **remote** MCP URL (not a local `command`/`args` stdio b
      the `/mcp` URL — the server speaks Streamable HTTP there and keeps legacy
      `/sse` only for older clients)
 4. Confirm load: Grok Bot should show tools > 0 (50 with `--scope implement`,
-   ~32 with supervise). Then in chat:
+   ~28 with supervise). Then in chat:
    - `puppetmaster_doctor`
    - `puppetmaster_start_cursor_swarm` (or `_review` / `_plan`) → `{job_id}`
    - `puppetmaster_status` / `puppetmaster_live_artifacts_follow` / `puppetmaster_show`
@@ -113,7 +113,7 @@ CI locks that sequence in `tests/test_mcp_remote_e2e.py`
 (`GrokBotHandshakeRegressionTests`).
 
 If Plugins still flaps after a green tools/list, try `--scope supervise` first
-(~32 tools, smaller payload) before `--scope implement` (50).
+(~28 tools, smaller payload) before `--scope implement` (50).
 
 Do **not** bind `0.0.0.0` on a public interface without TLS and a strong token.
 Toward a proper HTTPS service: terminate TLS on Caddy/nginx/Traefik and forward
@@ -141,7 +141,7 @@ Default **`supervise`** — read-only / supervise-first:
 | Allowed | Examples |
 |---|---|
 | Health / routing | `puppetmaster_doctor`, `puppetmaster_route_task`, `puppetmaster_list_models` |
-| Start analysis | `puppetmaster_start_cursor_review`, `puppetmaster_start_cursor_plan`, `puppetmaster_start_cursor_swarm`, `puppetmaster_start_swarm`, `puppetmaster_start_prewalk` |
+| Start analysis | `puppetmaster_start_cursor_review`, `puppetmaster_start_cursor_plan`, `puppetmaster_start_cursor_swarm`, `puppetmaster_start_swarm` |
 | Observe | `puppetmaster_status`, `puppetmaster_logs`, `puppetmaster_live_artifacts`, `puppetmaster_live_artifacts_follow`, `puppetmaster_partial_summary`, `puppetmaster_artifacts`, `puppetmaster_show`, `puppetmaster_await_job`, `puppetmaster_job_graph`, … |
 | CodeGraph reads | `puppetmaster_codegraph_search`, `_context`, `_affected`, `_files`, `_status` |
 
@@ -151,8 +151,12 @@ Default **`supervise`** — read-only / supervise-first:
 - `puppetmaster_edit`
 - `puppetmaster_start_codex` / `_agentic` / `_openai` and their sync twins
 - `puppetmaster_start_browser_swarm`
+- `puppetmaster_start_prewalk`, `puppetmaster_dashboard`, `puppetmaster_mcp_cleanup`, `puppetmaster_gate`
 - `puppetmaster_reset_subgraph`, `puppetmaster_gc`
 - `puppetmaster_codegraph_init` / `_index` / `puppetmaster_repair_codegraph`
+
+The supervise list is an explicit safe allowlist. New tools stay hidden until
+they are reviewed for read-only remote use.
 
 Opt in explicitly:
 
