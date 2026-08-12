@@ -63,14 +63,15 @@ breaks.
 
 `puppetmaster models init` writes tiered model entries that
 map directly to the "easy / balanced / high / extra-high" mental
-model — Cursor/Claude tiers (including Grok 4.5 as the Cursor
-workhorse), 4 OpenAI tiers, and 2 Codex tiers, covering every cheap
+model — Cursor/Claude tiers (including Grok 4.6 as the Cursor
+workhorse for ambitious/agentic work, with Grok 4.5 kept as the prior
+Opus-class rung), 4 OpenAI tiers, and 2 Codex tiers, covering every cheap
 → frontier pairing across the production adapters. **The
 `adapter_model_name` values are the literal strings each adapter
 passes through to its SDK / CLI today** (verified against Cursor's
 runtime catalog, Anthropic's `claude` CLI, and OpenAI's `codex` CLI):
 `composer-2.5`, `gpt-5.6-luna`, `gpt-5.6-terra`, `gpt-5.6-sol`,
-`grok-4.5`, `claude-fable-5`, `claude-haiku-4-5`,
+`grok-4.5`, `grok-4.6`, `claude-fable-5`, `claude-haiku-4-5`,
 `claude-opus-4-6`, `claude-opus-4-7`, `claude-opus-4-8` for the
 Cursor/Claude tier; `gpt-5.5` / `gpt-5.4` /
 `gpt-5.4-mini` / `gpt-5.4-nano` for the OpenAI tier; `gpt-5.5` /
@@ -84,7 +85,8 @@ tier. When newer versions land, edit `adapter_model_name` in
 | `cursor/gpt-5-6-luna`    | `cursor`      | affordable GPT-5.6 tier — nominal \$1 / \$6; \$0 marginal on Cursor plan | `affordable`, `balanced`, `fast`, `vision` |
 | `cursor/gpt-5-6-terra`   | `cursor`      | pretty-expensive GPT-5.6 tier — nominal \$2.50 / \$15 | `quality`, `vision`, `reasoning` |
 | `cursor/gpt-5-6-sol`     | `cursor`      | very-expensive GPT-5.6 frontier — nominal \$5 / \$30 | `frontier`, `vision`, `reasoning` |
-| `cursor/grok-4-5`        | `cursor`      | **Cursor workhorse** — Opus-class at plan-billed speed/cost (capability 97; CursorBench High 66.7% above Opus 4.8 Max) | `frontier`, `fast`, `code`, `reasoning`, `workhorse`, `xai` |
+| `cursor/grok-4-5`        | `cursor`      | previous Opus-class rung — plan-billed speed/cost (capability 97; CursorBench High 66.7% above Opus 4.8 Max); still the right-sized pick in the mid-90s | `frontier`, `fast`, `code`, `reasoning`, `xai` |
+| `cursor/grok-4-6`        | `cursor`      | **Cursor workhorse for ambitious/agentic work** — Sol-class at Grok pricing (capability 99; nominal \$2 / \$6, 500K context, long-running agents + visual work) | `frontier`, `fast`, `code`, `reasoning`, `agentic`, `workhorse`, `vision`, `xai` |
 | `claude-code/haiku-4-5`  | `claude-code` | cheap on the Anthropic side (\$1 / \$5) — the cheap tier for Claude-Code-only users | `cheap`, `fast`, `vision`, `reading`, `code` |
 | `claude-code/opus-4-6`   | `claude-code` | high-quality — \$5 / \$25 per MTok                  | `quality`, `vision`, `reasoning` |
 | `claude-code/opus-4-7`   | `claude-code` | previous frontier — \$5 / \$25, superseded by 4.8  | `frontier`, `vision`, `detailed-vision`, `reasoning` |
@@ -105,7 +107,8 @@ With the starter registry, balanced-policy routing lands roughly:
 | `format these files`                            | `cursor/composer-2-5` |
 | `map the auth module`                           | `cursor/composer-2-5` |
 | `add password reset endpoint`                   | `cursor/gpt-5-6-luna` |
-| `implement a multi-file refactor with tests` (Cursor-only) | `cursor/grok-4-5` (workhorse — Opus-class, plan-billed) |
+| `implement a multi-file refactor with tests` (Cursor-only) | `cursor/grok-4-5` (right-sized Opus-class rung, plan-billed) |
+| `run a long-horizon agentic migration` (Cursor-only, min capability 98) | `cursor/grok-4-6` (workhorse — Sol-class at \$2 / \$6 instead of Sol's \$5 / \$30) |
 | `decision: which caching strategy fits`         | `claude-code/opus-4-6` |
 | `security audit every endpoint`                 | `cursor/claude-opus-5` (everyday frontier — near-Fable at half price) |
 | `describe what you see in the screenshot`       | `cursor/gpt-5-6-luna` (vision-tagged) |

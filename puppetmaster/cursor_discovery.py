@@ -55,6 +55,7 @@ _CURSOR_FRONTIER_KIN_ALIASES: dict[str, str] = {
 _CURSOR_NOMINAL_RATES: dict[str, tuple[float, float]] = {
     "composer-2.5": (0.5, 2.5),
     "grok-4.5": (2.0, 6.0),
+    "grok-4.6": (2.0, 6.0),
     "claude-opus-5": (5.0, 25.0),
     "opus-5": (5.0, 25.0),
     "claude-fable-5": (10.0, 50.0),
@@ -140,7 +141,8 @@ def default_variant_params(item: Mapping) -> list[dict[str, str]]:
     Cursor models keep a single live identity (e.g. ``grok-4.5``) and expose
     effort/fast knobs as ``parameters`` / ``variants`` — not as expanded ids
     like ``cursor-grok-4.5-high-fast``. Prefer the variant marked
-    ``isDefault`` (UI High+Fast for Grok 4.5); otherwise the first variant.
+    ``isDefault`` (UI High+Fast for Grok 4.5 / 4.6); otherwise the first
+    variant.
     """
     variants = item.get("variants") or []
     if not isinstance(variants, list):

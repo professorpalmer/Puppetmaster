@@ -8611,7 +8611,7 @@ class ModelRouterTests(unittest.TestCase):
         self.assertIn("opus-5", claude_fable.notes)
 
     def test_starter_registry_includes_grok_4_5_cursor_workhorse(self) -> None:
-        """Grok 4.5 is the Cursor Opus-class workhorse under Fable/Opus tip."""
+        """Grok 4.5 stays the prior Opus-class rung under Fable/Opus tip."""
         from puppetmaster.model_registry import starter_registry
 
         registry = {spec.id: spec for spec in starter_registry()}
@@ -8622,7 +8622,10 @@ class ModelRouterTests(unittest.TestCase):
         self.assertEqual(grok.capability_score, 97)
         self.assertEqual(grok.billing, "plan")
         self.assertEqual(grok.input_per_mtok_usd, 2.0)
-        self.assertIn("workhorse", grok.tags)
+        self.assertEqual(grok.output_per_mtok_usd, 6.0)
+        # The workhorse badge moved to Grok 4.6; 4.5 remains routable and
+        # pinnable at the mid-90s rung.
+        self.assertNotIn("workhorse", grok.tags)
         self.assertIn("xai", grok.tags)
         self.assertEqual(
             grok.payload_defaults.get("params"),
@@ -8640,6 +8643,47 @@ class ModelRouterTests(unittest.TestCase):
         self.assertLess(grok.capability_score, registry["claude-code/opus-4-7"].capability_score)
         self.assertLess(grok.capability_score, registry["claude-code/opus-4-8"].capability_score)
         self.assertLess(grok.capability_score, registry["cursor/claude-fable-5"].capability_score)
+
+    def test_starter_registry_includes_grok_4_6_cursor_workhorse(self) -> None:
+        """Grok 4.6 is the Sol-class Cursor workhorse at Grok pricing."""
+        from puppetmaster.model_registry import starter_registry
+
+        registry = {spec.id: spec for spec in starter_registry()}
+        self.assertIn("cursor/grok-4-6", registry)
+        grok = registry["cursor/grok-4-6"]
+        self.assertEqual(grok.adapter, "cursor")
+        self.assertEqual(grok.adapter_model_name, "grok-4.6")
+        self.assertEqual(grok.capability_score, 99)
+        self.assertEqual(grok.billing, "plan")
+        self.assertEqual(grok.input_per_mtok_usd, 2.0)
+        self.assertEqual(grok.output_per_mtok_usd, 6.0)
+        self.assertEqual(grok.context_window, 500_000)
+        self.assertIn("workhorse", grok.tags)
+        self.assertIn("xai", grok.tags)
+        self.assertIn("agentic", grok.tags)
+        # Text + image inputs, but not the detailed-vision tier.
+        self.assertIn("vision", grok.tags)
+        self.assertNotIn("detailed-vision", grok.tags)
+        self.assertEqual(
+            grok.payload_defaults.get("params"),
+            [
+                {"id": "effort", "value": "high"},
+                {"id": "fast", "value": "true"},
+            ],
+        )
+        self.assertIn("effort:high", grok.tags)
+        self.assertIn("param:fast", grok.tags)
+        # Sol-class rung: above Grok 4.5, level with GPT-5.6 Sol, still under
+        # the Opus 5 / Fable 5 tip.
+        self.assertGreater(
+            grok.capability_score, registry["cursor/grok-4-5"].capability_score
+        )
+        self.assertEqual(
+            grok.capability_score, registry["cursor/gpt-5-6-sol"].capability_score
+        )
+        self.assertLess(
+            grok.capability_score, registry["cursor/claude-opus-5"].capability_score
+        )
 
     def test_cursor_plan_routing_uses_nominal_usage_rates(self) -> None:
         from puppetmaster.model_registry import starter_registry
@@ -9538,6 +9582,7 @@ class ModelRouterTests(unittest.TestCase):
         self.assertIn("cursor/gpt-5-6-sol", ids)
         self.assertNotIn("cursor/gpt-5-5", ids)
         self.assertIn("cursor/grok-4-5", ids)
+        self.assertIn("cursor/grok-4-6", ids)
         self.assertIn("claude-code/opus-4-6", ids)
         self.assertIn("claude-code/opus-4-7", ids)
         # Capability scores are monotone across tiers.
@@ -9559,6 +9604,19 @@ class ModelRouterTests(unittest.TestCase):
         self.assertLess(
             by_id["cursor/grok-4-5"].capability_score,
             by_id["claude-code/opus-4-7"].capability_score,
+        )
+        # Grok 4.6 is the Sol-class rung above 4.5, still under the tip.
+        self.assertLess(
+            by_id["cursor/grok-4-5"].capability_score,
+            by_id["cursor/grok-4-6"].capability_score,
+        )
+        self.assertEqual(
+            by_id["cursor/grok-4-6"].capability_score,
+            by_id["cursor/gpt-5-6-sol"].capability_score,
+        )
+        self.assertLess(
+            by_id["cursor/grok-4-6"].capability_score,
+            by_id["cursor/claude-opus-5"].capability_score,
         )
         self.assertLess(
             by_id["claude-code/opus-4-6"].capability_score,
@@ -9637,6 +9695,7 @@ class ModelRouterTests(unittest.TestCase):
         self.assertIn("claude-code/opus-4-8", rejected_ids)
         self.assertIn("cursor/claude-fable-5", rejected_ids)
         self.assertIn("cursor/grok-4-5", rejected_ids)
+        self.assertIn("cursor/grok-4-6", rejected_ids)
 
     def test_starter_registry_routes_hard_cursor_work_to_grok_4_5(self) -> None:
         """Hard Cursor-eligible work should land on Grok 4.5, not burn Opus/Fable.
@@ -9659,6 +9718,32 @@ class ModelRouterTests(unittest.TestCase):
         self.assertEqual(decision.model.id, "cursor/grok-4-5")
         rejected_ids = {spec.id for spec, _ in decision.rejected}
         self.assertIn("cursor/claude-fable-5", rejected_ids)
+
+    def test_starter_registry_routes_sol_class_cursor_work_to_grok_4_6(self) -> None:
+        """Sol-class Cursor work lands on Grok 4.6, not Sol or Fable.
+
+        At a need above Grok 4.5's 97, balanced still prefers the cheapest
+        sufficient plan model: Grok 4.6 clears the bar at $2/$6 where Sol
+        costs $5/$30 and Fable more still.
+        """
+        from puppetmaster.model_registry import starter_registry
+        from puppetmaster.router import TaskSignals, route_task
+
+        cursor_only = [s for s in starter_registry() if s.adapter == "cursor"]
+        signal = TaskSignals(
+            instruction=(
+                "Run a long-horizon agentic migration across the service and "
+                "its interactive dashboards"
+            ),
+            role="implement",
+            explicit_min_capability=98,
+        )
+        decision = route_task(signal, cursor_only, policy="balanced")
+        self.assertEqual(decision.model.id, "cursor/grok-4-6")
+        rejected_ids = {spec.id for spec, _ in decision.rejected}
+        self.assertIn("cursor/gpt-5-6-sol", rejected_ids)
+        self.assertIn("cursor/claude-fable-5", rejected_ids)
+        self.assertIn("cursor/grok-4-5", rejected_ids)
 
     def test_starter_registry_routes_easy_task_to_composer(self) -> None:
         from puppetmaster.model_registry import starter_registry

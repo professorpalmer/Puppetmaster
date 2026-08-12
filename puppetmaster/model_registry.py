@@ -211,16 +211,18 @@ def starter_registry() -> list[ModelSpec]:
     actually think in: fast/cheap, balanced, high-quality, frontier.
 
     Tier IDs (``cursor/composer-2-5``, ``cursor/grok-4-5``,
-    ``cursor/gpt-5-6-luna``,
+    ``cursor/grok-4-6``, ``cursor/gpt-5-6-luna``,
     ``cursor/gpt-5-6-terra``, ``cursor/gpt-5-6-sol``,
     ``claude-code/opus-4-6``, ``claude-code/opus-4-7``,
     ``claude-code/opus-4-8``, ``cursor/claude-opus-5``,
     ``claude-code/opus-5``, ``cursor/claude-fable-5``,
     ``claude-code/fable-5``)
     reflect a common mental model where the cheap tier is Cursor's house
-    model, the balanced tier is GPT, the Cursor workhorse is Grok 4.5
-    (Opus-class at plan-billed speed/cost), and the tip-of-stack frontier
-    is Anthropic Opus 5 (near-Fable everyday) / Fable 5 (absolute tip).
+    model, the balanced tier is GPT, the Cursor workhorse for ambitious
+    and agentic work is Grok 4.6 (Sol-class at Grok pricing) with Grok 4.5
+    kept as the prior Opus-class rung for right-sized mid-90s work, and
+    the tip-of-stack frontier is Anthropic Opus 5 (near-Fable everyday) /
+    Fable 5 (absolute tip).
     ``adapter_model_name`` values are the literal strings each adapter
     passes through to its SDK / CLI today (verified against Cursor's
     runtime model catalog and Anthropic's claude CLI), so the starter
@@ -323,24 +325,71 @@ def starter_registry() -> list[ModelSpec]:
                 "code",
                 "reasoning",
                 "agentic",
-                "workhorse",
                 "effort:high",
                 "param:fast",
             ],
             notes=(
-                "Cursor workhorse (released 2026-07-08). SpaceXAI Grok 4.5 via "
-                "the Cursor SDK — trained alongside Cursor; ~80 TPS with ~2x "
-                "token efficiency vs Opus-class peers. CursorBench 3.2 High "
-                "scores 66.7% (above Opus 4.8 Max at 62.3%, below Fable 5 Max "
-                "at 70.5%) at ~$1.51/task vs Opus Max ~$5.77 and Fable Max "
+                "Previous Cursor Opus-class workhorse (released 2026-07-08); "
+                "superseded as the ambitious/agentic workhorse by "
+                "cursor/grok-4-6, and kept so existing pins, allowlists, and "
+                "cost history stay valid. SpaceXAI Grok 4.5 via the Cursor "
+                "SDK — trained alongside Cursor; ~80 TPS with ~2x token "
+                "efficiency vs Opus-class peers. CursorBench 3.2 High scores "
+                "66.7% (above Opus 4.8 Max at 62.3%, below Fable 5 Max at "
+                "70.5%) at ~$1.51/task vs Opus Max ~$5.77 and Fable Max "
                 "~$17.32; Cursor notes a training-data asterisk on that "
                 "leaderboard. API list price is $2/$6 per MTok, but this "
                 "entry is plan-billed ($0 marginal). capability_score=97 sits "
-                "just under Opus 4.7/4.8 so balanced routing prefers Grok for "
-                "most hard Cursor work while reserving Opus/Fable for the "
-                "tip-of-stack. Absorbs the prior Opus-class workhorse band on "
-                "Cursor when Fable is available for the absolute hardest tasks. "
-                "Default variant is High+Fast via payload_defaults.params."
+                "just under Opus 4.7/4.8 and under Grok 4.6, so balanced "
+                "routing still right-sizes mid-90s Cursor work here instead "
+                "of reaching for a Sol-class model. Default variant is "
+                "High+Fast via payload_defaults.params."
+            ),
+        ),
+        ModelSpec(
+            id="cursor/grok-4-6",
+            adapter="cursor",
+            adapter_model_name="grok-4.6",
+            capability_score=99,
+            input_per_mtok_usd=2.0,
+            output_per_mtok_usd=6.0,
+            context_window=500_000,
+            billing="plan",
+            # Live SDK identity is grok-4.6; the Fast variant is a param at 2x
+            # list price, not a separate catalog id.
+            payload_defaults={
+                "params": [
+                    {"id": "effort", "value": "high"},
+                    {"id": "fast", "value": "true"},
+                ]
+            },
+            tags=[
+                "tools",
+                "cursor",
+                "xai",
+                "frontier",
+                "fast",
+                "code",
+                "reasoning",
+                "agentic",
+                "workhorse",
+                "vision",
+                "effort:high",
+                "param:fast",
+            ],
+            notes=(
+                "Cursor workhorse for ambitious and agentic work (released "
+                "2026-08-12; Cursor catalog id grok-4.6). SpaceXAI Grok 4.6 "
+                "via the Cursor SDK, aimed at long-running agents and "
+                "visual/interactive work; matches GPT-5.6 Sol on the "
+                "Artificial Analysis Intelligence Index at Grok's $2/$6 per "
+                "MTok list price (Fast is 2x via param, not a separate id). "
+                "Plan-billed here, so $0 marginal. capability_score=99 puts "
+                "it on the Sol / Opus 4.8 rung, so balanced routing prefers "
+                "it over Sol ($5/$30) on cost for Sol-class work while Grok "
+                "4.5 (97) stays the right-sized pick in the mid-90s; Opus 5 / "
+                "Fable 5 remain the tip at 100. Default variant is High+Fast "
+                "via payload_defaults.params."
             ),
         ),
         ModelSpec(

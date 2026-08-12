@@ -36,6 +36,7 @@ OPENAI_RESPONSES = "openai_responses"
 # is the current DeepSeek-V4-Flash-0731 build — older v3/v2 slugs were never
 # Go models and must not reappear as aliases here.
 CURATED_MODELS = (
+    "grok-4.6",
     "grok-4.5",
     "glm-5.2",
     "glm-5.1",

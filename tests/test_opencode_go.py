@@ -60,7 +60,7 @@ class OpenCodeGoCatalogTests(unittest.TestCase):
 
     def test_curated_catalog_covers_published_endpoint_table(self) -> None:
         for model in (
-            "grok-4.5", "gpt-5.6-luna", "glm-5.2", "glm-5.1", "kimi-k3",
+            "grok-4.6", "grok-4.5", "gpt-5.6-luna", "glm-5.2", "glm-5.1", "kimi-k3",
             "kimi-k2.7-code", "kimi-k2.6", "mimo-v2.5", "mimo-v2.5-pro",
             "minimax-m3", "minimax-m2.7", "qwen3.7-max", "qwen3.7-plus",
             "qwen3.6-plus", "deepseek-v4-pro", "deepseek-v4-flash", "hy3",
@@ -96,6 +96,7 @@ class OpenCodeGoNormalizeAndRouteTests(unittest.TestCase):
             ("deepseek-v4-flash", go.CHAT_COMPLETIONS),
             ("mimo-v2.5-pro", go.CHAT_COMPLETIONS),
             ("grok-4.5", go.CHAT_COMPLETIONS),
+            ("grok-4.6", go.CHAT_COMPLETIONS),
             ("hy3", go.CHAT_COMPLETIONS),
             ("minimax-m3", go.ANTHROPIC_MESSAGES),
             ("minimax-m2.7", go.ANTHROPIC_MESSAGES),

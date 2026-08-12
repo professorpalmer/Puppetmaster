@@ -1,3 +1,31 @@
+## v1.22.3
+
+**Grok 4.6 lands as the Cursor workhorse for ambitious and agentic work.**
+
+SpaceXAI shipped Grok 4.6 on 2026-08-12 with Cursor catalog id `grok-4.6`.
+Without a starter overlay, `models discover --write` would have seeded it at
+the conservative capability 60 / \$0 / \$0, letting it undercut Composer on
+mid-tier work.
+
+- **Starter overlay.** New `cursor/grok-4-6` (capability 99, nominal \$2 / \$6,
+  plan-billed, 500K context, `vision`, default High+Fast via
+  `payload_defaults.params`) sits on the Sol / Opus 4.8 rung, so balanced
+  routing prefers it over GPT-5.6 Sol (\$5 / \$30) for Sol-class work while
+  Opus 5 / Fable 5 stay the tip at 100.
+- **Grok 4.5 stays put.** `cursor/grok-4-5` keeps capability 97 and its prices
+  so existing pins, allowlists, and cost history remain valid; it is now the
+  prior Opus-class rung and the right-sized pick in the mid-90s. The
+  `workhorse` tag moved to 4.6.
+- **Discovery and catalogs.** `grok-4.6` added to the Cursor nominal usage
+  rates (\$2 / \$6) and to the OpenCode Go curated model list.
+- **Docs.** [docs/MODEL_ROUTING.md](MODEL_ROUTING.md) gains the `grok-4-6` tier
+  row plus a Sol-class routing example; [docs/FEATURES.md](FEATURES.md) counts
+  twelve starter tiers.
+- **Tests.** New starter-registry and routing coverage in
+  `tests/test_puppetmaster.py` (4.6 identity, 4.5 < 4.6 == Sol < Opus 5,
+  min-capability 98 routes to `cursor/grok-4-6`) and curated-catalog coverage
+  in `tests/test_opencode_go.py`.
+
 ## v1.22.2
 
 **Shared verified context (DeLM-inspired): admitted gists, selective unfold, adaptive enqueue, dashboard Frontier.**
