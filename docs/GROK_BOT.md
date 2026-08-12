@@ -228,3 +228,4 @@ See also [SECURITY.md](SECURITY.md) — the "no remote control" claim now has th
 - [ADAPTERS.md](ADAPTERS.md) — worker adapters (Grok Bot is a *pilot*, not an adapter)
 - [CLI_REFERENCE.md](CLI_REFERENCE.md) — `mcp serve-remote` flags
 - [SECURITY.md](SECURITY.md) — threat model
+- [examples/grok-bot-remote-e2e/](../examples/grok-bot-remote-e2e/) — shippable fixture cwd for Plugins review/implement e2e

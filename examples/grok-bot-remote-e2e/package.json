@@ -1,0 +1,21 @@
+{
+  "name": "puppetmaster-grok-bot-e2e",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal fixture workspace for Grok Bot Plugins → Puppetmaster remote MCP review/implement e2e validation.",
+  "main": "index.js",
+  "scripts": {
+    "test": "node --check index.js && node --test"
+  },
+  "dependencies": {
+    "@cursor/sdk": "^1.0.26"
+  },
+  "keywords": [
+    "puppetmaster",
+    "grok-bot",
+    "remote-mcp",
+    "e2e"
+  ],
+  "license": "MIT"
+}

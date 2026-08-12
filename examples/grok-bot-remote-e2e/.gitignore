@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+package-lock.json
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Puppetmaster / CodeGraph local state
+.puppetmaster/
+.codegraph/codegraph.db
+.codegraph/codegraph.db-*
+
+# Logs and OS junk
+*.log
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Build / coverage artifacts
+dist/
+build/
+coverage/
+.coverage
+.nyc_output/

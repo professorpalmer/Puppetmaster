@@ -19,4 +19,6 @@ puppetmaster run "demo goal" --config examples/enterprise-workflow.json
 
 The [`transcripts/`](transcripts) folder holds captured example outputs for reference.
 
+[`grok-bot-remote-e2e/`](grok-bot-remote-e2e) is a tiny Node fixture workspace for Grok Bot Plugins → Puppetmaster remote MCP review/implement validation (see [docs/GROK_BOT.md](../docs/GROK_BOT.md)).
+
 The workflow config schema (roles, adapters, payloads, routing overrides, DAG edges) is documented in [docs/CLI_REFERENCE.md](../docs/CLI_REFERENCE.md).
