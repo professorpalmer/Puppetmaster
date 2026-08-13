@@ -15153,6 +15153,37 @@ class CursorModelPinTests(unittest.TestCase):
             self.assertEqual(pin.registry_id, "cursor/grok-4-5")
             self.assertEqual(pin.adapter_model_name, "grok-4.5")
 
+    def test_resolve_exact_registry_id_wins_over_ambiguous_model_alias(self) -> None:
+        from puppetmaster.model_registry import ModelSpec, resolve_model_pin
+
+        registry = [
+            ModelSpec(
+                id="agentic/gpt-5.6-sol",
+                adapter="agentic",
+                adapter_model_name="gpt-5.6-sol",
+                enabled=True,
+                payload_defaults={"provider": "openai-api"},
+            ),
+            ModelSpec(
+                id="agentic/openai-codex/gpt-5.6-sol",
+                adapter="agentic",
+                adapter_model_name="gpt-5.6-sol",
+                enabled=True,
+                payload_defaults={"provider": "openai-codex"},
+            ),
+        ]
+
+        pin = resolve_model_pin(
+            "agentic/gpt-5.6-sol",
+            registry,
+            adapter="agentic",
+        )
+
+        self.assertIsNotNone(pin)
+        assert pin is not None
+        self.assertEqual(pin.registry_id, "agentic/gpt-5.6-sol")
+        self.assertEqual(pin.spec.payload_defaults["provider"], "openai-api")
+
     def test_resolve_rejects_ambiguous_pin(self) -> None:
         from puppetmaster.model_registry import AmbiguousModelPinError, ModelSpec, resolve_model_pin
 
