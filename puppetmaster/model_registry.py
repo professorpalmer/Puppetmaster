@@ -1165,19 +1165,25 @@ def resolve_model_pin(
     if not needle:
         return None
 
+    eligible = [
+        spec
+        for spec in enabled_specs(registry)
+        if adapter is None or spec.adapter == adapter
+    ]
+    exact_ids = [spec for spec in eligible if spec.id == needle]
+
     token = _normalize_model_token(needle.split("/")[-1])
-    candidates: list[ModelSpec] = []
-    for spec in enabled_specs(registry):
-        if adapter is not None and spec.adapter != adapter:
-            continue
-        if spec.id == needle or spec.adapter_model_name == needle:
-            candidates.append(spec)
-            continue
-        if token and (
-            _normalize_model_token(spec.adapter_model_name) == token
-            or _normalize_model_token(spec.id.split("/")[-1]) == token
-        ):
-            candidates.append(spec)
+    candidates: list[ModelSpec] = list(exact_ids)
+    if not candidates:
+        for spec in eligible:
+            if spec.adapter_model_name == needle:
+                candidates.append(spec)
+                continue
+            if token and (
+                _normalize_model_token(spec.adapter_model_name) == token
+                or _normalize_model_token(spec.id.split("/")[-1]) == token
+            ):
+                candidates.append(spec)
 
     if not candidates:
         return None
