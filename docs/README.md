@@ -2,7 +2,7 @@
 
 The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
 
-**Current release:** [v1.22.4](CHANGELOG.md#v1224) — Grok 4.6 as the Cursor workhorse for ambitious and agentic work (clean rebuild of v1.22.3); see [CHANGELOG.md](CHANGELOG.md) for the full line.
+**Current release:** [v1.22.5](CHANGELOG.md#v1225) — exact registry pins and GPT-5.6 tool reasoning on direct OpenAI; see [CHANGELOG.md](CHANGELOG.md) for the full line.
 
 ## Start here
 

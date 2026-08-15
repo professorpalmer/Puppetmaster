@@ -1,3 +1,20 @@
+## v1.22.5
+
+**Exact registry pins and GPT-5.6 tool reasoning on direct OpenAI.**
+
+Contributor Benton (kbentonferguson) plus a small maintainer follow-up on the
+Sol catalog alias.
+
+- **Exact registry IDs win.** `resolve_model_pin` prefers an exact enabled
+  registry id over adapter-model and normalized-token aliases, so
+  `agentic/gpt-5.6-sol` is not rejected as ambiguous when a Codex sibling
+  shares the same adapter model name. Bare names stay fail-closed. (#22)
+- **Direct OpenAI tool reasoning by family.** Agentic Chat Completions sends
+  `reasoning_effort=none` for GPT-5.6 function-tool requests (named tiers and
+  the catalog alias `gpt-5.6`) so OpenAI accepts tools; older GPT-5 omits the
+  field because they reject `none`. OpenRouter defaults and `openai-codex`
+  Responses mapping are unchanged. (#23)
+
 ## v1.22.4
 
 **Rebuild v1.22.3 from a clean tree so untracked research WIP is not on PyPI.**
