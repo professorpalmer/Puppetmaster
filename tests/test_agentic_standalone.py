@@ -26,6 +26,91 @@ from puppetmaster import providers
 from puppetmaster.models import ArtifactType, Task
 
 
+class AgenticReasoningEffortTests(unittest.TestCase):
+    def _extra(
+        self,
+        provider: str,
+        model: str = "test-model",
+        **payload_overrides: object,
+    ) -> dict:
+        from puppetmaster.adapters.agentic import AgenticAdapter
+
+        payload = {"provider": provider, "model": model, **payload_overrides}
+        task = Task(
+            job_id="reasoning-effort", role="implement", instruction="test",
+            payload=payload,
+        )
+        return AgenticAdapter()._extra_params(task)
+
+    def _openai_wire_body(self, provider: str, model: str, **payload: object) -> dict:
+        captured: dict = {}
+
+        def fake_post_json(*_args, **kwargs):
+            captured.update(kwargs["body"])
+            return {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+
+        extra = self._extra(provider, model=model, **payload)
+        with mock.patch.object(providers, "_post_json", side_effect=fake_post_json):
+            providers._openai_chat(
+                base_url="https://api.openai.com/v1",
+                api_key=None,
+                model=model,
+                messages=[{"role": "user", "content": "test"}],
+                tools=[{"type": "function", "function": {"name": "submit_findings"}}],
+                extra=extra,
+                headers={},
+                timeout=10,
+            )
+        return captured
+
+    def test_direct_openai_gpt56_tool_requests_send_none(self) -> None:
+        for provider in ("openai", "openai-api"):
+            for model in ("gpt-5.6", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"):
+                with self.subTest(provider=provider, model=model):
+                    self.assertEqual(
+                        self._extra(provider, model=model).get("reasoning_effort"),
+                        "none",
+                    )
+                    self.assertEqual(
+                        self._openai_wire_body(provider, model).get("reasoning_effort"),
+                        "none",
+                    )
+
+    def test_direct_openai_older_gpt5_tool_requests_omit_reasoning(self) -> None:
+        for provider in ("openai", "openai-api"):
+            for model in ("gpt-5", "gpt-5.5"):
+                with self.subTest(provider=provider, model=model):
+                    self.assertNotIn("reasoning_effort", self._extra(provider, model=model))
+                    self.assertNotIn(
+                        "reasoning_effort",
+                        self._extra(provider, model=model, reasoning_effort="high"),
+                    )
+                    self.assertNotIn(
+                        "reasoning_effort",
+                        self._openai_wire_body(provider, model),
+                    )
+
+    def test_direct_openai_gpt56_prefixed_alias_sends_none(self) -> None:
+        self.assertEqual(
+            self._extra("openai-api", model="openai/gpt-5.6").get("reasoning_effort"),
+            "none",
+        )
+
+    def test_other_openai_wire_provider_keeps_reasoning_effort(self) -> None:
+        self.assertEqual(
+            self._extra("openrouter", model="gpt-5.6-luna")["reasoning_effort"],
+            "low",
+        )
+
+    def test_openai_codex_responses_behavior_is_preserved(self) -> None:
+        self.assertEqual(
+            self._extra(
+                "openai-codex", model="gpt-5.6-luna", reasoning_effort="high",
+            )["reasoning_effort"],
+            "high",
+        )
+
+
 class ProviderRegistryTests(unittest.TestCase):
     def test_available_providers_reflects_present_keys(self) -> None:
         env = {"ANTHROPIC_API_KEY": "sk-a", "GEMINI_API_KEY": "g"}
