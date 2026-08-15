@@ -65,7 +65,7 @@ class AgenticReasoningEffortTests(unittest.TestCase):
 
     def test_direct_openai_gpt56_tool_requests_send_none(self) -> None:
         for provider in ("openai", "openai-api"):
-            for model in ("gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"):
+            for model in ("gpt-5.6", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"):
                 with self.subTest(provider=provider, model=model):
                     self.assertEqual(
                         self._extra(provider, model=model).get("reasoning_effort"),
@@ -89,6 +89,12 @@ class AgenticReasoningEffortTests(unittest.TestCase):
                         "reasoning_effort",
                         self._openai_wire_body(provider, model),
                     )
+
+    def test_direct_openai_gpt56_prefixed_alias_sends_none(self) -> None:
+        self.assertEqual(
+            self._extra("openai-api", model="openai/gpt-5.6").get("reasoning_effort"),
+            "none",
+        )
 
     def test_other_openai_wire_provider_keeps_reasoning_effort(self) -> None:
         self.assertEqual(

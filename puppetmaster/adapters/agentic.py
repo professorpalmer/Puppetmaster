@@ -485,10 +485,14 @@ class AgenticAdapter(FullEditWorkerAdapter):
         model = str(
             task.payload.get("model") or task.payload.get("adapter_model_name") or ""
         ).strip().lower()
-        direct_openai_gpt56 = direct_openai_api and model.startswith("gpt-5.6-")
+        model_leaf = model.split("/")[-1]
+        # Catalog alias `gpt-5.6` is Sol; hyphenated ids are the named tiers.
         # Direct OpenAI GPT-5.6 Chat Completions defaults reasoning on when the
         # field is omitted, then rejects function tools. Explicit `none` is the
         # accepted tool contract. Older GPT-5 rejects `none`, so omit it there.
+        direct_openai_gpt56 = direct_openai_api and (
+            model_leaf == "gpt-5.6" or model_leaf.startswith("gpt-5.6-")
+        )
         if direct_openai_gpt56:
             extra["reasoning_effort"] = "none"
         elif task.payload.get("reasoning_effort") and not direct_openai_api:

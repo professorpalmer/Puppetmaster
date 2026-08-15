@@ -10664,13 +10664,14 @@ class ModelRouterTests(unittest.TestCase):
         # function tools, while older GPT-5 models reject `none` and work with
         # the field omitted.
         for provider in ("openai", "openai-api"):
-            gpt56_task = Task(
-                job_id="j", role="explore", instruction="x",
-                payload={"provider": provider, "model": "gpt-5.6-luna"},
-            )
-            self.assertEqual(
-                adapter._extra_params(gpt56_task).get("reasoning_effort"), "none"
-            )
+            for model in ("gpt-5.6", "gpt-5.6-luna"):
+                gpt56_task = Task(
+                    job_id="j", role="explore", instruction="x",
+                    payload={"provider": provider, "model": model},
+                )
+                self.assertEqual(
+                    adapter._extra_params(gpt56_task).get("reasoning_effort"), "none"
+                )
             older_task = Task(
                 job_id="j", role="explore", instruction="x",
                 payload={"provider": provider, "model": "gpt-5"},
