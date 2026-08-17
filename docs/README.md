@@ -2,7 +2,7 @@
 
 The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
 
-**Current release:** [v1.22.6](CHANGELOG.md#v1226) — agentic/OpenRouter browser-swarm parity (Hermes preferred; stdlib CDP fallback); see [CHANGELOG.md](CHANGELOG.md) for the full line.
+**Current release:** [v1.22.7](CHANGELOG.md#v1227) — Windows Codex/Claude Code spawn fix (prompts on stdin, not argv); see [CHANGELOG.md](CHANGELOG.md) for the full line.
 
 ## Start here
 

@@ -1,4 +1,4 @@
-## Unreleased
+## v1.22.7
 
 **Fix: Codex and Claude Code worker runs failed to spawn on Windows once the
 prompt got large — `[WinError 206] The filename or extension is too long`.**
