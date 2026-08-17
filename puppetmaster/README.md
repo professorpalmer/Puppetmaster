@@ -45,6 +45,7 @@ The Python package. This is an orientation map, not API docs — for the object 
 | `store_factory.py` | Backend selection (`file` / `sqlite`) |
 | `models.py` | Job / Task / Artifact / AgentRun / MemoryRecord dataclasses + (de)serialization |
 | `state.py` / `config.py` | State-dir resolution and config loading |
+| `research.py` | Durable autoresearch claims, harness runs, typed publishing, leaderboards, and verification |
 
 ## Repo intelligence (CodeGraph)
 
@@ -62,3 +63,6 @@ The Python package. This is an orientation map, not API docs — for the object 
 | `telemetry.py` | Optional OpenTelemetry (zero cost unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set) |
 | `dashboard.py` | Zero-dependency local web board served from durable state |
 | `diagnostics.py` | `doctor` checks (each crash-proofed into a Check result) |
+| `browser.py` | Browser-swarm specs: Hermes preferred, agentic/OpenRouter via stdlib CDP |
+| `browser_cdp.py` | Dependency-free Chrome DevTools engine for agentic browser tools |
+| `cli/commands_research.py` | CLI handlers for the durable `research` experiment loop |

@@ -51,6 +51,8 @@ class _FakeSession:
             return self._page["text"]
         if "location.href" in expr or "href" in expr:
             return self._page["href"]
+        if "__pmNet" in expr or "JSON.stringify" in expr:
+            return self._page.get("network", "[]")
         return None
 
     def shutdown(self):
@@ -103,7 +105,49 @@ class BrowserCdpTest(unittest.TestCase):
 
     def test_dispatch_routes_known_and_unknown(self):
         self.assertIsNotNone(b.dispatch("browser_get_text", {}))
+        self.assertIsNotNone(b.dispatch("browser_network", {}))
         self.assertIsNone(b.dispatch("not_a_browser_tool", {}))
+
+    def test_type_uses_native_value_setter(self):
+        exprs = []
+        orig = self.fake._eval
+
+        def capture(expr):
+            exprs.append(expr)
+            return orig(expr)
+
+        self.fake._eval = capture
+        self.assertIn("Typed into @e2", b.type_text("@e2", "hello"))
+        joined = "\n".join(exprs)
+        self.assertIn("getOwnPropertyDescriptor", joined)
+        self.assertIn("input", joined)
+        self.assertIn("change", joined)
+
+    def test_click_uses_real_mouse_events(self):
+        exprs = []
+        orig = self.fake._eval
+
+        def capture(expr):
+            exprs.append(expr)
+            return orig(expr)
+
+        self.fake._eval = capture
+        self.assertIn("Clicked @e1", b.click("@e1"))
+        joined = "\n".join(exprs)
+        self.assertIn("MouseEvent", joined)
+        self.assertIn("mousedown", joined)
+        self.assertIn("mouseup", joined)
+
+    def test_network_log_empty_and_captured(self):
+        empty = b.network_log()
+        self.assertIn("No captured network traffic", empty)
+        self.fake._page["network"] = (
+            '[{"url":"https://example.com/search","status":200,"body":"<JAD_ERROR>"}]'
+        )
+        captured = b.network_log()
+        self.assertIn("https://example.com/search", captured)
+        self.assertIn("<JAD_ERROR>", captured)
+        self.assertIn("200", captured)
 
     def test_chrome_not_found_message(self):
         saved_find = b._find_chrome

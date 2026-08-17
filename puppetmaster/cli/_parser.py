@@ -1634,10 +1634,11 @@ def build_parser() -> argparse.ArgumentParser:
     browser = subcommands.add_parser(
         "browser",
         help=(
-            "Browser-QA swarm: N parallel Hermes workers, each driving a real "
-            "browser against a live site to capture real network payloads. Bakes "
-            "in the React-controlled-input, network-truth, and strong-model "
-            "guardrails. ACTING AGENT — has external side effects."
+            "Browser-QA swarm: N parallel workers, each driving a real "
+            "browser against a live site to capture real network payloads. "
+            "Hermes is preferred; agentic/OpenRouter uses the stdlib CDP "
+            "engine. Bakes in the React-controlled-input, network-truth, and "
+            "strong-model guardrails. ACTING AGENT — has external side effects."
         ),
     )
     browser.add_argument(
@@ -1649,16 +1650,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--cwd", default=str(Path.cwd()), help="Workspace for repo context."
     )
     browser.add_argument(
+        "--adapter",
+        choices=["hermes", "agentic"],
+        help=(
+            "Browser adapter. Hermes is preferred (agent-browser CLI). "
+            "agentic uses the stdlib CDP engine (OpenRouter / standalone keys). "
+            "Omit to prefer Hermes, falling back to agentic if Hermes is locked out."
+        ),
+    )
+    browser.add_argument(
         "--model",
-        help="Pin the Hermes model (overrides the strong-model routing floor).",
+        help="Pin the model (overrides the strong-model routing floor).",
     )
     browser.add_argument(
         "--provider",
-        help="Hermes provider (e.g. anthropic). Routes credentials/wire protocol.",
+        help=(
+            "Provider slug (Hermes: anthropic/…; agentic: openrouter/openai/…). "
+            "Routes credentials/wire protocol."
+        ),
     )
     browser.add_argument(
         "--toolsets",
-        help="Override the Hermes toolsets (default: file,web,vision,browser).",
+        help="Override toolsets (default: file,web,vision,browser).",
     )
     browser.add_argument(
         "--min-capability",
@@ -1683,8 +1696,225 @@ def build_parser() -> argparse.ArgumentParser:
         default="subprocess",
         help="subprocess (default) runs the workers in parallel; inline serializes them.",
     )
-    browser.add_argument("--executable", help="Override the hermes executable / command.")
+    browser.add_argument(
+        "--executable",
+        help="Override the hermes executable / command (Hermes adapter only).",
+    )
     _add_label_argument(browser)
+
+    research = subcommands.add_parser(
+        "research",
+        help=(
+            "Durable Autoresearch: claim / run / publish / verify experiment loops "
+            "against the Puppetmaster store (not an ephemeral shared transcript)."
+        ),
+    )
+    research.add_argument(
+        "--worker-id",
+        help="Optional stable worker id for claim leases and result attribution.",
+    )
+    research_sub = research.add_subparsers(dest="research_command", required=True)
+
+    research_init = research_sub.add_parser(
+        "init",
+        help="Open a research lab job for a goal.",
+    )
+    research_init.add_argument("goal", help="Research goal / question.")
+    research_init.add_argument(
+        "--label",
+        help="Job label (default: autoresearch-lab).",
+    )
+    research_init.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON.",
+    )
+
+    research_announce = research_sub.add_parser(
+        "announce",
+        help="Post a lab announcement (decision artifact).",
+    )
+    research_announce.add_argument("job_id", help="Research lab job id.")
+    research_announce.add_argument("message", help="Announcement text.")
+    research_announce.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON.",
+    )
+
+    research_think = research_sub.add_parser(
+        "think",
+        help=(
+            "Zero-token artifact recall: status, hypotheses, insights, and "
+            "leaderboard from durable store state (no nested LLM)."
+        ),
+    )
+    research_think.add_argument("job_id", help="Research lab job id.")
+    research_think.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON.",
+    )
+
+    research_claim = research_sub.add_parser(
+        "claim",
+        help="Exclusively claim an experiment fingerprint (optional --run).",
+    )
+    research_claim.add_argument("job_id", help="Research lab job id.")
+    research_claim.add_argument("hypothesis", help="Hypothesis label / name.")
+    research_claim.add_argument(
+        "--harness",
+        help="Harness id (default: toy-compression).",
+    )
+    research_claim.add_argument(
+        "--config",
+        help="Experiment config as a JSON object.",
+    )
+    research_claim.add_argument(
+        "--run",
+        action="store_true",
+        help="Run the claimed experiment immediately after claiming.",
+    )
+    research_claim.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON.",
+    )
+
+    research_publish = research_sub.add_parser(
+        "publish",
+        help="Publish metrics for a claimed task (--metrics JSON and/or --run).",
+    )
+    research_publish.add_argument("job_id", help="Research lab job id.")
+    research_publish.add_argument(
+        "--task-id",
+        required=True,
+        dest="task_id",
+        help="Claimed research-runner task id.",
+    )
+    research_publish.add_argument(
+        "--metrics",
+        help="Metrics JSON object (bits_per_byte, …).",
+    )
+    research_publish.add_argument(
+        "--run",
+        action="store_true",
+        help="Run the claimed task to obtain metrics when --metrics is omitted.",
+    )
+    research_publish.add_argument(
+        "--no-keep",
+        action="store_true",
+        help="Do not mark the published result as a keep candidate.",
+    )
+    research_publish.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON.",
+    )
+
+    research_insight = research_sub.add_parser(
+        "insight",
+        help="Post a durable lab insight.",
+    )
+    research_insight.add_argument("job_id", help="Research lab job id.")
+    research_insight.add_argument("insight", help="Insight claim text.")
+    research_insight.add_argument(
+        "--why",
+        default="",
+        help="Optional rationale.",
+    )
+    research_insight.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON.",
+    )
+
+    research_hypothesis = research_sub.add_parser(
+        "hypothesis",
+        help="Publish a candidate hypothesis for the lab.",
+    )
+    research_hypothesis.add_argument("job_id", help="Research lab job id.")
+    research_hypothesis.add_argument("hypothesis", help="Hypothesis label / name.")
+    research_hypothesis.add_argument(
+        "--why",
+        default="",
+        help="Optional rationale.",
+    )
+    research_hypothesis.add_argument(
+        "--config",
+        help="Optional suggested config as a JSON object.",
+    )
+    research_hypothesis.add_argument(
+        "--harness",
+        help="Optional harness id hint.",
+    )
+    research_hypothesis.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON.",
+    )
+
+    research_verify = research_sub.add_parser(
+        "verify",
+        help="Re-run and verify a published result artifact.",
+    )
+    research_verify.add_argument("job_id", help="Research lab job id.")
+    research_verify.add_argument(
+        "artifact_id",
+        help="Result artifact id to verify.",
+    )
+    research_verify.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON.",
+    )
+
+    research_status = research_sub.add_parser(
+        "status",
+        help="Print research lab status JSON (counts by research_kind, …).",
+    )
+    research_status.add_argument("job_id", help="Research lab job id.")
+
+    research_leaderboard = research_sub.add_parser(
+        "leaderboard",
+        help="Print kept results ranked by bits_per_byte (lower is better).",
+    )
+    research_leaderboard.add_argument("job_id", help="Research lab job id.")
+    research_leaderboard.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON.",
+    )
+
+    research_demo = research_sub.add_parser(
+        "demo",
+        help=(
+            "Run an end-to-end ToyCompressionHarness lab demo "
+            "(claim / run / publish / verify) and write a durable brief."
+        ),
+        description=(
+            "Run an end-to-end ToyCompressionHarness lab demo: claim, run, "
+            "publish, and verify against the durable store, then write a brief."
+        ),
+    )
+    research_demo.add_argument(
+        "--goal",
+        help="Override the demo goal (default built into ResearchLab.run_demo).",
+    )
+    research_demo.add_argument(
+        "--brief-path",
+        dest="brief_path",
+        help="Where to write the demo brief markdown.",
+    )
+    research_demo.add_argument(
+        "--label",
+        help="Job label (default: autoresearch-lab).",
+    )
+    research_demo.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON.",
+    )
 
     demo = subcommands.add_parser("demo", help="Run the Puppetmaster concept demo.")
     demo.add_argument(

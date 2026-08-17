@@ -2,7 +2,7 @@
 
 The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
 
-**Current release:** [v1.22.5](CHANGELOG.md#v1225) — exact registry pins and GPT-5.6 tool reasoning on direct OpenAI; see [CHANGELOG.md](CHANGELOG.md) for the full line.
+**Current release:** [v1.22.6](CHANGELOG.md#v1226) — agentic/OpenRouter browser-swarm parity (Hermes preferred; stdlib CDP fallback); see [CHANGELOG.md](CHANGELOG.md) for the full line.
 
 ## Start here
 
@@ -26,6 +26,7 @@ Reproducible evidence behind the durable-state thesis, including an independent 
 | [State, Not Tokens (paper site)](https://professorpalmer.github.io/durable-state-vs-context/) | The controlled JS→TS migration study + NL2Repo-Bench external validation: **91.1% mean test-pass, ~2.28× the ~40% published SOTA**, with honest limits (the K≈10–12 concurrency cap is a serving-platform property, not durable state) |
 | [Zenodo record (citable, DOI)](https://doi.org/10.5281/zenodo.20709565) | Archived paper + self-contained source; concept DOI resolves to the latest version. Carries the model-attribution caveat and keeps packaging-bound tasks in the denominator |
 | [SWE-bench Lite study](https://github.com/professorpalmer/swebench-pm) | 3-arm controlled cost/quality study on SWE-bench Lite (routing + CodeGraph + durable retries vs a frontier baseline) |
+| [RESEARCH.md](RESEARCH.md) | Durable autoresearch protocol: fingerprinted claims, lease-backed runs, typed publishing, leaderboard recall, and verification by re-run |
 
 ## Concepts & reference
 

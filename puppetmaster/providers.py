@@ -268,11 +268,13 @@ PROVIDER_REGISTRY: dict[str, ProviderDescriptor] = {
         api_key_env_vars=("NOUS_API_KEY", "HERMES_API_KEY"),
         label="Nous Research",
     ),
-    # Z.AI (GLM) OpenAI-compatible PaaS — same keys Marionette keyed pilots use.
+    # Z.AI (GLM) OpenAI-compatible Chat Completions. Default is the GLM
+    # Coding Plan host — pay-as-you-go /api/paas/v4 cannot burn weekly
+    # plan credits. Override with ZAI_BASE_URL for the general API.
     "zai": ProviderDescriptor(
         slug="zai",
         wire="openai",
-        base_url="https://api.z.ai/api/paas/v4",
+        base_url="https://api.z.ai/api/coding/paas/v4",
         base_url_env_var="ZAI_BASE_URL",
         api_key_env_vars=("ZAI_API_KEY", "GLM_API_KEY", "Z_AI_API_KEY"),
         label="Z.AI",

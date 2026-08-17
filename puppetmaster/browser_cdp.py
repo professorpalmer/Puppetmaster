@@ -287,7 +287,12 @@ def navigate(url: str) -> str:
             time.sleep(0.25)
         title = _SESSION._eval("document.title") or ""
         cur = _SESSION._eval("location.href") or url
-        return f"Navigated to {cur}\nTitle: {title}\nCall browser_snapshot to see interactable elements."
+        _install_network_hook()
+        return (
+            f"Navigated to {cur}\nTitle: {title}\n"
+            "Call browser_snapshot to see interactable elements. "
+            "Call browser_network after key actions to read captured request/response bodies."
+        )
     except Exception as e:
         return f"navigate failed: {type(e).__name__}: {e}"
 
@@ -317,11 +322,70 @@ _SNAPSHOT_JS = r"""
 """
 
 
+_NETWORK_HOOK_JS = r"""
+(() => {
+  if (window.__pmNetHooked) return 'already';
+  window.__pmNetHooked = true;
+  window.__pmNet = [];
+  const push = (entry) => {
+    window.__pmNet.push(entry);
+    if (window.__pmNet.length > 80) window.__pmNet.shift();
+  };
+  const origFetch = window.fetch;
+  if (typeof origFetch === 'function') {
+    window.fetch = async function() {
+      const input = arguments[0];
+      const url = (typeof input === 'string') ? input : (input && input.url) || '';
+      try {
+        const res = await origFetch.apply(this, arguments);
+        let body = '';
+        try { body = await res.clone().text(); } catch (e) { body = ''; }
+        push({url: String(url), status: res.status, body: String(body).slice(0, 4000)});
+        return res;
+      } catch (err) {
+        push({url: String(url), error: String(err)});
+        throw err;
+      }
+    };
+  }
+  const XHR = window.XMLHttpRequest;
+  if (XHR && XHR.prototype) {
+    const origOpen = XHR.prototype.open;
+    const origSend = XHR.prototype.send;
+    XHR.prototype.open = function(method, url) {
+      this.__pmUrl = url;
+      return origOpen.apply(this, arguments);
+    };
+    XHR.prototype.send = function() {
+      this.addEventListener('load', function() {
+        push({
+          url: String(this.__pmUrl || ''),
+          status: this.status,
+          body: String(this.responseText || '').slice(0, 4000),
+        });
+      });
+      return origSend.apply(this, arguments);
+    };
+  }
+  return 'installed';
+})()
+"""
+
+
+def _install_network_hook() -> None:
+    """Best-effort fetch/XHR capture so workers can judge by network truth."""
+    try:
+        _SESSION._eval(_NETWORK_HOOK_JS)
+    except Exception:
+        pass
+
+
 def snapshot() -> str:
     err = _SESSION.ensure()
     if err:
         return err
     try:
+        _install_network_hook()
         listing = _SESSION._eval(_SNAPSHOT_JS) or ""
         title = _SESSION._eval("document.title") or ""
         cur = _SESSION._eval("location.href") or ""
@@ -344,7 +408,15 @@ def click(ref: str) -> str:
         return err
     try:
         el = _ref_expr(ref)
-        found = _SESSION._eval(f"(function(){{var e={el};if(!e)return false;e.scrollIntoView({{block:'center'}});e.click();return true;}})()")
+        found = _SESSION._eval(
+            f"(function(){{var e={el};if(!e)return false;"
+            f"e.scrollIntoView({{block:'center'}});"
+            f"var o={{bubbles:true,cancelable:true,view:window}};"
+            f"e.dispatchEvent(new MouseEvent('mousedown',o));"
+            f"e.dispatchEvent(new MouseEvent('mouseup',o));"
+            f"e.dispatchEvent(new MouseEvent('click',o));"
+            f"return true;}})()"
+        )
         if not found:
             return f"click failed: no element for {ref} (run browser_snapshot to refresh refs)."
         time.sleep(0.4)
@@ -362,8 +434,14 @@ def type_text(ref: str, text: str) -> str:
         js_text = json.dumps(text)
         ok = _SESSION._eval(
             f"(function(){{var e={el};if(!e)return false;e.focus();"
-            f"e.value={js_text};e.dispatchEvent(new Event('input',{{bubbles:true}}));"
-            f"e.dispatchEvent(new Event('change',{{bubbles:true}}));return true;}})()")
+            f"var proto=e.tagName==='TEXTAREA'"
+            f"?window.HTMLTextAreaElement.prototype"
+            f":window.HTMLInputElement.prototype;"
+            f"var desc=Object.getOwnPropertyDescriptor(proto,'value');"
+            f"if(desc&&desc.set)desc.set.call(e,{js_text});else e.value={js_text};"
+            f"e.dispatchEvent(new Event('input',{{bubbles:true}}));"
+            f"e.dispatchEvent(new Event('change',{{bubbles:true}}));"
+            f"return true;}})()")
         if not ok:
             return f"type failed: no element for {ref}."
         return f"Typed into {ref}."
@@ -408,6 +486,33 @@ def get_text() -> str:
         return f"get_text failed: {type(e).__name__}: {e}"
 
 
+def network_log() -> str:
+    """Return captured fetch/XHR request/response pairs (network-truth)."""
+    err = _SESSION.ensure()
+    if err:
+        return err
+    try:
+        _install_network_hook()
+        raw = _SESSION._eval(
+            "JSON.stringify(window.__pmNet || [])"
+        )
+        if not raw or raw in ("[]", "null"):
+            return (
+                "No captured network traffic yet. Trigger the action "
+                "(submit/search), then call browser_network again. "
+                "Judge success by status AND body — HTTP 200 can carry an error."
+            )
+        body = raw if isinstance(raw, str) else json.dumps(raw)
+        if len(body) > _TEXT_LIMIT:
+            body = body[:_TEXT_LIMIT] + "\n... (network log truncated)"
+        return (
+            "Captured fetch/XHR traffic (judge by status AND body; "
+            f"HTTP 200 can hide an application error):\n{body}"
+        )
+    except Exception as e:
+        return f"network_log failed: {type(e).__name__}: {e}"
+
+
 def screenshot(out_dir: Optional[str] = None) -> str:
     err = _SESSION.ensure()
     if err:
@@ -441,6 +546,8 @@ def dispatch(name: str, args: dict, out_dir: Optional[str] = None) -> Optional[s
         return back()
     if name == "browser_get_text":
         return get_text()
+    if name == "browser_network":
+        return network_log()
     if name == "browser_screenshot":
         return screenshot(out_dir)
     return None
@@ -448,5 +555,6 @@ def dispatch(name: str, args: dict, out_dir: Optional[str] = None) -> Optional[s
 
 BROWSER_TOOL_NAMES = (
     "browser_navigate", "browser_snapshot", "browser_click", "browser_type",
-    "browser_scroll", "browser_back", "browser_get_text", "browser_screenshot",
+    "browser_scroll", "browser_back", "browser_get_text", "browser_network",
+    "browser_screenshot",
 )

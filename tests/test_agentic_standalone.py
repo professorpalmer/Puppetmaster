@@ -2507,6 +2507,78 @@ class AgenticLoopTests(unittest.TestCase):
         from puppetmaster.adapters.agentic import AgenticAdapter
         return AgenticAdapter()
 
+    def test_browser_tools_absent_by_default(self) -> None:
+        schema = self.adapter()._tool_schema(
+            implement=False, task=_task({"cwd": "."}), graph_on=False
+        )
+        names = {t["function"]["name"] for t in schema}
+        self.assertNotIn("browser_navigate", names)
+
+    def test_browser_tools_registered_when_allow_browser(self) -> None:
+        schema = self.adapter()._tool_schema(
+            implement=False,
+            task=_task({"cwd": ".", "allow_browser": True}),
+            graph_on=False,
+        )
+        names = {t["function"]["name"] for t in schema}
+        for tool in (
+            "browser_navigate",
+            "browser_snapshot",
+            "browser_click",
+            "browser_type",
+            "browser_scroll",
+            "browser_back",
+            "browser_get_text",
+            "browser_screenshot",
+        ):
+            self.assertIn(tool, names)
+        # web_fetch stays opt-in via allow_web (browser swarm sets both).
+        self.assertNotIn("web_fetch", names)
+
+    def test_browser_tools_registered_via_toolsets(self) -> None:
+        schema = self.adapter()._tool_schema(
+            implement=False,
+            task=_task({"cwd": ".", "toolsets": "file,web,vision,browser"}),
+            graph_on=False,
+        )
+        names = {t["function"]["name"] for t in schema}
+        self.assertIn("browser_navigate", names)
+
+    def test_browser_guardrails_are_described_for_allow_browser(self) -> None:
+        schema = self.adapter()._tool_schema(
+            implement=False,
+            task=_task({"cwd": ".", "allow_browser": True}),
+            graph_on=False,
+        )
+        descriptions = " ".join(
+            tool["function"]["description"]
+            for tool in schema
+            if tool["function"]["name"].startswith("browser_")
+        )
+        self.assertIn("React-controlled", descriptions)
+        self.assertIn("HTTP 200", descriptions)
+
+    def test_browser_tool_dispatch_uses_cdp(self) -> None:
+        from unittest import mock
+
+        import puppetmaster.browser_cdp as bcdp
+
+        adapter = self.adapter()
+        task = _task({"cwd": ".", "allow_browser": True})
+        with mock.patch.object(
+            bcdp, "dispatch", return_value="Navigated to https://example.com"
+        ) as dispatch:
+            out = adapter._execute_tool(
+                "browser_navigate",
+                {"url": "https://example.com"},
+                Path("."),
+                False,
+                task,
+            )
+        self.assertIn("Navigated", out)
+        dispatch.assert_called_once()
+        self.assertEqual(dispatch.call_args.args[0], "browser_navigate")
+
 def _git_repo(test) -> Path:
     tmp = tempfile.TemporaryDirectory()
     test.addCleanup(tmp.cleanup)

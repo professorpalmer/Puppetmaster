@@ -1,3 +1,46 @@
+## v1.22.6
+
+**Agentic/OpenRouter browser-swarm parity and durable autoresearch.**
+
+Browser QA is no longer Hermes-only. The first-class `puppetmaster browser` /
+`puppetmaster_start_browser_swarm` verb still prefers Hermes (`hermes chat -t
+browser`, including private-URL local-engine fallback) and now accepts
+`--adapter agentic` / MCP `adapter=agentic` for the standalone keys stack
+(OpenRouter and other agentic providers) through the existing stdlib CDP
+engine. Same acting-agent banner, React-controlled-input native setter,
+network-truth capture, and strong-model floor (`min_capability=80`).
+
+- **Adapter selection.** `resolve_browser_adapter` prefers Hermes when enabled,
+  falls back to agentic when Hermes is locked out, and fails closed with a
+  precise `platform enable` remediation when neither is usable. Explicit pins
+  (`hermes` / `agentic`) are validated against the platform lock.
+- **Agentic specs stay analysis.** Agentic browser workers set `mode=analyze`,
+  `allow_browser=true`, and `no_edit=true` so `swarm_mode` stays `analysis`
+  (no clean-tree guard) while `payload.side_effecting` still raises the
+  ACTING AGENT banner.
+- **CDP guardrails.** `browser_type` uses the native value setter + bubbling
+  `input`/`change` events; `browser_click` dispatches real `mousedown` /
+  `mouseup` / `click` MouseEvents; new `browser_network` returns captured
+  fetch/XHR URL, status, and body so workers can judge HTTP 200 error
+  envelopes. Wired into the agentic tool schema.
+- **Surfaces.** CLI `--adapter hermes|agentic` and MCP `adapter` enum on
+  `puppetmaster_start_browser_swarm`. Provider slug is adapter-aware
+  (Hermes: anthropic/…; agentic: openrouter/openai/…).
+- **Docs.** FEATURES / CLI_REFERENCE / ADAPTERS / AGENTS / bundled skill
+  updated; Hermes remains the preferred browser adapter, not the only one.
+- **Tests.** `tests/test_browser_swarm.py` covers resolve/fallback, agentic
+  spec guardrails, CLI/MCP adapter selection, and CDP tool dispatch.
+  `tests/test_browser_cdp.py` locks the native setter, MouseEvents, and
+  network-log surface.
+- **Durable autoresearch.** `puppetmaster research` now provides
+  fingerprinted claims, lease-backed harness runs, typed result publishing,
+  zero-token `think` recall, leaderboards, and verification by re-run.
+  `ToyCompressionHarness` makes the protocol runnable without a GPU; see
+  `docs/RESEARCH.md` for the extension contract.
+- **Packaging and documentation.** The public README, feature matrix, CLI
+  reference, adapter guide, package source map, bundled skill, and docs index
+  now describe the v1.22.6 browser and research surfaces consistently.
+
 ## v1.22.5
 
 **Exact registry pins and GPT-5.6 tool reasoning on direct OpenAI.**

@@ -1443,15 +1443,16 @@ def _build_tools() -> list[McpTool]:
         McpTool(
             name="puppetmaster_start_browser_swarm",
             description=(
-                "Start a browser-QA swarm: N parallel Hermes workers, each driving a REAL "
+                "Start a browser-QA swarm: N parallel workers, each driving a REAL "
                 "browser against a LIVE site to capture real network payloads (the QA "
-                "that mock-backend tests and read-only repo analysis cannot reach). Bakes "
-                "in three guardrails: React-controlled-input native-event entry, "
-                "network-truth (a 200 can hide an error body), and a strong-model "
-                "capability floor (cheap models fail browser grounding and lie about it). "
-                "ACTING AGENT — workers have external side effects (logins, form fills), so "
-                "treat with implement-style approval. Requires the Hermes platform. Returns "
-                "job_id immediately."
+                "that mock-backend tests and read-only repo analysis cannot reach). "
+                "Hermes is preferred (agent-browser CLI); pass adapter=agentic for the "
+                "stdlib CDP / OpenRouter path. Bakes in three guardrails: "
+                "React-controlled-input native-event entry, network-truth (a 200 can "
+                "hide an error body), and a strong-model capability floor (cheap models "
+                "fail browser grounding and lie about it). ACTING AGENT — workers have "
+                "external side effects (logins, form fills), so treat with "
+                "implement-style approval. Returns job_id immediately."
             ),
             input_schema=browser_swarm_schema(),
             handler=start_browser_swarm,
@@ -2361,6 +2362,8 @@ def browser_swarm_command(args: JsonObject) -> list[str]:
     if not tasks:
         raise ValueError("browser: 'tasks' must be a non-empty string or list of strings")
     command = ["browser", *tasks, "--cwd", cwd(args)]
+    if args.get("adapter"):
+        command.extend(["--adapter", str(args["adapter"])])
     if args.get("model"):
         command.extend(["--model", str(args["model"])])
     if args.get("provider"):
@@ -2383,22 +2386,22 @@ def browser_swarm_command(args: JsonObject) -> list[str]:
 def start_browser_swarm(args: JsonObject) -> JsonObject:
     """Start a browser-QA swarm asynchronously and return job_id immediately.
 
-    Validates that Hermes (the only browser-capable adapter) is enabled before
-    dispatching, so a platform-locked host gets a precise error instead of
-    workers that silently cannot carry the toolset.
+    Hermes is preferred; agentic/OpenRouter is the CDP fallback. Validates
+    that a browser-capable adapter is enabled before dispatching, so a
+    platform-locked host gets a precise error instead of workers that
+    silently cannot carry the toolset.
     """
-    from puppetmaster import platform_lock
-    from puppetmaster.browser import BROWSER_ADAPTER
+    from puppetmaster.browser import BrowserAdapterUnavailable, resolve_browser_adapter
 
-    if not platform_lock.is_adapter_enabled(BROWSER_ADAPTER):
-        return tool_error(
-            f"the {BROWSER_ADAPTER!r} adapter is disabled by the platform lock, "
-            "but it is the only adapter that can drive a browser.",
-            {
-                "enabled": sorted(platform_lock.enabled_adapters()),
-                "fix": f"puppetmaster platform enable {BROWSER_ADAPTER}",
-            },
-        )
+    try:
+        resolve_browser_adapter(args.get("adapter") if args.get("adapter") else None)
+    except BrowserAdapterUnavailable as exc:
+        details: JsonObject = {"enabled": sorted(exc.enabled)}
+        if exc.requested is not None:
+            details["requested"] = exc.requested
+        if exc.fix:
+            details["fix"] = exc.fix
+        return tool_error(str(exc), details)
     try:
         command = browser_swarm_command(args)
     except ValueError as exc:
@@ -4494,17 +4497,28 @@ def browser_swarm_schema() -> JsonObject:
                 "type": "string",
                 "description": "Workspace/repo for context. Defaults to the server's cwd.",
             },
+            "adapter": {
+                "type": "string",
+                "enum": ["hermes", "agentic"],
+                "description": (
+                    "Browser adapter. Hermes is preferred (agent-browser CLI). "
+                    "agentic uses the stdlib CDP engine (OpenRouter / standalone keys). "
+                    "Omit to prefer Hermes, falling back to agentic if Hermes is locked out."
+                ),
+            },
             "model": {
                 "type": "string",
-                "description": "Pin the Hermes model (overrides the strong-model routing floor).",
+                "description": "Pin the model (overrides the strong-model routing floor).",
             },
             "provider": {
                 "type": "string",
-                "description": "Hermes provider (e.g. anthropic).",
+                "description": (
+                    "Provider slug (Hermes: anthropic/…; agentic: openrouter/openai/…)."
+                ),
             },
             "toolsets": {
                 "type": "string",
-                "description": "Override Hermes toolsets (default: file,web,vision,browser).",
+                "description": "Override toolsets (default: file,web,vision,browser).",
             },
             "min_capability": {
                 "type": "integer",

@@ -26,7 +26,7 @@ class ZaiProviderTests(unittest.TestCase):
         assert desc is not None
         self.assertEqual(desc.slug, "zai")
         self.assertEqual(desc.wire, "openai")
-        self.assertEqual(desc.base_url, "https://api.z.ai/api/paas/v4")
+        self.assertEqual(desc.base_url, "https://api.z.ai/api/coding/paas/v4")
         self.assertEqual(
             desc.api_key_env_vars,
             ("ZAI_API_KEY", "GLM_API_KEY", "Z_AI_API_KEY"),
@@ -44,6 +44,20 @@ class ZaiProviderTests(unittest.TestCase):
 
     def test_env_hint(self) -> None:
         self.assertIn("ZAI_API_KEY", _PROVIDER_ENV_HINTS["zai"])
+
+    def test_resolve_base_url_defaults_to_coding_plan(self) -> None:
+        desc = providers.get_provider("zai")
+        assert desc is not None
+        self.assertEqual(
+            providers.resolve_base_url(desc, {}),
+            "https://api.z.ai/api/coding/paas/v4",
+        )
+        self.assertEqual(
+            providers.resolve_base_url(
+                desc, {"ZAI_BASE_URL": "https://api.z.ai/api/paas/v4"}
+            ),
+            "https://api.z.ai/api/paas/v4",
+        )
 
 
 class MinimaxProviderTests(unittest.TestCase):
