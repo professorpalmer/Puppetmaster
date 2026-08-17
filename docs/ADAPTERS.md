@@ -64,7 +64,7 @@ Requirements:
 
 ### `claude-code`
 
-Runs the Claude Code CLI in non-interactive mode and allows real repository edits.
+Runs the Claude Code CLI in non-interactive mode and allows real repository edits. The prompt is piped on stdin (`claude --print` with no positional) so a large enriched prompt stays under Windows' 32767-character `CreateProcess` cap.
 
 Requirements:
 
@@ -127,7 +127,7 @@ Requirements:
 
 ### `codex`
 
-Shells out to the official OpenAI Codex CLI (`codex exec --json`) — the OpenAI-side analog of the Claude Code CLI. The Codex CLI ships a real coding-agent loop (file edits, shell, search, tool use) on top of `gpt-5.5` / `gpt-5.4` / `gpt-5.4-mini`, so the adapter can act on the repo, not just answer.
+Shells out to the official OpenAI Codex CLI (`codex exec --json`) — the OpenAI-side analog of the Claude Code CLI. The Codex CLI ships a real coding-agent loop (file edits, shell, search, tool use) on top of `gpt-5.5` / `gpt-5.4` / `gpt-5.4-mini`, so the adapter can act on the repo, not just answer. The prompt is piped on stdin (`codex exec -`) so a large enriched prompt stays under Windows' 32767-character `CreateProcess` cap.
 
 This adapter is the most telemetry-rich of the four live adapters: it parses Codex's structured JSONL event stream (`--json`) and captures real `input_tokens`, `output_tokens`, `cached_input_tokens`, `reasoning_output_tokens`, and `thread_id` from `turn.completed.usage` into the verification artifact payload. The full event stream is spooled to a sidecar log so nothing is silently dropped.
 
