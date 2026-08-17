@@ -202,6 +202,8 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
         return CliInvocation(
             command=command,
             sidecar_name="claude_implement",
+            # The prompt travels on stdin, not argv — see build_claude_code_command.
+            subprocess_kwargs={"stdin_data": prompt},
             extras={
                 "prompt": prompt,
                 "codegraph_used": codegraph_used,
@@ -389,7 +391,7 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
 
 def build_claude_code_command(
     *,
-    prompt: str,
+    prompt: Optional[str] = None,
     executable: Union[str, list[str]] = "claude",
     model: object = None,
     output_format: str = "json",
@@ -398,8 +400,18 @@ def build_claude_code_command(
     disallowed_tools: object = None,
     extra_args: object = None,
 ) -> list[str]:
+    """Build the non-interactive ``claude --print`` argv.
+
+    ``--print`` with no prompt positional makes the CLI read its prompt from
+    stdin, which the caller supplies via
+    ``CliInvocation.subprocess_kwargs['stdin_data']``. Keeping the prompt out of
+    argv is what makes a large enriched prompt spawnable on Windows, where
+    ``CreateProcess`` rejects any command line past 32767 characters with
+    ``[WinError 206]``. ``prompt`` is accepted and ignored so this exported
+    signature stays source-compatible.
+    """
     command = command_parts(executable)
-    command.extend(["--print", prompt, "--output-format", output_format])
+    command.extend(["--print", "--output-format", output_format])
     if model:
         command.extend(["--model", str(model)])
     if permission_mode:

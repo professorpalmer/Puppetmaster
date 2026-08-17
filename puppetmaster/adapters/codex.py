@@ -132,7 +132,6 @@ class CodexAdapter(CliWorkerAdapter):
         skip_git_repo_check = bool(task.payload.get("skip_git_repo_check", True))
         command = build_codex_exec_command(
             executable=[resolved, *command_base[1:]],
-            prompt=prompt,
             model=model,
             cwd=cwd,
             sandbox=sandbox,
@@ -146,6 +145,8 @@ class CodexAdapter(CliWorkerAdapter):
         return CliInvocation(
             command=command,
             sidecar_name="codex_exec",
+            # The prompt travels on stdin, not argv — see build_codex_exec_command.
+            subprocess_kwargs={"stdin_data": prompt},
             extras={
                 "prompt": prompt,
                 "codegraph_used": codegraph_used,
@@ -417,7 +418,7 @@ class CodexAdapter(CliWorkerAdapter):
 def build_codex_exec_command(
     *,
     executable: Union[str, list[str]] = "codex",
-    prompt: str,
+    prompt: Optional[str] = None,
     model: Optional[str] = None,
     cwd: Optional[Path] = None,
     sandbox: str = "workspace-write",
@@ -427,6 +428,16 @@ def build_codex_exec_command(
     dangerously_bypass: bool = False,
     extra_args: object = None,
 ) -> list[str]:
+    """Build the non-interactive ``codex exec`` argv.
+
+    The prompt is **not** part of the command: the trailing ``-`` positional
+    tells ``codex exec`` to read its instructions from stdin, and the caller
+    feeds them through ``CliInvocation.subprocess_kwargs['stdin_data']``. An
+    enriched Puppetmaster prompt routinely runs past Windows' 32767-character
+    ``CreateProcess`` command-line cap, which fails the spawn outright with
+    ``[WinError 206]``; stdin has no such limit. ``prompt`` is accepted and
+    ignored so this exported signature stays source-compatible.
+    """
     command = command_parts(executable)
     command.append("exec")
     command.extend(["--json"])
@@ -445,7 +456,10 @@ def build_codex_exec_command(
         command.extend(["-m", str(model)])
     if extra_args:
         command.extend(command_parts(extra_args))
-    command.append(prompt)
+    # Read the prompt from stdin. Never pass a prompt positional as well: codex
+    # then appends the piped text as a separate `<stdin>` block instead of
+    # treating it as the instruction.
+    command.append("-")
     return command
 
 
