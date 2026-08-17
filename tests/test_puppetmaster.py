@@ -5877,6 +5877,22 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertIn("--allowedTools", command)
         self.assertIn("Read,Edit,Bash", command)
 
+    def test_claude_command_stays_under_windows_command_line_cap(self) -> None:
+        """Regression: a large enriched prompt used to be appended after
+        `--print`, so `CreateProcess` rejected the spawn with WinError 206 once
+        the joined command line passed 32767 characters."""
+        import subprocess as _subprocess
+
+        prompt = "\n".join(f"# context filler line {i}" for i in range(2000))
+        self.assertGreater(len(prompt), 32767)
+        cmd = build_claude_code_command(
+            prompt=prompt,
+            executable=["claude"],
+            model="claude-opus-5",
+        )
+        self.assertNotIn(prompt, cmd)
+        self.assertLess(len(_subprocess.list2cmdline(cmd)), 32767)
+
     def test_claude_code_missing_cli_returns_blocked_artifact(self) -> None:
         task = Task(
             job_id="job",
@@ -7347,6 +7363,39 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
         # then treat the piped text as a trailing `<stdin>` block, not the task.
         self.assertNotIn(stdin_data, command)
 
+    def test_claude_code_adapter_sends_prompt_on_stdin_not_argv(self) -> None:
+        """The adapter must hand the prompt to the runner as `stdin_data` and
+        leave `--print` without a prompt positional."""
+        streamed = StreamedProcess(
+            returncode=0,
+            stdout=json.dumps({"result": "done", "is_error": False}),
+            stderr="",
+            timed_out=False,
+            live_log_path=None,
+        )
+        task = Task(
+            id="t-claude-stdin",
+            job_id="job-claude-stdin",
+            role="claude-code",
+            adapter="claude-code",
+            instruction="Implement the change.",
+            payload={"cwd": str(Path.cwd()), "allow_dirty": True, "disable_codegraph": True},
+        )
+        clean = {"sha": "s", "changed_files": [], "untracked_files": [], "diff": ""}
+        with patch("puppetmaster.adapters.resolve_command", return_value="/usr/bin/claude"), patch(
+            "puppetmaster.adapters.worktree_guard", return_value=None
+        ), patch("puppetmaster.adapters.git_snapshot", side_effect=[clean, clean]), patch(
+            "puppetmaster.adapters.run_streamed_subprocess", return_value=streamed
+        ) as streamed_run:
+            ClaudeCodeAdapter().run(task, "goal", "worker")
+
+        kwargs = streamed_run.call_args.kwargs
+        command = kwargs["command"]
+        self.assertEqual(command[1], "--print")
+        stdin_data = kwargs["stdin_data"]
+        self.assertIn("Implement the change.", stdin_data)
+        self.assertNotIn(stdin_data, command)
+
     def test_run_streamed_subprocess_feeds_stdin_data_to_child(self) -> None:
         """`stdin_data` must reach the child verbatim and then EOF, so a CLI
         that reads its prompt from stdin terminates instead of hanging."""
@@ -7435,6 +7484,42 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
         self.assertFalse(result.timed_out)
         self.assertEqual(result.returncode, 0)
         self.assertIn("ignored stdin", result.stdout)
+
+    def test_run_streamed_subprocess_winerror_206_reports_command_line_length(self) -> None:
+        """WinError 206 reads like a bad path; the spawn path must name the real
+        CreateProcess command-line cap so argv regressions are diagnosable."""
+        import subprocess as _subprocess
+        from unittest.mock import patch
+
+        from puppetmaster.adapters import run_streamed_subprocess
+
+        long_arg = "x" * 40000
+        command = ["codex", "exec", long_arg]
+        task = Task(
+            id="t-win206",
+            job_id="job-win206",
+            role="codex-review",
+            adapter="codex",
+            instruction="x",
+            payload={},
+        )
+        err = OSError()
+        err.winerror = 206  # type: ignore[attr-defined]
+        err.strerror = "The filename or extension is too long"
+        err.errno = 206
+
+        with patch.object(_subprocess, "Popen", side_effect=err):
+            result = run_streamed_subprocess(
+                command=command,
+                env=None,
+                task=task,
+                sidecar_name="win206_probe",
+                timeout_seconds=5,
+            )
+
+        self.assertIsNotNone(result.spawn_error)
+        self.assertIn("32767", result.spawn_error)
+        self.assertIn(str(len(_subprocess.list2cmdline(command))), result.spawn_error)
 
     def test_parse_codex_events_skips_banners_and_invalid_json(self) -> None:
         """Codex CLI mixes a few non-JSON banner lines into its --json
@@ -9345,6 +9430,7 @@ class ModelRouterTests(unittest.TestCase):
             model="claude-fable-5",
             extra_args=["--effort", "low"],
         )
+        self.assertNotIn("do the thing", command)
         self.assertIn("--effort", command)
         self.assertEqual(command[command.index("--effort") + 1], "low")
 
