@@ -5869,6 +5869,9 @@ class PuppetmasterTests(unittest.TestCase):
         )
 
         self.assertEqual(command[:2], ["claude", "--print"])
+        # The prompt is fed on stdin, never as argv: Windows caps a command line
+        # at 32767 chars and an enriched prompt blows straight past it.
+        self.assertNotIn("Implement the change", command)
         self.assertIn("--permission-mode", command)
         self.assertIn("acceptEdits", command)
         self.assertIn("--allowedTools", command)
@@ -7242,12 +7245,13 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
         """The Codex command builder must produce the non-interactive
         flag soup that v0.7.0 ships by default: `exec --json`,
         `approval_policy="never"`, `--sandbox`, `--ephemeral`,
-        `--skip-git-repo-check`, `-C cwd`, `-m model`, and the prompt as
-        the final positional argument. Asserting on the exact command
-        shape protects against accidental regressions."""
+        `--skip-git-repo-check`, `-C cwd`, `-m model`, and `-` as the
+        final positional argument so the prompt is read from stdin
+        rather than argv (Windows caps a command line at 32767 chars).
+        Asserting on the exact command shape protects against accidental
+        regressions."""
         cmd = build_codex_exec_command(
             executable=["codex"],
-            prompt="hello world",
             model="gpt-5.4-mini",
             cwd=Path("/tmp/codex-test-cwd"),
             sandbox="workspace-write",
@@ -7270,18 +7274,167 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
         self.assertIn(str(Path("/tmp/codex-test-cwd")), cmd)
         self.assertIn("-m", cmd)
         self.assertIn("gpt-5.4-mini", cmd)
-        self.assertEqual(cmd[-1], "hello world")
+        self.assertEqual(cmd[-1], "-")
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", cmd)
 
     def test_build_codex_exec_command_with_danger_bypass(self) -> None:
         cmd = build_codex_exec_command(
             executable=["codex"],
-            prompt="audit",
             model=None,
             sandbox="workspace-write",
             dangerously_bypass=True,
         )
         self.assertIn("--dangerously-bypass-approvals-and-sandbox", cmd)
+
+    def test_codex_command_stays_under_windows_command_line_cap(self) -> None:
+        """Regression: a large enriched prompt used to be appended to argv, so
+        `CreateProcess` rejected the spawn outright with `[WinError 206] The
+        filename or extension is too long` once the joined command line passed
+        32767 characters. The prompt must not appear in argv at any size."""
+        import subprocess as _subprocess
+
+        prompt = "\n".join(f"# context filler line {i}" for i in range(2000))
+        self.assertGreater(len(prompt), 32767)
+        cmd = build_codex_exec_command(
+            executable=["codex"],
+            prompt=prompt,
+            model="gpt-5.4-mini",
+            cwd=Path("/tmp/codex-test-cwd"),
+        )
+        self.assertNotIn(prompt, cmd)
+        # list2cmdline is what subprocess hands to CreateProcess on Windows, so
+        # measure the real joined line rather than len(prompt): quote/backslash
+        # escaping inflates it well beyond the raw character count.
+        self.assertLess(len(_subprocess.list2cmdline(cmd)), 32767)
+
+    def test_codex_adapter_sends_prompt_on_stdin_not_argv(self) -> None:
+        """The adapter must hand the prompt to the runner as `stdin_data` and
+        leave a bare `-` in argv for `codex exec` to read stdin from."""
+        streamed = StreamedProcess(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": "done"},
+                }
+            ),
+            stderr="",
+            timed_out=False,
+            live_log_path=None,
+        )
+        task = Task(
+            id="t-codex-stdin",
+            job_id="job-codex-stdin",
+            role="codex-review",
+            adapter="codex",
+            instruction="Review the repo.",
+            payload={"cwd": str(Path.cwd()), "sandbox": "read-only", "disable_codegraph": True},
+        )
+        clean = {"sha": "s", "changed_files": [], "untracked_files": [], "diff": ""}
+        with patch("puppetmaster.adapters.resolve_command", return_value="/usr/bin/codex"), patch(
+            "puppetmaster.adapters.git_snapshot", side_effect=[clean, clean]
+        ), patch(
+            "puppetmaster.adapters.run_streamed_subprocess", return_value=streamed
+        ) as streamed_run:
+            CodexAdapter().run(task, "goal", "worker")
+
+        kwargs = streamed_run.call_args.kwargs
+        command = kwargs["command"]
+        self.assertEqual(command[-1], "-")
+        stdin_data = kwargs["stdin_data"]
+        self.assertIn("Review the repo.", stdin_data)
+        # The prompt must not have leaked into argv alongside stdin: codex would
+        # then treat the piped text as a trailing `<stdin>` block, not the task.
+        self.assertNotIn(stdin_data, command)
+
+    def test_run_streamed_subprocess_feeds_stdin_data_to_child(self) -> None:
+        """`stdin_data` must reach the child verbatim and then EOF, so a CLI
+        that reads its prompt from stdin terminates instead of hanging."""
+        from puppetmaster.adapters import run_streamed_subprocess
+
+        task = Task(
+            id="t-stdin-data",
+            job_id="job-stdin-data",
+            role="codex-review",
+            adapter="codex",
+            instruction="x",
+            payload={},
+        )
+        result = run_streamed_subprocess(
+            command=[
+                sys.executable,
+                "-c",
+                "import sys; sys.stdout.write(sys.stdin.read())",
+            ],
+            env=None,
+            task=task,
+            sidecar_name="stdin_data_probe",
+            timeout_seconds=30,
+            stdin_data="hello from stdin",
+        )
+        self.assertFalse(result.timed_out)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("hello from stdin", result.stdout)
+
+    def test_run_streamed_subprocess_large_stdin_data_does_not_deadlock(self) -> None:
+        """A payload larger than the OS pipe buffer must not wedge the runner.
+
+        Writing from the calling thread would block before `process.wait()` can
+        time the child out; the write has to happen on its own thread while the
+        stdout readers keep draining.
+        """
+        from puppetmaster.adapters import run_streamed_subprocess
+
+        payload = "\n".join(f"line {i} of a very large prompt" for i in range(20000))
+        self.assertGreater(len(payload), 500_000)
+        task = Task(
+            id="t-stdin-big",
+            job_id="job-stdin-big",
+            role="codex-review",
+            adapter="codex",
+            instruction="x",
+            payload={},
+        )
+        result = run_streamed_subprocess(
+            command=[
+                sys.executable,
+                "-c",
+                "import sys; sys.stdout.write(str(len(sys.stdin.read())))",
+            ],
+            env=None,
+            task=task,
+            sidecar_name="stdin_big_probe",
+            timeout_seconds=60,
+            stdin_data=payload,
+        )
+        self.assertFalse(result.timed_out)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(str(len(payload)), result.stdout)
+
+    def test_run_streamed_subprocess_stdin_data_survives_child_ignoring_it(self) -> None:
+        """A child that exits without draining stdin must not raise or hang the
+        runner — the writer swallows the broken pipe and the rc still lands."""
+        from puppetmaster.adapters import run_streamed_subprocess
+
+        task = Task(
+            id="t-stdin-ignored",
+            job_id="job-stdin-ignored",
+            role="codex-review",
+            adapter="codex",
+            instruction="x",
+            payload={},
+        )
+        result = run_streamed_subprocess(
+            command=[sys.executable, "-c", "print('ignored stdin')"],
+            env=None,
+            task=task,
+            sidecar_name="stdin_ignored_probe",
+            timeout_seconds=30,
+            stdin_data="\n".join(f"unread line {i}" for i in range(20000)),
+        )
+        self.assertFalse(result.timed_out)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("ignored stdin", result.stdout)
 
     def test_parse_codex_events_skips_banners_and_invalid_json(self) -> None:
         """Codex CLI mixes a few non-JSON banner lines into its --json

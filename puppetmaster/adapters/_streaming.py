@@ -174,6 +174,7 @@ def run_streamed_subprocess(
     cwd: Optional[str] = None,
     heartbeat_seconds: float = 30.0,
     start_new_session: bool = False,
+    stdin_data: Optional[str] = None,
 ) -> StreamedProcess:
     """Run ``command`` while teeing its output to a live sidecar log.
 
@@ -184,6 +185,16 @@ def run_streamed_subprocess(
     they arrive and writes a ``still working`` heartbeat every
     ``heartbeat_seconds`` of the run, so the log visibly grows. Returns separate
     stdout/stderr buffers so existing artifact payloads are unchanged.
+
+    ``stdin_data`` feeds text to the child on stdin instead of closing it. Agent
+    CLIs take their prompt either as an argv positional or on stdin, and on
+    Windows argv is not an option for a large prompt: ``CreateProcess`` caps the
+    whole command line at 32767 characters, so an enriched prompt fails the spawn
+    outright with ``[WinError 206] The filename or extension is too long``. The
+    payload is written from a daemon thread (never the caller's) so the
+    ``process.wait(timeout=...)`` below keeps governing a child that does not
+    drain stdin, and stdin is always closed afterwards to preserve the "an agent
+    CLI must never block forever on terminal input" invariant.
     """
     import threading
     import time as _time
@@ -243,7 +254,9 @@ def run_streamed_subprocess(
             # Close stdin: an agent CLI launched in a non-interactive worker must
             # never block forever waiting on terminal input (a silent "stall").
             # Callers that previously passed input="" rely on this EOF behavior.
-            stdin=subprocess.DEVNULL,
+            # When stdin_data is supplied the pipe is opened instead, written by
+            # the daemon writer below, and then closed — same EOF guarantee.
+            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             # Never decode Cursor/agent SDK output with the Windows ANSI code
@@ -261,6 +274,16 @@ def run_streamed_subprocess(
         # leak, and surface a structured failure instead of letting the OSError
         # escape the adapter.
         message = redact_secrets(f"{type(exc).__name__}: {exc}") or "spawn_error"
+        if getattr(exc, "winerror", None) == 206:
+            # WinError 206 reads like a bad path ("filename or extension is too
+            # long") but is really the 32767-char CreateProcess command-line cap.
+            # Name the real cause so this is not misdiagnosed as a missing CLI.
+            message = (
+                f"{message} (command line is "
+                f"{len(subprocess.list2cmdline(command))} characters; Windows "
+                "CreateProcess caps it at 32767 - send large input via "
+                "stdin_data instead of argv)"
+            )
         if live_handle is not None:
             try:
                 live_handle.write(f"[puppetmaster] spawn failed: {message}\n")
@@ -299,6 +322,25 @@ def run_streamed_subprocess(
     ]
     for thread in threads:
         thread.start()
+
+    if stdin_data is not None and getattr(process, "stdin", None) is not None:
+        # Daemon, and started only after the readers are draining: a large
+        # payload can exceed the pipe buffer, so writing from this function
+        # would block before process.wait() below could time the child out.
+        def _writer() -> None:
+            try:
+                process.stdin.write(stdin_data)
+            except (BrokenPipeError, OSError, ValueError):
+                # Child exited or closed stdin early; its returncode and stderr
+                # are the real signal, so never let this thread raise.
+                pass
+            finally:
+                try:
+                    process.stdin.close()  # EOF, so the child never waits on us
+                except Exception:
+                    pass
+
+        threading.Thread(target=_writer, daemon=True).start()
 
     stop_heartbeat = threading.Event()
     started = _time.monotonic()

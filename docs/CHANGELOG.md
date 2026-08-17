@@ -1,3 +1,49 @@
+## Unreleased
+
+**Fix: Codex and Claude Code worker runs failed to spawn on Windows once the
+prompt got large — `[WinError 206] The filename or extension is too long`.**
+
+Both adapters passed the fully enriched prompt as an argv element
+(`codex exec … "<prompt>"`, `claude --print "<prompt>"`). On Windows the whole
+command line goes through `CreateProcessW`, which caps it at **32767
+characters**, so a prompt carrying repo census + CodeGraph context + a pasted
+diff failed the spawn outright. The error names the *filename*, not the length,
+so it reads like a missing or misresolved CLI — the failure was routinely
+misdiagnosed. Linux/macOS have a far larger `ARG_MAX` and were unaffected.
+
+- **Prompts now travel on stdin, not argv.** `build_codex_exec_command` emits a
+  trailing `-` (Codex reads instructions from stdin) and
+  `build_claude_code_command` emits `--print` with no prompt positional (same
+  behavior). Neither passes a prompt positional *and* pipes stdin: Codex would
+  otherwise append the piped text as a separate `<stdin>` block rather than
+  treating it as the task.
+- **`run_streamed_subprocess(..., stdin_data=...)`.** New optional keyword. When
+  omitted, stdin stays `DEVNULL` exactly as before, so every other adapter is
+  byte-for-byte unchanged. When supplied, the payload is written by a **daemon
+  thread started after the stdout/stderr readers**, then stdin is closed. Doing
+  the write inline would block before `process.wait(timeout=...)` could time out
+  a child that never drains stdin — trading a hard spawn failure for a silent
+  stall, the exact thing the original `stdin=DEVNULL` comment guards against.
+- **`WinError 206` now explains itself.** The spawn-error path appends the
+  measured command-line length and the 32767 cap, so any future argv regression
+  (long `extra_args`, deep `cwd`, long executable path) reports the real cause
+  instead of looking like a missing CLI.
+- **Signatures stay source-compatible.** `build_codex_exec_command` and
+  `build_claude_code_command` are exported from `puppetmaster.adapters`, so
+  `prompt` is retained as an optional keyword and simply ignored rather than
+  removed.
+
+Not affected: the Cursor adapter already ships its prompt through the
+`PUPPETMASTER_CURSOR_INPUT` environment variable (the Windows Unicode
+environment block has no comparable limit). `hermes.py`'s `chat -q <prompt>` has
+the same argv shape but is left alone here — its stdin behavior was not
+verifiable in this environment.
+
+Verified on Windows 11 with codex-cli 0.147.0: a 42,543-character prompt fails
+to spawn on `main` (command line 42,816 chars → WinError 206) and completes
+through stdin after the fix, with the instruction on the payload's final line to
+prove the whole stream is read.
+
 ## v1.22.6
 
 **Agentic/OpenRouter browser-swarm parity and durable autoresearch.**
