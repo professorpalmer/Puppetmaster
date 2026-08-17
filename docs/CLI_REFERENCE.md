@@ -88,20 +88,43 @@ Also available as the async `puppetmaster_start_prewalk` MCP tool (returns `job_
 
 ## Browser swarm (live-site QA)
 
-The `browser` verb runs N parallel **Hermes** workers, each driving a real browser against a live site to capture real network payloads — the QA that mock-backend tests and read-only repo analysis can't reach. It is Hermes-only: Hermes is the only adapter that exposes a `browser` toolset (`hermes chat -t browser`), so the verb pins the worker to it and fails fast if Hermes is disabled. Each task becomes its own parallel worker.
+The `browser` verb runs N parallel workers, each driving a real browser against a live site to capture real network payloads — the QA that mock-backend tests and read-only repo analysis can't reach. **Hermes is preferred** (`hermes chat -t browser`, including local-engine fallback for private/VPN hosts). **agentic** is the keys/OpenRouter fallback through the stdlib CDP engine (`puppetmaster/browser_cdp.py`). Omit `--adapter` to prefer Hermes and fall back to agentic if Hermes is locked out; pin `--adapter hermes` or `--adapter agentic` to force one. Cursor/Claude Code/Codex still have no headless browser toolset. Each task becomes its own parallel worker.
 
-Three guardrails are baked in: React-controlled-input native-event entry, network-truth (an HTTP 200 can carry an error body), and a strong-model capability floor (default `min_capability=80` — cheap models fail browser grounding and lie about it). Private/VPN-only hosts rely on Hermes' local-engine fallback for private URLs.
+Three guardrails are baked in: React-controlled-input native-event entry, network-truth (an HTTP 200 can carry an error body; agentic workers read it via `browser_network`), and a strong-model capability floor (default `min_capability=80` — cheap models fail browser grounding and lie about it).
 
 A browser worker edits no files (`mode=analysis`) but is an **acting agent** with external side effects (logins, form fills), so the run prints an `ACTING AGENT` banner — treat it with implement-style approval, not as a harmless read-only run.
 
 ```bash
 python -m puppetmaster browser "QA the login flow on https://app.example.com"
 python -m puppetmaster browser "QA route classes" "QA airports" "QA maintenance"   # 3 parallel workers
-python -m puppetmaster browser "QA the dev box" --model claude-opus-4-8 --provider anthropic   # pin a strong model
+python -m puppetmaster browser "QA the dev box" --model claude-opus-4-8 --provider anthropic   # pin a strong Hermes model
+python -m puppetmaster browser "QA login" --adapter agentic --provider openrouter   # keys/OpenRouter CDP path
 python -m puppetmaster browser "QA login" --min-capability 90 --timeout-seconds 1800
 ```
 
-Also available as the `puppetmaster_start_browser_swarm` MCP tool (async; returns `job_id`). Requires the Hermes platform enabled (`puppetmaster platform enable hermes`).
+Also available as the `puppetmaster_start_browser_swarm` MCP tool (async; returns `job_id`; optional `adapter` = `hermes` | `agentic`). Enable at least one browser-capable adapter (`puppetmaster platform enable hermes` or `agentic`).
+
+## Durable autoresearch
+
+The `research` command coordinates long-lived experiment loops against the
+durable job store. Claims are fingerprinted and lease-backed, results are
+typed artifacts, `think` recalls those artifacts without an LLM call, and
+`verify` re-runs the harness before accepting a result.
+
+```bash
+python -m puppetmaster research init "Explore zlib ratios"
+python -m puppetmaster research claim <job_id> "level-6" \
+  --config '{"level":6,"seed":7,"size":4096}' --run
+python -m puppetmaster research publish <job_id> --task-id <task_id> --run
+python -m puppetmaster research leaderboard <job_id>
+python -m puppetmaster research verify <job_id> <artifact_id>
+python -m puppetmaster research think <job_id>
+python -m puppetmaster research demo
+```
+
+The included `ToyCompressionHarness` is a deterministic CPU zlib microbench.
+Future GPU or nanochat runners can implement the same `ExperimentHarness`
+protocol without changing claim, publish, leaderboard, or verification logic.
 
 ## Routing / cost
 

@@ -308,7 +308,8 @@ _BINARY_SNIFF_BYTES = 8000
 
 _BROWSER_TOOL_NAMES = frozenset((
     "browser_navigate", "browser_snapshot", "browser_click", "browser_type",
-    "browser_scroll", "browser_back", "browser_get_text", "browser_screenshot",
+    "browser_scroll", "browser_back", "browser_get_text", "browser_network",
+    "browser_screenshot",
 ))
 
 
@@ -1798,14 +1799,15 @@ class AgenticAdapter(FullEditWorkerAdapter):
                             {"url": {"type": "string"}}, ["url"]))
             tools.append(fn("browser_snapshot", "Return the current page's interactable elements with @e1-style refs. Snapshot before clicking/typing so you have fresh refs.",
                             {}, []))
-            tools.append(fn("browser_click", "Click the element with the given ref (from browser_snapshot, e.g. @e3).",
+            tools.append(fn("browser_click", "Click the element with the given ref (from browser_snapshot, e.g. @e3). Uses real DOM MouseEvents (mousedown/mouseup/click), not a synthetic shortcut.",
                             {"ref": {"type": "string"}}, ["ref"]))
-            tools.append(fn("browser_type", "Type text into the input/textarea element with the given ref.",
+            tools.append(fn("browser_type", "Type text into the input/textarea with the given ref using the native value setter plus bubbling input/change events (React-controlled inputs ignore a raw .value write).",
                             {"ref": {"type": "string"}, "text": {"type": "string"}}, ["ref", "text"]))
             tools.append(fn("browser_scroll", "Scroll the page 'up' or 'down'.",
                             {"direction": {"type": "string", "description": "up or down"}}, []))
             tools.append(fn("browser_back", "Navigate the browser back one page.", {}, []))
             tools.append(fn("browser_get_text", "Return the page's main readable text (document body innerText).", {}, []))
+            tools.append(fn("browser_network", "Return captured fetch/XHR request URL, HTTP status, and response body. Judge success by the body — HTTP 200 can carry an application error.", {}, []))
             tools.append(fn("browser_screenshot", "Capture a PNG screenshot of the current page; returns a file path you can view_image.", {}, []))
         if bool(task.payload.get("plan_tool", True)):
             tools.append(fn(

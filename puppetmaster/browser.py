@@ -1,6 +1,6 @@
 """First-class browser-swarm support.
 
-A *browser swarm* is N independent Hermes workers, each carrying the ``browser``
+A *browser swarm* is N independent workers, each carrying the ``browser``
 toolset, dispatched in parallel against a live site to capture real network
 payloads — the QA shape that read-only repo analysis cannot reach. Static
 analysis and mock-backend tests only see the response shapes you stub; a browser
@@ -11,10 +11,19 @@ correct instead of a guess.
 This is deliberately **not** built on the MCP swarm specs. Those hardcode a
 ``file,web,vision`` (analyze) / ``file,terminal,code_execution,web,vision``
 (implement) toolset list with no ``browser`` in it, and the cursor swarm adapter
-has no browser at all. The only adapter that can drive a real browser is Hermes
-(``hermes chat -t browser``), so a browser worker is always a Hermes worker with
-the toolset explicitly threaded through ``payload.toolsets`` — which
-:class:`puppetmaster.adapters.hermes.HermesAdapter` already honors.
+has no browser at all.
+
+Two adapters can drive a real browser:
+
+* **Hermes** (preferred) — ``hermes chat -t browser``, including Hermes'
+  local-engine fallback for private/VPN-only hosts.
+* **agentic** — the standalone keys/OpenRouter worker plus the stdlib CDP
+  engine in :mod:`puppetmaster.browser_cdp` (no Hermes CLI required).
+
+The verb prefers Hermes when that adapter is enabled, and falls back to
+agentic when Hermes is locked out. Callers can pin either via ``--adapter`` /
+MCP ``adapter``. Cursor/Claude Code/Codex still have no headless browser
+toolset wired here.
 
 Three hard-won guardrails are baked into every browser worker, because a naive
 ``-t browser`` user re-derives them painfully:
@@ -22,8 +31,9 @@ Three hard-won guardrails are baked into every browser worker, because a naive
 1. **Private-URL / local-engine fallback.** Hermes' cloud browser
    (``cloud_provider: browser-use``) lives outside your network and cannot reach
    a VPN-only host. ``auto_local_for_private_urls: true`` makes the engine fall
-   back to a local browser for private targets. Without it, an internal box is
-   simply unreachable and the whole run is dead on arrival.
+   back to a local browser for private targets. The agentic CDP path is already
+   a local Chrome. Without a local engine, an internal box is simply
+   unreachable and the whole run is dead on arrival.
 2. **Model-capability floor.** Browser grounding — mapping "click the Search
    button" to the right DOM node across React re-renders — is hard, and weak
    models fail it *and then lie about it*, reporting a false "login failed" that
@@ -45,14 +55,15 @@ just read-only analysis" framing. See :func:`puppetmaster.workers.spec_has_side_
 """
 from __future__ import annotations
 
-from typing import Iterable, Optional
+from typing import AbstractSet, Iterable, Optional
 
 from puppetmaster.workers import WorkerSpec
 
 # Browser plus the analyze-mode defaults: the worker still needs ``file`` to
 # read repo context, ``web`` for plain HTTP, and ``vision`` to reason over
 # screenshots it captures. ``browser`` is the addition the MCP swarm path
-# strips. The hermes adapter passes this straight to ``hermes chat -t``.
+# strips. The hermes adapter passes this straight to ``hermes chat -t``;
+# the agentic adapter treats ``browser`` in the list as the CDP opt-in.
 BROWSER_TOOLSETS = "file,web,vision,browser"
 
 # Capability floor (registry ``capability_score`` is 0..100). Browser grounding
@@ -68,9 +79,11 @@ BROWSER_MIN_CAPABILITY = 80
 # mid-capture.
 DEFAULT_BROWSER_TIMEOUT_SECONDS = 1200
 
-# Only Hermes can drive a browser, so a browser worker is pinned to it. Routing
-# still runs (to pick the strongest sufficient Hermes model), but never off-adapter.
-BROWSER_ADAPTER = "hermes"
+# Hermes is preferred (agent-browser CLI + private-URL local-engine fallback).
+# Agentic is the keys/OpenRouter fallback through the stdlib CDP engine.
+PREFERRED_BROWSER_ADAPTER = "hermes"
+BROWSER_ADAPTERS = ("hermes", "agentic")
+BROWSER_ADAPTER = PREFERRED_BROWSER_ADAPTER
 
 BROWSER_GUARDRAILS = (
     "You are a browser-QA worker driving a REAL browser against a LIVE site to "
@@ -101,6 +114,69 @@ BROWSER_GUARDRAILS = (
 )
 
 
+class BrowserAdapterUnavailable(ValueError):
+    """No browser-capable adapter is usable for this host/request.
+
+    Carries the resolved ``enabled`` set and the (optional) ``requested``
+    adapter so CLI/MCP can render a precise remediation without re-deriving
+    lock state.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        enabled: AbstractSet[str],
+        requested: Optional[str] = None,
+        fix: Optional[str] = None,
+    ):
+        super().__init__(message)
+        self.enabled = set(enabled)
+        self.requested = requested
+        self.fix = fix
+
+
+def resolve_browser_adapter(requested: Optional[str] = None) -> str:
+    """Pick a browser-capable adapter, preferring Hermes.
+
+    An explicit ``requested`` pin must be one of :data:`BROWSER_ADAPTERS` and
+    enabled by the platform lock. When omitted, Hermes wins if enabled,
+    otherwise agentic. Raises :class:`BrowserAdapterUnavailable` when nothing
+    usable is left.
+    """
+    from puppetmaster import platform_lock
+
+    enabled = platform_lock.enabled_adapters()
+    pin = (requested or "").strip().lower() or None
+    if pin is not None:
+        if pin not in BROWSER_ADAPTERS:
+            raise BrowserAdapterUnavailable(
+                f"browser adapter {pin!r} is not browser-capable "
+                f"(supported: {', '.join(BROWSER_ADAPTERS)}; "
+                f"{PREFERRED_BROWSER_ADAPTER} is preferred).",
+                enabled=enabled,
+                requested=pin,
+            )
+        if not platform_lock.is_adapter_enabled(pin):
+            raise BrowserAdapterUnavailable(
+                f"the {pin!r} adapter is disabled by the platform lock.",
+                enabled=enabled,
+                requested=pin,
+                fix=f"puppetmaster platform enable {pin}",
+            )
+        return pin
+    for name in BROWSER_ADAPTERS:
+        if platform_lock.is_adapter_enabled(name):
+            return name
+    raise BrowserAdapterUnavailable(
+        "no browser-capable adapter is enabled. Hermes is preferred "
+        "(agent-browser CLI); agentic provides the stdlib CDP / OpenRouter "
+        "fallback.",
+        enabled=enabled,
+        fix=f"puppetmaster platform enable {PREFERRED_BROWSER_ADAPTER}",
+    )
+
+
 def browser_prompt(task: str) -> str:
     """Prefix a QA task with the three-guardrail browser preamble."""
     return BROWSER_GUARDRAILS + (task or "").strip()
@@ -120,15 +196,19 @@ def build_browser_spec(
     auto_route: bool = True,
     allow_api_billing: bool = True,
     executable: Optional[str] = None,
+    adapter: Optional[str] = None,
 ) -> WorkerSpec:
-    """Build one browser-QA worker spec (a Hermes analyze worker with browser).
+    """Build one browser-QA worker spec.
 
-    The worker emits structured findings (analyze mode) — it does not edit the
-    repo — but it acts on the live world, so the spec is marked
-    ``side_effecting``. Routing is pinned to the Hermes adapter with a strong
-    ``min_capability`` floor unless an explicit ``model`` is pinned (a pin always
-    wins over routing). The three guardrails are baked into the prompt.
+    Default adapter is Hermes (preferred). Pass ``adapter="agentic"`` for the
+    keys/OpenRouter CDP path. The worker emits structured findings (analyze
+    mode) — it does not edit the repo — but it acts on the live world, so the
+    spec is marked ``side_effecting``. Routing stays on the chosen adapter with
+    a strong ``min_capability`` floor unless an explicit ``model`` is pinned
+    (a pin always wins over routing). The three guardrails are baked into the
+    prompt.
     """
+    resolved = resolve_browser_adapter(adapter)
     payload: dict = {
         "prompt": browser_prompt(instruction),
         "cwd": cwd,
@@ -138,7 +218,13 @@ def build_browser_spec(
             timeout_seconds if timeout_seconds is not None else DEFAULT_BROWSER_TIMEOUT_SECONDS
         ),
     }
-    if executable:
+    if resolved == "agentic":
+        # Agentic is edit-capable by adapter identity; pin analyze + no_edit so
+        # swarm_mode stays analysis and the clean-tree guard does not fire.
+        payload["mode"] = "analyze"
+        payload["allow_browser"] = True
+        payload["no_edit"] = True
+    if executable and resolved == "hermes":
         payload["executable"] = executable
     if provider:
         payload["provider"] = provider
@@ -147,7 +233,7 @@ def build_browser_spec(
         payload["model"] = model
     elif auto_route:
         payload["auto_route"] = True
-        payload["allowed_adapters"] = [BROWSER_ADAPTER]
+        payload["allowed_adapters"] = [resolved]
         payload["min_capability"] = int(
             min_capability if min_capability is not None else BROWSER_MIN_CAPABILITY
         )
@@ -157,7 +243,7 @@ def build_browser_spec(
     return WorkerSpec(
         role=role,
         instruction=instruction,
-        adapter=BROWSER_ADAPTER,
+        adapter=resolved,
         payload=payload,
     )
 

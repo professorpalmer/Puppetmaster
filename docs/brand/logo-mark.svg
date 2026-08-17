@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Puppetmaster">
+  <title>Puppetmaster</title>
+  <rect width="512" height="512" rx="96" fill="#0c0d0f"/>
+  <rect x="96" y="168" width="48" height="4" fill="#d8b465"/>
+  <text
+    x="96"
+    y="268"
+    font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Helvetica, Arial, sans-serif"
+    font-size="72"
+    font-weight="620"
+    letter-spacing="-0.03em"
+    fill="#e8e6e1">Puppet</text>
+  <text
+    x="96"
+    y="348"
+    font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Helvetica, Arial, sans-serif"
+    font-size="72"
+    font-weight="620"
+    letter-spacing="-0.03em"
+    fill="#d8b465">master</text>
+</svg>

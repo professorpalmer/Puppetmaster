@@ -102,6 +102,7 @@ from puppetmaster.cli.commands_models import _run_models_subcommand
 from puppetmaster.cli.commands_evaluators import _run_evaluators_subcommand
 from puppetmaster.cli.commands_platform import _run_platform_subcommand, _run_skills_subcommand
 from puppetmaster.cli.commands_codegraph import _run_codegraph_passthrough, _run_repair_codegraph
+from puppetmaster.cli.commands_research import _run_research_subcommand
 from puppetmaster.cli.commands_jobs import (
     _reap_quietly,
     _run_await_command,
@@ -1018,28 +1019,30 @@ def _main(argv: Optional[list[str]] = None) -> int:
             )
         return 0
 
-    if args.command == "browser":
-        from puppetmaster import platform_lock
-        from puppetmaster.browser import BROWSER_ADAPTER, browser_swarm_specs
+    if args.command == "research":
+        return _run_research_subcommand(args, state_dir)
 
-        # Only Hermes can drive a browser, so the browser verb is dead without
-        # it — fail fast with the exact remediation rather than dispatching
-        # workers that can't possibly carry the toolset.
-        if not platform_lock.is_adapter_enabled(BROWSER_ADAPTER):
-            print(
-                f"browser: the {BROWSER_ADAPTER!r} adapter is disabled by the "
-                "platform lock, but it is the only adapter that can drive a "
-                "browser.",
-                file=sys.stderr,
-            )
-            print(
-                f"  enable it: puppetmaster platform enable {BROWSER_ADAPTER}",
-                file=sys.stderr,
-            )
+    if args.command == "browser":
+        from puppetmaster.browser import (
+            BrowserAdapterUnavailable,
+            browser_swarm_specs,
+            resolve_browser_adapter,
+        )
+
+        # Hermes is preferred; agentic/OpenRouter is the CDP fallback. Fail
+        # fast with the exact remediation rather than dispatching workers
+        # that can't carry the toolset.
+        try:
+            adapter = resolve_browser_adapter(getattr(args, "adapter", None))
+        except BrowserAdapterUnavailable as exc:
+            print(f"browser: {exc}", file=sys.stderr)
+            if exc.fix:
+                print(f"  enable it: {exc.fix}", file=sys.stderr)
             return 2
         specs = browser_swarm_specs(
             args.tasks,
             args.cwd,
+            adapter=adapter,
             model=args.model,
             provider=args.provider,
             toolsets=args.toolsets,

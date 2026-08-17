@@ -20277,7 +20277,7 @@ class PuppetmasterFrictionFixTests(unittest.TestCase):
 
         spec = build_browser_spec("x", cwd="/repo")
         self.assertTrue(spec.payload["auto_route"])
-        # Only Hermes can drive a browser — routing must never leave the adapter.
+        # Hermes is the preferred browser adapter — routing must stay on it.
         self.assertEqual(spec.payload["allowed_adapters"], [BROWSER_ADAPTER])
         # Strong-model floor (guardrail #2: cheap models fail browser grounding).
         self.assertGreaterEqual(spec.payload["min_capability"], BROWSER_MIN_CAPABILITY)
@@ -20367,6 +20367,7 @@ class PuppetmasterFrictionFixTests(unittest.TestCase):
                 "cwd": "/repo",
                 "min_capability": 85,
                 "worker_mode": "subprocess",
+                "adapter": "agentic",
             }
         )
         self.assertEqual(command[0], "browser")
@@ -20374,6 +20375,7 @@ class PuppetmasterFrictionFixTests(unittest.TestCase):
         self.assertIn("QA airports", command)
         self.assertIn("--cwd", command)
         self.assertEqual(command[command.index("--min-capability") + 1], "85")
+        self.assertEqual(command[command.index("--adapter") + 1], "agentic")
         with self.assertRaises(ValueError):
             browser_swarm_command({"tasks": []})
 

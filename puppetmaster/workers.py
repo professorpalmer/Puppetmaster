@@ -374,6 +374,10 @@ def spec_has_side_effects(spec: WorkerSpec) -> bool:
     payload = spec.payload or {}
     if payload.get("side_effecting"):
         return True
+    # Agentic browser workers often opt in via allow_browser rather than
+    # (or in addition to) a Hermes-style toolsets string.
+    if payload.get("allow_browser"):
+        return True
     toolsets = payload.get("toolsets")
     if isinstance(toolsets, str):
         return "browser" in {part.strip() for part in toolsets.split(",")}

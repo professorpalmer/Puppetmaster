@@ -115,6 +115,7 @@ The [docs index](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/
 - [DASHBOARD.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/DASHBOARD.md) — live job dashboard
 - [OUTPUT_STYLE.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/OUTPUT_STYLE.md) and [COMPRESSION.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/COMPRESSION.md) — output and context options
 - [MOBILE.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/MOBILE.md) — watching jobs from a phone
+- [RESEARCH.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/RESEARCH.md) — durable autoresearch claims, runs, publishing, and verification
 
 ## Uninstall
 
@@ -127,7 +128,7 @@ pip uninstall puppetmaster-ai   # or: pipx uninstall puppetmaster-ai
 
 ## Status
 
-Puppetmaster is a daily-driver beta at **v1.22.5**, suitable for supervised local engineering rather than hosted multi-user use. The current release includes SQLite-backed jobs, Cursor Agent MCP support, Grok Bot remote MCP (streamable HTTP pilot path), full-edit adapters, constrained model routing (with Grok 4.6 as the Cursor workhorse for ambitious and agentic work), shared verified context (admitted gists + dashboard Frontier), passive provider rate-limit harvest, AWS Bedrock, OpenCode Go, and Marionette-keyed Z.AI / MiniMax / NVIDIA NIM providers through the agentic adapter. See the [feature matrix](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/FEATURES.md), [Grok Bot harness](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/GROK_BOT.md), and [CHANGELOG.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/CHANGELOG.md) for the current details.
+Puppetmaster is a daily-driver beta at **v1.22.6**, suitable for supervised local engineering rather than hosted multi-user use. The current release includes SQLite-backed jobs, Cursor Agent MCP support, Grok Bot remote MCP (streamable HTTP pilot path), full-edit adapters, live-site browser swarms (Hermes preferred; agentic/OpenRouter via stdlib CDP), durable autoresearch claim/run/publish/verify loops, constrained model routing (with Grok 4.6 as the Cursor workhorse for ambitious and agentic work), shared verified context (admitted gists + dashboard Frontier), passive provider rate-limit harvest, AWS Bedrock, OpenCode Go, and Marionette-keyed Z.AI / MiniMax / NVIDIA NIM providers through the agentic adapter. See the [feature matrix](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/FEATURES.md), [research guide](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/RESEARCH.md), [Grok Bot harness](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/GROK_BOT.md), and [CHANGELOG.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/CHANGELOG.md) for the current details.
 
 PyPI uses the package name [`puppetmaster-ai`](https://pypi.org/project/puppetmaster-ai/); the import name, CLI, and repository use `puppetmaster`.
 

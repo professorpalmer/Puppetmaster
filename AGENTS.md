@@ -54,14 +54,16 @@ For QA that needs a **real browser against a live site** — capturing actual
 network payloads instead of mocked ones — use the first-class browser verb, not
 a read-only swarm. A read-only swarm can't reach it: the MCP swarm specs hardcode
 a `file,web,vision` toolset list with no `browser`, and the cursor swarm adapter
-has no browser at all. Only the **Hermes** adapter can drive a browser
-(`hermes chat -t browser`).
+has no browser at all. **Hermes is the preferred browser adapter**
+(`hermes chat -t browser`). The keys-only **agentic** adapter is the fallback
+(stdlib CDP / OpenRouter) when Hermes is locked out or `--adapter agentic` is
+set.
 
-- **Verb:** `puppetmaster_start_browser_swarm` (MCP) / `python -m puppetmaster browser "<task>" ["<task2>" ...]` (CLI). Each task becomes one parallel Hermes worker. Requires the Hermes platform enabled.
+- **Verb:** `puppetmaster_start_browser_swarm` (MCP) / `python -m puppetmaster browser "<task>" ["<task2>" ...]` (CLI). Each task becomes one parallel worker. Optional `adapter` / `--adapter` is `hermes` (preferred) or `agentic`.
 - **Single source of truth:** `puppetmaster/browser.py`. It bakes in three hard-won guardrails so callers don't re-derive them:
   1. **React-controlled inputs** — automation must use native value setters + dispatched `input`/`change` events, or submits fire nothing (a fake, reproducible "bug").
   2. **Network truth** — judge success by the captured request/response, not the UI; an HTTP 200 can carry an application error body.
-  3. **Strong-model floor** — browser grounding needs a capable model; the spec carries a high `min_capability` (default 80) pinned to the Hermes adapter, because cheap models fail browser grounding *and lie about it*. Private/VPN-only hosts rely on Hermes' local-engine fallback for private URLs.
+  3. **Strong-model floor** — browser grounding needs a capable model; the spec carries a high `min_capability` (default 80) pinned to the chosen browser adapter, because cheap models fail browser grounding *and lie about it*. Private/VPN-only hosts rely on Hermes' local-engine fallback; the agentic path is already a local Chrome.
 - **Safety posture:** a browser worker edits no repo files (`swarm_mode` stays `analysis`, no clean-tree guard) but is an **acting agent** with external side effects (logins, form fills). Specs carry `payload.side_effecting = True`; `workers.spec_has_side_effects` / `swarm_is_acting` drive an acting-agent banner. Treat with implement-style approval, never the swarm's "read-only, harmless" framing.
 - The reusable playbook with the full gotcha derivation lives in the `jadui-browser-qa-swarm` skill.
 
