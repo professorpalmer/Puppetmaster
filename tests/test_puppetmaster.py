@@ -13889,6 +13889,53 @@ class InstallRulesTests(unittest.TestCase):
             self.assertIn("Partial coverage is still coverage", flattened)
             self.assertIn("never re-crawl directories the graph already covers", flattened)
 
+    def test_rules_exempt_puppetmaster_workers_from_delegation(self):
+        """A Puppetmaster worker runs as a plain agent CLI with no
+        ``puppetmaster_*`` MCP tools, but it still reads the managed rule
+        block (workspace ``AGENTS.md``, ``~/.codex/instructions.md``,
+        ``~/.claude/CLAUDE.md``, the Cursor ``.mdc``). Without an explicit
+        exemption the delegate-first gate tells it to start a swarm it cannot
+        reach, so it burns its context and returns a clarifying question
+        instead of findings. The exemption must appear in every render, and
+        ahead of the gate it overrides."""
+        from puppetmaster.rules import RULE_BODY, render_agents_block, render_cursor_mdc
+
+        for content in (RULE_BODY, render_cursor_mdc(), render_agents_block()):
+            flattened = " ".join(content.split())
+            self.assertIn("Are you a Puppetmaster worker? (check this first)", flattened)
+            self.assertIn("every delegation rule below is void", flattened)
+            self.assertIn("Puppetmaster artifact contract:", flattened)
+            self.assertIn("submit_findings", flattened)
+            self.assertIn("no `puppetmaster_*` MCP tools", flattened)
+            self.assertLess(
+                flattened.index("Are you a Puppetmaster worker?"),
+                flattened.index("Delegate-first gate"),
+                msg="the worker exemption must precede the delegate-first gate",
+            )
+
+    def test_hand_maintained_rules_exempt_puppetmaster_workers(self):
+        """Repo ``AGENTS.md`` and ``puppetmaster-workflow.mdc`` are not rendered
+        from ``RULE_BODY``. They must carry the same worker exemption, ahead of
+        the swarm-start language, or a Codex/Cursor worker in this repo still
+        hits the original self-delegation loop."""
+        root = Path(__file__).resolve().parents[1]
+        files = (
+            root / "AGENTS.md",
+            root / ".cursor" / "rules" / "puppetmaster-workflow.mdc",
+        )
+        for path in files:
+            text = path.read_text(encoding="utf-8")
+            flattened = " ".join(text.split())
+            lowered = flattened.lower()
+            self.assertIn("are you a puppetmaster worker", lowered)
+            self.assertIn("Puppetmaster artifact contract:", flattened)
+            self.assertIn("submit_findings", flattened)
+            self.assertLess(
+                lowered.index("are you a puppetmaster worker"),
+                lowered.index("start a puppetmaster swarm"),
+                msg=f"{path.name} must exempt workers before telling them to start a swarm",
+            )
+
     def test_rules_nudge_labeling_every_job(self):
         """Every platform's managed rules (they share RULE_BODY) must tell the
         agent to pass a short `label` on start_*/edit verbs so dashboard jobs

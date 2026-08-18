@@ -59,6 +59,20 @@ RULE_BODY = textwrap.dedent(
     `puppetmaster install-codex-mcp`), the `puppetmaster_*` MCP tools are
     available in this environment.
 
+    ## Are you a Puppetmaster worker? (check this first)
+
+    **If Puppetmaster issued your prompt, every delegation rule below is void
+    for you.** You *are* the worker it delegated to. Do the analysis or the
+    edit yourself and return the artifacts your prompt asks for.
+
+    You are a Puppetmaster worker if your prompt contains a `Puppetmaster
+    artifact contract:` block, a `Role: <role>` + `Goal: <goal>` header, or an
+    instruction to finish by calling `submit_findings` / `submit_report`.
+    Workers run as plain agent CLIs with **no `puppetmaster_*` MCP tools**, so
+    delegating is impossible; attempting it spends the whole context window and
+    returns a clarifying question instead of findings. Explore with your own
+    native tools — that is the job you were spawned for.
+
     ## Trigger convention (must obey)
 
     When the user says **"Use Puppetmaster to …"**, **"PM this …"**, or
