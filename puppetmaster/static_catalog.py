@@ -23,6 +23,7 @@ models. Keep capability/price/context in sync with the starter registry.
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -742,22 +743,38 @@ def curated_to_specs(
             if (prior and prior.payload_defaults)
             else dict(item.get("payload_defaults", {}))
         )
-        specs.append(
-            ModelSpec(
-                id=spec_id,
-                adapter=adapter,
-                adapter_model_name=model,
-                capability_score=capability,
-                input_per_mtok_usd=float(item["input"]),
-                output_per_mtok_usd=float(item["output"]),
-                context_window=context,
-                billing=entry_billing,
-                tags=sorted(tags),
-                notes=note,
-                enabled=prior.enabled if prior else True,
-                payload_defaults=payload_defaults,
+        if prior is not None:
+            specs.append(
+                replace(
+                    prior,
+                    adapter_model_name=model,
+                    capability_score=capability,
+                    input_per_mtok_usd=float(item["input"]),
+                    output_per_mtok_usd=float(item["output"]),
+                    context_window=context,
+                    billing=entry_billing,
+                    tags=sorted(tags),
+                    notes=note,
+                    enabled=prior.enabled,
+                    payload_defaults=payload_defaults,
+                )
             )
-        )
+        else:
+            specs.append(
+                ModelSpec(
+                    id=spec_id,
+                    adapter=adapter,
+                    adapter_model_name=model,
+                    capability_score=capability,
+                    input_per_mtok_usd=float(item["input"]),
+                    output_per_mtok_usd=float(item["output"]),
+                    context_window=context,
+                    billing=entry_billing,
+                    tags=sorted(tags),
+                    notes=note,
+                    payload_defaults=payload_defaults,
+                )
+            )
     return specs
 
 

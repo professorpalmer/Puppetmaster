@@ -137,6 +137,7 @@ python -m puppetmaster models list                            # show registered 
 python -m puppetmaster models discover --probe                 # snapshot reachable catalogs without changing models.json
 python -m puppetmaster doctor                                  # report stale catalogs and pending registry drift
 python -m puppetmaster models discover --source agentic --write   # seed keys-only agentic catalog (filtered by visible provider keys)
+python -m puppetmaster models import-baseline [--dry-run]     # overlay adapter-scoped role scorecards; never writes capability_score
 python -m puppetmaster models path                            # print resolved registry path
 ```
 
@@ -145,8 +146,8 @@ python -m puppetmaster models path                            # print resolved r
 ```bash
 python -m puppetmaster audit                                 # per-model report + suggested score diff (dry-run)
 python -m puppetmaster audit --window 7                       # only jobs from the last 7 days
-python -m puppetmaster audit --json                           # machine-readable report + suggestions
-python -m puppetmaster audit --apply                          # write the suggested score changes to models.json
+python -m puppetmaster audit --json                           # machine-readable report + suggestions + role_scorecard_suggestions
+python -m puppetmaster audit --apply                          # write suggested capability_score changes only (not role cards)
 ```
 
 Read-only by default. It aggregates the routing/escalation/verification artifacts already in your store and proposes a lower `capability_score` only for an **under-delivering** model (keeps getting escalated away from / finishing with low confidence) so harder work routes to a stronger model. A strong model doing trivial work is flagged `possibly-over-used` but never auto-adjusted — proving a cheaper model would've sufficed needs a counterfactual the audit doesn't run. The registry stays your assertion; nothing is written without `--apply`.

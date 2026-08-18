@@ -64,6 +64,13 @@ class TaskAuditRecord:
     # char/4 approximation. None when the run reported no token usage at all
     # (so drift is simply unknown, never faked as zero).
     actual_tokens_measured: Optional[bool] = None
+    role: str = ""
+    elapsed_seconds: Optional[float] = None
+    verification_result: Optional[str] = None
+    gate_passed: Optional[bool] = None
+    attempts: int = 0
+    fallback_attempts: int = 0
+    escalation_attempts: int = 0
 
     @property
     def has_actuals(self) -> bool:
@@ -102,6 +109,10 @@ class ModelAudit:
     token_drift_ratio: Optional[float] = None
     actual_spend_usd: float = 0.0
     cost_drift_ratio: Optional[float] = None
+    mean_elapsed_seconds: Optional[float] = None
+    timeout_or_failed_rate: float = 0.0
+    degraded_rate: float = 0.0
+    roles: dict = field(default_factory=dict)
     flags: list[str] = field(default_factory=list)
     suggested_score: Optional[int] = None
     rationale: Optional[str] = None
@@ -123,6 +134,7 @@ class AuditReport:
     # denominator for cost drift (``total_est_spend_usd`` covers every task,
     # including ones with no actuals, so it must not anchor the ratio).
     total_est_spend_reconciled_usd: float = 0.0
+    role_scorecard_suggestions: list[dict] = field(default_factory=list)
 
     @property
     def token_drift_ratio(self) -> Optional[float]:
@@ -149,8 +161,123 @@ class AuditReport:
         return out
 
 
+_FAILED_RESULTS = frozenset({"failed", "timeout", "error", "fail"})
+_DEGRADED_RESULTS = frozenset({"degraded"})
+
+
 def _mean(values: list[float]) -> Optional[float]:
     return sum(values) / len(values) if values else None
+
+
+def _verification_label(result: Optional[str]) -> str:
+    if not isinstance(result, str):
+        return ""
+    return result.strip().lower()
+
+
+def _record_failed(record: TaskAuditRecord) -> bool:
+    if _verification_label(record.verification_result) in _FAILED_RESULTS:
+        return True
+    return record.gate_passed is False
+
+
+def _record_degraded(record: TaskAuditRecord) -> bool:
+    return _verification_label(record.verification_result) in _DEGRADED_RESULTS
+
+
+def _role_counts(
+    model_id: str, retained: list[TaskAuditRecord], records: list[TaskAuditRecord]
+) -> dict:
+    counts: dict[str, int] = {}
+    for record in retained:
+        role = record.role or ""
+        if role:
+            counts[role] = counts.get(role, 0) + 1
+    for record in records:
+        if record.escalated and record.escalated_from == model_id:
+            role = record.role or ""
+            if role:
+                counts[role] = counts.get(role, 0) + 1
+    return counts
+
+
+def _role_scorecard_suggestions(
+    records: list[TaskAuditRecord],
+    registry_scores: dict[str, int],
+    min_sample: int,
+) -> list[dict]:
+    """Recommendation-only per-role card hints. Never written by --apply."""
+    groups: dict[tuple, list[TaskAuditRecord]] = {}
+    for record in records:
+        role = record.role or ""
+        if not role:
+            continue
+        key = (record.model_id, record.adapter, role)
+        groups.setdefault(key, []).append(record)
+
+    suggestions: list[dict] = []
+    for (model_id, adapter, role), recs in sorted(groups.items()):
+        n = len(recs)
+        if n < min_sample:
+            continue
+        elapsed_vals = [r.elapsed_seconds for r in recs if r.elapsed_seconds is not None]
+        mean_elapsed = _mean(elapsed_vals)
+        failed_rate = sum(1 for r in recs if _record_failed(r)) / n
+        degraded_rate = sum(1 for r in recs if _record_degraded(r)) / n
+
+        peer_means: list[float] = []
+        for (other_id, _adapter, other_role), other_recs in groups.items():
+            if other_role != role or other_id == model_id:
+                continue
+            other_elapsed = [
+                r.elapsed_seconds for r in other_recs if r.elapsed_seconds is not None
+            ]
+            other_mean = _mean(other_elapsed)
+            if other_mean is not None:
+                peer_means.append(other_mean)
+        high_elapsed = False
+        if mean_elapsed is not None and peer_means:
+            peer_median = sorted(peer_means)[len(peer_means) // 2]
+            if peer_median > 0 and mean_elapsed >= 2.0 * peer_median:
+                high_elapsed = True
+        high_fail = (
+            failed_rate >= UNDER_PROVISIONED_RATE
+            or degraded_rate >= UNDER_PROVISIONED_RATE
+        )
+        if not high_elapsed and not high_fail:
+            continue
+        from_cap = registry_scores.get(model_id)
+        if from_cap is None:
+            continue
+        to_cap = max(MIN_SCORE_FLOOR, from_cap - 5)
+        if to_cap >= from_cap:
+            continue
+        reasons: list[str] = []
+        if high_elapsed:
+            reasons.append(
+                f"mean elapsed {mean_elapsed:.1f}s is much higher than peer "
+                f"models for role={role}"
+            )
+        if high_fail:
+            reasons.append(
+                f"failed/timeout rate {failed_rate:.0%} / degraded rate "
+                f"{degraded_rate:.0%} over {n} {role} runs"
+            )
+        suggestions.append(
+            {
+                "model_id": model_id,
+                "adapter": adapter,
+                "role": role,
+                "from_capability": from_cap,
+                "to_capability": to_cap,
+                "rationale": (
+                    "; ".join(reasons)
+                    + "; recommendation-only role card, not applied to capability_score."
+                ),
+                "sample_count": n,
+            }
+        )
+    return suggestions
 
 
 def build_audit_report(
@@ -210,6 +337,8 @@ def build_audit_report(
                 for r in reconciled
             )
         recon_est_spend = sum(r.est_cost_usd for r in reconciled)
+        elapsed_vals = [r.elapsed_seconds for r in retained if r.elapsed_seconds is not None]
+        mean_elapsed = _mean(elapsed_vals)
 
         audit = ModelAudit(
             model_id=model_id,
@@ -233,6 +362,22 @@ def build_audit_report(
             cost_drift_ratio=(
                 round(actual_spend / recon_est_spend, 3) if recon_est_spend else None
             ),
+            mean_elapsed_seconds=(
+                round(mean_elapsed, 3) if mean_elapsed is not None else None
+            ),
+            timeout_or_failed_rate=round(
+                (sum(1 for r in retained if _record_failed(r)) / len(retained))
+                if retained
+                else 0.0,
+                3,
+            ),
+            degraded_rate=round(
+                (sum(1 for r in retained if _record_degraded(r)) / len(retained))
+                if retained
+                else 0.0,
+                3,
+            ),
+            roles=_role_counts(model_id, retained, records),
         )
         _classify(audit, retained, low_confidence_bar, min_sample)
         audits.append(audit)
@@ -257,6 +402,9 @@ def build_audit_report(
         total_actual_spend_usd=round(total_actual_spend, 6),
         total_est_spend_reconciled_usd=round(
             sum(r.est_cost_usd for r in reconciled_all), 6
+        ),
+        role_scorecard_suggestions=_role_scorecard_suggestions(
+            records, registry_scores, min_sample
         ),
     )
 
@@ -324,6 +472,8 @@ def collect_records(store, *, window_days: Optional[float] = None) -> tuple[list
     created within ``window_days``. Returns (records, jobs_considered)."""
     from datetime import datetime, timedelta, timezone
 
+    from puppetmaster.receipt import _elapsed_seconds
+
     cutoff: Optional[datetime] = None
     if window_days is not None:
         cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
@@ -359,6 +509,8 @@ def collect_records(store, *, window_days: Optional[float] = None) -> tuple[list
         # run that actually reported token usage. Only verification artifacts that
         # carry a usage record contribute, so a task with no usage stays unknown.
         latest_usage: dict[str, tuple[str, int, int, bool]] = {}
+        latest_verif_result: dict[str, tuple[str, object]] = {}
+        gate_flags_by_task: dict[str, list[bool]] = {}
         for a in artifacts:
             payload = a.payload or {}
             kind = a.type.value
@@ -375,6 +527,13 @@ def collect_records(store, *, window_days: Optional[float] = None) -> tuple[list
                 prev = latest_conf.get(a.task_id)
                 if prev is None or a.created_at >= prev[0]:
                     latest_conf[a.task_id] = (a.created_at, float(a.confidence))
+                if "result" in payload:
+                    prev_result = latest_verif_result.get(a.task_id)
+                    if prev_result is None or a.created_at >= prev_result[0]:
+                        latest_verif_result[a.task_id] = (
+                            a.created_at,
+                            payload.get("result"),
+                        )
                 if "tokens_in" in payload or "tokens_out" in payload:
                     prev_usage = latest_usage.get(a.task_id)
                     if prev_usage is None or a.created_at >= prev_usage[0]:
@@ -384,6 +543,10 @@ def collect_records(store, *, window_days: Optional[float] = None) -> tuple[list
                             int(payload.get("tokens_out") or 0),
                             bool(payload.get("tokens_estimated")),
                         )
+            elif kind == "gate" and "passed" in payload:
+                gate_flags_by_task.setdefault(a.task_id, []).append(
+                    bool(payload.get("passed"))
+                )
 
         for task_id, task in tasks.items():
             payload = task.payload or {}
@@ -393,6 +556,13 @@ def collect_records(store, *, window_days: Optional[float] = None) -> tuple[list
             initial = initial_by_task.get(task_id, {})
             conf = latest_conf.get(task_id)
             usage = latest_usage.get(task_id)
+            verif = latest_verif_result.get(task_id)
+            verification_result = verif[1] if verif else None
+            if verification_result is not None and not isinstance(
+                verification_result, str
+            ):
+                verification_result = str(verification_result)
+            gates = gate_flags_by_task.get(task_id)
             records.append(
                 TaskAuditRecord(
                     model_id=final_model,
@@ -412,6 +582,15 @@ def collect_records(store, *, window_days: Optional[float] = None) -> tuple[list
                     actual_tokens_in=usage[1] if usage else 0,
                     actual_tokens_out=usage[2] if usage else 0,
                     actual_tokens_measured=(not usage[3]) if usage else None,
+                    role=task.role or initial.get("role") or "",
+                    elapsed_seconds=_elapsed_seconds(
+                        task.created_at, task.completed_at
+                    ),
+                    verification_result=verification_result,
+                    gate_passed=all(gates) if gates else None,
+                    attempts=int(getattr(task, "attempts", 0) or 0),
+                    fallback_attempts=int(payload.get("fallback_attempts") or 0),
+                    escalation_attempts=int(payload.get("escalation_attempts") or 0),
                 )
             )
     return records, jobs_considered

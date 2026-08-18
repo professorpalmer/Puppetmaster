@@ -294,6 +294,7 @@ def _run_audit_command(args, store) -> int:
                     },
                     "models": [asdict(m) for m in report.models],
                     "suggestions": report.suggestions,
+                    "role_scorecard_suggestions": report.role_scorecard_suggestions,
                 },
                 indent=2,
             )
@@ -312,7 +313,7 @@ def _run_audit_command(args, store) -> int:
             )
         else:
             print(
-                f"  {'model':<26}{'picks':>6}{'conf':>7}{'esc%':>7}{'drift':>8}  flags"
+                f"  {'model':<26}{'picks':>6}{'conf':>7}{'esc%':>7}{'elapsed':>8}{'drift':>8}  flags"
             )
             for m in report.models:
                 if m.selections == 0 and m.runs_with_confidence == 0:
@@ -320,8 +321,13 @@ def _run_audit_command(args, store) -> int:
                 conf = f"{m.mean_confidence:.2f}" if m.mean_confidence is not None else "  -"
                 esc = f"{m.escalated_away_rate:.0%}"
                 drift = f"{m.token_drift_ratio:.2f}x" if m.token_drift_ratio is not None else "  -"
+                elapsed = (
+                    f"{m.mean_elapsed_seconds:.1f}s"
+                    if m.mean_elapsed_seconds is not None
+                    else "  -"
+                )
                 print(
-                    f"  {m.model_id:<26}{m.selections:>6}{conf:>7}{esc:>7}{drift:>8}  "
+                    f"  {m.model_id:<26}{m.selections:>6}{conf:>7}{esc:>7}{elapsed:>8}{drift:>8}  "
                     f"{', '.join(m.flags)}"
                 )
             if report.tasks_with_actuals:
@@ -353,6 +359,17 @@ def _run_audit_command(args, store) -> int:
                 print(f"      {s['rationale']}")
         elif report.tasks_considered:
             print("\nNo score changes suggested — routing looks well-calibrated.")
+        if report.role_scorecard_suggestions:
+            print(
+                "\nRole scorecard recommendations "
+                "(not applied; --apply only writes capability_score):"
+            )
+            for sug in report.role_scorecard_suggestions:
+                print(
+                    f"  {sug['model_id']} role={sug['role']}: "
+                    f"{sug['from_capability']} -> {sug['to_capability']}"
+                )
+                print(f"      {sug['rationale']}")
 
     if args.apply:
         if not report.suggestions:
@@ -603,6 +620,23 @@ def _run_route_command(args) -> int:
         f"capability needed: {decision.capability_needed}  "
         f"chosen capability: {decision.model.capability_score}"
     )
+    if decision.score_source or decision.effective_capability_score is not None:
+        print(
+            f"score source: {decision.score_source or '-'}  "
+            f"effective capability: {decision.effective_capability_score}"
+        )
+        provenance = decision.score_provenance or {}
+        if provenance or decision.sample_count is not None:
+            sample = (
+                decision.sample_count
+                if decision.sample_count is not None
+                else provenance.get("sample_count", "-")
+            )
+            print(
+                f"provenance: source={provenance.get('source', '-')}  "
+                f"bundle={provenance.get('bundle_id', '-')}  "
+                f"sample_count={sample}"
+            )
     print(
         f"estimated tokens: in={decision.estimated_tokens_in}  "
         f"out={decision.estimated_tokens_out}  "

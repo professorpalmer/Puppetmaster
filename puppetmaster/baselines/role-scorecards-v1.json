@@ -1,0 +1,113 @@
+{
+  "bundle_id": "puppetmaster-community-scorecards",
+  "version": "1.0.0",
+  "published": "2026-08-18",
+  "adapter_scoped": true,
+  "not_ground_truth": true,
+  "methodology": [
+    "RouteLLM",
+    "RouterBench",
+    "SWE-bench",
+    "Aider polyglot",
+    "Terminal-Bench",
+    "Artificial Analysis latency methodology"
+  ],
+  "notes": "Prior only. Adapter-keyed. Import overlays role cards; never mutates capability_score. Do not treat as a leaderboard.",
+  "entries": [
+    {
+      "id": "cursor/composer-2-5",
+      "adapter": "cursor",
+      "adapter_model_name": "composer-2.5",
+      "role_scorecards": {
+        "implement": {
+          "quality": null,
+          "latency_p50_ms": null,
+          "latency_p95_ms": null,
+          "timeout_rate": null,
+          "retry_rate": null,
+          "degraded_rate": null,
+          "sample_count": 0,
+          "last_calibrated": "2026-08-18"
+        },
+        "explore": {
+          "quality": null,
+          "latency_p50_ms": null,
+          "latency_p95_ms": null,
+          "timeout_rate": null,
+          "retry_rate": null,
+          "degraded_rate": null,
+          "sample_count": 0,
+          "last_calibrated": "2026-08-18"
+        }
+      },
+      "score_provenance": {
+        "source": "community_baseline",
+        "bundle_id": "puppetmaster-community-scorecards",
+        "bundle_version": "1.0.0",
+        "calibrated_at": "2026-08-18",
+        "sample_count": 0,
+        "notes": "Schema example only. No public benchmark scores claimed."
+      }
+    },
+    {
+      "id": "cursor/grok-4-6",
+      "adapter": "cursor",
+      "adapter_model_name": "grok-4.6",
+      "role_scorecards": {
+        "implement": {
+          "quality": null,
+          "latency_p50_ms": null,
+          "latency_p95_ms": null,
+          "timeout_rate": null,
+          "retry_rate": null,
+          "degraded_rate": null,
+          "sample_count": 0,
+          "last_calibrated": "2026-08-18"
+        },
+        "review": {
+          "quality": null,
+          "latency_p50_ms": null,
+          "latency_p95_ms": null,
+          "timeout_rate": null,
+          "retry_rate": null,
+          "degraded_rate": null,
+          "sample_count": 0,
+          "last_calibrated": "2026-08-18"
+        }
+      },
+      "score_provenance": {
+        "source": "community_baseline",
+        "bundle_id": "puppetmaster-community-scorecards",
+        "bundle_version": "1.0.0",
+        "calibrated_at": "2026-08-18",
+        "sample_count": 0,
+        "notes": "Schema example only. No public benchmark scores claimed."
+      }
+    },
+    {
+      "id": "codex/gpt-5-6-luna",
+      "adapter": "codex",
+      "adapter_model_name": "gpt-5.6-luna",
+      "role_scorecards": {
+        "implement": {
+          "quality": null,
+          "latency_p50_ms": null,
+          "latency_p95_ms": null,
+          "timeout_rate": null,
+          "retry_rate": null,
+          "degraded_rate": null,
+          "sample_count": 0,
+          "last_calibrated": "2026-08-18"
+        }
+      },
+      "score_provenance": {
+        "source": "community_baseline",
+        "bundle_id": "puppetmaster-community-scorecards",
+        "bundle_version": "1.0.0",
+        "calibrated_at": "2026-08-18",
+        "sample_count": 0,
+        "notes": "Schema example only. No public benchmark scores claimed."
+      }
+    }
+  ]
+}

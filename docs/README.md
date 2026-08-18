@@ -2,7 +2,7 @@
 
 The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
 
-**Current release:** [v1.22.7](CHANGELOG.md#v1227) — Windows Codex/Claude Code spawn fix (prompts on stdin, not argv); see [CHANGELOG.md](CHANGELOG.md) for the full line.
+**Current release:** [v1.22.8](CHANGELOG.md#v1228) — evidence-backed role scorecards for routing (issue #28); see [CHANGELOG.md](CHANGELOG.md) for the full line.
 
 ## Start here
 

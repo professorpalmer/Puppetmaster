@@ -4,13 +4,15 @@
     "id": "user-chosen unique id, e.g. 'cursor/composer-2-5' or 'anthropic/claude-opus'",
     "adapter": "puppetmaster adapter name: 'claude-code', 'cursor', or a future raw HTTP adapter",
     "adapter_model_name": "literal model name passed through to the adapter at runtime",
-    "capability_score": "0..100, user-asserted skill (55=cheap helper, 78=balanced, 88=high, 98=frontier)",
+    "capability_score": "0..100, user-asserted manual fallback (55=cheap helper, 78=balanced, 88=high, 98=frontier). Used when a role card has no capability override.",
     "input_per_mtok_usd": "$ per million input tokens (0 for models billed via your Cursor/Claude plan)",
     "output_per_mtok_usd": "$ per million output tokens",
     "context_window": "tokens",
     "tags": "free-form tags; routing policies and the vision classifier filter on these",
     "enabled": "set false to skip without deleting",
-    "notes": "optional human-readable notes"
+    "notes": "optional human-readable notes",
+    "role_scorecards": "optional per-role cards keyed by TaskSignals.role. Optional keys: capability (int 0-100), quality (0-1), latency_p50_ms, latency_p95_ms, timeout_rate, retry_rate, degraded_rate, sample_count, last_calibrated",
+    "score_provenance": "optional {source, bundle_id, bundle_version, calibrated_at, sample_count, notes}. source in manual | community_baseline | local_audit | none"
   },
   "models": [
     {
