@@ -13889,6 +13889,30 @@ class InstallRulesTests(unittest.TestCase):
             self.assertIn("Partial coverage is still coverage", flattened)
             self.assertIn("never re-crawl directories the graph already covers", flattened)
 
+    def test_rules_exempt_puppetmaster_workers_from_delegation(self):
+        """A Puppetmaster worker runs as a plain agent CLI with no
+        ``puppetmaster_*`` MCP tools, but it still reads the managed rule
+        block (workspace ``AGENTS.md``, ``~/.codex/instructions.md``,
+        ``~/.claude/CLAUDE.md``, the Cursor ``.mdc``). Without an explicit
+        exemption the delegate-first gate tells it to start a swarm it cannot
+        reach, so it burns its context and returns a clarifying question
+        instead of findings. The exemption must appear in every render, and
+        ahead of the gate it overrides."""
+        from puppetmaster.rules import RULE_BODY, render_agents_block, render_cursor_mdc
+
+        for content in (RULE_BODY, render_cursor_mdc(), render_agents_block()):
+            flattened = " ".join(content.split())
+            self.assertIn("Are you a Puppetmaster worker? (check this first)", flattened)
+            self.assertIn("every delegation rule below is void", flattened)
+            self.assertIn("Puppetmaster artifact contract:", flattened)
+            self.assertIn("submit_findings", flattened)
+            self.assertIn("no `puppetmaster_*` MCP tools", flattened)
+            self.assertLess(
+                flattened.index("Are you a Puppetmaster worker?"),
+                flattened.index("Delegate-first gate"),
+                msg="the worker exemption must precede the delegate-first gate",
+            )
+
     def test_rules_nudge_labeling_every_job(self):
         """Every platform's managed rules (they share RULE_BODY) must tell the
         agent to pass a short `label` on start_*/edit verbs so dashboard jobs

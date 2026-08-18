@@ -2,9 +2,33 @@
 
 Repo-level guidance for AI coding agents (Cursor, Claude Code, Codex, etc.) working in this repository. Cursor users see the same directive via `.cursor/rules/puppetmaster-workflow.mdc`.
 
+## First: are you a Puppetmaster worker?
+
+**If your prompt was issued by Puppetmaster, everything below about starting a
+swarm does not apply to you.** You *are* the swarm. Do the analysis or the edit
+yourself, directly, and return the artifacts your prompt asks for.
+
+You are a Puppetmaster worker if your prompt contains any of:
+
+- a `Puppetmaster artifact contract:` / `Return only Puppetmaster artifact JSON` block,
+- a `Role: <role>` + `Goal: <goal>` header,
+- an instruction to finish by calling `submit_findings` or `submit_report`.
+
+Workers are spawned by `puppetmaster.worker_runtime` as plain agent CLIs. They
+have **no Puppetmaster MCP tools**, so "start a swarm before exploring" is an
+instruction they cannot follow — following it costs a full context load and
+returns a request for clarification instead of findings. Roll your own
+grep/read loop; that is your job.
+
+The rest of this file addresses an **interactive agent working with the user**,
+which has the MCP tools available.
+
 ## Default subagent runtime: Puppetmaster
 
-When this repo is open, **Puppetmaster's MCP tools are the primary path for fanning out work**. Do not roll your own grep/read exploration loops or invoke ad-hoc subagents when a Puppetmaster swarm is available.
+When this repo is open — and you are *not* a Puppetmaster worker (see above) —
+**Puppetmaster's MCP tools are the primary path for fanning out work**. Do not
+roll your own grep/read exploration loops or invoke ad-hoc subagents when a
+Puppetmaster swarm is available.
 
 ## When to start a Puppetmaster swarm (do this by default)
 
