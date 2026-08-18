@@ -1,12 +1,27 @@
-## Unreleased
+## v1.22.9
 
-- **SWE-bench Bash Only community priors.** Absorb the library-only
-  connector from PR
-  [#30](https://github.com/professorpalmer/Puppetmaster/pull/30)
-  (issue [#28](https://github.com/professorpalmer/Puppetmaster/issues/28)):
-  explicit registry mapping, fail-closed `resolved_scale` (percent vs
-  unit-interval rate), and `import-baseline` overlay that never writes
-  `capability_score`.
+**Consume community SWE-bench Bash Only evidence as labeled implement
+priors, without treating a leaderboard as ground truth.**
+
+Follow-up to issue [#28](https://github.com/professorpalmer/Puppetmaster/issues/28)
+and absorb of PR
+[#30](https://github.com/professorpalmer/Puppetmaster/pull/30)
+(@kbentonferguson): v1.22.8 shipped the scorecard plumbing; this cut
+feeds it a real public board through an explicit mapping.
+
+- **Connector.** Stdlib `puppetmaster.swebench_baseline` fetches the
+  pinned Bash Only JSON (same mini-SWE-agent version only). Exact
+  `leaderboard_name` → registry id; no fuzzy match. Library-only:
+  write JSON, then `models import-baseline --dry-run`.
+- **Scale.** Comparable rows share one `resolved_scale`. Mixed percent
+  and unit-interval rates fail closed. Percent stores
+  `quality = resolved/100`; rate stores `quality = resolved`.
+  Capability stays a same-harness weak percentile. Provenance keeps
+  harness, revision, sample count, and `not_ground_truth`.
+- **Contract.** Import still never writes `capability_score`. Starter
+  registry has no `codex/gpt-5-2`; that example is an operator mapping.
+- **Router.** ROUTING artifacts merge card-level provenance when a role
+  card drives the pick.
 
 ## v1.22.8
 
