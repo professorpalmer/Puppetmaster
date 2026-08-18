@@ -898,6 +898,7 @@ def ensure_subscription_plan_catalog(
         has_plan_frontier,
     )
     from puppetmaster.model_registry import (
+        DISCOVERY_ORIGIN_CURATED,
         load_registry,
         read_discovery_meta,
         save_registry,
@@ -936,6 +937,7 @@ def ensure_subscription_plan_catalog(
                 registry_path,
                 model_ids=[item["model"] for item in catalog if item.get("model")],
                 catalog_hash=catalog_content_hash(catalog),
+                origin=DISCOVERY_ORIGIN_CURATED,
             )
             return {
                 "action": "discovered",

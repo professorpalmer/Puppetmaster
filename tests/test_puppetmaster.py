@@ -18588,6 +18588,123 @@ class SubscriptionPlanCatalogTests(unittest.TestCase):
             self.assertTrue(meta.get("claude"))
             self.assertTrue(meta["claude"].get("model_ids"))
 
+    def test_curated_autodiscovery_records_curated_origin(self) -> None:
+        """`ensure_subscription_plan_catalog` applies CURATED_CATALOGS -- a list
+        compiled into the package -- but writes the same sidecar shape a live
+        `/v1/models` fetch does. Without an origin marker the two are
+        indistinguishable: the entry carries a fresh `refreshed_at` that reads
+        as a successful refresh, so `doctor` calls the catalog fresh and
+        re-running discovery looks like it could surface new models when it can
+        only ever re-apply the same compiled-in list."""
+        from puppetmaster.model_registry import (
+            DISCOVERY_ORIGIN_CURATED,
+            discovery_origin,
+            read_discovery_meta,
+        )
+        from puppetmaster.static_catalog import ensure_subscription_plan_catalog
+
+        with TemporaryDirectory() as tmp:
+            path = self._registry_path(tmp)
+            report = ensure_subscription_plan_catalog(
+                path,
+                billing_detector=lambda a: self._status(
+                    a,
+                    healthy=(a == "claude-code"),
+                    billing="plan" if a == "claude-code" else "unknown",
+                ),
+            )
+            self.assertEqual(report["action"], "discovered")
+            meta = read_discovery_meta(path)
+            self.assertEqual(meta["claude"]["origin"], DISCOVERY_ORIGIN_CURATED)
+            self.assertEqual(
+                discovery_origin(meta, "claude"), DISCOVERY_ORIGIN_CURATED
+            )
+
+    def test_discovery_origin_defaults_live_for_legacy_entries(self) -> None:
+        """Sidecars written before the field exists must stay readable."""
+        from puppetmaster.model_registry import (
+            DISCOVERY_ORIGIN_LIVE,
+            discovery_origin,
+            write_discovery_meta,
+        )
+
+        legacy = {"cursor": {"refreshed_at": "2026-01-01T00:00:00Z", "count": 3}}
+        self.assertEqual(discovery_origin(legacy, "cursor"), DISCOVERY_ORIGIN_LIVE)
+        self.assertEqual(discovery_origin(legacy, "absent"), DISCOVERY_ORIGIN_LIVE)
+        self.assertEqual(
+            discovery_origin({"x": {"origin": "nonsense"}}, "x"), DISCOVERY_ORIGIN_LIVE
+        )
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "models.json"
+            # Default stays live so every existing caller is unchanged.
+            write_discovery_meta("cursor", 2, path)
+            from puppetmaster.model_registry import read_discovery_meta
+
+            self.assertEqual(
+                read_discovery_meta(path)["cursor"]["origin"], DISCOVERY_ORIGIN_LIVE
+            )
+            with self.assertRaises(ValueError):
+                write_discovery_meta("cursor", 2, path, origin="bogus")
+
+    def test_doctor_labels_curated_catalog_instead_of_ageing_it(self) -> None:
+        """A curated catalog does not go stale with wall-clock time and cannot
+        be refreshed by re-running discovery, so `doctor` must neither nag
+        about its age nor claim a live check happened."""
+        from puppetmaster.diagnostics import _catalog_freshness_check
+        from puppetmaster.model_registry import DISCOVERY_ORIGIN_CURATED
+
+        old = "2020-01-01T00:00:00Z"
+        meta = {
+            "cursor": {"refreshed_at": old, "count": 3, "origin": "live"},
+            "claude": {
+                "refreshed_at": old,
+                "count": 8,
+                "origin": DISCOVERY_ORIGIN_CURATED,
+            },
+        }
+        with patch(
+            "puppetmaster.model_registry.read_discovery_meta", return_value=meta
+        ), patch(
+            "puppetmaster.model_registry.discovery_catalog_changed", return_value=False
+        ), patch(
+            "puppetmaster.model_registry.discovery_registry_drift",
+            return_value={"status": "match"},
+        ):
+            check = _catalog_freshness_check()
+        self.assertEqual(check.status, "warn")
+        # The live source is aged and named in the stale list...
+        self.assertIn("cursor", check.detail)
+        # ...the curated one is not dragged into it.
+        self.assertNotIn("claude", check.detail.split("registry")[0])
+
+    def test_doctor_reports_curated_catalog_as_curated_not_fresh(self) -> None:
+        from puppetmaster.diagnostics import _catalog_freshness_check
+        from puppetmaster.model_registry import DISCOVERY_ORIGIN_CURATED
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        meta = {
+            "claude": {
+                "refreshed_at": now,
+                "count": 8,
+                "origin": DISCOVERY_ORIGIN_CURATED,
+            }
+        }
+        with patch(
+            "puppetmaster.model_registry.read_discovery_meta", return_value=meta
+        ), patch(
+            "puppetmaster.model_registry.discovery_catalog_changed", return_value=False
+        ), patch(
+            "puppetmaster.model_registry.discovery_registry_drift",
+            return_value={"status": "match"},
+        ):
+            check = _catalog_freshness_check()
+        self.assertEqual(check.status, "ok")
+        self.assertIn("curated", check.detail)
+        self.assertIn("claude", check.detail)
+        self.assertNotIn("catalog fresh", check.detail)
+
     def test_skips_when_plan_frontier_present(self) -> None:
         from puppetmaster.model_registry import ModelSpec, save_registry
         from puppetmaster.static_catalog import ensure_subscription_plan_catalog
