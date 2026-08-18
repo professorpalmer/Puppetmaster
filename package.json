@@ -8,6 +8,6 @@
     "smoke:cursor-runner": "node --check puppetmaster/cursor_sdk_runner.mjs"
   },
   "optionalDependencies": {
-    "@cursor/sdk": "^1.0.26"
+    "@cursor/sdk": "^1.0.28"
   }
 }

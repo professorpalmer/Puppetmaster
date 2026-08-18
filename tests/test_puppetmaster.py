@@ -12130,6 +12130,53 @@ class OpenAIAdapterTests(unittest.TestCase):
         self.assertIn("cheap", nano.tags)
         self.assertLess(nano.capability_score, 60)
 
+    def test_curated_catalogs_include_claude_sonnet_5(self) -> None:
+        """Claude Code and Codex cannot enumerate their own models, so
+        CURATED_CATALOGS is the only place a Claude model can enter routing.
+        The Claude 5 family shipped with opus-5 and fable-5 but the newest
+        Sonnet stayed at 4.5 (capability 82 / 200K), so the router could
+        neither select Sonnet 5 nor rank it against its real 1M context."""
+        from puppetmaster.model_registry import starter_registry
+        from puppetmaster.static_catalog import (
+            CURATED_CATALOGS,
+            merge_curated_into_registry,
+        )
+
+        for catalog_name in ("claude-code", "agentic", "hermes"):
+            entries = {entry["model"]: entry for entry in CURATED_CATALOGS[catalog_name]}
+            self.assertIn(
+                "claude-sonnet-5", entries, f"{catalog_name} missing claude-sonnet-5"
+            )
+            sonnet5 = entries["claude-sonnet-5"]
+            sonnet45 = entries["claude-sonnet-4-5"]
+            self.assertEqual(sonnet5["context"], 1_000_000)
+            self.assertEqual(sonnet5["input"], 3.0)
+            self.assertEqual(sonnet5["output"], 15.0)
+            self.assertIn("long-context", sonnet5["tags"])
+            self.assertGreater(sonnet5["capability"], sonnet45["capability"])
+
+        # A curated entry is only useful if it survives the merge into a real
+        # registry as a routable, plan-billed spec.
+        merged, report = merge_curated_into_registry(
+            "claude-code", "plan", starter_registry()
+        )
+        self.assertIn("claude-sonnet-5", report["added"])
+        spec = next(
+            s
+            for s in merged
+            if s.adapter == "claude-code" and s.adapter_model_name == "claude-sonnet-5"
+        )
+        self.assertEqual(spec.context_window, 1_000_000)
+        self.assertEqual(spec.billing, "plan")
+        self.assertIn("plan-billed", spec.tags)
+        # Sonnet stays under every Opus tier so quality routing is unchanged.
+        opus_caps = [
+            s.capability_score
+            for s in merged
+            if s.adapter == "claude-code" and "opus" in s.adapter_model_name
+        ]
+        self.assertTrue(all(spec.capability_score < cap for cap in opus_caps))
+
     def test_starter_registry_includes_gpt_5_6_family(self) -> None:
         from puppetmaster.model_registry import starter_registry
         from puppetmaster.static_catalog import CURATED_CATALOGS
