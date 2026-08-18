@@ -53,6 +53,45 @@ still only writes the global scalar.
 `effective_capability_score`, `score_provenance`, and `sample_count`
 when present. Empty cards keep today's picks.
 
+### SWE-bench Bash Only Python connector
+
+The narrow community-data MVP is available as a Python import. It fetches the
+latest commit that changed SWE-bench's public `bash-only` leaderboard, then
+fetches the leaderboard by that immutable commit SHA. Model identity is always
+an explicit mapping; unknown or duplicate names fail closed and no fuzzy or
+cross-adapter inference occurs.
+
+```python
+import json
+from pathlib import Path
+
+from puppetmaster.swebench_baseline import (
+    RegistryModelMapping,
+    fetch_swebench_bash_only_bundle,
+)
+
+bundle = fetch_swebench_bash_only_bundle([
+    RegistryModelMapping(
+        registry_id="codex/gpt-5-2",
+        adapter="codex",
+        adapter_model_name="gpt-5.2",
+        leaderboard_name="GPT 5.2 Codex",
+    )
+])
+Path("swe-bench-bash-only.json").write_text(
+    json.dumps(bundle, indent=2) + "\n",
+    encoding="utf-8",
+)
+```
+
+The bundle is accepted by `puppetmaster models import-baseline <bundle.json>
+--dry-run`. It maps SWE-bench to the `implement` role, preserves resolved rate,
+cost, calls, sample count, exact source revision, and card-level provenance.
+The provisional capability translation is the submission's weak percentile
+rank among comparable `mini-SWE-agent` Bash Only entries (0–100). This is a
+transparent community prior, not an absolute accuracy claim or cross-adapter
+benchmark result; review the generated bundle before import.
+
 ## Where it kicks in automatically (and where it doesn't)
 
 This is the part to be honest about:

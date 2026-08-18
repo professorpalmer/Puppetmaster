@@ -904,9 +904,13 @@ def _decision_score_fields(pick: ModelSpec, role: str) -> dict:
     card = (pick.role_scorecards or {}).get(role) if used_card else None
     if not isinstance(card, dict):
         card = {}
+    provenance = dict(pick.score_provenance or {})
+    card_provenance = card.get("provenance") if used_card else None
+    if isinstance(card_provenance, dict):
+        provenance.update(card_provenance)
     sample = card.get("sample_count") if used_card else None
     if isinstance(sample, bool) or not isinstance(sample, int):
-        sample = (pick.score_provenance or {}).get("sample_count")
+        sample = provenance.get("sample_count")
         if isinstance(sample, bool) or not isinstance(sample, int):
             sample = None
     quality = card.get("quality") if used_card else None
@@ -923,7 +927,7 @@ def _decision_score_fields(pick: ModelSpec, role: str) -> dict:
         "role": role or "",
         "effective_capability_score": effective,
         "score_source": "role_card" if used_card else "manual",
-        "score_provenance": dict(pick.score_provenance or {}),
+        "score_provenance": provenance,
         "sample_count": sample,
         "predicted_quality": quality,
         "predicted_latency_p50_ms": latency,
