@@ -33,6 +33,26 @@ alternatives with the reason each was rejected — all stored as an
 `puppetmaster artifacts <job_id>` to see why each task went where,
 or `puppetmaster cost <job_id>` to sum spend across the run.
 
+## Role scorecards (v1.22.8+)
+
+`capability_score` is still the explicit **manual fallback**. Optional
+`role_scorecards` on a registry entry are keyed by task role
+(`implement`, `explore`, `review`, …) and scoped to that
+model+adapter. When a card has an integer `capability` in 0–100, the
+router uses it for that role only — so a Codex GPT-5.5 scored 97
+globally can still lose an implement route if its implement card is 70.
+
+Cards do not transfer across adapters. Import a versioned community
+prior with `puppetmaster models import-baseline` (never writes
+`capability_score`; `--dry-run` writes nothing). Local cards win unless
+you pass `--replace-cards`. `puppetmaster audit` can recommend a role-
+card change from latency / verification / retry receipts; `--apply`
+still only writes the global scalar.
+
+`puppetmaster route --json` and ROUTING artifacts expose `score_source`,
+`effective_capability_score`, `score_provenance`, and `sample_count`
+when present. Empty cards keep today's picks.
+
 ## Where it kicks in automatically (and where it doesn't)
 
 This is the part to be honest about:

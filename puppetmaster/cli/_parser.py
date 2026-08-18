@@ -2230,6 +2230,34 @@ def build_parser() -> argparse.ArgumentParser:
     models_set.add_argument("--registry-path", help="Override the registry path.")
     models_set.add_argument("model_id", help="Model id to update.")
     models_set.add_argument("assignments", nargs="+", help="key=value updates.")
+    models_import = models_sub.add_parser(
+        "import-baseline",
+        help=(
+            "Import adapter-scoped community role scorecards into the registry. "
+            "Never overwrites capability_score. Existing local cards win unless "
+            "--replace-cards."
+        ),
+    )
+    models_import.add_argument("--registry-path", help="Override the registry path.")
+    models_import.add_argument(
+        "path",
+        nargs="?",
+        default=None,
+        help=(
+            "Baseline JSON path (default: docs/baselines/role-scorecards-v1.json "
+            "from the package/repo)."
+        ),
+    )
+    models_import.add_argument(
+        "--replace-cards",
+        action="store_true",
+        help="Overwrite existing per-role cards instead of keeping local cards.",
+    )
+    models_import.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the import report without writing the registry.",
+    )
 
     evaluators_cmd = subcommands.add_parser(
         "evaluators",

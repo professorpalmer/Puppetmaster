@@ -1,3 +1,43 @@
+## v1.22.8
+
+**Ground routing in optional role scorecards so a high editorial
+`capability_score` cannot hide a weak implement card.**
+
+Issue [#28](https://github.com/professorpalmer/Puppetmaster/issues/28):
+catalog discovery can prove a model exists, but capability was still one
+user-curated scalar. A `codex/gpt-5-5` scored 97 would win a need-80
+implement over `gpt-5-4-mini` at 72 even when local receipts showed
+slow, unfinished Codex runs. This slice adds evidence-backed, adapter-
+scoped, per-role cards without rewriting routing into a utility function
+and without silently mutating the global score.
+
+- **Registry.** Optional `role_scorecards` (keyed by task role) and
+  `score_provenance` on `ModelSpec`. `capability_score` stays the
+  explicit manual fallback. Empty cards omit from saved JSON.
+- **Router.** Ranks on `effective_capability_score(spec, role)` — a
+  card `capability` int 0–100 overrides that role only. `ROUTING`
+  artifacts and `puppetmaster route` now show score source, effective
+  capability, provenance, and sample count. Empty cards keep today's
+  picks.
+- **Community baseline.** Versioned bundle at
+  `docs/baselines/role-scorecards-v1.json` (also shipped in the wheel).
+  Schema examples only — no invented SWE-bench / Aider numbers.
+  `puppetmaster models import-baseline` matches adapter + id/name,
+  never writes `capability_score`, and skips cross-adapter copies.
+  `--dry-run` writes nothing; local cards win unless `--replace-cards`.
+- **Discovery.** Same-adapter overlay uses `dataclasses.replace` so
+  cards survive `models discover --write`. Kin / cross-adapter inherit
+  still copies only `capability_score`.
+- **Audit.** Collects role, elapsed, verification result, gate, retries.
+  Prints recommendation-only `role_scorecard_suggestions`. `--apply`
+  still writes `capability_score` only.
+- **Tests.** `tests/test_role_scorecards.py` covers the #28 implement-
+  card reject, import/discover preservation, and `--apply` isolation.
+
+Not in this slice: weighted success − latency − cost utility, `fast` /
+deadline policies, automatic global score mutation, or treating the
+community bundle as a leaderboard.
+
 ## v1.22.7
 
 **Fix: Codex and Claude Code worker runs failed to spawn on Windows once the

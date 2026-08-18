@@ -22,6 +22,7 @@ import json
 import os
 import re
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Mapping, Optional
 
@@ -253,11 +254,10 @@ def catalog_to_specs(
         default_params = list(payload_defaults.get("params") or [])
         if overlay is not None:
             specs.append(
-                ModelSpec(
-                    id=overlay.id,
+                replace(
+                    overlay,
                     adapter="cursor",
                     adapter_model_name=model_id,
-                    capability_score=overlay.capability_score,
                     input_per_mtok_usd=(
                         nominal_rate[0]
                         if nominal_rate is not None
@@ -268,16 +268,12 @@ def catalog_to_specs(
                         if nominal_rate is not None
                         else overlay.output_per_mtok_usd
                     ),
-                    context_window=overlay.context_window,
                     billing="plan",
                     tags=_tags_for_cursor_params(
                         sorted(set(overlay.tags) | {"discovered"}),
                         default_params,
                     ),
-                    notes=overlay.notes,
-                    enabled=overlay.enabled,
                     payload_defaults=payload_defaults,
-                    output_token_multiplier=overlay.output_token_multiplier,
                 )
             )
         else:

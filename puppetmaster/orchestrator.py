@@ -193,6 +193,15 @@ def merge_routing_payload(payload: dict, decision, extra_fields: Optional[dict] 
     # drift if ~/.pmharness/routing.json changes mid-job.
     if decision.allowed_model_ids is not None:
         merged["allowed_model_ids"] = list(decision.allowed_model_ids)
+    effective = getattr(decision, "effective_capability_score", None)
+    if effective is not None:
+        merged["router_effective_capability"] = effective
+    score_source = getattr(decision, "score_source", None)
+    if score_source:
+        merged["router_score_source"] = score_source
+    provenance = getattr(decision, "score_provenance", None)
+    if provenance:
+        merged["router_score_provenance"] = dict(provenance)
     if extra_fields:
         merged.update(extra_fields)
     return merged

@@ -24,6 +24,7 @@ import os
 import re
 import urllib.error
 import urllib.request
+from dataclasses import replace
 from typing import Callable, Mapping, Optional
 
 from puppetmaster.model_registry import ModelSpec, normalize_model_token
@@ -159,18 +160,12 @@ def catalog_to_specs(
         )
         if overlay is not None:
             specs.append(
-                ModelSpec(
-                    id=overlay.id,
+                replace(
+                    overlay,
                     adapter=adapter,
                     adapter_model_name=model_id,
-                    capability_score=overlay.capability_score,
-                    input_per_mtok_usd=overlay.input_per_mtok_usd,
-                    output_per_mtok_usd=overlay.output_per_mtok_usd,
-                    context_window=overlay.context_window,
                     billing=overlay.billing if overlay.billing != "unknown" else billing,
                     tags=sorted(set(overlay.tags) | {"discovered"}),
-                    notes=overlay.notes,
-                    enabled=overlay.enabled,
                 )
             )
             continue

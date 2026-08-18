@@ -593,9 +593,14 @@ def _run_models_subcommand(args) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 1
         if args.json:
-            from dataclasses import asdict
+            from puppetmaster.model_registry import _spec_to_jsonable
 
-            print(json.dumps({"path": str(path), "models": [asdict(s) for s in specs]}, indent=2))
+            print(
+                json.dumps(
+                    {"path": str(path), "models": [_spec_to_jsonable(s) for s in specs]},
+                    indent=2,
+                )
+            )
             return 0
         if not specs:
             print(f"No models registered (looked at {path}).")
@@ -626,7 +631,48 @@ def _run_models_subcommand(args) -> int:
     if args.models_command == "set":
         return _run_models_set(args, path)
 
+    if args.models_command == "import-baseline":
+        return _run_models_import_baseline(args, path)
+
     raise SystemExit(f"unknown models subcommand: {args.models_command}")
+
+
+def _run_models_import_baseline(args, path: Path) -> int:
+    """Overlay a community scorecard bundle. Dry-run writes nothing."""
+    from puppetmaster.model_registry import load_registry, save_registry
+    from puppetmaster.scorecards import (
+        default_community_baseline_path,
+        import_community_baseline,
+        load_community_baseline,
+    )
+
+    bundle_path = Path(args.path) if args.path else default_community_baseline_path()
+    try:
+        bundle = load_community_baseline(bundle_path)
+        specs = load_registry(path)
+    except (RuntimeError, ValueError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    new_specs, report = import_community_baseline(
+        specs, bundle, replace_cards=bool(getattr(args, "replace_cards", False))
+    )
+    dry_run = bool(getattr(args, "dry_run", False))
+    if not dry_run:
+        save_registry(new_specs, path)
+    print(
+        f"import-baseline{' (dry-run)' if dry_run else ''}: "
+        f"matched={len(report['matched'])} "
+        f"skipped_adapter_mismatch={len(report['skipped_adapter_mismatch'])} "
+        f"cards_added={report['cards_added']}"
+    )
+    if report["matched"]:
+        print("  matched: " + ", ".join(report["matched"]))
+    for skip in report["skipped_adapter_mismatch"]:
+        print(f"  skipped_adapter_mismatch: {skip.get('id')} ({skip.get('reason')})")
+    if not dry_run:
+        print(f"  wrote {path}")
+    return 0
+
 
 _DISCOVER_SOURCE_BY_ADAPTER = {
     "agentic": "agentic",

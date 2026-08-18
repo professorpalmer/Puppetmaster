@@ -88,6 +88,13 @@ class ModelSpec:
     # :mod:`puppetmaster.platform_billing` detection. The router prefers
     # ``plan`` at sufficient capability unless the caller opts into API spend.
     billing: str = "unknown"
+    # Optional per-role evidence cards keyed by TaskSignals.role. A card's
+    # ``capability`` (int 0-100) overrides ``capability_score`` for that role
+    # only; ``capability_score`` stays the explicit manual fallback.
+    role_scorecards: dict[str, dict] = field(default_factory=dict)
+    # Optional provenance for imported / calibrated cards. ``source`` is one of
+    # manual, community_baseline, local_audit, none.
+    score_provenance: dict = field(default_factory=dict)
 
     _VALID_BILLING = ("plan", "api", "unknown")
 
@@ -106,6 +113,16 @@ class ModelSpec:
             raise ValueError(
                 f"payload_defaults for {self.id} must be a JSON object, "
                 f"got {type(self.payload_defaults).__name__}"
+            )
+        if not isinstance(self.role_scorecards, dict):
+            raise ValueError(
+                f"role_scorecards for {self.id} must be a JSON object, "
+                f"got {type(self.role_scorecards).__name__}"
+            )
+        if not isinstance(self.score_provenance, dict):
+            raise ValueError(
+                f"score_provenance for {self.id} must be a JSON object, "
+                f"got {type(self.score_provenance).__name__}"
             )
         if self.billing not in self._VALID_BILLING:
             raise ValueError(
@@ -200,6 +217,8 @@ def _spec_to_jsonable(spec: ModelSpec) -> dict[str, Any]:
         ("billing", "unknown"),
         ("payload_defaults", {}),
         ("output_token_multiplier", 1.0),
+        ("role_scorecards", {}),
+        ("score_provenance", {}),
     ]:
         if data.get(k) == default_value:
             data.pop(k)
@@ -1278,3 +1297,14 @@ def apply_agentic_model_pin(
     return apply_model_pin(
         payload, model, adapter="agentic", registry=registry
     )
+
+
+# Role-scorecard helpers live in :mod:`puppetmaster.scorecards` so this module
+# stays the registry type/IO surface. Re-exported for callers that already
+# import from here.
+from puppetmaster.scorecards import (  # noqa: E402
+    default_community_baseline_path,
+    effective_capability_score,
+    import_community_baseline,
+    load_community_baseline,
+)

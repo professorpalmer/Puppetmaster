@@ -27,6 +27,11 @@ from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
 from puppetmaster.model_registry import ModelSpec, enabled_specs, model_id_allowed
+from puppetmaster.scorecards import (
+    card_capability,
+    effective_capability_score,
+    role_card_override_note,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -380,6 +385,13 @@ class RoutingDecision:
     baseline_nominal_cost_usd: float = 0.0
     baseline_model_id: str = ""
     allowed_model_ids: Optional[list[str]] = None
+    role: str = ""
+    effective_capability_score: Optional[int] = None
+    score_source: str = ""
+    score_provenance: dict = field(default_factory=dict)
+    sample_count: Optional[int] = None
+    predicted_quality: Optional[float] = None
+    predicted_latency_p50_ms: Optional[float] = None
 
     def to_artifact_payload(self) -> dict:
         payload = {
@@ -406,6 +418,20 @@ class RoutingDecision:
             payload["allowed_model_ids"] = list(self.allowed_model_ids)
         if self.model.payload_defaults:
             payload["payload_defaults"] = self.model.payload_defaults
+        if self.role:
+            payload["role"] = self.role
+        if self.effective_capability_score is not None:
+            payload["effective_capability_score"] = self.effective_capability_score
+        if self.score_source:
+            payload["score_source"] = self.score_source
+        if self.score_provenance:
+            payload["score_provenance"] = dict(self.score_provenance)
+        if self.sample_count is not None:
+            payload["sample_count"] = self.sample_count
+        if self.predicted_quality is not None:
+            payload["predicted_quality"] = self.predicted_quality
+        if self.predicted_latency_p50_ms is not None:
+            payload["predicted_latency_p50_ms"] = self.predicted_latency_p50_ms
         return payload
 
 
@@ -655,7 +681,10 @@ def route_task(
     # penalised by) a model it could never have run. Stored on the decision so
     # the ledger compares like-for-like later instead of recomputing against a
     # possibly-changed registry.
-    _baseline_model = max(after_cost, key=lambda s: s.capability_score)
+    def _cap(spec: ModelSpec) -> int:
+        return effective_capability_score(spec, task.role)
+
+    _baseline_model = max(after_cost, key=_cap)
     _baseline_cost = _baseline_model.marginal_cost_usd(tokens_in, tokens_out)
     _baseline_nominal = _baseline_model.estimate_cost_usd(tokens_in, tokens_out)
     _baseline_id = _baseline_model.id
@@ -678,10 +707,13 @@ def route_task(
             key=lambda s: (
                 s.routing_cost_usd(tokens_in, tokens_out),
                 _plan_rank(s),
-                s.capability_score,
+                _cap(s),
             ),
         )
-        reason = "policy=cheap: lowest nominal per-call usage cost"
+        reason = (
+            "policy=cheap: lowest nominal per-call usage cost"
+            + role_card_override_note(pick, task.role)
+        )
         for spec in after_cost:
             if spec.id != pick.id:
                 rejected.append(
@@ -691,6 +723,7 @@ def route_task(
             pick, policy, need, tokens_in, tokens_out, reason, rejected,
             _baseline_cost, _baseline_id, _baseline_nominal,
             allowed_model_ids=_allowed_for_artifact,
+            role=task.role,
         )
 
     if policy == "quality":
@@ -698,9 +731,12 @@ def route_task(
         # for an out-of-pocket model when an equally-capable plan one exists.
         pick = max(
             after_cost,
-            key=lambda s: (s.capability_score, 1 if s.is_plan_billed else 0),
+            key=lambda s: (_cap(s), 1 if s.is_plan_billed else 0),
         )
-        reason = "policy=quality: highest capability_score"
+        reason = (
+            "policy=quality: highest capability_score"
+            + role_card_override_note(pick, task.role)
+        )
         for spec in after_cost:
             if spec.id != pick.id:
                 rejected.append((spec, f"higher-capability {pick.id} chosen"))
@@ -708,6 +744,7 @@ def route_task(
             pick, policy, need, tokens_in, tokens_out, reason, rejected,
             _baseline_cost, _baseline_id, _baseline_nominal,
             allowed_model_ids=_allowed_for_artifact,
+            role=task.role,
         )
 
     if policy == "escalating":
@@ -722,28 +759,29 @@ def route_task(
             return (
                 _plan_rank(spec),
                 spec.routing_cost_usd(tokens_in, tokens_out),
-                spec.capability_score,
+                _cap(spec),
             )
 
         sufficient = sorted(
-            (s for s in after_cost if s.capability_score >= need),
+            (s for s in after_cost if _cap(s) >= need),
             key=_escalation_key,
         )
         if sufficient:
             pick = sufficient[0]
         else:
             # Nothing clears the bar; escalate to the strongest available.
-            pick = max(after_cost, key=lambda s: s.capability_score)
+            pick = max(after_cost, key=_cap)
         reason = (
             "policy=escalating: start with cheapest sufficient; "
             "rejected list is the ordered escalation chain"
+            + role_card_override_note(pick, task.role)
         )
         # Order the escalation chain cheapest-first so the orchestrator retries
         # up the ladder, with any insufficient models trailing the sufficient
         # ones (they only get tried after every sufficient option is exhausted).
         escalation_order = sorted(
             after_cost,
-            key=lambda s: (0 if s.capability_score >= need else 1, *_escalation_key(s)),
+            key=lambda s: (0 if _cap(s) >= need else 1, *_escalation_key(s)),
         )
         for spec in escalation_order:
             if spec.id != pick.id:
@@ -752,10 +790,11 @@ def route_task(
             pick, policy, need, tokens_in, tokens_out, reason, rejected,
             _baseline_cost, _baseline_id, _baseline_nominal,
             allowed_model_ids=_allowed_for_artifact,
+            role=task.role,
         )
 
     # balanced (default)
-    sufficient = [s for s in after_cost if s.capability_score >= need]
+    sufficient = [s for s in after_cost if _cap(s) >= need]
     if sufficient:
         # Pick the cheapest sufficient model using nominal usage rates. This
         # keeps the router cost-aware even when Cursor reports every
@@ -765,7 +804,7 @@ def route_task(
             key=lambda s: (
                 _plan_rank(s),
                 s.routing_cost_usd(tokens_in, tokens_out),
-                s.capability_score,
+                _cap(s),
             ),
         )
         plan_note = (
@@ -773,16 +812,17 @@ def route_task(
         )
         reason = (
             f"policy=balanced: cheapest sufficient model whose capability_score "
-            f"({pick.capability_score}) >= needed ({need}){plan_note}"
+            f"({_cap(pick)}) >= needed ({need}){plan_note}"
+            f"{role_card_override_note(pick, task.role)}"
         )
         pick_cost = pick.routing_cost_usd(tokens_in, tokens_out)
         for spec in after_cost:
             if spec.id != pick.id:
-                if spec.capability_score < need:
+                if _cap(spec) < need:
                     rejected.append(
                         (
                             spec,
-                            f"capability_score {spec.capability_score} < needed {need}",
+                            f"capability_score {_cap(spec)} < needed {need}",
                         )
                     )
                 else:
@@ -811,22 +851,24 @@ def route_task(
     else:
         # Nothing meets the bar; surface the best we have rather than
         # silently failing — but the reason makes the gap obvious.
-        pick = max(after_cost, key=lambda s: s.capability_score)
+        pick = max(after_cost, key=_cap)
         reason = (
             f"policy=balanced: NO model meets capability need ({need}); "
             f"falling back to highest-capability available "
-            f"({pick.id} @ {pick.capability_score}). Consider adding a stronger "
+            f"({pick.id} @ {_cap(pick)}). Consider adding a stronger "
             f"model to your registry or lowering payload.min_capability."
+            f"{role_card_override_note(pick, task.role)}"
         )
         for spec in after_cost:
             if spec.id != pick.id:
                 rejected.append(
-                    (spec, f"lower capability_score {spec.capability_score}")
+                    (spec, f"lower capability_score {_cap(spec)}")
                 )
     return _decision(
         pick, policy, need, tokens_in, tokens_out, reason, rejected,
         _baseline_cost, _baseline_id, _baseline_nominal,
         allowed_model_ids=_allowed_for_artifact,
+        role=task.role,
     )
 
 
@@ -855,6 +897,39 @@ def _effective_allowed_model_ids(task: TaskSignals) -> Optional[frozenset[str]]:
     )
 
 
+def _decision_score_fields(pick: ModelSpec, role: str) -> dict:
+    """Provenance fields for a pick; empty cards stay omitted-friendly."""
+    effective = effective_capability_score(pick, role)
+    used_card = card_capability(pick, role) is not None
+    card = (pick.role_scorecards or {}).get(role) if used_card else None
+    if not isinstance(card, dict):
+        card = {}
+    sample = card.get("sample_count") if used_card else None
+    if isinstance(sample, bool) or not isinstance(sample, int):
+        sample = (pick.score_provenance or {}).get("sample_count")
+        if isinstance(sample, bool) or not isinstance(sample, int):
+            sample = None
+    quality = card.get("quality") if used_card else None
+    if isinstance(quality, bool) or not isinstance(quality, (int, float)):
+        quality = None
+    elif quality is not None:
+        quality = float(quality)
+    latency = card.get("latency_p50_ms") if used_card else None
+    if isinstance(latency, bool) or not isinstance(latency, (int, float)):
+        latency = None
+    elif latency is not None:
+        latency = float(latency)
+    return {
+        "role": role or "",
+        "effective_capability_score": effective,
+        "score_source": "role_card" if used_card else "manual",
+        "score_provenance": dict(pick.score_provenance or {}),
+        "sample_count": sample,
+        "predicted_quality": quality,
+        "predicted_latency_p50_ms": latency,
+    }
+
+
 def _decision(
     pick: ModelSpec,
     policy: str,
@@ -867,7 +942,9 @@ def _decision(
     baseline_model_id: str = "",
     baseline_nominal_cost_usd: float = 0.0,
     allowed_model_ids: Optional[list[str]] = None,
+    role: str = "",
 ) -> RoutingDecision:
+    score_fields = _decision_score_fields(pick, role)
     return RoutingDecision(
         model=pick,
         policy=policy,
@@ -882,6 +959,7 @@ def _decision(
         baseline_nominal_cost_usd=baseline_nominal_cost_usd,
         baseline_model_id=baseline_model_id,
         allowed_model_ids=allowed_model_ids,
+        **score_fields,
     )
 
 
