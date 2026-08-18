@@ -1,3 +1,13 @@
+## Unreleased
+
+- **SWE-bench Bash Only community priors.** Absorb the library-only
+  connector from PR
+  [#30](https://github.com/professorpalmer/Puppetmaster/pull/30)
+  (issue [#28](https://github.com/professorpalmer/Puppetmaster/issues/28)):
+  explicit registry mapping, fail-closed `resolved_scale` (percent vs
+  unit-interval rate), and `import-baseline` overlay that never writes
+  `capability_score`.
+
 ## v1.22.8
 
 **Ground routing in optional role scorecards so a high editorial
