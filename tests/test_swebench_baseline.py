@@ -1,6 +1,13 @@
 from __future__ import annotations
 
+import os
+import sys
 import unittest
+
+_HERMETIC_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HERMETIC_DIR not in sys.path:
+    sys.path.insert(0, _HERMETIC_DIR)
+import hermetic_env  # noqa: F401
 
 
 class SweBenchBaselineTests(unittest.TestCase):
@@ -70,6 +77,7 @@ class SweBenchBaselineTests(unittest.TestCase):
         self.assertEqual(card["provenance"]["source_revision"], "abc123")
         self.assertEqual(card["provenance"]["raw_model_name"], "Model 3")
         self.assertEqual(card["provenance"]["capability_method"], "leaderboard_percentile")
+        self.assertEqual(card["provenance"]["resolved_scale"], "percent")
 
     def test_bundle_import_changes_only_role_capability(self) -> None:
         from puppetmaster.model_registry import ModelSpec
@@ -163,6 +171,46 @@ class SweBenchBaselineTests(unittest.TestCase):
         card = bundle["entries"][0]["role_scorecards"]["implement"]
         self.assertEqual(card["capability"], 50)
         self.assertEqual(card["provenance"]["harness_version"], "2.0.0")
+
+    def test_mixed_percent_and_unit_interval_resolved_fails_closed(self) -> None:
+        from puppetmaster.swebench_baseline import (
+            RegistryModelMapping,
+            build_swebench_bash_only_bundle,
+        )
+
+        payload = self._payload()
+        payload["leaderboards"][0]["results"][0]["resolved"] = 0.728
+        with self.assertRaisesRegex(ValueError, "mixed resolved scale"):
+            build_swebench_bash_only_bundle(
+                payload,
+                mappings=[RegistryModelMapping("codex/model-3", "codex", "model-3", "Model 3")],
+                source_revision="abc123",
+                published="2026-08-18",
+            )
+
+    def test_all_rate_board_keeps_quality_equal_to_resolved(self) -> None:
+        from puppetmaster.swebench_baseline import (
+            RegistryModelMapping,
+            build_swebench_bash_only_bundle,
+        )
+
+        payload = self._payload()
+        rates = (0.20, 0.40, 0.60, 0.80, 0.90)
+        for row, resolved in zip(payload["leaderboards"][0]["results"][:5], rates):
+            row["resolved"] = resolved
+
+        bundle = build_swebench_bash_only_bundle(
+            payload,
+            mappings=[RegistryModelMapping("codex/model-3", "codex", "model-3", "Model 3")],
+            source_revision="abc123",
+            published="2026-08-18",
+        )
+
+        card = bundle["entries"][0]["role_scorecards"]["implement"]
+        self.assertEqual(card["quality"], 0.60)
+        self.assertNotEqual(card["quality"], 0.006)
+        self.assertEqual(card["capability"], 50)
+        self.assertEqual(card["provenance"]["resolved_scale"], "rate")
 
     def test_rejects_out_of_range_quality_and_negative_economics(self) -> None:
         from puppetmaster.swebench_baseline import (

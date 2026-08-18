@@ -55,11 +55,11 @@ when present. Empty cards keep today's picks.
 
 ### SWE-bench Bash Only Python connector
 
-The narrow community-data MVP is available as a Python import. It fetches the
-latest commit that changed SWE-bench's public `bash-only` leaderboard, then
-fetches the leaderboard by that immutable commit SHA. Model identity is always
-an explicit mapping; unknown or duplicate names fail closed and no fuzzy or
-cross-adapter inference occurs.
+The narrow community-data MVP is a library-only path: fetch the latest commit
+that changed SWE-bench's public `bash-only` leaderboard, write that pinned
+JSON, then overlay it with `puppetmaster models import-baseline`. Model
+identity is always an explicit mapping; unknown or duplicate names fail closed
+and no fuzzy or cross-adapter inference occurs.
 
 ```python
 import json
@@ -84,13 +84,20 @@ Path("swe-bench-bash-only.json").write_text(
 )
 ```
 
-The bundle is accepted by `puppetmaster models import-baseline <bundle.json>
---dry-run`. It maps SWE-bench to the `implement` role, preserves resolved rate,
-cost, calls, sample count, exact source revision, and card-level provenance.
-The provisional capability translation is the submission's weak percentile
-rank among comparable `mini-SWE-agent` Bash Only entries (0–100). This is a
-transparent community prior, not an absolute accuracy claim or cross-adapter
-benchmark result; review the generated bundle before import.
+`import-baseline` matches adapter + registry id and no-ops when that id is
+absent. The starter registry has `codex/gpt-5-4-mini`, `codex/gpt-5-5`, and
+the GPT-5.6 sol/terra/luna rows — not `codex/gpt-5-2`. The GPT 5.2 Codex
+example above is an operator mapping, not a `models init` row.
+
+The bundle maps SWE-bench to the `implement` role and stamps
+`resolved_scale` (`percent` or `rate`) on card provenance. Comparable rows on
+one harness version must share a scale; mixing percent scores with exclusive
+unit-interval rates fails closed. Capability stays the submission's weak
+percentile of the raw resolved values among comparable `mini-SWE-agent` Bash
+Only entries (0–100). This is a transparent community prior, not an absolute
+accuracy claim or cross-adapter benchmark result; review the generated bundle
+with `puppetmaster models import-baseline <bundle.json> --dry-run` before
+import.
 
 ## Where it kicks in automatically (and where it doesn't)
 

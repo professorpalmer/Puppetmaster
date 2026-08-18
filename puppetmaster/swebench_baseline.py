@@ -116,14 +116,45 @@ def _bash_only_rows(payload: dict) -> list[dict]:
     return rows
 
 
+def _classify_resolved_scale(rows: list[dict]) -> str:
+    """Return ``percent`` or ``rate`` for one comparable resolved set.
+
+    Values outside 0..100 are rejected. A set that contains both a percent
+    score (``> 1``) and an exclusive unit-interval rate (``0 < value < 1``)
+    is mixed and fails closed. ``0`` and ``1.0`` stay valid on a percent
+    board and do not count as mixed.
+    """
+    values = []
+    for row in rows:
+        resolved = float(row["resolved"])
+        if not 0.0 <= resolved <= 100.0:
+            raise ValueError(
+                f"SWE-bench row {str(row.get('name') or '')!r} resolved must be 0..100"
+            )
+        values.append(resolved)
+    has_percent = any(value > 1.0 for value in values)
+    has_unit_interval = any(0.0 < value < 1.0 for value in values)
+    if has_percent and has_unit_interval:
+        raise ValueError("SWE-bench comparable rows have mixed resolved scale")
+    return "percent" if has_percent else "rate"
+
+
+def _quality_from_resolved(resolved: float, resolved_scale: str) -> float:
+    """Store quality on the unit interval without inventing a second scale."""
+    if resolved_scale == "percent":
+        return round(resolved / 100.0, 6)
+    return round(resolved, 6)
+
+
 def _percentile_capability(rows: list[dict], resolved: float) -> int:
     """Place one result from last to first on a 0-100 scale.
 
-    The raw resolved rate stays in the scorecard as ``quality``. Puppetmaster's
-    router also needs a 0-100 capability value, so the MVP uses position within
-    the comparable leaderboard group. A value of 80 means the submission ranks
-    at or above roughly 80 percent of that group. It does not mean 80 percent of
-    SWE-bench tasks passed.
+    Rank uses the published resolved values as-is. Scorecard ``quality`` is a
+    separate scale-normalized copy. Puppetmaster's router also needs a 0-100
+    capability value, so the MVP uses position within the comparable
+    leaderboard group. A value of 80 means the submission ranks at or above
+    roughly 80 percent of that group. It does not mean 80 percent of SWE-bench
+    tasks passed.
 
     Ties receive the same rank. The exact source revision and comparison count
     are saved so the number can always be reproduced.
@@ -182,10 +213,6 @@ def build_swebench_bash_only_bundle(
         # newest model on their behalf.
         row = _mapped_row(rows, mapping)
         resolved = float(row["resolved"])
-        if not 0.0 <= resolved <= 100.0:
-            raise ValueError(
-                f"SWE-bench row {mapping.leaderboard_name!r} resolved must be 0..100"
-            )
         for field_name in ("instance_cost", "instance_calls"):
             value = row.get(field_name)
             if (
@@ -215,6 +242,7 @@ def build_swebench_bash_only_bundle(
                 f"SWE-bench harness version {harness_version!r} has only "
                 f"{len(comparable)} comparable rows; need at least {_MIN_COMPARABLE_ROWS}"
             )
+        resolved_scale = _classify_resolved_scale(comparable)
         details = row.get("per_instance_details")
         if isinstance(details, dict) and details:
             # Prefer the task-level evidence when the row includes it.
@@ -239,11 +267,12 @@ def build_swebench_bash_only_bundle(
             "source_revision": revision,
             "raw_model_name": mapping.leaderboard_name,
             "capability_method": "leaderboard_percentile",
+            "resolved_scale": resolved_scale,
             "sample_count_source": sample_count_source,
         }
         card = {
             "capability": capability,
-            "quality": round(resolved / 100.0, 6),
+            "quality": _quality_from_resolved(resolved, resolved_scale),
             "sample_count": sample_count,
             "last_calibrated": str(row.get("date") or published_at),
             "provenance": provenance,
