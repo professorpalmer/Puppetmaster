@@ -13913,6 +13913,29 @@ class InstallRulesTests(unittest.TestCase):
                 msg="the worker exemption must precede the delegate-first gate",
             )
 
+    def test_hand_maintained_rules_exempt_puppetmaster_workers(self):
+        """Repo ``AGENTS.md`` and ``puppetmaster-workflow.mdc`` are not rendered
+        from ``RULE_BODY``. They must carry the same worker exemption, ahead of
+        the swarm-start language, or a Codex/Cursor worker in this repo still
+        hits the original self-delegation loop."""
+        root = Path(__file__).resolve().parents[1]
+        files = (
+            root / "AGENTS.md",
+            root / ".cursor" / "rules" / "puppetmaster-workflow.mdc",
+        )
+        for path in files:
+            text = path.read_text(encoding="utf-8")
+            flattened = " ".join(text.split())
+            lowered = flattened.lower()
+            self.assertIn("are you a puppetmaster worker", lowered)
+            self.assertIn("Puppetmaster artifact contract:", flattened)
+            self.assertIn("submit_findings", flattened)
+            self.assertLess(
+                lowered.index("are you a puppetmaster worker"),
+                lowered.index("start a puppetmaster swarm"),
+                msg=f"{path.name} must exempt workers before telling them to start a swarm",
+            )
+
     def test_rules_nudge_labeling_every_job(self):
         """Every platform's managed rules (they share RULE_BODY) must tell the
         agent to pass a short `label` on start_*/edit verbs so dashboard jobs
