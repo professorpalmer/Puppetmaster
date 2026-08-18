@@ -2,7 +2,7 @@
 
 The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
 
-**Current release:** [v1.22.9](CHANGELOG.md#v1229) — SWE-bench Bash Only community priors for implement routing (issue #28 / PR #30); see [CHANGELOG.md](CHANGELOG.md) for the full line.
+**Current release:** [v1.22.10](CHANGELOG.md#v12210) — spawned workers are exempt from the delegate-first gate; see [CHANGELOG.md](CHANGELOG.md) for the full line.
 
 ## Start here
 

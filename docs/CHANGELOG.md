@@ -1,3 +1,23 @@
+## v1.22.10
+
+**Fix: spawned Codex / Claude Code / Cursor workers read the delegate-first
+rule and tried to start a swarm they cannot reach.**
+
+A worker is a plain agent CLI with no `puppetmaster_*` MCP tools, but it
+still loads `install-rules` output (`AGENTS.md`, `~/.codex/instructions.md`,
+`~/.claude/CLAUDE.md`, the Cursor `.mdc`). The gate sat ahead of the
+fallback, so workers burned a context load and returned a clarifying
+question instead of findings.
+
+- **Worker exemption first.** `RULE_BODY` now tells a worker to do the
+  analysis or edit itself when the prompt carries a `Puppetmaster
+  artifact contract:`, a `Role:` + `Goal:` header, or a
+  `submit_findings` / `submit_report` instruction. The exemption sits
+  above the delegate-first gate in every managed render.
+- **Hand-maintained copies.** Repo `AGENTS.md` and
+  `.cursor/rules/puppetmaster-workflow.mdc` are not generated from
+  `RULE_BODY`; they get the same exemption, locked by test.
+
 ## v1.22.9
 
 **Consume community SWE-bench Bash Only evidence as labeled implement
