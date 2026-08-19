@@ -11361,6 +11361,285 @@ class ModelRouterTests(unittest.TestCase):
             routed = Orchestrator(store)._with_retrieved_memory(specs, goal)
             self.assertIn("retrieved_memory", routed[0].payload)
 
+    def test_run_verb_timeout_reaches_the_orchestrator_watchdog(self) -> None:
+        """End to end through the real dispatch path: `--timeout-seconds` on
+        `run` must land in every role's payload, because that payload is the
+        *only* thing `Orchestrator._worker_wait_timeout` reads. Unstamped, the
+        default workers give `max([60]) + 30` = 90s base and a 270s ceiling --
+        shorter than one real agent turn, and the reason a 600s request was
+        killed at the ceiling."""
+        from puppetmaster import cli
+        from puppetmaster.cli._dispatch import _main
+        from puppetmaster.models import Task
+        from puppetmaster.orchestrator import Orchestrator
+
+        class _Stop(Exception):
+            pass
+
+        def watchdog_bounds(argv: list) -> tuple:
+            captured = {}
+
+            def fake_run(self, goal, *, specs, **kwargs):
+                captured["specs"] = specs
+                raise _Stop()
+
+            with TemporaryDirectory() as tmp:
+                with patch.object(cli.Orchestrator, "run", fake_run):
+                    with self.assertRaises(_Stop):
+                        _main(["--state-dir", tmp, *argv])
+
+            specs = captured["specs"]
+            self.assertEqual(
+                [spec.role for spec in specs],
+                ["explore", "architect", "implement", "redteam", "test"],
+                msg="every role must be stamped, or the chain stalls later",
+            )
+            tasks = [
+                Task(
+                    job_id="j",
+                    role=spec.role,
+                    instruction=spec.instruction,
+                    payload=dict(spec.payload),
+                )
+                for spec in specs
+            ]
+            base = Orchestrator._worker_wait_timeout(tasks[:1])
+            return base, Orchestrator._worker_hard_cap(tasks[:1], base)
+
+        # Unchanged when the flag is absent, so existing runs and configs move.
+        self.assertEqual(watchdog_bounds(["run", "goal"]), (90, 270))
+        self.assertEqual(
+            watchdog_bounds(["run", "goal", "--timeout-seconds", "600"]),
+            (630, 1890),
+        )
+        self.assertEqual(
+            watchdog_bounds(
+                [
+                    "run",
+                    "goal",
+                    "--timeout-seconds",
+                    "600",
+                    "--max-timeout-seconds",
+                    "1800",
+                ]
+            ),
+            (630, 1800),
+        )
+
+    def test_run_verb_stamps_timeout_on_every_role(self) -> None:
+        from puppetmaster.cli._parser import build_parser
+        from puppetmaster.workers import specs_for_roles
+
+        args = build_parser().parse_args(["run", "goal", "--timeout-seconds", "600"])
+        self.assertEqual(args.timeout_seconds, 600)
+        self.assertIsNone(args.max_timeout_seconds)
+        # Every default role, not just the first, or the chain stalls later.
+        self.assertEqual(
+            [spec.role for spec in specs_for_roles(args.workers)],
+            ["explore", "architect", "implement", "redteam", "test"],
+        )
+
+    def test_analysis_swarm_specs_carry_the_explicit_hard_cap(self) -> None:
+        """The generated-config branch is the other way a swarm is launched;
+        it stamped `timeout_seconds` but had no way to set the ceiling."""
+        from puppetmaster.swarm_launch import build_analysis_swarm_specs
+
+        specs = build_analysis_swarm_specs(
+            "goal",
+            ["explore", "test"],
+            adapter="cursor",
+            timeout_seconds=600,
+            max_timeout_seconds=1800,
+        )
+        for spec in specs:
+            self.assertEqual(spec.payload["timeout_seconds"], 600)
+            self.assertEqual(spec.payload["max_timeout_seconds"], 1800)
+
+        # Absent by default, so the 3x-base ceiling still applies.
+        default = build_analysis_swarm_specs(
+            "goal", ["explore"], adapter="cursor", timeout_seconds=600
+        )
+        self.assertNotIn("max_timeout_seconds", default[0].payload)
+
+    def test_start_swarm_forwards_the_timeout_it_advertises(self) -> None:
+        """`timeout_seconds` is on this tool's schema (via goal_schema) and every
+        sibling start verb forwards it, but `start_swarm` consumed it only on the
+        `adapter` branch. A plain `start_swarm(goal, timeout_seconds=600)` fell
+        through to `["run", goal]`, which had no such flag, so the value was
+        dropped and the orchestrator used its 90s floor instead."""
+        from puppetmaster import mcp_server
+
+        captured = {}
+
+        def fake_start_cli(command, args):
+            captured["command"] = command
+            return {"ok": True}
+
+        with patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
+            mcp_server.start_swarm(
+                {
+                    "goal": "long audit",
+                    "cwd": ".",
+                    "roles": ["explore"],
+                    "allow_local_demo": True,
+                    "timeout_seconds": 600,
+                    "max_timeout_seconds": 1800,
+                }
+            )
+
+        command = captured["command"]
+        self.assertIn("--timeout-seconds", command)
+        self.assertEqual(command[command.index("--timeout-seconds") + 1], "600")
+        self.assertIn("--max-timeout-seconds", command)
+        self.assertEqual(command[command.index("--max-timeout-seconds") + 1], "1800")
+
+    def test_start_swarm_omits_timeout_flags_when_not_asked(self) -> None:
+        from puppetmaster import mcp_server
+
+        captured = {}
+
+        def fake_start_cli(command, args):
+            captured["command"] = command
+            return {"ok": True}
+
+        with patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
+            mcp_server.start_swarm(
+                {
+                    "goal": "quick audit",
+                    "cwd": ".",
+                    "roles": ["explore"],
+                    "allow_local_demo": True,
+                }
+            )
+
+        self.assertNotIn("--timeout-seconds", captured["command"])
+        self.assertNotIn("--max-timeout-seconds", captured["command"])
+
+    def test_swarm_timeout_arg_coercion_rejects_nonsense(self) -> None:
+        """Numeric strings are tolerated (JSON-RPC clients send them); bools,
+        zero, negatives, and unparseable values never become a flag -- a
+        `timeout_seconds: true` must not turn into `--timeout-seconds 1`."""
+        from puppetmaster.mcp_server import _append_swarm_timeout_flags
+
+        for value, expected in (
+            (600, ["--timeout-seconds", "600"]),
+            ("600", ["--timeout-seconds", "600"]),
+            (600.0, ["--timeout-seconds", "600"]),
+            (True, []),
+            (False, []),
+            (0, []),
+            (-5, []),
+            ("soon", []),
+            (None, []),
+        ):
+            command = ["run", "goal"]
+            _append_swarm_timeout_flags(command, {"timeout_seconds": value})
+            self.assertEqual(command[2:], expected, msg=f"value={value!r}")
+
+    def test_generated_config_timeout_survives_a_junk_argument(self) -> None:
+        """The generated-config branch used a bare `int(... or 900)`, so
+        `timeout_seconds: true` became **1** -- a 1-second timeout stamped onto
+        every worker payload, killing each worker immediately -- and a negative
+        went straight through to `subprocess.wait()`. The flag path already
+        rejected both, so nothing downstream corrected it."""
+        import json
+
+        from puppetmaster.mcp_server import write_generated_swarm_config
+
+        for junk in (True, -30, 0, "soon", None):
+            with TemporaryDirectory() as tmp:
+                path = write_generated_swarm_config(
+                    {
+                        "goal": "audit",
+                        "cwd": tmp,
+                        "state_dir": tmp,
+                        "timeout_seconds": junk,
+                    },
+                    ["explore"],
+                    "cursor",
+                )
+                workers = json.loads(Path(path).read_text("utf-8"))["workers"]
+            self.assertEqual(
+                [w["payload"]["timeout_seconds"] for w in workers],
+                [900],
+                msg=f"timeout_seconds={junk!r} must fall back, not be coerced",
+            )
+
+        # ...and a usable value still reaches every generated payload.
+        with TemporaryDirectory() as tmp:
+            path = write_generated_swarm_config(
+                {
+                    "goal": "audit",
+                    "cwd": tmp,
+                    "state_dir": tmp,
+                    "timeout_seconds": 600,
+                    "max_timeout_seconds": 1800,
+                },
+                ["explore", "test"],
+                "cursor",
+            )
+            workers = json.loads(Path(path).read_text("utf-8"))["workers"]
+        for worker in workers:
+            self.assertEqual(worker["payload"]["timeout_seconds"], 600)
+            self.assertEqual(worker["payload"]["max_timeout_seconds"], 1800)
+
+    def test_start_swarm_forwards_timeout_with_a_caller_supplied_config(self) -> None:
+        """A caller-supplied `config=` stamps nothing into worker payloads, so
+        the advertised `timeout_seconds` would be dropped there just as it was
+        on the bare `run` branch. The CLI applies the flag on top of whatever
+        the config declares, which is the precedence an explicit argument
+        should have."""
+        from puppetmaster import mcp_server
+
+        captured = {}
+
+        def fake_start_cli(command, args):
+            captured["command"] = command
+            return {"ok": True}
+
+        with patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
+            mcp_server.start_swarm(
+                {
+                    "goal": "team audit",
+                    "cwd": ".",
+                    "config": "team.json",
+                    "timeout_seconds": 3600,
+                }
+            )
+
+        command = captured["command"]
+        self.assertIn("--config", command)
+        self.assertIn("--timeout-seconds", command)
+        self.assertEqual(command[command.index("--timeout-seconds") + 1], "3600")
+
+    def test_start_swarm_generated_config_also_carries_the_flag(self) -> None:
+        """Redundant on this branch (write_analysis_swarm_config stamps the same
+        value into every payload) but never contradictory -- both come from the
+        same argument."""
+        from puppetmaster import mcp_server
+
+        captured = {}
+
+        def fake_start_cli(command, args):
+            captured["command"] = command
+            return {"ok": True}
+
+        with patch.object(mcp_server, "start_cli", side_effect=fake_start_cli), patch.object(
+            mcp_server, "write_generated_swarm_config", return_value=Path("generated.json")
+        ), patch.object(mcp_server, "_platform_lock_preflight", return_value=None):
+            mcp_server.start_swarm(
+                {
+                    "goal": "cursor audit",
+                    "cwd": ".",
+                    "adapter": "cursor",
+                    "timeout_seconds": 600,
+                }
+            )
+
+        command = captured["command"]
+        self.assertIn("--config", command)
+        self.assertEqual(command[command.index("--timeout-seconds") + 1], "600")
+
     def test_start_swarm_passes_disable_memory_flag_by_default(self) -> None:
         from puppetmaster import mcp_server
 
@@ -21849,6 +22128,399 @@ class PuppetmasterLoudFailureTests(unittest.TestCase):
             verdict = assess_run_quality(artifacts)
             self.assertEqual(verdict["quality"], "blocked")
             self.assertIn("worker_timeout", verdict["blocking_failures"])
+
+    def test_timeout_artifact_reports_elapsed_not_base_timeout(self) -> None:
+        """The bug that cost the most debugging time: `_kill_and_report_timeout`
+        was handed `base_timeout`, so a run extended all the way to the 3x hard
+        cap still reported "killed after 90s". Observed on a real job that ran
+        269s and reported 90. The record must say how long it actually ran, and
+        that an extension happened."""
+        from puppetmaster.models import Task
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("long audit")
+            task = Task(job_id=job.id, role="explore", instruction="audit")
+            store.save_task(task)
+
+            Orchestrator(store)._emit_timeout_artifact(
+                job,
+                [task],
+                90,
+                elapsed_seconds=269,
+                hard_cap_seconds=270,
+                extended=True,
+            )
+
+            payload = store.list_artifacts(job.id)[0].payload
+            self.assertEqual(payload["elapsed_seconds"], 269)
+            self.assertEqual(payload["base_timeout_seconds"], 90)
+            self.assertEqual(payload["hard_cap_seconds"], 270)
+            self.assertTrue(payload["extended"])
+            self.assertEqual(payload["limit_hit"], "hard_cap")
+            self.assertIn("killed after 269s", payload["message"])
+            self.assertIn("hard cap", payload["message"])
+            self.assertNotIn("killed after 90s", payload["message"])
+
+    def test_timeout_artifact_without_extension_names_the_base_timeout(self) -> None:
+        from puppetmaster.models import Task
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("wedged")
+            task = Task(job_id=job.id, role="explore", instruction="audit")
+            store.save_task(task)
+
+            Orchestrator(store)._emit_timeout_artifact(
+                job, [task], 600, elapsed_seconds=601, hard_cap_seconds=1800
+            )
+
+            payload = store.list_artifacts(job.id)[0].payload
+            self.assertFalse(payload["extended"])
+            self.assertEqual(payload["limit_hit"], "base_timeout")
+            self.assertIn("killed after 601s", payload["message"])
+            self.assertIn("600s base timeout", payload["message"])
+
+    def test_extended_but_quiet_run_is_not_reported_as_hitting_the_cap(self) -> None:
+        """Because the progress signal is really liveness, nearly every worker
+        gets extended -- so `extended` must not be read as "reached the
+        ceiling". A run extended at 110s and killed at 150s under a 270s cap
+        stopped emitting events; saying it "hit the 270s hard cap" would be the
+        same class of misreporting this change exists to remove."""
+        from puppetmaster.models import Task
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("quiet after extension")
+            task = Task(job_id=job.id, role="explore", instruction="audit")
+            store.save_task(task)
+
+            Orchestrator(store)._emit_timeout_artifact(
+                job,
+                [task],
+                90,
+                elapsed_seconds=150,
+                hard_cap_seconds=270,
+                extended=True,
+            )
+
+            payload = store.list_artifacts(job.id)[0].payload
+            self.assertTrue(payload["extended"])
+            self.assertEqual(payload["limit_hit"], "went_quiet_after_extension")
+            self.assertIn("killed after 150s", payload["message"])
+            self.assertIn("stopped emitting events", payload["message"])
+            self.assertNotIn("hit the 270s hard cap", payload["message"])
+
+    def test_limit_hit_tolerates_elapsed_truncation_at_the_cap(self) -> None:
+        """`elapsed_seconds` is int(float), so a kill at 269.7s against a 270s
+        cap arrives as 269 -- the real job this came from reported exactly that.
+        The fallback classifier must still call it a cap kill."""
+        self.assertEqual(Orchestrator._timeout_limit_hit(269, 270, True), "hard_cap")
+        self.assertEqual(Orchestrator._timeout_limit_hit(270, 270, True), "hard_cap")
+        self.assertEqual(
+            Orchestrator._timeout_limit_hit(150, 270, True),
+            "went_quiet_after_extension",
+        )
+        self.assertEqual(Orchestrator._timeout_limit_hit(91, 270, False), "base_timeout")
+        self.assertEqual(Orchestrator._timeout_limit_hit(None, None, False), "base_timeout")
+
+    def test_cap_near_the_base_is_still_reported_as_a_cap_kill(self) -> None:
+        """A ceiling within one poll of the base timeout is reached on the first
+        post-base check, so no extension is ever recorded. Keying the label off
+        `extended` would then describe a worker that was actively emitting
+        events as having "hit its base timeout without further progress" --
+        newly reachable now that an explicit cap is used as given."""
+        import subprocess as sp
+        import time
+
+        from puppetmaster.models import Task
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("tight ceiling")
+            task = Task(job_id=job.id, role="cursor", instruction="e2e")
+
+            class BusyProc:
+                """Alive and emitting, but one poll already overruns the tight
+                ceiling -- so the kill happens before any extension is recorded."""
+
+                def __init__(self) -> None:
+                    self.returncode = -15
+                    self.calls = 0
+                    self.killed = False
+
+                def wait(self, timeout=None):
+                    if self.killed:
+                        return -15
+                    self.calls += 1
+                    store.emit(job.id, "run.heartbeat", {"n": self.calls})
+                    time.sleep(0.15)
+                    raise sp.TimeoutExpired(cmd="x", timeout=timeout)
+
+                def terminate(self):
+                    self.killed = True
+
+                def kill(self):
+                    self.killed = True
+
+            orch = Orchestrator(store)
+            # A real ceiling just above the base: reached on the first post-base
+            # check, so `extended` is never recorded.
+            with patch.object(
+                Orchestrator, "_worker_wait_timeout", staticmethod(lambda tasks: 0)
+            ), patch.object(
+                Orchestrator, "_worker_hard_cap", staticmethod(lambda tasks, base: 0.1)
+            ):
+                with self.assertRaises(RuntimeError):
+                    orch._wait_for_worker(BusyProc(), job, [task])
+
+            events = [e["event"] for e in store.read_events(job.id)]
+            self.assertNotIn("worker.timeout_extended", events)
+            payload = [
+                e for e in store.read_events(job.id) if e["event"] == "worker.timed_out"
+            ][0]["payload"]
+            self.assertEqual(payload["limit_hit"], "hard_cap")
+            self.assertFalse(payload["extended"])
+
+            # The message must not claim an extension the payload denies.
+            message = [
+                a
+                for a in store.list_artifacts(job.id)
+                if a.payload.get("check") == "worker.timeout"
+            ][0].payload["message"]
+            self.assertIn("hard cap", message)
+            self.assertNotIn("was extended", message)
+            # A cap kill points at the knob that moves the ceiling.
+            self.assertIn("max_timeout_seconds", message)
+
+    def test_timeout_artifact_keeps_working_without_the_new_details(self) -> None:
+        """The keyword arguments are optional, so older/direct callers still get
+        a blocked artifact rather than a TypeError."""
+        from puppetmaster.models import Task
+        from puppetmaster.quality import assess_run_quality
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("legacy call")
+            task = Task(job_id=job.id, role="implement", instruction="e2e")
+            store.save_task(task)
+
+            Orchestrator(store)._emit_timeout_artifact(job, [task], timeout_seconds=600)
+
+            artifacts = store.list_artifacts(job.id)
+            self.assertEqual(assess_run_quality(artifacts)["quality"], "blocked")
+            self.assertIn("killed after 600s", artifacts[0].payload["message"])
+
+    def test_explicit_hard_cap_is_used_as_given(self) -> None:
+        """`max_timeout_seconds` was folded in with `max(base * 3, explicit)`, so
+        an explicit ceiling could only ever raise it: asking for 1800s on a 630s
+        base silently produced 1890s and there was no way to bound a run more
+        tightly than 3x."""
+        from puppetmaster.models import Task
+
+        def bounds(payload: dict) -> tuple:
+            tasks = [
+                Task(job_id="j", role="explore", instruction="i", payload=payload)
+            ]
+            base = Orchestrator._worker_wait_timeout(tasks)
+            return base, Orchestrator._worker_hard_cap(tasks, base)
+
+        self.assertEqual(bounds({"timeout_seconds": 600}), (630, 1890))
+        self.assertEqual(
+            bounds({"timeout_seconds": 600, "max_timeout_seconds": 1800}), (630, 1800)
+        )
+        self.assertEqual(
+            bounds({"timeout_seconds": 600, "max_timeout_seconds": 3600}), (630, 3600)
+        )
+        # A cap under the base would kill the worker before its own timeout and
+        # make timeout_seconds meaningless, so it floors at the base.
+        self.assertEqual(
+            bounds({"timeout_seconds": 600, "max_timeout_seconds": 60}), (630, 630)
+        )
+        # Junk falls back to 3x rather than producing a nonsense ceiling.
+        for junk in (True, 0, -5):
+            self.assertEqual(
+                bounds({"timeout_seconds": 600, "max_timeout_seconds": junk}),
+                (630, 1890),
+                msg=f"max_timeout_seconds={junk!r}",
+            )
+
+    def test_cli_rejects_a_non_positive_timeout_at_parse_time(self) -> None:
+        """Worker payload timeouts go straight to `subprocess.wait(timeout=)`,
+        so `--timeout-seconds 0` or a negative would kill every worker the
+        instant it started. The MCP path already guarded this; the CLI must
+        too, and loudly rather than by silently falling back."""
+        from puppetmaster.cli._parser import build_parser
+
+        for verb in ("run", "swarm"):
+            for flag in ("--timeout-seconds", "--max-timeout-seconds"):
+                for bad in ("0", "-5", "abc"):
+                    with self.assertRaises(SystemExit, msg=f"{verb} {flag} {bad}"):
+                        with contextlib.redirect_stderr(io.StringIO()):
+                            build_parser().parse_args([verb, "goal", flag, bad])
+        # ...and a usable value still parses.
+        args = build_parser().parse_args(
+            ["run", "goal", "--timeout-seconds", "600", "--max-timeout-seconds", "1800"]
+        )
+        self.assertEqual((args.timeout_seconds, args.max_timeout_seconds), (600, 1800))
+
+    def test_extended_kill_at_the_ceiling_says_it_was_extended(self) -> None:
+        self.assertIn(
+            "was extended past its",
+            Orchestrator._timeout_message(["explore"], 90, 269, 270, "hard_cap", True),
+        )
+        self.assertNotIn(
+            "was extended",
+            Orchestrator._timeout_message(["explore"], 600, 601, 630, "hard_cap", False),
+        )
+
+    def test_one_roles_tight_cap_does_not_starve_an_uncapped_sibling(self) -> None:
+        """`_wait_for_worker` is handed every task in the batch, not one role.
+        Using the explicit ceiling as given would let a short-capped role set the
+        ceiling for a long-running sibling that never asked for one -- with
+        `{timeout_seconds: 3600}` beside `{timeout_seconds: 600,
+        max_timeout_seconds: 900}` the batch base is 3630, so a naive
+        `max(base, explicit)` collapses the ceiling onto the base and the long
+        role gets no extension at all."""
+        from puppetmaster.models import Task
+
+        def cap(payloads: list) -> tuple:
+            tasks = [
+                Task(job_id="j", role=f"r{i}", instruction="i", payload=p)
+                for i, p in enumerate(payloads)
+            ]
+            base = Orchestrator._worker_wait_timeout(tasks)
+            return base, Orchestrator._worker_hard_cap(tasks, base)
+
+        self.assertEqual(
+            cap(
+                [
+                    {"timeout_seconds": 3600},
+                    {"timeout_seconds": 600, "max_timeout_seconds": 900},
+                ]
+            ),
+            (3630, 10890),
+        )
+        # When every task carries a ceiling, the largest is used as given.
+        self.assertEqual(
+            cap(
+                [
+                    {"timeout_seconds": 600, "max_timeout_seconds": 900},
+                    {"timeout_seconds": 600, "max_timeout_seconds": 1200},
+                ]
+            ),
+            (630, 1200),
+        )
+
+    def test_timed_out_event_carries_the_full_picture(self) -> None:
+        import subprocess as sp
+
+        from puppetmaster.models import Task
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("wedged")
+            task = Task(job_id=job.id, role="cursor", instruction="e2e")
+
+            class WedgedProc:
+                def __init__(self) -> None:
+                    self.returncode = -15
+                    self.killed = False
+
+                def wait(self, timeout=None):
+                    if self.killed:
+                        return -15
+                    raise sp.TimeoutExpired(cmd="x", timeout=timeout)
+
+                def terminate(self):
+                    self.killed = True
+
+                def kill(self):
+                    self.killed = True
+
+            orch = Orchestrator(store)
+            with patch.object(
+                Orchestrator, "_worker_wait_timeout", staticmethod(lambda tasks: 0)
+            ), patch.object(
+                Orchestrator, "_worker_hard_cap", staticmethod(lambda tasks, base: 0)
+            ):
+                with self.assertRaises(RuntimeError):
+                    orch._wait_for_worker(WedgedProc(), job, [task])
+
+            timed_out = [
+                e for e in store.read_events(job.id) if e["event"] == "worker.timed_out"
+            ]
+            self.assertEqual(len(timed_out), 1)
+            payload = timed_out[0]["payload"]
+            self.assertIsNotNone(payload["elapsed_seconds"])
+            self.assertEqual(payload["hard_cap_seconds"], 0)
+            self.assertFalse(payload["extended"])
+            self.assertEqual(payload["limit_hit"], "base_timeout")
+            # Kept for anything already reading the old key.
+            self.assertIn("timeout_seconds", payload)
+
+    def test_wait_loop_labels_a_cap_kill_as_hard_cap(self) -> None:
+        """`_wait_for_worker` decides `limit_hit` where the real float elapsed
+        and the branch taken are both known, instead of re-deriving it from a
+        truncated int downstream."""
+        import subprocess as sp
+        import time
+
+        from puppetmaster.models import Task
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("busy but capped")
+            task = Task(job_id=job.id, role="cursor", instruction="e2e")
+
+            class BusyProc:
+                """Always alive, always emitting -- only the cap can stop it.
+
+                Burns a little real time per poll so `elapsed` actually walks
+                past the cap; the extension is granted on the way there.
+                """
+
+                def __init__(self) -> None:
+                    self.returncode = -15
+                    self.calls = 0
+                    self.killed = False
+
+                def wait(self, timeout=None):
+                    if self.killed:
+                        return -15
+                    self.calls += 1
+                    store.emit(job.id, "run.heartbeat", {"n": self.calls})
+                    time.sleep(0.4)
+                    raise sp.TimeoutExpired(cmd="x", timeout=timeout)
+
+                def terminate(self):
+                    self.killed = True
+
+                def kill(self):
+                    self.killed = True
+
+            orch = Orchestrator(store)
+            with patch.object(
+                Orchestrator, "_worker_wait_timeout", staticmethod(lambda tasks: 0)
+            ), patch.object(
+                Orchestrator, "_worker_hard_cap", staticmethod(lambda tasks, base: 1)
+            ):
+                with self.assertRaises(RuntimeError):
+                    orch._wait_for_worker(BusyProc(), job, [task])
+
+            events = [e["event"] for e in store.read_events(job.id)]
+            self.assertIn("worker.timeout_extended", events)
+
+            timed_out = [
+                e for e in store.read_events(job.id) if e["event"] == "worker.timed_out"
+            ][0]["payload"]
+            self.assertEqual(timed_out["limit_hit"], "hard_cap")
+            artifact = [
+                a
+                for a in store.list_artifacts(job.id)
+                if a.payload.get("check") == "worker.timeout"
+            ][0]
+            self.assertEqual(artifact.payload["limit_hit"], "hard_cap")
 
     def test_worker_wait_extends_while_progressing(self) -> None:
         """A4: a worker still emitting events past base timeout is extended, not killed."""

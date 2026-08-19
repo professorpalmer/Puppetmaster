@@ -71,6 +71,28 @@ from puppetmaster.worker_runtime import WorkerDaemon
 from puppetmaster.workers import WorkerSpec
 
 
+def _positive_seconds(value: str) -> int:
+    """argparse type for a timeout: a positive whole number of seconds.
+
+    Worker payload timeouts are handed straight to ``subprocess.wait(timeout=)``
+    by the adapters, so ``--timeout-seconds 0`` or a negative kills every worker
+    the instant it starts. Fail at parse time with a readable message instead of
+    stamping the value onto every role. Mirrors ``_positive_int_arg`` on the MCP
+    side.
+    """
+    import argparse as _argparse
+
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        raise _argparse.ArgumentTypeError(f"expected a whole number of seconds, got {value!r}")
+    if seconds <= 0:
+        raise _argparse.ArgumentTypeError(
+            f"must be a positive number of seconds, got {seconds}"
+        )
+    return seconds
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="puppetmaster",
@@ -489,6 +511,29 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["subprocess", "inline", "daemon"],
         default="subprocess",
         help="Use subprocess workers, inline workers, or wait for warm daemon workers.",
+    )
+    run.add_argument(
+        "--timeout-seconds",
+        type=_positive_seconds,
+        default=None,
+        help=(
+            "Base per-worker timeout, stamped onto every role's payload. A "
+            "worker still alive past this point is extended rather than killed, "
+            "so the actual kill deadline is --max-timeout-seconds (default 3x "
+            "the base, where base = this value + 30s grace). Without this flag "
+            "the orchestrator falls back to a 90s base / 270s ceiling, far "
+            "shorter than a real agent turn."
+        ),
+    )
+    run.add_argument(
+        "--max-timeout-seconds",
+        type=_positive_seconds,
+        default=None,
+        help=(
+            "Absolute ceiling a worker may reach while still showing progress. "
+            "Used as given (floored at the base timeout). Defaults to 3x the "
+            "base timeout, which is --timeout-seconds plus a 30s grace."
+        ),
     )
     run.add_argument(
         "--disable-memory",
@@ -1587,9 +1632,24 @@ def build_parser() -> argparse.ArgumentParser:
     swarm.add_argument("--model", help="Optional model pin (disables auto-route unless --auto-route).")
     swarm.add_argument(
         "--timeout-seconds",
-        type=int,
+        type=_positive_seconds,
         default=900,
-        help="Per-worker timeout (default 900).",
+        help=(
+            "Base per-worker timeout (default 900). A worker still alive past "
+            "this point is extended, so the actual kill deadline is "
+            "--max-timeout-seconds."
+        ),
+    )
+    swarm.add_argument(
+        "--max-timeout-seconds",
+        type=_positive_seconds,
+        default=None,
+        help=(
+            "Absolute ceiling a worker may reach while still showing progress, "
+            "and the value it is actually killed at. Used as given (floored at "
+            "the base timeout). Defaults to 3x the base timeout, where base = "
+            "--timeout-seconds plus a 30s grace."
+        ),
     )
     swarm.add_argument(
         "--worker-mode",
