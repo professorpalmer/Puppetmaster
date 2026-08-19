@@ -2735,9 +2735,54 @@ def start_swarm(args: JsonObject) -> JsonObject:
     worker_mode = args.get("worker_mode")
     if worker_mode:
         command.extend(["--worker-mode", str(worker_mode)])
+    # `timeout_seconds` is advertised on this tool's schema (goal_schema), and
+    # every sibling start verb forwards it. Only the adapter branch above
+    # consumed it -- via write_generated_swarm_config -- so a plain
+    # `start_swarm(goal, timeout_seconds=600)` dropped the value on the floor
+    # and the run silently used the orchestrator's 90s base / 270s hard cap.
+    _append_swarm_timeout_flags(command, args)
     _append_swarm_memory_flags(command, args)
     _append_label_flag(command, args)
     return start_cli(command, args)
+
+
+def _append_swarm_timeout_flags(command: list[str], args: JsonObject) -> None:
+    """Forward the advertised worker timeouts to the ``run`` verb.
+
+    Forwarded on every branch, including ``--config``. The generated-config
+    branch already stamps the same value into each worker payload, so the flag
+    is redundant there but never contradictory -- both come from this same
+    argument. A **caller-supplied** config stamps nothing, so skipping it there
+    would drop the advertised value exactly as the bare ``run`` branch did; the
+    CLI applies the flag on top of whatever the config declares, which is the
+    precedence an explicit argument should have.
+
+    No-op when the caller passed nothing.
+    """
+    for key, flag in (
+        ("timeout_seconds", "--timeout-seconds"),
+        ("max_timeout_seconds", "--max-timeout-seconds"),
+    ):
+        seconds = _positive_int_arg(args.get(key))
+        if seconds is None:
+            continue
+        command.extend([flag, str(seconds)])
+
+
+def _positive_int_arg(value: Any) -> Optional[int]:
+    """Coerce an MCP argument to a positive int, or None when unusable.
+
+    Tolerates the numeric strings JSON-RPC clients sometimes send, and rejects
+    bools (which are ints in Python) so ``timeout_seconds: true`` can never
+    become ``--timeout-seconds 1``.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds > 0 else None
 
 
 def start_cursor_swarm(args: JsonObject) -> JsonObject:
@@ -2828,7 +2873,12 @@ def write_generated_swarm_config(args: JsonObject, roles: list[str], adapter: st
         adapter=adapter,
         state_dir=mcp_state_dir(args),
         cwd=cwd(args),
-        timeout_seconds=int(args.get("timeout_seconds") or 900),
+        # Same guard as the flag path: a bare int() would turn
+        # `timeout_seconds: true` into 1 and stamp a 1-second timeout onto every
+        # generated worker payload, and would pass a negative straight through
+        # to subprocess.wait().
+        timeout_seconds=_positive_int_arg(args.get("timeout_seconds")) or 900,
+        max_timeout_seconds=_positive_int_arg(args.get("max_timeout_seconds")),
         model=str(args["model"]) if args.get("model") else None,
         auto_route=auto_route,
         routing_policy=str(args["routing_policy"])
@@ -4017,6 +4067,16 @@ def swarm_schema() -> JsonObject:
                 "description": "Optional local worker roles to run.",
             },
             "config": {"type": "string", "description": "Optional workflow config path."},
+            "max_timeout_seconds": {
+                "type": "integer",
+                "description": (
+                    "Absolute ceiling a worker may reach while still showing "
+                    "progress, and the value a worker is actually killed at. "
+                    "Used as given, floored at the base timeout. Defaults to 3x "
+                    "the base timeout, where base = timeout_seconds + 30s grace "
+                    "(so timeout_seconds=600 defaults to a 1890s ceiling)."
+                ),
+            },
             "adapter": {
                 "type": "string",
                 "enum": ["cursor", "local"],
