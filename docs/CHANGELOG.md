@@ -1,10 +1,10 @@
-## Unreleased
+## v1.22.11
 
 Absorb of [@bsmi021](https://github.com/bsmi021) PRs
 [#35](https://github.com/professorpalmer/Puppetmaster/pull/35),
 [#36](https://github.com/professorpalmer/Puppetmaster/pull/36), and
 [#37](https://github.com/professorpalmer/Puppetmaster/pull/37), plus
-stack edits. No version bump on this landing.
+stack edits.
 
 - **claude-sonnet-5.** Curated `claude-code` / `agentic` / `hermes`
   catalogs gain Sonnet 5 (cap 87, $3/$15, 1M, `long-context`) so the
