@@ -546,6 +546,29 @@ def _main(argv: Optional[list[str]] = None) -> int:
                 replace(spec, payload={**spec.payload, "disable_memory": True})
                 for spec in specs
             ]
+        # The orchestrator's watchdog reads `timeout_seconds` off each task
+        # payload (Orchestrator._worker_wait_timeout). Nothing in the default
+        # worker specs sets it, so an unstamped `run` silently falls back to
+        # the 60s floor + 30s grace = 90s base / 270s hard cap -- shorter than
+        # a single real agent turn. Stamp the caller's value onto every role.
+        #
+        # Applied on top of `--config` too, so an explicit flag outranks the
+        # per-worker values a config declares -- the usual precedence, and what
+        # MCP `start_swarm` relies on to honor its advertised `timeout_seconds`
+        # when the caller supplied their own config. Skipped entirely when the
+        # flags are absent, so a config-only run is untouched.
+        timeout_seconds = getattr(args, "timeout_seconds", None)
+        max_timeout_seconds = getattr(args, "max_timeout_seconds", None)
+        if timeout_seconds is not None or max_timeout_seconds is not None:
+            overrides: dict = {}
+            if timeout_seconds is not None:
+                overrides["timeout_seconds"] = int(timeout_seconds)
+            if max_timeout_seconds is not None:
+                overrides["max_timeout_seconds"] = int(max_timeout_seconds)
+            specs = [
+                replace(spec, payload={**spec.payload, **overrides})
+                for spec in specs
+            ]
         result = cli.Orchestrator(store).run(
             args.goal,
             specs=specs,
@@ -969,6 +992,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
                 adapter=adapter,
                 cwd=args.cwd,
                 timeout_seconds=int(args.timeout_seconds),
+                max_timeout_seconds=getattr(args, "max_timeout_seconds", None),
                 model=args.model,
                 auto_route=auto_route,
                 routing_policy=getattr(args, "routing_policy", None),
@@ -997,6 +1021,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
                 state_dir=state_dir,
                 cwd=args.cwd,
                 timeout_seconds=int(args.timeout_seconds),
+                max_timeout_seconds=getattr(args, "max_timeout_seconds", None),
                 model=args.model,
                 auto_route=auto_route,
                 routing_policy=getattr(args, "routing_policy", None),

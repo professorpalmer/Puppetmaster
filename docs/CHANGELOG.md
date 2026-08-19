@@ -1,3 +1,48 @@
+## v1.22.12
+
+Absorb of [@bsmi021](https://github.com/bsmi021) PR
+[#40](https://github.com/professorpalmer/Puppetmaster/pull/40), plus
+stack edits.
+
+**Let a swarm actually use the timeout it was given, and make the
+timeout record say what happened.**
+
+- **Propagation.** `timeout_seconds` is advertised on
+  `puppetmaster_start_swarm`'s schema, but only the `adapter` branch ever
+  consumed it. A plain `start_swarm(goal, timeout_seconds=600)` fell
+  through to `run <goal>`, which had no such flag, so nothing reached the
+  task payloads that `Orchestrator._worker_wait_timeout` reads and the
+  run silently used `max([60]) + 30` = 90s base / 270s ceiling. `run` and
+  `swarm` now take `--timeout-seconds` / `--max-timeout-seconds`, `run`
+  stamps them onto every role, and `start_swarm` forwards them on every
+  branch (including a caller-supplied `--config`, where an explicit
+  argument outranks the config's per-worker values). `start_cursor_swarm`
+  now forwards the same flags.
+- **BREAKING: explicit `max_timeout_seconds` is now used as given.**
+  `_worker_hard_cap` was `max(base * 3, explicit)`, so an explicit
+  ceiling could only ever *raise* it and there was no way to bound a run
+  more tightly than 3x. It is now the explicit value, floored at the base
+  timeout. **A config that already sets `max_timeout_seconds` below 3x
+  base gets a lower ceiling than before** — e.g. `timeout_seconds: 900`
+  with `max_timeout_seconds: 1200` drops from 2790s to 1200s. Remove the
+  key to keep the 3x default. A batch that mixes capped and uncapped
+  roles keeps the 3x floor, so one role's tight ceiling can't strip a
+  sibling's extension headroom.
+- **Honest reporting.** `_kill_and_report_timeout` was handed the *base*
+  timeout, so a run extended to the 3x ceiling still reported "killed
+  after 90s" — off by a factor of three, and silent about the extension.
+  The `worker.timed_out` event and the blocked VERIFICATION artifact now
+  carry `elapsed_seconds`, `base_timeout_seconds`, `hard_cap_seconds`,
+  `extended`, and `limit_hit` (`base_timeout` /
+  `went_quiet_after_extension` / `hard_cap`), and the message names the
+  limit that actually ended the run. The old `timeout_seconds` key is
+  kept.
+- **Docs.** `_job_progress_cursor` now states that the progress signal is
+  liveness, not productivity — `run.heartbeat` and `task.lease_renewed`
+  fire for any live worker, so the extension is granted to essentially
+  every one of them and the hard cap, not the base timeout, is the real
+  kill deadline. The CLI help and the MCP schema say so too.
+
 ## v1.22.11
 
 Absorb of [@bsmi021](https://github.com/bsmi021) PRs

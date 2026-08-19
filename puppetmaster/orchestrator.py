@@ -2314,19 +2314,45 @@ class Orchestrator:
         A4: a worker actively making progress past its base timeout (e.g. a long
         but legitimate e2e verify phase) is extended rather than SIGKILL'd, but
         only up to this cap so a wedged-yet-heartbeating worker can't run forever.
-        Honors an explicit ``payload.max_timeout_seconds``; otherwise 3× base.
+        Honors an explicit ``payload.max_timeout_seconds``; otherwise 3x base.
+
+        "Honors" used to mean ``max(base * 3, explicit)``, so an explicit cap
+        could only ever *raise* the ceiling: asking for 1800s on a 630s base
+        silently got you 1890s, and there was no way to bound a run more tightly
+        than 3x. An explicit ceiling is now used as given, floored at
+        ``base_timeout`` because a cap below the base would kill the worker
+        before its own timeout and make ``timeout_seconds`` meaningless.
         """
         explicit = [
-            int(task.payload.get("max_timeout_seconds", 0))
+            int(task.payload["max_timeout_seconds"])
             for task in tasks
-            if isinstance(task.payload.get("max_timeout_seconds", 0), int)
+            if isinstance(task.payload.get("max_timeout_seconds"), int)
+            and not isinstance(task.payload.get("max_timeout_seconds"), bool)
+            and int(task.payload["max_timeout_seconds"]) > 0
         ]
-        return max([base_timeout * 3, *explicit])
+        if not explicit:
+            return base_timeout * 3
+        if len(explicit) < len(tasks):
+            # A batch mixes roles. Any task without its own ceiling still keeps
+            # the 3x default, so one role's tight cap can't silently strip the
+            # extension headroom from a sibling that never asked for one.
+            return max(base_timeout * 3, max(explicit))
+        return max(base_timeout, max(explicit))
 
     def _job_progress_cursor(self, job_id: str) -> int:
         """Monotonic event cursor for a job — the cheap, backend-agnostic
         progress signal. A growing cursor between polls means the worker is
         still doing work (heartbeats, lease renewals, saved tasks/artifacts).
+
+        Read this as **liveness, not productivity**. ``worker_runtime`` emits
+        ``run.heartbeat`` + ``task.lease_renewed`` every couple of seconds for a
+        worker's whole life, so any process that is still up advances the
+        cursor. That is deliberate: a single agent turn can spend minutes inside
+        one provider call and legitimately produce nothing else, so demanding
+        artifacts here would SIGKILL exactly the long-but-healthy runs the
+        extension exists to protect. The consequence is that the extension is
+        granted to essentially every live worker, which makes ``hard_cap`` -- not
+        ``base_timeout`` -- the number that decides when a run dies.
 
         Uses ``event_cursor`` (SQLite ``MAX(id)``, file backend's size-keyed
         cache) rather than ``len(read_events())`` so a long-running worker's
@@ -2376,34 +2402,186 @@ class Orchestrator:
                                 "base_timeout_seconds": base_timeout,
                                 "hard_cap_seconds": hard_cap,
                                 "elapsed_seconds": int(elapsed),
-                                "reason": "worker still emitting progress events",
+                                "reason": (
+                                    "worker process still alive and emitting "
+                                    "events; will be killed at hard_cap_seconds"
+                                ),
                             },
                         )
                         extended = True
                     continue
-                raise self._kill_and_report_timeout(process, job, tasks, base_timeout)
+                # Which limit ended it, decided here where the real (float)
+                # elapsed and the branch taken are both known. Deriving it later
+                # from int(elapsed) vs hard_cap misclassifies a cap kill at
+                # 269.7s as "went quiet".
+                if hard_cap > base_timeout and elapsed >= hard_cap:
+                    # The ceiling is what set this poll's wake deadline
+                    # (`wait_for` is clamped to `hard_cap - elapsed`), so
+                    # reaching it is a cap kill regardless of whether this
+                    # particular poll happened to catch a heartbeat. Checked
+                    # before `extended` because a ceiling within one poll of the
+                    # base is hit on the first post-base check, so no extension
+                    # is ever recorded -- and calling that "hit its base timeout
+                    # without further progress" is exactly the misdescription
+                    # this record exists to remove. The `hard_cap > base_timeout`
+                    # guard keeps the degenerate equal case honest: with no
+                    # extension window at all, the base is what ended it.
+                    limit_hit = "hard_cap"
+                elif extended:
+                    limit_hit = "went_quiet_after_extension"
+                else:
+                    limit_hit = "base_timeout"
+                raise self._kill_and_report_timeout(
+                    process,
+                    job,
+                    tasks,
+                    base_timeout,
+                    elapsed_seconds=int(elapsed),
+                    hard_cap_seconds=hard_cap,
+                    extended=extended,
+                    limit_hit=limit_hit,
+                )
 
     def _kill_and_report_timeout(
-        self, process: subprocess.Popen, job: Job, tasks: list[Task], timeout_seconds: int
+        self,
+        process: subprocess.Popen,
+        job: Job,
+        tasks: list[Task],
+        timeout_seconds: int,
+        *,
+        elapsed_seconds: Optional[int] = None,
+        hard_cap_seconds: Optional[int] = None,
+        extended: bool = False,
+        limit_hit: Optional[str] = None,
     ) -> RuntimeError:
         """Terminate a timed-out worker, emit the timeout event + blocked
-        artifact, and return the error for the caller to raise."""
+        artifact, and return the error for the caller to raise.
+
+        ``timeout_seconds`` is the *base* timeout. It used to be the only number
+        reported, so an extended run that survived to the 3x hard cap still said
+        "killed after 90s" -- off by a factor of three, and it hid the fact that
+        an extension had been granted at all. ``elapsed_seconds`` is what
+        actually happened; the base and the cap are reported alongside it so the
+        message explains which limit was hit. The keyword arguments are optional
+        so existing direct callers (and tests) keep working.
+        """
         process.terminate()
         try:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             process.kill()
-            process.wait(timeout=5)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
         self.store.emit(
             job.id,
             "worker.timed_out",
-            {"returncode": process.returncode, "timeout_seconds": timeout_seconds},
+            {
+                "returncode": process.returncode,
+                "timeout_seconds": timeout_seconds,
+                "base_timeout_seconds": timeout_seconds,
+                "elapsed_seconds": elapsed_seconds,
+                "hard_cap_seconds": hard_cap_seconds,
+                "extended": extended,
+                "limit_hit": limit_hit
+                or self._timeout_limit_hit(elapsed_seconds, hard_cap_seconds, extended),
+            },
         )
-        self._emit_timeout_artifact(job, tasks, timeout_seconds)
+        self._emit_timeout_artifact(
+            job,
+            tasks,
+            timeout_seconds,
+            elapsed_seconds=elapsed_seconds,
+            hard_cap_seconds=hard_cap_seconds,
+            extended=extended,
+            limit_hit=limit_hit,
+        )
         return RuntimeError("worker process timed out")
 
+    @staticmethod
+    def _timeout_limit_hit(
+        elapsed_seconds: Optional[int],
+        hard_cap_seconds: Optional[int],
+        extended: bool,
+    ) -> str:
+        """Which limit actually ended the run.
+
+        Deliberately derived from ``elapsed`` against the cap, not from
+        ``extended``. Because the progress signal is really a liveness signal
+        (see ``_job_progress_cursor``), nearly every worker gets extended, so
+        keying off that flag would report "hit the hard cap" for runs that went
+        quiet far below it -- the same misreporting this record exists to fix.
+        """
+        # The cap can only be what ended a run that was extended past its base
+        # timeout in the first place; an unextended kill is always the base.
+        if not extended:
+            return "base_timeout"
+        if elapsed_seconds is not None and hard_cap_seconds is not None:
+            # `elapsed_seconds` is int(float elapsed), so a kill at 269.7s
+            # against a 270s cap arrives here as 269. Allow one second of
+            # truncation rather than mislabelling a cap kill as "went quiet".
+            if elapsed_seconds >= hard_cap_seconds - 1:
+                return "hard_cap"
+        return "went_quiet_after_extension"
+
+    @staticmethod
+    def _timeout_message(
+        roles: list[str],
+        timeout_seconds: int,
+        elapsed_seconds: Optional[int],
+        hard_cap_seconds: Optional[int],
+        limit_hit: str,
+        extended: bool = False,
+    ) -> str:
+        """One line saying how long the worker actually ran and which limit ended it."""
+        ran = f"{elapsed_seconds}s" if elapsed_seconds is not None else f"{timeout_seconds}s"
+        if limit_hit == "hard_cap":
+            # `extended` is False when the ceiling sits within one poll of the
+            # base: it is reached on the first post-base check, before any
+            # extension is recorded. Saying "was extended" there would
+            # contradict `extended: false` in the same payload.
+            passed = (
+                "was extended past its"
+                if extended
+                else "passed its"
+            )
+            limit = (
+                f"it {passed} {timeout_seconds}s base timeout while still alive "
+                f"and hit the {hard_cap_seconds}s hard cap"
+            )
+        elif limit_hit == "went_quiet_after_extension":
+            limit = (
+                f"it passed its {timeout_seconds}s base timeout while still alive "
+                f"and was extended, then stopped emitting events before the "
+                f"{hard_cap_seconds}s hard cap"
+            )
+        else:
+            limit = f"it hit its {timeout_seconds}s base timeout without further progress"
+        # Point at the knob that actually moves the deadline that was hit.
+        # Raising timeout_seconds does nothing to a cap kill until it is pushed
+        # past the ceiling.
+        knob = (
+            "raising the task's max_timeout_seconds, and timeout_seconds with it"
+            if limit_hit == "hard_cap"
+            else "raising the task's timeout_seconds"
+        )
+        return (
+            f"Worker for roles {roles} was killed after {ran}: {limit}. "
+            f"Results are partial and must not be trusted; re-run after {knob}, "
+            f"or split the work."
+        )
+
     def _emit_timeout_artifact(
-        self, job: Job, tasks: list[Task], timeout_seconds: int
+        self,
+        job: Job,
+        tasks: list[Task],
+        timeout_seconds: int,
+        *,
+        elapsed_seconds: Optional[int] = None,
+        hard_cap_seconds: Optional[int] = None,
+        extended: bool = False,
+        limit_hit: Optional[str] = None,
     ) -> None:
         """Record an explicit *blocked* VERIFICATION artifact when a worker is
         killed on timeout.
@@ -2419,13 +2597,20 @@ class Orchestrator:
         if representative is None:
             return
         roles = sorted({task.role for task in tasks})
+        resolved_limit = limit_hit or self._timeout_limit_hit(
+            elapsed_seconds, hard_cap_seconds, extended
+        )
         artifact = Artifact(
             job_id=job.id,
             task_id=representative.id,
             type=ArtifactType.VERIFICATION,
             created_by="orchestrator",
             confidence=0.9,
-            evidence=["orchestrator:worker-timeout", f"timeout_seconds:{timeout_seconds}"],
+            evidence=[
+                "orchestrator:worker-timeout",
+                f"timeout_seconds:{timeout_seconds}",
+                f"elapsed_seconds:{elapsed_seconds if elapsed_seconds is not None else timeout_seconds}",
+            ],
             payload={
                 "adapter": "orchestrator",
                 "check": "worker.timeout",
@@ -2433,10 +2618,18 @@ class Orchestrator:
                 "failure": "worker_timeout",
                 "roles": roles,
                 "timeout_seconds": timeout_seconds,
-                "message": (
-                    f"Worker for roles {roles} was killed after {timeout_seconds}s. "
-                    "Results are partial and must not be trusted; re-run with a longer "
-                    "timeout (raise the task's timeout_seconds) or split the work."
+                "base_timeout_seconds": timeout_seconds,
+                "elapsed_seconds": elapsed_seconds,
+                "hard_cap_seconds": hard_cap_seconds,
+                "extended": extended,
+                "limit_hit": resolved_limit,
+                "message": self._timeout_message(
+                    roles,
+                    timeout_seconds,
+                    elapsed_seconds,
+                    hard_cap_seconds,
+                    resolved_limit,
+                    extended,
                 ),
             },
         )
