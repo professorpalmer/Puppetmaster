@@ -919,6 +919,37 @@ def discovery_meta_path(registry_path: Optional[Path] = None) -> Path:
     return resolved.with_name(resolved.stem + ".discovery.json")
 
 
+DISCOVERY_ORIGIN_LIVE = "live"
+DISCOVERY_ORIGIN_CURATED = "curated"
+DISCOVERY_ORIGINS = frozenset({DISCOVERY_ORIGIN_LIVE, DISCOVERY_ORIGIN_CURATED})
+
+# Sources whose "discovery" re-applies CURATED_CATALOGS. A pre-field sidecar
+# for these was never a live fetch; cursor/openai/anthropic stay live.
+_CURATED_DISCOVERY_SOURCES = frozenset({"claude", "codex", "hermes", "agentic"})
+
+
+def discovery_origin(meta: dict[str, Any], source: str) -> str:
+    """How ``source``'s recorded snapshot was obtained.
+
+    Explicit garbage (an unrecognized ``origin`` value) defaults to ``"live"``
+    so a typo cannot silently flip a live fetch into curated treatment.
+
+    When the entry exists and ``origin`` is missing or empty — not garbage —
+    claude/codex/hermes/agentic read as ``"curated"``: those platforms have
+    never had a queryable catalog. cursor/openai/anthropic missing origin
+    stay ``"live"``.
+    """
+    entry = meta.get(source)
+    if not isinstance(entry, dict):
+        return DISCOVERY_ORIGIN_LIVE
+    if "origin" not in entry or entry.get("origin") in (None, ""):
+        if source in _CURATED_DISCOVERY_SOURCES:
+            return DISCOVERY_ORIGIN_CURATED
+        return DISCOVERY_ORIGIN_LIVE
+    value = str(entry.get("origin"))
+    return value if value in DISCOVERY_ORIGINS else DISCOVERY_ORIGIN_LIVE
+
+
 def read_discovery_meta(registry_path: Optional[Path] = None) -> dict[str, Any]:
     """Return ``{source: {refreshed_at, count}}`` recorded by ``models discover``."""
     path = discovery_meta_path(registry_path)
@@ -941,6 +972,7 @@ def write_discovery_meta(
     catalog_hash: Optional[str] = None,
     mode: str = "apply",
     pending_diff: Optional[dict[str, Any]] = None,
+    origin: str = DISCOVERY_ORIGIN_LIVE,
 ) -> Path:
     """Record that ``source`` (e.g. ``cursor``/``openai``/``anthropic``) was
     just discovered, with how many models it returned and when.
@@ -948,15 +980,36 @@ def write_discovery_meta(
     ``model_ids`` is an optional membership snapshot. Keeping it beside the
     timestamp lets diagnostics distinguish an old catalog from a registry
     whose entries have drifted away from the last known live catalog.
+
+    ``origin`` records *how* the snapshot was obtained. ``"live"`` means the
+    platform was actually queried (Cursor's plan endpoint, ``/v1/models``).
+    ``"curated"`` means it came from :data:`puppetmaster.static_catalog.
+    CURATED_CATALOGS` -- a hand-maintained list compiled into the package,
+    because that platform has no queryable model API. Without this the two are
+    indistinguishable in the sidecar: a curated apply writes a fresh
+    ``refreshed_at`` that reads as a successful live refresh, so `doctor`
+    reports the catalog "fresh" and re-running ``models discover`` looks like
+    it should surface new models when it can only ever re-apply the same
+    compiled-in list. Legacy entries written before this field are read by
+    :func:`discovery_origin`.
     """
     from datetime import datetime, timezone
 
     if mode not in {"apply", "probe"}:
         raise ValueError("discovery metadata mode must be 'apply' or 'probe'")
+    if origin not in DISCOVERY_ORIGINS:
+        raise ValueError(
+            "discovery metadata origin must be one of "
+            f"{sorted(DISCOVERY_ORIGINS)}"
+        )
     path = discovery_meta_path(registry_path)
     meta = read_discovery_meta(registry_path)
     stamp = now_iso or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    entry: dict[str, Any] = {"refreshed_at": stamp, "count": count}
+    entry: dict[str, Any] = {
+        "refreshed_at": stamp,
+        "count": count,
+        "origin": origin,
+    }
     if model_ids is not None:
         normalized_ids = sorted(
             {str(model_id) for model_id in model_ids if str(model_id)}

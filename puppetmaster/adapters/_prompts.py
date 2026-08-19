@@ -28,8 +28,25 @@ _IMPLEMENT_REPORT_CONTRACT = (
 )
 
 
+# Opening line of every analysis prompt. gpt-5.6 models read the first noun
+# phrase they see as the subject of the request, so a prompt that opened on
+# "Puppetmaster artifact contract:" got answered *about the contract*. Naming
+# where the assignment actually lives, before anything else, is what fixes it.
+# Static, so it stays inside the shared cacheable prefix.
+# NB: do not write the literal "Your task:" (with the colon) here --
+# split_prompt_messages() splits the system/user seam on the first bare
+# occurrence of TASK_INSTRUCTION_HEADER, so an inline mention would move the
+# seam to this line and collapse the shared system prefix.
+_PROMPT_ORIENTATION = (
+    "Read this entire prompt before acting. Your assignment is the final "
+    'section, the one headed "Your task". Everything above it -- output '
+    "format, contract, repository context -- tells you HOW to answer and is "
+    "never itself the thing to analyze, define, or ask about."
+)
+
+
 _PUPPETMASTER_ARTIFACT_CONTRACT_LINES = (
-    "Puppetmaster artifact contract:",
+    "OUTPUT FORMAT (the Puppetmaster artifact contract for your reply):",
     "Return only JSON, with no markdown wrapper, in this shape:",
     '{"artifacts":[{"type":"finding","claim":"...","evidence":["path or symbol"],"confidence":0.8}]}',
     "Allowed artifact types:",
@@ -142,7 +159,7 @@ def build_structured_prompt(
         else (prompt or "")
     )
 
-    lines: list[str] = []
+    lines: list[str] = [_PROMPT_ORIENTATION, ""]
     if final_message_note:
         # Primary contract: finish by CALLING the submit_findings tool. The
         # provider constrains the tool's arguments, so structure is reliable even

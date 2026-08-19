@@ -116,6 +116,7 @@ def _cached_catalog_membership(
     authoritative and block absent models.
     """
     from puppetmaster.model_registry import (
+        DISCOVERY_ORIGIN_CURATED,
         DISCOVERY_SOURCE_TO_ADAPTER,
         catalog_staleness_days,
         default_registry_path,
@@ -148,20 +149,27 @@ def _cached_catalog_membership(
     age = catalog_staleness_days(meta, source)
     if age is None:
         return None
-    if ttl_seconds is None:
-        try:
-            ttl_seconds = float(
-                os.environ.get("PUPPETMASTER_CATALOG_CACHE_TTL_SECONDS", "3600")
+    # Fail-closed: only an explicit sidecar origin skips the TTL. Missing
+    # origin keeps today's 1h gate so legacy sidecars do not suddenly block.
+    explicit_curated = entry.get("origin") == DISCOVERY_ORIGIN_CURATED
+    if not explicit_curated:
+        if ttl_seconds is None:
+            try:
+                ttl_seconds = float(
+                    os.environ.get("PUPPETMASTER_CATALOG_CACHE_TTL_SECONDS", "3600")
+                )
+            except ValueError:
+                ttl_seconds = 3600.0
+        if age * 86400.0 > max(0.0, ttl_seconds):
+            return (
+                True,
+                f"catalog unverified (cached {age:.1f}d old)",
+                ["preflight:cached_catalog_stale"],
             )
-        except ValueError:
-            ttl_seconds = 3600.0
-    if age * 86400.0 > max(0.0, ttl_seconds):
-        return (
-            True,
-            f"catalog unverified (cached {age:.1f}d old)",
-            ["preflight:cached_catalog_stale"],
-        )
     available = {str(model_id) for model_id in entry["model_ids"]}
+    catalog_label = (
+        f"curated {source} catalog" if explicit_curated else f"recent {source} catalog"
+    )
     if not available:
         if source == "agentic":
             return (
@@ -171,18 +179,18 @@ def _cached_catalog_membership(
             )
         return (
             False,
-            f"model {model!r} is absent from the recent {source} catalog",
+            f"model {model!r} is absent from the {catalog_label}",
             ["preflight:cached_model_not_in_catalog"],
         )
     if model not in available:
         return (
             False,
-            f"model {model!r} is absent from the recent {source} catalog",
+            f"model {model!r} is absent from the {catalog_label}",
             ["preflight:cached_model_not_in_catalog"],
         )
     return (
         True,
-        f"model {model!r} present in recent {source} catalog",
+        f"model {model!r} present in {catalog_label}",
         ["preflight:cached_catalog_match"],
     )
 

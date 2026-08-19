@@ -51,16 +51,65 @@ class BuildPromptOrderTests(unittest.TestCase):
     def test_build_structured_prompt_puts_contract_before_instruction(self) -> None:
         instruction = "Review the payment module"
         prompt = build_structured_prompt(instruction)
-        self.assertTrue(prompt.startswith("Puppetmaster artifact contract:"))
+        # The contract still precedes the instruction (static-first, so sibling
+        # workers share a cacheable prefix) -- it is just no longer the first
+        # thing the model reads. See the orientation test below.
         self.assertTrue(prompt.rstrip().endswith(instruction))
         self.assertLess(
-            prompt.index("Puppetmaster artifact contract:"),
+            prompt.index("Puppetmaster artifact contract"),
             prompt.index(TASK_INSTRUCTION_HEADER),
         )
         note = build_structured_prompt(instruction, final_message_note=True)
         self.assertTrue(note.rstrip().endswith(instruction))
         self.assertIn("submit_findings", note)
         self.assertLess(note.index("submit_findings"), note.index(TASK_INSTRUCTION_HEADER))
+
+    def test_structured_prompt_opens_by_locating_the_task(self) -> None:
+        """gpt-5.6 models answer *about* the first noun phrase they read.
+
+        Opening on "Puppetmaster artifact contract:" made them treat the
+        contract as the subject: one asked what to do with the contract,
+        another spent 51k input tokens explaining what it is. Four of four
+        Codex analysis runs degraded that way, across two models. So the
+        prompt must open by saying where the assignment lives and that nothing
+        above it is the subject, and must label the contract as output format.
+        """
+        for prompt in (
+            build_structured_prompt("Review the payment module"),
+            build_structured_prompt("Review the payment module", final_message_note=True),
+        ):
+            first_line = prompt.splitlines()[0]
+            self.assertIn("Read this entire prompt before acting", first_line)
+            self.assertIn("Your task", first_line)
+            # The orientation must NOT contain the bare TASK_INSTRUCTION_HEADER:
+            # split_prompt_messages() cuts the system/user seam at its first
+            # occurrence, so an inline mention would collapse the shared prefix.
+            self.assertNotIn(TASK_INSTRUCTION_HEADER, first_line)
+            self.assertEqual(prompt.count(TASK_INSTRUCTION_HEADER), 1)
+            self.assertLess(
+                prompt.index("Read this entire prompt"),
+                prompt.index("Puppetmaster artifact contract"),
+            )
+            self.assertIn("OUTPUT FORMAT", prompt)
+            # `with_report_contract` keys off this literal to avoid stacking a
+            # second contract; the relabel must not break that detection.
+            self.assertIn("Puppetmaster artifact contract", prompt)
+
+    def test_report_contract_still_detects_the_relabelled_contract(self) -> None:
+        from puppetmaster.adapters._prompts import with_report_contract
+
+        structured = build_structured_prompt("Review the payment module")
+        self.assertEqual(with_report_contract(structured), structured)
+
+    def test_split_prompt_messages_keeps_orientation_in_system_prefix(self) -> None:
+        from puppetmaster.adapters._prompts import _PROMPT_ORIENTATION
+
+        system_prefix, user_suffix = split_prompt_messages(
+            build_structured_prompt("Review the payment module")
+        )
+        self.assertTrue(system_prefix.startswith(_PROMPT_ORIENTATION))
+        self.assertTrue(user_suffix.startswith(TASK_INSTRUCTION_HEADER))
+        self.assertNotIn(_PROMPT_ORIENTATION, user_suffix)
 
 class JobStableSectionOrderTests(unittest.TestCase):
     def test_memory_skills_census_appear_before_instruction(self) -> None:
