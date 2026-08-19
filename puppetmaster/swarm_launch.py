@@ -69,6 +69,7 @@ def build_analysis_swarm_specs(
     adapter: str = "cursor",
     cwd: str = "",
     timeout_seconds: int = 900,
+    max_timeout_seconds: Optional[int] = None,
     model: Optional[str] = None,
     auto_route: Optional[bool] = None,
     routing_policy: Optional[str] = None,
@@ -102,6 +103,10 @@ def build_analysis_swarm_specs(
             "timeout_seconds": int(timeout_seconds),
             **ANALYSIS_NO_EDIT_PAYLOAD,
         }
+        if max_timeout_seconds is not None:
+            # Orchestrator._worker_hard_cap honors this; without it the ceiling
+            # is 3x the base timeout.
+            payload["max_timeout_seconds"] = int(max_timeout_seconds)
         try:
             from puppetmaster.acceptance_criteria import parse_acceptance_criteria_block
 
@@ -166,6 +171,7 @@ def write_analysis_swarm_config(
     state_dir: Path,
     cwd: str = "",
     timeout_seconds: int = 900,
+    max_timeout_seconds: Optional[int] = None,
     model: Optional[str] = None,
     auto_route: Optional[bool] = None,
     routing_policy: Optional[str] = None,
@@ -183,6 +189,7 @@ def write_analysis_swarm_config(
         adapter=adapter,
         cwd=cwd,
         timeout_seconds=timeout_seconds,
+        max_timeout_seconds=max_timeout_seconds,
         model=model,
         auto_route=auto_route,
         routing_policy=routing_policy,
@@ -264,6 +271,7 @@ def detach_analysis_swarm(
     state_dir: Path,
     cwd: str,
     timeout_seconds: int = 900,
+    max_timeout_seconds: Optional[int] = None,
     model: Optional[str] = None,
     auto_route: Optional[bool] = None,
     routing_policy: Optional[str] = None,
@@ -285,6 +293,7 @@ def detach_analysis_swarm(
         state_dir=state_dir,
         cwd=cwd,
         timeout_seconds=timeout_seconds,
+        max_timeout_seconds=max_timeout_seconds,
         model=model,
         auto_route=auto_route,
         routing_policy=routing_policy,
