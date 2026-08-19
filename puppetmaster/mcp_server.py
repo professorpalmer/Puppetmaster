@@ -2806,6 +2806,7 @@ def start_cursor_swarm(args: JsonObject) -> JsonObject:
     worker_mode = args.get("worker_mode")
     if worker_mode:
         command.extend(["--worker-mode", str(worker_mode)])
+    _append_swarm_timeout_flags(command, args)
     _append_label_flag(command, args)
     return start_cli(command, args)
 

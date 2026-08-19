@@ -1,5 +1,9 @@
 ## Unreleased
 
+Absorb of [@bsmi021](https://github.com/bsmi021) PR
+[#40](https://github.com/professorpalmer/Puppetmaster/pull/40), plus
+stack edits.
+
 **Let a swarm actually use the timeout it was given, and make the
 timeout record say what happened.**
 
@@ -12,7 +16,8 @@ timeout record say what happened.**
   `swarm` now take `--timeout-seconds` / `--max-timeout-seconds`, `run`
   stamps them onto every role, and `start_swarm` forwards them on every
   branch (including a caller-supplied `--config`, where an explicit
-  argument outranks the config's per-worker values).
+  argument outranks the config's per-worker values). `start_cursor_swarm`
+  now forwards the same flags.
 - **BREAKING: explicit `max_timeout_seconds` is now used as given.**
   `_worker_hard_cap` was `max(base * 3, explicit)`, so an explicit
   ceiling could only ever *raise* it and there was no way to bound a run

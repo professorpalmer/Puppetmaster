@@ -11493,6 +11493,37 @@ class ModelRouterTests(unittest.TestCase):
         self.assertIn("--max-timeout-seconds", command)
         self.assertEqual(command[command.index("--max-timeout-seconds") + 1], "1800")
 
+    def test_start_cursor_swarm_forwards_the_timeout_it_advertises(self) -> None:
+        """`timeout_seconds` / `max_timeout_seconds` are on this verb's schema
+        (via goal_schema) and `start_swarm` already forwards them, but
+        `start_cursor_swarm` only stamped generated-config payloads and never
+        appended the CLI flags the advertised schema must forward."""
+        from puppetmaster import mcp_server
+
+        captured = {}
+
+        def fake_start_cli(command, args):
+            captured["command"] = command
+            return {"ok": True}
+
+        with patch.object(mcp_server, "start_cli", side_effect=fake_start_cli), patch.object(
+            mcp_server, "write_generated_swarm_config", return_value=Path("generated.json")
+        ), patch.object(mcp_server, "_platform_lock_preflight", return_value=None):
+            mcp_server.start_cursor_swarm(
+                {
+                    "goal": "long audit",
+                    "cwd": ".",
+                    "timeout_seconds": 600,
+                    "max_timeout_seconds": 1800,
+                }
+            )
+
+        command = captured["command"]
+        self.assertIn("--timeout-seconds", command)
+        self.assertEqual(command[command.index("--timeout-seconds") + 1], "600")
+        self.assertIn("--max-timeout-seconds", command)
+        self.assertEqual(command[command.index("--max-timeout-seconds") + 1], "1800")
+
     def test_start_swarm_omits_timeout_flags_when_not_asked(self) -> None:
         from puppetmaster import mcp_server
 
@@ -11536,6 +11567,15 @@ class ModelRouterTests(unittest.TestCase):
             _append_swarm_timeout_flags(command, {"timeout_seconds": value})
             self.assertEqual(command[2:], expected, msg=f"value={value!r}")
 
+        for value in (True, -30, 0, "soon"):
+            command = ["run", "goal"]
+            _append_swarm_timeout_flags(command, {"max_timeout_seconds": value})
+            self.assertEqual(
+                command[2:],
+                [],
+                msg=f"max_timeout_seconds={value!r} must be omitted",
+            )
+
     def test_generated_config_timeout_survives_a_junk_argument(self) -> None:
         """The generated-config branch used a bare `int(... or 900)`, so
         `timeout_seconds: true` became **1** -- a 1-second timeout stamped onto
@@ -11564,6 +11604,31 @@ class ModelRouterTests(unittest.TestCase):
                 [900],
                 msg=f"timeout_seconds={junk!r} must fall back, not be coerced",
             )
+
+        for junk in (True, -30, 0, "soon"):
+            with TemporaryDirectory() as tmp:
+                path = write_generated_swarm_config(
+                    {
+                        "goal": "audit",
+                        "cwd": tmp,
+                        "state_dir": tmp,
+                        "timeout_seconds": 600,
+                        "max_timeout_seconds": junk,
+                    },
+                    ["explore"],
+                    "cursor",
+                )
+                workers = json.loads(Path(path).read_text("utf-8"))["workers"]
+            for worker in workers:
+                self.assertEqual(worker["payload"]["timeout_seconds"], 600)
+                self.assertNotIn(
+                    "max_timeout_seconds",
+                    worker["payload"],
+                    msg=(
+                        f"max_timeout_seconds={junk!r} must be omitted, "
+                        "not stamped as 1 / negative"
+                    ),
+                )
 
         # ...and a usable value still reaches every generated payload.
         with TemporaryDirectory() as tmp:

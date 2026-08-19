@@ -2470,7 +2470,10 @@ class Orchestrator:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             process.kill()
-            process.wait(timeout=5)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
         self.store.emit(
             job.id,
             "worker.timed_out",
