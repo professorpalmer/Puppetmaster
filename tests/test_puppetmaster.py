@@ -12130,6 +12130,57 @@ class OpenAIAdapterTests(unittest.TestCase):
         self.assertIn("cheap", nano.tags)
         self.assertLess(nano.capability_score, 60)
 
+    def test_curated_catalogs_include_claude_sonnet_5(self) -> None:
+        """Claude Code and Codex cannot enumerate their own models, so
+        CURATED_CATALOGS is the only place a Claude model can enter routing.
+        The Claude 5 family shipped with opus-5 and fable-5 but the newest
+        Sonnet stayed at 4.5 (capability 82 / 200K), so the router could
+        neither select Sonnet 5 nor rank it against its real 1M context."""
+        from puppetmaster.model_registry import starter_registry
+        from puppetmaster.static_catalog import (
+            CURATED_CATALOGS,
+            merge_curated_into_registry,
+        )
+
+        for catalog_name in ("claude-code", "agentic", "hermes"):
+            entries = {entry["model"]: entry for entry in CURATED_CATALOGS[catalog_name]}
+            self.assertIn(
+                "claude-sonnet-5", entries, f"{catalog_name} missing claude-sonnet-5"
+            )
+            sonnet5 = entries["claude-sonnet-5"]
+            sonnet45 = entries["claude-sonnet-4-5"]
+            self.assertEqual(sonnet5["context"], 1_000_000)
+            self.assertEqual(sonnet5["input"], 3.0)
+            self.assertEqual(sonnet5["output"], 15.0)
+            self.assertIn("long-context", sonnet5["tags"])
+            self.assertGreater(sonnet5["capability"], sonnet45["capability"])
+            if catalog_name == "claude-code":
+                self.assertNotIn("payload_defaults", sonnet5)
+            else:
+                self.assertEqual(sonnet5["payload_defaults"]["provider"], "anthropic")
+
+        # A curated entry is only useful if it survives the merge into a real
+        # registry as a routable, plan-billed spec.
+        merged, report = merge_curated_into_registry(
+            "claude-code", "plan", starter_registry()
+        )
+        self.assertIn("claude-sonnet-5", report["added"])
+        spec = next(
+            s
+            for s in merged
+            if s.adapter == "claude-code" and s.adapter_model_name == "claude-sonnet-5"
+        )
+        self.assertEqual(spec.context_window, 1_000_000)
+        self.assertEqual(spec.billing, "plan")
+        self.assertIn("plan-billed", spec.tags)
+        # Sonnet stays under every Opus tier so quality routing is unchanged.
+        opus_caps = [
+            s.capability_score
+            for s in merged
+            if s.adapter == "claude-code" and "opus" in s.adapter_model_name
+        ]
+        self.assertTrue(all(spec.capability_score < cap for cap in opus_caps))
+
     def test_starter_registry_includes_gpt_5_6_family(self) -> None:
         from puppetmaster.model_registry import starter_registry
         from puppetmaster.static_catalog import CURATED_CATALOGS
@@ -16225,6 +16276,127 @@ class PreflightTests(unittest.TestCase):
             self.assertIn("preflight:cached_catalog_stale", result.evidence)
             self.assertNotIn("preflight:cached_model_not_in_catalog", result.evidence)
 
+    def test_explicit_curated_old_catalog_still_consults_model_ids(self) -> None:
+        """An explicit curated snapshot ages with the package, not the clock."""
+        from puppetmaster.model_registry import (
+            DISCOVERY_ORIGIN_CURATED,
+            ModelSpec,
+            save_registry,
+            write_discovery_meta,
+        )
+        from puppetmaster.platform_billing import BillingStatus
+        from puppetmaster.preflight import preflight_check
+
+        with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "models.json"
+            save_registry(
+                [
+                    ModelSpec(
+                        id="agentic/gpt-5",
+                        adapter="agentic",
+                        adapter_model_name="gpt-5",
+                        capability_score=90,
+                        billing="api",
+                    )
+                ],
+                registry_path,
+            )
+            write_discovery_meta(
+                "agentic",
+                1,
+                registry_path,
+                model_ids=["other-model"],
+                now_iso="2020-01-01T00:00:00Z",
+                origin=DISCOVERY_ORIGIN_CURATED,
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "PUPPETMASTER_MODELS_PATH": str(registry_path),
+                    "PUPPETMASTER_CATALOG_CACHE_TTL_SECONDS": "3600",
+                },
+                clear=False,
+            ):
+                result = preflight_check(
+                    "agentic",
+                    "gpt-5",
+                    billing_status=BillingStatus(
+                        adapter="agentic",
+                        billing="api",
+                        healthy=True,
+                        detail="openai key",
+                        evidence=[],
+                    ),
+                )
+
+            self.assertFalse(result.ok)
+            self.assertIn("curated agentic catalog", result.reason)
+            self.assertNotIn("recent", result.reason)
+            self.assertIn("preflight:cached_model_not_in_catalog", result.evidence)
+            self.assertNotIn("preflight:cached_catalog_stale", result.evidence)
+
+    def test_missing_origin_old_catalog_still_fails_open_stale(self) -> None:
+        """Legacy sidecars without origin keep the 1h TTL / fail-open path."""
+        from puppetmaster.model_registry import (
+            ModelSpec,
+            discovery_meta_path,
+            save_registry,
+        )
+        from puppetmaster.platform_billing import BillingStatus
+        from puppetmaster.preflight import preflight_check
+
+        with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "models.json"
+            save_registry(
+                [
+                    ModelSpec(
+                        id="agentic/gpt-5",
+                        adapter="agentic",
+                        adapter_model_name="gpt-5",
+                        capability_score=90,
+                        billing="api",
+                    )
+                ],
+                registry_path,
+            )
+            discovery_meta_path(registry_path).write_text(
+                json.dumps(
+                    {
+                        "agentic": {
+                            "refreshed_at": "2020-01-01T00:00:00Z",
+                            "count": 1,
+                            "model_ids": ["other-model"],
+                        }
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "PUPPETMASTER_MODELS_PATH": str(registry_path),
+                    "PUPPETMASTER_CATALOG_CACHE_TTL_SECONDS": "3600",
+                },
+                clear=False,
+            ):
+                result = preflight_check(
+                    "agentic",
+                    "gpt-5",
+                    billing_status=BillingStatus(
+                        adapter="agentic",
+                        billing="api",
+                        healthy=True,
+                        detail="openai key",
+                        evidence=[],
+                    ),
+                )
+
+            self.assertTrue(result.ok)
+            self.assertIn("catalog unverified", result.reason)
+            self.assertIn("preflight:cached_catalog_stale", result.evidence)
+            self.assertNotIn("preflight:cached_model_not_in_catalog", result.evidence)
+
 class AdapterCliPresenceTests(unittest.TestCase):
     """`adapter_cli_present` closes the gap billing detection can't see: an
     adapter that reads billing-healthy off a stale auth file but whose CLI
@@ -18634,6 +18806,227 @@ class SubscriptionPlanCatalogTests(unittest.TestCase):
             meta = read_discovery_meta(path)
             self.assertTrue(meta.get("claude"))
             self.assertTrue(meta["claude"].get("model_ids"))
+
+    def test_curated_autodiscovery_records_curated_origin(self) -> None:
+        """`ensure_subscription_plan_catalog` applies CURATED_CATALOGS -- a list
+        compiled into the package -- but writes the same sidecar shape a live
+        `/v1/models` fetch does. Without an origin marker the two are
+        indistinguishable: the entry carries a fresh `refreshed_at` that reads
+        as a successful refresh, so `doctor` calls the catalog fresh and
+        re-running discovery looks like it could surface new models when it can
+        only ever re-apply the same compiled-in list."""
+        from puppetmaster.model_registry import (
+            DISCOVERY_ORIGIN_CURATED,
+            discovery_origin,
+            read_discovery_meta,
+        )
+        from puppetmaster.static_catalog import ensure_subscription_plan_catalog
+
+        with TemporaryDirectory() as tmp:
+            path = self._registry_path(tmp)
+            report = ensure_subscription_plan_catalog(
+                path,
+                billing_detector=lambda a: self._status(
+                    a,
+                    healthy=(a == "claude-code"),
+                    billing="plan" if a == "claude-code" else "unknown",
+                ),
+            )
+            self.assertEqual(report["action"], "discovered")
+            meta = read_discovery_meta(path)
+            self.assertEqual(meta["claude"]["origin"], DISCOVERY_ORIGIN_CURATED)
+            self.assertEqual(
+                discovery_origin(meta, "claude"), DISCOVERY_ORIGIN_CURATED
+            )
+
+    def test_discovery_origin_defaults_live_for_legacy_entries(self) -> None:
+        """Sidecars written before the field exists must stay readable."""
+        from puppetmaster.model_registry import (
+            DISCOVERY_ORIGIN_LIVE,
+            discovery_origin,
+            write_discovery_meta,
+        )
+
+        legacy = {"cursor": {"refreshed_at": "2026-01-01T00:00:00Z", "count": 3}}
+        self.assertEqual(discovery_origin(legacy, "cursor"), DISCOVERY_ORIGIN_LIVE)
+        self.assertEqual(discovery_origin(legacy, "absent"), DISCOVERY_ORIGIN_LIVE)
+        self.assertEqual(
+            discovery_origin({"x": {"origin": "nonsense"}}, "x"), DISCOVERY_ORIGIN_LIVE
+        )
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "models.json"
+            # Default stays live so every existing caller is unchanged.
+            write_discovery_meta("cursor", 2, path)
+            from puppetmaster.model_registry import read_discovery_meta
+
+            self.assertEqual(
+                read_discovery_meta(path)["cursor"]["origin"], DISCOVERY_ORIGIN_LIVE
+            )
+            with self.assertRaises(ValueError):
+                write_discovery_meta("cursor", 2, path, origin="bogus")
+
+    def test_legacy_claude_sidecar_without_origin_reads_curated(self) -> None:
+        """Pre-field claude sidecars were curated applies, not live fetches."""
+        from puppetmaster.diagnostics import _catalog_freshness_check
+        from puppetmaster.model_registry import (
+            DISCOVERY_ORIGIN_CURATED,
+            DISCOVERY_ORIGIN_LIVE,
+            discovery_origin,
+        )
+
+        legacy = {"claude": {"refreshed_at": "2020-01-01T00:00:00Z", "count": 7}}
+        self.assertEqual(discovery_origin(legacy, "claude"), DISCOVERY_ORIGIN_CURATED)
+        self.assertEqual(
+            discovery_origin(
+                {"hermes": {"origin": "", "refreshed_at": "2020-01-01T00:00:00Z"}},
+                "hermes",
+            ),
+            DISCOVERY_ORIGIN_CURATED,
+        )
+        self.assertEqual(
+            discovery_origin(
+                {"claude": {"origin": "nonsense", "refreshed_at": "x"}},
+                "claude",
+            ),
+            DISCOVERY_ORIGIN_LIVE,
+        )
+
+        with patch(
+            "puppetmaster.model_registry.read_discovery_meta", return_value=legacy
+        ), patch(
+            "puppetmaster.model_registry.discovery_catalog_changed", return_value=False
+        ), patch(
+            "puppetmaster.model_registry.discovery_registry_drift",
+            return_value={"status": "match"},
+        ):
+            check = _catalog_freshness_check()
+        self.assertEqual(check.status, "ok")
+        self.assertIn("curated", check.detail)
+        self.assertIn("claude", check.detail)
+        self.assertNotIn("catalog stale", check.detail)
+        self.assertNotIn("catalog fresh", check.detail)
+
+    def test_doctor_labels_curated_catalog_instead_of_ageing_it(self) -> None:
+        """A curated catalog does not go stale with wall-clock time and cannot
+        be refreshed by re-running discovery, so `doctor` must neither nag
+        about its age nor claim a live check happened."""
+        from puppetmaster.diagnostics import _catalog_freshness_check
+        from puppetmaster.model_registry import DISCOVERY_ORIGIN_CURATED
+
+        old = "2020-01-01T00:00:00Z"
+        meta = {
+            "cursor": {"refreshed_at": old, "count": 3, "origin": "live"},
+            "claude": {
+                "refreshed_at": old,
+                "count": 8,
+                "origin": DISCOVERY_ORIGIN_CURATED,
+            },
+        }
+        with patch(
+            "puppetmaster.model_registry.read_discovery_meta", return_value=meta
+        ), patch(
+            "puppetmaster.model_registry.discovery_catalog_changed", return_value=False
+        ), patch(
+            "puppetmaster.model_registry.discovery_registry_drift",
+            return_value={"status": "match"},
+        ):
+            check = _catalog_freshness_check()
+        self.assertEqual(check.status, "warn")
+        # The live source is aged and named in the stale list...
+        self.assertIn("cursor", check.detail)
+        # ...the curated one is not dragged into it.
+        self.assertNotIn("claude", check.detail.split("registry")[0])
+
+    def test_doctor_reports_curated_catalog_as_curated_not_fresh(self) -> None:
+        from puppetmaster.diagnostics import _catalog_freshness_check
+        from puppetmaster.model_registry import DISCOVERY_ORIGIN_CURATED
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        meta = {
+            "claude": {
+                "refreshed_at": now,
+                "count": 8,
+                "origin": DISCOVERY_ORIGIN_CURATED,
+            }
+        }
+        with patch(
+            "puppetmaster.model_registry.read_discovery_meta", return_value=meta
+        ), patch(
+            "puppetmaster.model_registry.discovery_catalog_changed", return_value=False
+        ), patch(
+            "puppetmaster.model_registry.discovery_registry_drift",
+            return_value={"status": "match"},
+        ):
+            check = _catalog_freshness_check()
+        self.assertEqual(check.status, "ok")
+        self.assertIn("curated", check.detail)
+        self.assertIn("claude", check.detail)
+        self.assertNotIn("catalog fresh", check.detail)
+
+    def test_discover_probe_persists_curated_origin_for_claude_and_hermes(self) -> None:
+        """`--probe` and `--write` both stamp the report origin onto the sidecar."""
+        from types import SimpleNamespace
+
+        from puppetmaster import cli
+        from puppetmaster.cli.commands_models import _discover_one_source
+        from puppetmaster.model_registry import (
+            DISCOVERY_ORIGIN_CURATED,
+            read_discovery_meta,
+        )
+        from puppetmaster.platform_billing import BillingStatus
+
+        with patch(
+            "puppetmaster.platform_billing.detect_adapter_billing",
+            return_value=BillingStatus(
+                adapter="claude-code",
+                billing="plan",
+                healthy=True,
+                detail="t",
+                evidence=[],
+            ),
+        ):
+            _, claude_report, _ = _discover_one_source("claude", [])
+        self.assertEqual(claude_report["origin"], DISCOVERY_ORIGIN_CURATED)
+
+        with patch(
+            "puppetmaster.adapters.available_hermes_providers", return_value=set()
+        ):
+            _, hermes_report, _ = _discover_one_source("hermes", [])
+        self.assertEqual(hermes_report["origin"], DISCOVERY_ORIGIN_CURATED)
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "models.json"
+            for source, persist_write in (("claude", False), ("hermes", True)):
+                args = SimpleNamespace(
+                    source=source,
+                    json=False,
+                    write=persist_write,
+                    probe=not persist_write,
+                    registry_path=None,
+                    prune=False,
+                )
+                with patch.object(
+                    cli,
+                    "_discover_one_source",
+                    return_value=(
+                        [],
+                        {
+                            "source": source,
+                            "discovered_count": 2,
+                            "added": [],
+                            "origin": DISCOVERY_ORIGIN_CURATED,
+                        },
+                        [{"id": "m1"}, {"id": "m2"}],
+                    ),
+                ):
+                    rc = cli._run_models_discover(args, path)
+                self.assertEqual(rc, 0)
+                self.assertEqual(
+                    read_discovery_meta(path)[source]["origin"],
+                    DISCOVERY_ORIGIN_CURATED,
+                )
 
     def test_skips_when_plan_frontier_present(self) -> None:
         from puppetmaster.model_registry import ModelSpec, save_registry

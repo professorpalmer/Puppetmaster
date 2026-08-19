@@ -121,8 +121,10 @@ def _catalog_freshness_check() -> Check:
     records when each source was last enumerated and its model membership;
     this surfaces a reminder before routing quietly uses an out-of-date view."""
     from puppetmaster.model_registry import (
+        DISCOVERY_ORIGIN_CURATED,
         catalog_staleness_days,
         discovery_catalog_changed,
+        discovery_origin,
         discovery_registry_drift,
         read_discovery_meta,
     )
@@ -141,6 +143,7 @@ def _catalog_freshness_check() -> Check:
         stale_threshold = 7.0
     stale: list[str] = []
     fresh: list[str] = []
+    curated: list[str] = []
     drift: list[str] = []
     changed: list[str] = []
     for source in meta:
@@ -148,7 +151,15 @@ def _catalog_freshness_check() -> Check:
         if age is None:
             continue
         label = f"{source} {age:.0f}d"
-        (stale if age > stale_threshold else fresh).append(label)
+        if discovery_origin(meta, source) == DISCOVERY_ORIGIN_CURATED:
+            # A curated catalog is compiled into the package: it does not go
+            # stale with wall-clock time and re-running discovery can never
+            # surface a model the installed version does not already list.
+            # Ageing it would nag the user toward a refresh that cannot help;
+            # calling it "fresh" would claim a live check that never happened.
+            curated.append(source)
+        else:
+            (stale if age > stale_threshold else fresh).append(label)
         if discovery_catalog_changed(meta, source):
             changed.append(source)
         membership = discovery_registry_drift(source=source)
@@ -175,10 +186,17 @@ def _catalog_freshness_check() -> Check:
             + ". Run `puppetmaster models discover --probe` to review, then "
             "`puppetmaster models discover --write` to apply.",
         )
+    details = []
+    if fresh:
+        details.append(f"catalog fresh ({', '.join(fresh)})")
+    if curated:
+        details.append(
+            f"curated (compiled into this build, not queryable): {', '.join(sorted(curated))}"
+        )
     return Check(
         "catalog-freshness",
         "ok",
-        f"catalog fresh ({', '.join(fresh) or 'recently discovered'})",
+        ". ".join(details) or "catalog fresh (recently discovered)",
     )
 
 

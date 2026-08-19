@@ -728,6 +728,7 @@ def _run_models_discover(args, path: Path) -> int:
     import json as _json
 
     from puppetmaster.model_registry import (
+        DISCOVERY_ORIGIN_LIVE,
         catalog_content_hash,
         discovery_registry_diff,
         load_registry,
@@ -816,6 +817,7 @@ def _run_models_discover(args, path: Path) -> int:
                 model_ids=[item["id"] for item in catalogs.get(src, []) if item.get("id")],
                 catalog_hash=catalog_content_hash(catalogs.get(src, [])),
                 mode="apply",
+                origin=report.get("origin", DISCOVERY_ORIGIN_LIVE),
             )
         if not args.json:
             print(f"Wrote merged registry to {path}")
@@ -879,6 +881,7 @@ def _run_models_discover(args, path: Path) -> int:
                 pending_diff=discovery_registry_diff(
                     original_registry, src, model_ids
                 ),
+                origin=report.get("origin", DISCOVERY_ORIGIN_LIVE),
             )
         if not args.json:
             print(
@@ -911,7 +914,18 @@ class _DiscoverSourceError(RuntimeError):
     pass
 
 def _discover_one_source(source: str, registry: list, *, prune: bool = False):
-    """Fetch + merge one catalog source; returns (registry, report, catalog)."""
+    """Fetch + merge one catalog source; returns (registry, report, catalog).
+
+    ``report["origin"]`` records whether the catalog was actually fetched from
+    the platform (``live``) or read out of the compiled-in curated list
+    (``curated``) -- Claude Code, Codex, Hermes, and the agentic providers
+    expose no queryable model API, so their "discovery" is a re-apply.
+    """
+    from puppetmaster.model_registry import (
+        DISCOVERY_ORIGIN_CURATED,
+        DISCOVERY_ORIGIN_LIVE,
+    )
+
     if source == "cursor":
         from puppetmaster.cursor_discovery import (
             CursorDiscoveryError,
@@ -927,6 +941,7 @@ def _discover_one_source(source: str, registry: list, *, prune: bool = False):
             registry, catalog, prune=prune
         )
         report["source"] = "cursor"
+        report["origin"] = DISCOVERY_ORIGIN_LIVE
         return merged, report, catalog
 
     if source == "hermes":
@@ -945,6 +960,7 @@ def _discover_one_source(source: str, registry: list, *, prune: bool = False):
             "hermes", "api", registry, allowed_providers=allowed
         )
         report["source"] = "hermes"
+        report["origin"] = DISCOVERY_ORIGIN_CURATED
         report["available_providers"] = sorted(allowed)
         catalog = [
             {"id": item["model"]}
@@ -980,6 +996,7 @@ def _discover_one_source(source: str, registry: list, *, prune: bool = False):
             except Exception as exc:
                 report["bedrock"] = {"error": repr(exc)}
         report["source"] = "agentic"
+        report["origin"] = DISCOVERY_ORIGIN_CURATED
         report["available_providers"] = sorted(allowed)
         if bedrock_present and "bedrock" not in allowed:
             report.setdefault("bedrock", {})
@@ -1029,6 +1046,7 @@ def _discover_one_source(source: str, registry: list, *, prune: bool = False):
         merged, report = merge_curated_into_registry(adapter, billing, registry)
         catalog = [{"id": item["model"]} for item in curated_catalog(adapter)]
         report["source"] = source
+        report["origin"] = DISCOVERY_ORIGIN_CURATED
         return merged, report, catalog
 
     from puppetmaster.api_discovery import (
@@ -1054,4 +1072,5 @@ def _discover_one_source(source: str, registry: list, *, prune: bool = False):
     except ApiDiscoveryError as exc:
         raise _DiscoverSourceError(str(exc)) from exc
     report["source"] = source
+    report["origin"] = DISCOVERY_ORIGIN_LIVE
     return merged, report, catalog

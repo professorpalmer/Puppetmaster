@@ -57,6 +57,14 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "tags": ["tools", "claude", "balanced", "vision", "code", "reasoning"],
         },
         {
+            "model": "claude-sonnet-5",
+            "capability": 87,
+            "input": 3.0,
+            "output": 15.0,
+            "context": 1_000_000,
+            "tags": ["tools", "claude", "balanced", "vision", "code", "reasoning", "long-context"],
+        },
+        {
             "model": "claude-opus-4-6",
             "capability": 88,
             "input": 5.0,
@@ -244,6 +252,15 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "output": 15.0,
             "context": 200_000,
             "tags": ["tools", "agentic", "anthropic", "balanced", "vision", "code", "reasoning"],
+            "payload_defaults": {"provider": "anthropic"},
+        },
+        {
+            "model": "claude-sonnet-5",
+            "capability": 87,
+            "input": 3.0,
+            "output": 15.0,
+            "context": 1_000_000,
+            "tags": ["tools", "agentic", "anthropic", "balanced", "vision", "code", "reasoning", "long-context"],
             "payload_defaults": {"provider": "anthropic"},
         },
         {
@@ -584,6 +601,15 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             "payload_defaults": {"provider": "anthropic"},
         },
         {
+            "model": "claude-sonnet-5",
+            "capability": 87,
+            "input": 3.0,
+            "output": 15.0,
+            "context": 1_000_000,
+            "tags": ["tools", "hermes", "anthropic", "balanced", "vision", "code", "reasoning", "long-context"],
+            "payload_defaults": {"provider": "anthropic"},
+        },
+        {
             "model": "gpt-5",
             "capability": 90,
             "input": 1.25,
@@ -898,6 +924,7 @@ def ensure_subscription_plan_catalog(
         has_plan_frontier,
     )
     from puppetmaster.model_registry import (
+        DISCOVERY_ORIGIN_CURATED,
         load_registry,
         read_discovery_meta,
         save_registry,
@@ -936,6 +963,7 @@ def ensure_subscription_plan_catalog(
                 registry_path,
                 model_ids=[item["model"] for item in catalog if item.get("model")],
                 catalog_hash=catalog_content_hash(catalog),
+                origin=DISCOVERY_ORIGIN_CURATED,
             )
             return {
                 "action": "discovered",

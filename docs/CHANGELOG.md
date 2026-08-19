@@ -1,3 +1,22 @@
+## Unreleased
+
+Absorb of [@bsmi021](https://github.com/bsmi021) PRs
+[#35](https://github.com/professorpalmer/Puppetmaster/pull/35),
+[#36](https://github.com/professorpalmer/Puppetmaster/pull/36), and
+[#37](https://github.com/professorpalmer/Puppetmaster/pull/37), plus
+stack edits. No version bump on this landing.
+
+- **claude-sonnet-5.** Curated `claude-code` / `agentic` / `hermes`
+  catalogs gain Sonnet 5 (cap 87, $3/$15, 1M, `long-context`) so the
+  router can select it. Agentic and Hermes keep `provider=anthropic`.
+- **Discovery origin.** `models.discovery.json` records `live` vs
+  `curated`. Doctor no longer ages compiled-in Claude/Codex/Hermes/
+  agentic catalogs. `--probe` and `--write` both stamp origin.
+  Preflight skips the clock TTL only for an explicit `origin=curated`.
+- **Analysis prompt orientation.** Structured prompts open by locating
+  `Your task` and label the artifact contract as output format so
+  gpt-5.6 / Codex stop treating the contract as the subject.
+
 ## v1.22.10
 
 **Fix: spawned Codex / Claude Code / Cursor workers read the delegate-first
