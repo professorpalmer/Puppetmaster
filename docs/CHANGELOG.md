@@ -1,3 +1,54 @@
+## Unreleased
+
+**Fix: `puppetmaster dashboard` for a second project silently shadowed the
+first instead of starting its own server.**
+
+Two independent defects, both confirmed by direct repro. Foreground: a stock
+`ThreadingHTTPServer` sets `SO_REUSEADDR`, which has inverted semantics on
+Windows — a second dashboard's `bind()` succeeds *over* the first's live
+listener, so it prints a URL, opens a browser tab, and never receives a
+single request (the kernel routes everything to the first binder; killing
+the first silently hands the tab to the second, with no reload). Background/
+MCP: the reuse check was a bare liveness probe (`GET /api/jobs` returns 200)
+with no project identity, so a second project's `dashboard --background` (or
+the `puppetmaster_dashboard` MCP tool) was told "reusing it" and handed the
+*first* project's URL — and because the early return preceded the runfile
+write, the second project got no runfile at all, so its own `--status` and
+`--stop` had nothing to work with.
+
+- **BREAKING: an explicit `--port N` on a busy port now fails instead of
+  silently colliding.** Omit `--port` (the common case) and a busy port is
+  auto-bumped to the next free one (capped at 20 attempts, then a clear
+  error naming the range tried and suggesting `dashboard --stop`) — this is
+  the default fix for the reported bug. But a *named* port is a promise a
+  script/bookmark/reverse-proxy may depend on, so naming one that's taken now
+  errors instead of quietly serving somewhere else; pass the new
+  `--port-search` to opt back into bumping from an explicit `--port`.
+- **Bind retry, not a probe-then-bind.** New `bind_dashboard_server()` binds
+  on a dashboard-specific server class with `allow_reuse_address = 0` on
+  Windows only (POSIX keeps it, where it only reclaims a `TIME_WAIT` socket —
+  needed for an immediate restart after Ctrl-C) and retries on the *real*
+  `OSError`/`PermissionError` (matching Windows' `EADDRINUSE` **and**
+  `winerror == 10013`, not just `errno.EADDRINUSE`) — `ports.reserve_port()`
+  was considered and rejected as the primary mechanism because its
+  bind-probe-then-close has an inherent TOCTOU window.
+- **Project identity on the wire.** A new `GET /api/meta` returns a hashed
+  `state_dir_id` + pid (never the raw path — the board is unauthenticated
+  and reachable off-loopback under `--mobile`) so `--background`/MCP reuse
+  and `--status` can tell "this project's dashboard" from "something is
+  listening." A pre-upgrade dashboard 404s the new route and is correctly
+  treated as foreign — no coordinated upgrade needed. A project-scoped
+  request never reuses a running `--all-projects` board, or vice versa.
+- **Truthful port propagation.** The *child* now writes its own runfile
+  (`--write-runfile`, internal) after it knows its real, possibly-bumped
+  port; the parent only ever reads it back. Previously the parent recorded
+  its own requested `--port`, which was simply wrong the moment the child
+  bumped — this also fixes the `--mobile` banner/QR printing the
+  pre-bump port before the bind even happened.
+- New `tests/test_dashboard_ports.py` and
+  `tests/test_dashboard_background_identity.py` cover the bind retry,
+  `/api/meta`, and identity-aware reuse end to end.
+
 ## v1.22.12
 
 Absorb of [@bsmi021](https://github.com/bsmi021) PR
