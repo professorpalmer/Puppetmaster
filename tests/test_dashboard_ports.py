@@ -16,9 +16,11 @@ two changes landing as separate PRs.
 from __future__ import annotations
 
 import errno
+import json
 import os
 import socket
 import threading
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -27,6 +29,7 @@ from puppetmaster.dashboard import (
     _port_taken,
     _state_dir_id,
     bind_dashboard_server,
+    dashboard_identity,
     dashboard_serves,
     make_handler,
     read_dashboard_runfile,
@@ -161,6 +164,17 @@ class BindDashboardServerTests(unittest.TestCase):
         self.assertIn(str(port), message)
         self.assertIn(str(port + 2), message)
 
+    def test_invalid_port_reports_actual_problem(self) -> None:
+        """70000 isn't a TCP port at all -- pre-fix this was reported as
+        "already in use", which is simply false: the bind loop's own
+        `candidate > 65535` guard breaks out before ever attempting a
+        bind."""
+        with self.assertRaises(OSError) as ctx:
+            bind_dashboard_server("127.0.0.1", 70000, _handler(), auto_port=False)
+        message = str(ctx.exception)
+        self.assertNotIn("already in use", message)
+        self.assertIn("70000", message)
+
 
 class ApiMetaTests(unittest.TestCase):
     def test_api_meta_reports_project_identity(self) -> None:
@@ -279,6 +293,123 @@ class RunfileAndOnBoundTests(unittest.TestCase):
             )
             self.addCleanup(httpd.server_close)
             self.assertEqual(calls, [("127.0.0.1", port + 1)])
+
+
+class DashboardIdentityRobustnessTests(unittest.TestCase):
+    """`dashboard_identity` against misbehaving (or hostile) listeners on the
+    port -- a real dashboard's own /api/meta is already covered by
+    ApiMetaTests; these exercise the "something else is on this port"
+    cases an ordinary `dashboard --background` can hit."""
+
+    @staticmethod
+    def _one_shot_server(respond) -> "tuple[socket.socket, int]":
+        """A raw socket server that accepts exactly one connection, hands
+        it to `respond(conn)` on a background thread, and returns
+        (listening_socket, port)."""
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+
+        def _serve() -> None:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            try:
+                respond(conn)
+            except OSError:
+                pass
+            finally:
+                conn.close()
+
+        threading.Thread(target=_serve, daemon=True).start()
+        return srv, port
+
+    def test_truncated_body_returns_none_not_a_traceback(self) -> None:
+        """A server that sends a valid Content-Length header then closes
+        early used to escape as a raw http.client.IncompleteRead out of an
+        ordinary `dashboard --background` -- the docstring promises None
+        for exactly this "can't vouch for it" case (§F3)."""
+
+        def truncate(conn: socket.socket) -> None:
+            conn.recv(4096)
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                b"Content-Length: 55\r\n\r\n1234567890"
+            )
+
+        srv, port = self._one_shot_server(truncate)
+        self.addCleanup(srv.close)
+        self.assertIsNone(dashboard_identity("127.0.0.1", port, timeout=1.0))
+
+    def test_non_http_squatter_returns_none_not_a_traceback(self) -> None:
+        """A non-HTTP service on the port (e.g. an SSH banner) raises
+        http.client.BadStatusLine, which the pre-fix `except (OSError,
+        ValueError)` also did not catch."""
+
+        def banner(conn: socket.socket) -> None:
+            conn.recv(4096)
+            conn.sendall(b"SSH-2.0-OpenSSH_9.6\r\n")
+
+        srv, port = self._one_shot_server(banner)
+        self.addCleanup(srv.close)
+        self.assertIsNone(dashboard_identity("127.0.0.1", port, timeout=1.0))
+
+    def test_slow_dribbler_is_bounded_by_a_wall_clock_deadline(self) -> None:
+        """`timeout=1.0` bounds each individual recv, not the call as a
+        whole: a peer trickling one byte at a time keeps every recv under
+        that timeout, so a bare per-recv timeout let this run for 12s
+        against a declared 1.0s budget (measured). Must return within a
+        small constant factor of `timeout`, not "eventually"."""
+        payload = json.dumps(
+            {"service": "puppetmaster-dashboard", "pid": 1, "state_dir_id": "x"}
+        ).encode("utf-8")
+
+        def dribble(conn: socket.socket) -> None:
+            conn.recv(4096)
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                + f"Content-Length: {len(payload)}\r\n\r\n".encode("utf-8")
+            )
+            for byte in payload:
+                conn.sendall(bytes([byte]))
+                time.sleep(0.5)
+
+        srv, port = self._one_shot_server(dribble)
+        self.addCleanup(srv.close)
+        started = time.monotonic()
+        result = dashboard_identity("127.0.0.1", port, timeout=1.0)
+        elapsed = time.monotonic() - started
+        self.assertIsNone(result)
+        self.assertLess(elapsed, 3.0, "must be bounded, not proportional to body size")
+
+    def test_flood_body_is_capped_not_read_into_memory_whole(self) -> None:
+        """A huge declared Content-Length must not be read in full -- the
+        payload is one small JSON object; anything that large is not a
+        dashboard, and reading it whole is an unbounded-memory foot-gun."""
+
+        def flood(conn: socket.socket) -> None:
+            conn.recv(4096)
+            declared = 400 * 1024 * 1024
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                + f"Content-Length: {declared}\r\n\r\n".encode("utf-8")
+            )
+            chunk = b"0" * 65536
+            try:
+                for _ in range(20):
+                    conn.sendall(chunk)
+            except OSError:
+                pass
+
+        srv, port = self._one_shot_server(flood)
+        self.addCleanup(srv.close)
+        started = time.monotonic()
+        result = dashboard_identity("127.0.0.1", port, timeout=2.0)
+        elapsed = time.monotonic() - started
+        self.assertIsNone(result)
+        self.assertLess(elapsed, 5.0)
 
 
 if __name__ == "__main__":

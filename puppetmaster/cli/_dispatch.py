@@ -177,6 +177,18 @@ def _resolve_store_for_job(
     return found, create_store(backend, found)
 
 
+def _read_child_stderr_tail(path: Path, *, max_bytes: int = 4000) -> str:
+    """Best-effort tail of a detached child's captured stderr, or "" if
+    there's nothing (file missing, empty, or unreadable)."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    if not data:
+        return ""
+    return data[-max_bytes:].decode("utf-8", errors="replace").strip()
+
+
 def _start_background_dashboard(
     args: argparse.Namespace,
     state_dir: Path,
@@ -204,7 +216,9 @@ def _start_background_dashboard(
     from puppetmaster.dashboard import (
         clear_dashboard_runfile,
         dashboard_identity,
+        dashboard_runfile,
         dashboard_serves,
+        normalize_dashboard_host,
         pid_alive,
         read_dashboard_runfile,
         write_dashboard_runfile,
@@ -240,22 +254,52 @@ def _start_background_dashboard(
     # `--background` doesn't spawn a redundant second server for the same
     # project (and clobber the runfile the first one is still using).
     existing = read_dashboard_runfile(state_dir)
-    if existing and existing.get("host", host) == host and pid_alive(int(existing.get("pid") or 0)):
+    if (
+        existing
+        and normalize_dashboard_host(existing.get("host", host)) == normalize_dashboard_host(host)
+        and pid_alive(int(existing.get("pid") or 0))
+    ):
         # Host-gated: a loopback dashboard tracked from an earlier plain
         # --background must not be "reused" for a --mobile request that
         # needs an externally-reachable bind. Falling through to the
         # literal-port probe below on a host mismatch correctly fails (a
         # loopback server doesn't answer on the LAN/Tailscale IP) and a new,
-        # properly-bound server gets spawned instead.
+        # properly-bound server gets spawned instead. Both sides of the host
+        # comparison are normalized (§F2) — the child always records the
+        # literal address it bound (e.g. "127.0.0.1"), never a loopback
+        # alias like "localhost", so comparing raw strings never matched a
+        # repeat --host localhost and piled up an orphaned server per call.
         existing_port = int(existing.get("port") or port)
-        if dashboard_serves(host, existing_port, state_dir, all_projects=all_projects):
+        # Port-gated (§F1): an explicit --port names a promise the caller
+        # may depend on (a script, a bookmark, a reverse proxy) -- reusing a
+        # tracked dashboard on a *different* port would silently discard
+        # that port with exit 0 instead of honoring or strict-failing it,
+        # exactly the collision --port is supposed to prevent. Only skip
+        # this gate when the caller didn't pin a port (auto_port, which is
+        # also true for an explicit --port --port-search) or the tracked
+        # port already matches what was asked for.
+        if (auto_port or existing_port == port) and dashboard_serves(
+            host, existing_port, state_dir, all_projects=all_projects
+        ):
             return _reuse(host, existing_port, existing.get("pid"))
 
-    # Nothing tracked (or it's stale/foreign) — something may still identify
-    # itself as this project's dashboard on the requested port specifically.
+    # Nothing tracked (or it's stale/foreign/on the wrong port) — something
+    # may still identify itself as this project's dashboard on the
+    # requested port specifically. This probe is always against the literal
+    # requested `port`, so it needs no explicit-port gate of its own: a
+    # match here already satisfies "this is a dashboard on the exact port
+    # asked for".
     if dashboard_serves(host, port, state_dir, all_projects=all_projects):
         identity = dashboard_identity(host, port)
-        return _reuse(host, port, (identity or {}).get("pid"))
+        if identity is None:
+            # dashboard_serves() just confirmed this identity a moment ago;
+            # None here means the server went away in between. Don't
+            # persist a runfile with a null pid (--stop would then report
+            # "process was not running" while a real server was still
+            # up) -- fall through and spawn our own instead.
+            pass
+        else:
+            return _reuse(host, port, identity.get("pid"))
 
     # Clear any stale/foreign runfile so the readiness poll below can't
     # mistake it for the child we're about to spawn.
@@ -286,13 +330,28 @@ def _start_background_dashboard(
     if args.job_id:
         command.append(args.job_id)
 
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    # The child's stderr used to be DEVNULL'd outright, so a real failure
+    # (the bind error, an import failure, ...) left the caller with nothing
+    # but "server did not come up" -- capture it to a file (not a pipe: this
+    # child is meant to outlive this process, and an unread PIPE would
+    # eventually fill and block a long-running server's own stderr writes)
+    # so a failure can quote it.
+    child_log = dashboard_runfile(state_dir).with_name("dashboard.err.log")
+    try:
+        err_handle: Any = open(child_log, "w", encoding="utf-8")
+    except OSError:
+        err_handle = subprocess.DEVNULL
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=err_handle,
+            start_new_session=True,
+        )
+    finally:
+        if err_handle is not subprocess.DEVNULL:
+            err_handle.close()
 
     # Poll the child's own runfile rather than re-probing `host:port` — the
     # child may have bumped, so a liveness/identity probe pinned to the
@@ -315,10 +374,12 @@ def _start_background_dashboard(
         state_dir,
         all_projects=all_projects,
     ):
+        hint = _read_child_stderr_tail(child_log)
+        detail = f"\n{hint}" if hint else ""
         print(
-            "puppetmaster dashboard --background: server did not come up. Run "
-            f"`python -m puppetmaster dashboard --port {port}` in the foreground "
-            "to see the error.",
+            "puppetmaster dashboard --background: server did not come up."
+            f"{detail}\nRun `python -m puppetmaster dashboard --port {port}` "
+            "in the foreground to see the error.",
             file=sys.stderr,
         )
         return 1
@@ -349,7 +410,9 @@ def _announce_background_dashboard(
 def _run_dashboard_command(args: argparse.Namespace, state_dir: Path) -> int:
     from puppetmaster.dashboard import (
         dashboard_alive,
+        dashboard_identity,
         dashboard_serves,
+        pid_alive,
         print_mobile_banner,
         read_dashboard_runfile,
         resolve_mobile_host,
@@ -397,16 +460,34 @@ def _run_dashboard_command(args: argparse.Namespace, state_dir: Path) -> int:
                     f"Background dashboard running: {info.get('url')} (pid {info.get('pid')})."
                 )
             elif dashboard_alive(info_host, info_port):
-                # Something answers at the tracked address, but it isn't
-                # provably *this* project (or --all-projects scope doesn't
-                # match) — the old bare-liveness check reported this as
-                # "running" even when it was a different project's board.
-                print(
-                    "A dashboard is running at the tracked address, but it is "
-                    "serving another project (or a different --all-projects "
-                    "scope) — not this state dir. Clear it with `dashboard "
-                    "--stop` and start a fresh one."
-                )
+                # Something answers at the tracked address, but it doesn't
+                # identify as this project (or --all-projects scope doesn't
+                # match) via /api/meta -- which is also what a *pre-upgrade*
+                # puppetmaster dashboard looks like: it 404s a route that
+                # didn't exist yet. Every existing user with a background
+                # board hits this in the upgrade window, and it would be a
+                # false statement to call their own older server "another
+                # project". Fall back to the runfile's own pid: if nothing
+                # identifies itself but the pid this project's own runfile
+                # tracked is still alive, it's far more likely that same
+                # process running old code than a coincidentally-arrived
+                # foreign dashboard. (This only changes what --status
+                # *reports* -- the reuse path above still requires a real
+                # identity match and is not weakened by this fallback.)
+                tracked_pid = int(info.get("pid") or 0)
+                if dashboard_identity(info_host, info_port) is None and pid_alive(tracked_pid):
+                    print(
+                        f"Background dashboard running: {info.get('url')} "
+                        f"(pid {info.get('pid')}) -- predates /api/meta, so "
+                        "identity could not be confirmed."
+                    )
+                else:
+                    print(
+                        "A dashboard is running at the tracked address, but it is "
+                        "serving another project (or a different --all-projects "
+                        "scope) — not this state dir. Clear it with `dashboard "
+                        "--stop` and start a fresh one."
+                    )
             else:
                 print(
                     "A background dashboard is tracked here but isn't answering "
