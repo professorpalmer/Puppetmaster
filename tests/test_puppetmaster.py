@@ -17796,9 +17796,11 @@ class DashboardTests(unittest.TestCase):
         Off by default (opt in with PUPPETMASTER_RUN_CONSOLE_TESTS=1): this
         needs a genuine console-attach dance (FreeConsole/AttachConsole/
         GenerateConsoleCtrlEvent) that is fragile under hosts that inherit
-        the "ignore Ctrl+C" flag — see plan-dashboard-ctrlc.md §2. The
-        portable regression guard is test_dashboard_serve_runs_loop_on_main_thread
-        above; this test is the belt-and-suspenders end-to-end check.
+        the console's "ignore Ctrl+C" flag (see the helper spawned below,
+        and the SetConsoleCtrlHandler(NULL, FALSE) call right before it).
+        The portable regression guard is
+        test_dashboard_serve_runs_loop_on_main_thread above; this test is
+        the belt-and-suspenders end-to-end check.
         """
         if os.environ.get("PUPPETMASTER_RUN_CONSOLE_TESTS") != "1":
             self.skipTest(
