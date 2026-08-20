@@ -17669,6 +17669,7 @@ class DashboardTests(unittest.TestCase):
                     self.assertTrue(any(j["id"] == job.id for j in jobs))
             finally:
                 httpd.shutdown()
+                httpd.server_close()
 
     def test_dashboard_rejects_traversal_job_id(self) -> None:
         """/api/job must reject ids that aren't plain job ids before they reach
@@ -17699,6 +17700,230 @@ class DashboardTests(unittest.TestCase):
                     self.assertIn(b"invalid id", exc.read())
             finally:
                 httpd.shutdown()
+                httpd.server_close()
+
+    def test_dashboard_serve_returns_open_socket_when_not_serving_forever(self) -> None:
+        """serve_forever=False must keep returning a bound, OPEN server —
+        callers (tests) drive a request against it and shut it down
+        themselves. Regression guard: server_close() must not creep into
+        this branch (it belongs only to the blocking path)."""
+        import urllib.request
+
+        from puppetmaster.dashboard import serve
+
+        with TemporaryDirectory() as tmp:
+            httpd = serve(
+                Path(tmp) / ".puppetmaster",
+                backend="file",
+                host="127.0.0.1",
+                port=0,
+                open_browser=False,
+                serve_forever=False,
+            )
+            self.assertNotEqual(httpd.socket.fileno(), -1)
+            port = httpd.server_address[1]
+            t = threading.Thread(target=httpd.serve_forever, daemon=True)
+            t.start()
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/") as r:
+                    self.assertEqual(r.status, 200)
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+
+    def test_dashboard_serve_closes_socket_on_interrupt(self) -> None:
+        """The blocking serve_forever() branch must release the listening
+        socket when interrupted. Before the fix, server_close() never ran
+        anywhere in dashboard.py, so the port stayed bound after Ctrl-C."""
+        from http.server import ThreadingHTTPServer
+
+        from puppetmaster.dashboard import serve
+
+        def fake_serve_forever(self, poll_interval=0.5):
+            raise KeyboardInterrupt
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(ThreadingHTTPServer, "serve_forever", fake_serve_forever):
+                httpd = serve(
+                    Path(tmp) / ".puppetmaster",
+                    backend="file",
+                    host="127.0.0.1",
+                    port=0,
+                    open_browser=False,
+                    serve_forever=True,
+                )
+            self.assertEqual(httpd.socket.fileno(), -1)
+
+    def test_dashboard_serve_runs_loop_on_main_thread(self) -> None:
+        """serve_forever() must run on the MAIN thread, not a spawned daemon
+        thread. This is the direct regression guard: the original code parked
+        the main thread in an untimed Thread.join() on a daemon thread running
+        serve_forever, which made Ctrl-C undeliverable on Windows (an untimed
+        lock acquire there is uninterruptible, so KeyboardInterrupt was never
+        raised). Also asserts poll_interval is passed and short enough that
+        the main thread keeps returning to the eval loop."""
+        from http.server import ThreadingHTTPServer
+
+        from puppetmaster.dashboard import serve
+
+        calls = {}
+
+        def fake_serve_forever(self, poll_interval=None):
+            calls["on_main_thread"] = threading.current_thread() is threading.main_thread()
+            calls["poll_interval"] = poll_interval
+            raise KeyboardInterrupt
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(ThreadingHTTPServer, "serve_forever", fake_serve_forever):
+                serve(
+                    Path(tmp) / ".puppetmaster",
+                    backend="file",
+                    host="127.0.0.1",
+                    port=0,
+                    open_browser=False,
+                    serve_forever=True,
+                )
+        self.assertTrue(calls.get("on_main_thread"))
+        self.assertIsNotNone(calls.get("poll_interval"))
+        self.assertLessEqual(calls["poll_interval"], 0.5)
+
+    @unittest.skipUnless(os.name == "nt", "console Ctrl-C semantics are Windows-specific")
+    def test_dashboard_ctrlc_e2e_windows_console(self) -> None:
+        """The actual user report: a real CTRL_C_EVENT delivered to
+        `python -m puppetmaster dashboard` must make it exit (within 5s,
+        code 0) with its listening socket released.
+
+        Off by default (opt in with PUPPETMASTER_RUN_CONSOLE_TESTS=1): this
+        needs a genuine console-attach dance (FreeConsole/AttachConsole/
+        GenerateConsoleCtrlEvent) that is fragile under hosts that inherit
+        the "ignore Ctrl+C" flag — see plan-dashboard-ctrlc.md §2. The
+        portable regression guard is test_dashboard_serve_runs_loop_on_main_thread
+        above; this test is the belt-and-suspenders end-to-end check.
+        """
+        if os.environ.get("PUPPETMASTER_RUN_CONSOLE_TESTS") != "1":
+            self.skipTest(
+                "set PUPPETMASTER_RUN_CONSOLE_TESTS=1 to run console Ctrl-C e2e tests"
+            )
+
+        import ctypes
+        import urllib.request
+
+        repo_root = Path(__file__).resolve().parent.parent
+        port = 18920
+        CREATE_NO_WINDOW = 0x08000000
+
+        # The "ignore Ctrl+C" flag is inherited by child processes, and an
+        # agent/CI shell commonly has it set — clear it here so children
+        # inherit "Ctrl+C enabled".
+        ctypes.WinDLL("kernel32", use_last_error=True).SetConsoleCtrlHandler(None, False)
+
+        # The AttachConsole()/GenerateConsoleCtrlEvent() dance must run in its
+        # OWN process — doing it in this process would detach the test
+        # runner's own console. Write the helper to a temp file and spawn it.
+        helper_src = (
+            "import ctypes, sys\n"
+            "from ctypes import wintypes\n"
+            'kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)\n'
+            "kernel32.AttachConsole.argtypes = [wintypes.DWORD]\n"
+            "kernel32.AttachConsole.restype = wintypes.BOOL\n"
+            "kernel32.FreeConsole.restype = wintypes.BOOL\n"
+            "kernel32.SetConsoleCtrlHandler.argtypes = [wintypes.LPVOID, wintypes.BOOL]\n"
+            "kernel32.SetConsoleCtrlHandler.restype = wintypes.BOOL\n"
+            "kernel32.GenerateConsoleCtrlEvent.argtypes = [wintypes.DWORD, wintypes.DWORD]\n"
+            "kernel32.GenerateConsoleCtrlEvent.restype = wintypes.BOOL\n"
+            "pid = int(sys.argv[1])\n"
+            "out = {}\n"
+            "kernel32.FreeConsole()\n"
+            "ok = kernel32.AttachConsole(pid)\n"
+            'out["attach_ok"] = bool(ok)\n'
+            "if not ok:\n"
+            "    print(out, flush=True)\n"
+            "    raise SystemExit(2)\n"
+            "kernel32.SetConsoleCtrlHandler(None, True)\n"
+            "buf = (wintypes.DWORD * 64)()\n"
+            "n = kernel32.GetConsoleProcessList(buf, 64)\n"
+            'out["console_pids"] = list(buf[:n])\n'
+            'out["target_on_console"] = pid in out["console_pids"]\n'
+            "ok = kernel32.GenerateConsoleCtrlEvent(0, 0)\n"
+            'out["generate_ok"] = bool(ok)\n'
+            "print(out, flush=True)\n"
+            "raise SystemExit(0 if ok else 3)\n"
+        )
+
+        with TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / ".puppetmaster"
+            helper_path = Path(tmp) / "send_ctrlc_helper.py"
+            helper_path.write_text(helper_src, encoding="utf-8")
+
+            cmd = [
+                sys.executable, "-m", "puppetmaster",
+                "--state-dir", str(state_dir),
+                "dashboard", "--port", str(port), "--no-open",
+            ]
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                cwd=str(repo_root),
+                creationflags=CREATE_NO_WINDOW,
+            )
+            try:
+                deadline = time.time() + 15
+                up = False
+                while time.time() < deadline:
+                    if proc.poll() is not None:
+                        break
+                    try:
+                        with urllib.request.urlopen(
+                            f"http://127.0.0.1:{port}/api/jobs", timeout=1
+                        ) as r:
+                            up = r.status == 200
+                            break
+                    except OSError:
+                        time.sleep(0.2)
+                self.assertIsNone(proc.poll(), "dashboard child exited before coming up")
+                self.assertTrue(up, "dashboard child never answered on its port")
+
+                helper = subprocess.run(
+                    [sys.executable, str(helper_path), str(proc.pid)],
+                    capture_output=True, text=True, creationflags=CREATE_NO_WINDOW,
+                )
+                self.assertIn(
+                    "'target_on_console': True",
+                    helper.stdout,
+                    "CTRL_C_EVENT delivery to the child console could not be "
+                    f"verified, so a hang here would be indistinguishable from "
+                    f"the bug: stdout={helper.stdout!r} stderr={helper.stderr!r}",
+                )
+
+                sent_at = time.time()
+                died_at = None
+                while time.time() - sent_at < 5.0:
+                    if proc.poll() is not None:
+                        died_at = time.time()
+                        break
+                    time.sleep(0.05)
+                self.assertIsNotNone(
+                    died_at, "dashboard did not exit within 5s of CTRL_C_EVENT"
+                )
+                self.assertEqual(proc.returncode, 0)
+
+                listeners = subprocess.run(
+                    [
+                        "powershell", "-NoProfile", "-Command",
+                        f"(Get-NetTCPConnection -LocalPort {port} -State Listen "
+                        f"-EA SilentlyContinue | Measure-Object).Count",
+                    ],
+                    capture_output=True, text=True, creationflags=CREATE_NO_WINDOW,
+                ).stdout.strip()
+                self.assertEqual(
+                    listeners, "0", "listening socket was not released after Ctrl-C"
+                )
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=10)
 
     def test_cost_rollup_tolerates_non_numeric_cost(self) -> None:
         """A ROUTING artifact with a non-numeric estimated_cost_usd must not
