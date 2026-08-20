@@ -24369,35 +24369,65 @@ class PuppetmasterMcpVerbTests(unittest.TestCase):
 
     def test_dashboard_tool_reuses_running_server(self) -> None:
         import puppetmaster.mcp_server as mcp
+        import puppetmaster.dashboard as dash
 
         self.assertIn("puppetmaster_dashboard", {tool.name for tool in mcp.tools()})
-        with patch.object(mcp, "_dashboard_alive", return_value=True), patch.object(
-            mcp, "_spawn_dashboard_server"
-        ) as popen:
+        # Reuse is identity-aware (dashboard_serves), not bare liveness — a
+        # foreign responder on the same host:port must never count as "ours".
+        # No tracked runfile (None) so the own-runfile pre-check falls
+        # through to the literal-port probe, which this mocks True. A pid
+        # from /api/meta is required so MCP can persist a runfile (CLI
+        # `_reuse` already did); without it this path used to return a URL
+        # that later stop=true could not tear down.
+        identity = {"pid": 4242, "state_dir_id": "abc", "service": "puppetmaster-dashboard"}
+        with patch.object(dash, "dashboard_serves", return_value=True), patch.object(
+            dash, "read_dashboard_runfile", return_value=None
+        ), patch.object(
+            dash, "dashboard_identity", return_value=identity
+        ), patch.object(
+            dash, "write_dashboard_runfile"
+        ) as write_runfile, patch.object(mcp, "_spawn_dashboard_server") as popen:
             result = mcp.call_tool(
                 "puppetmaster_dashboard", {"cwd": "/tmp", "job_id": "job_abc"}
             )
         body = json.loads(result["content"][0]["text"])
         popen.assert_not_called()
+        write_runfile.assert_called_once()
+        written = write_runfile.call_args[0][1]
+        self.assertEqual(written["pid"], 4242)
+        self.assertEqual(written["port"], 8787)
         self.assertTrue(body["already_running"])
         self.assertFalse(body["started"])
         self.assertEqual(body["url"], "http://127.0.0.1:8787/?job=job_abc")
 
     def test_dashboard_tool_starts_server_when_absent(self) -> None:
         import puppetmaster.mcp_server as mcp
+        import puppetmaster.dashboard as dash
 
         spawned = MagicMock()
         spawned.pid = 4321
         spawned.poll.return_value = None
-        # alive checks: initial probe (absent), readiness loop, post-loop verify
+        # The child writes its own runfile post-bind (--write-runfile); the
+        # parent polls for it rather than re-probing host:port.
+        runfile = {
+            "pid": 4321, "host": "127.0.0.1", "port": 9000,
+            "url": "http://127.0.0.1:9000/",
+        }
+        # identity checks: initial probe (absent), post-spawn confirm (ours).
+        # read_dashboard_runfile: None first (own-runfile pre-check finds
+        # nothing tracked, so it can't short-circuit to a false "reuse"),
+        # then the child's runfile once the poll loop looks for it.
         with patch.object(
-            mcp, "_dashboard_alive", side_effect=[False, True, True]
+            dash, "dashboard_serves", side_effect=[False, True]
+        ), patch.object(
+            dash, "read_dashboard_runfile", side_effect=[None, runfile]
         ), patch.object(mcp, "_spawn_dashboard_server", return_value=spawned) as popen:
             result = mcp.call_tool("puppetmaster_dashboard", {"cwd": "/tmp", "port": 9000})
         body = json.loads(result["content"][0]["text"])
         command = popen.call_args.args[0]
         self.assertIn("dashboard", command)
         self.assertIn("--no-open", command)
+        self.assertIn("--write-runfile", command)
         self.assertIn("9000", command)
         self.assertTrue(body["started"])
         self.assertEqual(body["pid"], 4321)
@@ -24405,6 +24435,7 @@ class PuppetmasterMcpVerbTests(unittest.TestCase):
 
     def test_dashboard_tool_forwards_all_projects_flag(self) -> None:
         import puppetmaster.mcp_server as mcp
+        import puppetmaster.dashboard as dash
 
         schema = mcp.dashboard_schema()
         self.assertIn("all_projects", schema["properties"])
@@ -24412,8 +24443,14 @@ class PuppetmasterMcpVerbTests(unittest.TestCase):
         spawned = MagicMock()
         spawned.pid = 5555
         spawned.poll.return_value = None
+        runfile = {
+            "pid": 5555, "host": "127.0.0.1", "port": 8787,
+            "url": "http://127.0.0.1:8787/",
+        }
         with patch.object(
-            mcp, "_dashboard_alive", side_effect=[False, True, True]
+            dash, "dashboard_serves", side_effect=[False, True]
+        ), patch.object(
+            dash, "read_dashboard_runfile", side_effect=[None, runfile]
         ), patch.object(mcp, "_spawn_dashboard_server", return_value=spawned) as popen:
             result = mcp.call_tool(
                 "puppetmaster_dashboard", {"cwd": "/tmp", "all_projects": True}
@@ -24425,12 +24462,19 @@ class PuppetmasterMcpVerbTests(unittest.TestCase):
 
     def test_dashboard_tool_omits_all_projects_by_default(self) -> None:
         import puppetmaster.mcp_server as mcp
+        import puppetmaster.dashboard as dash
 
         spawned = MagicMock()
         spawned.pid = 5556
         spawned.poll.return_value = None
+        runfile = {
+            "pid": 5556, "host": "127.0.0.1", "port": 8787,
+            "url": "http://127.0.0.1:8787/",
+        }
         with patch.object(
-            mcp, "_dashboard_alive", side_effect=[False, True, True]
+            dash, "dashboard_serves", side_effect=[False, True]
+        ), patch.object(
+            dash, "read_dashboard_runfile", side_effect=[None, runfile]
         ), patch.object(mcp, "_spawn_dashboard_server", return_value=spawned) as popen:
             mcp.call_tool("puppetmaster_dashboard", {"cwd": "/tmp"})
         command = popen.call_args.args[0]
@@ -24438,13 +24482,14 @@ class PuppetmasterMcpVerbTests(unittest.TestCase):
 
     def test_dashboard_tool_reports_failed_start(self) -> None:
         import puppetmaster.mcp_server as mcp
+        import puppetmaster.dashboard as dash
 
         dead = MagicMock()
         dead.pid = 4321
         dead.poll.return_value = 1
-        with patch.object(mcp, "_dashboard_alive", return_value=False), patch.object(
-            mcp, "_spawn_dashboard_server", return_value=dead
-        ):
+        with patch.object(dash, "dashboard_serves", return_value=False), patch.object(
+            dash, "read_dashboard_runfile", return_value=None
+        ), patch.object(mcp, "_spawn_dashboard_server", return_value=dead):
             result = mcp.call_tool("puppetmaster_dashboard", {"cwd": "/tmp"})
         self.assertTrue(result["isError"])
         body = json.loads(result["content"][0]["text"])
@@ -24457,16 +24502,20 @@ class PuppetmasterMcpVerbTests(unittest.TestCase):
         spawned = MagicMock()
         spawned.pid = 7777
         spawned.poll.return_value = None
+        runfile = {
+            "pid": 7777, "host": "100.64.0.7", "port": 8787,
+            "url": "http://100.64.0.7:8787/",
+        }
         with patch.object(
             dash, "resolve_mobile_host", return_value=("100.64.0.7", "tailscale")
         ), patch.object(
-            mcp, "_dashboard_alive", side_effect=[False, True, True]
+            dash, "dashboard_serves", side_effect=[False, True]
+        ), patch.object(
+            dash, "read_dashboard_runfile", side_effect=[None, runfile]
         ), patch.object(
             mcp, "_spawn_dashboard_server", return_value=spawned
         ) as popen, patch.object(
             dash, "write_qr_png", return_value=True
-        ), patch.object(
-            dash, "write_dashboard_runfile"
         ):
             result = mcp.call_tool(
                 "puppetmaster_dashboard", {"cwd": "/tmp", "mobile": True}
@@ -24516,6 +24565,13 @@ class PuppetmasterMcpVerbTests(unittest.TestCase):
         self.assertIn("mobile", props)
         self.assertIn("qr", props)
         self.assertIn("stop", props)
+
+    def test_dashboard_tool_description_is_identity_aware(self) -> None:
+        import puppetmaster.mcp_server as mcp
+
+        tool = next(t for t in mcp.tools() if t.name == "puppetmaster_dashboard")
+        self.assertIn("/api/meta", tool.description)
+        self.assertNotIn("already listening on the port", tool.description)
 
     def test_installed_rules_teach_the_dashboard_verb(self) -> None:
         from puppetmaster.rules import RULE_BODY

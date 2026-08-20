@@ -16,23 +16,33 @@ python -m puppetmaster dashboard            # jobs index for this workspace
 python -m puppetmaster dashboard <job_id>   # deep-link straight to one job
 ```
 
-From an agent, the MCP verb `puppetmaster_dashboard` starts the server (if one
-isn't already listening) and returns the URL to open — pass `job_id` to deep-link,
-`mobile: true` to get a phone URL + QR, and `stop: true` to tear it down. The
-server runs **detached**, so there's no terminal to keep open.
+From an agent, the MCP verb `puppetmaster_dashboard` starts the server (or reuses
+this project's own, if one is already running) and returns the URL to open — pass
+`job_id` to deep-link, `mobile: true` to get a phone URL + QR, and `stop: true` to
+tear it down. The server runs **detached**, so there's no terminal to keep open.
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--port` | `8787` | Port to serve on. |
+| `--port` | auto | Port to serve on. **Omit it** (the common case) to auto-pick the next free port starting at 8787 — a busy port (e.g. another project's dashboard) is never silently shared. **Pass it explicitly** and it's a strict promise: a busy port fails outright instead of quietly landing somewhere else, so a script/bookmark/reverse-proxy pinning a port can rely on it. Add `--port-search` to opt an explicit `--port` back into auto-bumping. |
+| `--port-search` | off | With an explicit `--port`, search upward from it instead of failing when it's busy. No effect without `--port` (bumping is already the default). |
 | `--host` | `127.0.0.1` | Bind host. Non-loopback is refused unless `--allow-external`. |
 | `--no-open` | off | Don't auto-open a browser tab. |
 | `--all-projects` | off | Aggregate jobs from every Puppetmaster project state dir on this machine. |
 | `--allow-external` | off | Allow binding to a non-loopback host. The board is **unauthenticated**, so this exposes job state to the network — only on a trusted one. |
 | `--mobile` | off | Serve on a phone-reachable address: auto-detect a Tailscale IP (falls back to LAN IP), bind it (implies `--allow-external`), and print the URL. See below. |
 | `--qr` | off | With `--mobile`, also print a scannable QR of the URL (needs the optional `qrcode` package). |
-| `--background` / `-b` | off | Run detached like a backend service and return to the prompt instead of holding the terminal. Prints the URL (and QR with `--qr`), then keeps serving until `--stop`. |
+| `--background` / `-b` | off | Run detached like a backend service and return to the prompt instead of holding the terminal. Prints the URL (and QR with `--qr`), then keeps serving until `--stop`. Reuses this project's own already-running background dashboard instead of spawning a redundant one. |
 | `--stop` | off | Stop the detached background dashboard for this state dir. |
 | `--status` | off | Report whether a background dashboard is running for this state dir. |
+
+**Project identity, not just liveness.** Every dashboard exposes `GET /api/meta`
+— a hashed id for its state dir, plus pid and `--all-projects` scope — so
+`--background`/the MCP tool can tell *this project's* dashboard apart from some
+other program (or another project's board) merely answering on the same
+host:port, and reuse only the former. A pre-upgrade dashboard without this route
+is never mistaken for a match — no coordinated upgrade needed, and `--status`
+still reports it as yours (noting it predates `/api/meta`) as long as the pid
+your own runfile tracked is still alive.
 
 ## Easiest setup: let the pilot run it (no second terminal)
 

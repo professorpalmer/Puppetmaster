@@ -1,3 +1,134 @@
+## Unreleased
+
+Absorb of [@bsmi021](https://github.com/bsmi021) PR
+[#46](https://github.com/professorpalmer/Puppetmaster/pull/46), plus
+stack edits.
+
+**Fix: `puppetmaster dashboard` for a second project silently shadowed the
+first instead of starting its own server.**
+
+Two independent defects, both confirmed by direct repro. Foreground: a stock
+`ThreadingHTTPServer` sets `SO_REUSEADDR`, which has inverted semantics on
+Windows — a second dashboard's `bind()` succeeds *over* the first's live
+listener, so it prints a URL, opens a browser tab, and never receives a
+single request (the kernel routes everything to the first binder; killing
+the first silently hands the tab to the second, with no reload). Background/
+MCP: the reuse check was a bare liveness probe (`GET /api/jobs` returns 200)
+with no project identity, so a second project's `dashboard --background` (or
+the `puppetmaster_dashboard` MCP tool) was told "reusing it" and handed the
+*first* project's URL — and because the early return preceded the runfile
+write, the second project got no runfile at all, so its own `--status` and
+`--stop` had nothing to work with.
+
+- **BREAKING: an explicit `--port N` on a busy port now fails instead of
+  silently colliding.** Omit `--port` (the common case) and a busy port is
+  auto-bumped to the next free one (capped at 20 attempts, then a clear
+  error naming the range tried and suggesting `dashboard --stop`) — this is
+  the default fix for the reported bug. But a *named* port is a promise a
+  script/bookmark/reverse-proxy may depend on, so naming one that's taken now
+  errors instead of quietly serving somewhere else; pass the new
+  `--port-search` to opt back into bumping from an explicit `--port`.
+- **Bind retry, not a probe-then-bind.** New `bind_dashboard_server()` binds
+  on a dashboard-specific server class with `allow_reuse_address = 0` on
+  Windows only (POSIX keeps it, where it only reclaims a `TIME_WAIT` socket —
+  needed for an immediate restart after Ctrl-C) and retries on the *real*
+  `OSError`/`PermissionError` (matching Windows' `EADDRINUSE` **and**
+  `winerror == 10013`, not just `errno.EADDRINUSE`) — `ports.reserve_port()`
+  was considered and rejected as the primary mechanism because its
+  bind-probe-then-close has an inherent TOCTOU window.
+- **Project identity on the wire.** A new `GET /api/meta` returns a hashed
+  `state_dir_id` + pid (never the raw path — the board is unauthenticated
+  and reachable off-loopback under `--mobile`) so `--background`/MCP reuse
+  and `--status` can tell "this project's dashboard" from "something is
+  listening." A pre-upgrade dashboard 404s the new route and is correctly
+  treated as foreign — no coordinated upgrade needed. A project-scoped
+  request never reuses a running `--all-projects` board, or vice versa.
+- **Truthful port propagation.** The *child* now writes its own runfile
+  (`--write-runfile`, internal) after it knows its real, possibly-bumped
+  port; the parent only ever reads it back. Previously the parent recorded
+  its own requested `--port`, which was simply wrong the moment the child
+  bumped — this also fixes the `--mobile` banner/QR printing the
+  pre-bump port before the bind even happened.
+- **Own-project reuse, host-gated.** `--background` and the MCP tool both
+  now check this project's own already-running dashboard — at whatever port
+  it actually bound to, which can be past the requested one from an earlier
+  bump — before probing the literal requested port, so a repeat call
+  doesn't spawn a redundant second server for the same project. Gated on
+  the tracked server's host matching the one requested: a loopback
+  dashboard from an earlier plain `--background` is never "reused" for a
+  later `--mobile` call, which needs an externally-reachable bind and would
+  otherwise get handed an unreachable `127.0.0.1` URL.
+- **`--status` compares against what it tracks, not what was just typed.**
+  `dashboard --status` (bare, so `--all-projects` defaults off) after
+  `dashboard --background --all-projects` now still reports the board it
+  started; it previously compared the runfile against *this* invocation's
+  `--all-projects` flag instead of the tracked record's own, so it wrongly
+  reported "serving another project."
+- New `tests/test_dashboard_ports.py` covers the bind retry and `/api/meta`
+  against real bound servers; `tests/test_dashboard_background_identity.py`
+  covers the CLI/MCP reuse wiring (mostly against a mocked identity check,
+  for speed) plus the `--port`/`auto_port` argv derivation, with a couple of
+  cases run against a real server to guard the wiring itself, not just the
+  identity functions.
+
+**Follow-up (adversarial review): the own-project-reuse pre-check had its own
+bugs.**
+
+- **Fix: an explicit `--port N` was silently discarded whenever this project
+  already had a live tracked dashboard.** The reuse pre-check (both CLI and
+  MCP) checked neither `auto_port` nor whether the tracked port matched the
+  one just asked for, so a tracked dashboard on a *different* port was
+  "reused" anyway — a regression against the `--port` semantics above:
+  moving a project's dashboard to a new port required `--stop` first, with
+  no error telling you so. Reuse of a tracked dashboard now requires either
+  `auto_port` (no explicit `--port`, or `--port-search`) or that the tracked
+  port equals the one requested.
+- **Fix: `--host localhost` piled up unstoppable servers.** The reuse
+  pre-check compared the requested host's *spelling* against the child's
+  recorded host, which is always the literal address it bound (e.g.
+  `127.0.0.1` — `--host` isn't forwarded for loopback names). `"localhost" !=
+  "127.0.0.1"` never matched, so every repeat `--background --host localhost`
+  spawned a brand-new server; only the last one was ever tracked, so the rest
+  leaked until reboot. Both sides of the comparison now fold through the same
+  loopback-alias table before comparing.
+- **Fix: a slow or hostile listener on the port could hang or balloon a
+  `dashboard` invocation.** `dashboard_identity`'s `timeout` bounded each
+  individual `recv`, not the call — a peer trickling one byte at a time kept
+  every `recv` under the timeout and could stall the caller far longer than
+  the declared budget (measured: 12s against 1.0s), and an unbounded `.read()`
+  would buffer an arbitrarily large body in full. It now enforces a real
+  wall-clock deadline across the whole read and caps the body size. Also
+  broadened its exception handling to cover `http.client`'s own exceptions
+  (a truncating server, a non-HTTP squatter) — these used to escape as a raw
+  traceback out of an ordinary `dashboard --background`, contradicting the
+  function's own "returns None" contract.
+- **Fix: `--status` called your own pre-upgrade dashboard "another
+  project."** A dashboard predating `/api/meta` 404s that route, which is
+  indistinguishable by liveness alone from a genuine foreign server — every
+  existing user with a background board hit this in the upgrade window.
+  `--status` now falls back to the runfile's own tracked pid: if nothing
+  identifies itself but that pid is still alive, it reports the board as
+  yours (noting identity couldn't be confirmed) rather than making the false
+  claim that it belongs to someone else. This only changes what `--status`
+  *reports* — the reuse path's identity requirement is unchanged.
+- A handful of nits: an invalid `--port` (e.g. `70000`) was reported as
+  "already in use," which was simply false — it's now reported as not a
+  valid port; `dashboard --background`'s failure message is no longer
+  generic (the detached child's stderr is now captured to a small log file
+  and quoted on failure, instead of being discarded to `DEVNULL`); the
+  literal-port reuse path no longer risks persisting a runfile with a null
+  pid from a redundant identity round-trip.
+- **Stack absorb:** MCP literal-port reuse now writes a runfile (and refuses
+  a null-pid persist), matching CLI `_reuse`, so `stop=true` can tear down a
+  dashboard that was already serving this project without a tracked marker.
+  MCP spawn captures `dashboard.err.log` the same way `--background` does.
+  The `puppetmaster_dashboard` tool description no longer advertises reuse
+  as bare liveness on the port. A host/port retarget no longer clears the
+  runfile before the replacement child binds (a failed `--mobile` after
+  loopback used to untrack the still-running board), and a successful
+  retarget SIGTERMs the previous pid so `--stop` is not left pointing at
+  one server while another stays up.
+
 ## v1.22.13
 
 Absorb of [@bsmi021](https://github.com/bsmi021) PR
@@ -34,6 +165,7 @@ the only way out was Ctrl-Break, closing the terminal, or `taskkill`.
   so the command fails loudly instead of silently. `main()` only pretty-prints
   `FileNotFoundError`, `ValueError` and `RuntimeError`, so an unexpected
   `OSError` here reaches the user as a traceback rather than an `error:` line.
+
 
 ## v1.22.12
 

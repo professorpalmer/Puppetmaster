@@ -48,6 +48,7 @@ Five production adapters live plus the keys-only `agentic` standalone worker; tw
 | Analysis prompt orientation (v1.22.11+) | Structured prompts locate `Your task` and label the artifact contract as output format so gpt-5.6 / Codex stop treating the contract as the subject |
 | Swarm timeout propagation (v1.22.12+) | `run` / `swarm` / `start_swarm` / `start_cursor_swarm` forward `timeout_seconds` and `max_timeout_seconds` onto worker payloads. Explicit ceilings are used as given (floored at the base). Timeout records report elapsed time and the limit that ended the run |
 | Dashboard Ctrl-C on Windows (v1.22.13+) | `puppetmaster dashboard` runs `serve_forever` on the main thread and closes the listener on stop, so Ctrl-C exits and the port is released |
+| Dashboard second-project bind (Unreleased) | A second project's dashboard no longer silently shadows the first: Windows bind refuses `SO_REUSEADDR` over a live listener, `--port` is strict unless `--port-search`, and background/MCP reuse is gated on `/api/meta` project identity |
 | CodeGraph | Optional shared repo intelligence ([docs](CODEGRAPH.md)) |
 | Patch workflow | Patch artifacts, path locks, approval/rejection events, dirty-worktree guard |
 | Reproducible benchmarks | Six harnesses in [`bench/`](../bench/), each with markdown + JSON receipts under `bench/results/` |
