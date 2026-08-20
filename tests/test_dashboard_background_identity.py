@@ -341,13 +341,16 @@ class BackgroundDashboardIdentityTests(unittest.TestCase):
                 dash, "pid_alive", return_value=True
             ), patch.object(
                 dash, "dashboard_serves", side_effect=[False, True]
-            ), patch("subprocess.Popen", return_value=spawned) as popen:
+            ), patch.object(
+                dash, "stop_dashboard_pid"
+            ) as stop_old, patch("subprocess.Popen", return_value=spawned) as popen:
                 rc = _start_background_dashboard(
                     self._args(mobile=True), state_dir, "100.64.0.7",
                     port=8787, auto_port=True,
                     source="tailscale", allow_external=True,
                 )
         popen.assert_called_once()
+        stop_old.assert_called_once_with(1111)
         self.assertEqual(rc, 0)
 
     def test_mcp_dashboard_own_runfile_reuse_is_host_gated(self) -> None:
@@ -378,12 +381,15 @@ class BackgroundDashboardIdentityTests(unittest.TestCase):
         ), patch.object(
             mcp, "_spawn_dashboard_server", return_value=spawned
         ) as popen, patch.object(
+            dash, "stop_dashboard_pid"
+        ) as stop_old, patch.object(
             dash, "write_qr_png", return_value=True
         ):
             result = mcp.call_tool(
                 "puppetmaster_dashboard", {"cwd": "/tmp", "mobile": True}
             )
         popen.assert_called_once()
+        stop_old.assert_called_once_with(3333)
         body = json.loads(result["content"][0]["text"])
         self.assertTrue(body["started"])
         self.assertEqual(body["host"], "100.64.0.7")
@@ -447,6 +453,61 @@ class BackgroundDashboardIdentityTests(unittest.TestCase):
         body = json.loads(result["content"][0]["text"])
         self.assertTrue(body["started"])
 
+    def test_mcp_literal_port_reuse_writes_runfile(self) -> None:
+        """A foreground (or otherwise untracked) dashboard that identifies
+        as this project must persist a runfile so later stop=true can
+        find it. CLI `_reuse` already wrote one; MCP did not."""
+        import puppetmaster.mcp_server as mcp
+
+        identity = {
+            "pid": 8080,
+            "state_dir_id": "abc",
+            "service": "puppetmaster-dashboard",
+        }
+        with patch.object(
+            dash, "read_dashboard_runfile", return_value=None
+        ), patch.object(
+            dash, "dashboard_serves", return_value=True
+        ), patch.object(
+            dash, "dashboard_identity", return_value=identity
+        ), patch.object(
+            dash, "write_dashboard_runfile"
+        ) as write_runfile, patch.object(mcp, "_spawn_dashboard_server") as popen:
+            result = mcp.call_tool("puppetmaster_dashboard", {"cwd": "/tmp"})
+        popen.assert_not_called()
+        write_runfile.assert_called_once()
+        self.assertEqual(write_runfile.call_args[0][1]["pid"], 8080)
+        body = json.loads(result["content"][0]["text"])
+        self.assertTrue(body["already_running"])
+        self.assertEqual(body["pid"], 8080)
+
+    def test_mcp_literal_port_reuse_without_pid_spawns(self) -> None:
+        """dashboard_serves True plus a raced-away identity must not persist
+        a null-pid runfile (CLI `_reuse` already refuses that)."""
+        import puppetmaster.mcp_server as mcp
+
+        spawned = MagicMock()
+        spawned.pid = 8081
+        spawned.poll.return_value = None
+        child_runfile = {
+            "pid": 8081, "host": "127.0.0.1", "port": 8787,
+            "url": "http://127.0.0.1:8787/",
+        }
+        with patch.object(
+            dash, "dashboard_serves", side_effect=[True, True]
+        ), patch.object(
+            dash, "dashboard_identity", return_value=None
+        ), patch.object(
+            dash, "write_dashboard_runfile"
+        ) as write_runfile, patch.object(
+            dash, "read_dashboard_runfile", side_effect=[None, child_runfile]
+        ), patch.object(mcp, "_spawn_dashboard_server", return_value=spawned) as popen:
+            result = mcp.call_tool("puppetmaster_dashboard", {"cwd": "/tmp"})
+        write_runfile.assert_not_called()
+        popen.assert_called_once()
+        body = json.loads(result["content"][0]["text"])
+        self.assertTrue(body["started"])
+
 
 class ExplicitPortReuseGateTests(unittest.TestCase):
     """§F1 -- an explicit --port is a promise the caller may depend on (a
@@ -502,13 +563,16 @@ class ExplicitPortReuseGateTests(unittest.TestCase):
                 dash, "pid_alive", return_value=True
             ), patch.object(
                 dash, "dashboard_serves", side_effect=_serves
-            ), patch("subprocess.Popen", return_value=spawned) as popen:
+            ), patch.object(
+                dash, "stop_dashboard_pid"
+            ) as stop_old, patch("subprocess.Popen", return_value=spawned) as popen:
                 _start_background_dashboard(
                     self._args(), state_dir, "127.0.0.1",
                     port=18811, auto_port=False,
                     source="loopback", allow_external=False,
                 )
         popen.assert_called_once()
+        stop_old.assert_not_called()
 
     def test_cli_explicit_port_matching_tracked_port_still_reuses(self) -> None:
         from puppetmaster.cli._dispatch import _start_background_dashboard
@@ -590,9 +654,12 @@ class ExplicitPortReuseGateTests(unittest.TestCase):
             dash, "pid_alive", return_value=True
         ), patch.object(
             dash, "dashboard_serves", side_effect=_serves
-        ), patch.object(mcp, "_spawn_dashboard_server", return_value=spawned) as popen:
+        ), patch.object(
+            dash, "stop_dashboard_pid"
+        ) as stop_old, patch.object(mcp, "_spawn_dashboard_server", return_value=spawned) as popen:
             mcp.call_tool("puppetmaster_dashboard", {"cwd": "/tmp", "port": 18814})
         popen.assert_called_once()
+        stop_old.assert_not_called()
 
     def test_mcp_explicit_port_matching_tracked_port_still_reuses(self) -> None:
         import puppetmaster.mcp_server as mcp

@@ -24375,15 +24375,27 @@ class PuppetmasterMcpVerbTests(unittest.TestCase):
         # Reuse is identity-aware (dashboard_serves), not bare liveness — a
         # foreign responder on the same host:port must never count as "ours".
         # No tracked runfile (None) so the own-runfile pre-check falls
-        # through to the literal-port probe, which this mocks True.
+        # through to the literal-port probe, which this mocks True. A pid
+        # from /api/meta is required so MCP can persist a runfile (CLI
+        # `_reuse` already did); without it this path used to return a URL
+        # that later stop=true could not tear down.
+        identity = {"pid": 4242, "state_dir_id": "abc", "service": "puppetmaster-dashboard"}
         with patch.object(dash, "dashboard_serves", return_value=True), patch.object(
             dash, "read_dashboard_runfile", return_value=None
-        ), patch.object(mcp, "_spawn_dashboard_server") as popen:
+        ), patch.object(
+            dash, "dashboard_identity", return_value=identity
+        ), patch.object(
+            dash, "write_dashboard_runfile"
+        ) as write_runfile, patch.object(mcp, "_spawn_dashboard_server") as popen:
             result = mcp.call_tool(
                 "puppetmaster_dashboard", {"cwd": "/tmp", "job_id": "job_abc"}
             )
         body = json.loads(result["content"][0]["text"])
         popen.assert_not_called()
+        write_runfile.assert_called_once()
+        written = write_runfile.call_args[0][1]
+        self.assertEqual(written["pid"], 4242)
+        self.assertEqual(written["port"], 8787)
         self.assertTrue(body["already_running"])
         self.assertFalse(body["started"])
         self.assertEqual(body["url"], "http://127.0.0.1:8787/?job=job_abc")
@@ -24553,6 +24565,13 @@ class PuppetmasterMcpVerbTests(unittest.TestCase):
         self.assertIn("mobile", props)
         self.assertIn("qr", props)
         self.assertIn("stop", props)
+
+    def test_dashboard_tool_description_is_identity_aware(self) -> None:
+        import puppetmaster.mcp_server as mcp
+
+        tool = next(t for t in mcp.tools() if t.name == "puppetmaster_dashboard")
+        self.assertIn("/api/meta", tool.description)
+        self.assertNotIn("already listening on the port", tool.description)
 
     def test_installed_rules_teach_the_dashboard_verb(self) -> None:
         from puppetmaster.rules import RULE_BODY

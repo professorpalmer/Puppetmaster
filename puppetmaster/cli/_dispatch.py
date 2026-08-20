@@ -178,15 +178,9 @@ def _resolve_store_for_job(
 
 
 def _read_child_stderr_tail(path: Path, *, max_bytes: int = 4000) -> str:
-    """Best-effort tail of a detached child's captured stderr, or "" if
-    there's nothing (file missing, empty, or unreadable)."""
-    try:
-        data = path.read_bytes()
-    except OSError:
-        return ""
-    if not data:
-        return ""
-    return data[-max_bytes:].decode("utf-8", errors="replace").strip()
+    from puppetmaster.dashboard import read_child_stderr_tail
+
+    return read_child_stderr_tail(path, max_bytes=max_bytes)
 
 
 def _start_background_dashboard(
@@ -214,13 +208,13 @@ def _start_background_dashboard(
     port (``--write-runfile``); the parent only ever reads that back.
     """
     from puppetmaster.dashboard import (
-        clear_dashboard_runfile,
         dashboard_identity,
         dashboard_runfile,
         dashboard_serves,
         normalize_dashboard_host,
         pid_alive,
         read_dashboard_runfile,
+        stop_dashboard_pid,
         write_dashboard_runfile,
     )
 
@@ -254,10 +248,13 @@ def _start_background_dashboard(
     # `--background` doesn't spawn a redundant second server for the same
     # project (and clobber the runfile the first one is still using).
     existing = read_dashboard_runfile(state_dir)
+    previous_pid = None
+    if existing and pid_alive(int(existing.get("pid") or 0)):
+        previous_pid = int(existing.get("pid") or 0)
     if (
         existing
         and normalize_dashboard_host(existing.get("host", host)) == normalize_dashboard_host(host)
-        and pid_alive(int(existing.get("pid") or 0))
+        and previous_pid
     ):
         # Host-gated: a loopback dashboard tracked from an earlier plain
         # --background must not be "reused" for a --mobile request that
@@ -301,9 +298,11 @@ def _start_background_dashboard(
         else:
             return _reuse(host, port, identity.get("pid"))
 
-    # Clear any stale/foreign runfile so the readiness poll below can't
-    # mistake it for the child we're about to spawn.
-    clear_dashboard_runfile(state_dir)
+    # Do not clear the runfile before the replacement child is known to
+    # have bound. The readiness poll already requires candidate.pid ==
+    # process.pid, so a leftover marker cannot be mistaken for the new
+    # child; clearing first made a failed retarget (--mobile after a live
+    # loopback board, or a busy explicit --port) untrack the old server.
 
     command = [
         sys.executable,
@@ -386,6 +385,10 @@ def _start_background_dashboard(
 
     bound_host = child_info.get("host", host)
     bound_port = int(child_info.get("port") or port)
+    if previous_pid and previous_pid != process.pid:
+        # Host/port retarget started a replacement; don't leave the old
+        # listener up with no runfile pointing at it.
+        stop_dashboard_pid(previous_pid)
     print(f"Dashboard running in the background (pid {process.pid}).")
     _announce_background_dashboard(args, bound_host, bound_port, source)
     print("Stop it with: python -m puppetmaster dashboard --stop")

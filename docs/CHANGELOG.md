@@ -1,5 +1,9 @@
 ## Unreleased
 
+Absorb of [@bsmi021](https://github.com/bsmi021) PR
+[#46](https://github.com/professorpalmer/Puppetmaster/pull/46), plus
+stack edits.
+
 **Fix: `puppetmaster dashboard` for a second project silently shadowed the
 first instead of starting its own server.**
 
@@ -114,6 +118,16 @@ bugs.**
   and quoted on failure, instead of being discarded to `DEVNULL`); the
   literal-port reuse path no longer risks persisting a runfile with a null
   pid from a redundant identity round-trip.
+- **Stack absorb:** MCP literal-port reuse now writes a runfile (and refuses
+  a null-pid persist), matching CLI `_reuse`, so `stop=true` can tear down a
+  dashboard that was already serving this project without a tracked marker.
+  MCP spawn captures `dashboard.err.log` the same way `--background` does.
+  The `puppetmaster_dashboard` tool description no longer advertises reuse
+  as bare liveness on the port. A host/port retarget no longer clears the
+  runfile before the replacement child binds (a failed `--mobile` after
+  loopback used to untrack the still-running board), and a successful
+  retarget SIGTERMs the previous pid so `--stop` is not left pointing at
+  one server while another stays up.
 
 ## v1.22.13
 

@@ -1602,9 +1602,11 @@ def _build_tools() -> list[McpTool]:
             name="puppetmaster_dashboard",
             description=(
                 "Open the live Puppetmaster web dashboard. Starts the "
-                "zero-dependency local server (loopback by default) if one isn't "
-                "already listening on the port and returns the URL to open — "
-                "pass job_id to deep-link straight to one job. Use whenever the "
+                "zero-dependency local server (loopback by default) if this "
+                "project does not already have one, or reuses this project's "
+                "own running dashboard (identity via /api/meta, not bare "
+                "liveness on the port) and returns the URL to open — pass "
+                "job_id to deep-link straight to one job. Use whenever the "
                 "user asks to see/open/show the job dashboard, then open the "
                 "returned URL in a browser tab for them. Pass mobile=true to "
                 "serve a phone-reachable Tailscale/LAN address and get a QR to "
@@ -3255,17 +3257,33 @@ def run_cli(command: list[str], args: JsonObject) -> JsonObject:
     }
 
 
-def _spawn_dashboard_server(command: list[str], args: JsonObject) -> subprocess.Popen:
+def _spawn_dashboard_server(
+    command: list[str], args: JsonObject, state_dir: str
+) -> subprocess.Popen:
     """Launch the dashboard CLI detached from this MCP process."""
-    return subprocess.Popen(
-        command,
-        cwd=cwd(args),
-        env=launcher_environment(args),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    from puppetmaster.dashboard import dashboard_runfile
+
+    # Same as CLI --background: keep the child's stderr in a file (not a
+    # pipe — this process is meant to outlive the MCP call) so a bind
+    # failure can be quoted instead of a generic "failed to start".
+    child_log = dashboard_runfile(state_dir).with_name("dashboard.err.log")
+    try:
+        err_handle: Any = open(child_log, "w", encoding="utf-8")
+    except OSError:
+        err_handle = subprocess.DEVNULL
+    try:
+        return subprocess.Popen(
+            command,
+            cwd=cwd(args),
+            env=launcher_environment(args),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=err_handle,
+            start_new_session=True,
+        )
+    finally:
+        if err_handle is not subprocess.DEVNULL:
+            err_handle.close()
 
 
 def run_dashboard(args: JsonObject) -> JsonObject:
@@ -3283,13 +3301,18 @@ def run_dashboard(args: JsonObject) -> JsonObject:
     with zero setup. ``stop=true`` shuts down the detached background server.
     """
     from puppetmaster.dashboard import (
+        dashboard_identity,
+        dashboard_runfile,
         dashboard_serves,
         normalize_dashboard_host,
         pid_alive,
         qr_ascii,
+        read_child_stderr_tail,
         read_dashboard_runfile,
         resolve_mobile_host,
         stop_background_dashboard,
+        stop_dashboard_pid,
+        write_dashboard_runfile,
         write_qr_png,
     )
 
@@ -3340,10 +3363,13 @@ def run_dashboard(args: JsonObject) -> JsonObject:
     # mismatch correctly fails and a new, properly-bound server gets spawned.
     tracked = read_dashboard_runfile(state_dir)
     already_running = False
+    previous_pid = None
+    if tracked and pid_alive(int(tracked.get("pid") or 0)):
+        previous_pid = int(tracked.get("pid") or 0)
     if (
         tracked
         and normalize_dashboard_host(tracked.get("host", host)) == normalize_dashboard_host(host)
-        and pid_alive(int(tracked.get("pid") or 0))
+        and previous_pid
     ):
         tracked_port = int(tracked.get("port") or port)
         # Port-gated (§F1): an explicit port is a promise this call may
@@ -3358,7 +3384,30 @@ def run_dashboard(args: JsonObject) -> JsonObject:
             bound_port = tracked_port
             pid = tracked.get("pid")
     if not already_running:
-        already_running = dashboard_serves(host, port, state_dir, all_projects=all_projects)
+        # Literal requested port: only reuse when /api/meta identifies this
+        # project *and* we have a pid to persist. CLI `_reuse` writes a
+        # runfile here so later --stop works; without that write, MCP
+        # stop=true reports nothing tracked while this project's server is
+        # still up. A raced-away identity (serves True, identity None) must
+        # not persist a null-pid runfile — fall through and spawn.
+        if dashboard_serves(host, port, state_dir, all_projects=all_projects):
+            identity = dashboard_identity(host, port)
+            identity_pid = None if identity is None else identity.get("pid")
+            if identity_pid is not None:
+                already_running = True
+                bound_port = port
+                pid = identity_pid
+                write_dashboard_runfile(
+                    state_dir,
+                    {
+                        "pid": pid,
+                        "host": host,
+                        "port": bound_port,
+                        "url": f"http://{host}:{bound_port}/"
+                        + (f"?job={job}" if job else ""),
+                        "all_projects": all_projects,
+                    },
+                )
 
     if not already_running:
         command = [
@@ -3381,7 +3430,7 @@ def run_dashboard(args: JsonObject) -> JsonObject:
             command.append("--all-projects")
         if job:
             command.append(job)
-        process = _spawn_dashboard_server(command, args)
+        process = _spawn_dashboard_server(command, args, state_dir)
         # Poll the child's own runfile (written post-bind, --write-runfile)
         # rather than re-probing host:port — the child may have bumped past
         # `port`, so a probe pinned to the requested port can miss it, or
@@ -3403,6 +3452,8 @@ def run_dashboard(args: JsonObject) -> JsonObject:
             state_dir,
             all_projects=all_projects,
         ):
+            child_log = dashboard_runfile(state_dir).with_name("dashboard.err.log")
+            stderr_tail = read_child_stderr_tail(child_log)
             body = {
                 "error": "dashboard failed to start",
                 "host": host,
@@ -3411,6 +3462,8 @@ def run_dashboard(args: JsonObject) -> JsonObject:
                 "returncode": process.poll(),
                 "hint": f"Try `python -m puppetmaster dashboard --port {port}` for the full error.",
             }
+            if stderr_tail:
+                body["stderr"] = stderr_tail
             return {
                 "content": [{"type": "text", "text": json.dumps(body, indent=2)}],
                 "isError": True,
@@ -3418,6 +3471,8 @@ def run_dashboard(args: JsonObject) -> JsonObject:
         pid = process.pid
         host = child_info.get("host", host)
         bound_port = int(child_info.get("port") or port)
+        if previous_pid and previous_pid != process.pid:
+            stop_dashboard_pid(previous_pid)
     elif mobile and pid is None:
         # The pre-check above already set pid when it found the match; this
         # only covers reuse discovered via the literal-port probe instead

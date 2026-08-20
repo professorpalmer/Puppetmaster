@@ -2535,6 +2535,18 @@ def read_dashboard_runfile(state_dir: Union[Path, str]) -> Optional[dict]:
         return None
 
 
+def read_child_stderr_tail(path: Path, *, max_bytes: int = 4000) -> str:
+    """Best-effort tail of a detached child's captured stderr, or "" if
+    there's nothing (file missing, empty, or unreadable)."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    if not data:
+        return ""
+    return data[-max_bytes:].decode("utf-8", errors="replace").strip()
+
+
 def clear_dashboard_runfile(state_dir: Union[Path, str]) -> None:
     """Remove the background dashboard marker (best effort)."""
     try:
@@ -2702,6 +2714,24 @@ def dashboard_serves(
     if identity.get("state_dir_id") != _state_dir_id(state_dir):
         return False
     return bool(identity.get("all_projects")) == bool(all_projects)
+
+
+def stop_dashboard_pid(pid: int) -> bool:
+    """Best-effort SIGTERM of a previously tracked dashboard pid.
+
+    Used when a retarget (``--mobile`` after loopback, or a new ``--port``)
+    starts a replacement server: the old listener would otherwise stay up
+    untracked once the runfile points at the new child.
+    """
+    import signal
+
+    if not pid or not pid_alive(pid):
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+        return True
+    except OSError:
+        return False
 
 
 def stop_background_dashboard(state_dir: Union[Path, str]) -> dict:
