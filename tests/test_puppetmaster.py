@@ -24130,9 +24130,11 @@ class PuppetmasterMcpVerbTests(unittest.TestCase):
         self.assertIn("puppetmaster_dashboard", {tool.name for tool in mcp.tools()})
         # Reuse is identity-aware (dashboard_serves), not bare liveness — a
         # foreign responder on the same host:port must never count as "ours".
+        # No tracked runfile (None) so the own-runfile pre-check falls
+        # through to the literal-port probe, which this mocks True.
         with patch.object(dash, "dashboard_serves", return_value=True), patch.object(
-            mcp, "_spawn_dashboard_server"
-        ) as popen:
+            dash, "read_dashboard_runfile", return_value=None
+        ), patch.object(mcp, "_spawn_dashboard_server") as popen:
             result = mcp.call_tool(
                 "puppetmaster_dashboard", {"cwd": "/tmp", "job_id": "job_abc"}
             )
@@ -24155,11 +24157,14 @@ class PuppetmasterMcpVerbTests(unittest.TestCase):
             "pid": 4321, "host": "127.0.0.1", "port": 9000,
             "url": "http://127.0.0.1:9000/",
         }
-        # identity checks: initial probe (absent), post-spawn confirm (ours)
+        # identity checks: initial probe (absent), post-spawn confirm (ours).
+        # read_dashboard_runfile: None first (own-runfile pre-check finds
+        # nothing tracked, so it can't short-circuit to a false "reuse"),
+        # then the child's runfile once the poll loop looks for it.
         with patch.object(
             dash, "dashboard_serves", side_effect=[False, True]
         ), patch.object(
-            dash, "read_dashboard_runfile", return_value=runfile
+            dash, "read_dashboard_runfile", side_effect=[None, runfile]
         ), patch.object(mcp, "_spawn_dashboard_server", return_value=spawned) as popen:
             result = mcp.call_tool("puppetmaster_dashboard", {"cwd": "/tmp", "port": 9000})
         body = json.loads(result["content"][0]["text"])
@@ -24189,7 +24194,7 @@ class PuppetmasterMcpVerbTests(unittest.TestCase):
         with patch.object(
             dash, "dashboard_serves", side_effect=[False, True]
         ), patch.object(
-            dash, "read_dashboard_runfile", return_value=runfile
+            dash, "read_dashboard_runfile", side_effect=[None, runfile]
         ), patch.object(mcp, "_spawn_dashboard_server", return_value=spawned) as popen:
             result = mcp.call_tool(
                 "puppetmaster_dashboard", {"cwd": "/tmp", "all_projects": True}
@@ -24213,7 +24218,7 @@ class PuppetmasterMcpVerbTests(unittest.TestCase):
         with patch.object(
             dash, "dashboard_serves", side_effect=[False, True]
         ), patch.object(
-            dash, "read_dashboard_runfile", return_value=runfile
+            dash, "read_dashboard_runfile", side_effect=[None, runfile]
         ), patch.object(mcp, "_spawn_dashboard_server", return_value=spawned) as popen:
             mcp.call_tool("puppetmaster_dashboard", {"cwd": "/tmp"})
         command = popen.call_args.args[0]
@@ -24250,7 +24255,7 @@ class PuppetmasterMcpVerbTests(unittest.TestCase):
         ), patch.object(
             dash, "dashboard_serves", side_effect=[False, True]
         ), patch.object(
-            dash, "read_dashboard_runfile", return_value=runfile
+            dash, "read_dashboard_runfile", side_effect=[None, runfile]
         ), patch.object(
             mcp, "_spawn_dashboard_server", return_value=spawned
         ) as popen, patch.object(

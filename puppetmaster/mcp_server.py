@@ -3284,6 +3284,7 @@ def run_dashboard(args: JsonObject) -> JsonObject:
     """
     from puppetmaster.dashboard import (
         dashboard_serves,
+        pid_alive,
         qr_ascii,
         read_dashboard_runfile,
         resolve_mobile_host,
@@ -3325,9 +3326,33 @@ def run_dashboard(args: JsonObject) -> JsonObject:
             }
         host = ip
 
-    already_running = dashboard_serves(host, port, state_dir, all_projects=all_projects)
     pid: Optional[int] = None
     bound_port = port
+
+    # This project's own dashboard may already be running at whatever port
+    # it actually bound to, which can be past `port` if an earlier call
+    # bumped — check the tracked runfile first so a repeat call doesn't
+    # spawn a redundant second server for the same project. Host-gated: a
+    # loopback dashboard tracked from an earlier non-mobile call must not be
+    # "reused" for a mobile=true request that needs an externally-reachable
+    # bind — falling through to the literal-port probe below on a host
+    # mismatch correctly fails and a new, properly-bound server gets spawned.
+    tracked = read_dashboard_runfile(state_dir)
+    already_running = False
+    if (
+        tracked
+        and tracked.get("host", host) == host
+        and pid_alive(int(tracked.get("pid") or 0))
+        and dashboard_serves(
+            host, int(tracked.get("port") or port), state_dir, all_projects=all_projects
+        )
+    ):
+        already_running = True
+        bound_port = int(tracked.get("port") or port)
+        pid = tracked.get("pid")
+    else:
+        already_running = dashboard_serves(host, port, state_dir, all_projects=all_projects)
+
     if not already_running:
         command = [
             sys.executable,
@@ -3386,19 +3411,22 @@ def run_dashboard(args: JsonObject) -> JsonObject:
         pid = process.pid
         host = child_info.get("host", host)
         bound_port = int(child_info.get("port") or port)
-    elif mobile:
-        # Keep the runfile pid current when reusing a server we can
-        # identify — compared via dashboard_serves (state_dir_id), not the
-        # bare host+port equality this used to do, which a foreign
-        # dashboard sharing the same host:port would satisfy by accident.
-        tracked = read_dashboard_runfile(state_dir)
-        if tracked and dashboard_serves(
-            tracked.get("host", host),
-            int(tracked.get("port") or port),
+    elif mobile and pid is None:
+        # The pre-check above already set pid when it found the match; this
+        # only covers reuse discovered via the literal-port probe instead
+        # (tracked runfile absent/host-mismatched but something still
+        # identifies as ours on host:port). Compared via dashboard_serves
+        # (state_dir_id), not the bare host+port equality this used to do,
+        # which a foreign dashboard sharing the same host:port would satisfy
+        # by accident.
+        refreshed = read_dashboard_runfile(state_dir)
+        if refreshed and dashboard_serves(
+            refreshed.get("host", host),
+            int(refreshed.get("port") or port),
             state_dir,
             all_projects=all_projects,
         ):
-            pid = tracked.get("pid")
+            pid = refreshed.get("pid")
 
     url = f"http://{host}:{bound_port}/" + (f"?job={job}" if job else "")
 

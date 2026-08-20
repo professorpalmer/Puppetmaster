@@ -45,9 +45,25 @@ write, the second project got no runfile at all, so its own `--status` and
   its own requested `--port`, which was simply wrong the moment the child
   bumped — this also fixes the `--mobile` banner/QR printing the
   pre-bump port before the bind even happened.
+- **Own-project reuse, host-gated.** `--background` and the MCP tool both
+  now check this project's own already-running dashboard — at whatever port
+  it actually bound to, which can be past the requested one from an earlier
+  bump — before probing the literal requested port, so a repeat call
+  doesn't spawn a redundant second server for the same project. Gated on
+  the tracked server's host matching the one requested: a loopback
+  dashboard from an earlier plain `--background` is never "reused" for a
+  later `--mobile` call, which needs an externally-reachable bind and would
+  otherwise get handed an unreachable `127.0.0.1` URL.
+- **`--status` compares against what it tracks, not what was just typed.**
+  `dashboard --status` (bare, so `--all-projects` defaults off) after
+  `dashboard --background --all-projects` now still reports the board it
+  started; it previously compared the runfile against *this* invocation's
+  `--all-projects` flag instead of the tracked record's own, so it wrongly
+  reported "serving another project."
 - New `tests/test_dashboard_ports.py` and
   `tests/test_dashboard_background_identity.py` cover the bind retry,
-  `/api/meta`, and identity-aware reuse end to end.
+  `/api/meta`, and identity-aware reuse (including both fixes above) end to
+  end.
 
 ## v1.22.12
 
