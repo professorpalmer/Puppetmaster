@@ -1,3 +1,48 @@
+## Unreleased
+
+**Fix: the test suite silently retargeted itself onto live provider APIs on any
+machine with an LLM API key.**
+
+`tests/hermetic_env.py` isolated the suite from the host's Puppetmaster config
+but not from the host's provider credentials. With, say, `GOOGLE_API_KEY` set,
+`available_providers()` was non-empty, so the auto-route path in the
+orchestrator reconciled the curated agentic catalog and persisted it through
+`save_registry(..., default_registry_path())` — which resolves to the very
+`PUPPETMASTER_MODELS_PATH` sentinel the harness had just created as
+*deliberately missing*. From that point the registry stayed populated with
+`agentic/gemini-*` for the rest of the process: every later "empty registry" or
+"routes to claude-code/cursor/local" assertion saw `agentic`, and worker tests
+quietly executed against the live API instead of the local stub. Measured on one
+developer machine: **13 failures and 820s with keys present, 0 failures and 464s
+without** — same commit, same box. CI was green throughout, because CI has no
+keys.
+
+- **Provider credentials are cleared for the suite**, derived from
+  `PROVIDER_REGISTRY` rather than hardcoded, so a provider added later is
+  covered without touching the harness. Includes the numbered rotation siblings
+  (`OPENAI_API_KEY_2` …) and the presence vars that opt keyless local endpoints
+  (Ollama / LM Studio) in. `PUPPETMASTER_DISABLED_PROVIDERS` is cleared too — a
+  provider the developer disconnected in Settings shouldn't change what tests
+  see either. Note `PUPPETMASTER_AUTODISCOVER=0` did *not* gate this path;
+  catalog reconciliation runs on the routing path, not via autodiscovery.
+- **A leaked registry is now reaped after every test, naming the culprit.**
+  Clearing credentials fixes today's writer; this is the guard for the next code
+  path that writes the pinned registry. Reaping happens *after* the test rather
+  than before, so the stderr warning names the test that actually did it instead
+  of the damage surfacing hundreds of tests later as an unrelated routing
+  assertion. The `.discovery.json` sidecar is reaped with it.
+- **`ensure_cursor_sdk` refuses to `npm install` into a git checkout.** Its
+  default prefix is `puppetmaster/..` — site-packages for a pip/pipx install,
+  but the *repo root* in a checkout, where `npm install --prefix` rewrote the
+  tracked `package.json` (bumping `@cursor/sdk` past its pinned range) so a
+  later `git commit -a` shipped a dependency change nobody asked for. An
+  explicit `package_root=` still installs anywhere, deliberately. This is a
+  user-visible behaviour change for anyone running from a checkout.
+- **`test_daemon_worker_mode_uses_warm_worker` no longer flakes under load** —
+  its `thread.join(timeout=3)` was a real-time budget on reaping an
+  already-finished job's thread. A genuine hang still fails the test; a busy
+  machine no longer does.
+
 ## v1.22.14
 
 Absorb of [@bsmi021](https://github.com/bsmi021) PR

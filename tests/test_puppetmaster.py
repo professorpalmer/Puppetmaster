@@ -2320,7 +2320,11 @@ class PuppetmasterTests(unittest.TestCase):
                 roles=["explore"],
                 worker_id="daemon-test",
             ).run(max_tasks=1, max_idle_seconds=2)
-            thread.join(timeout=3)
+            # Generous budget on purpose: this only bounds how long we wait for
+            # an already-finished job's thread to be reaped, so a large value
+            # masks nothing (a genuine hang still fails, just later) while a
+            # tight one flakes whenever the machine is busy.
+            thread.join(timeout=30)
 
             self.assertFalse(thread.is_alive())
             self.assertNotIn("error", result_holder)
@@ -20840,6 +20844,64 @@ class EnsureCursorSdkTests(unittest.TestCase):
         self.assertEqual(result.status, "skipped")
         self.assertIn("npm not on PATH", result.detail)
 
+    def test_refuses_to_install_into_a_git_checkout(self) -> None:
+        """`npm install --prefix <repo>` rewrites the *tracked* package.json.
+
+        The default package root is ``puppetmaster/..``, which is site-packages
+        for a pip install but the repo root in a checkout — so running from a
+        checkout bumped @cursor/sdk in git and a later `git commit -a` shipped
+        a dependency change nobody asked for. Refuse unless the caller named
+        the root deliberately.
+        """
+        from types import SimpleNamespace
+
+        from puppetmaster.installers import ensure_cursor_sdk
+
+        with TemporaryDirectory() as tmp:
+            checkout = Path(tmp) / "repo"
+            (checkout / "puppetmaster").mkdir(parents=True)
+            # A worktree's .git is a FILE, not a directory — cover that case,
+            # since it is exactly how this bug was found.
+            (checkout / ".git").write_text("gitdir: /elsewhere\n", encoding="utf-8")
+            calls = []
+
+            def fake_run(cmd, **kwargs):  # pragma: no cover - must not run
+                calls.append(cmd)
+                raise AssertionError("npm must not be invoked for a checkout")
+
+            with patch(
+                "puppetmaster.diagnostics._find_cursor_sdk_install", return_value=None
+            ), patch(
+                "puppetmaster.installers._default_package_root", return_value=checkout
+            ), patch(
+                "puppetmaster.installers.subprocess.run", side_effect=fake_run
+            ):
+                result = ensure_cursor_sdk(
+                    Path(tmp), npm_executable="/usr/local/bin/npm"
+                )
+
+            self.assertEqual(result.status, "skipped")
+            self.assertIn("git checkout", result.detail)
+            self.assertIn("package_root", result.detail)
+            self.assertEqual(calls, [], "npm was invoked against the checkout")
+
+            # An explicit package_root is a deliberate choice: still allowed,
+            # even when it is the checkout.
+            with patch(
+                "puppetmaster.diagnostics._find_cursor_sdk_install", return_value=None
+            ), patch(
+                "puppetmaster.installers._default_package_root", return_value=checkout
+            ), patch(
+                "puppetmaster.installers.subprocess.run",
+                return_value=SimpleNamespace(returncode=0, stdout="ok", stderr=""),
+            ):
+                explicit = ensure_cursor_sdk(
+                    Path(tmp),
+                    package_root=checkout,
+                    npm_executable="/usr/local/bin/npm",
+                )
+            self.assertNotEqual(explicit.status, "skipped")
+
     def test_installs_via_npm_into_package_root(self) -> None:
         from types import SimpleNamespace
 
@@ -20876,9 +20938,17 @@ class EnsureCursorSdkTests(unittest.TestCase):
         def fake_run(cmd, **kwargs):
             return SimpleNamespace(returncode=1, stdout="", stderr="npm ERR! network timeout")
 
-        with patch("puppetmaster.diagnostics._find_cursor_sdk_install", return_value=None), \
+        with TemporaryDirectory() as tmp, \
+                patch("puppetmaster.diagnostics._find_cursor_sdk_install", return_value=None), \
                 patch("puppetmaster.installers.subprocess.run", side_effect=fake_run):
-            result = ensure_cursor_sdk(Path("/tmp"), npm_executable="/usr/local/bin/npm")
+            # Explicit package_root: without one the default is the repo root,
+            # and running the suite from a checkout now (correctly) refuses to
+            # npm-install there — see test_refuses_to_install_into_a_git_checkout.
+            result = ensure_cursor_sdk(
+                Path("/tmp"),
+                package_root=Path(tmp),
+                npm_executable="/usr/local/bin/npm",
+            )
         self.assertEqual(result.status, "error")
         self.assertIn("npm ERR! network timeout", result.detail)
 

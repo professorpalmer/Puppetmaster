@@ -124,6 +124,17 @@ class SdkBootstrapResult:
     location: Optional[str] = None
 
 
+def _default_package_root() -> Path:
+    """Where ``npm install --prefix`` points when the caller didn't say.
+
+    ``puppetmaster/..`` — site-packages for a pip/pipx install, which is the
+    directory Node's resolution walks up to from ``cursor_sdk_runner.mjs``.
+    Split out so the checkout guard below is testable without patching
+    ``__file__``.
+    """
+    return Path(__file__).resolve().parent.parent
+
+
 def ensure_cursor_sdk(
     root: Optional[Path] = None,
     *,
@@ -158,7 +169,21 @@ def ensure_cursor_sdk(
             "`puppetmaster install-cursor-mcp` to bootstrap @cursor/sdk",
         )
 
-    install_root = package_root or Path(__file__).resolve().parent.parent
+    install_root = package_root or _default_package_root()
+    # In a pip/pipx install that parent is site-packages, which is exactly
+    # where Node's resolution needs the SDK. In a git checkout it is the repo
+    # root, and `npm install --prefix <repo>` rewrites the *tracked*
+    # package.json (bumping @cursor/sdk to whatever satisfies the range) —
+    # so a later `git commit -a` silently ships a dependency bump nobody
+    # asked for. Refuse, unless the caller named the root deliberately.
+    if package_root is None and (install_root / ".git").exists():
+        return SdkBootstrapResult(
+            "skipped",
+            f"refusing to `npm install` into the git checkout at {install_root} "
+            "— it would rewrite the tracked package.json. Run this from an "
+            "installed copy, or pass package_root= to target a directory "
+            "deliberately.",
+        )
     try:
         completed = subprocess.run(
             # as_posix(): npm accepts forward slashes on every platform, and
