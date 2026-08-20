@@ -15,6 +15,7 @@ from __future__ import annotations
 import atexit
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -26,6 +27,9 @@ _ENV_BEFORE: dict[str, Optional[str]] = {}
 _ISOLATION_TMP: Optional[str] = None
 _ORIG_TESTCASE_RUN = None
 _ATEXIT_REGISTERED = False
+# How many tests left a registry behind at the sentinel path (see
+# ``reap_leaked_registry``). Exposed for the harness's own tests.
+_LEAKED_REGISTRY_REAPS = 0
 
 # Host pins that short-circuit discovery / routing when left in place.
 _PIN_KEYS_TO_CLEAR = (
@@ -33,7 +37,75 @@ _PIN_KEYS_TO_CLEAR = (
     "PUPPETMASTER_CODEGRAPH_JS",
     "PUPPETMASTER_STATE_DIR",
     "PUPPETMASTER_CURSOR_INPUT",
+    # A provider the developer disconnected in Marionette Settings must not
+    # change what the suite sees either — tests that care set it themselves.
+    "PUPPETMASTER_DISABLED_PROVIDERS",
 )
+
+
+def _provider_credential_env_names() -> "tuple[str, ...]":
+    """Every env var that can make a direct-API provider auto-routable.
+
+    Derived from ``PROVIDER_REGISTRY`` rather than hardcoded, so a provider
+    added later is covered without touching this file. Includes the numbered
+    rotation siblings (``OPENAI_API_KEY_2`` ...) and the presence vars that
+    opt keyless local endpoints (Ollama / LM Studio) in.
+    """
+    from puppetmaster.providers import PROVIDER_REGISTRY, _numbered_env_names
+
+    names: list[str] = []
+    for desc in PROVIDER_REGISTRY.values():
+        for var in desc.api_key_env_vars:
+            names.extend(_numbered_env_names(var))
+        names.extend(desc.presence_env_vars)
+    # dict.fromkeys: de-dupe (gemini lists GOOGLE_API_KEY too) but keep order
+    # stable so the restore path is deterministic.
+    return tuple(dict.fromkeys(names))
+
+
+def _sentinel_paths() -> "tuple[Path, ...]":
+    """The registry the harness promises is absent, plus its meta sidecar."""
+    if _ISOLATION_TMP is None:
+        return ()
+    from puppetmaster.model_registry import discovery_meta_path
+
+    sentinel = Path(_ISOLATION_TMP) / "models-does-not-exist.json"
+    return (sentinel, discovery_meta_path(sentinel))
+
+
+def reap_leaked_registry(test_id: str = "") -> bool:
+    """Delete any registry a test wrote at the pinned sentinel path.
+
+    ``hermetic_env`` points ``PUPPETMASTER_MODELS_PATH`` at a file that does
+    not exist, but nothing stops code under test from *creating* it: routing
+    persists a reconciled catalog through ``save_registry(...,
+    default_registry_path())``. When that happens the registry stays populated
+    for the rest of the process and every later "empty registry" assertion
+    fails hundreds of tests downstream of the one that actually did it.
+
+    So we reap after each test and name the culprit on stderr. Returns True if
+    something was reaped.
+    """
+    global _LEAKED_REGISTRY_REAPS
+    reaped = False
+    for path in _sentinel_paths():
+        try:
+            if not path.exists():
+                continue
+            path.unlink()
+        except OSError:
+            continue
+        reaped = True
+    if reaped:
+        _LEAKED_REGISTRY_REAPS += 1
+        print(
+            f"hermetic_env: {test_id or 'a test'} left a model registry at the "
+            f"pinned sentinel path; reaped it so later tests stay isolated. "
+            f"Something under test called save_registry() against "
+            f"default_registry_path().",
+            file=sys.stderr,
+        )
+    return reaped
 
 
 def apply_hermetic_isolation(*, register_atexit: bool = True) -> None:
@@ -60,12 +132,25 @@ def apply_hermetic_isolation(*, register_atexit: bool = True) -> None:
     _ENV_BEFORE[ONLY_ENV] = os.environ.get(ONLY_ENV)
     for key in _PIN_KEYS_TO_CLEAR:
         _ENV_BEFORE[key] = os.environ.get(key)
+    for key in _provider_credential_env_names():
+        _ENV_BEFORE[key] = os.environ.get(key)
 
     os.environ["PUPPETMASTER_MODELS_PATH"] = str(sentinel)
     os.environ["PUPPETMASTER_PROVIDER_HEALTH_PATH"] = str(health_db)
     os.environ["PUPPETMASTER_RATE_LIMIT_PATH"] = str(rate_limit_db)
     os.environ[ONLY_ENV] = ",".join(KNOWN_ADAPTERS)
     for key in _PIN_KEYS_TO_CLEAR:
+        os.environ.pop(key, None)
+
+    # A developer's own provider API keys must not reach the suite. With, say,
+    # GOOGLE_API_KEY set, ``available_providers()`` is non-empty, so the
+    # auto-route path in the orchestrator reconciles the curated agentic
+    # catalog, persists it to PUPPETMASTER_MODELS_PATH above (creating the
+    # "missing" sentinel), and every later routing assertion sees `agentic`
+    # instead of the pinned adapter — while worker tests quietly execute
+    # against the live API. CI is green precisely because it has no keys;
+    # clearing them here is what makes a local run mean the same thing.
+    for key in _provider_credential_env_names():
         os.environ.pop(key, None)
 
     # Orchestrator plan-catalog auto-discovery shells out to the Cursor SDK
@@ -107,7 +192,17 @@ def apply_hermetic_isolation(*, register_atexit: bool = True) -> None:
             reset_cursor_codegraph_invocation_cache()
         except Exception:
             pass
-        return _ORIG_TESTCASE_RUN(self, result)
+        try:
+            return _ORIG_TESTCASE_RUN(self, result)
+        finally:
+            # Reap AFTER the test, not before: this way the warning names the
+            # test that actually wrote the registry, instead of the isolation
+            # silently absorbing it and the damage surfacing hundreds of tests
+            # later as an unrelated routing assertion.
+            try:
+                reap_leaked_registry(self.id())
+            except Exception:
+                pass
 
     unittest.TestCase.run = _hermetic_run  # type: ignore[method-assign]
 
