@@ -141,10 +141,13 @@ def _fail_leaking_test(case: unittest.TestCase, result) -> None:
     in atexit callback" and still exits 0 — verified on 3.12 — so a leak would
     report as a green run.)
     """
-    if result is None:
-        return
-    error = AssertionError(f"{_LEAK_MESSAGE}\n(test: {case.id()})")
-    result.addFailure(case, (AssertionError, error, error.__traceback__))
+    try:
+        raise AssertionError(f"{_LEAK_MESSAGE}\n(test: {case.id()})")
+    except AssertionError:
+        info = sys.exc_info()
+        if result is None:
+            raise
+        result.addFailure(case, info)
 
 
 def reap_leaked_registry(test_id: str = "") -> bool:
@@ -230,8 +233,12 @@ def apply_hermetic_isolation(*, register_atexit: bool = True) -> None:
 
     # Orchestrator plan-catalog auto-discovery shells out to the Cursor SDK
     # when CURSOR_API_KEY is set; tests that need it inject their own fetcher.
+    # Force-assign rather than setdefault: a host PUPPETMASTER_AUTODISCOVER=1
+    # would still run _ensure_plan_catalog, and file-based Claude/Codex
+    # billing can persist a plan catalog onto the sentinel even with
+    # CURSOR_API_KEY cleared.
     _ENV_BEFORE["PUPPETMASTER_AUTODISCOVER"] = os.environ.get("PUPPETMASTER_AUTODISCOVER")
-    os.environ.setdefault("PUPPETMASTER_AUTODISCOVER", "0")
+    os.environ["PUPPETMASTER_AUTODISCOVER"] = "0"
 
     # Keep process-local provider circuit state from leaking across tests.
     # Pytest also resets via ``pytest_runtest_setup``; double-reset is a no-op.
@@ -272,12 +279,10 @@ def apply_hermetic_isolation(*, register_atexit: bool = True) -> None:
         # Reap AFTER the test, not before: this attributes the leak to the test
         # that actually wrote the registry, instead of the isolation silently
         # absorbing it and the damage surfacing hundreds of tests later as an
-        # unrelated routing assertion.
-        try:
-            if reap_leaked_registry(self.id()) and not _EXPECT_REGISTRY_LEAK:
-                _fail_leaking_test(self, result if result is not None else outcome)
-        except Exception:
-            pass
+        # unrelated routing assertion. Do not swallow addFailure errors — a
+        # silent except would turn a leak into a green run.
+        if reap_leaked_registry(self.id()) and not _EXPECT_REGISTRY_LEAK:
+            _fail_leaking_test(self, result if result is not None else outcome)
         return outcome
 
     unittest.TestCase.run = _hermetic_run  # type: ignore[method-assign]

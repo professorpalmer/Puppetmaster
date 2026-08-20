@@ -1,5 +1,9 @@
 ## Unreleased
 
+Absorb of [@bsmi021](https://github.com/bsmi021) PR
+[#49](https://github.com/professorpalmer/Puppetmaster/pull/49), plus
+stack edits.
+
 **Fix: the test suite silently retargeted itself onto live provider APIs on any
 machine with an LLM API key.**
 

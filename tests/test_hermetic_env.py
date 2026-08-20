@@ -32,6 +32,10 @@ class HermeticEnvIsolationTests(unittest.TestCase):
         self.assertNotIn("PUPPETMASTER_CODEGRAPH_JS", os.environ)
 
     def test_autodiscover_disabled_for_suite(self) -> None:
+        """Host PUPPETMASTER_AUTODISCOVER=1 must not survive isolation.
+
+        setdefault would leave a developer pin in place; isolation force-assigns 0.
+        """
         self.assertEqual(os.environ.get("PUPPETMASTER_AUTODISCOVER"), "0")
 
     def test_no_provider_credentials_reach_the_suite(self) -> None:
