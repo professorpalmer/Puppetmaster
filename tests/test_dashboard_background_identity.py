@@ -214,6 +214,113 @@ class BackgroundDashboardIdentityTests(unittest.TestCase):
         self.assertIn("8788", text)
         self.assertNotIn("http://127.0.0.1:8787/", text)
 
+    def test_background_own_runfile_reuse_is_host_gated(self) -> None:
+        """A loopback dashboard tracked from an earlier plain --background
+        must not be "reused" for a later --mobile request that needs an
+        externally-reachable bind -- it must spawn a new, properly-bound
+        server on the requested host instead."""
+        from puppetmaster.cli._dispatch import _start_background_dashboard
+
+        with TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / ".puppetmaster"
+            state_dir.mkdir()
+            loopback_runfile = {
+                "pid": 1111, "host": "127.0.0.1", "port": 8787,
+                "url": "http://127.0.0.1:8787/",
+            }
+            spawned = MagicMock()
+            spawned.pid = 2222
+            spawned.poll.return_value = None
+            mobile_runfile = {
+                "pid": 2222, "host": "100.64.0.7", "port": 8787,
+                "url": "http://100.64.0.7:8787/",
+            }
+            with patch.object(
+                dash, "read_dashboard_runfile",
+                side_effect=[loopback_runfile, mobile_runfile],
+            ), patch.object(
+                dash, "pid_alive", return_value=True
+            ), patch.object(
+                dash, "dashboard_serves", side_effect=[False, True]
+            ), patch("subprocess.Popen", return_value=spawned) as popen:
+                rc = _start_background_dashboard(
+                    self._args(mobile=True), state_dir, "100.64.0.7",
+                    port=8787, auto_port=True,
+                    source="tailscale", allow_external=True,
+                )
+        popen.assert_called_once()
+        self.assertEqual(rc, 0)
+
+    def test_mcp_dashboard_own_runfile_reuse_is_host_gated(self) -> None:
+        """Same host-gating as test_background_own_runfile_reuse_is_host_gated,
+        on the MCP tool's mirrored pre-check."""
+        import puppetmaster.mcp_server as mcp
+
+        loopback_runfile = {
+            "pid": 3333, "host": "127.0.0.1", "port": 8787,
+            "url": "http://127.0.0.1:8787/",
+        }
+        spawned = MagicMock()
+        spawned.pid = 4444
+        spawned.poll.return_value = None
+        mobile_runfile = {
+            "pid": 4444, "host": "100.64.0.7", "port": 8787,
+            "url": "http://100.64.0.7:8787/",
+        }
+        with patch.object(
+            dash, "resolve_mobile_host", return_value=("100.64.0.7", "tailscale")
+        ), patch.object(
+            dash, "read_dashboard_runfile",
+            side_effect=[loopback_runfile, mobile_runfile],
+        ), patch.object(
+            dash, "pid_alive", return_value=True
+        ), patch.object(
+            dash, "dashboard_serves", side_effect=[False, True]
+        ), patch.object(
+            mcp, "_spawn_dashboard_server", return_value=spawned
+        ) as popen, patch.object(
+            dash, "write_qr_png", return_value=True
+        ):
+            result = mcp.call_tool(
+                "puppetmaster_dashboard", {"cwd": "/tmp", "mobile": True}
+            )
+        popen.assert_called_once()
+        body = json.loads(result["content"][0]["text"])
+        self.assertTrue(body["started"])
+        self.assertEqual(body["host"], "100.64.0.7")
+
+    def test_status_uses_tracked_all_projects_not_invocation_flag(self) -> None:
+        """`dashboard --status` (all_projects defaults False) after
+        `dashboard --background --all-projects` must still report the board
+        it started, not "serving another project" -- --status asks whether
+        what its own runfile points at is still there, not whether that
+        matches this invocation's flags."""
+        from puppetmaster.cli._dispatch import _run_dashboard_command
+
+        with TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / ".puppetmaster"
+            state_dir.mkdir()
+            tracked = {
+                "pid": 5555, "host": "127.0.0.1", "port": 8787,
+                "url": "http://127.0.0.1:8787/", "all_projects": True,
+            }
+
+            def _serves(host, port, sd, *, all_projects=False, timeout=1.0):
+                return all_projects is True  # "matches" only when asked True
+
+            with patch.object(
+                dash, "read_dashboard_runfile", return_value=tracked
+            ), patch.object(dash, "dashboard_serves", side_effect=_serves):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    rc = _run_dashboard_command(
+                        self._args(status=True, all_projects=False), state_dir
+                    )
+        self.assertEqual(rc, 0)
+        text = out.getvalue()
+        self.assertIn("Background dashboard running", text)
+        self.assertNotIn("another project", text)
+
     def test_mcp_dashboard_does_not_reuse_foreign_project(self) -> None:
         """Same defect as test_background_reuses_only_same_project, on the
         MCP puppetmaster_dashboard tool's identical code shape."""
@@ -229,7 +336,12 @@ class BackgroundDashboardIdentityTests(unittest.TestCase):
         with patch.object(
             dash, "dashboard_serves", side_effect=[False, True]
         ), patch.object(
-            dash, "read_dashboard_runfile", return_value=child_runfile
+            # None first: MCP's own-runfile pre-check must find nothing
+            # tracked for this project before falling through to the
+            # literal-port probe (mocked False -- a foreign dashboard) and
+            # spawning its own. The child's runfile only appears once the
+            # poll loop looks for it (second call).
+            dash, "read_dashboard_runfile", side_effect=[None, child_runfile]
         ), patch.object(mcp, "_spawn_dashboard_server", return_value=spawned) as popen:
             result = mcp.call_tool("puppetmaster_dashboard", {"cwd": "/tmp"})
         popen.assert_called_once()

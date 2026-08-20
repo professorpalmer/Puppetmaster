@@ -240,11 +240,16 @@ def _start_background_dashboard(
     # `--background` doesn't spawn a redundant second server for the same
     # project (and clobber the runfile the first one is still using).
     existing = read_dashboard_runfile(state_dir)
-    if existing and pid_alive(int(existing.get("pid") or 0)):
-        existing_host = existing.get("host", host)
+    if existing and existing.get("host", host) == host and pid_alive(int(existing.get("pid") or 0)):
+        # Host-gated: a loopback dashboard tracked from an earlier plain
+        # --background must not be "reused" for a --mobile request that
+        # needs an externally-reachable bind. Falling through to the
+        # literal-port probe below on a host mismatch correctly fails (a
+        # loopback server doesn't answer on the LAN/Tailscale IP) and a new,
+        # properly-bound server gets spawned instead.
         existing_port = int(existing.get("port") or port)
-        if dashboard_serves(existing_host, existing_port, state_dir, all_projects=all_projects):
-            return _reuse(existing_host, existing_port, existing.get("pid"))
+        if dashboard_serves(host, existing_port, state_dir, all_projects=all_projects):
+            return _reuse(host, existing_port, existing.get("pid"))
 
     # Nothing tracked (or it's stale/foreign) — something may still identify
     # itself as this project's dashboard on the requested port specifically.
@@ -378,7 +383,16 @@ def _run_dashboard_command(args: argparse.Namespace, state_dir: Path) -> int:
         if info:
             info_host = info.get("host", "127.0.0.1")
             info_port = int(info.get("port") or port)
-            if dashboard_serves(info_host, info_port, state_dir, all_projects=all_projects):
+            # Compare against the *tracked* record's own all_projects, not
+            # this invocation's flag: --status asks "is what my runfile
+            # points at still there", not "does it match what I'd request
+            # right now" -- `dashboard --status` (all_projects defaults
+            # False) after `dashboard --background --all-projects` must
+            # still report the board it started, not "another project".
+            if dashboard_serves(
+                info_host, info_port, state_dir,
+                all_projects=bool(info.get("all_projects")),
+            ):
                 print(
                     f"Background dashboard running: {info.get('url')} (pid {info.get('pid')})."
                 )
