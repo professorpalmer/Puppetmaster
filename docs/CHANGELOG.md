@@ -22,6 +22,14 @@ the only way out was Ctrl-Break, closing the terminal, or `taskkill`.
   that drive `serve(..., serve_forever=False)` against a manually-started
   thread now call `server_close()` too, so they stop leaking a bound
   listener on every run.
+- **Behaviour change: a crash inside the serve loop now surfaces.**
+  Previously an exception other than `KeyboardInterrupt` escaping
+  `serve_forever` was raised on the daemon thread, where the thread excepthook
+  printed it and `join()` returned normally — `puppetmaster dashboard` exited
+  **0** with a dead server. On the main thread the exception now propagates,
+  so the command fails loudly instead of silently. `main()` only pretty-prints
+  `FileNotFoundError`, `ValueError` and `RuntimeError`, so an unexpected
+  `OSError` here reaches the user as a traceback rather than an `error:` line.
 
 ## v1.22.12
 

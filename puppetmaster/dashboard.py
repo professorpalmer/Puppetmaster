@@ -2569,10 +2569,12 @@ def serve(
     allow_external: bool = False,
     all_projects: bool = False,
 ):
-    """Start the dashboard HTTP server. Returns the server (already bound).
+    """Start the dashboard HTTP server. Returns the server.
 
-    ``serve_forever=False`` binds and returns without blocking — used by tests
-    to drive a single request, then ``server.shutdown()``.
+    ``serve_forever=False`` binds and returns without blocking, with the socket
+    still **open** — used by tests to drive a single request, then
+    ``server.shutdown()`` / ``server.server_close()`` themselves. Otherwise this
+    blocks until Ctrl-C and returns an already-closed server.
 
     The dashboard serves durable job state with no authentication, so binding
     to a non-loopback interface would expose it to the local network. That is
@@ -2631,7 +2633,7 @@ def serve(
     except KeyboardInterrupt:
         print("\nDashboard stopped.")
     finally:
-        # Release the listening socket. Without this the port stays bound for
-        # the life of the process and, on Windows, briefly after it.
+        # Release the listening socket rather than leaving it to process exit,
+        # so an in-process caller (and the tests) can rebind immediately.
         httpd.server_close()
     return httpd

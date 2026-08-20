@@ -17797,7 +17797,7 @@ class DashboardTests(unittest.TestCase):
         needs a genuine console-attach dance (FreeConsole/AttachConsole/
         GenerateConsoleCtrlEvent) that is fragile under hosts that inherit
         the console's "ignore Ctrl+C" flag (see the helper spawned below,
-        and the SetConsoleCtrlHandler(NULL, FALSE) call right before it).
+        and the SetConsoleCtrlHandler(NULL, FALSE) the child does to itself).
         The portable regression guard is
         test_dashboard_serve_runs_loop_on_main_thread above; this test is
         the belt-and-suspenders end-to-end check.
@@ -17807,17 +17807,18 @@ class DashboardTests(unittest.TestCase):
                 "set PUPPETMASTER_RUN_CONSOLE_TESTS=1 to run console Ctrl-C e2e tests"
             )
 
-        import ctypes
+        import socket
         import urllib.request
 
         repo_root = Path(__file__).resolve().parent.parent
-        port = 18920
         CREATE_NO_WINDOW = 0x08000000
 
-        # The "ignore Ctrl+C" flag is inherited by child processes, and an
-        # agent/CI shell commonly has it set — clear it here so children
-        # inherit "Ctrl+C enabled".
-        ctypes.WinDLL("kernel32", use_last_error=True).SetConsoleCtrlHandler(None, False)
+        # Ask the OS for a free port rather than hardcoding one: a fixed port
+        # collides with whatever else the machine (or a parallel CI job) is
+        # running, and the failure would look exactly like the bug.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
 
         # The AttachConsole()/GenerateConsoleCtrlEvent() dance must run in its
         # OWN process — doing it in this process would detach the test
@@ -17857,11 +17858,20 @@ class DashboardTests(unittest.TestCase):
             helper_path = Path(tmp) / "send_ctrlc_helper.py"
             helper_path.write_text(helper_src, encoding="utf-8")
 
-            cmd = [
-                sys.executable, "-m", "puppetmaster",
-                "--state-dir", str(state_dir),
-                "dashboard", "--port", str(port), "--no-open",
-            ]
+            # The "ignore Ctrl+C" flag is inherited by child processes and an
+            # agent/CI shell commonly has it set — with it set the child would
+            # ignore the CTRL_C_EVENT below and the test would fail exactly the
+            # way the bug does. The child clears it for *itself* here, so the
+            # unittest runner's own console behaviour is never modified.
+            bootstrap = (
+                "import ctypes, runpy, sys\n"
+                "ctypes.WinDLL('kernel32', use_last_error=True)"
+                ".SetConsoleCtrlHandler(None, False)\n"
+                "sys.argv = ['puppetmaster', '--state-dir', sys.argv[1],\n"
+                "            'dashboard', '--port', sys.argv[2], '--no-open']\n"
+                "runpy.run_module('puppetmaster', run_name='__main__')\n"
+            )
+            cmd = [sys.executable, "-c", bootstrap, str(state_dir), str(port)]
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
@@ -17891,13 +17901,20 @@ class DashboardTests(unittest.TestCase):
                     [sys.executable, str(helper_path), str(proc.pid)],
                     capture_output=True, text=True, creationflags=CREATE_NO_WINDOW,
                 )
-                self.assertIn(
-                    "'target_on_console': True",
-                    helper.stdout,
+                # Both halves matter: attaching to the child's console proves we
+                # aimed at the right target, and generate_ok proves the event was
+                # actually raised. Without the second assertion a delivery failure
+                # would fall through to "did not exit within 5s" — the exact
+                # message the real bug produces.
+                delivery_context = (
                     "CTRL_C_EVENT delivery to the child console could not be "
-                    f"verified, so a hang here would be indistinguishable from "
-                    f"the bug: stdout={helper.stdout!r} stderr={helper.stderr!r}",
+                    "verified, so a hang here would be indistinguishable from "
+                    f"the bug: rc={helper.returncode} "
+                    f"stdout={helper.stdout!r} stderr={helper.stderr!r}"
                 )
+                self.assertIn("'target_on_console': True", helper.stdout, delivery_context)
+                self.assertIn("'generate_ok': True", helper.stdout, delivery_context)
+                self.assertEqual(0, helper.returncode, delivery_context)
 
                 sent_at = time.time()
                 died_at = None
