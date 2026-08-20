@@ -1,3 +1,28 @@
+## Unreleased
+
+**Fix: `puppetmaster dashboard` never exited on Ctrl-C on Windows, and its
+listening socket was never released either.**
+
+`serve()` ran `ThreadingHTTPServer.serve_forever` on a daemon thread and
+parked the main thread in an untimed `Thread.join()`. On Windows an untimed
+lock acquire is uninterruptible, so the eval breaker set by `CTRL_C_EVENT`
+was never checked, `KeyboardInterrupt` was never raised, and
+`except KeyboardInterrupt: httpd.shutdown()` never ran. Ctrl-C did nothing;
+the only way out was Ctrl-Break, closing the terminal, or `taskkill`.
+
+- **Main-thread `serve_forever`.** `serve()` now calls
+  `httpd.serve_forever(poll_interval=0.5)` directly on the main thread — the
+  same shape stdlib's `python -m http.server` uses — instead of a daemon
+  thread plus an untimed join. Ctrl-C now interrupts the loop and is
+  swallowed with `"Dashboard stopped."`, exiting 0 (`dashboard.py` already
+  advertises Ctrl-C as the normal way to stop).
+- **Socket release.** `httpd.server_close()` now runs in a `finally` on the
+  blocking path, so the port is actually freed on exit — it previously
+  appeared nowhere in `dashboard.py`. The two existing dashboard HTTP tests
+  that drive `serve(..., serve_forever=False)` against a manually-started
+  thread now call `server_close()` too, so they stop leaking a bound
+  listener on every run.
+
 ## v1.22.12
 
 Absorb of [@bsmi021](https://github.com/bsmi021) PR
