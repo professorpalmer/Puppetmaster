@@ -13,6 +13,7 @@ effect before exercising Puppetmaster code.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import os
 import shutil
 import sys
@@ -30,6 +31,11 @@ _ATEXIT_REGISTERED = False
 # How many tests left a registry behind at the sentinel path (see
 # ``reap_leaked_registry``). Exposed for the harness's own tests.
 _LEAKED_REGISTRY_REAPS = 0
+# Test ids that leaked, kept for diagnostics (the failure itself is reported
+# against the guilty test -- see _fail_leaking_test).
+_LEAKED_REGISTRY_TESTS: list[str] = []
+# >0 while a test leaks on purpose (the reaper's own test).
+_EXPECT_REGISTRY_LEAK = 0
 
 # Host pins that short-circuit discovery / routing when left in place.
 _PIN_KEYS_TO_CLEAR = (
@@ -51,16 +57,40 @@ def _provider_credential_env_names() -> "tuple[str, ...]":
     rotation siblings (``OPENAI_API_KEY_2`` ...) and the presence vars that
     opt keyless local endpoints (Ollama / LM Studio) in.
     """
-    from puppetmaster.providers import PROVIDER_REGISTRY, _numbered_env_names
+    from puppetmaster.providers import PROVIDER_REGISTRY
+
+    try:
+        from puppetmaster.providers import _numbered_env_names
+    except ImportError:  # private helper; keep isolation working if it moves
+        def _numbered_env_names(name: str) -> "list[str]":
+            return [name] + [f"{name}_{i}" for i in range(2, 10)]
 
     names: list[str] = []
     for desc in PROVIDER_REGISTRY.values():
         for var in desc.api_key_env_vars:
             names.extend(_numbered_env_names(var))
         names.extend(desc.presence_env_vars)
+    # Not in PROVIDER_REGISTRY (it drives the Cursor *CLI/SDK* path, not a
+    # direct-API provider) but it still turns on plan-catalog discovery.
+    names.extend(_numbered_env_names("CURSOR_API_KEY"))
     # dict.fromkeys: de-dupe (gemini lists GOOGLE_API_KEY too) but keep order
     # stable so the restore path is deterministic.
     return tuple(dict.fromkeys(names))
+
+
+def _clear_provider_credentials(env) -> "list[str]":
+    """Remove every provider credential from ``env``; return what was removed.
+
+    Split out from :func:`apply_hermetic_isolation` so the behaviour is
+    testable on a fixture dict. Testing it against ``os.environ`` alone is
+    vacuous on a keyless machine (CI) — there the assertion holds whether or
+    not the clearing works.
+    """
+    removed = []
+    for key in _provider_credential_env_names():
+        if env.pop(key, None) is not None:
+            removed.append(key)
+    return removed
 
 
 def _sentinel_paths() -> "tuple[Path, ...]":
@@ -71,6 +101,50 @@ def _sentinel_paths() -> "tuple[Path, ...]":
 
     sentinel = Path(_ISOLATION_TMP) / "models-does-not-exist.json"
     return (sentinel, discovery_meta_path(sentinel))
+
+
+@contextlib.contextmanager
+def expect_registry_leak():
+    """Mark a deliberate leak so it doesn't fail the run at exit.
+
+    Only the harness's own test for the reaper should need this.
+    """
+    global _EXPECT_REGISTRY_LEAK
+    _EXPECT_REGISTRY_LEAK += 1
+    try:
+        yield
+    finally:
+        _EXPECT_REGISTRY_LEAK -= 1
+
+
+_LEAK_MESSAGE = (
+    "hermetic isolation was broken: this test wrote a model registry to "
+    "PUPPETMASTER_MODELS_PATH, which the suite pins at a path that must stay "
+    "absent. It was reaped so later tests stay isolated, but the write itself "
+    "is the bug — something under test called save_registry() against "
+    "default_registry_path(). With a provider credential in the environment "
+    "that is exactly how routing used to retarget the whole suite onto a live "
+    "API."
+)
+
+
+def _fail_leaking_test(case: unittest.TestCase, result) -> None:
+    """Record a leak as a failure of the test that caused it.
+
+    Reaping keeps later tests isolated, but on its own it would *silence* the
+    canary that caught this class of bug — with the reaper in place,
+    ``test_models_path_points_at_missing_sentinel`` can no longer fail, because
+    the leak is always cleaned up before it looks. So the leak still fails the
+    run; it just fails the guilty test instead of an innocent one downstream.
+
+    (An ``atexit`` hook cannot do this job: CPython prints "Exception ignored
+    in atexit callback" and still exits 0 — verified on 3.12 — so a leak would
+    report as a green run.)
+    """
+    if result is None:
+        return
+    error = AssertionError(f"{_LEAK_MESSAGE}\n(test: {case.id()})")
+    result.addFailure(case, (AssertionError, error, error.__traceback__))
 
 
 def reap_leaked_registry(test_id: str = "") -> bool:
@@ -98,6 +172,8 @@ def reap_leaked_registry(test_id: str = "") -> bool:
         reaped = True
     if reaped:
         _LEAKED_REGISTRY_REAPS += 1
+        if not _EXPECT_REGISTRY_LEAK:
+            _LEAKED_REGISTRY_TESTS.append(test_id or "<unknown test>")
         print(
             f"hermetic_env: {test_id or 'a test'} left a model registry at the "
             f"pinned sentinel path; reaped it so later tests stay isolated. "
@@ -150,11 +226,11 @@ def apply_hermetic_isolation(*, register_atexit: bool = True) -> None:
     # instead of the pinned adapter — while worker tests quietly execute
     # against the live API. CI is green precisely because it has no keys;
     # clearing them here is what makes a local run mean the same thing.
-    for key in _provider_credential_env_names():
-        os.environ.pop(key, None)
+    _clear_provider_credentials(os.environ)
 
     # Orchestrator plan-catalog auto-discovery shells out to the Cursor SDK
     # when CURSOR_API_KEY is set; tests that need it inject their own fetcher.
+    _ENV_BEFORE["PUPPETMASTER_AUTODISCOVER"] = os.environ.get("PUPPETMASTER_AUTODISCOVER")
     os.environ.setdefault("PUPPETMASTER_AUTODISCOVER", "0")
 
     # Keep process-local provider circuit state from leaking across tests.
@@ -192,17 +268,17 @@ def apply_hermetic_isolation(*, register_atexit: bool = True) -> None:
             reset_cursor_codegraph_invocation_cache()
         except Exception:
             pass
+        outcome = _ORIG_TESTCASE_RUN(self, result)
+        # Reap AFTER the test, not before: this attributes the leak to the test
+        # that actually wrote the registry, instead of the isolation silently
+        # absorbing it and the damage surfacing hundreds of tests later as an
+        # unrelated routing assertion.
         try:
-            return _ORIG_TESTCASE_RUN(self, result)
-        finally:
-            # Reap AFTER the test, not before: this way the warning names the
-            # test that actually wrote the registry, instead of the isolation
-            # silently absorbing it and the damage surfacing hundreds of tests
-            # later as an unrelated routing assertion.
-            try:
-                reap_leaked_registry(self.id())
-            except Exception:
-                pass
+            if reap_leaked_registry(self.id()) and not _EXPECT_REGISTRY_LEAK:
+                _fail_leaking_test(self, result if result is not None else outcome)
+        except Exception:
+            pass
+        return outcome
 
     unittest.TestCase.run = _hermetic_run  # type: ignore[method-assign]
 

@@ -20844,63 +20844,56 @@ class EnsureCursorSdkTests(unittest.TestCase):
         self.assertEqual(result.status, "skipped")
         self.assertIn("npm not on PATH", result.detail)
 
-    def test_refuses_to_install_into_a_git_checkout(self) -> None:
-        """`npm install --prefix <repo>` rewrites the *tracked* package.json.
+    def test_npm_install_never_writes_the_manifest_at_the_prefix(self) -> None:
+        """`npm install --prefix X` also writes X/package.json without --no-save.
 
-        The default package root is ``puppetmaster/..``, which is site-packages
-        for a pip install but the repo root in a checkout — so running from a
-        checkout bumped @cursor/sdk in git and a later `git commit -a` shipped
-        a dependency change nobody asked for. Refuse unless the caller named
-        the root deliberately.
+        The default prefix is ``puppetmaster/..`` -- site-packages for a pip
+        install, but the *repo root* for an editable install, an sdist, or a
+        Docker COPY of the source. There it rewrote the project's own tracked
+        package.json, bumping @cursor/sdk past its pinned range so a later
+        `git commit -a` shipped a dependency change nobody asked for. Node
+        resolves node_modules without reading that manifest, so --no-save
+        costs nothing and is the fix.
         """
         from types import SimpleNamespace
 
         from puppetmaster.installers import ensure_cursor_sdk
 
         with TemporaryDirectory() as tmp:
-            checkout = Path(tmp) / "repo"
-            (checkout / "puppetmaster").mkdir(parents=True)
-            # A worktree's .git is a FILE, not a directory — cover that case,
-            # since it is exactly how this bug was found.
-            (checkout / ".git").write_text("gitdir: /elsewhere\n", encoding="utf-8")
+            prefix = Path(tmp) / "repo"
+            prefix.mkdir()
+            manifest = prefix / "package.json"
+            original = '{"optionalDependencies": {"@cursor/sdk": "^1.0.26"}}'
+            manifest.write_text(original, encoding="utf-8")
             calls = []
 
-            def fake_run(cmd, **kwargs):  # pragma: no cover - must not run
+            def fake_run(cmd, **kwargs):
                 calls.append(cmd)
-                raise AssertionError("npm must not be invoked for a checkout")
+                return SimpleNamespace(returncode=0, stdout="added 7 packages", stderr="")
 
             with patch(
-                "puppetmaster.diagnostics._find_cursor_sdk_install", return_value=None
-            ), patch(
-                "puppetmaster.installers._default_package_root", return_value=checkout
-            ), patch(
-                "puppetmaster.installers.subprocess.run", side_effect=fake_run
-            ):
+                "puppetmaster.diagnostics._find_cursor_sdk_install",
+                side_effect=[None, prefix / "node_modules" / "@cursor" / "sdk"],
+            ), patch("puppetmaster.installers.subprocess.run", side_effect=fake_run):
                 result = ensure_cursor_sdk(
-                    Path(tmp), npm_executable="/usr/local/bin/npm"
+                    Path(tmp), package_root=prefix, npm_executable="/usr/local/bin/npm"
                 )
 
-            self.assertEqual(result.status, "skipped")
-            self.assertIn("git checkout", result.detail)
-            self.assertIn("package_root", result.detail)
-            self.assertEqual(calls, [], "npm was invoked against the checkout")
+            self.assertEqual(result.status, "installed")
+            self.assertIn(
+                "--no-save",
+                calls[0],
+                "without --no-save npm rewrites the manifest at the prefix",
+            )
+            # The flag must precede --prefix's value, not trail the whole
+            # command, or npm treats it as a package name.
+            self.assertLess(calls[0].index("--no-save"), calls[0].index("--prefix"))
+            self.assertEqual(
+                manifest.read_text(encoding="utf-8"),
+                original,
+                "the manifest at the prefix must be byte-identical afterwards",
+            )
 
-            # An explicit package_root is a deliberate choice: still allowed,
-            # even when it is the checkout.
-            with patch(
-                "puppetmaster.diagnostics._find_cursor_sdk_install", return_value=None
-            ), patch(
-                "puppetmaster.installers._default_package_root", return_value=checkout
-            ), patch(
-                "puppetmaster.installers.subprocess.run",
-                return_value=SimpleNamespace(returncode=0, stdout="ok", stderr=""),
-            ):
-                explicit = ensure_cursor_sdk(
-                    Path(tmp),
-                    package_root=checkout,
-                    npm_executable="/usr/local/bin/npm",
-                )
-            self.assertNotEqual(explicit.status, "skipped")
 
     def test_installs_via_npm_into_package_root(self) -> None:
         from types import SimpleNamespace
@@ -20927,7 +20920,14 @@ class EnsureCursorSdkTests(unittest.TestCase):
         self.assertEqual(result.location, str(sdk_path))
         self.assertEqual(
             calls[0],
-            ["/usr/local/bin/npm", "install", "@cursor/sdk", "--prefix", "/fake/site-packages"],
+            [
+                "/usr/local/bin/npm",
+                "install",
+                "@cursor/sdk",
+                "--no-save",
+                "--prefix",
+                "/fake/site-packages",
+            ],
         )
 
     def test_error_when_npm_fails(self) -> None:
@@ -20941,9 +20941,6 @@ class EnsureCursorSdkTests(unittest.TestCase):
         with TemporaryDirectory() as tmp, \
                 patch("puppetmaster.diagnostics._find_cursor_sdk_install", return_value=None), \
                 patch("puppetmaster.installers.subprocess.run", side_effect=fake_run):
-            # Explicit package_root: without one the default is the repo root,
-            # and running the suite from a checkout now (correctly) refuses to
-            # npm-install there — see test_refuses_to_install_into_a_git_checkout.
             result = ensure_cursor_sdk(
                 Path("/tmp"),
                 package_root=Path(tmp),
@@ -25688,7 +25685,9 @@ class SetupHooksStepTests(unittest.TestCase):
             cwd0 = Path.cwd()
             try:
                 os.chdir(tmp)
-                with patch.object(cli, "install_cursor_mcp", return_value=_Res()), \
+                with patch.object(cli, "ensure_cursor_sdk", return_value=MagicMock(
+                            status="unchanged", detail="stubbed: no real npm in tests")), \
+                        patch.object(cli, "install_cursor_mcp", return_value=_Res()), \
                         patch.object(cli, "install_codex_mcp", return_value=_Res()), \
                         patch.object(cli, "install_claude_mcp", return_value=_Res()), \
                         patch.object(cli, "resolve_claude_command", return_value="claude"), \
@@ -25713,7 +25712,9 @@ class SetupHooksStepTests(unittest.TestCase):
             cwd0 = Path.cwd()
             try:
                 os.chdir(tmp)
-                with patch.object(cli, "install_cursor_mcp", return_value=_Res()), \
+                with patch.object(cli, "ensure_cursor_sdk", return_value=MagicMock(
+                            status="unchanged", detail="stubbed: no real npm in tests")), \
+                        patch.object(cli, "install_cursor_mcp", return_value=_Res()), \
                         patch.object(cli, "install_codex_mcp", return_value=_Res()), \
                         patch("puppetmaster.platform_lock.is_configured", return_value=True), \
                         patch("puppetmaster.platform_lock.enabled_adapters", return_value={"cursor"}):
@@ -25736,7 +25737,9 @@ class SetupHooksStepTests(unittest.TestCase):
             home = Path(home_tmp)
             try:
                 os.chdir(tmp)
-                with patch.object(cli, "install_cursor_mcp", return_value=_Res()), \
+                with patch.object(cli, "ensure_cursor_sdk", return_value=MagicMock(
+                            status="unchanged", detail="stubbed: no real npm in tests")), \
+                        patch.object(cli, "install_cursor_mcp", return_value=_Res()), \
                         patch.object(cli, "install_codex_mcp", return_value=_Res()), \
                         patch("puppetmaster.platform_lock.is_configured", return_value=True), \
                         patch("puppetmaster.platform_lock.enabled_adapters", return_value={"cursor"}), \
@@ -25770,7 +25773,9 @@ class SetupHooksStepTests(unittest.TestCase):
             cwd0 = Path.cwd()
             try:
                 os.chdir(tmp)
-                with patch.object(cli, "install_cursor_mcp", return_value=_Res()), \
+                with patch.object(cli, "ensure_cursor_sdk", return_value=MagicMock(
+                            status="unchanged", detail="stubbed: no real npm in tests")), \
+                        patch.object(cli, "install_cursor_mcp", return_value=_Res()), \
                         patch.object(cli, "install_codex_mcp", return_value=_Res()), \
                         patch.object(cli, "install_hermes_mcp", return_value=_Res()), \
                         patch.object(cli, "install_hermes_hooks", side_effect=fake_hermes_hooks), \

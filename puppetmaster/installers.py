@@ -129,7 +129,7 @@ def _default_package_root() -> Path:
 
     ``puppetmaster/..`` — site-packages for a pip/pipx install, which is the
     directory Node's resolution walks up to from ``cursor_sdk_runner.mjs``.
-    Split out so the checkout guard below is testable without patching
+    Split out so tests can point the default somewhere safe without patching
     ``__file__``.
     """
     return Path(__file__).resolve().parent.parent
@@ -170,28 +170,27 @@ def ensure_cursor_sdk(
         )
 
     install_root = package_root or _default_package_root()
-    # In a pip/pipx install that parent is site-packages, which is exactly
-    # where Node's resolution needs the SDK. In a git checkout it is the repo
-    # root, and `npm install --prefix <repo>` rewrites the *tracked*
-    # package.json (bumping @cursor/sdk to whatever satisfies the range) —
-    # so a later `git commit -a` silently ships a dependency bump nobody
-    # asked for. Refuse, unless the caller named the root deliberately.
-    if package_root is None and (install_root / ".git").exists():
-        return SdkBootstrapResult(
-            "skipped",
-            f"refusing to `npm install` into the git checkout at {install_root} "
-            "— `--prefix` there rewrites the tracked package.json and a later "
-            "`git commit -a` would ship the dependency bump. This checkout "
-            f"already declares @cursor/sdk, so run `npm install` in "
-            f"{install_root} yourself (Node resolves it from there), or pass "
-            "package_root= to target a directory deliberately.",
-        )
     try:
         completed = subprocess.run(
             # as_posix(): npm accepts forward slashes on every platform, and
             # native backslashes get mangled by Git-Bash-style shells on
             # Windows (same class of bug as the v0.9.34 hook-path fix).
-            [npm, "install", "@cursor/sdk", "--prefix", install_root.as_posix()],
+            # --no-save: we only need @cursor/sdk resolvable under
+            # <prefix>/node_modules. Without it npm also *writes the manifest*
+            # at the prefix — and when the prefix is a git checkout (an
+            # editable install, an sdist, a Docker COPY of the source) that is
+            # the repo's own tracked package.json, silently bumping @cursor/sdk
+            # past its pinned range so a later `git commit -a` ships a
+            # dependency change nobody asked for. Node resolution never reads
+            # that manifest, so skipping the write costs nothing.
+            [
+                npm,
+                "install",
+                "@cursor/sdk",
+                "--no-save",
+                "--prefix",
+                install_root.as_posix(),
+            ],
             capture_output=True,
             text=True,
             timeout=timeout_seconds,

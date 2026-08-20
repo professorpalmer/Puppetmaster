@@ -1,6 +1,8 @@
 """Regression: unittest discover must isolate host Puppetmaster env pins."""
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import sys
 
@@ -49,6 +51,41 @@ class HermeticEnvIsolationTests(unittest.TestCase):
         self.assertEqual(leaked, [], f"provider credentials leaked into the suite: {leaked}")
         self.assertEqual(available_providers(), set())
 
+    def test_clearing_removes_credentials_from_a_populated_env(self) -> None:
+        """The assertion above is vacuous on a keyless machine.
+
+        On CI there are no provider keys, so "none leaked" holds whether or not
+        the clearing works. Drive the clearing over a fixture that definitely
+        has keys, so this fails on CI too if the mechanism breaks.
+        """
+        fake = {
+            "GOOGLE_API_KEY": "g",
+            "OPENROUTER_API_KEY": "o",
+            "ANTHROPIC_API_KEY": "a",
+            "OPENAI_API_KEY_3": "numbered sibling",
+            "CURSOR_API_KEY": "c",
+            "PATH": "/keep/me",
+        }
+        removed = hermetic_env._clear_provider_credentials(fake)
+
+        self.assertEqual(fake, {"PATH": "/keep/me"}, "non-credentials must survive")
+        for expected in (
+            "GOOGLE_API_KEY",
+            "OPENROUTER_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY_3",
+            "CURSOR_API_KEY",
+        ):
+            self.assertIn(expected, removed)
+
+        from puppetmaster.providers import available_providers
+
+        self.assertEqual(
+            available_providers(env={"GOOGLE_API_KEY": "g"}),
+            {"gemini"},
+            "control: a key really does make a provider available",
+        )
+
     def test_credential_names_are_derived_from_the_registry(self) -> None:
         """Derived, not hardcoded, so a provider added later is covered."""
         names = hermetic_env._provider_credential_env_names()
@@ -75,9 +112,6 @@ class HermeticEnvIsolationTests(unittest.TestCase):
         silently poisoning every later test. Reaping happens *after* each test
         so the warning names the culprit.
         """
-        import io
-        import contextlib
-
         from puppetmaster.model_registry import ModelSpec, save_registry
 
         sentinel = Path(os.environ["PUPPETMASTER_MODELS_PATH"])
@@ -101,7 +135,9 @@ class HermeticEnvIsolationTests(unittest.TestCase):
 
         stderr = io.StringIO()
         result = unittest.TestResult()
-        with contextlib.redirect_stderr(stderr):
+        # expect_registry_leak: this leak is deliberate, so it must not be
+        # reported as a failure the way an undeclared one is.
+        with contextlib.redirect_stderr(stderr), hermetic_env.expect_registry_leak():
             _LeakyTest().run(result)
 
         # Without these two the test passes vacuously when the leak never
@@ -121,6 +157,63 @@ class HermeticEnvIsolationTests(unittest.TestCase):
         before = hermetic_env._LEAKED_REGISTRY_REAPS
         self.assertFalse(hermetic_env.reap_leaked_registry("noop"))
         self.assertEqual(hermetic_env._LEAKED_REGISTRY_REAPS, before)
+
+    def test_a_real_leak_fails_the_test_that_caused_it(self) -> None:
+        """Reaping must not *silence* the canary.
+
+        Cleaning up after each test keeps later tests isolated, but it also
+        means test_models_path_points_at_missing_sentinel can no longer fail --
+        the leak is always gone before it looks. The write is still the bug, so
+        it has to fail the run somewhere. It fails the guilty test, at the
+        scene, instead of an innocent one hundreds of tests later.
+
+        (atexit cannot do this job: CPython prints "Exception ignored in atexit
+        callback" and still exits 0, so a leak would report as a green run.)
+        """
+        from puppetmaster.model_registry import ModelSpec, save_registry
+
+        sentinel = Path(os.environ["PUPPETMASTER_MODELS_PATH"])
+        leak = {}
+
+        class _LeakyTest(unittest.TestCase):
+            def runTest(self) -> None:  # noqa: N802 - unittest API
+                save_registry([ModelSpec(id="x/leaked", adapter="agentic",
+                                         adapter_model_name="leaked")])
+                leak["created"] = sentinel.exists()
+
+        # No expect_registry_leak() here: this is the undeclared case, which
+        # must be reported as a failure.
+        result = unittest.TestResult()
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            case = _LeakyTest()
+            case.run(result)
+
+        self.assertTrue(leak.get("created"), "the inner test never created the registry")
+        self.assertEqual(result.errors, [], f"inner test errored: {result.errors}")
+        self.assertEqual(
+            len(result.failures), 1, "an undeclared leak must fail its own test"
+        )
+        failed_case, message = result.failures[0]
+        self.assertIs(failed_case, case, "the failure must be attributed to the culprit")
+        self.assertIn("hermetic isolation was broken", message)
+        self.assertIn("save_registry", message)
+        self.assertFalse(result.wasSuccessful())
+
+    def test_declared_leaks_do_not_fail_their_test(self) -> None:
+        """The reaper's own test leaks on purpose; that must stay green."""
+        from puppetmaster.model_registry import ModelSpec, save_registry
+
+        class _DeliberateLeak(unittest.TestCase):
+            def runTest(self) -> None:  # noqa: N802 - unittest API
+                save_registry([ModelSpec(id="x/ok", adapter="agentic",
+                                         adapter_model_name="ok")])
+
+        result = unittest.TestResult()
+        with contextlib.redirect_stderr(io.StringIO()), hermetic_env.expect_registry_leak():
+            _DeliberateLeak().run(result)
+        self.assertTrue(result.wasSuccessful(), f"{result.failures}")
+
 
 
 if __name__ == "__main__":
