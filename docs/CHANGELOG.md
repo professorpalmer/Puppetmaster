@@ -1,5 +1,9 @@
 ## Unreleased
 
+Absorb of [@bsmi021](https://github.com/bsmi021) PR
+[#43](https://github.com/professorpalmer/Puppetmaster/pull/43), plus
+stack edits.
+
 **Fix: `puppetmaster dashboard` never exited on Ctrl-C on Windows, and its
 listening socket was never released either.**
 
