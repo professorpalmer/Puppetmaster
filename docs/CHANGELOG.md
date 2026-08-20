@@ -1,4 +1,4 @@
-## Unreleased
+## v1.22.13
 
 Absorb of [@bsmi021](https://github.com/bsmi021) PR
 [#43](https://github.com/professorpalmer/Puppetmaster/pull/43), plus
