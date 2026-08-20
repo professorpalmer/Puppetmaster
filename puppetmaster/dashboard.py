@@ -2308,6 +2308,23 @@ def make_handler(
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", ""})
 
 
+def normalize_dashboard_host(host: str) -> str:
+    """Fold loopback spellings together for an own-runfile host comparison.
+
+    A tracked runfile always records the host the child actually *bound*
+    (``bind_dashboard_server`` never sees ``"localhost"`` — the CLI/MCP only
+    forward a non-loopback ``--host``, so a loopback request always binds as
+    literal ``127.0.0.1``). Comparing that against a fresh request's host
+    *spelling* — ``"localhost"`` vs. ``"127.0.0.1"`` — never matches, so a
+    repeated ``--host localhost`` used to spawn a brand-new server every
+    time instead of reusing the one already running (orphaning the rest,
+    since only the last spawn gets tracked). Route every such comparison
+    through this so both sides fold onto the same spelling.
+    """
+    normalized = host.strip().lower()
+    return "127.0.0.1" if normalized in _LOOPBACK_HOSTS else normalized
+
+
 def _state_dir_id(state_dir: Optional[Union[Path, str]]) -> Optional[str]:
     """A stable, non-reversible id for ``state_dir``.
 
@@ -2582,22 +2599,82 @@ def dashboard_identity(
 
     None covers every case that means "can't vouch for this server": no
     response, non-200, a body that isn't JSON (a foreign, non-dashboard web
-    server could 200 anything on that port), or a JSON body missing the
-    ``service`` marker. A pre-upgrade puppetmaster dashboard 404s
-    ``/api/meta`` and also lands here — the conservative default is "not
-    mine, don't reuse it, bump past it" (§3.2 rollout note).
-    """
-    import urllib.request
+    server could 200 anything on that port), a JSON body missing the
+    ``service`` marker, or any HTTP-protocol violation (``http.client``'s
+    exceptions, e.g. a server that sends a valid ``Content-Length`` header
+    then truncates, or a non-HTTP squatter whose first line isn't a status
+    line — neither is an ``OSError``/``ValueError``, so both used to escape
+    as a raw traceback out of an ordinary ``dashboard --background``). A
+    pre-upgrade puppetmaster dashboard 404s ``/api/meta`` and also lands
+    here — the conservative default is "not mine, don't reuse it, bump past
+    it" (§3.2 rollout note).
 
+    Bounded on two axes so a misbehaving (or hostile) listener on the port
+    can't stall or balloon this call: ``max_body`` caps how much of the
+    response we'll ever hold in memory (the real payload is one short JSON
+    object), and ``deadline`` is a wall-clock budget across every recv of
+    the *response body* -- unlike a bare socket ``timeout``, which only
+    bounds a single recv, so a peer trickling one byte at a time keeps each
+    individual recv under the timeout and can otherwise stall the caller
+    far longer than ``timeout`` (measured: 12s against a declared 1.0s).
+
+    The deadline clock starts only once connected, not before: ``"host"``
+    resolution can itself legitimately eat close to the full ``timeout``
+    (e.g. ``"localhost"`` resolving to ``::1`` first, which the OS doesn't
+    always refuse instantly, before falling back to ``127.0.0.1``) with no
+    misbehaving peer involved at all -- charging that against the same
+    budget as the body read left nothing for a perfectly fine connection to
+    read its (already fully buffered) response.
+    """
+    import http.client
+    import time as _time
+
+    max_body = 65536  # generous headroom for one small JSON object
+    conn = http.client.HTTPConnection(host, port, timeout=timeout)
     try:
-        with urllib.request.urlopen(
-            f"http://{host}:{port}/api/meta", timeout=timeout
-        ) as response:
-            if response.status != 200:
+        conn.request("GET", "/api/meta")
+        # Capture the socket now, before getresponse(): the dashboard's
+        # handler is HTTP/1.0 (no keep-alive), so a "will_close" response
+        # makes getresponse() call conn.close() internally, which sets
+        # conn.sock to None -- but it hands the live socket off to the
+        # response object first (its .fp keeps the real fd open via the
+        # same refcounting makefile() always uses), so this reference stays
+        # valid for the reads below even once conn.sock reads back None.
+        sock = conn.sock
+        response = conn.getresponse()
+        if response.status != 200:
+            return None
+        deadline = _time.monotonic() + timeout
+        chunks: list[bytes] = []
+        total = 0
+        while total < max_body and not response.isclosed():
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
                 return None
-            payload = json.loads(response.read().decode("utf-8"))
-    except (OSError, ValueError):
+            if sock is not None:
+                sock.settimeout(remaining)
+            # read1(), not read(): read() loops internally until it fills
+            # the requested amount (or hits EOF/Content-Length), so a slow
+            # dribbler still keeps every individual recv under the timeout
+            # and the call as a whole can run far past ``deadline``. read1()
+            # returns after at most one underlying read, so the deadline
+            # check above actually gets a turn between reads. A read1() that
+            # exactly exhausts Content-Length closes the response (and,
+            # once nothing else references it, the socket itself) as a
+            # side effect -- checking isclosed() up front (rather than only
+            # `if not chunk: break` after the call) keeps this loop from
+            # calling settimeout() on that now-closed socket on its next
+            # spin.
+            chunk = response.read1(min(8192, max_body - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        payload = json.loads(b"".join(chunks).decode("utf-8"))
+    except (OSError, ValueError, http.client.HTTPException):
         return None
+    finally:
+        conn.close()
     if not isinstance(payload, dict) or payload.get("service") != "puppetmaster-dashboard":
         return None
     return payload
@@ -2703,6 +2780,13 @@ def bind_dashboard_server(
     fix is retrying the bind on the real server socket, which is what this
     does.
     """
+    if not 0 <= port <= 65535:
+        # Caught before the bind loop below: an out-of-range port (e.g. a
+        # typo'd --port 70000) would otherwise report "already in use",
+        # which is simply false -- it was never attempted, since the loop's
+        # own `candidate > 65535` guard breaks out on the very first
+        # iteration without ever calling bind().
+        raise OSError(f"port {port} is not a valid TCP port (must be 0-65535).")
     server_class = _dashboard_server_class()
     last: Optional[OSError] = None
     attempts = max_attempts if auto_port else 1

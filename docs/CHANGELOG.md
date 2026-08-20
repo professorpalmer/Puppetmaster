@@ -60,10 +60,60 @@ write, the second project got no runfile at all, so its own `--status` and
   started; it previously compared the runfile against *this* invocation's
   `--all-projects` flag instead of the tracked record's own, so it wrongly
   reported "serving another project."
-- New `tests/test_dashboard_ports.py` and
-  `tests/test_dashboard_background_identity.py` cover the bind retry,
-  `/api/meta`, and identity-aware reuse (including both fixes above) end to
-  end.
+- New `tests/test_dashboard_ports.py` covers the bind retry and `/api/meta`
+  against real bound servers; `tests/test_dashboard_background_identity.py`
+  covers the CLI/MCP reuse wiring (mostly against a mocked identity check,
+  for speed) plus the `--port`/`auto_port` argv derivation, with a couple of
+  cases run against a real server to guard the wiring itself, not just the
+  identity functions.
+
+**Follow-up (adversarial review): the own-project-reuse pre-check had its own
+bugs.**
+
+- **Fix: an explicit `--port N` was silently discarded whenever this project
+  already had a live tracked dashboard.** The reuse pre-check (both CLI and
+  MCP) checked neither `auto_port` nor whether the tracked port matched the
+  one just asked for, so a tracked dashboard on a *different* port was
+  "reused" anyway — a regression against the `--port` semantics above:
+  moving a project's dashboard to a new port required `--stop` first, with
+  no error telling you so. Reuse of a tracked dashboard now requires either
+  `auto_port` (no explicit `--port`, or `--port-search`) or that the tracked
+  port equals the one requested.
+- **Fix: `--host localhost` piled up unstoppable servers.** The reuse
+  pre-check compared the requested host's *spelling* against the child's
+  recorded host, which is always the literal address it bound (e.g.
+  `127.0.0.1` — `--host` isn't forwarded for loopback names). `"localhost" !=
+  "127.0.0.1"` never matched, so every repeat `--background --host localhost`
+  spawned a brand-new server; only the last one was ever tracked, so the rest
+  leaked until reboot. Both sides of the comparison now fold through the same
+  loopback-alias table before comparing.
+- **Fix: a slow or hostile listener on the port could hang or balloon a
+  `dashboard` invocation.** `dashboard_identity`'s `timeout` bounded each
+  individual `recv`, not the call — a peer trickling one byte at a time kept
+  every `recv` under the timeout and could stall the caller far longer than
+  the declared budget (measured: 12s against 1.0s), and an unbounded `.read()`
+  would buffer an arbitrarily large body in full. It now enforces a real
+  wall-clock deadline across the whole read and caps the body size. Also
+  broadened its exception handling to cover `http.client`'s own exceptions
+  (a truncating server, a non-HTTP squatter) — these used to escape as a raw
+  traceback out of an ordinary `dashboard --background`, contradicting the
+  function's own "returns None" contract.
+- **Fix: `--status` called your own pre-upgrade dashboard "another
+  project."** A dashboard predating `/api/meta` 404s that route, which is
+  indistinguishable by liveness alone from a genuine foreign server — every
+  existing user with a background board hit this in the upgrade window.
+  `--status` now falls back to the runfile's own tracked pid: if nothing
+  identifies itself but that pid is still alive, it reports the board as
+  yours (noting identity couldn't be confirmed) rather than making the false
+  claim that it belongs to someone else. This only changes what `--status`
+  *reports* — the reuse path's identity requirement is unchanged.
+- A handful of nits: an invalid `--port` (e.g. `70000`) was reported as
+  "already in use," which was simply false — it's now reported as not a
+  valid port; `dashboard --background`'s failure message is no longer
+  generic (the detached child's stderr is now captured to a small log file
+  and quoted on failure, instead of being discarded to `DEVNULL`); the
+  literal-port reuse path no longer risks persisting a runfile with a null
+  pid from a redundant identity round-trip.
 
 ## v1.22.13
 

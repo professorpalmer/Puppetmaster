@@ -3284,6 +3284,7 @@ def run_dashboard(args: JsonObject) -> JsonObject:
     """
     from puppetmaster.dashboard import (
         dashboard_serves,
+        normalize_dashboard_host,
         pid_alive,
         qr_ascii,
         read_dashboard_runfile,
@@ -3341,16 +3342,22 @@ def run_dashboard(args: JsonObject) -> JsonObject:
     already_running = False
     if (
         tracked
-        and tracked.get("host", host) == host
+        and normalize_dashboard_host(tracked.get("host", host)) == normalize_dashboard_host(host)
         and pid_alive(int(tracked.get("pid") or 0))
-        and dashboard_serves(
-            host, int(tracked.get("port") or port), state_dir, all_projects=all_projects
-        )
     ):
-        already_running = True
-        bound_port = int(tracked.get("port") or port)
-        pid = tracked.get("pid")
-    else:
+        tracked_port = int(tracked.get("port") or port)
+        # Port-gated (§F1): an explicit port is a promise this call may
+        # depend on -- reusing a tracked dashboard on a *different* port
+        # would silently hand back a URL for a port the caller never asked
+        # for, with no error. Only skip this gate when the caller didn't
+        # pin a port (auto_port) or the tracked port already matches.
+        if (auto_port or tracked_port == port) and dashboard_serves(
+            host, tracked_port, state_dir, all_projects=all_projects
+        ):
+            already_running = True
+            bound_port = tracked_port
+            pid = tracked.get("pid")
+    if not already_running:
         already_running = dashboard_serves(host, port, state_dir, all_projects=all_projects)
 
     if not already_running:
