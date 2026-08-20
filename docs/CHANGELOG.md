@@ -1,3 +1,64 @@
+## Unreleased
+
+Absorb of [@bsmi021](https://github.com/bsmi021) PR
+[#49](https://github.com/professorpalmer/Puppetmaster/pull/49), plus
+stack edits.
+
+**Fix: the test suite silently retargeted itself onto live provider APIs on any
+machine with an LLM API key.**
+
+`tests/hermetic_env.py` isolated the suite from the host's Puppetmaster config
+but not from the host's provider credentials. With, say, `GOOGLE_API_KEY` set,
+`available_providers()` was non-empty, so the auto-route path in the
+orchestrator reconciled the curated agentic catalog and persisted it through
+`save_registry(..., default_registry_path())` — which resolves to the very
+`PUPPETMASTER_MODELS_PATH` sentinel the harness had just created as
+*deliberately missing*. From that point the registry stayed populated with
+`agentic/gemini-*` for the rest of the process: every later "empty registry" or
+"routes to claude-code/cursor/local" assertion saw `agentic`, and worker tests
+quietly executed against the live API instead of the local stub. Measured on one
+developer machine: **13 failures and 820s with keys present, 0 failures and 464s
+without** — same commit, same box. CI was green throughout, because CI has no
+keys.
+
+- **Provider credentials are cleared for the suite**, derived from
+  `PROVIDER_REGISTRY` rather than hardcoded, so a provider added later is
+  covered without touching the harness. Includes the numbered rotation siblings
+  (`OPENAI_API_KEY_2` …) and the presence vars that opt keyless local endpoints
+  (Ollama / LM Studio) in. `PUPPETMASTER_DISABLED_PROVIDERS` is cleared too — a
+  provider the developer disconnected in Settings shouldn't change what tests
+  see either. Note `PUPPETMASTER_AUTODISCOVER=0` did *not* gate this path;
+  catalog reconciliation runs on the routing path, not via autodiscovery.
+- **A leaked registry now fails the test that caused it.** It is reaped so
+  later tests stay isolated, and the leak is reported as a failure of the
+  guilty test — reaping alone would *silence* the canary
+  (`test_models_path_points_at_missing_sentinel` can no longer fail once the
+  leak is always cleaned up before it looks). An `atexit` hook cannot do this:
+  CPython prints "Exception ignored in atexit callback" and still exits 0.
+  Clearing credentials fixes today's writer; this is the guard for the next code
+  path that writes the pinned registry. Reaping happens *after* the test rather
+  than before, so the stderr warning names the test that actually did it instead
+  of the damage surfacing hundreds of tests later as an unrelated routing
+  assertion. The `.discovery.json` sidecar is reaped with it.
+- **`ensure_cursor_sdk` passes `--no-save`, and five tests stop shelling out to
+  real npm.** `npm install --prefix X` also *writes the manifest* at X. The
+  default prefix is `puppetmaster/..` — site-packages for a pip/pipx install,
+  but the repo root for an editable install, an sdist, or a Docker `COPY` of
+  the source, where it rewrote the project's own tracked `package.json`
+  (bumping `@cursor/sdk` past its pinned range) so a later `git commit -a`
+  shipped a dependency change nobody asked for. Node resolves `node_modules`
+  without reading that manifest, so `--no-save` costs nothing. Separately,
+  `SetupHooksStepTests` patched `install_cursor_mcp` but not
+  `ensure_cursor_sdk`, so five tests ran a real network install; they now patch
+  it. Measured on a `git archive` export: before, 7.9s and `@cursor/sdk`
+  bumped; after, 2.7s, manifest untouched, no `node_modules`.
+- **`test_daemon_worker_mode_uses_warm_worker` no longer flakes under load.**
+  Its `thread.join(timeout=3)` is a real-time budget on reaping an
+  already-finished job's thread. This was *not* the baseline failure above
+  (that was the routing cascade, five lines further down the test); it is a
+  separate flake that only became visible once the cascade was fixed. A genuine
+  hang still fails the test; a busy machine no longer does.
+
 ## v1.22.14
 
 Absorb of [@bsmi021](https://github.com/bsmi021) PR

@@ -124,6 +124,17 @@ class SdkBootstrapResult:
     location: Optional[str] = None
 
 
+def _default_package_root() -> Path:
+    """Where ``npm install --prefix`` points when the caller didn't say.
+
+    ``puppetmaster/..`` — site-packages for a pip/pipx install, which is the
+    directory Node's resolution walks up to from ``cursor_sdk_runner.mjs``.
+    Split out so tests can point the default somewhere safe without patching
+    ``__file__``.
+    """
+    return Path(__file__).resolve().parent.parent
+
+
 def ensure_cursor_sdk(
     root: Optional[Path] = None,
     *,
@@ -158,13 +169,28 @@ def ensure_cursor_sdk(
             "`puppetmaster install-cursor-mcp` to bootstrap @cursor/sdk",
         )
 
-    install_root = package_root or Path(__file__).resolve().parent.parent
+    install_root = package_root or _default_package_root()
     try:
         completed = subprocess.run(
             # as_posix(): npm accepts forward slashes on every platform, and
             # native backslashes get mangled by Git-Bash-style shells on
             # Windows (same class of bug as the v0.9.34 hook-path fix).
-            [npm, "install", "@cursor/sdk", "--prefix", install_root.as_posix()],
+            # --no-save: we only need @cursor/sdk resolvable under
+            # <prefix>/node_modules. Without it npm also *writes the manifest*
+            # at the prefix — and when the prefix is a git checkout (an
+            # editable install, an sdist, a Docker COPY of the source) that is
+            # the repo's own tracked package.json, silently bumping @cursor/sdk
+            # past its pinned range so a later `git commit -a` ships a
+            # dependency change nobody asked for. Node resolution never reads
+            # that manifest, so skipping the write costs nothing.
+            [
+                npm,
+                "install",
+                "@cursor/sdk",
+                "--no-save",
+                "--prefix",
+                install_root.as_posix(),
+            ],
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
