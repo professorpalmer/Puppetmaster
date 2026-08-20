@@ -180,9 +180,11 @@ def ensure_cursor_sdk(
         return SdkBootstrapResult(
             "skipped",
             f"refusing to `npm install` into the git checkout at {install_root} "
-            "— it would rewrite the tracked package.json. Run this from an "
-            "installed copy, or pass package_root= to target a directory "
-            "deliberately.",
+            "— `--prefix` there rewrites the tracked package.json and a later "
+            "`git commit -a` would ship the dependency bump. This checkout "
+            f"already declares @cursor/sdk, so run `npm install` in "
+            f"{install_root} yourself (Node resolves it from there), or pass "
+            "package_root= to target a directory deliberately.",
         )
     try:
         completed = subprocess.run(
