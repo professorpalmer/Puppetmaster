@@ -20,6 +20,8 @@ socket:
 """
 from __future__ import annotations
 
+import errno
+import hashlib
 import json
 import os
 import re
@@ -2214,7 +2216,13 @@ setInterval(tick, 1500);
 INDEX_HTML = _PAGE_HEAD + RENDERER_JS + _PAGE_APP_JS
 
 
-def make_handler(store_factory: Callable[[], SwarmStore], *, all_projects: bool = False, backend: str = "sqlite"):
+def make_handler(
+    store_factory: Callable[[], SwarmStore],
+    *,
+    all_projects: bool = False,
+    backend: str = "sqlite",
+    state_dir: Optional[Union[Path, str]] = None,
+):
     from http.server import BaseHTTPRequestHandler
     from urllib.parse import parse_qs, urlparse
 
@@ -2268,6 +2276,26 @@ def make_handler(store_factory: Callable[[], SwarmStore], *, all_projects: bool 
                     except (FileNotFoundError, KeyError):
                         self._json(404, {"error": "job not found", "id": job_id})
                     return
+                if path == "/api/meta":
+                    # Identity on the wire (§3.2): lets a caller ask "is this
+                    # server mine?" without guessing from liveness alone. The
+                    # id is hashed — see _state_dir_id — so an unauthenticated,
+                    # possibly non-loopback endpoint never leaks the absolute
+                    # state dir path. The human-readable basename is loopback
+                    # gated; a remote (--mobile) peer only gets the hash.
+                    is_loopback = self.client_address[0] in ("127.0.0.1", "::1")
+                    project = None
+                    if is_loopback and state_dir is not None:
+                        project = Path(state_dir).name
+                    self._json(200, {
+                        "service": "puppetmaster-dashboard",
+                        "state_dir_id": _state_dir_id(state_dir),
+                        "project": project,
+                        "pid": os.getpid(),
+                        "all_projects": all_projects,
+                        "backend": backend,
+                    })
+                    return
                 self._json(404, {"error": "not found"})
             except Exception:
                 # Never leak internals (paths, backend details) to the client;
@@ -2278,6 +2306,23 @@ def make_handler(store_factory: Callable[[], SwarmStore], *, all_projects: bool 
 
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", ""})
+
+
+def _state_dir_id(state_dir: Optional[Union[Path, str]]) -> Optional[str]:
+    """A stable, non-reversible id for ``state_dir``.
+
+    Used on both sides of the identity check (the server's /api/meta response
+    and every prober) so "same project" is a plain string comparison. Hashed
+    rather than the raw path because the endpoint is unauthenticated and can
+    be reachable off-loopback under --mobile — the id must be safe to hand to
+    an unauthenticated peer while the path itself (username, directory
+    layout) is not. ``normcase`` is a no-op on POSIX and folds Windows drive-
+    letter/case variance before hashing.
+    """
+    if state_dir is None:
+        return None
+    resolved = os.path.normcase(str(Path(state_dir).resolve()))
+    return hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:12]
 
 
 def _tailscale_binary() -> Optional[str]:
@@ -2530,6 +2575,58 @@ def dashboard_alive(host: str = "127.0.0.1", port: int = 8787, *, timeout: float
         return False
 
 
+def dashboard_identity(
+    host: str = "127.0.0.1", port: int = 8787, *, timeout: float = 1.0
+) -> Optional[dict]:
+    """The ``/api/meta`` payload from the dashboard on ``host:port``, or None.
+
+    None covers every case that means "can't vouch for this server": no
+    response, non-200, a body that isn't JSON (a foreign, non-dashboard web
+    server could 200 anything on that port), or a JSON body missing the
+    ``service`` marker. A pre-upgrade puppetmaster dashboard 404s
+    ``/api/meta`` and also lands here — the conservative default is "not
+    mine, don't reuse it, bump past it" (§3.2 rollout note).
+    """
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(
+            f"http://{host}:{port}/api/meta", timeout=timeout
+        ) as response:
+            if response.status != 200:
+                return None
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("service") != "puppetmaster-dashboard":
+        return None
+    return payload
+
+
+def dashboard_serves(
+    host: str,
+    port: int,
+    state_dir: Union[Path, str],
+    *,
+    all_projects: bool = False,
+    timeout: float = 1.0,
+) -> bool:
+    """True only when ``host:port`` is a dashboard serving *this* state dir.
+
+    Encodes decision (f) in one place: a project-scoped caller (``all_projects=
+    False``) must not treat a running ``--all-projects`` board as "this
+    project's dashboard" — it should bump and start its own project-scoped
+    one — and vice versa. Both sides of the comparison route through
+    :func:`_state_dir_id` so this never compares raw paths.
+    """
+    identity = dashboard_identity(host, port, timeout=timeout)
+    if identity is None:
+        return False
+    if identity.get("state_dir_id") != _state_dir_id(state_dir):
+        return False
+    return bool(identity.get("all_projects")) == bool(all_projects)
+
+
 def stop_background_dashboard(state_dir: Union[Path, str]) -> dict:
     """Stop the detached background dashboard recorded for ``state_dir``.
 
@@ -2557,6 +2654,81 @@ def stop_background_dashboard(state_dir: Union[Path, str]) -> dict:
     return result
 
 
+def _port_taken(exc: OSError) -> bool:
+    """True when a bind failure means "pick another port" rather than "give up"."""
+    if exc.errno == errno.EADDRINUSE:  # 10048 on Windows, 98 on Linux
+        return True
+    # Windows-only: WSAEACCES surfaces as PermissionError(errno=EACCES,
+    # winerror=10013) both when another socket holds the port with
+    # incompatible SO_REUSEADDR options and when the port sits in a range
+    # Windows reserves for Hyper-V/WSL/winnat. Either way: bump. Deliberately
+    # NOT generalised to a bare EACCES, which on POSIX means "privileged port
+    # (<1024)" — bumping there would retry against a permissions wall instead
+    # of surfacing the real problem.
+    return getattr(exc, "winerror", None) == 10013
+
+
+def _dashboard_server_class():
+    from http.server import ThreadingHTTPServer
+
+    class _DashboardServer(ThreadingHTTPServer):
+        # SO_REUSEADDR has inverted semantics on Windows: when both the
+        # incumbent and the newcomer set it, bind() succeeds *over a live
+        # listener* and the first binder silently keeps every connection — a
+        # second project's dashboard prints its URL, opens a browser tab, and
+        # never receives a request (it serves the first project's jobs
+        # instead). Disabling it on Windows turns the collision into a real,
+        # detectable EADDRINUSE/EACCES (mirrors puppetmaster/ports.py's
+        # _port_is_free, which guards the same inversion). On POSIX we keep
+        # it: there it only permits rebinding a TIME_WAIT socket, which is
+        # what makes an immediate restart after Ctrl-C work.
+        allow_reuse_address = 0 if os.name == "nt" else 1
+
+    return _DashboardServer
+
+
+def bind_dashboard_server(
+    host: str, port: int, handler, *, auto_port: bool = True, max_attempts: int = 20
+):
+    """Bind the dashboard, bumping past ports already in use when ``auto_port``.
+
+    Returns the bound server; read the real port from
+    ``server.server_address[1]`` — never assume it equals ``port``.
+    ``port=0`` (OS-assigned ephemeral port, used by tests) always succeeds on
+    the first attempt.
+
+    ``ports.reserve_port()`` is not used here: it binds a probe socket, closes
+    it, and returns — a TOCTOU window (documented on that function) that
+    another process can win before this call binds for real. The only sound
+    fix is retrying the bind on the real server socket, which is what this
+    does.
+    """
+    server_class = _dashboard_server_class()
+    last: Optional[OSError] = None
+    attempts = max_attempts if auto_port else 1
+    for offset in range(attempts):
+        candidate = port + offset
+        if candidate > 65535:
+            break
+        try:
+            return server_class((host, candidate), handler)
+        except OSError as exc:
+            if not _port_taken(exc):
+                raise
+            last = exc
+    if not auto_port:
+        raise OSError(
+            f"port {port} on {host} is already in use — another dashboard (or "
+            f"another program) owns it. Omit --port to auto-pick the next free "
+            f"port, or pass --port-search to start searching from {port}."
+        ) from last
+    raise OSError(
+        f"no free port for the dashboard in {port}-{port + attempts - 1} on {host}. "
+        f"Stop an old dashboard (`puppetmaster dashboard --stop`) or pass an "
+        f"explicit --port."
+    ) from last
+
+
 def serve(
     state_dir: Union[Path, str],
     *,
@@ -2568,6 +2740,10 @@ def serve(
     serve_forever: bool = True,
     allow_external: bool = False,
     all_projects: bool = False,
+    auto_port: bool = True,
+    max_port_attempts: int = 20,
+    on_bound: Optional[Callable[[str, int], None]] = None,
+    runfile_state_dir: Optional[Union[Path, str]] = None,
 ):
     """Start the dashboard HTTP server. Returns the server.
 
@@ -2581,9 +2757,18 @@ def serve(
     refused unless ``allow_external`` (or
     ``PUPPETMASTER_DASHBOARD_ALLOW_EXTERNAL=1``) is set, making the exposure an
     explicit, deliberate choice.
-    """
-    from http.server import ThreadingHTTPServer
 
+    Two dashboards started for different projects used to both silently
+    "succeed" in binding the same port (Windows' inverted SO_REUSEADDR
+    semantics — see :func:`_dashboard_server_class`), with only the first
+    binder ever receiving a request. ``auto_port`` (the default, matching a
+    bare ``--port``-less invocation) makes that collision a real, detectable
+    bind failure and bumps to the next free port instead; pass
+    ``auto_port=False`` for the strict "this exact port or fail" behaviour an
+    explicit ``--port`` gets. Callers that need the *actual* bound port
+    (which may differ from the requested one) should use ``on_bound`` rather
+    than assuming it equals ``port``.
+    """
     from puppetmaster.store_factory import create_store
 
     allow_external = allow_external or os.environ.get(
@@ -2604,21 +2789,59 @@ def serve(
         # avoids cross-thread cursor reuse under the threading server.
         return create_store(backend, resolved)
 
-    httpd = ThreadingHTTPServer((host, port), make_handler(store_factory, all_projects=all_projects, backend=backend))
-    url = f"http://{host}:{port}/" + (f"?job={job_id}" if job_id else "")
-    print(f"Puppetmaster dashboard: {url}")
-    if all_projects:
-        print("Serving all projects (--all-projects mode)")
-    else:
-        print("Reading durable state from:", resolved)
-    print("Press Ctrl-C to stop.")
-    if open_browser:
-        try:
-            import webbrowser
+    handler = make_handler(
+        store_factory, all_projects=all_projects, backend=backend, state_dir=resolved
+    )
+    httpd = bind_dashboard_server(
+        host, port, handler, auto_port=auto_port, max_attempts=max_port_attempts
+    )
+    # Everything from here down runs *after* the bind (runfile write,
+    # on_bound callback) and can fail for reasons unrelated to the socket —
+    # a failure here must not leak the now-listening socket behind it.
+    try:
+        bound_port = httpd.server_address[1]
+        if port != 0 and bound_port != port:
+            print(
+                f"Port {port} is busy (another project's dashboard?) — serving "
+                f"this project on {bound_port} instead."
+            )
+        # The single place the URL is derived — everything downstream (the
+        # browser tab, the runfile, on_bound, the mobile banner) must consume
+        # this variable, never the originally-requested `port`.
+        url = f"http://{host}:{bound_port}/" + (f"?job={job_id}" if job_id else "")
+        print(f"Puppetmaster dashboard: {url}")
+        if all_projects:
+            print("Serving all projects (--all-projects mode)")
+        else:
+            print("Reading durable state from:", resolved)
+        print("Press Ctrl-C to stop.")
+        if open_browser:
+            try:
+                import webbrowser
 
-            webbrowser.open(url)
-        except Exception:
-            pass
+                webbrowser.open(url)
+            except Exception:
+                pass
+        if runfile_state_dir is not None:
+            # The *serving* process writes its own runfile, post-bind, so the
+            # recorded port is never a guess (previously the parent guessed
+            # its own requested --port, which was wrong the moment the child
+            # bumped — see docs/CHANGELOG.md).
+            write_dashboard_runfile(
+                runfile_state_dir,
+                {
+                    "pid": os.getpid(),
+                    "host": host,
+                    "port": bound_port,
+                    "url": url,
+                    "all_projects": all_projects,
+                },
+            )
+        if on_bound is not None:
+            on_bound(host, bound_port)
+    except BaseException:
+        httpd.server_close()
+        raise
     if not serve_forever:
         # Caller owns the socket: return it bound and OPEN (tests drive a
         # request, then shutdown()/server_close() themselves).

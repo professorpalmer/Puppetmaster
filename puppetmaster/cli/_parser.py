@@ -899,7 +899,25 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         help="Job to open. Omit to land on the job list.",
     )
-    dashboard_cmd.add_argument("--port", type=int, default=8787, help="Port (default 8787).")
+    dashboard_cmd.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help=(
+            "Port. Default: auto-picks the next free port starting at 8787 "
+            "(so a second project's dashboard never silently shadows the "
+            "first). An explicit --port is strict: it fails if busy unless "
+            "--port-search is also given."
+        ),
+    )
+    dashboard_cmd.add_argument(
+        "--port-search",
+        action="store_true",
+        help=(
+            "With an explicit --port, search upward from it instead of "
+            "failing when it is busy."
+        ),
+    )
     dashboard_cmd.add_argument("--host", default="127.0.0.1", help="Bind host (default 127.0.0.1).")
     dashboard_cmd.add_argument(
         "--no-open",
@@ -957,6 +975,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--status",
         action="store_true",
         help="Report whether a background dashboard is running for this state dir.",
+    )
+    dashboard_cmd.add_argument(
+        "--write-runfile",
+        action="store_true",
+        help=argparse.SUPPRESS,  # internal contract: set by the --background
+        # parent on the child it spawns, so the *serving* process is the one
+        # that records its own (possibly bumped) port. Not for direct use.
     )
 
     await_cmd = subcommands.add_parser(

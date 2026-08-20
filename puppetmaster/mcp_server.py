@@ -8,7 +8,6 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -3256,17 +3255,6 @@ def run_cli(command: list[str], args: JsonObject) -> JsonObject:
     }
 
 
-def _dashboard_alive(host: str = "127.0.0.1", port: int = 8787) -> bool:
-    """True when a dashboard already answers on ``host:port``."""
-    try:
-        with urllib.request.urlopen(
-            f"http://{host}:{port}/api/jobs", timeout=1.0
-        ) as response:
-            return response.status == 200
-    except OSError:
-        return False
-
-
 def _spawn_dashboard_server(command: list[str], args: JsonObject) -> subprocess.Popen:
     """Launch the dashboard CLI detached from this MCP process."""
     return subprocess.Popen(
@@ -3283,22 +3271,30 @@ def _spawn_dashboard_server(command: list[str], args: JsonObject) -> subprocess.
 def run_dashboard(args: JsonObject) -> JsonObject:
     """Ensure a dashboard server is running and return its URL (and QR for phones).
 
-    Idempotent: an already-listening dashboard on the host:port is reused rather
-    than spawning a duplicate. Defaults to loopback; ``mobile=true`` binds a
-    phone-reachable Tailscale/LAN address (still unauthenticated + read-only) and
-    returns a scannable QR so the pilot can hand off a link with zero setup.
-    ``stop=true`` shuts down the detached background server."""
+    Idempotent: an already-listening dashboard for *this project's* state dir
+    is reused rather than spawning a duplicate — checked by identity
+    (``/api/meta``), not bare liveness, so a different project's dashboard
+    (or a mismatched --all-projects scope) answering on the same host:port is
+    never mistaken for "ours". A busy port bumps to the next free one unless
+    an explicit ``port`` was given, in which case the child fails the same
+    way the CLI's strict ``--port`` does. Defaults to loopback; ``mobile=true``
+    binds a phone-reachable Tailscale/LAN address (still unauthenticated +
+    read-only) and returns a scannable QR so the pilot can hand off a link
+    with zero setup. ``stop=true`` shuts down the detached background server.
+    """
     from puppetmaster.dashboard import (
+        dashboard_serves,
         qr_ascii,
         read_dashboard_runfile,
         resolve_mobile_host,
         stop_background_dashboard,
-        write_dashboard_runfile,
         write_qr_png,
     )
 
     state_dir = str(mcp_state_dir(args))
-    port = int(args.get("port") or 8787)
+    explicit_port = args.get("port") is not None
+    port = int(args["port"]) if explicit_port else 8787
+    auto_port = not explicit_port
     job_id = args.get("job_id")
     job = job_id.strip() if isinstance(job_id, str) and job_id.strip() else None
     all_projects = bool(args.get("all_projects"))
@@ -3329,10 +3325,9 @@ def run_dashboard(args: JsonObject) -> JsonObject:
             }
         host = ip
 
-    url = f"http://{host}:{port}/" + (f"?job={job}" if job else "")
-
-    already_running = _dashboard_alive(host, port)
+    already_running = dashboard_serves(host, port, state_dir, all_projects=all_projects)
     pid: Optional[int] = None
+    bound_port = port
     if not already_running:
         command = [
             sys.executable,
@@ -3344,7 +3339,10 @@ def run_dashboard(args: JsonObject) -> JsonObject:
             "--port",
             str(port),
             "--no-open",
+            "--write-runfile",
         ]
+        if auto_port:
+            command.append("--port-search")
         if host != "127.0.0.1":
             command += ["--host", host, "--allow-external"]
         if all_projects:
@@ -3352,13 +3350,27 @@ def run_dashboard(args: JsonObject) -> JsonObject:
         if job:
             command.append(job)
         process = _spawn_dashboard_server(command, args)
-        pid = process.pid
+        # Poll the child's own runfile (written post-bind, --write-runfile)
+        # rather than re-probing host:port — the child may have bumped past
+        # `port`, so a probe pinned to the requested port can miss it, or
+        # worse, see a *different* project's dashboard there and declare
+        # success (the identity-blind bug this whole change fixes).
         deadline = time.time() + 10
-        while time.time() < deadline and not _dashboard_alive(host, port):
+        child_info = None
+        while time.time() < deadline:
+            candidate = read_dashboard_runfile(state_dir)
+            if candidate and candidate.get("pid") == process.pid:
+                child_info = candidate
+                break
             if process.poll() is not None:
                 break
             time.sleep(0.2)
-        if not _dashboard_alive(host, port):
+        if child_info is None or not dashboard_serves(
+            child_info.get("host", host),
+            int(child_info.get("port") or port),
+            state_dir,
+            all_projects=all_projects,
+        ):
             body = {
                 "error": "dashboard failed to start",
                 "host": host,
@@ -3371,27 +3383,29 @@ def run_dashboard(args: JsonObject) -> JsonObject:
                 "content": [{"type": "text", "text": json.dumps(body, indent=2)}],
                 "isError": True,
             }
-        write_dashboard_runfile(
-            state_dir,
-            {
-                "pid": pid,
-                "host": host,
-                "port": port,
-                "url": url,
-                "source": source,
-                "all_projects": all_projects,
-            },
-        )
+        pid = process.pid
+        host = child_info.get("host", host)
+        bound_port = int(child_info.get("port") or port)
     elif mobile:
-        # Keep the runfile pid current when reusing a server we can identify.
+        # Keep the runfile pid current when reusing a server we can
+        # identify — compared via dashboard_serves (state_dir_id), not the
+        # bare host+port equality this used to do, which a foreign
+        # dashboard sharing the same host:port would satisfy by accident.
         tracked = read_dashboard_runfile(state_dir)
-        if tracked and tracked.get("host") == host and int(tracked.get("port") or 0) == port:
+        if tracked and dashboard_serves(
+            tracked.get("host", host),
+            int(tracked.get("port") or port),
+            state_dir,
+            all_projects=all_projects,
+        ):
             pid = tracked.get("pid")
+
+    url = f"http://{host}:{bound_port}/" + (f"?job={job}" if job else "")
 
     body: JsonObject = {
         "url": url,
         "host": host,
-        "port": port,
+        "port": bound_port,
         "source": source,
         "state_dir": state_dir,
         "all_projects": all_projects,
@@ -3426,10 +3440,17 @@ def run_dashboard(args: JsonObject) -> JsonObject:
         )
     else:
         body["note"] = (
-            "Reused the dashboard already listening on this port — it may be "
-            "serving a different project's state dir or all-projects mode."
+            "Reused this project's own dashboard, already running."
             if already_running
-            else "Open the URL in a browser tab for the user."
+            else (
+                "Started a new dashboard for this project."
+                + (
+                    f" Port {port} was busy (another project's dashboard?), so "
+                    f"it's serving on {bound_port} instead."
+                    if bound_port != port
+                    else ""
+                )
+            )
         )
     return {"content": [{"type": "text", "text": json.dumps(body, indent=2)}]}
 
@@ -3792,8 +3813,12 @@ def dashboard_schema() -> JsonObject:
     )
     schema["properties"]["port"] = {
         "type": "integer",
-        "default": 8787,
-        "description": "Dashboard port (default 8787).",
+        "description": (
+            "Dashboard port. Omit to auto-pick the next free port starting "
+            "at 8787 (a busy port — e.g. another project's dashboard — is "
+            "never silently shared). An explicit port is strict: starting "
+            "the dashboard fails if it's busy."
+        ),
     }
     schema["properties"]["all_projects"] = {
         "type": "boolean",
