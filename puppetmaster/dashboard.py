@@ -23,7 +23,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import threading
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
@@ -2570,10 +2569,12 @@ def serve(
     allow_external: bool = False,
     all_projects: bool = False,
 ):
-    """Start the dashboard HTTP server. Returns the server (already bound).
+    """Start the dashboard HTTP server. Returns the server.
 
-    ``serve_forever=False`` binds and returns without blocking — used by tests
-    to drive a single request, then ``server.shutdown()``.
+    ``serve_forever=False`` binds and returns without blocking, with the socket
+    still **open** — used by tests to drive a single request, then
+    ``server.shutdown()`` / ``server.server_close()`` themselves. Otherwise this
+    blocks until Ctrl-C and returns an already-closed server.
 
     The dashboard serves durable job state with no authentication, so binding
     to a non-loopback interface would expose it to the local network. That is
@@ -2619,11 +2620,20 @@ def serve(
         except Exception:
             pass
     if not serve_forever:
+        # Caller owns the socket: return it bound and OPEN (tests drive a
+        # request, then shutdown()/server_close() themselves).
         return httpd
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
+    # serve_forever() must run on the MAIN thread. Parking the main thread in an
+    # untimed Thread.join() instead makes Ctrl-C undeliverable on Windows: an
+    # untimed lock acquire is uninterruptible there, so the eval breaker set by
+    # the console CTRL_C_EVENT is never checked and KeyboardInterrupt is never
+    # raised. The 0.5s poll keeps the main thread returning to the eval loop.
     try:
-        thread.join()
+        httpd.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
-        httpd.shutdown()
+        print("\nDashboard stopped.")
+    finally:
+        # Release the listening socket rather than leaving it to process exit,
+        # so an in-process caller (and the tests) can rebind immediately.
+        httpd.server_close()
     return httpd
