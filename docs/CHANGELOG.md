@@ -25,23 +25,35 @@ keys.
   provider the developer disconnected in Settings shouldn't change what tests
   see either. Note `PUPPETMASTER_AUTODISCOVER=0` did *not* gate this path;
   catalog reconciliation runs on the routing path, not via autodiscovery.
-- **A leaked registry is now reaped after every test, naming the culprit.**
+- **A leaked registry now fails the test that caused it.** It is reaped so
+  later tests stay isolated, and the leak is reported as a failure of the
+  guilty test — reaping alone would *silence* the canary
+  (`test_models_path_points_at_missing_sentinel` can no longer fail once the
+  leak is always cleaned up before it looks). An `atexit` hook cannot do this:
+  CPython prints "Exception ignored in atexit callback" and still exits 0.
   Clearing credentials fixes today's writer; this is the guard for the next code
   path that writes the pinned registry. Reaping happens *after* the test rather
   than before, so the stderr warning names the test that actually did it instead
   of the damage surfacing hundreds of tests later as an unrelated routing
   assertion. The `.discovery.json` sidecar is reaped with it.
-- **`ensure_cursor_sdk` refuses to `npm install` into a git checkout.** Its
+- **`ensure_cursor_sdk` passes `--no-save`, and five tests stop shelling out to
+  real npm.** `npm install --prefix X` also *writes the manifest* at X. The
   default prefix is `puppetmaster/..` — site-packages for a pip/pipx install,
-  but the *repo root* in a checkout, where `npm install --prefix` rewrote the
-  tracked `package.json` (bumping `@cursor/sdk` past its pinned range) so a
-  later `git commit -a` shipped a dependency change nobody asked for. An
-  explicit `package_root=` still installs anywhere, deliberately. This is a
-  user-visible behaviour change for anyone running from a checkout.
-- **`test_daemon_worker_mode_uses_warm_worker` no longer flakes under load** —
-  its `thread.join(timeout=3)` was a real-time budget on reaping an
-  already-finished job's thread. A genuine hang still fails the test; a busy
-  machine no longer does.
+  but the repo root for an editable install, an sdist, or a Docker `COPY` of
+  the source, where it rewrote the project's own tracked `package.json`
+  (bumping `@cursor/sdk` past its pinned range) so a later `git commit -a`
+  shipped a dependency change nobody asked for. Node resolves `node_modules`
+  without reading that manifest, so `--no-save` costs nothing. Separately,
+  `SetupHooksStepTests` patched `install_cursor_mcp` but not
+  `ensure_cursor_sdk`, so five tests ran a real network install; they now patch
+  it. Measured on a `git archive` export: before, 7.9s and `@cursor/sdk`
+  bumped; after, 2.7s, manifest untouched, no `node_modules`.
+- **`test_daemon_worker_mode_uses_warm_worker` no longer flakes under load.**
+  Its `thread.join(timeout=3)` is a real-time budget on reaping an
+  already-finished job's thread. This was *not* the baseline failure above
+  (that was the routing cascade, five lines further down the test); it is a
+  separate flake that only became visible once the cascade was fixed. A genuine
+  hang still fails the test; a busy machine no longer does.
 
 ## v1.22.14
 
