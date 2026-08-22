@@ -42,6 +42,13 @@ class CliStateRoutingTests(unittest.TestCase):
         self.create_store = create_store
         return detached
 
+    def _assert_launcher_relative_state(
+        self, actual: Path, launcher: Path, name: str
+    ) -> None:
+        """Compare path identity across symlink and Windows short-name aliases."""
+        self.assertEqual(actual.name, name)
+        self.assertTrue(actual.parent.samefile(launcher))
+
     def test_detached_swarm_uses_target_workspace_for_store_and_launcher_config(self) -> None:
         """A nested target repo must not persist under the launcher folder."""
         with TemporaryDirectory() as tmp:
@@ -112,9 +119,12 @@ class CliStateRoutingTests(unittest.TestCase):
             with self._launcher_cwd(outer):
                 detached = self._start_detached_swarm(target, "--state-dir", "relative-state")
 
-            expected = outer.resolve() / "relative-state"
-            self.assertEqual(self.create_store.call_args.args[1], expected)
-            self.assertEqual(detached.call_args.kwargs["state_dir"], expected)
+            self._assert_launcher_relative_state(
+                self.create_store.call_args.args[1], outer, "relative-state"
+            )
+            self._assert_launcher_relative_state(
+                detached.call_args.kwargs["state_dir"], outer, "relative-state"
+            )
 
     def test_relative_environment_state_dir_stays_relative_to_launcher_shell(self) -> None:
         """The environment override keeps its precedence and path interpretation."""
@@ -127,9 +137,12 @@ class CliStateRoutingTests(unittest.TestCase):
             ):
                 detached = self._start_detached_swarm(target)
 
-            expected = outer.resolve() / "environment-state"
-            self.assertEqual(self.create_store.call_args.args[1], expected)
-            self.assertEqual(detached.call_args.kwargs["state_dir"], expected)
+            self._assert_launcher_relative_state(
+                self.create_store.call_args.args[1], outer, "environment-state"
+            )
+            self._assert_launcher_relative_state(
+                detached.call_args.kwargs["state_dir"], outer, "environment-state"
+            )
 
     def test_absolute_environment_state_dir_still_overrides_worker_cwd(self) -> None:
         """An absolute environment override retains its existing precedence."""
