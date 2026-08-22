@@ -22,6 +22,20 @@ Google Antigravity (`agy`) is a first-class worker adapter. Canonical lock/adapt
 - **Billing honesty**: PATH-only `agy` is unhealthy `unknown`. Healthy plan requires session files inside `~/.gemini/antigravity-cli` (empty dir is not a login). Healthy api requires `GEMINI_API_KEY`/`GOOGLE_API_KEY` *and* `agy` on PATH — a stray Gemini key used by agentic/hermes is not Antigravity proof. `agy` is canonicalized to `antigravity` at the lock gate so the alias cannot bypass `platform disable antigravity`.
 - **Live E2E (agy 1.1.18 + Gemini API key):** analyze on `gemini-3.7-flash` returned a FINDING; implement wrote a tracked file and emitted a PATCH on `gemini-3.5-flash`. Gemini 3.6/3.7 implement on a free-tier key hit provider 503 (high demand) — the adapter failed closed, not a silent no-op.
 
+**Fix: MCP jobs that completed successfully could still look hung or crashed to
+Codex and Claude clients.**
+
+- `puppetmaster_live_artifacts_follow` now returns terminal job state
+  immediately instead of waiting for an artifact that can never arrive and
+  reporting a false timeout.
+- Final JSON-RPC responses and keepalive notifications now share one serialized,
+  guarded stdio writer; a disconnected client no longer leaks an unobserved
+  `BrokenPipeError` / `OSError` from a worker-thread future.
+- On Windows, the default Codex adapter launch resolves the npm batch shim to
+  `node.exe` plus `@openai/codex/bin/codex.js`, keeping Puppetmaster in direct
+  ownership of the child process and its pipes. Explicit `CODEX_COMMAND` and
+  task executable overrides retain their existing command semantics.
+
 ## v1.22.15
 
 Absorb of [@bsmi021](https://github.com/bsmi021) PR

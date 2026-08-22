@@ -41,6 +41,43 @@ from .cursor import (
 )
 
 DEFAULT_CODEX_MODEL = "gpt-5.4-mini"
+_CODEX_NPM_ENTRYPOINT = Path("node_modules") / "@openai" / "codex" / "bin" / "codex.js"
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def _configured_codex_executable(task: Task) -> object:
+    return task.payload.get("executable") or os.environ.get("CODEX_COMMAND") or "codex"
+
+
+def _default_codex_command_base(resolved: str) -> Optional[list[str]]:
+    """Resolve the default Codex command without a Windows batch intermediary.
+
+    Global npm installs expose ``codex.CMD`` on Windows. Launching that shim
+    inserts ``cmd.exe`` between Puppetmaster and the long-lived Node process,
+    weakening signal, pipe, and timeout ownership. Resolve the package's real
+    JavaScript entrypoint and invoke it with Node directly instead.
+    """
+    resolved_path = Path(resolved)
+    if not _is_windows() or resolved_path.suffix.lower() not in {".cmd", ".bat"}:
+        return [resolved]
+
+    entrypoint = resolved_path.parent / _CODEX_NPM_ENTRYPOINT
+    node = facade("resolve_command")("node")
+    if node is None or not entrypoint.is_file():
+        return None
+    return [node, str(entrypoint)]
+
+
+def _codex_command_base(task: Task, resolved: str) -> Optional[list[str]]:
+    """Build the launch prefix while preserving explicit user commands."""
+    executable = _configured_codex_executable(task)
+    command = command_parts(executable)
+    if task.payload.get("executable") or os.environ.get("CODEX_COMMAND"):
+        return [resolved, *command[1:]]
+    return _default_codex_command_base(resolved)
 
 
 class CodexAdapter(CliWorkerAdapter):
@@ -71,7 +108,7 @@ class CodexAdapter(CliWorkerAdapter):
         return self._run_cli_lifecycle(task, goal, worker_id)
 
     def _resolve_cli_executable(self, task: Task) -> tuple[str, Optional[str]]:
-        executable = task.payload.get("executable") or os.environ.get("CODEX_COMMAND") or "codex"
+        executable = _configured_codex_executable(task)
         command_base = command_parts(executable)
         resolved = facade("resolve_command")(command_base[0])
         if resolved is None:
@@ -122,8 +159,10 @@ class CodexAdapter(CliWorkerAdapter):
             cwd=cwd,
             disabled=bool(task.payload.get("disable_codegraph", False)),
         )
-        executable = task.payload.get("executable") or os.environ.get("CODEX_COMMAND") or "codex"
-        command_base = command_parts(executable)
+        executable = _configured_codex_executable(task)
+        command_base = _codex_command_base(task, resolved)
+        if command_base is None:
+            return self._missing_cli(task, worker_id, str(executable))
         model = str(task.payload.get("model") or DEFAULT_CODEX_MODEL)
         sandbox = str(task.payload.get("sandbox") or "workspace-write")
         approval_policy = str(task.payload.get("approval_policy") or "never")
@@ -131,7 +170,7 @@ class CodexAdapter(CliWorkerAdapter):
         ephemeral = bool(task.payload.get("ephemeral", True))
         skip_git_repo_check = bool(task.payload.get("skip_git_repo_check", True))
         command = build_codex_exec_command(
-            executable=[resolved, *command_base[1:]],
+            executable=command_base,
             model=model,
             cwd=cwd,
             sandbox=sandbox,
