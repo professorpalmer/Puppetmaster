@@ -112,7 +112,7 @@ class CliStateRoutingTests(unittest.TestCase):
             with self._launcher_cwd(outer):
                 detached = self._start_detached_swarm(target, "--state-dir", "relative-state")
 
-            expected = outer / "relative-state"
+            expected = outer.resolve() / "relative-state"
             self.assertEqual(self.create_store.call_args.args[1], expected)
             self.assertEqual(detached.call_args.kwargs["state_dir"], expected)
 
@@ -127,7 +127,7 @@ class CliStateRoutingTests(unittest.TestCase):
             ):
                 detached = self._start_detached_swarm(target)
 
-            expected = outer / "environment-state"
+            expected = outer.resolve() / "environment-state"
             self.assertEqual(self.create_store.call_args.args[1], expected)
             self.assertEqual(detached.call_args.kwargs["state_dir"], expected)
 
