@@ -339,16 +339,67 @@ class Orchestrator:
         worker_mode: str = "subprocess",
         on_job_created: Optional[Callable[[Job], None]] = None,
         label: Optional[str] = None,
+        launch_key: Optional[str] = None,
     ) -> RunResult:
-        job = self.store.create_job(goal, label=label)
-        _tag_job_effort(self.store, job.id)
-        _snapshot_evaluator_epoch(self.store, job)
+        if launch_key is None:
+            launch_key = os.environ.get("PUPPETMASTER_LAUNCH_KEY")
+        launch_specs = specs or specs_for_roles(roles)
+        output_limit = os.environ.get("PUPPETMASTER_MAX_OUTPUT_BYTES")
+        if output_limit:
+            try:
+                parsed_output_limit = int(output_limit)
+            except ValueError:
+                parsed_output_limit = 0
+            if parsed_output_limit > 0:
+                launch_specs = [
+                    replace(
+                        spec,
+                        payload={
+                            **spec.payload,
+                            "max_output_bytes": parsed_output_limit,
+                        },
+                    )
+                    for spec in launch_specs
+                ]
+        fingerprint = self.store.launch_fingerprint(
+            goal,
+            label,
+            request={
+                "specs": launch_specs,
+                "lease_seconds": lease_seconds,
+                "worker_mode": worker_mode,
+            },
+        )
+        job, created = self.store.create_or_get_job(
+            goal,
+            label=label,
+            launch_key=launch_key,
+            launch_fingerprint=fingerprint,
+        )
         if on_job_created is not None:
             on_job_created(job)
+        if not created:
+            artifacts = self.store.list_artifacts(job.id)
+            summary_path = self.store.job_dir(job.id) / "summaries" / "stitched.md"
+            summary = (
+                summary_path.read_text(encoding="utf-8")
+                if summary_path.is_file()
+                else Stitcher(self.store).preview(job.id)
+            )
+            return RunResult(
+                job=job,
+                artifacts=artifacts,
+                summary=summary,
+                summary_path=summary_path,
+                mode=swarm_mode(launch_specs),
+                acting=swarm_is_acting(launch_specs),
+            )
+        _tag_job_effort(self.store, job.id)
+        _snapshot_evaluator_epoch(self.store, job)
         record_orchestrator_heartbeat(self.store, job.id, started=True)
         self._begin_trace()
         try:
-            specs = self._with_retrieved_memory(specs or specs_for_roles(roles), goal, job_id=job.id)
+            specs = self._with_retrieved_memory(launch_specs, goal, job_id=job.id)
             specs = self._with_injected_skills(job, specs)
             specs = self._with_output_style(specs)
             self._announce_mode(job, specs)
@@ -357,6 +408,8 @@ class Orchestrator:
             self.store.update_job_status(job.id, JobStatus.RUNNING)
             tasks = self._create_tasks(job, specs)
             self._run_workers(job, tasks, lease_seconds=lease_seconds, worker_mode=worker_mode)
+            if swarm_mode(specs) == "analysis":
+                self._enforce_analysis_no_worker_diff(job, tasks)
             rerouted = self._auto_fallback(job, lease_seconds=lease_seconds, worker_mode=worker_mode)
             rerouted += self._auto_escalate(job, lease_seconds=lease_seconds, worker_mode=worker_mode)
             rerouted += self._auto_review_escalate(
@@ -1548,6 +1601,11 @@ class Orchestrator:
         failure mode because it looks like success. Partial failure stays
         COMPLETE (the stitched summary carries the surviving findings)."""
         tasks = self.store.list_tasks(job.id)
+        if any(
+            (artifact.payload or {}).get("failure") == "analysis_worker_diff"
+            for artifact in self.store.list_artifacts(job.id)
+        ):
+            return JobStatus.FAILED
         if tasks and all(t.status == TaskStatus.FAILED for t in tasks):
             self.store.emit(
                 job.id,
@@ -1556,6 +1614,47 @@ class Orchestrator:
             )
             return JobStatus.FAILED
         return JobStatus.COMPLETE
+
+    def _enforce_analysis_no_worker_diff(self, job: Job, tasks: list[Task]) -> None:
+        """Make read-only intent an orchestration postcondition.
+
+        Adapter flags are defense in depth.  A worker-side snapshot is the
+        authoritative attribution boundary: pre-existing dirty files are not a
+        violation, but a diff attributed to an analysis worker is blocked.
+        """
+        violating = []
+        for task in tasks:
+            for artifact in self.store.list_artifacts(job.id):
+                if artifact.task_id != task.id:
+                    continue
+                if (artifact.payload or {}).get("worker_diff_present"):
+                    violating.append(task)
+                    break
+        if not violating:
+            return
+        representative = violating[0]
+        self.store.emit(
+            job.id,
+            "analysis.worker_diff_blocked",
+            {"task_ids": [task.id for task in violating]},
+        )
+        self.store.save_artifact(
+            Artifact(
+                job_id=job.id,
+                task_id=representative.id,
+                type=ArtifactType.VERIFICATION,
+                created_by="orchestrator",
+                confidence=1.0,
+                evidence=["orchestrator:analysis-no-worker-diff", "worker_diff_present"],
+                payload={
+                    "adapter": "orchestrator",
+                    "check": "analysis.no_worker_diff",
+                    "result": "blocked",
+                    "failure": "analysis_worker_diff",
+                    "task_ids": [task.id for task in violating],
+                },
+            )
+        )
 
     def _enforce_platform_lock(self, job: Job, specs: list[WorkerSpec]) -> None:
         """Kernel-level platform lock: refuse to create tasks on disabled adapters.

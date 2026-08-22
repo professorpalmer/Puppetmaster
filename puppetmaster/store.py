@@ -63,6 +63,10 @@ class ActiveTaskLeaseError(RuntimeError):
         )
 
 
+class LaunchConflictError(ValueError):
+    """A launch key was reused for a different normalized request."""
+
+
 class ResetSubgraphResult(list):
     """Task list from ``reset_subgraph`` plus superseded artifact ids.
 
@@ -237,25 +241,109 @@ class SwarmStore:
         ]:
             mkdir_private(directory)
 
-    def create_job(self, goal: str, *, label: Optional[str] = None) -> Job:
+    @staticmethod
+    def launch_fingerprint(
+        goal: str,
+        label: Optional[str] = None,
+        request: Optional[dict[str, Any]] = None,
+    ) -> str:
+        value = json.dumps(
+            {
+                "goal": " ".join(str(goal).split()),
+                "label": label or "",
+                "request": to_jsonable(request or {}),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    def create_job(
+        self,
+        goal: str,
+        *,
+        label: Optional[str] = None,
+        launch_key: Optional[str] = None,
+        launch_fingerprint: Optional[str] = None,
+    ) -> Job:
+        return self.create_or_get_job(
+            goal,
+            label=label,
+            launch_key=launch_key,
+            launch_fingerprint=launch_fingerprint,
+        )[0]
+
+    def create_or_get_job(
+        self,
+        goal: str,
+        *,
+        label: Optional[str] = None,
+        launch_key: Optional[str] = None,
+        launch_fingerprint: Optional[str] = None,
+    ) -> tuple[Job, bool]:
         self.init()
-        job = Job(goal=goal, label=label)
-        job_dir = self.job_dir(job.id)
-        for directory in [
-            job_dir,
-            job_dir / "tasks",
-            job_dir / "runs",
-            job_dir / "artifacts",
-            job_dir / "edges",
-            job_dir / "summaries",
-        ]:
-            mkdir_private(directory)
-        self.write_json(job_dir / "job.json", job)
-        payload: dict[str, Any] = {"goal": goal}
-        if label is not None:
-            payload["label"] = label
-        self.emit(job.id, "job.created", payload)
-        return job
+        fingerprint = launch_fingerprint or self.launch_fingerprint(goal, label)
+        if launch_key:
+            lock_name = f"launch:{launch_key}"
+            owner = f"{os.getpid()}:{threading.get_ident()}"
+            acquired = self.acquire_lock(lock_name, owner, ttl_seconds=300)
+            if not acquired:
+                # A concurrent creator may be between lock acquisition and its
+                # first durable write. Give that creator a bounded hand-off
+                # window so identical retries converge on one job.
+                for _ in range(100):
+                    if any(item.launch_key == launch_key for item in self.list_jobs()):
+                        break
+                    time.sleep(0.02)
+                    acquired = self.acquire_lock(lock_name, owner, ttl_seconds=300)
+                    if acquired:
+                        break
+            # Search after acquiring too: a completed prior launch leaves no
+            # lock, so idempotent retries must inspect durable jobs on both
+            # sides of the lock race.
+            for existing in self.list_jobs():
+                if existing.launch_key != launch_key:
+                    continue
+                if acquired:
+                    self.release_lock(lock_name, owner)
+                if existing.launch_fingerprint != fingerprint:
+                    raise LaunchConflictError(
+                        "launch_key already belongs to a different request"
+                    )
+                return existing, False
+            if not acquired:
+                raise RuntimeError("launch_key is currently being created")
+        else:
+            owner = None
+        job = Job(
+            goal=goal,
+            label=label,
+            launch_key=launch_key,
+            launch_fingerprint=fingerprint if launch_key else None,
+        )
+        try:
+            job_dir = self.job_dir(job.id)
+            for directory in [
+                job_dir,
+                job_dir / "tasks",
+                job_dir / "runs",
+                job_dir / "artifacts",
+                job_dir / "edges",
+                job_dir / "summaries",
+            ]:
+                mkdir_private(directory)
+            self.write_json(job_dir / "job.json", job)
+            payload: dict[str, Any] = {"goal": goal}
+            if label is not None:
+                payload["label"] = label
+            if launch_key:
+                payload["launch_key"] = launch_key
+            self.emit(job.id, "job.created", payload)
+            return job, True
+        finally:
+            if owner is not None:
+                self.release_lock(f"launch:{launch_key}", owner)
 
     def update_job_status(self, job_id: str, status: JobStatus) -> Job:
         job = self.get_job(job_id)
@@ -281,6 +369,8 @@ class SwarmStore:
                 JobStatus.CANCELLED,
             }
             else job.completed_at,
+            launch_key=job.launch_key,
+            launch_fingerprint=job.launch_fingerprint,
         )
 
     @staticmethod
@@ -1806,6 +1896,7 @@ class SwarmStore:
         for task in tasks:
             status_counts[str(task.status)] = status_counts.get(str(task.status), 0) + 1
         artifacts = self.list_artifacts(job_id)
+        job = self.get_job(job_id)
         job_payload = to_jsonable(self.get_job(job_id))
         task_payloads = [to_jsonable(task) for task in tasks]
         if compact:
@@ -1825,7 +1916,59 @@ class SwarmStore:
             "outcome": self._outcome_signals(artifacts),
             # Wave 4: DeLM-inspired frontier observability (compact, numbers-only).
             "frontier": self._frontier_signals(tasks, artifacts),
+            "delivery": self._delivery_signals(job, tasks, artifacts),
+            "progress": self._progress_signals(job_id, artifacts),
         }
+
+    def _delivery_signals(self, job: Job, tasks: list[Task], artifacts: list[Any]) -> dict[str, Any]:
+        from puppetmaster.delivery import delivery_verdict
+        from puppetmaster.quality import assess_run_quality
+
+        quality = assess_run_quality(artifacts)
+        stale = [task.id for task in tasks if self.is_task_stale(task)]
+        return delivery_verdict(
+            job.status,
+            quality=quality.get("quality"),
+            stale_tasks=stale,
+            incomplete_tasks=any(task.status != TaskStatus.COMPLETE for task in tasks),
+            required_artifacts=bool(artifacts),
+        )
+
+    def _progress_signals(self, job_id: str, artifacts: list[Any]) -> dict[str, Any]:
+        substantive = [
+            artifact.created_at
+            for artifact in artifacts
+            if str(getattr(artifact, "type", "")) in {"finding", "decision", "risk", "patch", "gist"}
+        ]
+        latest_substantive = max(substantive) if substantive else None
+        latest_liveness = self.latest_liveness_at(job_id)
+        from datetime import datetime, timezone
+
+        def age(value: Optional[str]) -> Optional[float]:
+            if not value:
+                return None
+            try:
+                parsed = datetime.fromisoformat(value)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds())
+            except (TypeError, ValueError):
+                return None
+
+        return {
+            "last_substantive_artifact_at": latest_substantive,
+            "last_liveness_at": latest_liveness,
+            "last_substantive_artifact_age_seconds": age(latest_substantive),
+            "last_liveness_age_seconds": age(latest_liveness),
+        }
+
+    def latest_liveness_at(self, job_id: str) -> Optional[str]:
+        values = [
+            event.get("at")
+            for event in self.read_events(job_id)
+            if event.get("event") in {"run.heartbeat", "task.lease_renewed"}
+        ]
+        return max((str(value) for value in values if value), default=None)
 
     @staticmethod
     def _frontier_signals(
@@ -2034,8 +2177,13 @@ class SwarmStore:
             if held_by and held_by != owner:
                 return
         try:
-            path.unlink()
+            _retry_on_windows_lock(path.unlink)
         except FileNotFoundError:
+            pass
+        except PermissionError:
+            # A competing same-key retry may have reclaimed the lock between
+            # the owner read and unlink.  The durable job is already written;
+            # leave the lock for that owner rather than raising into success.
             pass
 
     @staticmethod

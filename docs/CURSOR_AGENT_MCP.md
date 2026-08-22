@@ -72,7 +72,11 @@ Final stitching is the publishable report. The live artifact board is the shared
 
 ### Push-style live feed (no polling loop in the Agent)
 
-`puppetmaster_live_artifacts_follow` blocks server-side until new artifacts arrive (or `timeout_seconds` elapses, default 10s) and returns a `next_cursor`. Chain calls with that cursor to get a push-feeling stream of new artifacts without the Agent running its own polling loop:
+Every asynchronous start returns `job_ref` plus a ready-to-call `monitor_with`
+object. Use that exact continuation; it preserves the owning state identity and
+backend even if the host's working directory changes.
+
+`puppetmaster_live_artifacts_follow` blocks server-side until new artifacts arrive (or `timeout_seconds` elapses, default 10s) and returns a `next_cursor`. Chain calls with that cursor to get a push-feeling stream of new artifacts without the Agent running its own polling loop. Optional `refs`, type filters, and `max_bytes` keep monitoring compact while the durable cursor still advances over omitted events:
 
 ```text
 1. Call puppetmaster_live_artifacts_follow with since_cursor=0.
@@ -81,6 +85,13 @@ Final stitching is the publishable report. The live artifact board is the shared
    Server blocks up to timeout_seconds and returns the next batch (or {timed_out: true}).
 3. Repeat with the latest next_cursor.
 ```
+
+Terminal lifecycle is not sufficient proof of useful work. Await/status/follow
+responses include `delivery`; only `delivery.verdict == "delivered"` is a
+successful handoff. A bounded MCP timeout remains retryable while
+`terminal=false`. If the MCP stdio link drops, continue the same job through
+`python -m puppetmaster status|await|show <job_id>` before considering a new
+launch.
 
 Internally this is a cursor-based read over the durable SQLite event log (or the file-backed `.jsonl` stream when `backend=file`). The store wakes up within ~50ms of the next artifact write, so latency feels real-time without taking on Redis or any extra daemon.
 

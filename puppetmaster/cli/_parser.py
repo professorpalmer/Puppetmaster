@@ -93,6 +93,18 @@ def _positive_seconds(value: str) -> int:
     return seconds
 
 
+def _positive_int(value: str) -> int:
+    import argparse as _argparse
+
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise _argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    if parsed <= 0:
+        raise _argparse.ArgumentTypeError(f"must be positive, got {parsed}")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="puppetmaster",
@@ -115,6 +127,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--emit-job-id-early",
         action="store_true",
         help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--launch-key",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--max-output-bytes",
+        type=_positive_int,
+        help="Hard limit for captured worker stdout+stderr where the adapter supports streaming.",
     )
 
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -494,7 +515,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     run = subcommands.add_parser("run", help="Run a local swarm against a goal.")
-    run.add_argument("goal", help="The swarm goal.")
+    run.add_argument("goal", nargs="?", help="The swarm goal (interactive compatibility form).")
+    run.add_argument(
+        "--goal-file",
+        help="Internal launch transport for large goals; mutually exclusive with the positional form.",
+    )
+    run.add_argument(
+        "--launch-key",
+        help="Optional caller-generated idempotency key for this asynchronous launch.",
+    )
     run.add_argument(
         "--effort",
         help="Tag this job with an effort id so it can be rolled up across "
@@ -1711,8 +1740,9 @@ def build_parser() -> argparse.ArgumentParser:
     swarm.add_argument(
         "--roles",
         nargs="+",
-        help="Worker roles (default: explore audit review).",
+        help="Legacy worker role names; use a generated config for structured assignments.",
     )
+    swarm.add_argument("--launch-key", help="Optional idempotency key for detached launch recovery.")
     swarm.add_argument("--model", help="Optional model pin (disables auto-route unless --auto-route).")
     swarm.add_argument(
         "--timeout-seconds",

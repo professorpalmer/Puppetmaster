@@ -66,6 +66,7 @@ from puppetmaster.store_factory import create_store
 from puppetmaster.stitcher import Stitcher
 from puppetmaster.worker_runtime import WorkerDaemon
 from puppetmaster.workers import WorkerSpec
+from puppetmaster.validation import compact_artifact_ref
 
 
 def print_run_result(job_id: str, artifact_count: int, summary_path: Path) -> None:
@@ -327,6 +328,10 @@ def artifact_feed_since(
     job_id: str,
     since: int = 0,
     limit: Optional[int] = None,
+    refs: bool = False,
+    include_types: Optional[list[str]] = None,
+    exclude_types: Optional[list[str]] = None,
+    max_bytes: Optional[int] = None,
 ) -> tuple[list[dict], int]:
     """Return (items, next_cursor) of new ``artifact.saved`` events.
 
@@ -363,17 +368,53 @@ def artifact_feed_since(
         artifact = fetched.get(artifact_id)
         if artifact is None or artifact_id in seen:
             continue
+        artifact_type = str(artifact.type)
+        includes = {str(item) for item in (include_types or []) if str(item)}
+        excludes = {str(item) for item in (exclude_types or []) if str(item)}
+        if includes and artifact_type not in includes:
+            continue
+        if artifact_type in excludes:
+            continue
         seen.add(artifact_id)
+        body = compact_artifact_ref(artifact) if refs else artifact.__dict__
         items.append(
             {
                 "at": event["at"],
                 "event": event["event"],
                 "id": event.get("id"),
-                "artifact": artifact.__dict__,
+                "artifact": body,
             }
         )
     if limit is not None:
         items = items[-limit:]
+    if max_bytes is not None and max_bytes > 0:
+        bounded: list[dict] = []
+        total = 2
+        for item in items:
+            candidate = item
+            size = len(json.dumps(candidate, default=str, separators=(",", ":")).encode("utf-8"))
+            separator = 1 if bounded else 0
+            if total + separator + size > max_bytes:
+                artifact = candidate.get("artifact") or {}
+                candidate = {
+                    "at": candidate.get("at"),
+                    "event": candidate.get("event"),
+                    "id": candidate.get("id"),
+                    "artifact": {
+                        "id": artifact.get("id"),
+                        "type": str(artifact.get("type") or ""),
+                        "task_id": artifact.get("task_id"),
+                        "payload_omitted": True,
+                    },
+                }
+                size = len(
+                    json.dumps(candidate, default=str, separators=(",", ":")).encode("utf-8")
+                )
+            if total + separator + size > max_bytes:
+                break
+            bounded.append(candidate)
+            total += separator + size
+        items = bounded
     return items, cursor
 
 def print_feed_item(item: dict) -> None:

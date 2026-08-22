@@ -125,6 +125,7 @@ class StreamedProcess:
     # bad cwd, ...). Callers treat a non-None value as a hard adapter failure
     # rather than an empty-but-successful run.
     spawn_error: Optional[str] = None
+    output_limit_hit: bool = False
 
 
 def _kill_process_tree(process: "subprocess.Popen", started_new_session: bool) -> None:
@@ -175,6 +176,7 @@ def run_streamed_subprocess(
     heartbeat_seconds: float = 30.0,
     start_new_session: bool = False,
     stdin_data: Optional[str] = None,
+    max_output_bytes: Optional[int] = None,
 ) -> StreamedProcess:
     """Run ``command`` while teeing its output to a live sidecar log.
 
@@ -304,10 +306,20 @@ def run_streamed_subprocess(
 
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
+    output_limit_hit = threading.Event()
+    output_bytes = {"value": 0}
+    output_lock = threading.Lock()
 
     def _reader(stream, buffer: list[str], tag: str) -> None:
         try:
             for line in iter(stream.readline, ""):
+                with output_lock:
+                    output_bytes["value"] += len(line.encode("utf-8", errors="replace"))
+                    over_limit = bool(max_output_bytes and output_bytes["value"] > max_output_bytes)
+                if over_limit:
+                    output_limit_hit.set()
+                    _kill_process_tree(process, start_new_session)
+                    break
                 buffer.append(line)
                 _write_live(line if line.endswith("\n") else line + "\n")
         finally:
@@ -370,6 +382,8 @@ def run_streamed_subprocess(
         except subprocess.TimeoutExpired:
             pass
     finally:
+        if output_limit_hit.is_set():
+            timed_out = True
         stop_heartbeat.set()
         for thread in threads:
             thread.join(timeout=2)
@@ -387,9 +401,13 @@ def run_streamed_subprocess(
     return StreamedProcess(
         returncode=process.returncode,
         stdout="".join(stdout_lines),
-        stderr="".join(stderr_lines),
+        stderr=(
+            "".join(stderr_lines)
+            + ("\n[puppetmaster] blocked: max_output_bytes exceeded" if output_limit_hit.is_set() else "")
+        ),
         timed_out=timed_out,
         live_log_path=str(live_path) if live_path is not None else None,
         elapsed_seconds=_time.monotonic() - started,
+        output_limit_hit=output_limit_hit.is_set(),
     )
 

@@ -75,12 +75,57 @@ SAME_ADAPTER_MODEL_REROUTE = frozenset(
 
 
 @dataclass(frozen=True)
+class RoleSpec:
+    """Structured analysis assignment with explicit scope boundaries."""
+
+    name: str
+    instruction: str
+    source_scope: Optional[list[str]] = None
+    negative_scope: Optional[list[str]] = None
+
+
+@dataclass(frozen=True)
 class WorkerSpec:
     role: str
     instruction: str
     adapter: str = "local"
     payload: dict = field(default_factory=dict)
     depends_on_roles: list[str] = field(default_factory=list)
+
+
+def normalize_role_specs(roles: Optional[list[object]], goal: str) -> tuple[list[RoleSpec], bool]:
+    """Normalize legacy role names and structured assignments once.
+
+    Returns ``(specs, duplicated_legacy_roles)``.  A missing role list is one
+    analysis assignment; callers that explicitly pass several bare names get a
+    visible warning because those names do not decompose a shared goal.
+    """
+    if not roles:
+        return [RoleSpec("analysis", goal)], False
+    structured: list[RoleSpec] = []
+    legacy_count = 0
+    for raw in roles:
+        if isinstance(raw, dict):
+            name = str(raw.get("name") or raw.get("role") or "").strip()
+            instruction = str(raw.get("instruction") or raw.get("goal") or "").strip()
+            if not name or not instruction:
+                raise ValueError("structured roles require name and instruction")
+            source = raw.get("source_scope") or raw.get("sources")
+            negative = raw.get("negative_scope") or raw.get("exclude")
+            structured.append(
+                RoleSpec(
+                    name,
+                    instruction,
+                    [str(item) for item in source] if isinstance(source, list) else None,
+                    [str(item) for item in negative] if isinstance(negative, list) else None,
+                )
+            )
+            continue
+        name = str(raw).strip()
+        if name:
+            legacy_count += 1
+            structured.append(RoleSpec(name, goal))
+    return structured, legacy_count > 1 and len(structured) > 1
 
 
 # Shared by DEFAULT_WORKERS and write_generated_swarm_config so analysis
@@ -641,8 +686,10 @@ def build_edit_spec(
 
 
 def specs_for_roles(roles: Optional[list[str]] = None) -> list[WorkerSpec]:
+    if roles is None:
+        return list(DEFAULT_WORKERS)
     if not roles:
-        return DEFAULT_WORKERS
+        return []
     known = {spec.role: spec for spec in DEFAULT_WORKERS}
     return [
         known.get(role, WorkerSpec(role=role, instruction=f"Run the {role} worker."))

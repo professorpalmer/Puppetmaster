@@ -57,6 +57,26 @@ TERMINAL_JOB_STATUSES = frozenset(
 )
 
 
+class DeliveryVerdict(StringEnum):
+    """Operator-facing delivery result, distinct from raw lifecycle status."""
+
+    PENDING = "pending"
+    DELIVERED = "delivered"
+    DEGRADED = "degraded"
+    BLOCKED = "blocked"
+
+
+@dataclass(frozen=True)
+class JobRef:
+    """Opaque continuation identity returned by asynchronous launchers."""
+
+    job_id: str
+    state_id: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {"job_id": self.job_id, "state_id": self.state_id}
+
+
 def is_terminal_job_status(status: JobStatus) -> bool:
     """Return whether ``status`` represents a job that will do no more work."""
     return status in TERMINAL_JOB_STATUSES
@@ -97,6 +117,10 @@ class Job:
     status: JobStatus = JobStatus.QUEUED
     created_at: str = field(default_factory=now_iso)
     completed_at: Optional[str] = None
+    # Optional caller-supplied idempotency key.  Older persisted jobs simply
+    # omit both fields and remain fully readable.
+    launch_key: Optional[str] = None
+    launch_fingerprint: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -327,6 +351,8 @@ def job_from_dict(data: dict[str, Any]) -> Job:
         status=_job_status_or_stalled(data["status"]),
         created_at=data["created_at"],
         completed_at=data.get("completed_at"),
+        launch_key=data.get("launch_key"),
+        launch_fingerprint=data.get("launch_fingerprint"),
     )
 
 

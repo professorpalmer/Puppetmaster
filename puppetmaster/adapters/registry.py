@@ -4,7 +4,7 @@ from typing import Optional
 
 from puppetmaster.platform_lock import canonicalize_adapter
 
-from ._base import AdapterInfo, WorkerAdapter
+from ._base import AdapterInfo, CliWorkerAdapter, WorkerAdapter
 from .agentic import AgenticAdapter
 from .antigravity import AntigravityAdapter
 from .claude_code import ClaudeCodeAdapter
@@ -128,14 +128,27 @@ def get_adapter(name: str) -> WorkerAdapter:
     raise ValueError(f"unsupported adapter: {name}")
 
 
-def adapter_runtime_capabilities(name: str) -> dict[str, Optional[str]]:
+def adapter_runtime_capabilities(name: str) -> dict[str, object]:
     """Expose conservative runtime/catalog capabilities for diagnostics.
 
     Isolation is opt-in and descriptive: the registry must never infer that
     one adapter's state workaround is safe for another harness.
     """
     adapter = get_adapter(name)
+    canonical = canonicalize_adapter(name)
+    streamed_cli = isinstance(adapter, CliWorkerAdapter)
+    native_turns = canonical in {"agentic", "hermes"}
     return {
         "state_isolation": getattr(adapter, "state_isolation", "none"),
         "catalog_source": getattr(adapter, "catalog_source", None),
+        # Every streamed CLI has a Puppetmaster wall-clock and captured-output
+        # boundary.  Native turn caps are only truthful for adapters that
+        # expose the knob; post-exit usage is reporting, not enforcement.
+        "enforced_runtime_limits": [
+            "wall_clock",
+            *(["output_bytes"] if streamed_cli else []),
+        ],
+        "native_turn_limit": native_turns,
+        "hard_token_limit": False,
+        "measured_usage_during_call": canonical in {"agentic"},
     }
