@@ -230,7 +230,8 @@ Telemetry and Billing:
 
 Requirements:
 - `agy` CLI installed and on PATH, or `AGY_COMMAND` / `ANTIGRAVITY_COMMAND` / `payload.executable` set.
-- Authenticated Antigravity settings directory, or `GEMINI_API_KEY` / `GOOGLE_API_KEY`.
+- **Account login:** sign in through `agy` so session files exist under `~/.gemini/antigravity-cli` (an empty directory is not a login).
+- **API key (agy 1.1.18):** set `"modelProvider": "gemini"` in `~/.gemini/antigravity-cli/settings.json` **and** export `GEMINI_API_KEY`. A key alone has no effect. Live `agy` reads `GEMINI_API_KEY` from the environment, not `.env` files. `GOOGLE_API_KEY` is a Puppetmaster billing signal only when `agy` is on PATH; the CLI does not consume it.
 
 ```json
 {

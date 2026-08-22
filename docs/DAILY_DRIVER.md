@@ -36,6 +36,15 @@ Use `--dry-run` for normal daily planning and review tasks. The Cursor adapter r
 
 Use `puppetmaster claude` when you intentionally want Claude Code to make real edits. It defaults to Claude Code `acceptEdits` permission mode and records tracked diffs as Puppetmaster patch artifacts.
 
+Use `puppetmaster antigravity` (alias `agy`) when Google Antigravity is installed. Enable it first; API-key runs need `GEMINI_API_KEY` plus `"modelProvider": "gemini"` in `~/.gemini/antigravity-cli/settings.json`. A key alone has no effect.
+
+```bash
+python -m puppetmaster platform enable antigravity
+python -m puppetmaster models discover --source antigravity --write
+python -m puppetmaster antigravity "Review the auth module" --mode analyze
+python -m puppetmaster antigravity "Add SMOKE.txt with ok" --mode implement
+```
+
 ## Keys-only recipe (no external CLI)
 
 When you have provider API keys but no Cursor/Claude/Codex/Hermes CLI installed, enable the `agentic` platform and drive work directly:

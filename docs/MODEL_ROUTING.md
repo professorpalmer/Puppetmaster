@@ -387,17 +387,20 @@ report and ignore the diff — that's a supported mode, not a degraded one.
 
 ## Scope and honesty
 
-Four production adapters plus the keys-only `agentic` standalone worker ship today: `cursor` (Cursor SDK via
-`@cursor/sdk`), `claude-code` (Anthropic via the `claude` CLI),
-`openai` (direct Chat Completions via `OPENAI_API_KEY`, added in
-v0.6.1-beta.1), `codex` (official OpenAI Codex CLI via
-`codex exec --json`, added in v0.7.0), and `agentic` (direct provider
-HTTP APIs with your own key — no external CLI). Together they cover the
-starter registry and curated catalogs. **`agentic` is the portable
-keys-only path** when you have API keys but no vendor CLI installed;
-vendor CLIs remain the ceiling for mature tool surfaces. Additional
-providers slot in as new registry entries — the router/classifier
-framework doesn't need to change.
+Six production CLI adapters plus the keys-only `agentic` standalone worker
+ship today: `cursor` (Cursor SDK via `@cursor/sdk`), `claude-code`
+(Anthropic via the `claude` CLI), `openai` (direct Chat Completions via
+`OPENAI_API_KEY`, added in v0.6.1-beta.1), `codex` (official OpenAI Codex
+CLI via `codex exec --json`, added in v0.7.0), `hermes` (NousResearch
+Hermes CLI), `antigravity` (Google Antigravity `agy`, added in v1.22.16),
+and `agentic` (direct provider HTTP APIs with your own key — no external
+CLI). Discover curated Gemini rows with
+`models discover --source antigravity` after `agy` is installed (`models
+init` does not seed them). Together they cover the starter registry and
+curated catalogs. **`agentic` is the portable keys-only path** when you
+have API keys but no vendor CLI installed; vendor CLIs remain the ceiling
+for mature tool surfaces. Additional providers slot in as new registry
+entries — the router/classifier framework doesn't need to change.
 
 Capability scores and prices stay **user-asserted**. Puppetmaster
 makes the **decision** transparent (full audit trail of why each

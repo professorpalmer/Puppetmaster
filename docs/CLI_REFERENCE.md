@@ -57,6 +57,7 @@ python -m puppetmaster claude "Goal" --permission-mode acceptEdits
 python -m puppetmaster codex "Goal"
 python -m puppetmaster hermes "Goal" --mode analyze
 python -m puppetmaster antigravity "Goal" --mode analyze
+python -m puppetmaster antigravity "Goal" --mode implement
 python -m puppetmaster agentic "Goal" --mode analyze --provider openai
 python -m puppetmaster openai "Goal"
 python -m puppetmaster crash-demo
