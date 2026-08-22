@@ -31,15 +31,15 @@ Each entry pairs:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-import hashlib
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from puppetmaster.fs_permissions import write_private_text
-
+from puppetmaster.interprocess_lock import InterProcessFileLock
 
 REGISTRY_ENV = "PUPPETMASTER_MODELS_PATH"
 
@@ -55,6 +55,8 @@ DISCOVERY_SOURCE_TO_ADAPTER: dict[str, str] = {
     "codex": "codex",
     "hermes": "hermes",
     "agentic": "agentic",
+    "antigravity": "antigravity",
+    "agy": "antigravity",
 }
 
 
@@ -202,7 +204,12 @@ def save_registry(
     payload: dict[str, Any] = {
         "models": [_spec_to_jsonable(spec) for spec in specs],
     }
-    write_private_text(resolved, json.dumps(payload, indent=2, sort_keys=False) + "\n")
+    # A registry is user-global. Serialize writers even when callers provide
+    # an explicit path, and publish the complete JSON document atomically.
+    with InterProcessFileLock.for_target(resolved):
+        write_private_text(
+            resolved, json.dumps(payload, indent=2, sort_keys=False) + "\n", lock=False
+        )
     return resolved
 
 
@@ -925,7 +932,9 @@ DISCOVERY_ORIGINS = frozenset({DISCOVERY_ORIGIN_LIVE, DISCOVERY_ORIGIN_CURATED})
 
 # Sources whose "discovery" re-applies CURATED_CATALOGS. A pre-field sidecar
 # for these was never a live fetch; cursor/openai/anthropic stay live.
-_CURATED_DISCOVERY_SOURCES = frozenset({"claude", "codex", "hermes", "agentic"})
+_CURATED_DISCOVERY_SOURCES = frozenset(
+    {"claude", "codex", "hermes", "agentic", "antigravity"}
+)
 
 
 def discovery_origin(meta: dict[str, Any], source: str) -> str:

@@ -35,8 +35,10 @@ from puppetmaster.mcp_registry import (
     deregister as registry_deregister,
     installed_puppetmaster_version,
     kill_stale as registry_kill_stale,
+    kill_selected as registry_kill_selected,
     list_entries as registry_list_entries,
     prune_dead as registry_prune_dead,
+    record_activity as registry_record_activity,
     register as registry_register,
     summarize as registry_summarize,
 )
@@ -204,6 +206,7 @@ _DEFAULT_MAX_BLOCK_SECONDS = 45.0
 _INPUT_STATE_LOCK = threading.Lock()
 _LAST_INBOUND_MESSAGE_AT = time.time()
 _ACTIVE_TOOL_CALLS = 0
+_REGISTRY_ACTIVITY_PATH: Optional[Path] = None
 _SHUTDOWN_REQUESTED = threading.Event()
 
 # Client identity from the MCP `initialize` handshake (params.clientInfo).
@@ -613,20 +616,41 @@ def _mark_inbound_message() -> None:
     orphan whose Cursor parent has stopped talking to it.
     """
     global _LAST_INBOUND_MESSAGE_AT
+    now = time.time()
     with _INPUT_STATE_LOCK:
-        _LAST_INBOUND_MESSAGE_AT = time.time()
+        _LAST_INBOUND_MESSAGE_AT = now
+        registration_path = _REGISTRY_ACTIVITY_PATH
+    if registration_path is not None:
+        try:
+            registry_record_activity(registration_path, inbound_at=now)
+        except OSError:
+            pass
 
 
 def _tool_call_started() -> None:
     global _ACTIVE_TOOL_CALLS
     with _INPUT_STATE_LOCK:
         _ACTIVE_TOOL_CALLS += 1
+        active_tool_calls = _ACTIVE_TOOL_CALLS
+        registration_path = _REGISTRY_ACTIVITY_PATH
+    if registration_path is not None:
+        try:
+            registry_record_activity(registration_path, active_tool_calls=active_tool_calls)
+        except OSError:
+            pass
 
 
 def _tool_call_finished() -> None:
     global _ACTIVE_TOOL_CALLS
     with _INPUT_STATE_LOCK:
         _ACTIVE_TOOL_CALLS = max(0, _ACTIVE_TOOL_CALLS - 1)
+        active_tool_calls = _ACTIVE_TOOL_CALLS
+        registration_path = _REGISTRY_ACTIVITY_PATH
+    if registration_path is not None:
+        try:
+            registry_record_activity(registration_path, active_tool_calls=active_tool_calls)
+        except OSError:
+            pass
 
 
 def _input_state_snapshot() -> tuple[float, int]:
@@ -931,10 +955,11 @@ def main() -> int:
 
     # Reset the staleness counter at startup so a slow Cursor handshake
     # doesn't immediately look orphaned to the watcher.
-    global _LAST_INBOUND_MESSAGE_AT, _ACTIVE_TOOL_CALLS
+    global _LAST_INBOUND_MESSAGE_AT, _ACTIVE_TOOL_CALLS, _REGISTRY_ACTIVITY_PATH
     with _INPUT_STATE_LOCK:
         _LAST_INBOUND_MESSAGE_AT = time.time()
         _ACTIVE_TOOL_CALLS = 0
+        _REGISTRY_ACTIVITY_PATH = registration_path
     _SHUTDOWN_REQUESTED.clear()
 
     input_watcher: Optional[_InputStalenessWatcher] = None
@@ -979,9 +1004,21 @@ def main() -> int:
                 except json.JSONDecodeError:
                     continue
                 _mark_inbound_message()
+                is_tool_call = message.get("method") == "tools/call"
+                if is_tool_call:
+                    # Persist this before the work reaches the executor. A
+                    # selected cleanup in another process must not be able to
+                    # kill a request merely because it is queued briefly.
+                    _tool_call_started()
                 try:
-                    executor.submit(_process_message_safely, message)
+                    executor.submit(
+                        _process_message_safely,
+                        message,
+                        tool_call_counted=is_tool_call,
+                    )
                 except RuntimeError as exc:
+                    if is_tool_call:
+                        _tool_call_finished()
                     exit_reason = f"executor_submit_failed: {exc}"
                     raise
         except KeyboardInterrupt:
@@ -1013,6 +1050,8 @@ def main() -> int:
                 registry_deregister(registration_path)
             except OSError:
                 pass
+        with _INPUT_STATE_LOCK:
+            _REGISTRY_ACTIVITY_PATH = None
     return 0
 
 
@@ -1036,7 +1075,7 @@ def _server_version() -> Optional[str]:
         return None
 
 
-def _process_message_safely(message: JsonObject) -> None:
+def _process_message_safely(message: JsonObject, *, tool_call_counted: bool = False) -> None:
     """Run handle_message on a worker thread and write any response.
 
     Wraps every ``tools/call`` in a :class:`_ToolCallKeepalive` so a long
@@ -1054,7 +1093,7 @@ def _process_message_safely(message: JsonObject) -> None:
             progress_token=_extract_progress_token(params),
         )
         keepalive.start()
-    if is_tool_call:
+    if is_tool_call and not tool_call_counted:
         _tool_call_started()
     try:
         response = handle_message(message)
@@ -1417,7 +1456,7 @@ def _build_tools() -> list[McpTool]:
             description=(
                 "PREFER over the built-in Task tool or an inline multi-file edit loop for "
                 "any cross-cutting change. Start a full-edit implement worker on whichever "
-                "platform you're locked to (cursor, claude-code, codex, hermes, or agentic), "
+                "platform you're locked to (cursor, claude-code, codex, hermes, antigravity, or agentic), "
                 "so implement isn't Claude-Code-only. Runs in a clean worktree and captures "
                 "a PATCH artifact. Returns job_id immediately. Pass adapter to force one; "
                 "otherwise the enabled platform is used."
@@ -1707,8 +1746,9 @@ def _build_tools() -> list[McpTool]:
             description=(
                 "Prune dead tracking files for MCP servers that exited without cleanup, "
                 "and (with kill_stale=true) SIGTERM/SIGKILL stale-but-alive Puppetmaster "
-                "MCP servers whose parent client appears to be gone. Never signals the "
-                "current process. Returns the before/after registry snapshot."
+                "MCP servers whose parent client appears to be gone. Explicit pids, workspace, "
+                "and idle_after_seconds selectors can terminate only matching inactive siblings. "
+                "Never signals the current process. Returns the before/after registry snapshot."
             ),
             input_schema=mcp_cleanup_schema(),
             handler=run_mcp_cleanup,
@@ -1952,6 +1992,31 @@ def run_mcp_cleanup(args: JsonObject) -> JsonObject:
             }
         )
     killed: list = []
+    selected_killed: list = []
+    refused: list = []
+    pids = args.get("pids")
+    workspace = args.get("workspace")
+    idle_after = args.get("idle_after_seconds")
+    has_selector = bool(pids) or workspace is not None or idle_after is not None
+    if has_selector:
+        try:
+            selected = registry_kill_selected(
+                pids=pids,
+                workspace=workspace,
+                idle_after_seconds=float(idle_after) if idle_after is not None else None,
+                self_pid=os.getpid(),
+            )
+        except Exception as exc:
+            return _mcp_diagnostic_response(
+                {
+                    "ok": False,
+                    "error": f"selected cleanup failed: {exc}",
+                    "before": before,
+                    "pruned": [entry.to_payload() for entry in pruned],
+                }
+            )
+        selected_killed = [entry.to_payload() for entry in selected.killed]
+        refused = selected.refused
     if bool(args.get("kill_stale", False)):
         stale_after = float(args.get("stale_after_seconds") or 300)
         try:
@@ -1977,6 +2042,8 @@ def run_mcp_cleanup(args: JsonObject) -> JsonObject:
             "after": after,
             "pruned": [entry.to_payload() for entry in pruned],
             "killed": killed,
+            "selected_killed": selected_killed,
+            "refused": refused,
             "self_pid": os.getpid(),
         }
     )
@@ -2209,6 +2276,8 @@ def _implement_command(args: JsonObject, adapter: str) -> list[str]:
         return codex_command(args)
     if adapter == "hermes":
         return hermes_command(args, implement=True)
+    if adapter == "antigravity":
+        return antigravity_command(args, implement=True)
     if adapter == "agentic":
         return agentic_command(args, implement=True)
     raise ValueError(f"adapter {adapter!r} has no implement command")
@@ -2263,6 +2332,28 @@ def hermes_command(args: JsonObject, implement: bool = True) -> list[str]:
         command.append("--allow-non-worktree")
     if args.get("use_hermes_rules"):
         command.append("--use-hermes-rules")
+    if args.get("disable_codegraph"):
+        command.append("--disable-codegraph")
+    _append_routing_cli_flags(command, args)
+    return command
+
+
+def antigravity_command(args: JsonObject, implement: bool = True) -> list[str]:
+    prompt = require_string(args, "goal")
+    command = ["antigravity", prompt, "--cwd", cwd(args)]
+    command.extend(["--mode", "implement" if implement else "analyze"])
+    if args.get("model"):
+        command.extend(["--model", str(args["model"])])
+    if args.get("effort"):
+        command.extend(["--effort", str(args["effort"])])
+    if args.get("timeout_seconds"):
+        command.extend(["--timeout-seconds", str(args["timeout_seconds"])])
+    if args.get("executable"):
+        command.extend(["--executable", str(args["executable"])])
+    if args.get("allow_dirty"):
+        command.append("--allow-dirty")
+    if args.get("allow_non_worktree"):
+        command.append("--allow-non-worktree")
     if args.get("disable_codegraph"):
         command.append("--disable-codegraph")
     _append_routing_cli_flags(command, args)
@@ -4390,6 +4481,20 @@ def mcp_cleanup_schema() -> JsonObject:
                     "process is never signalled."
                 ),
             },
+            "pids": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": "Explicit MCP server PIDs to terminate. Intersects other selectors.",
+            },
+            "workspace": {
+                "type": "string",
+                "description": "Explicit workspace selector; normalized before matching.",
+            },
+            "idle_after_seconds": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Terminate only servers with no inbound MCP message for this many seconds.",
+            },
             "stale_after_seconds": {
                 "type": "integer",
                 "default": 300,
@@ -4576,11 +4681,11 @@ def implement_schema() -> JsonObject:
         {
             "adapter": {
                 "type": "string",
-                "enum": ["cursor", "claude-code", "codex", "hermes", "agentic"],
+                "enum": ["cursor", "claude-code", "codex", "hermes", "antigravity", "agentic"],
                 "description": (
                     "Force a specific implement-capable platform. Omit to use whichever "
                     "platform the lock has enabled (cursor preferred, then claude-code, "
-                    "then codex, then hermes, then agentic)."
+                    "then codex, then hermes, then antigravity, then agentic)."
                 ),
             },
             "sandbox": {
@@ -4612,7 +4717,7 @@ def edit_schema() -> JsonObject:
             },
             "adapter": {
                 "type": "string",
-                "enum": ["cursor", "claude-code", "codex", "hermes", "agentic"],
+                "enum": ["cursor", "claude-code", "codex", "hermes", "antigravity", "agentic"],
                 "description": (
                     "Force a full-edit adapter. Omit to use the highest-priority "
                     "adapter the platform lock enables."
@@ -4743,7 +4848,7 @@ def prewalk_schema() -> JsonObject:
             },
             "adapter": {
                 "type": "string",
-                "enum": ["cursor", "claude-code", "codex", "hermes", "agentic"],
+                "enum": ["cursor", "claude-code", "codex", "hermes", "antigravity", "agentic"],
                 "description": (
                     "Force the implement adapter. Omit to use the highest-priority "
                     "adapter the platform lock enables."

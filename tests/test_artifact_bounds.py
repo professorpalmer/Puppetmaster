@@ -174,6 +174,17 @@ class ArtifactBoundsUnitTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             bait = Path(tmp) / "bait-secret.txt"
             bait.write_text(secret, encoding="utf-8")
+            original_read_text = Path.read_text
+            bait_reads = []
+
+            def guarded_read_text(path, *args, **kwargs):
+                if Path(path).resolve() == bait.resolve():
+                    bait_reads.append(Path(path))
+                    raise AssertionError(
+                        "artifact persistence must not open untrusted offload paths"
+                    )
+                return original_read_text(path, *args, **kwargs)
+
             # Oversized claim so shrink runs; plant an attacker-controlled path
             # that would be opened by the old offload_path re-read path.
             claim = "SAFE-HEAD-" + ("body" * 15_000) + "-SAFE-TAIL"
@@ -201,13 +212,11 @@ class ArtifactBoundsUnitTests(unittest.TestCase):
                     "PUPPETMASTER_ARTIFACT_PREVIEW_HEAD_CHARS": "60",
                     "PUPPETMASTER_ARTIFACT_PREVIEW_TAIL_CHARS": "60",
                 },
-            ), patch.object(Path, "read_text", autospec=True) as read_text:
-                # Any Path.read_text during prepare would be a disclosure bug;
-                # force a failure so the call cannot silently succeed.
-                read_text.side_effect = AssertionError(
-                    "artifact persistence must not open filesystem paths"
-                )
+            ), patch.object(
+                Path, "read_text", autospec=True, side_effect=guarded_read_text
+            ):
                 prepared = prepare_artifact_for_persist(artifact, state_dir=tmp)
+            self.assertEqual(bait_reads, [])
             self.assertNotIn(secret, prepared.payload.get("claim", ""))
             self.assertNotIn(secret, json.dumps(prepared.payload))
             # Still produces reviewable bounded output from the claim itself.

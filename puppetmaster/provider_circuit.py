@@ -9,11 +9,12 @@ Thread-safe, stdlib-only, Python 3.9+. Kill with ``PUPPETMASTER_PROVIDER_CIRCUIT
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, Mapping, Optional
 
 from puppetmaster.failure import RATE_LIMIT
 from puppetmaster.providers import ProviderError, get_provider, is_retryable_provider_error, resolve_base_url
@@ -101,21 +102,88 @@ def closed_bucket_ttl_seconds() -> float:
     return max(_ABS_MIN_CLOSED_TTL, min(value, _ABS_MAX_CLOSED_TTL))
 
 
-def circuit_key(provider: str, model: str = "", *, base_url: str = "") -> str:
-    """Stable admission key: provider + model + base URL (when known)."""
-    return f"{(provider or '').strip().lower()}\x1f{(model or '').strip()}\x1f{(base_url or '').rstrip('/')}"
+def credential_fingerprint(api_key: Optional[str]) -> str:
+    """Return a non-secret stable scope for an API credential.
+
+    The value is stored in the user-global passive rate-limit database and used
+    by the process-local breaker, so it must distinguish independently limited
+    credentials without retaining the bearer itself.  ``keyless`` is explicit
+    rather than an empty field: local endpoints genuinely share one admission
+    scope because there is no credential boundary to distinguish.
+    """
+    normalized = (api_key or "").strip()
+    if not normalized:
+        return "keyless"
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
 
 
-def resolve_circuit_key(provider: str, model: str = "") -> str:
-    """Build a key, resolving the provider's effective base URL when registered."""
-    base_url = ""
+def circuit_key(
+    provider: str,
+    model: str = "",
+    *,
+    base_url: str = "",
+    api_key: Optional[str] = None,
+    credential_scope: Optional[str] = None,
+) -> str:
+    """Stable admission key scoped to provider, model, endpoint, and credential."""
+    scope = (credential_scope or "").strip() or credential_fingerprint(api_key)
+    return (
+        f"{(provider or '').strip().lower()}\x1f{(model or '').strip()}"
+        f"\x1f{(base_url or '').rstrip('/')}\x1f{scope}"
+    )
+
+
+def resolve_circuit_key(
+    provider: str,
+    model: str = "",
+    *,
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    env: Optional[Mapping[str, str]] = None,
+) -> str:
+    """Build a credential-scoped key using the provider's effective endpoint.
+
+    Passing an explicit key is required for rotating-key callers.  When omitted,
+    the descriptor's normal environment resolution is used so direct
+    ``provider_chat`` calls and agentic admission use the same scope.
+    """
+    resolved_base_url = (base_url or "").rstrip("/")
+    credential_scope = ""
     desc = get_provider(provider)
     if desc is not None:
-        try:
-            base_url = resolve_base_url(desc)
-        except Exception:
-            base_url = (desc.base_url or "").rstrip("/")
-    return circuit_key(provider, model, base_url=base_url)
+        if not resolved_base_url:
+            try:
+                resolved_base_url = resolve_base_url(desc, env)
+            except Exception:
+                resolved_base_url = (desc.base_url or "").rstrip("/")
+        if api_key is None:
+            # Local import avoids making the registry's module import cycle
+            # eager; provider_circuit is itself imported by providers at call
+            # time around HTTP harvest scopes.
+            from puppetmaster.providers import resolve_api_key
+
+            api_key = resolve_api_key(desc, env)
+        if desc.slug == "bedrock" and api_key is None:
+            # Bedrock may use ambient SigV4 credentials instead of a bearer.
+            # Reuse its health subsystem's non-secret identity fingerprint so
+            # distinct AWS identities do not share a quota/circuit bucket.
+            from puppetmaster.bedrock import resolve_bedrock_credentials
+            from puppetmaster.provider_health import fingerprint_bedrock_credentials
+
+            credentials = resolve_bedrock_credentials(env)
+            if credentials is not None:
+                credential_scope = (
+                    "bedrock:"
+                    + fingerprint_bedrock_credentials(credentials)
+                )
+    return circuit_key(
+        provider,
+        model,
+        base_url=resolved_base_url,
+        api_key=api_key,
+        credential_scope=credential_scope,
+    )
 
 
 def admission_blocked_error(key: str) -> ProviderError:

@@ -9,7 +9,13 @@ from puppetmaster.models import AgentRun, Artifact, Task, TaskStatus, now_iso
 
 # Adapters that bill an LLM provider and therefore benefit from a pre-dispatch
 # auth/billing gate. ``local``/``shell`` run no model, so they're never gated.
-_PREFLIGHTABLE_ADAPTERS = {"agentic", "cursor", "claude-code", "codex", "openai"}
+_PREFLIGHTABLE_ADAPTERS = {
+    "agentic",
+    "cursor",
+    "claude-code",
+    "codex",
+    "openai",
+}
 
 # Failure classes that are about *this adapter's account* (auth, billing,
 # quota, missing CLI/key, or a preflight block) rather than the task itself.
@@ -394,7 +400,14 @@ def swarm_is_acting(specs: list[WorkerSpec]) -> bool:
 # either can still implement. This is the single source of truth — the MCP
 # ``start_implement`` verb, the CLI, and the lightweight ``edit`` verb all import
 # it instead of re-declaring the order.
-IMPLEMENT_ADAPTER_PRIORITY = ("cursor", "claude-code", "codex", "hermes", "agentic")
+IMPLEMENT_ADAPTER_PRIORITY = (
+    "cursor",
+    "claude-code",
+    "codex",
+    "hermes",
+    "antigravity",
+    "agentic",
+)
 
 
 class NoImplementAdapterError(RuntimeError):
@@ -417,6 +430,7 @@ _ADAPTER_AVAILABILITY_HINT: dict[str, str] = {
     "claude-code": "claude-code (`npm install -g @anthropic-ai/claude-code`, then authenticate)",
     "codex": "codex (`npm install -g @openai/codex`, then `codex login`)",
     "hermes": "hermes (install the NousResearch hermes CLI on PATH)",
+    "antigravity": "antigravity (install the Google Antigravity CLI `agy` on PATH)",
     "agentic": (
         "agentic (set a provider API key: OPENAI_API_KEY, ANTHROPIC_API_KEY, "
         "GEMINI_API_KEY, GOOGLE_API_KEY, or OPENROUTER_API_KEY — no external CLI)"
@@ -459,6 +473,8 @@ def adapter_is_available(
         return diagnostics._codex_cli_installed()
     if name == "hermes":
         return diagnostics._hermes_cli_installed()
+    if name == "antigravity":
+        return diagnostics._antigravity_installed()
     if name == "openai":
         return bool(env.get("OPENAI_API_KEY"))
     if name == "agentic":

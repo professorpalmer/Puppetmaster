@@ -63,6 +63,7 @@ def run_doctor(root: Path, state_dir: Optional[Path] = None) -> list[Check]:
         _guard("cursor-sdk", lambda: _cursor_sdk_check(root)),
         _guard("claude-code", _claude_code_check),
         _guard("codex", _codex_check),
+        _guard("antigravity", _antigravity_check),
         _guard("codegraph", lambda: _codegraph_check(root)),
         _guard("mcp-servers", _mcp_servers_check),
         _guard("CURSOR_API_KEY", lambda: _env_check("CURSOR_API_KEY")),
@@ -208,7 +209,7 @@ def _billing_checks() -> list[Check]:
     from puppetmaster.provider_health import bedrock_health_report
 
     checks: list[Check] = []
-    for adapter in ("agentic", "cursor", "claude-code", "codex", "hermes", "openai"):
+    for adapter in ("agentic", "cursor", "claude-code", "codex", "hermes", "openai", "antigravity"):
         try:
             status = detect_adapter_billing(adapter)
         except Exception as exc:  # pragma: no cover - defensive
@@ -279,6 +280,10 @@ _PROVIDER_CREDENTIAL_ENV_KEYS: dict[str, tuple[str, ...]] = {
         "CLAUDE_CODE_USE_BEDROCK",
         "AWS_PROFILE",
         "AWS_BEARER_TOKEN_BEDROCK",
+    ),
+    "antigravity": (
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
     ),
 }
 
@@ -508,6 +513,7 @@ def adapter_status(root: Path) -> list[dict[str, object]]:
     cursor_key = bool(os.environ.get("CURSOR_API_KEY"))
     claude_installed = _claude_code_installed()
     codex_installed = _codex_cli_installed()
+    antigravity_installed = _antigravity_installed()
     openai_key = bool(os.environ.get("OPENAI_API_KEY"))
     hermes_installed = _hermes_cli_installed()
     try:
@@ -550,6 +556,8 @@ def adapter_status(root: Path) -> list[dict[str, object]]:
             configured = hermes_installed and hermes_creds
         elif info.name == "agentic":
             configured = bool(agentic_providers)
+        elif info.name == "antigravity":
+            configured = antigravity_installed
         if info.status == "stub":
             configured = False
         rows.append(
@@ -768,6 +776,31 @@ def _hermes_cli_installed() -> bool:
 
 def _hermes_command() -> str:
     return os.environ.get("HERMES_COMMAND", "hermes")
+
+
+def _antigravity_check() -> Check:
+    if _antigravity_installed():
+        return Check("antigravity", "ok", _antigravity_command())
+    return Check(
+        "antigravity",
+        "optional",
+        "install the Antigravity CLI (agy) or set AGY_COMMAND / ANTIGRAVITY_COMMAND. "
+        "Required only if you want to route to antigravity/* tiers.",
+    )
+
+
+def _antigravity_installed() -> bool:
+    command = shlex.split(_antigravity_command())
+    if not command:
+        return False
+    first = command[0]
+    if Path(first).expanduser().exists():
+        return True
+    return shutil.which(first) is not None
+
+
+def _antigravity_command() -> str:
+    return os.environ.get("AGY_COMMAND") or os.environ.get("ANTIGRAVITY_COMMAND") or "agy"
 
 
 def _env_check(name: str) -> Check:

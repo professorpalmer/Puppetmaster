@@ -1,3 +1,13 @@
+## Unreleased
+
+**Feature: Antigravity CLI adapter (`agy`) stack-fit to existing adapter contracts.**
+
+Google Antigravity (`agy`) is a first-class worker adapter. Canonical lock/adapter name is `antigravity`; registry alias `agy` resolves to the same adapter. Not enabled in anyone's platform lock by default — use `puppetmaster platform enable antigravity`. `models init` does not seed antigravity starter-registry rows; curated discovery is `models discover --source antigravity` when `agy` is installed.
+
+- **Headless contract**: `--input-format stream-json` + `--output-format stream-json` with one stdin line `{"event":"user","message":{"content": prompt}}` (no `-p=`). Parse a json envelope, NDJSON `event==result` payloads, or a trailing `{...}` object. `--print-timeout` comes from `timeout_seconds`. `--add-dir` is not a CLI flag (subprocess cwd is the workspace). `--disable-slash-commands` stays. `--dangerously-skip-permissions` is opt-in (`payload.dangerously_skip_permissions=true`) and never added in plan mode. Effort is not appended when the model slug already ends in `-high`/`-medium`/`-low`.
+- **Surfaces**: `puppetmaster antigravity` (alias `agy`), MCP `antigravity_command` on implement/edit, swarm analysis adapters, model-backed auto-route, implement priority (before agentic), curated discover source. Not in the browser-swarm enum. Analysis swarms stay read-only labeled (not `_EDIT_CAPABLE_ADAPTERS`).
+- **Billing honesty**: PATH-only `agy` is unhealthy `unknown`. Healthy plan requires session files inside `~/.gemini/antigravity-cli` (empty dir is not a login). Healthy api requires `GEMINI_API_KEY`/`GOOGLE_API_KEY` *and* `agy` on PATH — a stray Gemini key used by agentic/hermes is not Antigravity proof. `agy` is canonicalized to `antigravity` at the lock gate so the alias cannot bypass `platform disable antigravity`.
+
 ## v1.22.15
 
 Absorb of [@bsmi021](https://github.com/bsmi021) PR

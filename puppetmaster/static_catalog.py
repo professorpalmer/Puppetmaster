@@ -204,6 +204,40 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
             ],
         },
     ],
+    "antigravity": [
+        {
+            "model": "gemini-3.5-flash",
+            "capability": 78,
+            "input": 0.15,
+            "output": 0.60,
+            "context": 1_000_000,
+            "tags": ["tools", "antigravity", "gemini", "fast", "cheap", "vision", "code", "agent-loop"],
+        },
+        {
+            "model": "gemini-3.6-flash",
+            "capability": 85,
+            "input": 0.30,
+            "output": 1.20,
+            "context": 1_000_000,
+            "tags": ["tools", "antigravity", "gemini", "balanced", "vision", "code", "agent-loop"],
+        },
+        {
+            "model": "gemini-3.7-flash",
+            "capability": 92,
+            "input": 0.50,
+            "output": 2.00,
+            "context": 1_000_000,
+            "tags": ["tools", "antigravity", "gemini", "balanced", "thinking", "vision", "code", "reasoning", "agent-loop"],
+        },
+        {
+            "model": "gemini-3.1-pro",
+            "capability": 97,
+            "input": 1.25,
+            "output": 5.00,
+            "context": 2_000_000,
+            "tags": ["tools", "antigravity", "gemini", "frontier", "vision", "code", "reasoning", "agent-loop", "long-context"],
+        },
+    ],
     # Hermes is API-billed: each entry routes through the user's own provider
     # key (Gemini / Anthropic / OpenAI). ``payload_defaults.provider`` is the
     # critical field — a bare model name routes to unconfigured OpenRouter, so
@@ -897,7 +931,7 @@ def reconcile_agentic_catalog(
 def ensure_subscription_plan_catalog(
     registry_path: "Path",
     *,
-    adapters: "tuple[str, ...]" = ("claude-code", "codex"),
+    adapters: "tuple[str, ...]" = ("claude-code", "codex", "antigravity"),
     billing_detector: Optional[Callable[[str], object]] = None,
     min_capability: Optional[int] = None,
 ) -> dict:

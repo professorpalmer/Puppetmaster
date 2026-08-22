@@ -681,6 +681,7 @@ _DISCOVER_SOURCE_BY_ADAPTER = {
     "claude-code": "claude",
     "codex": "codex",
     "hermes": "hermes",
+    "antigravity": "antigravity",
 }
 
 def _all_discover_sources() -> list[str]:
@@ -694,10 +695,12 @@ def _all_discover_sources() -> list[str]:
     # users who don't run Hermes don't get hermes/* entries injected just
     # because they happen to have an OPENAI/ANTHROPIC/GEMINI key set. The
     # explicit `--source hermes` path always works regardless.
-    from puppetmaster.diagnostics import _hermes_cli_installed
+    from puppetmaster.diagnostics import _antigravity_installed, _hermes_cli_installed
 
     if _hermes_cli_installed():
         sources.append("hermes")
+    if _antigravity_installed():
+        sources.append("antigravity")
     return sources
 
 def _default_discover_sources() -> list[str]:
@@ -1024,7 +1027,7 @@ def _discover_one_source(source: str, registry: list, *, prune: bool = False):
                 pass
         return merged, report, catalog
 
-    if source in ("claude", "codex"):
+    if source in ("claude", "codex", "antigravity"):
         from puppetmaster.platform_billing import detect_adapter_billing
         from puppetmaster.static_catalog import (
             SOURCE_TO_ADAPTER,

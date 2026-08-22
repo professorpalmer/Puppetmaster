@@ -58,6 +58,11 @@ DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 10.0
 # whose parent client is gone.
 DEFAULT_STALE_AFTER_SECONDS = 300.0
 
+# A server's heartbeat thread and its request workers update the same tracking
+# file.  The registry is per-process (one file per PID), so an in-process lock
+# is sufficient to prevent one update from silently dropping another field.
+_REGISTRY_FILE_LOCK = threading.Lock()
+
 
 @dataclass
 class McpServerEntry:
@@ -67,6 +72,8 @@ class McpServerEntry:
     workspace: Optional[str]
     started_at: float
     last_heartbeat: float
+    last_inbound_at: Optional[float] = None
+    active_tool_calls: int = 0
     transport: str = "stdio"
     version: Optional[str] = None
     parent_pid: Optional[int] = None
@@ -80,6 +87,12 @@ class McpServerEntry:
         current = now if now is not None else time.time()
         return (current - self.last_heartbeat) > stale_after_seconds
 
+    def is_idle(self, *, now: Optional[float] = None, idle_after_seconds: float) -> bool:
+        """Whether this server has received no inbound MCP traffic recently."""
+        current = now if now is not None else time.time()
+        last_inbound = self.last_inbound_at if self.last_inbound_at is not None else self.last_heartbeat
+        return (current - last_inbound) >= idle_after_seconds
+
     def to_payload(self, *, now: Optional[float] = None) -> dict:
         current = now if now is not None else time.time()
         return {
@@ -87,8 +100,14 @@ class McpServerEntry:
             "workspace": self.workspace,
             "started_at": self.started_at,
             "last_heartbeat": self.last_heartbeat,
+            "last_inbound_at": self.last_inbound_at,
             "age_seconds": round(current - self.started_at, 3),
             "heartbeat_age_seconds": round(current - self.last_heartbeat, 3),
+            "inbound_age_seconds": round(
+                current - (self.last_inbound_at if self.last_inbound_at is not None else self.last_heartbeat),
+                3,
+            ),
+            "active_tool_calls": self.active_tool_calls,
             "parent_pid": self.parent_pid,
             "parent_process": self.parent_process,
             "transport": self.transport,
@@ -97,6 +116,14 @@ class McpServerEntry:
             "stale": self.is_stale(now=current),
             "path": self.path,
         }
+
+
+@dataclass
+class McpSelectionResult:
+    """Outcome of an explicitly-selected server cleanup operation."""
+
+    killed: list[McpServerEntry]
+    refused: list[dict]
 
 
 def registry_dir() -> Path:
@@ -134,6 +161,8 @@ def register(
     transport: str = "stdio",
     parent_pid: Optional[int] = None,
     parent_process: Optional[str] = None,
+    last_inbound_at: Optional[float] = None,
+    active_tool_calls: int = 0,
 ) -> Path:
     """Write this server's tracking file and return its path.
 
@@ -153,6 +182,8 @@ def register(
         "workspace": workspace,
         "started_at": now,
         "last_heartbeat": now,
+        "last_inbound_at": last_inbound_at if last_inbound_at is not None else now,
+        "active_tool_calls": max(0, int(active_tool_calls)),
         "transport": transport,
         "version": version,
         "parent_pid": actual_parent_pid,
@@ -170,17 +201,47 @@ def heartbeat(path: Path, *, now: Optional[float] = None) -> bool:
     up because it thought we were dead) so the heartbeat thread can
     re-register itself instead of dying silently.
     """
-    if not path.exists():
-        return False
-    try:
-        data = _read_entry(path)
-    except (OSError, ValueError):
-        return False
-    if data is None:
-        return False
-    data["last_heartbeat"] = now if now is not None else time.time()
-    _atomic_write(path, data)
-    return True
+    with _REGISTRY_FILE_LOCK:
+        if not path.exists():
+            return False
+        try:
+            data = _read_entry(path)
+        except (OSError, ValueError):
+            return False
+        if data is None:
+            return False
+        data["last_heartbeat"] = now if now is not None else time.time()
+        _atomic_write(path, data)
+        return True
+
+
+def record_activity(
+    path: Path,
+    *,
+    inbound_at: Optional[float] = None,
+    active_tool_calls: Optional[int] = None,
+) -> bool:
+    """Persist request activity for safe cleanup decisions.
+
+    Heartbeats prove a process is alive; they do not prove its MCP client is
+    still talking to it.  The active-call count is persisted as well so a
+    separate CLI/MCP process can refuse to terminate work in flight.
+    """
+    with _REGISTRY_FILE_LOCK:
+        if not path.exists():
+            return False
+        try:
+            data = _read_entry(path)
+        except (OSError, ValueError):
+            return False
+        if data is None:
+            return False
+        if inbound_at is not None:
+            data["last_inbound_at"] = float(inbound_at)
+        if active_tool_calls is not None:
+            data["active_tool_calls"] = max(0, int(active_tool_calls))
+        _atomic_write(path, data)
+        return True
 
 
 def deregister(path: Path) -> None:
@@ -222,6 +283,8 @@ def list_entries(*, include_stale: bool = True) -> list[McpServerEntry]:
                 workspace=data.get("workspace"),
                 started_at=float(data.get("started_at") or now),
                 last_heartbeat=float(data.get("last_heartbeat") or now),
+                last_inbound_at=_coerce_optional_float(data.get("last_inbound_at")),
+                active_tool_calls=max(0, _coerce_optional_int(data.get("active_tool_calls")) or 0),
                 transport=str(data.get("transport") or "stdio"),
                 version=data.get("version"),
                 parent_pid=_coerce_optional_int(data.get("parent_pid")),
@@ -303,6 +366,94 @@ def kill_stale(
     return killed
 
 
+def normalize_workspace(workspace: Optional[str]) -> Optional[str]:
+    """Return a stable workspace identity for explicit cleanup selectors."""
+    if workspace is None:
+        return None
+    value = str(workspace).strip()
+    if not value:
+        return None
+    try:
+        return os.path.normcase(os.path.normpath(str(Path(value).expanduser().resolve(strict=False))))
+    except (OSError, RuntimeError):
+        return os.path.normcase(os.path.normpath(os.path.abspath(os.path.expanduser(value))))
+
+
+def kill_selected(
+    *,
+    pids: Optional[Iterable[int]] = None,
+    workspace: Optional[str] = None,
+    idle_after_seconds: Optional[float] = None,
+    self_pid: Optional[int] = None,
+    grace_seconds: float = 3.0,
+) -> McpSelectionResult:
+    """Terminate only explicitly selected, inactive sibling MCP servers.
+
+    All supplied selectors intersect.  This deliberately has no implicit
+    target set: callers must name a PID, workspace, or inbound-idle threshold.
+    Unlike historical ``kill_stale``, this precise manual path refuses active
+    tool calls as an additional safety boundary.
+    """
+    requested_pids = {int(pid) for pid in pids} if pids else None
+    requested_workspace = normalize_workspace(workspace)
+    requested_idle = float(idle_after_seconds) if idle_after_seconds is not None else None
+    if requested_idle is not None and requested_idle < 0:
+        raise ValueError("idle_after_seconds must be non-negative")
+    if requested_pids is None and requested_workspace is None and requested_idle is None:
+        return McpSelectionResult(killed=[], refused=[])
+
+    me = self_pid if self_pid is not None else os.getpid()
+    now = time.time()
+    targets: list[McpServerEntry] = []
+    refused: list[dict] = []
+    for entry in list_entries():
+        if not entry.is_alive():
+            continue
+        if requested_pids is not None and entry.pid not in requested_pids:
+            continue
+        if requested_workspace is not None and normalize_workspace(entry.workspace) != requested_workspace:
+            continue
+        if requested_idle is not None and not entry.is_idle(now=now, idle_after_seconds=requested_idle):
+            continue
+        if entry.pid == me:
+            refused.append({"pid": entry.pid, "workspace": entry.workspace, "reason": "self"})
+            continue
+        if entry.active_tool_calls > 0:
+            refused.append(
+                {
+                    "pid": entry.pid,
+                    "workspace": entry.workspace,
+                    "reason": "active_tool_calls",
+                    "active_tool_calls": entry.active_tool_calls,
+                }
+            )
+            continue
+        targets.append(entry)
+
+    killed: list[McpServerEntry] = []
+    for entry in targets:
+        try:
+            os.kill(entry.pid, signal.SIGTERM)
+        except OSError:
+            continue
+        killed.append(entry)
+    if grace_seconds > 0 and targets:
+        time.sleep(grace_seconds)
+    for entry in targets:
+        if not _pid_alive(entry.pid):
+            if entry.path:
+                deregister(Path(entry.path))
+            continue
+        hard_kill = getattr(signal, "SIGKILL", signal.SIGTERM)
+        try:
+            os.kill(entry.pid, hard_kill)
+        except OSError:
+            continue
+        if entry.path:
+            deregister(Path(entry.path))
+    return McpSelectionResult(killed=killed, refused=refused)
+
+
 class HeartbeatThread(threading.Thread):
     """Background thread that bumps a tracking file on a fixed cadence.
 
@@ -346,6 +497,8 @@ class HeartbeatThread(threading.Thread):
             transport=str(self._registration_payload.get("transport") or "stdio"),
             parent_pid=_coerce_optional_int(self._registration_payload.get("parent_pid")),
             parent_process=_coerce_optional_str(self._registration_payload.get("parent_process")),
+            last_inbound_at=_coerce_optional_float(self._registration_payload.get("last_inbound_at")),
+            active_tool_calls=_coerce_optional_int(self._registration_payload.get("active_tool_calls")) or 0,
         )
 
     @staticmethod
@@ -404,6 +557,15 @@ def _coerce_optional_int(value: object) -> Optional[int]:
         return None
     try:
         return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_optional_float(value: object) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
     except (TypeError, ValueError):
         return None
 

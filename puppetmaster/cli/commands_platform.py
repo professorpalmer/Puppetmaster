@@ -118,8 +118,8 @@ def _run_platform_subcommand(args) -> int:
 
     The platform lock decides which adapters Puppetmaster may route to,
     auto-discover, or fall back onto (see ``platform_lock.KNOWN_ADAPTERS``:
-    agentic, cursor, claude-code, codex, openai, hermes). It is persisted next
-    to the model registry; an empty lock means everything is on.
+    agentic, cursor, claude-code, codex, openai, hermes, antigravity). It is
+    persisted next to the model registry; an empty lock means everything is on.
     """
     import json as _json
 
@@ -129,7 +129,9 @@ def _run_platform_subcommand(args) -> int:
     sub = args.platform_command
 
     def _normalize(raw_adapters) -> tuple[set[str], list[str]]:
-        wanted = {a.strip() for a in raw_adapters if a.strip()}
+        wanted = {
+            pl.canonicalize_adapter(a.strip()) for a in raw_adapters if a.strip()
+        }
         unknown = sorted(a for a in wanted if a not in pl.KNOWN_ADAPTERS)
         return {a for a in wanted if a in pl.KNOWN_ADAPTERS}, unknown
 

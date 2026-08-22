@@ -612,6 +612,93 @@ def detect_agentic_billing(
     )
 
 
+def _antigravity_session_present(settings_dir: Path) -> bool:
+    """True when the Antigravity CLI settings dir has session contents.
+
+    An empty ``~/.gemini/antigravity-cli`` (mkdir leftover) is not a login.
+    """
+    if not settings_dir.is_dir():
+        return False
+    try:
+        return any(settings_dir.iterdir())
+    except OSError:
+        return False
+
+
+def detect_antigravity_billing(
+    env: Optional[Mapping[str, str]] = None,
+    home: Optional[Path] = None,
+) -> BillingStatus:
+    """Detect Antigravity CLI (agy) billing posture (plan vs API key)."""
+    import shutil as _shutil
+
+    env = env if env is not None else os.environ
+    home = home if home is not None else Path.home()
+
+    gemini_key = env.get("GEMINI_API_KEY") or env.get("GOOGLE_API_KEY")
+    evidence: list[str] = []
+    if gemini_key:
+        evidence.append("gemini_api_key:set")
+
+    settings_dir = home / ".gemini" / "antigravity-cli"
+    session_present = _antigravity_session_present(settings_dir)
+    agy_on_path = (
+        _shutil.which(
+            env.get("AGY_COMMAND") or env.get("ANTIGRAVITY_COMMAND") or "agy"
+        )
+        is not None
+    )
+
+    # A stray GEMINI/GOOGLE key is often for agentic/hermes. Only treat it as
+    # Antigravity API billing when ``agy`` is actually resolvable.
+    if gemini_key and agy_on_path:
+        return BillingStatus(
+            adapter="antigravity",
+            billing="api",
+            healthy=True,
+            detail=(
+                "GEMINI_API_KEY/GOOGLE_API_KEY is set and `agy` is on PATH — "
+                "Antigravity bills per-token to that account (out-of-pocket)."
+            ),
+            evidence=evidence + ["agy_on_path"],
+        )
+    if session_present:
+        evidence.append("antigravity_session:present")
+        return BillingStatus(
+            adapter="antigravity",
+            billing="plan",
+            healthy=True,
+            detail=(
+                "Antigravity CLI is authenticated via user account / "
+                "subscription (no marginal API spend)."
+            ),
+            evidence=evidence,
+        )
+    missing = ["antigravity_auth:missing"]
+    if agy_on_path:
+        missing.append("agy_on_path:unauthenticated")
+    if gemini_key and not agy_on_path:
+        missing.append("gemini_api_key:unbound")
+        detail = (
+            "GEMINI_API_KEY/GOOGLE_API_KEY is set but `agy` is not on PATH — "
+            "that key is not proof Antigravity will use it."
+        )
+    else:
+        detail = (
+            "No GEMINI_API_KEY/GOOGLE_API_KEY bound to `agy` and no "
+            "Antigravity session files — `agy` on PATH is not an "
+            "authenticated session. Run `agy` interactively to log in, or "
+            "install `agy` and set a Gemini API key."
+        )
+    return BillingStatus(
+        adapter="antigravity",
+        billing="unknown",
+        healthy=False,
+        detail=detail,
+        evidence=missing,
+    )
+
+
 _DETECTORS: dict[str, Callable[..., BillingStatus]] = {
     "cursor": lambda **kw: detect_cursor_billing(env=kw.get("env")),
     "claude-code": lambda **kw: detect_claude_billing(
@@ -625,6 +712,9 @@ _DETECTORS: dict[str, Callable[..., BillingStatus]] = {
     ),
     "openai": lambda **kw: detect_openai_billing(env=kw.get("env")),
     "agentic": lambda **kw: detect_agentic_billing(
+        env=kw.get("env"), home=kw.get("home")
+    ),
+    "antigravity": lambda **kw: detect_antigravity_billing(
         env=kw.get("env"), home=kw.get("home")
     ),
 }
@@ -644,6 +734,9 @@ def detect_adapter_billing(
     can treat them as pass-through (the mod never blocks a path it can't
     reason about).
     """
+    from puppetmaster.platform_lock import canonicalize_adapter
+
+    adapter = canonicalize_adapter(adapter)
     detector = _DETECTORS.get(adapter)
     if detector is None:
         return BillingStatus(

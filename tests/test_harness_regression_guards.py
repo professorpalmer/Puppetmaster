@@ -50,6 +50,7 @@ REQUIRED_ADAPTERS = frozenset(
         "openai",
         "codex",
         "hermes",
+        "antigravity",
         "agentic",
         "shell",
     }
@@ -114,8 +115,17 @@ class AdapterInventoryGuards(unittest.TestCase):
     def test_platform_lock_known_adapters_exclude_grok_bot(self) -> None:
         known = set(KNOWN_ADAPTERS)
         # Platform lock covers billable host adapters (not local/shell demos).
-        for name in ("cursor", "claude-code", "openai", "codex", "hermes", "agentic"):
+        for name in (
+            "cursor",
+            "claude-code",
+            "openai",
+            "codex",
+            "hermes",
+            "antigravity",
+            "agentic",
+        ):
             self.assertIn(name, known)
+        self.assertNotIn("agy", known)
         leaked = sorted(FORBIDDEN_ADAPTERS & known)
         self.assertEqual(leaked, [], f"forbidden adapter names in KNOWN_ADAPTERS: {leaked}")
 

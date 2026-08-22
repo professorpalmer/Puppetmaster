@@ -25,14 +25,40 @@ from pathlib import Path
 from typing import Optional
 
 from puppetmaster.fs_permissions import write_private_text
+from puppetmaster.interprocess_lock import InterProcessFileLock
 from puppetmaster.model_registry import default_registry_path
 
 # The user-billable adapters the lock governs. ``shell`` and any future
 # internal adapter are intentionally excluded — they are never platform-billed
 # and must not be blocked by a platform lock.
-KNOWN_ADAPTERS: tuple[str, ...] = ("agentic", "cursor", "claude-code", "codex", "openai", "hermes")
+KNOWN_ADAPTERS: tuple[str, ...] = (
+    "agentic",
+    "cursor",
+    "claude-code",
+    "codex",
+    "openai",
+    "hermes",
+    "antigravity",
+)
+
+# CLI nicknames are not lock keys. ``agy`` is the Antigravity binary, not a
+# second billable platform. Unknown names are treated as unlocked (shell /
+# local), so leaving ``agy`` uncanonicalized would bypass
+# ``platform disable antigravity``.
+ADAPTER_ALIASES = {
+    "agy": "antigravity",
+}
 
 ONLY_ENV = "PUPPETMASTER_ONLY_ADAPTERS"
+
+
+def canonicalize_adapter(name: str) -> str:
+    """Map a public adapter alias onto the lock/registry canonical name."""
+    return ADAPTER_ALIASES.get(name, name)
+
+
+def _canonicalize_adapter_set(adapters: set[str]) -> set[str]:
+    return {canonicalize_adapter(a) for a in adapters}
 
 
 class PlatformLockedError(RuntimeError):
@@ -81,7 +107,11 @@ def _read_disabled(registry_path: Optional[Path] = None) -> set[str]:
     except (json.JSONDecodeError, OSError):
         return set()
     disabled = data.get("disabled", []) if isinstance(data, dict) else []
-    return {str(a).strip() for a in disabled if str(a).strip()}
+    return {
+        canonicalize_adapter(str(a).strip())
+        for a in disabled
+        if str(a).strip()
+    }
 
 
 def _write_disabled(disabled: set[str], registry_path: Optional[Path] = None) -> Path:
@@ -91,6 +121,13 @@ def _write_disabled(disabled: set[str], registry_path: Optional[Path] = None) ->
     # defaults on). Replacing the whole document strips foreign keys and makes
     # the next harness boot re-apply ITS defaults, silently undoing an
     # operator's `platform enable`. Preserve everything we don't own.
+    with InterProcessFileLock.for_target(path):
+        _write_disabled_locked(disabled, path)
+    return path
+
+
+def _write_disabled_locked(disabled: set[str], path: Path) -> Path:
+    """Write while the caller holds the per-target platform lock."""
     payload: dict = {}
     if path.is_file():
         try:
@@ -100,7 +137,7 @@ def _write_disabled(disabled: set[str], registry_path: Optional[Path] = None) ->
         except (json.JSONDecodeError, OSError):
             payload = {}
     payload["disabled"] = sorted(a for a in disabled if a in KNOWN_ADAPTERS)
-    write_private_text(path, json.dumps(payload, indent=2) + "\n")
+    write_private_text(path, json.dumps(payload, indent=2) + "\n", lock=False)
     return path
 
 
@@ -117,7 +154,7 @@ def enabled_adapters(registry_path: Optional[Path] = None) -> set[str]:
     """
     env = os.environ.get(ONLY_ENV)
     if env and env.strip():
-        return _parse_adapters(env)
+        return _canonicalize_adapter_set(_parse_adapters(env))
     return set(KNOWN_ADAPTERS) - _read_disabled(registry_path)
 
 
@@ -132,6 +169,7 @@ def is_adapter_enabled(adapter: str, registry_path: Optional[Path] = None) -> bo
     Non-billable / internal adapters (anything outside ``KNOWN_ADAPTERS``,
     e.g. ``shell``) are never blocked by a platform lock.
     """
+    adapter = canonicalize_adapter(adapter)
     if adapter not in KNOWN_ADAPTERS:
         return True
     return adapter in enabled_adapters(registry_path)
@@ -153,20 +191,27 @@ def active_allowlist(registry_path: Optional[Path] = None) -> Optional[frozenset
 
 def set_enabled(adapters: set[str], registry_path: Optional[Path] = None) -> Path:
     """Enable exactly ``adapters`` (the ``only`` command). Others get disabled."""
+    adapters = _canonicalize_adapter_set(adapters)
     disabled = set(KNOWN_ADAPTERS) - {a for a in adapters if a in KNOWN_ADAPTERS}
     return _write_disabled(disabled, registry_path)
 
 
 def enable(adapters: set[str], registry_path: Optional[Path] = None) -> Path:
     """Turn ``adapters`` back on (remove from the denylist)."""
-    disabled = _read_disabled(registry_path) - adapters
-    return _write_disabled(disabled, registry_path)
+    adapters = _canonicalize_adapter_set(adapters)
+    path = platform_config_path(registry_path)
+    with InterProcessFileLock.for_target(path):
+        disabled = _read_disabled(registry_path) - adapters
+        return _write_disabled_locked(disabled, path)
 
 
 def disable(adapters: set[str], registry_path: Optional[Path] = None) -> Path:
     """Turn ``adapters`` off (add to the denylist)."""
-    disabled = _read_disabled(registry_path) | {a for a in adapters if a in KNOWN_ADAPTERS}
-    return _write_disabled(disabled, registry_path)
+    adapters = _canonicalize_adapter_set(adapters)
+    path = platform_config_path(registry_path)
+    with InterProcessFileLock.for_target(path):
+        disabled = _read_disabled(registry_path) | {a for a in adapters if a in KNOWN_ADAPTERS}
+        return _write_disabled_locked(disabled, path)
 
 
 def reset(registry_path: Optional[Path] = None) -> Path:
