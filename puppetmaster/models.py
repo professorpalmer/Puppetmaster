@@ -47,6 +47,21 @@ class JobStatus(StringEnum):
     CANCELLED = "cancelled"
 
 
+TERMINAL_JOB_STATUSES = frozenset(
+    {
+        JobStatus.COMPLETE,
+        JobStatus.FAILED,
+        JobStatus.STALLED,
+        JobStatus.CANCELLED,
+    }
+)
+
+
+def is_terminal_job_status(status: JobStatus) -> bool:
+    """Return whether ``status`` represents a job that will do no more work."""
+    return status in TERMINAL_JOB_STATUSES
+
+
 class TaskStatus(StringEnum):
     BLOCKED = "blocked"
     QUEUED = "queued"

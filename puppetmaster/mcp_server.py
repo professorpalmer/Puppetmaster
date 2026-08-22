@@ -343,23 +343,29 @@ def _extract_progress_token(params: Any) -> Any:
     return meta.get("progressToken")
 
 
-def _emit_notification(notification: JsonObject) -> bool:
-    """Serialize and write a JSON-RPC notification under the stdout lock.
+def _write_protocol_message(message: JsonObject) -> bool:
+    """Serialize and atomically write one JSON-RPC frame to the client.
 
     Returns False when the pipe is gone (BrokenPipeError or general OSError),
-    so callers running on a daemon thread can stop trying. Notifications
-    must never have an ``id`` field — that's how clients distinguish them
-    from responses.
+    allowing worker and keepalive threads to finish without leaking an
+    unobserved exception through their Future. All protocol frames use this
+    function so the shared lock prevents byte interleaving.
     """
-    serialized = json.dumps(notification) + "\n"
+    serialized = json.dumps(message) + "\n"
     try:
         with _STDOUT_LOCK:
             stream = _protocol_stream()
             stream.write(serialized)
             stream.flush()
     except (BrokenPipeError, OSError):
+        _SHUTDOWN_REQUESTED.set()
         return False
     return True
+
+
+def _emit_notification(notification: JsonObject) -> bool:
+    """Write a JSON-RPC notification through the shared protocol writer."""
+    return _write_protocol_message(notification)
 
 
 class _ToolCallKeepalive:
@@ -1108,11 +1114,7 @@ def _process_message_safely(message: JsonObject, *, tool_call_counted: bool = Fa
             _tool_call_finished()
     if response is None:
         return
-    serialized = json.dumps(response) + "\n"
-    with _STDOUT_LOCK:
-        stream = _protocol_stream()
-        stream.write(serialized)
-        stream.flush()
+    _write_protocol_message(response)
 
 
 def handle_message(message: JsonObject) -> Optional[JsonObject]:
@@ -1573,8 +1575,9 @@ def _build_tools() -> list[McpTool]:
             name="puppetmaster_live_artifacts_follow",
             description=(
                 "Long-poll for new artifacts since a cursor. Returns immediately when new "
-                "artifacts arrive, or after timeout_seconds with an empty items array. "
-                "Chain calls with the returned next_cursor for a push-feeling stream."
+                "artifacts arrive or the job reaches a terminal state; otherwise returns "
+                "after timeout_seconds with an empty items array. Includes status, terminal, "
+                "completed_at, and next_cursor so callers can stop cleanly or continue."
             ),
             input_schema=follow_schema(),
             handler=run_feed_follow,
@@ -3660,7 +3663,7 @@ def run_feed(args: JsonObject) -> JsonObject:
 
 
 def run_feed_follow(args: JsonObject) -> JsonObject:
-    from puppetmaster.cli import artifact_feed_since
+    from puppetmaster.cli import artifact_feed_since, read_job_state
 
     job_id = require_string(args, "job_id")
     since = int(args.get("since_cursor") or args.get("since") or 0)
@@ -3675,7 +3678,8 @@ def run_feed_follow(args: JsonObject) -> JsonObject:
     store = create_store(backend, state_dir)
 
     items, cursor = artifact_feed_since(store, job_id, since=since, limit=limit)
-    if not items:
+    state = read_job_state(store, job_id)
+    if not items and not state["terminal"]:
         store.wait_for_events(
             job_id,
             since=cursor,
@@ -3683,16 +3687,17 @@ def run_feed_follow(args: JsonObject) -> JsonObject:
             poll_interval=poll_interval,
         )
         items, cursor = artifact_feed_since(store, job_id, since=since, limit=limit)
+        state = read_job_state(store, job_id)
 
     body = {
-        "job_id": job_id,
+        **state,
         "since_cursor": since,
         "next_cursor": cursor,
         "item_count": len(items),
         "items": items,
-        "timed_out": len(items) == 0,
+        "timed_out": len(items) == 0 and not state["terminal"],
     }
-    if was_capped:
+    if was_capped and not state["terminal"]:
         # Tell the caller the block was shortened so it knows to re-poll
         # rather than assuming the job produced nothing for `requested_timeout`.
         body["capped"] = True

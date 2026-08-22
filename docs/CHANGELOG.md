@@ -9,6 +9,20 @@ Adds first-class support for running Google Antigravity CLI (`agy`) as an extern
 - **Structured token telemetry & billing**: Captures input tokens, output tokens, thinking/reasoning tokens, and cache read tokens directly from `agy` output into `VERIFICATION` artifacts. Implements billing posture detection in `platform_billing.py` (`plan` for subscription sessions, `api` when `GEMINI_API_KEY`/`GOOGLE_API_KEY` is present).
 - **Diagnostics and failure handling**: Integrated into `puppetmaster doctor`, adapter discovery, platform lock (`KNOWN_ADAPTERS`), and curated static catalogs (`CURATED_CATALOGS["antigravity"]`).
 
+**Fix: MCP jobs that completed successfully could still look hung or crashed to
+Codex and Claude clients.**
+
+- `puppetmaster_live_artifacts_follow` now returns terminal job state
+  immediately instead of waiting for an artifact that can never arrive and
+  reporting a false timeout.
+- Final JSON-RPC responses and keepalive notifications now share one serialized,
+  guarded stdio writer; a disconnected client no longer leaks an unobserved
+  `BrokenPipeError` / `OSError` from a worker-thread future.
+- On Windows, the default Codex adapter launch resolves the npm batch shim to
+  `node.exe` plus `@openai/codex/bin/codex.js`, keeping Puppetmaster in direct
+  ownership of the child process and its pipes. Explicit `CODEX_COMMAND` and
+  task executable overrides retain their existing command semantics.
+
 ## v1.22.15
 
 Absorb of [@bsmi021](https://github.com/bsmi021) PR
