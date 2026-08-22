@@ -1,13 +1,18 @@
-## Unreleased
+## v1.22.16
 
-**Feature: Antigravity CLI adapter (`agy`) stack-fit to existing adapter contracts.**
+Absorb of [@bsmi021](https://github.com/bsmi021) PR
+[#52](https://github.com/professorpalmer/Puppetmaster/pull/52)
+(landed via [#53](https://github.com/professorpalmer/Puppetmaster/pull/53)), plus
+live `agy` 1.1.18 headless fixes.
+
+**Feature: Google Antigravity CLI (`agy`) as a first-class worker adapter.**
 
 Google Antigravity (`agy`) is a first-class worker adapter. Canonical lock/adapter name is `antigravity`; registry alias `agy` resolves to the same adapter. Not enabled in anyone's platform lock by default — use `puppetmaster platform enable antigravity`. `models init` does not seed antigravity starter-registry rows; curated discovery is `models discover --source antigravity` when `agy` is installed.
 
-- **Headless contract**: `--input-format stream-json` + `--output-format stream-json` with one stdin line `{"event":"user","message":{"content": prompt}}` (no `-p=`). Parse a json envelope, NDJSON `event==result` payloads, or a trailing `{...}` object. `--print-timeout` comes from `timeout_seconds`. `--add-dir` is not a CLI flag (subprocess cwd is the workspace). `--disable-slash-commands` stays. `--dangerously-skip-permissions` is opt-in (`payload.dangerously_skip_permissions=true`) and never added in plan mode. Effort is not appended when the model slug already ends in `-high`/`-medium`/`-low`.
+- **Headless contract**: `--input-format stream-json` + `--output-format stream-json` with one stdin line `{"event":"user","message":{"content": prompt}}` (no `-p=`). Parse a json envelope, NDJSON `event==result` payloads, or a trailing `{...}` object. `--print-timeout` comes from `timeout_seconds`. Live `agy` 1.1.18 accepts `--add-dir` as a CLI flag; the adapter passes the task workspace once and still strips `--add-dir` from `extra_args`. `--disable-slash-commands` stays. `--dangerously-skip-permissions` is the **implement default** (live `agy` 1.1.18 still auto-denies tools under `request-review` even with `--mode accept-edits`); set `payload.dangerously_skip_permissions=false` to opt out. Never added in plan mode. Effort is not appended when the model slug already ends in `-high`/`-medium`/`-low`, or on models that reject `--effort` (Gemini 3.5 Flash).
 - **Surfaces**: `puppetmaster antigravity` (alias `agy`), MCP `antigravity_command` on implement/edit, swarm analysis adapters, model-backed auto-route, implement priority (before agentic), curated discover source. Not in the browser-swarm enum. Analysis swarms stay read-only labeled (not `_EDIT_CAPABLE_ADAPTERS`).
 - **Billing honesty**: PATH-only `agy` is unhealthy `unknown`. Healthy plan requires session files inside `~/.gemini/antigravity-cli` (empty dir is not a login). Healthy api requires `GEMINI_API_KEY`/`GOOGLE_API_KEY` *and* `agy` on PATH — a stray Gemini key used by agentic/hermes is not Antigravity proof. `agy` is canonicalized to `antigravity` at the lock gate so the alias cannot bypass `platform disable antigravity`.
-
+- **Live E2E (agy 1.1.18 + Gemini API key):** analyze on `gemini-3.7-flash` returned a FINDING; implement wrote a tracked file and emitted a PATCH on `gemini-3.5-flash`. Gemini 3.6/3.7 implement on a free-tier key hit provider 503 (high demand) — the adapter failed closed, not a silent no-op.
 ## v1.22.15
 
 Absorb of [@bsmi021](https://github.com/bsmi021) PR

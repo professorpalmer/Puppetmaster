@@ -121,6 +121,8 @@ _ADAPTER_EXTRA_RULES: dict[str, Tuple[Rule, ...]] = {
         (_any("not recognized as a known model", "invalid model selection"), MODEL_UNAVAILABLE),
         (_any("requires --effort", "invalid effort"), MODEL_UNAVAILABLE),
         (_any("not authenticated", "please authenticate", "login to", "oauth"), NOT_AUTHENTICATED),
+        (_any("high demand", "error 503", "status: unavailable"), RATE_LIMIT),
+        (_any("jetski:", "headless mode cannot prompt", "user denied permission"), PERMISSION_DENIED),
     ),
 }
 

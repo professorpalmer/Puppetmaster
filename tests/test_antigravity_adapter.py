@@ -25,10 +25,12 @@ from puppetmaster.adapters.antigravity import (
     build_antigravity_command,
     resolve_antigravity_mode,
     resolve_antigravity_model,
+    resolve_antigravity_skip_permissions,
 )
 from puppetmaster.failure import (
     MODEL_UNAVAILABLE,
     NOT_AUTHENTICATED,
+    PERMISSION_DENIED,
     classify_antigravity_failure,
 )
 from puppetmaster.models import ArtifactType, Task
@@ -67,7 +69,9 @@ class AntigravityCommandBuilderTests(unittest.TestCase):
         self.assertIn("--effort", cmd)
         self.assertIn("medium", cmd)
         self.assertEqual(cmd[cmd.index("--print-timeout") + 1], "120s")
-        self.assertNotIn("--add-dir", cmd)
+        self.assertEqual(
+            cmd[cmd.index("--add-dir") + 1], str(Path("/tmp/work").resolve())
+        )
         self.assertTrue(all(not part.startswith("-p=") for part in cmd))
 
     def test_skip_permissions_only_when_explicitly_true(self) -> None:
@@ -112,6 +116,35 @@ class AntigravityCommandBuilderTests(unittest.TestCase):
         self.assertEqual(model3, DEFAULT_ANTIGRAVITY_MODEL)
         self.assertEqual(effort3, DEFAULT_ANTIGRAVITY_EFFORT)
 
+        model4, effort4 = resolve_antigravity_model({"model": "gemini-3.5-flash"})
+        self.assertEqual(model4, "gemini-3.5-flash")
+        self.assertIsNone(effort4)
+        no_effort = build_antigravity_command(
+            prompt="x", model="gemini-3.5-flash", effort="low"
+        )
+        self.assertNotIn("--effort", no_effort)
+
+    def test_resolve_antigravity_skip_permissions_defaults(self) -> None:
+        self.assertTrue(resolve_antigravity_skip_permissions({"mode": "implement"}))
+        self.assertTrue(resolve_antigravity_skip_permissions({"mode": "accept-edits"}))
+        self.assertFalse(resolve_antigravity_skip_permissions({"mode": "analyze"}))
+        self.assertFalse(resolve_antigravity_skip_permissions({"mode": "plan"}))
+        self.assertFalse(
+            resolve_antigravity_skip_permissions(
+                {"mode": "implement", "dangerously_skip_permissions": False}
+            )
+        )
+        self.assertTrue(
+            resolve_antigravity_skip_permissions(
+                {"mode": "implement", "dangerously_skip_permissions": True}
+            )
+        )
+        self.assertFalse(
+            resolve_antigravity_skip_permissions(
+                {"mode": "plan", "dangerously_skip_permissions": True}
+            )
+        )
+
     def test_resolve_antigravity_mode_maps_cli_verbs(self) -> None:
         self.assertEqual(resolve_antigravity_mode({"mode": "implement"}), "accept-edits")
         self.assertEqual(resolve_antigravity_mode({"mode": "analyze"}), "plan")
@@ -141,7 +174,6 @@ class AntigravityCommandBuilderTests(unittest.TestCase):
         self.assertEqual(cmd.count("--mode"), 1)
         self.assertEqual(cmd[cmd.index("--mode") + 1], "plan")
         self.assertNotIn("--dangerously-skip-permissions", cmd)
-        self.assertNotIn("--add-dir", cmd)
         self.assertNotIn("/tmp/escape", cmd)
         self.assertIn("--verbose", cmd)
 
@@ -169,6 +201,19 @@ class AntigravityFailureClassificationTests(unittest.TestCase):
         self.assertEqual(
             classify_antigravity_failure("ResourceExhausted: 429 quota exceeded"),
             "rate_limit",
+        )
+        self.assertEqual(
+            classify_antigravity_failure(
+                "Error 503, Message: This model is currently experiencing high demand."
+            ),
+            "rate_limit",
+        )
+        self.assertEqual(
+            classify_antigravity_failure(
+                'jetski: no output produced — a tool required the "command" '
+                "permission that headless mode cannot prompt for"
+            ),
+            PERMISSION_DENIED,
         )
 
 
@@ -282,11 +327,15 @@ class AntigravityAdapterLifecycleTests(unittest.TestCase):
         self.assertEqual(command[command.index("--input-format") + 1], "stream-json")
         self.assertEqual(command[command.index("--output-format") + 1], "stream-json")
         self.assertNotIn("--dangerously-skip-permissions", command)
-        self.assertNotIn("--add-dir", command)
+        self.assertIn("--add-dir", command)
+        self.assertEqual(
+            command[command.index("--add-dir") + 1], str(Path(".").resolve())
+        )
         self.assertTrue(all(not part.startswith("-p=") for part in command))
         event = json.loads(stdin_data.strip())
         self.assertEqual(event["event"], "user")
         self.assertIn("Audit security", event["message"]["content"])
+        self.assertIn("Git workspace (absolute path):", event["message"]["content"])
         self.assertEqual(stdin_data, antigravity_stdin_data(event["message"]["content"]))
 
         self.assertTrue(len(artifacts) >= 2)
@@ -307,7 +356,7 @@ class AntigravityAdapterLifecycleTests(unittest.TestCase):
     @mock.patch("puppetmaster.adapters.git_snapshot")
     @mock.patch("puppetmaster.adapters.resolve_command")
     @mock.patch("puppetmaster.adapters.run_streamed_subprocess")
-    def test_implement_skip_permissions_opt_in_via_subprocess_kwargs(
+    def test_implement_skip_permissions_default_on(
         self,
         mock_run: mock.MagicMock,
         mock_resolve: mock.MagicMock,
@@ -335,7 +384,6 @@ class AntigravityAdapterLifecycleTests(unittest.TestCase):
             instruction="Edit files",
             payload={
                 "mode": "accept-edits",
-                "dangerously_skip_permissions": True,
                 "allow_dirty": True,
                 "allow_non_worktree": True,
             },
@@ -345,6 +393,46 @@ class AntigravityAdapterLifecycleTests(unittest.TestCase):
         self.assertIn("--dangerously-skip-permissions", kwargs["command"])
         self.assertIn("stdin_data", kwargs)
         self.assertEqual(json.loads(kwargs["stdin_data"].strip())["event"], "user")
+
+    @mock.patch("puppetmaster.adapters.git_snapshot")
+    @mock.patch("puppetmaster.adapters.resolve_command")
+    @mock.patch("puppetmaster.adapters.run_streamed_subprocess")
+    def test_implement_skip_permissions_explicit_false(
+        self,
+        mock_run: mock.MagicMock,
+        mock_resolve: mock.MagicMock,
+        mock_snapshot: mock.MagicMock,
+    ) -> None:
+        mock_resolve.return_value = "/usr/local/bin/agy"
+        mock_snapshot.return_value = {
+            "sha": "abc1234",
+            "changed_files": [],
+            "untracked_files": [],
+            "tree": "tree1",
+            "diff": "",
+        }
+        mock_run.return_value = mock.MagicMock(
+            returncode=0,
+            stdout=json.dumps({"status": "SUCCESS", "response": "ok"}),
+            stderr="",
+            timed_out=False,
+            live_log_path="/tmp/live.log",
+        )
+        task = Task(
+            job_id="job-skip-off",
+            id="task-skip-off",
+            role="implement",
+            instruction="Edit files",
+            payload={
+                "mode": "accept-edits",
+                "dangerously_skip_permissions": False,
+                "allow_dirty": True,
+                "allow_non_worktree": True,
+            },
+        )
+        self.adapter.run(task, goal="Edit files", worker_id="w1")
+        kwargs = mock_run.call_args.kwargs
+        self.assertNotIn("--dangerously-skip-permissions", kwargs["command"])
 
     @mock.patch("puppetmaster.adapters.git_snapshot")
     @mock.patch("puppetmaster.adapters.resolve_command")

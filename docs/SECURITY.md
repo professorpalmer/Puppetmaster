@@ -30,6 +30,7 @@ Read-only work (review, plan, route, discovery, follow-up reads) never edits any
 | `cursor` | `--review` / `--plan` are read-only; implement edits via the SDK | use review/plan | — |
 | `claude-code` | `--permission-mode acceptEdits` (edits in `cwd`, no prompts) | `payload.permission_mode="plan"` / read-only modes | — |
 | `codex` | `--sandbox workspace-write`, `--approval-policy never` | `payload.sandbox="read-only"` | `payload.dangerously_bypass_approvals_and_sandbox=true` |
+| `antigravity` | `--mode accept-edits` plus `--dangerously-skip-permissions` (required for headless tools on `agy` 1.1.18) | `--mode plan` | `payload.dangerously_skip_permissions=false` restores prompts |
 
 Built-in guardrails:
 

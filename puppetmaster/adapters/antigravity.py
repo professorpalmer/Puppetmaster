@@ -39,7 +39,6 @@ DEFAULT_ANTIGRAVITY_EFFORT = "high"
 MODELS_REQUIRING_EFFORT = (
     "gemini-3.7-flash",
     "gemini-3.6-flash",
-    "gemini-3.5-flash",
     "gemini-3.1-pro",
 )
 _EFFORT_SLUG_SUFFIXES = ("-high", "-medium", "-low")
@@ -62,12 +61,12 @@ def resolve_antigravity_model(payload: Optional[Mapping[str, object]] = None) ->
     model = str(payload.get("model") or DEFAULT_ANTIGRAVITY_MODEL)
     if _model_slug_encodes_effort(model):
         return model, None
+    if not any(prefix in model.lower() for prefix in MODELS_REQUIRING_EFFORT):
+        return model, None
     effort = payload.get("effort")
     if effort is not None:
         return model, str(effort)
-    if any(prefix in model.lower() for prefix in MODELS_REQUIRING_EFFORT):
-        return model, DEFAULT_ANTIGRAVITY_EFFORT
-    return model, None
+    return model, DEFAULT_ANTIGRAVITY_EFFORT
 
 
 def resolve_antigravity_mode(payload: Optional[Mapping[str, object]] = None) -> str:
@@ -84,9 +83,53 @@ def resolve_antigravity_mode(payload: Optional[Mapping[str, object]] = None) -> 
     return "plan" if read_only_intent else "accept-edits"
 
 
+def resolve_antigravity_skip_permissions(
+    payload: Optional[Mapping[str, object]] = None,
+    *,
+    mode: Optional[str] = None,
+) -> bool:
+    """Headless accept-edits must skip prompts; plan never does.
+
+    Live ``agy`` 1.1.18 keeps ``toolPermission=request-review`` even after
+    ``--mode accept-edits``. Headless then auto-denies ``command`` / write
+    tools (``jetski: … permission that headless mode cannot prompt for``).
+    Opt out with ``payload.dangerously_skip_permissions=false``.
+    """
+    payload = payload or {}
+    resolved_mode = mode or resolve_antigravity_mode(payload)
+    if resolved_mode != "accept-edits":
+        return False
+    return payload.get("dangerously_skip_permissions") is not False
+
+
 def antigravity_stdin_data(prompt: str) -> str:
     """One stream-json user event; the prompt never goes on argv."""
     return json.dumps({"event": "user", "message": {"content": prompt}}) + "\n"
+
+
+def _with_agy_workspace_path(prompt: str, cwd: Path) -> str:
+    """agy tool shells start in scratch; pin the git workspace as an abs path."""
+    workspace = str(Path(cwd).expanduser().resolve())
+    note = (
+        "Git workspace (absolute path): {workspace}. "
+        "agy list_dir/run_command start in a private scratch directory, not "
+        "this workspace. Read and write repository files with write_to_file / "
+        "replace_file_content / view_file using that absolute path. "
+        "Do not search the whole filesystem."
+    ).format(workspace=workspace)
+    return note + "\n\n" + prompt
+
+
+def _workspace_add_dir(cwd: Optional[Path]) -> Optional[str]:
+    if cwd is None:
+        return None
+    try:
+        resolved = str(Path(cwd).expanduser().resolve())
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+    if not resolved:
+        return None
+    return resolved
 
 
 def _unwrap_agy_envelope(parsed: object) -> dict[str, object]:
@@ -168,13 +211,15 @@ class AntigravityAdapter(CliWorkerAdapter):
         model, effort = resolve_antigravity_model(task.payload)
         mode = resolve_antigravity_mode(task.payload)
         write_capable = mode != "plan"
-        # Workspace writes are already auto-allowed. The CLI flag defaults
-        # false; only pass it when the payload opts in explicitly.
-        dangerously_skip = task.payload.get("dangerously_skip_permissions") is True
+        dangerously_skip = resolve_antigravity_skip_permissions(
+            task.payload, mode=mode
+        )
         timeout_seconds = int(
             task.payload.get("timeout_seconds", self.default_timeout_seconds)
         )
-        stdin_data = antigravity_stdin_data(prompt)
+        stdin_data = antigravity_stdin_data(
+            _with_agy_workspace_path(prompt, cwd)
+        )
 
         command = build_antigravity_command(
             prompt=prompt,
@@ -449,11 +494,10 @@ def build_antigravity_command(
     reads one ``{"event":"user",...}`` line from stdin (see
     ``antigravity_stdin_data`` / ``CliInvocation.subprocess_kwargs``). Putting
     the prompt on ``-p=`` hits Windows ``CreateProcess`` 32767 / WinError 206.
-    ``prompt`` and ``cwd`` stay in the signature for source compatibility;
-    ``cwd`` is the subprocess working directory, not an ``--add-dir`` flag
-    (that token is a slash command, not a documented CLI flag).
+    Live ``agy`` 1.1.18 accepts ``--add-dir`` as a CLI flag; the adapter passes
+    the task workspace once. ``extra_args`` cannot inject additional dirs.
     """
-    del prompt, cwd
+    del prompt
     if mode in ("implement", "analyze"):
         mode = "accept-edits" if mode == "implement" else "plan"
     command = command_parts(executable)
@@ -461,13 +505,18 @@ def build_antigravity_command(
     command.extend(["--output-format", "stream-json"])
     if mode in ("accept-edits", "plan"):
         command.extend(["--mode", mode])
+    add_dir = _workspace_add_dir(cwd)
+    if add_dir:
+        command.extend(["--add-dir", add_dir])
     if dangerously_skip_permissions and mode == "accept-edits":
         command.append("--dangerously-skip-permissions")
     if disable_slash_commands:
         command.append("--disable-slash-commands")
     if model:
         command.extend(["--model", str(model)])
-    if effort and not _model_slug_encodes_effort(model):
+    if effort and any(
+        prefix in str(model or "").lower() for prefix in MODELS_REQUIRING_EFFORT
+    ) and not _model_slug_encodes_effort(model):
         command.extend(["--effort", str(effort)])
     if timeout_seconds is not None:
         command.extend(["--print-timeout", "{}s".format(int(timeout_seconds))])

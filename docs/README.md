@@ -2,7 +2,7 @@
 
 The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
 
-**Current release:** [v1.22.10](CHANGELOG.md#v12210) — spawned workers are exempt from the delegate-first gate; see [CHANGELOG.md](CHANGELOG.md) for the full line.
+**Current release:** [v1.22.16](CHANGELOG.md#v12216) — Google Antigravity (`agy`) worker adapter; see [CHANGELOG.md](CHANGELOG.md) for the full line.
 
 ## Start here
 

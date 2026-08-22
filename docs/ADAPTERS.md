@@ -216,13 +216,13 @@ When a Hermes implement worker edits tracked files, Puppetmaster records a `patc
 
 ### `antigravity`
 
-Runs the Google Antigravity CLI (`agy`) headlessly. The prompt is sent on stdin as one stream-json user event (`--input-format stream-json` + `--output-format stream-json`) so Windows `CreateProcess` does not hit argv-length WinError 206. Do not pass `-p=`. Supports Gemini 3.7 Flash (`gemini-3.7-flash`), Gemini 3.6 Flash, Gemini 3.5 Flash, and Gemini 3.1 Pro. Model slugs that already encode effort (`gemini-3.7-flash-high`) do not also get `--effort`.
+Runs the Google Antigravity CLI (`agy`) headlessly. The prompt is sent on stdin as one stream-json user event (`--input-format stream-json` + `--output-format stream-json`) so Windows `CreateProcess` does not hit argv-length WinError 206. Do not pass `-p=`. Supports Gemini 3.7 Flash (`gemini-3.7-flash`), Gemini 3.6 Flash, Gemini 3.5 Flash, and Gemini 3.1 Pro. Model slugs that already encode effort (`gemini-3.7-flash-high`) do not also get `--effort`. Live `agy` 1.1.18 rejects `--effort` on Gemini 3.5 Flash, so that slug never receives it. The task workspace is passed once as `--add-dir` (a real CLI flag on 1.1.18); `extra_args` cannot inject additional dirs.
 
 CLI: `python -m puppetmaster antigravity "Goal" --mode analyze` (alias `agy`). Enable a restricted lock with `puppetmaster platform enable antigravity` — nothing enables antigravity in anyone's lock by default. Discover the curated catalog with `models discover --source antigravity` after `agy` is installed; `models init` does not seed antigravity starter-registry rows.
 
 Two execution modes:
 - **`plan`** (analyze / read-only): Audit or inspection without modifying the working tree.
-- **`accept-edits`** (implement / full-edit): Workspace file writes are already auto-allowed. `--dangerously-skip-permissions` is opt-in (`payload.dangerously_skip_permissions=true`) and is never added in plan mode.
+- **`accept-edits`** (implement / full-edit): Headless `agy` 1.1.18 keeps `toolPermission=request-review` even with `--mode accept-edits`, so command/write tools are auto-denied unless `--dangerously-skip-permissions` is passed. Implement mode adds that flag by default; set `payload.dangerously_skip_permissions=false` to opt out. Never added in plan mode.
 
 Telemetry and Billing:
 - Captures input tokens, output tokens, thinking/reasoning tokens, and cache read tokens from the final `event==result` payload (same shape as `--output-format json`).
