@@ -127,6 +127,25 @@ from puppetmaster.cli.commands_gate import (
 )
 
 
+def _resolve_command_state_dir(args: argparse.Namespace) -> Path:
+    """Resolve durable state for the command's workspace without moving overrides.
+
+    Worker-launching commands accept ``--cwd`` to select a target repository.
+    In the absence of an explicit state override, their durable job state must
+    follow that repository too.  Explicit ``--state-dir`` and
+    ``PUPPETMASTER_STATE_DIR`` retain the historic launcher-shell-relative
+    resolution so existing scripts keep their path semantics.
+    """
+    explicit_state_dir = getattr(args, "state_dir", None)
+    if explicit_state_dir or os.environ.get("PUPPETMASTER_STATE_DIR"):
+        return resolve_state_dir(explicit_state_dir)
+
+    command_cwd = getattr(args, "cwd", None)
+    if command_cwd:
+        return resolve_state_dir(cwd=Path(command_cwd))
+    return resolve_state_dir()
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     from puppetmaster.win_console import hide_child_consoles
 
@@ -573,7 +592,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
     import puppetmaster.cli as cli
 
     args = build_parser().parse_args(argv)
-    state_dir = resolve_state_dir(args.state_dir)
+    state_dir = _resolve_command_state_dir(args)
     store = create_store(args.backend, state_dir)
     on_job_created = early_job_printer if args.emit_job_id_early else None
 

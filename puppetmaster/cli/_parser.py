@@ -2151,6 +2151,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Heartbeat age that defines a stale server (default: 300).",
     )
     mcp_cleanup.add_argument(
+        "--pid",
+        dest="pids",
+        type=int,
+        action="append",
+        help="Explicit MCP server PID to terminate; may be repeated and intersects other selectors.",
+    )
+    mcp_cleanup.add_argument(
+        "--workspace",
+        help="Explicit workspace selector to terminate; normalized before matching.",
+    )
+    mcp_cleanup.add_argument(
+        "--idle-after-seconds",
+        type=float,
+        help="Terminate only servers with no inbound MCP message for this many seconds.",
+    )
+    mcp_cleanup.add_argument(
         "--json",
         action="store_true",
         help="Print the before/after registry payload as JSON.",

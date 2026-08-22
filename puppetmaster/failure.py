@@ -117,12 +117,21 @@ _ADAPTER_EXTRA_RULES: dict[str, Tuple[Rule, ...]] = {
         (_any("no provider", "provider credentials"), NOT_AUTHENTICATED),
     ),
     "openai": (),
+    "antigravity": (
+        (_any("not recognized as a known model", "invalid model selection"), MODEL_UNAVAILABLE),
+        (_any("requires --effort", "invalid effort"), MODEL_UNAVAILABLE),
+        (_any("not authenticated", "please authenticate", "login to", "oauth"), NOT_AUTHENTICATED),
+    ),
 }
 
 
 def classify_adapter_failure(adapter: str, output: str) -> str:
     extra = _ADAPTER_EXTRA_RULES.get(adapter, ())
     return _classify(output, (*extra, *_BASE_RULES))
+
+
+def classify_antigravity_failure(output: str) -> str:
+    return classify_adapter_failure("antigravity", output)
 
 
 def classify_codex_failure(output: str) -> str:

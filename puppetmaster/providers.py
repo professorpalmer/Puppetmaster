@@ -2083,8 +2083,19 @@ def provider_chat_streaming(
     from puppetmaster.provider_circuit import resolve_circuit_key
     from puppetmaster.rate_limit_state import harvesting_rate_limits
 
+    env = env if env is not None else os.environ
+    desc = get_provider(provider)
+    resolved_api_key = api_key
+    if resolved_api_key is None and desc is not None:
+        resolved_api_key = resolve_api_key(desc, env)
     with harvesting_rate_limits(
-        resolve_circuit_key(provider, model),
+        resolve_circuit_key(
+            provider,
+            model,
+            api_key=resolved_api_key,
+            base_url=base_url,
+            env=env,
+        ),
         provider=provider,
         model=model,
     ):
@@ -2194,8 +2205,19 @@ def provider_chat(
     from puppetmaster.provider_circuit import resolve_circuit_key
     from puppetmaster.rate_limit_state import harvesting_rate_limits
 
+    env = env if env is not None else os.environ
+    desc = get_provider(provider)
+    resolved_api_key = api_key
+    if resolved_api_key is None and desc is not None:
+        resolved_api_key = resolve_api_key(desc, env)
     with harvesting_rate_limits(
-        resolve_circuit_key(provider, model),
+        resolve_circuit_key(
+            provider,
+            model,
+            api_key=resolved_api_key,
+            base_url=base_url,
+            env=env,
+        ),
         provider=provider,
         model=model,
     ):

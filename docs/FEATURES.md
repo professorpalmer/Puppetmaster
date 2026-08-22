@@ -4,7 +4,7 @@ A full map of what ships today, plus the adapter matrix. For the design rational
 
 ## Adapters
 
-Five production adapters live plus the keys-only `agentic` standalone worker; twelve tiers in the starter registry (6 Cursor/Claude + 4 OpenAI + 2 Codex, including the Grok 4.6 Cursor overlay added in v1.22.3). Tier and pricing details in [docs/MODEL_ROUTING.md](MODEL_ROUTING.md); adapter wiring details in [docs/ADAPTERS.md](ADAPTERS.md).
+Six production adapters live plus the keys-only `agentic` standalone worker; curated tiers across Cursor, Claude, OpenAI, Codex, Antigravity (Gemini 3.7 / 3.6 / 3.5 / 3.1 Pro), and Hermes. Tier and pricing details in [docs/MODEL_ROUTING.md](MODEL_ROUTING.md); adapter wiring details in [docs/ADAPTERS.md](ADAPTERS.md).
 
 | Adapter | What it's for | Telemetry | Setup |
 |---|---|---|---|
@@ -12,6 +12,7 @@ Five production adapters live plus the keys-only `agentic` standalone worker; tw
 | `claude-code` | Full-edit workflows via the `claude` CLI | usage from CLI | `npm i -g @anthropic-ai/claude-code` + `ANTHROPIC_API_KEY` |
 | `openai` | Direct Chat Completions (the most pricing-transparent path) | real `usage.prompt_tokens`/`completion_tokens` | `OPENAI_API_KEY` |
 | `codex` | Full-edit via the OpenAI Codex CLI agent loop | `input_tokens` + `output_tokens` + `cached_input_tokens` + `reasoning_output_tokens` per turn | `npm i -g @openai/codex` + `codex login` |
+| `antigravity` | Analyze (`--mode plan`) + full-edit (`--mode accept-edits`) via Google Antigravity CLI (`agy --output-format json`); supports Gemini 3.7 / 3.6 / 3.5 / 3.1 Pro with reasoning effort | `input_tokens` + `output_tokens` + `thinking_tokens` + `cache_read_tokens` + `conversation_id` | `agy` CLI on PATH + Antigravity session / `GEMINI_API_KEY` |
 | `hermes` | Analyze + full-edit via the NousResearch Hermes CLI (`hermes chat`); preferred live-site browser adapter (`hermes chat -t browser`); auto-injects CodeGraph context, parses typed artifacts | exit-code- and diff-based success (Hermes exit codes are unreliable) | `pipx install hermes-agent` (or any `hermes` on PATH) + `puppetmaster install-hermes-mcp` |
 | `agentic` | Keys-only analyze + full-edit via direct provider HTTP APIs (no external CLI); browser-swarm fallback via stdlib CDP (OpenRouter / standalone keys) | tool-loop artifacts + PATCH on implement; tokens + cache reads + `price_job` / savings | any provider API key (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `OPENROUTER_API_KEY`, `OPENCODE_GO_API_KEY`, `ZAI_API_KEY`/`GLM_API_KEY`/`Z_AI_API_KEY`, `MINIMAX_API_KEY`, `NVIDIA_API_KEY`) or AWS Bedrock IAM / `AWS_BEARER_TOKEN_BEDROCK` (`provider=bedrock`, Converse + ConverseStream + live catalog) |
 | `shell` | Bounded verification commands | n/a | none |
