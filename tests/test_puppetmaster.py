@@ -26168,7 +26168,11 @@ class UninstallTests(unittest.TestCase):
             cwd0 = os.getcwd()
             try:
                 os.chdir(cwd)
-                with patch.object(cli.Path, "home", return_value=Path(home_tmp)):
+                hermes_home = Path(home_tmp) / ".hermes"
+                with patch.dict(
+                    os.environ,
+                    {"HOME": home_tmp, "HERMES_HOME": str(hermes_home)},
+                ), patch.object(cli.Path, "home", return_value=Path(home_tmp)):
                     rc = cli._run_uninstall(
                         argparse.Namespace(
                             cwd=str(cwd),

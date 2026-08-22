@@ -1,10 +1,37 @@
-## Unreleased
+## v1.22.17
 
-**Docs: Antigravity API-key setup (`modelProvider: gemini`).**
+Absorb of [@bsmi021](https://github.com/bsmi021) PR
+[#56](https://github.com/professorpalmer/Puppetmaster/pull/56)
+(landed via absorb, not a merge of the fork branch), plus stack-fit so
+Antigravity timeouts stay timeouts.
 
-Live `agy` 1.1.18 ignores `GEMINI_API_KEY` unless
-`~/.gemini/antigravity-cli/settings.json` sets `"modelProvider": "gemini"`.
-Documented in `docs/ADAPTERS.md` and the daily-driver recipe.
+**Feature: safely resumable jobs and honest delivery verdicts.**
+
+Asynchronous starts accept an optional caller launch key with durable
+full-request idempotency, return an opaque `job_ref` plus a bounded
+`monitor_with` continuation, and keep internal run goals off Windows argv.
+CLI and MCP observers share quality-aware delivery verdicts (`delivered`,
+`degraded`, `blocked`, `pending`); cancellation and empty/degraded terminal
+work are not successful delivery. Compact feeds can filter artifact types
+without losing cursor progress.
+
+- **MCP hang / Codex Windows launch**: `puppetmaster_live_artifacts_follow`
+  returns terminal job state immediately instead of waiting for an artifact
+  that can never arrive. Final JSON-RPC responses and keepalive notifications
+  share one serialized, guarded stdio writer. On Windows, the default Codex
+  launch resolves the npm batch shim to `node.exe` plus
+  `@openai/codex/bin/codex.js`.
+- **One-assignment swarm default**: analysis swarms default to one
+  assignment. Structured role objects carry their own instructions and
+  scopes; repeated legacy role names produce a visible fan-out warning.
+  Read-only analysis has an orchestration-level worker-diff postcondition.
+- **Runtime budgets**: streamed CLI adapters can enforce a captured-output
+  limit. Cost reports expose token-volume and nominal-cost estimate drift
+  without treating plan billing as zero resource consumption.
+- **Stack-fit**: `output_limit_hit` is only acted on when it is the boolean
+  `True`, so existing MagicMock adapter tests (and Antigravity timeouts)
+  are not misread as a budget stop. API-key Antigravity setup
+  (`modelProvider: gemini`) is documented in `docs/ADAPTERS.md`.
 
 ## v1.22.16
 
@@ -21,35 +48,6 @@ Google Antigravity (`agy`) is a first-class worker adapter. Canonical lock/adapt
 - **Surfaces**: `puppetmaster antigravity` (alias `agy`), MCP `antigravity_command` on implement/edit, swarm analysis adapters, model-backed auto-route, implement priority (before agentic), curated discover source. Not in the browser-swarm enum. Analysis swarms stay read-only labeled (not `_EDIT_CAPABLE_ADAPTERS`).
 - **Billing honesty**: PATH-only `agy` is unhealthy `unknown`. Healthy plan requires session files inside `~/.gemini/antigravity-cli` (empty dir is not a login). Healthy api requires `GEMINI_API_KEY`/`GOOGLE_API_KEY` *and* `agy` on PATH — a stray Gemini key used by agentic/hermes is not Antigravity proof. `agy` is canonicalized to `antigravity` at the lock gate so the alias cannot bypass `platform disable antigravity`.
 - **Live E2E (agy 1.1.18 + Gemini API key):** analyze on `gemini-3.7-flash` returned a FINDING; implement wrote a tracked file and emitted a PATCH on `gemini-3.5-flash`. Gemini 3.6/3.7 implement on a free-tier key hit provider 503 (high demand) — the adapter failed closed, not a silent no-op.
-
-**Fix: MCP jobs that completed successfully could still look hung or crashed to
-Codex and Claude clients.**
-
-- `puppetmaster_live_artifacts_follow` now returns terminal job state
-  immediately instead of waiting for an artifact that can never arrive and
-  reporting a false timeout.
-- Final JSON-RPC responses and keepalive notifications now share one serialized,
-  guarded stdio writer; a disconnected client no longer leaks an unobserved
-  `BrokenPipeError` / `OSError` from a worker-thread future.
-- On Windows, the default Codex adapter launch resolves the npm batch shim to
-  `node.exe` plus `@openai/codex/bin/codex.js`, keeping Puppetmaster in direct
-  ownership of the child process and its pipes. Explicit `CODEX_COMMAND` and
-  task executable overrides retain their existing command semantics.
-
-**Operator remediation contracts.** Asynchronous starts now support an optional
-caller launch key with durable full-request idempotency, return an opaque
-`job_ref` and bounded `monitor_with` continuation, and keep internal run goals
-out of Windows argv. CLI and MCP observers share quality-aware delivery verdicts
-(`delivered`, `degraded`, `blocked`, `pending`); cancellation and empty/degraded
-terminal work are not successful delivery. Compact feeds can filter artifact
-types without losing cursor progress.
-
-Analysis swarms default to one assignment. Structured role objects carry their
-own instructions and source/negative scopes, while repeated legacy role names
-produce a visible fan-out warning. Read-only analysis has an orchestration-level
-worker-diff postcondition. Streamed CLI adapters can enforce a captured-output
-limit, and cost reports expose token-volume and nominal-cost estimate drift
-without treating plan billing as zero resource consumption.
 
 ## v1.22.15
 

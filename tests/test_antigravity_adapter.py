@@ -309,6 +309,7 @@ class AntigravityAdapterLifecycleTests(unittest.TestCase):
             stdout=raw_output,
             stderr="",
             timed_out=False,
+            output_limit_hit=False,
             live_log_path="/tmp/live.log",
         )
 
@@ -506,6 +507,7 @@ class AntigravityAdapterLifecycleTests(unittest.TestCase):
             stdout="partial progress...",
             stderr="",
             timed_out=True,
+            output_limit_hit=False,
             live_log_path="/tmp/live.log",
         )
 
@@ -522,6 +524,41 @@ class AntigravityAdapterLifecycleTests(unittest.TestCase):
         self.assertEqual(artifacts[0].type, ArtifactType.VERIFICATION)
         self.assertEqual(artifacts[0].payload["result"], "failed")
         self.assertEqual(artifacts[0].payload["failure"], "timeout")
+
+    @mock.patch("puppetmaster.adapters.git_snapshot")
+    @mock.patch("puppetmaster.adapters.resolve_command")
+    @mock.patch("puppetmaster.adapters.run_streamed_subprocess")
+    def test_timeout_magicmock_does_not_look_like_output_budget(
+        self,
+        mock_run: mock.MagicMock,
+        mock_resolve: mock.MagicMock,
+        mock_snapshot: mock.MagicMock,
+    ) -> None:
+        mock_resolve.return_value = "/usr/local/bin/agy"
+        mock_snapshot.return_value = {
+            "sha": "abc1234",
+            "changed_files": [],
+            "untracked_files": [],
+            "tree": "tree1",
+        }
+        mock_run.return_value = mock.MagicMock(
+            returncode=None,
+            stdout="partial progress...",
+            stderr="",
+            timed_out=True,
+            live_log_path="/tmp/live.log",
+        )
+        task = Task(
+            job_id="job3b",
+            id="task3b",
+            role="explore",
+            instruction="Long running task",
+            payload={"mode": "plan", "read_only": True},
+        )
+        artifacts = self.adapter.run(task, goal="Long running task", worker_id="w1")
+        self.assertEqual(artifacts[0].payload["result"], "failed")
+        self.assertEqual(artifacts[0].payload["failure"], "timeout")
+        self.assertNotEqual(artifacts[0].payload.get("failure"), "runtime_budget_exceeded")
 
 
 class AntigravityBillingTests(unittest.TestCase):

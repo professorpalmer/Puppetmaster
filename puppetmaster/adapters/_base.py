@@ -349,7 +349,11 @@ class CliWorkerAdapter(FullEditWorkerAdapter):
 
         completed = self._invoke_cli(task, prepared, cwd, timeout_seconds)
         after = facade("git_snapshot")(cwd, base_tree=str(before.get("tree") or "") or None)
-        if completed.output_limit_hit:
+        # Strict identity: unittest MagicMock is truthy, so a mock that never
+        # set output_limit_hit must not look like a real budget stop. Timeouts
+        # stay timeouts (result=failed) unless the streamed run actually tripped
+        # the byte ceiling.
+        if getattr(completed, "output_limit_hit", False) is True:
             artifacts = [
                 verification_artifact(
                     task=task,
