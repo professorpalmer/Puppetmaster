@@ -932,7 +932,9 @@ DISCOVERY_ORIGINS = frozenset({DISCOVERY_ORIGIN_LIVE, DISCOVERY_ORIGIN_CURATED})
 
 # Sources whose "discovery" re-applies CURATED_CATALOGS. A pre-field sidecar
 # for these was never a live fetch; cursor/openai/anthropic stay live.
-_CURATED_DISCOVERY_SOURCES = frozenset({"claude", "codex", "hermes", "agentic"})
+_CURATED_DISCOVERY_SOURCES = frozenset(
+    {"claude", "codex", "hermes", "agentic", "antigravity"}
+)
 
 
 def discovery_origin(meta: dict[str, Any], source: str) -> str:

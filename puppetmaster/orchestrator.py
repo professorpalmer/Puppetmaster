@@ -216,7 +216,7 @@ def _payload_has_explicit_model_pin(payload: dict) -> bool:
 
 
 _MODEL_BACKED_ADAPTERS = frozenset(
-    {"agentic", "openai", "cursor", "codex", "claude-code", "hermes"}
+    {"agentic", "openai", "cursor", "codex", "claude-code", "hermes", "antigravity"}
 )
 
 

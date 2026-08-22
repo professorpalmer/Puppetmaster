@@ -1456,7 +1456,7 @@ def _build_tools() -> list[McpTool]:
             description=(
                 "PREFER over the built-in Task tool or an inline multi-file edit loop for "
                 "any cross-cutting change. Start a full-edit implement worker on whichever "
-                "platform you're locked to (cursor, claude-code, codex, hermes, or agentic), "
+                "platform you're locked to (cursor, claude-code, codex, hermes, antigravity, or agentic), "
                 "so implement isn't Claude-Code-only. Runs in a clean worktree and captures "
                 "a PATCH artifact. Returns job_id immediately. Pass adapter to force one; "
                 "otherwise the enabled platform is used."
@@ -2276,6 +2276,8 @@ def _implement_command(args: JsonObject, adapter: str) -> list[str]:
         return codex_command(args)
     if adapter == "hermes":
         return hermes_command(args, implement=True)
+    if adapter == "antigravity":
+        return antigravity_command(args, implement=True)
     if adapter == "agentic":
         return agentic_command(args, implement=True)
     raise ValueError(f"adapter {adapter!r} has no implement command")
@@ -2330,6 +2332,28 @@ def hermes_command(args: JsonObject, implement: bool = True) -> list[str]:
         command.append("--allow-non-worktree")
     if args.get("use_hermes_rules"):
         command.append("--use-hermes-rules")
+    if args.get("disable_codegraph"):
+        command.append("--disable-codegraph")
+    _append_routing_cli_flags(command, args)
+    return command
+
+
+def antigravity_command(args: JsonObject, implement: bool = True) -> list[str]:
+    prompt = require_string(args, "goal")
+    command = ["antigravity", prompt, "--cwd", cwd(args)]
+    command.extend(["--mode", "implement" if implement else "analyze"])
+    if args.get("model"):
+        command.extend(["--model", str(args["model"])])
+    if args.get("effort"):
+        command.extend(["--effort", str(args["effort"])])
+    if args.get("timeout_seconds"):
+        command.extend(["--timeout-seconds", str(args["timeout_seconds"])])
+    if args.get("executable"):
+        command.extend(["--executable", str(args["executable"])])
+    if args.get("allow_dirty"):
+        command.append("--allow-dirty")
+    if args.get("allow_non_worktree"):
+        command.append("--allow-non-worktree")
     if args.get("disable_codegraph"):
         command.append("--disable-codegraph")
     _append_routing_cli_flags(command, args)
@@ -4657,11 +4681,11 @@ def implement_schema() -> JsonObject:
         {
             "adapter": {
                 "type": "string",
-                "enum": ["cursor", "claude-code", "codex", "hermes", "agentic"],
+                "enum": ["cursor", "claude-code", "codex", "hermes", "antigravity", "agentic"],
                 "description": (
                     "Force a specific implement-capable platform. Omit to use whichever "
                     "platform the lock has enabled (cursor preferred, then claude-code, "
-                    "then codex, then hermes, then agentic)."
+                    "then codex, then hermes, then antigravity, then agentic)."
                 ),
             },
             "sandbox": {
@@ -4693,7 +4717,7 @@ def edit_schema() -> JsonObject:
             },
             "adapter": {
                 "type": "string",
-                "enum": ["cursor", "claude-code", "codex", "hermes", "agentic"],
+                "enum": ["cursor", "claude-code", "codex", "hermes", "antigravity", "agentic"],
                 "description": (
                     "Force a full-edit adapter. Omit to use the highest-priority "
                     "adapter the platform lock enables."
@@ -4824,7 +4848,7 @@ def prewalk_schema() -> JsonObject:
             },
             "adapter": {
                 "type": "string",
-                "enum": ["cursor", "claude-code", "codex", "hermes", "agentic"],
+                "enum": ["cursor", "claude-code", "codex", "hermes", "antigravity", "agentic"],
                 "description": (
                     "Force the implement adapter. Omit to use the highest-priority "
                     "adapter the platform lock enables."

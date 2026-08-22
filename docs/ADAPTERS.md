@@ -216,19 +216,21 @@ When a Hermes implement worker edits tracked files, Puppetmaster records a `patc
 
 ### `antigravity`
 
-Runs the Google Antigravity CLI (`agy --output-format json`) headlessly in non-interactive mode. Supports Gemini 3.7 Flash (`gemini-3.7-flash`), Gemini 3.6 Flash, Gemini 3.5 Flash, and Gemini 3.1 Pro with automatic reasoning effort mapping (`high`, `medium`, `low`).
+Runs the Google Antigravity CLI (`agy`) headlessly. The prompt is sent on stdin as one stream-json user event (`--input-format stream-json` + `--output-format stream-json`) so Windows `CreateProcess` does not hit argv-length WinError 206. Do not pass `-p=`. Supports Gemini 3.7 Flash (`gemini-3.7-flash`), Gemini 3.6 Flash, Gemini 3.5 Flash, and Gemini 3.1 Pro. Model slugs that already encode effort (`gemini-3.7-flash-high`) do not also get `--effort`.
+
+CLI: `python -m puppetmaster antigravity "Goal" --mode analyze` (alias `agy`). Enable a restricted lock with `puppetmaster platform enable antigravity` — nothing enables antigravity in anyone's lock by default. Discover the curated catalog with `models discover --source antigravity` after `agy` is installed; `models init` does not seed antigravity starter-registry rows.
 
 Two execution modes:
-- **`plan`** (analyze / read-only): Executes audit or inspection queries without modifying the working tree, extracting structured findings, risks, and decisions.
-- **`accept-edits`** (implement / full-edit): Passes `--dangerously-skip-permissions` to allow full workspace edits and captures the resulting diff as a `PATCH` artifact.
+- **`plan`** (analyze / read-only): Audit or inspection without modifying the working tree.
+- **`accept-edits`** (implement / full-edit): Workspace file writes are already auto-allowed. `--dangerously-skip-permissions` is opt-in (`payload.dangerously_skip_permissions=true`) and is never added in plan mode.
 
 Telemetry and Billing:
-- Captures input tokens, output tokens, thinking/reasoning tokens, and cache read tokens directly from the CLI JSON response.
-- Billing is automatically detected as `plan` when running on an authenticated `agy` session, or `api` when `GEMINI_API_KEY` / `GOOGLE_API_KEY` is present.
+- Captures input tokens, output tokens, thinking/reasoning tokens, and cache read tokens from the final `event==result` payload (same shape as `--output-format json`).
+- Billing is `plan` when `~/.gemini/antigravity-cli` contains session files, or `api` when `GEMINI_API_KEY` / `GOOGLE_API_KEY` is set *and* `agy` is on PATH. An empty settings directory or a stray Gemini key without `agy` is **not** healthy. `agy` merely on PATH is **not** an authenticated session.
 
 Requirements:
 - `agy` CLI installed and on PATH, or `AGY_COMMAND` / `ANTIGRAVITY_COMMAND` / `payload.executable` set.
-- Antigravity session authenticated or `GEMINI_API_KEY` / `GOOGLE_API_KEY` set.
+- Authenticated Antigravity settings directory, or `GEMINI_API_KEY` / `GOOGLE_API_KEY`.
 
 ```json
 {

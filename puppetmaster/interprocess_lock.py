@@ -36,18 +36,14 @@ def _lock_path_for(target: Path) -> Path:
 
 
 def _pid_is_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # A process owned by another account is still an active owner.
-        return True
-    except OSError:
-        return False
-    return True
+    """Delegate to the shared Windows-safe probe after imports settle.
+
+    A top-level ``liveness`` import cycles through ``store`` →
+    ``fs_permissions`` → this module.
+    """
+    from puppetmaster.liveness import _pid_alive
+
+    return _pid_alive(pid)
 
 
 class InterProcessFileLock:

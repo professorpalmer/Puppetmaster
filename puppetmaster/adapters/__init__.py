@@ -98,7 +98,9 @@ from .antigravity import (
     DEFAULT_ANTIGRAVITY_EFFORT,
     DEFAULT_ANTIGRAVITY_MODEL,
     AntigravityAdapter,
+    antigravity_stdin_data,
     build_antigravity_command,
+    resolve_antigravity_mode,
     resolve_antigravity_model,
 )
 from .claude_code import (
@@ -183,6 +185,7 @@ __all__ = [
     "VALID_HERMES_REASONING_EFFORTS",
     "WorkerAdapter",
     "apply_worktree_ports",
+    "antigravity_stdin_data",
     "available_hermes_providers",
     "build_antigravity_command",
     "build_claude_code_command",
@@ -234,6 +237,7 @@ __all__ = [
     "prune_hermes_tool_sessions",
     "redact_secrets",
     "repo_file_census",
+    "resolve_antigravity_mode",
     "resolve_antigravity_model",
     "resolve_claude_code_model",
     "resolve_command",

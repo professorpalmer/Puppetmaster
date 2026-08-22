@@ -931,7 +931,7 @@ def reconcile_agentic_catalog(
 def ensure_subscription_plan_catalog(
     registry_path: "Path",
     *,
-    adapters: "tuple[str, ...]" = ("claude-code", "codex"),
+    adapters: "tuple[str, ...]" = ("claude-code", "codex", "antigravity"),
     billing_detector: Optional[Callable[[str], object]] = None,
     min_capability: Optional[int] = None,
 ) -> dict:

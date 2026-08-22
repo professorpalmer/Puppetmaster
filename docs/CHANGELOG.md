@@ -1,13 +1,12 @@
 ## Unreleased
 
-**Feature: Antigravity CLI adapter (`agy`) with Gemini 3.7 / 3.6 / 3.5 / 3.1 Pro integration.**
+**Feature: Antigravity CLI adapter (`agy`) stack-fit to existing adapter contracts.**
 
-Adds first-class support for running Google Antigravity CLI (`agy`) as an external worker adapter across Puppetmaster swarms, model routing, and task execution.
+Google Antigravity (`agy`) is a first-class worker adapter. Canonical lock/adapter name is `antigravity`; registry alias `agy` resolves to the same adapter. Not enabled in anyone's platform lock by default — use `puppetmaster platform enable antigravity`. `models init` does not seed antigravity starter-registry rows; curated discovery is `models discover --source antigravity` when `agy` is installed.
 
-- **Non-interactive execution lifecycle**: Launches `agy --output-format json` in headless print mode. In `implement` mode, passes `--mode accept-edits --dangerously-skip-permissions` to allow full repository edits and captures resulting changes as `PATCH` artifacts via git diff. In `analyze` mode, runs under `--mode plan` to emit structured findings, risks, and decisions without dirtying the working tree.
-- **Thinking / Effort resolution**: Seamlessly maps reasoning effort (`high`, `medium`, `low`) for Gemini 3.7 Flash (`gemini-3.7-flash`), Gemini 3.6 Flash, Gemini 3.5 Flash, and Gemini 3.1 Pro, defaulting to `high` effort when required by the model.
-- **Structured token telemetry & billing**: Captures input tokens, output tokens, thinking/reasoning tokens, and cache read tokens directly from `agy` output into `VERIFICATION` artifacts. Implements billing posture detection in `platform_billing.py` (`plan` for subscription sessions, `api` when `GEMINI_API_KEY`/`GOOGLE_API_KEY` is present).
-- **Diagnostics and failure handling**: Integrated into `puppetmaster doctor`, adapter discovery, platform lock (`KNOWN_ADAPTERS`), and curated static catalogs (`CURATED_CATALOGS["antigravity"]`).
+- **Headless contract**: `--input-format stream-json` + `--output-format stream-json` with one stdin line `{"event":"user","message":{"content": prompt}}` (no `-p=`). Parse a json envelope, NDJSON `event==result` payloads, or a trailing `{...}` object. `--print-timeout` comes from `timeout_seconds`. `--add-dir` is not a CLI flag (subprocess cwd is the workspace). `--disable-slash-commands` stays. `--dangerously-skip-permissions` is opt-in (`payload.dangerously_skip_permissions=true`) and never added in plan mode. Effort is not appended when the model slug already ends in `-high`/`-medium`/`-low`.
+- **Surfaces**: `puppetmaster antigravity` (alias `agy`), MCP `antigravity_command` on implement/edit, swarm analysis adapters, model-backed auto-route, implement priority (before agentic), curated discover source. Not in the browser-swarm enum. Analysis swarms stay read-only labeled (not `_EDIT_CAPABLE_ADAPTERS`).
+- **Billing honesty**: PATH-only `agy` is unhealthy `unknown`. Healthy plan requires session files inside `~/.gemini/antigravity-cli` (empty dir is not a login). Healthy api requires `GEMINI_API_KEY`/`GOOGLE_API_KEY` *and* `agy` on PATH — a stray Gemini key used by agentic/hermes is not Antigravity proof. `agy` is canonicalized to `antigravity` at the lock gate so the alias cannot bypass `platform disable antigravity`.
 
 ## v1.22.15
 

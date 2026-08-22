@@ -5,10 +5,8 @@ import os
 from pathlib import Path
 from typing import Mapping, Optional, Union
 
-from puppetmaster.codegraph import enrich_prompt_with_codegraph
 from puppetmaster.failure import classify_antigravity_failure
 from puppetmaster.models import Artifact, ArtifactType, Task
-from puppetmaster.usage import token_usage
 
 from ._base import (
     CliInvocation,
@@ -34,10 +32,7 @@ from ._streaming import (
     _redacted_tail,
     capture_subprocess_stdout,
 )
-from .cursor import (
-    cursor_result_artifacts,
-    implement_report_artifacts,
-)
+from .cursor import implement_report_artifacts
 
 DEFAULT_ANTIGRAVITY_MODEL = "gemini-3.7-flash"
 DEFAULT_ANTIGRAVITY_EFFORT = "high"
@@ -47,18 +42,61 @@ MODELS_REQUIRING_EFFORT = (
     "gemini-3.5-flash",
     "gemini-3.1-pro",
 )
+_EFFORT_SLUG_SUFFIXES = ("-high", "-medium", "-low")
+
+
+def _model_slug_encodes_effort(model: Optional[str]) -> bool:
+    """True when the model slug already ends in an effort suffix."""
+    if not model:
+        return False
+    return str(model).lower().endswith(_EFFORT_SLUG_SUFFIXES)
 
 
 def resolve_antigravity_model(payload: Optional[Mapping[str, object]] = None) -> tuple[str, Optional[str]]:
-    """Determine effective model and reasoning effort for an Antigravity CLI run."""
+    """Determine effective model and reasoning effort for an Antigravity CLI run.
+
+    Slugs that already encode effort (``gemini-3.7-flash-high``) must not also
+    receive ``--effort`` — the CLI treats that as a double application.
+    """
     payload = payload or {}
     model = str(payload.get("model") or DEFAULT_ANTIGRAVITY_MODEL)
+    if _model_slug_encodes_effort(model):
+        return model, None
     effort = payload.get("effort")
     if effort is not None:
         return model, str(effort)
     if any(prefix in model.lower() for prefix in MODELS_REQUIRING_EFFORT):
         return model, DEFAULT_ANTIGRAVITY_EFFORT
     return model, None
+
+
+def resolve_antigravity_mode(payload: Optional[Mapping[str, object]] = None) -> str:
+    """Map CLI/MCP verbs onto agy ``--mode`` values."""
+    payload = payload or {}
+    raw = str(payload.get("mode") or "").strip().lower()
+    read_only_intent = bool(payload.get("read_only")) or (
+        payload.get("sandbox") == "read-only"
+    )
+    if raw in ("plan", "analyze"):
+        return "plan"
+    if raw in ("accept-edits", "implement"):
+        return "accept-edits"
+    return "plan" if read_only_intent else "accept-edits"
+
+
+def antigravity_stdin_data(prompt: str) -> str:
+    """One stream-json user event; the prompt never goes on argv."""
+    return json.dumps({"event": "user", "message": {"content": prompt}}) + "\n"
+
+
+def _unwrap_agy_envelope(parsed: object) -> dict[str, object]:
+    """Normalize a json envelope or a stream-json ``result`` event."""
+    if not isinstance(parsed, dict):
+        return {}
+    inner = parsed.get("result")
+    if parsed.get("event") == "result" and isinstance(inner, dict):
+        return inner
+    return parsed
 
 
 class AntigravityAdapter(CliWorkerAdapter):
@@ -128,13 +166,15 @@ class AntigravityAdapter(CliWorkerAdapter):
         )
         command_base = command_parts(executable)
         model, effort = resolve_antigravity_model(task.payload)
-
-        read_only_intent = bool(task.payload.get("read_only")) or (
-            task.payload.get("sandbox") == "read-only"
-        )
-        mode = str(task.payload.get("mode") or ("plan" if read_only_intent else "accept-edits"))
+        mode = resolve_antigravity_mode(task.payload)
         write_capable = mode != "plan"
-        dangerously_skip = bool(task.payload.get("dangerously_skip_permissions", True))
+        # Workspace writes are already auto-allowed. The CLI flag defaults
+        # false; only pass it when the payload opts in explicitly.
+        dangerously_skip = task.payload.get("dangerously_skip_permissions") is True
+        timeout_seconds = int(
+            task.payload.get("timeout_seconds", self.default_timeout_seconds)
+        )
+        stdin_data = antigravity_stdin_data(prompt)
 
         command = build_antigravity_command(
             prompt=prompt,
@@ -144,13 +184,16 @@ class AntigravityAdapter(CliWorkerAdapter):
             effort=effort,
             cwd=cwd,
             dangerously_skip_permissions=dangerously_skip,
+            timeout_seconds=timeout_seconds,
             extra_args=task.payload.get("extra_args"),
         )
         return CliInvocation(
             command=command,
             sidecar_name="antigravity_run",
+            subprocess_kwargs={"stdin_data": stdin_data},
             extras={
                 "prompt": prompt,
+                "stdin_data": stdin_data,
                 "codegraph_used": codegraph_used,
                 "model": model,
                 "effort": effort,
@@ -188,7 +231,6 @@ class AntigravityAdapter(CliWorkerAdapter):
         effort = prepared.extras.get("effort")
         mode = str(prepared.extras.get("mode") or "accept-edits")
         codegraph_used = bool(prepared.extras.get("codegraph_used"))
-        prompt = str(prepared.extras.get("prompt") or "")
         cwd = Path(task.payload.get("cwd") or ".").resolve()
 
         if completed.timed_out:
@@ -344,34 +386,79 @@ class AntigravityAdapter(CliWorkerAdapter):
         return artifacts
 
     def _parse_agy_output(self, stdout: str) -> dict[str, object]:
-        """Extract root JSON object from agy --output-format json output."""
+        """Parse a json envelope, NDJSON ``result`` events, or a trailing object."""
         text = (stdout or "").strip()
         if not text:
             return {}
         try:
             parsed = json.loads(text)
-            if isinstance(parsed, dict):
-                return parsed
+            unwrapped = _unwrap_agy_envelope(parsed)
+            if unwrapped:
+                return unwrapped
         except (json.JSONDecodeError, TypeError):
             pass
+
+        last_result: dict[str, object] = {}
+        last_object: dict[str, object] = {}
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                parsed = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            last_object = parsed
+            if parsed.get("event") == "result":
+                last_result = _unwrap_agy_envelope(parsed)
+        if last_result:
+            return last_result
+        if last_object:
+            return _unwrap_agy_envelope(last_object)
+
+        start = text.rfind("{")
+        if start >= 0:
+            try:
+                parsed = json.loads(text[start:])
+                unwrapped = _unwrap_agy_envelope(parsed)
+                if unwrapped:
+                    return unwrapped
+            except (json.JSONDecodeError, TypeError):
+                pass
         return {}
 
 
 def build_antigravity_command(
     *,
-    prompt: str,
+    prompt: str = "",
     executable: Union[str, list[str]] = "agy",
     model: Optional[str] = None,
     mode: str = "accept-edits",
     effort: Optional[str] = None,
     cwd: Optional[Path] = None,
-    dangerously_skip_permissions: bool = True,
+    dangerously_skip_permissions: bool = False,
     disable_slash_commands: bool = True,
+    timeout_seconds: Optional[int] = None,
     extra_args: object = None,
 ) -> list[str]:
-    """Build the non-interactive ``agy --output-format json`` argv."""
+    """Build the non-interactive ``agy`` stream-json argv.
+
+    The prompt is **not** part of the command: ``--input-format stream-json``
+    reads one ``{"event":"user",...}`` line from stdin (see
+    ``antigravity_stdin_data`` / ``CliInvocation.subprocess_kwargs``). Putting
+    the prompt on ``-p=`` hits Windows ``CreateProcess`` 32767 / WinError 206.
+    ``prompt`` and ``cwd`` stay in the signature for source compatibility;
+    ``cwd`` is the subprocess working directory, not an ``--add-dir`` flag
+    (that token is a slash command, not a documented CLI flag).
+    """
+    del prompt, cwd
+    if mode in ("implement", "analyze"):
+        mode = "accept-edits" if mode == "implement" else "plan"
     command = command_parts(executable)
-    command.extend(["--output-format", "json"])
+    command.extend(["--input-format", "stream-json"])
+    command.extend(["--output-format", "stream-json"])
     if mode in ("accept-edits", "plan"):
         command.extend(["--mode", mode])
     if dangerously_skip_permissions and mode == "accept-edits":
@@ -380,11 +467,56 @@ def build_antigravity_command(
         command.append("--disable-slash-commands")
     if model:
         command.extend(["--model", str(model)])
-    if effort:
+    if effort and not _model_slug_encodes_effort(model):
         command.extend(["--effort", str(effort)])
-    if cwd is not None:
-        command.extend(["--add-dir", str(cwd)])
+    if timeout_seconds is not None:
+        command.extend(["--print-timeout", "{}s".format(int(timeout_seconds))])
     if extra_args:
-        command.extend(command_parts(extra_args))
-    command.append(f"-p={prompt}")
+        command.extend(_sanitize_antigravity_extra_args(extra_args))
     return command
+
+
+_RESERVED_EXTRA_VALUE_FLAGS = frozenset(
+    {
+        "-p",
+        "--print",
+        "--mode",
+        "--input-format",
+        "--output-format",
+        "--print-timeout",
+        "--add-dir",
+    }
+)
+_RESERVED_EXTRA_FLAG_ONLY = frozenset({"--dangerously-skip-permissions"})
+_RESERVED_EXTRA_PREFIXES = (
+    "-p=",
+    "--print=",
+    "--mode=",
+    "--input-format=",
+    "--output-format=",
+    "--print-timeout=",
+    "--add-dir=",
+)
+
+
+def _sanitize_antigravity_extra_args(extra_args: object) -> list[str]:
+    """Drop extra_args that would rewrite the headless contract or flip mode."""
+    parts = command_parts(extra_args)
+    safe: list[str] = []
+    index = 0
+    while index < len(parts):
+        part = parts[index]
+        if part in _RESERVED_EXTRA_FLAG_ONLY:
+            index += 1
+            continue
+        if part in _RESERVED_EXTRA_VALUE_FLAGS:
+            index += 1
+            if index < len(parts) and not parts[index].startswith("-"):
+                index += 1
+            continue
+        if any(part.startswith(prefix) for prefix in _RESERVED_EXTRA_PREFIXES):
+            index += 1
+            continue
+        safe.append(part)
+        index += 1
+    return safe

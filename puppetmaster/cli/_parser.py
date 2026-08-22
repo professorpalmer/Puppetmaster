@@ -1396,6 +1396,64 @@ def build_parser() -> argparse.ArgumentParser:
     _add_routing_flags(hermes)
     _add_label_argument(hermes)
 
+    antigravity = subcommands.add_parser(
+        "antigravity",
+        aliases=["agy"],
+        help="Run a Google Antigravity CLI worker (agy) headlessly.",
+    )
+    antigravity.add_argument("prompt", help="Prompt for the Antigravity worker.")
+    antigravity.add_argument(
+        "--cwd", default=str(Path.cwd()), help="Workspace for Antigravity."
+    )
+    antigravity.add_argument(
+        "--mode",
+        choices=["implement", "analyze"],
+        default="implement",
+        help=(
+            "implement = full-edit (`--mode accept-edits`) with git-diff PATCH "
+            "attribution; analyze = read-only (`--mode plan`)."
+        ),
+    )
+    antigravity.add_argument(
+        "--model",
+        help="Model passed to `agy --model` (e.g. gemini-3.7-flash, gemini-3.7-flash-high).",
+    )
+    antigravity.add_argument(
+        "--effort",
+        choices=["low", "medium", "high"],
+        help=(
+            "Reasoning effort. Omitted when the model slug already ends in "
+            "-high/-medium/-low."
+        ),
+    )
+    antigravity.add_argument(
+        "--executable", help="Override the agy executable / command."
+    )
+    antigravity.add_argument("--timeout-seconds", type=int, default=600)
+    antigravity.add_argument(
+        "--worker-mode",
+        choices=["subprocess", "inline", "daemon"],
+        default="inline",
+        help="Antigravity runs default to inline orchestration while agy remains a separate process.",
+    )
+    antigravity.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="Allow Antigravity to run in a dirty working tree.",
+    )
+    antigravity.add_argument(
+        "--allow-non-worktree",
+        action="store_true",
+        help="Allow Antigravity to run outside a git work tree (no diff attribution).",
+    )
+    antigravity.add_argument(
+        "--disable-codegraph",
+        action="store_true",
+        help="Skip CodeGraph context injection (e.g. for non-repo prompts).",
+    )
+    _add_routing_flags(antigravity)
+    _add_label_argument(antigravity)
+
     agentic = subcommands.add_parser(
         "agentic",
         help=(
@@ -1477,7 +1535,7 @@ def build_parser() -> argparse.ArgumentParser:
     edit.add_argument(
         "--adapter",
         help=(
-            "Force a full-edit adapter (cursor | claude-code | codex | hermes | agentic). "
+            "Force a full-edit adapter (cursor | claude-code | codex | hermes | antigravity | agentic). "
             "Default: the highest-priority adapter the platform lock enables."
         ),
     )
@@ -1537,7 +1595,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--adapter",
         help=(
             "Force the implement adapter (cursor | claude-code | codex | hermes | "
-            "agentic). Default: highest-priority enabled implement adapter."
+            "antigravity | agentic). Default: highest-priority enabled implement adapter."
         ),
     )
     prewalk.add_argument(
@@ -1646,6 +1704,7 @@ def build_parser() -> argparse.ArgumentParser:
             "codex",
             "hermes",
             "openai",
+            "antigravity",
         ],
         help="Analysis adapter (default: cursor).",
     )
@@ -2282,7 +2341,7 @@ def build_parser() -> argparse.ArgumentParser:
     models_discover.add_argument("--registry-path", help="Override the registry path.")
     models_discover.add_argument(
         "--source",
-        choices=["cursor", "openai", "anthropic", "claude", "codex", "hermes", "agentic", "all"],
+        choices=["cursor", "openai", "anthropic", "claude", "codex", "hermes", "agentic", "antigravity", "all"],
         default=None,
         help=(
             "Which platform catalog to enumerate. Default: derived from the "
@@ -2293,7 +2352,8 @@ def build_parser() -> argparse.ArgumentParser:
             "(curated catalogs for the CLI agent loops that can't self-enumerate; "
             "billed as your detected subscription/API posture), hermes (curated "
             "multi-provider catalog, API-billed via your own keys), agentic "
-            "(curated keys-only catalog filtered by visible provider keys), or all."
+            "(curated keys-only catalog filtered by visible provider keys), "
+            "antigravity (curated Gemini catalog for the agy CLI), or all."
         ),
     )
     models_discover.add_argument(

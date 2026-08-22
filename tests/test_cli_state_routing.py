@@ -75,6 +75,7 @@ class CliStateRoutingTests(unittest.TestCase):
             ["openai", "prompt"],
             ["codex", "prompt"],
             ["hermes", "prompt"],
+            ["antigravity", "prompt"],
             ["agentic", "prompt"],
             ["swarm", "goal"],
             ["browser", "mission"],

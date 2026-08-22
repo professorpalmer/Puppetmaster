@@ -1027,6 +1027,41 @@ def _main(argv: Optional[list[str]] = None) -> int:
         )
         return cli.finalize_cli_run(result)
 
+    if args.command in ("antigravity", "agy"):
+        payload = {
+            "prompt": args.prompt,
+            "cwd": args.cwd,
+            "mode": args.mode,
+            "timeout_seconds": args.timeout_seconds,
+            "allow_dirty": args.allow_dirty,
+            "allow_non_worktree": args.allow_non_worktree,
+        }
+        if args.model:
+            payload["model"] = args.model
+        if args.effort:
+            payload["effort"] = args.effort
+        if args.executable:
+            payload["executable"] = args.executable
+        if args.disable_codegraph:
+            payload["disable_codegraph"] = True
+        payload.update(routing_payload_from_args(args, adapter="antigravity"))
+        result = cli.Orchestrator(store).run(
+            args.prompt,
+            specs=[
+                WorkerSpec(
+                    role=f"antigravity-{args.mode}",
+                    instruction=args.prompt,
+                    adapter="antigravity",
+                    payload=payload,
+                )
+            ],
+            lease_seconds=10,
+            worker_mode=args.worker_mode,
+            on_job_created=on_job_created,
+            label=args.label,
+        )
+        return cli.finalize_cli_run(result)
+
     if args.command == "agentic":
         payload = {
             "prompt": args.prompt,

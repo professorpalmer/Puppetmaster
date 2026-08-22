@@ -37,6 +37,7 @@ SWARM_ANALYSIS_ADAPTERS: tuple[str, ...] = (
     "codex",
     "hermes",
     "openai",
+    "antigravity",
 )
 
 
