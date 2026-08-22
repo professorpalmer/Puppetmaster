@@ -4,6 +4,7 @@ from typing import Optional
 
 from ._base import AdapterInfo, WorkerAdapter
 from .agentic import AgenticAdapter
+from .antigravity import AntigravityAdapter
 from .claude_code import ClaudeCodeAdapter
 from .codex import CodexAdapter
 from .cursor import CursorAdapter
@@ -20,6 +21,8 @@ ADAPTERS: dict[str, WorkerAdapter] = {
     "openai": OpenAIAdapter(),
     "codex": CodexAdapter(),
     "hermes": HermesAdapter(),
+    "antigravity": AntigravityAdapter(),
+    "agy": AntigravityAdapter(),
 }
 
 
@@ -95,6 +98,19 @@ ADAPTER_INFO = [
         requires=[
             "hermes CLI on PATH",
             "provider credential in ~/.hermes/.env or `hermes login` OAuth",
+        ],
+    ),
+    AdapterInfo(
+        name="antigravity",
+        status="optional",
+        description=(
+            "Runs the Google Antigravity CLI (`agy --output-format json`) headlessly "
+            "for analyze (`--mode plan`) and full-edit (`--mode accept-edits`) worker tasks. "
+            "Extracts structured token/thinking usage and attributes file edits via git diff."
+        ),
+        requires=[
+            "agy CLI on PATH",
+            "Antigravity CLI authenticated",
         ],
     ),
 ]

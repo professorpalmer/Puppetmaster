@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/professorpalmer/Puppetmaster/blob/main/LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://github.com/professorpalmer/Puppetmaster/blob/main/pyproject.toml)
 
-Puppetmaster runs multi-step engineering work through the agent tools you already use: Cursor, Claude Code, Codex, Hermes, or a provider API. It starts independent workers, routes tasks to an available model, and stores their typed results in SQLite so jobs can be inspected and resumed. It is aimed at developers who want durable state and reviewable output for repository investigations, audits, refactors, and implementations.
+Puppetmaster runs multi-step engineering work through the agent tools you already use: Cursor, Claude Code, Codex, Hermes, Antigravity (Gemini 3.7 / 3.6 / 3.5 / 3.1 Pro), or a provider API. It starts independent workers, routes tasks to an available model, and stores their typed results in SQLite so jobs can be inspected and resumed. It is aimed at developers who want durable state and reviewable output for repository investigations, audits, refactors, and implementations.
 
 ## Measured results
 
@@ -38,9 +38,9 @@ puppetmaster setup               # installs MCP tools, rules, and hooks
 puppetmaster setup --platforms cursor
 ```
 
-Restart Cursor, Codex, Claude, or Hermes after setup. The host then has the `puppetmaster_*` MCP tools and, where supported, hooks that suggest delegation for larger tasks. Disable those hooks with `PUPPETMASTER_AUTO_INVOKE_DISABLED=1`. For CI, use `--platforms <comma-list>` or `--platforms all`. Add another adapter later with `puppetmaster platform enable <name>`.
+Restart Cursor, Codex, Claude, Antigravity, or Hermes after setup. The host then has the `puppetmaster_*` MCP tools and, where supported, hooks that suggest delegation for larger tasks. Disable those hooks with `PUPPETMASTER_AUTO_INVOKE_DISABLED=1`. For CI, use `--platforms <comma-list>` or `--platforms all`. Add another adapter later with `puppetmaster platform enable <name>`.
 
-The built-in `agentic` adapter needs only a provider API key, so it can run without an external CLI. See [adapter setup](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/ADAPTERS.md) for provider and Hermes details.
+The built-in `agentic` adapter needs only a provider API key, so it can run without an external CLI. See [adapter setup](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/ADAPTERS.md) for provider, Antigravity, and Hermes details.
 
 ## Quickstart
 
@@ -76,13 +76,13 @@ More recipes are in [DAILY_DRIVER.md](https://github.com/professorpalmer/Puppetm
 Puppetmaster is a supervisor and job store for agent CLIs and provider adapters:
 
 ```text
-Cursor / Claude Code / Codex / Hermes / agentic
-        |
-        v
-supervisor -> model router -> independent workers -> SQLite artifacts
-                                                   |
-                                                   v
-                                            stitched summary
+Cursor / Claude Code / Codex / Hermes / Antigravity / agentic
+                                |
+                                v
+      supervisor -> model router -> independent workers -> SQLite artifacts
+                                                                |
+                                                                v
+                                                         stitched summary
 ```
 
 Workers claim tasks, write artifacts containing payloads and evidence, and do not share one growing transcript. The parent agent receives the stitched result and can inspect the stored artifacts with:
@@ -113,6 +113,7 @@ The [docs index](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/
 - [FEATURES.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/FEATURES.md) — adapters and shipped features
 - [SECURITY.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/SECURITY.md) — safety and threat model
 - [DASHBOARD.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/DASHBOARD.md) — live job dashboard
+- [CONCURRENT_SESSIONS.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/CONCURRENT_SESSIONS.md) — operating concurrent agent sessions, state scope, dashboard URLs, and worktrees
 - [OUTPUT_STYLE.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/OUTPUT_STYLE.md) and [COMPRESSION.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/COMPRESSION.md) — output and context options
 - [MOBILE.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/MOBILE.md) — watching jobs from a phone
 - [RESEARCH.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/RESEARCH.md) — durable autoresearch claims, runs, publishing, and verification
@@ -128,7 +129,7 @@ pip uninstall puppetmaster-ai   # or: pipx uninstall puppetmaster-ai
 
 ## Status
 
-Puppetmaster is a daily-driver beta at **v1.22.15**, suitable for supervised local engineering rather than hosted multi-user use. The current release includes SQLite-backed jobs, Cursor Agent MCP support, Grok Bot remote MCP (streamable HTTP pilot path), full-edit adapters, live-site browser swarms (Hermes preferred; agentic/OpenRouter via stdlib CDP), durable autoresearch claim/run/publish/verify loops, constrained model routing with optional evidence-backed role scorecards and a SWE-bench Bash Only community-prior connector (issue #28 / PR #30; Grok 4.6 remains the Cursor workhorse for ambitious and agentic work), shared verified context (admitted gists + dashboard Frontier), passive provider rate-limit harvest, AWS Bedrock, OpenCode Go, and Marionette-keyed Z.AI / MiniMax / NVIDIA NIM providers through the agentic adapter. Codex and Claude Code now send large prompts on stdin so Windows `CreateProcess` no longer fails with WinError 206. Spawned workers are exempt from the delegate-first gate so they do not try to start a swarm they cannot reach. v1.22.12 honors advertised swarm timeouts on `run` / `swarm` / `start_cursor_swarm` (instead of a silent 90s / 270s fallback), uses an explicit `max_timeout_seconds` as given, and reports the limit that actually killed the worker. v1.22.13 makes `puppetmaster dashboard` exit on Ctrl-C on Windows and release its listening socket. v1.22.15 stops the test suite from retargeting onto live provider APIs when a developer machine has keys, and `ensure_cursor_sdk` no longer rewrites tracked `package.json`. See the [feature matrix](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/FEATURES.md), [research guide](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/RESEARCH.md), [Grok Bot harness](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/GROK_BOT.md), and [CHANGELOG.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/CHANGELOG.md) for the current details.
+Puppetmaster is a daily-driver beta at **v1.22.15**, suitable for supervised local engineering rather than hosted multi-user use. The current release includes SQLite-backed jobs, Cursor Agent MCP support, Grok Bot remote MCP (streamable HTTP pilot path), full-edit adapters (including Google Antigravity CLI `agy` with Gemini 3.7 / 3.6 / 3.5 / 3.1 Pro), live-site browser swarms (Hermes preferred; agentic/OpenRouter via stdlib CDP), durable autoresearch claim/run/publish/verify loops, constrained model routing with optional evidence-backed role scorecards and a SWE-bench Bash Only community-prior connector (issue #28 / PR #30; Grok 4.6 remains the Cursor workhorse for ambitious and agentic work), shared verified context (admitted gists + dashboard Frontier), passive provider rate-limit harvest, AWS Bedrock, OpenCode Go, and Marionette-keyed Z.AI / MiniMax / NVIDIA NIM providers through the agentic adapter. Codex and Claude Code now send large prompts on stdin so Windows `CreateProcess` no longer fails with WinError 206. Spawned workers are exempt from the delegate-first gate so they do not try to start a swarm they cannot reach. v1.22.12 honors advertised swarm timeouts on `run` / `swarm` / `start_cursor_swarm` (instead of a silent 90s / 270s fallback), uses an explicit `max_timeout_seconds` as given, and reports the limit that actually killed the worker. v1.22.13 makes `puppetmaster dashboard` exit on Ctrl-C on Windows and release its listening socket. v1.22.15 stops the test suite from retargeting onto live provider APIs when a developer machine has keys, and `ensure_cursor_sdk` no longer rewrites tracked `package.json`. See the [feature matrix](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/FEATURES.md), [research guide](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/RESEARCH.md), [Grok Bot harness](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/GROK_BOT.md), and [CHANGELOG.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/CHANGELOG.md) for the current details.
 
 PyPI uses the package name [`puppetmaster-ai`](https://pypi.org/project/puppetmaster-ai/); the import name, CLI, and repository use `puppetmaster`.
 

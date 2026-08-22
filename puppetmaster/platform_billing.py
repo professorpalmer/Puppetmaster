@@ -612,6 +612,50 @@ def detect_agentic_billing(
     )
 
 
+def detect_antigravity_billing(
+    env: Optional[Mapping[str, str]] = None,
+    home: Optional[Path] = None,
+) -> BillingStatus:
+    """Detect Antigravity CLI (agy) billing posture (plan vs API key)."""
+    import shutil as _shutil
+
+    env = env if env is not None else os.environ
+    home = home if home is not None else Path.home()
+
+    gemini_key = env.get("GEMINI_API_KEY") or env.get("GOOGLE_API_KEY")
+    evidence: list[str] = []
+    if gemini_key:
+        evidence.append("gemini_api_key:set")
+
+    settings_dir = home / ".gemini" / "antigravity-cli"
+    agy_on_path = _shutil.which(env.get("AGY_COMMAND") or env.get("ANTIGRAVITY_COMMAND") or "agy") is not None
+
+    if gemini_key:
+        return BillingStatus(
+            adapter="antigravity",
+            billing="api",
+            healthy=True,
+            detail="GEMINI_API_KEY/GOOGLE_API_KEY is set — Antigravity bills per-token to that account (out-of-pocket).",
+            evidence=evidence,
+        )
+    if agy_on_path or settings_dir.is_dir():
+        evidence.append("antigravity_session:present")
+        return BillingStatus(
+            adapter="antigravity",
+            billing="plan",
+            healthy=True,
+            detail="Antigravity CLI is authenticated via user account / subscription (no marginal API spend).",
+            evidence=evidence,
+        )
+    return BillingStatus(
+        adapter="antigravity",
+        billing="unknown",
+        healthy=False,
+        detail="No GEMINI_API_KEY/GOOGLE_API_KEY and no Antigravity CLI session found — run `agy` to authenticate.",
+        evidence=["antigravity_auth:missing"],
+    )
+
+
 _DETECTORS: dict[str, Callable[..., BillingStatus]] = {
     "cursor": lambda **kw: detect_cursor_billing(env=kw.get("env")),
     "claude-code": lambda **kw: detect_claude_billing(
@@ -625,6 +669,12 @@ _DETECTORS: dict[str, Callable[..., BillingStatus]] = {
     ),
     "openai": lambda **kw: detect_openai_billing(env=kw.get("env")),
     "agentic": lambda **kw: detect_agentic_billing(
+        env=kw.get("env"), home=kw.get("home")
+    ),
+    "antigravity": lambda **kw: detect_antigravity_billing(
+        env=kw.get("env"), home=kw.get("home")
+    ),
+    "agy": lambda **kw: detect_antigravity_billing(
         env=kw.get("env"), home=kw.get("home")
     ),
 }

@@ -1,3 +1,14 @@
+## Unreleased
+
+**Feature: Antigravity CLI adapter (`agy`) with Gemini 3.7 / 3.6 / 3.5 / 3.1 Pro integration.**
+
+Adds first-class support for running Google Antigravity CLI (`agy`) as an external worker adapter across Puppetmaster swarms, model routing, and task execution.
+
+- **Non-interactive execution lifecycle**: Launches `agy --output-format json` in headless print mode. In `implement` mode, passes `--mode accept-edits --dangerously-skip-permissions` to allow full repository edits and captures resulting changes as `PATCH` artifacts via git diff. In `analyze` mode, runs under `--mode plan` to emit structured findings, risks, and decisions without dirtying the working tree.
+- **Thinking / Effort resolution**: Seamlessly maps reasoning effort (`high`, `medium`, `low`) for Gemini 3.7 Flash (`gemini-3.7-flash`), Gemini 3.6 Flash, Gemini 3.5 Flash, and Gemini 3.1 Pro, defaulting to `high` effort when required by the model.
+- **Structured token telemetry & billing**: Captures input tokens, output tokens, thinking/reasoning tokens, and cache read tokens directly from `agy` output into `VERIFICATION` artifacts. Implements billing posture detection in `platform_billing.py` (`plan` for subscription sessions, `api` when `GEMINI_API_KEY`/`GOOGLE_API_KEY` is present).
+- **Diagnostics and failure handling**: Integrated into `puppetmaster doctor`, adapter discovery, platform lock (`KNOWN_ADAPTERS`), and curated static catalogs (`CURATED_CATALOGS["antigravity"]`).
+
 ## v1.22.15
 
 Absorb of [@bsmi021](https://github.com/bsmi021) PR

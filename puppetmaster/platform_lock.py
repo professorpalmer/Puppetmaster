@@ -25,12 +25,21 @@ from pathlib import Path
 from typing import Optional
 
 from puppetmaster.fs_permissions import write_private_text
+from puppetmaster.interprocess_lock import InterProcessFileLock
 from puppetmaster.model_registry import default_registry_path
 
 # The user-billable adapters the lock governs. ``shell`` and any future
 # internal adapter are intentionally excluded — they are never platform-billed
 # and must not be blocked by a platform lock.
-KNOWN_ADAPTERS: tuple[str, ...] = ("agentic", "cursor", "claude-code", "codex", "openai", "hermes")
+KNOWN_ADAPTERS: tuple[str, ...] = (
+    "agentic",
+    "cursor",
+    "claude-code",
+    "codex",
+    "openai",
+    "hermes",
+    "antigravity",
+)
 
 ONLY_ENV = "PUPPETMASTER_ONLY_ADAPTERS"
 
@@ -91,6 +100,13 @@ def _write_disabled(disabled: set[str], registry_path: Optional[Path] = None) ->
     # defaults on). Replacing the whole document strips foreign keys and makes
     # the next harness boot re-apply ITS defaults, silently undoing an
     # operator's `platform enable`. Preserve everything we don't own.
+    with InterProcessFileLock.for_target(path):
+        _write_disabled_locked(disabled, path)
+    return path
+
+
+def _write_disabled_locked(disabled: set[str], path: Path) -> Path:
+    """Write while the caller holds the per-target platform lock."""
     payload: dict = {}
     if path.is_file():
         try:
@@ -100,7 +116,7 @@ def _write_disabled(disabled: set[str], registry_path: Optional[Path] = None) ->
         except (json.JSONDecodeError, OSError):
             payload = {}
     payload["disabled"] = sorted(a for a in disabled if a in KNOWN_ADAPTERS)
-    write_private_text(path, json.dumps(payload, indent=2) + "\n")
+    write_private_text(path, json.dumps(payload, indent=2) + "\n", lock=False)
     return path
 
 
@@ -159,14 +175,18 @@ def set_enabled(adapters: set[str], registry_path: Optional[Path] = None) -> Pat
 
 def enable(adapters: set[str], registry_path: Optional[Path] = None) -> Path:
     """Turn ``adapters`` back on (remove from the denylist)."""
-    disabled = _read_disabled(registry_path) - adapters
-    return _write_disabled(disabled, registry_path)
+    path = platform_config_path(registry_path)
+    with InterProcessFileLock.for_target(path):
+        disabled = _read_disabled(registry_path) - adapters
+        return _write_disabled_locked(disabled, path)
 
 
 def disable(adapters: set[str], registry_path: Optional[Path] = None) -> Path:
     """Turn ``adapters`` off (add to the denylist)."""
-    disabled = _read_disabled(registry_path) | {a for a in adapters if a in KNOWN_ADAPTERS}
-    return _write_disabled(disabled, registry_path)
+    path = platform_config_path(registry_path)
+    with InterProcessFileLock.for_target(path):
+        disabled = _read_disabled(registry_path) | {a for a in adapters if a in KNOWN_ADAPTERS}
+        return _write_disabled_locked(disabled, path)
 
 
 def reset(registry_path: Optional[Path] = None) -> Path:

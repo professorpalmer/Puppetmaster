@@ -8,7 +8,10 @@ strip mode bits from ``mkdir``, so we always follow up with an explicit
 from __future__ import annotations
 
 import os
+import secrets
 from pathlib import Path
+
+from puppetmaster.interprocess_lock import InterProcessFileLock
 
 _DIR_MODE = 0o700
 _FILE_MODE = 0o600
@@ -51,20 +54,53 @@ def open_private(path: Path, flags: int) -> int:
     return os.open(path, flags)
 
 
-def write_private_text(path: Path, content: str, *, encoding: str = "utf-8") -> None:
+def write_private_text(
+    path: Path,
+    content: str,
+    *,
+    encoding: str = "utf-8",
+    lock: bool = True,
+) -> None:
+    """Atomically replace private text, serializing writers for ``path``.
+
+    The replacement file is written and synced in the destination directory
+    before ``os.replace`` makes it visible.  Pass ``lock=False`` only while a
+    caller already holds :meth:`InterProcessFileLock.for_target` over a larger
+    read-modify-write transaction.
+    """
+    if lock:
+        with InterProcessFileLock.for_target(path):
+            write_private_text(path, content, encoding=encoding, lock=False)
+        return
     mkdir_private(path.parent)
+    temp = path.parent / ("." + path.name + "." + secrets.token_hex(12) + ".tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
     if supports_posix_modes():
-        fd = os.open(
-            path,
-            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_CLOEXEC", 0),
-            _FILE_MODE,
-        )
-        try:
-            os.write(fd, content.encode(encoding))
-        finally:
-            os.close(fd)
+        fd = os.open(temp, flags, _FILE_MODE)
     else:
-        path.write_text(content, encoding=encoding)
+        fd = os.open(temp, flags)
+    try:
+        with os.fdopen(fd, "w", encoding=encoding, closefd=False) as handle:
+            handle.write(content)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                # Atomic replacement remains correct when an uncommon local
+                # filesystem cannot fsync a file descriptor.
+                pass
+        os.close(fd)
+        fd = -1
+        chmod_private_file(temp)
+        os.replace(temp, path)
+        chmod_private_file(path)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def append_private_text(path: Path, content: str, *, encoding: str = "utf-8") -> None:

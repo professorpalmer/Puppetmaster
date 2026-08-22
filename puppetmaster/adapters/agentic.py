@@ -1080,18 +1080,32 @@ class AgenticAdapter(FullEditWorkerAdapter):
         attempt = 0
         last: Optional[ProviderError] = None
         breaker = get_provider_circuit_breaker()
-        admission_key = resolve_circuit_key(provider, model)
         call_extra = dict(extra)
         tool_choice_stripped = False
         while True:
+            api_key = keys[key_index]
+            # The credential is part of admission: one exhausted rotating key
+            # must not preemptively block another key for the same endpoint.
+            admission_key = resolve_circuit_key(
+                provider, model, api_key=api_key,
+            )
             # Refuse before dialing when harvested remaining is 0 or the
             # process-local breaker is open (both raise recoverable 429s).
             from puppetmaster.rate_limit_state import admit_or_raise
 
-            admit_or_raise(admission_key)
-            breaker.before_call(admission_key)
+            try:
+                admit_or_raise(admission_key)
+                breaker.before_call(admission_key)
+            except ProviderError as exc:
+                # Admission happens before provider_chat, so it must use the
+                # same rotation path as a live 429.  Otherwise an exhausted A
+                # could incorrectly prevent an available B from being tried.
+                last = exc
+                if exc.status == 429 and key_index + 1 < len(keys):
+                    key_index += 1
+                    continue
+                raise
             recorded = False
-            api_key = keys[key_index]
             kwargs: dict = dict(
                 provider=provider, model=model, messages=messages,
                 tools=tools or None, extra=call_extra, timeout=timeout,

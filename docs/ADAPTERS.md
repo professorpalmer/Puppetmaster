@@ -214,6 +214,37 @@ If it returns `failure=dirty_worktree` in implement mode, run from a clean tree 
 
 When a Hermes implement worker edits tracked files, Puppetmaster records a `patch` artifact alongside the verification artifact.
 
+### `antigravity`
+
+Runs the Google Antigravity CLI (`agy --output-format json`) headlessly in non-interactive mode. Supports Gemini 3.7 Flash (`gemini-3.7-flash`), Gemini 3.6 Flash, Gemini 3.5 Flash, and Gemini 3.1 Pro with automatic reasoning effort mapping (`high`, `medium`, `low`).
+
+Two execution modes:
+- **`plan`** (analyze / read-only): Executes audit or inspection queries without modifying the working tree, extracting structured findings, risks, and decisions.
+- **`accept-edits`** (implement / full-edit): Passes `--dangerously-skip-permissions` to allow full workspace edits and captures the resulting diff as a `PATCH` artifact.
+
+Telemetry and Billing:
+- Captures input tokens, output tokens, thinking/reasoning tokens, and cache read tokens directly from the CLI JSON response.
+- Billing is automatically detected as `plan` when running on an authenticated `agy` session, or `api` when `GEMINI_API_KEY` / `GOOGLE_API_KEY` is present.
+
+Requirements:
+- `agy` CLI installed and on PATH, or `AGY_COMMAND` / `ANTIGRAVITY_COMMAND` / `payload.executable` set.
+- Antigravity session authenticated or `GEMINI_API_KEY` / `GOOGLE_API_KEY` set.
+
+```json
+{
+  "role": "gemini-audit",
+  "instruction": "Audit auth module and identify token expiration issues.",
+  "adapter": "antigravity",
+  "payload": {
+    "model": "gemini-3.7-flash",
+    "effort": "high",
+    "mode": "plan",
+    "cwd": ".",
+    "timeout_seconds": 300
+  }
+}
+```
+
 ### `agentic`
 
 Runs Puppetmaster's **standalone, provider-agnostic worker**: an in-process tool-use loop that calls provider HTTP APIs directly with your own API key (or AWS IAM for Bedrock). No external agent CLI (no Cursor, Claude Code, Codex, or Hermes binary required) — just a visible provider credential such as `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `OPENROUTER_API_KEY`, `OPENCODE_GO_API_KEY`, `ZAI_API_KEY` / `GLM_API_KEY` / `Z_AI_API_KEY`, `MINIMAX_API_KEY`, `NVIDIA_API_KEY`, or AWS Bedrock (`AWS_BEARER_TOKEN_BEDROCK` / `AWS_ACCESS_KEY_ID`+`AWS_SECRET_ACCESS_KEY` / `~/.aws`, with `provider=bedrock`).
