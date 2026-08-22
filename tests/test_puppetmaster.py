@@ -336,7 +336,15 @@ class PuppetmasterTests(unittest.TestCase):
             # The launcher pid is now labeled honestly and monitoring is pointed
             # at job_id rather than the misleading supervisor pid (C2).
             self.assertEqual(payload["launcher_pid"], payload["pid"])
+            self.assertEqual(payload["orchestrator_pid"], payload["launcher_pid"])
+            self.assertTrue(payload["pid_deprecated"])
             self.assertEqual(payload["monitor_with"]["job_id"], payload["job_id"])
+            self.assertEqual(
+                payload["monitor_with"]["arguments"]["job_ref"], payload["job_ref"]
+            )
+            self.assertEqual(
+                payload["monitor_with"]["arguments"]["backend"], "sqlite"
+            )
             self.assertFalse(result["isError"])
 
             spawned = ASYNC_PROCESSES[before_process_count:]
@@ -1101,7 +1109,8 @@ class PuppetmasterTests(unittest.TestCase):
             self.assertGreater(body["next_cursor"], 0)
             self.assertEqual(body["job_id"], result.job.id)
 
-    def test_mcp_follow_times_out_cleanly_when_no_new_artifacts(self) -> None:
+    def test_mcp_follow_returns_terminal_state_without_waiting_for_artifacts(self) -> None:
+        # Arrange
         with TemporaryDirectory() as tmp:
             state_dir = Path(tmp) / ".pm-state"
             store = SQLiteSwarmStore(state_dir)
@@ -1112,11 +1121,49 @@ class PuppetmasterTests(unittest.TestCase):
             )
             current = store.event_cursor(result.job.id)
 
+            # Act
+            with patch.object(
+                SQLiteSwarmStore,
+                "wait_for_events",
+                side_effect=AssertionError("terminal follow must not wait"),
+            ):
+                response = call_tool(
+                    "puppetmaster_live_artifacts_follow",
+                    {
+                        "job_id": result.job.id,
+                        "state_dir": str(state_dir),
+                        "since_cursor": current,
+                        "timeout_seconds": 0.2,
+                        "poll_interval_seconds": 0.05,
+                    },
+                )
+
+            self.assertFalse(response["isError"])
+            body = json.loads(response["content"][0]["text"])
+            self.assertEqual(body["item_count"], 0)
+            self.assertEqual(body["status"], "complete")
+            self.assertTrue(body["terminal"])
+            self.assertFalse(body["timed_out"])
+            self.assertIsNotNone(body["completed_at"])
+            self.assertEqual(body["next_cursor"], current)
+
+    def test_mcp_follow_still_times_out_for_running_job_without_new_artifacts(self) -> None:
+        # Arrange
+        with TemporaryDirectory() as tmp:
+            from puppetmaster.models import JobStatus
+
+            state_dir = Path(tmp) / ".pm-state"
+            store = SQLiteSwarmStore(state_dir)
+            job = store.create_job("running feed follow")
+            store.update_job_status(job.id, JobStatus.RUNNING)
+            current = store.event_cursor(job.id)
+
+            # Act
             start = time.monotonic()
             response = call_tool(
                 "puppetmaster_live_artifacts_follow",
                 {
-                    "job_id": result.job.id,
+                    "job_id": job.id,
                     "state_dir": str(state_dir),
                     "since_cursor": current,
                     "timeout_seconds": 0.2,
@@ -1125,9 +1172,12 @@ class PuppetmasterTests(unittest.TestCase):
             )
             elapsed = time.monotonic() - start
 
+            # Assert
             self.assertFalse(response["isError"])
             body = json.loads(response["content"][0]["text"])
             self.assertEqual(body["item_count"], 0)
+            self.assertEqual(body["status"], "running")
+            self.assertFalse(body["terminal"])
             self.assertTrue(body["timed_out"])
             self.assertEqual(body["next_cursor"], current)
             self.assertGreaterEqual(elapsed, 0.15)
@@ -4750,6 +4800,51 @@ class PuppetmasterTests(unittest.TestCase):
         # loop that would spam stderr or hold CPU.
         self.assertLessEqual(call_count["value"], 1)
 
+    def test_protocol_writer_contains_broken_pipe_failures(self) -> None:
+        # Arrange
+        from puppetmaster import mcp_server
+
+        class BrokenProtocolStream:
+            def write(self, payload):
+                raise BrokenPipeError("client disconnected")
+
+            def flush(self):
+                raise AssertionError("flush must not follow a failed write")
+
+        message = {"jsonrpc": "2.0", "id": 7, "result": {"ok": True}}
+
+        # Act
+        mcp_server._SHUTDOWN_REQUESTED.clear()
+        try:
+            with patch.object(mcp_server, "_protocol_stream", return_value=BrokenProtocolStream()):
+                written = mcp_server._write_protocol_message(message)
+
+            # Assert
+            self.assertFalse(written)
+            self.assertTrue(mcp_server._SHUTDOWN_REQUESTED.is_set())
+        finally:
+            mcp_server._SHUTDOWN_REQUESTED.clear()
+
+    def test_notifications_and_final_responses_share_the_guarded_writer(self) -> None:
+        # Arrange
+        from puppetmaster import mcp_server
+        from unittest.mock import call
+
+        notification = {"jsonrpc": "2.0", "method": "notifications/message", "params": {}}
+        response = {"jsonrpc": "2.0", "id": 9, "result": {"ok": True}}
+
+        # Act
+        with patch.object(mcp_server, "_write_protocol_message", return_value=False) as writer:
+            notification_written = mcp_server._emit_notification(notification)
+            with patch.object(mcp_server, "handle_message", return_value=response), patch.object(
+                mcp_server, "_keepalive_disabled", return_value=True
+            ):
+                mcp_server._process_message_safely({"method": "tools/list", "id": 9})
+
+        # Assert
+        self.assertFalse(notification_written)
+        self.assertEqual(writer.call_args_list, [call(notification), call(response)])
+
     def test_tool_call_keepalive_disabled_via_env(self) -> None:
         """PUPPETMASTER_MCP_KEEPALIVE_DISABLED short-circuits the wiring in _process_message_safely."""
         from puppetmaster.mcp_server import _keepalive_disabled
@@ -4853,10 +4948,14 @@ class PuppetmasterTests(unittest.TestCase):
     def test_feed_follow_caps_block_and_stamps_capped(self) -> None:
         """run_feed_follow clamps an oversized timeout under the Codex ceiling."""
         from puppetmaster import mcp_server
+        from puppetmaster.models import Job, JobStatus
 
         observed: dict = {}
 
         class _FakeStore:
+            def get_job(self, job_id):
+                return Job(id=job_id, goal="running follow", status=JobStatus.RUNNING)
+
             def wait_for_events(self, job_id, since, timeout_seconds, poll_interval):
                 observed["timeout_seconds"] = timeout_seconds
                 return None
@@ -6687,6 +6786,60 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
         self.assertEqual(artifact.payload["adapter"], "codex")
         self.assertEqual(artifact.payload["result"], "blocked")
         self.assertEqual(artifact.payload["failure"], "missing_cli")
+
+    def test_default_windows_codex_command_bypasses_the_npm_cmd_shim(self) -> None:
+        # Arrange
+        from puppetmaster.adapters import codex as codex_module
+
+        with TemporaryDirectory() as tmp:
+            npm_root = Path(tmp) / "npm"
+            shim = npm_root / "codex.CMD"
+            entrypoint = npm_root / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
+            node = Path(tmp) / "node.exe"
+            entrypoint.parent.mkdir(parents=True)
+            shim.write_text("@echo off\r\n", encoding="utf-8")
+            entrypoint.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+            node.write_bytes(b"")
+
+            # Act
+            with patch.object(codex_module, "_is_windows", return_value=True), patch.object(
+                codex_module, "facade", return_value=lambda executable: str(node) if executable == "node" else None
+            ):
+                command = codex_module._default_codex_command_base(str(shim))
+
+            # Assert
+            self.assertEqual(command, [str(node), str(entrypoint)])
+            self.assertNotIn(str(shim), command)
+
+    def test_explicit_codex_commands_are_not_rewritten(self) -> None:
+        from puppetmaster.adapters import codex as codex_module
+
+        cases = [
+            ({"executable": "custom-codex --profile payload"}, {}, "payload"),
+            ({}, {"CODEX_COMMAND": "env-codex --profile environment"}, "environment"),
+        ]
+        for payload, environment, profile in cases:
+            with self.subTest(profile=profile):
+                # Arrange
+                task = Task(
+                    id=f"t-codex-{profile}",
+                    job_id="job-codex-explicit",
+                    role="codex-review",
+                    adapter="codex",
+                    instruction="Review the repo.",
+                    payload=payload,
+                )
+                resolved = str(Path("/tools") / f"{profile}-codex")
+
+                # Act
+                with patch.dict(os.environ, environment, clear=False), patch.object(
+                    codex_module, "_default_codex_command_base"
+                ) as default_command:
+                    command = codex_module._codex_command_base(task, resolved)
+
+                # Assert
+                self.assertEqual(command, [resolved, "--profile", profile])
+                default_command.assert_not_called()
 
     def test_codex_adapter_streams_and_surfaces_live_log(self) -> None:
         """Codex must run through the streamed runner (live sidecar log +
@@ -22235,11 +22388,47 @@ class PuppetmasterFrictionFixTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             store = self._store(tmp)
             job = store.create_job("goal")
+            store.save_artifact(
+                Artifact(
+                    job_id=job.id,
+                    task_id=job.id,
+                    type=ArtifactType.FINDING,
+                    created_by="test",
+                    payload={"claim": "useful result"},
+                    confidence=1.0,
+                    evidence=["test:delivered"],
+                )
+            )
             store.update_job_status(job.id, JobStatus.COMPLETE)
             rc = cli_main(
                 ["--state-dir", str(store.root), "--backend", "sqlite", "wait", job.id]
             )
             self.assertEqual(rc, 0)
+
+    def test_wait_uses_the_shared_terminal_contract_for_cancelled_jobs(self) -> None:
+        # Arrange
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            job = store.create_job("goal")
+            store.update_job_status(job.id, JobStatus.CANCELLED)
+
+            # Act
+            rc = cli_main(
+                [
+                    "--state-dir",
+                    str(store.root),
+                    "--backend",
+                    "sqlite",
+                    "wait",
+                    job.id,
+                    "--timeout",
+                    "0.1",
+                ]
+            )
+
+            # Cancellation is terminal for waiting, but it is not successful
+            # delivery and must remain non-zero for shell automation.
+            self.assertEqual(rc, 1)
 
     def test_await_treats_stalled_as_terminal(self) -> None:
         from puppetmaster.cli import await_job_state
@@ -25979,7 +26168,11 @@ class UninstallTests(unittest.TestCase):
             cwd0 = os.getcwd()
             try:
                 os.chdir(cwd)
-                with patch.object(cli.Path, "home", return_value=Path(home_tmp)):
+                hermes_home = Path(home_tmp) / ".hermes"
+                with patch.dict(
+                    os.environ,
+                    {"HOME": home_tmp, "HERMES_HOME": str(hermes_home)},
+                ), patch.object(cli.Path, "home", return_value=Path(home_tmp)):
                     rc = cli._run_uninstall(
                         argparse.Namespace(
                             cwd=str(cwd),

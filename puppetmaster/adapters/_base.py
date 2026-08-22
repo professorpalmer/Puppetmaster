@@ -349,6 +349,51 @@ class CliWorkerAdapter(FullEditWorkerAdapter):
 
         completed = self._invoke_cli(task, prepared, cwd, timeout_seconds)
         after = facade("git_snapshot")(cwd, base_tree=str(before.get("tree") or "") or None)
+        # Strict identity: unittest MagicMock is truthy, so a mock that never
+        # set output_limit_hit must not look like a real budget stop. Timeouts
+        # stay timeouts (result=failed) unless the streamed run actually tripped
+        # the byte ceiling.
+        if getattr(completed, "output_limit_hit", False) is True:
+            artifacts = [
+                verification_artifact(
+                    task=task,
+                    worker_id=worker_id,
+                    adapter=self.name,
+                    check=task.instruction,
+                    result="blocked",
+                    confidence=1.0,
+                    evidence=["runtime_budget:max_output_bytes"],
+                    payload={
+                        "failure": "runtime_budget_exceeded",
+                        "limit": "max_output_bytes",
+                        "max_output_bytes": task.payload.get("max_output_bytes"),
+                        "returncode": completed.returncode,
+                        "stderr": _redacted_tail(completed.stderr, _STDOUT_TAIL_CHARS),
+                        "live_log": completed.live_log_path,
+                        **diff_source_payload(before, after),
+                    },
+                )
+            ]
+            if _should_emit_patch_artifact(before, after):
+                artifacts.append(
+                    Artifact(
+                        job_id=task.job_id,
+                        task_id=task.id,
+                        type=ArtifactType.PATCH,
+                        created_by=worker_id,
+                        confidence=0.9,
+                        evidence=[f"adapter:{self.name}", "runtime_budget:max_output_bytes"],
+                        payload=build_patch_payload(
+                            task=task,
+                            before=before,
+                            after=after,
+                            status="partial",
+                            change="Worker changed files before the output budget stopped it.",
+                            sidecar_name=f"{prepared.sidecar_name}_budget",
+                        ),
+                    )
+                )
+            return artifacts
         return self._finalize_cli_run(
             task, worker_id, goal, prepared, before, after, completed
         )
@@ -410,6 +455,13 @@ class CliWorkerAdapter(FullEditWorkerAdapter):
             task=task,
             sidecar_name=prepared.sidecar_name,
             timeout_seconds=timeout_seconds,
+            max_output_bytes=(
+                int(task.payload["max_output_bytes"])
+                if isinstance(task.payload.get("max_output_bytes"), int)
+                and not isinstance(task.payload.get("max_output_bytes"), bool)
+                and int(task.payload["max_output_bytes"]) > 0
+                else None
+            ),
             **kwargs,
         )
 
@@ -449,6 +501,8 @@ class AdapterInfo:
     status: str
     description: str
     requires: list[str]
+    runtime_limits: tuple[str, ...] = ()
+    runtime_limit_notes: str = ""
 
 
 class WorkerAdapter(Protocol):

@@ -20,11 +20,34 @@ import { spawn } from "node:child_process";
 
 export interface AwaitJobResult {
   job_id: string;
-  status: "complete" | "failed" | "running" | "stitching" | "queued" | string;
+  status:
+    | "complete"
+    | "failed"
+    | "stalled"
+    | "cancelled"
+    | "running"
+    | "stitching"
+    | "queued"
+    | string;
   terminal: boolean;
   timed_out: boolean;
   completed_at: string | null;
   summary: string;
+  delivery?: {
+    verdict: "pending" | "delivered" | "degraded" | "blocked" | string;
+    successful: boolean;
+    status: string;
+    quality: string | null;
+    stale_task_ids: string[];
+    incomplete_tasks: boolean;
+    required_artifacts: boolean;
+  };
+  progress?: {
+    last_substantive_artifact_at: string | null;
+    last_liveness_at: string | null;
+    last_substantive_artifact_age_seconds: number | null;
+    last_liveness_age_seconds: number | null;
+  };
 }
 
 export interface AwaitJobOptions {
@@ -61,7 +84,8 @@ export class PuppetmasterError extends Error {
  * Block until `jobId` reaches a terminal state (or the optional timeout), then
  * resolve with the job's final state + stitched summary. Rejects with a
  * {@link PuppetmasterError} if the CLI exits non-zero for a reason other than a
- * cleanly-reported failed job.
+ * cleanly reported unsuccessful delivery (failed, stalled, cancelled, blocked,
+ * empty, or degraded).
  */
 export function awaitJob(
   jobId: string,
@@ -128,8 +152,8 @@ export function awaitJob(
       } catch {
         parsed = undefined;
       }
-      // `await` exits 1 when the job itself FAILED but still prints valid JSON;
-      // that's a successful await of a failed job, not a client error.
+      // `await` exits 1 for a parsed unsuccessful delivery. That is a successful
+      // observation of a non-successful job, not a transport/client error.
       if (parsed && (code === 0 || code === 1)) {
         resolve(parsed);
         return;

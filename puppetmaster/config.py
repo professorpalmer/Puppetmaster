@@ -35,11 +35,16 @@ def _worker_spec_from_dict(data: dict[str, Any]) -> WorkerSpec:
     adapter = data.get("adapter", "local")
     if adapter not in ADAPTERS:
         raise ValueError(f"unsupported adapter: {adapter}")
+    payload = dict(data.get("payload", {}))
+    if data.get("source_scope") is not None:
+        payload["source_scope"] = list(data["source_scope"])
+    if data.get("negative_scope") is not None:
+        payload["negative_scope"] = list(data["negative_scope"])
     return WorkerSpec(
         role=role,
         instruction=instruction,
         adapter=adapter,
-        payload=data.get("payload", {}),
+        payload=payload,
         depends_on_roles=data.get("depends_on", []),
     )
 

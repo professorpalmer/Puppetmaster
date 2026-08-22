@@ -154,8 +154,11 @@ RULE_BODY = textwrap.dedent(
 
     ## Fallback
 
-    If `puppetmaster_*` tools are not connected, fall back to native
-    tooling — do not pretend the tools exist.
+    If a `puppetmaster_*` observation tool is not connected, continue the same
+    durable job through `python -m puppetmaster status|await|show <job_id>`.
+    Check recent jobs before retrying a start; a dropped MCP reply is not proof
+    that no job was created. Use native tooling only when no Puppetmaster job
+    exists and the task itself permits inline work.
 
     ## Usage
 
@@ -183,11 +186,17 @@ RULE_BODY = textwrap.dedent(
        edits (typo/rename/comment) inline.
     4. `puppetmaster_artifacts <job_id>` — read structured outputs at zero
        token cost (results persist in SQLite).
-    5. `puppetmaster_dashboard [job_id]` — when the user asks to see/open
+    5. Every asynchronous `start_*` response is a resumable contract: follow
+       its returned `monitor_with` tool using the exact `job_ref`, backend, and
+       cursor. If MCP disconnects, resume that same job through the CLI
+       fallback; do not launch an unrelated replacement. Treat only
+       `delivery.verdict == "delivered"` as success; cancelled, stalled,
+       degraded, empty, blocked, or stale work is not successful delivery.
+    6. `puppetmaster_dashboard [job_id]` — when the user asks to see/open
        the job dashboard, call this (it starts the local server if needed)
        and open the returned URL in a browser tab for them. CLI fallback:
        `python -m puppetmaster dashboard [job_id]`.
-    6. `puppetmaster_doctor` — sanity-check Puppetmaster's runtime
+    7. `puppetmaster_doctor` — sanity-check Puppetmaster's runtime
        dependencies once per session.
 
     If `puppetmaster_doctor` reports critical failures, surface them to
