@@ -43,7 +43,10 @@ await awaitJob("job_abc123", { env: { PUPPETMASTER_STATE_DIR: "/data/pm" } });
 `options`: `timeoutSeconds` (0 = block forever), `pollIntervalSeconds`,
 `python`, `cwd`, `env`, `killAfterSeconds`.
 
-`AwaitJobResult`: `{ job_id, status, terminal, timed_out, completed_at, summary }`.
+`AwaitJobResult`: `{ job_id, status, terminal, timed_out, completed_at, summary,
+delivery?, progress? }`. Treat only `delivery?.successful === true` as successful
+work; a parsed failed/stalled/cancelled/degraded result still resolves normally
+because the client successfully observed the durable terminal state.
 
 A job that finishes as **failed** resolves normally (the await succeeded); the
 promise only rejects when the CLI can't run or returns no parseable JSON.

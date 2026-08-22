@@ -42,7 +42,8 @@ instead of renaming your shell environment.
 ## Running swarms
 
 ```bash
-# Daily-driver multi-role analysis (CLI twin of puppetmaster_start_cursor_swarm).
+# Daily-driver analysis (CLI twin of puppetmaster_start_cursor_swarm).
+# Bare `swarm` is one assignment; pass --roles for parallel fan-out.
 # Detaches by default, prints job_id — the MCP Not-connected fallback.
 python -m puppetmaster swarm "Audit the MCP surface"
 python -m puppetmaster swarm "Goal" --roles explore audit review --label "MCP peel"

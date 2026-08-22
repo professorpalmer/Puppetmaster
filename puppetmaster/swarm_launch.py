@@ -18,16 +18,18 @@ from pathlib import Path
 from typing import Any, Optional
 
 from puppetmaster.run_id import reserve_run_logs, write_exclusive_run_text
+from puppetmaster.state import state_identity
 from puppetmaster.workers import (
     ANALYSIS_NO_EDIT_PAYLOAD,
+    RoleSpec,
     WorkerSpec,
     default_routing_policy_for_role,
+    normalize_role_specs,
 )
 
-# Sensible CLI / MCP-fallback defaults. MCP ``start_cursor_swarm`` keeps its
-# historical role list when the caller omits ``roles``; CLI ``swarm`` uses this
-# shorter audit trio so a one-liner matches how operators actually peel.
-DEFAULT_SWARM_ROLES: tuple[str, ...] = ("explore", "audit", "review")
+# Safe CLI / MCP-fallback default: one assignment unless the caller provides
+# genuinely distinct structured roles or an explicit workflow config.
+DEFAULT_SWARM_ROLES: tuple[str, ...] = ("analysis",)
 
 SWARM_ANALYSIS_ADAPTERS: tuple[str, ...] = (
     "agentic",
@@ -65,7 +67,7 @@ def analysis_swarm_prompt(*, role: str, goal: str) -> str:
 
 def build_analysis_swarm_specs(
     goal: str,
-    roles: list[str],
+    roles: list[object],
     *,
     adapter: str = "cursor",
     cwd: str = "",
@@ -86,8 +88,7 @@ def build_analysis_swarm_specs(
             f"adapter {adapter!r} cannot run an analysis swarm. Supported: "
             f"{', '.join(SWARM_ANALYSIS_ADAPTERS)}."
         )
-    if not roles:
-        roles = list(DEFAULT_SWARM_ROLES)
+    role_specs, duplicated_legacy_roles = normalize_role_specs(roles, goal)
     explicit_model = model
     model_name = str(explicit_model or "default")
     if auto_route is not None:
@@ -96,14 +97,25 @@ def build_analysis_swarm_specs(
         auto_route_enabled = not bool(explicit_model)
 
     specs: list[WorkerSpec] = []
-    for role in roles:
-        prompt = analysis_swarm_prompt(role=str(role), goal=goal)
+    for role_spec in role_specs:
+        role = role_spec.name
+        assignment = role_spec.instruction
+        prompt = analysis_swarm_prompt(role=str(role), goal=assignment)
         payload: dict[str, Any] = {
             "prompt": prompt,
             "cwd": cwd or str(Path.cwd()),
             "timeout_seconds": int(timeout_seconds),
             **ANALYSIS_NO_EDIT_PAYLOAD,
         }
+        if role_spec.source_scope:
+            payload["source_scope"] = list(role_spec.source_scope)
+        if role_spec.negative_scope:
+            payload["negative_scope"] = list(role_spec.negative_scope)
+        if duplicated_legacy_roles:
+            payload["duplication_warning"] = {
+                "message": "Multiple bare role names received the same goal; provide structured role instructions for decomposition.",
+                "fan_out_multiplier": len(role_specs),
+            }
         if max_timeout_seconds is not None:
             # Orchestrator._worker_hard_cap honors this; without it the ceiling
             # is 3x the base timeout.
@@ -111,7 +123,7 @@ def build_analysis_swarm_specs(
         try:
             from puppetmaster.acceptance_criteria import parse_acceptance_criteria_block
 
-            criteria = parse_acceptance_criteria_block(goal or "")
+            criteria = parse_acceptance_criteria_block(assignment or "")
             if criteria:
                 payload["acceptance_criteria"] = criteria
         except Exception:
@@ -167,7 +179,7 @@ def build_analysis_swarm_specs(
 def write_analysis_swarm_config(
     *,
     goal: str,
-    roles: list[str],
+    roles: list[object],
     adapter: str,
     state_dir: Path,
     cwd: str = "",
@@ -201,19 +213,30 @@ def write_analysis_swarm_config(
         disable_memory=disable_memory,
     )
     config_dir = Path(state_dir) / "mcp-configs"
+    role_specs, duplicated_legacy_roles = normalize_role_specs(roles, goal)
     workers = [
         {
             "role": spec.role,
             "instruction": spec.instruction,
             "adapter": spec.adapter,
             "payload": dict(spec.payload),
+            "source_scope": next((r.source_scope for r in role_specs if r.name == spec.role), None),
+            "negative_scope": next((r.negative_scope for r in role_specs if r.name == spec.role), None),
         }
         for spec in specs
     ]
     _, config_path = write_exclusive_run_text(
         config_dir,
         "swarm_config",
-        json.dumps({"lease_seconds": lease_seconds, "workers": workers}, indent=2),
+        json.dumps(
+            {
+                "lease_seconds": lease_seconds,
+                "workers": workers,
+                "warnings": ([{"type": "duplicate_legacy_roles", "fan_out_multiplier": len(specs)}]
+                              if duplicated_legacy_roles else []),
+            },
+            indent=2,
+        ),
         suffix=".json",
     )
     return config_path
@@ -264,10 +287,30 @@ def wait_for_job_id(
     )
 
 
+def terminate_launcher_tree(process: subprocess.Popen) -> None:
+    """Terminate a detached launcher's exact process tree on early failure."""
+    try:
+        if os.name == "nt":
+            from puppetmaster.win_process import kill_process_tree
+
+            if process.pid and kill_process_tree(process.pid):
+                return
+    except Exception:
+        pass
+    try:
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+    except (OSError, ProcessLookupError):
+        pass
+
+
 def detach_analysis_swarm(
     *,
     goal: str,
-    roles: list[str],
+    roles: list[object],
     adapter: str,
     state_dir: Path,
     cwd: str,
@@ -285,8 +328,10 @@ def detach_analysis_swarm(
     worker_mode: str = "subprocess",
     backend: str = "sqlite",
     job_id_timeout_seconds: float = EARLY_JOB_ID_TIMEOUT_SECONDS,
+    launch_key: Optional[str] = None,
 ) -> dict[str, Any]:
     """Write config, spawn ``run --config`` detached, return ``{job_id, ...}``."""
+    _normalized_roles, duplicated_legacy_roles = normalize_role_specs(roles, goal)
     config_path = write_analysis_swarm_config(
         goal=goal,
         roles=roles,
@@ -308,6 +353,8 @@ def detach_analysis_swarm(
     run_id, stdout_path, stderr_path, stdout_handle, stderr_handle = reserve_run_logs(
         run_dir, "swarm"
     )
+    goal_path = run_dir / f"{run_id}.goal"
+    goal_path.write_text(goal, encoding="utf-8")
     full_command = [
         sys.executable,
         "-u",
@@ -319,7 +366,8 @@ def detach_analysis_swarm(
         backend,
         "--emit-job-id-early",
         "run",
-        goal,
+        "--goal-file",
+        str(goal_path),
         "--config",
         str(config_path),
         "--worker-mode",
@@ -331,6 +379,8 @@ def detach_analysis_swarm(
         full_command.append("--enable-memory")
     if label:
         full_command.extend(["--label", label])
+    if launch_key:
+        full_command.extend(["--launch-key", str(launch_key)])
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
@@ -363,19 +413,31 @@ def detach_analysis_swarm(
             stdout_path, stderr_path, process, timeout_seconds=job_id_timeout_seconds
         )
     except BaseException:
-        try:
-            process.terminate()
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                process.kill()
-        except (OSError, ProcessLookupError):
-            pass
+        terminate_launcher_tree(process)
         raise
-    return {
+    job_ref = {
+        "job_id": job_id,
+        "state_id": state_identity(state_dir),
+    }
+    body = {
         "ok": True,
         "job_id": job_id,
+        "job_ref": job_ref,
+        "monitor_with": {
+            "tool": "puppetmaster_live_artifacts_follow",
+            "job_id": job_id,
+            "backend": backend,
+            "state_id": state_identity(state_dir),
+            "initial_cursor": 0,
+            "arguments": {
+                "job_ref": job_ref,
+                "backend": backend,
+                "since_cursor": 0,
+                "timeout_seconds": 10,
+            },
+        },
         "run_id": run_id,
+        "orchestrator_pid": process.pid,
         "launcher_pid": process.pid,
         "config": str(config_path),
         "cwd": cwd or str(Path.cwd()),
@@ -387,3 +449,15 @@ def detach_analysis_swarm(
             f"python -m puppetmaster show {job_id}",
         ],
     }
+    if duplicated_legacy_roles:
+        body["warnings"] = [
+            {
+                "kind": "duplicate_legacy_roles",
+                "fan_out_multiplier": len(_normalized_roles),
+                "message": (
+                    "Multiple bare role names received the same goal; use "
+                    "structured role instructions for real decomposition."
+                ),
+            }
+        ]
+    return body

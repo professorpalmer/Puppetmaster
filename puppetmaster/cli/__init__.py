@@ -67,6 +67,7 @@ from puppetmaster.cli.commands_jobs import (
     _run_reap_command,
     _run_wait_command,
     await_job_state,
+    read_job_state,
 )
 from puppetmaster.cli.commands_mcp import (
     _run_mcp_cleanup,
@@ -301,6 +302,7 @@ __all__ = [
     "artifact_headline",
     "artifact_job_id",
     "await_job_state",
+    "read_job_state",
     "build_parser",
     "create_store",
     "cursor_prompt",

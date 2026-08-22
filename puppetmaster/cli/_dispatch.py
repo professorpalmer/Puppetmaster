@@ -592,6 +592,8 @@ def _main(argv: Optional[list[str]] = None) -> int:
     import puppetmaster.cli as cli
 
     args = build_parser().parse_args(argv)
+    if getattr(args, "max_output_bytes", None) is not None:
+        os.environ["PUPPETMASTER_MAX_OUTPUT_BYTES"] = str(args.max_output_bytes)
     state_dir = _resolve_command_state_dir(args)
     store = create_store(args.backend, state_dir)
     on_job_created = early_job_printer if args.emit_job_id_early else None
@@ -752,6 +754,12 @@ def _main(argv: Optional[list[str]] = None) -> int:
 
         from puppetmaster.workers import specs_for_roles
 
+        if args.goal and getattr(args, "goal_file", None):
+            raise ValueError("run accepts either a positional goal or --goal-file, not both")
+        if not args.goal and getattr(args, "goal_file", None):
+            args.goal = Path(args.goal_file).read_text(encoding="utf-8")
+        if not args.goal:
+            raise ValueError("run requires a goal or --goal-file")
         if getattr(args, "effort", None):
             os.environ["PUPPETMASTER_EFFORT_ID"] = args.effort
         if args.config:
@@ -801,6 +809,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
             worker_mode=args.worker_mode,
             on_job_created=on_job_created,
             label=args.label,
+            launch_key=getattr(args, "launch_key", None),
         )
         return cli.finalize_cli_run(result)
 
@@ -1289,6 +1298,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
                 label=args.label,
                 worker_mode=args.worker_mode,
                 backend=args.backend,
+                launch_key=getattr(args, "launch_key", None),
             )
         except Exception as exc:
             print(f"swarm: failed to start: {exc}", file=sys.stderr)

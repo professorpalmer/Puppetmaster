@@ -788,6 +788,14 @@ def _run_cost_command(args, store) -> int:
                 for mid, v in routing_by_model.items()
             },
             "token_usage": aggregate_token_usage(artifacts),
+            "estimate_drift": {
+                "route_estimated_tokens": job_cost.route_estimated_tokens,
+                "measured_usage_tokens": job_cost.measured_usage_tokens,
+                "token_ratio": job_cost.token_estimate_drift_ratio,
+                "route_nominal_cost_usd": job_cost.route_nominal_cost_usd,
+                "nominal_usage_cost_usd": job_cost.nominal_usage_cost_usd,
+                "nominal_cost_ratio": job_cost.nominal_cost_drift_ratio,
+            },
             # The honest, routing-independent number.
             "actual_cost": {
                 "cost_basis": "measured_usage_x_registry_price",

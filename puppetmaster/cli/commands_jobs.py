@@ -55,12 +55,14 @@ from puppetmaster.mcp_registry import (
     prune_dead as registry_prune_dead,
     summarize as registry_summarize,
 )
+from puppetmaster.models import is_terminal_job_status
 from puppetmaster.redaction import redact_secrets
 from puppetmaster.orchestrator import Orchestrator
 from puppetmaster.state import (
     find_state_dir_for_job,
     list_project_state_dirs,
     resolve_state_dir,
+    state_identity,
 )
 from puppetmaster.store_factory import create_store
 from puppetmaster.stitcher import Stitcher
@@ -68,6 +70,30 @@ from puppetmaster.worker_runtime import WorkerDaemon
 from puppetmaster.workers import WorkerSpec
 
 from puppetmaster.cli.helpers import _registry_path_from_args
+
+
+def read_job_state(store, job_id: str, *, timed_out: bool = False) -> dict:
+    """Return the canonical non-blocking state payload for one durable job."""
+    _reap_quietly(store)
+    job = store.get_job(job_id)
+    snapshot = (
+        store.status_snapshot(job_id, compact=True)
+        if hasattr(store, "status_snapshot")
+        else {}
+    )
+    return {
+        "job_id": job_id,
+        "status": str(job.status),
+        "terminal": is_terminal_job_status(job.status),
+        "timed_out": bool(timed_out),
+        "completed_at": job.completed_at,
+        "job_ref": {
+            "job_id": job_id,
+            "state_id": state_identity(getattr(store, "root", Path.cwd())),
+        },
+        "delivery": snapshot.get("delivery"),
+        "progress": snapshot.get("progress"),
+    }
 
 
 def await_job_state(
@@ -84,35 +110,15 @@ def await_job_state(
     (so the MCP path can return and be re-called). Uses the store's
     event-wait primitive between checks instead of busy-polling.
     """
-    from puppetmaster.models import JobStatus
-
-    terminal = {
-        JobStatus.COMPLETE,
-        JobStatus.FAILED,
-        JobStatus.STALLED,
-        JobStatus.CANCELLED,
-    }
     poll = max(0.05, poll_interval_seconds)
     deadline = time.monotonic() + timeout_seconds if timeout_seconds > 0 else None
     cursor = 0
     while True:
-        job = store.get_job(job_id)
-        if job.status in terminal:
-            return {
-                "job_id": job_id,
-                "status": str(job.status),
-                "terminal": True,
-                "timed_out": False,
-                "completed_at": job.completed_at,
-            }
+        state = read_job_state(store, job_id)
+        if state["terminal"]:
+            return state
         if deadline is not None and time.monotonic() >= deadline:
-            return {
-                "job_id": job_id,
-                "status": str(job.status),
-                "terminal": False,
-                "timed_out": True,
-                "completed_at": job.completed_at,
-            }
+            return {**state, "timed_out": True}
         block = poll if deadline is None else max(0.05, min(poll * 4, deadline - time.monotonic()))
         events = store.wait_for_events(
             job_id,
@@ -253,7 +259,6 @@ def _run_wait_command(args, store) -> int:
     deadline = (
         time.monotonic() + args.timeout_seconds if args.timeout_seconds > 0 else None
     )
-    terminal = {"complete", "failed", "stalled"}
     while True:
         try:
             from puppetmaster.liveness import reap_stalled_jobs
@@ -263,7 +268,8 @@ def _run_wait_command(args, store) -> int:
             pass
         job = store.get_job(args.job_id)
         status = str(job.status)
-        if status in terminal:
+        terminal = is_terminal_job_status(job.status)
+        if terminal:
             timed_out = False
             break
         if deadline is not None and time.monotonic() >= deadline:
@@ -282,9 +288,10 @@ def _run_wait_command(args, store) -> int:
     payload = {
         "job_id": args.job_id,
         "status": status,
-        "terminal": status in terminal,
+        "terminal": terminal,
         "timed_out": timed_out,
         "completed_at": job.completed_at,
+        "delivery": store.status_snapshot(args.job_id, compact=True).get("delivery"),
     }
     if args.json:
         print(json.dumps({**payload, "summary": summary}, indent=2, default=str))
@@ -300,7 +307,8 @@ def _run_wait_command(args, store) -> int:
             print(summary)
     # Exit non-zero on the bad terminal states (and on timeout) so scripts can
     # branch on it without parsing output.
-    if timed_out or status in {"failed", "stalled"}:
+    delivery = payload.get("delivery") or {}
+    if timed_out or not delivery.get("successful", False):
         return 1
     return 0
 
@@ -326,4 +334,6 @@ def _run_await_command(args, store) -> int:
             print(f"timed out after {args.timeout_seconds}s; job {args.job_id} is {state['status']}")
         else:
             print(summary or f"job {args.job_id} finished: {state['status']}")
-    return 0 if state["status"] not in {"failed", "stalled"} else 1
+    if state["timed_out"]:
+        return 1
+    return 0 if (state.get("delivery") or {}).get("successful", False) else 1
