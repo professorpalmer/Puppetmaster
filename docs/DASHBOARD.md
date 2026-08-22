@@ -16,6 +16,13 @@ python -m puppetmaster dashboard            # jobs index for this workspace
 python -m puppetmaster dashboard <job_id>   # deep-link straight to one job
 ```
 
+The normal board is project-scoped: it shows the state directory for the
+workspace you selected, not every job on the machine. Use `--all-projects` only
+for an intentional aggregate view. When the command starts a board, open the
+exact URL it prints or that the MCP tool returns; the default port starts at
+8787 but may auto-bump. See [CONCURRENT_SESSIONS.md](CONCURRENT_SESSIONS.md)
+for the complete concurrent-session contract.
+
 From an agent, the MCP verb `puppetmaster_dashboard` starts the server (or reuses
 this project's own, if one is already running) and returns the URL to open — pass
 `job_id` to deep-link, `mobile: true` to get a phone URL + QR, and `stop: true` to

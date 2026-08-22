@@ -54,6 +54,13 @@ CREATE INDEX IF NOT EXISTS idx_rate_limits_updated
     ON rate_limits(updated_at);
 """
 
+# Version-1 keys ended after provider/model/base-URL.  They cannot safely be
+# associated with one credential after the credential-scoping upgrade, so a
+# fresh process retires them once instead of allowing a stale shared 429 to
+# block every credential indefinitely.  Version-2 keys always have a fourth
+# fingerprint field (three unit separators).
+_LEGACY_ADMISSION_KEY_SEPARATOR_COUNT = 2
+
 _HARVEST_KEY: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "puppetmaster_rate_limit_harvest_key",
     default=None,
@@ -164,6 +171,14 @@ class RateLimitStore:
             connection = self._connect()
             try:
                 connection.executescript(_SCHEMA)
+                connection.execute(
+                    """
+                    DELETE FROM rate_limits
+                    WHERE length(admission_key) - length(replace(admission_key, char(31), ''))
+                          <= ?
+                    """,
+                    (_LEGACY_ADMISSION_KEY_SEPARATOR_COUNT,),
+                )
                 connection.commit()
             finally:
                 connection.close()

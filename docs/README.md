@@ -2,7 +2,7 @@
 
 The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
 
-**Current release:** [v1.22.10](CHANGELOG.md#v12210) — spawned workers are exempt from the delegate-first gate; see [CHANGELOG.md](CHANGELOG.md) for the full line.
+**Current release:** [v1.22.16](CHANGELOG.md#v12216) — Google Antigravity (`agy`) worker adapter; see [CHANGELOG.md](CHANGELOG.md) for the full line.
 
 ## Start here
 
@@ -14,6 +14,7 @@ The full documentation set. Start at the [project README](../README.md) for the 
 | [COMPARISON.md](COMPARISON.md) | How it differs from LangGraph / CrewAI / Claude Agent SDK / native subagents + "pick X instead if…" |
 | [SECURITY.md](SECURITY.md) | Threat model: what it can do, what it touches, network egress, and how to run it safely |
 | [DAILY_DRIVER.md](DAILY_DRIVER.md) | Prompt recipes for review, swarm, implement, post-job inspection |
+| [CONCURRENT_SESSIONS.md](CONCURRENT_SESSIONS.md) | Concurrent agent/CLI operations: project state, dashboard URLs, explicit overrides, and isolated worktrees |
 | [DASHBOARD.md](DASHBOARD.md) | The live, zero-dependency web board: jobs index, routing rollup, and per-job detail |
 | [MOBILE.md](MOBILE.md) | Watch swarms from your phone: Tailscale setup, agent/CLI start, QR handoff, troubleshooting |
 
@@ -34,7 +35,7 @@ Reproducible evidence behind the durable-state thesis, including an independent 
 |---|---|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Job / Task / Worker / Artifact / Stitcher / Memory object model |
 | [MODEL_ROUTING.md](MODEL_ROUTING.md) | Router policies, classifier, registry schema, the starter tiers |
-| [ADAPTERS.md](ADAPTERS.md) | All production adapters (cursor, claude-code, openai, codex, hermes, agentic) + shell + how to add a new one |
+| [ADAPTERS.md](ADAPTERS.md) | All production adapters (cursor, claude-code, openai, codex, hermes, antigravity, agentic) + shell + how to add a new one |
 | [CLI_REFERENCE.md](CLI_REFERENCE.md) | Every CLI subcommand, workflow config schema, daemon mode |
 | [CURSOR_AGENT_MCP.md](CURSOR_AGENT_MCP.md) | The MCP tool surface in detail |
 | [GROK_BOT.md](GROK_BOT.md) | Grok Bot as remote MCP pilot (streamable HTTP; supervise-first; not a worker adapter) |

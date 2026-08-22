@@ -116,7 +116,9 @@ python -m puppetmaster dashboard --mobile --qr
 ## 3. Open it on your phone
 
 - **Scan** the QR, or
-- type the URL (e.g. `http://100.96.89.15:8787/`) into your phone browser.
+- type the exact URL the command printed (for example,
+  `http://100.96.89.15:<returned-port>/`) into your phone browser. The default
+  search starts at 8787, but a concurrent dashboard can use a higher port.
 
 The board is responsive — the jobs grid, headlines, tables, and footer all reflow
 for a phone screen. Tap a job to drill in; the jobs index is the default landing.

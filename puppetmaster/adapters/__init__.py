@@ -30,6 +30,7 @@ from puppetmaster.codegraph import (
 )
 from puppetmaster.failure import (
     NOT_AUTHENTICATED,
+    classify_antigravity_failure,
     classify_claude_code_failure,
     classify_codex_failure,
     classify_cursor_failure,
@@ -93,6 +94,15 @@ from ._streaming import (
     capture_subprocess_stdout,
     run_streamed_subprocess,
 )
+from .antigravity import (
+    DEFAULT_ANTIGRAVITY_EFFORT,
+    DEFAULT_ANTIGRAVITY_MODEL,
+    AntigravityAdapter,
+    antigravity_stdin_data,
+    build_antigravity_command,
+    resolve_antigravity_mode,
+    resolve_antigravity_model,
+)
 from .claude_code import (
     DEFAULT_CLAUDE_CODE_MODEL,
     ClaudeCodeAdapter,
@@ -146,6 +156,7 @@ __all__ = [
     "ADAPTERS",
     "ADAPTER_INFO",
     "AdapterInfo",
+    "AntigravityAdapter",
     "Artifact",
     "ArtifactType",
     "ClaudeCodeAdapter",
@@ -153,6 +164,8 @@ __all__ = [
     "CliWorkerAdapter",
     "CodexAdapter",
     "CursorAdapter",
+    "DEFAULT_ANTIGRAVITY_EFFORT",
+    "DEFAULT_ANTIGRAVITY_MODEL",
     "DEFAULT_CLAUDE_CODE_MODEL",
     "DEFAULT_CODEX_MODEL",
     "DEFAULT_HERMES_ANALYZE_TOOLSETS",
@@ -172,7 +185,9 @@ __all__ = [
     "VALID_HERMES_REASONING_EFFORTS",
     "WorkerAdapter",
     "apply_worktree_ports",
+    "antigravity_stdin_data",
     "available_hermes_providers",
+    "build_antigravity_command",
     "build_claude_code_command",
     "build_codex_exec_command",
     "build_hermes_chat_command",
@@ -180,6 +195,7 @@ __all__ = [
     "build_patch_payload",
     "build_structured_prompt",
     "capture_subprocess_stdout",
+    "classify_antigravity_failure",
     "classify_claude_code_failure",
     "classify_codex_failure",
     "classify_cursor_failure",
@@ -221,6 +237,8 @@ __all__ = [
     "prune_hermes_tool_sessions",
     "redact_secrets",
     "repo_file_census",
+    "resolve_antigravity_mode",
+    "resolve_antigravity_model",
     "resolve_claude_code_model",
     "resolve_command",
     "run_streamed_subprocess",

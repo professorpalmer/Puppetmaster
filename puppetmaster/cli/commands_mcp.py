@@ -50,6 +50,7 @@ from puppetmaster.hook_installers import (
     uninstall_hooks,
 )
 from puppetmaster.mcp_registry import (
+    kill_selected as registry_kill_selected,
     kill_stale as registry_kill_stale,
     list_entries as registry_list_entries,
     prune_dead as registry_prune_dead,
@@ -242,6 +243,21 @@ def _run_mcp_cleanup(args) -> int:
     before = registry_summarize(registry_list_entries())
     pruned = registry_prune_dead()
     killed: list = []
+    selected_killed: list = []
+    refused: list = []
+    pids = getattr(args, "pids", None)
+    workspace = getattr(args, "workspace", None)
+    idle_after = getattr(args, "idle_after_seconds", None)
+    has_selector = bool(pids) or workspace is not None or idle_after is not None
+    if has_selector:
+        selected = registry_kill_selected(
+            pids=pids,
+            workspace=workspace,
+            idle_after_seconds=float(idle_after) if idle_after is not None else None,
+            self_pid=os.getpid(),
+        )
+        selected_killed = [entry.to_payload() for entry in selected.killed]
+        refused = selected.refused
     if args.kill_stale:
         killed_entries = registry_kill_stale(
             stale_after_seconds=float(args.stale_after_seconds),
@@ -253,6 +269,8 @@ def _run_mcp_cleanup(args) -> int:
         "after": after,
         "pruned": [entry.to_payload() for entry in pruned],
         "killed": killed,
+        "selected_killed": selected_killed,
+        "refused": refused,
     }
     if args.json:
         print(json.dumps(payload, indent=2))
@@ -268,6 +286,14 @@ def _run_mcp_cleanup(args) -> int:
         print(f"killed stale: {len(killed)}")
         for row in killed:
             print(f"  - PID {row['pid']} ({row.get('workspace') or '-'})")
+    if has_selector:
+        print(f"selected killed: {len(selected_killed)}")
+        for row in selected_killed:
+            print(f"  - PID {row['pid']} ({row.get('workspace') or '-'})")
+        if refused:
+            print(f"selected refused: {len(refused)}")
+            for row in refused:
+                print(f"  - PID {row['pid']} ({row.get('reason')})")
     elif before["stale"]:
         print(
             f"note: {before['stale']} stale-but-alive server(s) detected; "

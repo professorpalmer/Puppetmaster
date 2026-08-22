@@ -214,6 +214,39 @@ If it returns `failure=dirty_worktree` in implement mode, run from a clean tree 
 
 When a Hermes implement worker edits tracked files, Puppetmaster records a `patch` artifact alongside the verification artifact.
 
+### `antigravity`
+
+Runs the Google Antigravity CLI (`agy`) headlessly. The prompt is sent on stdin as one stream-json user event (`--input-format stream-json` + `--output-format stream-json`) so Windows `CreateProcess` does not hit argv-length WinError 206. Do not pass `-p=`. Supports Gemini 3.7 Flash (`gemini-3.7-flash`), Gemini 3.6 Flash, Gemini 3.5 Flash, and Gemini 3.1 Pro. Model slugs that already encode effort (`gemini-3.7-flash-high`) do not also get `--effort`. Live `agy` 1.1.18 rejects `--effort` on Gemini 3.5 Flash, so that slug never receives it. The task workspace is passed once as `--add-dir` (a real CLI flag on 1.1.18); `extra_args` cannot inject additional dirs.
+
+CLI: `python -m puppetmaster antigravity "Goal" --mode analyze` (alias `agy`). Enable a restricted lock with `puppetmaster platform enable antigravity` — nothing enables antigravity in anyone's lock by default. Discover the curated catalog with `models discover --source antigravity` after `agy` is installed; `models init` does not seed antigravity starter-registry rows.
+
+Two execution modes:
+- **`plan`** (analyze / read-only): Audit or inspection without modifying the working tree.
+- **`accept-edits`** (implement / full-edit): Headless `agy` 1.1.18 keeps `toolPermission=request-review` even with `--mode accept-edits`, so command/write tools are auto-denied unless `--dangerously-skip-permissions` is passed. Implement mode adds that flag by default; set `payload.dangerously_skip_permissions=false` to opt out. Never added in plan mode.
+
+Telemetry and Billing:
+- Captures input tokens, output tokens, thinking/reasoning tokens, and cache read tokens from the final `event==result` payload (same shape as `--output-format json`).
+- Billing is `plan` when `~/.gemini/antigravity-cli` contains session files, or `api` when `GEMINI_API_KEY` / `GOOGLE_API_KEY` is set *and* `agy` is on PATH. An empty settings directory or a stray Gemini key without `agy` is **not** healthy. `agy` merely on PATH is **not** an authenticated session.
+
+Requirements:
+- `agy` CLI installed and on PATH, or `AGY_COMMAND` / `ANTIGRAVITY_COMMAND` / `payload.executable` set.
+- Authenticated Antigravity settings directory, or `GEMINI_API_KEY` / `GOOGLE_API_KEY`.
+
+```json
+{
+  "role": "gemini-audit",
+  "instruction": "Audit auth module and identify token expiration issues.",
+  "adapter": "antigravity",
+  "payload": {
+    "model": "gemini-3.7-flash",
+    "effort": "high",
+    "mode": "plan",
+    "cwd": ".",
+    "timeout_seconds": 300
+  }
+}
+```
+
 ### `agentic`
 
 Runs Puppetmaster's **standalone, provider-agnostic worker**: an in-process tool-use loop that calls provider HTTP APIs directly with your own API key (or AWS IAM for Bedrock). No external agent CLI (no Cursor, Claude Code, Codex, or Hermes binary required) — just a visible provider credential such as `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `OPENROUTER_API_KEY`, `OPENCODE_GO_API_KEY`, `ZAI_API_KEY` / `GLM_API_KEY` / `Z_AI_API_KEY`, `MINIMAX_API_KEY`, `NVIDIA_API_KEY`, or AWS Bedrock (`AWS_BEARER_TOKEN_BEDROCK` / `AWS_ACCESS_KEY_ID`+`AWS_SECRET_ACCESS_KEY` / `~/.aws`, with `provider=bedrock`).

@@ -87,4 +87,9 @@ python -m puppetmaster clean --completed
 
 SQLite is the default backend. Runtime state is stored outside the repository by default so Puppetmaster jobs, logs, artifacts, and SQLite files do not inflate `git status`. Use `--state-dir .puppetmaster` or `PUPPETMASTER_STATE_DIR=.puppetmaster` only when you intentionally want repo-local state.
 
+When several conversations or shells are active, keep write-capable jobs in
+separate worktrees, treat `--all-projects` as an explicit aggregate view, and
+open the dashboard URL that Puppetmaster actually returns. The full state and
+dashboard-scope contract is in [CONCURRENT_SESSIONS.md](CONCURRENT_SESSIONS.md).
+
 Use `--backend file` only when you want fully inspectable JSON state for debugging.
