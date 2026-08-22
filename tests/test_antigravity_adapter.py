@@ -7,6 +7,7 @@ import shutil
 import sys
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest import mock
 
 _HERMETIC_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -269,9 +270,15 @@ class AntigravityBillingTests(unittest.TestCase):
         self.assertIn("gemini_api_key:set", status.evidence)
 
     def test_detect_antigravity_billing_session(self) -> None:
-        status = detect_antigravity_billing(env={})
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / ".gemini" / "antigravity-cli").mkdir(parents=True)
+
+            status = detect_antigravity_billing(env={}, home=home)
+
         self.assertTrue(status.healthy)
-        self.assertIn(status.billing, ("plan", "api"))
+        self.assertEqual(status.billing, "plan")
+        self.assertIn("antigravity_session:present", status.evidence)
 
 
 @unittest.skipUnless(shutil.which("agy") is not None, "Live test requires agy CLI on PATH")
