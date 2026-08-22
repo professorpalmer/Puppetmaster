@@ -62,6 +62,7 @@ from puppetmaster.state import (
     find_state_dir_for_job,
     list_project_state_dirs,
     resolve_state_dir,
+    state_identity,
 )
 from puppetmaster.store_factory import create_store
 from puppetmaster.stitcher import Stitcher
@@ -73,13 +74,25 @@ from puppetmaster.cli.helpers import _registry_path_from_args
 
 def read_job_state(store, job_id: str, *, timed_out: bool = False) -> dict:
     """Return the canonical non-blocking state payload for one durable job."""
+    _reap_quietly(store)
     job = store.get_job(job_id)
+    snapshot = (
+        store.status_snapshot(job_id, compact=True)
+        if hasattr(store, "status_snapshot")
+        else {}
+    )
     return {
         "job_id": job_id,
         "status": str(job.status),
         "terminal": is_terminal_job_status(job.status),
         "timed_out": bool(timed_out),
         "completed_at": job.completed_at,
+        "job_ref": {
+            "job_id": job_id,
+            "state_id": state_identity(getattr(store, "root", Path.cwd())),
+        },
+        "delivery": snapshot.get("delivery"),
+        "progress": snapshot.get("progress"),
     }
 
 
@@ -278,6 +291,7 @@ def _run_wait_command(args, store) -> int:
         "terminal": terminal,
         "timed_out": timed_out,
         "completed_at": job.completed_at,
+        "delivery": store.status_snapshot(args.job_id, compact=True).get("delivery"),
     }
     if args.json:
         print(json.dumps({**payload, "summary": summary}, indent=2, default=str))
@@ -293,7 +307,8 @@ def _run_wait_command(args, store) -> int:
             print(summary)
     # Exit non-zero on the bad terminal states (and on timeout) so scripts can
     # branch on it without parsing output.
-    if timed_out or status in {"failed", "stalled"}:
+    delivery = payload.get("delivery") or {}
+    if timed_out or not delivery.get("successful", False):
         return 1
     return 0
 
@@ -319,4 +334,6 @@ def _run_await_command(args, store) -> int:
             print(f"timed out after {args.timeout_seconds}s; job {args.job_id} is {state['status']}")
         else:
             print(summary or f"job {args.job_id} finished: {state['status']}")
-    return 0 if state["status"] not in {"failed", "stalled"} else 1
+    if state["timed_out"]:
+        return 1
+    return 0 if (state.get("delivery") or {}).get("successful", False) else 1

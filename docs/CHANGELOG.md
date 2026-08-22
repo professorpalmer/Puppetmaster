@@ -36,6 +36,21 @@ Codex and Claude clients.**
   ownership of the child process and its pipes. Explicit `CODEX_COMMAND` and
   task executable overrides retain their existing command semantics.
 
+**Operator remediation contracts.** Asynchronous starts now support an optional
+caller launch key with durable full-request idempotency, return an opaque
+`job_ref` and bounded `monitor_with` continuation, and keep internal run goals
+out of Windows argv. CLI and MCP observers share quality-aware delivery verdicts
+(`delivered`, `degraded`, `blocked`, `pending`); cancellation and empty/degraded
+terminal work are not successful delivery. Compact feeds can filter artifact
+types without losing cursor progress.
+
+Analysis swarms default to one assignment. Structured role objects carry their
+own instructions and source/negative scopes, while repeated legacy role names
+produce a visible fan-out warning. Read-only analysis has an orchestration-level
+worker-diff postcondition. Streamed CLI adapters can enforce a captured-output
+limit, and cost reports expose token-volume and nominal-cost estimate drift
+without treating plan billing as zero resource consumption.
+
 ## v1.22.15
 
 Absorb of [@bsmi021](https://github.com/bsmi021) PR

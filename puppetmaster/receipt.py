@@ -37,6 +37,7 @@ def build_job_receipt(store: Any, job_id: str) -> dict[str, Any]:
     stdout_salvage = _stdout_salvage_count(artifacts)
     elapsed = _elapsed_seconds(job.created_at, job.completed_at)
     total_tokens = int(token_usage.get("total_tokens") or 0)
+    drift = _estimate_drift(artifacts, total_tokens)
     return {
         "job_id": job_id,
         "status": str(job.status),
@@ -58,11 +59,44 @@ def build_job_receipt(store: Any, job_id: str) -> dict[str, Any]:
             "stdout_salvage": stdout_salvage,
         },
         "tokens": token_usage,
+        "estimate_drift": drift,
+        "delivery": _delivery(store, job_id, tasks, artifacts),
         "efficiency": {
             "tokens_per_typed_artifact": round(total_tokens / typed_total, 3) if typed_total else None,
             "degraded_rate": round(len(degraded_tasks) / len(tasks), 3) if tasks else 0.0,
         },
     }
+
+
+def _estimate_drift(artifacts: list[Artifact], measured_tokens: int) -> dict[str, Any]:
+    from puppetmaster.cost import final_routing_artifacts
+
+    routes = final_routing_artifacts(artifacts)
+    estimated = sum(
+        int((artifact.payload or {}).get("estimated_tokens_in") or 0)
+        + int((artifact.payload or {}).get("estimated_tokens_out") or 0)
+        for artifact in routes.values()
+    )
+    return {
+        "route_estimated_tokens": estimated,
+        "measured_usage_tokens": measured_tokens,
+        "token_ratio": round(measured_tokens / estimated, 6) if estimated else None,
+    }
+
+
+def _delivery(store: Any, job_id: str, tasks: list[Any], artifacts: list[Artifact]) -> dict[str, Any]:
+    from puppetmaster.delivery import delivery_verdict
+    from puppetmaster.quality import assess_run_quality
+
+    quality = assess_run_quality(artifacts)
+    stale = [task.id for task in tasks if store.is_task_stale(task)]
+    return delivery_verdict(
+        store.get_job(job_id).status,
+        quality=quality.get("quality"),
+        stale_tasks=stale,
+        incomplete_tasks=any(str(task.status) != "complete" for task in tasks),
+        required_artifacts=bool(artifacts),
+    )
 
 
 def _task_status_count(tasks: list[Any], status: str) -> int:

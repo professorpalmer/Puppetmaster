@@ -72,6 +72,12 @@ class JobCost:
     unpriced_tasks: int = 0
     by_model: dict = field(default_factory=dict)
     tasks: list = field(default_factory=list)
+    route_estimated_tokens: int = 0
+    measured_usage_tokens: int = 0
+    token_estimate_drift_ratio: Optional[float] = None
+    route_nominal_cost_usd: float = 0.0
+    nominal_usage_cost_usd: float = 0.0
+    nominal_cost_drift_ratio: Optional[float] = None
 
 
 def _model_index(registry: list) -> tuple[dict, dict]:
@@ -105,6 +111,21 @@ def _routing_created_by_rank(created_by: Optional[str]) -> int:
     return _ROUTING_CREATED_BY_RANK.get(created_by or "", 0)
 
 
+def final_routing_artifacts(artifacts: Iterable[Artifact]) -> dict[str, Artifact]:
+    best: dict[str, tuple[int, Artifact]] = {}
+    for artifact in artifacts:
+        if artifact.type != ArtifactType.ROUTING:
+            continue
+        rank = _routing_created_by_rank(getattr(artifact, "created_by", None))
+        task_id = getattr(artifact, "task_id", None)
+        if rank == 0 or not task_id:
+            continue
+        previous = best.get(task_id)
+        if previous is None or rank > previous[0]:
+            best[task_id] = (rank, artifact)
+    return {task_id: artifact for task_id, (_rank, artifact) in best.items()}
+
+
 def _routing_model_ids(artifacts: Iterable[Artifact]) -> dict:
     """task_id -> registry model id from the FINAL routing decision.
 
@@ -112,23 +133,12 @@ def _routing_model_ids(artifacts: Iterable[Artifact]) -> dict:
     (plan-billed cursor with ``sdk_not_installed``) does not price the
     successful fallback run as $0.
     """
-    best: dict = {}  # task_id -> (rank, model_id)
-    for artifact in artifacts:
-        if artifact.type != ArtifactType.ROUTING:
-            continue
-        rank = _routing_created_by_rank(getattr(artifact, "created_by", None))
-        if rank == 0:
-            continue
-        task_id = getattr(artifact, "task_id", None)
-        if not task_id:
-            continue
+    result: dict[str, str] = {}
+    for task_id, artifact in final_routing_artifacts(artifacts).items():
         model_id = (artifact.payload or {}).get("model_id")
-        if not model_id:
-            continue
-        prev = best.get(task_id)
-        if prev is None or rank > prev[0]:
-            best[task_id] = (rank, str(model_id))
-    return {task_id: model_id for task_id, (_rank, model_id) in best.items()}
+        if model_id:
+            result[task_id] = str(model_id)
+    return result
 
 
 def _usage_records(artifacts: Iterable[Artifact]) -> dict:
@@ -178,10 +188,26 @@ def price_job(artifacts: Iterable[Artifact], registry: list) -> JobCost:
     of the model each task actually ran on. Independent of routing."""
     artifacts = list(artifacts)
     by_id, by_adapter_name = _model_index(registry)
-    routing_models = _routing_model_ids(artifacts)
+    final_routes = final_routing_artifacts(artifacts)
+    routing_models = {
+        task_id: str((artifact.payload or {}).get("model_id"))
+        for task_id, artifact in final_routes.items()
+        if (artifact.payload or {}).get("model_id")
+    }
     usage = _usage_records(artifacts)
 
     result = JobCost()
+    result.route_estimated_tokens = sum(
+        int((artifact.payload or {}).get("estimated_tokens_in") or 0)
+        + int((artifact.payload or {}).get("estimated_tokens_out") or 0)
+        for artifact in final_routes.values()
+    )
+    result.route_nominal_cost_usd = round(
+        sum(
+            float((artifact.payload or {}).get("nominal_cost_usd") or 0.0)
+            for artifact in final_routes.values()
+        ), 6
+    )
     for task_id, record in usage.items():
         spec = _resolve_spec(
             routing_models.get(task_id), record["model"], by_id, by_adapter_name
@@ -197,6 +223,13 @@ def price_job(artifacts: Iterable[Artifact], registry: list) -> JobCost:
             real_cost_f = 0.0
 
         plan_billed = spec is not None and getattr(spec, "billing", None) == "plan"
+        nominal_cost = (
+            _cost_with_cache_discount(spec, tokens_in, tokens_out, tokens_cached)
+            if spec is not None
+            else 0.0
+        )
+        result.nominal_usage_cost_usd += nominal_cost
+        result.measured_usage_tokens += tokens_in + tokens_out
 
         if plan_billed:
             model_id = spec.id
@@ -265,6 +298,15 @@ def price_job(artifacts: Iterable[Artifact], registry: list) -> JobCost:
     result.estimated_cost_usd = round(result.estimated_cost_usd, 6)
     for bucket in result.by_model.values():
         bucket["marginal_cost_usd"] = round(bucket["marginal_cost_usd"], 6)
+    result.nominal_usage_cost_usd = round(result.nominal_usage_cost_usd, 6)
+    if result.route_estimated_tokens > 0:
+        result.token_estimate_drift_ratio = round(
+            result.measured_usage_tokens / result.route_estimated_tokens, 6
+        )
+    if result.route_nominal_cost_usd > 0:
+        result.nominal_cost_drift_ratio = round(
+            result.nominal_usage_cost_usd / result.route_nominal_cost_usd, 6
+        )
     return result
 
 

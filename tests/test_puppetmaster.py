@@ -336,7 +336,15 @@ class PuppetmasterTests(unittest.TestCase):
             # The launcher pid is now labeled honestly and monitoring is pointed
             # at job_id rather than the misleading supervisor pid (C2).
             self.assertEqual(payload["launcher_pid"], payload["pid"])
+            self.assertEqual(payload["orchestrator_pid"], payload["launcher_pid"])
+            self.assertTrue(payload["pid_deprecated"])
             self.assertEqual(payload["monitor_with"]["job_id"], payload["job_id"])
+            self.assertEqual(
+                payload["monitor_with"]["arguments"]["job_ref"], payload["job_ref"]
+            )
+            self.assertEqual(
+                payload["monitor_with"]["arguments"]["backend"], "sqlite"
+            )
             self.assertFalse(result["isError"])
 
             spawned = ASYNC_PROCESSES[before_process_count:]
@@ -22380,6 +22388,17 @@ class PuppetmasterFrictionFixTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             store = self._store(tmp)
             job = store.create_job("goal")
+            store.save_artifact(
+                Artifact(
+                    job_id=job.id,
+                    task_id=job.id,
+                    type=ArtifactType.FINDING,
+                    created_by="test",
+                    payload={"claim": "useful result"},
+                    confidence=1.0,
+                    evidence=["test:delivered"],
+                )
+            )
             store.update_job_status(job.id, JobStatus.COMPLETE)
             rc = cli_main(
                 ["--state-dir", str(store.root), "--backend", "sqlite", "wait", job.id]
@@ -22407,8 +22426,9 @@ class PuppetmasterFrictionFixTests(unittest.TestCase):
                 ]
             )
 
-            # Assert
-            self.assertEqual(rc, 0)
+            # Cancellation is terminal for waiting, but it is not successful
+            # delivery and must remain non-zero for shell automation.
+            self.assertEqual(rc, 1)
 
     def test_await_treats_stalled_as_terminal(self) -> None:
         from puppetmaster.cli import await_job_state

@@ -30,6 +30,7 @@ from puppetmaster.codegraph import (
     maybe_autosync_codegraph,
 )
 from puppetmaster.codegraph_repair import repair_codegraph_sqlite
+from puppetmaster.fs_permissions import write_private_text
 from puppetmaster.mcp_registry import (
     HeartbeatThread,
     deregister as registry_deregister,
@@ -43,7 +44,7 @@ from puppetmaster.mcp_registry import (
     summarize as registry_summarize,
 )
 from puppetmaster.run_id import reserve_run_logs
-from puppetmaster.state import resolve_state_dir
+from puppetmaster.state import resolve_state_dir, state_identity
 from puppetmaster.store_factory import create_store
 from puppetmaster.swarm_launch import (
     EARLY_JOB_ID_TIMEOUT_SECONDS,
@@ -1352,7 +1353,7 @@ def _build_tools() -> list[McpTool]:
             ),
             input_schema=job_schema(required=True),
             handler=lambda args: run_cli(
-                ["cost", require_string(args, "job_id"), "--json"], args
+                ["cost", require_job_id(args), "--json"], args
             ),
         ),
         McpTool(
@@ -1367,7 +1368,7 @@ def _build_tools() -> list[McpTool]:
             ),
             input_schema=job_schema(required=True),
             handler=lambda args: run_cli(
-                ["receipt", require_string(args, "job_id"), "--json"], args
+                ["receipt", require_job_id(args), "--json"], args
             ),
         ),
         McpTool(
@@ -1586,7 +1587,7 @@ def _build_tools() -> list[McpTool]:
             name="puppetmaster_partial_summary",
             description="Return a live summary from current artifacts without waiting for final stitching.",
             input_schema=job_schema(required=True),
-            handler=lambda args: run_cli(["show", require_string(args, "job_id"), "--partial"], args),
+            handler=lambda args: run_cli(["show", require_job_id(args), "--partial"], args),
         ),
         McpTool(
             name="puppetmaster_await_job",
@@ -1619,7 +1620,7 @@ def _build_tools() -> list[McpTool]:
                 "Does not mutate job state."
             ),
             input_schema=job_schema(required=True),
-            handler=lambda args: run_cli(["graph", require_string(args, "job_id")], args),
+            handler=lambda args: run_cli(["graph", require_job_id(args)], args),
         ),
         McpTool(
             name="puppetmaster_reset_subgraph",
@@ -1638,7 +1639,7 @@ def _build_tools() -> list[McpTool]:
             name="puppetmaster_show",
             description="Return the stitched summary for a Puppetmaster job.",
             input_schema=job_schema(required=True),
-            handler=lambda args: run_cli(["show", require_string(args, "job_id")], args),
+            handler=lambda args: run_cli(["show", require_job_id(args)], args),
         ),
         McpTool(
             name="puppetmaster_dashboard",
@@ -2776,9 +2777,11 @@ def _enabled_swarm_adapters() -> list[str]:
 
 
 def start_swarm(args: JsonObject) -> JsonObject:
+    from puppetmaster.workers import normalize_role_specs
+
     goal = require_string(args, "goal")
     command = ["run", goal]
-    roles = normalized_roles(args)
+    role_inputs = normalized_role_specs(args)
     adapter = args.get("adapter")
     if args.get("config"):
         command.extend(["--config", str(args["config"])])
@@ -2800,7 +2803,7 @@ def start_swarm(args: JsonObject) -> JsonObject:
             return locked
         try:
             config_path = write_generated_swarm_config(
-                args, roles or ["explore"], str(adapter)
+                args, role_inputs, str(adapter)
             )
         except Exception as exc:
             blocked = _ambiguous_model_pin_tool_error(exc, args.get("model"))
@@ -2808,37 +2811,90 @@ def start_swarm(args: JsonObject) -> JsonObject:
                 return blocked
             raise
         command.extend(["--config", str(config_path)])
-    elif roles:
-        if not args.get("allow_local_demo"):
-            enabled = _enabled_swarm_adapters()
+    else:
+        enabled = _enabled_swarm_adapters()
+        if role_inputs and not args.get("allow_local_demo"):
+            _normalized, duplicated = normalize_role_specs(role_inputs, goal)
+            details: JsonObject = {
+                "roles": role_inputs,
+                "enabled_adapters": enabled,
+                "fix": (
+                    "Pass adapter=<your platform>, pass a workflow config, or "
+                    "set allow_local_demo=true for deterministic tests."
+                ),
+            }
+            if duplicated:
+                details["warnings"] = [
+                    {
+                        "kind": "duplicate_legacy_roles",
+                        "fan_out_multiplier": len(_normalized),
+                        "message": (
+                            "Multiple bare role names would receive the same goal; "
+                            "use structured role instructions for decomposition."
+                        ),
+                    }
+                ]
             return tool_error(
-                "Custom-role MCP swarms require a workflow config or an explicit adapter. "
-                "Otherwise Puppetmaster would use the demo local adapter and return generic artifacts.",
+                "Custom-role MCP swarms require a workflow config or explicit adapter; "
+                "otherwise Puppetmaster would use the demo local adapter.",
+                details,
+            )
+        selected = "local" if args.get("allow_local_demo") else next(
+            (item for item in enabled if item != "local"), None
+        )
+        if selected is None and args.get("allow_local_demo"):
+            selected = "local"
+        if selected is None:
+            return tool_error(
+                "No enabled non-demo analysis adapter is available.",
                 {
-                    "roles": roles,
+                    "roles": role_inputs,
                     "enabled_adapters": enabled,
                     "fix": (
-                        "Pass adapter=<your platform> (one of: "
-                        f"{', '.join(enabled) or ', '.join(SWARM_ANALYSIS_ADAPTERS)}), "
-                        "pass a config, or use the platform-specific start verb that "
-                        "matches your platform. For tests/demos set allow_local_demo=true."
+                        "Enable an analysis adapter, pass adapter/config explicitly, "
+                        "or set allow_local_demo=true for deterministic tests."
                     ),
                 },
             )
-        command.append("--workers")
-        command.extend(roles)
+        locked = _platform_lock_preflight(selected)
+        if locked is not None:
+            return locked
+        try:
+            config_path = write_generated_swarm_config(args, role_inputs, selected)
+        except Exception as exc:
+            blocked = _ambiguous_model_pin_tool_error(exc, args.get("model"))
+            if blocked is not None:
+                return blocked
+            raise
+        command.extend(["--config", str(config_path)])
     worker_mode = args.get("worker_mode")
     if worker_mode:
         command.extend(["--worker-mode", str(worker_mode)])
-    # `timeout_seconds` is advertised on this tool's schema (goal_schema), and
-    # every sibling start verb forwards it. Only the adapter branch above
-    # consumed it -- via write_generated_swarm_config -- so a plain
-    # `start_swarm(goal, timeout_seconds=600)` dropped the value on the floor
-    # and the run silently used the orchestrator's 90s base / 270s hard cap.
+    # Keep explicit timeouts authoritative even for caller-supplied configs.
     _append_swarm_timeout_flags(command, args)
     _append_swarm_memory_flags(command, args)
     _append_label_flag(command, args)
-    return start_cli(command, args)
+    result = start_cli(command, args)
+    _normalized, duplicated = normalize_role_specs(role_inputs, goal)
+    if duplicated and not result.get("isError"):
+        content = result.get("content") or []
+        if content and content[0].get("type") == "text":
+            try:
+                body = json.loads(content[0]["text"])
+                body.setdefault("warnings", []).append(
+                    {
+                        "kind": "duplicate_legacy_roles",
+                        "fan_out_multiplier": len(role_inputs),
+                        "message": (
+                            "Multiple bare role names received the same goal; "
+                            "use structured role instructions for real decomposition."
+                        ),
+                    }
+                )
+                content[0]["text"] = json.dumps(body, indent=2)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+    return result
 
 
 def _append_swarm_timeout_flags(command: list[str], args: JsonObject) -> None:
@@ -2884,12 +2940,7 @@ def start_cursor_swarm(args: JsonObject) -> JsonObject:
     locked = _platform_lock_preflight("cursor")
     if locked is not None:
         return locked
-    roles = normalized_roles(args) or [
-        "pipeline-mapper",
-        "decision-explainer",
-        "conflict-auditor",
-        "test-coverage-reviewer",
-    ]
+    roles = normalized_role_specs(args)
     try:
         config_path = write_generated_swarm_config(args, roles, "cursor")
     except Exception as exc:
@@ -2920,6 +2971,13 @@ def normalized_roles(args: JsonObject) -> list[str]:
     return [str(role) for role in roles if str(role).strip()]
 
 
+def normalized_role_specs(args: JsonObject) -> list[object]:
+    roles = args.get("roles")
+    if not isinstance(roles, list):
+        return []
+    return [role for role in roles if isinstance(role, dict) or str(role).strip()]
+
+
 def _ambiguous_model_pin_tool_error(
     exc: BaseException, model: Any
 ) -> Optional[JsonObject]:
@@ -2944,7 +3002,7 @@ def _ambiguous_model_pin_tool_error(
     )
 
 
-def write_generated_swarm_config(args: JsonObject, roles: list[str], adapter: str) -> Path:
+def write_generated_swarm_config(args: JsonObject, roles: list[object], adapter: str) -> Path:
     """MCP entry: persist the same analysis-swarm config the CLI ``swarm`` verb uses."""
     from puppetmaster.swarm_launch import write_analysis_swarm_config
 
@@ -3133,14 +3191,14 @@ def run_route_task(args: JsonObject) -> JsonObject:
 
 
 def run_status(args: JsonObject) -> JsonObject:
-    command = ["status", require_string(args, "job_id")]
+    command = ["status", require_job_id(args)]
     if args.get("compact"):
         command.append("--compact")
     return run_cli(command, args)
 
 
 def run_artifacts(args: JsonObject) -> JsonObject:
-    command = ["artifacts", require_string(args, "job_id")]
+    command = ["artifacts", require_job_id(args)]
     if args.get("refs"):
         command.append("--refs")
     return run_cli(command, args)
@@ -3151,7 +3209,7 @@ def run_reset_subgraph(args: JsonObject) -> JsonObject:
     from puppetmaster.store import ActiveTaskLeaseError
     from puppetmaster.store_factory import create_store
 
-    job_id = require_string(args, "job_id")
+    job_id = require_job_id(args)
     raw_task_ids = args.get("task_ids")
     if raw_task_ids is None and args.get("task_id") is not None:
         raw_task_ids = [args.get("task_id")]
@@ -3264,6 +3322,26 @@ def _coerce_subprocess_text(value: object) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return str(value)
+
+
+def _terminate_launcher_tree(process: subprocess.Popen) -> None:
+    """Stop the exact detached launcher tree after early identity failure."""
+    try:
+        if os.name == "nt":
+            from puppetmaster.win_process import kill_process_tree
+
+            if process.pid and kill_process_tree(process.pid):
+                return
+    except Exception:
+        pass
+    try:
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+    except (OSError, ProcessLookupError):
+        pass
 
 
 def run_worker_cli(command: list[str], args: JsonObject) -> JsonObject:
@@ -3680,7 +3758,7 @@ def run_gate(args: JsonObject) -> JsonObject:
 
 
 def run_feed(args: JsonObject) -> JsonObject:
-    command = ["feed", require_string(args, "job_id"), "--json"]
+    command = ["feed", require_job_id(args), "--json"]
     if args.get("limit"):
         command.extend(["--limit", str(args["limit"])])
     return run_cli(command, args)
@@ -3689,19 +3767,26 @@ def run_feed(args: JsonObject) -> JsonObject:
 def run_feed_follow(args: JsonObject) -> JsonObject:
     from puppetmaster.cli import artifact_feed_since, read_job_state
 
-    job_id = require_string(args, "job_id")
+    job_id = require_job_id(args)
     since = int(args.get("since_cursor") or args.get("since") or 0)
     requested_timeout = float(args.get("timeout_seconds") or 10.0)
     timeout_seconds, was_capped = _capped_block_seconds(requested_timeout)
     poll_interval = float(args.get("poll_interval_seconds") or 0.1)
     limit_value = args.get("limit")
     limit = int(limit_value) if limit_value is not None else None
+    refs = bool(args.get("refs"))
+    include_types = args.get("include_types") if isinstance(args.get("include_types"), list) else None
+    exclude_types = args.get("exclude_types") if isinstance(args.get("exclude_types"), list) else None
+    max_bytes = int(args["max_bytes"]) if isinstance(args.get("max_bytes"), (int, float)) else None
     backend = str(args.get("backend") or "sqlite")
 
     state_dir = mcp_state_dir(args)
     store = create_store(backend, state_dir)
 
-    items, cursor = artifact_feed_since(store, job_id, since=since, limit=limit)
+    items, cursor = artifact_feed_since(
+        store, job_id, since=since, limit=limit, refs=refs,
+        include_types=include_types, exclude_types=exclude_types, max_bytes=max_bytes,
+    )
     state = read_job_state(store, job_id)
     if not items and not state["terminal"]:
         store.wait_for_events(
@@ -3710,7 +3795,10 @@ def run_feed_follow(args: JsonObject) -> JsonObject:
             timeout_seconds=timeout_seconds,
             poll_interval=poll_interval,
         )
-        items, cursor = artifact_feed_since(store, job_id, since=since, limit=limit)
+        items, cursor = artifact_feed_since(
+            store, job_id, since=since, limit=limit, refs=refs,
+            include_types=include_types, exclude_types=exclude_types, max_bytes=max_bytes,
+        )
         state = read_job_state(store, job_id)
 
     body = {
@@ -3766,7 +3854,10 @@ def run_await_job(args: JsonObject) -> JsonObject:
         body["effective_timeout_seconds"] = timeout_seconds
     return {
         "content": [{"type": "text", "text": json.dumps(body, indent=2, default=str)}],
-        "isError": state["status"] in {"failed", "stalled"},
+        "isError": bool(
+            state["terminal"]
+            and not (state.get("delivery") or {}).get("successful", False)
+        ),
     }
 
 
@@ -3778,6 +3869,17 @@ def start_cli(command: list[str], args: JsonObject) -> JsonObject:
     run_id, stdout_path, stderr_path, stdout_handle, stderr_handle = reserve_run_logs(
         run_dir, "mcp"
     )
+    launch_key = args.get("launch_key")
+    goal_file: Optional[Path] = None
+    if command and command[0] == "run" and len(command) > 1 and isinstance(command[1], str):
+        # Keep internal launcher goals out of Windows argv.  The public CLI
+        # positional form remains intact; only detached MCP transport uses a
+        # private prompt file.
+        goal_file = run_dir / f"{run_id}.goal"
+        write_private_text(goal_file, command[1])
+        command = [command[0], *command[2:], "--goal-file", str(goal_file)]
+    if launch_key and command and command[0] == "run":
+        command.extend(["--launch-key", str(launch_key)])
     full_command = [
         sys.executable,
         "-u",
@@ -3786,7 +3888,10 @@ def start_cli(command: list[str], args: JsonObject) -> JsonObject:
         "--state-dir",
         state_dir,
         "--emit-job-id-early",
-    ] + command
+    ]
+    if launch_key and not (command and command[0] == "run"):
+        full_command.extend(["--launch-key", str(launch_key)])
+    full_command.extend(command)
     try:
         process = subprocess.Popen(
             full_command,
@@ -3816,29 +3921,44 @@ def start_cli(command: list[str], args: JsonObject) -> JsonObject:
     except BaseException:
         # The child was spawned but never reported a job id (startup crash or
         # parse timeout). Don't leave a detached full-edit agent running.
-        try:
-            process.terminate()
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                process.kill()
-        except (OSError, ProcessLookupError):
-            pass
+        _terminate_launcher_tree(process)
         raise
+    job_ref = {
+        "job_id": job_id,
+        "state_id": state_identity(state_dir),
+    }
+    backend = str(args.get("backend") or "sqlite")
     body = {
         "run_id": run_id,
         "job_id": job_id,
+        "job_ref": job_ref,
         # `launcher_pid` is the detached launcher/orchestrator process, NOT the
         # durable worker doing the edits — that worker is a downstream child with
         # its own (shorter) lifetime and pid. Don't monitor progress by this pid;
         # use `job_id` with status/logs/feed. `pid` is kept as a back-compat alias.
+        "orchestrator_pid": process.pid,
         "launcher_pid": process.pid,
         "pid": process.pid,
+        "pid_deprecated": True,
         "pid_note": (
             "launcher_pid is the orchestrator launcher, not the worker; "
             "track progress via job_id (status/logs/feed), not this pid"
         ),
-        "monitor_with": {"job_id": job_id, "use": "status/logs/feed"},
+        "monitor_with": {
+            "tool": "puppetmaster_live_artifacts_follow",
+            "job_id": job_id,
+            "backend": backend,
+            "state_id": state_identity(state_dir),
+            "job_ref": job_ref,
+            "initial_cursor": 0,
+            "since_cursor": 0,
+            "arguments": {
+                "job_ref": job_ref,
+                "backend": backend,
+                "since_cursor": 0,
+                "timeout_seconds": 10,
+            },
+        },
         "command": "python -m puppetmaster " + " ".join(command),
         "cwd": cwd(args),
         "stdout_path": str(stdout_path),
@@ -3857,6 +3977,10 @@ def launcher_environment(args: JsonObject) -> dict[str, str]:
     # Detached launchers must flush the early ``job_id:`` line promptly so
     # wait_for_job_id cannot time out on a healthy but slow Windows import.
     env["PYTHONUNBUFFERED"] = "1"
+    if args.get("launch_key"):
+        env["PUPPETMASTER_LAUNCH_KEY"] = str(args["launch_key"])
+    if args.get("max_output_bytes"):
+        env["PUPPETMASTER_MAX_OUTPUT_BYTES"] = str(args["max_output_bytes"])
     source_root = str(Path(__file__).resolve().parents[1])
     env["PYTHONPATH"] = (
         f"{source_root}{os.pathsep}{env['PYTHONPATH']}"
@@ -3899,7 +4023,23 @@ def cwd(args: JsonObject) -> str:
 
 def mcp_state_dir(args: JsonObject) -> Path:
     value = args.get("state_dir")
-    return resolve_state_dir(str(value) if value else None, cwd=Path(cwd(args)))
+    if value:
+        return resolve_state_dir(str(value), cwd=Path(cwd(args)))
+    resolved = resolve_state_dir(None, cwd=Path(cwd(args)))
+    ref = args.get("job_ref")
+    job_id = args.get("job_id")
+    if not job_id and isinstance(ref, dict):
+        job_id = ref.get("job_id")
+    if job_id:
+        from puppetmaster.state import find_state_dir_for_job
+
+        owner = find_state_dir_for_job(str(job_id))
+        if owner is not None:
+            expected_state = ref.get("state_id") if isinstance(ref, dict) else None
+            if expected_state and state_identity(owner) != str(expected_state):
+                raise ValueError("job_ref.state_id does not match the owning project")
+            return owner
+    return resolved
 
 
 def require_string(args: JsonObject, name: str) -> str:
@@ -3909,8 +4049,19 @@ def require_string(args: JsonObject, name: str) -> str:
     return value
 
 
+def require_job_id(args: JsonObject) -> str:
+    value = args.get("job_id")
+    if not value and isinstance(args.get("job_ref"), dict):
+        value = args["job_ref"].get("job_id")
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("job_id or job_ref.job_id is required")
+    return value
+
+
 def optional_job(args: JsonObject) -> list[str]:
     job_id = args.get("job_id")
+    if not job_id and isinstance(args.get("job_ref"), dict):
+        job_id = args["job_ref"].get("job_id")
     return [str(job_id)] if job_id else []
 
 
@@ -3937,8 +4088,17 @@ def base_schema() -> JsonObject:
 def job_schema(required: bool = False) -> JsonObject:
     schema = base_schema()
     schema["properties"]["job_id"] = {"type": "string", "description": "Puppetmaster job id."}
+    schema["properties"]["job_ref"] = {
+        "type": "object",
+        "description": "Opaque continuation identity returned by an asynchronous start.",
+        "properties": {
+            "job_id": {"type": "string"},
+            "state_id": {"type": "string"},
+        },
+        "required": ["job_id", "state_id"],
+    }
     if required:
-        schema["required"] = ["job_id"]
+        schema["anyOf"] = [{"required": ["job_id"]}, {"required": ["job_ref"]}]
     return schema
 
 
@@ -4144,6 +4304,22 @@ def follow_schema() -> JsonObject:
                 "type": "integer",
                 "description": "Optional cap on the number of artifacts returned in one batch.",
             },
+            "refs": {
+                "type": "boolean",
+                "description": "Return compact artifact refs without full payload bodies.",
+            },
+            "include_types": {
+                "type": "array", "items": {"type": "string"},
+                "description": "Only return these artifact types; the event cursor still advances over all events.",
+            },
+            "exclude_types": {
+                "type": "array", "items": {"type": "string"},
+                "description": "Omit these artifact types while advancing the durable cursor.",
+            },
+            "max_bytes": {
+                "type": "integer",
+                "description": "Bound the serialized item response size.",
+            },
             "backend": {
                 "type": "string",
                 "enum": ["file", "sqlite"],
@@ -4247,10 +4423,18 @@ def goal_schema(default_goal: str) -> JsonObject:
                     "derived from the goal."
                 ),
             },
+            "launch_key": {
+                "type": "string",
+                "description": "Optional caller-generated key; retries with the same request resume one durable job.",
+            },
             "model": {"type": "string", "description": "Optional provider model name."},
             "timeout_seconds": {
                 "type": "integer",
                 "description": "Worker timeout passed to the adapter.",
+            },
+            "max_output_bytes": {
+                "type": "integer",
+                "description": "Optional captured-output hard limit; exceeded runs are blocked.",
             },
             "cursor_api_key": {
                 "type": "string",
@@ -4275,8 +4459,22 @@ def swarm_schema() -> JsonObject:
         {
             "roles": {
                 "type": "array",
-                "items": {"type": "string"},
-                "description": "Optional local worker roles to run.",
+                "items": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {
+                            "type": "object",
+                            "required": ["name", "instruction"],
+                            "properties": {
+                                "name": {"type": "string"},
+                                "instruction": {"type": "string"},
+                                "source_scope": {"type": "array", "items": {"type": "string"}},
+                                "negative_scope": {"type": "array", "items": {"type": "string"}},
+                            },
+                        },
+                    ]
+                },
+                "description": "Optional structured assignments. Omit for one analysis worker; bare multi-role names are accepted with a duplication warning.",
             },
             "config": {"type": "string", "description": "Optional workflow config path."},
             "max_timeout_seconds": {
@@ -4291,7 +4489,7 @@ def swarm_schema() -> JsonObject:
             },
             "adapter": {
                 "type": "string",
-                "enum": ["cursor", "local"],
+                "enum": list(SWARM_ANALYSIS_ADAPTERS),
                 "description": "Adapter to use for generated role configs. Required for custom roles unless config or allow_local_demo is set.",
             },
             "allow_local_demo": {
@@ -4319,7 +4517,7 @@ def swarm_schema() -> JsonObject:
             },
             "max_cost_usd": {
                 "type": "number",
-                "description": "Hard cap on estimated per-call USD cost for auto-routed workers.",
+                "description": "Routing constraint on estimated per-call USD cost; not a total-run circuit breaker.",
             },
             "min_capability": {
                 "type": "integer",

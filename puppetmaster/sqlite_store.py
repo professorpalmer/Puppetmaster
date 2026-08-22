@@ -38,6 +38,7 @@ from puppetmaster.store import (
     _memory_retrieval_score,
     _memory_within_max_age,
     _normalize_memory_statement,
+    LaunchConflictError,
 )
 
 _SQLITE_IN_CHUNK = 900
@@ -352,16 +353,22 @@ class SQLiteSwarmStore(SwarmStore):
         connection = sqlite3.connect(
             self.db_path, timeout=self.busy_timeout_ms / 1000.0
         )
-        connection.row_factory = sqlite3.Row
-        self._apply_connection_pragmas(connection)
+        try:
+            connection.row_factory = sqlite3.Row
+            self._apply_connection_pragmas(connection)
+        except Exception:
+            connection.close()
+            raise
         chmod_private_file(self.db_path)
         return connection
 
     def _apply_connection_pragmas(self, connection: sqlite3.Connection) -> None:
         """Apply the durable connection policy to a freshly opened handle."""
+        # Install the lock wait before journal_mode: concurrent first-openers
+        # can otherwise fail immediately while another process initializes WAL.
+        connection.execute(f"PRAGMA busy_timeout = {int(self.busy_timeout_ms)}")
         # Fetch journal_mode so the result row does not linger unread.
         connection.execute("PRAGMA journal_mode = WAL").fetchone()
-        connection.execute(f"PRAGMA busy_timeout = {int(self.busy_timeout_ms)}")
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(f"PRAGMA synchronous = {self.synchronous_policy}")
 
@@ -390,20 +397,65 @@ class SQLiteSwarmStore(SwarmStore):
             (job_id, now_iso(), event, json.dumps(payload, sort_keys=True)),
         )
 
-    def create_job(self, goal: str, *, label: Optional[str] = None) -> Job:
+    def create_job(
+        self,
+        goal: str,
+        *,
+        label: Optional[str] = None,
+        launch_key: Optional[str] = None,
+        launch_fingerprint: Optional[str] = None,
+    ) -> Job:
+        return self.create_or_get_job(
+            goal,
+            label=label,
+            launch_key=launch_key,
+            launch_fingerprint=launch_fingerprint,
+        )[0]
+
+    def create_or_get_job(
+        self,
+        goal: str,
+        *,
+        label: Optional[str] = None,
+        launch_key: Optional[str] = None,
+        launch_fingerprint: Optional[str] = None,
+    ) -> tuple[Job, bool]:
         self.init()
-        job = Job(goal=goal, label=label)
-        self._ensure_job_dirs(job.id)
+        fingerprint = launch_fingerprint or self.launch_fingerprint(goal, label)
+        job = Job(
+            goal=goal,
+            label=label,
+            launch_key=launch_key,
+            launch_fingerprint=fingerprint if launch_key else None,
+        )
         with self._session() as connection:
+            # BEGIN IMMEDIATE makes the read/insert pair one atomic operation
+            # across independent processes.  The JSON data remains the source
+            # of truth, so legacy databases need no data migration.
+            connection.execute("BEGIN IMMEDIATE")
+            if launch_key:
+                rows = connection.execute("SELECT data FROM jobs").fetchall()
+                for row in rows:
+                    existing = job_from_dict(json.loads(row["data"]))
+                    if existing.launch_key != launch_key:
+                        continue
+                    if existing.launch_fingerprint != fingerprint:
+                        raise LaunchConflictError(
+                            "launch_key already belongs to a different request"
+                        )
+                    return existing, False
             connection.execute(
                 "INSERT INTO jobs(id, data) VALUES(?, ?)",
                 (job.id, self._dumps(job)),
             )
+        self._ensure_job_dirs(job.id)
         payload: dict[str, Any] = {"goal": goal}
         if label is not None:
             payload["label"] = label
+        if launch_key:
+            payload["launch_key"] = launch_key
         self.emit(job.id, "job.created", payload)
-        return job
+        return job, True
 
     def update_job_status(self, job_id: str, status: JobStatus) -> Job:
         job = self.get_job(job_id)
@@ -416,6 +468,16 @@ class SQLiteSwarmStore(SwarmStore):
             )
             self._emit(connection, job_id, "job.status", payload)
         return updated
+
+    def latest_liveness_at(self, job_id: str) -> Optional[str]:
+        self.init()
+        with self._session() as connection:
+            row = connection.execute(
+                "SELECT MAX(at) AS latest FROM events "
+                "WHERE job_id = ? AND event IN ('run.heartbeat', 'task.lease_renewed')",
+                (job_id,),
+            ).fetchone()
+        return str(row["latest"]) if row and row["latest"] else None
 
     def save_task(self, task: Task) -> None:
         self.init()
