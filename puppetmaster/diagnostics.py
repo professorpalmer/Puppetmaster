@@ -8,7 +8,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Mapping, Optional, AbstractSet
 
 from puppetmaster.adapters import ADAPTER_INFO
 from puppetmaster.codegraph import (
@@ -76,6 +76,7 @@ def run_doctor(root: Path, state_dir: Optional[Path] = None) -> list[Check]:
     checks.extend(_guard_many(_billing_checks))
     checks.append(_guard("catalog-freshness", _catalog_freshness_check))
     checks.append(_guard("platform-lock", _platform_lock_check))
+    checks.append(_guard("grok-bot-path", lambda: grok_bot_path_check(root)))
     checks.append(_guard("rate-limit-harvest", _rate_limit_harvest_check))
     return checks
 
@@ -92,6 +93,71 @@ def _rate_limit_harvest_check() -> Check:
     if detail.startswith("unavailable"):
         return Check("rate-limit-harvest", "warn", detail)
     return Check("rate-limit-harvest", "ok", detail)
+
+
+def grok_bot_path_check(
+    root: Path,
+    *,
+    env: Optional[Mapping[str, str]] = None,
+    enabled: Optional[AbstractSet[str]] = None,
+) -> Check:
+    """Grok Bot contained path: agentic keys without Cursor is healthy.
+
+    Cursor-only platform lock + no Cursor fails closed with the unlock fix.
+    """
+    from puppetmaster import platform_lock as pl
+    from puppetmaster.workers import (
+        CURSOR_ONLY_LOCK_FIX,
+        adapter_is_available,
+        agentic_provider_keys_visible,
+    )
+
+    probe_env = env if env is not None else os.environ
+    enabled_set = enabled if enabled is not None else pl.enabled_adapters()
+    cursor_runnable = adapter_is_available("cursor", env=probe_env, root=root)
+    agentic_keys = agentic_provider_keys_visible(probe_env)
+    agentic_enabled = "agentic" in enabled_set
+    implement_enabled = {
+        name
+        for name in ("cursor", "claude-code", "codex", "hermes", "antigravity", "agentic")
+        if name in enabled_set
+    }
+    cursor_only = implement_enabled == {"cursor"}
+    if cursor_only and not cursor_runnable:
+        return Check(
+            "grok-bot-path",
+            "error",
+            "cursor-only platform lock but Cursor is not runnable. "
+            f"Fix: {CURSOR_ONLY_LOCK_FIX}.",
+        )
+    if not cursor_runnable and agentic_enabled and agentic_keys:
+        return Check(
+            "grok-bot-path",
+            "ok",
+            "healthy Grok Bot path — Cursor SDK not installed; "
+            "default implement/swarm adapter is agentic (keys-only, in-process). "
+            "Prefer remote MCP + worker subprocesses on this box.",
+        )
+    if cursor_runnable:
+        return Check(
+            "grok-bot-path",
+            "ok",
+            "Cursor SDK runnable (preferred); Grok Bot may still use remote MCP.",
+        )
+    if agentic_enabled and not agentic_keys:
+        return Check(
+            "grok-bot-path",
+            "warn",
+            "Cursor is not runnable and no agentic provider key is visible "
+            "(OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, GOOGLE_API_KEY, "
+            "or OPENROUTER_API_KEY).",
+        )
+    return Check(
+        "grok-bot-path",
+        "warn",
+        "no Cursor SDK and agentic is not enabled — "
+        f"Fix: {CURSOR_ONLY_LOCK_FIX}.",
+    )
 
 
 def _platform_lock_check() -> Check:

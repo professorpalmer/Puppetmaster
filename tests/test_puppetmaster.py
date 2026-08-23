@@ -2563,6 +2563,8 @@ class PuppetmasterTests(unittest.TestCase):
 
         with patch(
             "puppetmaster.platform_lock.enabled_adapters", return_value={"cursor"}
+        ), patch(
+            "puppetmaster.workers.adapter_is_available", return_value=True
         ), patch.object(mcp_server, "start_cli", side_effect=fake_start_cli):
             result = mcp_server.start_implement({"goal": "ship the audit", "cwd": "."})
 
