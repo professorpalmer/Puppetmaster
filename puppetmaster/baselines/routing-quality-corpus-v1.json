@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "corpus_id": "puppetmaster-routing-quality",
+  "corpus_version": "2026-08-22.1",
+  "cases": [
+    {
+      "case_id": "implement-bounded-change",
+      "role": "implement",
+      "instruction": "Read the packaged authority and apply only its bounded fixture change.",
+      "snapshot_id": "implement-fixture-v1",
+      "snapshot_digest": "sha256:611989a5801d4a52de4022093e537c5710d66e1049f055de51f63668289a4101",
+      "snapshot_files": {
+        "fixtures/implement/authority.txt": "The accepted bounded-change result is IMPLEMENT_OK."
+      },
+      "min_capability": 60,
+      "estimated_tokens_in": 1200,
+      "estimated_tokens_out": 300,
+      "allowed_changed_files": ["fixtures/implement/target.txt"],
+      "criteria": [
+        {
+          "criterion_id": "implement-required-marker",
+          "description": "The bounded implementation success marker is present.",
+          "evaluator": {"kind": "contains", "expected": "IMPLEMENT_OK"}
+        }
+      ],
+      "seeded_failures": []
+    },
+    {
+      "case_id": "explore-source-finding",
+      "role": "explore",
+      "instruction": "Inspect the packaged authority and report its grounded fixture finding.",
+      "snapshot_id": "explore-fixture-v1",
+      "snapshot_digest": "sha256:dce42e4868d079db0480e3149b8f73b628c5fcbb6dee767eccb6a426b82cb111",
+      "snapshot_files": {
+        "fixtures/explore/authority.txt": "The grounded fixture finding is EXPLORE_FOUND."
+      },
+      "min_capability": 50,
+      "estimated_tokens_in": 1000,
+      "estimated_tokens_out": 250,
+      "allowed_changed_files": [],
+      "criteria": [
+        {
+          "criterion_id": "explore-grounded-marker",
+          "description": "The fixture-specific finding is present.",
+          "evaluator": {"kind": "contains", "expected": "EXPLORE_FOUND"}
+        }
+      ],
+      "seeded_failures": []
+    },
+    {
+      "case_id": "audit-seeded-defect",
+      "role": "audit",
+      "instruction": "Audit the packaged authority and identify its seeded fixture defect.",
+      "snapshot_id": "audit-fixture-v1",
+      "snapshot_digest": "sha256:42391b62e098df4a4a27b9d87e5e089d02f4c48beae0c9b0e2846459a6afbe5b",
+      "snapshot_files": {
+        "fixtures/audit/authority.txt": "The seeded defect identifier is AUDIT_DEFECT_FOUND."
+      },
+      "min_capability": 75,
+      "estimated_tokens_in": 1400,
+      "estimated_tokens_out": 350,
+      "allowed_changed_files": [],
+      "criteria": [
+        {
+          "criterion_id": "audit-detects-seeded-defect",
+          "description": "The seeded defect marker is identified.",
+          "evaluator": {"kind": "contains", "expected": "AUDIT_DEFECT_FOUND"}
+        }
+      ],
+      "seeded_failures": [
+        {
+          "failure_id": "plausible-but-misses-defect",
+          "description": "The response is structurally substantive but omits the seeded defect marker.",
+          "output_text": "The fixture appears internally consistent and no material defect was found.",
+          "changed_files": [],
+          "catastrophic": false
+        }
+      ]
+    },
+    {
+      "case_id": "plan-ordered-dependencies",
+      "role": "plan",
+      "instruction": "Use the packaged authority to produce the valid fixture dependency order.",
+      "snapshot_id": "plan-fixture-v1",
+      "snapshot_digest": "sha256:90563d30c786533f73ddb1b14420e22181b8308d58d21f4baa27200825230d86",
+      "snapshot_files": {
+        "fixtures/plan/authority.txt": "The valid dependency order result is PLAN_ORDER_VALID."
+      },
+      "min_capability": 65,
+      "estimated_tokens_in": 1100,
+      "estimated_tokens_out": 300,
+      "allowed_changed_files": [],
+      "criteria": [
+        {
+          "criterion_id": "plan-valid-order-marker",
+          "description": "The dependency order acceptance marker is present.",
+          "evaluator": {"kind": "contains", "expected": "PLAN_ORDER_VALID"}
+        }
+      ],
+      "seeded_failures": []
+    }
+  ]
+}

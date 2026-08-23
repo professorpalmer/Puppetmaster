@@ -1,3 +1,33 @@
+## v1.22.19
+
+Absorb of [@bsmi021](https://github.com/bsmi021) PR
+[#64](https://github.com/professorpalmer/Puppetmaster/pull/64)
+(landed via absorb, not a merge of the fork branch).
+
+**BREAKING — Feature: quality-aware, reproducible model routing.**
+
+Routing roles and tool-loop requirements now come from a packaged, versioned
+taxonomy instead of Python tables. Role aliases normalize to canonical roles,
+and routing evidence records the taxonomy and registry authority used for each
+decision. Selection accounts for enriched request size, context-window safety,
+qualified role scorecards, and estimate calibration. The `cheap` policy is now
+the cheapest sufficient model; the previous capability-agnostic behavior is
+available only through the explicit `absolute-cheapest` policy.
+
+- Requested review fails closed when no adequate independent judge runs, and
+  successful review evidence identifies the judge, evaluator, and reviewed
+  artifact. This intentionally replaces the prior pass-on-unavailable behavior.
+- Model registries validate identities and adapters, preserve retired-model
+  quarantine across discovery, expose a deterministic digest, and revalidate
+  pins and escalation authority before dispatch.
+- Recovery follows the newest failure and current registry authority. Audit
+  feedback attributes rejected outputs to their producing models and separates
+  qualified, role-specific objective outcomes by evaluation epoch.
+- A versioned paired-routing evaluation corpus and runner compare balanced
+  routing with strongest-eligible pinned baselines using deterministic grading,
+  uncertainty-aware non-inferiority reporting, and opt-in non-interfering shadow
+  decisions.
+
 ## v1.22.18
 
 Leftover from the Marionette

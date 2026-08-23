@@ -31,6 +31,7 @@ from puppetmaster.model_registry import (
     DISCOVERY_SOURCE_TO_ADAPTER,
     ModelSpec,
     catalog_content_hash,
+    normalize_model_token,
 )
 
 # Hand-maintained catalog of what each non-enumerable platform offers. The
@@ -760,6 +761,11 @@ def curated_to_specs(
     filtering entirely (the default — preserves every existing caller).
     """
     by_name = {s.adapter_model_name: s for s in existing if s.adapter == adapter}
+    by_normalized_name = {
+        normalize_model_token(s.adapter_model_name): s
+        for s in existing
+        if s.adapter == adapter and normalize_model_token(s.adapter_model_name)
+    }
     specs: list[ModelSpec] = []
     for item in curated_catalog(adapter):
         if allowed_providers is not None:
@@ -771,7 +777,9 @@ def curated_to_specs(
         entry_billing = str(item.get("billing") or billing).strip().lower() or billing
         plan = entry_billing == "plan"
         model = str(item["model"])
-        prior = by_name.get(model)
+        prior = by_name.get(model) or by_normalized_name.get(
+            normalize_model_token(model)
+        )
         capability = prior.capability_score if prior else int(item["capability"])
         context = (
             prior.context_window
@@ -859,20 +867,31 @@ def merge_curated_into_registry(
     discovered = curated_to_specs(
         adapter, billing, existing, allowed_providers=allowed_providers
     )
-    by_name = {s.adapter_model_name: s for s in discovered}
-    existing_names = {s.adapter_model_name for s in existing if s.adapter == adapter}
-    added = sorted(by_name.keys() - existing_names)
+    by_identity = {
+        normalize_model_token(s.adapter_model_name): s for s in discovered
+    }
+    existing_identities = {
+        normalize_model_token(s.adapter_model_name)
+        for s in existing
+        if s.adapter == adapter
+    }
+    added = sorted(
+        spec.adapter_model_name
+        for identity, spec in by_identity.items()
+        if identity not in existing_identities
+    )
 
     merged: list[ModelSpec] = []
     seen: set[str] = set()
     for spec in existing:
-        if spec.adapter == adapter and spec.adapter_model_name in by_name:
-            merged.append(by_name[spec.adapter_model_name])
-            seen.add(spec.adapter_model_name)
+        identity = normalize_model_token(spec.adapter_model_name)
+        if spec.adapter == adapter and identity in by_identity:
+            merged.append(by_identity[identity])
+            seen.add(identity)
         else:
             merged.append(spec)
-    for name, spec in by_name.items():
-        if name not in seen:
+    for identity, spec in by_identity.items():
+        if identity not in seen:
             merged.append(spec)
 
     skipped: list[dict] = []
@@ -887,7 +906,7 @@ def merge_curated_into_registry(
         "source": ADAPTER_TO_SOURCE.get(adapter, adapter),
         "discovered_count": len(discovered),
         "added": added,
-        "refreshed": sorted(seen),
+        "refreshed": sorted(by_identity[identity].adapter_model_name for identity in seen),
         "skipped": skipped,
         "billing": billing,
     }

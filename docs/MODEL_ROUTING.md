@@ -33,6 +33,11 @@ alternatives with the reason each was rejected — all stored as an
 `puppetmaster artifacts <job_id>` to see why each task went where,
 or `puppetmaster cost <job_id>` to sum spend across the run.
 
+Routing artifacts explain a selection; structural artifact presence is process
+health evidence, not semantic quality. For provider-neutral paired grading,
+strongest-eligible baselines, uncertainty, bounded non-inferiority claims, and
+opt-in shadow evidence, see [Routing-quality evaluation](routing-quality-evaluation.md).
+
 ## Role scorecards (v1.22.8+)
 
 `capability_score` is still the explicit **manual fallback**. Optional
@@ -274,6 +279,7 @@ python -m puppetmaster artifacts <job_id> | jq '.[] | select(.type=="routing") |
 | `payload.max_cost_usd` (float) | Hard cap on estimated per-call USD cost. Models over budget are excluded with a clear rejection reason. |
 | `payload.required_tags` (list) | Only consider models whose `tags` include ALL of these.                |
 | `payload.routing_policy` (str) | One of `balanced` (default), `cheap`, `quality`, `escalating`.         |
+| `payload.shadow_policy` (str) | Opt-in counterfactual policy recorded on the ROUTING artifact; never changes the production model, adapter, or policy. |
 | `payload.registry_path` (str)  | Use a different registry file for this task.                           |
 | `payload.min_confidence` (float) | Confidence floor for mid-run escalation (0..1). Below it, the task is re-run one capability tier up. Off unless set (or `$PUPPETMASTER_ESCALATE_CONFIDENCE`). |
 
