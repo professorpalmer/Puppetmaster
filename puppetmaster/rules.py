@@ -185,7 +185,8 @@ RULE_BODY = textwrap.dedent(
        worktree and would never see that uncommitted work. Keep truly trivial
        edits (typo/rename/comment) inline.
     4. `puppetmaster_artifacts <job_id>` — read structured outputs at zero
-       token cost (results persist in SQLite).
+       token cost (results persist in SQLite). Prefer refs; use
+       `puppetmaster_effort_index` for an effort that spanned jobs.
     5. Every asynchronous `start_*` response is a resumable contract: follow
        its returned `monitor_with` tool using the exact `job_ref`, backend, and
        cursor. If MCP disconnects, resume that same job through the CLI

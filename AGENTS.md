@@ -101,6 +101,18 @@ set.
 
 If a swarm completes with empty findings, only verification artifacts, or a degraded Cursor SDK artifact, report Puppetmaster as **degraded** and do not treat the run as a successful analysis.
 
+## Head-seat loop (Chief / Marionette)
+
+You are the head seat. Consume **artifacts / refs / show / effort-index**, never worker transcripts.
+
+1. Size the worker with `puppetmaster_route_task` / `auto_route` / `puppetmaster_start_prewalk`.
+2. Spawn a Puppetmaster job (one disposable worker, or an optional swarm of roles).
+3. Persist typed artifacts. The worker dies. No long-lived role bots.
+4. Read `puppetmaster_effort_index` (latest tagged effort when `effort_id` is omitted; filter with `type` / `query`) or `puppetmaster_artifacts` with `refs=true`, then `puppetmaster_show`. Expand a payload only when you need the body.
+5. Optional quality layer: one-shot `puppetmaster_gate` / `puppetmaster gate` on the worker worktree. Reuse Puppetmaster gate. Do not invent a fake PC.
+
+`puppetmaster_rollup` is the jobs/cost/tokens ledger. `puppetmaster_effort_index` is queryable memory on top.
+
 ## Model routing (auto_route)
 
 Puppetmaster ships a task-aware **model router** that picks the right LLM per task. Use it instead of hardcoding `model` in every spec.
@@ -135,14 +147,14 @@ Puppetmaster keeps a **read-only, local, numbers-only** ledger of what it saved,
 ## Coding conventions in this repo
 
 - Python 3.9+. Match existing style; do not introduce new dependencies without a clear need.
-- Tests live in `tests/test_puppetmaster.py`. New behavior gets a focused test; mock subprocess calls for adapter coverage.
+- Tests live under `tests/` (`test_*.py`). New behavior gets a focused hermetic `unittest`; mock subprocess calls for adapter coverage.
 - The `SwarmStore` abstract base is the storage seam — the SQLite implementation lives in `puppetmaster/sqlite_store.py` and overrides hot methods for O(1) cursor reads. Don't break that contract.
 - Don't commit provider keys, `.cursor/mcp.json` user-specific paths, or anything in `.puppetmaster/` runtime state.
-- Run `python -m pytest tests/test_puppetmaster.py -q` before suggesting a commit.
+- Run `python -m unittest discover -s tests -v` before suggesting a commit. CI is unittest discover, not pytest.
 
 ## MCP surface (quick reference)
 
-Orchestration: `puppetmaster_doctor`, `puppetmaster_review`, `puppetmaster_start_review`, `puppetmaster_start_swarm`, `puppetmaster_start_cursor_swarm`, `puppetmaster_start_cursor_review`, `puppetmaster_start_cursor_plan`, `puppetmaster_start_claude_implement`, `puppetmaster_start_browser_swarm`, `puppetmaster_status`, `puppetmaster_logs`, `puppetmaster_live_artifacts`, `puppetmaster_live_artifacts_follow`, `puppetmaster_partial_summary`, `puppetmaster_artifacts`, `puppetmaster_show`, `puppetmaster_job_cost`, `puppetmaster_job_receipt`, `puppetmaster_last_job`, `puppetmaster_dashboard`.
+Orchestration: `puppetmaster_doctor`, `puppetmaster_review`, `puppetmaster_start_review`, `puppetmaster_start_swarm`, `puppetmaster_start_cursor_swarm`, `puppetmaster_start_cursor_review`, `puppetmaster_start_cursor_plan`, `puppetmaster_start_claude_implement`, `puppetmaster_start_browser_swarm`, `puppetmaster_status`, `puppetmaster_logs`, `puppetmaster_live_artifacts`, `puppetmaster_live_artifacts_follow`, `puppetmaster_partial_summary`, `puppetmaster_artifacts`, `puppetmaster_effort_index`, `puppetmaster_show`, `puppetmaster_job_cost`, `puppetmaster_job_receipt`, `puppetmaster_last_job`, `puppetmaster_dashboard`.
 
 Bundled CodeGraph: `puppetmaster_codegraph_search`, `puppetmaster_codegraph_context`, `puppetmaster_codegraph_affected`, `puppetmaster_codegraph_files`, `puppetmaster_codegraph_status`, `puppetmaster_codegraph_init`.
 
@@ -163,6 +175,7 @@ If any `puppetmaster_*` MCP tool returns `Tool execution error. Not connected`, 
 | `puppetmaster_live_artifacts_follow` | `python -m puppetmaster feed <job_id> --follow` |
 | `puppetmaster_partial_summary` | `python -m puppetmaster show <job_id> --partial` |
 | `puppetmaster_artifacts` | `python -m puppetmaster artifacts <job_id>` |
+| `puppetmaster_effort_index` | `python -m puppetmaster effort-index [--effort ID] [--type TYPE] [--query TEXT]` |
 | `puppetmaster_show` | `python -m puppetmaster show <job_id>` |
 | `puppetmaster_job_cost` | `python -m puppetmaster cost <job_id>` |
 | `puppetmaster_job_receipt` | `python -m puppetmaster receipt <job_id>` |

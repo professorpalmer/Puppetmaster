@@ -25,6 +25,7 @@ Puppetmaster exposes these MCP tools:
 - `puppetmaster_live_artifacts_follow`
 - `puppetmaster_partial_summary`
 - `puppetmaster_artifacts`
+- `puppetmaster_effort_index`
 - `puppetmaster_show`
 - `puppetmaster_dashboard`
 - `puppetmaster_codegraph_search`

@@ -2,7 +2,7 @@
 
 The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
 
-**Current release:** [v1.22.20](CHANGELOG.md#v12220) — configurable default reviewer platform (explicit > default > fail-closed; no implicit Cursor); requested review still fail-closed; see [CHANGELOG.md](CHANGELOG.md) for the full line.
+**Current release:** [v1.22.21](CHANGELOG.md#v12221) — effort-level artifact index (`effort-index` / `puppetmaster_effort_index`) plus the v1.22.20 configurable default reviewer; see [CHANGELOG.md](CHANGELOG.md) for the full line.
 
 ## Start here
 

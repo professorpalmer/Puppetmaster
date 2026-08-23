@@ -103,6 +103,7 @@ If a `puppetmaster_*` MCP call returns **`Tool execution error. Not connected`**
 | `puppetmaster_live_artifacts_follow` | `python -m puppetmaster feed <job_id> --follow` |
 | `puppetmaster_partial_summary` | `python -m puppetmaster show <job_id> --partial` |
 | `puppetmaster_artifacts` | `python -m puppetmaster artifacts <job_id>` |
+| `puppetmaster_effort_index` | `python -m puppetmaster effort-index [--effort ID]` |
 | `puppetmaster_show` | `python -m puppetmaster show <job_id>` |
 | `puppetmaster_last_job` | `python -m puppetmaster last` |
 | `puppetmaster_jobs` | `python -m puppetmaster jobs` (add `--all-projects` to see every workspace) |
