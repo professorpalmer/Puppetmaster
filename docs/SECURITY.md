@@ -70,7 +70,7 @@ When you run `mcp serve-remote` you deliberately open a network endpoint that ca
 
 ## Hardening recommendations
 
-1. **Untrusted or high-stakes repo?** Use read-only modes (`cursor --review/--plan`, `codex payload.sandbox="read-only"`) until you've read the plan, then approve edits explicitly.
+1. **Untrusted or high-stakes repo?** Use the generic read-only `review` command (or explicit platform modes such as `cursor --review/--plan` and `codex payload.sandbox="read-only"`) until you've read the findings, then approve edits explicitly.
 2. **Run implement work in a dedicated git worktree** so diffs are isolated and a bad run is `git worktree remove` away.
 3. **Scope your provider tokens** to least privilege; prefer the platform's own login over inlining keys in MCP config.
 4. **Only use `--dangerously-bypass...` inside a container/VM** you already trust to be sandboxed.

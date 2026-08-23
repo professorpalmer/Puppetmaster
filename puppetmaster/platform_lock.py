@@ -50,6 +50,7 @@ ADAPTER_ALIASES = {
 }
 
 ONLY_ENV = "PUPPETMASTER_ONLY_ADAPTERS"
+DEFAULT_REVIEWER_KEY = "default_reviewer"
 
 
 def canonicalize_adapter(name: str) -> str:
@@ -217,3 +218,59 @@ def disable(adapters: set[str], registry_path: Optional[Path] = None) -> Path:
 def reset(registry_path: Optional[Path] = None) -> Path:
     """Clear the lock — every known adapter enabled again."""
     return _write_disabled(set(), registry_path)
+
+
+def get_default_reviewer(registry_path: Optional[Path] = None) -> Optional[str]:
+    """Return the configured default reviewer adapter, if any.
+
+    Returns ``None`` when no default is configured. The returned adapter name is
+    already canonicalized (aliases like ``agy`` → ``antigravity``).
+    """
+    path = platform_config_path(registry_path)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    reviewer = data.get(DEFAULT_REVIEWER_KEY)
+    if reviewer is None or not str(reviewer).strip():
+        return None
+    return canonicalize_adapter(str(reviewer).strip())
+
+
+def set_default_reviewer(
+    adapter: Optional[str], registry_path: Optional[Path] = None
+) -> Path:
+    """Set the default reviewer adapter (or clear it with ``None``).
+
+    The adapter is canonicalized before being persisted. Setting ``None`` clears
+    the default (generic review dispatch will fail closed until a default is set).
+    """
+    canonical: Optional[str] = None
+    if adapter is not None:
+        canonical = canonicalize_adapter(str(adapter).strip())
+        if canonical not in KNOWN_ADAPTERS:
+            raise ValueError(
+                f"unknown reviewer platform {adapter!r}. Known: "
+                f"{', '.join(KNOWN_ADAPTERS)}"
+            )
+
+    path = platform_config_path(registry_path)
+    with InterProcessFileLock.for_target(path):
+        payload: dict = {}
+        if path.is_file():
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(existing, dict):
+                    payload = existing
+            except (json.JSONDecodeError, OSError):
+                payload = {}
+        if canonical is None:
+            payload.pop(DEFAULT_REVIEWER_KEY, None)
+        else:
+            payload[DEFAULT_REVIEWER_KEY] = canonical
+        write_private_text(path, json.dumps(payload, indent=2) + "\n", lock=False)
+    return path

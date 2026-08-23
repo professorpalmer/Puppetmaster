@@ -141,7 +141,7 @@ Default **`supervise`** — read-only / supervise-first:
 | Allowed | Examples |
 |---|---|
 | Health / routing | `puppetmaster_doctor`, `puppetmaster_route_task`, `puppetmaster_list_models` |
-| Start analysis | `puppetmaster_start_cursor_review`, `puppetmaster_start_cursor_plan`, `puppetmaster_start_cursor_swarm`, `puppetmaster_start_swarm` |
+| Start analysis | `puppetmaster_start_review`, `puppetmaster_start_cursor_review`, `puppetmaster_start_cursor_plan`, `puppetmaster_start_cursor_swarm`, `puppetmaster_start_swarm` |
 | Observe | `puppetmaster_status`, `puppetmaster_logs`, `puppetmaster_live_artifacts`, `puppetmaster_live_artifacts_follow`, `puppetmaster_partial_summary`, `puppetmaster_artifacts`, `puppetmaster_show`, `puppetmaster_await_job`, `puppetmaster_job_graph`, … |
 | CodeGraph reads | `puppetmaster_codegraph_search`, `_context`, `_affected`, `_files`, `_status` |
 

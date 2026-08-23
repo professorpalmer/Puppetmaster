@@ -42,9 +42,9 @@ For any request that involves more than a single trivial change, start a Puppetm
 
 Default routing:
 
-1. `puppetmaster_start_cursor_swarm` — multi-role read-only analysis (the daily-driver entry point).
+1. `puppetmaster_start_swarm` — multi-role read-only analysis. Use `puppetmaster_start_review` for one focused review on the explicit or configured reviewer platform; Cursor-specific verbs are opt-in.
 2. `puppetmaster_start_implement` — durable, patch-producing implementation that runs on whatever platform the lock enables (cursor preferred, then claude-code). Use this as the default implement verb so it works regardless of platform lock. `puppetmaster_start_cursor_implement` / `puppetmaster_start_claude_implement` force a specific platform.
-3. `puppetmaster_start_cursor_review` / `puppetmaster_start_cursor_plan` — lightweight single-pass review or plan.
+3. `puppetmaster_start_review` / `puppetmaster_start_cursor_plan` — lightweight single-pass review or plan. Generic review uses an explicit platform or the user's configured default reviewer and fails closed when neither is set; `puppetmaster_start_cursor_review` remains the explicit Cursor-only path.
 
 Every implement verb runs full-edit in a clean worktree (clean-tree guard; set `allow_dirty` to override) and captures the resulting diff as a `PATCH` artifact.
 
@@ -142,7 +142,7 @@ Puppetmaster keeps a **read-only, local, numbers-only** ledger of what it saved,
 
 ## MCP surface (quick reference)
 
-Orchestration: `puppetmaster_doctor`, `puppetmaster_start_swarm`, `puppetmaster_start_cursor_swarm`, `puppetmaster_start_cursor_review`, `puppetmaster_start_cursor_plan`, `puppetmaster_start_claude_implement`, `puppetmaster_start_browser_swarm`, `puppetmaster_status`, `puppetmaster_logs`, `puppetmaster_live_artifacts`, `puppetmaster_live_artifacts_follow`, `puppetmaster_partial_summary`, `puppetmaster_artifacts`, `puppetmaster_show`, `puppetmaster_job_cost`, `puppetmaster_job_receipt`, `puppetmaster_last_job`, `puppetmaster_dashboard`.
+Orchestration: `puppetmaster_doctor`, `puppetmaster_review`, `puppetmaster_start_review`, `puppetmaster_start_swarm`, `puppetmaster_start_cursor_swarm`, `puppetmaster_start_cursor_review`, `puppetmaster_start_cursor_plan`, `puppetmaster_start_claude_implement`, `puppetmaster_start_browser_swarm`, `puppetmaster_status`, `puppetmaster_logs`, `puppetmaster_live_artifacts`, `puppetmaster_live_artifacts_follow`, `puppetmaster_partial_summary`, `puppetmaster_artifacts`, `puppetmaster_show`, `puppetmaster_job_cost`, `puppetmaster_job_receipt`, `puppetmaster_last_job`, `puppetmaster_dashboard`.
 
 Bundled CodeGraph: `puppetmaster_codegraph_search`, `puppetmaster_codegraph_context`, `puppetmaster_codegraph_affected`, `puppetmaster_codegraph_files`, `puppetmaster_codegraph_status`, `puppetmaster_codegraph_init`.
 
@@ -154,6 +154,8 @@ If any `puppetmaster_*` MCP tool returns `Tool execution error. Not connected`, 
 | --- | --- |
 | `puppetmaster_doctor` | `python -m puppetmaster doctor` |
 | `puppetmaster_start_cursor_swarm` | `python -m puppetmaster swarm "<goal>"` |
+| `puppetmaster_review` | `python -m puppetmaster review "<goal>" --wait` |
+| `puppetmaster_start_review` | `python -m puppetmaster review "<goal>"` |
 | `puppetmaster_start_swarm` | `python -m puppetmaster swarm "<goal>" --adapter <name>` |
 | `puppetmaster_status` | `python -m puppetmaster status <job_id>` |
 | `puppetmaster_logs` | `python -m puppetmaster logs <job_id>` |
