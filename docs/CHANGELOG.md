@@ -1,3 +1,33 @@
+## Unreleased
+
+**Feature: User-configurable default reviewer platform with fail-closed dispatch.**
+
+Generic review dispatch now resolves in strict precedence order: explicit
+adapter/platform selection, then the user's configured default reviewer,
+then fail closed with an actionable error listing enabled valid reviewer
+platforms and how to configure one. There is no built-in reviewer platform
+default. If the configured reviewer is disabled or unavailable, dispatch
+fails clearly and does not silently fall back. Explicit platform-specific
+review commands such as `puppetmaster_cursor_review` remain platform-specific
+and fail rather than reinterpreting the command. Reviewer-platform selection
+is kept separate from model auto-routing.
+
+- **CLI**: `puppetmaster platform reviewer [<platform>]` shows or sets the
+  default reviewer; `--clear` unsets it. `puppetmaster review "<goal>"` uses
+  that choice (or an explicit `--adapter`/`--platform`) and detaches by default.
+  `puppetmaster platform status` shows the current default reviewer alongside
+  enabled/disabled adapters.
+- **MCP**: New generic `puppetmaster_review` and `puppetmaster_start_review`
+  tools use the configured default or explicit adapter. Platform-specific
+  tools such as `puppetmaster_cursor_review` remain unchanged.
+- **Configuration**: `~/.puppetmaster/platform.json` gains `default_reviewer`
+  field. Persisted alongside the platform lock's `disabled` list.
+- **Fail-closed behavior**: Generic review dispatch with no configured default
+  and no explicit adapter fails with an actionable error message, never silently
+  falls back.
+- **Tests**: Comprehensive regression tests cover precedence, configured-default
+  use, unset fail-closed behavior, and disabled/unavailable configured defaults.
+
 ## v1.22.19
 
 Absorb of [@bsmi021](https://github.com/bsmi021) PR

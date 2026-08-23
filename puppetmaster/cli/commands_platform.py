@@ -135,7 +135,47 @@ def _run_platform_subcommand(args) -> int:
         unknown = sorted(a for a in wanted if a not in pl.KNOWN_ADAPTERS)
         return {a for a in wanted if a in pl.KNOWN_ADAPTERS}, unknown
 
-    if sub in ("only", "enable", "disable"):
+    reviewer_commands = {
+        "reviewer",
+        "default-reviewer",
+        "set-reviewer",
+        "set-default-reviewer",
+    }
+    if sub in reviewer_commands:
+        from puppetmaster.workers import REVIEW_ADAPTERS
+
+        reviewer = getattr(args, "reviewer_adapter", None)
+        clear_reviewer = getattr(args, "clear_reviewer", False)
+        if clear_reviewer and reviewer:
+            print(
+                "error: pass a reviewer platform or --clear, not both.",
+                file=sys.stderr,
+            )
+            return 1
+        if clear_reviewer:
+            pl.set_default_reviewer(None, path)
+        elif reviewer:
+            reviewer = pl.canonicalize_adapter(reviewer)
+            if reviewer not in REVIEW_ADAPTERS:
+                print(
+                    f"error: {reviewer!r} is not a valid reviewer platform. "
+                    f"Known: {', '.join(REVIEW_ADAPTERS)}.",
+                    file=sys.stderr,
+                )
+                return 1
+            pl.set_default_reviewer(reviewer, path)
+        elif not getattr(args, "json", False):
+            current = pl.get_default_reviewer(path)
+            if current:
+                print(f"Default reviewer platform: {current}")
+            else:
+                print(
+                    "No default reviewer platform is configured. Set one with "
+                    "`puppetmaster platform reviewer <platform>`."
+                )
+            return 0
+        # Fall through to the common status rendering below.
+    elif sub in ("only", "enable", "disable"):
         valid, unknown = _normalize(args.adapters)
         if unknown:
             print(
@@ -167,6 +207,7 @@ def _run_platform_subcommand(args) -> int:
                 {
                     "enabled": sorted(enabled),
                     "disabled": sorted(set(pl.KNOWN_ADAPTERS) - enabled),
+                    "default_reviewer": pl.get_default_reviewer(path),
                     "restricted": restricted,
                     "env_override": env_override,
                     "config_path": str(pl.platform_config_path(path)),
@@ -183,6 +224,7 @@ def _run_platform_subcommand(args) -> int:
     for adapter in pl.KNOWN_ADAPTERS:
         mark = "on " if adapter in enabled else "off"
         print(f"  [{mark}] {adapter}")
+    print(f"  default reviewer: {pl.get_default_reviewer(path) or '(unset)'}")
     if env_override:
         print(
             f"note: ${pl.ONLY_ENV} is set and overrides the saved config "

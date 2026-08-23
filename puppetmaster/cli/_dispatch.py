@@ -1227,7 +1227,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
         )
         return cli.finalize_cli_run(result)
 
-    if args.command == "swarm":
+    if args.command in ("swarm", "review"):
         from dataclasses import replace
 
         from puppetmaster import platform_lock
@@ -1237,16 +1237,51 @@ def _main(argv: Optional[list[str]] = None) -> int:
             detach_analysis_swarm,
         )
 
-        adapter = str(getattr(args, "adapter", None) or "cursor")
+        if args.command == "review":
+            from puppetmaster.workers import NoReviewAdapterError, pick_review_adapter
+
+            explicit_adapter = getattr(args, "adapter", None)
+            explicit_platform = getattr(args, "platform", None)
+            if (
+                explicit_adapter
+                and explicit_platform
+                and explicit_adapter != explicit_platform
+            ):
+                print(
+                    "review: pass only one of --adapter or --platform.",
+                    file=sys.stderr,
+                )
+                return 2
+            try:
+                adapter = pick_review_adapter(
+                    platform_lock.enabled_adapters(),
+                    explicit_adapter or explicit_platform,
+                    platform_lock.get_default_reviewer(),
+                )
+            except NoReviewAdapterError as exc:
+                print(f"review: {exc}", file=sys.stderr)
+                print(
+                    "  configure: puppetmaster platform reviewer <platform>",
+                    file=sys.stderr,
+                )
+                return 2
+            roles = ["review"]
+        else:
+            adapter = str(getattr(args, "adapter", None) or "cursor")
+            roles = (
+                list(args.roles)
+                if getattr(args, "roles", None)
+                else list(DEFAULT_SWARM_ROLES)
+            )
+
         if adapter != "local" and not platform_lock.is_adapter_enabled(adapter):
             print(
-                f"swarm: adapter {adapter!r} is disabled by the platform lock.",
+                f"{args.command}: adapter {adapter!r} is disabled by the platform lock.",
                 file=sys.stderr,
             )
             print(f"  enable it: puppetmaster platform enable {adapter}", file=sys.stderr)
             return 2
 
-        roles = list(args.roles) if getattr(args, "roles", None) else list(DEFAULT_SWARM_ROLES)
         disable_memory = not bool(getattr(args, "enable_memory", False))
         auto_route = None
         if getattr(args, "no_auto_route", False):
@@ -1301,7 +1336,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
                 launch_key=getattr(args, "launch_key", None),
             )
         except Exception as exc:
-            print(f"swarm: failed to start: {exc}", file=sys.stderr)
+            print(f"{args.command}: failed to start: {exc}", file=sys.stderr)
             return 1
         if getattr(args, "json", False):
             print(json.dumps(body, indent=2))

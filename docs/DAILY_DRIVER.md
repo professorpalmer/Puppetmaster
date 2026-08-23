@@ -24,7 +24,8 @@ conversational questions yourself without a job.
 
 ```bash
 python -m puppetmaster doctor
-python -m puppetmaster cursor "Review the current repo and propose the next patch" --review --dry-run
+python -m puppetmaster platform reviewer codex
+python -m puppetmaster review "Review the current repo and propose the next patch" --wait
 python -m puppetmaster cursor "Plan the next implementation slice" --plan --dry-run
 python -m puppetmaster claude "Implement the approved change and run focused tests" --permission-mode acceptEdits
 python -m puppetmaster logs

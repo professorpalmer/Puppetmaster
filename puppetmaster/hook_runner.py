@@ -71,7 +71,7 @@ _ASSUME_TOOLS_ENV = "PUPPETMASTER_HOOK_ASSUME_TOOLS"
 # route to whatever platform the lock enables, so they are safe everywhere.
 _HOST_PORTABLE_VERBS = {
     "puppetmaster_start_cursor_swarm": "puppetmaster_start_swarm",
-    "puppetmaster_start_cursor_review": "puppetmaster_start_swarm",
+    "puppetmaster_start_cursor_review": "puppetmaster_start_review",
     "puppetmaster_start_cursor_plan": "puppetmaster_start_swarm",
     "puppetmaster_start_cursor_implement": "puppetmaster_start_implement",
 }

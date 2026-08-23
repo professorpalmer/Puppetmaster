@@ -53,7 +53,7 @@ Use Puppetmaster to run doctor in this repo and summarize what is missing.
 For a supervised change:
 
 ```text
-Use Puppetmaster to start a cursor swarm for this repo and return the job id immediately.
+Use Puppetmaster to start a review for this repo on my configured reviewer platform and return the job id immediately.
 Problem: users get logged out after refresh and token-refresh tests are flaky.
 Constraints: keep the patch focused, preserve public API behavior, run relevant tests.
 Do review/plan first. Poll status/logs by job id. Do not edit until you summarize findings and ask for approval.
@@ -65,6 +65,8 @@ From the shell:
 puppetmaster doctor
 puppetmaster route "Security audit every endpoint" --role audit
 puppetmaster cursor "Review this repo for release blockers" --review --dry-run
+puppetmaster platform reviewer codex
+puppetmaster review "Review this repo for release blockers"
 puppetmaster claude "Implement the approved change and run focused tests" --permission-mode acceptEdits
 puppetmaster show "$(puppetmaster last)"
 ```
