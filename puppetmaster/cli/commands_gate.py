@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import json
 import subprocess
 import os
@@ -690,46 +689,10 @@ def _run_proxy_command(args) -> int:
     return 0
 
 def _routing_estimate_rows(artifacts) -> tuple[list[dict], dict[str, dict], float]:
-    """The pre-flight routing estimate: per-task rows + per-model rollup + total.
+    """Compatibility wrapper. Prefer ``puppetmaster.cost.routing_estimate_rows``."""
+    from puppetmaster.cost import routing_estimate_rows
 
-    Only the router's *initial* decision per task counts. Fallback/escalation
-    reroutes (created_by 'router-fallback' / 'router-escalation') emit their own
-    ROUTING artifacts; summing all of them double-counts a rerouted task. Dedup
-    by task_id mirrors ``savings.collect_routing_records``.
-    """
-    from puppetmaster.models import ArtifactType
-
-    rows: list[dict] = []
-    by_model: dict[str, dict] = {}
-    total = 0.0
-    seen_router_tasks: set = set()
-    for artifact in artifacts:
-        if artifact.type != ArtifactType.ROUTING or artifact.created_by != "router":
-            continue
-        task_id = artifact.task_id
-        if task_id:
-            if task_id in seen_router_tasks:
-                continue
-            seen_router_tasks.add(task_id)
-        payload = artifact.payload or {}
-        model_id = payload.get("model_id", "<unknown>")
-        cost = float(payload.get("estimated_cost_usd") or 0.0)
-        total += cost
-        rows.append(
-            {
-                "task_id": task_id,
-                "role": payload.get("role"),
-                "model_id": model_id,
-                "adapter": payload.get("adapter"),
-                "policy": payload.get("policy"),
-                "capability_needed": payload.get("capability_needed"),
-                "estimated_cost_usd": cost,
-            }
-        )
-        bucket = by_model.setdefault(model_id, {"calls": 0, "cost": 0.0})
-        bucket["calls"] += 1
-        bucket["cost"] += cost
-    return rows, by_model, round(total, 6)
+    return routing_estimate_rows(artifacts)
 
 
 def _run_cost_command(args, store) -> int:
@@ -750,83 +713,30 @@ def _run_cost_command(args, store) -> int:
     Cost no longer depends on a ROUTING artifact existing: a pinned run gets a
     priced ledger from its usage, not a "$0, didn't auto-route" dead end.
     """
-    from puppetmaster.cost import job_counterfactual, price_job
+    from puppetmaster.cost import build_cost_report
     from puppetmaster.model_registry import default_registry_path, load_registry
-    from puppetmaster.usage import aggregate_token_usage
 
     job_id = args.job_id
-    artifacts = store.list_artifacts(job_id)
-
     try:
         registry_path = _registry_path_from_args(args) or default_registry_path()
         registry = load_registry(registry_path)
     except Exception:
         registry = []
 
-    routing_rows, routing_by_model, routing_total = _routing_estimate_rows(artifacts)
-    job_cost = price_job(artifacts, registry)
-    counterfactual = job_counterfactual(job_cost, registry)
-
+    payload = build_cost_report(store, job_id, registry=registry)
     if args.json:
-        actual_by_model = {
-            mid: {
-                "calls": v["calls"],
-                "tokens_in": v["tokens_in"],
-                "tokens_out": v["tokens_out"],
-                "marginal_cost_usd": v["marginal_cost_usd"],
-                "billing": v["billing"],
-            }
-            for mid, v in job_cost.by_model.items()
-        }
-        payload = {
-            "job_id": job_id,
-            # Backward-compatible: the pre-flight routing estimate fields.
-            "cost_basis": "preflight_routing_estimate",
-            "total_estimated_cost_usd": routing_total,
-            "by_model": {
-                mid: {"calls": v["calls"], "estimated_cost_usd": round(v["cost"], 6)}
-                for mid, v in routing_by_model.items()
-            },
-            "token_usage": aggregate_token_usage(artifacts),
-            "estimate_drift": {
-                "route_estimated_tokens": job_cost.route_estimated_tokens,
-                "measured_usage_tokens": job_cost.measured_usage_tokens,
-                "token_ratio": job_cost.token_estimate_drift_ratio,
-                "route_nominal_cost_usd": job_cost.route_nominal_cost_usd,
-                "nominal_usage_cost_usd": job_cost.nominal_usage_cost_usd,
-                "nominal_cost_ratio": job_cost.nominal_cost_drift_ratio,
-            },
-            # The honest, routing-independent number.
-            "actual_cost": {
-                "cost_basis": "measured_usage_x_registry_price",
-                "total_marginal_cost_usd": job_cost.total_marginal_cost_usd,
-                "measured_cost_usd": job_cost.measured_cost_usd,
-                "estimated_cost_usd": job_cost.estimated_cost_usd,
-                "measured_runs": job_cost.measured_runs,
-                "estimated_runs": job_cost.estimated_runs,
-                "priced_tasks": job_cost.priced_tasks,
-                "unpriced_tasks": job_cost.unpriced_tasks,
-                "by_model": actual_by_model,
-                "tasks": [dataclasses.asdict(t) for t in job_cost.tasks],
-            },
-            "counterfactual": (
-                dataclasses.asdict(counterfactual) if counterfactual is not None else None
-            ),
-            # When the job auto-routed, the per-task routing rows; otherwise the
-            # priced-usage rows so the task breakdown is never empty for a run
-            # that actually consumed tokens.
-            "tasks": routing_rows if routing_rows else [dataclasses.asdict(t) for t in job_cost.tasks],
-        }
         print(json.dumps(payload, indent=2))
         return 0
 
-    has_usage = bool(job_cost.tasks)
+    artifacts = store.list_artifacts(job_id)
+    actual = payload.get("actual_cost") or {}
+    has_usage = bool(actual.get("tasks"))
     print(
         f"job {job_id}: actual measured spend = "
-        f"${job_cost.total_marginal_cost_usd:.6f}"
+        f"${float(actual.get('total_marginal_cost_usd') or 0.0):.6f}"
         + (
-            f"  ({job_cost.measured_cost_usd:.6f} measured / "
-            f"{job_cost.estimated_cost_usd:.6f} from estimated tokens)"
+            f"  ({float(actual.get('measured_cost_usd') or 0.0):.6f} measured / "
+            f"{float(actual.get('estimated_cost_usd') or 0.0):.6f} from estimated tokens)"
             if has_usage
             else ""
         )
@@ -834,17 +744,18 @@ def _run_cost_command(args, store) -> int:
     if has_usage:
         print()
         print(f"  {'MODEL':<28}  {'CALLS':>5}  {'TOKENS':>14}  {'COST':>12}")
+        by_model = actual.get("by_model") or {}
         for mid, v in sorted(
-            job_cost.by_model.items(), key=lambda kv: -kv[1]["marginal_cost_usd"]
+            by_model.items(), key=lambda kv: -kv[1]["marginal_cost_usd"]
         ):
             tokens = v["tokens_in"] + v["tokens_out"]
             print(
                 f"  {mid[:28]:<28}  {v['calls']:>5}  {tokens:>14,}  "
                 f"${v['marginal_cost_usd']:>10.6f}"
             )
-        if job_cost.unpriced_tasks:
+        if actual.get("unpriced_tasks"):
             print(
-                f"\n  note: {job_cost.unpriced_tasks} task(s) ran on a model not in "
+                f"\n  note: {actual['unpriced_tasks']} task(s) ran on a model not in "
                 "your registry, so their spend could not be priced (tokens still counted)."
             )
     else:
@@ -853,14 +764,20 @@ def _run_cost_command(args, store) -> int:
             "(the job may still be running, or produced no worker artifacts)."
         )
 
-    if counterfactual is not None and counterfactual.reference_priced:
+    counterfactual = payload.get("counterfactual")
+    if counterfactual is not None and counterfactual.get("reference_priced"):
         print()
         print(
-            f"  counterfactual: this volume on {counterfactual.reference_model_id} "
-            f"at metered rates ≈ ${counterfactual.naive_cost_usd:.6f}; you paid "
-            f"${counterfactual.actual_cost_usd:.6f} → avoided ${counterfactual.avoided_usd:.6f}."
+            f"  counterfactual: this volume on {counterfactual['reference_model_id']} "
+            f"at metered rates ≈ ${counterfactual['naive_cost_usd']:.6f}; you paid "
+            f"${counterfactual['actual_cost_usd']:.6f} → avoided ${counterfactual['avoided_usd']:.6f}."
         )
 
+    routing_rows = [
+        row for row in (payload.get("tasks") or [])
+        if isinstance(row, dict) and "estimated_cost_usd" in row and "role" in row
+    ]
+    routing_total = float(payload.get("total_estimated_cost_usd") or 0.0)
     if routing_rows:
         print()
         print(f"  pre-flight routing estimate (relative model cost) = ${routing_total:.6f}")

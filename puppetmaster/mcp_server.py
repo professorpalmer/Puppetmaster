@@ -1352,9 +1352,7 @@ def _build_tools() -> list[McpTool]:
                 "Puppetmaster does not call a billing API."
             ),
             input_schema=job_schema(required=True),
-            handler=lambda args: run_cli(
-                ["cost", require_job_id(args), "--json"], args
-            ),
+            handler=run_job_cost,
         ),
         McpTool(
             name="puppetmaster_job_receipt",
@@ -3186,6 +3184,43 @@ def run_route_task(args: JsonObject) -> JsonObject:
     payload["registry_path"] = str(registry_path)
     return {
         "content": [{"type": "text", "text": json.dumps(payload, indent=2)}],
+        "isError": False,
+    }
+
+
+def run_job_cost(args: JsonObject) -> JsonObject:
+    """Return the structured cost report via ``build_cost_report``.
+
+    Envelope matches the previous CLI-subprocess tool so hosts that parse
+    ``stdout`` still see ``puppetmaster cost <job_id> --json``.
+    """
+    from puppetmaster.cost import build_cost_report
+    from puppetmaster.model_registry import default_registry_path, load_registry
+
+    job_id = require_job_id(args)
+    backend = str(args.get("backend") or "sqlite")
+    state_dir = mcp_state_dir(args)
+    store = create_store(backend, state_dir)
+    registry_path_arg = args.get("registry_path")
+    try:
+        registry_path = (
+            Path(str(registry_path_arg)).expanduser()
+            if registry_path_arg
+            else default_registry_path()
+        )
+        registry = load_registry(registry_path)
+    except Exception:
+        registry = []
+    report = build_cost_report(store, job_id, registry=registry)
+    body = {
+        "command": f"python -m puppetmaster cost {job_id} --json",
+        "cwd": cwd(args),
+        "returncode": 0,
+        "stdout": json.dumps(report, indent=2) + "\n",
+        "stderr": "",
+    }
+    return {
+        "content": [{"type": "text", "text": json.dumps(body, indent=2)}],
         "isError": False,
     }
 
