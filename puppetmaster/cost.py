@@ -19,11 +19,15 @@ reference model (resolved by :mod:`puppetmaster.savings`) so "what would this
 have cost on the flagship at metered rates?" is answerable post-hoc — again,
 pinned or not. On a plan-billed setup the actual marginal cost is ~$0, so the
 avoided figure ≈ the naive figure.
+
+``build_cost_report`` is the structured payload behind
+``puppetmaster cost <job_id> --json``. CLI, MCP ``puppetmaster_job_cost``, and
+Marionette all consume that one function. It does not invent a second ledger.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Iterable, Optional
+from dataclasses import asdict, dataclass, field
+from typing import Any, Iterable, Optional
 
 from puppetmaster.models import Artifact, ArtifactType
 from puppetmaster.savings import (
@@ -334,3 +338,116 @@ def job_counterfactual(job_cost: JobCost, registry: list) -> Optional[Counterfac
         avoided_usd=round(naive - actual, 6),
         tasks=len(job_cost.tasks),
     )
+
+
+
+def routing_estimate_rows(artifacts: Iterable[Artifact]) -> tuple[list[dict], dict[str, dict], float]:
+    """The pre-flight routing estimate: per-task rows + per-model rollup + total.
+
+    Only the router's *initial* decision per task counts. Fallback/escalation
+    reroutes (created_by 'router-fallback' / 'router-escalation') emit their own
+    ROUTING artifacts; summing all of them double-counts a rerouted task. Dedup
+    by task_id mirrors ``savings.collect_routing_records``.
+    """
+    rows: list[dict] = []
+    by_model: dict[str, dict] = {}
+    total = 0.0
+    seen_router_tasks: set = set()
+    for artifact in artifacts:
+        if artifact.type != ArtifactType.ROUTING or artifact.created_by != "router":
+            continue
+        task_id = artifact.task_id
+        if task_id:
+            if task_id in seen_router_tasks:
+                continue
+            seen_router_tasks.add(task_id)
+        payload = artifact.payload or {}
+        model_id = payload.get("model_id", "<unknown>")
+        cost = float(payload.get("estimated_cost_usd") or 0.0)
+        total += cost
+        rows.append(
+            {
+                "task_id": task_id,
+                "role": payload.get("role"),
+                "model_id": model_id,
+                "adapter": payload.get("adapter"),
+                "policy": payload.get("policy"),
+                "capability_needed": payload.get("capability_needed"),
+                "estimated_cost_usd": cost,
+            }
+        )
+        bucket = by_model.setdefault(model_id, {"calls": 0, "cost": 0.0})
+        bucket["calls"] += 1
+        bucket["cost"] += cost
+    return rows, by_model, round(total, 6)
+
+
+def build_cost_report(store: Any, job_id: str, registry: Optional[list] = None) -> dict:
+    """Structured report behind ``puppetmaster cost <job_id> --json``.
+
+    Shared by the CLI, the MCP ``puppetmaster_job_cost`` tool, and Marionette.
+    Prices against the current registry; does not invent a second economics DB.
+    """
+    from puppetmaster.usage import aggregate_token_usage
+
+    artifacts = store.list_artifacts(job_id) if store is not None else []
+    if registry is None:
+        try:
+            from puppetmaster.model_registry import default_registry_path, load_registry
+
+            registry = load_registry(default_registry_path()) or []
+        except Exception:
+            registry = []
+
+    routing_rows, routing_by_model, routing_total = routing_estimate_rows(artifacts)
+    job_cost = price_job(artifacts, registry)
+    counterfactual = job_counterfactual(job_cost, registry)
+    actual_by_model = {
+        mid: {
+            "calls": v["calls"],
+            "tokens_in": v["tokens_in"],
+            "tokens_out": v["tokens_out"],
+            "marginal_cost_usd": v["marginal_cost_usd"],
+            "billing": v["billing"],
+        }
+        for mid, v in job_cost.by_model.items()
+    }
+    return {
+        "job_id": job_id,
+        # Backward-compatible: the pre-flight routing estimate fields.
+        "cost_basis": "preflight_routing_estimate",
+        "total_estimated_cost_usd": routing_total,
+        "by_model": {
+            mid: {"calls": v["calls"], "estimated_cost_usd": round(v["cost"], 6)}
+            for mid, v in routing_by_model.items()
+        },
+        "token_usage": aggregate_token_usage(artifacts),
+        "estimate_drift": {
+            "route_estimated_tokens": job_cost.route_estimated_tokens,
+            "measured_usage_tokens": job_cost.measured_usage_tokens,
+            "token_ratio": job_cost.token_estimate_drift_ratio,
+            "route_nominal_cost_usd": job_cost.route_nominal_cost_usd,
+            "nominal_usage_cost_usd": job_cost.nominal_usage_cost_usd,
+            "nominal_cost_ratio": job_cost.nominal_cost_drift_ratio,
+        },
+        # The honest, routing-independent number.
+        "actual_cost": {
+            "cost_basis": "measured_usage_x_registry_price",
+            "total_marginal_cost_usd": job_cost.total_marginal_cost_usd,
+            "measured_cost_usd": job_cost.measured_cost_usd,
+            "estimated_cost_usd": job_cost.estimated_cost_usd,
+            "measured_runs": job_cost.measured_runs,
+            "estimated_runs": job_cost.estimated_runs,
+            "priced_tasks": job_cost.priced_tasks,
+            "unpriced_tasks": job_cost.unpriced_tasks,
+            "by_model": actual_by_model,
+            "tasks": [asdict(t) for t in job_cost.tasks],
+        },
+        "counterfactual": (
+            asdict(counterfactual) if counterfactual is not None else None
+        ),
+        # When the job auto-routed, the per-task routing rows; otherwise the
+        # priced-usage rows so the task breakdown is never empty for a run
+        # that actually consumed tokens.
+        "tasks": routing_rows if routing_rows else [asdict(t) for t in job_cost.tasks],
+    }

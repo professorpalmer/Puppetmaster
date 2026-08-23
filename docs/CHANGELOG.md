@@ -1,3 +1,17 @@
+## v1.22.18
+
+Leftover from the Marionette
+[#102](https://github.com/professorpalmer/marionette/issues/102) /
+[PR #103](https://github.com/professorpalmer/marionette/pull/103) absorb:
+the structured `puppetmaster cost <job_id> --json` payload is now one reusable
+function instead of living only inside the CLI handler.
+
+- **`puppetmaster.cost.build_cost_report(store, job_id, registry=None)`.** Same
+  JSON shape as before (`total_estimated_cost_usd`, `by_model`, `tasks`,
+  `actual_cost`, `counterfactual`, `estimate_drift`). CLI `--json`, MCP
+  `puppetmaster_job_cost`, and Mari all consume this function. No new economics
+  database and no kernel-contract change.
+
 ## v1.22.17
 
 Absorb of [@bsmi021](https://github.com/bsmi021) PR
