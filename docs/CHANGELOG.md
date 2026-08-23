@@ -15,6 +15,8 @@ as a subprocess worker; Pi stays the TUI.
   path in settings.json. Documented: pi install PATH_TO_PI_PACKAGE.
 - Doctor: pi-pilot is healthy when the Pi CLI is visible, the package is listed,
   and Puppetmaster MCP is reachable. Missing pieces print the exact fix.
+  Windows treats ``pi`` and ``pi.exe`` as the CLI (PATHEXT / PATH scan); a
+  no-extension stub is visible, and package listings compare via resolve/samefile.
 - Tests: hermetic unittest (no pytest). Live E2E is skipped unless PI_LIVE_E2E=1
   and a provider key plus pi are available; never faked.
 - Docs: [PI.md](PI.md), ADAPTERS.md, CLI_REFERENCE.md. Does not reopen 1.22.22.

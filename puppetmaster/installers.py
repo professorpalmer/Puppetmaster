@@ -2510,14 +2510,38 @@ def _normalize_package_source(value: object) -> str:
         return str(Path(raw).expanduser())
 
 
+def _package_paths_equivalent(left: object, right: object) -> bool:
+    """True when two package listings name the same directory.
+
+    Windows CI can write 8.3 short names or mix ``/`` and ``\\``; a raw
+    ``Path == Path`` (or even ``str(resolve())``) then misses a listed package.
+    Prefer resolve + samefile when both sides exist.
+    """
+    a = _normalize_package_source(left)
+    b = _normalize_package_source(right)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b)):
+        return True
+    if os.path.normcase(a.replace("\\", "/")) == os.path.normcase(b.replace("\\", "/")):
+        return True
+    try:
+        if os.path.exists(a) and os.path.exists(b) and os.path.samefile(a, b):
+            return True
+    except OSError:
+        pass
+    return False
+
+
 def _settings_has_package(settings: Mapping, package_dir: Path) -> bool:
     packages = settings.get("packages")
     if not isinstance(packages, list):
         return False
-    wanted = _normalize_package_source(package_dir)
     for item in packages:
         source = item if isinstance(item, str) else (item or {}).get("source") if isinstance(item, dict) else ""
-        if _normalize_package_source(source) == wanted:
+        if _package_paths_equivalent(source, package_dir):
             return True
     return False
 
@@ -2729,7 +2753,7 @@ def uninstall_pi_mcp(
             removed = 0
             for item in packages:
                 source = item if isinstance(item, str) else str((item or {}).get("source") or "")
-                if str(Path(source).expanduser()) == wanted:
+                if _package_paths_equivalent(source, pkg):
                     removed += 1
                     continue
                 kept.append(item)
