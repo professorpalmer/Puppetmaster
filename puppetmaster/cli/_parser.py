@@ -873,6 +873,40 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rollup.add_argument("--json", action="store_true", help="Emit JSON.")
 
+    effort_index = subcommands.add_parser(
+        "effort-index",
+        help=(
+            "Queryable effort-level artifact index: compact refs across jobs "
+            "and worktrees. Omit --effort to use the most recently tagged "
+            "effort. Never returns worker transcripts; omit --expand to keep "
+            "payload bodies out."
+        ),
+    )
+    effort_index.add_argument(
+        "--effort",
+        help="Effort id to index. Omit to use the most recently tagged effort.",
+    )
+    effort_index.add_argument(
+        "--type",
+        dest="artifact_type",
+        help="Only include artifacts of this type (finding, decision, ...).",
+    )
+    effort_index.add_argument(
+        "--query",
+        help="Substring filter on claim, check, or decision (case-insensitive).",
+    )
+    effort_index.add_argument(
+        "--expand",
+        action="store_true",
+        help="Include full payload bodies. Default is compact refs only.",
+    )
+    effort_index.add_argument(
+        "--all-projects",
+        action="store_true",
+        help="Index every project state dir (usual for a multi-worktree effort).",
+    )
+    effort_index.add_argument("--json", action="store_true", help="Emit JSON.")
+
     gate = subcommands.add_parser(
         "gate",
         help=(

@@ -89,6 +89,7 @@ This keeps the daily-driver workflow serious without handing write access to eve
 python -m puppetmaster state
 python -m puppetmaster jobs
 python -m puppetmaster last
+python -m puppetmaster effort-index
 python -m puppetmaster status <job_id>
 python -m puppetmaster logs [job_id]
 python -m puppetmaster open [job_id]

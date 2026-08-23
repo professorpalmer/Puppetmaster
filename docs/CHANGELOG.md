@@ -1,3 +1,24 @@
+## v1.22.21 — 2026-08-23
+
+**Feature: effort-level artifact index (queryable memory on the effort ledger).**
+
+`rollup_stores` remains the jobs/cost/tokens ledger. On top of it, Chief/Marionette
+can now list compact artifact refs for one effort across jobs and worktrees
+without opening worker transcripts or full payload bodies.
+
+- **Query:** `index_effort_artifacts` reuses `compact_artifact_ref` and returns
+  `id`, `type`, `sha256`, `claim`/`check`/`decision`, `confidence`, `job_id`,
+  `task_id`, `created_at`. Filter by type and by claim/check/decision substring.
+  Omit `effort_id` to resolve the most recently tagged effort from sidecar
+  `tagged_at` / `efforts_seen`.
+- **CLI:** `puppetmaster effort-index [--effort ID] [--type TYPE] [--query TEXT] [--expand] [--all-projects] [--json]`.
+- **MCP / discovery:** `puppetmaster_effort_index` is registered on the stdio
+  tool list (and remote supervise scope) so hosts discover it via `tools/list`.
+- **Head-seat loop:** size via `route_task` / `auto_route` / `prewalk`, spawn a
+  disposable Puppetmaster job, persist artifacts, die. Optional one-shot
+  `gate`/tests on the worker worktree. No long-lived role bots; swarm is optional.
+- **Tests:** hermetic `unittest` coverage (CI remains `unittest discover`).
+
 ## v1.22.20 — 2026-08-23
 
 Absorb of [@bsmi021](https://github.com/bsmi021) PR

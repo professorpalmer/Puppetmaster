@@ -139,6 +139,39 @@ def _run_rollup_command(args, store) -> int:
         print(f"  efforts seen: {', '.join(rollup['efforts_seen'])}")
     return 0
 
+def _run_effort_index_command(args, store) -> int:
+    from puppetmaster.lifecycle import index_effort_artifacts
+
+    import puppetmaster.cli as cli
+
+    payload = index_effort_artifacts(
+        cli._gc_target_stores(args, store),
+        effort_id=getattr(args, "effort", None),
+        artifact_type=getattr(args, "artifact_type", None),
+        query=getattr(args, "query", None),
+        expand=bool(getattr(args, "expand", False)),
+    )
+    if args.json:
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    effort = payload.get("effort_id") or "(none)"
+    source = "requested" if payload.get("requested_effort_id") else "latest tagged"
+    print(f"effort-index ({source} '{effort}'):")
+    print(f"  jobs: {payload['jobs']}  refs: {payload['count']}")
+    if payload.get("type") or payload.get("query"):
+        print(f"  filter: type={payload.get('type') or '-'}  query={payload.get('query') or '-'}")
+    if payload.get("efforts_seen") and not payload.get("requested_effort_id"):
+        print(f"  efforts seen: {', '.join(payload['efforts_seen'])}")
+    for ref in payload["refs"]:
+        headline = ref.get("claim") or ref.get("check") or ref.get("decision") or ""
+        if isinstance(headline, str) and len(headline) > 80:
+            headline = headline[:77] + "..."
+        print(
+            f"  {ref.get('id')}  {ref.get('type')}  job={ref.get('job_id')}  "
+            f"conf={ref.get('confidence')}  {headline}"
+        )
+    return 0
+
 def _gate_specs_from_args(args) -> list[dict]:
     """Translate the gate flags + --gates-json into the same spec list the
     runtime resolves from ``task.payload['gates']``."""
