@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import unittest
+from datetime import date
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -25,6 +26,19 @@ def _spec(**kwargs):
     )
     defaults.update(kwargs)
     return ModelSpec(**defaults)
+
+
+def _qualified_card(capability, **extra):
+    card = {
+        "capability": capability,
+        "sample_count": 5,
+        "last_calibrated": date.today().isoformat(),
+        "scale": "puppetmaster-capability-0-100",
+        "scale_version": "1",
+        "provenance": {"source": "test_objective_evaluator", "version": "1"},
+    }
+    card.update(extra)
+    return card
 
 
 def _three_tier():
@@ -130,16 +144,34 @@ class EffectiveCapabilityTests(unittest.TestCase):
         self.assertEqual(effective_capability_score(spec, "implement"), 97)
         self.assertEqual(effective_capability_score(spec, "explore"), 97)
 
-    def test_role_card_overrides_only_that_role(self) -> None:
+    def test_only_qualified_role_card_overrides_matching_role(self) -> None:
         from puppetmaster.scorecards import effective_capability_score
 
-        spec = _spec(
+        unqualified = _spec(
             capability_score=97,
             role_scorecards={"implement": {"capability": 70}},
         )
-        self.assertEqual(effective_capability_score(spec, "implement"), 70)
-        self.assertEqual(effective_capability_score(spec, "explore"), 97)
-        self.assertEqual(effective_capability_score(spec, "review"), 97)
+        self.assertEqual(effective_capability_score(unqualified, "implement"), 97)
+
+        qualified = _spec(
+            capability_score=97,
+            role_scorecards={
+                "implement": {
+                    "capability": 70,
+                    "sample_count": 5,
+                    "last_calibrated": date.today().isoformat(),
+                    "scale": "puppetmaster-capability-0-100",
+                    "scale_version": "1",
+                    "provenance": {
+                        "source": "test_objective_evaluator",
+                        "version": "1",
+                    },
+                }
+            },
+        )
+        self.assertEqual(effective_capability_score(qualified, "implement"), 70)
+        self.assertEqual(effective_capability_score(qualified, "explore"), 97)
+        self.assertEqual(effective_capability_score(qualified, "review"), 97)
 
 
 class ImportBaselineTests(unittest.TestCase):
@@ -299,14 +331,16 @@ class ImportBaselineTests(unittest.TestCase):
 
 
 class RouteTaskScorecardTests(unittest.TestCase):
-    def test_empty_cards_same_pick_as_today(self) -> None:
+    def test_empty_cards_use_manual_scores_across_cost_policies(self) -> None:
         from puppetmaster.router import TaskSignals, route_task
 
         signal = TaskSignals(instruction="add a feature", role="implement")
         decision = route_task(signal, _three_tier(), policy="balanced")
         self.assertEqual(decision.model.id, "mid-model")
         cheap = route_task(signal, _three_tier(), policy="cheap")
-        self.assertEqual(cheap.model.id, "cheap-model")
+        self.assertEqual(cheap.model.id, "mid-model")
+        absolute = route_task(signal, _three_tier(), policy="absolute-cheapest")
+        self.assertEqual(absolute.model.id, "cheap-model")
 
     def test_implement_card_rejects_high_manual_score(self) -> None:
         from puppetmaster.model_registry import ModelSpec
@@ -320,7 +354,7 @@ class RouteTaskScorecardTests(unittest.TestCase):
             input_per_mtok_usd=0.5,
             output_per_mtok_usd=2.0,
             billing="api",
-            role_scorecards={"implement": {"capability": 72}},
+            role_scorecards={"implement": _qualified_card(72)},
         )
         gpt = ModelSpec(
             id="cursor/gpt-5-5",
@@ -330,7 +364,7 @@ class RouteTaskScorecardTests(unittest.TestCase):
             input_per_mtok_usd=5.0,
             output_per_mtok_usd=30.0,
             billing="api",
-            role_scorecards={"implement": {"capability": 70}},
+            role_scorecards={"implement": _qualified_card(70)},
             score_provenance={
                 "source": "community_baseline",
                 "bundle_id": "test-bundle",
@@ -363,12 +397,17 @@ class RouteTaskScorecardTests(unittest.TestCase):
             output_per_mtok_usd=6.0,
             billing="plan",
             role_scorecards={
-                "implement": {
-                    "capability": 88,
-                    "quality": 0.71,
-                    "latency_p50_ms": 1200,
-                    "sample_count": 40,
-                }
+                "implement": _qualified_card(
+                    88,
+                    quality=0.71,
+                    latency_p50_ms=1200,
+                    sample_count=40,
+                    provenance={
+                        "source": "community_baseline",
+                        "version": "1.0.0",
+                        "bundle_id": "puppetmaster-community-scorecards",
+                    },
+                )
             },
             score_provenance={
                 "source": "community_baseline",
@@ -554,7 +593,7 @@ class AuditScorecardTests(unittest.TestCase):
             self.assertEqual(record.attempts, 2)
             self.assertEqual(record.fallback_attempts, 1)
 
-    def test_apply_still_writes_capability_score_only(self) -> None:
+    def test_apply_ignores_self_signal_and_preserves_authority(self) -> None:
         import argparse
 
         from puppetmaster.cli import _run_audit_command
@@ -657,12 +696,129 @@ class AuditScorecardTests(unittest.TestCase):
             rc = _run_audit_command(args, store)
             self.assertEqual(rc, 0)
             after = {s.id: s for s in load_registry(registry_path)}
-            self.assertLess(after["weak/55"].capability_score, 55)
+            self.assertEqual(after["weak/55"].capability_score, 55)
             self.assertEqual(after["strong/80"].capability_score, 80)
             self.assertEqual(
                 after["weak/55"].role_scorecards["implement"]["capability"], 50
             )
             self.assertEqual(after["weak/55"].score_provenance["source"], "manual")
+
+    def test_apply_writes_only_qualified_objective_role_card(self) -> None:
+        import argparse
+
+        from puppetmaster.cli import _run_audit_command
+        from puppetmaster.model_registry import load_registry, save_registry
+        from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
+        from puppetmaster.store import SwarmStore
+
+        with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "models.json"
+            review_card = {"capability": 73, "notes": "preserve unrelated role"}
+            save_registry(
+                [
+                    _spec(
+                        id="weak/55",
+                        adapter="cursor",
+                        adapter_model_name="weak",
+                        capability_score=55,
+                        role_scorecards={"review": review_card},
+                        score_provenance={"source": "manual"},
+                    ),
+                    _spec(
+                        id="strong/80",
+                        adapter="cursor",
+                        adapter_model_name="strong",
+                        capability_score=80,
+                    ),
+                ],
+                registry_path,
+            )
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            job = store.create_job("objective role-card authority")
+            epoch = {
+                "registry_digest": "registry-a",
+                "classifier_version": "classifier-a",
+                "taxonomy_version": "taxonomy-a",
+                "adapter_version": "cursor-a",
+            }
+            for index in range(6):
+                task = Task(
+                    job_id=job.id,
+                    role="implement",
+                    instruction=f"objective evaluation {index}",
+                    adapter="cursor",
+                    status=TaskStatus.COMPLETE,
+                    payload={
+                        "router_model_id": "weak/55",
+                        "router_capability_needed": 50,
+                        "router_estimated_cost_usd": 0.001,
+                    },
+                )
+                store.save_task(task)
+                store.save_artifact(
+                    Artifact(
+                        job_id=job.id,
+                        task_id=task.id,
+                        type=ArtifactType.ROUTING,
+                        created_by="router",
+                        payload={
+                            "model_id": "weak/55",
+                            "adapter": "cursor",
+                            "policy": "balanced",
+                            "capability_needed": 50,
+                            **epoch,
+                        },
+                        confidence=0.9,
+                        evidence=["routing"],
+                        created_at=f"2026-08-22T12:00:{index:02d}Z",
+                    )
+                )
+                store.save_artifact(
+                    Artifact(
+                        job_id=job.id,
+                        task_id=task.id,
+                        type=ArtifactType.GATE,
+                        created_by="objective-review",
+                        payload={
+                            "gate": "review",
+                            "passed": False,
+                            "review_status": "completed",
+                            "objective_score": 0.0,
+                            "evaluator_revision": "review-v2",
+                        },
+                        confidence=1.0,
+                        evidence=["objective evaluator"],
+                        created_at=f"2026-08-22T12:01:{index:02d}Z",
+                    )
+                )
+
+            args = argparse.Namespace(
+                registry_path=str(registry_path),
+                window=None,
+                apply=True,
+                json=False,
+            )
+            rc = _run_audit_command(args, store)
+
+            self.assertEqual(rc, 0)
+            after = {s.id: s for s in load_registry(registry_path)}
+            weak = after["weak/55"]
+            self.assertEqual(weak.capability_score, 55)
+            self.assertEqual(after["strong/80"].capability_score, 80)
+            self.assertEqual(weak.role_scorecards["review"], review_card)
+            implement = weak.role_scorecards["implement"]
+            self.assertEqual(implement["capability"], 50)
+            self.assertEqual(implement["sample_count"], 6)
+            self.assertEqual(implement["last_calibrated"], "2026-08-22")
+            self.assertEqual(implement["scale"], "puppetmaster-capability-0-100")
+            self.assertEqual(implement["scale_version"], "1")
+            self.assertEqual(implement["provenance"]["source"], "local_audit")
+            self.assertEqual(
+                implement["provenance"]["epoch"],
+                {**epoch, "evaluator_revision": "review-v2"},
+            )
+            self.assertEqual(weak.score_provenance["source"], "manual")
 
 
 if __name__ == "__main__":

@@ -240,11 +240,10 @@ def _run_preflight_command(args) -> int:
     return 0 if result.ok else 1
 
 def _run_audit_command(args, store) -> int:
-    """Analyze past routing behavior and propose conservative score changes.
+    """Analyze routing behavior and propose qualified role-card changes.
 
-    Read-only by default: prints a per-model report (picks, mean confidence,
-    escalation rate, spend) plus a suggested models.json diff. ``--apply``
-    writes the suggested score changes; nothing is mutated otherwise.
+    Read-only by default. ``--apply`` writes objective, epoch-qualified role
+    cards; it never infers a global capability score from one role's outcomes.
     """
     import json as _json
     from dataclasses import asdict, replace
@@ -352,17 +351,10 @@ def _run_audit_command(args, store) -> int:
                     "  No token usage recorded yet — estimate-vs-actual drift will "
                     "populate once routed runs report usage."
                 )
-        if report.suggestions:
-            print("\nSuggested score changes (your assertion stays the source of truth):")
-            for s in report.suggestions:
-                print(f"  {s['model_id']}: {s['from_score']} -> {s['to_score']}")
-                print(f"      {s['rationale']}")
-        elif report.tasks_considered:
-            print("\nNo score changes suggested — routing looks well-calibrated.")
         if report.role_scorecard_suggestions:
             print(
                 "\nRole scorecard recommendations "
-                "(not applied; --apply only writes capability_score):"
+                "(--apply writes qualified role cards only):"
             )
             for sug in report.role_scorecard_suggestions:
                 print(
@@ -370,22 +362,43 @@ def _run_audit_command(args, store) -> int:
                     f"{sug['from_capability']} -> {sug['to_capability']}"
                 )
                 print(f"      {sug['rationale']}")
+        elif report.tasks_considered:
+            print("\nNo objective role-card changes suggested.")
 
     if args.apply:
-        if not report.suggestions:
+        if not report.role_scorecard_suggestions:
             print("\nNothing to apply.")
             return 0
+        from puppetmaster.scorecards import ROLE_CARD_SCALE
+
         by_id = {s.id: s for s in registry}
         changed = 0
-        for sug in report.suggestions:
+        for sug in report.role_scorecard_suggestions:
             spec = by_id.get(sug["model_id"])
             if spec is None:
                 continue
-            by_id[sug["model_id"]] = replace(spec, capability_score=sug["to_score"])
+            cards = {
+                str(role): dict(card)
+                for role, card in (spec.role_scorecards or {}).items()
+                if isinstance(card, dict)
+            }
+            cards[sug["role"]] = {
+                "capability": sug["to_capability"],
+                "sample_count": sug["sample_count"],
+                "last_calibrated": sug["last_calibrated"],
+                "scale": ROLE_CARD_SCALE,
+                "scale_version": "1",
+                "provenance": {
+                    "source": "local_audit",
+                    "version": "objective-epoch-v1",
+                    "epoch": dict(sug.get("epoch") or {}),
+                },
+            }
+            by_id[sug["model_id"]] = replace(spec, role_scorecards=cards)
             changed += 1
         if changed:
             save_registry(list(by_id.values()), registry_path)
-            print(f"\nApplied {changed} score change(s) to {registry_path}.")
+            print(f"\nApplied {changed} role-card change(s) to {registry_path}.")
     return 0
 
 def _run_savings_command(args, state_dir) -> int:

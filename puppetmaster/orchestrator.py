@@ -227,11 +227,6 @@ def _auto_route_must_resolve_model(spec: WorkerSpec) -> bool:
         return False
     if spec.adapter not in _MODEL_BACKED_ADAPTERS:
         return False
-    if payload.get("pinned_model"):
-        return False
-    model = payload.get("model")
-    if model is not None and str(model).strip():
-        return False
     return True
 
 
@@ -788,8 +783,8 @@ class Orchestrator:
     def _reroute_recoverable_failures(self, job: Job) -> int:
         """Re-queue each FAILED task with a recoverable failure onto a funded
         adapter. Returns the count re-queued (0 when nothing is re-routable)."""
-        from puppetmaster.model_registry import default_registry_path, load_registry
         from puppetmaster.platform_billing import detect_adapter_billing_cached
+        from puppetmaster.routing_authority import load_bound_registry
         from puppetmaster.router import (
             NoEligibleModelError,
             route_task,
@@ -808,11 +803,6 @@ class Orchestrator:
         failure_by_task = self._recoverable_failure_by_task(job)
         failed = [t for t in failed if t.id in failure_by_task]
         if not failed:
-            return 0
-
-        registry_path = default_registry_path()
-        registry = [s for s in load_registry(registry_path) if s.enabled]
-        if not registry:
             return 0
 
         billing_cache: dict[str, object] = {}
@@ -838,6 +828,12 @@ class Orchestrator:
             # Never silently re-route an explicit hand pin. Router-placed work
             # (auto_route + router_model_id) may still fall back to another model.
             if _payload_has_explicit_model_pin(payload):
+                continue
+            registry_path, bound_registry, registry_epoch = load_bound_registry(
+                payload
+            )
+            registry = [spec for spec in bound_registry if spec.is_routable]
+            if not registry:
                 continue
             tried_models = set(payload.get("tried_models") or [])
             current_model_id = str(payload.get("router_model_id") or "")
@@ -945,6 +941,8 @@ class Orchestrator:
                 artifact_payload["fallback_from_model"] = current_model_id
             artifact_payload["fallback_reason"] = reason
             artifact_payload["fallback_attempt"] = attempts
+            artifact_payload["registry_path"] = str(registry_path)
+            artifact_payload["registry_digest"] = registry_epoch
             self.store.save_artifact(
                 Artifact(
                     job_id=job.id,
@@ -1012,20 +1010,16 @@ class Orchestrator:
         """Re-queue each COMPLETE task whose verification confidence is below its
         configured threshold onto the cheapest strictly-stronger funded model.
         Returns the count re-queued (0 when nothing qualifies)."""
-        from puppetmaster.model_registry import default_registry_path, load_registry
         from puppetmaster.platform_billing import detect_adapter_billing
         from puppetmaster.platform_lock import is_adapter_enabled
         from puppetmaster.preflight import adapter_cli_present
+        from puppetmaster.routing_authority import load_bound_registry
+        from puppetmaster.scorecards import effective_capability_score
         from puppetmaster.router import (
             NoEligibleModelError,
             route_task,
             signals_from_worker_spec,
         )
-
-        registry = [s for s in load_registry(default_registry_path()) if s.enabled]
-        if not registry:
-            return 0
-        by_model_id = {s.id: s for s in registry}
 
         billing_cache: dict[str, object] = {}
 
@@ -1054,6 +1048,11 @@ class Orchestrator:
             # router_model_id for cost/audit).
             if _payload_has_explicit_model_pin(payload):
                 continue
+            registry_path, bound_registry, registry_epoch = load_bound_registry(
+                payload
+            )
+            registry = [spec for spec in bound_registry if spec.is_routable]
+            by_model_id = {spec.id: spec for spec in registry}
             current_model_id = payload.get("router_model_id")
             current_spec = by_model_id.get(current_model_id) if current_model_id else None
             if current_spec is None:
@@ -1078,11 +1077,12 @@ class Orchestrator:
             if not candidates:
                 continue
 
-            # Demand strictly more capability than the current model by lifting
-            # the floor one point above its score, then route normally.
+            # Demand strictly more role-effective capability than the current
+            # model; global manual scores do not override qualified role cards.
+            current_capability = effective_capability_score(current_spec, task.role)
             signals = replace(
                 signals_from_worker_spec(task),
-                explicit_min_capability=current_spec.capability_score + 1,
+                explicit_min_capability=current_capability + 1,
             )
             policy = payload.get("router_policy") or "balanced"
             try:
@@ -1093,7 +1093,8 @@ class Orchestrator:
             # meets the floor — guard so we only act on a genuine upgrade.
             if (
                 decision.model.id == current_model_id
-                or decision.model.capability_score <= current_spec.capability_score
+                or effective_capability_score(decision.model, task.role)
+                <= current_capability
             ):
                 continue
 
@@ -1126,6 +1127,8 @@ class Orchestrator:
             artifact_payload["escalated_from_confidence"] = round(confidence, 3)
             artifact_payload["confidence_threshold"] = threshold
             artifact_payload["escalation_attempt"] = attempts
+            artifact_payload["registry_path"] = str(registry_path)
+            artifact_payload["registry_digest"] = registry_epoch
             self.store.save_artifact(
                 Artifact(
                     job_id=job.id,
@@ -1235,20 +1238,16 @@ class Orchestrator:
     def _reroute_failed_review(self, job: Job) -> int:
         """Re-queue each review-rejected task onto the cheapest strictly-stronger
         funded model. Returns the count re-queued (0 when nothing qualifies)."""
-        from puppetmaster.model_registry import default_registry_path, load_registry
         from puppetmaster.platform_billing import detect_adapter_billing
         from puppetmaster.platform_lock import is_adapter_enabled
         from puppetmaster.preflight import adapter_cli_present
+        from puppetmaster.routing_authority import load_bound_registry
+        from puppetmaster.scorecards import effective_capability_score
         from puppetmaster.router import (
             NoEligibleModelError,
             route_task,
             signals_from_worker_spec,
         )
-
-        registry = [s for s in load_registry(default_registry_path()) if s.enabled]
-        if not registry:
-            return 0
-        by_model_id = {s.id: s for s in registry}
 
         artifacts = self.store.list_artifacts(job.id)
         failed_review = self._failed_review_task_ids(artifacts)
@@ -1276,6 +1275,11 @@ class Orchestrator:
             # model (the user chose it deliberately).
             if _payload_has_explicit_model_pin(payload):
                 continue
+            registry_path, bound_registry, registry_epoch = load_bound_registry(
+                payload
+            )
+            registry = [spec for spec in bound_registry if spec.is_routable]
+            by_model_id = {spec.id: spec for spec in registry}
             current_model_id = payload.get("router_model_id")
             current_spec = by_model_id.get(current_model_id) if current_model_id else None
             if current_spec is None:
@@ -1297,9 +1301,10 @@ class Orchestrator:
             if not candidates:
                 continue
 
+            current_capability = effective_capability_score(current_spec, task.role)
             signals = replace(
                 signals_from_worker_spec(task),
-                explicit_min_capability=current_spec.capability_score + 1,
+                explicit_min_capability=current_capability + 1,
             )
             policy = payload.get("router_policy") or "balanced"
             try:
@@ -1308,7 +1313,8 @@ class Orchestrator:
                 continue
             if (
                 decision.model.id == current_model_id
-                or decision.model.capability_score <= current_spec.capability_score
+                or effective_capability_score(decision.model, task.role)
+                <= current_capability
             ):
                 continue  # no genuine upgrade available — leave it FAILED
 
@@ -1338,6 +1344,8 @@ class Orchestrator:
             artifact_payload["role"] = task.role
             artifact_payload["review_escalated_from_model"] = current_model_id
             artifact_payload["review_escalation_attempt"] = attempts
+            artifact_payload["registry_path"] = str(registry_path)
+            artifact_payload["registry_digest"] = registry_epoch
             self.store.save_artifact(
                 Artifact(
                     job_id=job.id,
@@ -1422,19 +1430,23 @@ class Orchestrator:
         Keeping the first artifact seen meant a stale failure reason could win
         after a retry produced a newer one; compare created_at so the most
         recent recoverable failure per task is the one reported."""
-        out: dict[str, str] = {}
-        latest_at: dict[str, str] = {}
+        latest: dict[str, tuple[str, int, object]] = {}
         if artifacts is None:
             artifacts = self.store.list_artifacts(job.id)
-        for artifact in artifacts:
+        for index, artifact in enumerate(artifacts):
             failure = (artifact.payload or {}).get("failure")
-            if failure not in RECOVERABLE_FAILURES:
+            if not failure:
                 continue
             task_id = artifact.task_id
-            if task_id not in latest_at or artifact.created_at > latest_at[task_id]:
-                latest_at[task_id] = artifact.created_at
-                out[task_id] = str(failure)
-        return out
+            candidate = (artifact.created_at, index, failure)
+            previous = latest.get(task_id)
+            if previous is None or candidate[:2] > previous[:2]:
+                latest[task_id] = candidate
+        return {
+            task_id: str(failure)
+            for task_id, (_created_at, _index, failure) in latest.items()
+            if failure in RECOVERABLE_FAILURES
+        }
 
     def _has_hard_failure(
         self,
@@ -1530,6 +1542,7 @@ class Orchestrator:
 
     def _create_tasks(self, job: Job, specs: list[WorkerSpec]) -> list[Task]:
         specs, routing_decisions = self._apply_auto_routing(job, specs)
+        specs = self._bind_explicit_model_pins(specs)
         self._enforce_platform_lock(job, specs)
         tasks_by_role: dict[str, Task] = {}
         for spec in specs:
@@ -1591,6 +1604,32 @@ class Orchestrator:
         self._emit_routing_artifacts(job, tasks_by_role, routing_decisions)
         self._emit_predicted_conflicts(job, tasks)
         return tasks
+
+    @staticmethod
+    def _bind_explicit_model_pins(specs: list[WorkerSpec]) -> list[WorkerSpec]:
+        """Resolve non-routed model pins before any task is persisted."""
+        from puppetmaster.routing_authority import resolve_and_bind_explicit_pin
+
+        bound: list[WorkerSpec] = []
+        for spec in specs:
+            payload = dict(spec.payload or {})
+            if (
+                payload.get("auto_route")
+                or not str(payload.get("model") or payload.get("pinned_model") or "").strip()
+                or spec.adapter not in _MODEL_BACKED_ADAPTERS
+            ):
+                bound.append(spec)
+                continue
+            bound.append(
+                replace(
+                    spec,
+                    payload=resolve_and_bind_explicit_pin(
+                        payload,
+                        adapter=spec.adapter,
+                    ),
+                )
+            )
+        return bound
 
     def _final_job_status(self, job: Job) -> JobStatus:
         """COMPLETE only when at least one task actually completed.
@@ -1774,21 +1813,35 @@ class Orchestrator:
         result: list[WorkerSpec] = []
         decisions: list[tuple[str, dict]] = []
         registry_cache: Optional[list] = None
+        registry_authority_cache: Optional[list] = None
         registry_path: Optional[Path] = None
         registry_reconciliation: Optional[RegistryReconciliation] = None
         empty_registry_announced = False
         for spec in specs:
-            payload = spec.payload or {}
+            payload = dict(spec.payload or {})
             if not payload.get("auto_route"):
                 result.append(spec)
                 continue
-            if registry_cache is None:
-                registry_path_override = payload.get("registry_path")
-                registry_path = (
-                    Path(str(registry_path_override)).expanduser()
-                    if registry_path_override
-                    else default_registry_path()
-                )
+            # auto_route is authoritative. Clear every stale explicit-pin and
+            # prior-route identity before classification so an old pin cannot
+            # suppress later fallback/escalation or override the fresh pick.
+            for stale_key in (
+                "model",
+                "router_model_id",
+                "pinned_model",
+                "pinned_adapter_model_name",
+            ):
+                payload.pop(stale_key, None)
+            spec = replace(spec, payload=payload)
+            registry_path_override = payload.get("registry_path")
+            requested_registry_path = (
+                Path(str(registry_path_override)).expanduser().resolve()
+                if registry_path_override
+                else default_registry_path().expanduser().resolve()
+            )
+            if registry_cache is None or registry_path != requested_registry_path:
+                registry_path = requested_registry_path
+                registry_reconciliation = None
                 registry_cache = load_registry(registry_path)
                 from puppetmaster.static_catalog import reconcile_agentic_catalog
 
@@ -1803,6 +1856,11 @@ class Orchestrator:
                         save_registry(registry_cache, registry_path)
                     except Exception:
                         pass
+                # Bind the same coherent registry epoch that supplied the
+                # route. Later billing/CLI eligibility views may filter or
+                # annotate candidates, but must not trigger a second authority
+                # read that can race with registry replacement.
+                registry_authority_cache = list(registry_cache)
                 self._emit_agentic_catalog_event(job, agentic_report)
                 if registry_cache:
                     registry_reconciliation = reconcile_registry(registry_cache)
@@ -1875,7 +1933,12 @@ class Orchestrator:
             policy = payload.get("routing_policy") or "balanced"
             signals = signals_from_worker_spec(spec)
             try:
-                decision = route_task(signals, registry_cache, policy=policy)
+                decision = route_task(
+                    signals,
+                    registry_cache,
+                    policy=policy,
+                    shadow_policy=payload.get("shadow_policy"),
+                )
             except NoEligibleModelError as exc:
                 self.store.emit(
                     job.id,
@@ -1898,7 +1961,29 @@ class Orchestrator:
                 result.append(spec)
                 continue
 
-            new_payload = merge_routing_payload(payload, decision)
+            from puppetmaster.routing_authority import bind_registry_authority
+
+            authority_registry = list(registry_authority_cache or [])
+            selected_authority = next(
+                (
+                    model
+                    for model in authority_registry
+                    if model.id == decision.model.id and model.is_routable
+                ),
+                None,
+            )
+            if selected_authority is None:
+                from puppetmaster.routing_authority import RegistryAuthorityError
+
+                raise RegistryAuthorityError(
+                    "initial route selected a model absent or unroutable in "
+                    f"the bound registry snapshot: {decision.model.id}"
+                )
+            new_payload = bind_registry_authority(
+                merge_routing_payload(payload, decision),
+                registry_path,
+                authority_registry,
+            )
             routed_spec = replace(
                 spec,
                 adapter=decision.model.adapter,
@@ -1915,6 +2000,7 @@ class Orchestrator:
                     )
             artifact_payload["role"] = spec.role
             artifact_payload["registry_path"] = str(registry_path) if registry_path else None
+            artifact_payload["registry_digest"] = new_payload["registry_digest"]
             decisions.append((spec.role, artifact_payload))
 
         return result, decisions

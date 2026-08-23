@@ -26,6 +26,18 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
+
+def _persist_test_registry(root, models):
+    """Write a real registry authority and return its durable payload fields."""
+    from puppetmaster.model_registry import registry_digest, save_registry
+
+    path = Path(root) / "models.json"
+    save_registry(models, path)
+    return {
+        "registry_path": str(path),
+        "registry_digest": registry_digest(models),
+    }
+
 # Hermetic tests: the orchestrator's first-run plan-catalog auto-discovery
 # shells out to the Cursor SDK (node) when CURSOR_API_KEY is set. The suite
 # must never make that network/subprocess call implicitly — tests that
@@ -9119,7 +9131,7 @@ class ModelRouterTests(unittest.TestCase):
         decision = route_task(signal, self._three_tier_registry(), policy="balanced")
         self.assertEqual(decision.model.id, "frontier-model")
 
-    def test_cheap_policy_always_picks_lowest_cost(self) -> None:
+    def test_cheap_policy_picks_cheapest_sufficient_model(self) -> None:
         from puppetmaster.router import TaskSignals, route_task
 
         signal = TaskSignals(
@@ -9127,8 +9139,11 @@ class ModelRouterTests(unittest.TestCase):
             role="audit",
         )
         decision = route_task(signal, self._three_tier_registry(), policy="cheap")
-        # Even though the task needs high capability, cheap policy ignores fit.
-        self.assertEqual(decision.model.id, "cheap-model")
+        self.assertEqual(decision.model.id, "frontier-model")
+        absolute = route_task(
+            signal, self._three_tier_registry(), policy="absolute-cheapest"
+        )
+        self.assertEqual(absolute.model.id, "cheap-model")
 
     def test_quality_policy_always_picks_highest_capability(self) -> None:
         from puppetmaster.router import TaskSignals, route_task
@@ -16418,43 +16433,29 @@ class PreflightTests(unittest.TestCase):
             self.assertIn("live_probe:registry_pin_fallback", result.evidence)
             self.assertIn("live_probe:billing_or_quota", result.evidence)
 
-    def test_ambiguous_model_pin_fails_closed_in_preflight(self) -> None:
+    def test_ambiguous_model_identity_fails_closed_at_registry_write(self) -> None:
         from puppetmaster.model_registry import ModelSpec, save_registry
-        from puppetmaster.preflight import preflight_check
 
         with TemporaryDirectory() as tmp:
             registry_path = Path(tmp) / "models.json"
-            save_registry(
-                [
-                    ModelSpec(
-                        id="cursor/grok-a",
-                        adapter="cursor",
-                        adapter_model_name="grok-a",
-                        enabled=True,
-                    ),
-                    ModelSpec(
-                        id="cursor/grok-a-alt",
-                        adapter="cursor",
-                        adapter_model_name="grok-a",
-                        enabled=True,
-                    ),
-                ],
-                registry_path,
-            )
-            with patch.dict(
-                os.environ,
-                {"PUPPETMASTER_MODELS_PATH": str(registry_path)},
-                clear=False,
-            ):
-                result = preflight_check(
-                    "cursor",
-                    "grok-a",
-                    env={"CURSOR_API_KEY": "k"},
-                    catalog_fetcher=lambda: [{"id": "grok-a"}],
+            with self.assertRaisesRegex(ValueError, "ambiguous model identity"):
+                save_registry(
+                    [
+                        ModelSpec(
+                            id="cursor/grok-a",
+                            adapter="cursor",
+                            adapter_model_name="grok-a",
+                            enabled=True,
+                        ),
+                        ModelSpec(
+                            id="cursor/grok-a-alt",
+                            adapter="cursor",
+                            adapter_model_name="grok-a",
+                            enabled=True,
+                        ),
+                    ],
+                    registry_path,
                 )
-            self.assertFalse(result.ok)
-            self.assertIn("ambiguous model pin", result.reason)
-            self.assertIn("preflight:ambiguous_model_pin", result.evidence)
 
     def test_probe_cursor_uses_devnull_utf8_and_hidden_console(self) -> None:
         import subprocess
@@ -18739,16 +18740,22 @@ class WorkerRuntimeFailureStatusTests(unittest.TestCase):
             self.assertEqual(orch._final_job_status(job), JobStatus.COMPLETE)
 
 class AutoFallbackTests(unittest.TestCase):
-    def _setup(self, tmp):
+    def _setup(self, tmp, registry=None):
         from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
         from puppetmaster.store import SwarmStore
 
         store = SwarmStore(Path(tmp) / ".puppetmaster")
         job = store.create_job("fix the bug")
+        authority = _persist_test_registry(tmp, registry) if registry is not None else {}
         task = Task(
             job_id=job.id, role="implement", instruction="implement the fix",
             adapter="claude-code", status=TaskStatus.FAILED,
-            payload={"auto_route": True, "model": "claude-opus-4-8"},
+            payload={
+                "auto_route": True,
+                "model": "claude-opus-4-8",
+                "router_model_id": "claude-code/opus-4-8",
+                **authority,
+            },
         )
         store.save_task(task)
         store.save_artifact(Artifact(
@@ -18777,10 +18784,9 @@ class AutoFallbackTests(unittest.TestCase):
             return BillingStatus(adapter=adapter, billing="unknown", healthy=False, detail="no", evidence=[])
 
         with TemporaryDirectory() as tmp:
-            store, job, task = self._setup(tmp)
+            store, job, task = self._setup(tmp, registry)
             orch = Orchestrator(store)
-            with patch("puppetmaster.model_registry.load_registry", return_value=registry), \
-                 patch("puppetmaster.platform_billing.detect_adapter_billing", side_effect=_billing):
+            with patch("puppetmaster.platform_billing.detect_adapter_billing", side_effect=_billing):
                 rerouted = orch._reroute_recoverable_failures(job)
             self.assertEqual(rerouted, 1)
             updated = store.get_task_by_id(task.id)
@@ -18978,7 +18984,12 @@ class AutoFallbackTests(unittest.TestCase):
                 instruction="implement the fix",
                 adapter="cursor",
                 status=TaskStatus.FAILED,
-                payload={"auto_route": True, "model": "x", "router_model_id": "cursor/x"},
+                payload={
+                    "auto_route": True,
+                    "model": "x",
+                    "router_model_id": "cursor/x",
+                    **_persist_test_registry(tmp, registry),
+                },
             )
             store.save_task(task)
             store.save_artifact(
@@ -18998,8 +19009,7 @@ class AutoFallbackTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             store, job, task = _make(tmp)
             orch = Orchestrator(store)
-            with patch("puppetmaster.model_registry.load_registry", return_value=registry), \
-                 patch("puppetmaster.platform_billing.detect_adapter_billing", side_effect=_healthy), \
+            with patch("puppetmaster.platform_billing.detect_adapter_billing", side_effect=_healthy), \
                  patch("puppetmaster.platform_lock.is_adapter_enabled", return_value=True), \
                  patch("puppetmaster.preflight.adapter_cli_present", return_value=False):
                 rerouted = orch._reroute_recoverable_failures(job)
@@ -19010,8 +19020,7 @@ class AutoFallbackTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             store, job, task = _make(tmp)
             orch = Orchestrator(store)
-            with patch("puppetmaster.model_registry.load_registry", return_value=registry), \
-                 patch("puppetmaster.platform_billing.detect_adapter_billing", side_effect=_healthy), \
+            with patch("puppetmaster.platform_billing.detect_adapter_billing", side_effect=_healthy), \
                  patch("puppetmaster.platform_lock.is_adapter_enabled", return_value=True), \
                  patch("puppetmaster.preflight.adapter_cli_present", return_value=True):
                 rerouted = orch._reroute_recoverable_failures(job)
@@ -19074,6 +19083,7 @@ class AutoFallbackTests(unittest.TestCase):
                     "auto_route": True,
                     "model": "claude-fable-5",
                     "router_model_id": "claude-code/fable-5",
+                    **_persist_test_registry(tmp, registry),
                 },
             )
             store.save_task(task)
@@ -19094,8 +19104,7 @@ class AutoFallbackTests(unittest.TestCase):
                 )
             )
             orch = Orchestrator(store)
-            with patch("puppetmaster.model_registry.load_registry", return_value=registry), \
-                 patch("puppetmaster.platform_billing.detect_adapter_billing", side_effect=_billing):
+            with patch("puppetmaster.platform_billing.detect_adapter_billing", side_effect=_billing):
                 rerouted = orch._reroute_recoverable_failures(job)
             self.assertEqual(rerouted, 1)
             updated = store.get_task_by_id(task.id)
@@ -19160,6 +19169,7 @@ class AutoFallbackTests(unittest.TestCase):
                     "auto_route": True,
                     "model": "claude-fable-5",
                     "router_model_id": "claude-code/fable-5",
+                    **_persist_test_registry(tmp, registry),
                 },
             )
             store.save_task(task)
@@ -19180,8 +19190,7 @@ class AutoFallbackTests(unittest.TestCase):
                 )
             )
             orch = Orchestrator(store)
-            with patch("puppetmaster.model_registry.load_registry", return_value=registry), \
-                 patch("puppetmaster.platform_billing.detect_adapter_billing", side_effect=_billing), \
+            with patch("puppetmaster.platform_billing.detect_adapter_billing", side_effect=_billing), \
                  patch("puppetmaster.platform_billing.detect_adapter_billing_cached", side_effect=_billing), \
                  patch("puppetmaster.preflight.adapter_cli_present", return_value=True), \
                  patch("puppetmaster.platform_lock.is_adapter_enabled", return_value=True):
@@ -19209,10 +19218,9 @@ class AutoFallbackTests(unittest.TestCase):
             return BillingStatus(adapter=adapter, billing="unknown", healthy=False, detail="no", evidence=[])
 
         with TemporaryDirectory() as tmp:
-            store, job, task = self._setup(tmp)
+            store, job, task = self._setup(tmp, registry)
             orch = Orchestrator(store)
-            with patch("puppetmaster.model_registry.load_registry", return_value=registry), \
-                 patch("puppetmaster.platform_billing.detect_adapter_billing", side_effect=_billing):
+            with patch("puppetmaster.platform_billing.detect_adapter_billing", side_effect=_billing):
                 rerouted = orch._reroute_recoverable_failures(job)
             self.assertEqual(rerouted, 0)
 
@@ -20359,7 +20367,12 @@ class AutoEscalationTests(unittest.TestCase):
 
         store = SwarmStore(Path(tmp) / ".puppetmaster")
         job = store.create_job("do the work")
-        payload = {"auto_route": True, "router_model_id": model_id, "model": "x"}
+        payload = {
+            "auto_route": True,
+            "router_model_id": model_id,
+            "model": "x",
+            **_persist_test_registry(tmp, self._registry()),
+        }
         payload.update(payload_extra or {})
         task = Task(
             job_id=job.id, role="implement", instruction="implement the thing",
@@ -20392,8 +20405,7 @@ class AutoEscalationTests(unittest.TestCase):
         from puppetmaster.orchestrator import Orchestrator
 
         orch = Orchestrator(store)
-        with patch("puppetmaster.model_registry.load_registry", return_value=self._registry()), \
-             patch("puppetmaster.platform_billing.detect_adapter_billing", side_effect=self._plan_billing), \
+        with patch("puppetmaster.platform_billing.detect_adapter_billing", side_effect=self._plan_billing), \
              patch("puppetmaster.platform_lock.is_adapter_enabled", return_value=True):
             return orch._reroute_low_confidence(job)
 
@@ -20514,7 +20526,7 @@ class RoutingAuditTests(unittest.TestCase):
             escalated_from=escalated_from, fell_back=fell_back,
         )
 
-    def test_under_delivering_model_gets_lower_score_suggested(self) -> None:
+    def test_self_signal_is_diagnostic_only_not_routing_authority(self) -> None:
         from puppetmaster.audit import build_audit_report
 
         # weak/55 is the initial pick on 6 tasks; 4 escalate away to strong/80.
@@ -20530,12 +20542,10 @@ class RoutingAuditTests(unittest.TestCase):
         weak = next(m for m in report.models if m.model_id == "weak/55")
         self.assertEqual(weak.selections, 6)  # 2 retained + 4 escalated away
         self.assertAlmostEqual(weak.escalated_away_rate, 4 / 6, places=2)
-        self.assertIn("under-provisioned", weak.flags)
-        self.assertIsNotNone(weak.suggested_score)
-        self.assertLess(weak.suggested_score, 55)
-        sug = report.suggestions
-        self.assertEqual(len(sug), 1)
-        self.assertEqual(sug[0]["model_id"], "weak/55")
+        self.assertEqual(weak.flags, ["weak-self-signal"])
+        self.assertIsNone(weak.suggested_score)
+        self.assertEqual(report.suggestions, [])
+        self.assertEqual(report.role_scorecard_suggestions, [])
 
     def test_well_calibrated_model_gets_no_suggestion(self) -> None:
         from puppetmaster.audit import build_audit_report
@@ -20759,7 +20769,7 @@ class RoutingAuditTests(unittest.TestCase):
             weak = next(m for m in report.models if m.model_id == "weak/55")
             self.assertEqual(weak.escalated_away, 1)
 
-    def test_cli_apply_writes_lowered_score(self) -> None:
+    def test_cli_apply_ignores_nonobjective_self_signal(self) -> None:
         import argparse
 
         from puppetmaster.cli import _run_audit_command
@@ -20825,9 +20835,10 @@ class RoutingAuditTests(unittest.TestCase):
             )
             rc = _run_audit_command(args, store)
             self.assertEqual(rc, 0)
-            after = {s.id: s.capability_score for s in load_registry(registry_path)}
-            self.assertLess(after["weak/55"], 55)  # lowered
-            self.assertEqual(after["strong/80"], 80)  # untouched
+            after = {s.id: s for s in load_registry(registry_path)}
+            self.assertEqual(after["weak/55"].capability_score, 55)
+            self.assertEqual(after["strong/80"].capability_score, 80)
+            self.assertEqual(after["weak/55"].role_scorecards, {})
 
 class CodegraphUsageTests(unittest.TestCase):
     """The local, numbers-only codegraph usage log + its aggregation."""
@@ -23521,6 +23532,10 @@ class ReviewGateTests(unittest.TestCase):
             ModelSpec(id="cursor/gpt-5-5", adapter="cursor", adapter_model_name="gpt-5.5", capability_score=90, billing="plan", tags=["cursor"]),
         ]
 
+    def _task_with_registry(self, tmp, registry=None, **payload):
+        models = self._registry() if registry is None else registry
+        return self._task(**payload, **_persist_test_registry(tmp, models))
+
     # ----- pure helpers -----
 
     def test_build_review_prompt_contains_intent_diff_and_contract(self) -> None:
@@ -23553,21 +23568,23 @@ class ReviewGateTests(unittest.TestCase):
     def test_resolve_judge_picks_cheapest_strictly_stronger(self) -> None:
         from puppetmaster.gates import resolve_judge_model
 
-        with patch("puppetmaster.model_registry.load_registry", return_value=self._registry()), \
-             patch("puppetmaster.platform_lock.is_adapter_enabled", return_value=True):
-            judge = resolve_judge_model(
-                self._task(router_model_id="cursor/composer-2-5"), {}
-            )
+        with TemporaryDirectory() as tmp, patch(
+            "puppetmaster.platform_lock.is_adapter_enabled", return_value=True
+        ):
+            judge = resolve_judge_model(self._task_with_registry(
+                tmp, router_model_id="cursor/composer-2-5"
+            ), {})
         self.assertEqual(judge.id, "cursor/gpt-5-5")
 
     def test_resolve_judge_peer_when_implementer_top_tier(self) -> None:
         from puppetmaster.gates import resolve_judge_model
 
-        with patch("puppetmaster.model_registry.load_registry", return_value=self._registry()), \
-             patch("puppetmaster.platform_lock.is_adapter_enabled", return_value=True):
-            judge = resolve_judge_model(
-                self._task(router_model_id="cursor/gpt-5-5"), {}
-            )
+        with TemporaryDirectory() as tmp, patch(
+            "puppetmaster.platform_lock.is_adapter_enabled", return_value=True
+        ):
+            judge = resolve_judge_model(self._task_with_registry(
+                tmp, router_model_id="cursor/gpt-5-5"
+            ), {})
         # No strictly-stronger model exists; the strongest available (the peer
         # top tier) is used rather than skipping review entirely.
         self.assertEqual(judge.id, "cursor/gpt-5-5")
@@ -23575,8 +23592,9 @@ class ReviewGateTests(unittest.TestCase):
     def test_resolve_judge_none_without_registry(self) -> None:
         from puppetmaster.gates import resolve_judge_model
 
-        with patch("puppetmaster.model_registry.load_registry", return_value=[]):
-            self.assertIsNone(resolve_judge_model(self._task(), {}))
+        with TemporaryDirectory() as tmp:
+            task = self._task_with_registry(tmp, [], router_model_id="cursor/missing")
+            self.assertIsNone(resolve_judge_model(task, {}))
 
     def test_default_judge_disabled_without_env(self) -> None:
         from unittest.mock import Mock
@@ -23695,26 +23713,52 @@ class ReviewGateTests(unittest.TestCase):
             self.assertEqual(verdict["quality"], "blocked")
             self.assertFalse(verdict["trustworthy"])
 
-    def test_gate_skips_when_no_diff(self) -> None:
+    def test_requested_review_blocks_when_no_diff(self) -> None:
         from puppetmaster.gates import ReviewVerdict
 
         with TemporaryDirectory() as tmp:
-            # Judge would reject, but there's no diff so the gate never consults it.
+            # No judge can review an absent diff, so an explicitly requested
+            # review remains unsatisfied rather than becoming a false pass.
             evald = self._eval_review(
                 tmp, with_change=False,
                 judge_verdict=ReviewVerdict(available=True, passed=False),
             )
-            self.assertTrue(evald.passed)
+            self.assertFalse(evald.passed)
+            self.assertIn("requested review unavailable: no diff", evald.failed_reason)
+            review = [
+                a for a in evald.artifacts if (a.payload or {}).get("kind") == "review"
+            ]
+            self.assertEqual(len(review), 1)
+            self.assertEqual(review[0].payload["review_status"], "unavailable")
+            self.assertTrue(review[0].payload["review_requested"])
+            self.assertTrue(review[0].payload["review_required"])
+            self.assertNotIn("judge_identity", review[0].payload)
 
-    def test_gate_skips_when_judge_unavailable(self) -> None:
+    def test_requested_review_blocks_when_judge_unavailable(self) -> None:
         from puppetmaster.gates import ReviewVerdict
 
         with TemporaryDirectory() as tmp:
             evald = self._eval_review(
                 tmp, with_change=True,
-                judge_verdict=ReviewVerdict(available=False, passed=True),
+                judge_verdict=ReviewVerdict(
+                    available=False,
+                    passed=True,
+                    reasons=["judge process unavailable"],
+                ),
             )
-            self.assertTrue(evald.passed)
+            self.assertFalse(evald.passed)
+            self.assertIn("requested review unavailable", evald.failed_reason)
+            review = [
+                a for a in evald.artifacts if (a.payload or {}).get("kind") == "review"
+            ]
+            self.assertEqual(len(review), 1)
+            payload = review[0].payload
+            self.assertEqual(payload["review_status"], "unavailable")
+            self.assertEqual(payload["judge"], "cursor/gpt-5-5")
+            self.assertEqual(payload["judge_model"], "cursor/gpt-5-5")
+            self.assertTrue(payload["review_requested"])
+            self.assertTrue(payload["review_required"])
+            self.assertFalse(payload["passed"])
 
     def test_deterministic_sampling(self) -> None:
         from puppetmaster.gates import _review_sampled
@@ -24045,7 +24089,13 @@ class ReviewEscalationTests(unittest.TestCase):
 
         store = SwarmStore(Path(tmp) / ".puppetmaster")
         job = store.create_job("do the work")
-        payload = {"auto_route": True, "router_model_id": model_id, "model": "x", "mode": "implement"}
+        payload = {
+            "auto_route": True,
+            "router_model_id": model_id,
+            "model": "x",
+            "mode": "implement",
+            **_persist_test_registry(tmp, self._registry()),
+        }
         payload.update(payload_extra or {})
         task = Task(
             job_id=job.id, role="implement", instruction="implement the thing",
@@ -24063,8 +24113,7 @@ class ReviewEscalationTests(unittest.TestCase):
         from puppetmaster.orchestrator import Orchestrator
 
         orch = Orchestrator(store)
-        with patch("puppetmaster.model_registry.load_registry", return_value=self._registry()), \
-             patch("puppetmaster.platform_billing.detect_adapter_billing", side_effect=self._plan_billing), \
+        with patch("puppetmaster.platform_billing.detect_adapter_billing", side_effect=self._plan_billing), \
              patch("puppetmaster.platform_lock.is_adapter_enabled", return_value=True):
             return orch._reroute_failed_review(job)
 

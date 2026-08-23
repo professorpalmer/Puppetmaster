@@ -217,30 +217,41 @@ def merge_api_catalog_into_registry(
     in the catalog — we only *add* newly-discovered ones and refresh overlays.
     Non-matching adapters and hand-tuned entries are preserved untouched."""
     discovered = catalog_to_specs(adapter, billing, catalog, existing)
-    discovered_by_name = {s.adapter_model_name: s for s in discovered}
-
-    existing_names = {
-        s.adapter_model_name for s in existing if s.adapter == adapter
+    discovered_by_identity = {
+        normalize_model_token(s.adapter_model_name): s for s in discovered
     }
-    added = sorted(discovered_by_name.keys() - existing_names)
+
+    existing_identities = {
+        normalize_model_token(s.adapter_model_name)
+        for s in existing
+        if s.adapter == adapter
+    }
+    added = sorted(
+        spec.adapter_model_name
+        for identity, spec in discovered_by_identity.items()
+        if identity not in existing_identities
+    )
 
     merged: list[ModelSpec] = []
     seen: set[str] = set()
     for spec in existing:
-        if spec.adapter == adapter and spec.adapter_model_name in discovered_by_name:
-            merged.append(discovered_by_name[spec.adapter_model_name])
-            seen.add(spec.adapter_model_name)
+        identity = normalize_model_token(spec.adapter_model_name)
+        if spec.adapter == adapter and identity in discovered_by_identity:
+            merged.append(discovered_by_identity[identity])
+            seen.add(identity)
         else:
             merged.append(spec)
-    for name, spec in discovered_by_name.items():
-        if name not in seen:
+    for identity, spec in discovered_by_identity.items():
+        if identity not in seen:
             merged.append(spec)
 
     report = {
         "adapter": adapter,
         "discovered_count": len(discovered),
         "added": added,
-        "refreshed": sorted(seen),
+        "refreshed": sorted(
+            discovered_by_identity[identity].adapter_model_name for identity in seen
+        ),
         "preserved": len([s for s in existing if s.adapter != adapter]),
     }
     return merged, report

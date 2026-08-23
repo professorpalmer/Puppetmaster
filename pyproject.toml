@@ -74,6 +74,7 @@ exclude = ["node_modules*", "docs*", "examples*", "tests*"]
 # copy it into ~/.hermes/plugins (a fresh pip install otherwise has no plugin).
 puppetmaster = [
   "*.mjs",
+  "routing_roles.json",
   "skills/**/*.md",
   "skills/**/*",
   "hermes_plugin/**/*.py",
