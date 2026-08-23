@@ -7,6 +7,7 @@ model, provider credential, or CLI installation.
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
@@ -24,6 +25,18 @@ from puppetmaster.workers import WorkerSpec
 
 
 class RecoveryPinGovernanceTests(TestCase):
+    def _assert_same_path(self, actual, expected) -> None:
+        """Compare registry paths after resolving 8.3 / /private aliases."""
+        actual_path = Path(actual)
+        expected_path = Path(expected)
+        if actual_path.exists() and expected_path.exists():
+            self.assertTrue(
+                os.path.samefile(actual_path, expected_path),
+                f"{actual_path} is not the same file as {expected_path}",
+            )
+            return
+        self.assertEqual(actual_path.resolve(), expected_path.resolve())
+
     @staticmethod
     def _store_job(root: str, goal: str = "govern routed work"):
         store = SwarmStore(Path(root) / ".puppetmaster")
@@ -182,7 +195,7 @@ class RecoveryPinGovernanceTests(TestCase):
             self.assertNotIn("pinned_model", task.payload)
             self.assertNotIn("pinned_adapter_model_name", task.payload)
             self.assertFalse(_payload_has_explicit_model_pin(task.payload))
-            self.assertEqual(Path(task.payload["registry_path"]), registry_path)
+            self._assert_same_path(task.payload["registry_path"], registry_path)
             self.assertEqual(task.payload["registry_digest"], registry_digest(models))
 
     def test_initial_route_and_bound_digest_describe_the_same_registry_snapshot(self) -> None:
@@ -262,7 +275,7 @@ class RecoveryPinGovernanceTests(TestCase):
             self.assertEqual(task.payload["pinned_model"], "cursor/current")
             self.assertEqual(task.payload["router_model_id"], "cursor/current")
             self.assertEqual(task.payload["model"], "current")
-            self.assertEqual(Path(task.payload["registry_path"]), registry_path)
+            self._assert_same_path(task.payload["registry_path"], registry_path)
             self.assertEqual(task.payload["registry_digest"], registry_digest(models))
 
     def test_retired_explicit_pin_is_rejected_before_task_is_persisted(self) -> None:
@@ -400,7 +413,7 @@ class RecoveryPinGovernanceTests(TestCase):
             dispatched = worker.return_value.run.call_args.args[0]
             self.assertEqual(dispatched.payload["pinned_model"], "cursor/current")
             self.assertEqual(dispatched.payload["router_model_id"], "cursor/current")
-            self.assertEqual(Path(dispatched.payload["registry_path"]), registry_path)
+            self._assert_same_path(dispatched.payload["registry_path"], registry_path)
             self.assertEqual(
                 dispatched.payload["registry_digest"], registry_digest(models)
             )
@@ -589,7 +602,7 @@ class RecoveryPinGovernanceTests(TestCase):
             updated = store.get_task_by_id(task.id)
             self.assertEqual(updated.payload["router_model_id"], "claude-code/recovery")
             self.assertEqual(updated.payload["fallback_from_model"], "cursor/failed")
-            self.assertEqual(Path(updated.payload["registry_path"]), registry_path)
+            self._assert_same_path(updated.payload["registry_path"], registry_path)
             self.assertEqual(updated.payload["registry_digest"], registry_digest(models))
             artifacts = [
                 artifact
@@ -655,7 +668,7 @@ class RecoveryPinGovernanceTests(TestCase):
             updated = store.get_task_by_id(task.id)
             self.assertEqual(updated.payload["router_model_id"], "cursor/role-stronger")
             self.assertEqual(updated.payload["escalated_from_model"], "cursor/current")
-            self.assertEqual(Path(updated.payload["registry_path"]), registry_path)
+            self._assert_same_path(updated.payload["registry_path"], registry_path)
             self.assertEqual(updated.payload["registry_digest"], registry_digest(models))
             artifact = next(
                 item
@@ -723,7 +736,7 @@ class RecoveryPinGovernanceTests(TestCase):
             self.assertEqual(
                 updated.payload["review_escalated_from_model"], "cursor/current"
             )
-            self.assertEqual(Path(updated.payload["registry_path"]), registry_path)
+            self._assert_same_path(updated.payload["registry_path"], registry_path)
             self.assertEqual(updated.payload["registry_digest"], registry_digest(models))
             artifact = next(
                 item
