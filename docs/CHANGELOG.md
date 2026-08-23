@@ -1,3 +1,52 @@
+## v1.22.27 — 2026-08-23
+
+**Fix: a dashboard could confidently serve the wrong project's state dir, and
+nothing said so.**
+
+`default_state_dir` hashes the git root of the caller's cwd *or* the cwd itself,
+so a session opened at a non-git wrapper folder above the checkout took the
+fallback and forked one logical project into two state dirs — a near-empty one
+the dashboard showed and the busy one every job actually wrote to. The two boards
+were pixel-identical and neither the CLI, the MCP tool, nor doctor contradicted
+the empty one. The dashboard header now carries a project tag —
+`<slug> · <first 8 hex of the state dir digest>`, rendered from `/api/meta` by a
+pure `projectLabel()` — and the same label goes in the browser tab title, so
+adjacent boards are distinguishable from the tab strip and the taskbar. The 8 hex
+digits are load-bearing: the two forked dirs differed only by letter case once
+the digest was stripped. **No existing state directory path changes** —
+repointing a hash would orphan live job history.
+
+- **Warn-only detection.** New `puppetmaster/state_health.py`
+  (`diagnose_state_dir`, `short_warning`) returns a verdict from a closed set
+  over directory stats only — no SQLite, and no `git` subprocess when the caller
+  supplies the state dir. It resolves nothing and moves nothing. `doctor` reports
+  it as a **state-identity** row (`warn` when forked, `optional` for a new or
+  explicitly pinned dir, `ok` otherwise), alongside the existing `sqlite-state` row (which still reports the DB file).
+  `sqlite-state` can still call a near-empty forked dir a benign "no local sqlite
+  state yet"; `state-identity` is the row that contradicts that.
+- **Three warning surfaces.** A `WARNING:` line on stderr when `serve()` starts,
+  directly after the `Reading durable state from:` line it contradicts (stderr
+  because that is what `--background` and the MCP launch redirect into
+  `dashboard.err.log`); a `state_dir_may_be_wrong` warning plus an appended
+  remedy in `run_dashboard`'s note, advisory and never `isError` since the server
+  did start; and an escaped in-page banner. Every message is basenames and counts
+  only — an absolute state dir carries the username and gets quoted verbatim into
+  agent transcripts.
+- **`/api/diagnostics`, deliberately not `/api/meta`.** The identity route is
+  what every reuse check depends on: `dashboard_identity` reads a bounded body
+  under a one-second timeout, so a slow or oversized response there degrades to
+  "not my dashboard" and the CLI and MCP spawn duplicate dashboards. The
+  filesystem walk lives behind its own TTL-cached route instead. Both routes gate
+  the human-readable basename to loopback, so a `--mobile` peer of an
+  unauthenticated board sees only a short state id.
+- **Never second-guessed.** An `--all-projects` board never warns (it serves
+  every project), and an explicit `--state-dir` or `PUPPETMASTER_STATE_DIR` is a
+  deliberate choice — only the hashed `projects/` layout can fork.
+- **Non-silent aggregation.** `list_all_projects_snapshot` reports a project it
+  cannot read instead of dropping it, so an `--all-projects` board showing less
+  than everything says so rather than erasing a project's job list with no log
+  line and no wire field.
+
 ## v1.22.26 — 2026-08-23
 
 **Fix: split artifact confidence into statuses so self-rating cannot admit memory or gists (#88).**
