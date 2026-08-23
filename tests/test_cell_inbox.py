@@ -31,9 +31,23 @@ from puppetmaster.mcp_server import handle_message, tools
 
 
 class CellInboxTests(unittest.TestCase):
-    def test_serial_inbox_two_enqueues_one_at_a_time(self) -> None:
+    @contextlib.contextmanager
+    def _cells(self):
+        """Cell registry whose sqlite handles are closed before rmdir.
+
+        Windows cannot unlink ``*.sqlite`` while a connection is open
+        (WinError 32). Product ``CellRegistry.close()`` checkpoints WAL
+        so TemporaryDirectory teardown succeeds on every platform.
+        """
         with TemporaryDirectory() as tmp:
             registry = CellRegistry(tmp)
+            try:
+                yield registry
+            finally:
+                registry.close()
+
+    def test_serial_inbox_two_enqueues_one_at_a_time(self) -> None:
+        with self._cells() as registry:
             first = registry.enqueue("job-alpha", "ping", {"n": 1})
             second = registry.enqueue("job-alpha", "ping", {"n": 2})
             self.assertLess(first, second)
@@ -55,8 +69,7 @@ class CellInboxTests(unittest.TestCase):
             self.assertEqual(event_a["id"] + 1, event_b["id"])
 
     def test_never_two_handlers_concurrently(self) -> None:
-        with TemporaryDirectory() as tmp:
-            registry = CellRegistry(tmp)
+        with self._cells() as registry:
             registry.enqueue("job-mutex", "hold", {"n": 1})
             registry.enqueue("job-mutex", "next", {"n": 2})
             started = threading.Event()
@@ -86,8 +99,7 @@ class CellInboxTests(unittest.TestCase):
             self.assertEqual(leftover["inbox_depth"], 1)
 
     def test_hibernate_then_alarm_resume(self) -> None:
-        with TemporaryDirectory() as tmp:
-            registry = CellRegistry(tmp)
+        with self._cells() as registry:
             registry.enqueue("job-sleep", "work", {"step": "once"})
             registry.process_one("job-sleep")
             hibernated = registry.status("job-sleep")
@@ -108,14 +120,13 @@ class CellInboxTests(unittest.TestCase):
             self.assertEqual(alarm["kind"], "alarm")
             registry.set_alarm("job-sleep", time.time() - 5)
             registry.hibernate("job-sleep")
-            store = type("Store", (), {"root": Path(tmp)})()
+            store = type("Store", (), {"root": registry.root})()
             polled = interned_poll(store)
             self.assertEqual(len(polled), 1)
             self.assertFalse(polled[0]["hibernating"])
 
     def test_inspectable_on_disk_sqlite(self) -> None:
-        with TemporaryDirectory() as tmp:
-            registry = CellRegistry(tmp)
+        with self._cells() as registry:
             registry.enqueue("job-disk", "note", {"hello": "world"})
             status = registry.status("job-disk")
             path = Path(status["path"])
@@ -123,7 +134,11 @@ class CellInboxTests(unittest.TestCase):
             self.assertTrue(is_sqlite_file(path))
             with path.open("rb") as handle:
                 self.assertEqual(handle.read(16), SQLITE_MAGIC)
-            with sqlite3.connect(str(path)) as connection:
+            # sqlite3.connect-as-context is a transaction manager: it does
+            # not close the OS handle. Close explicitly so Windows can
+            # later unlink the inspectable file (WinError 32 otherwise).
+            connection = sqlite3.connect(str(path))
+            try:
                 kinds = [
                     row[0]
                     for row in connection.execute("SELECT kind FROM inbox ORDER BY id")
@@ -133,27 +148,35 @@ class CellInboxTests(unittest.TestCase):
                     "SELECT value FROM cell_meta WHERE key = 'hibernating'"
                 ).fetchone()[0]
                 self.assertIn(hibernating, ("0", "1"))
+            finally:
+                connection.close()
             inspect = registry.inspect("job-disk")
             self.assertEqual(inspect["inbox_depth"], 1)
             self.assertEqual(inspect["inbox"][0]["kind"], "note")
             self.assertTrue(inspect["sqlite"])
+            registry.close()
+            path.unlink()
+            self.assertFalse(path.exists())
 
 
 class CellCliMcpTests(unittest.TestCase):
     def test_cli_cell_status_json(self) -> None:
         with TemporaryDirectory() as tmp:
             registry = CellRegistry(tmp)
-            registry.enqueue("job-cli", "ping", {"ok": True})
-            stdout = io.StringIO()
-            with contextlib.redirect_stdout(stdout):
-                code = cli_main(["--state-dir", tmp, "cell-status", "job-cli", "--json"])
-            self.assertEqual(code, 0)
-            payload = json.loads(stdout.getvalue())
-            self.assertEqual(payload["cell_id"], "job-cli")
-            self.assertEqual(payload["inbox_depth"], 1)
-            self.assertIn("hibernating", payload)
-            self.assertIn("next_alarm", payload)
-            self.assertTrue(Path(payload["path"]).is_file())
+            try:
+                registry.enqueue("job-cli", "ping", {"ok": True})
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    code = cli_main(["--state-dir", tmp, "cell-status", "job-cli", "--json"])
+                self.assertEqual(code, 0)
+                payload = json.loads(stdout.getvalue())
+                self.assertEqual(payload["cell_id"], "job-cli")
+                self.assertEqual(payload["inbox_depth"], 1)
+                self.assertIn("hibernating", payload)
+                self.assertIn("next_alarm", payload)
+                self.assertTrue(Path(payload["path"]).is_file())
+            finally:
+                registry.close()
 
     def test_mcp_tool_is_additive(self) -> None:
         names = {tool.name for tool in tools()}
