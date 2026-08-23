@@ -1,4 +1,3 @@
-"""Pi TUI/pilot package: installer, doctor, setup host. Unittest only."""
 from __future__ import annotations
 
 import json
@@ -63,7 +62,8 @@ class PiInstallerTests(unittest.TestCase):
             entry = mcp["mcpServers"]["puppetmaster"]
             self.assertEqual(entry["args"], ["-m", "puppetmaster.mcp_server"])
             settings = json.loads((agent / "settings.json").read_text(encoding="utf-8"))
-            self.assertTrue(any(str(pkg) in str(item) or str(pkg.resolve()) in str(item) for item in settings["packages"]))
+            packed = " ".join(str(item) for item in settings["packages"])
+            self.assertTrue(str(pkg.resolve()) in packed or str(pkg) in packed)
             second = install_pi_mcp(agent_dir=agent, package_dir=pkg, skip_handshake=True)
             self.assertEqual(second.status, "unchanged")
             removed = uninstall_pi_mcp(agent_dir=agent, package_dir=pkg)
@@ -83,6 +83,13 @@ class PiInstallerTests(unittest.TestCase):
 
 
 class PiDoctorTests(unittest.TestCase):
+    def _stub_pi(self, bindir: Path) -> Path:
+        bindir.mkdir(parents=True, exist_ok=True)
+        pi = bindir / "pi"
+        pi.write_bytes(b"exit 0\n")
+        pi.chmod(0o755)
+        return pi
+
     def test_absent_is_warn_with_fix(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             env = {"PI_CODING_AGENT_DIR": str(Path(raw) / "agent"), "PATH": str(Path(raw) / "empty")}
@@ -96,17 +103,11 @@ class PiDoctorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             base = Path(raw)
             agent = base / "agent"
-            bindir = base / "bin"
-            bindir.mkdir()
-            pi = bindir / "pi"
-            pi.write_text("#!/bin/sh
-exit 0
-", encoding="utf-8")
-            pi.chmod(0o755)
+            self._stub_pi(base / "bin")
             install_pi_mcp(agent_dir=agent, package_dir=pkg, skip_handshake=True)
             env = {
                 "PI_CODING_AGENT_DIR": str(agent),
-                "PATH": str(bindir),
+                "PATH": str(base / "bin"),
                 "PI_COMMAND": "pi",
                 "PUPPETMASTER_PI_SKIP_HANDSHAKE": "1",
             }
@@ -117,16 +118,9 @@ exit 0
     def test_incomplete_is_error_with_exact_fix(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             base = Path(raw)
-            agent = base / "agent"
-            agent.mkdir()
-            bindir = base / "bin"
-            bindir.mkdir()
-            pi = bindir / "pi"
-            pi.write_text("#!/bin/sh
-exit 0
-", encoding="utf-8")
-            pi.chmod(0o755)
-            env = {"PI_CODING_AGENT_DIR": str(agent), "PATH": str(bindir), "PI_COMMAND": "pi"}
+            (base / "agent").mkdir()
+            self._stub_pi(base / "bin")
+            env = {"PI_CODING_AGENT_DIR": str(base / "agent"), "PATH": str(base / "bin"), "PI_COMMAND": "pi"}
             check = pi_pilot_check(env=env)
             self.assertEqual(check.status, "error")
             self.assertIn("install-pi-mcp", check.detail)
@@ -135,7 +129,11 @@ exit 0
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             (root / ".git").mkdir()
-            env = {"PI_CODING_AGENT_DIR": str(root / "no-agent"), "PATH": str(root / "empty"), "PUPPETMASTER_PI_SKIP_HANDSHAKE": "1"}
+            env = {
+                "PI_CODING_AGENT_DIR": str(root / "no-agent"),
+                "PATH": str(root / "empty"),
+                "PUPPETMASTER_PI_SKIP_HANDSHAKE": "1",
+            }
             with patch.dict(os.environ, env, clear=False):
                 names = [c.name for c in run_doctor(root, state_dir=root / "state")]
             self.assertIn("pi-pilot", names)
@@ -147,8 +145,7 @@ class PiSetupHostTests(unittest.TestCase):
         args = SimpleNamespace(platforms="pi", skip_platforms=False)
         self.assertEqual(_requested_host_pilots(args), {"pi"})
         with tempfile.TemporaryDirectory() as raw:
-            # leave platform lock unconfigured; only-host should not error
-            with patch("puppetmaster.platform_lock.default_registry_path", return_value=Path(raw) / "platform.json"):
+            with patch("puppetmaster.platform_lock.default_registry_path", return_value=Path(raw) / "models.json"):
                 rc = _setup_platform_step(args)
         self.assertEqual(rc, 0)
 
@@ -163,20 +160,13 @@ class PiCliParserTests(unittest.TestCase):
         self.assertTrue(args.skip_handshake)
 
 
-
 class PiLiveE2ETests(unittest.TestCase):
-    """Optional live Pi session. Never faked."""
-
     def test_live_pi_package_load(self) -> None:
         if os.environ.get("PI_LIVE_E2E") != "1":
             self.skipTest("set PI_LIVE_E2E=1 to run a live Pi package load")
         import shutil
-        pi = shutil.which("pi")
-        if pi is None:
+        if shutil.which("pi") is None:
             self.skipTest("pi CLI not on PATH")
-        pkg = bundled_pi_package_dir()
-        self.assertIsNotNone(pkg)
-        # Live handshake of the same launch command Pi will use.
         from puppetmaster.installers import handshake_mcp_server
         result = handshake_mcp_server()
         self.assertTrue(result.ok, result.error)

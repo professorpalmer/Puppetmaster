@@ -39,7 +39,7 @@ Reproducible evidence behind the durable-state thesis, including an independent 
 | [CLI_REFERENCE.md](CLI_REFERENCE.md) | Every CLI subcommand, workflow config schema, daemon mode |
 | [CURSOR_AGENT_MCP.md](CURSOR_AGENT_MCP.md) | The MCP tool surface in detail |
 | [GROK_BOT.md](GROK_BOT.md) | Grok Bot as remote MCP pilot (streamable HTTP; supervise-first; not a worker adapter) |
-| [PI.md](PI.md) | Pi TUI as stdio MCP pilot (package + skill; not a worker adapter) |
+| [PI.md](PI.md) | Pi TUI/pilot package (stdio MCP + pi-package; not a worker adapter) |
 | [CODEGRAPH.md](CODEGRAPH.md) | CodeGraph integration, bundled MCP tools, cost comparison |
 | [OUTPUT_STYLE.md](OUTPUT_STYLE.md) | Optional Signal-maximizer worker output tiers (`terse` / `lithic`) |
 | [COMPRESSION.md](COMPRESSION.md) | Why input-side compression isn't bundled + a bring-your-own recipe |

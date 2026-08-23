@@ -1002,7 +1002,7 @@ def _pi_cli_visible(env: Optional[Mapping[str, str]] = None) -> bool:
         candidate = Path(command).expanduser()
         return candidate.is_file()
     name = Path(resolved).name.lower()
-    return name == "pi" or name.startswith("pi") or command.rstrip("/").endswith("/pi")
+    return name == "pi" or name.startswith("pi-") or Path(command).name.lower() == "pi"
 
 
 def _pi_package_files_ok(pkg: Optional[Path]) -> bool:
