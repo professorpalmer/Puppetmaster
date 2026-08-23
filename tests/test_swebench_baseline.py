@@ -28,6 +28,9 @@ class SweBenchBaselineTests(unittest.TestCase):
                     "per_instance_details": {
                         f"task-{index}-a": {"resolved": True},
                         f"task-{index}-b": {"resolved": False},
+                        f"task-{index}-c": {"resolved": True},
+                        f"task-{index}-d": {"resolved": False},
+                        f"task-{index}-e": {"resolved": True},
                     },
                 }
             )
@@ -70,7 +73,7 @@ class SweBenchBaselineTests(unittest.TestCase):
         card = entry["role_scorecards"]["implement"]
         self.assertEqual(card["capability"], 50)
         self.assertEqual(card["quality"], 0.6)
-        self.assertEqual(card["sample_count"], 2)
+        self.assertEqual(card["sample_count"], 5)
         self.assertEqual(card["cost_per_task_usd"], 0.3)
         self.assertEqual(card["calls_per_task"], 6.0)
         self.assertEqual(card["provenance"]["benchmark"], "swe-bench-bash-only")

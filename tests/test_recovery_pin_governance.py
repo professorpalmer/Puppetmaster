@@ -357,6 +357,8 @@ class RecoveryPinGovernanceTests(TestCase):
             registry_path = Path(root) / "models.json"
             models = [self._model("cursor/current", 80)]
             save_registry(models, registry_path)
+            from puppetmaster.model_registry import load_registry
+            models = load_registry(registry_path)
             store, job = self._store_job(root)
             task = Task(
                 job_id=job.id,
@@ -364,7 +366,12 @@ class RecoveryPinGovernanceTests(TestCase):
                 instruction="dispatch a legacy persisted pin",
                 adapter="cursor",
                 status=TaskStatus.QUEUED,
-                payload={"model": "current", "auto_route": False},
+                payload={
+                    "model": "current",
+                    "auto_route": False,
+                    "registry_path": str(registry_path),
+                    "registry_digest": registry_digest(models),
+                },
             )
             store.save_task(task)
             runtime = WorkerRuntime(
