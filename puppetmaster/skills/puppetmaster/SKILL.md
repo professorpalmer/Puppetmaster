@@ -35,7 +35,7 @@ broad investigation, multi-file audits, and cross-cutting changes.
 | Task shape | Verb | Why |
 |---|---|---|
 | **One focused edit** ("fix this fn", "add a flag", "wire up retries") | `edit` | Cheapest sufficient model + CodeGraph + in-place edit + synchronous diff. The snappy path between editing inline and a full implement job. |
-| **One coupled multi-file feature** | `start_implement` | Isolated clean worktree, one coherent PATCH artifact. |
+| **One coupled multi-file feature** | `start_implement` | Isolated clean worktree, one coherent PATCH artifact. Grok Bot contained path is agentic (keys-only), not Cursor SDK. |
 | **One focused read-only review** | `start_review` | Resolves explicit adapter/platform → configured default reviewer → actionable fail-closed error. Cursor tools remain Cursor-only. |
 | **Broad read-only analysis** (audit, "find all X") | `start_swarm` / `start_cursor_swarm` | Parallel roles over read-only analysis; use the Cursor-specific verb only when Cursor is an explicit choice. |
 | **Live-site browser QA** (drive a real browser, capture real network payloads) | `start_browser_swarm` | N parallel browser workers with React-input/network-truth/strong-model guardrails. Hermes preferred; `adapter=agentic` uses stdlib CDP / OpenRouter. ACTING AGENT (side effects). |

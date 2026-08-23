@@ -43,7 +43,7 @@ For any request that involves more than a single trivial change, start a Puppetm
 Default routing:
 
 1. `puppetmaster_start_swarm` — multi-role read-only analysis. Use `puppetmaster_start_review` for one focused review on the explicit or configured reviewer platform; Cursor-specific verbs are opt-in.
-2. `puppetmaster_start_implement` — durable, patch-producing implementation that runs on whatever platform the lock enables (cursor preferred, then claude-code). Use this as the default implement verb so it works regardless of platform lock. `puppetmaster_start_cursor_implement` / `puppetmaster_start_claude_implement` force a specific platform.
+2. `puppetmaster_start_implement` — durable, patch-producing implementation that runs on whatever platform the lock enables (cursor preferred when the SDK is runnable, then claude-code, then agentic). Use this as the default implement verb so it works regardless of platform lock. `puppetmaster_start_cursor_implement` / `puppetmaster_start_claude_implement` force a specific platform. **Grok Bot contained path is agentic (keys-only), not Cursor SDK.**
 3. `puppetmaster_start_review` / `puppetmaster_start_cursor_plan` — lightweight single-pass review or plan. Generic review uses an explicit platform or the user's configured default reviewer and fails closed when neither is set; `puppetmaster_start_cursor_review` remains the explicit Cursor-only path.
 
 Every implement verb runs full-edit in a clean worktree (clean-tree guard; set `allow_dirty` to override) and captures the resulting diff as a `PATCH` artifact.

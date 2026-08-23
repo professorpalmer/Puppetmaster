@@ -11,15 +11,25 @@ Grok Bot can consume MCP connectors that are **remote HTTP/SSE (or streamable HT
 The remote transport exposes the **same** MCP tool handlers (leases, jobs, artifacts, stitching, routing) over streamable HTTP, with bearer auth and a supervise-first scope. Stdio MCP is unchanged and remains the daily driver for Cursor.
 
 ```text
-Grok Bot (pilot)
+Grok Bot (pilot; no Cursor SDK required)
   -> HTTPS/SSE connector (Authorization: Bearer …)
   -> puppetmaster mcp serve-remote   (streamable HTTP /mcp)
   -> same tool handlers as stdio MCP
   -> detached python -m puppetmaster job
-  -> independent worker subprocesses (cursor / claude / codex / …)
-  -> SQLite events + artifacts
-  -> Grok Bot polls status / logs / live_artifacts / show
+  -> agentic worker subprocesses on this box (keys-only, in-process tool loop)
+  -> SQLite events + artifacts + effort-index
+  -> Grok Bot polls status / logs / live_artifacts / show / effort_index
 ```
+
+**Contained topology (preferred for Grok Bot).** Run remote MCP and the
+workers on the *same* Grok Bot box (or any Puppetmaster host that has only
+agentic provider keys). There is no `grok-bot` adapter and no CreateAgent
+fleet. `start_implement` / `start_prewalk` / `start_swarm` pick **agentic**
+when Cursor is not installed and a provider key is visible
+(`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`,
+or `OPENROUTER_API_KEY`). Cursor remains preferred only when the SDK *and*
+`CURSOR_API_KEY` are actually runnable.
+
 
 ## Quick start (local PoC)
 
@@ -80,10 +90,16 @@ Grok Bot only accepts a **remote** MCP URL (not a local `command`/`args` stdio b
      the `/mcp` URL — the server speaks Streamable HTTP there and keeps legacy
      `/sse` only for older clients)
 4. Confirm load: Grok Bot should show tools > 0 (50 with `--scope implement`,
-   ~28 with supervise). Then in chat:
-   - `puppetmaster_doctor`
-   - `puppetmaster_start_cursor_swarm` (or `_review` / `_plan`) → `{job_id}`
+   ~28 with supervise). Then in chat (agentic default — **not** Cursor swarm):
+   - `puppetmaster_doctor` — healthy when Cursor is missing and agentic keys
+     are visible (`grok-bot-path` ok)
+   - `puppetmaster_start_agentic` or `puppetmaster_start_implement` → `{job_id}`
+     (picker falls to agentic; does not fail solely because Cursor is missing)
+   - `puppetmaster_effort_index` (same artifact / effort-index contract)
    - `puppetmaster_status` / `puppetmaster_live_artifacts_follow` / `puppetmaster_show`
+
+   `puppetmaster_start_cursor_swarm` is opt-in for hosts that actually have
+   the Cursor SDK. Do not use it as the lead Grok Bot demo.
 
 Equivalent connector JSON:
 
@@ -141,7 +157,7 @@ Default **`supervise`** — read-only / supervise-first:
 | Allowed | Examples |
 |---|---|
 | Health / routing | `puppetmaster_doctor`, `puppetmaster_route_task`, `puppetmaster_list_models` |
-| Start analysis | `puppetmaster_start_review`, `puppetmaster_start_cursor_review`, `puppetmaster_start_cursor_plan`, `puppetmaster_start_cursor_swarm`, `puppetmaster_start_swarm` |
+| Start analysis | `puppetmaster_start_agentic`, `puppetmaster_start_implement`, `puppetmaster_start_swarm`, `puppetmaster_start_review` (Cursor-specific swarm/review/plan verbs are opt-in when the SDK is installed) |
 | Observe | `puppetmaster_status`, `puppetmaster_logs`, `puppetmaster_live_artifacts`, `puppetmaster_live_artifacts_follow`, `puppetmaster_partial_summary`, `puppetmaster_artifacts`, `puppetmaster_show`, `puppetmaster_await_job`, `puppetmaster_job_graph`, … |
 | CodeGraph reads | `puppetmaster_codegraph_search`, `_context`, `_affected`, `_files`, `_status` |
 
@@ -170,13 +186,12 @@ Treat `--scope implement` like giving a remote client the power to start full-ed
 ## Pilot loop (same as Cursor Agent)
 
 ```text
-1. puppetmaster_doctor
-2. puppetmaster_start_cursor_swarm / _review / _plan  →  {job_id} immediately
-3. puppetmaster_live_artifacts_follow (chain next_cursor)
-   or puppetmaster_status / puppetmaster_logs
+1. puppetmaster_doctor          (healthy Grok Bot path: no Cursor + agentic keys)
+2. puppetmaster_start_agentic / puppetmaster_start_implement  →  {job_id}
+3. puppetmaster_effort_index    (or live_artifacts_follow / status / logs)
 4. puppetmaster_partial_summary while running
 5. puppetmaster_show when complete
-6. Approve in chat before any implement (local CLI / stdio / --scope implement)
+6. Approve in chat before further implement if you started on supervise scope
 ```
 
 Do **not** hold one long MCP call open for a multi-minute swarm. Always use the `start_*` verbs and poll.

@@ -1,3 +1,27 @@
+## v1.22.22 — 2026-08-23
+
+**Feature: Grok Bot contained workers default to agentic (no Cursor SDK required).**
+
+Grok Bot remains a remote-MCP *pilot*, not a `grok-bot` adapter and not a
+CreateAgent fleet. When Cursor is not installed, implement / prewalk / swarm
+pick the keys-only **agentic** in-process tool loop so a Grok Bot box (or any
+Puppetmaster host with only provider keys) still gets the full runtime-size →
+disposable worker → artifacts → effort-index → nuke loop.
+
+- **Picker:** `pick_implement_adapter` / `pick_swarm_adapter` prefer Cursor only
+  when the SDK + `CURSOR_API_KEY` are actually runnable. Otherwise an enabled
+  agentic path with `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` /
+  `GOOGLE_API_KEY` / `OPENROUTER_API_KEY` wins. Missing Cursor is not a sole
+  failure.
+- **Lock fail-closed:** a cursor-only platform lock with no Cursor errors with
+  the fix: enable agentic, unlock, or install Cursor.
+- **Doctor:** new `grok-bot-path` check — healthy when Cursor is missing and
+  agentic keys are visible; cursor-only lock + no Cursor is `error`.
+- **Docs:** `docs/GROK_BOT.md` lead recipe is `start_agentic` /
+  `start_implement` (agentic) then `effort-index`, not `start_cursor_swarm`.
+  Contained topology is remote MCP + worker subprocesses on the same box.
+- **Tests:** hermetic `unittest` (no pytest); CI remains `unittest discover`.
+
 ## v1.22.21 — 2026-08-23
 
 **Feature: effort-level artifact index (queryable memory on the effort ledger).**

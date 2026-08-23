@@ -2403,7 +2403,18 @@ def antigravity_command(args: JsonObject, implement: bool = True) -> list[str]:
     return command
 
 
+def _no_implement_tool_error(exc: "NoImplementAdapterError") -> JsonObject:
+    details: JsonObject = {"enabled": sorted(exc.enabled)}
+    if exc.requested is not None:
+        details["requested"] = exc.requested
+        details["fix"] = exc.fix or ("puppetmaster platform enable " + exc.requested)
+    elif exc.fix:
+        details["fix"] = exc.fix
+    return tool_error(str(exc), details)
+
+
 def start_implement(args: JsonObject) -> JsonObject:
+
     """Platform-agnostic implement: pick the full-edit adapter for whichever
     platform the user is locked to, so `implement` works no matter which single
     platform is enabled (not Claude-Code-only)."""
@@ -2414,11 +2425,7 @@ def start_implement(args: JsonObject) -> JsonObject:
     try:
         adapter = pick_implement_adapter(enabled, args.get("adapter"))
     except NoImplementAdapterError as exc:
-        details: JsonObject = {"enabled": sorted(exc.enabled)}
-        if exc.requested is not None:
-            details["requested"] = exc.requested
-            details["fix"] = "puppetmaster platform enable " + exc.requested
-        return tool_error(str(exc), details)
+        return _no_implement_tool_error(exc)
     blocked = _worktree_preflight(args)
     if blocked is not None:
         return blocked
@@ -2566,11 +2573,7 @@ def run_edit(args: JsonObject) -> JsonObject:
     try:
         pick_implement_adapter(enabled, args.get("adapter"))
     except NoImplementAdapterError as exc:
-        details: JsonObject = {"enabled": sorted(exc.enabled)}
-        if exc.requested is not None:
-            details["requested"] = exc.requested
-            details["fix"] = "puppetmaster platform enable " + exc.requested
-        return tool_error(str(exc), details)
+        return _no_implement_tool_error(exc)
     return run_cli(edit_command(args), args)
 
 
@@ -2691,11 +2694,7 @@ def start_prewalk(args: JsonObject) -> JsonObject:
     try:
         pick_implement_adapter(enabled, args.get("adapter"))
     except NoImplementAdapterError as exc:
-        details: JsonObject = {"enabled": sorted(exc.enabled)}
-        if exc.requested is not None:
-            details["requested"] = exc.requested
-            details["fix"] = "puppetmaster platform enable " + exc.requested
-        return tool_error(str(exc), details)
+        return _no_implement_tool_error(exc)
     if not args.get("allow_dirty") and not args.get("allow_non_worktree"):
         blocked = _worktree_preflight(args)
         if blocked is not None:
@@ -2971,23 +2970,27 @@ def start_swarm(args: JsonObject) -> JsonObject:
                 "otherwise Puppetmaster would use the demo local adapter.",
                 details,
             )
-        selected = "local" if args.get("allow_local_demo") else next(
-            (item for item in enabled if item != "local"), None
-        )
-        if selected is None and args.get("allow_local_demo"):
-            selected = "local"
-        if selected is None:
-            return tool_error(
-                "No enabled non-demo analysis adapter is available.",
-                {
-                    "roles": role_inputs,
-                    "enabled_adapters": enabled,
-                    "fix": (
-                        "Enable an analysis adapter, pass adapter/config explicitly, "
-                        "or set allow_local_demo=true for deterministic tests."
-                    ),
-                },
+        from puppetmaster.workers import NoImplementAdapterError, pick_swarm_adapter
+
+        try:
+            selected = pick_swarm_adapter(
+                set(enabled),
+                allow_local_demo=bool(args.get("allow_local_demo")),
             )
+        except NoImplementAdapterError as exc:
+            details: JsonObject = {
+                "roles": role_inputs,
+                "enabled_adapters": enabled,
+                "enabled": sorted(exc.enabled),
+            }
+            if exc.fix:
+                details["fix"] = exc.fix
+            else:
+                details["fix"] = (
+                    "Enable an analysis adapter, pass adapter/config explicitly, "
+                    "or set allow_local_demo=true for deterministic tests."
+                )
+            return tool_error(str(exc), details)
         locked = _platform_lock_preflight(selected)
         if locked is not None:
             return locked

@@ -476,10 +476,18 @@ class NoImplementAdapterError(RuntimeError):
     so callers can render a precise, actionable error without re-deriving state.
     """
 
-    def __init__(self, message: str, *, enabled: AbstractSet[str], requested: Optional[str] = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        enabled: AbstractSet[str],
+        requested: Optional[str] = None,
+        fix: Optional[str] = None,
+    ):
         super().__init__(message)
         self.enabled = enabled
         self.requested = requested
+        self.fix = fix
 
 
 class NoReviewAdapterError(RuntimeError):
@@ -502,6 +510,29 @@ class NoReviewAdapterError(RuntimeError):
         self.enabled = enabled
         self.requested = requested
         self.configured_default = configured_default
+
+
+# Keys-only agentic path (Grok Bot contained hosts / no Cursor SDK). These
+# env vars are enough to run the in-process tool loop — no external CLI.
+AGENTIC_PROVIDER_KEY_ENVS: tuple[str, ...] = (
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "OPENROUTER_API_KEY",
+)
+
+CURSOR_ONLY_LOCK_FIX = (
+    "enable agentic (`puppetmaster platform enable agentic`), unlock the "
+    "platform lock, or install Cursor (`CURSOR_API_KEY` + "
+    "`puppetmaster install-cursor-mcp`)"
+)
+
+
+def agentic_provider_keys_visible(env: Optional[Mapping[str, str]] = None) -> bool:
+    """True when a keys-only agentic provider credential is in ``env``."""
+    probe = env if env is not None else os.environ
+    return any((probe.get(name) or "").strip() for name in AGENTIC_PROVIDER_KEY_ENVS)
 
 
 # Actionable, per-adapter "how to make me runnable" hints, surfaced when the
@@ -559,6 +590,8 @@ def adapter_is_available(
     if name == "openai":
         return bool(env.get("OPENAI_API_KEY"))
     if name == "agentic":
+        if agentic_provider_keys_visible(env):
+            return True
         from puppetmaster.providers import available_providers
 
         return bool(available_providers(env))
@@ -611,17 +644,114 @@ def pick_implement_adapter(
             f"{', '.join(IMPLEMENT_ADAPTER_PRIORITY)} via the platform lock.",
             enabled=enabled,
         )
-    # A lock pinned to exactly one implement-capable adapter is an explicit
-    # choice — honor it verbatim instead of overriding on availability.
-    if len(candidates) == 1:
-        return candidates[0]
     available = is_available or adapter_is_available
+    # A lock pinned to exactly one implement-capable adapter is an explicit
+    # choice — honor it verbatim, except a cursor-only lock with no Cursor
+    # must fail closed with the Grok Bot / agentic unlock fix rather than
+    # dispatching a worker that cannot start.
+    if len(candidates) == 1:
+        only = candidates[0]
+        if only == "cursor" and not available("cursor"):
+            raise NoImplementAdapterError(
+                "cursor-only platform lock but Cursor is not runnable on this "
+                f"machine. Fix: {CURSOR_ONLY_LOCK_FIX}.",
+                enabled=enabled,
+                fix=CURSOR_ONLY_LOCK_FIX,
+            )
+        return only
     runnable = next((a for a in candidates if available(a)), None)
     if runnable is not None:
         return runnable
     hints = ", ".join(_ADAPTER_AVAILABILITY_HINT.get(a, a) for a in candidates)
     raise NoImplementAdapterError(
         "No implement-capable platform is runnable on this machine — these are "
+        f"enabled but their CLI/credentials are missing: {', '.join(candidates)}. "
+        f"Install/configure one of: {hints}.",
+        enabled=enabled,
+    )
+
+
+# Analysis-swarm preference when the caller did not pin an adapter. Cursor
+# stays first *when it is actually runnable*; otherwise agentic (keys-only)
+# is the Grok Bot contained default. Do not invent a grok-bot adapter.
+SWARM_ADAPTER_PRIORITY = (
+    "cursor",
+    "agentic",
+    "claude-code",
+    "codex",
+    "hermes",
+    "openai",
+    "antigravity",
+)
+
+
+def pick_swarm_adapter(
+    enabled: AbstractSet[str],
+    requested: Optional[str] = None,
+    *,
+    is_available: Optional[Callable[[str], bool]] = None,
+    allow_local_demo: bool = False,
+) -> str:
+    """Resolve the analysis-swarm adapter, honoring lock + runnability.
+
+    Missing Cursor is never a sole failure when agentic is enabled and has a
+    provider key. A cursor-only lock with no Cursor fails closed with
+    ``CURSOR_ONLY_LOCK_FIX``.
+    """
+    if allow_local_demo:
+        return "local"
+    if requested:
+        adapter = str(requested)
+        if adapter == "local":
+            return "local"
+        if adapter not in SWARM_ADAPTER_PRIORITY:
+            raise NoImplementAdapterError(
+                f"adapter {adapter!r} cannot run an analysis swarm.",
+                enabled=enabled,
+                requested=adapter,
+            )
+        if adapter in enabled or adapter not in (
+            "agentic",
+            "cursor",
+            "claude-code",
+            "codex",
+            "openai",
+            "hermes",
+            "antigravity",
+        ):
+            return adapter
+        raise NoImplementAdapterError(
+            f"adapter {adapter!r} is disabled by the platform lock.",
+            enabled=enabled,
+            requested=adapter,
+        )
+    candidates = [a for a in SWARM_ADAPTER_PRIORITY if a in enabled]
+    if not candidates:
+        raise NoImplementAdapterError(
+            "No enabled non-demo analysis adapter is available.",
+            enabled=enabled,
+            fix=(
+                "Enable an analysis adapter, pass adapter/config explicitly, "
+                "or set allow_local_demo=true for deterministic tests."
+            ),
+        )
+    available = is_available or adapter_is_available
+    if len(candidates) == 1:
+        only = candidates[0]
+        if only == "cursor" and not available("cursor"):
+            raise NoImplementAdapterError(
+                "cursor-only platform lock but Cursor is not runnable on this "
+                f"machine. Fix: {CURSOR_ONLY_LOCK_FIX}.",
+                enabled=enabled,
+                fix=CURSOR_ONLY_LOCK_FIX,
+            )
+        return only
+    runnable = next((a for a in candidates if available(a)), None)
+    if runnable is not None:
+        return runnable
+    hints = ", ".join(_ADAPTER_AVAILABILITY_HINT.get(a, a) for a in candidates)
+    raise NoImplementAdapterError(
+        "No analysis adapter is runnable on this machine — these are "
         f"enabled but their CLI/credentials are missing: {', '.join(candidates)}. "
         f"Install/configure one of: {hints}.",
         enabled=enabled,
