@@ -27,6 +27,7 @@ from puppetmaster.installers import (
     install_hermes_mcp,
     install_hermes_plugin,
     install_hermes_skill,
+    install_pi_mcp,
     list_skill_candidates,
     promote_skill_candidate,
     resolve_claude_command,
@@ -35,6 +36,7 @@ from puppetmaster.installers import (
     uninstall_codex_mcp,
     uninstall_cursor_mcp,
     uninstall_hermes_mcp,
+    uninstall_pi_mcp,
 )
 from puppetmaster.rules import (
     VALID_TARGETS,
@@ -90,6 +92,7 @@ from puppetmaster.cli.commands_install import (
     _run_install_codex,
     _run_install_cursor,
     _run_install_hermes,
+    _run_install_pi,
     _run_install_hooks,
     _run_install_rules,
     _run_self_update,
@@ -671,6 +674,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
 
     if args.command == "install-hermes-mcp":
         return _run_install_hermes(args)
+
+    if args.command == "install-pi-mcp":
+        return _run_install_pi(args)
 
     if args.command == "install-cursor-mcp":
         return _run_install_cursor(args)

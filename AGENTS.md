@@ -21,7 +21,7 @@ returns a request for clarification instead of findings. Roll your own
 grep/read loop; that is your job.
 
 The rest of this file addresses an **interactive agent working with the user**,
-which has the MCP tools available.
+which has the MCP tools available. **Pi** is in that class: a TUI/pilot via the bundled `@puppetmaster/pi-pilot` package (`puppetmaster install-pi-mcp` / `setup --platforms pi`). Do not lease `pi` as a worker.
 
 ## Default subagent runtime: Puppetmaster
 

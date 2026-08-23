@@ -27,6 +27,7 @@ from puppetmaster.installers import (
     install_hermes_mcp,
     install_hermes_plugin,
     install_hermes_skill,
+    install_pi_mcp,
     list_skill_candidates,
     promote_skill_candidate,
     resolve_claude_command,
@@ -35,6 +36,7 @@ from puppetmaster.installers import (
     uninstall_codex_mcp,
     uninstall_cursor_mcp,
     uninstall_hermes_mcp,
+    uninstall_pi_mcp,
 )
 from puppetmaster.rules import (
     VALID_TARGETS,
@@ -72,6 +74,7 @@ from puppetmaster.cli.guidance import (
     CODEX_SANDBOX_GUIDANCE,
     CURSOR_NEXT_STEPS_GUIDANCE,
     HERMES_NEXT_STEPS_GUIDANCE,
+    PI_NEXT_STEPS_GUIDANCE,
 )
 from puppetmaster.cli.helpers import (
     _print_install_result,
@@ -157,6 +160,10 @@ def _run_uninstall(args) -> int:
     print("=== uninstall: hermes MCP ===")
     hermes_result = uninstall_hermes_mcp(dry_run=dry_run)
     overall_rc |= _print_uninstall_mcp_result(hermes_result, "hermes")
+
+    print("=== uninstall: pi MCP / package listing ===")
+    pi_result = uninstall_pi_mcp(dry_run=dry_run)
+    overall_rc |= _print_uninstall_mcp_result(pi_result, "pi")
     hermes_hooks = uninstall_hermes_hooks(dry_run=dry_run)
     print(f"[uninstall-hermes-hooks] {hermes_hooks.status:<14} {hermes_hooks.reason}")
     if hermes_hooks.status == "error":
@@ -369,6 +376,32 @@ def _seed_agentic_registry() -> None:
             )
     except Exception as exc:  # never let registry seeding abort the wizard
         print(f"  registry  note: agentic registry seeding skipped ({exc!r})")
+
+def _requested_host_pilots(args) -> set[str]:
+    raw = getattr(args, "platforms", None)
+    if not raw:
+        return set()
+    tokens = {a.strip() for a in raw.split(",") if a.strip()}
+    return tokens & {"pi"}
+
+
+def _run_install_pi(args) -> int:
+    """Dispatch for puppetmaster install-pi-mcp."""
+    explicit = getattr(args, "path", None)
+    agent_dir = Path(explicit).expanduser().resolve() if explicit else None
+    result = install_pi_mcp(
+        agent_dir=agent_dir,
+        force=getattr(args, "force", False),
+        dry_run=getattr(args, "dry_run", False),
+        skip_handshake=getattr(args, "skip_handshake", False),
+    )
+    rc = _print_install_result(result, "pi")
+    if result.status in {"installed", "unchanged"}:
+        print()
+        print("Next steps:")
+        for line in PI_NEXT_STEPS_GUIDANCE.splitlines():
+            print(f"  {line}")
+    return rc
 
 def _run_install_hermes(args) -> int:
     """Dispatch for ``puppetmaster install-hermes-mcp``."""
@@ -590,6 +623,17 @@ def _setup_platform_step(args) -> int:
             _show_state()
             return 0
         wanted = {a.strip() for a in raw.split(",") if a.strip()}
+        hosts = wanted & {"pi"}
+        wanted -= {"pi"}
+        if hosts:
+            print(
+                "  note  pi is a TUI/pilot host, not a worker adapter "
+                "(not added to the platform lock)"
+            )
+            try:
+                args._host_pilots = set(hosts)
+            except Exception:
+                pass
         unknown = sorted(a for a in wanted if a not in known)
         if unknown:
             print(
@@ -599,6 +643,10 @@ def _setup_platform_step(args) -> int:
             return 1
         valid = {a for a in wanted if a in known}
         if not valid:
+            if hosts:
+                print("  unchanged  worker platform lock left as-is (only host pilots requested)")
+                _show_state(wizard_first_run=not configured)
+                return 0
             print("  error  --platforms named no known platform.")
             return 1
         pl.set_enabled(valid)
@@ -844,12 +892,19 @@ def _run_setup(args) -> int:
         return 1
 
     from puppetmaster import platform_lock as _pl
+    host_pilots = _requested_host_pilots(args) | set(getattr(args, "_host_pilots", set()) or set())
     if not _pl.is_configured():
-        print(
-            "\nSetup aborted — no platform selected. Re-run in an interactive "
-            "terminal or pass --platforms <comma-list>."
-        )
-        return 1
+        if "pi" in host_pilots:
+            print(
+                "  note  no worker platform lock — Pi is a pilot host; "
+                "enable a worker later with --platforms agentic (or similar)."
+            )
+        else:
+            print(
+                "\nSetup aborted — no platform selected. Re-run in an interactive "
+                "terminal or pass --platforms <comma-list>."
+            )
+            return 1
     print()
 
     if not getattr(args, "skip_models", False):
@@ -876,6 +931,8 @@ def _run_setup(args) -> int:
 
     from puppetmaster import platform_lock as _pl
     enabled_adapters = _pl.enabled_adapters()
+    if not _pl.is_configured() and "pi" in _requested_host_pilots(args):
+        enabled_adapters = set()
 
     if "agentic" in enabled_adapters:
         print("=== agentic (keys-only standalone worker) ===")
@@ -1029,6 +1086,28 @@ def _run_setup(args) -> int:
                 overall_rc = 1
     print()
 
+    host_pilots = _requested_host_pilots(args) | set(getattr(args, "_host_pilots", set()) or set())
+    print("=== install-pi-mcp (Pi TUI/pilot package; not a worker) ===")
+    import shutil as _shutil_pi
+    pi_cli = _shutil_pi.which(os.environ.get("PI_COMMAND") or "pi")
+    want_pi = "pi" in host_pilots or bool(pi_cli) or bool(os.environ.get("PI_CODING_AGENT_DIR"))
+    if not want_pi:
+        print("  skipped  Pi CLI not on PATH — pass --platforms pi or install the Pi coding agent and re-run")
+    else:
+        if "pi" not in host_pilots and pi_cli:
+            print("  note  Pi CLI detected; wiring the pilot package (not a worker adapter)")
+        pi_result = install_pi_mcp(
+            force=getattr(args, "force", False),
+            dry_run=getattr(args, "dry_run", False),
+            skip_handshake=getattr(args, "skip_handshake", False),
+        )
+        for line in pi_result.messages:
+            print(f"  {line}")
+        if pi_result.status not in {"installed", "unchanged", "would_install"}:
+            overall_rc = 1
+        host_pilots.add("pi")
+    print()
+
     if not getattr(args, "skip_rules", False):
         print("=== step 8/9: install-rules (soft agent nudges) ===")
         rules_result = install_rules(
@@ -1082,13 +1161,13 @@ def _run_setup(args) -> int:
 
     if overall_rc == 0:
         print("Setup complete.")
-        for line in _setup_next_steps(enabled_adapters):
+        for line in _setup_next_steps(enabled_adapters, host_pilots=host_pilots):
             print(f"  {line}")
     else:
         print("Setup completed with errors — see above. Individual `puppetmaster install-*` commands can be re-run after fixing.")
     return overall_rc
 
-def _setup_next_steps(enabled_adapters: set[str]) -> list[str]:
+def _setup_next_steps(enabled_adapters: set[str], host_pilots: Optional[set[str]] = None) -> list[str]:
     """Next-steps lines tailored to the platform(s) the user actually enabled.
 
     Cursor/Codex/Claude/Hermes each pick up the MCP server differently (restart
@@ -1105,6 +1184,8 @@ def _setup_next_steps(enabled_adapters: set[str]) -> list[str]:
         steps.append("claude-code: start a new Claude Code session; verify with `claude mcp list`.")
     if "hermes" in enabled_adapters:
         steps.append("hermes: start a new Hermes session; verify with `hermes mcp list`.")
+    if host_pilots and "pi" in host_pilots:
+        steps.append("pi: restart pi (or start a new session) so the package extension can register Puppetmaster MCP tools. Pi stays the TUI/pilot — do not lease pi as a worker.")
     if "openai" in enabled_adapters:
         steps.append("openai: set OPENAI_API_KEY; the API adapter needs no host restart.")
     if "agentic" in enabled_adapters:

@@ -46,6 +46,7 @@ from puppetmaster.cli.commands_install import (
     _run_install_codex,
     _run_install_cursor,
     _run_install_hermes,
+    _run_install_pi,
     _run_install_hooks,
     _run_install_rules,
     _run_self_update,
@@ -161,6 +162,7 @@ from puppetmaster.installers import (
     install_hermes_mcp,
     install_hermes_plugin,
     install_hermes_skill,
+    install_pi_mcp,
     list_skill_candidates,
     promote_skill_candidate,
     resolve_claude_command,
@@ -169,6 +171,7 @@ from puppetmaster.installers import (
     uninstall_codex_mcp,
     uninstall_cursor_mcp,
     uninstall_hermes_mcp,
+    uninstall_pi_mcp,
 )
 from puppetmaster.mcp_registry import (
     kill_stale as registry_kill_stale,
@@ -260,6 +263,7 @@ __all__ = [
     "_run_install_codex",
     "_run_install_cursor",
     "_run_install_hermes",
+    "_run_install_pi",
     "_run_install_hooks",
     "_run_install_rules",
     "_run_invocation_gate_command",
@@ -321,6 +325,7 @@ __all__ = [
     "install_hermes_mcp",
     "install_hermes_plugin",
     "install_hermes_skill",
+    "install_pi_mcp",
     "install_hooks",
     "install_rules",
     "json",
@@ -360,6 +365,7 @@ __all__ = [
     "uninstall_cursor_mcp",
     "uninstall_hermes_hooks",
     "uninstall_hermes_mcp",
+    "uninstall_pi_mcp",
     "uninstall_hooks",
     "uninstall_rules",
 ]
