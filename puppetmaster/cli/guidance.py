@@ -5,6 +5,7 @@ from puppetmaster.installers import (
     CODEX_SANDBOX_GUIDANCE,
     CURSOR_NEXT_STEPS_GUIDANCE,
     HERMES_NEXT_STEPS_GUIDANCE,
+    PI_NEXT_STEPS_GUIDANCE,
 )
 
 

@@ -6,6 +6,18 @@ Most of these are MCP-transport edge cases or environment quirks
 here, `puppetmaster doctor` should flag it directly — open an issue
 with that output attached.
 
+## Pi cannot see Puppetmaster MCP
+
+Pi is a TUI/pilot. Wire it with:
+
+```bash
+puppetmaster install-pi-mcp
+```
+
+Then start a new `pi` session. Doctor should report `pi-pilot` ok when the
+CLI is on PATH, the bundled package is listed, and `python -m puppetmaster.mcp_server`
+answers `tools/list`. Details: [PI.md](PI.md). Do not lease `pi` as a worker.
+
 ## Grok Bot cannot see Puppetmaster MCP
 
 Grok Bot only attaches **remote** HTTP/SSE MCP connectors. The stdio

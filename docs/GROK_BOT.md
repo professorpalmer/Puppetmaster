@@ -237,6 +237,27 @@ Remote MCP **exposes job control** to whoever holds the token. That is stronger 
 
 See also [SECURITY.md](SECURITY.md) — the "no remote control" claim now has this explicit, authenticated exception.
 
+
+## Pi TUI/pilot (stdio; v1.22.23+)
+
+Grok Bot is a *remote HTTP* pilot. **Pi** is a *local TUI* pilot. Neither is a
+worker adapter — do not invent a `pi` or `grok-bot` leased subprocess.
+
+Pi has no built-in MCP. Install the in-repo package:
+
+    puppetmaster install-pi-mcp
+    # or: setup --platforms pi
+    # or: pi install PATH_TO_puppetmaster/pi_package
+
+That writes `~/.pi/agent/mcp.json` to the same stdio launch other hosts use
+and lists the package in `~/.pi/agent/settings.json`. The extension registers
+Puppetmaster tools inside Pi. Prefer start_implement / start_agentic /
+start_prewalk, then effort_index / show. Artifacts, not transcripts. Size the
+runtime, then nuke the job.
+
+Doctor `pi-pilot` is healthy when the Pi CLI is visible, the package is loaded,
+and Puppetmaster MCP is reachable.
+
 ## Related docs
 
 - [CURSOR_AGENT_MCP.md](CURSOR_AGENT_MCP.md) — full tool surface (stdio daily driver)

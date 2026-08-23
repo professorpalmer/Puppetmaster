@@ -1,3 +1,24 @@
+## v1.22.23 — 2026-08-23
+
+**Feature: Pi as a TUI/pilot package (not a worker adapter).**
+
+Pi ships without MCP, sub-agents, or plan mode. This release adds an in-repo
+pi-package that registers Puppetmaster MCP tools over stdio. Do not lease pi
+as a subprocess worker; Pi stays the TUI.
+
+- Package: puppetmaster/pi_package (@puppetmaster/pi-pilot) with a pi manifest,
+  pi-package keyword, stdio MCP extension, skill, and optional prompt.
+  Skill steers start_implement / start_agentic / start_prewalk / effort-index /
+  show. Artifacts not transcripts; size the runtime; nuke the job.
+- Install: puppetmaster install-pi-mcp and setup --platforms pi (idempotent).
+  Writes ~/.pi/agent/mcp.json using the stdio MCP module and lists the bundled
+  path in settings.json. Documented: pi install PATH_TO_PI_PACKAGE.
+- Doctor: pi-pilot is healthy when the Pi CLI is visible, the package is listed,
+  and Puppetmaster MCP is reachable. Missing pieces print the exact fix.
+- Tests: hermetic unittest (no pytest). Live E2E is skipped unless PI_LIVE_E2E=1
+  and a provider key plus pi are available; never faked.
+- Docs: [PI.md](PI.md), ADAPTERS.md, CLI_REFERENCE.md. Does not reopen 1.22.22.
+
 ## v1.22.22 — 2026-08-23
 
 **Feature: Grok Bot contained workers default to agentic (no Cursor SDK required).**

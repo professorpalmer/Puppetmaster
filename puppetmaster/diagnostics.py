@@ -77,6 +77,7 @@ def run_doctor(root: Path, state_dir: Optional[Path] = None) -> list[Check]:
     checks.append(_guard("catalog-freshness", _catalog_freshness_check))
     checks.append(_guard("platform-lock", _platform_lock_check))
     checks.append(_guard("grok-bot-path", lambda: grok_bot_path_check(root)))
+    checks.append(_guard("pi-pilot", lambda: pi_pilot_check()))
     checks.append(_guard("rate-limit-harvest", _rate_limit_harvest_check))
     return checks
 
@@ -987,3 +988,102 @@ def _git_clean_check(root: Path) -> Check:
         return Check("git-status", "optional", "not a git repository")
     detail = completed.stdout.strip()
     return Check("git-status", "ok" if not detail else "warn", detail or "clean")
+
+def _pi_cli_command(env: Optional[Mapping[str, str]] = None) -> str:
+    probe = env if env is not None else os.environ
+    return (probe.get("PI_COMMAND") or "pi").strip() or "pi"
+
+
+def _pi_cli_visible(env: Optional[Mapping[str, str]] = None) -> bool:
+    probe = env if env is not None else os.environ
+    command = _pi_cli_command(probe)
+    resolved = shutil.which(command, path=probe.get("PATH"))
+    if resolved is None:
+        candidate = Path(command).expanduser()
+        return candidate.is_file()
+    name = Path(resolved).name.lower()
+    return name == "pi" or name.startswith("pi-") or Path(command).name.lower() == "pi"
+
+
+def _pi_package_files_ok(pkg: Optional[Path]) -> bool:
+    if pkg is None:
+        return False
+    return (
+        (pkg / "package.json").is_file()
+        and (pkg / "extensions" / "puppetmaster-mcp.ts").is_file()
+        and (pkg / "skills" / "puppetmaster-pilot" / "SKILL.md").is_file()
+    )
+
+
+def pi_pilot_check(*, env=None) -> Check:
+    """Pi TUI/pilot health: CLI visible + package listed + MCP reachable."""
+    from puppetmaster.installers import (
+        bundled_pi_package_dir,
+        handshake_mcp_server,
+        pi_agent_dir,
+        _read_json_object,
+        _settings_has_package,
+    )
+
+    probe_env = env if env is not None else os.environ
+    fixes = []
+    pieces = []
+    cli_ok = _pi_cli_visible(probe_env)
+    if cli_ok:
+        pieces.append("pi CLI visible")
+    else:
+        fixes.append("install the Pi CLI (@earendil-works/pi-coding-agent) and put pi on PATH")
+    agent = pi_agent_dir(probe_env)
+    settings_path = agent / "settings.json"
+    mcp_path = agent / "mcp.json"
+    pkg = bundled_pi_package_dir()
+    files_ok = _pi_package_files_ok(pkg)
+    listed = False
+    if pkg is not None and settings_path.is_file():
+        try:
+            settings = _read_json_object(settings_path)
+        except Exception:
+            settings = {}
+        listed = _settings_has_package(settings, pkg)
+    package_ok = files_ok and listed
+    if package_ok:
+        pieces.append("pi-package extension+skill listed in settings.json")
+    else:
+        pkg_hint = str(pkg) if pkg is not None else "<bundled puppetmaster/pi_package>"
+        if not files_ok:
+            fixes.append("restore the bundled Pi package (reinstall puppetmaster-ai); expected extension + skill under " + pkg_hint)
+        if not listed:
+            fixes.append("load the package/extension: puppetmaster install-pi-mcp (or pi install " + pkg_hint + ")")
+    mcp_ok = False
+    mcp_detail = ""
+    if mcp_path.is_file():
+        try:
+            mcp = _read_json_object(mcp_path)
+        except Exception as exc:
+            mcp_detail = "mcp.json unreadable: " + repr(exc)
+            mcp = {}
+        servers = mcp.get("mcpServers") if isinstance(mcp, dict) else {}
+        entry = servers.get("puppetmaster") if isinstance(servers, dict) else None
+        if isinstance(entry, dict) and entry.get("command"):
+            from puppetmaster.installers import HandshakeResult
+            skip = str(probe_env.get("PUPPETMASTER_PI_SKIP_HANDSHAKE") or "") == "1"
+            handshake = HandshakeResult(ok=True, tool_count=-1) if skip else handshake_mcp_server(str(entry.get("command")))
+            mcp_ok = handshake.ok
+            if handshake.ok:
+                mcp_detail = "MCP reachable (%s tools)" % handshake.tool_count
+            else:
+                mcp_detail = "MCP not reachable: " + handshake.error
+        else:
+            mcp_detail = "no puppetmaster stdio entry in mcp.json"
+    else:
+        mcp_detail = "no " + str(mcp_path)
+    if mcp_ok:
+        pieces.append(mcp_detail)
+    else:
+        fixes.append("make Puppetmaster MCP reachable: puppetmaster install-pi-mcp. " + mcp_detail)
+    if cli_ok and package_ok and mcp_ok:
+        return Check("pi-pilot", "ok", "healthy Pi pilot -- " + "; ".join(pieces) + ". Pi stays the TUI, not a worker.")
+    if not cli_ok and not package_ok and not mcp_ok:
+        return Check("pi-pilot", "warn", "Pi pilot not installed. Fix: " + " ".join(fixes))
+    return Check("pi-pilot", "error", "Pi pilot incomplete. Fix: " + " ".join(fixes))
+
