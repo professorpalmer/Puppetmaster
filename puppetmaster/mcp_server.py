@@ -1807,6 +1807,19 @@ def _build_tools() -> list[McpTool]:
             handler=run_rollup,
         ),
         McpTool(
+            name="puppetmaster_effort_index",
+            description=(
+                "Queryable effort-level artifact memory: compact refs (id/type/sha256/"
+                "claim|check|decision/confidence/job_id/task_id/created_at) across jobs "
+                "and worktrees. Omit effort_id to use the most recently tagged effort. "
+                "Filter with type and query (substring on claim/check/decision). Never "
+                "returns worker transcripts; expand=true is required for full payloads. "
+                "rollup remains the jobs/cost/tokens ledger — this is the artifact index."
+            ),
+            input_schema=effort_index_schema(),
+            handler=run_effort_index,
+        ),
+        McpTool(
             name="puppetmaster_gate",
             description=(
                 "Replay the non-bypassable completion gates against a working tree, outside "
@@ -3902,6 +3915,22 @@ def run_rollup(args: JsonObject) -> JsonObject:
     return run_cli(command, args)
 
 
+def run_effort_index(args: JsonObject) -> JsonObject:
+    command = ["effort-index", "--json"]
+    if isinstance(args.get("effort_id"), str) and args["effort_id"].strip():
+        command.extend(["--effort", args["effort_id"]])
+    type_value = args.get("type") or args.get("artifact_type")
+    if isinstance(type_value, str) and type_value.strip():
+        command.extend(["--type", type_value.strip()])
+    if isinstance(args.get("query"), str) and args["query"].strip():
+        command.extend(["--query", args["query"].strip()])
+    if args.get("expand"):
+        command.append("--expand")
+    if args.get("all_projects"):
+        command.append("--all-projects")
+    return run_cli(command, args)
+
+
 def run_gate(args: JsonObject) -> JsonObject:
     command = ["gate", "--json"]
     if isinstance(args.get("gate_cwd"), str) and args["gate_cwd"].strip():
@@ -4393,6 +4422,38 @@ def rollup_schema() -> JsonObject:
             "all_projects": {
                 "type": "boolean",
                 "description": "Aggregate across every project state dir (usual for an effort).",
+            },
+        }
+    )
+    return schema
+
+
+def effort_index_schema() -> JsonObject:
+    schema = base_schema()
+    schema["properties"].update(
+        {
+            "effort_id": {
+                "type": "string",
+                "description": (
+                    "Effort id to index. Omit to use the most recently tagged effort "
+                    "(sidecar tagged_at / efforts_seen)."
+                ),
+            },
+            "type": {
+                "type": "string",
+                "description": "Only include artifacts of this type (finding, decision, ...).",
+            },
+            "query": {
+                "type": "string",
+                "description": "Substring filter on claim, check, or decision.",
+            },
+            "expand": {
+                "type": "boolean",
+                "description": "Include full payload bodies. Default is compact refs only.",
+            },
+            "all_projects": {
+                "type": "boolean",
+                "description": "Index every project state dir (usual for a multi-worktree effort).",
             },
         }
     )

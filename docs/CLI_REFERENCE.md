@@ -209,6 +209,10 @@ python -m puppetmaster watch <job_id>
 python -m puppetmaster events <job_id>
 python -m puppetmaster feed [job_id] [--follow]
 python -m puppetmaster artifacts <job_id>
+python -m puppetmaster artifacts <job_id> --refs
+python -m puppetmaster effort-index                  # latest tagged effort
+python -m puppetmaster effort-index --effort EFF --type finding --query auth
+python -m puppetmaster rollup --effort EFF --all-projects
 python -m puppetmaster logs [job_id]
 python -m puppetmaster open [job_id]
 python -m puppetmaster last

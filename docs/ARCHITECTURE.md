@@ -61,7 +61,7 @@ python -m puppetmaster crash-demo
 
 - Workers do not communicate directly.
 - Durable state goes through the coordination store.
-- Final synthesis reads artifacts, not transcripts.
+- Final synthesis reads artifacts, not transcripts. Recall across jobs with `effort-index` (compact refs; `rollup` stays the cost ledger).
 - Artifacts require evidence and type-specific payload fields.
 - Optional providers must fail as structured artifacts, not runtime crashes.
 

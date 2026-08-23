@@ -66,6 +66,24 @@ change:
 Use `start_implement` instead when the change is coupled/multi-file and wants an
 isolated worktree.
 
+## Head-seat recipe (Chief / Marionette)
+
+Chief and Marionette consume **artifacts / refs / show / effort-index**. Never
+read worker transcripts.
+
+- **Size** with `route_task` / `auto_route` / `start_prewalk`.
+- **Spawn** a disposable Puppetmaster job (swarm roles optional). Persist
+  artifacts, then die. No long-lived role bots.
+- **Recall** with `effort_index` (omit `effort_id` for the latest tagged
+  effort; `type` + `query` filter claim/check/decision). Use `artifacts` +
+  `refs=true` for one job. `show` for the stitch. Expand a payload only when
+  needed.
+- **Quality (optional):** one-shot `gate` on the worker worktree. Reuse
+  Puppetmaster gate; do not invent a fake PC.
+
+`rollup` remains the jobs/cost/tokens ledger. `effort_index` is queryable
+memory on top.
+
 ## CodeGraph (the exploration layer — use BEFORE reading files)
 
 For any "where is X / what calls Y / what implements Z" question, query
@@ -101,6 +119,21 @@ CodeGraph first, then read only the files it points to. Verbs: `codegraph_search
   reviewer that is disabled or unavailable never falls back to another enabled
   platform. Pass `adapter` or `platform` explicitly when a one-off choice is
   intended.
+
+
+## Head-seat loop (Chief / Marionette)
+
+Consume **artifacts / refs / show / effort-index**, never worker transcripts.
+
+1. Size the worker with `route_task` / `auto_route` / `start_prewalk`.
+2. Spawn a Puppetmaster job (one disposable worker; swarm is optional).
+3. Persist typed artifacts. The worker dies. No long-lived role bots.
+4. Recall with `artifacts` (`refs=true`), `show`, or `effort-index` /
+   `puppetmaster_effort_index` (latest tagged effort when `effort_id` is
+   omitted; filter with `type` / `query`). Expand a payload only when needed.
+5. Optional one-shot `gate` / tests on the worker worktree.
+
+`rollup` is the jobs/cost/tokens ledger. `effort-index` is queryable memory.
 
 ## Output style (optional "Signal-maximizer")
 

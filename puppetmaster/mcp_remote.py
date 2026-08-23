@@ -155,6 +155,7 @@ SUPERVISE_TOOL_NAMES = frozenset(
         "puppetmaster_codegraph_status",
         "puppetmaster_mcp_status",
         "puppetmaster_rollup",
+        "puppetmaster_effort_index",
     }
 )
 

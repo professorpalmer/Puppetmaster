@@ -120,6 +120,7 @@ from puppetmaster.cli.commands_gate import (
     _run_preflight_command,
     _run_proxy_command,
     _run_receipt_command,
+    _run_effort_index_command,
     _run_rollup_command,
     _run_route_command,
     _run_savings_command,
@@ -1643,6 +1644,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
 
     if args.command == "rollup":
         return _run_rollup_command(args, store)
+
+    if args.command == "effort-index":
+        return _run_effort_index_command(args, store)
 
     if args.command == "gate":
         return _run_gate_command(args, store)
