@@ -68,6 +68,48 @@ class WorkerRuntime:
             )
             raise SystemExit(77)
 
+        # Explicit model pins are executable authority, so revalidate their
+        # bound registry epoch after claim and immediately before constructing
+        # LocalWorker. A retirement/disable/drift between creation and dispatch
+        # must never reach an adapter.
+        from puppetmaster.routing_authority import (
+            RegistryAuthorityError,
+            validate_pinned_dispatch,
+        )
+
+        try:
+            dispatch_payload = validate_pinned_dispatch(
+                task.payload or {}, adapter=task.adapter
+            )
+            if dispatch_payload != (task.payload or {}):
+                task = replace(task, payload=dispatch_payload, updated_at=now_iso())
+                self.store.save_task(task)
+        except RegistryAuthorityError as exc:
+            failed_run = AgentRun(
+                job_id=self.job_id,
+                task_id=task.id,
+                role=task.role,
+                worker_id=self.worker_id,
+                status=TaskStatus.FAILED,
+                completed_at=now_iso(),
+            )
+            self.store.save_run(failed_run)
+            self.store.update_task_status(
+                task, TaskStatus.FAILED, worker_id=self.worker_id
+            )
+            self.store.emit(
+                self.job_id,
+                "worker.failed_task",
+                {
+                    "worker_id": self.worker_id,
+                    "task_id": task.id,
+                    "role": task.role,
+                    "failure": "registry_authority_invalid",
+                    "error": str(exc),
+                },
+            )
+            return True
+
         run = AgentRun(
             job_id=self.job_id,
             task_id=task.id,

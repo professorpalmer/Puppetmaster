@@ -157,8 +157,18 @@ def build_parser() -> argparse.ArgumentParser:
         )
         group.add_argument(
             "--routing-policy",
-            choices=["balanced", "cheap", "quality", "escalating"],
-            help="Routing policy when --auto-route is set. Default: balanced.",
+            choices=[
+                "balanced",
+                "cheap",
+                "absolute-cheapest",
+                "quality",
+                "escalating",
+            ],
+            help=(
+                "Routing policy when --auto-route is set: cheap selects the "
+                "cheapest sufficient model; absolute-cheapest explicitly "
+                "allows an insufficient lowest-cost model. Default: balanced."
+            ),
         )
         group.add_argument(
             "--max-cost-usd",
@@ -1580,7 +1590,7 @@ def build_parser() -> argparse.ArgumentParser:
     edit.add_argument(
         "--routing-policy",
         default="cheap",
-        choices=["cheap", "balanced", "quality", "escalating"],
+        choices=["cheap", "absolute-cheapest", "balanced", "quality", "escalating"],
         help="Router policy when not pinning --model (default: cheap).",
     )
     edit.add_argument(
@@ -1783,7 +1793,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     swarm.add_argument(
         "--routing-policy",
-        choices=["balanced", "cheap", "quality", "escalating"],
+        choices=["balanced", "cheap", "absolute-cheapest", "quality", "escalating"],
         help="Override per-role routing policy for all workers.",
     )
     swarm.add_argument(
@@ -1861,7 +1871,7 @@ def build_parser() -> argparse.ArgumentParser:
     browser.add_argument(
         "--routing-policy",
         default="balanced",
-        choices=["cheap", "balanced", "quality", "escalating"],
+        choices=["cheap", "absolute-cheapest", "balanced", "quality", "escalating"],
         help="Router policy above the capability floor (default: balanced).",
     )
     browser.add_argument(
@@ -2710,8 +2720,12 @@ def build_parser() -> argparse.ArgumentParser:
     route_cmd.add_argument(
         "--policy",
         default="balanced",
-        choices=["balanced", "cheap", "quality", "escalating"],
-        help="Routing policy. Default: balanced.",
+        choices=["balanced", "cheap", "absolute-cheapest", "quality", "escalating"],
+        help=(
+            "Routing policy: cheap selects the cheapest sufficient model; "
+            "absolute-cheapest explicitly selects the lowest-cost model even "
+            "when insufficient. Default: balanced."
+        ),
     )
     route_cmd.add_argument(
         "--min-capability",

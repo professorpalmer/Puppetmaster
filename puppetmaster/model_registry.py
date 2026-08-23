@@ -31,6 +31,7 @@ Each entry pairs:
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 import hashlib
 import json
 import os
@@ -42,6 +43,7 @@ from puppetmaster.fs_permissions import write_private_text
 from puppetmaster.interprocess_lock import InterProcessFileLock
 
 REGISTRY_ENV = "PUPPETMASTER_MODELS_PATH"
+REGISTRY_SCHEMA_VERSION = 1
 
 # Discovery names are user-facing source names, while registry entries use
 # adapter names. Keep this mapping in the shared registry layer so diagnostics,
@@ -58,6 +60,11 @@ DISCOVERY_SOURCE_TO_ADAPTER: dict[str, str] = {
     "antigravity": "antigravity",
     "agy": "antigravity",
 }
+
+# Registry rows are executable authority, so adapter aliases and arbitrary
+# future strings are not accepted here.  New model-backed adapters must first
+# become canonical discovery/runtime adapters and then be added to this set.
+REGISTRY_ADAPTERS = frozenset(DISCOVERY_SOURCE_TO_ADAPTER.values())
 
 
 @dataclass(frozen=True)
@@ -80,6 +87,14 @@ class ModelSpec:
     tags: list[str] = field(default_factory=list)
     notes: str = ""
     enabled: bool = True
+    disabled_reason: str = ""
+    disabled_authority: str = ""
+    # Retirement is a durable, user-authorized quarantine.  It is deliberately
+    # separate from ``enabled``: a temporary disable may later be toggled,
+    # while discovery must never infer that a retired identity is available.
+    retired: bool = False
+    retirement_reason: str = ""
+    retirement_authority: str = ""
     payload_defaults: dict[str, Any] = field(default_factory=dict)
     output_token_multiplier: float = 1.0
     # Billing source for routing cost-containment. ``plan`` = covered by a
@@ -101,6 +116,40 @@ class ModelSpec:
     _VALID_BILLING = ("plan", "api", "unknown")
 
     def __post_init__(self) -> None:
+        for field_name, value in (
+            ("id", self.id),
+            ("adapter", self.adapter),
+            ("adapter_model_name", self.adapter_model_name),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field_name} must be a non-empty string")
+            if value != value.strip():
+                raise ValueError(f"{field_name} must not contain surrounding whitespace")
+        if not isinstance(self.enabled, bool):
+            raise ValueError(f"enabled for {self.id} must be a boolean")
+        if not isinstance(self.retired, bool):
+            raise ValueError(f"retired for {self.id} must be a boolean")
+        for field_name, value in (
+            ("disabled_reason", self.disabled_reason),
+            ("disabled_authority", self.disabled_authority),
+            ("retirement_reason", self.retirement_reason),
+            ("retirement_authority", self.retirement_authority),
+        ):
+            if not isinstance(value, str):
+                raise ValueError(f"{field_name} for {self.id} must be a string")
+        if bool(self.disabled_reason) != bool(self.disabled_authority):
+            missing = "authority" if self.disabled_reason else "reason"
+            raise ValueError(f"disabled {missing} for {self.id} must be non-empty")
+        if self.retired:
+            if not isinstance(self.retirement_reason, str) or not self.retirement_reason.strip():
+                raise ValueError(f"retirement reason for {self.id} must be non-empty")
+            if (
+                not isinstance(self.retirement_authority, str)
+                or not self.retirement_authority.strip()
+            ):
+                raise ValueError(f"retirement authority for {self.id} must be non-empty")
+            if self.enabled:
+                raise ValueError(f"retired model {self.id} must have enabled=false")
         if not 0 <= self.capability_score <= 100:
             raise ValueError(
                 f"capability_score for {self.id} must be 0..100, got {self.capability_score}"
@@ -130,6 +179,11 @@ class ModelSpec:
             raise ValueError(
                 f"billing for {self.id} must be one of {self._VALID_BILLING}, got {self.billing!r}"
             )
+
+    @property
+    def is_routable(self) -> bool:
+        """Whether routing and direct-pin resolution may use this model."""
+        return self.enabled and not self.retired
 
     @property
     def is_plan_billed(self) -> bool:
@@ -175,11 +229,12 @@ def default_registry_path() -> Path:
 
 
 def load_registry(path: Optional[Path] = None) -> list[ModelSpec]:
-    """Read the registry from disk. Returns [] if no file exists.
+    """Read and atomically validate the user-owned registry authority.
 
-    Missing fields fall back to dataclass defaults so users can author
-    minimal entries. Unknown fields are tolerated and dropped (forward
-    compat for future Puppetmaster releases).
+    Both documented shapes are accepted: a top-level list of model objects,
+    and an object containing a ``models`` list.  Unknown model fields remain
+    forward-compatible, but malformed envelopes, rows, identities, and
+    adapters fail closed instead of returning a partial or empty registry.
     """
     resolved = path or default_registry_path()
     if not resolved.is_file():
@@ -188,11 +243,56 @@ def load_registry(path: Optional[Path] = None) -> list[ModelSpec]:
         raw = json.loads(resolved.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"models registry at {resolved} is not valid JSON: {exc}") from exc
-    entries = raw.get("models", raw if isinstance(raw, list) else [])
+    if isinstance(raw, list):
+        entries = raw
+    elif isinstance(raw, dict):
+        if "models" not in raw:
+            raise RuntimeError(
+                f"models registry at {resolved} must contain a 'models' list"
+            )
+        entries = raw["models"]
+        version = raw.get("schema_version", REGISTRY_SCHEMA_VERSION)
+        if type(version) is not int or version != REGISTRY_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"models registry at {resolved} has unsupported schema_version "
+                f"{version!r}; expected {REGISTRY_SCHEMA_VERSION}"
+            )
+    else:
+        raise RuntimeError(
+            f"models registry at {resolved} must be a list or an object containing 'models'"
+        )
+    if not isinstance(entries, list):
+        raise RuntimeError(f"models registry at {resolved} field 'models' must be a list")
+
     specs: list[ModelSpec] = []
-    for entry in entries:
-        kwargs = {k: v for k, v in entry.items() if k in ModelSpec.__dataclass_fields__}
-        specs.append(ModelSpec(**kwargs))
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, Mapping):
+            raise RuntimeError(
+                f"models registry at {resolved} entry {index} must be an object"
+            )
+        missing = [
+            name
+            for name in ("id", "adapter", "adapter_model_name")
+            if name not in entry
+        ]
+        if missing:
+            raise RuntimeError(
+                f"models registry at {resolved} entry {index} is missing required "
+                f"field(s): {', '.join(missing)}"
+            )
+        kwargs = {
+            k: v for k, v in entry.items() if k in ModelSpec.__dataclass_fields__
+        }
+        try:
+            specs.append(ModelSpec(**kwargs))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"models registry at {resolved} entry {index} is invalid: {exc}"
+            ) from exc
+    try:
+        validate_registry(specs)
+    except ValueError as exc:
+        raise RuntimeError(f"models registry at {resolved} is invalid: {exc}") from exc
     return specs
 
 
@@ -201,8 +301,11 @@ def save_registry(
 ) -> Path:
     """Persist the registry. Creates parent dirs. Returns the written path."""
     resolved = path or default_registry_path()
+    materialized = list(specs)
+    validate_registry(materialized)
     payload: dict[str, Any] = {
-        "models": [_spec_to_jsonable(spec) for spec in specs],
+        "schema_version": REGISTRY_SCHEMA_VERSION,
+        "models": [_spec_to_jsonable(spec) for spec in materialized],
     }
     # A registry is user-global. Serialize writers even when callers provide
     # an explicit path, and publish the complete JSON document atomically.
@@ -218,6 +321,11 @@ def _spec_to_jsonable(spec: ModelSpec) -> dict[str, Any]:
     # Drop fields equal to their default to keep the file readable.
     for k, default_value in [
         ("enabled", True),
+        ("disabled_reason", ""),
+        ("disabled_authority", ""),
+        ("retired", False),
+        ("retirement_reason", ""),
+        ("retirement_authority", ""),
         ("notes", ""),
         ("tags", []),
         ("context_window", 0),
@@ -230,6 +338,74 @@ def _spec_to_jsonable(spec: ModelSpec) -> dict[str, Any]:
         if data.get(k) == default_value:
             data.pop(k)
     return data
+
+
+def _execution_identity(spec: ModelSpec) -> tuple[str, str, str]:
+    """Return the adapter-scoped identity that a direct pin can execute.
+
+    Payload defaults are part of the identity because effort/provider variants
+    intentionally share a wire model name.  Two otherwise identical normalized
+    identities are ambiguous authority and therefore rejected.
+    """
+    defaults = json.dumps(
+        spec.payload_defaults or {}, sort_keys=True, separators=(",", ":")
+    )
+    return (
+        spec.adapter,
+        _normalize_model_token(spec.adapter_model_name),
+        defaults,
+    )
+
+
+def validate_registry(specs: Iterable[ModelSpec]) -> None:
+    """Validate a complete registry without accepting a partial authority."""
+    ids: set[str] = set()
+    identities: dict[tuple[str, str, str], str] = {}
+    for index, spec in enumerate(specs):
+        if not isinstance(spec, ModelSpec):
+            raise ValueError(
+                f"entry {index} must be ModelSpec, got {type(spec).__name__}"
+            )
+        if spec.adapter not in REGISTRY_ADAPTERS:
+            known = ", ".join(sorted(REGISTRY_ADAPTERS))
+            raise ValueError(
+                f"adapter for {spec.id} must be canonical and supported; "
+                f"got {spec.adapter!r} (known: {known})"
+            )
+        if spec.id in ids:
+            raise ValueError(f"duplicate model id: {spec.id}")
+        ids.add(spec.id)
+
+        identity = _execution_identity(spec)
+        prior_id = identities.get(identity)
+        if prior_id is not None:
+            raise ValueError(
+                "duplicate or ambiguous model identity for adapter "
+                f"{spec.adapter!r}: {prior_id!r} and {spec.id!r} normalize to "
+                f"{identity[1]!r}"
+            )
+        identities[identity] = spec.id
+
+
+def registry_digest(specs: Iterable[ModelSpec]) -> str:
+    """Return a deterministic SHA-256 digest of routing authority.
+
+    JSON object order is normalized, while registry row order is deliberately
+    preserved because it remains routing precedence for otherwise equal
+    candidates.  Material model fields, including capability, lifecycle state,
+    retirement provenance, and payload defaults, remain digest inputs so
+    recovery/audit can detect drift.
+    """
+    materialized = list(specs)
+    validate_registry(materialized)
+    canonical = {
+        "schema_version": REGISTRY_SCHEMA_VERSION,
+        "models": [asdict(spec) for spec in materialized],
+    }
+    encoded = json.dumps(
+        canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def starter_registry() -> list[ModelSpec]:
@@ -1164,7 +1340,7 @@ def catalog_staleness_days(
 
 
 def enabled_specs(specs: Iterable[ModelSpec]) -> list[ModelSpec]:
-    return [s for s in specs if s.enabled]
+    return [s for s in specs if s.is_routable]
 
 
 def _normalize_model_token(value: str) -> str:

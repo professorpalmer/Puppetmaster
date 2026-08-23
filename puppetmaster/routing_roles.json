@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "taxonomy_version": "2026-08-22.1",
+  "unknown_role": {
+    "canonical_role": "unknown",
+    "base_capability": 60,
+    "tool_loop": true,
+    "output_tokens": 1500
+  },
+  "roles": {
+    "verify-runtime": {
+      "base_capability": 25,
+      "tool_loop": false,
+      "output_tokens": 300,
+      "aliases": ["verify", "runtime-check"]
+    },
+    "shell": {
+      "base_capability": 20,
+      "tool_loop": false,
+      "output_tokens": 200,
+      "aliases": ["command", "command-runner"]
+    },
+    "demo": {
+      "base_capability": 25,
+      "tool_loop": false,
+      "output_tokens": 500,
+      "aliases": ["demonstration"]
+    },
+    "explore": {
+      "base_capability": 50,
+      "tool_loop": true,
+      "output_tokens": 1500,
+      "aliases": ["analysis", "analyze", "investigate", "research"]
+    },
+    "review": {
+      "base_capability": 55,
+      "tool_loop": true,
+      "output_tokens": 1500,
+      "aliases": ["code-review", "codex-review", "test"]
+    },
+    "plan": {
+      "base_capability": 60,
+      "tool_loop": true,
+      "output_tokens": 2000,
+      "aliases": ["planning", "planner"]
+    },
+    "implement": {
+      "base_capability": 75,
+      "tool_loop": true,
+      "output_tokens": 3000,
+      "aliases": ["implementation", "hermes-implement"]
+    },
+    "refactor": {
+      "base_capability": 75,
+      "tool_loop": true,
+      "output_tokens": 3000,
+      "aliases": ["refactoring"]
+    },
+    "patch": {
+      "base_capability": 75,
+      "tool_loop": true,
+      "output_tokens": 3000,
+      "aliases": ["edit", "code-edit"]
+    },
+    "fix": {
+      "base_capability": 70,
+      "tool_loop": true,
+      "output_tokens": 1500,
+      "aliases": ["bugfix", "bug-fix"]
+    },
+    "build": {
+      "base_capability": 75,
+      "tool_loop": true,
+      "output_tokens": 1500,
+      "aliases": ["builder"]
+    },
+    "architect": {
+      "base_capability": 85,
+      "tool_loop": true,
+      "output_tokens": 5000,
+      "aliases": ["architecture", "evaluation-design"]
+    },
+    "audit": {
+      "base_capability": 85,
+      "tool_loop": true,
+      "output_tokens": 5000,
+      "aliases": ["redteam", "red-team", "routing-quality", "recovery-governance"]
+    },
+    "security-review": {
+      "base_capability": 90,
+      "tool_loop": true,
+      "output_tokens": 5000,
+      "aliases": ["security-audit", "security"]
+    },
+    "decision-explainer": {
+      "base_capability": 70,
+      "tool_loop": true,
+      "output_tokens": 1500,
+      "aliases": ["explain-decision"]
+    },
+    "conflict-auditor": {
+      "base_capability": 75,
+      "tool_loop": true,
+      "output_tokens": 1500,
+      "aliases": ["conflict-audit"]
+    },
+    "pipeline-mapper": {
+      "base_capability": 65,
+      "tool_loop": true,
+      "output_tokens": 1500,
+      "aliases": ["pipeline-map"]
+    },
+    "test-coverage-reviewer": {
+      "base_capability": 60,
+      "tool_loop": true,
+      "output_tokens": 1500,
+      "aliases": ["coverage-reviewer"]
+    }
+  }
+}

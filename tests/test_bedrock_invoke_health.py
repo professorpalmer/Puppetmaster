@@ -16,6 +16,7 @@ _HERMETIC_DIR = os.path.dirname(os.path.abspath(__file__))
 if _HERMETIC_DIR not in sys.path:
     sys.path.insert(0, _HERMETIC_DIR)
 import hermetic_env  # noqa: F401
+from puppetmaster.model_registry import registry_digest
 
 
 class BedrockInvokeHealthTests(unittest.TestCase):
@@ -559,6 +560,11 @@ class BedrockInvokeHealthTests(unittest.TestCase):
                 evidence=[],
             )
 
+        from puppetmaster.model_registry import load_registry, save_registry
+
+        models_path = Path(self.tmp) / "models.json"
+        save_registry([bedrock_spec, openai_spec], models_path)
+        bound = load_registry(models_path)
         store = SwarmStore(Path(self.tmp) / ".puppetmaster")
         job = store.create_job("bedrock auth recovery")
         task = Task(
@@ -573,6 +579,8 @@ class BedrockInvokeHealthTests(unittest.TestCase):
                 "provider": "bedrock",
                 "fallback_attempts": 0,
                 "allow_api_billing": True,
+                "registry_path": str(models_path),
+                "registry_digest": registry_digest(bound),
             },
         )
         store.save_task(task)

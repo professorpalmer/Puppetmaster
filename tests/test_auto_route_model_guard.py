@@ -114,7 +114,9 @@ class AutoRouteModelGuardTests(unittest.TestCase):
             self.assertEqual(decisions, [])
             self.assertEqual(orchestrator.store.list_tasks(job.id), [])
 
-    def test_explicit_model_pin_can_still_pass_through_without_registry(self):
+    def test_explicit_model_pin_fails_closed_without_registry(self):
+        from puppetmaster.router import NoEligibleModelError
+
         with tempfile.TemporaryDirectory() as tmp:
             orchestrator, job = self._orchestrator(tmp)
             spec = WorkerSpec(
@@ -127,11 +129,9 @@ class AutoRouteModelGuardTests(unittest.TestCase):
                 "puppetmaster.model_registry.load_registry",
                 return_value=[],
             ):
-                routed, decisions = orchestrator._apply_auto_routing(job, [spec])
-
-            self.assertEqual(routed, [spec])
-            self.assertEqual(decisions, [])
-            self.assertEqual(routed[0].payload["model"], "grok-4.5")
+                with self.assertRaises(NoEligibleModelError) as ctx:
+                    orchestrator._apply_auto_routing(job, [spec])
+            self.assertIn("model registry is empty", str(ctx.exception))
 
 
 if __name__ == "__main__":

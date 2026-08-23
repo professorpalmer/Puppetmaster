@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from datetime import date
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -16,6 +17,9 @@ from typing import Any, Iterable, Optional
 _PACKAGED_BASELINE = Path("baselines") / "role-scorecards-v1.json"
 _DOCS_BASELINE = Path("docs") / "baselines" / "role-scorecards-v1.json"
 _PROVENANCE_SOURCE_COMMUNITY = "community_baseline"
+ROLE_CARD_SCALE = "puppetmaster-capability-0-100"
+MIN_QUALIFIED_SAMPLE_COUNT = 5
+MAX_CALIBRATION_AGE_DAYS = 180
 
 
 def default_community_baseline_path() -> Path:
@@ -32,13 +36,56 @@ def default_community_baseline_path() -> Path:
     return candidates[0]
 
 
+def _qualified_card(card: Any, *, today: Optional[date] = None) -> bool:
+    """Whether a role card is current, reproducible routing authority.
+
+    Incomplete cards remain useful evidence in the registry and audit output,
+    but they cannot override the user's manual ``capability_score``.  The
+    qualification fields are deliberately card-local: a model-wide provenance
+    blob cannot make one role's stale or undersampled measurement authoritative.
+    """
+    if not isinstance(card, dict):
+        return False
+    sample_count = card.get("sample_count")
+    if (
+        isinstance(sample_count, bool)
+        or not isinstance(sample_count, int)
+        or sample_count < MIN_QUALIFIED_SAMPLE_COUNT
+    ):
+        return False
+    if card.get("scale") != ROLE_CARD_SCALE:
+        return False
+    scale_version = card.get("scale_version")
+    if not isinstance(scale_version, str) or not scale_version.strip():
+        return False
+    provenance = card.get("provenance")
+    if not isinstance(provenance, dict) or not provenance:
+        return False
+    source = provenance.get("source")
+    version = provenance.get("version")
+    if not isinstance(source, str) or not source.strip():
+        return False
+    if not isinstance(version, str) or not version.strip():
+        return False
+    calibrated = card.get("last_calibrated")
+    if not isinstance(calibrated, str):
+        return False
+    try:
+        calibrated_on = date.fromisoformat(calibrated)
+    except ValueError:
+        return False
+    reference = today or date.today()
+    age_days = (reference - calibrated_on).days
+    return 0 <= age_days <= MAX_CALIBRATION_AGE_DAYS
+
+
 def card_capability(spec: Any, role: str) -> Optional[int]:
-    """Return the role card capability when it is an int in 0-100, else None."""
+    """Return a qualified role-card capability, otherwise ``None``."""
     cards = getattr(spec, "role_scorecards", None) or {}
     if not isinstance(cards, dict):
         return None
     card = cards.get(role or "")
-    if not isinstance(card, dict):
+    if not _qualified_card(card):
         return None
     cap = card.get("capability")
     if isinstance(cap, bool) or not isinstance(cap, int):

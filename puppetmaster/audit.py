@@ -1,6 +1,4 @@
-"""Routing self-audit: turn the artifacts you already store into a
-"here's how your routing actually behaved, here's where it looks mis-scored"
-report — plus a *suggested* models.json diff you apply by hand.
+"""Objective, role-specific routing audit over durable run artifacts.
 
 Design stance (deliberate): this **recommends**, it does not silently
 autopilot. The signals available (model self-reported confidence, escalation
@@ -9,11 +7,11 @@ feedback ratchets that only ever raise cost — the opposite of the point. So:
 
 * The aggregator (:func:`build_audit_report`) is a pure function over records
   the caller collects from the store. Same input, same output.
-* It only proposes a score change for the one defensible case:
-  **an under-delivering model** (it keeps getting picked, then escalated away
-  from or finishing with low confidence). Lowering its score reserves the
-  harder work for a stronger model and stops the cheap-then-expensive
-  double-run.
+* Self-confidence and ordinary escalation remain visible diagnostics, but they
+  never authorize a score change.
+* Objective evaluator outcomes may recommend a role card change only inside a
+  compatible registry/classifier/adapter/evaluator epoch. They never lower the
+  model's global manual score.
 * "Over-used" (a strong model doing trivial work) is **flagged but never
   auto-adjusted** — proving a cheaper model would have sufficed needs a
   counterfactual (a shadow run), which this audit does not perform.
@@ -22,7 +20,10 @@ feedback ratchets that only ever raise cost — the opposite of the point. So:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
 from typing import Callable, Optional
+
+from puppetmaster.scorecards import MAX_CALIBRATION_AGE_DAYS
 
 # Confidence at or above this is "fine"; below it counts toward low-confidence.
 LOW_CONFIDENCE_BAR = 0.6
@@ -38,6 +39,23 @@ SEVERE_RATE = 0.6
 # A model whose typical task needed this much less capability than its score is
 # "possibly over-used" (informational only).
 OVER_USE_GAP = 20
+
+
+@dataclass(frozen=True)
+class ObjectiveAuditOutcome:
+    """One completed objective evaluation attributed to its producing model."""
+
+    model_id: str
+    predicted_quality: Optional[float]
+    objective_quality: Optional[float]
+    passed: bool
+    source: str = ""
+    registry_digest: str = ""
+    classifier_version: str = ""
+    taxonomy_version: str = ""
+    adapter_version: str = ""
+    evaluator_revision: str = ""
+    evaluated_at: str = ""
 
 
 @dataclass(frozen=True)
@@ -71,6 +89,29 @@ class TaskAuditRecord:
     attempts: int = 0
     fallback_attempts: int = 0
     escalation_attempts: int = 0
+    # Reroute attribution is kept per mechanism.  A fallback or independent
+    # review rejection belongs to the model that produced the rejected run,
+    # not to the stronger model that eventually completed the task.
+    fallback_from: Optional[str] = None
+    review_escalated_from: Optional[str] = None
+    fallback_from_models: tuple[str, ...] = ()
+    review_escalated_from_models: tuple[str, ...] = ()
+    # Prediction-versus-outcome evidence.  ``confidence`` above remains the
+    # worker's weak self-report; these fields are populated only from routing
+    # provenance and objective gate/evaluator artifacts.
+    predicted_quality: Optional[float] = None
+    objective_quality: Optional[float] = None
+    objective_passed: Optional[bool] = None
+    objective_source: Optional[str] = None
+    objective_model_id: Optional[str] = None
+    # Historical audit samples are comparable only inside one complete epoch.
+    registry_digest: str = ""
+    classifier_version: str = ""
+    taxonomy_version: str = ""
+    adapter_version: str = ""
+    evaluator_revision: str = ""
+    evaluated_at: str = ""
+    objective_outcomes: tuple[ObjectiveAuditOutcome, ...] = ()
 
     @property
     def has_actuals(self) -> bool:
@@ -113,6 +154,11 @@ class ModelAudit:
     timeout_or_failed_rate: float = 0.0
     degraded_rate: float = 0.0
     roles: dict = field(default_factory=dict)
+    review_escalated_away: int = 0
+    runs_with_objective_outcomes: int = 0
+    objective_pass_rate: Optional[float] = None
+    mean_predicted_quality: Optional[float] = None
+    mean_objective_quality: Optional[float] = None
     flags: list[str] = field(default_factory=list)
     suggested_score: Optional[int] = None
     rationale: Optional[str] = None
@@ -135,6 +181,7 @@ class AuditReport:
     # including ones with no actuals, so it must not anchor the ratio).
     total_est_spend_reconciled_usd: float = 0.0
     role_scorecard_suggestions: list[dict] = field(default_factory=list)
+    epoch_count: int = 0
 
     @property
     def token_drift_ratio(self) -> Optional[float]:
@@ -175,10 +222,117 @@ def _verification_label(result: Optional[str]) -> str:
     return result.strip().lower()
 
 
+def _optional_unit_float(value: object) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if 0.0 <= number <= 1.0 else None
+
+
+def _record_objective_outcomes(
+    record: TaskAuditRecord,
+) -> tuple[ObjectiveAuditOutcome, ...]:
+    if record.objective_outcomes:
+        return record.objective_outcomes
+    if record.objective_passed is None:
+        return ()
+    return (
+        ObjectiveAuditOutcome(
+            model_id=record.objective_model_id or record.model_id,
+            predicted_quality=record.predicted_quality,
+            objective_quality=record.objective_quality,
+            passed=record.objective_passed,
+            source=record.objective_source or "",
+            registry_digest=record.registry_digest,
+            classifier_version=record.classifier_version,
+            taxonomy_version=record.taxonomy_version,
+            adapter_version=record.adapter_version,
+            evaluator_revision=record.evaluator_revision,
+            evaluated_at=record.evaluated_at,
+        ),
+    )
+
+
+def _complete_epoch(outcome: ObjectiveAuditOutcome) -> bool:
+    # Classifier logic is governed by the external taxonomy; either explicit
+    # classifier version or taxonomy version is accepted, while every other
+    # reproducibility dimension is mandatory.
+    complete = all(
+        (
+            outcome.registry_digest,
+            outcome.classifier_version or outcome.taxonomy_version,
+            outcome.adapter_version,
+            outcome.evaluator_revision,
+        )
+    )
+    if not complete:
+        return False
+    if not outcome.evaluated_at:
+        return False
+    evaluated_on = _evaluated_on(outcome.evaluated_at)
+    if evaluated_on is None:
+        return False
+    age_days = (date.today() - evaluated_on).days
+    return 0 <= age_days <= MAX_CALIBRATION_AGE_DAYS
+
+
+def _evaluated_on(value: str) -> Optional[date]:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        try:
+            return date.fromisoformat(value)
+        except (ValueError, TypeError):
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).date()
+
+
+def _epoch_keys(records: list[TaskAuditRecord]) -> set[tuple[str, str, str, str, str]]:
+    keys: set[tuple[str, str, str, str, str]] = set()
+    for record in records:
+        outcomes = _record_objective_outcomes(record)
+        if outcomes:
+            keys.update(
+                (
+                    outcome.registry_digest,
+                    outcome.classifier_version,
+                    outcome.taxonomy_version,
+                    outcome.adapter_version,
+                    outcome.evaluator_revision,
+                )
+                for outcome in outcomes
+            )
+        else:
+            keys.add(
+                (
+                    record.registry_digest,
+                    record.classifier_version,
+                    record.taxonomy_version,
+                    record.adapter_version,
+                    record.evaluator_revision,
+                )
+            )
+    return keys
+
+
 def _record_failed(record: TaskAuditRecord) -> bool:
     if _verification_label(record.verification_result) in _FAILED_RESULTS:
         return True
     return record.gate_passed is False
+
+
+def _fallback_sources(record: TaskAuditRecord) -> tuple[str, ...]:
+    if record.fallback_from_models:
+        return record.fallback_from_models
+    return (record.fallback_from,) if record.fallback_from else ()
+
+
+def _review_escalation_sources(record: TaskAuditRecord) -> tuple[str, ...]:
+    if record.review_escalated_from_models:
+        return record.review_escalated_from_models
+    return (record.review_escalated_from,) if record.review_escalated_from else ()
 
 
 def _record_degraded(record: TaskAuditRecord) -> bool:
@@ -194,7 +348,11 @@ def _role_counts(
         if role:
             counts[role] = counts.get(role, 0) + 1
     for record in records:
-        if record.escalated and record.escalated_from == model_id:
+        if (
+            (record.escalated and record.escalated_from == model_id)
+            or model_id in _fallback_sources(record)
+            or model_id in _review_escalation_sources(record)
+        ):
             role = record.role or ""
             if role:
                 counts[role] = counts.get(role, 0) + 1
@@ -206,45 +364,41 @@ def _role_scorecard_suggestions(
     registry_scores: dict[str, int],
     min_sample: int,
 ) -> list[dict]:
-    """Recommendation-only per-role card hints. Never written by --apply."""
-    groups: dict[tuple, list[TaskAuditRecord]] = {}
+    """Objective, epoch-local role-card hints. Never mutate a global score.
+
+    Each epoch is evaluated independently.  Suggestions with the same
+    model/adapter/role are deduplicated only after one complete epoch has met
+    the sample floor, so incompatible historical samples can never manufacture
+    authority by pooling.
+    """
+    groups: dict[tuple, list[ObjectiveAuditOutcome]] = {}
     for record in records:
         role = record.role or ""
         if not role:
             continue
-        key = (record.model_id, record.adapter, role)
-        groups.setdefault(key, []).append(record)
+        for outcome in _record_objective_outcomes(record):
+            if not _complete_epoch(outcome):
+                continue
+            key = (
+                outcome.model_id,
+                record.adapter,
+                role,
+                outcome.registry_digest,
+                outcome.classifier_version,
+                outcome.taxonomy_version,
+                outcome.adapter_version,
+                outcome.evaluator_revision,
+            )
+            groups.setdefault(key, []).append(outcome)
 
-    suggestions: list[dict] = []
-    for (model_id, adapter, role), recs in sorted(groups.items()):
+    candidates: dict[tuple[str, str, str], tuple[tuple, dict]] = {}
+    for group_key, recs in sorted(groups.items()):
+        model_id, adapter, role = group_key[:3]
         n = len(recs)
         if n < min_sample:
             continue
-        elapsed_vals = [r.elapsed_seconds for r in recs if r.elapsed_seconds is not None]
-        mean_elapsed = _mean(elapsed_vals)
-        failed_rate = sum(1 for r in recs if _record_failed(r)) / n
-        degraded_rate = sum(1 for r in recs if _record_degraded(r)) / n
-
-        peer_means: list[float] = []
-        for (other_id, _adapter, other_role), other_recs in groups.items():
-            if other_role != role or other_id == model_id:
-                continue
-            other_elapsed = [
-                r.elapsed_seconds for r in other_recs if r.elapsed_seconds is not None
-            ]
-            other_mean = _mean(other_elapsed)
-            if other_mean is not None:
-                peer_means.append(other_mean)
-        high_elapsed = False
-        if mean_elapsed is not None and peer_means:
-            peer_median = sorted(peer_means)[len(peer_means) // 2]
-            if peer_median > 0 and mean_elapsed >= 2.0 * peer_median:
-                high_elapsed = True
-        high_fail = (
-            failed_rate >= UNDER_PROVISIONED_RATE
-            or degraded_rate >= UNDER_PROVISIONED_RATE
-        )
-        if not high_elapsed and not high_fail:
+        failed_rate = sum(1 for outcome in recs if not outcome.passed) / n
+        if failed_rate < UNDER_PROVISIONED_RATE:
             continue
         from_cap = registry_scores.get(model_id)
         if from_cap is None:
@@ -252,32 +406,46 @@ def _role_scorecard_suggestions(
         to_cap = max(MIN_SCORE_FLOOR, from_cap - 5)
         if to_cap >= from_cap:
             continue
-        reasons: list[str] = []
-        if high_elapsed:
-            reasons.append(
-                f"mean elapsed {mean_elapsed:.1f}s is much higher than peer "
-                f"models for role={role}"
-            )
-        if high_fail:
-            reasons.append(
-                f"failed/timeout rate {failed_rate:.0%} / degraded rate "
-                f"{degraded_rate:.0%} over {n} {role} runs"
-            )
-        suggestions.append(
-            {
-                "model_id": model_id,
-                "adapter": adapter,
-                "role": role,
-                "from_capability": from_cap,
-                "to_capability": to_cap,
-                "rationale": (
-                    "; ".join(reasons)
-                    + "; recommendation-only role card, not applied to capability_score."
-                ),
-                "sample_count": n,
-            }
+        identity = (model_id, adapter, role)
+        evidence_dates = [
+            evaluated
+            for outcome in recs
+            if outcome.evaluated_at
+            and (evaluated := _evaluated_on(outcome.evaluated_at)) is not None
+        ]
+        last_calibrated = (
+            max(evidence_dates).isoformat()
+            if evidence_dates
+            else ""
         )
-    return suggestions
+        if not last_calibrated:
+            continue
+        suggestion = {
+            "model_id": model_id,
+            "adapter": adapter,
+            "role": role,
+            "from_capability": from_cap,
+            "to_capability": to_cap,
+            "rationale": (
+                f"objective evaluator failure rate {failed_rate:.0%} over "
+                f"{n} {role} runs in one compatible epoch; recommendation-only "
+                "role card, not applied to capability_score."
+            ),
+            "sample_count": n,
+            "last_calibrated": last_calibrated,
+            "epoch": {
+                "registry_digest": group_key[3],
+                "classifier_version": group_key[4],
+                "taxonomy_version": group_key[5],
+                "adapter_version": group_key[6],
+                "evaluator_revision": group_key[7],
+            },
+        }
+        rank = (last_calibrated, *group_key[3:])
+        previous = candidates.get(identity)
+        if previous is None or rank > previous[0]:
+            candidates[identity] = (rank, suggestion)
+    return [candidates[identity][1] for identity in sorted(candidates)]
 
 
 def build_audit_report(
@@ -301,26 +469,66 @@ def build_audit_report(
     """
     model_ids = set(registry_scores) | {r.model_id for r in records}
     model_ids |= {r.escalated_from for r in records if r.escalated_from}
+    model_ids |= {
+        source for record in records for source in _fallback_sources(record)
+    }
+    model_ids |= {
+        source
+        for record in records
+        for source in _review_escalation_sources(record)
+    }
 
     # escalated-away counts keyed by the model the task escalated OFF of.
     escalated_away: dict[str, int] = {}
     for r in records:
         if r.escalated and r.escalated_from:
             escalated_away[r.escalated_from] = escalated_away.get(r.escalated_from, 0) + 1
+    fallback_away: dict[str, int] = {}
+    review_escalated_away: dict[str, int] = {}
+    for r in records:
+        for source in _fallback_sources(r):
+            fallback_away[source] = fallback_away.get(source, 0) + 1
+        for source in _review_escalation_sources(r):
+            review_escalated_away[source] = review_escalated_away.get(source, 0) + 1
 
     audits: list[ModelAudit] = []
     for model_id in sorted(model_ids):
         retained = [r for r in records if r.model_id == model_id]
         away = escalated_away.get(model_id, 0)
+        fallback_away_count = fallback_away.get(model_id, 0)
+        review_away_count = review_escalated_away.get(model_id, 0)
         # A model was the initial pick if it either retained the task (no
         # escalation) or the task escalated away from it.
-        retained_initial = [r for r in retained if not r.escalated]
-        selections = len(retained_initial) + away
+        retained_initial = [
+            r
+            for r in retained
+            if not r.escalated
+            and not _fallback_sources(r)
+            and not _review_escalation_sources(r)
+        ]
+        selections = (
+            len(retained_initial) + away + fallback_away_count + review_away_count
+        )
 
         confidences = [r.confidence for r in retained if r.confidence is not None]
         low = [c for c in confidences if c < low_confidence_bar]
         spend = sum(r.est_cost_usd for r in retained)
-        fell_back_away = sum(1 for r in records if r.fell_back and r.escalated_from == model_id)
+        objective_outcomes = [
+            outcome
+            for r in records
+            for outcome in _record_objective_outcomes(r)
+            if outcome.model_id == model_id
+        ]
+        predicted = [
+            outcome.predicted_quality
+            for outcome in objective_outcomes
+            if outcome.predicted_quality is not None
+        ]
+        objective_quality = [
+            outcome.objective_quality
+            for outcome in objective_outcomes
+            if outcome.objective_quality is not None
+        ]
 
         score = registry_scores.get(model_id)
         escalated_away_rate = (away / selections) if selections else 0.0
@@ -351,7 +559,7 @@ def build_audit_report(
             low_confidence_rate=round(low_conf_rate, 3),
             escalated_away=away,
             escalated_away_rate=round(escalated_away_rate, 3),
-            fell_back_away=fell_back_away,
+            fell_back_away=fallback_away_count,
             est_spend_usd=round(spend, 6),
             runs_with_actuals=len(reconciled),
             measured_runs=measured_runs,
@@ -378,6 +586,23 @@ def build_audit_report(
                 3,
             ),
             roles=_role_counts(model_id, retained, records),
+            review_escalated_away=review_away_count,
+            runs_with_objective_outcomes=len(objective_outcomes),
+            objective_pass_rate=(
+                round(
+                    sum(1 for outcome in objective_outcomes if outcome.passed) /
+                    len(objective_outcomes),
+                    3,
+                )
+                if objective_outcomes
+                else None
+            ),
+            mean_predicted_quality=(
+                round(_mean(predicted), 3) if predicted else None
+            ),
+            mean_objective_quality=(
+                round(_mean(objective_quality), 3) if objective_quality else None
+            ),
         )
         _classify(audit, retained, low_confidence_bar, min_sample)
         audits.append(audit)
@@ -406,6 +631,7 @@ def build_audit_report(
         role_scorecard_suggestions=_role_scorecard_suggestions(
             records, registry_scores, min_sample
         ),
+        epoch_count=len(_epoch_keys(records)),
     )
 
 
@@ -416,9 +642,8 @@ def _classify(
     min_sample: int,
 ) -> None:
     """Attach flags + (only when defensible) a suggested score to ``audit``."""
-    # Under-provisioned: gets picked, then can't finish confidently. Lower the
-    # score so harder work routes to a stronger model. Defensible — there's a
-    # real failure signal (escalation / low confidence), not a guess.
+    # Confidence/escalation is retained as a weak diagnostic, never as routing
+    # authority.  Objective failures are handled by epoch-local role cards.
     under = (
         audit.selections >= min_sample
         and (
@@ -426,19 +651,13 @@ def _classify(
             or audit.low_confidence_rate >= 0.5
         )
     )
-    if under and audit.score is not None:
-        audit.flags.append("under-provisioned")
-        severe = (
-            audit.escalated_away_rate >= SEVERE_RATE
-            or audit.low_confidence_rate >= 0.7
-        )
-        step = 10 if severe else 5
-        audit.suggested_score = max(MIN_SCORE_FLOOR, audit.score - step)
+    if under:
+        audit.flags.append("weak-self-signal")
         audit.rationale = (
             f"escalated away {audit.escalated_away_rate:.0%} of "
             f"{audit.selections} picks / low-confidence "
-            f"{audit.low_confidence_rate:.0%}; lower score so harder work "
-            f"routes to a stronger model."
+            f"{audit.low_confidence_rate:.0%}; diagnostic only, because worker "
+            "self-confidence is not objective routing authority."
         )
         return
 
@@ -502,7 +721,10 @@ def collect_records(store, *, window_days: Optional[float] = None) -> tuple[list
 
         # Initial routing picks and escalation/fallback events, per task.
         initial_by_task: dict[str, dict] = {}
+        routing_history_by_task: dict[str, list[tuple[str, dict]]] = {}
         escalated_from: dict[str, str] = {}
+        fallback_events: dict[str, list[tuple[str, str]]] = {}
+        review_escalation_events: dict[str, list[tuple[str, str]]] = {}
         fell_back: set[str] = set()
         latest_conf: dict[str, tuple[str, float]] = {}  # task_id -> (created_at, confidence)
         # task_id -> (created_at, tokens_in, tokens_out, estimated) for the latest
@@ -510,11 +732,17 @@ def collect_records(store, *, window_days: Optional[float] = None) -> tuple[list
         # carry a usage record contribute, so a task with no usage stays unknown.
         latest_usage: dict[str, tuple[str, int, int, bool]] = {}
         latest_verif_result: dict[str, tuple[str, object]] = {}
+        objective_events: dict[
+            str, list[tuple[str, bool, Optional[float], str, str]]
+        ] = {}
         gate_flags_by_task: dict[str, list[bool]] = {}
         for a in artifacts:
             payload = a.payload or {}
             kind = a.type.value
             if kind == "routing":
+                routing_history_by_task.setdefault(a.task_id, []).append(
+                    (a.created_at, payload)
+                )
                 if a.created_by == "router":
                     initial_by_task[a.task_id] = payload
                 elif a.created_by == "router-escalation":
@@ -523,6 +751,17 @@ def collect_records(store, *, window_days: Optional[float] = None) -> tuple[list
                         escalated_from[a.task_id] = frm
                 elif a.created_by == "router-fallback":
                     fell_back.add(a.task_id)
+                    frm = payload.get("fallback_from_model")
+                    if frm:
+                        fallback_events.setdefault(a.task_id, []).append(
+                            (a.created_at, str(frm))
+                        )
+                elif a.created_by == "router-review-escalation":
+                    frm = payload.get("review_escalated_from_model")
+                    if frm:
+                        review_escalation_events.setdefault(a.task_id, []).append(
+                            (a.created_at, str(frm))
+                        )
             elif kind == "verification":
                 prev = latest_conf.get(a.task_id)
                 if prev is None or a.created_at >= prev[0]:
@@ -544,8 +783,44 @@ def collect_records(store, *, window_days: Optional[float] = None) -> tuple[list
                             bool(payload.get("tokens_estimated")),
                         )
             elif kind == "gate" and "passed" in payload:
-                gate_flags_by_task.setdefault(a.task_id, []).append(
-                    bool(payload.get("passed"))
+                passed = bool(payload.get("passed"))
+                gate_flags_by_task.setdefault(a.task_id, []).append(passed)
+                review_status = str(payload.get("review_status") or "").lower()
+                if review_status in {
+                    "unavailable",
+                    "skipped",
+                    "independence_failed",
+                }:
+                    continue
+                raw_score = payload.get("objective_score")
+                objective_score: Optional[float] = None
+                if (
+                    not isinstance(raw_score, bool)
+                    and isinstance(raw_score, (int, float))
+                    and 0.0 <= float(raw_score) <= 1.0
+                ):
+                    objective_score = float(raw_score)
+                elif raw_score is None:
+                    objective_score = 1.0 if passed else 0.0
+                source = str(
+                    payload.get("evaluator_slot")
+                    or payload.get("kind")
+                    or payload.get("gate")
+                    or "gate"
+                )
+                evaluator_revision = str(
+                    payload.get("evaluator_revision")
+                    or payload.get("evaluator_version")
+                    or ""
+                )
+                objective_events.setdefault(a.task_id, []).append(
+                    (
+                        a.created_at,
+                        passed,
+                        objective_score,
+                        source,
+                        evaluator_revision,
+                    )
                 )
 
         for task_id, task in tasks.items():
@@ -557,6 +832,64 @@ def collect_records(store, *, window_days: Optional[float] = None) -> tuple[list
             conf = latest_conf.get(task_id)
             usage = latest_usage.get(task_id)
             verif = latest_verif_result.get(task_id)
+            objectives = sorted(
+                objective_events.get(task_id, []), key=lambda item: item[0]
+            )
+            objective = objectives[-1] if objectives else None
+            objective_routing = initial
+            fallback_sources = tuple(
+                model_id
+                for _, model_id in sorted(fallback_events.get(task_id, []))
+            )
+            review_escalation_sources = tuple(
+                model_id
+                for _, model_id in sorted(
+                    review_escalation_events.get(task_id, [])
+                )
+            )
+            if objective:
+                prior_routes = [
+                    item
+                    for item in routing_history_by_task.get(task_id, [])
+                    if item[0] <= objective[0]
+                ]
+                if prior_routes:
+                    objective_routing = max(prior_routes, key=lambda item: item[0])[1]
+            attributed_outcomes: list[ObjectiveAuditOutcome] = []
+            for event in objectives:
+                prior_routes = [
+                    item
+                    for item in routing_history_by_task.get(task_id, [])
+                    if item[0] <= event[0]
+                ]
+                event_routing = (
+                    max(prior_routes, key=lambda item: item[0])[1]
+                    if prior_routes
+                    else initial
+                )
+                attributed_outcomes.append(
+                    ObjectiveAuditOutcome(
+                        model_id=str(event_routing.get("model_id") or final_model),
+                        predicted_quality=_optional_unit_float(
+                            event_routing.get("predicted_quality")
+                        ),
+                        objective_quality=event[2],
+                        passed=event[1],
+                        source=event[3],
+                        registry_digest=str(event_routing.get("registry_digest") or ""),
+                        classifier_version=str(
+                            event_routing.get("classifier_version") or ""
+                        ),
+                        taxonomy_version=str(
+                            event_routing.get("taxonomy_version") or ""
+                        ),
+                        adapter_version=str(
+                            event_routing.get("adapter_version") or ""
+                        ),
+                        evaluator_revision=event[4],
+                        evaluated_at=event[0],
+                    )
+                )
             verification_result = verif[1] if verif else None
             if verification_result is not None and not isinstance(
                 verification_result, str
@@ -591,6 +924,48 @@ def collect_records(store, *, window_days: Optional[float] = None) -> tuple[list
                     attempts=int(getattr(task, "attempts", 0) or 0),
                     fallback_attempts=int(payload.get("fallback_attempts") or 0),
                     escalation_attempts=int(payload.get("escalation_attempts") or 0),
+                    fallback_from=(fallback_sources[-1] if fallback_sources else None),
+                    review_escalated_from=(
+                        review_escalation_sources[-1]
+                        if review_escalation_sources
+                        else None
+                    ),
+                    fallback_from_models=fallback_sources,
+                    review_escalated_from_models=review_escalation_sources,
+                    predicted_quality=_optional_unit_float(
+                        objective_routing.get("predicted_quality")
+                    ),
+                    objective_quality=objective[2] if objective else None,
+                    objective_passed=objective[1] if objective else None,
+                    objective_source=objective[3] if objective else None,
+                    objective_model_id=(
+                        str(objective_routing.get("model_id") or final_model)
+                        if objective
+                        else None
+                    ),
+                    registry_digest=str(
+                        objective_routing.get("registry_digest")
+                        or payload.get("router_registry_digest")
+                        or ""
+                    ),
+                    classifier_version=str(
+                        objective_routing.get("classifier_version")
+                        or payload.get("router_classifier_version")
+                        or ""
+                    ),
+                    taxonomy_version=str(
+                        objective_routing.get("taxonomy_version")
+                        or payload.get("router_taxonomy_version")
+                        or ""
+                    ),
+                    adapter_version=str(
+                        objective_routing.get("adapter_version")
+                        or payload.get("router_adapter_version")
+                        or ""
+                    ),
+                    evaluator_revision=(objective[4] if objective else ""),
+                    evaluated_at=(objective[0] if objective else ""),
+                    objective_outcomes=tuple(attributed_outcomes),
                 )
             )
     return records, jobs_considered

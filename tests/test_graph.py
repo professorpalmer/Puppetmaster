@@ -1051,59 +1051,57 @@ class SharedPrewalkPromptPathTests(unittest.TestCase):
 
 class AmbiguousModelPinBoundaryTests(unittest.TestCase):
     def _ambiguous_registry(self, path: Path):
-        from puppetmaster.model_registry import ModelSpec, save_registry
-
-        save_registry(
-            [
-                ModelSpec(
-                    id="cursor/grok-a",
-                    adapter="cursor",
-                    adapter_model_name="grok-a",
-                    enabled=True,
-                ),
-                ModelSpec(
-                    id="cursor/grok-a-alt",
-                    adapter="cursor",
-                    adapter_model_name="grok-a",
-                    enabled=True,
-                ),
-            ],
-            path,
+        # Hand-written: save_registry now rejects duplicate identities. Preflight
+        # / load still have to fail closed on a corrupt on-disk registry.
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "models": [
+                        {
+                            "id": "cursor/grok-a",
+                            "adapter": "cursor",
+                            "adapter_model_name": "grok-a",
+                            "enabled": True,
+                        },
+                        {
+                            "id": "cursor/grok-a-alt",
+                            "adapter": "cursor",
+                            "adapter_model_name": "grok-a",
+                            "enabled": True,
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
         )
 
-    def test_cli_cursor_dispatch_returns_structured_preflight_blocked(self) -> None:
+    def test_cli_cursor_dispatch_fails_closed_on_ambiguous_registry(self) -> None:
         with TemporaryDirectory() as tmp:
             registry_path = Path(tmp) / "models.json"
             self._ambiguous_registry(registry_path)
             state_dir = Path(tmp) / ".puppetmaster"
-            buf = io.StringIO()
             with mock.patch.dict(
                 os.environ,
                 {"PUPPETMASTER_MODELS_PATH": str(registry_path)},
                 clear=False,
-            ), redirect_stdout(buf):
-                code = _main(
-                    [
-                        "--state-dir",
-                        str(state_dir),
-                        "cursor",
-                        "check pin",
-                        "--cwd",
-                        tmp,
-                        "--model",
-                        "grok-a",
-                        "--dry-run",
-                    ]
-                )
-            self.assertEqual(code, 1)
-            payload = json.loads(buf.getvalue())
-            self.assertFalse(payload["ok"])
-            self.assertEqual(payload["failure"], "preflight_blocked")
-            self.assertEqual(payload["result"], "blocked")
-            self.assertIn("preflight:ambiguous_model_pin", payload["evidence"])
-            self.assertIn("ambiguous model pin", payload["reason"])
+            ):
+                with self.assertRaisesRegex(RuntimeError, "ambiguous model identity"):
+                    _main(
+                        [
+                            "--state-dir",
+                            str(state_dir),
+                            "cursor",
+                            "check pin",
+                            "--cwd",
+                            tmp,
+                            "--model",
+                            "grok-a",
+                            "--dry-run",
+                        ]
+                    )
 
-    def test_mcp_generated_config_returns_structured_preflight_blocked(self) -> None:
+    def test_mcp_generated_config_fails_closed_on_ambiguous_registry(self) -> None:
         from puppetmaster.mcp_server import start_cursor_swarm, start_swarm
 
         with TemporaryDirectory() as tmp:
@@ -1123,13 +1121,8 @@ class AmbiguousModelPinBoundaryTests(unittest.TestCase):
             ):
                 for starter in (start_swarm, start_cursor_swarm):
                     with self.subTest(starter=starter.__name__):
-                        result = starter(args)
-                        self.assertTrue(result.get("isError"))
-                        blob = json.dumps(result)
-                        self.assertIn("preflight_blocked", blob)
-                        self.assertIn("ambiguous model pin", blob)
-                        self.assertIn("preflight:ambiguous_model_pin", blob)
-                        self.assertNotIn("Traceback", blob)
+                        with self.assertRaisesRegex(RuntimeError, "ambiguous model identity"):
+                            starter(args)
 
 class FileConsumesJournalTests(unittest.TestCase):
     def test_record_consumes_journal_replays_after_crash(self) -> None:

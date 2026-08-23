@@ -90,9 +90,52 @@ def _is_max_turns_without_findings(
     return not _worker_has_substantive_output(artifacts, artifact.created_by)
 
 
+def _objective_evaluator_summary(artifacts: list[Artifact]) -> dict[str, Any]:
+    """Summarize explicit evaluator evidence without inferring semantics.
+
+    Structural artifact presence still drives the legacy ``quality`` field,
+    while this companion field makes the proof boundary machine-readable.
+    """
+    outcomes: list[bool] = []
+    revisions: set[str] = set()
+    for artifact in artifacts:
+        if artifact.type != ArtifactType.GATE:
+            continue
+        payload = _payload(artifact)
+        review_status = str(payload.get("review_status") or "").lower()
+        if review_status in {"unavailable", "skipped", "independence_failed"}:
+            continue
+        is_evaluator = bool(
+            payload.get("evaluator_revision")
+            or payload.get("evaluator_version")
+            or payload.get("reviewed_artifact_fingerprint")
+            or payload.get("objective_score") is not None
+        )
+        if not is_evaluator or "passed" not in payload:
+            continue
+        outcomes.append(bool(payload.get("passed")))
+        revision = payload.get("evaluator_revision") or payload.get("evaluator_version")
+        if revision not in (None, ""):
+            revisions.add(str(revision))
+    return {
+        "semantic_quality": (
+            "passed" if outcomes and all(outcomes)
+            else "failed" if outcomes
+            else "not_evaluated"
+        ),
+        "objective_evaluations": len(outcomes),
+        "evaluator_revisions": sorted(revisions),
+        "trust_basis": (
+            "objective_evaluator" if outcomes
+            else "structural_artifact_presence"
+        ),
+    }
+
+
 def assess_run_quality(artifacts: Iterable[Artifact]) -> dict[str, Any]:
     """Classify a finished run. See module docstring for verdict semantics."""
     artifacts = list(artifacts)
+    evaluator_summary = _objective_evaluator_summary(artifacts)
     reasons: list[str] = []
 
     blocked = [a for a in artifacts if _is_blocked(a)]
@@ -113,6 +156,7 @@ def assess_run_quality(artifacts: Iterable[Artifact]) -> dict[str, Any]:
             "reasons": reasons,
             "trustworthy": False,
             "blocking_failures": failures,
+            **evaluator_summary,
         }
 
     if not artifacts:
@@ -121,6 +165,7 @@ def assess_run_quality(artifacts: Iterable[Artifact]) -> dict[str, Any]:
             "reasons": ["no artifacts were produced"],
             "trustworthy": False,
             "blocking_failures": [],
+            **evaluator_summary,
         }
 
     substantive = [a for a in artifacts if a.type in _SUBSTANTIVE_TYPES and not _is_degraded_marker(a)]
@@ -137,6 +182,7 @@ def assess_run_quality(artifacts: Iterable[Artifact]) -> dict[str, Any]:
             "reasons": reasons,
             "trustworthy": False,
             "blocking_failures": [],
+            **evaluator_summary,
         }
 
     return {
@@ -144,4 +190,5 @@ def assess_run_quality(artifacts: Iterable[Artifact]) -> dict[str, Any]:
         "reasons": [],
         "trustworthy": True,
         "blocking_failures": [],
+        **evaluator_summary,
     }

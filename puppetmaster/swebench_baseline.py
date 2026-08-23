@@ -258,6 +258,7 @@ def build_swebench_bash_only_bundle(
         # local evidence for one role with community evidence for another.
         provenance = {
             "source": "community_benchmark",
+            "version": f"{_BENCHMARK_ID}:{revision}:{harness_version}",
             "benchmark": _BENCHMARK_ID,
             "leaderboard": "bash-only",
             "agent": _AGENT,
@@ -275,6 +276,8 @@ def build_swebench_bash_only_bundle(
             "quality": _quality_from_resolved(resolved, resolved_scale),
             "sample_count": sample_count,
             "last_calibrated": str(row.get("date") or published_at),
+            "scale": "puppetmaster-capability-0-100",
+            "scale_version": "1",
             "provenance": provenance,
         }
         if isinstance(row.get("instance_cost"), (int, float)):
