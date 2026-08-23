@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+
+from puppetmaster.model_registry import load_registry, registry_digest, save_registry
 from tempfile import TemporaryDirectory
 from unittest import mock
 
@@ -67,10 +69,18 @@ class GrokComposerEnabledRegistryTests(unittest.TestCase):
             registry,
             policy="cheap",
         )
+        absolute = route_task(
+            TaskSignals(instruction=instruction, role="implement"),
+            registry,
+            policy="absolute-cheapest",
+        )
         self.assertEqual(quality.model.id, "cursor/grok-4-5")
         self.assertEqual(quality.model.adapter_model_name, "grok-4.5")
-        self.assertEqual(cheap.model.id, "cursor/composer-2-5")
-        self.assertEqual(cheap.model.adapter_model_name, "composer-2.5")
+        # cheap is cheapest-sufficient; composer 55 is not enough for this implement.
+        self.assertEqual(cheap.model.id, "cursor/grok-4-5")
+        self.assertEqual(cheap.model.adapter_model_name, "grok-4.5")
+        self.assertEqual(absolute.model.id, "cursor/composer-2-5")
+        self.assertEqual(absolute.model.adapter_model_name, "composer-2.5")
 
 
 class AllowedModelFilterTests(unittest.TestCase):
@@ -321,6 +331,9 @@ class RunStatusErrorRerouteTests(unittest.TestCase):
             )
 
         with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "models.json"
+            save_registry(registry, registry_path)
+            bound = load_registry(registry_path)
             store = SwarmStore(Path(tmp) / ".puppetmaster")
             job = store.create_job("auto-routed cursor swarm")
             task = Task(
@@ -334,6 +347,8 @@ class RunStatusErrorRerouteTests(unittest.TestCase):
                     "model": "claude-fable-5",
                     "router_model_id": "cursor/claude-fable-5",
                     "allowed_model_ids": ["grok-4.5", "composer-2.5"],
+                    "registry_path": str(registry_path),
+                    "registry_digest": registry_digest(bound),
                 },
             )
             store.save_task(task)
@@ -449,6 +464,9 @@ class RunStatusErrorRerouteTests(unittest.TestCase):
             )
 
         with TemporaryDirectory() as tmp:
+            registry_path = Path(tmp) / "models.json"
+            save_registry(registry, registry_path)
+            bound = load_registry(registry_path)
             store = SwarmStore(Path(tmp) / ".puppetmaster")
             job = store.create_job("run-status-error exhaustion")
             task = Task(
@@ -467,6 +485,8 @@ class RunStatusErrorRerouteTests(unittest.TestCase):
                         "cursor/claude-fable-5",
                         "cursor/grok-4-5",
                     ],
+                    "registry_path": str(registry_path),
+                    "registry_digest": registry_digest(bound),
                 },
             )
             store.save_task(task)

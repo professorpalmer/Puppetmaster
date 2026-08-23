@@ -2,7 +2,7 @@
 
 The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
 
-**Current release:** [v1.22.18](CHANGELOG.md#v12218) — reusable `build_cost_report` for CLI / MCP / Mari; see [CHANGELOG.md](CHANGELOG.md) for the full line.
+**Current release:** [v1.22.19](CHANGELOG.md#v12219) — quality-aware routing (`cheap` = cheapest-sufficient; requested review fail-closed); see [CHANGELOG.md](CHANGELOG.md) for the full line.
 
 ## Start here
 

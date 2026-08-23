@@ -335,6 +335,9 @@ def merge_catalog_into_registry(
     """
     discovered = catalog_to_specs(catalog, existing)
     discovered_model_names = {s.adapter_model_name for s in discovered}
+    discovered_identity_names = {
+        normalize_model_token(name) for name in discovered_model_names
+    }
 
     non_cursor = [s for s in existing if s.adapter != "cursor"]
     existing_cursor_names = {
@@ -350,7 +353,8 @@ def merge_catalog_into_registry(
             spec
             for spec in existing
             if spec.adapter == "cursor"
-            and spec.adapter_model_name not in discovered_model_names
+            and normalize_model_token(spec.adapter_model_name)
+            not in discovered_identity_names
         ]
         merged = non_cursor + discovered + preserved_cursor
     report = {

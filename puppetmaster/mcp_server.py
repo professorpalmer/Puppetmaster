@@ -3062,11 +3062,20 @@ def route_task_schema() -> JsonObject:
             },
             "policy": {
                 "type": "string",
-                "enum": ["balanced", "cheap", "quality", "escalating"],
+                "enum": [
+                    "balanced",
+                    "cheap",
+                    "absolute-cheapest",
+                    "quality",
+                    "escalating",
+                ],
                 "default": "balanced",
                 "description": (
-                    "Routing policy. balanced=cheapest sufficient; cheap=lowest cost; "
-                    "quality=highest capability; escalating=ordered chain for retries."
+                    "Routing policy. balanced=cost-aware cheapest sufficient; "
+                    "cheap=cheapest sufficient by nominal usage cost; "
+                    "absolute-cheapest=explicitly allow the lowest-cost model "
+                    "even when insufficient; quality=highest capability; "
+                    "escalating=ordered chain for retries."
                 ),
             },
             "min_capability": {
@@ -4418,7 +4427,7 @@ def _auto_route_schema_properties(*, include_required_tags: bool = True) -> Json
         },
         "routing_policy": {
             "type": "string",
-            "enum": ["balanced", "cheap", "quality", "escalating"],
+            "enum": ["balanced", "cheap", "absolute-cheapest", "quality", "escalating"],
             "description": "Routing policy for auto-routed workers.",
         },
         "max_cost_usd": {
@@ -4547,7 +4556,7 @@ def swarm_schema() -> JsonObject:
             },
             "routing_policy": {
                 "type": "string",
-                "enum": ["balanced", "cheap", "quality", "escalating"],
+                "enum": ["balanced", "cheap", "absolute-cheapest", "quality", "escalating"],
                 "description": "Routing policy for auto-routed workers. Defaults to 'balanced'.",
             },
             "max_cost_usd": {
@@ -4971,7 +4980,7 @@ def edit_schema() -> JsonObject:
             },
             "routing_policy": {
                 "type": "string",
-                "enum": ["cheap", "balanced", "quality", "escalating"],
+                "enum": ["cheap", "absolute-cheapest", "balanced", "quality", "escalating"],
                 "default": "cheap",
                 "description": "Router policy when not pinning a model (default: cheap).",
             },
@@ -5049,7 +5058,7 @@ def browser_swarm_schema() -> JsonObject:
             },
             "routing_policy": {
                 "type": "string",
-                "enum": ["cheap", "balanced", "quality", "escalating"],
+                "enum": ["cheap", "absolute-cheapest", "balanced", "quality", "escalating"],
                 "default": "balanced",
                 "description": "Router policy above the capability floor (default: balanced).",
             },

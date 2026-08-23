@@ -185,6 +185,22 @@ def _updated_spec_for_assignment(spec, key: str, value: str):
         return _replace_model_spec(spec, payload_defaults=payload_defaults)
     raise ValueError(f"unknown models set key: {key}")
 
+
+_LIFECYCLE_ASSIGNMENTS = {
+    "enabled",
+    "disabled_reason",
+    "disabled_authority",
+    "retired",
+    "retirement_reason",
+    "retirement_authority",
+}
+
+
+def _lifecycle_assignment_value(key: str, value: str) -> Any:
+    if key in ("enabled", "retired"):
+        return _parse_bool_value(value)
+    return value
+
 def _run_models_set(args, path: Path) -> int:
     from puppetmaster.model_registry import load_registry, save_registry
 
@@ -201,11 +217,20 @@ def _run_models_set(args, path: Path) -> int:
     index = by_id[args.model_id]
     updated = specs[index]
     try:
+        lifecycle_updates: dict[str, Any] = {}
         for assignment in args.assignments:
             if "=" not in assignment:
                 raise ValueError(f"expected key=value assignment, got {assignment!r}")
             key, value = assignment.split("=", 1)
-            updated = _updated_spec_for_assignment(updated, key, value)
+            if key in _LIFECYCLE_ASSIGNMENTS:
+                lifecycle_updates[key] = _lifecycle_assignment_value(key, value)
+            else:
+                updated = _updated_spec_for_assignment(updated, key, value)
+        if lifecycle_updates:
+            # Lifecycle fields are one authority mutation.  Construct once so
+            # assignment ordering cannot create a transient invalid retirement
+            # (for example retired=true before its reason/authority fields).
+            updated = _replace_model_spec(updated, **lifecycle_updates)
     except (TypeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
