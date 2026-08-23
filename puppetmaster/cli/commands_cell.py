@@ -51,6 +51,8 @@ def _run_cell_status_command(args, store) -> int:
     except (CellNotFoundError, InvalidCellIdError) as exc:
         print(f"error: {exc}")
         return 1
+    finally:
+        registry.close()
     return _print_status(payload, json_mode=json_mode)
 
 
@@ -66,6 +68,8 @@ def _run_cell_inspect_command(args, store) -> int:
     except (CellNotFoundError, InvalidCellIdError) as exc:
         print(f"error: {exc}")
         return 1
+    finally:
+        registry.close()
     if json_mode:
         print(json.dumps(payload, indent=2, default=str))
         return 0
