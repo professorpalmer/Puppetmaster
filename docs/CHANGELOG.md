@@ -1,4 +1,8 @@
-## Unreleased
+## v1.22.20 — 2026-08-23
+
+Absorb of [@bsmi021](https://github.com/bsmi021) PR
+[#71](https://github.com/professorpalmer/Puppetmaster/pull/71)
+(landed via absorb, not a merge of the fork branch).
 
 **Feature: User-configurable default reviewer platform with fail-closed dispatch.**
 
