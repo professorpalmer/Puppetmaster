@@ -1,4 +1,4 @@
-## v1.22.21 — 2026-08-23
+## Unreleased
 
 **Feature: effort-level artifact index (queryable memory on the effort ledger).**
 
