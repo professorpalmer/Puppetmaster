@@ -1815,6 +1815,72 @@ def build_parser() -> argparse.ArgumentParser:
     swarm.add_argument("--json", action="store_true", help="Emit the start receipt as JSON.")
     _add_label_argument(swarm)
 
+    review = subcommands.add_parser(
+        "review",
+        help=(
+            "Run one read-only review assignment. Uses --adapter/--platform when "
+            "provided, otherwise the configured default reviewer; fails closed "
+            "when neither is set. Detaches by default and prints job_id."
+        ),
+    )
+    review.add_argument("goal", help="Review goal / audit prompt.")
+    review.add_argument(
+        "--cwd",
+        default=str(Path.cwd()),
+        help="Workspace for worker cwd + CodeGraph context.",
+    )
+    review.add_argument(
+        "--adapter",
+        choices=list(_platform_lock.KNOWN_ADAPTERS),
+        help="Explicit reviewer platform; overrides the configured default.",
+    )
+    review.add_argument(
+        "--platform",
+        choices=list(_platform_lock.KNOWN_ADAPTERS),
+        help="Alias for --adapter; pass only one.",
+    )
+    review.add_argument(
+        "--launch-key", help="Optional idempotency key for detached launch recovery."
+    )
+    review.add_argument(
+        "--model", help="Optional model pin (disables auto-route unless --auto-route)."
+    )
+    review.add_argument("--timeout-seconds", type=_positive_seconds, default=900)
+    review.add_argument("--max-timeout-seconds", type=_positive_seconds, default=None)
+    review.add_argument(
+        "--worker-mode",
+        choices=["subprocess", "inline", "daemon"],
+        default="subprocess",
+    )
+    review.add_argument("--auto-route", action="store_true", default=None)
+    review.add_argument(
+        "--no-auto-route",
+        action="store_true",
+        help="Disable auto-route (use adapter default / pinned model).",
+    )
+    review.add_argument(
+        "--routing-policy",
+        choices=["balanced", "cheap", "absolute-cheapest", "quality", "escalating"],
+    )
+    review.add_argument(
+        "--wait",
+        action="store_true",
+        help="Block until review finishes (default: detach and print job_id).",
+    )
+    review.add_argument(
+        "--disable-memory",
+        action="store_true",
+        default=True,
+        help="Skip promoted memory injection (default: on).",
+    )
+    review.add_argument(
+        "--enable-memory",
+        action="store_true",
+        help="Force promoted memory injection.",
+    )
+    review.add_argument("--json", action="store_true", help="Emit the start receipt as JSON.")
+    _add_label_argument(review)
+
     browser = subcommands.add_parser(
         "browser",
         help=(
@@ -2602,6 +2668,28 @@ def build_parser() -> argparse.ArgumentParser:
         "reset", help="Clear the lock; enable every platform again."
     )
     platform_reset.add_argument("--registry-path", help="Override the registry path.")
+    platform_reviewer = platform_sub.add_parser(
+        "reviewer",
+        aliases=["default-reviewer", "set-reviewer", "set-default-reviewer"],
+        help=(
+            "Show or set the default platform for generic reviews. There is no "
+            "built-in reviewer platform; unset fails closed."
+        ),
+    )
+    platform_reviewer.add_argument(
+        "reviewer_adapter",
+        nargs="?",
+        choices=list(_platform_lock.KNOWN_ADAPTERS),
+        help="Reviewer platform to persist. Omit to show the current setting.",
+    )
+    platform_reviewer.add_argument(
+        "--clear",
+        dest="clear_reviewer",
+        action="store_true",
+        help="Unset the default reviewer so generic review fails closed.",
+    )
+    platform_reviewer.add_argument("--registry-path", help="Override the registry path.")
+    platform_reviewer.add_argument("--json", action="store_true", help="Emit JSON.")
 
     skills_cmd = subcommands.add_parser(
         "skills",

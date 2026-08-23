@@ -27,6 +27,7 @@ REQUIRED_STDIO_TOOLS = frozenset(
     {
         "puppetmaster_doctor",
         "puppetmaster_start_cursor_review",
+        "puppetmaster_start_review",
         "puppetmaster_start_cursor_plan",
         "puppetmaster_start_cursor_swarm",
         "puppetmaster_start_swarm",

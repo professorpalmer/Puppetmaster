@@ -133,8 +133,8 @@ _TRIVIAL_PATTERNS = [
 # Role inference → (canonical role for the classifier, suggested Puppetmaster
 # verb the host should reach for). Order matters: first match wins.
 _ROLE_INFERENCE = [
-    (re.compile(r"\b(security|vuln|exploit|cve)\b"), "security-review", "puppetmaster_start_cursor_review"),
-    (re.compile(r"\b(audit|review|risk|find issues|what could break)\b"), "review", "puppetmaster_start_cursor_review"),
+    (re.compile(r"\b(security|vuln|exploit|cve)\b"), "security-review", "puppetmaster_start_review"),
+    (re.compile(r"\b(audit|review|risk|find issues|what could break)\b"), "review", "puppetmaster_start_review"),
     (re.compile(r"\b(architect|design|approach|trade[-\s]?off|plan|scope)\b"), "plan", "puppetmaster_start_cursor_plan"),
     # Implementation intent → a SINGLE implement worker, never a fan-out swarm.
     # Broadened beyond the old narrow verb list because plain feature work
@@ -174,6 +174,11 @@ _IMPLEMENT_VERBS = frozenset(
 # intent (no broad-scope signal) here instead of the heavier implement job.
 _EDIT_VERB = "puppetmaster_edit"
 _EDIT_VERBS = frozenset({_EDIT_VERB})
+
+# Generic review is intentionally one read-only assignment on the user's
+# selected reviewer platform. It is not a cursor-specific command and it is not
+# inherently a fan-out swarm.
+_REVIEW_VERBS = frozenset({"puppetmaster_review", "puppetmaster_start_review"})
 
 # Verbs that resolve a "where/what/how is X" question structurally instead of
 # crawling the tree. Framed as look-up, not fan-out.
@@ -259,6 +264,16 @@ class DelegationDecision:
                 f"the code instead of grepping, then read only what it points to. "
                 f"If the MCP tool isn't reachable, run `python -m puppetmaster "
                 f"codegraph search '<query>'`. {tail}"
+            )
+        if verb in _REVIEW_VERBS:
+            return (
+                f"[Puppetmaster] This warrants a read-only review pass (capability "
+                f"{self.capability_score}, {self.reason}). Call `{verb}` to run one "
+                f"review assignment on the explicitly selected or configured default "
+                f"reviewer platform. Puppetmaster has no built-in reviewer default; "
+                f"configure one with `puppetmaster platform reviewer <platform>`. "
+                f"For implementation, follow up with `puppetmaster_start_implement`. "
+                f"{tail}"
             )
         return (
             f"[Puppetmaster] This warrants a read-only analysis pass (capability "

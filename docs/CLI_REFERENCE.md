@@ -49,6 +49,8 @@ python -m puppetmaster swarm "Audit the MCP surface"
 python -m puppetmaster swarm "Goal" --roles explore audit review --label "MCP peel"
 python -m puppetmaster swarm "Goal" --wait          # block until complete
 python -m puppetmaster swarm "Goal" --adapter agentic
+python -m puppetmaster review "Goal"                # configured default reviewer
+python -m puppetmaster review "Goal" --adapter codex # explicit one-off reviewer
 
 python -m puppetmaster run "Goal" --config examples/enterprise-workflow.json
 python -m puppetmaster daemon --roles explore architect implement redteam test
@@ -179,11 +181,23 @@ python -m puppetmaster platform only cursor                   # lock to Cursor o
 python -m puppetmaster platform enable claude-code codex      # turn platforms back on
 python -m puppetmaster platform disable openai                # turn a platform off
 python -m puppetmaster platform reset                         # clear the lock (all platforms on)
+python -m puppetmaster platform reviewer                     # show generic review default
+python -m puppetmaster platform reviewer cursor              # set generic review default
+python -m puppetmaster platform reviewer --clear              # unset; generic review fails closed
 # ephemeral / CI override (wins over saved config):
 PUPPETMASTER_ONLY_ADAPTERS=cursor python -m puppetmaster route "audit" --role audit
 ```
 
 A disabled platform is never routed to, auto-discovered, or used for fallback. Default is everything-on. Lock state persists in `~/.puppetmaster/platform.json`.
+
+Generic MCP review selection is separate from model auto-routing: explicit
+`adapter`/`platform` wins, then the persisted `default_reviewer`, otherwise
+dispatch fails closed with the enabled valid reviewer platforms and the command
+to configure one. A configured reviewer that is disabled or unavailable is an
+error; it is never silently replaced. Platform-specific commands such as
+`cursor --review` and `puppetmaster_cursor_review` remain Cursor-only.
+The CLI equivalent is `python -m puppetmaster review "<goal>"`; it detaches by
+default and accepts `--wait` for synchronous use.
 
 The lock is enforced at three layers (v1.12.0+): the router excludes disabled platforms; the platform-specific MCP verbs (`start_cursor_swarm`, `start_claude_implement`, ...) fail fast with remediation before spawning anything; and the orchestrator's task-creation gate raises `PlatformLockedError` for any spec that still carries a disabled adapter — so a hardcoded verb can never run work on a platform you turned off. Related honesty guarantee: a worker dispatched without a routed model records a FAILED task (`no_model`), and a job whose every task failed finishes FAILED with a `job.all_tasks_failed` event instead of stitching into a green COMPLETE.
 
