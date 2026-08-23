@@ -25,11 +25,13 @@ python -m puppetmaster install-claude-mcp           # claude mcp add --scope use
 python -m puppetmaster install-codex-mcp --inherit-env OPENAI_API_KEY,CODEX_HOME
 python -m puppetmaster install-codex-mcp --map-env CODEX_HOME=MY_CODEX_API_HOME
 python -m puppetmaster install-codex-mcp --env-file ~/.config/puppetmaster/env.zsh
+python -m puppetmaster install-hermes-mcp           # ~/.hermes/config.yaml
+python -m puppetmaster install-pi-mcp              # ~/.pi/agent mcp.json + pi-package (pilot, not a worker)
 python -m puppetmaster install-rules                # write .cursor/rules/puppetmaster.mdc + AGENTS.md
 python -m puppetmaster install-rules --global       # also ~/.codex/instructions.md and ~/.claude/CLAUDE.md
 ```
 
-All four installers resolve `sys.executable`, run a `tools/list`
+All of these installers resolve `sys.executable`, run a `tools/list`
 handshake before writing anything, are idempotent (re-run =
 `unchanged`), and preserve existing user content in the target files.
 For Codex MCP credentials, prefer a private env file (`chmod 600`) over

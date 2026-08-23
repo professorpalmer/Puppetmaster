@@ -2452,3 +2452,299 @@ def uninstall_hermes_mcp(
     os.replace(tmp_path, target)
     messages.append(f"removed puppetmaster MCP entry from {target}")
     return UninstallResult(status="removed", target=str(target), messages=messages)
+
+PI_NEXT_STEPS_GUIDANCE = (
+    "Pi is the TUI/pilot, not a leased worker. Restart pi (or start a new session)\n"
+    "so the package extension can register Puppetmaster MCP tools.\n"
+    "Install/refresh the package with `pi install` of the bundled path printed above,\n"
+    "or re-run `puppetmaster install-pi-mcp`.\n"
+    "Then: start_implement / start_agentic / start_prewalk, read effort_index / show,\n"
+    "consume artifacts (not transcripts), size the runtime, nuke the job."
+)
+
+
+def pi_agent_dir(env=None) -> Path:
+    env = env if env is not None else os.environ
+    override = env.get("PI_CODING_AGENT_DIR")
+    if override:
+        return Path(override).expanduser()
+    return Path("~/.pi/agent").expanduser()
+
+
+def bundled_pi_package_dir() -> Optional[Path]:
+    candidate = Path(__file__).with_name("pi_package")
+    return candidate if (candidate / "package.json").is_file() else None
+
+
+def build_pi_mcp_entry(python_executable: str, *, prior: Optional[Mapping] = None) -> dict:
+    entry: dict = dict(prior) if isinstance(prior, Mapping) else {}
+    entry.pop("url", None)
+    entry.pop("headers", None)
+    entry["command"] = python_executable
+    entry["args"] = ["-m", "puppetmaster.mcp_server"]
+    entry["transport"] = "stdio"
+    return entry
+
+
+def _read_json_object(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    loaded = json.loads(path.read_text(encoding="utf-8"))
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _normalize_package_source(value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        return str(Path(raw).expanduser().resolve())
+    except (OSError, RuntimeError):
+        return str(Path(raw).expanduser())
+
+
+def _settings_has_package(settings: Mapping, package_dir: Path) -> bool:
+    packages = settings.get("packages")
+    if not isinstance(packages, list):
+        return False
+    wanted = _normalize_package_source(package_dir)
+    for item in packages:
+        source = item if isinstance(item, str) else (item or {}).get("source") if isinstance(item, dict) else ""
+        if _normalize_package_source(source) == wanted:
+            return True
+    return False
+
+
+def install_pi_mcp(
+    *,
+    python_executable: Optional[str] = None,
+    agent_dir: Optional[Path] = None,
+    package_dir: Optional[Path] = None,
+    force: bool = False,
+    dry_run: bool = False,
+    skip_handshake: bool = False,
+    env: Optional[Mapping[str, str]] = None,
+) -> InstallResult:
+    """Register Puppetmaster stdio MCP + the in-repo Pi pilot package.
+
+    Pi is a TUI/pilot host, not a worker adapter. This writes
+    ``<agent>/mcp.json`` (same command/args shape as Cursor/Hermes) and
+    adds the bundled pi-package path to ``<agent>/settings.json``.
+    Idempotent when both already match.
+    """
+    python = python_executable or sys.executable
+    base = Path(agent_dir) if agent_dir is not None else pi_agent_dir(env)
+    mcp_path = base / "mcp.json"
+    settings_path = base / "settings.json"
+    pkg = Path(package_dir) if package_dir is not None else bundled_pi_package_dir()
+    messages: list[str] = []
+
+    if pkg is None:
+        messages.append(
+            "no bundled Pi package in this install (package-data missing). "
+            "Reinstall puppetmaster-ai or point package_dir at clients/pi."
+        )
+        return InstallResult(
+            status="error",
+            target=str(mcp_path),
+            python_executable=python,
+            messages=messages,
+        )
+
+    try:
+        existing_mcp = _read_json_object(mcp_path)
+    except json.JSONDecodeError as exc:
+        messages.append(f"existing config at {mcp_path} is not valid JSON: {exc!r}")
+        return InstallResult(
+            status="error",
+            target=str(mcp_path),
+            python_executable=python,
+            messages=messages,
+        )
+
+    mcp_servers = existing_mcp.setdefault("mcpServers", {})
+    if not isinstance(mcp_servers, dict):
+        messages.append(f"'mcpServers' in {mcp_path} is not an object; cannot merge")
+        return InstallResult(
+            status="error",
+            target=str(mcp_path),
+            python_executable=python,
+            messages=messages,
+        )
+
+    prior = mcp_servers.get("puppetmaster")
+    prior = prior if isinstance(prior, dict) else None
+    desired = build_pi_mcp_entry(python, prior=prior)
+
+    try:
+        existing_settings = _read_json_object(settings_path)
+    except json.JSONDecodeError as exc:
+        messages.append(f"existing settings at {settings_path} is not valid JSON: {exc!r}")
+        return InstallResult(
+            status="error",
+            target=str(settings_path),
+            python_executable=python,
+            messages=messages,
+        )
+
+    package_present = _settings_has_package(existing_settings, pkg)
+    same_mcp = False
+    if prior is not None:
+        same_mcp = (
+            prior.get("command") == desired["command"]
+            and list(prior.get("args") or []) == desired["args"]
+        )
+        if not same_mcp:
+            if prior.get("command") != desired["command"]:
+                messages.append(
+                    f"updating command: {prior.get('command')!r} -> {desired['command']!r}"
+                )
+            if list(prior.get("args") or []) != desired["args"]:
+                messages.append(
+                    f"updating args: {prior.get('args')!r} -> {desired['args']!r}"
+                )
+
+    if same_mcp and package_present and not force:
+        messages.append(
+            f"pi puppetmaster MCP entry in {mcp_path} already launches {python}; "
+            f"package {pkg} already listed in {settings_path}"
+        )
+        return InstallResult(
+            status="unchanged",
+            target=str(mcp_path),
+            python_executable=python,
+            messages=messages,
+        )
+
+    handshake: Optional[HandshakeResult] = None
+    if not skip_handshake:
+        handshake = handshake_mcp_server(python)
+        if not handshake.ok:
+            messages.append(
+                "handshake FAILED — refusing to write a broken registration. "
+                f"Reason: {handshake.error}"
+            )
+            return InstallResult(
+                status="error",
+                target=str(mcp_path),
+                python_executable=python,
+                handshake=handshake,
+                messages=messages,
+            )
+        messages.append(f"handshake OK ({handshake.tool_count} tools advertised by {python})")
+
+    if dry_run:
+        messages.append(f"DRY RUN — would write puppetmaster MCP entry to {mcp_path}")
+        messages.append(f"DRY RUN — would add {pkg} to {settings_path} packages")
+        messages.append(f"Then: pi install {pkg}")
+        return InstallResult(
+            status="would_install",
+            target=str(mcp_path),
+            python_executable=python,
+            handshake=handshake,
+            messages=messages,
+        )
+
+    mcp_servers["puppetmaster"] = desired
+    existing_mcp["mcpServers"] = mcp_servers
+    _write_json(mcp_path, existing_mcp)
+    messages.append(f"wrote puppetmaster MCP entry to {mcp_path}")
+
+    packages = existing_settings.get("packages")
+    if not isinstance(packages, list):
+        packages = []
+    if not package_present:
+        packages.append(str(pkg.resolve()))
+        existing_settings["packages"] = packages
+        _write_json(settings_path, existing_settings)
+        messages.append(f"added Pi package {pkg} to {settings_path}")
+    else:
+        messages.append(f"Pi package {pkg} already listed in {settings_path}")
+
+    messages.append(f"Documented: pi install {pkg.resolve()}")
+    messages.append("Pi stays the TUI/pilot — do not lease pi as a worker.")
+    return InstallResult(
+        status="installed",
+        target=str(mcp_path),
+        python_executable=python,
+        handshake=handshake,
+        messages=messages,
+    )
+
+
+def uninstall_pi_mcp(
+    *,
+    agent_dir: Optional[Path] = None,
+    package_dir: Optional[Path] = None,
+    dry_run: bool = False,
+    env: Optional[Mapping[str, str]] = None,
+) -> UninstallResult:
+    """Remove Puppetmaster's Pi MCP entry and bundled package listing."""
+    base = Path(agent_dir) if agent_dir is not None else pi_agent_dir(env)
+    mcp_path = base / "mcp.json"
+    settings_path = base / "settings.json"
+    pkg = Path(package_dir) if package_dir is not None else bundled_pi_package_dir()
+    messages: list[str] = []
+    changed = False
+
+    if mcp_path.exists():
+        try:
+            data = _read_json_object(mcp_path)
+        except json.JSONDecodeError as exc:
+            messages.append(f"existing config at {mcp_path} is not valid JSON: {exc!r}")
+            return UninstallResult(status="error", target=str(mcp_path), messages=messages)
+        servers = data.get("mcpServers")
+        if isinstance(servers, dict) and "puppetmaster" in servers:
+            if dry_run:
+                messages.append(f"DRY RUN — would remove puppetmaster MCP entry from {mcp_path}")
+            else:
+                del servers["puppetmaster"]
+                if not servers:
+                    data.pop("mcpServers", None)
+                _write_json(mcp_path, data)
+                messages.append(f"removed puppetmaster MCP entry from {mcp_path}")
+            changed = True
+        else:
+            messages.append(f"no puppetmaster MCP entry in {mcp_path}")
+    else:
+        messages.append(f"no Pi MCP config at {mcp_path}")
+
+    if settings_path.exists() and pkg is not None:
+        try:
+            settings = _read_json_object(settings_path)
+        except json.JSONDecodeError as exc:
+            messages.append(f"existing settings at {settings_path} is not valid JSON: {exc!r}")
+            return UninstallResult(status="error", target=str(settings_path), messages=messages)
+        packages = settings.get("packages")
+        if isinstance(packages, list):
+            wanted = str(pkg.resolve())
+            kept = []
+            removed = 0
+            for item in packages:
+                source = item if isinstance(item, str) else str((item or {}).get("source") or "")
+                if str(Path(source).expanduser()) == wanted:
+                    removed += 1
+                    continue
+                kept.append(item)
+            if removed:
+                if dry_run:
+                    messages.append(f"DRY RUN — would remove {wanted} from {settings_path}")
+                else:
+                    settings["packages"] = kept
+                    _write_json(settings_path, settings)
+                    messages.append(f"removed Pi package listing from {settings_path}")
+                changed = True
+
+    if dry_run and changed:
+        return UninstallResult(status="would_remove", target=str(mcp_path), messages=messages)
+    if changed:
+        return UninstallResult(status="removed", target=str(mcp_path), messages=messages)
+    return UninstallResult(status="unchanged", target=str(mcp_path), messages=messages)
+

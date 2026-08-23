@@ -1,0 +1,28 @@
+{
+  "name": "@puppetmaster/pi-pilot",
+  "version": "1.22.23",
+  "description": "Pi TUI/pilot package: register Puppetmaster MCP tools over stdio. Pi stays the pilot, not a leased worker.",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "puppetmaster",
+    "mcp",
+    "pilot"
+  ],
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ],
+    "skills": [
+      "./skills"
+    ],
+    "prompts": [
+      "./prompts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
