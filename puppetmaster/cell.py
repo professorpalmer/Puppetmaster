@@ -101,16 +101,44 @@ class CellRegistry:
 
     @contextmanager
     def _connect(self, path: Path):
+        """Open a cell DB, apply PRAGMAs, and ALWAYS close the handle.
+
+        ``with sqlite3.connect(...) as conn`` is a *transaction* context
+        manager — it commits/rolls back but leaves the OS file handle
+        open. Windows holds a mandatory lock on that handle, so a later
+        unlink / TemporaryDirectory cleanup fails with ``WinError 32``.
+        Fetch ``journal_mode`` so the result row does not linger unread.
+        """
         connection = sqlite3.connect(str(path), timeout=_BUSY_TIMEOUT_MS / 1000.0)
-        connection.row_factory = sqlite3.Row
-        connection.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA synchronous = NORMAL")
-        connection.execute("PRAGMA foreign_keys = ON")
         try:
+            connection.row_factory = sqlite3.Row
+            connection.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+            connection.execute("PRAGMA journal_mode = WAL").fetchone()
+            connection.execute("PRAGMA synchronous = NORMAL")
+            connection.execute("PRAGMA foreign_keys = ON")
             yield connection
         finally:
             connection.close()
+
+    def close(self) -> None:
+        """Drop live workers and checkpoint every cell file.
+
+        Call this before deleting a temporary state dir so Windows can
+        unlink ``*.sqlite`` (and ``-wal`` / ``-shm``) after inspect.
+        Connections are already closed per ``_connect``; the checkpoint
+        releases WAL sidecar locks that otherwise race teardown.
+        """
+        self._live.clear()
+        if not self.cells_dir.is_dir():
+            return
+        for path in sorted(self.cells_dir.glob("*.sqlite")):
+            connection = sqlite3.connect(str(path), timeout=_BUSY_TIMEOUT_MS / 1000.0)
+            try:
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                pass
+            finally:
+                connection.close()
 
     def _init_schema(self, connection: sqlite3.Connection, cell_id: str) -> None:
         connection.executescript(
@@ -470,4 +498,8 @@ def registry_for_store(store: Any) -> CellRegistry:
 
 def interned_poll(store: Any, *, now: Optional[float] = None) -> list[dict[str, Any]]:
     """Process due cell alarms from an in-process daemon poll."""
-    return registry_for_store(store).tick(now=now)
+    registry = registry_for_store(store)
+    try:
+        return registry.tick(now=now)
+    finally:
+        registry.close()
