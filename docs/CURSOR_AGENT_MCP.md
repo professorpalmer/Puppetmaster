@@ -26,6 +26,7 @@ Puppetmaster exposes these MCP tools:
 - `puppetmaster_partial_summary`
 - `puppetmaster_artifacts`
 - `puppetmaster_effort_index`
+- `puppetmaster_cell_status`
 - `puppetmaster_show`
 - `puppetmaster_dashboard`
 - `puppetmaster_codegraph_search`
