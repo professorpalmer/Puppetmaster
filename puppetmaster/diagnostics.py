@@ -994,15 +994,105 @@ def _pi_cli_command(env: Optional[Mapping[str, str]] = None) -> str:
     return (probe.get("PI_COMMAND") or "pi").strip() or "pi"
 
 
+# Windows PATHEXT suffixes we treat as the same CLI as a bare name.
+# shutil.which already honors PATHEXT, but a stub named ``pi`` (no extension)
+# is invisible on Windows, and a real ``pi.exe`` fails a naive
+# ``name == "pi" or name.startswith("pi-")`` check.
+_PI_PATHEXT = (".exe", ".cmd", ".bat", ".com")
+
+
+def _pi_cli_name_ok(name: str) -> bool:
+    """Accept resolved basenames ``pi``, ``pi.exe``, and ``pi-*`` (plus PATHEXT)."""
+    n = (name or "").lower()
+    stem = n
+    for ext in _PI_PATHEXT:
+        if stem.endswith(ext):
+            stem = stem[: -len(ext)]
+            break
+    return stem == "pi" or stem.startswith("pi-") or n == "pi" or n.startswith("pi-")
+
+
+def _pi_which_on_path(command: str, path_value: Optional[str], pathext: Optional[str]) -> Optional[str]:
+    """Locate the Pi CLI without assuming POSIX ``which`` semantics.
+
+    Order: ``shutil.which`` on the given command, then ``pi.exe`` when the
+    command is the bare CLI, then a PATH-directory scan for either filename
+    (and PATHEXT variants). A file literally named ``pi`` with no extension
+    is a valid stub on Windows CI.
+    """
+    names: list[str] = []
+    # Honor an explicit PI_COMMAND path first (absolute or with a separator).
+    direct = Path(command).expanduser()
+    if os.path.isabs(str(direct)) or os.sep in command or (os.altsep and os.altsep in command):
+        try:
+            if direct.is_file():
+                return str(direct)
+        except OSError:
+            pass
+    found = shutil.which(command, path=path_value)
+    if found:
+        return found
+
+    cmd_name = Path(command).name
+    if cmd_name:
+        names.append(cmd_name)
+    if cmd_name.lower() in ("", "pi", "pi.exe"):
+        for extra in ("pi", "pi.exe"):
+            if extra.lower() not in {n.lower() for n in names} and extra.lower() != command.lower():
+                names.append(extra)
+
+    search_path = path_value
+    for name in names:
+        found = shutil.which(name, path=search_path)
+        if found:
+            return found
+
+    exts: list[str] = []
+    raw_ext = pathext if pathext is not None else os.environ.get("PATHEXT", "")
+    if raw_ext:
+        exts = [e for e in raw_ext.split(os.pathsep) if e]
+
+    for directory in (search_path or "").split(os.pathsep):
+        if not directory:
+            continue
+        folder = Path(directory)
+        try:
+            if not folder.is_dir():
+                continue
+        except OSError:
+            continue
+        for name in names:
+            candidate = folder / name
+            try:
+                if candidate.is_file():
+                    return str(candidate)
+            except OSError:
+                pass
+            for ext in exts:
+                if name.lower().endswith(ext.lower()):
+                    continue
+                extra = folder / f"{name}{ext}"
+                try:
+                    if extra.is_file():
+                        return str(extra)
+                except OSError:
+                    continue
+    return None
+
+
 def _pi_cli_visible(env: Optional[Mapping[str, str]] = None) -> bool:
     probe = env if env is not None else os.environ
     command = _pi_cli_command(probe)
-    resolved = shutil.which(command, path=probe.get("PATH"))
+    resolved = _pi_which_on_path(command, probe.get("PATH"), probe.get("PATHEXT"))
     if resolved is None:
         candidate = Path(command).expanduser()
-        return candidate.is_file()
-    name = Path(resolved).name.lower()
-    return name == "pi" or name.startswith("pi-") or Path(command).name.lower() == "pi"
+        try:
+            if candidate.is_file():
+                return _pi_cli_name_ok(candidate.name)
+        except OSError:
+            return False
+        return False
+    return _pi_cli_name_ok(Path(resolved).name)
 
 
 def _pi_package_files_ok(pkg: Optional[Path]) -> bool:

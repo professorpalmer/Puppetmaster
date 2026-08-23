@@ -14,9 +14,16 @@ if _HERMETIC_DIR not in sys.path:
     sys.path.insert(0, _HERMETIC_DIR)
 import hermetic_env  # noqa: F401
 
-from puppetmaster.diagnostics import pi_pilot_check, run_doctor
+from puppetmaster.diagnostics import (
+    _pi_cli_name_ok,
+    _pi_cli_visible,
+    pi_pilot_check,
+    run_doctor,
+)
 from puppetmaster.installers import (
     HandshakeResult,
+    _package_paths_equivalent,
+    _settings_has_package,
     build_pi_mcp_entry,
     bundled_pi_package_dir,
     install_pi_mcp,
@@ -83,9 +90,9 @@ class PiInstallerTests(unittest.TestCase):
 
 
 class PiDoctorTests(unittest.TestCase):
-    def _stub_pi(self, bindir: Path) -> Path:
+    def _stub_pi(self, bindir: Path, name: str = "pi") -> Path:
         bindir.mkdir(parents=True, exist_ok=True)
-        pi = bindir / "pi"
+        pi = bindir / name
         pi.write_bytes(b"exit 0\n")
         pi.chmod(0o755)
         return pi
@@ -124,6 +131,41 @@ class PiDoctorTests(unittest.TestCase):
             check = pi_pilot_check(env=env)
             self.assertEqual(check.status, "error")
             self.assertIn("install-pi-mcp", check.detail)
+
+    def test_pi_exe_stub_is_visible(self) -> None:
+        """Windows installs the real CLI as pi.exe; which('pi') can miss a stub.
+
+        The file is named pi.exe even on Linux so the same which/PATH-scan
+        logic is covered without a Windows runner.
+        """
+        with tempfile.TemporaryDirectory() as raw:
+            bindir = Path(raw) / "bin"
+            self._stub_pi(bindir, "pi.exe")
+            env = {"PATH": str(bindir), "PI_COMMAND": "pi"}
+            self.assertTrue(_pi_cli_visible(env))
+            env_exe = {"PATH": str(bindir), "PI_COMMAND": "pi.exe"}
+            self.assertTrue(_pi_cli_visible(env_exe))
+            self.assertTrue(_pi_cli_name_ok("pi.exe"))
+            self.assertTrue(_pi_cli_name_ok("pi"))
+            self.assertTrue(_pi_cli_name_ok("pi-coding-agent"))
+            self.assertFalse(_pi_cli_name_ok("pip"))
+            # Incomplete (cli only) is still error, not warn-as-uninstalled.
+            env_err = {
+                "PI_CODING_AGENT_DIR": str(Path(raw) / "agent"),
+                "PATH": str(bindir),
+                "PI_COMMAND": "pi",
+            }
+            (Path(raw) / "agent").mkdir()
+            check = pi_pilot_check(env=env_err)
+            self.assertEqual(check.status, "error", check.detail)
+
+    def test_package_listing_matches_slash_and_samefile(self) -> None:
+        pkg = bundled_pi_package_dir()
+        self.assertIsNotNone(pkg)
+        assert pkg is not None
+        posix = str(pkg.resolve()).replace("\\", "/")
+        self.assertTrue(_package_paths_equivalent(posix, pkg))
+        self.assertTrue(_settings_has_package({"packages": [posix]}, pkg))
 
     def test_run_doctor_includes_pi_pilot(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
