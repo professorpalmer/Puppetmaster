@@ -2,7 +2,7 @@
 
 The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
 
-**Current release:** [v1.22.23](CHANGELOG.md#v12223) — Pi TUI/pilot package (stdio MCP + pi-package); see [CHANGELOG.md](CHANGELOG.md) for the full line.
+**Current release:** [v1.22.24](CHANGELOG.md#v12224) — named cells (serial inbox + hibernate/alarm on inspectable sqlite); see [CHANGELOG.md](CHANGELOG.md) for the full line.
 
 ## Start here
 
@@ -34,6 +34,7 @@ Reproducible evidence behind the durable-state thesis, including an independent 
 | Doc | What's in it |
 |---|---|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Job / Task / Worker / Artifact / Stitcher / Memory object model |
+| [CELL.md](CELL.md) | Named cells: inspectable sqlite, serial inbox, hibernate/alarm (celld slice) |
 | [MODEL_ROUTING.md](MODEL_ROUTING.md) | Router policies, classifier, registry schema, the starter tiers |
 | [ADAPTERS.md](ADAPTERS.md) | All production adapters (cursor, claude-code, openai, codex, hermes, antigravity, agentic) + shell + how to add a new one |
 | [CLI_REFERENCE.md](CLI_REFERENCE.md) | Every CLI subcommand, workflow config schema, daemon mode |

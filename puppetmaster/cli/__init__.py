@@ -37,6 +37,11 @@ from puppetmaster.cli.commands_gate import (
     _run_savings_command,
     _run_should_delegate_command,
 )
+from puppetmaster.cli.commands_cell import (
+    _run_cell_inspect_command,
+    _run_cell_status_command,
+    _run_cell_tick_command,
+)
 from puppetmaster.cli.commands_install import (
     _confirm_uninstall,
     _detected_platforms,
@@ -255,6 +260,9 @@ __all__ = [
     "_run_await_command",
     "_run_codegraph_passthrough",
     "_run_cost_command",
+    "_run_cell_inspect_command",
+    "_run_cell_status_command",
+    "_run_cell_tick_command",
     "_run_effort_index_command",
     "_run_finalize_command",
     "_run_gate_command",

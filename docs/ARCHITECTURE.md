@@ -38,6 +38,8 @@ flowchart TD
 
 The default backend is SQLite with WAL enabled. It stores jobs, tasks, runs, artifacts, memory, and events in the resolved Puppetmaster state directory.
 
+Named cells (v1.22.24) sit **beside** that store as `<state>/cells/<id>.sqlite` files: serial inbox, hibernate flag, and next alarm. They reuse the lease idea from tasks; they do not replace SwarmStore or task claiming.
+
 By default that directory is outside the target repository, under per-user app state:
 
 ```text

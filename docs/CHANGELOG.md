@@ -1,4 +1,31 @@
+## v1.22.24 — 2026-08-23
+
+**Feature: named cells (celld Durable Object slice) on local SQLite.**
+
+Steal the useful celld bits — one named cell, one private SQLite, serial
+inbox, idle hibernate, alarm resume, inspectable on-disk state — without
+the fleet. No S3 coordinator, no LTX replication, no V8 isolates, no
+Wrangler bundles, no distributed CAS ownership.
+
+- **On top of SwarmStore:** cells are sibling files at
+  `<state>/cells/<id>.sqlite`. Existing `state.sqlite3`, task leases, and
+  resumable jobs are unchanged.
+- **Serial inbox:** enqueue events; `process_one` dequeues a single row
+  under a mutex/lease. A second handler for the same cell raises
+  `CellBusyError`.
+- **Hibernate / alarm:** idle cells persist and drop the in-memory worker.
+  `next_alarm` lives in sqlite. `cell-tick` and the interned daemon poll
+  wake due alarms.
+- **Inspect:** CLI `puppetmaster cell-status` / `cell-inspect` / `cell-tick`
+  and MCP `puppetmaster_cell_status` return path, inbox depth, hibernating,
+  next_alarm. A human can open the file with `sqlite3`.
+- **Marionette contract:** ADDITIVE CLI/MCP only. No harness, SSE, or
+  session JSON shape changes.
+- **Tests:** hermetic `unittest` (no pytest) proves serial inbox,
+  hibernate-then-alarm resume, and on-disk sqlite magic.
+
 ## v1.22.23 — 2026-08-23
+
 
 **Feature: Pi as a TUI/pilot package (not a worker adapter).**
 
