@@ -45,6 +45,7 @@ from puppetmaster.mcp_registry import (
 )
 from puppetmaster.run_id import reserve_run_logs
 from puppetmaster.state import resolve_state_dir, state_identity
+from puppetmaster.state_health import diagnose_state_dir, short_warning
 from puppetmaster.store_factory import create_store
 from puppetmaster.swarm_launch import (
     EARLY_JOB_ID_TIMEOUT_SECONDS,
@@ -3639,6 +3640,63 @@ def _spawn_dashboard_server(
             err_handle.close()
 
 
+# How to get *out* of a wrong-state-dir situation, appended to the dashboard
+# note whenever the diagnosis is suspect. Basenames only by construction —
+# there is no path in here at all, so this can never leak the caller's home
+# directory into an agent transcript.
+_STATE_DIR_REMEDY = (
+    "The state dir is derived from the git root of whatever cwd you sent, so a "
+    "cwd above the checkout gets its own separate store: pass the repo root as "
+    "cwd, or an explicit state_dir, or all_projects=true to serve every "
+    "project at once. `python -m puppetmaster projects` lists every project."
+)
+
+
+def _attach_state_dir_warning(body: JsonObject, args: JsonObject, state_dir: str) -> None:
+    """Fold a wrong-state-dir advisory into an *already successful* dashboard body.
+
+    The reported defect was silence: ``dashboard_serves`` only proves "the
+    server on this port serves the state dir I computed", never "that state dir
+    is where this workspace's jobs go", so ``run_dashboard`` reported
+    ``started=true`` with a cheerful note while serving an empty store.
+
+    Advisory, never fatal — the dashboard *did* start, so this sets no
+    ``isError`` and the whole probe sits inside one swallow-all guard: a
+    diagnostic that can fail a dashboard start is worse than no diagnostic.
+    The note is appended to rather than replaced (same shape as
+    ``_attach_codegraph_freshness`` folding a warning into an existing hint),
+    so the caller still learns whether the server was reused or freshly
+    started.
+    """
+    try:
+        diagnosis = diagnose_state_dir(cwd=cwd(args), state_dir=state_dir)
+        if not diagnosis.suspect:
+            return
+        message = short_warning(diagnosis)
+        candidate = diagnosis.candidates[0] if diagnosis.candidates else None
+    except Exception:
+        return
+    body.setdefault("warnings", []).append(
+        {
+            "kind": "state_dir_may_be_wrong",
+            "verdict": diagnosis.verdict,
+            # Basenames and counts only — `short_warning` guarantees the same
+            # for `message`. An absolute state dir path carries the username
+            # and the on-disk layout, and this body is quoted verbatim into
+            # agent transcripts.
+            "state_dir_name": Path(diagnosis.state_dir).name,
+            "active_jobs": diagnosis.active.job_count,
+            "candidate": None if candidate is None else candidate.state_dir.name,
+            "candidate_jobs": 0 if candidate is None else candidate.job_count,
+            "message": message
+            or "This state dir may not be where this workspace's jobs go.",
+        }
+    )
+    existing = body.get("note") or ""
+    warning_note = " ".join(part for part in (message, _STATE_DIR_REMEDY) if part)
+    body["note"] = (existing + " " + warning_note).strip() if existing else warning_note
+
+
 def run_dashboard(args: JsonObject) -> JsonObject:
     """Ensure a dashboard server is running and return its URL (and QR for phones).
 
@@ -3895,6 +3953,15 @@ def run_dashboard(args: JsonObject) -> JsonObject:
                 )
             )
         )
+
+    # Last, so the advisory lands on a body that is otherwise complete and
+    # already carries its note. Skipped for all_projects=true: that board
+    # serves every project's store, so "you may be pointed at the wrong one"
+    # is not a thing that can be true of it. The three early returns above
+    # (stop=true, no phone-reachable address, failed to start) never reach
+    # here on purpose — none of them is this problem.
+    if not all_projects:
+        _attach_state_dir_warning(body, args, state_dir)
     return {"content": [{"type": "text", "text": json.dumps(body, indent=2)}]}
 
 
