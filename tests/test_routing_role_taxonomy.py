@@ -91,6 +91,16 @@ def _authority_json() -> dict:
 
 
 class RoutingRoleTaxonomyTests(unittest.TestCase):
+    def _assert_message_names_path(self, message: str, path: Path) -> None:
+        """Error text should name the resolved path and/or filename, not 8.3."""
+        lowered = message.lower()
+        resolved = str(path.resolve()).lower()
+        filename = path.name.lower()
+        self.assertTrue(
+            resolved in lowered or filename in lowered,
+            f"{path.name} / resolved path missing from: {message}",
+        )
+
     def test_taxonomy_is_external_package_data_without_literal_role_tables(self) -> None:
         resource = importlib.resources.files("puppetmaster").joinpath("routing_roles.json")
         self.assertTrue(resource.is_file(), "routing_roles.json must be shipped inside puppetmaster")
@@ -212,7 +222,7 @@ class RoutingRoleTaxonomyTests(unittest.TestCase):
                     with self.assertRaises(error_type) as caught:
                         load(authority_path)
                     message = str(caught.exception).lower()
-                    self.assertIn(str(authority_path).lower(), message)
+                    self._assert_message_names_path(message, authority_path)
                     self.assertIn(message_fragment, message)
 
     def test_loader_rejects_alias_collision_with_reserved_unknown_role(self) -> None:
@@ -226,7 +236,7 @@ class RoutingRoleTaxonomyTests(unittest.TestCase):
             with self.assertRaises(error_type) as caught:
                 load(authority_path)
             message = str(caught.exception).lower()
-            self.assertIn(str(authority_path).lower(), message)
+            self._assert_message_names_path(message, authority_path)
             self.assertIn("unknown", message)
             self.assertTrue("alias" in message or "ambiguous" in message)
 
