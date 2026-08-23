@@ -916,6 +916,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     effort_index.add_argument("--json", action="store_true", help="Emit JSON.")
 
+    cell_status = subcommands.add_parser(
+        "cell-status",
+        help=(
+            "Inspect a named cell (Durable Object slice): sqlite path, "
+            "inbox depth, hibernating flag, next alarm. Omit the id to list."
+        ),
+    )
+    cell_status.add_argument("cell_id", nargs="?", help="Cell id (job or effort name).")
+    cell_status.add_argument("--json", action="store_true", help="Emit JSON.")
+
+    cell_inspect = subcommands.add_parser(
+        "cell-inspect",
+        help="Dump a cell's inspectable sqlite inbox (path + rows a human can open with sqlite3).",
+    )
+    cell_inspect.add_argument("cell_id", help="Cell id to inspect.")
+    cell_inspect.add_argument("--json", action="store_true", help="Emit JSON.")
+
+    cell_tick = subcommands.add_parser(
+        "cell-tick",
+        help="Process due cell alarms (same work as the interned daemon poll).",
+    )
+    cell_tick.add_argument("--json", action="store_true", help="Emit JSON.")
+
     gate = subcommands.add_parser(
         "gate",
         help=(
