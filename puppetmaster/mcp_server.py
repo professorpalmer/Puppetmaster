@@ -1229,6 +1229,8 @@ _TRACKABLE_SWARM_BLOCKED_TOOLS = frozenset(
         "puppetmaster_start_codex",
         "puppetmaster_start_agentic",
         "puppetmaster_start_browser_swarm",
+        "puppetmaster_review",
+        "puppetmaster_start_review",
         "puppetmaster_start_openai",
         "puppetmaster_start_prewalk",
         # Sync wait verbs also write jobs outside Marionette swarm_pending.
@@ -1384,6 +1386,32 @@ def _build_tools() -> list[McpTool]:
                 "Review this repo and identify risks, findings, and verification gaps."
             ),
             handler=lambda args: start_cursor(args, review=True),
+        ),
+        McpTool(
+            name="puppetmaster_review",
+            description=(
+                "Platform-agnostic review: run one read-only review worker on the explicitly "
+                "selected platform or the user's configured default reviewer. Generic review "
+                "dispatch resolves: explicit adapter selection, then configured default "
+                "reviewer, then fails closed with actionable guidance. Returns structured "
+                "FINDING artifacts. WAIT for completion (synchronous). Use start_review for "
+                "async. Requires a configured default reviewer or explicit adapter selection."
+            ),
+            input_schema=review_schema(),
+            handler=run_review,
+        ),
+        McpTool(
+            name="puppetmaster_start_review",
+            description=(
+                "Platform-agnostic review: start one read-only review worker asynchronously on "
+                "the explicitly selected platform or the user's configured default reviewer. "
+                "Generic review dispatch resolves: explicit adapter selection, then configured "
+                "default reviewer, then fails closed with actionable guidance. Returns job_id "
+                "immediately. Requires a configured default reviewer or explicit adapter selection. "
+                "Configure with: puppetmaster platform reviewer <platform>."
+            ),
+            input_schema=review_schema(),
+            handler=start_review,
         ),
         McpTool(
             name="puppetmaster_cursor_plan",
@@ -2385,6 +2413,99 @@ def start_implement(args: JsonObject) -> JsonObject:
     if isinstance(result, dict):
         result.setdefault("implement_adapter", adapter)
     return result
+
+
+def _review_command(args: JsonObject, adapter: str) -> list[str]:
+    """Build one read-only review assignment through the analysis runtime.
+
+    Platform CLIs do not share Cursor's ``--review``/``--dry-run`` flags. The
+    analysis-swarm builder already knows how to express read-only work for every
+    supported adapter, so generic review uses that common contract with exactly
+    one structured ``review`` role.
+    """
+    goal = require_string(args, "goal")
+    roles: list[object] = [{"role": "review", "instruction": goal}]
+    config_path = write_generated_swarm_config(args, roles, adapter)
+    command = ["run", goal, "--config", str(config_path)]
+    worker_mode = args.get("worker_mode")
+    if worker_mode:
+        command.extend(["--worker-mode", str(worker_mode)])
+    _append_swarm_timeout_flags(command, args)
+    _append_swarm_memory_flags(command, args)
+    _append_label_flag(command, args)
+    return command
+
+
+def _resolve_review_adapter(args: JsonObject) -> tuple[Optional[str], Optional[JsonObject]]:
+    """Resolve explicit/configured review policy once for sync and async verbs."""
+    from puppetmaster import platform_lock
+    from puppetmaster.workers import NoReviewAdapterError, REVIEW_ADAPTERS, pick_review_adapter
+
+    explicit_adapter = args.get("adapter")
+    explicit_platform = args.get("platform")
+    if (
+        explicit_adapter
+        and explicit_platform
+        and str(explicit_adapter) != str(explicit_platform)
+    ):
+        return None, tool_error(
+            "pass only one of adapter or platform for generic review dispatch."
+        )
+
+    enabled = platform_lock.enabled_adapters()
+    configured_default = platform_lock.get_default_reviewer()
+    requested = explicit_adapter or explicit_platform
+    try:
+        adapter = pick_review_adapter(enabled, requested, configured_default)
+    except NoReviewAdapterError as exc:
+        valid_enabled = [name for name in REVIEW_ADAPTERS if name in exc.enabled]
+        details: JsonObject = {
+            "enabled_review_platforms": valid_enabled,
+            "configure": "puppetmaster platform reviewer <platform>",
+        }
+        if exc.requested is not None:
+            details["requested"] = exc.requested
+        if exc.configured_default is not None:
+            details["configured_default"] = exc.configured_default
+        return None, tool_error(str(exc), details)
+    return adapter, None
+
+
+def start_review(args: JsonObject) -> JsonObject:
+    """Platform-agnostic review: resolve the reviewer adapter from explicit request,
+    configured default, or fail closed with actionable guidance. Generic review
+    dispatch works no matter which platform is enabled and configured."""
+    adapter, blocked = _resolve_review_adapter(args)
+    if blocked is not None:
+        return blocked
+    assert adapter is not None
+    try:
+        command = _review_command(args, adapter)
+    except Exception as exc:
+        ambiguous = _ambiguous_model_pin_tool_error(exc, args.get("model"))
+        if ambiguous is not None:
+            return ambiguous
+        raise
+    result = start_cli(command, args)
+    if isinstance(result, dict):
+        result.setdefault("review_adapter", adapter)
+    return result
+
+
+def run_review(args: JsonObject) -> JsonObject:
+    """Synchronous platform-agnostic review: resolve the adapter and wait for completion."""
+    adapter, blocked = _resolve_review_adapter(args)
+    if blocked is not None:
+        return blocked
+    assert adapter is not None
+    try:
+        command = _review_command(args, adapter)
+    except Exception as exc:
+        ambiguous = _ambiguous_model_pin_tool_error(exc, args.get("model"))
+        if ambiguous is not None:
+            return ambiguous
+        raise
+    return run_worker_cli(command, args)
 
 
 def edit_command(args: JsonObject) -> list[str]:
@@ -4583,6 +4704,35 @@ def swarm_schema() -> JsonObject:
                 ),
             },
         }
+    )
+    return schema
+
+
+def review_schema() -> JsonObject:
+    """Schema for generic review dispatch.
+
+    Keep this separate from platform-specific review schemas so the absence of
+    ``adapter`` is visible to MCP clients as an intentional fail-closed choice,
+    not a hidden Cursor default.
+    """
+    schema = swarm_schema()
+    for name in ("roles", "config", "allow_local_demo"):
+        schema["properties"].pop(name, None)
+    schema["properties"]["adapter"] = {
+        "type": "string",
+        "enum": [name for name in SWARM_ANALYSIS_ADAPTERS if name != "local"],
+        "description": (
+            "Explicit reviewer platform. Overrides the persisted default reviewer."
+        ),
+    }
+    schema["properties"]["platform"] = {
+        "type": "string",
+        "enum": [name for name in SWARM_ANALYSIS_ADAPTERS if name != "local"],
+        "description": "Alias for adapter; pass only one of adapter or platform.",
+    }
+    schema["description"] = (
+        "Generic review: explicit adapter/platform, then configured default "
+        "reviewer; no built-in default."
     )
     return schema
 

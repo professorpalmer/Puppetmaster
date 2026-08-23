@@ -454,6 +454,20 @@ IMPLEMENT_ADAPTER_PRIORITY = (
     "agentic",
 )
 
+# Platforms that can run a read-only analysis worker. This is deliberately a
+# capability set, not a priority list: generic review never chooses the first
+# enabled platform. It requires an explicit request or the user's configured
+# default reviewer.
+REVIEW_ADAPTERS = (
+    "agentic",
+    "cursor",
+    "claude-code",
+    "codex",
+    "openai",
+    "hermes",
+    "antigravity",
+)
+
 
 class NoImplementAdapterError(RuntimeError):
     """Raised when no implement-capable adapter is available/enabled.
@@ -466,6 +480,28 @@ class NoImplementAdapterError(RuntimeError):
         super().__init__(message)
         self.enabled = enabled
         self.requested = requested
+
+
+class NoReviewAdapterError(RuntimeError):
+    """Raised when no review-capable adapter is available/enabled.
+
+    Carries the resolved ``enabled`` set, the (optional) ``requested`` adapter,
+    and the (optional) ``configured_default`` so callers can render a precise,
+    actionable error without re-deriving state.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        enabled: AbstractSet[str],
+        requested: Optional[str] = None,
+        configured_default: Optional[str] = None,
+    ):
+        super().__init__(message)
+        self.enabled = enabled
+        self.requested = requested
+        self.configured_default = configured_default
 
 
 # Actionable, per-adapter "how to make me runnable" hints, surfaced when the
@@ -589,6 +625,105 @@ def pick_implement_adapter(
         f"enabled but their CLI/credentials are missing: {', '.join(candidates)}. "
         f"Install/configure one of: {hints}.",
         enabled=enabled,
+    )
+
+
+def pick_review_adapter(
+    enabled: AbstractSet[str],
+    requested: Optional[str] = None,
+    configured_default: Optional[str] = None,
+    *,
+    is_available: Optional[Callable[[str], bool]] = None,
+) -> str:
+    """Resolve the review adapter to use, honoring the platform lock.
+
+    Resolution order:
+    1. ``requested`` (explicit adapter/platform selection) → validate it's
+       review-capable AND enabled, else raise.
+    2. ``configured_default`` (user's configured default reviewer) → validate
+       it's review-capable, enabled, AND available, else raise with clear
+       guidance (no silent fallback).
+    3. Fail closed with an actionable error listing enabled valid reviewer
+       platforms and how to configure a default.
+
+    Review-capable means any adapter in ``REVIEW_ADAPTERS``. An explicit
+    ``requested`` adapter is allowed to reach its platform-specific preflight;
+    a configured default is checked here so an unavailable default fails with
+    precise guidance instead of silently falling back.
+
+    Raising (vs. returning ``None``) keeps the single decision point honest:
+    every caller gets the same precise failure with the same context.
+    """
+    # Explicit request wins and is never second-guessed.
+    if requested:
+        adapter = str(requested)
+        if adapter not in REVIEW_ADAPTERS:
+            raise NoReviewAdapterError(
+                f"adapter {adapter!r} cannot review. Review-capable: "
+                f"{', '.join(REVIEW_ADAPTERS)}.",
+                enabled=enabled,
+                requested=adapter,
+                configured_default=configured_default,
+            )
+        if adapter not in enabled:
+            raise NoReviewAdapterError(
+                f"adapter {adapter!r} is disabled by the platform lock.",
+                enabled=enabled,
+                requested=adapter,
+                configured_default=configured_default,
+            )
+        return adapter
+
+    # Configured default is authoritative when present — fail clearly if it's
+    # disabled or unavailable instead of silently falling back.
+    if configured_default:
+        adapter = str(configured_default)
+        if adapter not in REVIEW_ADAPTERS:
+            raise NoReviewAdapterError(
+                f"configured default reviewer {adapter!r} is not review-capable. "
+                f"Review-capable: {', '.join(REVIEW_ADAPTERS)}. "
+                f"Fix: run `puppetmaster platform reviewer <platform>`.",
+                enabled=enabled,
+                configured_default=adapter,
+            )
+        if adapter not in enabled:
+            raise NoReviewAdapterError(
+                f"configured default reviewer {adapter!r} is disabled by the platform lock. "
+                f"Fix: run `puppetmaster platform enable {adapter}` or choose a different "
+                f"default reviewer with `puppetmaster platform reviewer <platform>`.",
+                enabled=enabled,
+                configured_default=adapter,
+            )
+        available = is_available or adapter_is_available
+        if not available(adapter):
+            hint = _ADAPTER_AVAILABILITY_HINT.get(adapter, adapter)
+            raise NoReviewAdapterError(
+                f"configured default reviewer {adapter!r} is enabled but not available "
+                f"on this machine (CLI/credentials missing). Install/configure: {hint}.",
+                enabled=enabled,
+                configured_default=adapter,
+            )
+        return adapter
+
+    # No explicit request and no configured default → fail closed with actionable guidance.
+    candidates = [a for a in REVIEW_ADAPTERS if a in enabled]
+    if not candidates:
+        raise NoReviewAdapterError(
+            "No review-capable platform is enabled and no default reviewer is configured. "
+            f"Enable one of {', '.join(REVIEW_ADAPTERS)} and configure it as your "
+            f"default reviewer: `puppetmaster platform enable <adapter> && "
+            f"puppetmaster platform reviewer <adapter>`.",
+            enabled=enabled,
+            configured_default=configured_default,
+        )
+
+    # Enabled platforms exist but no default is configured — fail closed.
+    raise NoReviewAdapterError(
+        f"No default reviewer configured. Enabled review-capable platforms: "
+        f"{', '.join(candidates)}. Configure one as your default: "
+        f"`puppetmaster platform reviewer <adapter>`.",
+        enabled=enabled,
+        configured_default=configured_default,
     )
 
 

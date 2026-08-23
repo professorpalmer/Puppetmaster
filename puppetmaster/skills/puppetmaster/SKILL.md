@@ -36,7 +36,8 @@ broad investigation, multi-file audits, and cross-cutting changes.
 |---|---|---|
 | **One focused edit** ("fix this fn", "add a flag", "wire up retries") | `edit` | Cheapest sufficient model + CodeGraph + in-place edit + synchronous diff. The snappy path between editing inline and a full implement job. |
 | **One coupled multi-file feature** | `start_implement` | Isolated clean worktree, one coherent PATCH artifact. |
-| **Broad read-only analysis** (audit, review, "find all X") | `start_swarm` / `start_cursor_swarm` | Parallel roles over read-only analysis. |
+| **One focused read-only review** | `start_review` | Resolves explicit adapter/platform → configured default reviewer → actionable fail-closed error. Cursor tools remain Cursor-only. |
+| **Broad read-only analysis** (audit, "find all X") | `start_swarm` / `start_cursor_swarm` | Parallel roles over read-only analysis; use the Cursor-specific verb only when Cursor is an explicit choice. |
 | **Live-site browser QA** (drive a real browser, capture real network payloads) | `start_browser_swarm` | N parallel browser workers with React-input/network-truth/strong-model guardrails. Hermes preferred; `adapter=agentic` uses stdlib CDP / OpenRouter. ACTING AGENT (side effects). |
 | **"Where is X / what calls Y"** | `codegraph_search` | Structural lookup before reading files. |
 | **"What model / how much?"** | `route_task` | Pure decision, no spend. |
@@ -93,6 +94,13 @@ CodeGraph first, then read only the files it points to. Verbs: `codegraph_search
 - **Platform lock** (`~/.puppetmaster/platform.json`, a denylist) restricts which
   adapters the router may pick. Lock rejections mid-migration are expected, not
   failures.
+- **Generic reviewer selection is separate from model routing.** Set the user
+  choice with `puppetmaster platform reviewer <adapter>` (or inspect it with
+  `puppetmaster platform reviewer`). There is no built-in reviewer platform:
+  `start_review` fails closed when unset, and a configured
+  reviewer that is disabled or unavailable never falls back to another enabled
+  platform. Pass `adapter` or `platform` explicitly when a one-off choice is
+  intended.
 
 ## Output style (optional "Signal-maximizer")
 

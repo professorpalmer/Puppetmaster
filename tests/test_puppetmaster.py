@@ -280,6 +280,8 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertIn("puppetmaster_doctor", tool_names)
         self.assertIn("puppetmaster_cursor_review", tool_names)
         self.assertIn("puppetmaster_start_cursor_review", tool_names)
+        self.assertIn("puppetmaster_review", tool_names)
+        self.assertIn("puppetmaster_start_review", tool_names)
         self.assertIn("puppetmaster_claude_implement", tool_names)
         self.assertIn("puppetmaster_start_claude_implement", tool_names)
         self.assertIn("puppetmaster_codex", tool_names)
@@ -24891,7 +24893,7 @@ class InvocationGateTests(unittest.TestCase):
 
         d = should_delegate("audit the auth module for security issues across the repo")
         self.assertTrue(d.should_delegate)
-        self.assertEqual(d.suggested_verb, "puppetmaster_start_cursor_review")
+        self.assertEqual(d.suggested_verb, "puppetmaster_start_review")
         self.assertGreaterEqual(d.capability_score, 60)
 
     def test_should_not_delegate_trivial_typo(self):
@@ -25040,13 +25042,14 @@ class InvocationGateTests(unittest.TestCase):
         self.assertIn("single", directive.lower())
         self.assertNotIn("fan it out to a swarm", directive)
 
-    def test_review_directive_still_uses_swarm_framing(self):
-        """Read-only analysis keeps the swarm framing — swarms are correct there."""
+    def test_review_directive_uses_configured_reviewer_framing(self):
+        """Review routing names the user-selected platform and does not assume Cursor."""
         from puppetmaster.invocation_gate import should_delegate
 
         d = should_delegate("audit the auth module for security issues across the repo")
-        self.assertEqual(d.suggested_verb, "puppetmaster_start_cursor_review")
-        self.assertIn("fan it out to a swarm", d.directive())
+        self.assertEqual(d.suggested_verb, "puppetmaster_start_review")
+        self.assertIn("configured default reviewer platform", d.directive())
+        self.assertNotIn("fan it out to a swarm", d.directive())
 
     def test_trivial_add_comment_stays_inline_despite_broadened_implement(self):
         """Broadening implement detection to include 'add' must not start
@@ -25197,7 +25200,7 @@ class HookRunnerTests(unittest.TestCase):
         cursor = handle_hook(
             prompt, host="cursor", event="beforeSubmitPrompt", env=self._TOOLS_ON
         )
-        self.assertEqual(cursor.decision.suggested_verb, "puppetmaster_start_cursor_review")
+        self.assertEqual(cursor.decision.suggested_verb, "puppetmaster_start_review")
 
     def test_verb_for_host_translation_table(self):
         from puppetmaster.hook_runner import verb_for_host

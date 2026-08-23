@@ -132,6 +132,8 @@ SUPERVISE_TOOL_NAMES = frozenset(
         "puppetmaster_job_receipt",
         "puppetmaster_cursor_review",
         "puppetmaster_start_cursor_review",
+        "puppetmaster_review",
+        "puppetmaster_start_review",
         "puppetmaster_cursor_plan",
         "puppetmaster_start_cursor_plan",
         "puppetmaster_start_swarm",
