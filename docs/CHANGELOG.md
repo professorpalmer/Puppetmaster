@@ -1,3 +1,24 @@
+## v1.22.28 — 2026-08-23
+
+**Fix: four DeepSeek-validated stdlib CDP and audit calibration defects.**
+
+- **A. CDP Ping/Pong.** `_WS.recv` treated opcode 0x9 (Ping) and 0xA (Pong)
+  as skip-and-continue. RFC 6455 requires a Pong with the same payload.
+  The client now sends a masked Pong; unsolicited Pongs are still ignored.
+- **B. Handshake Accept.** After HTTP 101, `Sec-WebSocket-Accept` must equal
+  `base64(SHA-1(key + GUID))`. A mismatch or missing header is rejected.
+- **C. Fail-closed measured tokens.** `actual_tokens_measured=(not usage[3])`
+  treated a missing `tokens_estimated` key as measured. It is now True only
+  when `tokens_estimated` is explicitly False; an omitted key is unknown
+  (not ground truth).
+- **D. Headline drift on measured runs.** `token_drift_ratio` /
+  `cost_drift_ratio` used every reconciled task while `measured_runs` was
+  unused. Calibration now uses measured (SDK) runs only so char/4
+  approximations cannot skew the number. All-reconciled totals remain.
+
+Marionette-safe: no harness / SSE / session JSON change. No Pi or grok-bot
+worker adapter.
+
 ## v1.22.27 — 2026-08-23
 
 **Fix: a dashboard could confidently serve the wrong project's state dir, and

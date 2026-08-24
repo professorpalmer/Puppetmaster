@@ -159,5 +159,148 @@ class BrowserCdpTest(unittest.TestCase):
         finally:
             b._find_chrome = saved_find
 
+
+class _WsScriptedSock:
+    """In-memory socket: HTTP 101 whose Accept matches the client's key."""
+
+    def __init__(self, extra_frames=b"", accept=None, omit_accept=False):
+        self.sent = bytearray()
+        self._out = b""
+        self._extra = extra_frames
+        self._accept = accept
+        self._omit_accept = omit_accept
+        self._hs = False
+
+    def sendall(self, data):
+        self.sent.extend(data)
+        if self._hs:
+            return
+        raw = bytes(data)
+        if b"Sec-WebSocket-Key:" not in raw:
+            return
+        self._hs = True
+        key = None
+        for line in raw.split(b"\r\n"):
+            if line.lower().startswith(b"sec-websocket-key:"):
+                key = line.split(b":", 1)[1].strip().decode("ascii")
+                break
+        accept = self._accept if self._accept is not None else b._ws_accept_key(key)
+        hdr = [
+            b"HTTP/1.1 101 Switching Protocols",
+            b"Upgrade: websocket",
+            b"Connection: Upgrade",
+        ]
+        if not self._omit_accept:
+            hdr.append(b"Sec-WebSocket-Accept: " + accept.encode("ascii"))
+        self._out = b"\r\n".join(hdr) + b"\r\n\r\n" + self._extra
+
+    def recv(self, n):
+        if not self._out:
+            return b""
+        chunk, self._out = self._out[:n], self._out[n:]
+        return chunk
+
+    def settimeout(self, _t):
+        pass
+
+    def close(self):
+        pass
+
+
+def _unmasked_frame(opcode, payload=b""):
+    header = bytearray([0x80 | (opcode & 0x0F)])
+    n = len(payload)
+    if n < 126:
+        header.append(n)
+    elif n < (1 << 16):
+        header.append(126)
+        header += __import__("struct").pack(">H", n)
+    else:
+        header.append(127)
+        header += __import__("struct").pack(">Q", n)
+    return bytes(header) + payload
+
+
+def _decode_masked_frames(blob):
+    """Yield (opcode, payload) from client-masked frames in *blob*."""
+    import struct
+    i = 0
+    out = []
+    while i + 2 <= len(blob):
+        b0, b1 = blob[i], blob[i + 1]
+        i += 2
+        opcode = b0 & 0x0F
+        length = b1 & 0x7F
+        if length == 126:
+            length = struct.unpack(">H", blob[i:i + 2])[0]
+            i += 2
+        elif length == 127:
+            length = struct.unpack(">Q", blob[i:i + 8])[0]
+            i += 8
+        mask = blob[i:i + 4]
+        i += 4
+        data = bytes(blob[j] ^ mask[(j - i) % 4] for j in range(i, i + length))
+        i += length
+        out.append((opcode, data))
+    return out
+
+
+class WsRfc6455Test(unittest.TestCase):
+    def _connect(self, sock):
+        saved = __import__("socket").create_connection
+
+        def fake_conn(_addr, timeout=None):
+            return sock
+
+        import socket
+        socket.create_connection = fake_conn
+        try:
+            return b._WS("ws://127.0.0.1:9/devtools")
+        finally:
+            socket.create_connection = saved
+
+    def test_handshake_accepts_matching_sec_websocket_accept(self):
+        sock = _WsScriptedSock()
+        ws = self._connect(sock)
+        self.assertIsNotNone(ws)
+        ws.close()
+
+    def test_handshake_rejects_mismatched_sec_websocket_accept(self):
+        sock = _WsScriptedSock(accept="AAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+        with self.assertRaises(ConnectionError) as ctx:
+            self._connect(sock)
+        self.assertIn("accept mismatch", str(ctx.exception))
+
+    def test_handshake_rejects_missing_sec_websocket_accept(self):
+        sock = _WsScriptedSock(omit_accept=True)
+        with self.assertRaises(ConnectionError) as ctx:
+            self._connect(sock)
+        self.assertIn("accept mismatch", str(ctx.exception))
+
+    def test_ping_is_answered_with_matching_pong(self):
+        payload = b"cdp-ping-payload"
+        frames = _unmasked_frame(0x9, payload) + _unmasked_frame(0x1, b'{"id":1}')
+        sock = _WsScriptedSock(extra_frames=frames)
+        ws = self._connect(sock)
+        text = ws.recv()
+        self.assertEqual(text, '{"id":1}')
+        # After the HTTP request, remaining sendall bytes are WS frames.
+        hs_end = bytes(sock.sent).find(b"\r\n\r\n")
+        self.assertNotEqual(hs_end, -1)
+        rest = bytes(sock.sent)[hs_end + 4:]
+        decoded = _decode_masked_frames(rest)
+        pongs = [pl for op, pl in decoded if op == 0xA]
+        self.assertEqual(pongs, [payload])
+
+    def test_unsolicited_pong_is_ignored(self):
+        frames = _unmasked_frame(0xA, b"unsolicited") + _unmasked_frame(0x1, b"ok")
+        sock = _WsScriptedSock(extra_frames=frames)
+        ws = self._connect(sock)
+        self.assertEqual(ws.recv(), "ok")
+        hs_end = bytes(sock.sent).find(b"\r\n\r\n")
+        rest = bytes(sock.sent)[hs_end + 4:]
+        self.assertEqual(_decode_masked_frames(rest), [])
+
+
 if __name__ == "__main__":
     unittest.main()

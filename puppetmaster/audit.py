@@ -183,14 +183,24 @@ class AuditReport:
     role_scorecard_suggestions: list[dict] = field(default_factory=list)
     epoch_count: int = 0
 
+    # Headline drift is measured-only (SDK usage), never char/4. The
+    # all-reconciled totals above stay available for accounting; these
+    # fields are the calibration denominator.
+    tasks_with_measured: int = 0
+    total_est_tokens_measured: int = 0
+    total_actual_tokens_measured: int = 0
+    total_actual_spend_measured_usd: float = 0.0
+    total_est_spend_measured_usd: float = 0.0
+
     @property
     def token_drift_ratio(self) -> Optional[float]:
-        return (self.total_actual_tokens / self.total_est_tokens) if self.total_est_tokens else None
+        denom = self.total_est_tokens_measured
+        return (self.total_actual_tokens_measured / denom) if denom else None
 
     @property
     def cost_drift_ratio(self) -> Optional[float]:
-        denom = self.total_est_spend_reconciled_usd
-        return (self.total_actual_spend_usd / denom) if denom else None
+        denom = self.total_est_spend_measured_usd
+        return (self.total_actual_spend_measured_usd / denom) if denom else None
 
     @property
     def suggestions(self) -> list[dict]:
@@ -535,9 +545,10 @@ def build_audit_report(
         low_conf_rate = (len(low) / len(confidences)) if confidences else 0.0
 
         reconciled = [r for r in retained if r.has_actuals]
+        measured_recs = [r for r in reconciled if r.actual_tokens_measured]
         est_tokens = sum(r.est_tokens_total for r in reconciled)
         actual_tokens = sum(r.actual_tokens_total for r in reconciled)
-        measured_runs = sum(1 for r in reconciled if r.actual_tokens_measured)
+        measured_runs = len(measured_recs)
         actual_spend = 0.0
         if actual_cost_fn is not None:
             actual_spend = sum(
@@ -545,6 +556,17 @@ def build_audit_report(
                 for r in reconciled
             )
         recon_est_spend = sum(r.est_cost_usd for r in reconciled)
+        # Headline calibration uses measured (SDK) runs only so char/4
+        # approximations cannot skew token/cost drift.
+        est_tokens_m = sum(r.est_tokens_total for r in measured_recs)
+        actual_tokens_m = sum(r.actual_tokens_total for r in measured_recs)
+        actual_spend_m = 0.0
+        if actual_cost_fn is not None:
+            actual_spend_m = sum(
+                actual_cost_fn(r.model_id, r.actual_tokens_in, r.actual_tokens_out)
+                for r in measured_recs
+            )
+        recon_est_spend_m = sum(r.est_cost_usd for r in measured_recs)
         elapsed_vals = [r.elapsed_seconds for r in retained if r.elapsed_seconds is not None]
         mean_elapsed = _mean(elapsed_vals)
 
@@ -565,10 +587,14 @@ def build_audit_report(
             measured_runs=measured_runs,
             est_tokens=est_tokens,
             actual_tokens=actual_tokens,
-            token_drift_ratio=round(actual_tokens / est_tokens, 3) if est_tokens else None,
+            token_drift_ratio=(
+                round(actual_tokens_m / est_tokens_m, 3) if est_tokens_m else None
+            ),
             actual_spend_usd=round(actual_spend, 6),
             cost_drift_ratio=(
-                round(actual_spend / recon_est_spend, 3) if recon_est_spend else None
+                round(actual_spend_m / recon_est_spend_m, 3)
+                if recon_est_spend_m
+                else None
             ),
             mean_elapsed_seconds=(
                 round(mean_elapsed, 3) if mean_elapsed is not None else None
@@ -609,11 +635,17 @@ def build_audit_report(
 
     audits.sort(key=lambda m: (m.selections, m.est_spend_usd), reverse=True)
     reconciled_all = [r for r in records if r.has_actuals]
+    measured_all = [r for r in reconciled_all if r.actual_tokens_measured]
     total_actual_spend = 0.0
+    total_actual_spend_m = 0.0
     if actual_cost_fn is not None:
         total_actual_spend = sum(
             actual_cost_fn(r.model_id, r.actual_tokens_in, r.actual_tokens_out)
             for r in reconciled_all
+        )
+        total_actual_spend_m = sum(
+            actual_cost_fn(r.model_id, r.actual_tokens_in, r.actual_tokens_out)
+            for r in measured_all
         )
     return AuditReport(
         jobs_considered=jobs_considered,
@@ -627,6 +659,13 @@ def build_audit_report(
         total_actual_spend_usd=round(total_actual_spend, 6),
         total_est_spend_reconciled_usd=round(
             sum(r.est_cost_usd for r in reconciled_all), 6
+        ),
+        tasks_with_measured=len(measured_all),
+        total_est_tokens_measured=sum(r.est_tokens_total for r in measured_all),
+        total_actual_tokens_measured=sum(r.actual_tokens_total for r in measured_all),
+        total_actual_spend_measured_usd=round(total_actual_spend_m, 6),
+        total_est_spend_measured_usd=round(
+            sum(r.est_cost_usd for r in measured_all), 6
         ),
         role_scorecard_suggestions=_role_scorecard_suggestions(
             records, registry_scores, min_sample
@@ -776,11 +815,18 @@ def collect_records(store, *, window_days: Optional[float] = None) -> tuple[list
                 if "tokens_in" in payload or "tokens_out" in payload:
                     prev_usage = latest_usage.get(a.task_id)
                     if prev_usage is None or a.created_at >= prev_usage[0]:
+                        # Fail-closed: measured only when tokens_estimated is
+                        # explicitly False. An omitted key is unknown, never
+                        # treated as ground-truth SDK usage.
+                        if "tokens_estimated" not in payload:
+                            measured_flag = None
+                        else:
+                            measured_flag = payload.get("tokens_estimated") is False
                         latest_usage[a.task_id] = (
                             a.created_at,
                             int(payload.get("tokens_in") or 0),
                             int(payload.get("tokens_out") or 0),
-                            bool(payload.get("tokens_estimated")),
+                            measured_flag,
                         )
             elif kind == "gate" and "passed" in payload:
                 passed = bool(payload.get("passed"))
@@ -914,7 +960,7 @@ def collect_records(store, *, window_days: Optional[float] = None) -> tuple[list
                     est_tokens_out=int(initial.get("estimated_tokens_out") or 0),
                     actual_tokens_in=usage[1] if usage else 0,
                     actual_tokens_out=usage[2] if usage else 0,
-                    actual_tokens_measured=(not usage[3]) if usage else None,
+                    actual_tokens_measured=usage[3] if usage else None,
                     role=task.role or initial.get("role") or "",
                     elapsed_seconds=_elapsed_seconds(
                         task.created_at, task.completed_at
