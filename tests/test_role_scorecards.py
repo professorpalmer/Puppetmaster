@@ -213,12 +213,44 @@ class ImportBaselineTests(unittest.TestCase):
         self.assertEqual(report["cards_added"], 1)
         self.assertEqual(report["skipped_adapter_mismatch"], [])
 
+    def test_exact_variant_id_prevents_effort_evidence_cross_contamination(self) -> None:
+        from puppetmaster.scorecards import import_community_baseline
+
+        low = _spec(
+            id="agentic/openai-api/gpt-5.6-luna-low",
+            adapter="agentic",
+            adapter_model_name="gpt-5.6-luna",
+            payload_defaults={"provider": "openai-api", "reasoning_effort": "low"},
+        )
+        max_effort = _spec(
+            id="agentic/openai-api/gpt-5.6-luna-max",
+            adapter="agentic",
+            adapter_model_name="gpt-5.6-luna",
+            payload_defaults={"provider": "openai-api", "reasoning_effort": "max"},
+        )
+        bundle = self._bundle([
+            {
+                "id": max_effort.id,
+                "adapter": "agentic",
+                "adapter_model_name": "gpt-5.6-luna",
+                "role_scorecards": {"implement": {"quality": 0.9}},
+            }
+        ])
+
+        imported, report = import_community_baseline([low, max_effort], bundle)
+        by_id = {spec.id: spec for spec in imported}
+
+        self.assertEqual(by_id[low.id].role_scorecards, {})
+        self.assertEqual(by_id[max_effort.id].role_scorecards["implement"]["quality"], 0.9)
+        self.assertEqual(report["matched"], [max_effort.id])
+        self.assertEqual(report["cards_added"], 1)
+
     def test_skips_adapter_mismatch(self) -> None:
         from puppetmaster.scorecards import import_community_baseline
 
         specs = [
             _spec(
-                id="openai/grok-4-6",
+                id="cursor/grok-4-6",
                 adapter="openai",
                 adapter_model_name="grok-4.6",
                 capability_score=88,
