@@ -39,11 +39,31 @@ def resolve_state_dir(value: Optional[Union[Path, str]] = None, cwd: Optional[Pa
 
 
 def default_state_dir(cwd: Optional[Path] = None) -> Path:
-    workspace = _git_root(cwd or Path.cwd()) or (cwd or Path.cwd())
-    resolved = workspace.resolve()
+    base = cwd or Path.cwd()
+    workspace = _git_root(base) or base
+    return project_state_dir_for(workspace)
+
+
+def projects_root() -> Path:
+    """Return the parent directory holding every project-scoped state dir."""
+    return app_state_root() / "projects"
+
+
+def project_state_dir_for(workspace: Union[Path, str]) -> Path:
+    """Return the state dir ``workspace`` hashes to, without probing git.
+
+    Split out of ``default_state_dir`` so a caller can ask "what state dir
+    would *that* directory get?" for an arbitrary path — the identity check
+    in ``state_health`` needs to map a sibling repo to its state dir without
+    shelling out to git and without re-deriving the slug/digest formula.
+
+    ``workspace`` is used verbatim (already the git root, or the cwd when the
+    caller has no repo): this helper never resolves a repository for you.
+    """
+    resolved = Path(workspace).resolve()
     slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", resolved.name).strip("-") or "workspace"
     digest = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:12]
-    return app_state_root() / "projects" / f"{slug}-{digest}"
+    return projects_root() / f"{slug}-{digest}"
 
 
 def app_state_root() -> Path:
@@ -68,10 +88,10 @@ def list_project_state_dirs() -> list[Path]:
     helper lets callers iterate every known project to support cross-
     workspace job lookup without forcing users to memorize the hash.
     """
-    projects_root = app_state_root() / "projects"
-    if not projects_root.is_dir():
+    root = projects_root()
+    if not root.is_dir():
         return []
-    return sorted(p for p in projects_root.iterdir() if p.is_dir())
+    return sorted(p for p in root.iterdir() if p.is_dir())
 
 
 def find_state_dir_for_job(job_id: str) -> Optional[Path]:
