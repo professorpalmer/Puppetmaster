@@ -45,56 +45,101 @@ class AgenticReasoningEffortTests(unittest.TestCase):
     def _openai_wire_body(self, provider: str, model: str, **payload: object) -> dict:
         captured: dict = {}
 
-        def fake_post_json(*_args, **kwargs):
-            captured.update(kwargs["body"])
+        def fake_post_json(url, *, headers, body, timeout):
+            captured.update(url=url, body=body)
             return {"choices": [{"message": {"content": "ok"}}], "usage": {}}
 
         extra = self._extra(provider, model=model, **payload)
         with mock.patch.object(providers, "_post_json", side_effect=fake_post_json):
-            providers._openai_chat(
-                base_url="https://api.openai.com/v1",
-                api_key=None,
+            providers.provider_chat(
+                provider=provider,
                 model=model,
                 messages=[{"role": "user", "content": "test"}],
                 tools=[{"type": "function", "function": {"name": "submit_findings"}}],
                 extra=extra,
-                headers={},
-                timeout=10,
+                api_key="test-key",
             )
         return captured
 
-    def test_direct_openai_gpt56_tool_requests_send_none(self) -> None:
+    def test_direct_openai_gpt56_without_selected_effort_keeps_none_fallback(self) -> None:
         for provider in ("openai", "openai-api"):
             for model in ("gpt-5.6", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"):
                 with self.subTest(provider=provider, model=model):
-                    self.assertEqual(
-                        self._extra(provider, model=model).get("reasoning_effort"),
-                        "none",
-                    )
-                    self.assertEqual(
-                        self._openai_wire_body(provider, model).get("reasoning_effort"),
-                        "none",
-                    )
+                    captured = self._openai_wire_body(provider, model)
+                    self.assertEqual(captured["url"], "https://api.openai.com/v1/chat/completions")
+                    self.assertEqual(captured["body"]["reasoning_effort"], "none")
+
+    def test_direct_openai_gpt56_selected_effort_reaches_responses_with_tools(self) -> None:
+        captured: dict = {}
+
+        def fake_post_json(url, *, headers, body, timeout):
+            captured.update(url=url, body=body)
+            return {
+                "status": "completed",
+                "output": [{
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "submit_findings",
+                    "arguments": '{"findings": []}',
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            }
+
+        tools = [{"type": "function", "function": {"name": "submit_findings"}}]
+        extra = self._extra(
+            "openai-api", model="gpt-5.6-luna", reasoning_effort="max",
+        )
+        with mock.patch.object(providers, "_post_json", side_effect=fake_post_json):
+            turn = providers.provider_chat(
+                provider="openai-api",
+                model="gpt-5.6-luna",
+                messages=[{"role": "user", "content": "inspect"}],
+                tools=tools,
+                extra=extra,
+                api_key="test-key",
+            )
+
+        self.assertEqual(captured["url"], "https://api.openai.com/v1/responses")
+        self.assertEqual(captured["body"]["reasoning"], {"effort": "max", "summary": "auto"})
+        self.assertEqual(captured["body"]["tools"][0]["name"], "submit_findings")
+        self.assertEqual(turn.tool_calls[0]["name"], "submit_findings")
+
+    def test_direct_openai_gpt56_selected_effort_streams_responses(self) -> None:
+        tools = [{"type": "function", "function": {"name": "submit_findings"}}]
+        extra = self._extra(
+            "openai-api", model="gpt-5.6-luna", reasoning_effort="max",
+        )
+        expected = object()
+        with mock.patch.object(
+            providers, "_openai_responses_chat_stream", return_value=expected,
+        ) as responses:
+            turn = providers.provider_chat_streaming(
+                provider="openai-api",
+                model="gpt-5.6-luna",
+                messages=[{"role": "user", "content": "inspect"}],
+                tools=tools,
+                extra=extra,
+                api_key="test-key",
+                on_delta=lambda _kind, _text: None,
+            )
+
+        self.assertIs(turn, expected)
+        self.assertEqual(responses.call_args.kwargs["extra"]["reasoning_effort"], "max")
+        self.assertEqual(responses.call_args.kwargs["tools"], tools)
 
     def test_direct_openai_older_gpt5_tool_requests_omit_reasoning(self) -> None:
         for provider in ("openai", "openai-api"):
             for model in ("gpt-5", "gpt-5.5"):
                 with self.subTest(provider=provider, model=model):
                     self.assertNotIn("reasoning_effort", self._extra(provider, model=model))
-                    self.assertNotIn(
-                        "reasoning_effort",
-                        self._extra(provider, model=model, reasoning_effort="high"),
+                    captured = self._openai_wire_body(
+                        provider, model, reasoning_effort="high",
                     )
-                    self.assertNotIn(
-                        "reasoning_effort",
-                        self._openai_wire_body(provider, model),
-                    )
+                    self.assertNotIn("reasoning_effort", captured["body"])
 
     def test_direct_openai_gpt56_prefixed_alias_sends_none(self) -> None:
-        self.assertEqual(
-            self._extra("openai-api", model="openai/gpt-5.6").get("reasoning_effort"),
-            "none",
-        )
+        captured = self._openai_wire_body("openai-api", "openai/gpt-5.6")
+        self.assertEqual(captured["body"]["reasoning_effort"], "none")
 
     def test_other_openai_wire_provider_keeps_reasoning_effort(self) -> None:
         self.assertEqual(
