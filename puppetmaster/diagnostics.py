@@ -69,6 +69,7 @@ def run_doctor(root: Path, state_dir: Optional[Path] = None) -> list[Check]:
         _guard("CURSOR_API_KEY", lambda: _env_check("CURSOR_API_KEY")),
         _guard("OPENAI_API_KEY", lambda: _env_check("OPENAI_API_KEY")),
         _guard("sqlite-state", lambda: _sqlite_state_check(state_path / "state.sqlite3")),
+        _guard("state-identity", lambda: _state_identity_check(root, state_path)),
         _guard("git-status", lambda: _git_clean_check(root)),
         _guard("agent-rules", lambda: _agent_rules_check(root)),
     ]
@@ -971,6 +972,74 @@ def _sqlite_state_check(path: Path) -> Check:
             f"synchronous={expected_synchronous})"
         )
     return Check("sqlite-state", status, detail)
+
+
+def _state_identity_check(root: Path, state_dir: Path) -> Check:
+    """Warn when the active state dir looks like a fork of a nested repo's.
+
+    ``default_state_dir`` hashes ``git root or cwd``. Opening a session one
+    level above the real checkout makes the ``or`` fallback fire, splitting a
+    single logical project into two state dirs — the sqlite-state row above
+    then reports the near-empty wrong one as a benign "no local sqlite state
+    yet" optional. This row names the busy dir instead.
+
+    Detect-only: nothing here changes what any path resolves to. ``state_dir``
+    is passed explicitly by ``run_doctor``, which keeps the probe git-free —
+    doctor adds no git subprocess for this check.
+    """
+    from puppetmaster.state_health import (
+        GUARD_VERDICTS,
+        VERDICT_NEW,
+        VERDICT_NOT_PROJECT_SCOPED,
+        VERDICT_UNAVAILABLE,
+        diagnose_state_dir,
+    )
+
+    diagnosis = diagnose_state_dir(cwd=root, state_dir=state_dir)
+    evidence = list(diagnosis.evidence)
+
+    if diagnosis.verdict == VERDICT_UNAVAILABLE:
+        return Check(
+            "state-identity",
+            "warn",
+            f"state dir identity probe unavailable; {'; '.join(evidence)}",
+            evidence,
+        )
+
+    if diagnosis.suspect and diagnosis.candidates:
+        best = diagnosis.candidates[0]
+        return Check(
+            "state-identity",
+            "warn",
+            (
+                f"{state_dir.name} holds {diagnosis.active.job_count} job(s) but "
+                f"{best.state_dir.name} holds {best.job_count}; this folder is not a "
+                f"git repository, so state forked to a second project dir. "
+                f"Re-run from the git root ({best.workspace.name}), pass an explicit "
+                f"--state-dir, or use `puppetmaster projects` and "
+                f"`puppetmaster dashboard --all-projects` to reach the other history."
+            ),
+            evidence,
+        )
+
+    # A brand-new project has nothing to compare against yet, and an
+    # explicitly pinned state dir is out of scope by construction.
+    if diagnosis.verdict in {VERDICT_NEW, VERDICT_NOT_PROJECT_SCOPED}:
+        return Check(
+            "state-identity",
+            "optional",
+            f"{diagnosis.verdict}; {state_dir.name}",
+            evidence,
+        )
+
+    guarded = "guarded" if diagnosis.verdict in GUARD_VERDICTS else "healthy"
+    return Check(
+        "state-identity",
+        "ok",
+        f"{guarded}: {diagnosis.verdict}; {state_dir.name} "
+        f"({diagnosis.active.job_count} job(s))",
+        evidence,
+    )
 
 
 def _git_clean_check(root: Path) -> Check:

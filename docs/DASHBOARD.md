@@ -51,6 +51,70 @@ is never mistaken for a match — no coordinated upgrade needed, and `--status`
 still reports it as yours (noting it predates `/api/meta`) as long as the pid
 your own runfile tracked is still alive.
 
+That same identity also has a human half. The header carries a **project tag**,
+rendered from `/api/meta` by a pure `projectLabel()` as
+`<slug> · <first 8 hex of the state dir digest>` — for example
+`puppetmaster · c3177e60` — and the identical label goes into the **browser tab
+title** (`Puppetmaster — puppetmaster · c3177e60`). Two boards on adjacent ports are
+therefore distinguishable at a glance, and from the taskbar or tab strip without
+focusing either one. The 8 hex digits are kept on purpose rather than trimmed for
+looks: the two dirs one real project forked into were
+`puppetmaster-c3177e6032c4` and `Puppetmaster-b92145e840c8`, which differ **only
+by letter case** once the digest is stripped — dropping it would re-merge on
+screen exactly what the tag exists to tell apart. An `--all-projects` board is
+labelled `all projects` instead of one incidental member of the set, and a state
+dir whose name isn't `<slug>-<12 hex>` is passed through unmangled.
+
+Under `--mobile` — or for any non-loopback peer — `/api/meta` withholds the
+human-readable basename, so the header degrades to a short state id
+(`state c3177e60`). That is deliberate, not a gap: the endpoint is
+**unauthenticated**, and a project basename is a folder name off the local
+filesystem, while the hash is safe to hand to anyone who can already reach the
+board.
+
+**When the board may be serving the wrong project.** Because the default state
+dir is derived from the git root of the launching shell's cwd, a session opened
+at a non-git wrapper folder *above* the checkout gets its own separate store —
+one logical project forks into two state dirs, and the emptier one renders as a
+perfectly healthy, perfectly empty board. A wrong-state-dir warning now appears
+in three places:
+
+- a `WARNING:` line on **stderr** when `serve()` starts, right after the
+  `Reading durable state from:` line it would otherwise contradict (the
+  `--background` and MCP launch paths redirect stderr into `dashboard.err.log`,
+  the only channel from a detached board that reaches a human);
+- a `state_dir_may_be_wrong` entry in `warnings` on the **MCP dashboard tool**
+  response, plus the same sentence appended to that response's `note` alongside
+  how to get out of it (pass the repo root as `cwd`, an explicit `state_dir`, or
+  `all_projects=true`). It is advisory: the dashboard did start, so nothing is
+  flagged as an error;
+- a **banner** in the page itself, fed by a separate `GET /api/diagnostics`
+  route and HTML-escaped like every other artifact-derived string on the board.
+
+`puppetmaster doctor` reports the same finding as a **state-identity** row —
+`warn` when the active dir looks forked, `optional` for a brand-new project or an
+explicitly pinned dir, `ok` otherwise.
+
+A few properties of this check are worth stating plainly:
+
+- The diagnosis is **not** served on `/api/meta`. The identity check that makes
+  reuse work reads a bounded body under a short socket timeout, so a slow or
+  oversized response there is silently read as "not my dashboard" — which is
+  precisely how you end up with duplicate dashboards. The filesystem walk stays
+  behind its own route.
+- Detection is **warn-only**. It changes no existing state directory path, so no
+  job history is moved, re-homed, or orphaned by it; the warning tells you where
+  the other history is and leaves it exactly where it is.
+- An `--all-projects` board **never warns** — it serves every project, so "you
+  may be pointed at the wrong one" cannot be true of it.
+- An explicit `--state-dir` (or `PUPPETMASTER_STATE_DIR`) is treated as a
+  deliberate choice and is **never second-guessed**; only the hashed
+  `projects/<slug>-<digest>` layout can fork.
+- `--all-projects` also stopped hiding failures: a project it cannot read is now
+  **reported** rather than silently omitted, so an aggregate board that is
+  showing less than everything says so instead of erasing a whole project's job
+  list without a trace.
+
 ## Easiest setup: let the pilot run it (no second terminal)
 
 The lowest-lift path is to have the agent start it for you. The MCP

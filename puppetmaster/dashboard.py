@@ -25,6 +25,9 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
+import sys
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
@@ -663,16 +666,78 @@ def list_jobs_snapshot(store: SwarmStore, *, limit: int = 50) -> list[dict[str, 
     return rows[:limit]
 
 
-def list_all_projects_snapshot(*, backend: str = "sqlite", limit: int = 200) -> list[dict[str, Any]]:
-    """Aggregate jobs from every project state dir on this machine."""
+# `default_state_dir` mints project dirs as ``<slug>-<12 hex of sha256>``; the
+# board wants the human half back. Named (rather than inlined at the one call
+# site) so a test can pin the exact strip against the digest convention.
+_PROJECT_DIGEST_RE = re.compile(r"-[0-9a-f]{12}$")
+
+
+def project_slug(name: str) -> str:
+    """Strip the hashed workspace suffix off a project state-dir name.
+
+    ``project_slug("alpha-0123456789ab") == "alpha"``, and a name without the
+    12-hex digest (or one that is *only* a digest) is returned unchanged.
+    """
+    return _PROJECT_DIGEST_RE.sub("", name) or name
+
+
+# Reading somebody else's project state dir is a best-effort operation, and
+# these are the ways it legitimately fails: the directory or DB file is
+# unreadable/locked (OSError), the sqlite file is corrupt or held by another
+# writer (sqlite3.Error), or a row was written by a schema this build cannot
+# decode (ValueError from json/enum, KeyError/TypeError from the job decoder).
+# Everything else — AttributeError, ImportError, RecursionError — is a bug in
+# *this* process and must propagate instead of being laundered into "that
+# project has no jobs".
+_PROJECT_READ_ERRORS = (OSError, sqlite3.Error, ValueError, KeyError, TypeError)
+
+
+class ProjectsSnapshot(list):
+    """The all-projects job list, plus the projects that could not be read.
+
+    A plain ``list`` subclass on purpose: ``/api/jobs`` is a bare JSON array on
+    the wire and the page's ``for (const j of jobs)`` iterates the top level, so
+    reshaping this into ``{"jobs": ..., "errors": ...}`` would break every
+    existing consumer. ``json.dumps`` dispatches on ``isinstance(obj, list)``,
+    so the failures ride along as an *attribute* and never reach the wire.
+
+    Base class is bare ``list`` (not ``list[dict]``) — subscripting a builtin in
+    a runtime base-class position needs 3.9+/PEP 585 semantics we don't rely on
+    here, and ``pyproject.toml`` declares ``requires-python >= 3.9``.
+    """
+
+    def __init__(self, rows: Any = (), errors: Any = None) -> None:
+        super().__init__(rows)
+        self.errors: list[dict[str, str]] = list(errors or ())
+
+    @property
+    def partial(self) -> bool:
+        """True when at least one project was skipped — i.e. the board is
+        showing less than everything and should say so."""
+        return bool(self.errors)
+
+
+def list_all_projects_snapshot(*, backend: str = "sqlite", limit: int = 200) -> "ProjectsSnapshot":
+    """Aggregate jobs from every project state dir on this machine.
+
+    A project that cannot be read is *reported*, not dropped: its slug and the
+    exception land in the returned snapshot's ``errors`` attribute so a caller
+    (see :func:`make_handler`) can put it in front of a human. Silently
+    continuing used to erase a whole project's job list from the board with no
+    trace anywhere — no log line, no wire field, nothing.
+    """
     from puppetmaster.state import list_project_state_dirs
     from puppetmaster.store_factory import create_store
 
     rows: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
     for project_dir in list_project_state_dirs():
+        short = project_slug(project_dir.name)
         try:
+            # create_store stays inside the try: SwarmStore.__init__ runs
+            # ensure_state_dir, which can legitimately raise a per-project
+            # OSError (unwritable or vanished directory).
             store = create_store(backend, project_dir)
-            short = re.sub(r"-[0-9a-f]{12}$", "", project_dir.name) or project_dir.name
             for job in store.list_jobs():
                 rows.append(
                     {
@@ -685,10 +750,14 @@ def list_all_projects_snapshot(*, backend: str = "sqlite", limit: int = 200) -> 
                         **_job_snapshot_meta(job),
                     }
                 )
-        except Exception:
+        except _PROJECT_READ_ERRORS as exc:
+            message = str(exc).strip() or type(exc).__name__
+            errors.append(
+                {"project": short, "error": f"{type(exc).__name__}: {message}"}
+            )
             continue
     rows.sort(key=lambda r: r.get("created_at") or "", reverse=True)
-    return rows[:limit]
+    return ProjectsSnapshot(rows[:limit], errors)
 
 
 # --- HTTP layer ------------------------------------------------------------
@@ -778,6 +847,58 @@ function phaseStrip(phase) {
 
 function jobHeadline(j) {
   return j.label || j.title || j.id;
+}
+
+// Header label answering "which project is this board serving?" from an
+// /api/meta payload. Pure by contract: no fetch/document/window/location, no
+// globals at all -- this constant is executed verbatim under node by the test
+// suite, and free identifiers in JS resolve at CALL time, so any browser API
+// touched here would blow up there rather than in a browser.
+function projectLabel(meta) {
+  if (!meta) return "";
+  // Checked BEFORE meta.project on purpose: serve() always passes a state_dir,
+  // so an --all-projects board carries a project basename too and would
+  // otherwise be labelled with one incidental project out of the set.
+  if (meta.all_projects) return "all projects";
+  const project = meta.project;
+  if (project) {
+    // default_state_dir() names dirs "<slug>-<12 hex digest>". Keeping 8 hex
+    // digits is load-bearing: "puppetmaster-c3177e6032c4" and
+    // "Puppetmaster-b92145e840c8" -- the two dirs one project forked into --
+    // differ ONLY by case once the digest is stripped, so dropping or
+    // over-truncating it would re-merge exactly what this tag exists to tell
+    // apart. A name of any other shape is passed through unmangled.
+    const parts = /^(.+)-([0-9a-f]{12})$/.exec(project);
+    if (parts) return parts[1] + " · " + parts[2].slice(0, 8);
+    return project;
+  }
+  // The --mobile / non-loopback path: /api/meta gates the human-readable
+  // basename to loopback callers, so a remote peer only ever gets the hash.
+  // String() before slice() so a non-string never renders as "null"/"NaN".
+  if (meta.state_dir_id) return "state " + String(meta.state_dir_id).slice(0, 8);
+  return "";
+}
+
+// Banner for "this board may be serving the wrong project's state dir", built
+// from an /api/diagnostics payload. Pure for the same reason as projectLabel()
+// -- and load-bearing here: with an explicit --state-dir the project basename
+// is filesystem-derived and never sanitised on its way out of the endpoint, so
+// its trip through esc() is exercised verbatim under node by the test suite.
+function stateDirHint(hint, jobsShown) {
+  if (!hint || !hint.suspect) return "";
+  // Client-side staleness guard. The server caches the diagnosis for ~15s, and
+  // it counts job *directories* -- so by the time the banner would render, the
+  // board may already show more jobs than the "nearly empty" dir the detector
+  // complained about. A board visibly busier than what was reported is not
+  // this incident; drop the banner rather than contradict the rows below it.
+  const counted = Number(hint.jobs);
+  if (Number.isFinite(counted) && Number(jobsShown) > counted) return "";
+  const message = hint.message
+    || "This state dir may not be where this workspace's jobs go.";
+  return '<div class="state-dir-hint" role="status">'
+    + "<strong>Possibly the wrong project.</strong> " + esc(message)
+    + " Run <code>puppetmaster projects</code>, or start the dashboard from the"
+    + " git root or with <code>--all-projects</code>.</div>";
 }
 """
 
@@ -1029,6 +1150,19 @@ _PAGE_HEAD = r"""<!doctype html>
     color: #d3f9d8;
     font-size: 13px;
   }
+  /* "This board may be serving the wrong project's state dir." Amber, not the
+     red .alert: nothing failed, the jobs are simply somewhere else. */
+  .state-dir-hint {
+    background: #2b2410;
+    border: 1px solid #9e6a03;
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin: 8px 0 12px;
+    color: #f2cc60;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  .state-dir-hint strong { color: #ffdf5d; }
   .ev {
     color: #6e7681;
     font-size: 12px;
@@ -1414,6 +1548,25 @@ _PAGE_HEAD = r"""<!doctype html>
   }
   .home-link:hover { color: #c9d1d9; border-color: #30363d; background: #161b22; }
   .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+  /* Which project is this board serving? Two dashboards on adjacent ports used
+     to be pixel-identical: default_state_dir() hashes the caller's git root, so
+     one logical project can fork into two state dirs whose basenames differ
+     only by case. Styled like the per-row .job-project pill so the header tag
+     and the row tags read as the same kind of thing. Declared AFTER .mono so
+     the 11px pill size wins over .mono's 12px at equal specificity. */
+  .project-tag {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11px;
+    color: #8b949e;
+    background: #21262d;
+    border-radius: 4px;
+    padding: 1px 6px;
+    white-space: nowrap;
+  }
+  /* The slot ships empty and is filled in from /api/meta. Without this, an
+     unreachable or pre-upgrade /api/meta would leave the pill's padding and
+     background showing as a permanent grey nub next to the brand. */
+  .project-tag:empty { display: none; }
   .swarm-hero { margin-bottom: 14px; }
   .swarm-hero-top {
     display: flex;
@@ -1619,6 +1772,11 @@ _PAGE_HEAD = r"""<!doctype html>
     header { flex-wrap: wrap; gap: 8px; padding: 8px 12px; box-shadow: none; }
     header h1 { font-size: 15px; }
     #updated, #jobid { display: none; }
+    /* #project deliberately NOT joined to the display:none rule above: on a
+       phone (dashboard --mobile, one tab per project over Tailscale) knowing
+       which project the board serves is the single most useful thing in the
+       header. Shrink it instead of hiding it. */
+    .project-tag { font-size: 10px; padding: 1px 5px; }
     .home-link { padding: 4px 8px; font-size: 12px; }
     /* Full-bleed content: cards run edge-to-edge like a native mobile list
        instead of floating in a centered, padded desktop column. */
@@ -1678,6 +1836,11 @@ _PAGE_HEAD = r"""<!doctype html>
 <header>
   <a href="/" class="home-link" id="home" title="All jobs">← Jobs</a>
   <h1>Puppetmaster</h1>
+  <!-- Filled in by loadMeta() from /api/meta; ships empty so a pre-upgrade or
+       unreachable /api/meta simply leaves no tag rather than a wrong one. A
+       SIBLING of #status on purpose -- loadIndex()/loadJob() replace #status
+       wholesale via outerHTML every 1.5s, which would wipe a nested tag. -->
+  <span class="project-tag mono" id="project" title=""></span>
   <span id="status" class="pill s-queued">…</span>
   <span class="muted mono" id="jobid"></span>
   <span class="muted" id="updated" style="margin-left:auto"></span>
@@ -1713,6 +1876,13 @@ let expandedSections = new Set();
 let expandedAlts = new Set();
 let taskFilter = "all";
 let lastContent = "";
+// The /api/meta payload (project identity), fetched once by loadMeta() at
+// bootstrap. Stays null if that fetch fails, which projectLabel() renders as "".
+let meta = null;
+// The /api/diagnostics `diagnosis` object (or null), fetched once by
+// loadDiagnostics() at bootstrap. Null covers every quiet path: healthy dir,
+// --all-projects board, non-loopback peer, pre-upgrade server, failed fetch.
+let stateDirDiagnosis = null;
 
 function pill(s) {
   return `<span class="pill s-${esc(s)}">${esc(s)}</span>`;
@@ -1759,6 +1929,12 @@ async function loadIndex() {
   const shown = jobFilter === "all" ? jobs : jobs.filter(j => j.status === jobFilter);
 
   let html = '<div class="card"><h2>Jobs</h2>';
+  // Right under the heading, NOT in the !shown.length branch below: the
+  // reported bad state dir held exactly ONE job, so the empty state never
+  // rendered and a hint placed there would have missed the actual incident.
+  // `jobs.length` (unfiltered) is the staleness comparison the server's count
+  // is comparable to -- a status filter shrinking the list is not new history.
+  html += stateDirHint(stateDirDiagnosis, jobs.length);
   html += '<div class="filter-bar">';
   html += `<button class="filter-btn ${jobFilter === "all" ? "active" : ""}" onclick="setJobFilter('all')">All (${jobs.length})</button>`;
   for (const status of Object.keys(counts).sort()) {
@@ -2241,6 +2417,55 @@ async function tick() {
   } catch (e) { /* keep polling; transient during writes */ }
 }
 
+// One-shot, deliberately NOT folded into tick(): which project a board serves
+// cannot change while the page is open, so polling it every 1.5s forever would
+// be pure noise. tick()'s bare catch is not an umbrella for anything called
+// outside it, so this owns its own rejection: a failed fetch, a non-2xx (a
+// pre-upgrade server 404s /api/meta) or malformed JSON all return without
+// touching the DOM, leaving the page exactly as the server shipped it.
+async function loadMeta() {
+  try {
+    const r = await fetch("/api/meta");
+    if (!r.ok) return;
+    meta = await r.json();
+  } catch (e) { return; }
+  applyMeta();
+}
+
+function applyMeta() {
+  const label = projectLabel(meta);
+  if (!label) return;
+  const el = document.getElementById("project");
+  if (el) {
+    // textContent, not innerHTML: with an explicit --state-dir the basename is
+    // filesystem-derived and never sanitised on the way out of /api/meta.
+    el.textContent = label;
+    el.title = label;
+  }
+  // Also the tab/window title, so two boards are distinguishable from the
+  // taskbar and from a browser's tab strip, not just from the header.
+  document.title = "Puppetmaster — " + label;
+}
+
+// Same one-shot bootstrap as loadMeta(), and for the same reason: which state
+// dir this board serves is a filesystem property that cannot change while the
+// page is open, and there is a directory walk behind the endpoint (TTL-cached
+// server-side, but still). Folding it into tick() would hit it every 1.5s
+// forever. It also owns its own rejection -- tick()'s bare catch is not an
+// umbrella for a sibling called from the bootstrap. No re-render here: the
+// running tick picks the banner up on its next pass, which keeps this off
+// loadIndex()'s promise chain entirely.
+async function loadDiagnostics() {
+  try {
+    const r = await fetch("/api/diagnostics");
+    if (!r.ok) return;
+    const data = await r.json();
+    stateDirDiagnosis = data && data.diagnosis ? data.diagnosis : null;
+  } catch (e) { return; }
+}
+
+loadMeta();
+loadDiagnostics();
 tick();
 setInterval(tick, 1500);
 </script>
@@ -2249,6 +2474,97 @@ setInterval(tick, 1500);
 """
 
 INDEX_HTML = _PAGE_HEAD + RENDERER_JS + _PAGE_APP_JS
+
+
+# How long a wrong-state-dir diagnosis is reused before the filesystem is
+# consulted again. The answer is a property of the on-disk layout, not of live
+# job state, so a stale-by-15s reading costs nothing — while a *fresh* reading
+# per request would put a directory walk behind an endpoint the page can hit on
+# every reload.
+_DIAGNOSTICS_TTL_SECONDS = 15.0
+
+
+def _state_dir_diagnosis(
+    state_dir: Optional[Union[Path, str]], *, all_projects: bool = False
+):
+    """The ``state_health`` diagnosis for ``state_dir`` when suspect, else None.
+
+    Returns None on **any** failure. Two callers, one guard, because in both
+    of them a raising diagnostic is worse than no diagnostic at all:
+
+    * In :func:`serve`, every statement after the bind runs inside an
+      ``except BaseException: httpd.server_close(); raise``, so an exception
+      escaping here would convert an already-listening dashboard into a
+      failed start.
+    * In :func:`make_handler`, the blanket ``except`` around ``do_GET`` turns
+      any error into a 500.
+
+    ``all_projects`` boards serve every project's store, so "you may be
+    pointed at the wrong one" cannot be true of them. ``state_dir=None`` is
+    what ``make_handler`` receives from several existing tests. Both short-
+    circuit without touching the filesystem.
+    """
+    if all_projects or state_dir is None:
+        return None
+    try:
+        # Imported lazily: this is an advisory path, and an ImportError on a
+        # partial install must not be able to reach the dashboard's bind.
+        from puppetmaster.state_health import diagnose_state_dir
+
+        diagnosis = diagnose_state_dir(state_dir=state_dir)
+        return diagnosis if diagnosis.suspect else None
+    except Exception:
+        return None
+
+
+def state_dir_warning(
+    state_dir: Optional[Union[Path, str]], *, all_projects: bool = False
+) -> Optional[str]:
+    """One stderr line for "this board may be serving the wrong project", or None.
+
+    Basenames only — ``short_warning`` guarantees that, and this string lands
+    in ``dashboard.err.log``, which users paste into issues verbatim.
+    """
+    diagnosis = _state_dir_diagnosis(state_dir, all_projects=all_projects)
+    if diagnosis is None:
+        return None
+    try:
+        from puppetmaster.state_health import short_warning
+
+        return short_warning(diagnosis)
+    except Exception:
+        return None
+
+
+def state_dir_diagnosis_payload(
+    state_dir: Optional[Union[Path, str]], *, all_projects: bool = False
+) -> dict:
+    """The ``/api/diagnostics`` body: ``{"diagnosis": {...}}`` or ``{"diagnosis": None}``.
+
+    Never raises, so the handler can serve a 200 with an absent diagnosis
+    instead of letting its blanket ``except`` turn a diagnostic hiccup into a
+    500 on a page that is otherwise fine.
+    """
+    diagnosis = _state_dir_diagnosis(state_dir, all_projects=all_projects)
+    if diagnosis is None:
+        return {"diagnosis": None}
+    try:
+        from puppetmaster.state_health import short_warning
+
+        candidate = diagnosis.candidates[0] if diagnosis.candidates else None
+        return {
+            "diagnosis": {
+                "suspect": True,
+                "verdict": diagnosis.verdict,
+                "project": Path(diagnosis.state_dir).name,
+                "jobs": diagnosis.active.job_count,
+                "candidate": None if candidate is None else candidate.state_dir.name,
+                "candidate_jobs": 0 if candidate is None else candidate.job_count,
+                "message": short_warning(diagnosis) or "",
+            }
+        }
+    except Exception:
+        return {"diagnosis": None}
 
 
 def make_handler(
@@ -2261,7 +2577,64 @@ def make_handler(
     from http.server import BaseHTTPRequestHandler
     from urllib.parse import parse_qs, urlparse
 
+    # Unreadable projects, kept in the handler's enclosing scope: {slug: error}
+    # is the *latest* state (so a project that recovers drops out), and
+    # `announced` is the once-per-process dedup for the stderr line. Dedup is
+    # not optional — /api/jobs is polled every 1.5s, so an un-deduped warning
+    # would emit ~40 identical lines a minute into dashboard.err.log forever.
+    # A dashboard process builds exactly one handler class, so "enclosing
+    # scope" and "per process" are the same lifetime here.
+    project_errors: dict[str, str] = {}
+    announced: set = set()
+
+    # Same enclosing-scope-is-per-process lifetime as `project_errors` above.
+    # `at` is monotonic seconds; `payload` is None only until the first probe,
+    # so a *negative* result caches too — an unremarkable state dir must not
+    # re-walk the projects dir on every reload either.
+    diagnostics_cache: dict = {"at": 0.0, "payload": None}
+
+    def _diagnostics_payload() -> dict:
+        """TTL-cached ``/api/diagnostics`` body. Never raises."""
+        now = time.monotonic()
+        cached = diagnostics_cache["payload"]
+        if cached is not None and (now - diagnostics_cache["at"]) < _DIAGNOSTICS_TTL_SECONDS:
+            return cached
+        payload = state_dir_diagnosis_payload(state_dir, all_projects=all_projects)
+        diagnostics_cache["at"] = now
+        diagnostics_cache["payload"] = payload
+        return payload
+
+    def _record_project_errors(snapshot: Any) -> None:
+        """Refresh `project_errors` and warn about newly seen failures.
+
+        stderr, specifically: `log_message` is silenced below, and stderr is
+        what the `--background` and MCP launch paths redirect into
+        dashboard.err.log — it is the only channel from this handler that
+        actually reaches a human.
+        """
+        errors = getattr(snapshot, "errors", None) or []
+        project_errors.clear()
+        for entry in errors:
+            project = entry.get("project", "?")
+            error = entry.get("error", "unknown error")
+            project_errors[project] = error
+            key = (project, error)
+            if key in announced:
+                continue
+            announced.add(key)
+            print(
+                f"dashboard: skipping project {project}: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+
     class _Handler(BaseHTTPRequestHandler):
+        # Exposed for callers/tests that want the current skip list without
+        # re-reading every project's store. Aliased under a different name
+        # because a class body cannot read a closure cell it also assigns
+        # (`x = x` there resolves to globals, not the enclosing scope).
+        skipped_projects = project_errors
+
         def log_message(self, *args: Any) -> None:  # silence default logging
             pass
 
@@ -2284,7 +2657,11 @@ def make_handler(
                     return
                 if path == "/api/jobs":
                     if all_projects:
-                        self._json(200, list_all_projects_snapshot(backend=backend))
+                        snapshot = list_all_projects_snapshot(backend=backend)
+                        _record_project_errors(snapshot)
+                        # Serializes as a bare JSON array — ProjectsSnapshot is
+                        # a list subclass, so the failures never hit the wire.
+                        self._json(200, snapshot)
                     else:
                         self._json(200, list_jobs_snapshot(store_factory()))
                     return
@@ -2330,6 +2707,30 @@ def make_handler(
                         "all_projects": all_projects,
                         "backend": backend,
                     })
+                    return
+                if path == "/api/diagnostics":
+                    # Deliberately NOT folded into /api/meta. That endpoint is
+                    # the identity contract every reuse check depends on:
+                    # `dashboard_identity` reads at most 65536 bytes under a
+                    # one-second socket timeout and json.loads the result, so
+                    # an oversized or slow body silently becomes None, which
+                    # reads as "not my dashboard" and makes the CLI and MCP
+                    # spawn duplicate servers. Putting a filesystem walk behind
+                    # /api/meta would risk exactly the duplicate-dashboard bug
+                    # that endpoint exists to prevent.
+                    payload = _diagnostics_payload()
+                    # Same loopback gate as /api/meta: a remote (--mobile) peer
+                    # learns only *that* something looks off — never a project
+                    # basename and never a job count, both of which disclose
+                    # the local filesystem and history.
+                    is_loopback = self.client_address[0] in ("127.0.0.1", "::1")
+                    if not is_loopback:
+                        self._json(
+                            200,
+                            {"diagnosis": None, "suspect": bool(payload.get("diagnosis"))},
+                        )
+                        return
+                    self._json(200, payload)
                     return
                 self._json(404, {"error": "not found"})
             except Exception:
@@ -2963,6 +3364,18 @@ def serve(
             print("Serving all projects (--all-projects mode)")
         else:
             print("Reading durable state from:", resolved)
+            # The surface the reporting user would have hit first — they ran
+            # the dashboard from a shell and got a confident "Reading durable
+            # state from: <the wrong dir>" with nothing to contradict it.
+            # stderr specifically, because the --background and MCP launch
+            # paths redirect stderr into dashboard.err.log, the only channel
+            # from a detached board that reaches a human. `state_dir_warning`
+            # swallows everything: an exception here would be caught by the
+            # `except BaseException` below and turn an already-listening
+            # dashboard into a failed start.
+            _warning = state_dir_warning(resolved, all_projects=all_projects)
+            if _warning:
+                print(f"WARNING: {_warning}", file=sys.stderr, flush=True)
         print("Press Ctrl-C to stop.")
         if open_browser:
             try:
