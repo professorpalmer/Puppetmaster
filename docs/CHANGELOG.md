@@ -1,3 +1,11 @@
+## v1.22.25 — 2026-08-23
+
+**Fix: close cell sqlite handles so Windows inspect/tempdir teardown does not WinError 32.**
+
+Still the 1.22.24 named-cell slice. `CellRegistry.close()` checkpoints WAL and
+releases connections so `inspect` / TemporaryDirectory cleanup can unlink
+`*.sqlite` (and `-wal` / `-shm`) on Windows. No product scope added.
+
 ## v1.22.24 — 2026-08-23
 
 **Feature: named cells (celld Durable Object slice) on local SQLite.**
