@@ -1956,6 +1956,43 @@ def _prepare_opencode_go_call(
     return bare, mode, prepared, url
 
 
+def _openai_api_chat(
+    *, base_url: str, api_key: Optional[str], model: str, messages: list[dict],
+    tools: Optional[list[dict]], extra: dict, headers: dict, timeout: int,
+    stream: bool = False, on_delta: Optional[Callable[[str, str], None]] = None,
+) -> AssistantTurn:
+    """Direct OpenAI call with GPT-5.6 reasoning transport ownership."""
+    model_leaf = str(model or "").strip().lower().split("/")[-1]
+    prepared = dict(extra or {})
+    effort = str(prepared.get("reasoning_effort") or "").strip().lower()
+    gpt56 = model_leaf == "gpt-5.6" or model_leaf.startswith("gpt-5.6-")
+    if gpt56 and effort not in ("", "none"):
+        responses = _openai_responses_chat_stream if stream else _openai_responses_chat
+        kwargs = {
+            "base_url": base_url, "api_key": api_key, "model": model,
+            "messages": messages, "tools": tools, "extra": prepared,
+            "headers": headers, "timeout": timeout,
+        }
+        if stream:
+            kwargs["on_delta"] = on_delta
+        return responses(**kwargs)
+
+    if gpt56:
+        prepared["reasoning_effort"] = "none"
+    else:
+        prepared.pop("reasoning_effort", None)
+    if stream:
+        return _openai_chat_stream(
+            base_url=base_url, api_key=api_key, model=model, messages=messages,
+            tools=tools, extra=prepared, headers=headers, timeout=timeout,
+            on_delta=on_delta,
+        )
+    return _openai_chat(
+        base_url=base_url, api_key=api_key, model=model, messages=messages,
+        tools=tools, extra=prepared, headers=headers, timeout=timeout,
+    )
+
+
 def _openai_codex_chat(
     *,
     base_url: str,
@@ -2165,6 +2202,12 @@ def _provider_chat_streaming_inner(
             tools=tools, extra=extra, headers=dict(desc.default_headers),
             timeout=timeout, on_delta=on_delta,
         )
+    if desc.slug in ("openai", "openai-api"):
+        return _openai_api_chat(
+            base_url=url, api_key=key, model=model, messages=messages,
+            tools=tools, extra=extra, headers=dict(desc.default_headers),
+            timeout=timeout, stream=True, on_delta=on_delta,
+        )
     if desc.wire == "anthropic":
         return _anthropic_chat_stream(
             base_url=url, api_key=key, model=model, messages=messages,
@@ -2283,6 +2326,11 @@ def _provider_chat_inner(
             base_url=url, api_key=key, model=model, messages=messages,
             tools=tools, extra=extra, headers=dict(desc.default_headers),
             timeout=timeout,
+        )
+    if desc.slug in ("openai", "openai-api"):
+        return _openai_api_chat(
+            base_url=url, api_key=key, model=model, messages=messages,
+            tools=tools, extra=extra, headers=dict(desc.default_headers), timeout=timeout,
         )
     if desc.wire == "anthropic":
         return _anthropic_chat(

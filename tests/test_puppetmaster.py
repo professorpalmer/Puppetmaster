@@ -11108,24 +11108,6 @@ class ModelRouterTests(unittest.TestCase):
         )
         self.assertNotIn("reasoning_effort", adapter._extra_params(anthropic_task))
 
-        # Direct OpenAI Chat Completions requires explicit `none` for GPT-5.6
-        # function tools, while older GPT-5 models reject `none` and work with
-        # the field omitted.
-        for provider in ("openai", "openai-api"):
-            for model in ("gpt-5.6", "gpt-5.6-luna"):
-                gpt56_task = Task(
-                    job_id="j", role="explore", instruction="x",
-                    payload={"provider": provider, "model": model},
-                )
-                self.assertEqual(
-                    adapter._extra_params(gpt56_task).get("reasoning_effort"), "none"
-                )
-            older_task = Task(
-                job_id="j", role="explore", instruction="x",
-                payload={"provider": provider, "model": "gpt-5"},
-            )
-            self.assertNotIn("reasoning_effort", adapter._extra_params(older_task))
-
         # openai-codex still gets the Chat Completions key; provider_chat maps
         # it to nested Responses ``reasoning`` (bare key would HTTP 400).
         openai_codex_task = Task(

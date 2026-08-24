@@ -1,3 +1,24 @@
+## v1.22.29 — 2026-08-24
+
+**Fix: selected Max never reached the worker on direct OpenAI GPT-5.6.**
+
+`adapters/agentic.py` forced `reasoning_effort=none` for `openai` / `openai-api`
+GPT-5.6 so a selected Max (or any non-none effort) was dropped before the
+provider call. Completions plus tools then rejected implicit reasoning.
+
+- Adapter `_extra_params` now passes `payload.reasoning_effort` through for
+  direct OpenAI as well. Transport owns the GPT-5.6 contract.
+- New `_openai_api_chat` used by `provider_chat` / `provider_chat_streaming`
+  for slugs `openai` / `openai-api`.
+- GPT-5.6 + selected effort not `none` → existing `_openai_responses_chat` /
+  `_openai_responses_chat_stream` (tools + `reasoning.effort`).
+- GPT-5.6 + no effort → Completions with `none` (current tool contract).
+- Older GPT-5: omit `reasoning_effort` (unchanged).
+- No routing, registry, or scoring policy changes. No new driver.
+- No Pi / grok-bot worker. Marionette pin unchanged.
+
+Absorbed inbound PR #97 (re-implemented on this ladder; #97 was not merged).
+
 ## v1.22.28 — 2026-08-23
 
 **Fix: four DeepSeek-validated stdlib CDP and audit calibration defects.**
