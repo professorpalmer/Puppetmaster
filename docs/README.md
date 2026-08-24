@@ -2,7 +2,7 @@
 
 The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
 
-**Current release:** [v1.22.24](CHANGELOG.md#v12224) — named cells (serial inbox + hibernate/alarm on inspectable sqlite); see [CHANGELOG.md](CHANGELOG.md) for the full line.
+**Current release:** [v1.22.25](CHANGELOG.md#v12225) — Windows cell sqlite handle close (still the 1.22.24 named-cell slice); see [CHANGELOG.md](CHANGELOG.md) for the full line.
 
 ## Start here
 
