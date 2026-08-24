@@ -168,7 +168,9 @@ def _run_effort_index_command(args, store) -> int:
             headline = headline[:77] + "..."
         print(
             f"  {ref.get('id')}  {ref.get('type')}  job={ref.get('job_id')}  "
-            f"conf={ref.get('confidence')}  {headline}"
+            f"execution_status={ref.get('execution_status') or 'unknown'}  "
+            f"claim_support_status={ref.get('claim_support_status') or 'unknown'}  "
+            f"{headline}"
         )
     return 0
 

@@ -28,6 +28,7 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
+from puppetmaster.artifact_status import format_status_label, status_fields
 from puppetmaster.models import Artifact, ArtifactType, Job, Task
 from puppetmaster.store import SwarmStore
 from puppetmaster.usage import aggregate_token_usage
@@ -181,13 +182,13 @@ def _extract_why(artifact: Artifact) -> str:
     if artifact.type == ArtifactType.VERIFICATION:
         check = payload.get("check", "")
         result = payload.get("result", "")
-        confidence = round(float(artifact.confidence), 2)
         if check:
             parts.append(f"Verified: {check}")
         if result:
             parts.append(f"Result: {result}")
-        if confidence > 0:
-            parts.append(f"confidence {confidence}")
+        status = format_status_label(artifact)
+        if status and status != "status=unknown":
+            parts.append(status)
 
     return " · ".join(parts)
 
@@ -222,10 +223,15 @@ def _build_task_activity(task_id: str, artifacts: list[Artifact]) -> list[dict[s
             # Represented by the synthesized diff entry appended below.
             continue
         payload = artifact.payload or {}
+        statuses = status_fields(artifact)
         item: dict[str, Any] = {
             "type": artifact.type.value,
-            "confidence": round(float(artifact.confidence), 2),
             "created_by": artifact.created_by,
+            "execution_status": statuses["execution_status"],
+            "grounding_status": statuses["grounding_status"],
+            "claim_support_status": statuses["claim_support_status"],
+            "criterion_status": statuses["criterion_status"],
+            "status_label": format_status_label(artifact),
         }
 
         if artifact.type == ArtifactType.VERIFICATION:
@@ -271,7 +277,9 @@ def _build_task_activity(task_id: str, artifacts: list[Artifact]) -> list[dict[s
                 "type": "patch",
                 "text": "Code changes",
                 "diff": patch_diff,
-                "confidence": 1.0,
+                "execution_status": "completed",
+                "criterion_status": "not_applicable",
+                "status_label": "execution_status=completed",
                 "created_by": "patch-artifact",
             }
         )
@@ -413,6 +421,11 @@ def _evaluator_epoch_lineage(store: SwarmStore, job_id: str) -> list[dict[str, A
 
 
 def _verification_score(artifacts: list[Artifact]) -> Optional[float]:
+    """Legacy mean of stored verification ``confidence`` values.
+
+    Kept in the snapshot JSON for older readers. Not shown as a percentage.
+    Uncalibrated; do not treat as predicted gate-pass probability.
+    """
     confidences = [
         float(artifact.confidence)
         for artifact in artifacts
@@ -421,6 +434,22 @@ def _verification_score(artifacts: list[Artifact]) -> Optional[float]:
     if not confidences:
         return None
     return round(sum(confidences) / len(confidences), 4)
+
+
+def _verification_criterion_label(artifacts: list[Artifact]) -> str:
+    results = [
+        str((artifact.payload or {}).get("result") or "").strip().lower()
+        for artifact in artifacts
+        if artifact.type == ArtifactType.VERIFICATION
+    ]
+    if not results:
+        return ""
+    passed = sum(1 for item in results if item in {"pass", "passed", "ok", "accept", "accepted"})
+    failed = sum(1 for item in results if item in {"fail", "failed", "blocked", "rejected"})
+    return (
+        f'<span class="swarm-verification">VERIFICATION '
+        f"{passed} passed / {failed} unmet / {len(results)} total</span>"
+    )
 
 
 def _routing_rollup(tasks: list[Task], artifacts: list[Artifact]) -> list[dict[str, Any]]:
@@ -517,13 +546,18 @@ def build_job_snapshot(store: SwarmStore, job_id: str) -> dict[str, Any]:
     for artifact in artifacts:
         kind = artifact.type.value
         counts[kind] = counts.get(kind, 0) + 1
+        statuses = status_fields(artifact)
         row = {
             "statement": _artifact_statement(artifact),
-            "confidence": round(float(artifact.confidence), 2),
             "evidence": list(artifact.evidence),
             "created_by": artifact.created_by,
             "failure": (artifact.payload or {}).get("failure"),
             "result": (artifact.payload or {}).get("result"),
+            "execution_status": statuses["execution_status"],
+            "grounding_status": statuses["grounding_status"],
+            "claim_support_status": statuses["claim_support_status"],
+            "criterion_status": statuses["criterion_status"],
+            "status_label": format_status_label(artifact),
         }
         if kind == "gist":
             admission = (artifact.payload or {}).get("admission")
@@ -602,6 +636,7 @@ def build_job_snapshot(store: SwarmStore, job_id: str) -> dict[str, Any]:
         "adapters": adapters,
         "primary_adapter": primary_adapter,
         "verification_score": _verification_score(artifacts),
+        "verification_criterion": _verification_criterion_label(artifacts),
         "routing_rollup": _routing_rollup(tasks, artifacts),
         "evaluator_epoch": _evaluator_epoch_lineage(store, job_id),
         "phase": _job_phase(job.status.value, task_rows, counts),
@@ -1839,14 +1874,14 @@ function renderGistSection(items) {
     </div>
     <div class="section-content ${isExpanded ? 'open' : ''}" id="section-${id}">`;
   if (list.length) {
-    html += '<table><tr><th>Admission</th><th>Claim</th><th>Confidence</th><th>Sources</th></tr>';
+    html += '<table><tr><th>Admission</th><th>Claim</th><th>Status</th><th>Sources</th></tr>';
     html += rows(list, [
       it => {
         const admission = it.admission || 'pending';
         return `<span class="summary-chip gist-${esc(admission)}">${esc(admission)}</span>`;
       },
       it => md(it.statement),
-      it => '<span class="conf">' + (it.confidence != null ? it.confidence.toFixed(2) : '') + '</span>',
+      it => '<span class="conf">' + esc(it.status_label || it.claim_support_status || '') + '</span>',
       it => '<span class="ev">' + esc((it.source_artifact_ids || []).join(', ')) + '</span>'
     ]);
     html += '</table>';
@@ -1897,8 +1932,8 @@ function renderTask(task) {
         const badgeClass = act.result === 'passed' ? 'success' : 'failure';
         html += `<span class="badge ${badgeClass}">${esc(act.result)}</span> `;
       }
-      if (act.confidence != null) {
-        html += `<span class="conf">confidence: ${act.confidence}</span>`;
+      if (act.status_label) {
+        html += `<span class="conf">${esc(act.status_label)}</span>`;
       }
 
       if (act.message && act.message.length > 20 && act.message !== act.text) {
@@ -1988,10 +2023,10 @@ function renderCollapsibleSection(title, id, items) {
     <div class="section-content ${isExpanded ? 'open' : ''}" id="section-${id}">`;
 
   if (items && items.length > 0) {
-    html += '<table><tr><th>Statement</th><th>Confidence</th><th>Evidence</th></tr>';
+    html += '<table><tr><th>Statement</th><th>Status</th><th>Evidence</th></tr>';
     html += rows(items, [
       it => md(it.statement),
-      it => '<span class="conf">' + (it.confidence != null ? it.confidence.toFixed(2) : '') + '</span>',
+      it => '<span class="conf">' + esc(it.status_label || it.claim_support_status || '') + '</span>',
       it => '<span class="ev">' + esc((it.evidence || []).join(', ')) + '</span>'
     ]);
     html += '</table>';
@@ -2112,7 +2147,7 @@ async function loadJob() {
     <div class="swarm-metrics">
       <span class="swarm-cost">$${(d.cost.total_estimated_cost_usd || 0).toFixed(4)}</span>
       <span class="swarm-tokens">${(d.tokens_total || 0).toLocaleString()}t</span>
-      ${d.verification_score != null ? `<span class="swarm-verification">VERIFICATION ${Math.round(d.verification_score * 100)}%</span>` : ""}
+      ${d.verification_criterion || ""}
     </div>
     <div class="progress-bar"><div class="progress-fill" style="width: ${progressPct}%"></div></div>
     <div class="progress-text">${completeTasks} / ${totalTasks} complete</div>

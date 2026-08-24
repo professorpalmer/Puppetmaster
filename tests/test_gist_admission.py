@@ -151,6 +151,20 @@ class MaybeAdmitFindingTests(unittest.TestCase):
                 confidence=0.85,
             )
             store.save_artifact(finding)
+            store.save_artifact(
+                Artifact(
+                    job_id=job.id,
+                    task_id="task-auto",
+                    type=ArtifactType.VERIFICATION,
+                    created_by="worker-gist",
+                    confidence=0.4,
+                    evidence=[finding.id],
+                    payload={
+                        "check": finding.payload["claim"],
+                        "result": "passed",
+                    },
+                )
+            )
 
             gist = maybe_admit_finding_as_gist(store, finding)
             self.assertIsNotNone(gist)
@@ -170,16 +184,44 @@ class MaybeAdmitFindingTests(unittest.TestCase):
                 any(e.get("event") == "gist.admitted" for e in events)
             )
 
-    def test_low_confidence_finding_skipped(self) -> None:
+    def test_self_rating_alone_does_not_admit_gist(self) -> None:
         with TemporaryDirectory() as tmp:
             store = SwarmStore(Path(tmp) / ".puppetmaster")
             store.init()
             job = store.create_job("skip gist")
             finding = _finding(
-                job_id=job.id, claim="weak signal", confidence=0.5
+                job_id=job.id, claim="self-rated theater", confidence=0.95
             )
             store.save_artifact(finding)
             self.assertIsNone(maybe_admit_finding_as_gist(store, finding))
+
+    def test_independent_verification_admits_even_low_self_rating(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            job = store.create_job("verify gist")
+            finding = _finding(
+                job_id=job.id,
+                task_id="task-v",
+                claim="independently checked",
+                confidence=0.2,
+            )
+            store.save_artifact(finding)
+            store.save_artifact(
+                Artifact(
+                    job_id=job.id,
+                    task_id="task-v",
+                    type=ArtifactType.VERIFICATION,
+                    created_by="worker-gist",
+                    confidence=0.99,
+                    evidence=[finding.id],
+                    payload={"check": "independently checked", "result": "passed"},
+                )
+            )
+            gist = maybe_admit_finding_as_gist(store, finding)
+            self.assertIsNotNone(gist)
+            assert gist is not None
+            self.assertEqual(gist.payload["admission"], "admitted")
 
 
 class ResolveEdgesAdmissionTests(unittest.TestCase):
