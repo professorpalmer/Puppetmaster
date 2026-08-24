@@ -170,10 +170,24 @@ class Artifact:
     id: str = field(default_factory=lambda: new_id("artifact"))
     created_at: str = field(default_factory=now_iso)
     sha256: Optional[str] = None
+    # Additive #88 status split. ``confidence`` stays for stored-record compat
+    # and maps to worker_self_rating. Statuses are the authoritative labels.
+    execution_status: Optional[str] = None
+    grounding_status: Optional[str] = None
+    claim_support_status: Optional[str] = None
+    criterion_status: Optional[str] = None
+    worker_self_rating: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        from puppetmaster.artifact_status import hydrate_artifact_fields
+
+        hydrate_artifact_fields(self)
 
     def validate(self) -> None:
         if not 0 <= self.confidence <= 1:
             raise ValueError("artifact confidence must be between 0 and 1")
+        if self.worker_self_rating is not None and not 0 <= self.worker_self_rating <= 1:
+            raise ValueError("artifact worker_self_rating must be between 0 and 1")
         if not self.payload:
             raise ValueError("artifact payload must not be empty")
         if not self.evidence:
@@ -388,6 +402,11 @@ def artifact_from_dict(data: dict[str, Any]) -> Artifact:
         evidence=data["evidence"],
         created_at=data["created_at"],
         sha256=data.get("sha256"),
+        execution_status=data.get("execution_status"),
+        grounding_status=data.get("grounding_status"),
+        claim_support_status=data.get("claim_support_status"),
+        criterion_status=data.get("criterion_status"),
+        worker_self_rating=data.get("worker_self_rating"),
     )
 
 

@@ -10,6 +10,7 @@ from puppetmaster.claim_conflicts import (
     conflicting_artifact_ids,
     detect_contradictory_peers,
 )
+from puppetmaster.artifact_status import durable_admission_allowed, format_status_label
 from puppetmaster.models import Artifact, ArtifactType, MemoryRecord
 from puppetmaster.store import SwarmStore, group_by_type
 
@@ -111,7 +112,7 @@ class Stitcher:
     def _promote_memories(self, artifacts: list[Artifact]) -> list[MemoryRecord]:
         promoted: list[MemoryRecord] = []
         for artifact in artifacts:
-            if artifact.confidence < 0.8:
+            if not durable_admission_allowed(artifact, peers=artifacts):
                 continue
             statement = self._statement_for(artifact)
             if not statement:
@@ -279,13 +280,13 @@ class Stitcher:
         for representative, members in clusters:
             headline = representative.payload.get(key, representative.payload)
             evidence = ", ".join(representative.evidence) or "no evidence"
-            confidence = max(member.confidence for member in members)
+            status = format_status_label(representative)
             suffix = (
                 f" (reported by {len(members)} workers)" if len(members) > 1 else ""
             )
             bullets.append(
                 f"- {headline}{suffix}\n"
-                f"{indent(f'confidence={confidence:.2f}; evidence={evidence}', '  ')}"
+                f"{indent(f'{status}; evidence={evidence}', '  ')}"
             )
         return bullets
 

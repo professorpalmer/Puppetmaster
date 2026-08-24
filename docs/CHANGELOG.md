@@ -1,3 +1,35 @@
+## v1.22.26 — 2026-08-23
+
+**Fix: split artifact confidence into statuses so self-rating cannot admit memory or gists (#88).**
+
+One `confidence` field mixed worker self-rating, adapter/process health, gate
+bookkeeping, and implied evidence. A 0.95 self-rating could admit durable
+memory / shared gists and render as a probability. Verification confidence
+could be assigned just because PM parsed the response.
+
+- **Statuses (additive):** `execution_status`, `grounding_status`,
+  `claim_support_status`, `criterion_status`, `worker_self_rating`
+  (non-authoritative). Legacy `confidence` still loads and maps to
+  `worker_self_rating` only. Inventory and number-vs-status table:
+  [ARTIFACT_STATUS.md](ARTIFACT_STATUS.md).
+- **Admission:** `maybe_admit_finding_as_gist` and `Stitcher._promote_memories`
+  require independent support (same-task accepting VERIFICATION or PM
+  `claim_support_status=independently_supported`). Self-rating / `confidence`
+  cannot admit. Worker payload cannot self-certify independent support.
+- **Display (PM):** CLI feed, effort-index, dashboard tables/activity, and
+  stitched bullets show status labels. Compact refs keep `confidence` for
+  readers and add the new fields. No `xx%` / green-bar treatment of
+  `worker_self_rating` on the PM side. Dashboard no longer paints
+  `VERIFICATION 80%`.
+- **No new calibrated score.** Do not invent
+  `predicted_independent_gate_pass_probability` until a named outcome has
+  held-out calibration.
+- **Marionette:** additive artifact JSON only. Harness / SSE / session
+  unchanged. Mari may still treat `confidence` as a bar until it adopts the
+  new fields; this slice does not edit Marionette.
+- **Tests:** `tests/test_artifact_status.py` plus gist/memory updates prove
+  self-rating cannot admit.
+
 ## v1.22.25 — 2026-08-23
 
 **Fix: close cell sqlite handles so Windows inspect/tempdir teardown does not WinError 32.**
