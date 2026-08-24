@@ -92,6 +92,7 @@ from puppetmaster.cli.commands_install import (
     _run_install_codex,
     _run_install_cursor,
     _run_install_hermes,
+    _run_install_omp,
     _run_install_pi,
     _run_install_hooks,
     _run_install_rules,
@@ -682,6 +683,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
 
     if args.command == "install-pi-mcp":
         return _run_install_pi(args)
+
+    if args.command == "install-omp-mcp":
+        return _run_install_omp(args)
 
     if args.command == "install-cursor-mcp":
         return _run_install_cursor(args)

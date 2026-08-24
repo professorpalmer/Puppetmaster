@@ -51,6 +51,7 @@ from puppetmaster.cli.commands_install import (
     _run_install_codex,
     _run_install_cursor,
     _run_install_hermes,
+    _run_install_omp,
     _run_install_pi,
     _run_install_hooks,
     _run_install_rules,

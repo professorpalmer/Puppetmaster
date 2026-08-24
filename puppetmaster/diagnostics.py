@@ -79,6 +79,7 @@ def run_doctor(root: Path, state_dir: Optional[Path] = None) -> list[Check]:
     checks.append(_guard("platform-lock", _platform_lock_check))
     checks.append(_guard("grok-bot-path", lambda: grok_bot_path_check(root)))
     checks.append(_guard("pi-pilot", lambda: pi_pilot_check()))
+    checks.append(_guard("omp-pilot", lambda: omp_pilot_check()))
     checks.append(_guard("rate-limit-harvest", _rate_limit_harvest_check))
     return checks
 
@@ -1246,3 +1247,105 @@ def pi_pilot_check(*, env=None) -> Check:
         return Check("pi-pilot", "warn", "Pi pilot not installed. Fix: " + " ".join(fixes))
     return Check("pi-pilot", "error", "Pi pilot incomplete. Fix: " + " ".join(fixes))
 
+
+def _omp_cli_name_ok(name: str) -> bool:
+    n = (name or "").strip().lower()
+    if n.endswith(".exe"):
+        n = n[:-4]
+    return n in {"omp", "ohmypi", "oh-my-pi"}
+
+
+def _omp_cli_visible(env: Optional[Mapping[str, str]] = None) -> bool:
+    """True when an omp/ohmypi CLI is on PATH (including Windows omp.exe)."""
+    probe = env if env is not None else os.environ
+    command = (probe.get("OMP_COMMAND") or "omp").strip() or "omp"
+    path_value = probe.get("PATH")
+    found = shutil.which(command, path=path_value)
+    if found and _omp_cli_name_ok(Path(found).name):
+        return True
+    names = ["omp", "omp.exe"]
+    cmd_name = Path(command).name
+    if cmd_name and cmd_name.lower() not in {n.lower() for n in names}:
+        names.insert(0, cmd_name)
+        if not cmd_name.lower().endswith(".exe"):
+            names.insert(1, cmd_name + ".exe")
+    for name in names:
+        hit = shutil.which(name, path=path_value)
+        if hit and _omp_cli_name_ok(Path(hit).name):
+            return True
+    for directory in (path_value or "").split(os.pathsep):
+        if not directory:
+            continue
+        folder = Path(directory)
+        try:
+            if not folder.is_dir():
+                continue
+        except OSError:
+            continue
+        for name in names:
+            try:
+                if (folder / name).is_file() and _omp_cli_name_ok(name):
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def omp_pilot_check(*, env=None) -> Check:
+    """OMP / oh-my-pi TUI/pilot health: optional when absent, never CI-fail.
+
+    Status is optional/ok/warn only. Missing ``omp`` CLI is not an error.
+    """
+    from puppetmaster.installers import (
+        handshake_mcp_server,
+        omp_agent_dir,
+        _read_json_object,
+    )
+
+    probe_env = env if env is not None else os.environ
+    cli_ok = _omp_cli_visible(probe_env)
+    agent = omp_agent_dir(probe_env)
+    mcp_path = agent / "mcp.json"
+    mcp_ok = False
+    mcp_detail = ""
+    if mcp_path.is_file():
+        try:
+            mcp = _read_json_object(mcp_path)
+        except Exception as exc:
+            mcp_detail = "mcp.json unreadable: " + repr(exc)
+            mcp = {}
+        servers = mcp.get("mcpServers") if isinstance(mcp, dict) else {}
+        entry = servers.get("puppetmaster") if isinstance(servers, dict) else None
+        if isinstance(entry, dict) and entry.get("command"):
+            from puppetmaster.installers import HandshakeResult
+            skip = str(probe_env.get("PUPPETMASTER_OMP_SKIP_HANDSHAKE") or "") == "1"
+            handshake = HandshakeResult(ok=True, tool_count=-1) if skip else handshake_mcp_server(str(entry.get("command")))
+            mcp_ok = handshake.ok
+            if handshake.ok:
+                mcp_detail = "MCP reachable (%s tools)" % handshake.tool_count
+            else:
+                mcp_detail = "MCP not reachable: " + handshake.error
+        else:
+            mcp_detail = "no puppetmaster stdio entry in mcp.json"
+    else:
+        mcp_detail = "no " + str(mcp_path)
+    if mcp_ok:
+        extra = "omp CLI visible" if cli_ok else "omp CLI not required"
+        return Check(
+            "omp-pilot",
+            "ok",
+            "healthy OMP pilot -- " + extra + "; " + mcp_detail
+            + ". OMP stays the TUI, not a worker.",
+        )
+    if not cli_ok and not mcp_ok:
+        return Check(
+            "omp-pilot",
+            "optional",
+            "OMP / oh-my-pi TUI not installed. Optional: puppetmaster install-omp-mcp "
+            "(writes ~/.omp/agent/mcp.json). Missing omp CLI is not a failure.",
+        )
+    return Check(
+        "omp-pilot",
+        "warn",
+        "OMP pilot incomplete. Fix: puppetmaster install-omp-mcp. " + mcp_detail,
+    )

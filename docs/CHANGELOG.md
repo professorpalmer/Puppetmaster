@@ -1,3 +1,25 @@
+## v1.22.31 — 2026-08-24
+
+**OMP / oh-my-pi TUI MCP install (not a worker).**
+
+oh-my-pi (`omp`) already speaks native MCP. This cut adds the smallest
+Pi-parity client: an idempotent writer for `~/.omp/agent/mcp.json`.
+
+- `puppetmaster install-omp-mcp` and `setup --platforms omp` (alias `ohmypi`)
+  write stdio MCP (`python -m puppetmaster.mcp_server`). Handshake unless
+  `--skip-handshake`. Idempotent. Other servers and existing env are preserved.
+- Default path is `~/.omp/agent/mcp.json`. `OMP_AGENT_DIR` overrides.
+  `OMP_PROFILE` / `PI_PROFILE` writes `~/.omp/profiles/<name>/agent/mcp.json`.
+- No TypeScript extension. No vendored `can1357/oh-my-pi`. No `omp` / `ohmypi`
+  worker adapter. Do not lease `omp` as a subprocess.
+- Skill text: OMP stays the TUI; use `start_implement` / `start_agentic` /
+  `start_prewalk`; consume artifacts; nuke the job.
+- Doctor `omp-pilot` is optional when nothing is installed, ok when MCP is
+  present, warn when partial. Missing `omp` CLI is not a CI failure.
+- Tests: `tests/test_omp_pilot_package.py` (unittest, temp HOME, no network).
+
+No Pi / grok-bot worker. Marionette pin unchanged.
+
 ## v1.22.30 — 2026-08-24
 
 **Fix: community scorecard import attached Max evidence to Low.**

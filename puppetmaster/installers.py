@@ -2772,3 +2772,209 @@ def uninstall_pi_mcp(
         return UninstallResult(status="removed", target=str(mcp_path), messages=messages)
     return UninstallResult(status="unchanged", target=str(mcp_path), messages=messages)
 
+
+OMP_NEXT_STEPS_GUIDANCE = (
+    "OMP / oh-my-pi is the TUI/pilot, not a leased worker. Restart omp (or start a new session)\n"
+    "so it picks up ~/.omp/agent/mcp.json.\n"
+    "Then: start_implement / start_agentic / start_prewalk, read effort_index / show,\n"
+    "consume artifacts (not transcripts), size the runtime, nuke the job.\n"
+    "Never lease omp as a Puppetmaster subprocess worker."
+)
+
+
+def _omp_home(env: Mapping[str, str]) -> Path:
+    """Home directory from the supplied env (tests pass a temp HOME)."""
+    raw = (env.get("HOME") or env.get("USERPROFILE") or "").strip()
+    return Path(raw) if raw else Path.home()
+
+
+def _omp_expand(value: str, env: Mapping[str, str]) -> Path:
+    if value.startswith("~/") or value.startswith("~\\"):
+        return _omp_home(env) / value[2:]
+    if value == "~":
+        return _omp_home(env)
+    return Path(value)
+
+
+def omp_agent_dir(env: Optional[Mapping[str, str]] = None) -> Path:
+    """Return the OMP agent directory that owns ``mcp.json``.
+
+    Default profile: ``~/.omp/agent``. A named profile (``OMP_PROFILE`` or
+    ``PI_PROFILE``) resolves to ``~/.omp/profiles/<name>/agent``. ``OMP_AGENT_DIR``
+    overrides both. Honors ``HOME`` / ``USERPROFILE`` on the supplied env so
+    tests can use a temp home without touching the real ``~/.omp``.
+    """
+    env = env if env is not None else os.environ
+    override = (env.get("OMP_AGENT_DIR") or "").strip()
+    if override:
+        return _omp_expand(override, env)
+    profile = (env.get("OMP_PROFILE") or env.get("PI_PROFILE") or "").strip()
+    home = _omp_home(env)
+    if profile and profile.lower() != "default":
+        return home / ".omp" / "profiles" / profile / "agent"
+    return home / ".omp" / "agent"
+
+
+def build_omp_mcp_entry(python_executable: str, *, prior: Optional[Mapping] = None) -> dict:
+    """Build the OMP-native stdio MCP entry (``python -m puppetmaster.mcp_server``)."""
+    entry: dict = dict(prior) if isinstance(prior, Mapping) else {}
+    entry.pop("url", None)
+    entry.pop("headers", None)
+    entry["command"] = python_executable
+    entry["args"] = ["-m", "puppetmaster.mcp_server"]
+    entry["type"] = "stdio"
+    return entry
+
+
+def install_omp_mcp(
+    *,
+    python_executable: Optional[str] = None,
+    agent_dir: Optional[Path] = None,
+    force: bool = False,
+    dry_run: bool = False,
+    skip_handshake: bool = False,
+    env: Optional[Mapping[str, str]] = None,
+) -> InstallResult:
+    """Register Puppetmaster as a stdio MCP server in OMP's ``mcp.json``.
+
+    OMP / oh-my-pi is a TUI/pilot host, not a worker adapter. OMP already
+    speaks native MCP, so this writes ``<agent>/mcp.json`` only — no
+    TypeScript extension, no vendored oh-my-pi, no leased ``omp`` subprocess.
+    Idempotent when the puppetmaster entry already launches this interpreter.
+    """
+    python = python_executable or sys.executable
+    base = Path(agent_dir) if agent_dir is not None else omp_agent_dir(env)
+    mcp_path = base / "mcp.json"
+    messages: list[str] = []
+
+    try:
+        existing_mcp = _read_json_object(mcp_path)
+    except json.JSONDecodeError as exc:
+        messages.append(f"existing config at {mcp_path} is not valid JSON: {exc!r}")
+        return InstallResult(
+            status="error",
+            target=str(mcp_path),
+            python_executable=python,
+            messages=messages,
+        )
+
+    mcp_servers = existing_mcp.setdefault("mcpServers", {})
+    if not isinstance(mcp_servers, dict):
+        messages.append(f"'mcpServers' in {mcp_path} is not an object; cannot merge")
+        return InstallResult(
+            status="error",
+            target=str(mcp_path),
+            python_executable=python,
+            messages=messages,
+        )
+
+    prior = mcp_servers.get("puppetmaster")
+    prior = prior if isinstance(prior, dict) else None
+    desired = build_omp_mcp_entry(python, prior=prior)
+
+    same_mcp = False
+    if prior is not None:
+        same_mcp = (
+            prior.get("command") == desired["command"]
+            and list(prior.get("args") or []) == desired["args"]
+        )
+        if not same_mcp:
+            if prior.get("command") != desired["command"]:
+                messages.append(
+                    f"updating command: {prior.get('command')!r} -> {desired['command']!r}"
+                )
+            if list(prior.get("args") or []) != desired["args"]:
+                messages.append(
+                    f"updating args: {prior.get('args')!r} -> {desired['args']!r}"
+                )
+
+    if same_mcp and not force:
+        messages.append(
+            f"omp puppetmaster MCP entry in {mcp_path} already launches {python}"
+        )
+        return InstallResult(
+            status="unchanged",
+            target=str(mcp_path),
+            python_executable=python,
+            messages=messages,
+        )
+
+    handshake: Optional[HandshakeResult] = None
+    if not skip_handshake:
+        handshake = handshake_mcp_server(python)
+        if not handshake.ok:
+            messages.append(
+                "handshake FAILED — refusing to write a broken registration. "
+                f"Reason: {handshake.error}"
+            )
+            return InstallResult(
+                status="error",
+                target=str(mcp_path),
+                python_executable=python,
+                handshake=handshake,
+                messages=messages,
+            )
+        messages.append(f"handshake OK ({handshake.tool_count} tools advertised by {python})")
+
+    if dry_run:
+        messages.append(f"DRY RUN — would write puppetmaster MCP entry to {mcp_path}")
+        return InstallResult(
+            status="would_install",
+            target=str(mcp_path),
+            python_executable=python,
+            handshake=handshake,
+            messages=messages,
+        )
+
+    mcp_servers["puppetmaster"] = desired
+    existing_mcp["mcpServers"] = mcp_servers
+    _write_json(mcp_path, existing_mcp)
+    messages.append(f"wrote puppetmaster MCP entry to {mcp_path}")
+    if prior and isinstance(prior.get("env"), dict) and prior["env"]:
+        messages.append(f"preserved existing env block ({len(prior['env'])} key(s))")
+    messages.append("OMP stays the TUI/pilot — do not lease omp as a worker.")
+    return InstallResult(
+        status="installed",
+        target=str(mcp_path),
+        python_executable=python,
+        handshake=handshake,
+        messages=messages,
+    )
+
+
+def uninstall_omp_mcp(
+    *,
+    agent_dir: Optional[Path] = None,
+    dry_run: bool = False,
+    env: Optional[Mapping[str, str]] = None,
+) -> UninstallResult:
+    """Remove Puppetmaster's OMP MCP entry. Other servers are never touched."""
+    base = Path(agent_dir) if agent_dir is not None else omp_agent_dir(env)
+    mcp_path = base / "mcp.json"
+    messages: list[str] = []
+
+    if not mcp_path.exists():
+        messages.append(f"no OMP MCP config at {mcp_path}")
+        return UninstallResult(status="unchanged", target=str(mcp_path), messages=messages)
+
+    try:
+        data = _read_json_object(mcp_path)
+    except json.JSONDecodeError as exc:
+        messages.append(f"existing config at {mcp_path} is not valid JSON: {exc!r}")
+        return UninstallResult(status="error", target=str(mcp_path), messages=messages)
+
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict) or "puppetmaster" not in servers:
+        messages.append(f"no puppetmaster MCP entry in {mcp_path}")
+        return UninstallResult(status="unchanged", target=str(mcp_path), messages=messages)
+
+    if dry_run:
+        messages.append(f"DRY RUN — would remove puppetmaster MCP entry from {mcp_path}")
+        return UninstallResult(status="would_remove", target=str(mcp_path), messages=messages)
+
+    del servers["puppetmaster"]
+    if not servers:
+        data.pop("mcpServers", None)
+    _write_json(mcp_path, data)
+    messages.append(f"removed puppetmaster MCP entry from {mcp_path}")
+    return UninstallResult(status="removed", target=str(mcp_path), messages=messages)

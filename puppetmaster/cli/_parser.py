@@ -331,6 +331,15 @@ def build_parser() -> argparse.ArgumentParser:
     install_pi.add_argument("--skip-handshake", action="store_true", help="Do not spawn the MCP server to verify it responds.")
     install_pi.add_argument("--path", default=None, help="Explicit Pi agent dir (defaults to $PI_CODING_AGENT_DIR or ~/.pi/agent).")
 
+    install_omp = subcommands.add_parser(
+        "install-omp-mcp",
+        help="Register Puppetmaster as an OMP/oh-my-pi TUI MCP server (~/.omp/agent/mcp.json). Not a worker adapter.",
+    )
+    install_omp.add_argument("--force", action="store_true", help="Rewrite even if the entry already matches.")
+    install_omp.add_argument("--dry-run", action="store_true", help="Print what would be written without modifying files.")
+    install_omp.add_argument("--skip-handshake", action="store_true", help="Do not spawn the MCP server to verify it responds.")
+    install_omp.add_argument("--path", default=None, help="Explicit OMP agent dir (defaults to $OMP_AGENT_DIR, profile, or ~/.omp/agent).")
+
     install_hermes = subcommands.add_parser(
         "install-hermes-mcp",
         help="Register Puppetmaster as an MCP server in Hermes' config.yaml.",
@@ -426,7 +435,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     setup_parser = subcommands.add_parser(
         "setup",
-        help="One-shot first-run: doctor + models init + install-cursor-mcp + install-codex-mcp + install-claude-mcp + install-hermes-mcp (+ Hermes hooks) + install-pi-mcp when --platforms includes pi + install-rules + install-hooks. Skips steps where the tool isn't present.",
+        help="One-shot first-run: doctor + models init + install-cursor-mcp + install-codex-mcp + install-claude-mcp + install-hermes-mcp (+ Hermes hooks) + install-pi-mcp when --platforms includes pi + install-omp-mcp when --platforms includes omp/ohmypi + install-rules + install-hooks. Skips steps where the tool isn't present.",
     )
     setup_parser.add_argument(
         "--skip-doctor",
