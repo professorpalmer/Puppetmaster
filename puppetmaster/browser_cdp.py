@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import hashlib
 import json
 import os
 import shutil
@@ -63,6 +64,26 @@ def _free_port() -> int:
     return port
 
 
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def _ws_accept_key(key: str) -> str:
+    """RFC 6455 Sec-WebSocket-Accept = base64(SHA-1(key + GUID))."""
+    digest = hashlib.sha1((key + _WS_GUID).encode("ascii")).digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
+def _http_header_value(header_blob: bytes, name: bytes) -> Optional[str]:
+    want = name.lower()
+    for line in header_blob.split(b"\r\n")[1:]:
+        if b":" not in line:
+            continue
+        raw_k, _, raw_v = line.partition(b":")
+        if raw_k.strip().lower() == want:
+            return raw_v.strip().decode("ascii", "replace")
+    return None
+
+
 class _WS:
     """Minimal RFC6455 client: text frames only, enough for CDP."""
 
@@ -94,12 +115,19 @@ class _WS:
             if not chunk:
                 raise ConnectionError("ws handshake closed early")
             resp += chunk
-        if b" 101 " not in resp.split(b"\r\n", 1)[0]:
+        header_blob, sep, leftover = resp.partition(b"\r\n\r\n")
+        if not sep or b" 101 " not in header_blob.split(b"\r\n", 1)[0]:
             raise ConnectionError(f"ws handshake failed: {resp[:120]!r}")
+        accept = _http_header_value(header_blob, b"sec-websocket-accept")
+        expected = _ws_accept_key(key)
+        if accept != expected:
+            raise ConnectionError(
+                f"ws accept mismatch: got {accept!r}, expected {expected!r}"
+            )
+        self._buf = leftover + self._buf
 
-    def send(self, text: str) -> None:
-        payload = text.encode("utf-8")
-        header = bytearray([0x81])
+    def _send_frame(self, opcode: int, payload: bytes) -> None:
+        header = bytearray([0x80 | (opcode & 0x0F)])
         n = len(payload)
         if n < 126:
             header.append(0x80 | n)
@@ -113,6 +141,9 @@ class _WS:
         header += mask
         masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
         self.sock.sendall(bytes(header) + masked)
+
+    def send(self, text: str) -> None:
+        self._send_frame(0x1, text.encode("utf-8"))
 
     def _recv_exact(self, n: int) -> bytes:
         while len(self._buf) < n:
@@ -139,7 +170,12 @@ class _WS:
                 data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
             if opcode == 0x8:
                 raise ConnectionError("ws closed by peer")
-            if opcode in (0x9, 0xA):
+            if opcode == 0x9:
+                # RFC 6455: a Ping must be answered with a Pong carrying the
+                # same application data. Unsolicited Pongs are ignored.
+                self._send_frame(0xA, data)
+                continue
+            if opcode == 0xA:
                 continue
             return data.decode("utf-8", "replace")
 

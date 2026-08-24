@@ -20718,7 +20718,78 @@ class RoutingAuditTests(unittest.TestCase):
         m = next(x for x in report.models if x.model_id == "m/60")
         self.assertEqual(m.runs_with_actuals, 1)
         self.assertEqual(m.measured_runs, 0)  # char/4 approximation, not measured
-        self.assertAlmostEqual(m.token_drift_ratio, 0.8, places=3)
+        # Headline calibration ignores char/4 so it cannot skew the ratio.
+        self.assertIsNone(m.token_drift_ratio)
+        self.assertIsNone(report.token_drift_ratio)
+
+    def test_headline_drift_uses_measured_runs_only(self) -> None:
+        from puppetmaster.audit import build_audit_report
+
+        # One SDK-measured 2.0x run plus a char/4 0.1x run. Calibration
+        # must stay 2.0, not blend the approximation into the headline.
+        records = [
+            self._rec_with_tokens("m/60", est_in=500, est_out=500,
+                                  act_in=1000, act_out=1000, measured=True,
+                                  cost=0.002),
+            self._rec_with_tokens("m/60", est_in=500, est_out=500,
+                                  act_in=50, act_out=50, measured=False,
+                                  cost=0.002),
+        ]
+        report = build_audit_report(
+            records, {"m/60": 60},
+            actual_cost_fn=lambda mid, tin, tout: (tin + tout) / 1_000_000.0,
+        )
+        m = next(x for x in report.models if x.model_id == "m/60")
+        self.assertEqual(m.runs_with_actuals, 2)
+        self.assertEqual(m.measured_runs, 1)
+        self.assertAlmostEqual(m.token_drift_ratio, 2.0, places=3)
+        self.assertAlmostEqual(m.cost_drift_ratio, 1.0, places=3)
+        self.assertEqual(report.tasks_with_measured, 1)
+        self.assertAlmostEqual(report.token_drift_ratio, 2.0, places=3)
+
+    def test_collect_records_omitted_tokens_estimated_is_not_measured(self) -> None:
+        from puppetmaster.audit import collect_records
+        from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
+        from puppetmaster.store import SwarmStore
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            job = store.create_job("omitted-flag")
+            task = Task(
+                job_id=job.id, role="implement", instruction="do it",
+                adapter="cursor", status=TaskStatus.COMPLETE,
+                payload={
+                    "router_model_id": "m/60",
+                    "router_capability_needed": 60,
+                    "router_estimated_cost_usd": 0.001,
+                },
+            )
+            store.save_task(task)
+            store.save_artifact(Artifact(
+                job_id=job.id, task_id=task.id, type=ArtifactType.ROUTING,
+                created_by="router",
+                payload={"model_id": "m/60", "adapter": "cursor",
+                         "policy": "balanced", "capability_needed": 60,
+                         "estimated_cost_usd": 0.001,
+                         "estimated_tokens_in": 800, "estimated_tokens_out": 200},
+                confidence=0.9, evidence=["role:implement"],
+            ))
+            # Token counts present, tokens_estimated key omitted — not ground truth.
+            store.save_artifact(Artifact(
+                job_id=job.id, task_id=task.id, type=ArtifactType.VERIFICATION,
+                created_by="w",
+                payload={"check": "x", "result": "passed",
+                         "tokens_in": 1200, "tokens_out": 300},
+                confidence=0.92, evidence=["e"],
+            ))
+
+            records, _jobs = collect_records(store)
+            self.assertEqual(len(records), 1)
+            r = records[0]
+            self.assertEqual(r.actual_tokens_total, 1500)
+            self.assertIsNone(r.actual_tokens_measured)
+            self.assertFalse(r.has_actuals)
 
     def test_collect_records_captures_token_usage(self) -> None:
         from puppetmaster.audit import build_audit_report, collect_records
