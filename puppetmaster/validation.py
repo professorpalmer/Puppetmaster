@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence, Union
 
+from puppetmaster.artifact_status import status_fields
 from puppetmaster.models import Artifact, ArtifactType
 
 VALIDATION_STATUSES = frozenset({"fresh", "reused", "stale", "superseded"})
@@ -500,6 +501,7 @@ def compact_artifact_ref(
             _truncate_text(item, _EVIDENCE_ITEM_MAX_CHARS) for item in evidence[:bound]
         ],
     }
+    statuses = status_fields(artifact)
     ref: dict[str, Any] = {
         "id": artifact.id,
         "type": str(artifact.type),
@@ -508,6 +510,11 @@ def compact_artifact_ref(
         "confidence": artifact.confidence,
         "created_at": artifact.created_at,
         "evidence_summary": evidence_summary,
+        "execution_status": statuses["execution_status"],
+        "grounding_status": statuses["grounding_status"],
+        "claim_support_status": statuses["claim_support_status"],
+        "criterion_status": statuses["criterion_status"],
+        "worker_self_rating": statuses["worker_self_rating"],
     }
     ref.update(concise)
     validation = validation_payload_of(artifact)

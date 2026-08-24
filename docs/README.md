@@ -2,7 +2,7 @@
 
 The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
 
-**Current release:** [v1.22.25](CHANGELOG.md#v12225) — Windows cell sqlite handle close (still the 1.22.24 named-cell slice); see [CHANGELOG.md](CHANGELOG.md) for the full line.
+**Current release:** [v1.22.26](CHANGELOG.md#v12226) — artifact status split (#88); see [CHANGELOG.md](CHANGELOG.md) and [ARTIFACT_STATUS.md](ARTIFACT_STATUS.md).
 
 ## Start here
 
@@ -34,6 +34,7 @@ Reproducible evidence behind the durable-state thesis, including an independent 
 | Doc | What's in it |
 |---|---|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Job / Task / Worker / Artifact / Stitcher / Memory object model |
+| [ARTIFACT_STATUS.md](ARTIFACT_STATUS.md) | #88 inventory: confidence vs execution/grounding/claim-support/criterion status |
 | [CELL.md](CELL.md) | Named cells: inspectable sqlite, serial inbox, hibernate/alarm (celld slice) |
 | [MODEL_ROUTING.md](MODEL_ROUTING.md) | Router policies, classifier, registry schema, the starter tiers |
 | [ADAPTERS.md](ADAPTERS.md) | All production adapters (cursor, claude-code, openai, codex, hermes, antigravity, agentic) + shell + how to add a new one |

@@ -151,7 +151,7 @@ class WorkerRuntime:
             artifacts = self._stamp_evaluator_metadata(task, artifacts)
             for artifact in artifacts:
                 self.store.save_artifact(artifact)
-                # Auto-materialize admitted gists from high-confidence findings
+                # Auto-materialize admitted gists from independently supported findings
                 # so swarm peers share verified compact discoveries without
                 # extra API churn.
                 try:

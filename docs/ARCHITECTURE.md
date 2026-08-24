@@ -20,7 +20,7 @@ flowchart TD
 - `Job`: one swarm run and user goal.
 - `Task`: a role-specific unit of work, optionally dependent on other tasks.
 - `AgentRun`: one attempt by one worker process.
-- `Artifact`: structured worker output with evidence, confidence, payload, and `sha256`.
+- `Artifact`: structured worker output with evidence, payload, `sha256`, legacy `confidence`, and explicit statuses (`execution_status` / `grounding_status` / `claim_support_status` / `criterion_status` / `worker_self_rating`). See [ARTIFACT_STATUS.md](ARTIFACT_STATUS.md).
 - `MemoryRecord`: promoted facts that future workers can retrieve.
 
 ## Runtime Flow

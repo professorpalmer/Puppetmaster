@@ -468,7 +468,8 @@ class PuppetmasterTests(unittest.TestCase):
             self.assertGreaterEqual(len(artifacts), 7)
             self.assertTrue(result.summary_path.exists())
             self.assertIn("Final synthesis used structured JSON artifacts only", result.summary)
-            self.assertGreaterEqual(len(memory), 4)
+            # Local demo findings are self-rated only. #88: that cannot admit memory.
+            self.assertEqual(len(memory), 0)
             self.assertTrue(all(artifact.sha256 for artifact in artifacts))
 
     def test_job_receipt_summarizes_run_efficiency_metrics(self) -> None:
@@ -1350,9 +1351,20 @@ class PuppetmasterTests(unittest.TestCase):
             self.assertEqual(first, second)
 
     def test_retrieved_memory_matches_goal_terms(self) -> None:
+        from puppetmaster.models import MemoryRecord
+
         with TemporaryDirectory() as tmp:
             store = SwarmStore(Path(tmp) / ".puppetmaster")
             result = Orchestrator(store).run("make stitching replayable", roles=["explore"])
+            store.promote_memory(
+                MemoryRecord(
+                    scope="swarm.findings",
+                    statement="independent workers share durable state",
+                    evidence=["concept:independent-workers"],
+                    source_artifacts=["artifact_seed"],
+                    confidence=0.9,
+                )
+            )
 
             matches = store.retrieve_memory("independent workers", limit=3)
 
@@ -1388,14 +1400,35 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertEqual(prompt_with_memory("base prompt", task), "base prompt")
 
     def test_memory_retrieval_supports_scope_filters(self) -> None:
+        from puppetmaster.models import MemoryRecord
+
         with TemporaryDirectory() as tmp:
             store = SwarmStore(Path(tmp) / ".puppetmaster")
             Orchestrator(store).run("make workers independent", roles=["explore"])
+            store.promote_memory(
+                MemoryRecord(
+                    scope="swarm.findings",
+                    statement="workers stay independent via durable artifacts",
+                    evidence=["e"],
+                    source_artifacts=["artifact_find"],
+                    confidence=0.9,
+                )
+            )
+            store.promote_memory(
+                MemoryRecord(
+                    scope="swarm.decisions",
+                    statement="workers use the file-backed store",
+                    evidence=["e"],
+                    source_artifacts=["artifact_dec"],
+                    confidence=0.9,
+                )
+            )
 
             scoped = store.retrieve_memory("workers", scope="swarm.findings")
             missing = store.retrieve_memory("workers", scope="swarm.decisions")
 
             self.assertTrue(scoped)
+            self.assertTrue(all(memory["scope"] == "swarm.findings" for memory in scoped))
             self.assertFalse(any(memory["scope"] == "swarm.findings" for memory in missing))
 
     def test_fresh_by_default_skips_memory_for_evaluative_roles(self) -> None:
@@ -17524,7 +17557,7 @@ class StitcherMemoryPromotionGateTests(unittest.TestCase):
                 )
                 self.assertEqual(self._promoted_statements([artifact]), [])
 
-    def test_finding_and_decision_promotion_unaffected(self) -> None:
+    def test_self_rating_does_not_promote_finding_or_decision(self) -> None:
         from puppetmaster.models import ArtifactType
 
         finding = self._artifact(
@@ -17536,8 +17569,27 @@ class StitcherMemoryPromotionGateTests(unittest.TestCase):
             payload={"decision": "use sqlite for hot path"},
         )
         statements = self._promoted_statements([finding, decision])
+        self.assertEqual(statements, [])
+
+    def test_independently_supported_finding_and_decision_are_promoted(self) -> None:
+        from puppetmaster.models import ArtifactType
+
+        finding = self._artifact(
+            artifact_type=ArtifactType.FINDING,
+            payload={"claim": "race in task claim path"},
+        )
+        decision = self._artifact(
+            artifact_type=ArtifactType.DECISION,
+            payload={"decision": "use sqlite for hot path"},
+        )
+        verification = self._artifact(
+            artifact_type=ArtifactType.VERIFICATION,
+            payload={"check": "race in task claim path", "result": "passed"},
+        )
+        statements = self._promoted_statements([finding, decision, verification])
         self.assertIn("race in task claim path", statements)
         self.assertIn("use sqlite for hot path", statements)
+        self.assertIn("race in task claim path", statements)
 
     def test_six_hundred_char_guard_trips(self) -> None:
         from puppetmaster.models import ArtifactType
@@ -28324,7 +28376,8 @@ class StitcherDedupTests(unittest.TestCase):
         bullets = Stitcher._bullet_payloads(arts, "claim", dedupe=True)
         self.assertEqual(len(bullets), 1)
         self.assertIn("reported by 3 workers", bullets[0])
-        self.assertIn("confidence=1.00", bullets[0])
+        self.assertIn("grounding_status=cited", bullets[0])
+        self.assertNotIn("confidence=", bullets[0])
 
     def test_distinct_bugs_at_same_file_stay_separate(self) -> None:
         """The collision guard: two unrelated bugs both citing cli.py must not

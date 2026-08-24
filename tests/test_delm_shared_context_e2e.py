@@ -73,6 +73,20 @@ class DelmSharedContextE2ETests(unittest.TestCase):
                 },
             )
             store.save_artifact(finding)
+            store.save_artifact(
+                Artifact(
+                    job_id=job.id,
+                    task_id=explore.id,
+                    type=ArtifactType.VERIFICATION,
+                    created_by="worker-explore",
+                    confidence=0.4,
+                    evidence=[finding.id],
+                    payload={
+                        "check": "Peers must only see admitted gists",
+                        "result": "passed",
+                    },
+                )
+            )
 
             gist = maybe_admit_finding_as_gist(store, finding)
             self.assertIsNotNone(gist)

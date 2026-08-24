@@ -421,7 +421,9 @@ def print_feed_item(item: dict) -> None:
     artifact = item["artifact"]
     print(
         f"{item['at']}\t{artifact['type']}\t{artifact['id']}\t"
-        f"task={artifact['task_id']}\tconfidence={artifact['confidence']}"
+        f"task={artifact['task_id']}\t"
+        f"execution_status={artifact.get('execution_status') or 'unknown'}\t"
+        f"claim_support_status={artifact.get('claim_support_status') or 'unknown'}"
     )
     print(f"  {artifact_headline(artifact)}")
 

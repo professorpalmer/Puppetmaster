@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any, Iterable, List, Optional, Sequence
 
+from puppetmaster.artifact_status import durable_admission_allowed
 from puppetmaster.models import Artifact, ArtifactType
 
 AdmissionStatus = str  # "pending" | "admitted" | "rejected"
@@ -239,19 +240,21 @@ def maybe_admit_finding_as_gist(
 ) -> Optional[Artifact]:
     """Materialize an admitted gist from a substantive FINDING when eligible.
 
-    Called after a successful ``save_artifact`` of a FINDING with
-    ``confidence >= min_confidence`` (default 0.8). Cheap structural admission:
-    Artifact.validate on the gist, optionally boosted by a same-task
-    VERIFICATION accept. Returns the saved gist, or None when skipped.
+    Called after a successful ``save_artifact`` of a FINDING. Self-rating /
+    ``confidence`` / ``min_confidence`` never admit. Requires independent
+    support (same-task accepting VERIFICATION or PM
+    ``claim_support_status=independently_supported``). ``min_confidence`` is
+    retained for call-compat only and is ignored.
     """
     if _artifact_type(finding) != ArtifactType.FINDING:
+        return None
+    _ = min_confidence  # explicitly unused — self-rating cannot admit
+    if not durable_admission_allowed(finding, store=store):
         return None
     try:
         confidence = float(finding.confidence)
     except (TypeError, ValueError):
-        return None
-    if confidence < min_confidence:
-        return None
+        confidence = 0.0
     claim = str((finding.payload or {}).get("claim") or "").strip()
     if not claim:
         return None
