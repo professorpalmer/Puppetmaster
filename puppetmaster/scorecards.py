@@ -142,17 +142,13 @@ def load_community_baseline(path: Path) -> dict:
 
 
 def _identity_hit(spec: Any, entry: dict) -> bool:
+    """Match evidence to one exact registry id, never a shared wire name."""
     entry_id = entry.get("id")
-    entry_name = entry.get("adapter_model_name")
-    if isinstance(entry_id, str) and entry_id and spec.id == entry_id:
-        return True
-    if (
-        isinstance(entry_name, str)
-        and entry_name
-        and spec.adapter_model_name == entry_name
-    ):
-        return True
-    return False
+    return (
+        isinstance(entry_id, str)
+        and bool(entry_id)
+        and spec.id == entry_id
+    )
 
 
 def _copy_card(card: Any) -> Optional[dict]:
@@ -217,8 +213,8 @@ def import_community_baseline(
 ) -> "tuple[list, dict]":
     """Overlay adapter-scoped community cards onto ``specs``.
 
-    Match only when both adapter and (id or adapter_model_name) match. Never
-    copies cards across adapters. Never overwrites ``capability_score``.
+    Match only when registry id and adapter both match. Never copies cards
+    across registry variants or adapters. Never overwrites ``capability_score``.
     Existing local cards win per role unless ``replace_cards``.
     """
     existing = list(specs)

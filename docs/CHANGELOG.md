@@ -1,3 +1,19 @@
+## v1.22.30 — 2026-08-24
+
+**Fix: community scorecard import attached Max evidence to Low.**
+
+`_identity_hit` matched `adapter_model_name` as well as registry id. Effort
+variants intentionally share a wire name (`gpt-5.6-luna`), so a Max card
+could overlay the Low sibling.
+
+- Community import now matches exact registry id only, plus the existing
+  adapter check.
+- Regression: Max implement evidence stays on Max and does not attach to Low.
+- No routing, scoring, bundle-format, or provider behavior changes.
+- No Pi / grok-bot worker. Marionette pin unchanged.
+
+Absorbed inbound PR #100 (re-implemented on this ladder; #100 was not merged).
+
 ## v1.22.29 — 2026-08-24
 
 **Fix: selected Max never reached the worker on direct OpenAI GPT-5.6.**
