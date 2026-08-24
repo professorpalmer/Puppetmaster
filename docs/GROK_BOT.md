@@ -258,6 +258,26 @@ runtime, then nuke the job.
 Doctor `pi-pilot` is healthy when the Pi CLI is visible, the package is loaded,
 and Puppetmaster MCP is reachable.
 
+## OMP / oh-my-pi TUI/pilot (stdio; v1.22.31+)
+
+Grok Bot is a *remote HTTP* pilot. **Pi** and **OMP** are *local TUI* pilots.
+None is a worker adapter — do not invent a `pi`, `omp`, `ohmypi`, or
+`grok-bot` leased subprocess.
+
+OMP already speaks native MCP. Install:
+
+    puppetmaster install-omp-mcp
+    # or: setup --platforms omp
+    # or: setup --platforms ohmypi
+
+That writes `~/.omp/agent/mcp.json` to the same stdio launch other hosts use
+(`python -m puppetmaster.mcp_server`). No TypeScript extension. Prefer
+start_implement / start_agentic / start_prewalk, then effort_index / show.
+Artifacts, not transcripts. Size the runtime, then nuke the job.
+
+Doctor `omp-pilot` is optional when OMP is not installed (missing CLI is not a
+failure), ok when MCP is present, and warn when the install is partial.
+
 ## Related docs
 
 - [CURSOR_AGENT_MCP.md](CURSOR_AGENT_MCP.md) — full tool surface (stdio daily driver)

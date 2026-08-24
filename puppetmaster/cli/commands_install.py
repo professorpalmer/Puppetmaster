@@ -27,6 +27,7 @@ from puppetmaster.installers import (
     install_hermes_mcp,
     install_hermes_plugin,
     install_hermes_skill,
+    install_omp_mcp,
     install_pi_mcp,
     list_skill_candidates,
     promote_skill_candidate,
@@ -36,6 +37,7 @@ from puppetmaster.installers import (
     uninstall_codex_mcp,
     uninstall_cursor_mcp,
     uninstall_hermes_mcp,
+    uninstall_omp_mcp,
     uninstall_pi_mcp,
 )
 from puppetmaster.rules import (
@@ -75,6 +77,7 @@ from puppetmaster.cli.guidance import (
     CURSOR_NEXT_STEPS_GUIDANCE,
     HERMES_NEXT_STEPS_GUIDANCE,
     PI_NEXT_STEPS_GUIDANCE,
+    OMP_NEXT_STEPS_GUIDANCE,
 )
 from puppetmaster.cli.helpers import (
     _print_install_result,
@@ -164,6 +167,10 @@ def _run_uninstall(args) -> int:
     print("=== uninstall: pi MCP / package listing ===")
     pi_result = uninstall_pi_mcp(dry_run=dry_run)
     overall_rc |= _print_uninstall_mcp_result(pi_result, "pi")
+
+    print("=== uninstall: omp MCP ===")
+    omp_result = uninstall_omp_mcp(dry_run=dry_run)
+    overall_rc |= _print_uninstall_mcp_result(omp_result, "omp")
     hermes_hooks = uninstall_hermes_hooks(dry_run=dry_run)
     print(f"[uninstall-hermes-hooks] {hermes_hooks.status:<14} {hermes_hooks.reason}")
     if hermes_hooks.status == "error":
@@ -377,12 +384,15 @@ def _seed_agentic_registry() -> None:
     except Exception as exc:  # never let registry seeding abort the wizard
         print(f"  registry  note: agentic registry seeding skipped ({exc!r})")
 
+_HOST_PILOT_TOKENS = frozenset({"pi", "omp", "ohmypi"})
+
+
 def _requested_host_pilots(args) -> set[str]:
     raw = getattr(args, "platforms", None)
     if not raw:
         return set()
     tokens = {a.strip() for a in raw.split(",") if a.strip()}
-    return tokens & {"pi"}
+    return tokens & _HOST_PILOT_TOKENS
 
 
 def _run_install_pi(args) -> int:
@@ -400,6 +410,24 @@ def _run_install_pi(args) -> int:
         print()
         print("Next steps:")
         for line in PI_NEXT_STEPS_GUIDANCE.splitlines():
+            print(f"  {line}")
+    return rc
+
+def _run_install_omp(args) -> int:
+    """Dispatch for puppetmaster install-omp-mcp."""
+    explicit = getattr(args, "path", None)
+    agent_dir = Path(explicit).expanduser().resolve() if explicit else None
+    result = install_omp_mcp(
+        agent_dir=agent_dir,
+        force=getattr(args, "force", False),
+        dry_run=getattr(args, "dry_run", False),
+        skip_handshake=getattr(args, "skip_handshake", False),
+    )
+    rc = _print_install_result(result, "omp")
+    if result.status in {"installed", "unchanged"}:
+        print()
+        print("Next steps:")
+        for line in OMP_NEXT_STEPS_GUIDANCE.splitlines():
             print(f"  {line}")
     return rc
 
@@ -623,11 +651,12 @@ def _setup_platform_step(args) -> int:
             _show_state()
             return 0
         wanted = {a.strip() for a in raw.split(",") if a.strip()}
-        hosts = wanted & {"pi"}
-        wanted -= {"pi"}
+        hosts = wanted & _HOST_PILOT_TOKENS
+        wanted -= _HOST_PILOT_TOKENS
         if hosts:
+            labels = ", ".join(sorted(hosts))
             print(
-                "  note  pi is a TUI/pilot host, not a worker adapter "
+                f"  note  {labels} is a TUI/pilot host, not a worker adapter "
                 "(not added to the platform lock)"
             )
             try:
@@ -894,9 +923,10 @@ def _run_setup(args) -> int:
     from puppetmaster import platform_lock as _pl
     host_pilots = _requested_host_pilots(args) | set(getattr(args, "_host_pilots", set()) or set())
     if not _pl.is_configured():
-        if "pi" in host_pilots:
+        if host_pilots:
             print(
-                "  note  no worker platform lock — Pi is a pilot host; "
+                "  note  no worker platform lock — requested host pilots "
+                f"({', '.join(sorted(host_pilots))}) are TUI/pilot only; "
                 "enable a worker later with --platforms agentic (or similar)."
             )
         else:
@@ -931,7 +961,7 @@ def _run_setup(args) -> int:
 
     from puppetmaster import platform_lock as _pl
     enabled_adapters = _pl.enabled_adapters()
-    if not _pl.is_configured() and "pi" in _requested_host_pilots(args):
+    if not _pl.is_configured() and _requested_host_pilots(args):
         enabled_adapters = set()
 
     if "agentic" in enabled_adapters:
@@ -1108,6 +1138,28 @@ def _run_setup(args) -> int:
         host_pilots.add("pi")
     print()
 
+    print("=== install-omp-mcp (OMP/oh-my-pi TUI/pilot; not a worker) ===")
+    import shutil as _shutil_omp
+    omp_cmd = os.environ.get("OMP_COMMAND") or "omp"
+    omp_cli = _shutil_omp.which(omp_cmd) or _shutil_omp.which("omp")
+    want_omp = bool({"omp", "ohmypi"} & host_pilots) or bool(omp_cli) or bool(os.environ.get("OMP_AGENT_DIR"))
+    if not want_omp:
+        print("  skipped  omp CLI not on PATH — pass --platforms omp or ohmypi, or install oh-my-pi and re-run")
+    else:
+        if not ({"omp", "ohmypi"} & host_pilots) and omp_cli:
+            print("  note  omp CLI detected; wiring ~/.omp/agent/mcp.json (not a worker adapter)")
+        omp_result = install_omp_mcp(
+            force=getattr(args, "force", False),
+            dry_run=getattr(args, "dry_run", False),
+            skip_handshake=getattr(args, "skip_handshake", False),
+        )
+        for line in omp_result.messages:
+            print(f"  {line}")
+        if omp_result.status not in {"installed", "unchanged", "would_install"}:
+            overall_rc = 1
+        host_pilots.add("omp")
+    print()
+
     if not getattr(args, "skip_rules", False):
         print("=== step 8/9: install-rules (soft agent nudges) ===")
         rules_result = install_rules(
@@ -1186,6 +1238,8 @@ def _setup_next_steps(enabled_adapters: set[str], host_pilots: Optional[set[str]
         steps.append("hermes: start a new Hermes session; verify with `hermes mcp list`.")
     if host_pilots and "pi" in host_pilots:
         steps.append("pi: restart pi (or start a new session) so the package extension can register Puppetmaster MCP tools. Pi stays the TUI/pilot — do not lease pi as a worker.")
+    if host_pilots and ({"omp", "ohmypi"} & host_pilots):
+        steps.append("omp: restart omp (or start a new session) so ~/.omp/agent/mcp.json registers Puppetmaster MCP tools. OMP stays the TUI/pilot — do not lease omp as a worker.")
     if "openai" in enabled_adapters:
         steps.append("openai: set OPENAI_API_KEY; the API adapter needs no host restart.")
     if "agentic" in enabled_adapters:

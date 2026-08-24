@@ -27,6 +27,7 @@ python -m puppetmaster install-codex-mcp --map-env CODEX_HOME=MY_CODEX_API_HOME
 python -m puppetmaster install-codex-mcp --env-file ~/.config/puppetmaster/env.zsh
 python -m puppetmaster install-hermes-mcp           # ~/.hermes/config.yaml
 python -m puppetmaster install-pi-mcp              # ~/.pi/agent mcp.json + pi-package (pilot, not a worker)
+python -m puppetmaster install-omp-mcp             # ~/.omp/agent/mcp.json (OMP/oh-my-pi TUI, not a worker)
 python -m puppetmaster install-rules                # write .cursor/rules/puppetmaster.mdc + AGENTS.md
 python -m puppetmaster install-rules --global       # also ~/.codex/instructions.md and ~/.claude/CLAUDE.md
 ```

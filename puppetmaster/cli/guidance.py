@@ -6,6 +6,7 @@ from puppetmaster.installers import (
     CURSOR_NEXT_STEPS_GUIDANCE,
     HERMES_NEXT_STEPS_GUIDANCE,
     PI_NEXT_STEPS_GUIDANCE,
+    OMP_NEXT_STEPS_GUIDANCE,
 )
 
 
