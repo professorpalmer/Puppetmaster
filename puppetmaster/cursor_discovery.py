@@ -61,6 +61,7 @@ _CURSOR_NOMINAL_RATES: dict[str, tuple[float, float]] = {
     "opus-5": (5.0, 25.0),
     "claude-fable-5": (10.0, 50.0),
     "fable-5": (10.0, 50.0),
+    "gpt-5": (1.25, 10.0),
     "gpt-5.6-luna": (1.0, 6.0),
     "gpt-5.6-terra": (2.5, 15.0),
     "gpt-5.6-sol": (5.0, 30.0),

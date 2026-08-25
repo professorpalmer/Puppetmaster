@@ -1,3 +1,12 @@
+## Unreleased
+
+**Issue #107: default routing no longer treats raw GPT-5 as the cheap auto pick when a GPT-5.6 successor is live on the same stream.**
+
+Availability is per lane `(adapter, provider)`. Marionette Codex auth
+(`agentic` + `openai-codex`) is not the Codex CLI adapter, and Cursor
+GPT-5.6 Sol does not enable Codex GPT-5.4 mini. Packaged Agent Arena
+Pareto snapshot is ranking only. `models recommend [--write]`.
+
 ## v1.22.34 — 2026-08-25
 
 **Universal playbook recipes: five frozen ids on the existing gate and launch seams, not a Cursor plugin.**

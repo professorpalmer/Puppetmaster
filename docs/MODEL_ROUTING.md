@@ -33,6 +33,27 @@ alternatives with the reason each was rejected — all stored as an
 `puppetmaster artifacts <job_id>` to see why each task went where,
 or `puppetmaster cost <job_id>` to sum spend across the run.
 
+## Streams (lanes) and Pareto recommendations (issue #107)
+
+Marionette Settings on/off and Puppetmaster-without-Marionette (`models
+discover` / hooked keys) share one detect path: **what adapter is
+hooked, what auth/provider that adapter is using, what catalog is
+actually live on that stream.** Ranking may come from a packaged Agent
+Arena Pareto snapshot; availability never unions streams.
+
+| Host | Stream |
+| --- | --- |
+| Marionette | `agentic` adapter, then `payload_defaults.provider` (Codex OAuth is `openai-codex`, not the `codex` CLI adapter) |
+| Puppetmaster inside Codex CLI | `codex` adapter |
+| Puppetmaster inside Cursor | `cursor` adapter + that plan catalog |
+
+GPT-5.6 Sol on Cursor does not mean GPT-5.4 mini is callable on Codex.
+Auto-route skips exact `gpt-5` only when a GPT-5.6 successor is eligible
+**in the same lane**. The row stays for explicit pins (`allowed_model_ids`
+or `payload.model`). `python -m puppetmaster models recommend [--write]`
+stamps tags / optional effort per lane. Kill switches:
+`PUPPETMASTER_GENERATION_FILTER=0`, `PUPPETMASTER_PARETO_RECOMMEND=0`.
+
 Routing artifacts explain a selection; structural artifact presence is process
 health evidence, not semantic quality. For provider-neutral paired grading,
 strongest-eligible baselines, uncertainty, bounded non-inferiority claims, and
@@ -208,6 +229,7 @@ python -m puppetmaster models discover --probe
 python -m puppetmaster doctor
 # Review the pending diff, then explicitly apply it:
 python -m puppetmaster models discover --write
+python -m puppetmaster models recommend --write
 
 # 3. Dry-run a routing decision before kicking off a swarm
 python -m puppetmaster route "Security audit across every endpoint" --role audit

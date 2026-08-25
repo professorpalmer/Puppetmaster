@@ -1018,6 +1018,23 @@ def _route_task_once(
             )
         after_cost = after_billing
 
+    # Same-lane prior-generation skip (issue #107). Cursor GPT-5.6 Sol must
+    # not retire a Codex or agentic-codex GPT-5 row. Fail-open per lane.
+    from puppetmaster.pareto_recommend import filter_prior_generation
+
+    after_cost, generation_rejected = filter_prior_generation(after_cost)
+    for spec, reason in generation_rejected:
+        rejected.append(
+            (
+                spec,
+                "prior generation on this adapter/provider lane: " + reason,
+            )
+        )
+    if not after_cost:
+        raise NoEligibleModelError(
+            "No model in registry remains after prior-generation filtering."
+        )
+
     # Snapshot the savings baseline from the strongest model that was *actually
     # eligible for this task* — i.e. the final candidate set the pick is drawn
     # from, after every hard constraint (platform lock, required tags, cost cap,

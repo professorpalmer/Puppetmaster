@@ -1,0 +1,100 @@
+{
+  "bundle_id": "arena-agent-pareto",
+  "version": "1.0.0",
+  "published": "2026-08-24",
+  "source_url": "https://arena.ai/leaderboard/agent/pareto",
+  "sessions": 1998757,
+  "not_ground_truth": true,
+  "notes": "Packaged Agent Arena Pareto snapshot (net improvement x cost/task). Default authority when the network is down. Optional refresh is a later lever; do not scrape arena.ai on the routing hot path.",
+  "workhorse_rule": "Cheapest Pareto-optimal row with net_improvement_pct > 0 that maps to a hooked model. On this snapshot that is GPT 5.6 Luna (xHigh) at $0.07/task.",
+  "rows": [
+    {
+      "arena_name": "Claude Opus 5 (High)",
+      "pareto_optimal": true,
+      "net_improvement_pct": 12.73,
+      "cost_per_task_usd": 2.55,
+      "effort": "high",
+      "recommended_capability": 100,
+      "identities": ["claude-opus-5", "opus-5"]
+    },
+    {
+      "arena_name": "Claude Fable 5 (High)",
+      "pareto_optimal": true,
+      "net_improvement_pct": 11.62,
+      "cost_per_task_usd": 2.27,
+      "effort": "high",
+      "recommended_capability": 100,
+      "identities": ["claude-fable-5", "fable-5"]
+    },
+    {
+      "arena_name": "GPT 5.6 Sol (xHigh)",
+      "pareto_optimal": true,
+      "net_improvement_pct": 10.31,
+      "cost_per_task_usd": 1.43,
+      "effort": "xhigh",
+      "recommended_capability": 99,
+      "identities": ["gpt-5.6-sol", "gpt-5.6", "gpt-5-6-sol"]
+    },
+    {
+      "arena_name": "Kimi K3 (Max)",
+      "pareto_optimal": true,
+      "net_improvement_pct": 9.53,
+      "cost_per_task_usd": 0.72,
+      "effort": "max",
+      "recommended_capability": 98,
+      "identities": ["kimi-k3", "moonshotai/kimi-k3", "kimi-k3-max"]
+    },
+    {
+      "arena_name": "DeepSeek V4 Pro (High) (0813)",
+      "pareto_optimal": true,
+      "net_improvement_pct": 6.97,
+      "cost_per_task_usd": 0.24,
+      "effort": "high",
+      "recommended_capability": 85,
+      "identities": ["deepseek-v4-pro", "deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-pro-0813"]
+    },
+    {
+      "arena_name": "GPT 5.6 Luna (xHigh)",
+      "pareto_optimal": true,
+      "net_improvement_pct": 3.83,
+      "cost_per_task_usd": 0.07,
+      "effort": "xhigh",
+      "recommended_capability": 90,
+      "workhorse": true,
+      "identities": ["gpt-5.6-luna", "gpt-5-6-luna"]
+    },
+    {
+      "arena_name": "Hy3",
+      "pareto_optimal": true,
+      "net_improvement_pct": -0.42,
+      "cost_per_task_usd": 0.05,
+      "effort": "",
+      "recommended_capability": 70,
+      "identities": ["hy3"]
+    },
+    {
+      "arena_name": "Mimo V2.5 Pro",
+      "pareto_optimal": true,
+      "net_improvement_pct": -2.79,
+      "cost_per_task_usd": 0.05,
+      "effort": "",
+      "recommended_capability": 55,
+      "identities": ["mimo-v2.5-pro", "xiaomi/mimo-v2.5-pro"]
+    }
+  ],
+  "prior_generation": [
+    {
+      "identities": ["gpt-5"],
+      "successors": [
+        "gpt-5.6-luna",
+        "gpt-5-6-luna",
+        "gpt-5.6-terra",
+        "gpt-5-6-terra",
+        "gpt-5.6-sol",
+        "gpt-5-6-sol",
+        "gpt-5.6"
+      ],
+      "reason": "Original GPT-5 is not on the 2026-08-24 Agent Arena Pareto. GPT-5.6 Luna (xHigh) is the cheap workhorse. Keep the row for explicit pins; auto-route skips it when a successor is eligible."
+    }
+  ]
+}
