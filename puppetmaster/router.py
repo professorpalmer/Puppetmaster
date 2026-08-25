@@ -746,6 +746,7 @@ def _route_task_once(
     policy: Optional[str] = None,
     calibration: Optional[TokenEstimateCalibration] = None,
     local_receipts: Optional[Iterable] = None,
+    generation_presence: Optional[Iterable[ModelSpec]] = None,
 ) -> RoutingDecision:
     """Pick a model for ``task`` from ``registry`` using ``policy``.
 
@@ -1022,7 +1023,10 @@ def _route_task_once(
     # not retire a Codex or agentic-codex GPT-5 row. Fail-open per lane.
     from puppetmaster.pareto_recommend import filter_prior_generation
 
-    after_cost, generation_rejected = filter_prior_generation(after_cost)
+    after_cost, generation_rejected = filter_prior_generation(
+        after_cost,
+        presence=generation_presence,
+    )
     for spec, reason in generation_rejected:
         rejected.append(
             (
@@ -1395,12 +1399,15 @@ def route_task(
     calibration: Optional[TokenEstimateCalibration] = None,
     shadow_policy: Optional[str] = None,
     local_receipts: Optional[Iterable] = None,
+    generation_presence: Optional[Iterable[ModelSpec]] = None,
 ) -> RoutingDecision:
     """Pick the production model and optionally attach counterfactual evidence.
 
     Shadow routing is opt-in and non-interfering: the production decision is
     computed first and returned unchanged except for an evidence-only payload.
     The counterfactual route cannot replace its model, adapter, or policy.
+    ``generation_presence`` is the bound registry used to decide whether a
+    GPT-5.6 successor still exists in-lane after fallback shrinks ``registry``.
     """
     models = tuple(registry)
     production = _route_task_once(
@@ -1409,6 +1416,7 @@ def route_task(
         policy=policy,
         calibration=calibration,
         local_receipts=local_receipts,
+        generation_presence=generation_presence,
     )
     if shadow_policy is None:
         return production
@@ -1422,6 +1430,7 @@ def route_task(
         policy=shadow_policy,
         calibration=calibration,
         local_receipts=local_receipts,
+        generation_presence=generation_presence,
     )
     from puppetmaster.shadow_routing import shadow_evidence
 

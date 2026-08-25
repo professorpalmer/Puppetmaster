@@ -203,25 +203,28 @@ def filter_prior_generation(
     candidates: list[ModelSpec],
     *,
     snapshot: Optional[dict] = None,
+    presence: Optional[Iterable[ModelSpec]] = None,
 ) -> tuple[list[ModelSpec], list[tuple[ModelSpec, str]]]:
-    """Drop exact prior-generation ids when a successor is eligible *in lane*.
+    """Drop exact prior-generation ids when a successor exists *in lane*.
 
-    Cursor GPT-5.6 Sol must not retire an agentic/Codex GPT-5 row, and the
-    reverse. Fail-open when the filter would empty a lane.
+    ``presence`` is the lane inventory (usually the bound registry). Fallback
+    routing shrinks ``candidates`` after a failed Luna run; successor presence
+    must still see Luna or GPT-5 comes back. Fail-open only when that lane
+    has no successor in ``presence``.
     """
     if not generation_filter_enabled() or not candidates:
         return list(candidates), []
     rules = prior_generation_rules(snapshot)
     if not rules:
         return list(candidates), []
+    inventory = list(presence) if presence is not None else list(candidates)
     present_by_lane: dict[tuple[str, str], set[str]] = {}
-    for spec in candidates:
+    for spec in inventory:
         present_by_lane.setdefault(spec_lane(spec), set()).update(
             spec_identity_tokens(spec)
         )
     kept: list[ModelSpec] = []
     rejected: list[tuple[ModelSpec, str]] = []
-    dropped_lanes: dict[tuple[str, str], int] = {}
     for spec in candidates:
         tokens = spec_identity_tokens(spec)
         lane = spec_lane(spec)
@@ -235,17 +238,27 @@ def filter_prior_generation(
                 break
         if drop:
             rejected.append((spec, reason))
-            dropped_lanes[lane] = dropped_lanes.get(lane, 0) + 1
         else:
             kept.append(spec)
     kept_lanes = {spec_lane(spec) for spec in kept}
-    for spec, _reason in list(rejected):
-        if spec_lane(spec) not in kept_lanes:
+    still_rejected: list[tuple[ModelSpec, str]] = []
+    for spec, reason in rejected:
+        lane = spec_lane(spec)
+        if lane in kept_lanes:
+            still_rejected.append((spec, reason))
+            continue
+        present = present_by_lane.get(lane) or set()
+        tokens = spec_identity_tokens(spec)
+        has_successor = False
+        for rule in rules:
+            if tokens & rule["identities"] and (present & rule["successors"]):
+                has_successor = True
+                break
+        if has_successor:
+            still_rejected.append((spec, reason))
+        else:
             kept.append(spec)
-            rejected = [item for item in rejected if item[0] is not spec]
-    if not kept:
-        return list(candidates), []
-    return kept, rejected
+    return kept, still_rejected
 
 
 def _can_overwrite_score(spec: ModelSpec) -> bool:

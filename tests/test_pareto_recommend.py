@@ -107,6 +107,28 @@ class PriorGenerationFilterTests(unittest.TestCase):
         self.assertEqual([spec.id for spec in kept], [gpt5.id])
         self.assertEqual(rejected, [])
 
+    def test_presence_pool_does_not_resurrect_gpt5_after_luna_tried(self) -> None:
+        from puppetmaster.pareto_recommend import filter_prior_generation
+        from puppetmaster.router import NoEligibleModelError, TaskSignals, route_task
+
+        gpt5 = _spec(
+            id="cursor/gpt-5",
+            adapter_model_name="gpt-5",
+            input_per_mtok_usd=0.0,
+            output_per_mtok_usd=0.0,
+        )
+        luna = _spec(id="cursor/gpt-5.6-luna", adapter_model_name="gpt-5.6-luna")
+        kept, rejected = filter_prior_generation([gpt5], presence=[gpt5, luna])
+        self.assertEqual(kept, [])
+        self.assertEqual(rejected[0][0].id, gpt5.id)
+        with self.assertRaises(NoEligibleModelError):
+            route_task(
+                TaskSignals(instruction="implement a feature", role="implement"),
+                [gpt5],
+                policy="cheap",
+                generation_presence=[gpt5, luna],
+            )
+
 
 class BentonDefaultPickTests(unittest.TestCase):
     def test_balanced_implement_skips_same_lane_gpt5_for_luna(self) -> None:

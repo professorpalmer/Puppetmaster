@@ -7,6 +7,11 @@ Availability is per lane `(adapter, provider)`. Marionette Codex auth
 GPT-5.6 Sol does not enable Codex GPT-5.4 mini. Packaged Agent Arena
 Pareto snapshot is ranking only. `models recommend [--write]`.
 
+Fallback routing keeps the bound registry as generation presence, so a
+failed Luna/Composer run does not resurrect leftover GPT-5. Live proof:
+`job_4acd87c90696` first-picked Composer and skipped GPT-5; after
+`run_status_error`, fallback picked Luna and still rejected GPT-5.
+
 ## v1.22.34 — 2026-08-25
 
 **Universal playbook recipes: five frozen ids on the existing gate and launch seams, not a Cursor plugin.**
