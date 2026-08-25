@@ -71,6 +71,7 @@ class BrowserCdpTest(unittest.TestCase):
             os.environ["PM_BROWSER_ALLOW_LOCAL"] = self._saved_allow_local
         else:
             os.environ.pop("PM_BROWSER_ALLOW_LOCAL", None)
+        os.environ.pop("PM_BROWSER_HEADED", None)
 
     def test_navigate_returns_title_and_url(self):
         out = b.navigate("https://example.com")
@@ -106,6 +107,7 @@ class BrowserCdpTest(unittest.TestCase):
     def test_dispatch_routes_known_and_unknown(self):
         self.assertIsNotNone(b.dispatch("browser_get_text", {}))
         self.assertIsNotNone(b.dispatch("browser_network", {}))
+        self.assertIsNotNone(b.dispatch("browser_auth_handoff", {"url": "https://example.com"}))
         self.assertIsNone(b.dispatch("not_a_browser_tool", {}))
 
     def test_type_uses_native_value_setter(self):
@@ -300,6 +302,250 @@ class WsRfc6455Test(unittest.TestCase):
         hs_end = bytes(sock.sent).find(b"\r\n\r\n")
         rest = bytes(sock.sent)[hs_end + 4:]
         self.assertEqual(_decode_masked_frames(rest), [])
+
+
+class BrowserCdpAuthHandoffTest(unittest.TestCase):
+    def setUp(self):
+        self._saved = {}
+        for key in (
+            "PM_BROWSER_HEADED",
+            "PM_BROWSER_USER_DATA_DIR",
+            "PM_BROWSER_CDP_PORT",
+            "PM_BROWSER_ATTACH_ONLY",
+        ):
+            self._saved[key] = os.environ.pop(key, None)
+        self._session = getattr(b, "_SESSION", None)
+        self._janitor = b._JANITOR
+        b._JANITOR = False
+
+    def tearDown(self):
+        b._JANITOR = self._janitor
+        b._SESSION = self._session
+        for key, val in self._saved.items():
+            if val is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = val
+
+    def test_headed_launch_args_omit_headless(self):
+        headed = b.chrome_launch_args("/chrome", 9333, "/prof", True)
+        self.assertNotIn("--headless=new", headed)
+        self.assertIn("--new-window", headed)
+        self.assertIn("--remote-debugging-port=9333", headed)
+
+    def test_headless_launch_args_keep_historical_flags(self):
+        args = b.chrome_launch_args("/chrome", 9222, "/tmp/p", False)
+        self.assertIn("--headless=new", args)
+        self.assertIn("--disable-gpu", args)
+        self.assertNotIn("--new-window", args)
+
+    def test_headed_default_profile_is_persistent(self):
+        os.environ["PM_BROWSER_HEADED"] = "1"
+        saved_home = os.environ.get("HOME")
+        with tempfile.TemporaryDirectory() as td:
+            os.environ["HOME"] = td
+            try:
+                path, owns = b._profile_dir_for_launch()
+            finally:
+                if saved_home is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = saved_home
+        self.assertFalse(owns)
+        self.assertIn("browser-profile", path)
+
+    def test_headless_without_dir_is_temp(self):
+        path, owns = b._profile_dir_for_launch()
+        self.assertTrue(owns)
+        self.assertIn("pm-cdp-", os.path.basename(path))
+        import shutil
+        shutil.rmtree(path, ignore_errors=True)
+
+    def test_ensure_attaches_when_cdp_port_live(self):
+        os.environ["PM_BROWSER_CDP_PORT"] = "9333"
+        b._SESSION = b._Session()
+
+        def fake_wait(port, seconds):
+            return "ws://127.0.0.1:9333/devtools"
+
+        def fake_attach(self, ws_url, **kwargs):
+            self.ws = object()
+            self.port = kwargs.get("port")
+            self.owns_proc = kwargs.get("owns_proc")
+            self.headed = kwargs.get("headed")
+            self.profile_dir = kwargs.get("profile_dir")
+            self.owns_profile = kwargs.get("owns_profile")
+            return None
+
+        saved_wait = b._wait_for_page_ws
+        saved_attach = b._Session._attach_ws
+        b._wait_for_page_ws = fake_wait
+        b._Session._attach_ws = fake_attach
+        try:
+            err = b._SESSION.ensure()
+            self.assertIsNone(err)
+            self.assertFalse(b._SESSION.owns_proc)
+            self.assertEqual(b._SESSION.port, 9333)
+        finally:
+            b._wait_for_page_ws = saved_wait
+            b._Session._attach_ws = saved_attach
+
+    def test_attach_only_without_target_is_calm(self):
+        os.environ["PM_BROWSER_CDP_PORT"] = "9333"
+        os.environ["PM_BROWSER_ATTACH_ONLY"] = "1"
+        b._SESSION = b._Session()
+        saved = b._wait_for_page_ws
+        b._wait_for_page_ws = lambda port, seconds: None
+        try:
+            err = b._SESSION.ensure()
+            self.assertIn("No Chrome DevTools", err or "")
+        finally:
+            b._wait_for_page_ws = saved
+
+    def test_shutdown_keeps_persistent_profile(self):
+        import shutil
+        td = tempfile.mkdtemp()
+        marker = os.path.join(td, "keep")
+        with open(marker, "w", encoding="utf-8") as fh:
+            fh.write("x")
+        s = b._Session()
+        s.profile_dir = td
+        s.owns_profile = False
+        s.owns_proc = False
+        s.shutdown()
+        self.assertTrue(os.path.isfile(marker))
+        shutil.rmtree(td, ignore_errors=True)
+
+    def test_shutdown_deletes_temp_profile(self):
+        td = tempfile.mkdtemp(prefix="pm-cdp-")
+        s = b._Session()
+        s.profile_dir = td
+        s.owns_profile = True
+        s.owns_proc = False
+        s.shutdown()
+        self.assertFalse(os.path.isdir(td))
+
+    def test_auth_handoff_never_echoes_cookies(self):
+        fake = _FakeSession()
+        fake.ws = None
+        fake.headed = False
+        fake.port = 9333
+        fake.profile_dir = "/tmp/harness-profile"
+        fake.owns_profile = False
+        fake.owns_proc = True
+        b._SESSION = fake
+        out = b.auth_handoff("https://example.com/login")
+        self.assertIn("Auth handoff", out)
+        self.assertIn("Do not paste passwords or cookies", out)
+        self.assertNotIn("Set-Cookie", out)
+        self.assertIn("https://example.com", out)
+
+    def test_reset_session_waits_for_owned_proc(self):
+        class FakeProc(object):
+            def __init__(self):
+                self.terminated = 0
+                self.waited = 0
+                self._alive = True
+
+            def terminate(self):
+                self.terminated += 1
+                self._alive = False
+
+            def kill(self):
+                self._alive = False
+
+            def poll(self):
+                return None if self._alive else 0
+
+            def wait(self, timeout=None):
+                self.waited += 1
+                return 0
+
+        proc = FakeProc()
+        s = b._Session()
+        s.owns_proc = True
+        s.proc = proc
+        s.port = 59999
+        s.ws = None
+        b._SESSION = s
+        saved = b._page_ws_url
+        b._page_ws_url = lambda port, timeout=2.0: None
+        try:
+            b.reset_session(keep_profile=True)
+        finally:
+            b._page_ws_url = saved
+        self.assertGreaterEqual(proc.terminated, 1)
+        self.assertGreaterEqual(proc.waited, 1)
+
+    def test_non_janitor_shared_shutdown_does_not_reap(self):
+        class FakeProc(object):
+            def __init__(self):
+                self.terminated = 0
+
+            def terminate(self):
+                self.terminated += 1
+
+            def kill(self):
+                pass
+
+            def poll(self):
+                return None
+
+            def wait(self, timeout=None):
+                return 0
+
+        os.environ["PM_BROWSER_CDP_PORT"] = "9333"
+        saved = b._JANITOR
+        b.set_janitor(False)
+        proc = FakeProc()
+        s = b._Session()
+        s.owns_proc = True
+        s.owns_profile = False
+        s.proc = proc
+        s.port = 9333
+        try:
+            s.shutdown()
+            self.assertEqual(proc.terminated, 0)
+            self.assertFalse(s.owns_proc)
+        finally:
+            b.set_janitor(saved)
+
+    def test_janitor_shared_shutdown_reaps(self):
+        class FakeProc(object):
+            def __init__(self):
+                self.terminated = 0
+                self._alive = True
+
+            def terminate(self):
+                self.terminated += 1
+                self._alive = False
+
+            def kill(self):
+                self._alive = False
+
+            def poll(self):
+                return None if self._alive else 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        os.environ["PM_BROWSER_CDP_PORT"] = "9333"
+        saved = b._JANITOR
+        saved_page = b._page_ws_url
+        b._page_ws_url = lambda port, timeout=2.0: None
+        b.set_janitor(True)
+        proc = FakeProc()
+        s = b._Session()
+        s.owns_proc = True
+        s.owns_profile = False
+        s.proc = proc
+        s.port = 9333
+        try:
+            s.shutdown()
+            self.assertGreaterEqual(proc.terminated, 1)
+        finally:
+            b.set_janitor(saved)
+            b._page_ws_url = saved_page
 
 
 if __name__ == "__main__":

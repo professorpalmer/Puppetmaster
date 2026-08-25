@@ -309,7 +309,7 @@ _BINARY_SNIFF_BYTES = 8000
 _BROWSER_TOOL_NAMES = frozenset((
     "browser_navigate", "browser_snapshot", "browser_click", "browser_type",
     "browser_scroll", "browser_back", "browser_get_text", "browser_network",
-    "browser_screenshot",
+    "browser_screenshot", "browser_auth_handoff",
 ))
 
 
@@ -1798,7 +1798,7 @@ class AgenticAdapter(FullEditWorkerAdapter):
             tools.append(fn("web_fetch", "Fetch a URL and return its text content.",
                             {"url": {"type": "string"}}, ["url"]))
         if self._browser_enabled(task):
-            tools.append(fn("browser_navigate", "Open a URL in a real headless browser. Call browser_snapshot next to see clickable elements.",
+            tools.append(fn("browser_navigate", "Open a URL in a real Chrome browser (headed when PM_BROWSER_HEADED=1). Call browser_snapshot next to see clickable elements.",
                             {"url": {"type": "string"}}, ["url"]))
             tools.append(fn("browser_snapshot", "Return the current page's interactable elements with @e1-style refs. Snapshot before clicking/typing so you have fresh refs.",
                             {}, []))
@@ -1812,6 +1812,15 @@ class AgenticAdapter(FullEditWorkerAdapter):
             tools.append(fn("browser_get_text", "Return the page's main readable text (document body innerText).", {}, []))
             tools.append(fn("browser_network", "Return captured fetch/XHR request URL, HTTP status, and response body. Judge success by the body — HTTP 200 can carry an application error.", {}, []))
             tools.append(fn("browser_screenshot", "Capture a PNG screenshot of the current page; returns a file path you can view_image.", {}, []))
+            tools.append(fn(
+                "browser_auth_handoff",
+                "Open a URL in a visible Chrome window using the harness durable "
+                "profile so the user can complete login or Cloudflare. Never ask "
+                "for passwords or cookies in chat. After the user finishes, "
+                "continue with browser_snapshot on the same session.",
+                {"url": {"type": "string"}},
+                ["url"],
+            ))
         if bool(task.payload.get("plan_tool", True)):
             tools.append(fn(
                 _PLAN_TOOL,
