@@ -2608,6 +2608,42 @@ def build_parser() -> argparse.ArgumentParser:
     models_set.add_argument("--registry-path", help="Override the registry path.")
     models_set.add_argument("model_id", help="Model id to update.")
     models_set.add_argument("assignments", nargs="+", help="key=value updates.")
+    models_recommend = models_sub.add_parser(
+        "recommend",
+        help=(
+            "Stamp the registry from the packaged Agent Arena Pareto snapshot, "
+            "intersected with each hooked stream (adapter + provider). Cursor "
+            "Sol never enables Codex or agentic-codex models."
+        ),
+    )
+    models_recommend.add_argument("--registry-path", help="Override the registry path.")
+    models_recommend.add_argument(
+        "--write",
+        action="store_true",
+        help="Persist the stamped registry (default: dry-run).",
+    )
+    models_recommend.add_argument(
+        "--available",
+        help=(
+            "Comma-separated live ids (Marionette Settings toggles, or "
+            "discover catalog). Prefer registry ids like cursor/gpt-5.6-sol. "
+            "Bare names only count on the spec they already belong to."
+        ),
+    )
+    models_recommend.add_argument(
+        "--stamp-scores",
+        action="store_true",
+        help=(
+            "Overwrite capability_score from the snapshot when provenance is "
+            "empty or already arena_pareto. Off by default."
+        ),
+    )
+    models_recommend.add_argument(
+        "--no-stamp-effort",
+        action="store_true",
+        help="Do not write adapter effort payload_defaults from the snapshot.",
+    )
+    models_recommend.add_argument("--json", action="store_true", help="Emit JSON.")
     models_import = models_sub.add_parser(
         "import-baseline",
         help=(
