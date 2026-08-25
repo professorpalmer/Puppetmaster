@@ -1,3 +1,24 @@
+## v1.22.32 — 2026-08-24
+
+**Fix: stale editorial capability_score beat a live local receipt.**
+
+A five-worker swarm could keep picking `gpt-5` on a manual prior of 90
+while `gpt-5.6-luna` already finished on the same host in 17s at
+confidence 0.99. Missing SWE-bench stays unknown. This is issue #28's
+later overlay, not a new evidence OS and not a Vals/LiveBench/Arena lab.
+
+- Same-host latency / confidence / success receipts overlay editorial
+  `capability_score` for that exact registry id + adapter + role.
+- Editorial scores decay when a newer sibling is already running
+  successfully here. No transfer across adapter, effort, harness, or role.
+- ROUTING artifacts disclose why: `score_source` is `role_card`,
+  `manual`, or `local_receipt`.
+- One card / receipt remains one raw observation. No averages.
+- Tests: `tests/test_local_receipt_overlay.py` (Benton case + guardrails).
+
+No Pi / grok-bot worker. Marionette pin unchanged. Issue #101 stays
+closed as not-planned for a public-board lab.
+
 ## v1.22.31 — 2026-08-24
 
 **OMP / oh-my-pi TUI MCP install (not a worker).**
