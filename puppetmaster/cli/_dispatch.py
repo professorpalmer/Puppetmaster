@@ -87,6 +87,7 @@ from puppetmaster.cli.helpers import (
     _warn_job_liveness,
     _warn_run_quality,
 )
+from puppetmaster.playbooks import maybe_stamp_payload
 from puppetmaster.cli.commands_install import (
     _run_install_claude,
     _run_install_codex,
@@ -877,6 +878,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
         if args.disable_memory or args.review or args.plan:
             payload["disable_memory"] = True
         payload.update(routing_payload_from_args(args, adapter="cursor"))
+        payload = maybe_stamp_payload(payload, args.prompt, args)
         result = cli.Orchestrator(store).run(
             args.prompt,
             specs=[
@@ -912,6 +914,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
         if getattr(args, "effort", None):
             payload["extra_args"] = ["--effort", args.effort]
         payload.update(routing_payload_from_args(args, adapter="claude-code"))
+        payload = maybe_stamp_payload(payload, args.prompt, args)
         result = cli.Orchestrator(store).run(
             args.prompt,
             specs=[
@@ -953,6 +956,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
         if args.disable_memory:
             payload["disable_memory"] = True
         payload.update(routing_payload_from_args(args, adapter="openai"))
+        payload = maybe_stamp_payload(payload, args.prompt, args)
         result = cli.Orchestrator(store).run(
             args.prompt,
             specs=[
@@ -994,6 +998,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
         ):
             payload["read_only"] = True
         payload.update(routing_payload_from_args(args, adapter="codex"))
+        payload = maybe_stamp_payload(payload, args.prompt, args)
         result = cli.Orchestrator(store).run(
             args.prompt,
             specs=[
@@ -1035,6 +1040,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
         if args.disable_codegraph:
             payload["disable_codegraph"] = True
         payload.update(routing_payload_from_args(args, adapter="hermes"))
+        payload = maybe_stamp_payload(payload, args.prompt, args)
         result = cli.Orchestrator(store).run(
             args.prompt,
             specs=[
@@ -1070,6 +1076,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
         if args.disable_codegraph:
             payload["disable_codegraph"] = True
         payload.update(routing_payload_from_args(args, adapter="antigravity"))
+        payload = maybe_stamp_payload(payload, args.prompt, args)
         result = cli.Orchestrator(store).run(
             args.prompt,
             specs=[
@@ -1121,6 +1128,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
         if args.disable_memory:
             payload["disable_memory"] = True
         payload.update(routing_payload_from_args(args, adapter="agentic"))
+        payload = maybe_stamp_payload(payload, args.prompt, args)
         result = cli.Orchestrator(store).run(
             args.prompt,
             specs=[
@@ -1248,7 +1256,6 @@ def _main(argv: Optional[list[str]] = None) -> int:
 
         from puppetmaster import platform_lock
         from puppetmaster.swarm_launch import (
-            DEFAULT_SWARM_ROLES,
             build_analysis_swarm_specs,
             detach_analysis_swarm,
         )
@@ -1284,11 +1291,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
             roles = ["review"]
         else:
             adapter = str(getattr(args, "adapter", None) or "cursor")
-            roles = (
-                list(args.roles)
-                if getattr(args, "roles", None)
-                else list(DEFAULT_SWARM_ROLES)
-            )
+            roles = list(args.roles) if getattr(args, "roles", None) else []
+
+        playbook_id = getattr(args, "playbook", None)
 
         if adapter != "local" and not platform_lock.is_adapter_enabled(adapter):
             print(
@@ -1317,6 +1322,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
                 auto_route=auto_route,
                 routing_policy=getattr(args, "routing_policy", None),
                 disable_memory=disable_memory,
+                playbook=playbook_id,
             )
             if args.enable_memory:
                 specs = [
@@ -1350,6 +1356,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
                 worker_mode=args.worker_mode,
                 backend=args.backend,
                 launch_key=getattr(args, "launch_key", None),
+                playbook=playbook_id,
             )
         except Exception as exc:
             print(f"{args.command}: failed to start: {exc}", file=sys.stderr)

@@ -29,9 +29,13 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Mapping, Optional
 
+from puppetmaster.playbooks import (
+    match_playbook,
+    recipe_for,
+)
 from puppetmaster.router import TaskSignals, classify_capability_needed
 
 # ----- Tunables (all overridable via env so users can calibrate) -----------
@@ -154,7 +158,7 @@ _ROLE_INFERENCE = [
     ),
     (re.compile(r"\b(where is|who calls|what implements|find all|trace|call graph)\b"), "explore", "puppetmaster_codegraph_search"),
 ]
-_DEFAULT_VERB = "puppetmaster_start_cursor_swarm"
+_DEFAULT_VERB = "puppetmaster_start_swarm"
 
 # Verbs that run a single edit-capable worker in an isolated worktree. These
 # must NOT be described as a "fan-out swarm": the whole point is that a coupled
@@ -206,6 +210,7 @@ class DelegationDecision:
     capability_score: int
     role: str
     matched_signals: tuple[str, ...] = ()
+    playbook: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -215,6 +220,7 @@ class DelegationDecision:
             "capability_score": self.capability_score,
             "role": self.role,
             "matched_signals": list(self.matched_signals),
+            "playbook": self.playbook,
         }
 
     def directive(self) -> str:
@@ -232,7 +238,7 @@ class DelegationDecision:
         verb = self.suggested_verb
         tail = "If this is actually trivial, say 'do it inline' to skip."
         if verb in _EDIT_VERBS:
-            return (
+            body = (
                 f"[Puppetmaster] This is a single, focused edit (capability "
                 f"{self.capability_score}, {self.reason}). Delegate it to "
                 f"`{verb}` — one in-place edit on the cheapest sufficient model, "
@@ -247,8 +253,8 @@ class DelegationDecision:
                 f"coupled multi-file change that doesn't depend on uncommitted "
                 f"state. {tail}"
             )
-        if verb in _IMPLEMENT_VERBS:
-            return (
+        elif verb in _IMPLEMENT_VERBS:
+            body = (
                 f"[Puppetmaster] This is a single implementation task (capability "
                 f"{self.capability_score}, {self.reason}). Delegate it to ONE "
                 f"implement worker in a clean worktree via `{verb}` — not a "
@@ -257,16 +263,16 @@ class DelegationDecision:
                 f"are unaware of each other. Reserve swarms for the "
                 f"explore/review/audit passes around the feature. {tail}"
             )
-        if verb in _CODEGRAPH_VERBS:
-            return (
+        elif verb in _CODEGRAPH_VERBS:
+            body = (
                 f"[Puppetmaster] Resolve this with CodeGraph first (capability "
                 f"{self.capability_score}, {self.reason}): call `{verb}` to locate "
                 f"the code instead of grepping, then read only what it points to. "
                 f"If the MCP tool isn't reachable, run `python -m puppetmaster "
                 f"codegraph search '<query>'`. {tail}"
             )
-        if verb in _REVIEW_VERBS:
-            return (
+        elif verb in _REVIEW_VERBS:
+            body = (
                 f"[Puppetmaster] This warrants a read-only review pass (capability "
                 f"{self.capability_score}, {self.reason}). Call `{verb}` to run one "
                 f"review assignment on the explicitly selected or configured default "
@@ -275,14 +281,25 @@ class DelegationDecision:
                 f"For implementation, follow up with `puppetmaster_start_implement`. "
                 f"{tail}"
             )
-        return (
-            f"[Puppetmaster] This warrants a read-only analysis pass (capability "
-            f"{self.capability_score}, {self.reason}). Call `{verb}` to fan it out "
-            f"to a swarm; recall results with puppetmaster_artifacts at zero token "
-            f"cost. For the implementation itself, follow up with a single "
-            f"`puppetmaster_start_implement` worker rather than editing in the "
-            f"swarm. {tail}"
-        )
+        else:
+            body = (
+                f"[Puppetmaster] This warrants a read-only analysis pass (capability "
+                f"{self.capability_score}, {self.reason}). Call `{verb}` to fan it out "
+                f"to a swarm; recall results with puppetmaster_artifacts at zero token "
+                f"cost. For the implementation itself, follow up with a single "
+                f"`puppetmaster_start_implement` worker rather than editing in the "
+                f"swarm. {tail}"
+            )
+        return self._with_playbook_directive(body)
+
+    def _with_playbook_directive(self, body: str) -> str:
+        if not self.playbook:
+            return body
+        try:
+            extra = recipe_for(self.playbook).directive
+        except ValueError:
+            return body
+        return body.rstrip() + " " + extra
 
 
 def gate_disabled(env: Optional[Mapping[str, str]] = None) -> bool:
@@ -316,6 +333,7 @@ def should_delegate(
     threshold: Optional[int] = None,
     trivial_threshold: Optional[int] = None,
     env: Optional[Mapping[str, str]] = None,
+    playbook: Optional[str] = None,
 ) -> DelegationDecision:
     """Decide whether ``prompt`` should be delegated to a Puppetmaster verb.
 
@@ -342,6 +360,9 @@ def should_delegate(
     role = role or inferred_role
     lower = prompt.lower()
 
+    def finish(decision: DelegationDecision) -> DelegationDecision:
+        return _apply_playbook(decision, prompt, env, explicit=playbook)
+
     if gate_disabled(env):
         return DelegationDecision(
             False, "auto-invocation disabled via kill-switch env", suggested_verb, 0, role,
@@ -355,10 +376,10 @@ def should_delegate(
         )
 
     if _matches_any(_EXPLICIT_DELEGATE_PATTERNS, lower):
-        return DelegationDecision(
+        return finish(DelegationDecision(
             True, "explicit Puppetmaster trigger phrase", suggested_verb, 100, role,
             ("explicit-trigger",),
-        )
+        ))
 
     signals = TaskSignals(
         instruction=prompt, role=role, payload_size_chars=payload_size_chars
@@ -389,11 +410,11 @@ def should_delegate(
         and not has_hard_scope
         and len(prompt) <= _TRIVIAL_MAX_CHARS
     ):
-        return DelegationDecision(
+        return finish(DelegationDecision(
             False,
             f"explicit trivial signal (score {score}); staying inline",
             suggested_verb, score, role, ("trivial",),
-        )
+        ))
 
     # Last-mile / dirty-tree dependency: the prompt explicitly builds on work
     # that is already in the tree but uncommitted. The isolated-worktree
@@ -408,13 +429,13 @@ def should_delegate(
     if builds_on_uncommitted and (
         suggested_verb in _IMPLEMENT_VERBS or suggested_verb in _EDIT_VERBS
     ):
-        return DelegationDecision(
+        return finish(DelegationDecision(
             True,
             f"builds on uncommitted work in the tree (score {score}); the "
             f"in-place edit verb sees the dirty tree that an isolated-worktree "
             f"implement job (branched off HEAD) would miss",
             _EDIT_VERB, score, role, ("last-mile",),
-        )
+        ))
 
     # CodeGraph lookups always delegate, regardless of score. A structural
     # "where is X / who calls Y / what implements Z" query is cheap, fast, and
@@ -424,36 +445,84 @@ def should_delegate(
     # a lookup back. The explicit-inline opt-out and trivial carve-out above
     # still win, so "just answer me" / "what is X" stays inline.
     if suggested_verb in _CODEGRAPH_VERBS:
-        return DelegationDecision(
+        return finish(DelegationDecision(
             True,
             f"CodeGraph lookup — delegate regardless of score ({score}); "
             f"structural lookup beats inline grep",
             suggested_verb, score, role, ("codegraph-lookup",),
-        )
+        ))
 
     if score < trivial_threshold and not has_hard_scope:
-        return DelegationDecision(
+        return finish(DelegationDecision(
             False, f"score {score} below trivial threshold {trivial_threshold}",
             suggested_verb, score, role,
-        )
+        ))
 
     if score >= threshold:
-        return DelegationDecision(
+        return finish(DelegationDecision(
             True, f"capability score {score} >= threshold {threshold}",
             suggested_verb, score, role, ("score",),
-        )
+        ))
 
     if has_hard_scope:
-        return DelegationDecision(
+        return finish(DelegationDecision(
             True,
             f"broad multi-file scope signal (score {score}, just under "
             f"threshold {threshold})",
             suggested_verb, score, role, ("hard-scope",),
-        )
+        ))
 
-    return DelegationDecision(
+    return finish(DelegationDecision(
         False, f"score {score} < threshold {threshold}, no broad-scope signal",
         suggested_verb, score, role,
+    ))
+
+
+def _apply_playbook(
+    decision: DelegationDecision,
+    prompt: str,
+    env: Mapping[str, str],
+    *,
+    explicit: Optional[str] = None,
+) -> DelegationDecision:
+    """Stamp a recipe onto a gate decision without undoing edit/CodeGraph verbs.
+
+    Auto investigation / bug-fix / feature never steal an inline turn:
+    ``match_playbook(..., delegating=False)`` drops those. Interrogate,
+    hillclimb, and explicit / in-prompt pins still opt the host in.
+    """
+    try:
+        playbook_id = match_playbook(
+            prompt,
+            explicit=explicit,
+            env=env,
+            delegating=decision.should_delegate,
+        )
+    except ValueError:
+        return decision
+    if not playbook_id:
+        return decision
+    verb = decision.suggested_verb
+    if verb not in _CODEGRAPH_VERBS and verb not in _EDIT_VERBS:
+        try:
+            verb = recipe_for(playbook_id).suggested_verb
+        except ValueError:
+            return decision
+    signals = decision.matched_signals
+    if "playbook" not in signals:
+        signals = signals + ("playbook",)
+    should = decision.should_delegate
+    reason = decision.reason
+    if not should:
+        should = True
+        reason = "playbook %s opts in to delegation" % playbook_id
+    return replace(
+        decision,
+        should_delegate=should,
+        reason=reason,
+        suggested_verb=verb,
+        matched_signals=signals,
+        playbook=playbook_id,
     )
 
 

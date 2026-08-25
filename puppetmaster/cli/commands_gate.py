@@ -720,7 +720,10 @@ def _run_should_delegate_command(args) -> int:
     from puppetmaster.invocation_gate import should_delegate
 
     decision = should_delegate(
-        args.prompt, role=args.role, threshold=args.threshold
+        args.prompt,
+        role=args.role,
+        threshold=args.threshold,
+        playbook=getattr(args, "playbook", None),
     )
     if args.json:
         print(json.dumps(decision.to_dict(), indent=2))
@@ -729,6 +732,8 @@ def _run_should_delegate_command(args) -> int:
     print(f"{verdict}  (capability {decision.capability_score}, role={decision.role})")
     print(f"verb:   {decision.suggested_verb}")
     print(f"why:    {decision.reason}")
+    if decision.playbook:
+        print(f"playbook: {decision.playbook}")
     if decision.matched_signals:
         print(f"signals: {', '.join(decision.matched_signals)}")
     return 0

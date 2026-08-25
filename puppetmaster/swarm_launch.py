@@ -1,9 +1,10 @@
 """Shared analysis-swarm launch helpers for MCP + CLI.
 
-The daily-driver MCP verb ``puppetmaster_start_cursor_swarm`` and the CLI
+The daily-driver MCP verb ``puppetmaster_start_swarm`` and the CLI
 ``python -m puppetmaster swarm`` must build the same worker specs. Agents that
 hit ``Tool execution error. Not connected`` should run ONE command — never
-hand-author a JSON config or explore ``run --help``.
+hand-author a JSON config or explore ``run --help``. Cursor-specific start
+verbs remain available; they are not the default.
 """
 
 from __future__ import annotations
@@ -19,9 +20,9 @@ from typing import Any, Optional
 
 from puppetmaster.run_id import reserve_run_logs, write_exclusive_run_text
 from puppetmaster.state import state_identity
+from puppetmaster.playbooks import recipe_for, stamp_payload
 from puppetmaster.workers import (
     ANALYSIS_NO_EDIT_PAYLOAD,
-    RoleSpec,
     WorkerSpec,
     default_routing_policy_for_role,
     normalize_role_specs,
@@ -81,8 +82,19 @@ def build_analysis_swarm_specs(
     required_tags: Optional[list[str]] = None,
     allowed_model_ids: Optional[list[str]] = None,
     disable_memory: bool = True,
+    playbook: Optional[str] = None,
 ) -> list[WorkerSpec]:
     """Build read-only analysis WorkerSpecs for a multi-role swarm."""
+    if not playbook:
+        from puppetmaster.playbooks import match_playbook
+
+        playbook = match_playbook(goal)
+    else:
+        playbook = recipe_for(playbook).playbook_id
+    if playbook and not roles:
+        recipe = recipe_for(playbook)
+        if recipe.roles:
+            roles = list(recipe.roles)
     if adapter not in SWARM_ANALYSIS_ADAPTERS:
         raise ValueError(
             f"adapter {adapter!r} cannot run an analysis swarm. Supported: "
@@ -165,6 +177,12 @@ def build_analysis_swarm_specs(
             if allowed_model_ids is not None:
                 payload["allowed_model_ids"] = list(allowed_model_ids)
         payload["disable_memory"] = not (disable_memory is False)
+        if playbook:
+            payload = stamp_payload(payload, playbook)
+            if playbook == "interrogate" and not (
+                isinstance(routing_policy, str) and routing_policy.strip()
+            ):
+                payload["routing_policy"] = "quality"
         specs.append(
             WorkerSpec(
                 role=str(role),
@@ -194,6 +212,7 @@ def write_analysis_swarm_config(
     allowed_model_ids: Optional[list[str]] = None,
     disable_memory: bool = True,
     lease_seconds: int = 10,
+    playbook: Optional[str] = None,
 ) -> Path:
     """Persist a generated swarm JSON config under ``state_dir/mcp-configs``."""
     specs = build_analysis_swarm_specs(
@@ -211,6 +230,7 @@ def write_analysis_swarm_config(
         required_tags=required_tags,
         allowed_model_ids=allowed_model_ids,
         disable_memory=disable_memory,
+        playbook=playbook,
     )
     config_dir = Path(state_dir) / "mcp-configs"
     role_specs, duplicated_legacy_roles = normalize_role_specs(roles, goal)
@@ -329,6 +349,7 @@ def detach_analysis_swarm(
     backend: str = "sqlite",
     job_id_timeout_seconds: float = EARLY_JOB_ID_TIMEOUT_SECONDS,
     launch_key: Optional[str] = None,
+    playbook: Optional[str] = None,
 ) -> dict[str, Any]:
     """Write config, spawn ``run --config`` detached, return ``{job_id, ...}``."""
     _normalized_roles, duplicated_legacy_roles = normalize_role_specs(roles, goal)
@@ -348,6 +369,7 @@ def detach_analysis_swarm(
         required_tags=required_tags,
         allowed_model_ids=allowed_model_ids,
         disable_memory=disable_memory,
+        playbook=playbook,
     )
     run_dir = Path(state_dir) / "mcp-runs"
     run_id, stdout_path, stderr_path, stdout_handle, stderr_handle = reserve_run_logs(
