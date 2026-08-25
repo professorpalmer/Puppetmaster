@@ -2,6 +2,17 @@
 
 A full map of what ships today, plus the adapter matrix. For the design rationale behind these, see [docs/WHY.md](WHY.md); for the proof behind the headline claims, see [docs/CLAIMS.md](CLAIMS.md).
 
+## Pilots
+
+A *pilot* starts and watches jobs. An *adapter* is a leased worker that claims tasks. Do not invent a `grok-bot`, `pi`, or `omp` worker adapter.
+
+| Pilot | Transport | Setup |
+|---|---|---|
+| Cursor Agent, Claude Desktop, Codex, Hermes | stdio MCP | `puppetmaster setup` / `install-*-mcp` |
+| Grok Bot | remote streamable HTTP only (cannot attach stdio) | `python -m puppetmaster mcp serve-remote` — [GROK_BOT.md](GROK_BOT.md). Contained path defaults to keys-only **agentic** when Cursor is not installed (v1.22.22+) |
+| Pi TUI | stdio MCP | `setup --platforms pi` — [PI.md](PI.md) |
+| OMP / oh-my-pi TUI | stdio MCP | `setup --platforms omp` — [OMP.md](OMP.md) |
+
 ## Adapters
 
 Six production adapters live plus the keys-only `agentic` standalone worker; curated tiers across Cursor, Claude, OpenAI, Codex, Antigravity (Gemini 3.7 / 3.6 / 3.5 / 3.1 Pro), and Hermes. Tier and pricing details in [docs/MODEL_ROUTING.md](MODEL_ROUTING.md); adapter wiring details in [docs/ADAPTERS.md](ADAPTERS.md).

@@ -1,6 +1,6 @@
 # Daily Driver
 
-Puppetmaster is meant to make repeated Cursor swarm work inspectable and replayable.
+Puppetmaster is meant to make repeated swarm work inspectable and replayable — from Cursor Agent, Grok Bot, or the CLI.
 
 ## Using it from the chat window (recommended)
 
@@ -19,6 +19,17 @@ conversational questions yourself without a job.
 ```
 
 **Don't route every message through Puppetmaster.** It's intentionally *not* a conversational tool — a durable worker per chat turn would add cost and latency to the cheapest asks and fight the IDE's message routing. The win is the split: instant cheap chat for talk, the full durable machine for work. Context still compounds, because each delegated job leaves typed artifacts and promoted memory the next job reuses — you don't need to feed the chitchat through it to get that.
+
+## Grok Bot (remote MCP)
+
+Grok Bot is the same split with a different transport. It cannot load the stdio MCP server Cursor Agent uses. Serve remote MCP, add the connector, then run the same start / poll / show loop:
+
+```bash
+export PUPPETMASTER_MCP_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+python -m puppetmaster mcp serve-remote --scope supervise
+```
+
+In Grok Bot chat: `puppetmaster_doctor`, then `puppetmaster_start_implement` or `puppetmaster_start_agentic` (agentic is the contained default when Cursor is not installed). Do not lead with `puppetmaster_start_cursor_swarm`. Full connector and handshake notes: [GROK_BOT.md](GROK_BOT.md).
 
 ## Recommended Loop
 

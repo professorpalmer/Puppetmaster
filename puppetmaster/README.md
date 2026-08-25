@@ -7,7 +7,8 @@ The Python package. This is an orientation map, not API docs — for the object 
 | Module | Role |
 |---|---|
 | `__main__.py` / `cli.py` | The `puppetmaster` CLI — every subcommand, arg wiring, read-only state-dir auto-pivot |
-| `mcp_server.py` | The MCP server Cursor/Codex/Claude talk to: tool dispatch, long-poll, await, heartbeat |
+| `mcp_server.py` | The stdio MCP server Cursor/Codex/Claude/Pi/OMP talk to: tool dispatch, long-poll, await, heartbeat |
+| `mcp_remote.py` | Streamable HTTP / SSE MCP for pilots that cannot attach stdio (Grok Bot). `puppetmaster mcp serve-remote` / `puppetmaster-mcp-remote` |
 
 ## Orchestration runtime
 

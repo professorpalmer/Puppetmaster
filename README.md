@@ -5,7 +5,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/professorpalmer/Puppetmaster/blob/main/LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://github.com/professorpalmer/Puppetmaster/blob/main/pyproject.toml)
 
-Puppetmaster runs multi-step engineering work through the agent tools you already use: Cursor, Claude Code, Codex, Hermes, Antigravity (Gemini 3.7 / 3.6 / 3.5 / 3.1 Pro), or a provider API. It starts independent workers, routes tasks to an available model, and stores their typed results in SQLite so jobs can be inspected and resumed. It is aimed at developers who want durable state and reviewable output for repository investigations, audits, refactors, and implementations.
+Puppetmaster runs multi-step engineering work through the agent tools you already use: Cursor, Grok Bot, Claude Code, Codex, Hermes, Antigravity (Gemini 3.7 / 3.6 / 3.5 / 3.1 Pro), or a provider API. It starts independent workers, routes tasks to an available model, and stores their typed results in SQLite so jobs can be inspected and resumed. It is aimed at developers who want durable state and reviewable output for repository investigations, audits, refactors, and implementations.
+
+**Grok Bot:** only remote MCP, not the stdio server Cursor Agent uses. Puppetmaster is the durable worker runtime behind that chat — same jobs, artifacts, and `effort-index`, over streamable HTTP. See [Grok Bot](#grok-bot).
 
 ## Measured results
 
@@ -17,6 +19,7 @@ Puppetmaster runs multi-step engineering work through the agent tools you alread
 ## Contents
 
 - [Install](#install)
+- [Grok Bot](#grok-bot)
 - [Quickstart](#quickstart)
 - [How it works](#how-it-works)
 - [Evidence](#evidence)
@@ -44,11 +47,30 @@ puppetmaster setup --platforms omp
 
 Restart Cursor, Codex, Claude, Antigravity, Hermes, Pi, or OMP after setup. The host then has the `puppetmaster_*` MCP tools and, where supported, hooks that suggest delegation for larger tasks. Disable those hooks with `PUPPETMASTER_AUTO_INVOKE_DISABLED=1`. For CI, use `--platforms <comma-list>` or `--platforms all`. Add another adapter later with `puppetmaster platform enable <name>`.
 
+Grok Bot does not use that stdio install. Start remote MCP and add the printed connector instead ([Grok Bot](#grok-bot)).
+
 The built-in `agentic` adapter needs only a provider API key, so it can run without an external CLI. See [adapter setup](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/ADAPTERS.md) for provider, Antigravity, and Hermes details.
+
+## Grok Bot
+
+Cursor's Grok Bot assistant attaches **remote** MCP connectors only (streamable HTTP / SSE). It cannot register `python -m puppetmaster.mcp_server` the way Cursor Agent, Claude Desktop, and Codex do. Serve the same tool handlers over HTTP and Grok Bot can start and watch durable jobs on this box:
+
+```bash
+export PUPPETMASTER_MCP_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+python -m puppetmaster mcp serve-remote --scope supervise
+# equivalent: puppetmaster-mcp-remote --scope supervise
+# one-shot PoC (prints connector JSON): ./scripts/grok-bot-remote-poc.sh
+```
+
+In Grok Bot → Add MCP server, use the printed `/mcp` URL and `Authorization: Bearer <token>`. Use a TLS tunnel if the bot is off-box. Confirm tools load, then `puppetmaster_doctor` and `puppetmaster_start_implement` or `puppetmaster_start_agentic`.
+
+When Cursor is not installed on that host, implement / prewalk / swarm pick keys-only **agentic** workers (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`, …). There is no `grok-bot` adapter and no CreateAgent fleet. Default `--scope supervise` omits implement/edit; pass `--scope implement` only when you want the remote client to start full-edit workers.
+
+Connector JSON, handshake notes, and auth: [GROK_BOT.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/GROK_BOT.md).
 
 ## Quickstart
 
-Inside Cursor Agent or Codex:
+Inside Cursor Agent, Grok Bot, or Codex:
 
 ```text
 Use Puppetmaster to run doctor in this repo and summarize what is missing.
@@ -79,10 +101,11 @@ More recipes are in [DAILY_DRIVER.md](https://github.com/professorpalmer/Puppetm
 
 ## How it works
 
-Puppetmaster is a supervisor and job store for agent CLIs and provider adapters:
+Puppetmaster is a supervisor and job store for agent CLIs and provider adapters. Grok Bot, Cursor Agent, Pi, and OMP are *pilots* (they call MCP tools); cursor / claude-code / agentic / … are *adapters* (leased workers):
 
 ```text
-Cursor / Claude Code / Codex / Hermes / Antigravity / agentic
+pilots (MCP):  Cursor Agent / Grok Bot / Claude Desktop / Pi / OMP
+workers:       cursor / claude-code / codex / hermes / antigravity / agentic
                                 |
                                 v
       supervisor -> model router -> independent workers -> SQLite artifacts
@@ -116,7 +139,8 @@ These are measurements of the included workflows, not guarantees for every repos
 
 The [docs index](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/README.md) covers:
 
-- [FEATURES.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/FEATURES.md) — adapters and shipped features
+- [GROK_BOT.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/GROK_BOT.md) — Grok Bot as remote MCP pilot (streamable HTTP; not a worker adapter)
+- [FEATURES.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/FEATURES.md) — adapters, pilots, and shipped features
 - [SECURITY.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/SECURITY.md) — safety and threat model
 - [DASHBOARD.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/DASHBOARD.md) — live job dashboard
 - [CONCURRENT_SESSIONS.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/CONCURRENT_SESSIONS.md) — operating concurrent agent sessions, state scope, dashboard URLs, and worktrees
