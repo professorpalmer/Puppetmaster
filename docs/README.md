@@ -2,7 +2,7 @@
 
 The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
 
-**Current release:** [v1.22.33](CHANGELOG.md#v12233) — portable working set (durable artifacts, not KV-cache portability); see [CHANGELOG.md](CHANGELOG.md), [WHY.md](WHY.md), and [CLAIMS.md](CLAIMS.md).
+**Current release:** [v1.22.34](CHANGELOG.md#v12234) — universal playbook recipes (not a Cursor plugin); see [CHANGELOG.md](CHANGELOG.md), [WHY.md](WHY.md), and [CLAIMS.md](CLAIMS.md).
 
 ## Start here
 

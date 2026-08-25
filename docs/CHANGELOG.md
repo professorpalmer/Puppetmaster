@@ -1,3 +1,19 @@
+## v1.22.34 — 2026-08-25
+
+**Universal playbook recipes: five frozen ids on the existing gate and launch seams, not a Cursor plugin.**
+
+Puppetmaster stays adapter-universal. These recipes stamp a generic verb, optional swarm roles, and complete gates onto jobs so agentic / cursor / claude-code / codex / hermes / openai see the same contract.
+
+- Five ids: `investigation`, `bug-fix`, `feature`, `interrogate`, `hillclimb`. Explicit `--playbook` / MCP `playbook` / `playbook: <id>` in the prompt always wins. Unknown ids fail closed.
+- Auto-match from prompt text. `PUPPETMASTER_PLAYBOOKS=0` disables auto-match; explicit pins still work. Kill-switch and "do it inline" are unchanged.
+- `investigation` / `interrogate` launch `puppetmaster_start_swarm` (explore+review, or review+audit). Analysis only; no `require_diff`. Interrogate prefers `routing_policy=quality` and can force-delegate under the score bar. Hillclimb can too.
+- `bug-fix` / `feature` / `hillclimb` launch `puppetmaster_start_implement`. Feature merges `require_diff` once. Hillclimb attaches a ratchet gate only when both `--ratchet-command` and `--metric` are set. Bug-fix does not attach an empty command gate.
+- Default suggested verb is `puppetmaster_start_swarm`, not `*_cursor_swarm`. CodeGraph lookups and last-mile `puppetmaster_edit` still beat those recipes.
+- CLI `--playbook` on swarm, review, should-delegate, and every implement adapter. MCP `goal_schema` carries the same enum.
+- Tests: `tests/test_playbooks.py`. Live proof: `job_90da6c9254b7` (`playbook investigation e2e`, local adapter) stored `playbook=investigation` on explore+review task payloads with no `require_diff`.
+
+No Pi / grok-bot worker. Marionette pin unchanged.
+
 ## v1.22.33 — 2026-08-25
 
 **Portable working set: model switch is cheap by construction, without implying KV-cache portability.**

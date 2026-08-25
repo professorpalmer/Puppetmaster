@@ -198,6 +198,33 @@ def build_parser() -> argparse.ArgumentParser:
             help="Optional human-readable job label for the dashboard.",
         )
 
+    def _add_playbook_argument(
+        job_parser: argparse.ArgumentParser, *, extras: bool = False
+    ) -> None:
+        from puppetmaster.playbooks import PLAYBOOK_IDS
+
+        job_parser.add_argument(
+            "--playbook",
+            choices=list(PLAYBOOK_IDS),
+            default=None,
+            help=(
+                "Optional universal recipe: investigation, bug-fix, feature, "
+                "interrogate, hillclimb. Adapter-agnostic; not a Cursor plugin."
+            ),
+        )
+        if extras:
+            job_parser.add_argument(
+                "--ratchet-command",
+                dest="ratchet_command",
+                default=None,
+                help="Hillclimb: command that prints the metric (requires --metric).",
+            )
+            job_parser.add_argument(
+                "--metric",
+                default=None,
+                help="Hillclimb: metric name to ratchet (requires --ratchet-command).",
+            )
+
     subcommands.add_parser("init", help="Create the local Puppetmaster state store.")
     subcommands.add_parser("state", help="Print the resolved Puppetmaster state directory.")
     doctor_parser = subcommands.add_parser("doctor", help="Check local runtime dependencies.")
@@ -1276,6 +1303,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_routing_flags(cursor)
     _add_label_argument(cursor)
+    _add_playbook_argument(cursor, extras=True)
 
     claude = subcommands.add_parser("claude", help="Run a full-featured Claude Code worker.")
     claude.add_argument("prompt", help="Prompt for the Claude Code worker.")
@@ -1319,6 +1347,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_routing_flags(claude)
     _add_label_argument(claude)
+    _add_playbook_argument(claude, extras=True)
 
     openai = subcommands.add_parser(
         "openai",
@@ -1388,6 +1417,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_routing_flags(openai)
     _add_label_argument(openai)
+    _add_playbook_argument(openai, extras=True)
 
     codex = subcommands.add_parser(
         "codex",
@@ -1449,6 +1479,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_routing_flags(codex)
     _add_label_argument(codex)
+    _add_playbook_argument(codex, extras=True)
 
     hermes = subcommands.add_parser(
         "hermes",
@@ -1509,6 +1540,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_routing_flags(hermes)
     _add_label_argument(hermes)
+    _add_playbook_argument(hermes, extras=True)
 
     antigravity = subcommands.add_parser(
         "antigravity",
@@ -1567,6 +1599,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_routing_flags(antigravity)
     _add_label_argument(antigravity)
+    _add_playbook_argument(antigravity, extras=True)
 
     agentic = subcommands.add_parser(
         "agentic",
@@ -1635,6 +1668,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_routing_flags(agentic)
     _add_label_argument(agentic)
+    _add_playbook_argument(agentic, extras=True)
 
     edit = subcommands.add_parser(
         "edit",
@@ -1796,7 +1830,7 @@ def build_parser() -> argparse.ArgumentParser:
         "swarm",
         help=(
             "One-shot multi-role analysis swarm (CLI twin of "
-            "puppetmaster_start_cursor_swarm). Detaches by default and prints "
+            "puppetmaster_start_swarm). Detaches by default and prints "
             "job_id immediately — use this when MCP returns Not connected. "
             "Do not hand-author a JSON config."
         ),
@@ -1889,6 +1923,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     swarm.add_argument("--json", action="store_true", help="Emit the start receipt as JSON.")
     _add_label_argument(swarm)
+    _add_playbook_argument(swarm)
 
     review = subcommands.add_parser(
         "review",
@@ -1955,6 +1990,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     review.add_argument("--json", action="store_true", help="Emit the start receipt as JSON.")
     _add_label_argument(review)
+    _add_playbook_argument(review)
 
     browser = subcommands.add_parser(
         "browser",
@@ -2947,6 +2983,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--threshold", type=int, default=None, help="Delegate at/above this capability score."
     )
     delegate_cmd.add_argument("--json", action="store_true", help="Emit JSON.")
+    _add_playbook_argument(delegate_cmd)
 
     gate_hook = subcommands.add_parser(
         "invocation-gate",

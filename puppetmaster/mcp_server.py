@@ -2219,12 +2219,26 @@ def _platform_lock_preflight(adapter: str) -> Optional[JsonObject]:
     )
 
 
+def _prepare_playbook(args: JsonObject) -> Optional[JsonObject]:
+    """Resolve/validate a universal playbook on MCP args. None means proceed."""
+    from puppetmaster.playbooks import PLAYBOOK_IDS, apply_playbook_to_mapping
+
+    try:
+        apply_playbook_to_mapping(args)
+    except ValueError as exc:
+        return tool_error(str(exc), {"valid_playbooks": list(PLAYBOOK_IDS)})
+    return None
+
+
 def run_cursor(
     args: JsonObject, review: bool = False, plan: bool = False, implement: bool = False
 ) -> JsonObject:
     locked = _platform_lock_preflight("cursor")
     if locked is not None:
         return locked
+    blocked_playbook = _prepare_playbook(args)
+    if blocked_playbook is not None:
+        return blocked_playbook
     if implement:
         blocked = _worktree_preflight(args)
         if blocked is not None:
@@ -2238,6 +2252,9 @@ def start_cursor(
     locked = _platform_lock_preflight("cursor")
     if locked is not None:
         return locked
+    blocked_playbook = _prepare_playbook(args)
+    if blocked_playbook is not None:
+        return blocked_playbook
     if implement:
         blocked = _worktree_preflight(args)
         if blocked is not None:
@@ -2433,6 +2450,9 @@ def start_implement(args: JsonObject) -> JsonObject:
     from puppetmaster import platform_lock
     from puppetmaster.workers import NoImplementAdapterError, pick_implement_adapter
 
+    blocked_playbook = _prepare_playbook(args)
+    if blocked_playbook is not None:
+        return blocked_playbook
     enabled = platform_lock.enabled_adapters()
     try:
         adapter = pick_implement_adapter(enabled, args.get("adapter"))
@@ -2507,6 +2527,9 @@ def start_review(args: JsonObject) -> JsonObject:
     """Platform-agnostic review: resolve the reviewer adapter from explicit request,
     configured default, or fail closed with actionable guidance. Generic review
     dispatch works no matter which platform is enabled and configured."""
+    blocked_playbook = _prepare_playbook(args)
+    if blocked_playbook is not None:
+        return blocked_playbook
     adapter, blocked = _resolve_review_adapter(args)
     if blocked is not None:
         return blocked
@@ -2526,6 +2549,9 @@ def start_review(args: JsonObject) -> JsonObject:
 
 def run_review(args: JsonObject) -> JsonObject:
     """Synchronous platform-agnostic review: resolve the adapter and wait for completion."""
+    blocked_playbook = _prepare_playbook(args)
+    if blocked_playbook is not None:
+        return blocked_playbook
     adapter, blocked = _resolve_review_adapter(args)
     if blocked is not None:
         return blocked
@@ -2832,6 +2858,12 @@ def _append_routing_cli_flags(command: list[str], args: JsonObject) -> None:
         command.extend(["--max-cost-usd", str(args["max_cost_usd"])])
     if args.get("min_capability") is not None:
         command.extend(["--min-capability", str(args["min_capability"])])
+    if args.get("playbook"):
+        command.extend(["--playbook", str(args["playbook"])])
+    if args.get("ratchet_command"):
+        command.extend(["--ratchet-command", str(args["ratchet_command"])])
+    if args.get("metric"):
+        command.extend(["--metric", str(args["metric"])])
     append_allowed_models_cli_flags(
         command, allowed_model_ids_list_from_mapping(args)
     )
@@ -2923,6 +2955,9 @@ def start_swarm(args: JsonObject) -> JsonObject:
     from puppetmaster.workers import normalize_role_specs
 
     goal = require_string(args, "goal")
+    blocked_playbook = _prepare_playbook(args)
+    if blocked_playbook is not None:
+        return blocked_playbook
     command = ["run", goal]
     role_inputs = normalized_role_specs(args)
     adapter = args.get("adapter")
@@ -3087,6 +3122,9 @@ def start_cursor_swarm(args: JsonObject) -> JsonObject:
     locked = _platform_lock_preflight("cursor")
     if locked is not None:
         return locked
+    blocked_playbook = _prepare_playbook(args)
+    if blocked_playbook is not None:
+        return blocked_playbook
     roles = normalized_role_specs(args)
     try:
         config_path = write_generated_swarm_config(args, roles, "cursor")
@@ -3168,6 +3206,12 @@ def write_generated_swarm_config(args: JsonObject, roles: list[object], adapter:
     )
     max_cost = args.get("max_cost_usd")
     min_cap = args.get("min_capability")
+    playbook = args.get("playbook")
+    playbook_id = (
+        str(playbook).strip().lower()
+        if isinstance(playbook, str) and playbook.strip()
+        else None
+    )
     return write_analysis_swarm_config(
         goal=goal,
         roles=roles,
@@ -3190,6 +3234,7 @@ def write_generated_swarm_config(args: JsonObject, roles: list[object], adapter:
         required_tags=tags_list,
         allowed_model_ids=allowed_model_ids_list_from_mapping(args),
         disable_memory=args.get("disable_memory") is not False,
+        playbook=playbook_id,
     )
 
 
@@ -4737,6 +4782,8 @@ def _auto_route_schema_properties(*, include_required_tags: bool = True) -> Json
 
 
 def goal_schema(default_goal: str) -> JsonObject:
+    from puppetmaster.playbooks import PLAYBOOK_IDS
+
     schema = base_schema()
     schema["properties"].update(
         {
@@ -4757,6 +4804,23 @@ def goal_schema(default_goal: str) -> JsonObject:
             "launch_key": {
                 "type": "string",
                 "description": "Optional caller-generated key; retries with the same request resume one durable job.",
+            },
+            "playbook": {
+                "type": "string",
+                "enum": list(PLAYBOOK_IDS),
+                "description": (
+                    "Optional universal recipe (investigation, bug-fix, feature, "
+                    "interrogate, hillclimb). Adapter-agnostic; stamps verb, "
+                    "roles, and gates. Not a Cursor plugin."
+                ),
+            },
+            "ratchet_command": {
+                "type": "string",
+                "description": "Hillclimb only: command that prints the metric. Ignored unless metric is also set.",
+            },
+            "metric": {
+                "type": "string",
+                "description": "Hillclimb only: metric name to ratchet. Ignored unless ratchet_command is also set.",
             },
             "model": {"type": "string", "description": "Optional provider model name."},
             "timeout_seconds": {
