@@ -1,6 +1,6 @@
 # How Puppetmaster compares
 
-Short version: **Puppetmaster is not another agent framework.** LangGraph, CrewAI, AutoGen/AG2, and the Claude Agent SDK are libraries you write code against to *build* an agent. Puppetmaster sits one layer up — it's a **supervisor that drives the agent CLIs/SDKs you already pay for** (Cursor, Claude Code, Codex, the OpenAI API, and Hermes), routes each task to the cheapest model that can handle it, keeps the spend inside your existing subscription, and stores every worker's output as a typed artifact so follow-ups cost zero tokens.
+Short version: **Puppetmaster is not another agent framework.** LangGraph, CrewAI, AutoGen/AG2, and the Claude Agent SDK are libraries you write code against to *build* an agent. Puppetmaster sits one layer up — it's a **supervisor that drives the agent CLIs/SDKs you already pay for** (Cursor, Grok Bot, Claude Code, Codex, the OpenAI API, and Hermes), routes each task to the cheapest model that can handle it, keeps the spend inside your existing subscription, and stores every worker's output as a typed artifact so follow-ups cost zero tokens.
 
 So this isn't "Puppetmaster vs LangGraph, who wins." They solve different problems and compose fine. This page is here to answer the only question that matters at a glance: *given what I'm trying to do, do I want this?*
 
@@ -9,7 +9,7 @@ So this isn't "Puppetmaster vs LangGraph, who wins." They solve different proble
 | | **Puppetmaster** | LangGraph | CrewAI | Claude Agent SDK / Code subagents | Native IDE subagents (Cursor / Claude built-in) |
 |---|---|---|---|---|---|
 | What it fundamentally is | A cost-aware **orchestrator** over existing agent CLIs | A library to build **stateful agent graphs** | A library for **role-based agent crews** | An SDK + CLI to build/run **one Anthropic agent loop** | Built-in helpers that spawn subagents for a task |
-| You interact by | MCP tools / CLI (no code to write) | Writing Python graph code | Writing Python role/task code | Writing code / using the CLI | Asking the IDE agent |
+| You interact by | MCP tools / CLI (stdio, or remote HTTP for Grok Bot) | Writing Python graph code | Writing Python role/task code | Writing code / using the CLI | Asking the IDE agent |
 | Fan a single run across **multiple vendors** (Cursor + Claude + Codex + OpenAI) | **Yes** — that's the point | You wire it yourself | Per-agent LLM config | Anthropic only | The host vendor only |
 | **Task → model cost routing** (auto-pick cheapest sufficient) | **Yes**, auditable per task | No (you choose models) | No (per-role models) | No | No |
 | **Subscription / plan-billing containment** (keep spend in the plan you already pay for) | **Yes** — plan-first routing + detection | No | No | Plan or API, single vendor | Yes (it's the vendor's own plan) |
@@ -34,6 +34,7 @@ Overlap is real and worth stating plainly: **LangGraph also gives you durable st
 - You need **auditable** per-task model decisions (why did this task run on that model? what did it reject and why?) — not a model picked by vibes.
 - You want a swarm to **survive a dead/over-quota provider** instead of returning a degraded run.
 - You want follow-up questions about a finished job to be **free** (durable typed artifacts, not a transcript replay).
+- You want **Grok Bot** as the always-on chat and durable workers on your box. Grok Bot cannot attach local stdio MCP; Puppetmaster's remote transport is the connector ([GROK_BOT.md](GROK_BOT.md)).
 
 ## Honest caveats
 

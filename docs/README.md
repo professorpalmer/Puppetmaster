@@ -2,15 +2,16 @@
 
 The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
 
-**Current release:** [v1.22.36](CHANGELOG.md#v12236) — headed Chrome auth handoff with a durable profile and shared CDP attach; see [CHANGELOG.md](CHANGELOG.md), [WHY.md](WHY.md), and [CLAIMS.md](CLAIMS.md).
+**Current release:** [v1.22.36](CHANGELOG.md#v12236) — headed Chrome auth handoff with a durable profile and shared CDP attach; see [CHANGELOG.md](CHANGELOG.md), [WHY.md](WHY.md), and [CLAIMS.md](CLAIMS.md). Grok Bot remote MCP (streamable HTTP pilot) is first-class — start at [GROK_BOT.md](GROK_BOT.md).
 
 ## Start here
 
 | Doc | What's in it |
 |---|---|
+| [GROK_BOT.md](GROK_BOT.md) | Cursor Grok Bot as the chat; Puppetmaster as the remote-MCP worker runtime (not a `grok-bot` adapter) |
 | [WHY.md](WHY.md) | Design rationale: what shared-transcript subagents get wrong, what durable state fixes |
 | [CLAIMS.md](CLAIMS.md) | The four headline claims with reproducible receipts from [`bench/`](../bench/) |
-| [FEATURES.md](FEATURES.md) | Full feature matrix + the adapter table |
+| [FEATURES.md](FEATURES.md) | Pilots (including Grok Bot remote MCP), adapters, and the full feature matrix |
 | [COMPARISON.md](COMPARISON.md) | How it differs from LangGraph / CrewAI / Claude Agent SDK / native subagents + "pick X instead if…" |
 | [SECURITY.md](SECURITY.md) | Threat model: what it can do, what it touches, network egress, and how to run it safely |
 | [DAILY_DRIVER.md](DAILY_DRIVER.md) | Prompt recipes for review, swarm, implement, post-job inspection |
