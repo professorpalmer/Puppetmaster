@@ -14387,6 +14387,16 @@ class HermesRegistryCredentialTests(unittest.TestCase):
             with home_patch, env_patch:
                 self.assertEqual(available_hermes_providers(), set())
 
+    def test_openrouter_key_satisfies_openrouter_provider(self):
+        from puppetmaster.adapters import available_hermes_providers
+
+        with TemporaryDirectory() as tmp:
+            home_patch, env_patch = self._isolated(
+                tmp, {"OPENROUTER_API_KEY": "sk-or-x"}
+            )
+            with home_patch, env_patch:
+                self.assertEqual(available_hermes_providers(), {"openrouter"})
+
     def test_curated_to_specs_filters_by_allowed_providers(self):
         from puppetmaster.static_catalog import curated_to_specs
 
@@ -15397,6 +15407,18 @@ class PlatformBillingDetectionTests(unittest.TestCase):
             self.assertEqual(plan.billing, "plan")
             self.assertTrue(plan.healthy)
             self.assertIn("hermes_oauth:anthropic", plan.evidence)
+
+    def test_hermes_billing_openrouter_key_is_healthy(self) -> None:
+        from puppetmaster.platform_billing import detect_hermes_billing
+
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            status = detect_hermes_billing(
+                env={"OPENROUTER_API_KEY": "sk-or-x"}, home=home
+            )
+            self.assertEqual(status.billing, "api")
+            self.assertTrue(status.healthy)
+            self.assertIn("hermes_api_key:OPENROUTER_API_KEY", status.evidence)
 
     def test_doctor_billing_includes_hermes_row(self) -> None:
         from puppetmaster.diagnostics import _billing_checks

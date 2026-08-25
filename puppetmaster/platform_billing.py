@@ -434,6 +434,7 @@ _HERMES_CREDENTIAL_ENV_KEYS = (
     "ANTHROPIC_API_KEY",
     "GEMINI_API_KEY",
     "GOOGLE_API_KEY",
+    "OPENROUTER_API_KEY",
 )
 
 
@@ -503,8 +504,8 @@ def detect_hermes_billing(
             healthy=False,
             detail=(
                 "No Hermes provider credential found — set a provider API key "
-                "(ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY) in "
-                "~/.hermes/.env or run `hermes login`."
+                "(ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / "
+                "OPENROUTER_API_KEY) in ~/.hermes/.env or run `hermes login`."
             ),
             evidence=evidence or ["hermes_credentials:missing"],
         )

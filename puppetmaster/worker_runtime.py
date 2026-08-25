@@ -137,34 +137,111 @@ class WorkerRuntime:
         )
         heartbeat.start()
         try:
-            worker_run, artifacts = LocalWorker(task.role, worker_id=self.worker_id).run(
-                task,
-                self.store.get_job(self.job_id).goal,
-            )
-            if self._lease_lost.is_set():
-                self.store.emit(
-                    self.job_id,
-                    "worker.lease_lost",
-                    {"worker_id": self.worker_id, "task_id": task.id, "role": self.role},
-                )
-                return True
-            artifacts = self._stamp_evaluator_metadata(task, artifacts)
-            for artifact in artifacts:
-                self.store.save_artifact(artifact)
-                # Auto-materialize admitted gists from independently supported findings
-                # so swarm peers share verified compact discoveries without
-                # extra API churn.
-                try:
-                    from puppetmaster.gist_admission import maybe_admit_finding_as_gist
+            reused: list = []
+            try:
+                from puppetmaster.working_set import maybe_reuse_artifacts
 
-                    maybe_admit_finding_as_gist(self.store, artifact)
+                reused = maybe_reuse_artifacts(self.store, task)
+            except Exception:
+                reused = []
+
+            if reused:
+                try:
+                    from puppetmaster.working_set import persist_reused_artifacts
+
+                    artifacts = persist_reused_artifacts(
+                        self.store,
+                        task,
+                        reused,
+                        worker_id=self.worker_id,
+                    )
+                except Exception:
+                    artifacts = []
+                if artifacts:
+                    try:
+                        from puppetmaster.working_set import rebuild_artifact_index
+
+                        rebuild_artifact_index(
+                            self.store.job_dir(self.job_id),
+                            self.store,
+                            self.job_id,
+                        )
+                    except Exception:
+                        pass
+                    worker_run = AgentRun(
+                        job_id=self.job_id,
+                        task_id=task.id,
+                        role=task.role,
+                        worker_id=self.worker_id,
+                        status=TaskStatus.COMPLETE,
+                        completed_at=now_iso(),
+                    )
+                    try:
+                        self.store.emit(
+                            self.job_id,
+                            "working_set.reused",
+                            {
+                                "task_id": task.id,
+                                "role": task.role,
+                                "artifacts": len(artifacts),
+                            },
+                        )
+                    except Exception:
+                        pass
+                else:
+                    reused = []
+
+            if not reused:
+                worker_run, artifacts = LocalWorker(
+                    task.role, worker_id=self.worker_id
+                ).run(
+                    task,
+                    self.store.get_job(self.job_id).goal,
+                )
+                if self._lease_lost.is_set():
+                    self.store.emit(
+                        self.job_id,
+                        "worker.lease_lost",
+                        {
+                            "worker_id": self.worker_id,
+                            "task_id": task.id,
+                            "role": self.role,
+                        },
+                    )
+                    return True
+                try:
+                    from puppetmaster.working_set import stamp_fresh_validation
+
+                    artifacts = stamp_fresh_validation(task, artifacts)
                 except Exception:
                     pass
+                artifacts = self._stamp_evaluator_metadata(task, artifacts)
+                for artifact in artifacts:
+                    self.store.save_artifact(artifact)
+                    # Auto-materialize admitted gists from high-confidence findings
+                    # so swarm peers share verified compact discoveries without
+                    # extra API churn.
+                    try:
+                        from puppetmaster.gist_admission import maybe_admit_finding_as_gist
+
+                        maybe_admit_finding_as_gist(self.store, artifact)
+                    except Exception:
+                        pass
+                    try:
+                        self.store.maybe_enqueue_follow_ups_from_artifact(
+                            artifact,
+                            parent_task_id=task.id,
+                            created_by=self.worker_id,
+                        )
+                    except Exception:
+                        pass
                 try:
-                    self.store.maybe_enqueue_follow_ups_from_artifact(
-                        artifact,
-                        parent_task_id=task.id,
-                        created_by=self.worker_id,
+                    from puppetmaster.working_set import rebuild_artifact_index
+
+                    rebuild_artifact_index(
+                        self.store.job_dir(self.job_id),
+                        self.store,
+                        self.job_id,
                     )
                 except Exception:
                     pass

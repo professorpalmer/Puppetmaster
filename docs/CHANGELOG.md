@@ -1,3 +1,40 @@
+## v1.22.33 — 2026-08-25
+
+**Portable working set: model switch is cheap by construction, without implying KV-cache portability.**
+
+Provider prompt/KV cache is per-model. Artifacts do not transfer GPU or API
+cache. This cut productizes the durable working set so a later model infers a
+small fresh prompt against stored findings, not a 200k chat.
+
+- Job-local `artifact_index.json` sidecar (compact refs via
+  `compact_artifact_ref`). The job brief gets a **stable one-liner** naming the
+  file; growing JSON is never inlined into the cached prefix.
+- Instruction-aware warm-skip for read-only/analysis workers: fingerprint is
+  scope bytes plus `sha256(role + instruction)`. Same files, different
+  question does not inherit the previous answer. Prewalk implement never
+  skips. Unlabeled artifacts fail closed.
+- Router **cache affinity** (`balanced` / `cheap`): sibling workers prefer the
+  previous same-job model when it still meets capability, so the shared
+  job-brief prefix stays cacheable. Not used for `quality` / `escalating`.
+  Kill switch `PUPPETMASTER_CACHE_AFFINITY=0`; per-task
+  `payload.skip_cache_affinity`.
+- Hermes workers already start a fresh `chat -q` (no `--resume`, isolated
+  sessions). A Hermes model switch cannot replay transcript; retrieve the
+  index / SQLite instead.
+- `puppetmaster savings` counts working-set reuse skips (measured) plus a
+  labeled avoided-inference token estimate. Not routed dollars. Not KV cache.
+- Hermes billing/credentials treat `OPENROUTER_API_KEY` as a Hermes provider
+  key (alongside Anthropic / OpenAI / Gemini).
+- Kill switches: `PUPPETMASTER_WORKING_SET=0`,
+  `PUPPETMASTER_WORKING_SET_REUSE=0`, `payload.skip_working_set_reuse`,
+  `PUPPETMASTER_WORKING_SET_USAGE=0`.
+- Tests: `tests/test_working_set.py`, `tests/test_router_cache_affinity.py`.
+
+State travels; KV cache does not. Public line: work once, recall at $0, next
+model sees findings not the chat.
+
+No Pi / grok-bot worker. Marionette pin unchanged.
+
 ## v1.22.32 — 2026-08-24
 
 **Fix: stale editorial capability_score beat a live local receipt.**

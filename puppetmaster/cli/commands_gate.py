@@ -462,6 +462,12 @@ def _run_savings_command(args, state_dir) -> int:
     cg = report["codegraph"]
     heal = report["self_heal"]
     reads = report["reads"]
+    working_set = report.get("working_set") or {
+        "skips": 0,
+        "artifacts_reused": 0,
+        "avoided_tokens_est": 0,
+        "skip_baseline_tokens": 4000,
+    }
     memory_cost = report["memory_cost"]
     tool_offload = report.get("tool_offload") or {
         "offloads": 0, "tokens_saved": 0, "chars_saved": 0,
@@ -482,6 +488,7 @@ def _run_savings_command(args, state_dir) -> int:
                     "self_heal": asdict(heal),
                     "codegraph": cg,
                     "reads": reads,
+                    "working_set": working_set,
                     "memory_cost": memory_cost,
                     "tool_offload": tool_offload,
                     "metrics": metrics,
@@ -522,6 +529,12 @@ def _run_savings_command(args, state_dir) -> int:
         f"  $0 follow-up reads: {reads['reads']} result read(s) served from durable "
         f"state at zero model cost"
     )
+    if working_set.get("skips"):
+        print(
+            f"  Working-set reuse skips: {working_set['skips']} analysis task(s) "
+            f"served from durable artifacts "
+            f"({working_set['artifacts_reused']} artifact(s); not provider KV cache)"
+        )
     if tool_offload.get("offloads"):
         print(
             f"  Tool-output offload: {tool_offload['offloads']} spill(s), "
@@ -545,6 +558,12 @@ def _run_savings_command(args, state_dir) -> int:
         f"  Avoided exploration: ~{cg['net_tokens_saved_est']:,} tokens "
         f"-> ~${cg['dollars_saved_est']:.4f} saved"
     )
+    if working_set.get("skips"):
+        print(
+            f"  Avoided worker inference (working-set skips): "
+            f"~{working_set['avoided_tokens_est']:,} tokens "
+            f"(baseline {working_set['skip_baseline_tokens']:,} tokens/skip; estimate)"
+        )
     print()
 
     if cf is not None:
