@@ -906,6 +906,7 @@ class Orchestrator:
                     candidates,
                     policy=policy,
                     local_receipts=self._host_local_receipts(),
+                    generation_presence=registry,
                 )
             except NoEligibleModelError:
                 continue
@@ -1108,6 +1109,7 @@ class Orchestrator:
                     candidates,
                     policy=policy,
                     local_receipts=receipts,
+                    generation_presence=registry,
                 )
             except NoEligibleModelError:
                 continue
@@ -1346,6 +1348,7 @@ class Orchestrator:
                     candidates,
                     policy=policy,
                     local_receipts=receipts,
+                    generation_presence=registry,
                 )
             except NoEligibleModelError:
                 continue

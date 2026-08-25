@@ -119,7 +119,7 @@ class BentonEditorialNinetyTests(unittest.TestCase):
     def test_quality_without_receipts_still_picks_editorial_90(self) -> None:
         from puppetmaster.router import route_task
 
-        gpt5 = _spec(id="codex/gpt-5", adapter_model_name="gpt-5", capability_score=90)
+        gpt5 = _spec(id="codex/gpt-5.5", adapter_model_name="gpt-5.5", capability_score=90)
         luna = _spec(
             id="codex/gpt-5-6-luna",
             adapter_model_name="gpt-5.6-luna",
@@ -235,7 +235,7 @@ class OverlayGuardrailTests(unittest.TestCase):
     def test_no_cross_role_receipt_transfer(self) -> None:
         from puppetmaster.router import route_task
 
-        gpt5 = _spec(id="codex/gpt-5", adapter_model_name="gpt-5", capability_score=90)
+        gpt5 = _spec(id="codex/gpt-5.5", adapter_model_name="gpt-5.5", capability_score=90)
         luna = _spec(
             id="codex/gpt-5-6-luna",
             adapter_model_name="gpt-5.6-luna",

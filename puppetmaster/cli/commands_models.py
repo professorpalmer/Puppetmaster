@@ -580,11 +580,8 @@ def _run_models_setup(args, path: Path) -> int:
 def _run_models_subcommand(args) -> int:
     """Dispatch `python -m puppetmaster models ...`.
 
-    Three subcommands:
-
-    * ``init`` — write a starter registry the user can edit.
-    * ``list`` — show what's registered, including price + capability.
-    * ``path`` — print the resolved registry path (handy in scripts).
+    Subcommands: init, list, path, discover, recommend, setup, set,
+    import-baseline.
     """
     from puppetmaster.model_registry import (
         default_registry_path,
@@ -656,10 +653,76 @@ def _run_models_subcommand(args) -> int:
     if args.models_command == "set":
         return _run_models_set(args, path)
 
+    if args.models_command == "recommend":
+        return _run_models_recommend(args, path)
+
     if args.models_command == "import-baseline":
         return _run_models_import_baseline(args, path)
 
     raise SystemExit(f"unknown models subcommand: {args.models_command}")
+
+
+def _run_models_recommend(args, path: Path) -> int:
+    """Stamp the registry from the packaged Agent Arena Pareto snapshot.
+
+    Intersects ranking with each hooked stream (adapter, plus provider on
+    agentic/hermes). Cursor Sol does not enable Codex models. Marionette
+    Settings toggles are the same allowlist as ``--available``.
+    """
+    from puppetmaster.model_registry import (
+        load_registry,
+        save_registry,
+        starter_registry,
+    )
+    from puppetmaster.pareto_recommend import apply_pareto_recommendations
+
+    try:
+        registry = load_registry(path)
+    except RuntimeError:
+        registry = starter_registry()
+
+    available = None
+    raw_available = getattr(args, "available", None)
+    if raw_available:
+        available = [
+            item.strip()
+            for item in str(raw_available).split(",")
+            if item.strip()
+        ]
+
+    updated, report = apply_pareto_recommendations(
+        registry,
+        available_ids=available,
+        stamp_effort=not bool(getattr(args, "no_stamp_effort", False)),
+        overwrite_scores=bool(getattr(args, "stamp_scores", False)),
+    )
+    if args.json:
+        print(json.dumps({"path": str(path), "report": report}, indent=2))
+    else:
+        print(
+            "Agent Arena Pareto "
+            f"{report.get('published') or ''}  ({report.get('source_url') or 'packaged'})"
+        )
+        horses = report.get("workhorse_by_lane") or {}
+        if horses:
+            print("workhorse by stream:")
+            for lane, name in sorted(horses.items()):
+                print(f"  {lane}: {name}")
+        disabled = report.get("disabled_prior_generation") or []
+        if disabled:
+            print("disabled prior-generation (same stream only):")
+            print("  " + ", ".join(disabled))
+        stamped = report.get("stamped") or []
+        if stamped and not args.json:
+            print(f"stamped {len(stamped)} row(s)")
+        if not getattr(args, "write", False):
+            print("dry-run (pass --write to persist)")
+
+    if getattr(args, "write", False):
+        save_registry(updated, path)
+        if not args.json:
+            print(f"Wrote recommended registry to {path}")
+    return 0
 
 
 def _run_models_import_baseline(args, path: Path) -> int:
@@ -819,6 +882,24 @@ def _run_models_discover(args, path: Path) -> int:
             continue
         reports.append(report)
         catalogs[source] = catalog
+
+    if args.write and reports:
+        from puppetmaster.pareto_recommend import maybe_apply_pareto_recommendations
+
+        registry, pareto_report = maybe_apply_pareto_recommendations(
+            registry,
+            stamp_effort=False,
+            overwrite_scores=False,
+        )
+        if pareto_report.get("action") == "applied":
+            for report in reports:
+                report["pareto"] = {
+                    "published": pareto_report.get("published"),
+                    "workhorse_by_lane": pareto_report.get("workhorse_by_lane"),
+                    "disabled_prior_generation": pareto_report.get(
+                        "disabled_prior_generation"
+                    ),
+                }
 
     if not args.json:
         for report in reports:

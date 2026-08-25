@@ -2,7 +2,7 @@
 
 The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
 
-**Current release:** [v1.22.34](CHANGELOG.md#v12234) — universal playbook recipes (not a Cursor plugin); see [CHANGELOG.md](CHANGELOG.md), [WHY.md](WHY.md), and [CLAIMS.md](CLAIMS.md).
+**Current release:** [v1.22.35](CHANGELOG.md#v12235) — leftover raw GPT-5 is skipped on the hooked stream when GPT-5.6 is live; see [CHANGELOG.md](CHANGELOG.md), [WHY.md](WHY.md), and [CLAIMS.md](CLAIMS.md).
 
 ## Start here
 

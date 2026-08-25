@@ -466,7 +466,10 @@ def starter_registry() -> list[ModelSpec]:
             notes=(
                 "Affordable GPT-5.6 Cursor tier. Prefer for capable everyday "
                 "implementation and subagent work before Terra/Sol; plan-billed "
-                "with no marginal API USD."
+                "with no marginal API USD. Agent Arena Pareto workhorse on "
+                "lanes that actually expose Luna (2026-08-24 snapshot, xHigh "
+                "$0.07/task); Cursor has no effort knob, so xHigh is ranking "
+                "only."
             ),
         ),
         ModelSpec(
