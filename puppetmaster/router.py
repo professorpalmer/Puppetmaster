@@ -44,6 +44,15 @@ from puppetmaster.scorecards import (
 
 logger = logging.getLogger(__name__)
 
+CACHE_AFFINITY_ENV = "PUPPETMASTER_CACHE_AFFINITY"
+CACHE_AFFINITY_POLICIES = frozenset({"balanced", "cheap"})
+
+
+def cache_affinity_enabled() -> bool:
+    """True unless the operator disables sibling model stickiness."""
+    raw = (os.environ.get(CACHE_AFFINITY_ENV) or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
 _ROUTING_OVERRIDES_CACHE: dict[str, tuple[float, dict]] = {}
 _ROUTING_OVERRIDES_PARSE_WARNED: set[str] = set()
 
@@ -334,6 +343,10 @@ class TaskSignals:
     # set (``frozenset()``) fails closed; a non-empty set restricts selection
     # and same-adapter reroute to those identities only.
     allowed_model_ids: Optional[frozenset[str]] = None
+    # Same-job sibling stickiness: keep a previous worker's model when it still
+    # meets capability so the shared job-brief prefix stays provider-cacheable.
+    # This avoids a model switch; it does not port KV cache across models.
+    prefer_model_id: Optional[str] = None
 
 
 # ----- Classifier ----------------------------------------------------------
@@ -1078,6 +1091,42 @@ def _route_task_once(
             f"at {_cap(strongest)}."
         )
 
+    prefer = (task.prefer_model_id or "").strip()
+    if (
+        prefer
+        and cache_affinity_enabled()
+        and policy in CACHE_AFFINITY_POLICIES
+        and sufficient
+    ):
+        wanted = frozenset([prefer])
+        sticky = None
+        for spec in sufficient:
+            if spec.id == prefer or model_id_allowed(spec, wanted):
+                sticky = spec
+                break
+        if sticky is not None:
+            pick = sticky
+            reason = (
+                "cache affinity: prefer_model_id="
+                f"{pick.id} still meets capability need ({need}); "
+                "keep shared job-brief prefix"
+                + _overlay_note(pick)
+            )
+            for spec in after_cost:
+                if spec.id != pick.id:
+                    rejected.append(
+                        (spec, f"cache affinity kept sibling {pick.id}")
+                    )
+            return _decision(
+                pick, policy, need, _tokens_in_for(pick), tokens_out, reason, rejected,
+                _baseline_cost, _baseline_id, _baseline_nominal,
+                allowed_model_ids=_allowed_for_artifact,
+                role=task.role,
+                calibration=_candidate_calibration(pick),
+                local_receipts=receipts,
+                candidates=after_cost,
+            )
+
     if policy == "cheap":
         # ``cheap`` means cheapest *sufficient*.  The old unconditional-lowest
         # behavior remains available only through the conspicuous
@@ -1601,4 +1650,7 @@ def signals_from_worker_spec(spec, *, instruction_override: Optional[str] = None
         allow_api_billing=_coerce_bool(payload.get("allow_api_billing"), True),
         allowed_adapters=allowed_adapters,
         allowed_model_ids=allowed_model_ids,
+        prefer_model_id=(
+            str(payload.get("prefer_model_id") or "").strip() or None
+        ),
     )

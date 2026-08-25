@@ -13,8 +13,9 @@ Honesty rules baked in (learned the hard way from a probe that "lost money"):
   spend by request* — reported on their own line, never as a loss.
 * **Measured vs estimated.** Routing dollars and CodeGraph context-tokens-fed
   are measured. Tool-output offload tokens (chars//4 of spilled results) are
-  measured. "Avoided exploration" is an estimate with a stated baseline and
-  is always presented as such.
+  measured. Working-set reuse **skips** are measured counts (not dollars, not
+  KV cache). "Avoided exploration" and avoided-inference tokens for those
+  skips are estimates with a stated baseline and are always presented as such.
 """
 from __future__ import annotations
 
@@ -322,7 +323,7 @@ def build_report(
     """Top-level: routing savings (measured) + CodeGraph usage (measured +
     estimated) + reliability/reuse counts + derived rates. Pure aggregation
     over local data; emits nothing."""
-    from puppetmaster import codegraph_usage, reads_log
+    from puppetmaster import codegraph_usage, reads_log, working_set_usage
     from puppetmaster.memory_cost_log import aggregate as aggregate_memory_cost
     from puppetmaster.memory_cost_log import load_memory_cost
     from puppetmaster.tool_offload import (
@@ -338,6 +339,9 @@ def build_report(
     routing = summarize_routing(routing_records)
     codegraph = codegraph_usage.aggregate(codegraph_usage.load_usage(since=since))
     reads = reads_log.aggregate(reads_log.load_reads(since=since))
+    working_set = working_set_usage.aggregate(
+        working_set_usage.load_usage(since=since)
+    )
     memory_cost = aggregate_memory_cost(load_memory_cost(since=since))
     state_dirs = []
     for store in stores:
@@ -365,6 +369,7 @@ def build_report(
         "self_heal": self_heal,
         "codegraph": codegraph,
         "reads": reads,
+        "working_set": working_set,
         "memory_cost": memory_cost,
         "tool_offload": tool_offload,
         "metrics": metrics,

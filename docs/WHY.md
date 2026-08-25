@@ -28,6 +28,14 @@ Puppetmaster is built around the opposite rule:
 
 > Agents should not share transcript history. They should share durable state.
 
+That durable state is a **portable working set**, not a portable KV cache.
+Provider prompt cache is per-model: switching models still rebills a full
+input on that provider. What travels is SQLite artifacts, a compact
+`artifact_index.json`, and `$0` follow-up reads. A later model gets a small
+fresh prompt and retrieves findings; it does not inherit another model's
+GPU/API cache. Sibling workers on the *same* model can keep a shared job-brief
+prefix so that provider's cache can hit.
+
 ## What Puppetmaster fixes
 
 ### 1. Context collapse

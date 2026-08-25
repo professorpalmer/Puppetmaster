@@ -63,6 +63,7 @@ _HERMES_ENV_CREDENTIAL_KEYS = (
     "ANTHROPIC_API_KEY",
     "GEMINI_API_KEY",
     "GOOGLE_API_KEY",
+    "OPENROUTER_API_KEY",
 )
 
 
@@ -70,6 +71,7 @@ _HERMES_PROVIDER_CREDENTIAL_ENV = {
     "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
     "anthropic": ("ANTHROPIC_API_KEY",),
     "openai-api": ("OPENAI_API_KEY",),
+    "openrouter": ("OPENROUTER_API_KEY",),
 }
 
 
@@ -95,9 +97,14 @@ def build_hermes_chat_command(
     Hermes's auto-injected AGENTS.md/SOUL.md/.cursorrules and — critically —
     its cross-session **memory** tool are skipped. Without this, a fact stored
     by one task ("remember codeword BANANA42") leaks into unrelated later tasks,
-    which would corrupt swarm isolation and replayability. Puppetmaster injects
+    which would corrupt swarm isolation and replayability.     Puppetmaster injects
     its own repo context (CodeGraph, report contract, per-task memory), so the
     native Hermes injection is redundant as well as unsafe here.
+
+    Workers always start a fresh ``chat -q`` process (no ``--resume``, isolated
+    sessions dir). A model switch therefore cannot replay a prior transcript;
+    the next model retrieves ``artifact_index.json`` / SQLite artifacts instead
+    of inheriting provider KV cache.
     """
     command = command_parts(executable)
     command.extend(["chat", "-q", prompt])

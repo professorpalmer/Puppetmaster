@@ -1817,6 +1817,33 @@ class Orchestrator:
         if routing_artifacts:
             self.store.save_artifacts(routing_artifacts)
 
+    def _last_routed_model_id(self, job: Job) -> Optional[str]:
+        """Return the most recent ROUTING pick on this job, if any.
+
+        Used for cache affinity across waves (later auto_route specs should
+        stick to a sibling model that still meets capability). Best-effort.
+        """
+        try:
+            lister = getattr(self.store, "list_artifacts_by_type", None)
+            if lister is not None:
+                arts = lister(ArtifactType.ROUTING, job_ids=[job.id])
+            else:
+                arts = [
+                    artifact
+                    for artifact in self.store.list_artifacts(job.id)
+                    if getattr(artifact, "type", None) == ArtifactType.ROUTING
+                ]
+            if not arts:
+                return None
+            arts.sort(key=lambda artifact: getattr(artifact, "created_at", "") or "")
+            payload = getattr(arts[-1], "payload", None) or {}
+            model_id = payload.get("model_id")
+            if model_id:
+                return str(model_id)
+        except Exception:
+            return None
+        return None
+
     def _apply_auto_routing(
         self, job: Job, specs: list[WorkerSpec]
     ) -> tuple[list[WorkerSpec], list[tuple[str, dict]]]:
@@ -1860,6 +1887,7 @@ class Orchestrator:
         registry_path: Optional[Path] = None
         registry_reconciliation: Optional[RegistryReconciliation] = None
         empty_registry_announced = False
+        last_model_id = self._last_routed_model_id(job)
         for spec in specs:
             payload = dict(spec.payload or {})
             if not payload.get("auto_route"):
@@ -1974,6 +2002,14 @@ class Orchestrator:
                 result.append(spec)
                 continue
             policy = payload.get("routing_policy") or "balanced"
+            if not payload.get("skip_cache_affinity"):
+                prefer = (
+                    str(payload.get("prefer_model_id") or "").strip()
+                    or last_model_id
+                )
+                if prefer:
+                    payload["prefer_model_id"] = prefer
+                    spec = replace(spec, payload=payload)
             signals = signals_from_worker_spec(spec)
             try:
                 decision = route_task(
@@ -2046,6 +2082,7 @@ class Orchestrator:
             artifact_payload["registry_path"] = str(registry_path) if registry_path else None
             artifact_payload["registry_digest"] = new_payload["registry_digest"]
             decisions.append((spec.role, artifact_payload))
+            last_model_id = decision.model.id
 
         return result, decisions
 

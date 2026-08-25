@@ -15,6 +15,8 @@ Every number here comes from a reproducible script in [`bench/`](../bench/).
 
 Honest scope: this is the *follow-up reads are free* claim. If your follow-up needs new reasoning the swarm didn't produce, that's a new task and it costs tokens like any other.
 
+v1.22.33 adds a **portable working set** so a *new* worker (including a different model) starts from stored findings and `artifact_index.json` instead of a prior chat. That makes a model switch cheap **relative to replaying the transcript**. It is not KV-cache portability and it is not "query vs infer 99% of the prompt" on the provider. Same-model sibling workers may keep one model (`cache affinity`) so the shared job-brief prefix can hit *that* provider's cache.
+
 ## 2. Transcript — workers don't share one
 
 The classic multi-subagent shape stuffs everything into one parent chat. Each subagent inherits stale context, results come back as prose, and the context window bloats until the important details are buried.

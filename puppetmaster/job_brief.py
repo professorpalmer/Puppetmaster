@@ -77,6 +77,16 @@ def build_job_brief(
         parts.append(
             "No repository census or CodeGraph context was available for this job."
         )
+    try:
+        from puppetmaster.working_set import (
+            working_set_brief_line,
+            working_set_enabled,
+        )
+
+        if working_set_enabled():
+            parts.append(working_set_brief_line())
+    except Exception:
+        pass
     return "\n\n".join(parts).strip() + "\n"
 
 
@@ -101,6 +111,19 @@ def write_job_brief(
         temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         temp_path.write_text(text, encoding="utf-8")
         os.replace(temp_path, path)
+        try:
+            from puppetmaster.working_set import (
+                artifact_index_path,
+                working_set_enabled,
+                write_artifact_index,
+            )
+
+            if working_set_enabled():
+                index_path = artifact_index_path(root)
+                if not index_path.is_file():
+                    write_artifact_index(root, [])
+        except Exception:
+            pass
         return path
     except Exception:
         try:
