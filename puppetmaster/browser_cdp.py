@@ -5,13 +5,19 @@ so browser-capable swarms run on the standalone-keys stack (Marionette's identit
 rather than requiring the Hermes adapter + agent-browser CLI.
 
 Design:
-- Launch a local Chrome/Chromium with ``--headless=new --remote-debugging-port``
-  and a throwaway profile; discover the page target's websocket via DevTools /json.
+- Launch a local Chrome/Chromium with ``--remote-debugging-port`` and a profile
+  directory; discover the page target's websocket via DevTools /json.
+- Default is ``--headless=new`` plus a throwaway ``pm-cdp-*`` profile. Auth
+  handoff uses ``PM_BROWSER_HEADED=1`` (visible window) and
+  ``PM_BROWSER_USER_DATA_DIR`` (durable cookies). ``PM_BROWSER_CDP_PORT``
+  publishes a shared debugging port so sibling workers attach instead of
+  spawning a second isolated Chrome.
 - Talk CDP over a MINIMAL, self-contained RFC6455 websocket client built on the
   stdlib ``socket`` module (no websockets/websocket-client dependency).
 - Expose small agent-facing functions returning STRINGS (never raise), mirroring
   the Hermes browser tool surface: navigate / snapshot (accessibility-ish tree
-  with @e1 refs) / click / type / scroll / back / get_text / screenshot.
+  with @e1 refs) / click / type / scroll / back / get_text / screenshot /
+  auth_handoff.
 
 Safety: navigation is refused for unsafe/internal URLs via is_safe_url unless
 PM_BROWSER_ALLOW_LOCAL=1. Every public function is best-effort.
@@ -24,6 +30,7 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -62,6 +69,125 @@ def _free_port() -> int:
     port = s.getsockname()[1]
     s.close()
     return port
+
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _headed() -> bool:
+    return _env_truthy("PM_BROWSER_HEADED")
+
+
+def _attach_only() -> bool:
+    return _env_truthy("PM_BROWSER_ATTACH_ONLY")
+
+
+def _preferred_port() -> Optional[int]:
+    raw = os.environ.get("PM_BROWSER_CDP_PORT", "").strip()
+    if not raw:
+        return None
+    try:
+        port = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if 1 <= port <= 65535:
+        return port
+    return None
+
+
+def _default_persistent_profile() -> str:
+    return os.path.join(os.path.expanduser("~"), ".puppetmaster", "browser-profile")
+
+
+def _profile_dir_for_launch() -> tuple:
+    """Return ``(path, owns_profile)``. Temp dirs are deleted on shutdown."""
+    explicit = os.environ.get("PM_BROWSER_USER_DATA_DIR", "").strip()
+    if explicit:
+        path = os.path.expanduser(explicit)
+        os.makedirs(path, exist_ok=True)
+        return path, False
+    if _headed():
+        path = _default_persistent_profile()
+        os.makedirs(path, exist_ok=True)
+        return path, False
+    return tempfile.mkdtemp(prefix="pm-cdp-"), True
+
+
+def chrome_launch_args(chrome: str, port: int, profile_dir: str, headed: bool) -> list:
+    """Chrome argv for a CDP session. Headless keeps the historical flags."""
+    args = [chrome]
+    if not headed:
+        args.append("--headless=new")
+        args.append("--disable-gpu")
+    args.extend([
+        "--remote-debugging-port=%d" % int(port),
+        "--user-data-dir=%s" % profile_dir,
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-dev-shm-usage",
+        "--remote-allow-origins=*",
+    ])
+    if headed:
+        args.extend(["--new-window", "--window-size=1280,800"])
+    args.append("about:blank")
+    return args
+
+
+def _page_ws_url(port: int, timeout: float = 2.0) -> Optional[str]:
+    try:
+        with urllib.request.urlopen(
+            "http://127.0.0.1:%d/json" % int(port), timeout=timeout
+        ) as r:
+            targets = json.loads(r.read().decode())
+    except Exception:
+        return None
+    if not isinstance(targets, list):
+        return None
+    for t in targets:
+        if not isinstance(t, dict):
+            continue
+        ws = t.get("webSocketDebuggerUrl")
+        if t.get("type") == "page" and ws:
+            return str(ws)
+    return None
+
+
+def _ensure_page_ws(port: int) -> Optional[str]:
+    ws = _page_ws_url(port)
+    if ws:
+        return ws
+    try:
+        with urllib.request.urlopen(
+            "http://127.0.0.1:%d/json/new?about:blank" % int(port), timeout=2
+        ) as r:
+            created = json.loads(r.read().decode())
+        if isinstance(created, dict) and created.get("webSocketDebuggerUrl"):
+            return str(created["webSocketDebuggerUrl"])
+    except Exception:
+        pass
+    return _page_ws_url(port)
+
+
+def _wait_for_page_ws(port: int, seconds: float) -> Optional[str]:
+    deadline = time.time() + seconds
+    ws_url = None
+    while time.time() < deadline:
+        ws_url = _ensure_page_ws(port)
+        if ws_url:
+            return ws_url
+        time.sleep(0.3)
+    return ws_url
+
+
+# True only in the interactive harness process. Shared CDP Chrome must survive
+# worker atexit; the janitor reaps it when the desktop/harness exits.
+_JANITOR = False
+
+
+def set_janitor(value: bool = True) -> None:
+    global _JANITOR
+    _JANITOR = bool(value)
 
 
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -193,49 +319,88 @@ class _Session:
         self.ws: Optional[_WS] = None
         self._id = 0
         self._lock = threading.Lock()
+        self.port: Optional[int] = None
+        self.headed = False
+        self.owns_proc = False
+        self.owns_profile = False
 
-    def ensure(self) -> Optional[str]:
-        if self.ws is not None:
-            return None
-        chrome = _find_chrome()
-        if not chrome:
-            return "Chrome/Chromium not found; browser tools unavailable. Set PM_BROWSER_CHROME."
-        port = _free_port()
-        self.profile_dir = tempfile.mkdtemp(prefix="pm-cdp-")
-        args = [
-            chrome, "--headless=new", f"--remote-debugging-port={port}",
-            f"--user-data-dir={self.profile_dir}", "--no-first-run",
-            "--no-default-browser-check", "--disable-gpu", "--disable-dev-shm-usage",
-            "--remote-allow-origins=*", "about:blank",
-        ]
-        try:
-            self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception as e:
-            return f"failed to launch Chrome: {e}"
-        ws_url = None
-        deadline = time.time() + 20
-        while time.time() < deadline:
-            try:
-                with urllib.request.urlopen(f"http://127.0.0.1:{port}/json", timeout=2) as r:
-                    targets = json.loads(r.read().decode())
-                for t in targets:
-                    if t.get("type") == "page" and t.get("webSocketDebuggerUrl"):
-                        ws_url = t["webSocketDebuggerUrl"]
-                        break
-                if ws_url:
-                    break
-            except Exception:
-                pass
-            time.sleep(0.3)
-        if not ws_url:
-            return "Chrome started but no DevTools page target appeared."
+    def _attach_ws(self, ws_url: str, *, port: int, headed: bool,
+                   profile_dir: Optional[str], owns_proc: bool,
+                   owns_profile: bool) -> Optional[str]:
         try:
             self.ws = _WS(ws_url)
             self._cmd("Page.enable")
             self._cmd("Runtime.enable")
             self._cmd("DOM.enable")
         except Exception as e:
-            return f"failed to attach to DevTools: {e}"
+            self.ws = None
+            return "failed to attach to DevTools: %s" % e
+        self.port = int(port)
+        self.headed = bool(headed)
+        self.profile_dir = profile_dir
+        self.owns_proc = bool(owns_proc)
+        self.owns_profile = bool(owns_profile)
+        os.environ["PM_BROWSER_CDP_PORT"] = str(int(port))
+        return None
+
+    def ensure(self) -> Optional[str]:
+        if self.ws is not None:
+            return None
+        headed = _headed()
+        preferred = _preferred_port()
+        persist = os.environ.get("PM_BROWSER_USER_DATA_DIR", "").strip()
+        if persist:
+            persist = os.path.expanduser(persist)
+        if preferred is not None:
+            ws_url = _wait_for_page_ws(preferred, 1.5)
+            if ws_url:
+                return self._attach_ws(
+                    ws_url, port=preferred, headed=headed,
+                    profile_dir=persist or None, owns_proc=False,
+                    owns_profile=False,
+                )
+            if _attach_only():
+                return (
+                    "No Chrome DevTools at 127.0.0.1:%d. Start Chrome with "
+                    "--remote-debugging-port=%d or unset PM_BROWSER_ATTACH_ONLY."
+                    % (preferred, preferred)
+                )
+        chrome = _find_chrome()
+        if not chrome:
+            return "Chrome/Chromium not found; browser tools unavailable. Set PM_BROWSER_CHROME."
+        port = preferred if preferred is not None else _free_port()
+        profile_dir, owns_profile = _profile_dir_for_launch()
+        args = chrome_launch_args(chrome, port, profile_dir, headed)
+        try:
+            popen_kw = {
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
+            }
+            if os.name != "nt":
+                popen_kw["start_new_session"] = True
+            self.proc = subprocess.Popen(args, **popen_kw)
+        except Exception as e:
+            return "failed to launch Chrome: %s" % e
+        ws_url = _wait_for_page_ws(port, 20)
+        if not ws_url:
+            # Port may already be a live Chrome we lost the race to launch.
+            if preferred is not None:
+                ws_url = _wait_for_page_ws(preferred, 5)
+                if ws_url:
+                    _stop_chrome_proc(self.proc)
+                    self.proc = None
+                    return self._attach_ws(
+                        ws_url, port=preferred, headed=headed,
+                        profile_dir=profile_dir, owns_proc=False,
+                        owns_profile=False,
+                    )
+            return "Chrome started but no DevTools page target appeared."
+        err = self._attach_ws(
+            ws_url, port=port, headed=headed, profile_dir=profile_dir,
+            owns_proc=True, owns_profile=owns_profile,
+        )
+        if err:
+            return err
         return None
 
     def _cmd(self, method: str, params: Optional[dict] = None, timeout: float = 30.0) -> dict:
@@ -266,20 +431,113 @@ class _Session:
         except Exception:
             pass
         self.ws = None
-        try:
-            if self.proc:
-                self.proc.terminate()
-        except Exception:
-            pass
+        shared = (_preferred_port() is not None) or (not self.owns_profile)
+        reap = self.owns_proc and ((not shared) or _JANITOR)
+        proc = self.proc
+        port = self.port if reap else None
         self.proc = None
-        try:
-            if self.profile_dir and os.path.isdir(self.profile_dir):
-                shutil.rmtree(self.profile_dir, ignore_errors=True)
-        except Exception:
-            pass
+        self.owns_proc = False
+        if reap:
+            _stop_chrome_proc(proc, port=port)
+        if self.owns_profile:
+            try:
+                if self.profile_dir and os.path.isdir(self.profile_dir):
+                    shutil.rmtree(self.profile_dir, ignore_errors=True)
+            except Exception:
+                pass
+        self.owns_profile = False
 
 
 _SESSION = _Session()
+
+
+def _stop_chrome_proc(proc, port=None, timeout=8.0):
+    """SIGTERM the owned Chrome, wait until it (and the CDP port) die, then SIGKILL.
+
+    Chrome is a process group. Dropping the Popen handle after a fire-and-forget
+    terminate leaves the debug port bound, so a headed relaunch cannot reuse it.
+    """
+    if proc is None and not port:
+        return
+    pid = getattr(proc, "pid", None) if proc is not None else None
+
+    def _signal_tree(sig_term):
+        if os.name != "nt" and pid:
+            try:
+                os.killpg(int(pid), signal.SIGTERM if sig_term else signal.SIGKILL)
+                return
+            except Exception:
+                pass
+        if proc is None:
+            return
+        try:
+            if sig_term:
+                proc.terminate()
+            else:
+                proc.kill()
+        except Exception:
+            pass
+
+    _signal_tree(True)
+    deadline = time.time() + float(timeout)
+    while time.time() < deadline:
+        alive = False
+        if proc is not None:
+            try:
+                if proc.poll() is None:
+                    alive = True
+            except Exception:
+                pass
+        if (not alive) and port:
+            if _page_ws_url(int(port), timeout=0.2):
+                alive = True
+        if not alive:
+            if proc is not None:
+                try:
+                    proc.wait(timeout=0.2)
+                except Exception:
+                    pass
+            return
+        time.sleep(0.1)
+    _signal_tree(False)
+    if proc is not None:
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+
+
+def reset_session(keep_profile: bool = True) -> None:
+    """Drop the live CDP connection so the next ensure() can relaunch.
+
+    Persistent profiles stay on disk. Chrome this process spawned is killed so
+    a headed relaunch can reuse the same debugging port.
+    """
+    global _SESSION
+    if keep_profile:
+        _SESSION.owns_profile = False
+    port = getattr(_SESSION, "port", None)
+    proc = _SESSION.proc if getattr(_SESSION, "owns_proc", False) else None
+    if getattr(_SESSION, "owns_proc", False):
+        _SESSION.proc = None
+        _SESSION.owns_proc = False
+        _stop_chrome_proc(proc, port=port)
+    _SESSION.shutdown()
+    _SESSION = _Session()
+
+
+def session_info() -> dict:
+    s = _SESSION
+    profile = getattr(s, "profile_dir", None)
+    owns_profile = bool(getattr(s, "owns_profile", False))
+    return {
+        "connected": getattr(s, "ws", None) is not None,
+        "headed": bool(getattr(s, "headed", False)),
+        "port": getattr(s, "port", None),
+        "profile_dir": profile,
+        "owns_proc": bool(getattr(s, "owns_proc", False)),
+        "persistent": bool(profile and not owns_profile),
+    }
 
 
 @atexit.register
@@ -331,6 +589,27 @@ def navigate(url: str) -> str:
         )
     except Exception as e:
         return f"navigate failed: {type(e).__name__}: {e}"
+
+
+def auth_handoff(url: str) -> str:
+    """Open ``url`` in a visible Chrome using the durable profile.
+
+    Never returns cookies or passwords. Workers attach via PM_BROWSER_CDP_PORT.
+    """
+    os.environ["PM_BROWSER_HEADED"] = "1"
+    if getattr(_SESSION, "ws", None) is not None and not getattr(_SESSION, "headed", False):
+        reset_session(keep_profile=True)
+    nav = navigate(url)
+    info = session_info()
+    port = info.get("port")
+    profile = info.get("profile_dir") or ""
+    persist = "yes" if info.get("persistent") else "no"
+    return (
+        "%s\n\nAuth handoff: complete login or Cloudflare in the visible Chrome "
+        "window. Do not paste passwords or cookies into chat. Workers reuse this "
+        "session (port=%s, persistent=%s, profile=%s)."
+        % (nav, port, persist, profile)
+    )
 
 
 _SNAPSHOT_JS = r"""
@@ -570,6 +849,8 @@ def dispatch(name: str, args: dict, out_dir: Optional[str] = None) -> Optional[s
     a = args or {}
     if name == "browser_navigate":
         return navigate(str(a.get("url", "")))
+    if name == "browser_auth_handoff":
+        return auth_handoff(str(a.get("url", "")))
     if name == "browser_snapshot":
         return snapshot()
     if name == "browser_click":
@@ -592,5 +873,5 @@ def dispatch(name: str, args: dict, out_dir: Optional[str] = None) -> Optional[s
 BROWSER_TOOL_NAMES = (
     "browser_navigate", "browser_snapshot", "browser_click", "browser_type",
     "browser_scroll", "browser_back", "browser_get_text", "browser_network",
-    "browser_screenshot",
+    "browser_screenshot", "browser_auth_handoff",
 )

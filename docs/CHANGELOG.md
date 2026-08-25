@@ -1,3 +1,17 @@
+## v1.22.36 — 2026-08-25
+
+**Headed Chrome auth handoff: one durable profile and a shared CDP port so workers attach instead of spawning a throwaway login.**
+
+Login and Cloudflare walls need a visible window the user can complete. The stdlib CDP engine no longer always launches `--headless=new` into a temp `pm-cdp-*` profile.
+
+- `PM_BROWSER_HEADED=1` omits headless and opens `--new-window`. `browser_auth_handoff` forces headed.
+- `PM_BROWSER_USER_DATA_DIR` keeps cookies on disk. Headed default is `~/.puppetmaster/browser-profile`. Temp profiles still delete on shutdown.
+- `PM_BROWSER_CDP_PORT` is the attach address. `PM_BROWSER_ATTACH_ONLY=1` never launches; it fails calmly if nothing is listening.
+- Harness sets `_JANITOR` via `set_janitor(True)` so worker atexit does not kill the shared Chrome. `reset_session` waits for the owned process group and debug port to die so a headed relaunch can reuse the port.
+- Tool output never includes cookies or passwords. Live proof: headed `https://example.com` handoff, second `_Session` attach with `owns_proc=False`, worker shutdown leaves Chrome up, janitor reset closes it (`PM_BROWSER_LIVE=1 python -m unittest tests.test_browser_cdp_live`).
+
+No Pi / grok-bot worker. Marionette pin follows in 0.9.357.
+
 ## v1.22.35 — 2026-08-25
 
 **Issue #107: default routing no longer treats raw GPT-5 as the cheap auto pick when a GPT-5.6 successor is live on the same stream.**

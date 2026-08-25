@@ -2575,6 +2575,7 @@ class AgenticLoopTests(unittest.TestCase):
             "browser_back",
             "browser_get_text",
             "browser_screenshot",
+            "browser_auth_handoff",
         ):
             self.assertIn(tool, names)
         # web_fetch stays opt-in via allow_web (browser swarm sets both).
