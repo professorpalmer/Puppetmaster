@@ -780,6 +780,14 @@ class Orchestrator:
             )
         return total
 
+    def _host_local_receipts(self):
+        """Same-host latency/confidence/success observations. No averages."""
+        from puppetmaster.audit import collect_records
+        from puppetmaster.scorecards import local_receipts_from_records
+
+        records, _jobs = collect_records(self.store)
+        return local_receipts_from_records(records)
+
     def _reroute_recoverable_failures(self, job: Job) -> int:
         """Re-queue each FAILED task with a recoverable failure onto a funded
         adapter. Returns the count re-queued (0 when nothing is re-routable)."""
@@ -894,7 +902,10 @@ class Orchestrator:
             policy = payload.get("router_policy") or "balanced"
             try:
                 decision = route_task(
-                    signals_from_worker_spec(task), candidates, policy=policy
+                    signals_from_worker_spec(task),
+                    candidates,
+                    policy=policy,
+                    local_receipts=self._host_local_receipts(),
                 )
             except NoEligibleModelError:
                 continue
@@ -1079,21 +1090,37 @@ class Orchestrator:
 
             # Demand strictly more role-effective capability than the current
             # model; global manual scores do not override qualified role cards.
-            current_capability = effective_capability_score(current_spec, task.role)
+            receipts = self._host_local_receipts()
+            current_capability = effective_capability_score(
+                current_spec,
+                task.role,
+                receipts=receipts,
+                candidates=candidates,
+            )
             signals = replace(
                 signals_from_worker_spec(task),
                 explicit_min_capability=current_capability + 1,
             )
             policy = payload.get("router_policy") or "balanced"
             try:
-                decision = route_task(signals, candidates, policy=policy)
+                decision = route_task(
+                    signals,
+                    candidates,
+                    policy=policy,
+                    local_receipts=receipts,
+                )
             except NoEligibleModelError:
                 continue
             # `balanced` degrades to the highest-available model when nothing
             # meets the floor — guard so we only act on a genuine upgrade.
             if (
                 decision.model.id == current_model_id
-                or effective_capability_score(decision.model, task.role)
+                or effective_capability_score(
+                    decision.model,
+                    task.role,
+                    receipts=receipts,
+                    candidates=candidates,
+                )
                 <= current_capability
             ):
                 continue
@@ -1301,19 +1328,35 @@ class Orchestrator:
             if not candidates:
                 continue
 
-            current_capability = effective_capability_score(current_spec, task.role)
+            receipts = self._host_local_receipts()
+            current_capability = effective_capability_score(
+                current_spec,
+                task.role,
+                receipts=receipts,
+                candidates=candidates,
+            )
             signals = replace(
                 signals_from_worker_spec(task),
                 explicit_min_capability=current_capability + 1,
             )
             policy = payload.get("router_policy") or "balanced"
             try:
-                decision = route_task(signals, candidates, policy=policy)
+                decision = route_task(
+                    signals,
+                    candidates,
+                    policy=policy,
+                    local_receipts=receipts,
+                )
             except NoEligibleModelError:
                 continue
             if (
                 decision.model.id == current_model_id
-                or effective_capability_score(decision.model, task.role)
+                or effective_capability_score(
+                    decision.model,
+                    task.role,
+                    receipts=receipts,
+                    candidates=candidates,
+                )
                 <= current_capability
             ):
                 continue  # no genuine upgrade available — leave it FAILED
@@ -1938,6 +1981,7 @@ class Orchestrator:
                     registry_cache,
                     policy=policy,
                     shadow_policy=payload.get("shadow_policy"),
+                    local_receipts=self._host_local_receipts(),
                 )
             except NoEligibleModelError as exc:
                 self.store.emit(

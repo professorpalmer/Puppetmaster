@@ -4,13 +4,20 @@
 the explicit manual fallback. A role card's ``capability`` (int 0-100) overrides
 that fallback for one :class:`~puppetmaster.router.TaskSignals` role only.
 Empty cards are bit-identical to today's routing.
+
+A later overlay (v1.22.32) lets one host-local latency/confidence/success
+receipt beat a stale editorial ``capability_score`` for the same registry
+id + adapter + role. Editorial scores decay when a newer sibling is already
+running successfully here. Receipts never transfer across adapter, effort,
+harness, or role. One receipt is one raw observation; nothing is averaged.
 """
 from __future__ import annotations
 
 import json
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from datetime import date
 from pathlib import Path
+import re
 from typing import Any, Iterable, Optional
 
 
@@ -20,6 +27,10 @@ _PROVENANCE_SOURCE_COMMUNITY = "community_baseline"
 ROLE_CARD_SCALE = "puppetmaster-capability-0-100"
 MIN_QUALIFIED_SAMPLE_COUNT = 5
 MAX_CALIBRATION_AGE_DAYS = 180
+SCORE_SOURCE_ROLE_CARD = "role_card"
+SCORE_SOURCE_LOCAL_RECEIPT = "local_receipt"
+SCORE_SOURCE_MANUAL = "manual"
+_PROVENANCE_SOURCE_LOCAL_RECEIPT = "local_receipt"
 
 
 def default_community_baseline_path() -> Path:
@@ -95,25 +106,381 @@ def card_capability(spec: Any, role: str) -> Optional[int]:
     return None
 
 
-def effective_capability_score(spec: Any, role: str) -> int:
-    """Role-card capability when present and valid; else ``spec.capability_score``."""
-    override = card_capability(spec, role)
-    if override is not None:
-        return override
-    return int(spec.capability_score)
+def effective_capability_score(
+    spec: Any,
+    role: str,
+    *,
+    receipts: Optional[Iterable["LocalReceipt"]] = None,
+    candidates: Optional[Iterable[Any]] = None,
+) -> int:
+    """Role-card capability when present and valid; else overlay or fallback.
+
+    Qualified role cards still win. Otherwise a successful host-local receipt
+    for this exact registry id + adapter + role can overlay the editorial
+    prior. A stale editorial score is decayed when a newer sibling is already
+    running successfully here. Empty receipts keep ``spec.capability_score``.
+    """
+    return resolve_score_authority(
+        spec, role, receipts=receipts, candidates=candidates
+    ).effective
 
 
-def role_card_override_note(spec: Any, role: str) -> str:
-    """Reason suffix when a role card overrode the manual capability score."""
-    override = card_capability(spec, role)
-    if override is None:
-        return ""
-    manual = int(spec.capability_score)
-    if override == manual:
-        return ""
+def role_card_override_note(
+    spec: Any,
+    role: str,
+    *,
+    receipts: Optional[Iterable["LocalReceipt"]] = None,
+    candidates: Optional[Iterable[Any]] = None,
+) -> str:
+    """Reason suffix when a card, local receipt, or sibling decay changed the pick."""
+    return resolve_score_authority(
+        spec, role, receipts=receipts, candidates=candidates
+    ).note
+
+
+@dataclass(frozen=True)
+class LocalReceipt:
+    """One raw host-local observation for one registry identity + role.
+
+    Not an average. Not a community card. Latency, confidence, and success
+    are the observation; ``capability_score`` is only the editorial prior.
+    """
+
+    registry_id: str
+    adapter: str
+    role: str
+    success: bool
+    elapsed_seconds: Optional[float] = None
+    confidence: Optional[float] = None
+    effort: str = ""
+    harness: str = ""
+    observed_at: str = ""
+
+
+@dataclass(frozen=True)
+class ScoreAuthority:
+    """Resolved routing authority for one spec + role."""
+
+    effective: int
+    source: str
+    decayed: bool = False
+    receipt: Optional[LocalReceipt] = None
+    provenance: dict = field(default_factory=dict)
+    note: str = ""
+    sample_count: Optional[int] = None
+    predicted_quality: Optional[float] = None
+    predicted_latency_p50_ms: Optional[float] = None
+
+
+def spec_effort(spec: Any) -> str:
+    raw = (getattr(spec, "payload_defaults", None) or {}).get("reasoning_effort")
+    return str(raw).strip() if raw not in (None, "") else ""
+
+
+def spec_harness(spec: Any) -> str:
+    raw = (getattr(spec, "payload_defaults", None) or {}).get("harness")
+    if raw not in (None, ""):
+        return str(raw).strip()
+    return str(getattr(spec, "adapter", "") or "").strip()
+
+
+def receipt_effort(receipt: LocalReceipt) -> str:
+    return str(receipt.effort or "").strip()
+
+
+def receipt_harness(receipt: LocalReceipt) -> str:
+    if str(receipt.harness or "").strip():
+        return str(receipt.harness).strip()
+    return str(receipt.adapter or "").strip()
+
+
+def model_family(adapter_model_name: str) -> str:
+    """Conservative family key so gpt-5 and gpt-5.6-luna are siblings.
+
+    Unrecognized names stay exact, so unrelated models never decay each other.
+    """
+    text = (adapter_model_name or "").strip().lower().replace("_", "-")
+    match = re.match(r"(gpt-\d+)", text)
+    if match:
+        return match.group(1)
+    return text
+
+
+def _same_lane(spec: Any, role: str, receipt: LocalReceipt) -> bool:
     return (
-        f"; role={role} card capability {override} (manual fallback {manual})"
+        str(receipt.registry_id) == str(spec.id)
+        and str(receipt.adapter) == str(spec.adapter)
+        and str(receipt.role or "") == str(role or "")
+        and receipt_effort(receipt) == spec_effort(spec)
+        and receipt_harness(receipt) == spec_harness(spec)
     )
+
+
+def _same_sibling_lane(left: Any, right: Any, role: str) -> bool:
+    if str(left.id) == str(right.id):
+        return False
+    if str(left.adapter) != str(right.adapter):
+        return False
+    if spec_effort(left) != spec_effort(right):
+        return False
+    if spec_harness(left) != spec_harness(right):
+        return False
+    if model_family(left.adapter_model_name) != model_family(right.adapter_model_name):
+        return False
+    return True
+
+
+def _receipt_sort_key(receipt: LocalReceipt) -> tuple:
+    return (str(receipt.observed_at or ""),)
+
+
+def latest_receipt_for(
+    spec: Any,
+    role: str,
+    receipts: Optional[Iterable[LocalReceipt]],
+) -> Optional[LocalReceipt]:
+    """Return the newest matching observation. No averaging."""
+    matched = [
+        receipt
+        for receipt in (receipts or [])
+        if isinstance(receipt, LocalReceipt) and _same_lane(spec, role, receipt)
+    ]
+    if not matched:
+        return None
+    return max(matched, key=_receipt_sort_key)
+
+
+def receipt_is_live(receipt: Optional[LocalReceipt]) -> bool:
+    if receipt is None or not receipt.success:
+        return False
+    if receipt.elapsed_seconds is None or receipt.confidence is None:
+        return False
+    if isinstance(receipt.elapsed_seconds, bool) or isinstance(receipt.confidence, bool):
+        return False
+    try:
+        elapsed = float(receipt.elapsed_seconds)
+        confidence = float(receipt.confidence)
+    except (TypeError, ValueError):
+        return False
+    return elapsed >= 0 and 0.0 <= confidence <= 1.0
+
+
+def receipt_beats_editorial_sibling(
+    live: LocalReceipt,
+    sibling: Optional[LocalReceipt],
+) -> bool:
+    """A faster, higher-confidence live receipt beats a stale or worse sibling."""
+    if not receipt_is_live(live):
+        return False
+    if sibling is None or not receipt_is_live(sibling):
+        return True
+    return (
+        float(live.elapsed_seconds) < float(sibling.elapsed_seconds)
+        and float(live.confidence) > float(sibling.confidence)
+    )
+
+
+def local_receipts_from_records(records: Iterable[Any]) -> list[LocalReceipt]:
+    """Project audit records into one-observation receipts. No averages."""
+    out: list[LocalReceipt] = []
+    for record in records:
+        registry_id = str(getattr(record, "model_id", "") or "")
+        adapter = str(getattr(record, "adapter", "") or "")
+        role = str(getattr(record, "role", "") or "")
+        if not registry_id or not adapter:
+            continue
+        verification = str(getattr(record, "verification_result", "") or "").strip().lower()
+        failed = verification in {"failed", "timeout", "error", "fail"}
+        gate_passed = getattr(record, "gate_passed", None)
+        success = (not failed) and gate_passed is not False
+        elapsed = getattr(record, "elapsed_seconds", None)
+        confidence = getattr(record, "confidence", None)
+        if isinstance(elapsed, bool) or isinstance(confidence, bool):
+            continue
+        out.append(
+            LocalReceipt(
+                registry_id=registry_id,
+                adapter=adapter,
+                role=role,
+                success=bool(success),
+                elapsed_seconds=float(elapsed) if elapsed is not None else None,
+                confidence=float(confidence) if confidence is not None else None,
+                effort=str(getattr(record, "effort", "") or ""),
+                harness=str(getattr(record, "harness", "") or adapter),
+                observed_at=str(getattr(record, "evaluated_at", "") or ""),
+            )
+        )
+    return out
+
+
+def resolve_score_authority(
+    spec: Any,
+    role: str,
+    *,
+    receipts: Optional[Iterable[LocalReceipt]] = None,
+    candidates: Optional[Iterable[Any]] = None,
+) -> ScoreAuthority:
+    """Resolve card vs local receipt vs editorial fallback for one spec."""
+    materialized = [item for item in (receipts or []) if isinstance(item, LocalReceipt)]
+    pool = list(candidates or [])
+    override = card_capability(spec, role)
+    manual = int(spec.capability_score)
+    card = (getattr(spec, "role_scorecards", None) or {}).get(role or "")
+    if not isinstance(card, dict):
+        card = {}
+    provenance = dict(getattr(spec, "score_provenance", None) or {})
+    card_provenance = card.get("provenance") if override is not None else None
+    if isinstance(card_provenance, dict):
+        provenance.update(card_provenance)
+    sample = card.get("sample_count") if override is not None else None
+    if isinstance(sample, bool) or not isinstance(sample, int):
+        sample = provenance.get("sample_count")
+        if isinstance(sample, bool) or not isinstance(sample, int):
+            sample = None
+    quality = card.get("quality") if override is not None else None
+    if isinstance(quality, bool) or not isinstance(quality, (int, float)):
+        quality = None
+    elif quality is not None:
+        quality = float(quality)
+    latency = card.get("latency_p50_ms") if override is not None else None
+    if isinstance(latency, bool) or not isinstance(latency, (int, float)):
+        latency = None
+    elif latency is not None:
+        latency = float(latency)
+    if override is not None:
+        note = ""
+        if override != manual:
+            note = (
+                f"; role={role} card capability {override} "
+                f"(manual fallback {manual})"
+            )
+        return ScoreAuthority(
+            effective=override,
+            source=SCORE_SOURCE_ROLE_CARD,
+            provenance=provenance,
+            note=note,
+            sample_count=sample,
+            predicted_quality=quality,
+            predicted_latency_p50_ms=latency,
+        )
+
+    own = latest_receipt_for(spec, role, materialized)
+    sibling_live: Optional[tuple[Any, LocalReceipt]] = None
+    for other in pool:
+        if not _same_sibling_lane(spec, other, role):
+            continue
+        other_receipt = latest_receipt_for(other, role, materialized)
+        if not receipt_is_live(other_receipt):
+            continue
+        if sibling_live is None or receipt_quality_tuple_from_receipt(
+            other_receipt
+        ) > receipt_quality_tuple_from_receipt(sibling_live[1]):
+            sibling_live = (other, other_receipt)
+
+    sibling_beats_own = (
+        sibling_live is not None
+        and receipt_beats_editorial_sibling(sibling_live[1], own)
+    )
+
+    if receipt_is_live(own) and not sibling_beats_own:
+        # Own live receipt is the observation for this identity. It overlays
+        # the editorial prior without inventing a new 0-100 number.
+        note = (
+            f"; role={role} local receipt {own.elapsed_seconds:g}s "
+            f"confidence {own.confidence:g} (manual fallback {manual})"
+        )
+        return ScoreAuthority(
+            effective=manual,
+            source=SCORE_SOURCE_LOCAL_RECEIPT,
+            receipt=own,
+            provenance={
+                "source": _PROVENANCE_SOURCE_LOCAL_RECEIPT,
+                "version": "1",
+                "elapsed_seconds": own.elapsed_seconds,
+                "confidence": own.confidence,
+                "success": True,
+                "sample_count": 1,
+                "effort": receipt_effort(own),
+                "harness": receipt_harness(own),
+            },
+            note=note,
+            sample_count=1,
+            predicted_quality=float(own.confidence),
+            predicted_latency_p50_ms=float(own.elapsed_seconds) * 1000.0,
+        )
+
+    if sibling_live is not None:
+        sibling_spec, sibling_receipt = sibling_live
+        sibling_effective = int(sibling_spec.capability_score)
+        decayed = min(manual, max(0, sibling_effective - 1))
+        note = (
+            f"; editorial capability_score {manual} decayed to {decayed}; "
+            f"sibling {sibling_spec.id} has a successful local receipt "
+            f"{sibling_receipt.elapsed_seconds:g}s confidence "
+            f"{sibling_receipt.confidence:g}"
+        )
+        return ScoreAuthority(
+            effective=decayed,
+            source=SCORE_SOURCE_MANUAL,
+            decayed=True,
+            receipt=sibling_receipt,
+            provenance={
+                "source": SCORE_SOURCE_MANUAL,
+                "decayed": True,
+                "decayed_from": manual,
+                "decayed_to": decayed,
+                "sibling_id": sibling_spec.id,
+                "sibling_receipt": {
+                    "source": _PROVENANCE_SOURCE_LOCAL_RECEIPT,
+                    "elapsed_seconds": sibling_receipt.elapsed_seconds,
+                    "confidence": sibling_receipt.confidence,
+                    "success": True,
+                    "sample_count": 1,
+                },
+            },
+            note=note if decayed != manual else (
+                f"; editorial capability_score {manual} stale; sibling "
+                f"{sibling_spec.id} has a successful local receipt"
+            ),
+        )
+
+    return ScoreAuthority(
+        effective=manual,
+        source=SCORE_SOURCE_MANUAL,
+        provenance=provenance,
+    )
+
+
+def source_rank(authority: ScoreAuthority) -> int:
+    """Higher rank outruns a stale editorial prior. Qualified cards stay first."""
+    if authority.source == SCORE_SOURCE_ROLE_CARD:
+        return 2
+    if authority.source == SCORE_SOURCE_LOCAL_RECEIPT:
+        return 1
+    if authority.decayed:
+        return -1
+    return 0
+
+
+def is_capability_sufficient(authority: ScoreAuthority, need: int) -> bool:
+    """A live local receipt already did this role here; it meets the need."""
+    if authority.source == SCORE_SOURCE_LOCAL_RECEIPT and receipt_is_live(authority.receipt):
+        return True
+    return authority.effective >= need
+
+
+def receipt_quality_tuple_from_receipt(receipt: Optional[LocalReceipt]) -> tuple:
+    """Higher is better. One observation; never an average."""
+    if not receipt_is_live(receipt):
+        return (0.0, 0.0)
+    return (-float(receipt.elapsed_seconds), float(receipt.confidence))
+
+
+def receipt_quality_tuple(authority: ScoreAuthority) -> tuple:
+    """Higher is better. One observation; never an average."""
+    if authority.source != SCORE_SOURCE_LOCAL_RECEIPT:
+        return (0.0, 0.0)
+    return receipt_quality_tuple_from_receipt(authority.receipt)
 
 
 def load_community_baseline(path: Path) -> dict:

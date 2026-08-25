@@ -54,9 +54,17 @@ you pass `--replace-cards`. `puppetmaster audit` can recommend a role-
 card change from latency / verification / retry receipts; `--apply`
 still only writes the global scalar.
 
-`puppetmaster route --json` and ROUTING artifacts expose `score_source`,
-`effective_capability_score`, `score_provenance`, and `sample_count`
-when present. Empty cards keep today's picks.
+`puppetmaster route --json` and ROUTING artifacts expose `score_source`
+(`role_card`, `manual`, or `local_receipt`), `effective_capability_score`,
+`score_provenance`, and `sample_count` when present. Empty cards keep
+today's picks.
+
+From v1.22.32, a successful host-local latency / confidence receipt for
+the same registry id + adapter + role can overlay a stale editorial
+`capability_score`. Editorial scores decay when a newer sibling is
+already succeeding here. Receipts never transfer across adapter, effort,
+harness, or role. One receipt is one observation; nothing is averaged.
+Missing SWE-bench rows stay unknown.
 
 ### SWE-bench Bash Only Python connector
 
