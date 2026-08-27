@@ -302,6 +302,16 @@ def index_effort_artifacts(
                 artifacts = store.list_artifacts(job.id)
             except Exception:
                 artifacts = []
+            from puppetmaster.metr_seams import is_coordination_protocol_payload
+
+            # Effort-index is not a message board: drop recruit/HOLD/VETO/mailbox
+            # protocol rows. Worker-asserted findings remain for operator recall
+            # but do not inject across jobs (see gist_admission for_job_id).
+            artifacts = [
+                artifact
+                for artifact in artifacts
+                if not is_coordination_protocol_payload(artifact)
+            ]
             for artifact in artifacts:
                 typ = str(getattr(artifact, "type", "")).lower()
                 if typ in _TRANSCRIPT_TYPES:

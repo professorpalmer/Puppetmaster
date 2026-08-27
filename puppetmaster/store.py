@@ -345,33 +345,308 @@ class SwarmStore:
             if owner is not None:
                 self.release_lock(f"launch:{launch_key}", owner)
 
-    def update_job_status(self, job_id: str, status: JobStatus) -> Job:
+    def save_job(self, job: Job) -> None:
+        """Persist a job record. Additive fields round-trip through JSON."""
+        self.write_json(self.job_dir(job.id) / "job.json", job)
+
+    def update_job_status(
+        self,
+        job_id: str,
+        status: JobStatus,
+        *,
+        actor: Optional[str] = None,
+    ) -> Job:
         job = self.get_job(job_id)
+        refused = self._refuse_worker_job_completion(job, status, actor)
+        if refused is not None:
+            return refused
         updated = self._job_with_status(job, status)
-        self.write_json(self.job_dir(job_id) / "job.json", updated)
-        self.emit(job_id, "job.status", {"status": str(status)})
+        self.save_job(updated)
+        self.emit(job_id, "job.status", {"status": str(status), "actor": actor or "coordinator"})
         return updated
+
+    def _refuse_worker_job_completion(
+        self,
+        job: Job,
+        status: JobStatus,
+        actor: Optional[str],
+    ) -> Optional[Job]:
+        from puppetmaster.metr_seams import (
+            REASON_WORKER_JOB_COMPLETE,
+            is_worker_actor,
+        )
+
+        if not is_worker_actor(actor) if actor is not None else False:
+            return None
+        if actor is None:
+            return None
+        if status not in {
+            JobStatus.COMPLETE,
+            JobStatus.FAILED,
+            JobStatus.CANCELLED,
+            JobStatus.STITCHING,
+        }:
+            return None
+        self.emit(
+            job.id,
+            "job.complete_refused",
+            {
+                "reason": REASON_WORKER_JOB_COMPLETE,
+                "status": str(status),
+                "actor": actor,
+            },
+        )
+        return job
 
     @staticmethod
     def _job_with_status(job: Job, status: JobStatus) -> Job:
-        return Job(
-            id=job.id,
-            goal=job.goal,
-            label=job.label,
+        terminal = status in {
+            JobStatus.COMPLETE,
+            JobStatus.FAILED,
+            JobStatus.STALLED,
+            JobStatus.CANCELLED,
+        }
+        return replace(
+            job,
             status=status,
-            created_at=job.created_at,
-            completed_at=now_iso()
-            if status
-            in {
-                JobStatus.COMPLETE,
-                JobStatus.FAILED,
-                JobStatus.STALLED,
-                JobStatus.CANCELLED,
-            }
-            else job.completed_at,
-            launch_key=job.launch_key,
-            launch_fingerprint=job.launch_fingerprint,
+            completed_at=now_iso() if terminal else job.completed_at,
         )
+
+    def bind_job_contract(
+        self,
+        job_id: str,
+        *,
+        acceptance_criteria: Optional[list[str]] = None,
+        granted_authority: Optional[Any] = None,
+        wait_reason: Optional[str] = None,
+    ) -> Job:
+        """Persist original goal/criteria/authority (additive; coordinator)."""
+        from puppetmaster.metr_seams import normalize_wait_reason
+
+        job = self.get_job(job_id)
+        updates: dict[str, Any] = {}
+        if acceptance_criteria is not None:
+            updates["acceptance_criteria"] = [
+                str(item) for item in acceptance_criteria if str(item).strip()
+            ]
+        if granted_authority is not None:
+            updates["granted_authority"] = granted_authority
+        if wait_reason is not None:
+            updates["wait_reason"] = normalize_wait_reason(wait_reason)
+        if not updates:
+            return job
+        updated = replace(job, **updates)
+        self.save_job(updated)
+        self.emit(job_id, "job.contract", {key: updates[key] for key in updates})
+        return updated
+
+    def set_job_wait_reason(
+        self,
+        job_id: str,
+        wait_reason: Optional[str],
+        *,
+        actor: Optional[str] = None,
+    ) -> Job:
+        from puppetmaster.metr_seams import (
+            REASON_WORKER_PROTOCOL,
+            is_worker_actor,
+            normalize_wait_reason,
+        )
+
+        job = self.get_job(job_id)
+        if is_worker_actor(actor):
+            self.emit(
+                job_id,
+                "task.enqueue_refused",
+                {
+                    "reason": REASON_WORKER_PROTOCOL,
+                    "protocol": "wait_reason",
+                    "actor": actor,
+                },
+            )
+            return job
+        updated = replace(job, wait_reason=normalize_wait_reason(wait_reason))
+        self.save_job(updated)
+        self.emit(
+            job_id,
+            "job.wait_reason",
+            {"wait_reason": updated.wait_reason, "actor": actor or "coordinator"},
+        )
+        return updated
+
+    def hold_subgraph(
+        self,
+        job_id: str,
+        *,
+        actor: Optional[str] = None,
+        wait_reason: str = "waiting_user",
+        note: Optional[str] = None,
+    ) -> Optional[Job]:
+        from puppetmaster.metr_seams import (
+            HOLD_STATE,
+            REASON_WORKER_PROTOCOL,
+            WAIT_USER,
+            is_worker_actor,
+            normalize_wait_reason,
+        )
+
+        job = self.get_job(job_id)
+        if is_worker_actor(actor):
+            self.emit(
+                job_id,
+                "task.enqueue_refused",
+                {
+                    "reason": REASON_WORKER_PROTOCOL,
+                    "protocol": "HOLD",
+                    "actor": actor,
+                },
+            )
+            return None
+        updated = replace(
+            job,
+            subgraph_hold=HOLD_STATE,
+            wait_reason=normalize_wait_reason(wait_reason) or WAIT_USER,
+        )
+        self.save_job(updated)
+        self.emit(
+            job_id,
+            "subgraph.hold",
+            {
+                "actor": actor or "coordinator",
+                "wait_reason": updated.wait_reason,
+                "note": note,
+            },
+        )
+        return updated
+
+    def veto_subgraph(
+        self,
+        job_id: str,
+        *,
+        actor: Optional[str] = None,
+        note: Optional[str] = None,
+    ) -> Optional[Job]:
+        from puppetmaster.metr_seams import (
+            REASON_WORKER_PROTOCOL,
+            VETO_STATE,
+            is_worker_actor,
+        )
+
+        job = self.get_job(job_id)
+        if is_worker_actor(actor):
+            self.emit(
+                job_id,
+                "task.enqueue_refused",
+                {
+                    "reason": REASON_WORKER_PROTOCOL,
+                    "protocol": "VETO",
+                    "actor": actor,
+                },
+            )
+            return None
+        updated = replace(job, subgraph_hold=VETO_STATE)
+        self.save_job(updated)
+        self.emit(
+            job_id,
+            "subgraph.veto",
+            {"actor": actor or "coordinator", "note": note},
+        )
+        return updated
+
+    def resume_subgraph(
+        self,
+        job_id: str,
+        *,
+        actor: Optional[str] = None,
+    ) -> Optional[Job]:
+        from puppetmaster.metr_seams import (
+            REASON_WORKER_PROTOCOL,
+            is_worker_actor,
+        )
+
+        job = self.get_job(job_id)
+        if is_worker_actor(actor):
+            self.emit(
+                job_id,
+                "task.enqueue_refused",
+                {
+                    "reason": REASON_WORKER_PROTOCOL,
+                    "protocol": "resume",
+                    "actor": actor,
+                },
+            )
+            return None
+        updated = replace(job, subgraph_hold=None, wait_reason=None)
+        self.save_job(updated)
+        self.emit(job_id, "subgraph.resume", {"actor": actor or "coordinator"})
+        return updated
+
+
+    def set_task_wait_reason(
+        self,
+        task: Task,
+        wait_reason: Optional[str],
+        *,
+        actor: Optional[str] = None,
+    ) -> Task:
+        """Stamp payload.wait_reason (waiting_external vs waiting_user)."""
+        from puppetmaster.metr_seams import normalize_wait_reason
+
+        payload = dict(task.payload or {})
+        normalized = normalize_wait_reason(wait_reason)
+        if normalized is None:
+            payload.pop("wait_reason", None)
+        else:
+            payload["wait_reason"] = normalized
+        updated = replace(task, payload=payload, updated_at=now_iso())
+        self.save_task(updated)
+        self.emit(
+            task.job_id,
+            "task.wait_reason",
+            {
+                "task_id": task.id,
+                "wait_reason": normalized,
+                "actor": actor or "coordinator",
+            },
+        )
+        return updated
+
+    def claim_subgraph_writer(
+        self,
+        job_id: str,
+        writer_id: str,
+        *,
+        actor: Optional[str] = None,
+    ) -> Optional[str]:
+        """First writer wins. A second writer is refused. Reuses job record."""
+        from puppetmaster.metr_seams import REASON_SUBGRAPH_WRITER
+
+        job = self.get_job(job_id)
+        owner = job.subgraph_owner
+        writer = str(writer_id or "").strip()
+        if not writer:
+            return None
+        if owner and owner != writer:
+            self.emit(
+                job_id,
+                "subgraph.writer_refused",
+                {
+                    "reason": REASON_SUBGRAPH_WRITER,
+                    "owner": owner,
+                    "writer_id": writer,
+                    "actor": actor,
+                },
+            )
+            return None
+        if owner == writer:
+            return owner
+        self.save_job(replace(job, subgraph_owner=writer))
+        self.emit(
+            job_id,
+            "subgraph.owner",
+            {"owner": writer, "actor": actor or "coordinator"},
+        )
+        return writer
 
     @staticmethod
     def _task_saved_payload(task: Task) -> dict[str, Any]:
@@ -416,6 +691,21 @@ class SwarmStore:
             current = task_map.get(parent_id)
         return depth
 
+    def _emit_enqueue_refused(
+        self,
+        job_id: str,
+        reason: str,
+        *,
+        parent_task_id: Optional[str] = None,
+        extra: Optional[dict[str, Any]] = None,
+    ) -> None:
+        payload: dict[str, Any] = {"reason": reason}
+        if parent_task_id:
+            payload["parent_task_id"] = parent_task_id
+        if extra:
+            payload.update(extra)
+        self.emit(job_id, "task.enqueue_refused", payload)
+
     def enqueue_subtask(
         self,
         job_id: str,
@@ -429,13 +719,27 @@ class SwarmStore:
         max_children_per_parent: Optional[int] = None,
         max_job_tasks: Optional[int] = None,
         created_by: Optional[str] = None,
+        actor: Optional[str] = None,
     ) -> Optional[Task]:
         """Durably enqueue a follow-up task linked to ``parent_task_id``.
 
         Lease-safe adaptive expansion (DeLM-inspired): workers/orchestrator may
         propose bounded follow-ups without removing the coordinator. Returns
         None when depth/count/idempotency gates refuse the enqueue.
+        Graph is the only dispatcher: worker proposals stay same-job children
+        of the producing parent. Recruit/HOLD/VETO/mailbox from workers are
+        refused.
         """
+        from puppetmaster.metr_seams import (
+            HOLD_STATE,
+            REASON_SUBGRAPH_HOLD,
+            REASON_SUBGRAPH_VETO,
+            REASON_WORKER_PROTOCOL,
+            VETO_STATE,
+            is_coordination_protocol_payload,
+            is_worker_actor,
+        )
+
         parent = self.get_task_by_id(parent_task_id)
         if parent.job_id != job_id:
             raise ValueError(
@@ -445,6 +749,46 @@ class SwarmStore:
         instruction_text = str(instruction or "").strip()
         if not role_text or not instruction_text:
             raise ValueError("enqueue_subtask requires non-empty role and instruction")
+
+        origin = actor
+        if origin is None and created_by and is_worker_actor(created_by):
+            origin = created_by
+        proposal = {
+            "role": role_text,
+            "instruction": instruction_text,
+            **(payload or {}),
+        }
+        if is_coordination_protocol_payload(proposal) or is_coordination_protocol_payload(
+            {"role": role_text, "instruction": instruction_text}
+        ):
+            # Coordinator/host HOLD/VETO live as first-class store methods, not
+            # worker-declared tasks.
+            if origin is None or is_worker_actor(origin):
+                self._emit_enqueue_refused(
+                    job_id,
+                    REASON_WORKER_PROTOCOL,
+                    parent_task_id=parent_task_id,
+                    extra={"role": role_text, "actor": origin or "worker"},
+                )
+                return None
+        try:
+            job = self.get_job(job_id)
+        except Exception:
+            job = None
+        if job is not None and job.subgraph_hold == HOLD_STATE:
+            self._emit_enqueue_refused(
+                job_id,
+                REASON_SUBGRAPH_HOLD,
+                parent_task_id=parent_task_id,
+            )
+            return None
+        if job is not None and job.subgraph_hold == VETO_STATE:
+            self._emit_enqueue_refused(
+                job_id,
+                REASON_SUBGRAPH_VETO,
+                parent_task_id=parent_task_id,
+            )
+            return None
 
         depth_limit = (
             self.max_enqueue_depth if max_depth is None else max(0, int(max_depth))
@@ -568,16 +912,108 @@ class SwarmStore:
 
         Each entry is ``{"role": "...", "instruction": "..."}`` (optional
         ``adapter``). Best-effort: refusals/dedupes are skipped; never raises
-        into the worker hot path.
+        into the worker hot path. Worker protocol (recruit/HOLD/VETO/mailbox),
+        foreign job_id, a new job, a parent that is not the producing task,
+        and merge/ship after a failed GATE are refused.
         """
-        parent_id = parent_task_id or artifact.task_id
+        from puppetmaster.metr_seams import (
+            REASON_CROSS_JOB,
+            REASON_GATE_FAILED,
+            REASON_NEW_JOB,
+            REASON_PARENT_MISMATCH,
+            REASON_WORKER_PROTOCOL,
+            artifact_is_failed_gate,
+            gate_failed_for_task,
+            is_coordination_protocol_payload,
+            is_ship_or_merge_proposal,
+            proposal_foreign_job_id,
+            proposal_foreign_parent_id,
+            proposal_requests_new_job,
+        )
+
+        producing_id = artifact.task_id
+        parent_id = parent_task_id or producing_id
         payload = artifact.payload or {}
+        if parent_id != producing_id:
+            self._emit_enqueue_refused(
+                artifact.job_id,
+                REASON_PARENT_MISMATCH,
+                parent_task_id=producing_id,
+                extra={"requested_parent_task_id": parent_id},
+            )
+            return []
+        if is_coordination_protocol_payload(payload) or is_coordination_protocol_payload(
+            artifact
+        ):
+            # Protocol on the artifact itself (not just enqueue_subtasks).
+            if not payload.get("enqueue_subtasks"):
+                self._emit_enqueue_refused(
+                    artifact.job_id,
+                    REASON_WORKER_PROTOCOL,
+                    parent_task_id=parent_id,
+                    extra={"artifact_id": artifact.id},
+                )
+                return []
         proposals = payload.get("enqueue_subtasks")
         if not isinstance(proposals, list) or not proposals:
+            if is_coordination_protocol_payload(payload):
+                self._emit_enqueue_refused(
+                    artifact.job_id,
+                    REASON_WORKER_PROTOCOL,
+                    parent_task_id=parent_id,
+                    extra={"artifact_id": artifact.id},
+                )
             return []
+        gate_failed = artifact_is_failed_gate(artifact) or gate_failed_for_task(
+            self, artifact.job_id, producing_id
+        )
         created: list[Task] = []
         for proposal in proposals[: max(0, int(limit))]:
             if not isinstance(proposal, dict):
+                continue
+            if proposal_requests_new_job(proposal):
+                self._emit_enqueue_refused(
+                    artifact.job_id,
+                    REASON_NEW_JOB,
+                    parent_task_id=parent_id,
+                    extra={"artifact_id": artifact.id},
+                )
+                continue
+            foreign_job = proposal_foreign_job_id(proposal, artifact.job_id)
+            if foreign_job:
+                self._emit_enqueue_refused(
+                    artifact.job_id,
+                    REASON_CROSS_JOB,
+                    parent_task_id=parent_id,
+                    extra={"requested_job_id": foreign_job},
+                )
+                continue
+            foreign_parent = proposal_foreign_parent_id(proposal, producing_id)
+            if foreign_parent:
+                self._emit_enqueue_refused(
+                    artifact.job_id,
+                    REASON_PARENT_MISMATCH,
+                    parent_task_id=producing_id,
+                    extra={"requested_parent_task_id": foreign_parent},
+                )
+                continue
+            if is_coordination_protocol_payload(proposal):
+                self._emit_enqueue_refused(
+                    artifact.job_id,
+                    REASON_WORKER_PROTOCOL,
+                    parent_task_id=parent_id,
+                    extra={"artifact_id": artifact.id},
+                )
+                continue
+            if gate_failed and (
+                artifact_is_failed_gate(artifact) or is_ship_or_merge_proposal(proposal)
+            ):
+                self._emit_enqueue_refused(
+                    artifact.job_id,
+                    REASON_GATE_FAILED,
+                    parent_task_id=parent_id,
+                    extra={"role": proposal.get("role")},
+                )
                 continue
             role = str(proposal.get("role") or "").strip()
             instruction = str(
@@ -593,6 +1029,7 @@ class SwarmStore:
                     instruction=instruction,
                     adapter=proposal.get("adapter"),
                     created_by=created_by or artifact.created_by,
+                    actor="worker",
                 )
             except Exception:
                 continue
@@ -710,7 +1147,7 @@ class SwarmStore:
         task_map: Optional[dict[str, Task]] = None,
     ) -> Optional[Task]:
         task = self.get_task_by_id(task_id)
-        if self._claim_precheck(task, task_map=task_map):
+        if self._claim_precheck(task, task_map=task_map, worker_id=worker_id):
             return None
         claimed = self._build_claimed_task(task, worker_id, lease_seconds)
         if not self._atomic_claim(task_id, task, claimed, worker_id=worker_id):
@@ -727,8 +1164,18 @@ class SwarmStore:
         task: Task,
         *,
         task_map: Optional[dict[str, Task]] = None,
+        worker_id: Optional[str] = None,
     ) -> bool:
         """Shared claim decision logic. Returns True when the claim attempt must abort."""
+        from puppetmaster.metr_seams import (
+            HOLD_STATE,
+            REASON_SUBGRAPH_HOLD,
+            REASON_SUBGRAPH_VETO,
+            REASON_SUBGRAPH_WRITER,
+            VETO_STATE,
+            foreign_active_writer,
+        )
+
         if not self.dependencies_complete(task, task_map=task_map):
             blocked = replace(task, status=TaskStatus.BLOCKED, updated_at=now_iso())
             self.save_task(blocked)
@@ -752,6 +1199,65 @@ class SwarmStore:
             return True
         if task.status == TaskStatus.RUNNING and not self.is_task_stale(task):
             return True
+        try:
+            job = self.get_job(task.job_id)
+        except Exception:
+            job = None
+        if job is not None and job.subgraph_hold == HOLD_STATE:
+            self.emit(
+                task.job_id,
+                "task.claim_refused",
+                {
+                    "reason": REASON_SUBGRAPH_HOLD,
+                    "task_id": task.id,
+                    "worker_id": worker_id,
+                },
+            )
+            return True
+        if job is not None and job.subgraph_hold == VETO_STATE:
+            self.emit(
+                task.job_id,
+                "task.claim_refused",
+                {
+                    "reason": REASON_SUBGRAPH_VETO,
+                    "task_id": task.id,
+                    "worker_id": worker_id,
+                },
+            )
+            return True
+        if (
+            job is not None
+            and job.subgraph_owner
+            and worker_id
+            and job.subgraph_owner != worker_id
+        ):
+            self.emit(
+                task.job_id,
+                "task.claim_refused",
+                {
+                    "reason": REASON_SUBGRAPH_WRITER,
+                    "task_id": task.id,
+                    "owner": job.subgraph_owner,
+                    "worker_id": worker_id,
+                },
+            )
+            return True
+        if worker_id:
+            foreign = foreign_active_writer(
+                self, task, worker_id, task_map=task_map
+            )
+            if foreign:
+                self.emit(
+                    task.job_id,
+                    "task.claim_refused",
+                    {
+                        "reason": REASON_SUBGRAPH_WRITER,
+                        "task_id": task.id,
+                        "owner": foreign,
+                        "worker_id": worker_id,
+                    },
+                )
+                return True
         return False
 
     @staticmethod
@@ -1442,7 +1948,9 @@ class SwarmStore:
         # Admission filter at the edge-resolution boundary so pending/rejected
         # gists never enter peer prompts. Raw list_artifacts remains unfiltered
         # for tooling/MCP.
-        artifacts = filter_shared_context_artifacts(artifacts)
+        artifacts = filter_shared_context_artifacts(
+            artifacts, for_job_id=task.job_id
+        )
         if record_consumes and artifacts:
             self.record_consumes(
                 task.job_id,

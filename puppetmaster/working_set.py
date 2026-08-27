@@ -96,7 +96,13 @@ def write_artifact_index(
 
         root = Path(job_dir)
         root.mkdir(parents=True, exist_ok=True)
-        filtered = filter_shared_context_artifacts(list(artifacts or []))
+        items = list(artifacts or [])
+        job_id = None
+        for item in items:
+            job_id = getattr(item, "job_id", None)
+            if job_id:
+                break
+        filtered = filter_shared_context_artifacts(items, for_job_id=job_id)
         refs = []
         for artifact in filtered:
             try:

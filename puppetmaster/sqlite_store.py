@@ -457,10 +457,27 @@ class SQLiteSwarmStore(SwarmStore):
         self.emit(job.id, "job.created", payload)
         return job, True
 
-    def update_job_status(self, job_id: str, status: JobStatus) -> Job:
+    def save_job(self, job: Job) -> None:
+        self.init()
+        with self._session() as connection:
+            connection.execute(
+                "UPDATE jobs SET data = ? WHERE id = ?",
+                (self._dumps(job), job.id),
+            )
+
+    def update_job_status(
+        self,
+        job_id: str,
+        status: JobStatus,
+        *,
+        actor: Optional[str] = None,
+    ) -> Job:
         job = self.get_job(job_id)
+        refused = self._refuse_worker_job_completion(job, status, actor)
+        if refused is not None:
+            return refused
         updated = self._job_with_status(job, status)
-        payload = {"status": str(status)}
+        payload = {"status": str(status), "actor": actor or "coordinator"}
         with self._session() as connection:
             connection.execute(
                 "UPDATE jobs SET data = ? WHERE id = ?",
@@ -759,7 +776,7 @@ class SQLiteSwarmStore(SwarmStore):
         task_map: Optional[dict[str, Task]] = None,
     ) -> Optional[Task]:
         task = self.get_task_by_id(task_id)
-        if self._claim_precheck(task, task_map=task_map):
+        if self._claim_precheck(task, task_map=task_map, worker_id=worker_id):
             return None
         claimed = self._build_claimed_task(task, worker_id, lease_seconds)
         if not self._atomic_claim(task_id, task, claimed, worker_id=worker_id):

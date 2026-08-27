@@ -248,13 +248,26 @@ def infer_claim_support_status(artifact: Any) -> str:
         else getattr(artifact, "claim_support_status", None)
     )
     if existing:
-        return normalize_claim_support_status(existing, from_worker_payload=False)
-    payload = _payload_of(artifact)
-    if payload.get("claim_support_status"):
-        return normalize_claim_support_status(
-            payload.get("claim_support_status"), from_worker_payload=True
-        )
-    return CLAIM_SUPPORT_UNKNOWN
+        status = normalize_claim_support_status(existing, from_worker_payload=False)
+    else:
+        payload = _payload_of(artifact)
+        if payload.get("claim_support_status"):
+            status = normalize_claim_support_status(
+                payload.get("claim_support_status"), from_worker_payload=True
+            )
+        else:
+            status = CLAIM_SUPPORT_UNKNOWN
+    # Worker "shipped"/"merged"/"released" is never host truth here. Host
+    # observations (git SHA / CI / PyPI / gate) live on the receipt overlay.
+    try:
+        from puppetmaster.metr_seams import is_worker_delivery_claim
+    except Exception:
+        return status
+    if is_worker_delivery_claim(artifact) and status == CLAIM_SUPPORT_INDEPENDENT:
+        return CLAIM_SUPPORT_WORKER_ASSERTED
+    if is_worker_delivery_claim(artifact) and status == CLAIM_SUPPORT_UNKNOWN:
+        return CLAIM_SUPPORT_WORKER_ASSERTED
+    return status
 
 
 def hydrate_artifact_fields(artifact: Any) -> None:

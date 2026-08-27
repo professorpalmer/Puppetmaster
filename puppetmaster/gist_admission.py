@@ -118,27 +118,67 @@ def _raw_type_name(artifact: Any) -> str:
     return str(getattr(raw, "value", raw)).strip().lower()
 
 
-def is_admitted_for_shared_context(artifact: Any) -> bool:
+def is_admitted_for_shared_context(
+    artifact: Any,
+    *,
+    for_job_id: Optional[str] = None,
+) -> bool:
     """Return True when ``artifact`` may be injected into peer shared context.
 
     Admitted gists pass. Pending/rejected gists are excluded. Legacy
     FINDING/DECISION/PATCH/RISK/VERIFICATION artifacts pass when structurally
     valid (backward compatible). Other non-gist types keep prior injection
     behavior (ROUTING/GATE/plan-shaped dicts, etc.).
+
+    Coordination-protocol gists never inject. Cross-job inject only
+    independently_supported host-admitted findings (worker_asserted must not
+    leak across jobs).
     """
+    from puppetmaster.metr_seams import (
+        independently_supported_artifact,
+        is_coordination_protocol_payload,
+        is_cross_job_injectable,
+    )
+
+    if is_coordination_protocol_payload(artifact):
+        return False
+    if not is_cross_job_injectable(artifact, for_job_id=for_job_id):
+        return False
     kind = _artifact_type(artifact)
     if kind == ArtifactType.GIST or _raw_type_name(artifact) == "gist":
         if _gist_admission(artifact) != GIST_ADMISSION_ADMITTED:
             return False
+        if for_job_id:
+            artifact_job = getattr(artifact, "job_id", None)
+            if isinstance(artifact, dict):
+                artifact_job = artifact.get("job_id") or artifact_job
+            if artifact_job and str(artifact_job) != str(for_job_id):
+                if not independently_supported_artifact(artifact):
+                    return False
         return _structurally_valid_artifact(artifact)
     if kind in _LEGACY_SHARED_CONTEXT_TYPES:
+        if for_job_id:
+            artifact_job = getattr(artifact, "job_id", None)
+            if isinstance(artifact, dict):
+                artifact_job = artifact.get("job_id") or artifact_job
+            if artifact_job and str(artifact_job) != str(for_job_id):
+                if not independently_supported_artifact(artifact):
+                    return False
         return _structurally_valid_artifact(artifact)
     return True
 
 
-def filter_shared_context_artifacts(artifacts: Iterable[Any]) -> List[Any]:
+def filter_shared_context_artifacts(
+    artifacts: Iterable[Any],
+    *,
+    for_job_id: Optional[str] = None,
+) -> List[Any]:
     """Keep only artifacts safe for peer prompt injection."""
-    return [artifact for artifact in artifacts if is_admitted_for_shared_context(artifact)]
+    return [
+        artifact
+        for artifact in artifacts
+        if is_admitted_for_shared_context(artifact, for_job_id=for_job_id)
+    ]
 
 
 def admit_gist(
@@ -150,6 +190,10 @@ def admit_gist(
     """Mark a gist admitted (when verifier accepts) and emit ``gist.admitted``."""
     if _artifact_type(artifact) != ArtifactType.GIST:
         raise ValueError("admit_gist requires an ArtifactType.GIST artifact")
+    from puppetmaster.metr_seams import is_coordination_protocol_payload
+
+    if is_coordination_protocol_payload(artifact):
+        return reject_gist(store, artifact, verifier_result=verifier_result)
     if not _verifier_accepted(verifier_result):
         return reject_gist(store, artifact, verifier_result=verifier_result)
     payload = dict(artifact.payload or {})
@@ -249,6 +293,10 @@ def maybe_admit_finding_as_gist(
     if _artifact_type(finding) != ArtifactType.FINDING:
         return None
     _ = min_confidence  # explicitly unused — self-rating cannot admit
+    from puppetmaster.metr_seams import is_coordination_protocol_payload
+
+    if is_coordination_protocol_payload(finding):
+        return None
     if not durable_admission_allowed(finding, store=store):
         return None
     try:
