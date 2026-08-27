@@ -1,3 +1,19 @@
+## v1.22.37 — 2026-08-26
+
+**METR seam closures: graph is the only dispatcher, listings are not a message board, the coordinator outlives workers, host receipts beat worker claims, one writer per subgraph.**
+
+Additive. No HF attack mechanics. Marionette JSON keys unchanged; new job fields are optional.
+
+- Graph dispatcher: worker `enqueue_subtasks` stay same-job children of the producing parent. Foreign `job_id`, a new job, or a parent that is not the producing task is `task.enqueue_refused`. Recruit / HOLD / VETO / mailbox protocol from workers is `reason=worker_protocol_refused`. Bounded role+instruction follow-ups still work.
+- No cross-job message board: coordination-protocol gists are rejected at admission and filtered from shared-context injection, Frontier-adjacent gist filters, and effort-index. Cross-job inject requires `independently_supported` (host-admitted). Workers still cannot self-upgrade that status.
+- Coordinator outlives workers: jobs persist original `goal` plus optional `acceptance_criteria` / `granted_authority`. `waiting_external` vs `waiting_user` is first-class. Failed GATE does not auto-enqueue merge/ship (`reason=gate_failed`). Completing or dying workers do not complete the job; `update_job_status(..., actor="worker")` no-ops terminal states.
+- Host receipts beat worker claims: shipped/merged/released stays `worker_asserted` until a host observation (git SHA / CI / PyPI / gate). Repeat observations are idempotent (`puppetmaster/receipt.py`, `metr_seams.record_host_observation`).
+- One writer per subgraph: coordinator HOLD / VETO / `subgraph_owner` first-class. A second writer is refused. Reuses leases + `reset_subgraph`; no parallel lock table.
+
+Files: `puppetmaster/metr_seams.py`, `store.py`, `sqlite_store.py`, `gist_admission.py`, `artifact_status.py`, `receipt.py`, `models.py`, `lifecycle.py`. Tests: `tests/test_metr_seams.py`.
+
+No Pi / grok-bot worker. Marionette pin unchanged.
+
 ## v1.22.36 — 2026-08-25
 
 **Headed Chrome auth handoff: one durable profile and a shared CDP port so workers attach instead of spawning a throwaway login.**

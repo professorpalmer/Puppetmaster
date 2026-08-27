@@ -61,6 +61,7 @@ def build_job_receipt(store: Any, job_id: str) -> dict[str, Any]:
         "tokens": token_usage,
         "estimate_drift": drift,
         "delivery": _delivery(store, job_id, tasks, artifacts),
+        "host_observations": _host_observations(store, job_id, artifacts),
         "efficiency": {
             "tokens_per_typed_artifact": round(total_tokens / typed_total, 3) if typed_total else None,
             "degraded_rate": round(len(degraded_tasks) / len(tasks), 3) if tasks else 0.0,
@@ -133,6 +134,48 @@ def _stdout_salvage_count(artifacts: list[Artifact]) -> int:
         if any(key in payload for key in ("stdout_excerpt", "stdout_capture", "last_message_capture")):
             count += 1
     return count
+
+
+def _host_observations(store: Any, job_id: str, artifacts: list[Artifact]) -> dict[str, Any]:
+    """Host-observed land/ship/merge vs worker claims (v1.22.37)."""
+    from puppetmaster.metr_seams import (
+        HOST_DELIVERY_KINDS,
+        delivery_claim_support_status,
+        is_worker_delivery_claim,
+        list_host_observations,
+    )
+
+    observations = list_host_observations(store, job_id)
+    worker_claims = []
+    for artifact in artifacts:
+        if not is_worker_delivery_claim(artifact):
+            continue
+        worker_claims.append(
+            {
+                "artifact_id": artifact.id,
+                "claim_support_status": delivery_claim_support_status(
+                    artifact, store
+                ),
+            }
+        )
+    return {
+        "kinds": sorted(HOST_DELIVERY_KINDS),
+        "observed": observations,
+        "worker_claims": worker_claims,
+    }
+
+
+def record_host_delivery_observation(
+    store: Any,
+    job_id: str,
+    kind: str,
+    *,
+    evidence: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    """Idempotent host observation of shipped/merged/released/landed."""
+    from puppetmaster.metr_seams import record_host_observation
+
+    return record_host_observation(store, job_id, kind, evidence=evidence)
 
 
 def _elapsed_seconds(created_at: str, completed_at: Optional[str]) -> Optional[float]:
