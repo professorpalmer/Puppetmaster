@@ -911,4 +911,39 @@ def _run_receipt_command(args, store) -> int:
         f"tokens_per_typed_artifact={efficiency['tokens_per_typed_artifact']}, "
         f"degraded_rate={efficiency['degraded_rate']}"
     )
+    attention = receipt.get("attention")
+    if attention:
+        print(f"  attention: {attention}")
+    return 0
+
+
+def _run_observe_scm_command(args, store) -> int:
+    from puppetmaster.scm_observe import observe_job_cwd
+
+    cwd = str(args.cwd or Path.cwd())
+    enqueue = not args.no_enqueue
+    result = observe_job_cwd(store, args.job_id, cwd, enqueue=enqueue)
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return 0
+    print(f"job {result['job_id']}: observe-scm")
+    pr_url = result.get("pr_url") or ""
+    if pr_url:
+        print(f"  pr: {pr_url}")
+    print(f"  attention: {result.get('attention')}")
+    errors = result.get("fetch_errors") or []
+    if errors:
+        print("  fetch_errors: " + "; ".join(str(item) for item in errors))
+    for row in result.get("observations") or []:
+        print(
+            "  observation: "
+            f"{row.get('kind')} key={row.get('key')} "
+            f"idempotent={bool(row.get('idempotent'))}"
+        )
+    for row in result.get("reactions") or []:
+        print(
+            "  reaction: "
+            f"{row.get('kind')} {row.get('outcome')} "
+            f"reason={row.get('reason')} task_id={row.get('task_id')}"
+        )
     return 0

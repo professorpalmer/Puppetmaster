@@ -788,6 +788,26 @@ def build_parser() -> argparse.ArgumentParser:
     receipt.add_argument("job_id")
     receipt.add_argument("--json", action="store_true", help="Emit JSON.")
 
+    observe_scm = subcommands.add_parser(
+        "observe-scm",
+        help=(
+            "One-shot host SCM observe: record CI/review/conflict facts for a "
+            "job and enqueue same-job follow-ups. Not a live TUI paste."
+        ),
+    )
+    observe_scm.add_argument("job_id")
+    observe_scm.add_argument(
+        "--cwd",
+        default=str(Path.cwd()),
+        help="Repo whose current-branch PR to inspect via gh.",
+    )
+    observe_scm.add_argument("--json", action="store_true", help="Emit JSON.")
+    observe_scm.add_argument(
+        "--no-enqueue",
+        action="store_true",
+        help="Record observations only; do not enqueue follow-up tasks.",
+    )
+
     finalize = subcommands.add_parser(
         "finalize",
         help=(

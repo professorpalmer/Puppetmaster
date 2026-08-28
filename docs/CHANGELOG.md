@@ -1,4 +1,19 @@
+## v1.22.38 — 2026-08-28
+
+**One-shot host SCM observe plus per-worker browser isolate profiles. Not an Agent-Orchestrator daemon.**
+
+CI / review / conflict facts are host observations. Independent reactions enqueue same-job children. `waiting_user` / HOLD / VETO suppress enqueue (retry later; suppressed ≠ delivered). Receipt `attention` is derived (`needs_you` | `working` | `ready` | `done` | `queued`) and never stored as a Kanban enum.
+
+- `puppetmaster observe-scm <job_id>` / `puppetmaster_observe_scm`: `gh pr view` → `record_host_observation` → coordinator `enqueue_subtask`. Dedup by reaction signature. Terminal jobs record facts and do not enqueue. `ci_passing` is observation-only.
+- Host observation documents keep extra keys (`reactions`) when a new observation is recorded.
+- Browser: `PM_BROWSER_ISOLATE_KEY=job_id:task_id` (agentic stamps this per worker) skips shared `PM_BROWSER_CDP_PORT` attach and uses `~/.puppetmaster/browser-profiles/<digest>`. Explicit `PM_BROWSER_USER_DATA_DIR` still wins for auth handoff.
+
+Files: `puppetmaster/scm_observe.py`, `metr_seams.py`, `receipt.py`, `browser_cdp.py`, `adapters/agentic.py`, CLI/MCP. Tests: `tests/test_scm_observe.py`, `tests/test_browser_cdp.py`.
+
+No Pi / grok-bot worker. Marionette derived-Kanban UI is a separate pin.
+
 ## v1.22.37 — 2026-08-26
+
 
 **METR seam closures: graph is the only dispatcher, listings are not a message board, the coordinator outlives workers, host receipts beat worker claims, one writer per subgraph.**
 
