@@ -130,6 +130,7 @@ SUPERVISE_TOOL_NAMES = frozenset(
         "puppetmaster_list_models",
         "puppetmaster_job_cost",
         "puppetmaster_job_receipt",
+        "puppetmaster_observe_scm",
         "puppetmaster_cursor_review",
         "puppetmaster_start_cursor_review",
         "puppetmaster_review",

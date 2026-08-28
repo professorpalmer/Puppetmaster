@@ -5,6 +5,7 @@ from typing import Any, Optional
 
 from puppetmaster.models import Artifact, ArtifactType, parse_iso
 from puppetmaster.usage import aggregate_token_usage
+from puppetmaster.scm_observe import derive_attention
 
 # Useful operator-facing outputs (not transport/meta). PATCH counts so implement
 # jobs are not scored as zero-typed when they only shipped a diff.
@@ -62,6 +63,7 @@ def build_job_receipt(store: Any, job_id: str) -> dict[str, Any]:
         "estimate_drift": drift,
         "delivery": _delivery(store, job_id, tasks, artifacts),
         "host_observations": _host_observations(store, job_id, artifacts),
+        "attention": derive_attention(store, job_id),
         "efficiency": {
             "tokens_per_typed_artifact": round(total_tokens / typed_total, 3) if typed_total else None,
             "degraded_rate": round(len(degraded_tasks) / len(tasks), 3) if tasks else 0.0,

@@ -312,6 +312,8 @@ class BrowserCdpAuthHandoffTest(unittest.TestCase):
             "PM_BROWSER_USER_DATA_DIR",
             "PM_BROWSER_CDP_PORT",
             "PM_BROWSER_ATTACH_ONLY",
+            "PM_BROWSER_ISOLATE_PROFILES",
+            "PM_BROWSER_ISOLATE_KEY",
         ):
             self._saved[key] = os.environ.pop(key, None)
         self._session = getattr(b, "_SESSION", None)
@@ -546,6 +548,70 @@ class BrowserCdpAuthHandoffTest(unittest.TestCase):
         finally:
             b.set_janitor(saved)
             b._page_ws_url = saved_page
+
+    def test_isolate_profile_is_keyed_not_cwd(self):
+        saved_home = os.environ.get("HOME")
+        with tempfile.TemporaryDirectory() as td:
+            os.environ["HOME"] = td
+            try:
+                os.environ["PM_BROWSER_ISOLATE_KEY"] = "job_a:task_1"
+                path_a, owns_a = b._profile_dir_for_launch()
+                os.environ["PM_BROWSER_ISOLATE_KEY"] = "job_a:task_2"
+                path_b, owns_b = b._profile_dir_for_launch()
+            finally:
+                if saved_home is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = saved_home
+        self.assertFalse(owns_a)
+        self.assertFalse(owns_b)
+        self.assertNotEqual(path_a, path_b)
+        self.assertIn("browser-profiles", path_a)
+        self.assertIn("browser-profiles", path_b)
+
+    def test_user_data_dir_wins_over_isolate(self):
+        with tempfile.TemporaryDirectory() as td:
+            explicit = os.path.join(td, "auth-profile")
+            os.environ["PM_BROWSER_USER_DATA_DIR"] = explicit
+            os.environ["PM_BROWSER_ISOLATE_KEY"] = "job_a:task_1"
+            path, owns = b._profile_dir_for_launch()
+        self.assertEqual(path, explicit)
+        self.assertFalse(owns)
+        self.assertFalse(b._isolating())
+
+    def test_stamp_worker_isolate_skips_when_user_data_dir_set(self):
+        with tempfile.TemporaryDirectory() as td:
+            os.environ["PM_BROWSER_USER_DATA_DIR"] = td
+            b.stamp_worker_isolate("job_a", "task_1")
+            self.assertNotIn("PM_BROWSER_ISOLATE_KEY", os.environ)
+
+    def test_stamp_worker_isolate_uses_job_and_task(self):
+        b.stamp_worker_isolate("job_a", "task_1")
+        self.assertEqual(os.environ.get("PM_BROWSER_ISOLATE_KEY"), "job_a:task_1")
+        self.assertEqual(os.environ.get("PM_BROWSER_ISOLATE_PROFILES"), "1")
+
+    def test_isolating_skips_shared_cdp_attach(self):
+        os.environ["PM_BROWSER_CDP_PORT"] = "9333"
+        os.environ["PM_BROWSER_ISOLATE_KEY"] = "job_a:task_1"
+        b._SESSION = b._Session()
+        waited = []
+
+        def fake_wait(port, seconds):
+            waited.append(port)
+            return "ws://127.0.0.1:%s/devtools" % port
+
+        saved_wait = b._wait_for_page_ws
+        saved_find = b._find_chrome
+        b._wait_for_page_ws = fake_wait
+        b._find_chrome = lambda: None
+        try:
+            err = b._SESSION.ensure()
+            self.assertIn("Chrome/Chromium not found", err)
+            self.assertEqual(waited, [])
+            self.assertIsNone(b._SESSION.ws)
+        finally:
+            b._wait_for_page_ws = saved_wait
+            b._find_chrome = saved_find
 
 
 if __name__ == "__main__":

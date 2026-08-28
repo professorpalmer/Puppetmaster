@@ -2054,6 +2054,7 @@ class AgenticAdapter(FullEditWorkerAdapter):
                         out_dir = str(_cwd)
                 except Exception:
                     out_dir = None
+                _bcdp.stamp_worker_isolate(task.job_id, task.id)
                 result = _bcdp.dispatch(name, args, out_dir=out_dir)
                 return result if result is not None else f"error: unknown browser tool {name!r}"
             return f"error: tool {name!r} is not available in this mode"

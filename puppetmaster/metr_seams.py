@@ -1,8 +1,9 @@
 """METR control seams: graph dispatcher, no cross-job board, host truth.
 
-v1.22.37 strengthens existing enqueue / gist / receipt / lease seams. Workers
-propose bounded same-job children; coordinators own HOLD/VETO, job completion,
-and host-observed land/ship/merge. Additive JSON only.
+v1.22.37–1.22.38: enqueue / gist / receipt / lease seams, plus one-shot host
+SCM observe. Workers propose bounded same-job children; coordinators own
+HOLD/VETO, job completion, and host-observed land/ship/merge/CI/review.
+Additive JSON only. Never a live TUI paste.
 """
 from __future__ import annotations
 
@@ -68,6 +69,13 @@ PROTOCOL_ROLES = frozenset(
 )
 _SHIP_ROLES = frozenset({"merge", "ship", "release", "land", "publish"})
 HOST_DELIVERY_KINDS = frozenset({"shipped", "merged", "released", "landed"})
+HOST_SCM_KINDS = frozenset(
+    {"ci_failed", "ci_passing", "changes_requested", "conflicting"}
+)
+HOST_SCM_ACTION_KINDS = frozenset(
+    {"ci_failed", "changes_requested", "conflicting"}
+)
+HOST_OBSERVATION_KINDS = HOST_DELIVERY_KINDS | HOST_SCM_KINDS
 HOST_OBSERVATIONS_FILENAME = "host_observations.json"
 
 _PROTOCOL_INSTRUCTION_RE = re.compile(
@@ -320,21 +328,38 @@ def _observations_path(store: Any, job_id: str):
     return store.job_dir(job_id) / HOST_OBSERVATIONS_FILENAME
 
 
-def list_host_observations(store: Any, job_id: str) -> list[dict[str, Any]]:
+def load_host_document(store: Any, job_id: str) -> dict[str, Any]:
+    """Return the host-observations JSON object, including extra keys.
+
+    Legacy files that stored a bare list are normalized to
+    ``{"observations": [...]}``. Missing or unreadable files are empty docs.
+    """
     path = _observations_path(store, job_id)
     try:
         if not path.is_file():
-            return []
+            return {"observations": []}
         data = store.read_json(path)
     except Exception:
-        return []
+        return {"observations": []}
+    if isinstance(data, list):
+        return {"observations": [row for row in data if isinstance(row, dict)]}
     if isinstance(data, dict):
-        rows = data.get("observations") or []
-    elif isinstance(data, list):
-        rows = data
-    else:
-        rows = []
-    return [row for row in rows if isinstance(row, dict)]
+        document = dict(data)
+        rows = document.get("observations") or []
+        document["observations"] = [row for row in rows if isinstance(row, dict)]
+        return document
+    return {"observations": []}
+
+
+def save_host_document(store: Any, job_id: str, document: dict[str, Any]) -> None:
+    payload = dict(document)
+    rows = payload.get("observations") or []
+    payload["observations"] = [row for row in rows if isinstance(row, dict)]
+    store.write_json(_observations_path(store, job_id), payload)
+
+
+def list_host_observations(store: Any, job_id: str) -> list[dict[str, Any]]:
+    return list(load_host_document(store, job_id).get("observations") or [])
 
 
 def host_observed_kind(store: Any, job_id: str, kind: str) -> bool:
@@ -358,11 +383,12 @@ def record_host_observation(
     Repeating the same kind + evidence digest does not double-apply.
     """
     normalized = str(kind or "").strip().lower()
-    if normalized not in HOST_DELIVERY_KINDS:
+    if normalized not in HOST_OBSERVATION_KINDS:
         raise ValueError(f"unsupported host observation kind: {kind!r}")
     evidence_list = [str(item) for item in (evidence or []) if str(item).strip()]
     fingerprint = _observation_fingerprint(normalized, evidence_list)
-    existing = list_host_observations(store, job_id)
+    document = load_host_document(store, job_id)
+    existing = list(document.get("observations") or [])
     for row in existing:
         if row.get("fingerprint") == fingerprint:
             return {**row, "idempotent": True}
@@ -379,8 +405,8 @@ def record_host_observation(
         "fingerprint": fingerprint,
         "claim_support_status": CLAIM_SUPPORT_INDEPENDENT,
     }
-    payload = {"observations": existing + [observation]}
-    store.write_json(_observations_path(store, job_id), payload)
+    document["observations"] = existing + [observation]
+    save_host_document(store, job_id, document)
     try:
         store.emit(
             job_id,

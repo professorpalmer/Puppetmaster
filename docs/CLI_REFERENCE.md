@@ -140,6 +140,8 @@ protocol without changing claim, publish, leaderboard, or verification logic.
 python -m puppetmaster route "instruction" --role <role>     # dry-run, returns picked model + cost
 python -m puppetmaster cost <job_id>                          # sum spend across all routing artifacts
 python -m puppetmaster receipt <job_id>                       # objective run-efficiency metrics
+python -m puppetmaster observe-scm <job_id> [--cwd] [--json] [--no-enqueue]
+                                                              # one-shot host CI/review/conflict observe + same-job follow-ups
 python -m puppetmaster models init                            # write starter registry
 python -m puppetmaster models list                            # show registered models
 python -m puppetmaster models discover --probe                 # snapshot reachable catalogs without changing models.json

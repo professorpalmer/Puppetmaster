@@ -1373,6 +1373,17 @@ def _build_tools() -> list[McpTool]:
             ),
         ),
         McpTool(
+            name="puppetmaster_observe_scm",
+            description=(
+                "One-shot host SCM observe for a job: record CI/review/conflict "
+                "facts from gh, enqueue same-job follow-ups. waiting_user/HOLD/"
+                "VETO suppress enqueue (retry later). Not a live TUI paste. "
+                "Receipt attention is derived, never stored."
+            ),
+            input_schema=observe_scm_schema(),
+            handler=run_observe_scm,
+        ),
+        McpTool(
             name="puppetmaster_cursor_review",
             description="Run a Cursor SDK review worker through Puppetmaster and wait for completion.",
             input_schema=goal_schema(
@@ -4428,6 +4439,29 @@ def job_schema(required: bool = False) -> JsonObject:
     if required:
         schema["anyOf"] = [{"required": ["job_id"]}, {"required": ["job_ref"]}]
     return schema
+
+
+def observe_scm_schema() -> JsonObject:
+    schema = job_schema(required=True)
+    schema["properties"]["enqueue"] = {
+        "type": "boolean",
+        "default": True,
+        "description": (
+            "When false, record host observations only and do not enqueue "
+            "same-job follow-ups."
+        ),
+    }
+    return schema
+
+
+def run_observe_scm(args: JsonObject) -> JsonObject:
+    command = ["observe-scm", require_job_id(args), "--json"]
+    if args.get("enqueue") is False:
+        command.append("--no-enqueue")
+    cwd_arg = args.get("cwd")
+    if cwd_arg:
+        command.extend(["--cwd", str(cwd_arg)])
+    return run_cli(command, args)
 
 
 def status_schema() -> JsonObject:

@@ -21,7 +21,7 @@ from puppetmaster.platform_lock import KNOWN_ADAPTERS
 
 # Floor for the stdio tool surface. Bump when tools are added; never lower
 # without an explicit product decision (and a CHANGELOG note).
-STDIO_TOOL_FLOOR = 45
+STDIO_TOOL_FLOOR = 46
 
 REQUIRED_STDIO_TOOLS = frozenset(
     {
@@ -39,6 +39,7 @@ REQUIRED_STDIO_TOOLS = frozenset(
         "puppetmaster_partial_summary",
         "puppetmaster_artifacts",
         "puppetmaster_show",
+        "puppetmaster_observe_scm",
         "puppetmaster_codegraph_search",
         "puppetmaster_codegraph_context",
     }

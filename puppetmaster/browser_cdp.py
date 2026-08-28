@@ -11,7 +11,10 @@ Design:
   handoff uses ``PM_BROWSER_HEADED=1`` (visible window) and
   ``PM_BROWSER_USER_DATA_DIR`` (durable cookies). ``PM_BROWSER_CDP_PORT``
   publishes a shared debugging port so sibling workers attach instead of
-  spawning a second isolated Chrome.
+  spawning a second isolated Chrome. Parallel QA workers set
+  ``PM_BROWSER_ISOLATE_KEY=job_id:task_id`` (or ``PM_BROWSER_ISOLATE_PROFILES=1``)
+  so each worker gets ``~/.puppetmaster/browser-profiles/<digest>`` and skips
+  shared-port attach. Explicit ``PM_BROWSER_USER_DATA_DIR`` still wins.
 - Talk CDP over a MINIMAL, self-contained RFC6455 websocket client built on the
   stdlib ``socket`` module (no websockets/websocket-client dependency).
 - Expose small agent-facing functions returning STRINGS (never raise), mirroring
@@ -96,6 +99,33 @@ def _preferred_port() -> Optional[int]:
     return None
 
 
+def _isolating() -> bool:
+    """Per-worker profiles. Explicit USER_DATA_DIR (auth handoff) wins."""
+    if os.environ.get("PM_BROWSER_USER_DATA_DIR", "").strip():
+        return False
+    if os.environ.get("PM_BROWSER_ISOLATE_KEY", "").strip():
+        return True
+    return _env_truthy("PM_BROWSER_ISOLATE_PROFILES")
+
+
+def stamp_worker_isolate(job_id: str, task_id: str) -> None:
+    """Pin this process to a job:task Chrome profile unless auth handoff set a dir."""
+    if os.environ.get("PM_BROWSER_USER_DATA_DIR", "").strip():
+        return
+    os.environ["PM_BROWSER_ISOLATE_KEY"] = "%s:%s" % (job_id, task_id)
+    os.environ["PM_BROWSER_ISOLATE_PROFILES"] = "1"
+
+
+def _isolate_profile_dir() -> str:
+    key = os.environ.get("PM_BROWSER_ISOLATE_KEY", "").strip() or "default"
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    path = os.path.join(
+        os.path.expanduser("~"), ".puppetmaster", "browser-profiles", digest
+    )
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 def _default_persistent_profile() -> str:
     return os.path.join(os.path.expanduser("~"), ".puppetmaster", "browser-profile")
 
@@ -107,6 +137,8 @@ def _profile_dir_for_launch() -> tuple:
         path = os.path.expanduser(explicit)
         os.makedirs(path, exist_ok=True)
         return path, False
+    if _isolating():
+        return _isolate_profile_dir(), False
     if _headed():
         path = _default_persistent_profile()
         os.makedirs(path, exist_ok=True)
@@ -347,7 +379,7 @@ class _Session:
         if self.ws is not None:
             return None
         headed = _headed()
-        preferred = _preferred_port()
+        preferred = None if _isolating() else _preferred_port()
         persist = os.environ.get("PM_BROWSER_USER_DATA_DIR", "").strip()
         if persist:
             persist = os.path.expanduser(persist)

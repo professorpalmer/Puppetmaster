@@ -125,6 +125,7 @@ from puppetmaster.cli.commands_gate import (
     _run_preflight_command,
     _run_proxy_command,
     _run_receipt_command,
+    _run_observe_scm_command,
     _run_effort_index_command,
     _run_rollup_command,
     _run_route_command,
@@ -616,6 +617,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
     if args.command in {
         "show",
         "receipt",
+        "observe-scm",
         "artifacts",
         "graph",
         "diff",
@@ -753,6 +755,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
 
     if args.command == "receipt":
         return _run_receipt_command(args, store)
+
+    if args.command == "observe-scm":
+        return _run_observe_scm_command(args, store)
 
     if args.command == "adapters":
         print(json.dumps(adapter_status(Path.cwd()), indent=2))
