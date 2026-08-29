@@ -711,6 +711,7 @@ def persist_reused_artifacts(
                 artifact,
                 parent_task_id=getattr(task, "id", None),
                 created_by=worker_id or getattr(artifact, "created_by", None),
+                cwd=_task_cwd(task),
             )
         except Exception:
             pass

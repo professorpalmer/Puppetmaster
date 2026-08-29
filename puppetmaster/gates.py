@@ -211,7 +211,9 @@ def evaluate_task_gates(
     for spec in specs:
         results.append(_evaluate_one(spec, task, artifacts, store, cwd, worker_id))
 
-    gate_artifacts = [_gate_artifact(task, worker_id, result) for result in results]
+    gate_artifacts = [
+        _gate_artifact(task, worker_id, result, cwd=cwd) for result in results
+    ]
     passed = all(result.passed for result in results)
     return GateEvaluation(passed=passed, results=results, artifacts=gate_artifacts)
 
@@ -1042,8 +1044,13 @@ def _write_baseline(store: "SwarmStore", path: Path, value: float) -> None:
     store.write_json(path, {"value": value, "updated_at": now_iso()})
 
 
-def _gate_artifact(task: Task, worker_id: str, result: GateResult) -> Artifact:
-    return Artifact(
+def _gate_artifact(
+    task: Task,
+    worker_id: str,
+    result: GateResult,
+    cwd: Optional[Path] = None,
+) -> Artifact:
+    artifact = Artifact(
         job_id=task.job_id,
         task_id=task.id,
         type=ArtifactType.GATE,
@@ -1058,3 +1065,8 @@ def _gate_artifact(task: Task, worker_id: str, result: GateResult) -> Artifact:
             **result.detail,
         },
     )
+    if result.passed:
+        return artifact
+    from puppetmaster.negative_claims import stamp_failed_gate
+
+    return stamp_failed_gate(artifact, task=task, cwd=cwd)

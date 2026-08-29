@@ -263,6 +263,11 @@ def reject_gist(
     payload["admission"] = GIST_ADMISSION_REJECTED
     payload.setdefault("level", "gist")
     updated = replace(artifact, payload=payload, sha256=None)
+    from puppetmaster.negative_claims import scope_from_source_ids, stamp_negative_claim
+
+    claim = str(payload.get("claim") or "").strip()
+    scope = scope_from_source_ids(payload.get("source_artifact_ids")) or claim
+    updated = stamp_negative_claim(updated, kind="gist", claim=claim, scope=scope)
     updated.validate()
     store.save_artifact(updated)
     store.emit(

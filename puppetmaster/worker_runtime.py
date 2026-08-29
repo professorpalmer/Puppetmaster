@@ -217,6 +217,16 @@ class WorkerRuntime:
                     pass
                 artifacts = self._stamp_evaluator_metadata(task, artifacts)
                 for artifact in artifacts:
+                    try:
+                        from puppetmaster.negative_claims import stamp_failed_gate
+
+                        artifact = stamp_failed_gate(
+                            artifact,
+                            task=task,
+                            cwd=(task.payload or {}).get("cwd"),
+                        )
+                    except Exception:
+                        pass
                     self.store.save_artifact(artifact)
                     # Auto-materialize admitted gists from high-confidence findings
                     # so swarm peers share verified compact discoveries without
@@ -232,6 +242,7 @@ class WorkerRuntime:
                             artifact,
                             parent_task_id=task.id,
                             created_by=self.worker_id,
+                            cwd=(task.payload or {}).get("cwd"),
                         )
                     except Exception:
                         pass
