@@ -227,20 +227,12 @@ class WorkerRuntime:
                     self.store.save_artifact(artifact)
                     # Auto-materialize admitted gists from high-confidence findings
                     # so swarm peers share verified compact discoveries without
-                    # extra API churn.
+                    # extra API churn. Follow-ups wait until completion gates
+                    # persist so a failed GATE cannot enqueue merge/ship.
                     try:
                         from puppetmaster.gist_admission import maybe_admit_finding_as_gist
 
                         maybe_admit_finding_as_gist(self.store, artifact)
-                    except Exception:
-                        pass
-                    try:
-                        self.store.maybe_enqueue_follow_ups_from_artifact(
-                            artifact,
-                            parent_task_id=task.id,
-                            created_by=self.worker_id,
-                            cwd=(task.payload or {}).get("cwd"),
-                        )
                     except Exception:
                         pass
                 try:
@@ -339,6 +331,17 @@ class WorkerRuntime:
             )
             self._emit_live_task_span(updated, artifacts + gate_eval.artifacts)
             return True
+
+        for artifact in artifacts:
+            try:
+                self.store.maybe_enqueue_follow_ups_from_artifact(
+                    artifact,
+                    parent_task_id=task.id,
+                    created_by=self.worker_id,
+                    cwd=(task.payload or {}).get("cwd"),
+                )
+            except Exception:
+                pass
 
         completed_run = replace(
             run,

@@ -1266,9 +1266,9 @@ class SwarmStore:
             )
             return True
         if worker_id:
-            foreign = foreign_active_writer(
-                self, task, worker_id, task_map=task_map
-            )
+            # Lease state must be live. claim_next_task's in-memory task_map is
+            # a dependency snapshot and can still show siblings as QUEUED.
+            foreign = foreign_active_writer(self, task, worker_id)
             if foreign:
                 self.emit(
                     task.job_id,
@@ -2522,7 +2522,14 @@ class SwarmStore:
         tasks: list[Task], artifacts: list[Any]
     ) -> dict[str, Any]:
         """Queue + admitted-gist frontier counts for status/dashboard."""
+        from puppetmaster.metr_seams import is_coordination_protocol_payload
         from puppetmaster.models import ArtifactType
+
+        artifacts = [
+            artifact
+            for artifact in artifacts
+            if not is_coordination_protocol_payload(artifact)
+        ]
 
         queued = 0
         running = 0

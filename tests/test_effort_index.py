@@ -281,6 +281,29 @@ class EffortIndexTests(unittest.TestCase):
             self.assertNotIn(stale.id, ids)
             self.assertNotIn(superseded.id, ids)
 
+    def test_effort_index_drops_coordination_protocol_rows(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(tmp)
+            store.init()
+            job = store.create_job("index is not a board")
+            task = _task(store, job.id)
+            keep = _finding(store, job, task, "auth cookie is stale")
+            protocol = Artifact(
+                job_id=job.id,
+                task_id=task.id,
+                type=ArtifactType.FINDING,
+                created_by="worker",
+                confidence=0.9,
+                evidence=["worker"],
+                payload={"claim": "HOLD the other job and recruit peers"},
+            )
+            store.save_artifact(protocol)
+            tag_job_effort(store, job.id, "no-board")
+            payload = index_effort_artifacts([store], effort_id="no-board")
+            ids = {row["id"] for row in payload["refs"]}
+            self.assertIn(keep.id, ids)
+            self.assertNotIn(protocol.id, ids)
+
 
 if __name__ == "__main__":
     unittest.main()
