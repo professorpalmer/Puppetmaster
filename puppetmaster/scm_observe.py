@@ -265,6 +265,17 @@ def observe_scm(
             actor=actor,
         )
         result["reactions"].append(reaction)
+        if (
+            fact.kind == "ci_failed"
+            and not observation.get("idempotent")
+            and reaction.get("outcome") == OUTCOME_ACCOUNTED
+        ):
+            try:
+                from puppetmaster.negative_claims import persist_ci_failed_negative
+
+                persist_ci_failed_negative(store, job_id, fact)
+            except Exception:
+                pass
     result["attention"] = derive_attention(store, job_id)
     return result
 
@@ -400,6 +411,33 @@ def _react(
             "kind": fact.kind,
             "outcome": OUTCOME_SKIPPED,
             "reason": "no_parent",
+            "task_id": None,
+        }
+    from puppetmaster.negative_claims import (
+        REASON_NEGATIVE_CLAIM,
+        ci_failed_negative_claim,
+        should_skip_negative,
+    )
+
+    if should_skip_negative(
+        store,
+        job_id,
+        ci_failed_negative_claim(fact.kind, fact.instruction),
+        fact.key,
+    ):
+        _stamp_reaction(
+            store,
+            job_id,
+            fact,
+            outcome=OUTCOME_SKIPPED,
+            task_id=None,
+            reason=REASON_NEGATIVE_CLAIM,
+        )
+        return {
+            "key": fact.key,
+            "kind": fact.kind,
+            "outcome": OUTCOME_SKIPPED,
+            "reason": REASON_NEGATIVE_CLAIM,
             "task_id": None,
         }
     child = store.enqueue_subtask(

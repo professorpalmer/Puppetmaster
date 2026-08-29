@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Union
+from typing import Any, Optional, Union
 
 from puppetmaster.codegraph import repo_file_census
 from puppetmaster.models import Task
@@ -486,7 +486,14 @@ def _load_upstream_artifacts_via_edges(task: Task, *, record_consumes: bool = Fa
     return list(store.resolve_artifacts_via_edges(task, record_consumes=record_consumes))
 
 
-def _prewalk_injection_body(prompt: str, artifacts: list, *, verify_role: bool) -> str:
+def _prewalk_injection_body(
+    prompt: str,
+    artifacts: list,
+    *,
+    verify_role: bool,
+    cwd: Optional[Any] = None,
+    store: Optional[Any] = None,
+) -> str:
     """Return the formattable injection body, or "" when nothing usable exists."""
     from puppetmaster.prewalk import (
         PREWALK_PLAN_SECTION_HEADER,
@@ -495,24 +502,35 @@ def _prewalk_injection_body(prompt: str, artifacts: list, *, verify_role: bool) 
     )
 
     if verify_role:
-        return format_upstream_artifacts_for_injection(artifacts)
+        return format_upstream_artifacts_for_injection(
+            artifacts, cwd=cwd, store=store
+        )
     if PREWALK_PLAN_SECTION_HEADER in (prompt or ""):
-        plan_text = format_plan_artifacts_for_injection(artifacts)
+        plan_text = format_plan_artifacts_for_injection(
+            artifacts, cwd=cwd, store=store
+        )
         if plan_text:
             return plan_text
     return (
-        format_upstream_artifacts_for_injection(artifacts)
-        or format_plan_artifacts_for_injection(artifacts)
+        format_upstream_artifacts_for_injection(artifacts, cwd=cwd, store=store)
+        or format_plan_artifacts_for_injection(artifacts, cwd=cwd, store=store)
     )
 
 
 def _artifacts_used_for_injection(
-    artifacts: list, *, verify_role: bool, prompt: str
+    artifacts: list,
+    *,
+    verify_role: bool,
+    prompt: str,
+    cwd: Optional[Any] = None,
+    store: Optional[Any] = None,
 ) -> list:
     """Filter edge-resolved artifacts to those that contribute injection text."""
     used: list = []
     for artifact in artifacts:
-        if _prewalk_injection_body(prompt, [artifact], verify_role=verify_role):
+        if _prewalk_injection_body(
+            prompt, [artifact], verify_role=verify_role, cwd=cwd, store=store
+        ):
             used.append(artifact)
     return used
 
@@ -538,18 +556,25 @@ def with_prewalk_plan(prompt: str, task: Task) -> str:
             inject_upstream_into_prompt,
         )
 
+        cwd = payload.get("cwd") or payload.get("workspace")
+        if cwd == "":
+            cwd = None
         role = str(payload.get("prewalk_role") or getattr(task, "role", "") or "")
         verify_role = role == VERIFY_ROLE
+        store = _open_store_for_task(task)
         inline = payload.get("prewalk_artifacts")
         if inline is not None:
             artifacts = list(inline)
             if not artifacts:
                 return prompt
             if verify_role:
-                return inject_upstream_into_prompt(prompt, artifacts)
-            return inject_plan_into_prompt(prompt, artifacts)
+                return inject_upstream_into_prompt(
+                    prompt, artifacts, cwd=cwd, store=store
+                )
+            return inject_plan_into_prompt(
+                prompt, artifacts, cwd=cwd, store=store
+            )
 
-        store = _open_store_for_task(task)
         edge_artifacts: list = []
         if store is not None:
             edge_artifacts = list(
@@ -557,10 +582,14 @@ def with_prewalk_plan(prompt: str, task: Task) -> str:
             )
         if edge_artifacts:
             used = _artifacts_used_for_injection(
-                edge_artifacts, verify_role=verify_role, prompt=prompt
+                edge_artifacts,
+                verify_role=verify_role,
+                prompt=prompt,
+                cwd=cwd,
+                store=store,
             )
             if used and _prewalk_injection_body(
-                prompt, used, verify_role=verify_role
+                prompt, used, verify_role=verify_role, cwd=cwd, store=store
             ):
                 store.record_consumes(
                     task.job_id,
@@ -571,14 +600,20 @@ def with_prewalk_plan(prompt: str, task: Task) -> str:
                         for artifact in used
                     ],
                 )
-                return inject_upstream_into_prompt(prompt, used)
+                return inject_upstream_into_prompt(
+                    prompt, used, cwd=cwd, store=store
+                )
 
         artifacts = _load_job_artifacts_for_task(task)
         if not artifacts:
             return prompt
         if verify_role:
-            return inject_upstream_into_prompt(prompt, artifacts)
-        return inject_plan_into_prompt(prompt, artifacts)
+            return inject_upstream_into_prompt(
+                prompt, artifacts, cwd=cwd, store=store
+            )
+        return inject_plan_into_prompt(
+            prompt, artifacts, cwd=cwd, store=store
+        )
     except Exception:
         return prompt
 
