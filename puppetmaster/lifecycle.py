@@ -272,7 +272,11 @@ def index_effort_artifacts(
     unless ``expand`` is true). When ``effort_id`` is omitted, the most recent
     tagged effort is used.
     """
-    from puppetmaster.validation import compact_artifact_ref
+    from puppetmaster.validation import (
+        REUSABLE_VALIDATION_STATUSES,
+        compact_artifact_ref,
+        validation_status_of,
+    )
 
     store_list = list(stores)
     requested = (effort_id or "").strip() or None
@@ -320,6 +324,12 @@ def index_effort_artifacts(
                     continue
                 payload = _payload_dict(artifact)
                 if query_filter and not _matches_index_query(payload, query_filter):
+                    continue
+                status = validation_status_of(artifact)
+                if (
+                    status is not None
+                    and status not in REUSABLE_VALIDATION_STATUSES
+                ):
                     continue
                 ref = compact_artifact_ref(artifact)
                 ref["job_id"] = getattr(artifact, "job_id", None) or job.id

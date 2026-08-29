@@ -101,6 +101,19 @@ class GistAdmissionFilterTests(unittest.TestCase):
         self.assertIn("Finding: legacy finding claim", text)
         self.assertNotIn("Gist:", text)
 
+    def test_stale_validation_status_refused_without_cwd(self) -> None:
+        from dataclasses import replace
+
+        finding = _finding(claim="cited bytes have moved")
+        payload = dict(finding.payload)
+        payload["validation"] = {
+            "status": "stale",
+            "source_digests": {"src/a.py": "abc123"},
+        }
+        stale = replace(finding, payload=payload, sha256=None)
+        self.assertFalse(is_admitted_for_shared_context(stale))
+        self.assertEqual(filter_shared_context_artifacts([stale]), [])
+
 
 class GistAdmissionEventTests(unittest.TestCase):
     def test_event_emission_on_admit_and_reject(self) -> None:

@@ -15,6 +15,7 @@ adapted to Puppetmaster's durable artifacts and worker specs.
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence, Union
 
 from puppetmaster.workers import ANALYSIS_NO_EDIT_PAYLOAD, WorkerSpec
@@ -35,6 +36,9 @@ _PLAN_ARTIFACT_TYPES = frozenset({"decision", "plan"})
 
 def format_plan_artifacts_for_injection(
     artifacts: Iterable[Any],
+    *,
+    cwd: Optional[Union[str, Path]] = None,
+    store: Any = None,
 ) -> str:
     """Format plan/decision artifacts into text for implement-worker injection.
 
@@ -45,7 +49,9 @@ def format_plan_artifacts_for_injection(
     from puppetmaster.gist_admission import filter_shared_context_artifacts
 
     blocks: list[str] = []
-    for artifact in filter_shared_context_artifacts(artifacts):
+    for artifact in filter_shared_context_artifacts(
+        artifacts, cwd=cwd, store=store
+    ):
         kind, payload = _artifact_type_and_payload(artifact)
         if kind not in _PLAN_ARTIFACT_TYPES:
             # Some decision-shaped payloads ride on other types; still accept
@@ -69,12 +75,17 @@ def format_plan_artifacts_for_injection(
 
 def format_upstream_artifacts_for_injection(
     artifacts: Iterable[Any],
+    *,
+    cwd: Optional[Union[str, Path]] = None,
+    store: Any = None,
 ) -> str:
     """Format edge-resolved upstream artifacts for implement/verify injection."""
     from puppetmaster.gist_admission import filter_shared_context_artifacts
 
     blocks: list[str] = []
-    for artifact in filter_shared_context_artifacts(artifacts):
+    for artifact in filter_shared_context_artifacts(
+        artifacts, cwd=cwd, store=store
+    ):
         kind, payload = _artifact_type_and_payload(artifact)
         if not isinstance(payload, dict):
             continue
@@ -89,7 +100,13 @@ def format_upstream_artifacts_for_injection(
     return "\n\n".join(blocks)
 
 
-def inject_plan_into_prompt(prompt: str, artifacts: Iterable[Any]) -> str:
+def inject_plan_into_prompt(
+    prompt: str,
+    artifacts: Iterable[Any],
+    *,
+    cwd: Optional[Union[str, Path]] = None,
+    store: Any = None,
+) -> str:
     """Inject formatted plan/decision artifact text into ``prompt``.
 
     When the prompt has no plan section yet, prepends one. When it already
@@ -98,20 +115,32 @@ def inject_plan_into_prompt(prompt: str, artifacts: Iterable[Any]) -> str:
     real plan content is already present under the header, leaves the prompt
     unchanged (avoids double-injection). No-op when formatting yields nothing.
     """
-    plan_text = format_plan_artifacts_for_injection(artifacts)
+    plan_text = format_plan_artifacts_for_injection(
+        artifacts, cwd=cwd, store=store
+    )
     if not plan_text:
         return prompt
     return _inject_section(prompt, PREWALK_PLAN_SECTION_HEADER, plan_text)
 
 
-def inject_upstream_into_prompt(prompt: str, artifacts: Iterable[Any]) -> str:
+def inject_upstream_into_prompt(
+    prompt: str,
+    artifacts: Iterable[Any],
+    *,
+    cwd: Optional[Union[str, Path]] = None,
+    store: Any = None,
+) -> str:
     """Inject edge-resolved upstream artifact text (plan/patch/verification)."""
-    body_text = format_upstream_artifacts_for_injection(artifacts)
+    body_text = format_upstream_artifacts_for_injection(
+        artifacts, cwd=cwd, store=store
+    )
     if not body_text:
         return prompt
     # Prefer the plan header when the prompt was built for implement.
     if PREWALK_PLAN_SECTION_HEADER in (prompt or ""):
-        plan_text = format_plan_artifacts_for_injection(artifacts)
+        plan_text = format_plan_artifacts_for_injection(
+            artifacts, cwd=cwd, store=store
+        )
         if plan_text:
             return _inject_section(prompt, PREWALK_PLAN_SECTION_HEADER, plan_text)
     return _inject_section(prompt, PREWALK_UPSTREAM_SECTION_HEADER, body_text)

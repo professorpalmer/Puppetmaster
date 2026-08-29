@@ -80,14 +80,60 @@ def working_set_brief_line() -> str:
     return WORKING_SET_BRIEF_LINE
 
 
+def _usable_repo_cwd(raw: Any) -> Optional[Path]:
+    if raw is None or raw == "":
+        return None
+    try:
+        path = Path(str(raw))
+        if path.is_dir():
+            return path
+    except Exception:
+        return None
+    return None
+
+
+def _cwd_from_artifacts(artifacts: Iterable[Any]) -> Optional[Path]:
+    for item in artifacts:
+        payload = getattr(item, "payload", None) or {}
+        if not isinstance(payload, dict):
+            continue
+        validation = payload.get("validation")
+        if not isinstance(validation, dict):
+            continue
+        cwd = _usable_repo_cwd(validation.get("repo_root"))
+        if cwd is not None:
+            return cwd
+    return None
+
+
+def _cwd_from_store_job(store: Any, job_id: str) -> Optional[Path]:
+    try:
+        tasks = store.list_tasks(job_id)
+    except Exception:
+        return None
+    for task in tasks:
+        payload = getattr(task, "payload", None) or {}
+        if not isinstance(payload, dict):
+            continue
+        cwd = _usable_repo_cwd(payload.get("cwd") or payload.get("workspace"))
+        if cwd is not None:
+            return cwd
+    return None
+
+
 def write_artifact_index(
     job_dir: Union[Path, str],
     artifacts: Iterable[Any],
+    *,
+    cwd: Optional[Union[Path, str]] = None,
+    store: Any = None,
 ) -> Optional[Path]:
     """Persist compact refs for shared-context artifacts. Best-effort.
 
     Uses ``filter_shared_context_artifacts`` + ``compact_artifact_ref`` so the
-    sidecar never contains full FINDING bodies.
+    sidecar never contains full FINDING bodies. When ``cwd`` (or a repo root
+    on the artifacts) is available, cited freshness is refreshed first;
+    already-stale status is refused either way.
     """
     if not working_set_enabled():
         return None
@@ -102,7 +148,15 @@ def write_artifact_index(
             job_id = getattr(item, "job_id", None)
             if job_id:
                 break
-        filtered = filter_shared_context_artifacts(items, for_job_id=job_id)
+        resolved_cwd = _usable_repo_cwd(cwd)
+        if resolved_cwd is None:
+            resolved_cwd = _cwd_from_artifacts(items)
+        filtered = filter_shared_context_artifacts(
+            items,
+            for_job_id=job_id,
+            cwd=resolved_cwd,
+            store=store,
+        )
         refs = []
         for artifact in filtered:
             try:
@@ -158,7 +212,8 @@ def rebuild_artifact_index(
         return None
     try:
         artifacts = store.list_artifacts(job_id)
-        return write_artifact_index(job_dir, artifacts)
+        cwd = _cwd_from_store_job(store, job_id)
+        return write_artifact_index(job_dir, artifacts, cwd=cwd, store=store)
     except Exception:
         return None
 

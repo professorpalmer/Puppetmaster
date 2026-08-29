@@ -1948,8 +1948,17 @@ class SwarmStore:
         # Admission filter at the edge-resolution boundary so pending/rejected
         # gists never enter peer prompts. Raw list_artifacts remains unfiltered
         # for tooling/MCP.
+        task_payload = getattr(task, "payload", None) or {}
+        if not isinstance(task_payload, dict):
+            task_payload = {}
+        cwd = task_payload.get("cwd") or task_payload.get("workspace")
+        if cwd == "":
+            cwd = None
         artifacts = filter_shared_context_artifacts(
-            artifacts, for_job_id=task.job_id
+            artifacts,
+            for_job_id=task.job_id,
+            cwd=cwd,
+            store=self,
         )
         if record_consumes and artifacts:
             self.record_consumes(

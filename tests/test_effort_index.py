@@ -237,6 +237,50 @@ class EffortIndexTests(unittest.TestCase):
             self.assertEqual(body["refs"][0]["claim"], "cli visible claim")
             self.assertNotIn("payload", body["refs"][0])
 
+    def test_stale_finding_omitted_fresh_finding_remains(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(tmp)
+            store.init()
+            job = store.create_job("freshness index")
+            task = _task(store, job.id)
+            tag_job_effort(store, job.id, "freshness-effort")
+            stale = _finding(
+                store,
+                job,
+                task,
+                "stale cited claim",
+                validation={
+                    "status": "stale",
+                    "source_digests": {"src/a.py": "deadbeef"},
+                },
+            )
+            fresh = _finding(
+                store,
+                job,
+                task,
+                "fresh cited claim",
+                validation={
+                    "status": "fresh",
+                    "source_digests": {"src/a.py": "abcd"},
+                },
+            )
+            unlabeled = _finding(store, job, task, "unlabeled cited claim")
+            superseded = _finding(
+                store,
+                job,
+                task,
+                "superseded cited claim",
+                validation={"status": "superseded"},
+            )
+            payload = index_effort_artifacts(
+                [store], effort_id="freshness-effort"
+            )
+            ids = {row["id"] for row in payload["refs"]}
+            self.assertIn(fresh.id, ids)
+            self.assertIn(unlabeled.id, ids)
+            self.assertNotIn(stale.id, ids)
+            self.assertNotIn(superseded.id, ids)
+
 
 if __name__ == "__main__":
     unittest.main()

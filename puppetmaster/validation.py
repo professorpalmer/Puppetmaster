@@ -20,6 +20,9 @@ Artifact.payload convention (optional; older artifacts load unchanged)::
         "evaluator_digest": "<hex>",
         "source_artifact_ids": ["artifact_...", ...],  # when reused
         "generation": 0,  # optional; bumped when prior outputs are superseded
+        "freshness_reason": "digest_mismatch" | "unprovable",  # refresh only
+        "missing_paths": ["rel/path", ...],
+        "unreadable_paths": ["rel/path", ...],
     }
 """
 
@@ -467,6 +470,142 @@ def with_validation_status(
     return replace(artifact, payload=payload, sha256=None)
 
 
+_FRESHNESS_META_KEYS = ("freshness_reason", "missing_paths", "unreadable_paths")
+
+
+def _source_digests_of(artifact: Artifact) -> dict[str, str]:
+    validation = validation_payload_of(artifact)
+    if not validation:
+        return {}
+    raw = validation.get("source_digests")
+    if not isinstance(raw, dict) or not raw:
+        return {}
+    digests: dict[str, str] = {}
+    for key, value in raw.items():
+        path = str(key or "").strip()
+        digest = str(value or "").strip()
+        if path and digest:
+            digests[path] = digest
+    return digests
+
+
+def _freshness_snapshot(artifact: Artifact) -> tuple:
+    validation = validation_payload_of(artifact) or {}
+    return (
+        str(validation.get("status") or ""),
+        str(validation.get("freshness_reason") or ""),
+        tuple(str(item) for item in (validation.get("missing_paths") or [])),
+        tuple(str(item) for item in (validation.get("unreadable_paths") or [])),
+    )
+
+
+def _with_freshness_fields(
+    artifact: Artifact,
+    status: str,
+    *,
+    freshness_reason: Optional[str] = None,
+    missing_paths: Optional[Sequence[str]] = None,
+    unreadable_paths: Optional[Sequence[str]] = None,
+    clear_reason: bool = False,
+) -> Artifact:
+    from dataclasses import replace
+
+    updated = with_validation_status(artifact, status)
+    payload = dict(getattr(updated, "payload", None) or {})
+    validation = dict(payload.get("validation") or {})
+    if clear_reason:
+        for key in _FRESHNESS_META_KEYS:
+            validation.pop(key, None)
+    else:
+        if freshness_reason is not None:
+            validation["freshness_reason"] = freshness_reason
+        if freshness_reason == "digest_mismatch":
+            validation.pop("missing_paths", None)
+            validation.pop("unreadable_paths", None)
+        if missing_paths is not None:
+            validation["missing_paths"] = [str(item) for item in missing_paths]
+        if unreadable_paths is not None:
+            validation["unreadable_paths"] = [str(item) for item in unreadable_paths]
+    payload["validation"] = validation
+    return replace(updated, payload=payload, sha256=None)
+
+
+def _persist_freshness(
+    original: Artifact, updated: Artifact, store: Any
+) -> Artifact:
+    if _freshness_snapshot(original) == _freshness_snapshot(updated):
+        return original
+    if store is not None:
+        try:
+            store.save_artifact(updated)
+        except Exception:
+            pass
+    return updated
+
+
+def refresh_cited_freshness(
+    artifact: Artifact,
+    cwd: Union[str, Path],
+    store: Any = None,
+) -> Artifact:
+    """Recompute cited source digests and persist fresh|stale on the artifact.
+
+    Missing ``source_digests`` is a no-op (unlabeled legacy still injects).
+    ``superseded`` is left unchanged. Withdrawal is a status change, never a
+    delete. ``unprovable`` is a freshness reason, not a validation status.
+    """
+    if not isinstance(artifact, Artifact):
+        return artifact
+    source_digests = _source_digests_of(artifact)
+    if not source_digests:
+        return artifact
+    if validation_status_of(artifact) == "superseded":
+        return artifact
+
+    cited_paths = list(source_digests)
+    missing_paths: list[str] = []
+    unreadable_paths: list[str] = []
+    current: Optional[dict[str, str]] = None
+    try:
+        result = compute_validation_fingerprint(cwd, cited_paths, strict=False)
+        missing_paths = list(result.missing_paths)
+        unreadable_paths = list(result.unreadable_paths)
+        current = dict(result.source_digests)
+    except ValidationFingerprintError as exc:
+        missing_paths = list(exc.missing_paths or [])
+        unreadable_paths = list(exc.unreadable_paths or [])
+    except Exception:
+        pass
+
+    if current is None or missing_paths or unreadable_paths:
+        updated = _with_freshness_fields(
+            artifact,
+            "stale",
+            freshness_reason="unprovable",
+            missing_paths=missing_paths,
+            unreadable_paths=unreadable_paths,
+        )
+        return _persist_freshness(artifact, updated, store)
+
+    mismatch = False
+    for rel, expected in source_digests.items():
+        if current.get(rel) != expected:
+            mismatch = True
+            break
+    if mismatch:
+        updated = _with_freshness_fields(
+            artifact,
+            "stale",
+            freshness_reason="digest_mismatch",
+        )
+        return _persist_freshness(artifact, updated, store)
+
+    if validation_status_of(artifact) == "stale":
+        updated = _with_freshness_fields(artifact, "fresh", clear_reason=True)
+        return _persist_freshness(artifact, updated, store)
+    return artifact
+
+
 def _truncate_text(value: Any, max_chars: int) -> Any:
     if not isinstance(value, str):
         return value
@@ -534,6 +673,7 @@ def compact_artifact_ref(
                 "dirty_scoped",
                 "source_artifact_ids",
                 "generation",
+                "freshness_reason",
             )
             if key in validation
         }
