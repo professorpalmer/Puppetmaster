@@ -760,7 +760,9 @@ class PuppetmasterTests(unittest.TestCase):
     def _store_for_backend(self, backend: str, root: Path):
         if backend == "file":
             return SwarmStore(root)
-        return SQLiteSwarmStore(root)
+        store = SQLiteSwarmStore(root)
+        store.ensure_schema()
+        return store
 
     def test_event_cursor_and_since_read_are_consistent_across_backends(self) -> None:
         for backend in ("file", "sqlite"):
@@ -1169,6 +1171,7 @@ class PuppetmasterTests(unittest.TestCase):
 
             state_dir = Path(tmp) / ".pm-state"
             store = SQLiteSwarmStore(state_dir)
+            store.init()
             job = store.create_job("running feed follow")
             store.update_job_status(job.id, JobStatus.RUNNING)
             current = store.event_cursor(job.id)
@@ -26417,6 +26420,7 @@ class AuditFixTests(unittest.TestCase):
     def test_sqlite_concurrent_claim_has_exactly_one_winner(self) -> None:
         with TemporaryDirectory() as tmp:
             store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
             job = store.create_job("race claim")
             task = Task(job_id=job.id, role="coder", instruction="work")
             store.save_task(task)
@@ -26437,6 +26441,7 @@ class AuditFixTests(unittest.TestCase):
             with self.subTest(backend=store_cls.backend_name):
                 with TemporaryDirectory() as tmp:
                     store = store_cls(Path(tmp) / ".puppetmaster")
+                    store.init()
                     job = store.create_job("max attempts event")
                     task = Task(
                         job_id=job.id,
@@ -26465,6 +26470,7 @@ class AuditFixTests(unittest.TestCase):
             with self.subTest(backend=store_cls.backend_name):
                 with TemporaryDirectory() as tmp:
                     store = store_cls(Path(tmp) / ".puppetmaster")
+                    store.init()
                     job = store.create_job("recover parity")
                     fresh = Task(job_id=job.id, role="fresh", instruction="live")
                     store.save_task(fresh)
@@ -26511,6 +26517,7 @@ class AuditFixTests(unittest.TestCase):
     def test_sqlite_lease_fenced_terminal_write_conflict(self) -> None:
         with TemporaryDirectory() as tmp:
             store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
             job = store.create_job("sqlite fence")
             task = Task(job_id=job.id, role="coder", instruction="work")
             store.save_task(task)
@@ -26666,6 +26673,7 @@ class AuditFixTests(unittest.TestCase):
     def test_sqlite_claims_blocked_task_after_dependency_completes(self) -> None:
         with TemporaryDirectory() as tmp:
             store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
             job = store.create_job("blocked then runnable")
             dep = Task(job_id=job.id, role="explore", instruction="dep")
             child = Task(
@@ -26702,6 +26710,7 @@ class AuditFixTests(unittest.TestCase):
         ):
             with TemporaryDirectory() as tmp:
                 store = store_factory(Path(tmp) / ".puppetmaster")
+                store.init()
                 job = store.create_job("lease token fence")
                 task = Task(job_id=job.id, role="coder", instruction="work")
                 store.save_task(task)
@@ -27004,6 +27013,7 @@ class AuditFixTests(unittest.TestCase):
     def test_sqlite_stalled_job_sets_completed_at(self) -> None:
         with TemporaryDirectory() as tmp:
             store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
             job = store.create_job("stall")
             updated = store.update_job_status(job.id, JobStatus.STALLED)
             self.assertIsNotNone(updated.completed_at)
@@ -27013,6 +27023,7 @@ class AuditFixTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
             job = store.create_job("atomic run event")
             task = Task(job_id=job.id, role="coder", instruction="work")
             store.save_task(task)
@@ -28853,6 +28864,7 @@ class JobLabelTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             for store_cls in (SwarmStore, SQLiteSwarmStore):
                 store = store_cls(Path(tmp) / store_cls.__name__)
+                store.init()
                 job = store.create_job("do the work", label="security audit")
                 loaded = store.get_job(job.id)
                 self.assertEqual(loaded.label, "security audit")
@@ -29154,6 +29166,7 @@ class NPlusOneRegressionTests(unittest.TestCase):
     def test_claim_reuses_task_map_without_per_dependency_fetch(self) -> None:
         with TemporaryDirectory() as tmp:
             store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
             job = store.create_job("dependency-heavy claim")
             deps = []
             for i in range(4):
@@ -29194,6 +29207,7 @@ class NPlusOneRegressionTests(unittest.TestCase):
     def test_recover_stale_tasks_batches_into_one_transaction(self) -> None:
         with TemporaryDirectory() as tmp:
             store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
             job = store.create_job("crashed worker wave")
             stale = []
             for i in range(5):
@@ -29228,6 +29242,7 @@ class NPlusOneRegressionTests(unittest.TestCase):
     def test_recover_stale_tasks_skips_fresh_leases(self) -> None:
         with TemporaryDirectory() as tmp:
             store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
             job = store.create_job("mixed staleness")
             fresh = Task(job_id=job.id, role="fresh", instruction="live")
             store.save_task(fresh)
@@ -30201,6 +30216,7 @@ class JobStatusToleranceTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             store = SQLiteSwarmStore(tmp)
+            store.init()
             ok_job = store.create_job("fine")
             store.update_job_status(ok_job.id, JobStatus.RUNNING)
             con = _sqlite3.connect(str(Path(tmp) / "state.sqlite3"))
@@ -30226,6 +30242,7 @@ class JobStatusToleranceTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             store = SQLiteSwarmStore(tmp)
+            store.init()
             job = store.create_job("g")
             store.update_job_status(job.id, JobStatus.CANCELLED)
             state = await_job_state(store, job.id, timeout_seconds=1)

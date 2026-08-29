@@ -356,6 +356,7 @@ class Orchestrator:
                     )
                     for spec in launch_specs
                 ]
+        self._ensure_store_schema()
         fingerprint = self.store.launch_fingerprint(
             goal,
             label,
@@ -2286,6 +2287,7 @@ class Orchestrator:
         allowed_task_ids: Optional[set[str]] = None,
         worker_mode: str = "subprocess",
     ) -> None:
+        self._ensure_store_schema()
         if worker_mode == "inline":
             self._run_inline_workers(
                 job,
@@ -2494,6 +2496,7 @@ class Orchestrator:
             return
         dependencies = self._dependency_closure(tasks, target.id)
         roles = sorted({task.role for task in dependencies})
+        self._ensure_store_schema()
         processes = [
             self._spawn_worker(job.id, role, lease_seconds=lease_seconds)
             for role in roles
@@ -2576,6 +2579,17 @@ class Orchestrator:
         ]
         return max([60, *task_timeouts]) + 30
 
+    def _ensure_store_schema(self) -> None:
+        """Supervisor-only schema ensure before workers attach or spawn."""
+        ensure = getattr(self.store, "ensure_schema", None)
+        if callable(ensure):
+            ensure()
+
+    def _tick_supervisor_recovery(self, job: Job) -> None:
+        """Reclaim stale short-lease workers and unblock while the supervisor waits."""
+        self.store.recover_stale_tasks(job.id)
+        self.store.refresh_blocked_tasks(job.id)
+
     @staticmethod
     def _worker_hard_cap(tasks: list[Task], base_timeout: int) -> int:
         """The absolute ceiling a worker may run to even while showing progress.
@@ -2650,6 +2664,7 @@ class Orchestrator:
         last_progress = self._job_progress_cursor(job.id)
         extended = False
         while True:
+            self._tick_supervisor_recovery(job)
             elapsed = time.monotonic() - start
             wait_for = poll if elapsed < base_timeout else min(poll, max(1.0, hard_cap - elapsed))
             try:

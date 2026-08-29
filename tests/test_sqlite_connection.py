@@ -17,7 +17,11 @@ from tempfile import TemporaryDirectory
 from unittest import mock
 
 from puppetmaster.diagnostics import run_doctor
-from puppetmaster.sqlite_store import SQLiteSwarmStore, SqliteBackupError
+from puppetmaster.sqlite_store import (
+    SQLiteSwarmStore,
+    SqliteBackupError,
+    SqliteSchemaError,
+)
 
 class SqliteConnectionPragmaTests(unittest.TestCase):
     def test_fresh_connections_apply_durable_pragma_policy(self) -> None:
@@ -30,6 +34,11 @@ class SqliteConnectionPragmaTests(unittest.TestCase):
                 self._assert_connection_policy(first, store)
             finally:
                 first.close()
+
+            # init() remains the supervisor ensure path (DDL + metadata).
+            status = store.schema_status()
+            self.assertEqual(status["schema_version"], str(store.schema_version))
+            store.attach()
 
             # A second handle must re-apply connection-local PRAGMAs even though
             # journal_mode already persisted on the database file.
@@ -91,6 +100,20 @@ class SqliteConnectionPragmaTests(unittest.TestCase):
         self.assertEqual(int(busy_timeout[0]), store.busy_timeout_ms)
         self.assertEqual(int(foreign_keys[0]), 1)
         self.assertEqual(int(synchronous[0]), store._synchronous_pragma_value())
+
+    def test_attach_without_schema_fails_closed(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+            with self.assertRaises(SqliteSchemaError):
+                store.attach()
+            store.ensure_schema()
+            connection = store.connect()
+            try:
+                store.attach()
+                self._assert_connection_policy(connection, store)
+            finally:
+                connection.close()
+
 
 class SqliteIntegrityAndBackupTests(unittest.TestCase):
     def test_integrity_status_ok_on_clean_db(self) -> None:

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import random
 import sqlite3
+import time
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -49,6 +51,12 @@ _SQLITE_IN_CHUNK = 900
 _SQLITE_BUSY_TIMEOUT_MS = 5000
 _SQLITE_SYNCHRONOUS = "NORMAL"
 
+# Safety net after busy_timeout expires or a first-open lock races. Not a
+# substitute for supervisor-only schema ensure. Short backoff so a locked
+# connect() does not multiply the 5s client timeout into a long stall.
+_SQLITE_LOCK_RETRY_ATTEMPTS = 5
+_SQLITE_LOCK_RETRY_BASE_DELAY_SECONDS = 0.01
+
 # Bounded diagnostic / backup surface (reliability Slice 10). quick_check is the
 # default integrity probe — faster than full integrity_check and safe to run
 # from doctor. Cap how much failure text we surface.
@@ -58,6 +66,17 @@ _QUICK_CHECK_DETAIL_CHARS = 500
 
 class SqliteBackupError(ValueError):
     """Raised when an opt-in SQLite backup is refused for safety."""
+
+
+class SqliteSchemaError(RuntimeError):
+    """Raised when attach() finds no usable schema (fail closed)."""
+
+
+def _is_sqlite_lock_error(exc: BaseException) -> bool:
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    message = str(exc).lower()
+    return "locked" in message or "busy" in message
 
 
 def _chunked(values: Iterable[str], size: int = _SQLITE_IN_CHUNK) -> list[list[str]]:
@@ -76,13 +95,18 @@ class SQLiteSwarmStore(SwarmStore):
     def __init__(self, root: Optional[Union[Path, str]] = None) -> None:
         super().__init__(root)
         self.db_path = self.root / "state.sqlite3"
-        # Schema/PRAGMA/DDL setup is idempotent but not free: re-running it from
-        # every public method (each opens a connection and replays the whole
-        # script) is pure overhead once the DB exists. Run it once per store
-        # instance and short-circuit afterward.
+        # Schema DDL is supervisor-only (ensure_schema / init). Workers attach
+        # and never CREATE/INSERT metadata. Both flags are per-process.
         self._initialized = False
+        self._attached = False
+        self._open_mode = "deferred"
+        self.lock_error_count = 0
 
     def init(self) -> None:
+        """Supervisor ensure: directories, DDL, schema_version, migrate."""
+        self.ensure_schema()
+
+    def ensure_schema(self) -> None:
         if self._initialized:
             return
         for directory in [
@@ -178,6 +202,59 @@ class SQLiteSwarmStore(SwarmStore):
             self._migrate_schema(connection)
         chmod_private_file(self.db_path)
         self._initialized = True
+        self._attached = True
+
+    def attach(self) -> None:
+        """Worker-safe open: PRAGMAs only. Never CREATE TABLE or migrate."""
+        self._open_mode = "attach"
+        self._ensure_attached()
+
+    def _ensure_attached(self) -> None:
+        if self._attached:
+            return
+        if not self.db_path.exists():
+            raise SqliteSchemaError(
+                f"SQLite store has no schema at {self.db_path}; "
+                "the supervisor must call ensure_schema() before workers attach"
+            )
+        if self._open_mode != "attach":
+            # Supervisor / CLI: migrate an older on-disk schema. Workers stay
+            # on attach() and fail closed instead of racing DDL.
+            self.ensure_schema()
+            return
+        connection = self.connect()
+        try:
+            self._assert_schema(connection)
+        finally:
+            connection.close()
+        self._attached = True
+
+    def _assert_schema(self, connection: sqlite3.Connection) -> None:
+        try:
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key = 'schema_version'"
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            raise SqliteSchemaError(
+                f"SQLite store schema is missing at {self.db_path}: {exc}"
+            ) from exc
+        if row is None:
+            raise SqliteSchemaError(
+                f"SQLite store has no schema_version at {self.db_path}; "
+                "the supervisor must call ensure_schema() before workers attach"
+            )
+        raw = row["value"] if isinstance(row, sqlite3.Row) else row[0]
+        try:
+            current = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise SqliteSchemaError(
+                f"SQLite store schema_version is invalid at {self.db_path}: {raw!r}"
+            ) from exc
+        if current != self.schema_version:
+            raise SqliteSchemaError(
+                f"SQLite store schema_version {current} does not match "
+                f"{self.schema_version} at {self.db_path}"
+            )
 
     def _migrate_schema(self, connection: sqlite3.Connection) -> None:
         """Upgrade older state.sqlite3 files to the current schema_version."""
@@ -372,6 +449,30 @@ class SQLiteSwarmStore(SwarmStore):
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(f"PRAGMA synchronous = {self.synchronous_policy}")
 
+    def _record_lock_error(self) -> None:
+        self.lock_error_count += 1
+
+    def _sleep_lock_backoff(self, attempt: int) -> None:
+        delay = _SQLITE_LOCK_RETRY_BASE_DELAY_SECONDS * (2 ** attempt)
+        time.sleep(delay + random.uniform(0, delay))
+
+    def _connect_with_lock_retry(self) -> sqlite3.Connection:
+        last_error: Optional[sqlite3.OperationalError] = None
+        for attempt in range(_SQLITE_LOCK_RETRY_ATTEMPTS):
+            try:
+                return self.connect()
+            except sqlite3.OperationalError as exc:
+                last_error = exc
+                if not _is_sqlite_lock_error(exc):
+                    raise
+                self._record_lock_error()
+                if attempt + 1 >= _SQLITE_LOCK_RETRY_ATTEMPTS:
+                    raise
+                self._sleep_lock_backoff(attempt)
+        if last_error is not None:
+            raise last_error
+        raise sqlite3.OperationalError("database is locked")
+
     @contextmanager
     def _session(self) -> "Iterator[sqlite3.Connection]":
         """Open a connection, run a transaction, and ALWAYS close it.
@@ -382,11 +483,19 @@ class SQLiteSwarmStore(SwarmStore):
         mandatory lock on the open database file, so a later unlink / temp-dir
         cleanup fails with ``WinError 32``. Closing the handle here keeps the
         store correct and leak-free on every platform.
+
+        SQLITE_BUSY / SQLITE_LOCKED on connect is retried with exponential
+        backoff and jitter. This is a safety net after busy_timeout, not a
+        replacement for supervisor-only schema init.
         """
-        connection = self.connect()
+        connection = self._connect_with_lock_retry()
         try:
             with connection:
                 yield connection
+        except sqlite3.OperationalError as exc:
+            if _is_sqlite_lock_error(exc):
+                self._record_lock_error()
+            raise
         finally:
             connection.close()
 
@@ -420,7 +529,7 @@ class SQLiteSwarmStore(SwarmStore):
         launch_key: Optional[str] = None,
         launch_fingerprint: Optional[str] = None,
     ) -> tuple[Job, bool]:
-        self.init()
+        self.ensure_schema()
         fingerprint = launch_fingerprint or self.launch_fingerprint(goal, label)
         job = Job(
             goal=goal,
@@ -458,7 +567,7 @@ class SQLiteSwarmStore(SwarmStore):
         return job, True
 
     def save_job(self, job: Job) -> None:
-        self.init()
+        self._ensure_attached()
         with self._session() as connection:
             connection.execute(
                 "UPDATE jobs SET data = ? WHERE id = ?",
@@ -487,7 +596,7 @@ class SQLiteSwarmStore(SwarmStore):
         return updated
 
     def latest_liveness_at(self, job_id: str) -> Optional[str]:
-        self.init()
+        self._ensure_attached()
         with self._session() as connection:
             row = connection.execute(
                 "SELECT MAX(at) AS latest FROM events "
@@ -497,7 +606,7 @@ class SQLiteSwarmStore(SwarmStore):
         return str(row["latest"]) if row and row["latest"] else None
 
     def save_task(self, task: Task) -> None:
-        self.init()
+        self._ensure_attached()
         # Persist the task row and its task.saved event in a single
         # transaction. Splitting them across two connections left a window
         # where a crash after the task write but before the event write would
@@ -541,7 +650,7 @@ class SQLiteSwarmStore(SwarmStore):
         task_list = list(tasks)
         if not task_list:
             return
-        self.init()
+        self._ensure_attached()
         rows: list[tuple[Any, ...]] = []
         event_rows: list[tuple[Any, ...]] = []
         reconcile_rows: list[tuple[Task, set[str], list[GraphEdge]]] = []
@@ -702,59 +811,127 @@ class SQLiteSwarmStore(SwarmStore):
     ) -> Optional[Task]:
         # Single CAS UPDATE fenced on (RUNNING, lease_owner, and the lease token
         # when present) so a stale owner can never extend a lease it no longer holds.
-        self.init()
+        self._ensure_attached()
         with self._session() as connection:
-            if lease_id is not None and task.lease_id is not None:
-                cursor = connection.execute(
-                    """
-                    UPDATE tasks SET data = ?
-                    WHERE id = ?
-                      AND status = ?
-                      AND json_extract(data, '$.lease_owner') = ?
-                      AND json_extract(data, '$.lease_id') = ?
-                    """,
-                    (
-                        self._dumps(renewed),
-                        task_id,
-                        str(TaskStatus.RUNNING),
-                        worker_id,
-                        task.lease_id,
-                    ),
-                )
-            else:
-                cursor = connection.execute(
-                    """
-                    UPDATE tasks SET data = ?
-                    WHERE id = ?
-                      AND status = ?
-                      AND json_extract(data, '$.lease_owner') = ?
-                    """,
-                    (
-                        self._dumps(renewed),
-                        task_id,
-                        str(TaskStatus.RUNNING),
-                        worker_id,
-                    ),
-                )
-            if cursor.rowcount != 1:
-                return None
-            connection.execute(
-                "INSERT INTO events(job_id, at, event, payload) VALUES(?, ?, ?, ?)",
+            return self._renew_lease_on_connection(
+                connection, task_id, task, renewed, worker_id, lease_id
+            )
+
+    def _renew_lease_on_connection(
+        self,
+        connection: sqlite3.Connection,
+        task_id: str,
+        task: Task,
+        renewed: Task,
+        worker_id: str,
+        lease_id: Optional[str],
+    ) -> Optional[Task]:
+        if lease_id is not None and task.lease_id is not None:
+            cursor = connection.execute(
+                """
+                UPDATE tasks SET data = ?
+                WHERE id = ?
+                  AND status = ?
+                  AND json_extract(data, '$.lease_owner') = ?
+                  AND json_extract(data, '$.lease_id') = ?
+                """,
                 (
-                    task.job_id,
-                    now_iso(),
-                    "task.lease_renewed",
-                    json.dumps(
-                        {
-                            "task_id": task.id,
-                            "worker_id": worker_id,
-                            "lease_expires_at": renewed.lease_expires_at,
-                        },
-                        sort_keys=True,
-                    ),
+                    self._dumps(renewed),
+                    task_id,
+                    str(TaskStatus.RUNNING),
+                    worker_id,
+                    task.lease_id,
                 ),
             )
+        else:
+            cursor = connection.execute(
+                """
+                UPDATE tasks SET data = ?
+                WHERE id = ?
+                  AND status = ?
+                  AND json_extract(data, '$.lease_owner') = ?
+                """,
+                (
+                    self._dumps(renewed),
+                    task_id,
+                    str(TaskStatus.RUNNING),
+                    worker_id,
+                ),
+            )
+        if cursor.rowcount != 1:
+            return None
+        connection.execute(
+            "INSERT INTO events(job_id, at, event, payload) VALUES(?, ?, ?, ?)",
+            (
+                task.job_id,
+                now_iso(),
+                "task.lease_renewed",
+                json.dumps(
+                    {
+                        "task_id": task.id,
+                        "worker_id": worker_id,
+                        "lease_expires_at": renewed.lease_expires_at,
+                    },
+                    sort_keys=True,
+                ),
+            ),
+        )
         return renewed
+
+    def heartbeat_run_and_renew_lease(
+        self,
+        run: AgentRun,
+        task_id: str,
+        worker_id: str,
+        lease_seconds: int = 60,
+        lease_id: Optional[str] = None,
+    ) -> tuple[AgentRun, Optional[Task]]:
+        """Persist a run heartbeat and renew the task lease in one transaction."""
+        self._ensure_attached()
+        updated = replace(run, heartbeat_at=now_iso())
+        heartbeat_payload = {
+            "run_id": updated.id,
+            "worker_id": updated.worker_id,
+            "task_id": updated.task_id,
+        }
+        saved_payload = {"run_id": updated.id, "role": updated.role}
+        with self._session() as connection:
+            row = connection.execute(
+                "SELECT data FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            renewed: Optional[Task] = None
+            if row is not None:
+                task = task_from_dict(json.loads(row["data"]))
+                if task.status == TaskStatus.RUNNING and self._lease_matches(
+                    task, worker_id, lease_id
+                ):
+                    renewed = self._renew_lease_on_connection(
+                        connection,
+                        task_id,
+                        task,
+                        self._build_renewed_task(task, lease_seconds),
+                        worker_id,
+                        lease_id,
+                    )
+            self._upsert_run_connection(connection, updated)
+            self._emit(connection, updated.job_id, "run.saved", saved_payload)
+            self._emit(connection, updated.job_id, "run.heartbeat", heartbeat_payload)
+        return updated, renewed
+
+    def _upsert_run_connection(
+        self, connection: sqlite3.Connection, run: AgentRun
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO runs(id, job_id, task_id, data)
+            VALUES(?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              job_id = excluded.job_id,
+              task_id = excluded.task_id,
+              data = excluded.data
+            """,
+            (run.id, run.job_id, run.task_id, self._dumps(run)),
+        )
 
     def claim_task(
         self,
@@ -763,7 +940,7 @@ class SQLiteSwarmStore(SwarmStore):
         lease_seconds: int = 60,
         task_map: Optional[dict[str, Task]] = None,
     ) -> Optional[Task]:
-        self.init()
+        self._ensure_attached()
         return self._perform_claim(
             task_id, worker_id, lease_seconds=lease_seconds, task_map=task_map
         )
@@ -832,7 +1009,7 @@ class SQLiteSwarmStore(SwarmStore):
         return True
 
     def recover_stale_tasks(self, job_id: str) -> list[Task]:
-        self.init()
+        self._ensure_attached()
         now = now_iso()
         stale = [task for task in self.list_tasks(job_id) if self.is_task_stale(task)]
         if not stale:
@@ -887,28 +1064,15 @@ class SQLiteSwarmStore(SwarmStore):
         return super()._atomic_recover_stale(task, queued)
 
     def save_run(self, run: AgentRun) -> None:
-        self.init()
+        self._ensure_attached()
         payload = {"run_id": run.id, "role": run.role}
         with self._session() as connection:
-            connection.execute(
-                """
-                INSERT INTO runs(id, job_id, task_id, data)
-                VALUES(?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                  job_id = excluded.job_id,
-                  task_id = excluded.task_id,
-                  data = excluded.data
-                """,
-                (run.id, run.job_id, run.task_id, self._dumps(run)),
-            )
-            connection.execute(
-                "INSERT INTO events(job_id, at, event, payload) VALUES(?, ?, ?, ?)",
-                (run.job_id, now_iso(), "run.saved", json.dumps(payload, sort_keys=True)),
-            )
+            self._upsert_run_connection(connection, run)
+            self._emit(connection, run.job_id, "run.saved", payload)
 
     def save_artifact(self, artifact: Artifact) -> None:
         artifact = self._prepare_artifact_for_save(artifact)
-        self.init()
+        self._ensure_attached()
         event_payload = {
             "artifact_id": artifact.id,
             "task_id": artifact.task_id,
@@ -961,7 +1125,7 @@ class SQLiteSwarmStore(SwarmStore):
         prepared: list[Artifact] = []
         for artifact in artifact_list:
             prepared.append(self._prepare_artifact_for_save(artifact))
-        self.init()
+        self._ensure_attached()
         rows: list[tuple[Any, ...]] = []
         event_rows: list[tuple[Any, ...]] = []
         for artifact in prepared:
@@ -1023,7 +1187,7 @@ class SQLiteSwarmStore(SwarmStore):
                 self._upsert_edge_connection(connection, edge)
 
     def upsert_edge(self, edge: GraphEdge) -> GraphEdge:
-        self.init()
+        self._ensure_attached()
         with self._session() as connection:
             return self._upsert_edge_connection(connection, edge)
 
@@ -1032,7 +1196,7 @@ class SQLiteSwarmStore(SwarmStore):
         edge_list = list(edges)
         if not edge_list:
             return []
-        self.init()
+        self._ensure_attached()
         with self._session() as connection:
             return [
                 self._upsert_edge_connection(connection, edge) for edge in edge_list
@@ -1131,7 +1295,7 @@ class SQLiteSwarmStore(SwarmStore):
         ]
         superseded_ids = [artifact.id for artifact in superseded_artifacts]
 
-        self.init()
+        self._ensure_attached()
         rows: list[tuple[Any, ...]] = []
         event_rows: list[tuple[Any, ...]] = []
         reconcile_rows: list[tuple[Task, set[str], list[GraphEdge]]] = []
@@ -1230,7 +1394,7 @@ class SQLiteSwarmStore(SwarmStore):
         return ResetSubgraphResult(finalized, superseded_ids)
 
     def delete_edge(self, job_id: str, edge_id: str) -> bool:
-        self.init()
+        self._ensure_attached()
         with self._session() as connection:
             row = connection.execute(
                 "SELECT id FROM graph_edges WHERE id = ? AND job_id = ?",
@@ -1289,7 +1453,7 @@ class SQLiteSwarmStore(SwarmStore):
             self._upsert_edge_connection(connection, edge)
 
     def get_edge(self, job_id: str, edge_id: str) -> Optional[GraphEdge]:
-        self.init()
+        self._ensure_attached()
         row = self._one(
             "SELECT data FROM graph_edges WHERE id = ? AND job_id = ?",
             (edge_id, job_id),
@@ -1308,7 +1472,7 @@ class SQLiteSwarmStore(SwarmStore):
         from_kind: Optional[Union[GraphNodeKind, str]] = None,
         to_kind: Optional[Union[GraphNodeKind, str]] = None,
     ) -> list[GraphEdge]:
-        self.init()
+        self._ensure_attached()
         clauses = ["job_id = ?"]
         params: list[Any] = [job_id]
         if edge_type is not None:
@@ -1344,7 +1508,7 @@ class SQLiteSwarmStore(SwarmStore):
                 continue
             if _normalize_memory_statement(str(existing.get("statement") or "")) == normalized:
                 return
-        self.init()
+        self._ensure_attached()
         with self._session() as connection:
             connection.execute(
                 """
@@ -1357,7 +1521,7 @@ class SQLiteSwarmStore(SwarmStore):
         self._enforce_memory_cap(_MEMORY_CAP)
 
     def _delete_memory_record(self, memory_id: str) -> None:
-        self.init()
+        self._ensure_attached()
         with self._session() as connection:
             connection.execute("DELETE FROM memory WHERE id = ?", (memory_id,))
 
@@ -1396,7 +1560,7 @@ class SQLiteSwarmStore(SwarmStore):
         memory_list = list(records)
         if not memory_list:
             return
-        self.init()
+        self._ensure_attached()
         rows = [(memory.id, self._dumps(memory)) for memory in memory_list]
         with self._session() as connection:
             connection.executemany(
@@ -1409,28 +1573,30 @@ class SQLiteSwarmStore(SwarmStore):
             )
 
     def get_job(self, job_id: str) -> Job:
-        self.init()
+        self._ensure_attached()
         row = self._one("SELECT data FROM jobs WHERE id = ?", (job_id,))
         if row is None:
             raise FileNotFoundError(f"job not found: {job_id}")
         return job_from_dict(json.loads(row["data"]))
 
     def get_task_by_id(self, task_id: str) -> Task:
-        self.init()
+        self._ensure_attached()
         row = self._one("SELECT data FROM tasks WHERE id = ?", (task_id,))
         if row is None:
             raise FileNotFoundError(f"task not found: {task_id}")
         return task_from_dict(json.loads(row["data"]))
 
     def list_jobs(self) -> list[Job]:
-        self.init()
+        if not self.db_path.exists():
+            return []
+        self._ensure_attached()
         return [
             job_from_dict(json.loads(row["data"]))
             for row in self._all("SELECT data FROM jobs ORDER BY id")
         ]
 
     def latest_job(self) -> Optional[Job]:
-        self.init()
+        self._ensure_attached()
         # Sort by the embedded created_at on the SQLite side and only
         # deserialize the single newest row, instead of loading and decoding
         # every job just to take a max().
@@ -1444,7 +1610,7 @@ class SQLiteSwarmStore(SwarmStore):
         return job_from_dict(json.loads(row["data"]))
 
     def list_tasks(self, job_id: str) -> list[Task]:
-        self.init()
+        self._ensure_attached()
         return [
             task_from_dict(json.loads(row["data"]))
             for row in self._all(
@@ -1457,7 +1623,7 @@ class SQLiteSwarmStore(SwarmStore):
         ids = list(dict.fromkeys(job_ids))
         if not ids:
             return []
-        self.init()
+        self._ensure_attached()
         tasks: list[Task] = []
         for chunk in _chunked(ids):
             placeholders = ",".join("?" for _ in chunk)
@@ -1469,7 +1635,7 @@ class SQLiteSwarmStore(SwarmStore):
         return tasks
 
     def list_artifacts(self, job_id: str) -> list[Artifact]:
-        self.init()
+        self._ensure_attached()
         return [
             artifact_from_dict(json.loads(row["data"]))
             for row in self._all(
@@ -1482,7 +1648,7 @@ class SQLiteSwarmStore(SwarmStore):
         ids = list(dict.fromkeys(job_ids))
         if not ids:
             return []
-        self.init()
+        self._ensure_attached()
         artifacts: list[Artifact] = []
         for chunk in _chunked(ids):
             placeholders = ",".join("?" for _ in chunk)
@@ -1494,14 +1660,14 @@ class SQLiteSwarmStore(SwarmStore):
         return artifacts
 
     def get_artifact_job_id(self, artifact_id: str) -> Optional[str]:
-        self.init()
+        self._ensure_attached()
         row = self._one("SELECT job_id FROM artifacts WHERE id = ?", (artifact_id,))
         if row is None:
             return None
         return str(row["job_id"])
 
     def count_artifacts(self, job_id: str) -> int:
-        self.init()
+        self._ensure_attached()
         row = self._one(
             "SELECT COUNT(*) AS n FROM artifacts WHERE job_id = ?",
             (job_id,),
@@ -1514,7 +1680,7 @@ class SQLiteSwarmStore(SwarmStore):
         unique_ids = [aid for aid in dict.fromkeys(artifact_ids) if aid]
         if not unique_ids:
             return {}
-        self.init()
+        self._ensure_attached()
         out: dict[str, Artifact] = {}
         for chunk in _chunked(unique_ids):
             placeholders = ",".join("?" for _ in chunk)
@@ -1530,7 +1696,7 @@ class SQLiteSwarmStore(SwarmStore):
     def list_artifacts_by_type(
         self, artifact_type: str, job_ids: Optional[Iterable[str]] = None
     ) -> list[Artifact]:
-        self.init()
+        self._ensure_attached()
         if job_ids is not None:
             ids = list(dict.fromkeys(job_ids))
             if not ids:
@@ -1554,7 +1720,7 @@ class SQLiteSwarmStore(SwarmStore):
         return [artifact_from_dict(json.loads(row["data"])) for row in rows]
 
     def list_memory(self) -> list[dict[str, Any]]:
-        self.init()
+        self._ensure_attached()
         return [
             json.loads(row["data"])
             for row in self._all("SELECT data FROM memory ORDER BY id")
@@ -1571,7 +1737,7 @@ class SQLiteSwarmStore(SwarmStore):
         max_age_days: Optional[int] = None,
         min_overlap: float = 0.0,
     ) -> list[dict[str, Any]]:
-        self.init()
+        self._ensure_attached()
         terms = {term.lower() for term in query.split() if len(term) > 2}
         filter_clauses: list[str] = []
         term_clauses: list[str] = []
@@ -1610,7 +1776,7 @@ class SQLiteSwarmStore(SwarmStore):
         return finalize_memory_retrieval(scored, terms, limit)
 
     def delete_job(self, job_id: str) -> None:
-        self.init()
+        self._ensure_attached()
         # Validate the path BEFORE touching SQL so an unsafe id (blank/relative/
         # absolute) can neither wipe rows nor rglob-unlink outside the jobs tree.
         job_dir = self._assert_safe_job_dir(job_id)
@@ -1627,7 +1793,7 @@ class SQLiteSwarmStore(SwarmStore):
             job_dir.rmdir()
 
     def schema_status(self) -> dict[str, str]:
-        self.init()
+        self._ensure_attached()
         with self._session() as connection:
             row = connection.execute(
                 "SELECT value FROM metadata WHERE key = 'schema_version'"
@@ -1816,7 +1982,7 @@ class SQLiteSwarmStore(SwarmStore):
         return mapping[self.synchronous_policy.upper()]
 
     def emit(self, job_id: str, event: str, payload: dict[str, Any]) -> None:
-        self.init()
+        self._ensure_attached()
         with self._session() as connection:
             connection.execute(
                 "INSERT INTO events(job_id, at, event, payload) VALUES(?, ?, ?, ?)",
@@ -1829,7 +1995,7 @@ class SQLiteSwarmStore(SwarmStore):
     def read_events_since(
         self, job_id: str, since: int = 0
     ) -> list[dict[str, Any]]:
-        self.init()
+        self._ensure_attached()
         return [
             {
                 "id": int(row["id"]),
@@ -1845,7 +2011,7 @@ class SQLiteSwarmStore(SwarmStore):
         ]
 
     def event_cursor(self, job_id: str) -> int:
-        self.init()
+        self._ensure_attached()
         row = self._one(
             "SELECT COALESCE(MAX(id), 0) AS cursor FROM events WHERE job_id = ?",
             (job_id,),

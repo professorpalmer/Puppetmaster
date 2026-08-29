@@ -1,3 +1,19 @@
+## v1.22.40 — 2026-08-29
+
+**Supervisor-only SQLite schema plus no worker stale-recovery herd.**
+
+This is local-adapter store contention on one `state.sqlite3`, not 1500 Hermes workers. Cold `--worker-mode subprocess` processes used to race `SQLiteSwarmStore.init()` (DDL + `schema_version` + migrate) from `recover_stale_tasks` and lock the database.
+
+- Attach vs ensure: `ensure_schema()` / `init()` remains supervisor DDL + metadata + migrate. Workers `attach()` — PRAGMAs and a `schema_version` assert only. Missing or older schema fails closed for workers. `create_store` defaults to deferred construct so a corrupt `state.sqlite3` is not rewritten on open; supervisor reads of an existing older schema migrate.
+- Worker recover removal: `WorkerRuntime.run_until_idle` and `WorkerDaemon.run_once` no longer call `recover_stale_tasks`. Orchestrator and CLI recover still do. `_wait_for_worker` ticks recover + `refresh_blocked_tasks` so short-lease crashes are reclaimed while the supervisor waits.
+- Busy retry: `_session` retries `SQLITE_BUSY` / `SQLITE_LOCKED` on connect (5 attempts, exponential backoff + jitter) and counts lock errors. `busy_timeout` is unchanged.
+- Heartbeat coalesce: `SQLiteSwarmStore.heartbeat_run_and_renew_lease` writes the run heartbeat and lease renewal in one transaction. File store keeps two calls. `WorkerRuntime` uses the coalesced path when present.
+- Claim no longer refresh_blocked: `SwarmStore.claim_next_task` does not call `refresh_blocked_tasks`. Supervisor ticks own unblock. Daemon `run_once` does not refresh either.
+
+Files: `puppetmaster/sqlite_store.py`, `store.py`, `store_factory.py`, `worker_runtime.py`, `orchestrator.py`. Tests: `tests/test_sqlite_concurrency.py`, `tests/test_sqlite_connection.py`.
+
+No Pi / grok-bot worker. Marionette pin stays on 1.22.39 until a separate ride.
+
 ## v1.22.39 — 2026-08-29
 
 **Cited freshness, last-wins residual inject, and negative-claim skip. No new store.**
