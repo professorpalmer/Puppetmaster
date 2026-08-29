@@ -6,7 +6,7 @@ v1.22.37 seams stay in force. This cut closes holes the leftover inventory found
 
 - Same-turn GATE: `WorkerRuntime.run_once` still saves FINDINGs and may admit gists, then evaluates gates, then enqueues follow-ups. A failed GATE returns before merge/ship enqueue. The GATE-artifact-only refuse path was already covered; this covers worker FINDINGs on the same turn.
 - Live-lease writer fence: `claim` calls `foreign_active_writer` against the store, not `claim_next_task`'s in-memory `task_map`. A stale snapshot that still shows siblings as QUEUED cannot hide a live writer.
-- Listing is not a board: Frontier gist counts drop coordination-protocol payloads. Effort-index already omitted those rows; the new test locks it. HOLD / VETO refuse both enqueue and claim.
+- Listing is not a board: Frontier gist counts drop coordination-protocol payloads. Effort-index drops protocol FINDING/DECISION/RISK/VERIFICATION rows (`decision` / `risk` / `check` are scanned, not only `claim`). HOLD / VETO refuse both enqueue and claim.
 
 Files: `puppetmaster/worker_runtime.py`, `store.py`. Tests: `tests/test_metr_seams.py`, `tests/test_effort_index.py`.
 
