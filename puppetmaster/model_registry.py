@@ -53,6 +53,7 @@ DISCOVERY_SOURCE_TO_ADAPTER: dict[str, str] = {
     "cursor": "cursor",
     "openai": "openai",
     "anthropic": "claude-code",
+    "openrouter": "agentic",
     "claude": "claude-code",
     "codex": "codex",
     "hermes": "hermes",

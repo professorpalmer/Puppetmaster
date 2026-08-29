@@ -2578,14 +2578,16 @@ def build_parser() -> argparse.ArgumentParser:
     models_discover.add_argument("--registry-path", help="Override the registry path.")
     models_discover.add_argument(
         "--source",
-        choices=["cursor", "openai", "anthropic", "claude", "codex", "hermes", "agentic", "antigravity", "all"],
+        choices=["cursor", "openai", "anthropic", "openrouter", "claude", "codex", "hermes", "agentic", "antigravity", "all"],
         default=None,
         help=(
             "Which platform catalog to enumerate. Default: derived from the "
             "platform lock — a single locked platform is discovered directly; "
             "otherwise every reachable source ('all'). cursor (plan, needs "
             "CURSOR_API_KEY + node), openai (GET /v1/models, needs OPENAI_API_KEY), "
-            "anthropic (needs ANTHROPIC_API_KEY for discovery), claude / codex "
+            "anthropic (needs ANTHROPIC_API_KEY for discovery), openrouter "
+            "(GET /api/v1/models with live price + context, needs "
+            "OPENROUTER_API_KEY; seeds tool-capable agentic entries), claude / codex "
             "(curated catalogs for the CLI agent loops that can't self-enumerate; "
             "billed as your detected subscription/API posture), hermes (curated "
             "multi-provider catalog, API-billed via your own keys), agentic "

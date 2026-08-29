@@ -147,6 +147,7 @@ python -m puppetmaster models list                            # show registered 
 python -m puppetmaster models discover --probe                 # snapshot reachable catalogs without changing models.json
 python -m puppetmaster doctor                                  # report stale catalogs and pending registry drift
 python -m puppetmaster models discover --source agentic --write   # seed keys-only agentic catalog (filtered by visible provider keys)
+python -m puppetmaster models discover --source openrouter --write # live OpenRouter catalog (tool-capable only) with real price + context, stamped provider=openrouter
 python -m puppetmaster models recommend [--write] [--json]        # Pareto ∩ each hooked stream; Cursor Sol does not enable Codex models
 python -m puppetmaster models import-baseline [--dry-run]     # overlay adapter-scoped role scorecards; never writes capability_score
 # SWE-bench Bash Only fetch is library-only: puppetmaster.swebench_baseline → JSON → import-baseline

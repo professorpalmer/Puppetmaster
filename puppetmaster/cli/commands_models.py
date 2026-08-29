@@ -779,6 +779,10 @@ def _all_discover_sources() -> list[str]:
 
     if available_providers():
         sources.append("agentic")
+    # OpenRouter stays opt-in (`--source openrouter`) rather than joining the
+    # catch-all: its catalog is ~330 tool-capable rows that all land on the
+    # conservative discovery capability seed, which would swamp a tuned
+    # registry the moment a key happens to be present.
     # Fold Hermes into the catch-all only when its CLI is actually present, so
     # users who don't run Hermes don't get hermes/* entries injected just
     # because they happen to have an OPENAI/ANTHROPIC/GEMINI key set. The
@@ -1162,6 +1166,7 @@ def _discover_one_source(source: str, registry: list, *, prune: bool = False):
         ApiDiscoveryError,
         fetch_anthropic_models,
         fetch_openai_models,
+        fetch_openrouter_models,
         merge_api_catalog_into_registry,
     )
 
@@ -1170,6 +1175,16 @@ def _discover_one_source(source: str, registry: list, *, prune: bool = False):
             catalog = fetch_openai_models()
             merged, report = merge_api_catalog_into_registry(
                 "openai", "api", registry, catalog
+            )
+        elif source == "openrouter":
+            catalog = fetch_openrouter_models()
+            merged, report = merge_api_catalog_into_registry(
+                "agentic",
+                "api",
+                registry,
+                catalog,
+                id_namespace="openrouter",
+                payload_defaults={"provider": "openrouter"},
             )
         elif source == "anthropic":
             catalog = fetch_anthropic_models()

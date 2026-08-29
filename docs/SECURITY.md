@@ -41,7 +41,7 @@ Built-in guardrails:
 ## Network egress (exactly what leaves your machine)
 
 - **Your prompts + code context → the LLM providers your workers use** (Cursor, Anthropic, OpenAI), exactly as if you used those CLIs directly. Their terms govern that data.
-- **Optional catalog discovery** → `GET /v1/models` on OpenAI/Anthropic and the Cursor SDK, only when you run `models discover` (or first-run auto-discovery). Curated Claude/Codex catalogs are local — no call.
+- **Optional catalog discovery** → `GET /v1/models` on OpenAI/Anthropic/OpenRouter and the Cursor SDK, only when you run `models discover` (or first-run auto-discovery). Curated Claude/Codex catalogs are local — no call.
 - **Optional live preflight probe** → a single real 1-token call to the routed provider, only with `--live` / `payload.live_preflight`.
 - **Optional OpenTelemetry** → only to the OTLP endpoint *you* set. **Off by default** (no endpoint, no export). There is no default telemetry and no vendor collector.
 

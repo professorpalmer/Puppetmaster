@@ -438,6 +438,17 @@ have API keys but no vendor CLI installed; vendor CLIs remain the ceiling
 for mature tool surfaces. Additional providers slot in as new registry
 entries — the router/classifier framework doesn't need to change.
 
+`models discover --source openrouter` (needs `OPENROUTER_API_KEY`) fills
+the `agentic` adapter from OpenRouter's live catalog: it keeps only models
+advertising `tools`, carries OpenRouter's published per-token price and
+context window into the registry so rows land cost-routable instead of
+price-zero, namespaces ids (`openrouter/openai-gpt-4o`) so it cannot
+collide with another catalog feeding the same adapter, and stamps
+`payload_defaults.provider = "openrouter"` so a bare `--model` pin routes
+to OpenRouter rather than the adapter's default provider. Capability
+scores are still the conservative discovery seed — tune them (or run
+`models recommend`) before leaning on auto-route across 300+ rows.
+
 Capability scores and prices stay **user-asserted**. Puppetmaster
 makes the **decision** transparent (full audit trail of why each
 task went where); it does not make the **value judgments** for you
