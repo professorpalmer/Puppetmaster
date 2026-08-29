@@ -155,7 +155,17 @@ def is_coordination_protocol_payload(value: Any) -> bool:
     keys = {str(key).strip().lower().replace("-", "_") for key in payload.keys()}
     if keys & PROTOCOL_KEYS:
         return True
-    for field in ("instruction", "goal", "claim", "protocol", "action", "command"):
+    for field in (
+        "instruction",
+        "goal",
+        "claim",
+        "decision",
+        "risk",
+        "check",
+        "protocol",
+        "action",
+        "command",
+    ):
         if is_coordination_protocol_text(payload.get(field)):
             return True
     if is_coordination_protocol_text(getattr(value, "instruction", None)):

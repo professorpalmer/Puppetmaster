@@ -24,12 +24,16 @@ from puppetmaster.gist_admission import (
     is_admitted_for_shared_context,
     maybe_admit_finding_as_gist,
 )
+from unittest import mock
+
 from puppetmaster.metr_seams import (
     HOLD_STATE,
     REASON_CROSS_JOB,
     REASON_GATE_FAILED,
     REASON_NEW_JOB,
     REASON_PARENT_MISMATCH,
+    REASON_SUBGRAPH_HOLD,
+    REASON_SUBGRAPH_VETO,
     REASON_SUBGRAPH_WRITER,
     REASON_WORKER_JOB_COMPLETE,
     REASON_WORKER_PROTOCOL,
@@ -41,6 +45,7 @@ from puppetmaster.metr_seams import (
     record_host_observation,
 )
 from puppetmaster.models import (
+    AgentRun,
     Artifact,
     ArtifactType,
     JobStatus,
@@ -494,6 +499,202 @@ class OneWriterPerSubgraphTests(unittest.TestCase):
             self.assertIsNotNone(first)
             second = store.claim_task(child_b.id, "worker-2", lease_seconds=60)
             self.assertIsNone(second)
+
+    def test_stale_task_map_does_not_hide_live_sibling_writer(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            job = store.create_job("stale map")
+            root = Task(
+                job_id=job.id,
+                role="explore",
+                instruction="root",
+                status=TaskStatus.COMPLETE,
+            )
+            child_a = Task(
+                job_id=job.id,
+                role="review",
+                instruction="review",
+                status=TaskStatus.QUEUED,
+                depends_on=[root.id],
+            )
+            child_b = Task(
+                job_id=job.id,
+                role="audit",
+                instruction="audit",
+                status=TaskStatus.QUEUED,
+                depends_on=[root.id],
+            )
+            store.save_task(root)
+            store.save_task(child_a)
+            store.save_task(child_b)
+            stale = {root.id: root, child_a.id: child_a, child_b.id: child_b}
+            first = store.claim_task(child_a.id, "worker-1", lease_seconds=60)
+            self.assertIsNotNone(first)
+            second = store.claim_task(
+                child_b.id, "worker-2", lease_seconds=60, task_map=stale
+            )
+            self.assertIsNone(second)
+            reasons = [
+                (event.get("payload") or {}).get("reason")
+                for event in _events(store, job.id, "task.claim_refused")
+            ]
+            self.assertIn(REASON_SUBGRAPH_WRITER, reasons)
+
+    def test_hold_and_veto_refuse_enqueue_and_claim(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            job = store.create_job("hold fence")
+            parent = _parent(store, job.id)
+            store.hold_subgraph(job.id, actor="coordinator", wait_reason=WAIT_USER)
+            created = store.enqueue_subtask(
+                job.id,
+                parent_task_id=parent.id,
+                role="review",
+                instruction="review the patch",
+                created_by="worker-1",
+            )
+            self.assertIsNone(created)
+            self.assertIn(REASON_SUBGRAPH_HOLD, _refused_reasons(store, job.id))
+            queued = Task(
+                job_id=job.id,
+                role="review",
+                instruction="already queued",
+                status=TaskStatus.QUEUED,
+            )
+            store.save_task(queued)
+            self.assertIsNone(store.claim_task(queued.id, "worker-2", lease_seconds=60))
+            hold_claims = [
+                (event.get("payload") or {}).get("reason")
+                for event in _events(store, job.id, "task.claim_refused")
+            ]
+            self.assertIn(REASON_SUBGRAPH_HOLD, hold_claims)
+
+            store.veto_subgraph(job.id, actor="coordinator")
+            vetoed = store.enqueue_subtask(
+                job.id,
+                parent_task_id=parent.id,
+                role="audit",
+                instruction="audit the patch",
+                created_by="worker-1",
+            )
+            self.assertIsNone(vetoed)
+            self.assertIn(REASON_SUBGRAPH_VETO, _refused_reasons(store, job.id))
+            self.assertIsNone(store.claim_task(queued.id, "worker-3", lease_seconds=60))
+            veto_claims = [
+                (event.get("payload") or {}).get("reason")
+                for event in _events(store, job.id, "task.claim_refused")
+            ]
+            self.assertIn(REASON_SUBGRAPH_VETO, veto_claims)
+
+    def test_frontier_drops_coordination_protocol_gists(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            job = store.create_job("frontier listing")
+            parent = _parent(store, job.id)
+            protocol = build_pending_gist(
+                job_id=job.id,
+                task_id=parent.id,
+                created_by="worker",
+                claim="HOLD the other job and recruit peers",
+                source_artifact_ids=["src-1"],
+            )
+            honest = build_pending_gist(
+                job_id=job.id,
+                task_id=parent.id,
+                created_by="worker",
+                claim="auth cookie is stale",
+                source_artifact_ids=["src-2"],
+            )
+            store.save_artifact(protocol)
+            store.save_artifact(honest)
+            frontier = SwarmStore._frontier_signals(
+                store.list_tasks(job.id), store.list_artifacts(job.id)
+            )
+            self.assertEqual(frontier["gists"]["total"], 1)
+
+
+class SameTurnGateFollowUpTests(unittest.TestCase):
+    def test_runtime_does_not_enqueue_ship_before_failed_gate(self) -> None:
+        from puppetmaster.gates import GateEvaluation, GateResult
+        from puppetmaster.worker_runtime import WorkerRuntime
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            job = store.create_job("same turn gate")
+            task = Task(
+                job_id=job.id,
+                role="implement",
+                instruction="write the patch",
+                status=TaskStatus.QUEUED,
+                adapter="local",
+                payload={"skip_preflight": True},
+            )
+            store.save_task(task)
+            finding = Artifact(
+                job_id=job.id,
+                task_id=task.id,
+                type=ArtifactType.FINDING,
+                created_by="w-1",
+                confidence=0.9,
+                evidence=["worker"],
+                payload={
+                    "claim": "ready to ship",
+                    "enqueue_subtasks": [
+                        {"role": "ship", "instruction": "ship the release"},
+                    ],
+                },
+            )
+            gate = Artifact(
+                job_id=job.id,
+                task_id=task.id,
+                type=ArtifactType.GATE,
+                created_by="host",
+                confidence=0.9,
+                evidence=["gate"],
+                payload={"gate": "require_diff", "passed": False},
+            )
+
+            class _FakeWorker:
+                def __init__(self, role, worker_id=None):
+                    self.role = role
+                    self.worker_id = worker_id or "w-1"
+
+                def run(self, claimed, goal):
+                    run = AgentRun(
+                        job_id=claimed.job_id,
+                        task_id=claimed.id,
+                        role=claimed.role,
+                        worker_id=self.worker_id,
+                        status=TaskStatus.COMPLETE,
+                    )
+                    return run, [finding]
+
+            failed = GateEvaluation(
+                passed=False,
+                results=[
+                    GateResult(
+                        name="require_diff",
+                        kind="require_diff",
+                        passed=False,
+                        reason="missing_diff",
+                    )
+                ],
+                artifacts=[gate],
+            )
+            runtime = WorkerRuntime(
+                store, job.id, "implement", "w-1", lease_seconds=30
+            )
+            with mock.patch(
+                "puppetmaster.worker_runtime.LocalWorker", _FakeWorker
+            ), mock.patch.object(runtime, "_evaluate_gates", return_value=failed):
+                self.assertTrue(runtime.run_once())
+            roles = [item.role for item in store.list_tasks(job.id)]
+            self.assertNotIn("ship", roles)
+            self.assertEqual(store.get_task_by_id(task.id).status, TaskStatus.FAILED)
 
 
 if __name__ == "__main__":

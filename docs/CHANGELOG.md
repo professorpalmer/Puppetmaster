@@ -1,3 +1,17 @@
+## v1.22.41 — 2026-08-29
+
+**METR leftover closures: same-turn GATE before follow-ups, live-lease writer fence, listing is still not a board.**
+
+v1.22.37 seams stay in force. This cut closes holes the leftover inventory found; it is not a new METR program and does not ship Slice C / FTS5 / GPU / Hermes stdin.
+
+- Same-turn GATE: `WorkerRuntime.run_once` still saves FINDINGs and may admit gists, then evaluates gates, then enqueues follow-ups. A failed GATE returns before merge/ship enqueue. The GATE-artifact-only refuse path was already covered; this covers worker FINDINGs on the same turn.
+- Live-lease writer fence: `claim` calls `foreign_active_writer` against the store, not `claim_next_task`'s in-memory `task_map`. A stale snapshot that still shows siblings as QUEUED cannot hide a live writer.
+- Listing is not a board: Frontier gist counts drop coordination-protocol payloads. Effort-index drops protocol FINDING/DECISION/RISK/VERIFICATION rows (`decision` / `risk` / `check` are scanned, not only `claim`). HOLD / VETO refuse both enqueue and claim.
+
+Files: `puppetmaster/worker_runtime.py`, `store.py`. Tests: `tests/test_metr_seams.py`, `tests/test_effort_index.py`.
+
+No Pi / grok-bot worker. Marionette pin stays on 1.22.39 until a separate ride.
+
 ## v1.22.40 — 2026-08-29
 
 **Supervisor-only SQLite schema plus no worker stale-recovery herd.**
