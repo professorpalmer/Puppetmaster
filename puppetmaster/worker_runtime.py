@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Optional
 
 from puppetmaster.models import AgentRun, JobStatus, TaskStatus, now_iso
 from puppetmaster.state import resolve_state_dir
-from puppetmaster.store_factory import create_store
+from puppetmaster.store_factory import create_store, create_worker_store
 from puppetmaster.workers import LocalWorker
 
 if TYPE_CHECKING:
@@ -123,10 +123,7 @@ class WorkerRuntime:
             time.sleep(
                 min(self._heartbeat_interval(), max(0.0, deadline - time.monotonic()))
             )
-            run = self.store.heartbeat_run(run)
-            self.store.renew_task_lease(
-                task.id, self.worker_id, self.lease_seconds, lease_id=task.lease_id
-            )
+            run, _renewed = self._heartbeat_run_and_lease(run, task.id, task.lease_id)
 
         stop_heartbeats = threading.Event()
         heartbeat = threading.Thread(
@@ -464,6 +461,23 @@ class WorkerRuntime:
                 return str(payload.get("failure") or "blocked")
         return None
 
+    def _heartbeat_run_and_lease(
+        self,
+        run: AgentRun,
+        task_id: str,
+        lease_id: Optional[str] = None,
+    ):
+        coalesced = getattr(type(self.store), "heartbeat_run_and_renew_lease", None)
+        if callable(coalesced):
+            return coalesced(
+                self.store, run, task_id, self.worker_id, self.lease_seconds, lease_id
+            )
+        updated = self.store.heartbeat_run(run)
+        renewed = self.store.renew_task_lease(
+            task_id, self.worker_id, self.lease_seconds, lease_id=lease_id
+        )
+        return updated, renewed
+
     def _heartbeat_until_stopped(
         self,
         run: AgentRun,
@@ -472,10 +486,7 @@ class WorkerRuntime:
         lease_id: Optional[str] = None,
     ) -> None:
         while not stop.wait(self._heartbeat_interval()):
-            run = self.store.heartbeat_run(run)
-            renewed = self.store.renew_task_lease(
-                task_id, self.worker_id, self.lease_seconds, lease_id=lease_id
-            )
+            run, renewed = self._heartbeat_run_and_lease(run, task_id, lease_id)
             if renewed is None:
                 self._lease_lost.set()
                 stop.set()
@@ -484,7 +495,6 @@ class WorkerRuntime:
     def run_until_idle(self) -> int:
         completed = 0
         while True:
-            self.store.recover_stale_tasks(self.job_id)
             if self.run_once():
                 completed += 1
                 continue
@@ -545,8 +555,6 @@ class WorkerDaemon:
 
         interned_poll(self.store)
         for job in self._running_jobs():
-            self.store.recover_stale_tasks(job.id)
-            self.store.refresh_blocked_tasks(job.id)
             for role in self.roles:
                 runtime = WorkerRuntime(
                     store=self.store,
@@ -609,7 +617,7 @@ def _write_startup_error(state_dir, job_id: str, worker_id: str, exc: BaseExcept
     except Exception:
         pass
     try:
-        create_store("sqlite", state_dir).emit(
+        create_store("sqlite", state_dir, mode="attach").emit(
             job_id,
             "worker.startup_failed",
             {"worker_id": worker_id, "error": str(exc)},
@@ -633,7 +641,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     worker_id = args.worker_id or worker_id_for(args.role)
     try:
         runtime = WorkerRuntime(
-            store=create_store(args.backend, state_dir),
+            store=create_worker_store(args.backend, state_dir),
             job_id=args.job_id,
             role=args.role,
             worker_id=worker_id,

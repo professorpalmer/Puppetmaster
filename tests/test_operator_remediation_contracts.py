@@ -34,6 +34,7 @@ class LaunchIdentityContractTests(unittest.TestCase):
         for store_type in (SwarmStore, SQLiteSwarmStore):
             with self.subTest(store=store_type.__name__), tempfile.TemporaryDirectory() as tmp:
                 store = store_type(Path(tmp))
+                store.init()
                 first = store.create_job("same goal", launch_key="retry-1")
                 second = store.create_job("  same   goal ", launch_key="retry-1")
                 self.assertEqual(first.id, second.id)
@@ -59,6 +60,7 @@ class LaunchIdentityContractTests(unittest.TestCase):
     def test_launch_fingerprint_covers_the_normalized_request(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteSwarmStore(Path(tmp))
+            store.init()
             first = store.create_job(
                 "goal",
                 launch_key="request-key",
@@ -86,6 +88,7 @@ class LaunchIdentityContractTests(unittest.TestCase):
     def test_orchestrator_retry_returns_existing_job_without_redispatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteSwarmStore(Path(tmp))
+            store.init()
             orchestrator = Orchestrator(store)
             specs = [WorkerSpec(role="analysis", instruction="inspect", adapter="local")]
             with patch.object(orchestrator, "_run_workers") as run_workers:
@@ -98,6 +101,7 @@ class LaunchIdentityContractTests(unittest.TestCase):
     def test_max_output_bytes_is_propagated_to_worker_payloads(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteSwarmStore(Path(tmp))
+            store.init()
             orchestrator = Orchestrator(store)
             specs = [WorkerSpec(role="analysis", instruction="inspect", adapter="local")]
             with patch.dict(os.environ, {"PUPPETMASTER_MAX_OUTPUT_BYTES": "1234"}), patch.object(
@@ -185,6 +189,7 @@ class OperatorContractTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteSwarmStore(Path(tmp))
+            store.init()
             job = store.create_job("cost")
             task = Task(job_id=job.id, id=task_id, role="cost", instruction="measure")
             store.save_task(task)
@@ -251,6 +256,7 @@ class OperatorContractTests(unittest.TestCase):
     def test_cli_await_rejects_terminal_empty_delivery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteSwarmStore(Path(tmp))
+            store.init()
             job = store.create_job("empty")
             store.update_job_status(job.id, JobStatus.COMPLETE)
             rc = cli_main(
@@ -286,6 +292,7 @@ class OperatorContractTests(unittest.TestCase):
     def test_read_job_state_reports_the_post_reaper_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteSwarmStore(Path(tmp))
+            store.init()
             job = store.create_job("liveness")
             store.update_job_status(job.id, JobStatus.RUNNING)
             with patch(
@@ -302,6 +309,7 @@ class OperatorContractTests(unittest.TestCase):
         for store_type in (SwarmStore, SQLiteSwarmStore):
             with self.subTest(store=store_type.__name__), tempfile.TemporaryDirectory() as tmp:
                 store = store_type(Path(tmp))
+                store.init()
                 job = store.create_job("progress")
                 store.emit(job.id, "run.heartbeat", {"worker": "test"})
                 progress = store.status_snapshot(job.id, compact=True)["progress"]
@@ -311,6 +319,7 @@ class OperatorContractTests(unittest.TestCase):
     def test_analysis_worker_diff_fails_the_orchestration_postcondition(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteSwarmStore(Path(tmp))
+            store.init()
             job = store.create_job("analysis")
             task = Task(job_id=job.id, role="analysis", instruction="inspect")
             store.save_task(task)
@@ -404,6 +413,7 @@ class OperatorContractTests(unittest.TestCase):
     def test_filtered_refs_advance_cursor_without_payload_bodies(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteSwarmStore(Path(tmp))
+            store.init()
             job = store.create_job("feed")
             task = Task(job_id=job.id, role="analysis", instruction="inspect")
             store.save_task(task)
