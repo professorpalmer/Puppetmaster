@@ -1368,7 +1368,8 @@ class SwarmStore:
         role: Optional[str] = None,
         lease_seconds: int = 60,
     ) -> Optional[Task]:
-        self.refresh_blocked_tasks(job_id)
+        # Unblock is a supervisor tick (recover/refresh loops), not a claim side
+        # effect. Workers must not refresh_blocked_tasks on every claim.
         # Load the job's tasks once and resolve dependency status from the
         # in-memory map instead of re-fetching each dependency by id (which is
         # a per-edge file glob / SQLite SELECT on every claim sweep).
