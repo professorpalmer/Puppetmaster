@@ -8,7 +8,8 @@ structural validation plus optional VERIFICATION accept is enough.
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Any, Iterable, List, Optional, Sequence
+from pathlib import Path
+from typing import Any, Iterable, List, Optional, Sequence, Union
 
 from puppetmaster.artifact_status import durable_admission_allowed
 from puppetmaster.models import Artifact, ArtifactType
@@ -144,6 +145,8 @@ def is_admitted_for_shared_context(
         return False
     if not is_cross_job_injectable(artifact, for_job_id=for_job_id):
         return False
+    if not _freshness_allows_shared_context(artifact):
+        return False
     kind = _artifact_type(artifact)
     if kind == ArtifactType.GIST or _raw_type_name(artifact) == "gist":
         if _gist_admission(artifact) != GIST_ADMISSION_ADMITTED:
@@ -168,17 +171,49 @@ def is_admitted_for_shared_context(
     return True
 
 
+def _validation_status_for_admission(artifact: Any) -> Optional[str]:
+    from puppetmaster.validation import validation_status_of
+
+    if isinstance(artifact, Artifact):
+        return validation_status_of(artifact)
+    payload = _payload(artifact)
+    validation = payload.get("validation")
+    if not isinstance(validation, dict):
+        return None
+    status = validation.get("status")
+    return str(status) if status is not None else None
+
+
+def _freshness_allows_shared_context(artifact: Any) -> bool:
+    from puppetmaster.validation import REUSABLE_VALIDATION_STATUSES
+
+    status = _validation_status_for_admission(artifact)
+    if status is None:
+        return True
+    return status in REUSABLE_VALIDATION_STATUSES
+
+
 def filter_shared_context_artifacts(
     artifacts: Iterable[Any],
     *,
     for_job_id: Optional[str] = None,
+    cwd: Optional[Union[str, Path]] = None,
+    store: Any = None,
 ) -> List[Any]:
     """Keep only artifacts safe for peer prompt injection."""
-    return [
-        artifact
-        for artifact in artifacts
-        if is_admitted_for_shared_context(artifact, for_job_id=for_job_id)
-    ]
+    from puppetmaster.validation import refresh_cited_freshness
+
+    refresh_cwd = cwd if cwd not in (None, "") else None
+    admitted: List[Any] = []
+    for artifact in artifacts:
+        if refresh_cwd is not None:
+            try:
+                artifact = refresh_cited_freshness(artifact, refresh_cwd, store=store)
+            except Exception:
+                pass
+        if is_admitted_for_shared_context(artifact, for_job_id=for_job_id):
+            admitted.append(artifact)
+    return admitted
 
 
 def admit_gist(
@@ -228,6 +263,11 @@ def reject_gist(
     payload["admission"] = GIST_ADMISSION_REJECTED
     payload.setdefault("level", "gist")
     updated = replace(artifact, payload=payload, sha256=None)
+    from puppetmaster.negative_claims import scope_from_source_ids, stamp_negative_claim
+
+    claim = str(payload.get("claim") or "").strip()
+    scope = scope_from_source_ids(payload.get("source_artifact_ids")) or claim
+    updated = stamp_negative_claim(updated, kind="gist", claim=claim, scope=scope)
     updated.validate()
     store.save_artifact(updated)
     store.emit(

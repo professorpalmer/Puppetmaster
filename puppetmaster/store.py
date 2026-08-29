@@ -907,6 +907,7 @@ class SwarmStore:
         parent_task_id: Optional[str] = None,
         created_by: Optional[str] = None,
         limit: int = 4,
+        cwd: Optional[Union[str, Path]] = None,
     ) -> list[Task]:
         """Enqueue follow-ups declared on ``artifact.payload['enqueue_subtasks']``.
 
@@ -929,6 +930,12 @@ class SwarmStore:
             proposal_foreign_job_id,
             proposal_foreign_parent_id,
             proposal_requests_new_job,
+        )
+        from puppetmaster.negative_claims import (
+            REASON_NEGATIVE_CLAIM,
+            enqueue_negative_scope,
+            resolve_negative_cwd,
+            should_skip_negative,
         )
 
         producing_id = artifact.task_id
@@ -967,6 +974,7 @@ class SwarmStore:
         gate_failed = artifact_is_failed_gate(artifact) or gate_failed_for_task(
             self, artifact.job_id, producing_id
         )
+        resolved_cwd = resolve_negative_cwd(self, artifact, cwd)
         created: list[Task] = []
         for proposal in proposals[: max(0, int(limit))]:
             if not isinstance(proposal, dict):
@@ -1020,6 +1028,21 @@ class SwarmStore:
                 proposal.get("instruction") or proposal.get("goal") or ""
             ).strip()
             if not role or not instruction:
+                continue
+            negative_scope = enqueue_negative_scope(artifact, proposal, instruction)
+            if should_skip_negative(
+                self,
+                artifact.job_id,
+                instruction,
+                negative_scope,
+                cwd=resolved_cwd,
+            ):
+                self._emit_enqueue_refused(
+                    artifact.job_id,
+                    REASON_NEGATIVE_CLAIM,
+                    parent_task_id=parent_id,
+                    extra={"role": role, "instruction": instruction},
+                )
                 continue
             try:
                 child = self.enqueue_subtask(
@@ -1948,8 +1971,17 @@ class SwarmStore:
         # Admission filter at the edge-resolution boundary so pending/rejected
         # gists never enter peer prompts. Raw list_artifacts remains unfiltered
         # for tooling/MCP.
+        task_payload = getattr(task, "payload", None) or {}
+        if not isinstance(task_payload, dict):
+            task_payload = {}
+        cwd = task_payload.get("cwd") or task_payload.get("workspace")
+        if cwd == "":
+            cwd = None
         artifacts = filter_shared_context_artifacts(
-            artifacts, for_job_id=task.job_id
+            artifacts,
+            for_job_id=task.job_id,
+            cwd=cwd,
+            store=self,
         )
         if record_consumes and artifacts:
             self.record_consumes(
@@ -2175,6 +2207,12 @@ class SwarmStore:
         # Central save seam: truthful execution provenance on typed peer
         # artifacts (all adapters). Additive / optional; never fabricates zeros.
         stamped = stamp_execution_provenance_for_store(artifact, self)
+        try:
+            from puppetmaster.negative_claims import stamp_failed_gate
+
+            stamped = stamp_failed_gate(stamped, store=self)
+        except Exception:
+            pass
         prepared = prepare_artifact_for_persist(stamped, state_dir=self.root)
         prepared.validate()
         if prepared.sha256 is None:

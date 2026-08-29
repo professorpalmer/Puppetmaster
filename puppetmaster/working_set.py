@@ -21,7 +21,7 @@ import json
 import os
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Iterable, List, Optional, Sequence, Union
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Union
 
 from puppetmaster.models import Artifact, new_id, now_iso
 from puppetmaster.validation import (
@@ -55,6 +55,9 @@ _ANALYSIS_ROLES = frozenset(
         "test",
     }
 )
+_RESIDUAL_STORY_TYPES = frozenset({"finding", "gist", "risk"})
+_RESIDUAL_HEADLINE_MAX_CHARS = 120
+_RESIDUAL_STORY_FIELDS = ("claim", "check", "decision", "risk")
 
 
 def working_set_enabled() -> bool:
@@ -80,14 +83,267 @@ def working_set_brief_line() -> str:
     return WORKING_SET_BRIEF_LINE
 
 
+def _usable_repo_cwd(raw: Any) -> Optional[Path]:
+    if raw is None or raw == "":
+        return None
+    try:
+        path = Path(str(raw))
+        if path.is_dir():
+            return path
+    except Exception:
+        return None
+    return None
+
+
+def _cwd_from_artifacts(artifacts: Iterable[Any]) -> Optional[Path]:
+    for item in artifacts:
+        payload = getattr(item, "payload", None) or {}
+        if not isinstance(payload, dict):
+            continue
+        validation = payload.get("validation")
+        if not isinstance(validation, dict):
+            continue
+        cwd = _usable_repo_cwd(validation.get("repo_root"))
+        if cwd is not None:
+            return cwd
+    return None
+
+
+def _cwd_from_store_job(store: Any, job_id: str) -> Optional[Path]:
+    try:
+        tasks = store.list_tasks(job_id)
+    except Exception:
+        return None
+    for task in tasks:
+        payload = getattr(task, "payload", None) or {}
+        if not isinstance(payload, dict):
+            continue
+        cwd = _usable_repo_cwd(payload.get("cwd") or payload.get("workspace"))
+        if cwd is not None:
+            return cwd
+    return None
+
+
+def _artifact_payload(artifact: Any) -> dict:
+    if isinstance(artifact, dict):
+        payload = artifact.get("payload") or {}
+    else:
+        payload = getattr(artifact, "payload", None) or {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _artifact_kind(artifact: Any) -> str:
+    if isinstance(artifact, dict):
+        raw = artifact.get("type", "")
+    else:
+        raw = getattr(artifact, "type", "") or ""
+    return str(getattr(raw, "value", raw)).strip().lower()
+
+
+def _artifact_id(artifact: Any) -> str:
+    if isinstance(artifact, dict):
+        return str(artifact.get("id") or "").strip()
+    return str(getattr(artifact, "id", "") or "").strip()
+
+
+def _artifact_created_at(artifact: Any) -> str:
+    if isinstance(artifact, dict):
+        return str(artifact.get("created_at") or "")
+    return str(getattr(artifact, "created_at", "") or "")
+
+
+def _gist_admission(artifact: Any) -> str:
+    value = _artifact_payload(artifact).get("admission")
+    return str(value).strip().lower() if value is not None else ""
+
+
+def _is_last_wins_groupable(artifact: Any) -> bool:
+    kind = _artifact_kind(artifact)
+    if kind in ("finding", "risk"):
+        return True
+    if kind == "gist":
+        return _gist_admission(artifact) == "admitted"
+    return False
+
+
+def _truncate_residual_headline(value: str) -> str:
+    text = value.strip()
+    limit = _RESIDUAL_HEADLINE_MAX_CHARS
+    if len(text) <= limit:
+        return text
+    if limit <= 3:
+        return text[:limit]
+    return text[: limit - 3] + "..."
+
+
+def _residual_rank(artifact: Any) -> tuple:
+    validation = _artifact_payload(artifact).get("validation")
+    generation = 0
+    if isinstance(validation, dict) and validation.get("generation") is not None:
+        try:
+            generation = int(validation["generation"])
+        except (TypeError, ValueError):
+            generation = 0
+    return (generation, _artifact_created_at(artifact), _artifact_id(artifact))
+
+
+def residual_story_key(artifact: Any) -> str:
+    """Normalize the overlap key for a shared-context story.
+
+    Uses claim, check, decision, or risk (strip, collapse space, lower).
+    An empty key means the artifact is not overlap-grouped.
+    """
+    payload = _artifact_payload(artifact)
+    raw = ""
+    for field in _RESIDUAL_STORY_FIELDS:
+        value = payload.get(field)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            raw = text
+            break
+    return " ".join(raw.split()).lower()
+
+
+def last_wins_residual(artifacts: Iterable[Any]) -> Dict[str, Any]:
+    """Keep one winner per story key among FINDING/GIST/RISK.
+
+    Winner: highest ``validation.generation``, then newest ``created_at``,
+    then id. PATCH/VERIFICATION/DECISION/PLAN and empty keys are not grouped.
+    Admitted gists group; pending/rejected gists stand alone.
+    """
+    items = list(artifacts or [])
+    groups: Dict[str, List[Any]] = {}
+    for artifact in items:
+        if not _is_last_wins_groupable(artifact):
+            continue
+        key = residual_story_key(artifact)
+        if not key:
+            continue
+        groups.setdefault(key, []).append(artifact)
+
+    omitted: List[dict] = []
+    omitted_identities = set()
+    for key, group in groups.items():
+        winner = max(group, key=_residual_rank)
+        for artifact in group:
+            if artifact is winner:
+                continue
+            omitted_identities.add(id(artifact))
+            omitted.append(
+                {
+                    "id": _artifact_id(artifact),
+                    "key": key,
+                    "superseded_by": _artifact_id(winner),
+                }
+            )
+    selected = [
+        artifact for artifact in items if id(artifact) not in omitted_identities
+    ]
+    return {"selected": selected, "omitted": omitted}
+
+
+def _residual_headline(artifact: Any, ref: Optional[dict] = None) -> str:
+    if isinstance(ref, dict):
+        for field in ("claim", "check", "decision"):
+            value = ref.get(field)
+            if value:
+                return _truncate_residual_headline(str(value))
+    payload = _artifact_payload(artifact)
+    for field in _RESIDUAL_STORY_FIELDS:
+        value = payload.get(field)
+        if value:
+            return _truncate_residual_headline(str(value))
+    return ""
+
+
+def _format_residual_handle(artifact: Any) -> str:
+    ref: Optional[dict] = None
+    if isinstance(artifact, Artifact):
+        try:
+            ref = compact_artifact_ref(artifact)
+        except Exception:
+            ref = None
+    kind = _artifact_kind(artifact) or "artifact"
+    artifact_id = _artifact_id(artifact)
+    status = None
+    if isinstance(ref, dict):
+        artifact_id = str(ref.get("id") or artifact_id).strip()
+        kind = str(ref.get("type") or kind).strip() or kind
+        validation = ref.get("validation")
+        if isinstance(validation, dict) and validation.get("status") is not None:
+            status = str(validation.get("status")).strip()
+    if not status:
+        validation = _artifact_payload(artifact).get("validation")
+        if isinstance(validation, dict) and validation.get("status") is not None:
+            status = str(validation.get("status")).strip()
+    headline = _residual_headline(artifact, ref)
+    if artifact_id and headline:
+        line = f"{kind} {artifact_id}: {headline}"
+    elif artifact_id:
+        line = f"{kind} {artifact_id}"
+    elif headline:
+        line = f"{kind}: {headline}"
+    else:
+        line = kind
+    if status:
+        line = f"{line} [{status}]"
+    return line
+
+
+def format_shared_context_residual(
+    artifacts: Iterable[Any],
+    cwd: Optional[Union[str, Path]] = None,
+    store: Any = None,
+) -> str:
+    """Render last-wins catalog handles for FINDING/GIST/RISK.
+
+    Filters stale/unadmitted artifacts first (Wave 1), then last-wins, then
+    one compact handle per selected story. Omitted overlap is a query line.
+    """
+    from puppetmaster.gist_admission import filter_shared_context_artifacts
+
+    filtered = filter_shared_context_artifacts(artifacts, cwd=cwd, store=store)
+    if not filtered:
+        return ""
+    residual = last_wins_residual(filtered)
+    lines: List[str] = []
+    for artifact in residual["selected"]:
+        if _artifact_kind(artifact) not in _RESIDUAL_STORY_TYPES:
+            continue
+        handle = _format_residual_handle(artifact)
+        if handle:
+            lines.append(handle)
+    omitted = residual["omitted"]
+    if omitted:
+        ids = [
+            str(item.get("id") or "").strip()
+            for item in omitted
+            if str(item.get("id") or "").strip()
+        ]
+        show_target = " ".join(ids) if ids else "<id>"
+        lines.append(
+            f"Overlap: {len(omitted)} claim(s) omitted (last-wins); "
+            f"query `puppetmaster show {show_target}` or "
+            f"`puppetmaster effort-index`."
+        )
+    return "\n".join(lines)
+
+
 def write_artifact_index(
     job_dir: Union[Path, str],
     artifacts: Iterable[Any],
+    *,
+    cwd: Optional[Union[Path, str]] = None,
+    store: Any = None,
 ) -> Optional[Path]:
     """Persist compact refs for shared-context artifacts. Best-effort.
 
     Uses ``filter_shared_context_artifacts`` + ``compact_artifact_ref`` so the
-    sidecar never contains full FINDING bodies.
+    sidecar never contains full FINDING bodies. When ``cwd`` (or a repo root
+    on the artifacts) is available, cited freshness is refreshed first;
+    already-stale status is refused either way.
     """
     if not working_set_enabled():
         return None
@@ -102,14 +358,38 @@ def write_artifact_index(
             job_id = getattr(item, "job_id", None)
             if job_id:
                 break
-        filtered = filter_shared_context_artifacts(items, for_job_id=job_id)
+        resolved_cwd = _usable_repo_cwd(cwd)
+        if resolved_cwd is None:
+            resolved_cwd = _cwd_from_artifacts(items)
+        filtered = filter_shared_context_artifacts(
+            items,
+            for_job_id=job_id,
+            cwd=resolved_cwd,
+            store=store,
+        )
         refs = []
         for artifact in filtered:
             try:
                 refs.append(compact_artifact_ref(artifact))
             except Exception:
                 continue
-        payload = {"artifacts": refs}
+        payload: Dict[str, Any] = {"artifacts": refs}
+        residual = last_wins_residual(filtered)
+        selected_ids = [
+            _artifact_id(item)
+            for item in residual["selected"]
+            if _artifact_kind(item) in _RESIDUAL_STORY_TYPES and _artifact_id(item)
+        ]
+        omitted_ids = [
+            str(item.get("id") or "").strip()
+            for item in residual["omitted"]
+            if str(item.get("id") or "").strip()
+        ]
+        if selected_ids or omitted_ids:
+            payload["residual"] = {
+                "omitted_ids": omitted_ids,
+                "selected_ids": selected_ids,
+            }
         path = artifact_index_path(root)
         temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         temp_path.write_text(
@@ -158,7 +438,8 @@ def rebuild_artifact_index(
         return None
     try:
         artifacts = store.list_artifacts(job_id)
-        return write_artifact_index(job_dir, artifacts)
+        cwd = _cwd_from_store_job(store, job_id)
+        return write_artifact_index(job_dir, artifacts, cwd=cwd, store=store)
     except Exception:
         return None
 
@@ -430,6 +711,7 @@ def persist_reused_artifacts(
                 artifact,
                 parent_task_id=getattr(task, "id", None),
                 created_by=worker_id or getattr(artifact, "created_by", None),
+                cwd=_task_cwd(task),
             )
         except Exception:
             pass

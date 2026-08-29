@@ -1,3 +1,17 @@
+## v1.22.39 — 2026-08-29
+
+**Cited freshness, last-wins residual inject, and negative-claim skip. No new store.**
+
+Shared-context FINDINGs are no longer immortal prompt bodies. Withdrawal is a status or skip, never a delete. Unlabeled legacy artifacts still inject; reuse was already fail-closed.
+
+- Fresh inject: `refresh_cited_freshness` recomputes existing `source_digests` before admission. Digest miss → `validation.status=stale` + `freshness_reason=digest_mismatch`. Missing cited path → stale + `unprovable`. Effort-index drops stale/superseded as cited truth. Persist via `save_artifact` when a store is present.
+- Query-first residual: FINDING/GIST/RISK inject as compact last-wins handles plus an Overlap line that points at `puppetmaster show` / `effort-index`. Plan/PATCH bodies stay intact. `artifact_index.json` still keeps every admitted ref.
+- Negative claims: SHA-256 of normalized scope + claim on failed GATE, rejected gist, and `ci_failed` host observations. Same fingerprint + fresh scope refuses re-enqueue (`reason=negative_claim`). Cited-byte change allows another attempt. No Discord-OS research table.
+
+Files: `puppetmaster/validation.py`, `gist_admission.py`, `working_set.py`, `negative_claims.py`, `lifecycle.py`, `store.py`, `prewalk.py`, `scm_observe.py`, `gates.py`, `worker_runtime.py`. Tests: `tests/test_artifact_freshness.py`, `tests/test_shared_context_residual.py`, `tests/test_negative_claims.py`.
+
+No Pi / grok-bot worker. Marionette pin stays on 1.22.38 until a separate ride.
+
 ## v1.22.38 — 2026-08-28
 
 **One-shot host SCM observe plus per-worker browser isolate profiles. Not an Agent-Orchestrator daemon.**
