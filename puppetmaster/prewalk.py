@@ -81,13 +81,20 @@ def format_upstream_artifacts_for_injection(
 ) -> str:
     """Format edge-resolved upstream artifacts for implement/verify injection."""
     from puppetmaster.gist_admission import filter_shared_context_artifacts
+    from puppetmaster.working_set import format_shared_context_residual
 
+    items = list(artifacts or [])
     blocks: list[str] = []
+    residual_text = format_shared_context_residual(items, cwd=cwd, store=store)
+    if residual_text:
+        blocks.append(residual_text)
     for artifact in filter_shared_context_artifacts(
-        artifacts, cwd=cwd, store=store
+        items, cwd=cwd, store=store
     ):
         kind, payload = _artifact_type_and_payload(artifact)
         if not isinstance(payload, dict):
+            continue
+        if kind in {"finding", "gist", "risk"}:
             continue
         if kind in _PLAN_ARTIFACT_TYPES or payload.get("decision") or payload.get("plan"):
             block = _format_one_plan_payload(payload)

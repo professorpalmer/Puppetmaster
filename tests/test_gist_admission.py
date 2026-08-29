@@ -81,7 +81,8 @@ class GistAdmissionFilterTests(unittest.TestCase):
         filtered = filter_shared_context_artifacts([admitted])
         self.assertEqual(filtered, [admitted])
         text = format_upstream_artifacts_for_injection([admitted])
-        self.assertIn("Gist: peers may see this", text)
+        self.assertIn(admitted.id, text)
+        self.assertIn("peers may see this", text)
 
     def test_rejected_gist_filtered(self) -> None:
         rejected = _gist(admission="rejected")
@@ -98,7 +99,8 @@ class GistAdmissionFilterTests(unittest.TestCase):
         text = format_upstream_artifacts_for_injection(
             [finding, _gist(admission="rejected")]
         )
-        self.assertIn("Finding: legacy finding claim", text)
+        self.assertIn(finding.id, text)
+        self.assertIn("legacy finding claim", text)
         self.assertNotIn("Gist:", text)
 
     def test_stale_validation_status_refused_without_cwd(self) -> None:

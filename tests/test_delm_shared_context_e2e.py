@@ -119,9 +119,11 @@ class DelmSharedContextE2ETests(unittest.TestCase):
             injected = format_upstream_artifacts_for_injection(
                 [finding, gist, pending]
             )
-            self.assertIn("Finding: Peers must only see admitted gists", injected)
-            self.assertIn("Gist: Peers must only see admitted gists", injected)
+            self.assertIn("Peers must only see admitted gists", injected)
+            selected_ids = [item for item in (finding.id, gist.id) if item in injected]
+            self.assertTrue(selected_ids)
             self.assertNotIn("unverified rumor", injected)
+            self.assertNotIn("enqueue_subtasks", injected)
 
             gist_view = unfold_shared_context(
                 store, gist, level=CONTEXT_LEVEL_GIST
