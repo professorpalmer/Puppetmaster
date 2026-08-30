@@ -1,4 +1,4 @@
-## Unreleased
+## v1.22.42 — 2026-08-30
 
 **Stable terminal job cost receipts (#122).**
 
