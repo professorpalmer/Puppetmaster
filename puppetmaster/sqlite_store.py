@@ -22,12 +22,14 @@ from puppetmaster.models import (
     TaskStatus,
     artifact_from_dict,
     graph_edge_from_dict,
+    is_cost_final_job_status,
     job_from_dict,
     make_graph_edge,
     now_iso,
     task_from_dict,
     to_jsonable,
 )
+from puppetmaster.cost import maybe_stamp_terminal_cost_receipt
 from puppetmaster.fs_permissions import chmod_private_file, mkdir_private
 from puppetmaster.store import (
     ActiveTaskLeaseError,
@@ -586,6 +588,8 @@ class SQLiteSwarmStore(SwarmStore):
         if refused is not None:
             return refused
         updated = self._job_with_status(job, status)
+        if is_cost_final_job_status(status):
+            updated = maybe_stamp_terminal_cost_receipt(self, updated)
         payload = {"status": str(status), "actor": actor or "coordinator"}
         with self._session() as connection:
             connection.execute(
@@ -1236,8 +1240,9 @@ class SQLiteSwarmStore(SwarmStore):
         """Idempotent subgraph reset in a single SQLite transaction/batch.
 
         Unlike the file backend (per-task writes), all selected task clears,
-        QUEUED/BLOCKED re-derivation, superseded artifact labeling, and the
-        canonical ``subgraph.reset`` event (including
+        QUEUED/BLOCKED re-derivation, superseded artifact labeling, coordinator
+        job reopen (RUNNING, cleared ``completed_at`` / ``cost_receipt``), and
+        the canonical ``subgraph.reset`` event (including
         ``superseded_artifact_ids``) commit together so a busy/crash mid-reset
         cannot leave a partial subgraph.
         """
@@ -1391,6 +1396,16 @@ class SQLiteSwarmStore(SwarmStore):
                     "superseded_artifact_ids": superseded_ids,
                 },
             )
+            row = connection.execute(
+                "SELECT data FROM jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is not None:
+                job = job_from_dict(json.loads(row["data"]))
+                connection.execute(
+                    "UPDATE jobs SET data = ? WHERE id = ?",
+                    (self._dumps(self._reopened_job_after_reset(job)), job_id),
+                )
         return ResetSubgraphResult(finalized, superseded_ids)
 
     def delete_edge(self, job_id: str, edge_id: str) -> bool:
