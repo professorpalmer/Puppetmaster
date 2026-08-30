@@ -61,17 +61,21 @@ RULE_BODY = textwrap.dedent(
 
     ## Are you a Puppetmaster worker? (check this first)
 
-    **If Puppetmaster issued your prompt, every delegation rule below is void
-    for you.** You *are* the worker it delegated to. Do the analysis or the
-    edit yourself and return the artifacts your prompt asks for.
+    **If `PUPPETMASTER_WORKER` is `1`, or Puppetmaster issued your prompt,
+    every delegation rule below is void for you.** You *are* the worker it
+    delegated to. Do the analysis or the edit yourself and return the
+    artifacts your prompt asks for.
 
-    You are a Puppetmaster worker if your prompt contains a `Puppetmaster
-    artifact contract:` block, a `Role: <role>` + `Goal: <goal>` header, or an
-    instruction to finish by calling `submit_findings` / `submit_report`.
-    Workers run as plain agent CLIs with **no `puppetmaster_*` MCP tools**, so
-    delegating is impossible; attempting it spends the whole context window and
-    returns a clarifying question instead of findings. Explore with your own
-    native tools — that is the job you were spawned for.
+    You are a Puppetmaster worker if `PUPPETMASTER_WORKER=1` in the
+    environment, or your prompt contains a `Puppetmaster artifact contract:`
+    block, a `Role: <role>` + `Goal: <goal>` header, or an instruction to
+    finish by calling `submit_findings` / `submit_report`. Nested job starts
+    (`python -m puppetmaster swarm`, MCP start verbs) are refused while that
+    env is set. Override: `PUPPETMASTER_ALLOW_NESTED=1`. Workers run as plain
+    agent CLIs with **no `puppetmaster_*` MCP tools**, so delegating is
+    impossible; attempting it spends the whole context window and returns a
+    clarifying question instead of findings. Explore with your own native
+    tools — that is the job you were spawned for.
 
     ## Trigger convention (must obey)
 

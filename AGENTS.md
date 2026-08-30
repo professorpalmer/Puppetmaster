@@ -8,7 +8,8 @@ Repo-level guidance for AI coding agents (Cursor, Claude Code, Codex, etc.) work
 swarm does not apply to you.** You *are* the swarm. Do the analysis or the edit
 yourself, directly, and return the artifacts your prompt asks for.
 
-You are a Puppetmaster worker if your prompt contains any of:
+You are a Puppetmaster worker if `PUPPETMASTER_WORKER=1`, or your prompt
+contains any of:
 
 - a `Puppetmaster artifact contract:` / `Return only Puppetmaster artifact JSON` block,
 - a `Role: <role>` + `Goal: <goal>` header,
@@ -17,8 +18,10 @@ You are a Puppetmaster worker if your prompt contains any of:
 Workers are spawned by `puppetmaster.worker_runtime` as plain agent CLIs. They
 have **no Puppetmaster MCP tools**, so "start a swarm before exploring" is an
 instruction they cannot follow — following it costs a full context load and
-returns a request for clarification instead of findings. Roll your own
-grep/read loop; that is your job.
+returns a request for clarification instead of findings. Nested job starts
+(`python -m puppetmaster swarm`, MCP start verbs) are refused while
+`PUPPETMASTER_WORKER=1`. Override: `PUPPETMASTER_ALLOW_NESTED=1`. Roll your
+own grep/read loop; that is your job.
 
 The rest of this file addresses an **interactive agent working with the user**,
 which has the MCP tools available. **Pi** is in that class: a TUI/pilot via the bundled `@puppetmaster/pi-pilot` package (`puppetmaster install-pi-mcp` / `setup --platforms pi`). **OMP / oh-my-pi** is the same class via native MCP (`puppetmaster install-omp-mcp` / `setup --platforms omp` or `ohmypi`; writes `~/.omp/agent/mcp.json`). Use start_implement / start_agentic / start_prewalk, consume artifacts, nuke the job. Do not lease `pi` or `omp` as a worker.
