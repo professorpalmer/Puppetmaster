@@ -9,12 +9,15 @@ alwaysApply: true
 below applies to you.** You *are* the swarm. Do the analysis or the edit
 yourself and return the artifacts your prompt asks for.
 
-You are a Puppetmaster worker if your prompt contains a `Puppetmaster artifact
-contract:` block, a `Role: <role>` + `Goal: <goal>` header, or an instruction to
-finish by calling `submit_findings` / `submit_report`. Workers run as plain
-agent CLIs with **no Puppetmaster MCP tools**, so delegating is impossible;
-attempting it burns the context window and returns a clarifying question instead
-of findings. Roll your own grep/read loop — that is your job.
+You are a Puppetmaster worker if `PUPPETMASTER_WORKER=1`, or your prompt contains
+a `Puppetmaster artifact contract:` block, a `Role: <role>` + `Goal: <goal>`
+header, or an instruction to finish by calling `submit_findings` /
+`submit_report`. Workers run as plain agent CLIs with **no Puppetmaster MCP
+tools**, so delegating is impossible; attempting it burns the context window and
+returns a clarifying question instead of findings. Nested job starts
+(`python -m puppetmaster swarm`, MCP start verbs) are refused while that env is
+set. Override: `PUPPETMASTER_ALLOW_NESTED=1`. Roll your own grep/read loop —
+that is your job.
 
 The rest of this file addresses an interactive agent working with the user,
 which does have the MCP tools.

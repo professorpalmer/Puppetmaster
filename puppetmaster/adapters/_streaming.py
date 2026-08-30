@@ -10,6 +10,7 @@ from typing import Any, Optional
 from puppetmaster.fs_permissions import mkdir_private, open_private, write_private_text
 from puppetmaster.models import Task
 from puppetmaster.redaction import redact_secrets
+from puppetmaster.worker_fence import stamp_worker_env
 
 _STDOUT_HEAD_CHARS = 1000
 
@@ -240,6 +241,12 @@ def run_streamed_subprocess(
     env.setdefault("PAGER", "cat")
     env["GIT_PAGER"] = "cat"
     env.setdefault("GIT_TERMINAL_PROMPT", "0")
+    stamp_worker_env(
+        env,
+        job_id=task.job_id,
+        task_id=task.id,
+        role=task.role,
+    )
 
     popen_kwargs: dict[str, Any] = {}
     if start_new_session:

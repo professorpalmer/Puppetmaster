@@ -53,6 +53,7 @@ from puppetmaster.swarm_launch import (
     wait_for_job_id,
 )
 from puppetmaster.update_check import pypi_update_note, version_is_newer
+from puppetmaster.worker_fence import nested_start_blocked
 from puppetmaster.cli.helpers import (
     allowed_model_ids_from_mapping,
     allowed_model_ids_list_from_mapping,
@@ -4201,6 +4202,10 @@ def run_await_job(args: JsonObject) -> JsonObject:
 
 
 def start_cli(command: list[str], args: JsonObject) -> JsonObject:
+    if command:
+        nested_msg = nested_start_blocked(command[0])
+        if nested_msg:
+            return tool_error(nested_msg)
     if command and command[0] != "run":
         _append_label_flag(command, args)
     state_dir = str(mcp_state_dir(args))

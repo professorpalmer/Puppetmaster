@@ -1,3 +1,15 @@
+## v1.22.43 — 2026-08-30
+
+**Nested job starts fail closed inside a worker.**
+
+Prompt-only exemption (v1.22.10) told spawned agents they were the swarm. They still ran `python -m puppetmaster swarm` because identity lived only in the prompt. Workers now get `PUPPETMASTER_WORKER=1` on spawn, and CLI/MCP job-start verbs refuse unless `PUPPETMASTER_ALLOW_NESTED=1`.
+
+- Stamp sites: `inject_worker_cli_env`, orchestrator `_spawn_worker` (job id + role), streamed agent subprocesses (job/task/role). Hermes still skips `inject_worker_cli_env` (foreign Python) and is covered by the streaming backstop.
+- Refuse `run` / `swarm` / `review` / adapter start verbs / `edit` / `prewalk` / `browser` / `research` / `daemon` / `rerun`. Read-only inspectors and `codegraph` stay available.
+- `RULE_BODY` plus hand-maintained `AGENTS.md` / `puppetmaster-workflow.mdc` name the env flag ahead of the delegate-first gate.
+
+Files: `puppetmaster/worker_fence.py`. Tests: `tests/test_worker_fence.py`.
+
 ## v1.22.42 — 2026-08-30
 
 **Stable terminal job cost receipts (#122).**

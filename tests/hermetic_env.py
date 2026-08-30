@@ -43,6 +43,8 @@ _PIN_KEYS_TO_CLEAR = (
     "PUPPETMASTER_CODEGRAPH_JS",
     "PUPPETMASTER_STATE_DIR",
     "PUPPETMASTER_CURSOR_INPUT",
+    "PUPPETMASTER_WORKER",
+    "PUPPETMASTER_ALLOW_NESTED",
     # A provider the developer disconnected in Marionette Settings must not
     # change what the suite sees either — tests that care set it themselves.
     "PUPPETMASTER_DISABLED_PROVIDERS",

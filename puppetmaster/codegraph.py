@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Optional, Union
 
 from puppetmaster.fs_permissions import mkdir_private, open_private
+from puppetmaster.worker_fence import stamp_worker_env
 
 
 CODEGRAPH_COMMAND = "codegraph"
@@ -493,13 +494,14 @@ def inject_worker_cli_env(env: dict[str, str]) -> dict[str, str]:
     up a *stale pip install* that predates the codegraph subcommand and fail
     with "unknown command". Prepending this install's source root to PYTHONPATH
     makes the current tree shadow any older one, so the worker's CLI matches the
-    parent's. Mutates and returns ``env``."""
+    parent's. Also stamps ``PUPPETMASTER_WORKER=1`` so nested job starts
+    fail closed. Mutates and returns ``env``."""
     source_root = puppetmaster_source_root()
     existing = env.get("PYTHONPATH")
     env["PYTHONPATH"] = (
         f"{source_root}{os.pathsep}{existing}" if existing else source_root
     )
-    return env
+    return stamp_worker_env(env)
 
 
 # Python env vars that select an interpreter's import roots. They are correct

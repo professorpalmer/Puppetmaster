@@ -16,6 +16,7 @@ from puppetmaster.liveness import record_orchestrator_heartbeat
 from puppetmaster.models import Artifact, ArtifactType, Job, JobStatus, Task, TaskStatus, now_iso
 from puppetmaster.stitcher import Stitcher
 from puppetmaster.store import SwarmStore
+from puppetmaster.worker_fence import stamp_worker_env
 from puppetmaster.worker_runtime import WorkerRuntime
 from puppetmaster.workers import (
     RECOVERABLE_FAILURES,
@@ -2565,6 +2566,7 @@ class Orchestrator:
         from puppetmaster.codegraph import inject_worker_cli_env
 
         env = inject_worker_cli_env(dict(os.environ))
+        stamp_worker_env(env, job_id=job_id, role=role)
         if self._traceparent:
             env["TRACEPARENT"] = self._traceparent
             env["PUPPETMASTER_TRACEPARENT"] = self._traceparent

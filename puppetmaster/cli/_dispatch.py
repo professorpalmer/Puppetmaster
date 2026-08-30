@@ -65,6 +65,7 @@ from puppetmaster.state import (
 )
 from puppetmaster.store_factory import create_store
 from puppetmaster.stitcher import Stitcher
+from puppetmaster.worker_fence import nested_start_blocked
 from puppetmaster.worker_runtime import WorkerDaemon
 from puppetmaster.workers import WorkerSpec
 
@@ -604,6 +605,10 @@ def _main(argv: Optional[list[str]] = None) -> int:
     import puppetmaster.cli as cli
 
     args = build_parser().parse_args(argv)
+    nested_msg = nested_start_blocked(getattr(args, "command", None))
+    if nested_msg:
+        print(nested_msg, file=sys.stderr)
+        return 2
     if getattr(args, "max_output_bytes", None) is not None:
         os.environ["PUPPETMASTER_MAX_OUTPUT_BYTES"] = str(args.max_output_bytes)
     state_dir = _resolve_command_state_dir(args)
