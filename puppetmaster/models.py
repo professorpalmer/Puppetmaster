@@ -56,6 +56,16 @@ TERMINAL_JOB_STATUSES = frozenset(
     }
 )
 
+# Cost-final jobs may own an immutable receipt. STALLED is recoverable
+# and is terminal for liveness, not for selected-model economics.
+COST_FINAL_JOB_STATUSES = frozenset(
+    {
+        JobStatus.COMPLETE,
+        JobStatus.FAILED,
+        JobStatus.CANCELLED,
+    }
+)
+
 
 class DeliveryVerdict(StringEnum):
     """Operator-facing delivery result, distinct from raw lifecycle status."""
@@ -80,6 +90,14 @@ class JobRef:
 def is_terminal_job_status(status: JobStatus) -> bool:
     """Return whether ``status`` represents a job that will do no more work."""
     return status in TERMINAL_JOB_STATUSES
+
+
+def is_cost_final_job_status(status: JobStatus) -> bool:
+    """True when ``status`` may own an immutable ``Job.cost_receipt``.
+
+    ``stalled`` is recoverable and must never stamp or retain a receipt.
+    """
+    return status in COST_FINAL_JOB_STATUSES
 
 
 class TaskStatus(StringEnum):
@@ -129,6 +147,10 @@ class Job:
     wait_reason: Optional[str] = None
     subgraph_owner: Optional[str] = None
     subgraph_hold: Optional[str] = None
+    # Coordinator-stamped selected-model economics at cost-final status.
+    # Older records omit the key. JSON on the job row only — not a new
+    # ArtifactType or store table. STALLED must not keep a receipt.
+    cost_receipt: Optional[dict[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -366,6 +388,7 @@ def _job_status_or_stalled(raw: Any) -> JobStatus:
 
 
 def job_from_dict(data: dict[str, Any]) -> Job:
+    raw_receipt = data.get("cost_receipt")
     return Job(
         id=data["id"],
         goal=data["goal"],
@@ -380,6 +403,7 @@ def job_from_dict(data: dict[str, Any]) -> Job:
         wait_reason=data.get("wait_reason"),
         subgraph_owner=data.get("subgraph_owner"),
         subgraph_hold=data.get("subgraph_hold"),
+        cost_receipt=raw_receipt if isinstance(raw_receipt, dict) else None,
     )
 
 

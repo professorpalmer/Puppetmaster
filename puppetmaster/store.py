@@ -24,6 +24,7 @@ from puppetmaster.models import (
     Task,
     TaskStatus,
     artifact_from_dict,
+    is_cost_final_job_status,
     graph_edge_from_dict,
     job_from_dict,
     make_graph_edge,
@@ -34,6 +35,7 @@ from puppetmaster.models import (
     task_from_dict,
     to_jsonable,
 )
+from puppetmaster.cost import maybe_stamp_terminal_cost_receipt
 from puppetmaster.redaction import redact_payload_for_storage
 from puppetmaster.fs_permissions import chmod_private_file, mkdir_private
 from puppetmaster.state import ensure_state_dir, resolve_state_dir
@@ -361,6 +363,8 @@ class SwarmStore:
         if refused is not None:
             return refused
         updated = self._job_with_status(job, status)
+        if is_cost_final_job_status(status):
+            updated = maybe_stamp_terminal_cost_receipt(self, updated)
         self.save_job(updated)
         self.emit(job_id, "job.status", {"status": str(status), "actor": actor or "coordinator"})
         return updated
@@ -406,10 +410,16 @@ class SwarmStore:
             JobStatus.STALLED,
             JobStatus.CANCELLED,
         }
+        # Recoverable / in-flight statuses must not keep a prior receipt so
+        # later work cannot reuse stale economics.
+        cost_receipt = (
+            job.cost_receipt if is_cost_final_job_status(status) else None
+        )
         return replace(
             job,
             status=status,
             completed_at=now_iso() if terminal else job.completed_at,
+            cost_receipt=cost_receipt,
         )
 
     def bind_job_contract(
@@ -2105,6 +2115,21 @@ class SwarmStore:
             return False
         return not SwarmStore.is_task_stale(task)
 
+    @staticmethod
+    def _reopened_job_after_reset(job: Job) -> Job:
+        """Coordinator job after an accepted non-empty reset.
+
+        Production finalize only stamps COMPLETE from a non-complete status.
+        Reopening to RUNNING and clearing ``completed_at`` / ``cost_receipt``
+        lets the next finalize freeze the new generation exactly once.
+        """
+        return replace(
+            job,
+            status=JobStatus.RUNNING,
+            completed_at=None,
+            cost_receipt=None,
+        )
+
     def reset_subgraph(
         self,
         job_id: str,
@@ -2120,7 +2145,9 @@ class SwarmStore:
         retained. Produced outputs are labeled ``superseded`` (audit retained).
 
         Emits one canonical ``subgraph.reset`` event whose payload includes
-        ``superseded_artifact_ids``.
+        ``superseded_artifact_ids``. A non-empty accepted reset reopens the
+        coordinator job to RUNNING and clears ``completed_at`` and
+        ``cost_receipt``.
 
         Refuses the whole reset when any selected task still holds an active
         (non-expired RUNNING) lease, so a live worker cannot be fenced into
@@ -2142,6 +2169,10 @@ class SwarmStore:
         ]
         if active:
             raise ActiveTaskLeaseError(active)
+        # Reopen and clear the job before mutating tasks/artifacts so a
+        # crash cannot leave a cost-final job with a valid receipt over
+        # superseded outputs. SQLite applies the same fields in one txn.
+        self.save_job(self._reopened_job_after_reset(self.get_job(job_id)))
         reset: list[Task] = []
         for task in tasks:
             if task.id not in selected:

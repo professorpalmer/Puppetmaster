@@ -1,3 +1,13 @@
+## v1.22.42 — 2026-08-30
+
+**Stable terminal job cost receipts (#122).**
+
+New final jobs (`complete` / `failed` / `cancelled`) freeze selected-model economics at coordinator completion. Pre-upgrade final jobs without a receipt use stable artifact-only economics (provider-reported cost and plan-billed routing stay known; registry rates are ignored). Stalled and active jobs can still reprice against the current registry and say so.
+
+- Stalled is recoverable: it never stamps or keeps a receipt. Transitions back to queued / running / stitching / stalled clear any prior receipt.
+- Unknown selected-model cost is not `$0`: unpriced work leaves job totals null, keeps any priced subtotal under `priced_subtotal_usd`, and suppresses numeric avoided spend. Plan-billed `$0` and provider-reported cost stay valid.
+- A final routing `model_id` missing from the registry is unpriced, not matched to another recorded model. Stale and superseded ROUTING artifacts are ignored before model, billing, or estimate selection. A non-empty subgraph reset reopens the coordinator job to running and clears `completed_at` plus the receipt so production finalize can stamp the new generation once. CLI says cost unavailable for unpriced work, never coerces null to zero, and still prints `priced subtotal ... $0.000000` when the known slice is plan-billed zero.
+
 ## v1.22.41 — 2026-08-29
 
 **METR leftover closures: same-turn GATE before follow-ups, live-lease writer fence, listing is still not a board.**

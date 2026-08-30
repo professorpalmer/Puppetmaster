@@ -19,6 +19,7 @@ from __future__ import annotations
 from typing import Any, Iterable, Optional
 
 from puppetmaster.models import Artifact
+from puppetmaster.validation import validation_status_of
 
 # Rough bytes-per-token for the char/4 fallback. Deliberately conservative and
 # labeled as an estimate wherever it's surfaced — never presented as measured.
@@ -137,12 +138,17 @@ def select_usage_records(artifacts: Iterable[Artifact]) -> dict:
     When a task retries after a failed first adapter (cursor -> agentic), both
     attempts stamp tokens. Prefer the successful / measured / higher-volume
     record so totals and pricing follow the run that actually did the work.
+    Artifacts whose canonical validation status is ``stale`` or ``superseded``
+    are excluded so a reset generation cannot be priced from withdrawn output.
     Untasked artifacts (no task_id) each contribute once under a unique key.
     """
     records: dict = {}
     scores: dict = {}
     untasked = 0
     for artifact in artifacts:
+        status = validation_status_of(artifact)
+        if status in {"stale", "superseded"}:
+            continue
         payload = getattr(artifact, "payload", None) or {}
         if "tokens_in" not in payload and "tokens_out" not in payload:
             continue
