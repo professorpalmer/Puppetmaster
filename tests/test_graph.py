@@ -28,6 +28,7 @@ from puppetmaster.models import (
     ArtifactType,
     GraphEdgeType,
     GraphNodeKind,
+    JobStatus,
     Task,
     TaskStatus,
     graph_edge_identity,
@@ -766,6 +767,8 @@ class SubgraphResetTests(unittest.TestCase):
             job, plan, implement, verify = self._seed_chain(store)
 
             first = store.reset_subgraph(job.id, [implement.id])
+            self.assertEqual(store.get_job(job.id).status, JobStatus.RUNNING)
+            self.assertIsNone(store.get_job(job.id).completed_at)
             by_id = {task.id: task for task in first}
             self.assertIn(implement.id, by_id)
             self.assertIn(verify.id, by_id)
@@ -1237,6 +1240,8 @@ class SqliteAtomicResetAndDoctorTests(unittest.TestCase):
                 side_effect=AssertionError("reset_subgraph must not call save_task"),
             ):
                 reset = store.reset_subgraph(job.id, [implement.id])
+            self.assertEqual(store.get_job(job.id).status, JobStatus.RUNNING)
+            self.assertIsNone(store.get_job(job.id).completed_at)
             by_id = {task.id: task for task in reset}
             self.assertEqual(by_id[implement.id].status, TaskStatus.QUEUED)
             self.assertEqual(by_id[verify.id].status, TaskStatus.BLOCKED)

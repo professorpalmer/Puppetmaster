@@ -767,6 +767,20 @@ def _routing_estimate_rows(artifacts) -> tuple[list[dict], dict[str, dict], floa
     return routing_estimate_rows(artifacts)
 
 
+def _format_cost_usd(value: Any, *, prefix: str = "") -> str:
+    """Render a dollar figure; never coerce JSON null into numeric zero."""
+    if value is None:
+        return "unavailable"
+    return f"{prefix}{float(value):.6f}"
+
+
+def _model_cost_sort_key(item: tuple) -> tuple:
+    cost = item[1].get("marginal_cost_usd")
+    if cost is None:
+        return (1, 0.0)
+    return (0, -float(cost))
+
+
 def _run_cost_command(args, store) -> int:
     """Report a job's cost on two clearly-labeled bases.
 
@@ -803,46 +817,81 @@ def _run_cost_command(args, store) -> int:
     artifacts = store.list_artifacts(job_id)
     actual = payload.get("actual_cost") or {}
     has_usage = bool(actual.get("tasks"))
-    print(
-        f"job {job_id}: actual measured spend = "
-        f"${float(actual.get('total_marginal_cost_usd') or 0.0):.6f}"
-        + (
-            f"  ({float(actual.get('measured_cost_usd') or 0.0):.6f} measured / "
-            f"{float(actual.get('estimated_cost_usd') or 0.0):.6f} from estimated tokens)"
-            if has_usage
-            else ""
-        )
+    selected_unknown = bool(actual.get("unpriced_tasks")) or (
+        actual.get("total_marginal_cost_usd") is None and has_usage
     )
+    if selected_unknown:
+        print(f"job {job_id}: cost unavailable")
+    else:
+        total = actual.get("total_marginal_cost_usd")
+        print(
+            f"job {job_id}: actual measured spend = "
+            f"{_format_cost_usd(total, prefix='$')}"
+            + (
+                f"  ({_format_cost_usd(actual.get('measured_cost_usd'))} measured / "
+                f"{_format_cost_usd(actual.get('estimated_cost_usd'))} from estimated tokens)"
+                if has_usage
+                else ""
+            )
+        )
     if has_usage:
         print()
         print(f"  {'MODEL':<28}  {'CALLS':>5}  {'TOKENS':>14}  {'COST':>12}")
         by_model = actual.get("by_model") or {}
-        for mid, v in sorted(
-            by_model.items(), key=lambda kv: -kv[1]["marginal_cost_usd"]
-        ):
+        for mid, v in sorted(by_model.items(), key=_model_cost_sort_key):
             tokens = v["tokens_in"] + v["tokens_out"]
+            cost = v.get("marginal_cost_usd")
+            cost_cell = (
+                "unavailable"
+                if cost is None
+                else f"${cost:>10.6f}"
+            )
             print(
                 f"  {mid[:28]:<28}  {v['calls']:>5}  {tokens:>14,}  "
-                f"${v['marginal_cost_usd']:>10.6f}"
+                f"{cost_cell:>12}"
             )
         if actual.get("unpriced_tasks"):
             print(
                 f"\n  note: {actual['unpriced_tasks']} task(s) ran on a model not in "
-                "your registry, so their spend could not be priced (tokens still counted)."
+                "your registry, so selected-model cost is unknown (not $0)."
             )
+            priced_subtotal = actual.get("priced_subtotal_usd")
+            if actual.get("priced_tasks") and priced_subtotal is not None:
+                print(
+                    f"  priced subtotal (excludes unpriced tasks): "
+                    f"${float(priced_subtotal):.6f}"
+                )
     else:
         print(
             "  no token usage recorded for this job yet — nothing to price "
             "(the job may still be running, or produced no worker artifacts)."
         )
 
+    if payload.get("pricing_source") == "current_registry" and has_usage:
+        print(
+            "\n  note: live reprice against the current model registry; "
+            "not a completion receipt."
+        )
+    elif payload.get("pricing_source") == "legacy_artifacts" and has_usage:
+        print(
+            "\n  note: stable artifact-only economics for a completed job "
+            "with no completion receipt; ignores current registry rates."
+        )
+
     counterfactual = payload.get("counterfactual")
-    if counterfactual is not None and counterfactual.get("reference_priced"):
+    avoided = None if counterfactual is None else counterfactual.get("avoided_usd")
+    if (
+        counterfactual is not None
+        and counterfactual.get("reference_priced")
+        and counterfactual.get("actual_priced", True)
+        and avoided is not None
+        and counterfactual.get("actual_cost_usd") is not None
+    ):
         print()
         print(
             f"  counterfactual: this volume on {counterfactual['reference_model_id']} "
             f"at metered rates ≈ ${counterfactual['naive_cost_usd']:.6f}; you paid "
-            f"${counterfactual['actual_cost_usd']:.6f} → avoided ${counterfactual['avoided_usd']:.6f}."
+            f"${counterfactual['actual_cost_usd']:.6f} → avoided ${avoided:.6f}."
         )
 
     routing_rows = [
