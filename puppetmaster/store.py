@@ -242,6 +242,9 @@ class SwarmStore:
             self.locks_dir,
         ]:
             mkdir_private(directory)
+        from puppetmaster.host_lifecycle import record_host_start
+
+        record_host_start(self)
 
     @staticmethod
     def launch_fingerprint(

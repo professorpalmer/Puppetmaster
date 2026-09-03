@@ -205,6 +205,9 @@ class SQLiteSwarmStore(SwarmStore):
         chmod_private_file(self.db_path)
         self._initialized = True
         self._attached = True
+        from puppetmaster.host_lifecycle import record_host_start
+
+        record_host_start(self)
 
     def attach(self) -> None:
         """Worker-safe open: PRAGMAs only. Never CREATE TABLE or migrate."""

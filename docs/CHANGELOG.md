@@ -1,3 +1,15 @@
+## v1.22.44 — 2026-09-02
+
+**Named host start vs crash, and lifecycle-default job event reads.**
+
+Supervisor boot now records `host.started` (first boot or clean reboot) vs `host.recovered` (start without a clean shutdown) and fail-soft fans that event to running/stitching jobs. `read_lifecycle_events` defaults to host.* plus `job.stalled`; per-turn heartbeats stay on `read_events`. Workers (`PUPPETMASTER_WORKER=1`) do not write the boot record.
+
+- `host_boot.json` plus process-idempotent `record_host_start`; planned exit sets `clean_shutdown`.
+- CLI noisy-event filter imports `NOISY_TURN_EVENTS` from the same module.
+- Do not rematerialize a chat request from job events (no second transcript store).
+
+Files: `puppetmaster/host_lifecycle.py`. Tests: `tests/test_host_lifecycle.py`.
+
 ## v1.22.43 — 2026-08-30
 
 **Nested job starts fail closed inside a worker.**

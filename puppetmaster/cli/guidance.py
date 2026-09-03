@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from puppetmaster.host_lifecycle import NOISY_TURN_EVENTS as _NOISY_LOG_EVENTS
 from puppetmaster.installers import (
     CLAUDE_NEXT_STEPS_GUIDANCE,
     CODEX_SANDBOX_GUIDANCE,
@@ -8,9 +9,6 @@ from puppetmaster.installers import (
     PI_NEXT_STEPS_GUIDANCE,
     OMP_NEXT_STEPS_GUIDANCE,
 )
-
-
-_NOISY_LOG_EVENTS = {"task.lease_renewed", "run.heartbeat", "task.saved"}
 
 _OPENAI_EFFORT_LEVELS = ("none", "low", "medium", "high", "xhigh", "max")
 
