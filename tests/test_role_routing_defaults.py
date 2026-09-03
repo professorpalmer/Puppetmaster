@@ -18,8 +18,11 @@ from puppetmaster.workers import (
     ANALYSIS_NO_EDIT_PAYLOAD,
     DEFAULT_ROLE_ROUTING_POLICY,
     DEFAULT_WORKERS,
+    WorkerSpec,
     analysis_auto_route_payload,
     default_routing_policy_for_role,
+    payload_forbids_writes,
+    spec_edits_files,
 )
 
 # Expected role → policy map for built-in analysis roles (OMP modelRoles.task
@@ -78,6 +81,37 @@ class DefaultRoleRoutingPolicyTests(unittest.TestCase):
         for role, policy in DEFAULT_ROLE_ROUTING_POLICY.items():
             self.assertIn(policy, allowed, role)
             self.assertNotIn("model", policy)
+
+    def test_analysis_no_edit_payload_forbids_writes_with_stray_implement_mode(self) -> None:
+        """Shared ANALYSIS_NO_EDIT_PAYLOAD wins over mode=implement; bare implement still edits."""
+        analysis_payload = {**analysis_auto_route_payload("implement"), "mode": "implement"}
+        for key, value in ANALYSIS_NO_EDIT_PAYLOAD.items():
+            self.assertEqual(analysis_payload.get(key), value, key)
+        self.assertTrue(payload_forbids_writes(analysis_payload))
+        self.assertFalse(
+            spec_edits_files(
+                WorkerSpec(
+                    role="implement",
+                    instruction="plan the change",
+                    adapter="cursor",
+                    payload=analysis_payload,
+                )
+            )
+        )
+
+        implement_payload = {"mode": "implement"}
+        self.assertFalse(payload_forbids_writes(implement_payload))
+        self.assertTrue(
+            spec_edits_files(
+                WorkerSpec(
+                    role="impl",
+                    instruction="edit files",
+                    adapter="cursor",
+                    payload=implement_payload,
+                )
+            )
+        )
+
 
 class GeneratedSwarmRoleRoutingTests(unittest.TestCase):
     def test_writer_stamps_per_role_defaults_when_policy_omitted(self) -> None:

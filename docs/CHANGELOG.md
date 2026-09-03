@@ -1,3 +1,14 @@
+## v1.22.45 — 2026-09-03
+
+**Analysis no-edit is a hard write fence.**
+
+`ANALYSIS_NO_EDIT_PAYLOAD` (`read_only` / `no_edit` / `dry_run`) now wins over a stray `mode=implement` on the same payload. Cursor analysis workers stay on `_run_analyze`. Skill injection tests encode retrieve-gated RAE (zero overlap injects nothing).
+
+- `payload_forbids_writes` is the single predicate; `spec_edits_files` and working-set classification use it.
+- CursorAdapter.run never takes the implement path when those flags are set.
+
+Files: `puppetmaster/workers.py`, `puppetmaster/adapters/cursor.py`, `puppetmaster/working_set.py`. Tests: `tests/test_puppetmaster.py`, `tests/test_role_routing_defaults.py`.
+
 ## v1.22.44 — 2026-09-02
 
 **Named host start vs crash, and lifecycle-default job event reads.**
