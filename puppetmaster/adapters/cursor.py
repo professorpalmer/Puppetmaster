@@ -55,6 +55,14 @@ class CursorAdapter(CliWorkerAdapter):
         # the tree; ``implement`` lets it edit files and captures the resulting
         # diff as a PATCH artifact — the same full-edit contract Claude Code and
         # Codex already honour, so a cursor-only platform lock can still ship code.
+        # Import lazily: workers imports adapters at module load.
+        from puppetmaster.workers import payload_forbids_writes
+
+        # No-edit flags (ANALYSIS_NO_EDIT_PAYLOAD / read_only / dry_run) win
+        # over a stray mode=implement so a read-only analysis worker cannot
+        # take the full-edit path.
+        if payload_forbids_writes(task.payload):
+            return self._run_analyze(task, goal, worker_id)
         if task.payload.get("mode") == "implement" or task.payload.get("implement"):
             return self._run_implement(task, goal, worker_id)
         return self._run_analyze(task, goal, worker_id)

@@ -2860,6 +2860,42 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertIn("diff --git", patch_artifact.payload["unified_diff"])
         self.assertEqual(artifacts[0].payload["result"], "passed")
 
+    def test_cursor_adapter_forbids_writes_when_analysis_no_edit_and_implement_mode(self) -> None:
+        """Read-only analysis payload must take _run_analyze even if mode=implement."""
+        from puppetmaster.workers import ANALYSIS_NO_EDIT_PAYLOAD
+
+        task = Task(
+            job_id="job",
+            role="implement",
+            instruction="plan the change",
+            adapter="cursor",
+            payload={**ANALYSIS_NO_EDIT_PAYLOAD, "mode": "implement", "cwd": "."},
+        )
+        adapter = CursorAdapter()
+        with patch.object(adapter, "_run_analyze", return_value=[]) as analyze, patch.object(
+            adapter, "_run_implement", return_value=[]
+        ) as implement:
+            adapter.run(task, "goal", "worker-cursor")
+        analyze.assert_called_once()
+        implement.assert_not_called()
+
+    def test_cursor_adapter_implement_without_read_only_still_edits(self) -> None:
+        """A genuine implement payload (no no-edit flags) still takes _run_implement."""
+        task = Task(
+            job_id="job",
+            role="cursor",
+            instruction="add a helper",
+            adapter="cursor",
+            payload={"mode": "implement", "cwd": "."},
+        )
+        adapter = CursorAdapter()
+        with patch.object(adapter, "_run_analyze", return_value=[]) as analyze, patch.object(
+            adapter, "_run_implement", return_value=[]
+        ) as implement:
+            adapter.run(task, "goal", "worker-cursor")
+        implement.assert_called_once()
+        analyze.assert_not_called()
+
     def test_cursor_implement_prompt_demands_a_final_report(self) -> None:
         """Field report (v0.9.40 CI fix): the implement worker's diagnosis only
         existed as prose the pipeline threw away. The prompt must now ask for a
@@ -21912,6 +21948,41 @@ class PuppetmasterFrictionFixTests(unittest.TestCase):
                 )
             )
         )
+
+    def test_analysis_no_edit_payload_forbids_writes_despite_implement_mode(self) -> None:
+        """ANALYSIS_NO_EDIT_PAYLOAD + stray mode=implement must stay no-edit.
+
+        Do not invent a second no-edit constant — stamp the shared payload
+        and assert writes stay forbidden. A bare implement payload still edits.
+        """
+        from puppetmaster.workers import (
+            ANALYSIS_NO_EDIT_PAYLOAD,
+            payload_forbids_writes,
+            spec_edits_files,
+            spec_explicitly_no_edit,
+        )
+
+        analysis_payload = {**ANALYSIS_NO_EDIT_PAYLOAD, "mode": "implement"}
+        self.assertTrue(payload_forbids_writes(analysis_payload))
+        analysis_spec = WorkerSpec(
+            role="implement",
+            instruction="plan the change",
+            adapter="cursor",
+            payload=analysis_payload,
+        )
+        self.assertTrue(spec_explicitly_no_edit(analysis_spec))
+        self.assertFalse(spec_edits_files(analysis_spec))
+
+        implement_payload = {"mode": "implement"}
+        self.assertFalse(payload_forbids_writes(implement_payload))
+        implement_spec = WorkerSpec(
+            role="impl",
+            instruction="edit files",
+            adapter="cursor",
+            payload=implement_payload,
+        )
+        self.assertFalse(spec_explicitly_no_edit(implement_spec))
+        self.assertTrue(spec_edits_files(implement_spec))
 
     def test_default_workers_carry_no_edit_fields(self) -> None:
         """Every built-in worker payload declares the same explicit no-edit

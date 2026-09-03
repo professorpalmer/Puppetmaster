@@ -573,8 +573,11 @@ def _is_read_only_or_analysis(task: Any) -> bool:
     """True when warm-skip is allowed (analysis / read-only, not an edit)."""
     if _is_prewalk_implement(task):
         return False
+    from puppetmaster.workers import payload_forbids_writes
+
     payload = _task_payload(task)
-    if payload.get("read_only") or payload.get("no_edit") or payload.get("dry_run"):
+    # ANALYSIS_NO_EDIT_PAYLOAD / read_only wins over a stray mode=implement.
+    if payload_forbids_writes(payload):
         return True
     if payload.get("mode") == "implement" or payload.get("implement"):
         return False
