@@ -14040,6 +14040,67 @@ class HermesSkillInjectionTests(unittest.TestCase):
             estimate_tokens(render_skill_packet_from_docs(picked)), 100
         )
 
+    def test_rae_same_instruction_zero_name_description_overlap_never_selected(self):
+        # RAE retrieve-gate: selection scores name+description only. A body that
+        # repeats the instruction must not sneak a skill past zero overlap.
+        from puppetmaster.skill_injection import SkillDoc, select_skills_for_task
+
+        instruction = "write release notes for this git range"
+        trap = SkillDoc(
+            "pdf-export",
+            "Export a report to a PDF file",
+            "Always write release notes for this git range using git log.",
+            "/x/pdf",
+        )
+        self.assertEqual(
+            select_skills_for_task(instruction, [trap], token_budget=2000, max_count=3),
+            [],
+        )
+
+    def test_rae_same_instruction_overlap_selected_when_it_fits_budget(self):
+        from puppetmaster.skill_injection import (
+            SkillDoc,
+            estimate_tokens,
+            render_skill_packet_from_docs,
+            select_skills_for_task,
+        )
+
+        instruction = "write release notes for this git range"
+        trap = SkillDoc(
+            "pdf-export",
+            "Export a report to a PDF file",
+            "Always write release notes for this git range using git log.",
+            "/x/pdf",
+        )
+        hit = SkillDoc(
+            "release-notes",
+            "Generate release notes from a git range",
+            "Use git log.",
+            "/x/rn",
+        )
+        picked = select_skills_for_task(
+            instruction, [trap, hit], token_budget=2000, max_count=3
+        )
+        self.assertEqual([s.name for s in picked], ["release-notes"])
+        self.assertLessEqual(
+            estimate_tokens(render_skill_packet_from_docs(picked)), 2000
+        )
+
+    def test_rae_empty_instruction_selects_nothing(self):
+        from puppetmaster.skill_injection import SkillDoc, select_skills_for_task
+
+        skill = SkillDoc(
+            "release-notes",
+            "Generate release notes from a git range",
+            "Use git log.",
+            "/x/rn",
+        )
+        for instruction in ("", "   ", "\n", "the and or"):
+            self.assertEqual(
+                select_skills_for_task(instruction, [skill], token_budget=2000),
+                [],
+            )
+
     def test_prompt_with_skills_noop_then_appends_bodies(self):
         from puppetmaster.adapters import prompt_with_skills
         from puppetmaster.models import Task
@@ -14150,6 +14211,42 @@ class HermesSkillInjectionTests(unittest.TestCase):
             self.assertNotIn("injected_skills", out[0].payload)
             events = {e["event"] for e in store.read_events(job.id)}
             self.assertIn("skills.none_discovered", events)
+            from puppetmaster.adapters import prompt_with_skills
+            from puppetmaster.models import Task
+
+            task = Task(
+                job_id=job.id,
+                role=out[0].role,
+                instruction=out[0].instruction,
+                payload=dict(out[0].payload or {}),
+            )
+            self.assertEqual(prompt_with_skills("BASE", task), "BASE")
+
+    def test_orchestrator_does_not_dump_unrelated_discovered_skills(self):
+        # Fail-close: discovered skills with zero name+description overlap are
+        # not concatenated into the payload (no dump-all path).
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            self._write_skill(
+                home / "skills", "pdf-export",
+                description="Export a report to a PDF file",
+                body="Always write release notes for this git range using git log.",
+            )
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            orch = Orchestrator(store)
+            job = store.create_job("g")
+            spec = WorkerSpec(
+                role="explore",
+                instruction="write release notes for this git range",
+                payload={"inject_skills": True},
+            )
+            with patch.dict(os.environ, {"HERMES_HOME": str(home)}, clear=False):
+                out = orch._with_injected_skills(job, [spec])
+            self.assertNotIn("injected_skills", out[0].payload)
+            events = {e["event"] for e in store.read_events(job.id)}
+            self.assertNotIn("skills.injected", events)
+            self.assertNotIn("skills.none_discovered", events)
 
 class InstallHermesPluginTests(unittest.TestCase):
     """Tests for :func:`install_hermes_plugin` — shipping the bundled
