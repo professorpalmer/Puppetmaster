@@ -1345,15 +1345,16 @@ def _build_tools() -> list[McpTool]:
         McpTool(
             name="puppetmaster_job_cost",
             description=(
-                "Report a job's cost on two bases: ACTUAL measured spend "
-                "(tokens actually consumed × registry price of the model each "
-                "task ran on — works for pinned, auto-routed, or plan-billed "
-                "runs) plus a counterfactual ('what this volume would cost on "
-                "the flagship'), and the PRE-FLIGHT routing estimate when the "
+                "Report a job's selected-model usage cost on two bases: the "
+                "mixed-basis ledger (plan-billed tasks are $0 marginal, else "
+                "positive artifact real_cost_usd, else tokens × registry "
+                "price; unpriced tasks stay unknown rather than $0) plus a "
+                "counterfactual ('what this volume would cost on the "
+                "flagship'), and the PRE-FLIGHT routing estimate when the "
                 "job auto-routed. Returns per-model breakdowns + totals. Use to "
                 "answer 'how much did this swarm cost?' or 'which model ate the "
-                "most tokens?'. Prices come from the user-asserted registry — "
-                "Puppetmaster does not call a billing API."
+                "most tokens?'. The aggregate is not a provider billing total "
+                "— Puppetmaster does not call a billing API."
             ),
             input_schema=job_schema(required=True),
             handler=run_job_cost,
