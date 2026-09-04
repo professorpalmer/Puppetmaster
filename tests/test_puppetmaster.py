@@ -11118,7 +11118,7 @@ class ModelRouterTests(unittest.TestCase):
         self.assertLess(600, agentic._budget_force_threshold(1000, 0.2))
 
     def test_agentic_default_reasoning_effort_when_unset(self) -> None:
-        """OpenAI-compatible workers get low reasoning_effort only when unset."""
+        """OpenAI-compatible workers get medium reasoning_effort only when unset."""
         from puppetmaster.adapters import agentic
         from puppetmaster.models import Task
 
@@ -11128,7 +11128,7 @@ class ModelRouterTests(unittest.TestCase):
             payload={"provider": "openrouter", "model": "m"},
         )
         extra = adapter._extra_params(openrouter_task)
-        self.assertEqual(extra.get("reasoning_effort"), "low")
+        self.assertEqual(extra.get("reasoning_effort"), "medium")
 
         overridden = Task(
             job_id="j", role="explore", instruction="x",
@@ -11154,7 +11154,7 @@ class ModelRouterTests(unittest.TestCase):
             payload={"provider": "openai-codex", "model": "gpt-5.6-luna"},
         )
         self.assertEqual(
-            adapter._extra_params(openai_codex_task).get("reasoning_effort"), "low"
+            adapter._extra_params(openai_codex_task).get("reasoning_effort"), "medium"
         )
 
     def test_router_prefers_tools_tagged_model_for_agentic_role(self) -> None:

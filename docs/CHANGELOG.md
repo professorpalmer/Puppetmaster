@@ -1,3 +1,14 @@
+## v1.22.47 — 2026-09-04
+
+**OpenRouter-class swarm workers default to medium reasoning.**
+
+`DEFAULT_SWARM_REASONING_EFFORT` is `medium` when the task did not set `reasoning_effort`. Caller payload still wins. Direct OpenAI Chat Completions, Cursor High+Fast, Hermes config defaults, and GPT-5.6 tool-`none` are unchanged.
+
+- StrongOrc confined runs showed a large quality drop from medium to low, then diminishing returns above medium.
+- There is still no escalate-on-stuck loop.
+
+Files: `puppetmaster/adapters/agentic.py`. Tests: `tests/test_puppetmaster.py`, `tests/test_agentic_standalone.py`.
+
 ## v1.22.46 — 2026-09-04
 
 **Selected-model usage cost is not actual spend.**
