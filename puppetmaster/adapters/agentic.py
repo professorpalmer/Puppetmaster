@@ -160,9 +160,9 @@ DEFAULT_NO_TOOL_CALLS_STREAK = 3
 SUBMIT_RESERVE_FRACTION = 0.2
 
 # Default reasoning_effort for OpenRouter / OpenAI-compatible swarm workers when
-# the caller did not set one. Caps chain-of-thought so CoT cannot consume the
-# whole token budget; payload.reasoning_effort still wins when present.
-DEFAULT_SWARM_REASONING_EFFORT = "low"
+# the caller did not set one. Medium is the quality floor (low is a large drop;
+# spend after medium returns less). payload.reasoning_effort still wins.
+DEFAULT_SWARM_REASONING_EFFORT = "medium"
 
 # Prompt-only first-turn nudge: deltas show turn 1 is often pure reasoning on
 # deep reasoners. Require a real tool call before analysis prose (no artificial
@@ -489,7 +489,7 @@ class AgenticAdapter(FullEditWorkerAdapter):
             extra["reasoning_effort"] = str(task.payload["reasoning_effort"])
         elif _provider_is_openai_compatible(provider) and not direct_openai_api:
             # Swarm workers on OpenRouter / OpenAI-compatible endpoints often
-            # default to unbounded CoT; pin a low effort unless the caller set one.
+            # default to unbounded CoT; pin medium unless the caller set one.
             extra["reasoning_effort"] = DEFAULT_SWARM_REASONING_EFFORT
         return extra
 
