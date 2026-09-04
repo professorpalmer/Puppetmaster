@@ -73,6 +73,7 @@ from puppetmaster.providers import (
     provider_retry_backoff_seconds,
 )
 from puppetmaster.redaction import redact_secrets
+from puppetmaster.swarm_reasoning import DEFAULT_SWARM_REASONING_EFFORT
 from puppetmaster.state import resolve_state_dir
 from puppetmaster.hashline import (
     SnapshotStore,
@@ -158,11 +159,6 @@ DEFAULT_NO_TOOL_CALLS_STREAK = 3
 # whatever partial findings exist -- so a CoT-heavy reasoner cannot burn the
 # entire budget without ever submitting. Override with PUPPETMASTER_SUBMIT_RESERVE.
 SUBMIT_RESERVE_FRACTION = 0.2
-
-# Default reasoning_effort for OpenRouter / OpenAI-compatible swarm workers when
-# the caller did not set one. Medium is the quality floor (low is a large drop;
-# spend after medium returns less). payload.reasoning_effort still wins.
-DEFAULT_SWARM_REASONING_EFFORT = "medium"
 
 # Prompt-only first-turn nudge: deltas show turn 1 is often pure reasoning on
 # deep reasoners. Require a real tool call before analysis prose (no artificial
@@ -332,22 +328,6 @@ def _budget_force_threshold(token_budget: int, reserve: float) -> float:
     return float(token_budget) * (1.0 - reserve)
 
 
-def _provider_is_openai_compatible(provider: str) -> bool:
-    """True for OpenRouter and other OpenAI-wire providers (reasoning_effort)."""
-    slug = (provider or "").strip().lower()
-    if slug == "openrouter":
-        return True
-    # OpenCode Go speaks per-model reasoning dialects; do not inject a generic
-    # OpenAI reasoning_effort default — provider_chat maps effort when set.
-    if slug == "opencode-go":
-        return False
-    # openai-codex is OpenAI-wire but Responses rejects top-level
-    # reasoning_effort. Still inject the Chat Completions key here;
-    # provider_chat / _build_responses_body maps it to nested ``reasoning``.
-    desc = get_provider(slug)
-    return bool(desc is not None and getattr(desc, "wire", None) == "openai")
-
-
 def tool_choice_force_supported(provider: str, model: str) -> bool:
     """False when the model rejects named/required ``tool_choice``.
 
@@ -481,16 +461,9 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 break
         if task.payload.get("temperature") is not None:
             extra["temperature"] = float(task.payload["temperature"])
-        provider = self._resolve_provider(task)
-        direct_openai_api = provider in ("openai", "openai-api")
-        # Pass selected effort through for every provider, including direct
-        # OpenAI. Transport owns GPT-5.6 none-fallback vs Responses routing.
-        if task.payload.get("reasoning_effort"):
-            extra["reasoning_effort"] = str(task.payload["reasoning_effort"])
-        elif _provider_is_openai_compatible(provider) and not direct_openai_api:
-            # Swarm workers on OpenRouter / OpenAI-compatible endpoints often
-            # default to unbounded CoT; pin medium unless the caller set one.
-            extra["reasoning_effort"] = DEFAULT_SWARM_REASONING_EFFORT
+        extra["reasoning_effort"] = str(
+            task.payload.get("reasoning_effort") or DEFAULT_SWARM_REASONING_EFFORT
+        )
         return extra
 
     def _pin_routing_artifact(

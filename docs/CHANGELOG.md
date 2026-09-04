@@ -1,8 +1,19 @@
+## v1.22.48 — 2026-09-04
+
+**Every swarm adapter defaults to medium reasoning. Caller pins still win.**
+
+`merge_routing_payload` stamps `reasoning_effort=medium` unless the caller pinned, then overlays Cursor `params`, Claude `--effort`, Codex `-c model_reasoning_effort=`, and Antigravity `effort`. Catalog High+Fast is not a pin. GPT-5.6 Completions `none` stays a wire rewrite when extra has no effort.
+
+- StrongOrc confined runs showed a large quality drop from medium to low, then diminishing returns above medium.
+- There is still no escalate-on-stuck loop.
+
+Files: `puppetmaster/swarm_reasoning.py`, `puppetmaster/orchestrator.py`, `puppetmaster/adapters/agentic.py`, `puppetmaster/adapters/antigravity.py`. Tests: `tests/test_swarm_reasoning.py`, `tests/test_puppetmaster.py`, `tests/test_agentic_standalone.py`.
+
 ## v1.22.47 — 2026-09-04
 
 **OpenRouter-class swarm workers default to medium reasoning.**
 
-`DEFAULT_SWARM_REASONING_EFFORT` is `medium` when the task did not set `reasoning_effort`. Caller payload still wins. Direct OpenAI Chat Completions, Cursor High+Fast, Hermes config defaults, and GPT-5.6 tool-`none` are unchanged.
+`DEFAULT_SWARM_REASONING_EFFORT` is `medium` when the task did not set `reasoning_effort`. Caller payload still wins. Direct OpenAI Chat Completions, Cursor High+Fast, Hermes config defaults, and GPT-5.6 tool-`none` are unchanged. Superseded for all adapters by v1.22.48.
 
 - StrongOrc confined runs showed a large quality drop from medium to low, then diminishing returns above medium.
 - There is still no escalate-on-stuck loop.

@@ -11118,7 +11118,7 @@ class ModelRouterTests(unittest.TestCase):
         self.assertLess(600, agentic._budget_force_threshold(1000, 0.2))
 
     def test_agentic_default_reasoning_effort_when_unset(self) -> None:
-        """OpenAI-compatible workers get medium reasoning_effort only when unset."""
+        """Every provider gets medium reasoning_effort when the task did not pin."""
         from puppetmaster.adapters import agentic
         from puppetmaster.models import Task
 
@@ -11145,10 +11145,10 @@ class ModelRouterTests(unittest.TestCase):
             job_id="j", role="explore", instruction="x",
             payload={"provider": "anthropic", "model": "m"},
         )
-        self.assertNotIn("reasoning_effort", adapter._extra_params(anthropic_task))
+        self.assertEqual(
+            adapter._extra_params(anthropic_task).get("reasoning_effort"), "medium"
+        )
 
-        # openai-codex still gets the Chat Completions key; provider_chat maps
-        # it to nested Responses ``reasoning`` (bare key would HTTP 400).
         openai_codex_task = Task(
             job_id="j", role="explore", instruction="x",
             payload={"provider": "openai-codex", "model": "gpt-5.6-luna"},
