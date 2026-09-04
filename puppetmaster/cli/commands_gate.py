@@ -825,7 +825,7 @@ def _run_cost_command(args, store) -> int:
     else:
         total = actual.get("total_marginal_cost_usd")
         print(
-            f"job {job_id}: actual measured spend = "
+            f"job {job_id}: selected-model usage cost = "
             f"{_format_cost_usd(total, prefix='$')}"
             + (
                 f"  ({_format_cost_usd(actual.get('measured_cost_usd'))} measured / "
@@ -877,6 +877,12 @@ def _run_cost_command(args, store) -> int:
             "\n  note: stable artifact-only economics for a completed job "
             "with no completion receipt; ignores current registry rates."
         )
+    if has_usage:
+        print(
+            "\n  note: selected-model usage cost uses plan-zero, then "
+            "provider-reported real_cost_usd, then tokens × registry price. "
+            "It is not a provider billing API total."
+        )
 
     counterfactual = payload.get("counterfactual")
     avoided = None if counterfactual is None else counterfactual.get("avoided_usd")
@@ -890,8 +896,9 @@ def _run_cost_command(args, store) -> int:
         print()
         print(
             f"  counterfactual: this volume on {counterfactual['reference_model_id']} "
-            f"at metered rates ≈ ${counterfactual['naive_cost_usd']:.6f}; you paid "
-            f"${counterfactual['actual_cost_usd']:.6f} → avoided ${avoided:.6f}."
+            f"at metered rates ≈ ${counterfactual['naive_cost_usd']:.6f}; "
+            f"selected-model total ${counterfactual['actual_cost_usd']:.6f} "
+            f"→ difference ${avoided:.6f}."
         )
 
     routing_rows = [
