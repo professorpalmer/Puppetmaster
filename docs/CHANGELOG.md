@@ -1,3 +1,14 @@
+## v1.22.46 — 2026-09-04
+
+**Selected-model usage cost is not actual spend.**
+
+Public CLI/MCP language now names the mixed-basis ledger honestly: plan-zero, then provider-reported `real_cost_usd`, then tokens × registry price. `billing=unknown` registry valuation is still a price, not a billing-API charge. JSON keys stay (`actual_cost`, `avoided_usd`).
+
+- `puppetmaster cost` headline: selected-model usage cost; counterfactual: selected-model total / difference.
+- `puppetmaster_job_cost` description discloses precedence and that the aggregate is not a provider billing total.
+
+Files: `puppetmaster/cli/commands_gate.py`, `puppetmaster/mcp_server.py`, `puppetmaster/cost.py`. Tests: `tests/test_cost_report.py`.
+
 ## v1.22.45 — 2026-09-03
 
 **Analysis no-edit is a hard write fence.**
