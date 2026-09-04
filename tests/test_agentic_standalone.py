@@ -144,7 +144,7 @@ class AgenticReasoningEffortTests(unittest.TestCase):
     def test_other_openai_wire_provider_keeps_reasoning_effort(self) -> None:
         self.assertEqual(
             self._extra("openrouter", model="gpt-5.6-luna")["reasoning_effort"],
-            "low",
+            "medium",
         )
 
     def test_openai_codex_responses_behavior_is_preserved(self) -> None:
