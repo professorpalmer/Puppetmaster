@@ -135,6 +135,14 @@ class MergeRoutingPayloadTests(unittest.TestCase):
         )
         self.assertEqual(merged["reasoning_effort"], "low")
 
+    def test_extra_fields_pin_wins(self) -> None:
+        merged = merge_routing_payload(
+            {},
+            _decision("openai", {"reasoning_effort": "high"}),
+            {"reasoning_effort": "low"},
+        )
+        self.assertEqual(merged["reasoning_effort"], "low")
+
     def test_cursor_catalog_params_are_not_a_pin(self) -> None:
         merged = merge_routing_payload(
             {},

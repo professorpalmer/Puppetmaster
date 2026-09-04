@@ -207,6 +207,7 @@ def merge_routing_payload(payload: dict, decision, extra_fields: Optional[dict] 
         merged["router_score_provenance"] = dict(provenance)
     if extra_fields:
         merged.update(extra_fields)
+        caller.update(extra_fields)
     apply_swarm_reasoning(
         merged,
         caller,
