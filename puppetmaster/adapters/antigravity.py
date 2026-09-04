@@ -7,6 +7,7 @@ from typing import Mapping, Optional, Union
 
 from puppetmaster.failure import classify_antigravity_failure
 from puppetmaster.models import Artifact, ArtifactType, Task
+from puppetmaster.swarm_reasoning import DEFAULT_SWARM_REASONING_EFFORT
 
 from ._base import (
     CliInvocation,
@@ -35,7 +36,7 @@ from ._streaming import (
 from .cursor import implement_report_artifacts
 
 DEFAULT_ANTIGRAVITY_MODEL = "gemini-3.7-flash"
-DEFAULT_ANTIGRAVITY_EFFORT = "high"
+DEFAULT_ANTIGRAVITY_EFFORT = DEFAULT_SWARM_REASONING_EFFORT
 MODELS_REQUIRING_EFFORT = (
     "gemini-3.7-flash",
     "gemini-3.6-flash",
@@ -64,6 +65,8 @@ def resolve_antigravity_model(payload: Optional[Mapping[str, object]] = None) ->
     if not any(prefix in model.lower() for prefix in MODELS_REQUIRING_EFFORT):
         return model, None
     effort = payload.get("effort")
+    if effort is None:
+        effort = payload.get("reasoning_effort")
     if effort is not None:
         return model, str(effort)
     return model, DEFAULT_ANTIGRAVITY_EFFORT

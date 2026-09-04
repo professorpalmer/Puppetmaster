@@ -16,6 +16,7 @@ from puppetmaster.liveness import record_orchestrator_heartbeat
 from puppetmaster.models import Artifact, ArtifactType, Job, JobStatus, Task, TaskStatus, now_iso
 from puppetmaster.stitcher import Stitcher
 from puppetmaster.store import SwarmStore
+from puppetmaster.swarm_reasoning import apply_swarm_reasoning
 from puppetmaster.worker_fence import stamp_worker_env
 from puppetmaster.worker_runtime import WorkerRuntime
 from puppetmaster.workers import (
@@ -174,9 +175,10 @@ def _temporary_env_var(name: str, value: str):
 
 def merge_routing_payload(payload: dict, decision, extra_fields: Optional[dict] = None) -> dict:
     """Stamp a routing decision while letting explicit task payload keys win."""
+    caller = dict(payload or {})
     merged = {
         **(decision.model.payload_defaults or {}),
-        **(payload or {}),
+        **caller,
         "model": decision.model.adapter_model_name,
         "router_model_id": decision.model.id,
         "router_policy": decision.policy,
@@ -205,6 +207,11 @@ def merge_routing_payload(payload: dict, decision, extra_fields: Optional[dict] 
         merged["router_score_provenance"] = dict(provenance)
     if extra_fields:
         merged.update(extra_fields)
+    apply_swarm_reasoning(
+        merged,
+        caller,
+        adapter=getattr(decision.model, "adapter", None),
+    )
     return merged
 
 
