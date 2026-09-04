@@ -935,9 +935,13 @@ class CostCliHumanTests(unittest.TestCase):
             job = _job_with_usage(store, "plan zero cli", model="plan/cursor")
             rc, text = _run_cost_text(store, job.id, registry_path)
             self.assertEqual(rc, 0)
-            self.assertIn("actual measured spend = $0.000000", text)
+            self.assertIn("selected-model usage cost = $0.000000", text)
+            self.assertNotIn("actual measured spend", text)
+            self.assertNotIn("you paid", text)
             self.assertNotIn("cost unavailable", text)
-            self.assertIn("avoided $", text)
+            self.assertIn("difference $", text)
+            self.assertNotIn("→ avoided", text)
+            self.assertIn("not a provider billing API total", text)
 
             mixed = build_current_registry_cost_report(
                 job.id,
@@ -987,6 +991,48 @@ class CostCliHumanTests(unittest.TestCase):
                 "priced subtotal (excludes unpriced tasks): $0.000000", text
             )
             self.assertNotIn("→ avoided", text)
+
+    def test_human_output_unknown_billing_is_registry_valuation(self) -> None:
+        registry = [
+            _spec(
+                "api/unknown-bill",
+                "unknown-v1",
+                70,
+                1.0,
+                2.0,
+                billing="unknown",
+            ),
+            *_flagship_only(),
+        ]
+        with _harness(registry=registry) as (store, registry_path):
+            job = _job_with_usage(
+                store,
+                "unknown billing valuation",
+                model="unknown-v1",
+                tokens_in=1_000_000,
+                tokens_out=1_000_000,
+            )
+            rc, text = _run_cost_text(store, job.id, registry_path)
+            self.assertEqual(rc, 0)
+            self.assertIn("selected-model usage cost = $3.000000", text)
+            self.assertIn("not a provider billing API total", text)
+            self.assertNotIn("you paid", text)
+            self.assertNotIn("actual measured spend", text)
+
+    def test_job_cost_mcp_description_is_neutral(self) -> None:
+        from puppetmaster.mcp_server import handle_message
+
+        response = handle_message(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        )
+        tools = {
+            tool["name"]: tool["description"]
+            for tool in response["result"]["tools"]
+        }
+        description = tools["puppetmaster_job_cost"]
+        self.assertIn("selected-model usage cost", description)
+        self.assertIn("not a provider billing total", description)
+        self.assertNotIn("ACTUAL measured spend", description)
 
 
 if __name__ == "__main__":

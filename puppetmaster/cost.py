@@ -293,8 +293,16 @@ def _cost_with_cache_discount(spec, tokens_in: int, tokens_out: int, tokens_cach
 
 
 def price_job(artifacts: Iterable[Artifact], registry: list) -> JobCost:
-    """Price a job's measured/estimated token usage against the registry price
-    of the model each task actually ran on. Independent of routing."""
+    """Price each task, then sum a selected-model usage cost.
+
+    Per-task precedence (unchanged): matching registry model with
+    ``billing="plan"`` → $0 marginal; else positive artifact
+    ``real_cost_usd`` → that reported value; else matching registry model →
+    tokens × registry prices (cache-read discount + output multiplier);
+    else unpriced (aggregate unknown, not $0). Measured vs estimated
+    describes the token source, not the billing basis. Independent of
+    routing.
+    """
     artifacts = list(artifacts)
     by_id, by_adapter_name = _model_index(registry)
     final_routes = final_routing_artifacts(artifacts)
