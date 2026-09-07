@@ -1,0 +1,26 @@
+name: Windows store canary
+
+# Fast Windows signal for the attach herd and crash-demo. Does not replace
+# the required CI matrix (`python -m unittest discover` on all four legs).
+# Do not skip, xfail, or raise timeouts here.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows-store:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Run SQLite attach concurrency tests
+        run: python -m unittest tests.test_sqlite_concurrency -v
+      - name: Run crash-demo
+        if: ${{ !cancelled() }}
+        run: python -m puppetmaster crash-demo
