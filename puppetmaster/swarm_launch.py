@@ -156,11 +156,10 @@ def build_analysis_swarm_specs(
             payload["model"] = str(explicit_model)
         if auto_route_enabled:
             payload["auto_route"] = True
-            # Pin every launch adapter — including cursor. Without this,
-            # start_cursor_swarm could hop onto agentic/minimax when vision
-            # tags or cursor-cli keys fail, yielding empty unstructured
-            # findings while the user asked for a Cursor SDK swarm.
+            # Launch-lane pin: first route stays on this adapter (v1.20.6).
+            # Classified billing/auth recovery may cross it (adapter_lock=lane).
             payload["allowed_adapters"] = [adapter]
+            payload["adapter_lock"] = "lane"
             if isinstance(routing_policy, str) and routing_policy:
                 payload["routing_policy"] = routing_policy
             else:

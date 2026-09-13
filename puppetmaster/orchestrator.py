@@ -224,6 +224,26 @@ def _payload_has_explicit_model_pin(payload: dict) -> bool:
     )
 
 
+def _is_lane_adapter_lock(payload: dict) -> bool:
+    """True when allowed_adapters is a generated launch lane, not a hard pin."""
+    return str((payload or {}).get("adapter_lock") or "") == "lane"
+
+
+def _fallback_route_signals(task):
+    """Signals for recoverable fallback.
+
+    Generated swarms stamp allowed_adapters to the launch adapter so the
+    first route cannot silently hop. That lane must not also reject a
+    funded cross-adapter recovery after billing_or_quota.
+    """
+    from puppetmaster.router import signals_from_worker_spec
+
+    signals = signals_from_worker_spec(task)
+    if _is_lane_adapter_lock(getattr(task, "payload", None) or {}):
+        return replace(signals, allowed_adapters=None)
+    return signals
+
+
 _MODEL_BACKED_ADAPTERS = frozenset(
     {"agentic", "openai", "cursor", "codex", "claude-code", "hermes", "antigravity"}
 )
@@ -827,7 +847,6 @@ class Orchestrator:
         from puppetmaster.router import (
             NoEligibleModelError,
             route_task,
-            signals_from_worker_spec,
         )
 
         failed = [
@@ -933,7 +952,7 @@ class Orchestrator:
             policy = payload.get("router_policy") or "balanced"
             try:
                 decision = route_task(
-                    signals_from_worker_spec(task),
+                    _fallback_route_signals(task),
                     candidates,
                     policy=policy,
                     local_receipts=self._host_local_receipts(),
@@ -952,6 +971,8 @@ class Orchestrator:
                 "fallback_from_model": current_model_id or None,
                 "tried_models": tried_out,
             }
+            if _is_lane_adapter_lock(payload):
+                fallback_extra["allowed_adapters"] = [decision.model.adapter]
             if (
                 reason == RUN_STATUS_ERROR
                 and decision.model.adapter == failed_adapter

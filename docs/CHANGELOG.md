@@ -1,5 +1,15 @@
 ## Unreleased
 
+**Generated auto-routed swarms can leave a spent launch adapter (#195).**
+
+- `build_analysis_swarm_specs` still pins `allowed_adapters` to the launch
+  adapter so the first route cannot silently hop (v1.20.6). That pin is now a
+  launch lane (`adapter_lock=lane`), not a hard platform prohibition.
+- After a classified recoverable failure, fallback may select a funded
+  identity such as `agentic/openai/gpt-5-6-sol` and emit `router-fallback`
+  with API billing provenance. Explicit model pins and `adapter_lock=hard`
+  stay locked. Credit @kbentonferguson.
+
 ## v1.27.17 — 2026-09-12
 
 **Read-only workers never claim another process's repository edits.**

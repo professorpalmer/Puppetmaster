@@ -74,6 +74,7 @@ class BuildAnalysisSwarmSpecsTests(unittest.TestCase):
             cwd="/tmp/x",
         )
         self.assertEqual(specs[0].payload.get("allowed_adapters"), ["agentic"])
+        self.assertEqual(specs[0].payload.get("adapter_lock"), "lane")
 
     def test_cursor_adapter_pins_allowed_adapters(self) -> None:
         specs = build_analysis_swarm_specs(
@@ -83,6 +84,7 @@ class BuildAnalysisSwarmSpecsTests(unittest.TestCase):
             cwd="/tmp/x",
         )
         self.assertEqual(specs[0].payload.get("allowed_adapters"), ["cursor"])
+        self.assertEqual(specs[0].payload.get("adapter_lock"), "lane")
 
     def test_rejects_unknown_adapter(self) -> None:
         with self.assertRaises(ValueError):
