@@ -1,3 +1,22 @@
+## v1.27.24 — 2026-09-14
+
+**Add the `fx` worker adapter, the first whose token usage arrives as a structured result instead of an estimated or scanned stream.**
+
+- Run `fx ask --json` with the prompt on stdin (never argv), `--auto` by default,
+  and no invented model default: `payload.model` is forwarded as `FX_MODEL` and
+  the verification payload records the model fx reports.
+- Parse billing-grade `input_tokens` / `output_tokens` from fx's single JSON
+  result; spool stdout that yields no parseable result to an `fx_result` sidecar
+  and report `failure=fx_unparseable_result`.
+- Record `enforcement: "prompt-only"` for analyze tasks, because fx exposes no
+  enforced read-only flag on `ask`; the adapter does not claim a sandbox that
+  does not exist.
+- Fail closed on fx-inside-Puppetmaster-inside-fx recursion: a worker bound to
+  an fx-spawned Puppetmaster returns `failure=nested_fx_worker` unless
+  `payload.max_worker_depth` deliberately allows the nesting.
+- Register `fx` in the adapter registry, the platform lock, and the
+  implement/review capability sets.
+
 ## v1.27.23 — 2026-09-14
 
 **High-contention SQLite workers stop reserving the writer for stale work.**

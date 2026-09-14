@@ -482,6 +482,10 @@ IMPLEMENT_ADAPTER_PRIORITY = (
     "hermes",
     "antigravity",
     "agentic",
+    # fx is full-edit and PATCH-producing, so it is implement-capable. It sits
+    # last because it is the newest entrant, not because it is weakest: promote
+    # it here to change which adapter an unspecified implement dispatch picks.
+    "fx",
 )
 
 # Platforms that can run a read-only analysis worker. This is deliberately a
@@ -493,6 +497,7 @@ REVIEW_ADAPTERS = (
     "cursor",
     "claude-code",
     "codex",
+    "fx",
     "openai",
     "hermes",
     "antigravity",

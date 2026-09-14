@@ -169,6 +169,52 @@ If it returns `failure=missing_cli`, install the CLI with `npm install -g @opena
 
 Like Claude Code, when Codex edits tracked files, Puppetmaster records a `patch` artifact alongside the verification artifact.
 
+### `fx`
+
+Shells out to the [fx](https://fx.sh) CLI (`fx ask --json`) — a native coding agent for the terminal with its own tool loop, skills, session store, and permission reviewer. fx is the only adapter whose non-interactive surface returns **structured usage natively**: `fx ask --json` emits a single JSON object whose `usage.input_tokens` / `output_tokens` are billing-grade, so token accounting is parsed rather than estimated, and unlike Codex there is no JSONL event stream to scan.
+
+The prompt is piped on stdin, never placed in argv, so a large enriched prompt stays visible only to the process that needs it and never hits an argv length limit.
+
+Requirements:
+
+- fx CLI on PATH (`FX_COMMAND` or `payload.executable` to override).
+- A configured fx model provider. fx resolves its model from `~/.fx/settings.json` or `FX_MODEL`; there is **no** `--model` flag. Set `payload.model` and the adapter forwards it as `FX_MODEL`, then records the model fx *reports* in the verification payload as `model`, keeping the request in `model_requested`.
+
+Defaults are tuned for unattended automation: `--auto` (fx routes unresolved actions through its own safety reviewer, which is strictly safer than bypassing policy) and `--no-save` (the worker's session is not persisted). Opt in with:
+
+| `payload` key | effect |
+|---|---|
+| `permission_mode` | `auto` (default), `full-access`, or `ask` |
+| `full_access` | shorthand for `permission_mode="full-access"`; never inferred from write capability |
+| `model` | forwarded as `FX_MODEL` |
+| `save_session` | keep the fx session instead of `--no-save` |
+| `resume_session_id` | continue an existing fx session (`--resume-id`); mutually exclusive with `--no-save` |
+| `system_prompt` | replace fx's built-in base prompt for this run (`--system`) |
+| `max_worker_depth` | allow bounded nesting of fx-inside-Puppetmaster-inside-fx (default `0`) |
+
+fx exposes no read-only flag on `ask`, so an analyze task is *instructed* read-only rather than enforced read-only. The verification payload records `enforcement: "prompt-only"` instead of claiming a sandbox that does not exist.
+
+If the adapter returns `failure=fx_unparseable_result`, the run exited cleanly but emitted no parseable JSON result, so Puppetmaster cannot attribute it. The raw stdout is spooled to the `fx_result` sidecar.
+If it returns `failure=fx_exit_code`, fx reported a nonzero exit code; `reported_exit_code` and `stderr` carry the detail.
+If it returns `failure=nested_fx_worker`, Puppetmaster was itself launched by an fx session that Puppetmaster spawned, so a worker here would recurse. Dispatch from the outer session, or raise `payload.max_worker_depth` deliberately.
+If it returns `failure=missing_cli`, install fx or set `FX_COMMAND`.
+
+```json
+{
+  "role": "fx-implement",
+  "instruction": "Implement the requested change and run the relevant tests.",
+  "adapter": "fx",
+  "payload": {
+    "prompt": "Implement the change and run the relevant tests.",
+    "cwd": ".",
+    "permission_mode": "auto",
+    "timeout_seconds": 900
+  }
+}
+```
+
+When fx edits or creates files, Puppetmaster records a `patch` artifact alongside the verification artifact, including untracked files added by the worker.
+
 ### `hermes`
 
 Shells out to the NousResearch [Hermes](https://hermes-agent.nousresearch.com) CLI (`hermes chat`) — a personal AI agent with its own terminal, browser, memory, and skills. The adapter runs Hermes headlessly (`-q`/`--quiet`/`--cli`) as either an **analyze** worker (read-only findings) or a **full-edit** worker (`payload.mode="implement"`), mirroring the Claude Code / Codex subprocess, git-snapshot, sidecar-spool, and PATCH-attribution semantics.
