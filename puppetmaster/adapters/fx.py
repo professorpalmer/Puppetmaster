@@ -21,6 +21,11 @@ Two fx-specific properties shape this adapter:
   from ``FX_MODEL`` or ``~/.fx/settings.json``. The adapter therefore forwards a
   requested model through the environment and records the model fx *reports*
   rather than the one it requested.
+- **A worker does not load MCP servers by default.** The worker inherits the
+  operator's MCP profile, which inside an fx-hosted PM session includes the
+  ``puppetmaster`` MCP server, so an unsuppressed worker could call back into PM
+  and start more workers. The adapter sets fx's ``FX_DISABLE_MCP`` for every
+  worker unless the caller passes ``payload.allow_mcp: true``.
 """
 
 from __future__ import annotations
@@ -71,6 +76,12 @@ PERMISSION_MODES = ("auto", "full-access", "ask")
 # depth counter bounds it and names it instead of letting it recurse silently.
 WORKER_DEPTH_ENV = "PUPPETMASTER_FX_WORKER_DEPTH"
 
+# fx's own "load no MCP servers" switch (fx >= the --no-mcp change). It travels in
+# the worker environment rather than argv on purpose: an env var is ignored by fx
+# builds that predate it, while an unknown argv flag would be rejected outright,
+# so an older fx keeps working unchanged.
+DISABLE_MCP_ENV = "FX_DISABLE_MCP"
+
 
 def resolve_fx_executable(task: Task) -> object:
     """Requested fx command, before PATH resolution."""
@@ -115,6 +126,24 @@ def resolve_max_worker_depth(task: Task) -> int:
     if isinstance(raw, bool) or not isinstance(raw, int):
         return 0
     return max(raw, 0)
+
+
+def resolve_mcp_disabled(task: Task) -> bool:
+    """Whether this worker should load MCP servers.
+
+    Default is to disable them. A PM-spawned fx worker inherits the operator's MCP
+    profile, and when PM was itself launched from an fx session that profile
+    includes the ``puppetmaster`` MCP server, so the worker could call back into it
+    and start more workers. The depth guard bounds that recursion downstream; this
+    removes the surface entirely for the worker.
+
+    Set ``payload.allow_mcp: true`` for a worker that legitimately needs MCP tools.
+    Any non-boolean value falls back to the default rather than guessing.
+    """
+    raw = task.payload.get("allow_mcp")
+    if isinstance(raw, bool):
+        return not raw
+    return True
 
 
 def build_fx_command(
@@ -340,6 +369,9 @@ class FxAdapter(CliWorkerAdapter):
 
         env = inject_worker_cli_env(apply_worktree_ports(os.environ.copy(), cwd))
         env[WORKER_DEPTH_ENV] = str(depth + 1)
+        mcp_disabled = resolve_mcp_disabled(task)
+        if mcp_disabled:
+            env[DISABLE_MCP_ENV] = "1"
         if model:
             env["FX_MODEL"] = str(model)
 
@@ -359,6 +391,7 @@ class FxAdapter(CliWorkerAdapter):
                 # read-only rather than enforced read-only. Recorded honestly.
                 "enforcement": "prompt-only",
                 "depth": depth + 1,
+                "mcp_disabled": mcp_disabled,
             },
         )
 
@@ -471,6 +504,7 @@ class FxAdapter(CliWorkerAdapter):
                 "resume_session_id": resume_session_id,
                 "session_id": session_id or None,
                 "worker_depth": prepared.extras.get("depth"),
+                "mcp_disabled": bool(prepared.extras.get("mcp_disabled")),
                 "stdout": _redacted_tail(completed.stdout, _STDOUT_TAIL_CHARS),
                 "stderr": _redacted_tail(completed.stderr, _STDOUT_TAIL_CHARS),
                 "stdout_capture": stdout_capture,

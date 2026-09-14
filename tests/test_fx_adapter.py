@@ -22,6 +22,7 @@ import hermetic_env  # noqa: F401
 from puppetmaster.adapters import ADAPTERS, get_adapter
 from puppetmaster.adapters._streaming import StreamedProcess
 from puppetmaster.adapters.fx import (
+    DISABLE_MCP_ENV,
     FxAdapter,
     WORKER_DEPTH_ENV,
     build_fx_command,
@@ -30,6 +31,7 @@ from puppetmaster.adapters.fx import (
     parse_fx_result,
     resolve_fx_permission_mode,
     resolve_fx_worker_depth,
+    resolve_mcp_disabled,
 )
 from puppetmaster.adapters.registry import ADAPTER_INFO
 from puppetmaster.models import ArtifactType, Task
@@ -262,6 +264,68 @@ class FxNestingGuardTests(unittest.TestCase):
                 _task(max_worker_depth=1), "goal", "worker_1", Path("/tmp"), "/usr/bin/fx"
             )
         self.assertNotIsInstance(prepared, list)
+
+
+class FxMcpSuppressionTests(unittest.TestCase):
+    """A spawned worker must not inherit the orchestrator's MCP surface."""
+
+    def test_workers_disable_mcp_by_default(self) -> None:
+        self.assertTrue(resolve_mcp_disabled(_task()))
+
+    def test_payload_can_opt_back_in(self) -> None:
+        self.assertFalse(resolve_mcp_disabled(_task(allow_mcp=True)))
+
+    def test_non_boolean_allow_mcp_falls_back_to_the_safe_default(self) -> None:
+        # A string or a number is a malformed payload, not an opt-in.
+        for raw in ("true", "1", 1, [], {}):
+            with self.subTest(raw=raw):
+                self.assertTrue(resolve_mcp_disabled(_task(allow_mcp=raw)))
+
+    def test_invocation_sets_the_env_and_records_the_flag(self) -> None:
+        adapter = FxAdapter()
+        with mock.patch.dict(os.environ, {}, clear=False), \
+             mock.patch("puppetmaster.adapters.with_repo_census", side_effect=lambda p, cwd: p), \
+             mock.patch(
+                 "puppetmaster.adapters.enrich_prompt_with_codegraph",
+                 return_value=("prompt", False),
+             ):
+            os.environ.pop(WORKER_DEPTH_ENV, None)
+            prepared = adapter._prepare_cli_invocation(
+                _task(), "goal", "worker_1", Path("/tmp"), "/usr/bin/fx"
+            )
+        self.assertNotIsInstance(prepared, list)
+        self.assertEqual(prepared.env[DISABLE_MCP_ENV], "1")
+        self.assertTrue(prepared.extras["mcp_disabled"])
+        # Suppression travels in the environment, never as an argv flag an older
+        # fx build would reject.
+        self.assertNotIn("--no-mcp", prepared.command)
+
+    def test_opt_in_leaves_the_environment_untouched(self) -> None:
+        adapter = FxAdapter()
+        with mock.patch.dict(os.environ, {}, clear=False), \
+             mock.patch("puppetmaster.adapters.with_repo_census", side_effect=lambda p, cwd: p), \
+             mock.patch(
+                 "puppetmaster.adapters.enrich_prompt_with_codegraph",
+                 return_value=("prompt", False),
+             ):
+            os.environ.pop(WORKER_DEPTH_ENV, None)
+            os.environ.pop(DISABLE_MCP_ENV, None)
+            prepared = adapter._prepare_cli_invocation(
+                _task(allow_mcp=True), "goal", "worker_1", Path("/tmp"), "/usr/bin/fx"
+            )
+        self.assertNotIsInstance(prepared, list)
+        self.assertNotIn(DISABLE_MCP_ENV, prepared.env)
+        self.assertFalse(prepared.extras["mcp_disabled"])
+
+    def test_a_stale_ambient_disable_is_not_mistaken_for_a_policy(self) -> None:
+        # The worker environment starts from the parent's, so an inherited
+        # FX_DISABLE_MCP must not be read back as this adapter's own decision.
+        adapter = FxAdapter()
+        with mock.patch.dict(os.environ, {DISABLE_MCP_ENV: "1"}):
+            prepared = adapter._prepare_cli_invocation(
+                _task(allow_mcp=True), "goal", "worker_1", Path("/tmp"), "/usr/bin/fx"
+            )
+        self.assertFalse(prepared.extras["mcp_disabled"])
 
 
 class FxLifecycleTests(unittest.TestCase):
@@ -498,6 +562,8 @@ class FxLifecycleTests(unittest.TestCase):
         self.assertEqual(captured["env"]["FX_MODEL"], "some/model")
         # The nesting counter is bumped for every spawned worker.
         self.assertEqual(captured["env"][WORKER_DEPTH_ENV], "1")
+        # MCP is off by default, so the worker cannot call back into this PM.
+        self.assertEqual(captured["env"][DISABLE_MCP_ENV], "1")
 
 
 if __name__ == "__main__":

@@ -129,6 +129,7 @@ from .cursor import (
 )
 from .fx import (
     DEFAULT_FX_MODEL,
+    DISABLE_MCP_ENV,
     FxAdapter,
     build_fx_command,
     fx_report_text,
@@ -137,6 +138,7 @@ from .fx import (
     resolve_fx_executable,
     resolve_fx_permission_mode,
     resolve_fx_worker_depth,
+    resolve_mcp_disabled,
 )
 from .hermes import (
     DEFAULT_HERMES_ANALYZE_TOOLSETS,

@@ -14,6 +14,11 @@
 - Fail closed on fx-inside-Puppetmaster-inside-fx recursion: a worker bound to
   an fx-spawned Puppetmaster returns `failure=nested_fx_worker` unless
   `payload.max_worker_depth` deliberately allows the nesting.
+- Run every worker with MCP disabled (`FX_DISABLE_MCP=1`), so a worker cannot
+  call back into the Puppetmaster MCP server that spawned it and start more
+  workers; `payload.allow_mcp: true` opts a worker back in. The switch is an
+  environment variable so an older fx build ignores it instead of rejecting an
+  unknown flag.
 - Register `fx` in the adapter registry, the platform lock, and the
   implement/review capability sets.
 

@@ -191,6 +191,11 @@ Defaults are tuned for unattended automation: `--auto` (fx routes unresolved act
 | `resume_session_id` | continue an existing fx session (`--resume-id`); mutually exclusive with `--no-save` |
 | `system_prompt` | replace fx's built-in base prompt for this run (`--system`) |
 | `max_worker_depth` | allow bounded nesting of fx-inside-Puppetmaster-inside-fx (default `0`) |
+| `allow_mcp` | let this worker load the operator's MCP servers (default: MCP disabled) |
+
+Every worker runs with MCP **disabled** (`FX_DISABLE_MCP=1` in the worker environment). A PM-spawned fx worker inherits the operator's MCP profile, and inside an fx-hosted Puppetmaster session that profile includes the `puppetmaster` MCP server, so an unsuppressed worker could call back into PM and start more workers. The depth guard above bounds that recursion downstream; this removes the surface for the worker itself. Set `payload.allow_mcp: true` for a worker that legitimately needs MCP tools.
+
+The switch travels in the environment rather than argv on purpose: fx builds that predate it ignore the variable, whereas an unknown flag would be rejected outright, so an older fx keeps working unchanged.
 
 fx exposes no read-only flag on `ask`, so an analyze task is *instructed* read-only rather than enforced read-only. The verification payload records `enforcement: "prompt-only"` instead of claiming a sandbox that does not exist.
 
