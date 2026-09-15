@@ -13,6 +13,7 @@ import hermetic_env  # noqa: F401
 from puppetmaster.adapters.codex import CodexAdapter
 from puppetmaster.adapters.claude_code import ClaudeCodeAdapter
 from puppetmaster.adapters.antigravity import AntigravityAdapter
+from puppetmaster.adapters.fx import FxAdapter
 from puppetmaster.adapters._git import GitSnapshot
 from puppetmaster.adapters._streaming import StreamedProcess
 from puppetmaster.models import ArtifactType, Task
@@ -24,6 +25,7 @@ class ReadonlyDiffAttributionTests(unittest.TestCase):
             (CodexAdapter, {"sandbox": "read-only"}, {"sandbox": "workspace-write"}),
             (ClaudeCodeAdapter, {"permission_mode": "plan"}, {"permission_mode": "acceptEdits"}),
             (AntigravityAdapter, {"mode": "plan"}, {"mode": "implement"}),
+            (FxAdapter, {"read_only": True, "sandbox": "read-only"}, {"permission_mode": "auto"}),
         ]
         for adapter_type, readonly, writable in cases:
             for outcome in ("success", "failure", "timeout", "budget"):
@@ -45,6 +47,17 @@ class ReadonlyDiffAttributionTests(unittest.TestCase):
                             stdout = json.dumps({"type": "item.completed", "item": {
                                 "type": "agent_message", "text": report,
                             }})
+                        elif adapter_type is FxAdapter:
+                            stdout = json.dumps({
+                                "output": report,
+                                "final_output": report,
+                                "exit_code": 0 if outcome == "success" else 1,
+                                "model": "test-model",
+                                "session_id": "",
+                                "steps": 0,
+                                "tool_calls": [],
+                                "usage": {"input_tokens": 1, "output_tokens": 1},
+                            })
                         completed = StreamedProcess(
                             returncode=0 if outcome == "success" else 1,
                             stdout=stdout, stderr="",

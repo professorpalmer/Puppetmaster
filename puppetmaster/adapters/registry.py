@@ -10,6 +10,7 @@ from .antigravity import AntigravityAdapter
 from .claude_code import ClaudeCodeAdapter
 from .codex import CodexAdapter
 from .cursor import CursorAdapter
+from .fx import FxAdapter
 from .hermes import HermesAdapter
 from .local import LocalAdapter, ShellAdapter
 from .openai import OpenAIAdapter
@@ -22,6 +23,7 @@ ADAPTERS: dict[str, WorkerAdapter] = {
     "claude-code": ClaudeCodeAdapter(),
     "openai": OpenAIAdapter(),
     "codex": CodexAdapter(),
+    "fx": FxAdapter(),
     "hermes": HermesAdapter(),
     "antigravity": AntigravityAdapter(),
     "agy": AntigravityAdapter(),
@@ -86,6 +88,21 @@ ADAPTER_INFO = [
         requires=[
             "codex CLI (`npm install -g @openai/codex`)",
             "OPENAI_API_KEY or `codex login`",
+        ],
+    ),
+    AdapterInfo(
+        name="fx",
+        status="optional",
+        description=(
+            "Runs the fx CLI (`fx ask --json`) non-interactively. fx reports "
+            "billing-grade input/output token counts in its JSON result, so usage "
+            "is parsed rather than estimated, and no JSONL event stream is needed. "
+            "Supports session resume via payload.resume_session_id and a bounded "
+            "nesting guard for fx-inside-Puppetmaster-inside-fx dispatch."
+        ),
+        requires=[
+            "fx CLI on PATH (`FX_COMMAND` or payload.executable to override)",
+            "fx model provider configured (fx login / FX_MODEL)",
         ],
     ),
     AdapterInfo(

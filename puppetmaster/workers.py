@@ -130,7 +130,8 @@ def normalize_role_specs(roles: Optional[list[object]], goal: str) -> tuple[list
 
 # Shared by DEFAULT_WORKERS and write_generated_swarm_config so analysis
 # swarms keep read-only intent when auto_route lands on an edit-capable
-# adapter (claude-code → permission_mode=plan; codex → sandbox read-only).
+# adapter (claude-code → permission_mode=plan; codex → sandbox read-only;
+# antigravity → mode=plan; fx → write_capable=False + prompt-only).
 # Without these, a Claude-only lock routing the "implement" *planning*
 # role to claude-code incorrectly takes acceptEdits and trips worktree
 # / dirty-tree guards.
@@ -482,6 +483,10 @@ IMPLEMENT_ADAPTER_PRIORITY = (
     "hermes",
     "antigravity",
     "agentic",
+    # fx is full-edit and PATCH-producing, so it is implement-capable. It sits
+    # last because it is the newest entrant, not because it is weakest: promote
+    # it here to change which adapter an unspecified implement dispatch picks.
+    "fx",
 )
 
 # Platforms that can run a read-only analysis worker. This is deliberately a
@@ -493,6 +498,7 @@ REVIEW_ADAPTERS = (
     "cursor",
     "claude-code",
     "codex",
+    "fx",
     "openai",
     "hermes",
     "antigravity",

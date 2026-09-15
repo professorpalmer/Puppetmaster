@@ -36,6 +36,7 @@ KNOWN_ADAPTERS: tuple[str, ...] = (
     "cursor",
     "claude-code",
     "codex",
+    "fx",
     "openai",
     "hermes",
     "antigravity",
