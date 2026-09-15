@@ -10,7 +10,12 @@
   and report `failure=fx_unparseable_result`.
 - Record `enforcement: "prompt-only"` for analyze tasks, because fx exposes no
   enforced read-only flag on `ask`; the adapter does not claim a sandbox that
-  does not exist.
+  does not exist. Analysis / no-edit payloads (`read_only`, `sandbox=read-only`,
+  `ANALYSIS_NO_EDIT_PAYLOAD`, …) now set `write_capable=False` so attribution
+  stays `repository_diff_attribution=none` (matching Codex / Claude Code /
+  Antigravity) and analysis swarms cannot trip `analysis_worker_diff` on
+  ambient dirt or a prompt-only slip; a READ-ONLY ANALYSIS preamble is
+  prepended and the dirty-tree guard is skipped.
 - Fail closed on fx-inside-Puppetmaster-inside-fx recursion: a worker bound to
   an fx-spawned Puppetmaster returns `failure=nested_fx_worker` unless
   `payload.max_worker_depth` deliberately allows the nesting.

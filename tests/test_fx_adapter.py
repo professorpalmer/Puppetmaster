@@ -25,11 +25,13 @@ from puppetmaster.adapters.fx import (
     DISABLE_MCP_ENV,
     FxAdapter,
     WORKER_DEPTH_ENV,
+    _FX_READ_ONLY_PREAMBLE,
     build_fx_command,
     fx_report_text,
     fx_usage_from_result,
     parse_fx_result,
     resolve_fx_permission_mode,
+    resolve_fx_read_only_intent,
     resolve_fx_worker_depth,
     resolve_mcp_disabled,
 )
@@ -129,6 +131,65 @@ class FxPermissionModeTests(unittest.TestCase):
     def test_invalid_mode_raises(self) -> None:
         with self.assertRaises(ValueError):
             resolve_fx_permission_mode(_task(permission_mode="banana"))
+
+
+class FxReadOnlyIntentTests(unittest.TestCase):
+    def test_analysis_no_edit_payload_is_read_only(self) -> None:
+        self.assertTrue(
+            resolve_fx_read_only_intent(
+                _task(read_only=True, sandbox="read-only")
+            )
+        )
+
+    def test_analyze_mode_is_read_only(self) -> None:
+        self.assertTrue(resolve_fx_read_only_intent(_task(mode="analyze")))
+        self.assertTrue(resolve_fx_read_only_intent(_task(mode="plan")))
+
+    def test_implement_default_is_write_capable_intent(self) -> None:
+        self.assertFalse(resolve_fx_read_only_intent(_task()))
+
+    def test_no_edit_and_dry_run_flags(self) -> None:
+        self.assertTrue(resolve_fx_read_only_intent(_task(no_edit=True)))
+        self.assertTrue(resolve_fx_read_only_intent(_task(dry_run=True)))
+
+
+class FxWriteCapablePrepareTests(unittest.TestCase):
+    def _prepare(self, **payload):
+        adapter = FxAdapter()
+        task = _task(cwd="/tmp", disable_codegraph=True, **payload)
+        with mock.patch("puppetmaster.adapters.resolve_command", return_value="/usr/bin/fx"), \
+             mock.patch("puppetmaster.adapters.with_repo_census", side_effect=lambda p, cwd: p), \
+             mock.patch(
+                 "puppetmaster.adapters.enrich_prompt_with_codegraph",
+                 side_effect=lambda prompt, **kw: (prompt, False),
+             ):
+            prepared = adapter._prepare_cli_invocation(
+                task, "goal", "worker_1", Path("/tmp"), "/usr/bin/fx"
+            )
+        self.assertIsInstance(prepared, object)
+        return prepared
+
+    def test_analysis_payload_sets_write_capable_false(self) -> None:
+        prepared = self._prepare(read_only=True, sandbox="read-only")
+        self.assertFalse(prepared.extras["write_capable"])
+        self.assertTrue(prepared.extras["read_only_intent"])
+        self.assertEqual(prepared.extras["enforcement"], "prompt-only")
+        self.assertIn("--auto", prepared.command)
+        stdin = prepared.subprocess_kwargs["stdin_data"]
+        self.assertTrue(str(stdin).startswith(_FX_READ_ONLY_PREAMBLE))
+
+    def test_implement_default_is_write_capable(self) -> None:
+        prepared = self._prepare()
+        self.assertTrue(prepared.extras["write_capable"])
+        self.assertFalse(prepared.extras["read_only_intent"])
+        self.assertEqual(prepared.extras["enforcement"], "cli")
+        stdin = prepared.subprocess_kwargs["stdin_data"]
+        self.assertFalse(str(stdin).startswith(_FX_READ_ONLY_PREAMBLE))
+
+    def test_ask_permission_mode_is_not_write_capable(self) -> None:
+        prepared = self._prepare(permission_mode="ask")
+        self.assertFalse(prepared.extras["write_capable"])
+        self.assertEqual(prepared.extras["enforcement"], "prompt-only")
 
 
 class FxWorkerDepthTests(unittest.TestCase):

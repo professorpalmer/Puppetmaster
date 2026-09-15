@@ -199,6 +199,8 @@ The switch travels in the environment rather than argv on purpose: fx builds tha
 
 fx exposes no read-only flag on `ask`, so an analyze task is *instructed* read-only rather than enforced read-only. The verification payload records `enforcement: "prompt-only"` instead of claiming a sandbox that does not exist.
 
+Analysis / no-edit intent (`payload.read_only`, `sandbox="read-only"`, `no_edit`, `dry_run`, or `mode` in `analyze`/`plan` — including `ANALYSIS_NO_EDIT_PAYLOAD` on analysis swarms) sets `write_capable=False` so git snapshot attribution is `repository_diff_attribution=none`, the dirty-tree guard is skipped, and concurrent ambient diffs cannot trip `analysis_worker_diff`. The worker still runs with `--auto` (headless `--ask` would deadlock); a READ-ONLY ANALYSIS preamble is prepended to the prompt.
+
 If the adapter returns `failure=fx_unparseable_result`, the run exited cleanly but emitted no parseable JSON result, so Puppetmaster cannot attribute it. The raw stdout is spooled to the `fx_result` sidecar.
 If it returns `failure=fx_exit_code`, fx reported a nonzero exit code; `reported_exit_code` and `stderr` carry the detail.
 If it returns `failure=nested_fx_worker`, Puppetmaster was itself launched by an fx session that Puppetmaster spawned, so a worker here would recurse. Dispatch from the outer session, or raise `payload.max_worker_depth` deliberately.

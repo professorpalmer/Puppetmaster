@@ -70,6 +70,34 @@ DEFAULT_FX_MODEL: Optional[str] = None
 
 PERMISSION_MODES = ("auto", "full-access", "ask")
 
+# Prepended to analyze / read-only prompts. fx has no enforced plan/sandbox flag
+# on `ask`, so the adapter stamps write_capable=False for attribution and relies
+# on this instruction (plus orchestration postconditions) for the rest.
+_FX_READ_ONLY_PREAMBLE = (
+    "READ-ONLY ANALYSIS: Do not create, edit, delete, rename, or move any files. "
+    "Do not run commands that mutate the repository or working tree. "
+    "Inspect the codebase and return structured findings only."
+)
+
+
+def resolve_fx_read_only_intent(task: Task) -> bool:
+    """True when the task is an analysis / no-edit run.
+
+    Mirrors ANALYSIS_NO_EDIT_PAYLOAD and the claude-code / antigravity read-only
+    detectors so an analysis swarm that auto-routes onto fx stays non-attributing
+    even though fx's CLI only offers prompt-level read-only enforcement.
+    """
+    payload = task.payload or {}
+    if bool(payload.get("read_only")) or bool(payload.get("no_edit")) or bool(
+        payload.get("dry_run")
+    ):
+        return True
+    if payload.get("sandbox") == "read-only":
+        return True
+    mode = str(payload.get("mode") or "").strip().lower()
+    return mode in {"analyze", "plan"}
+
+
 # fx is spawned by Puppetmaster, which may itself be running inside an fx session.
 # That is the interesting case (fx delegates to PM swarms) but also the runaway
 # case (fx worker calls puppetmaster_start_swarm, spawning more fx workers). The
@@ -354,6 +382,14 @@ class FxAdapter(CliWorkerAdapter):
         command_base = [resolved, *command_base[1:]]
 
         permission_mode = resolve_fx_permission_mode(task)
+        read_only_intent = resolve_fx_read_only_intent(task)
+        # Attribution contract (matches claude-code / codex / antigravity):
+        # analysis / no-edit payloads and the interactive `ask` posture never
+        # claim repository diffs. fx still runs `--auto` when read-only because
+        # `--ask` would deadlock without a TTY; enforcement stays prompt-only.
+        write_capable = (not read_only_intent) and permission_mode != "ask"
+        if not write_capable:
+            prompt = f"{_FX_READ_ONLY_PREAMBLE}\n\n{prompt}"
         model = task.payload.get("model") or DEFAULT_FX_MODEL
         save_session = bool(task.payload.get("save_session", False))
         resume_session_id = task.payload.get("resume_session_id")
@@ -385,15 +421,34 @@ class FxAdapter(CliWorkerAdapter):
                 "codegraph_used": codegraph_used,
                 "model": str(model) if model else None,
                 "permission_mode": permission_mode,
+                "write_capable": write_capable,
+                "read_only_intent": read_only_intent,
                 "save_session": save_session,
                 "resume_session_id": str(resume_session_id) if resume_session_id else None,
                 # fx has no read-only flag on `ask`, so analyze runs are instructed
                 # read-only rather than enforced read-only. Recorded honestly.
-                "enforcement": "prompt-only",
+                # write_capable=False still suppresses worker_diff attribution so
+                # analysis swarms do not trip analysis_worker_diff on ambient dirt
+                # or a prompt-only slip.
+                "enforcement": "prompt-only" if not write_capable else "cli",
                 "depth": depth + 1,
                 "mcp_disabled": mcp_disabled,
             },
         )
+
+    def _apply_pre_run_guards(
+        self,
+        task: Task,
+        worker_id: str,
+        cwd: Path,
+        prepared: CliInvocation,
+    ) -> tuple[Optional[list[Artifact]], dict]:
+        # Read-only / analyze runs take a snapshot but skip the clean-tree guard
+        # so an analysis swarm can review the caller's existing diff — same
+        # contract as Codex read-only, Claude Code plan, and Antigravity plan.
+        if not prepared.extras.get("write_capable", True):
+            return None, facade("git_snapshot")(cwd)
+        return super()._apply_pre_run_guards(task, worker_id, cwd, prepared)
 
     def _finalize_cli_run(
         self,
@@ -462,23 +517,27 @@ class FxAdapter(CliWorkerAdapter):
         process_failed = completed.returncode != 0 or (
             reported_exit_code is not None and reported_exit_code != 0
         )
-        # A write-capable run that produced no typed artifacts is *not* degraded:
-        # the PATCH artifact is its real evidence, and prose-only reporting is
-        # normal for a coding worker. This mirrors the codex/claude-code path.
-        # fx has no enforced read-only mode, so write capability is a property of
-        # the permission posture, and `ask` is the only non-writing posture.
-        write_capable = permission_mode != "ask"
-        missing_result = result is None and not process_failed
-        unstructured = (
-            not process_failed and not missing_result and bool(report.strip())
+        # Prefer the prepare-time write_capable flag (honors ANALYSIS_NO_EDIT /
+        # read_only / sandbox=read-only); fall back to the ask posture.
+        write_capable = bool(
+            prepared.extras["write_capable"]
+            if "write_capable" in prepared.extras
+            else permission_mode != "ask"
         )
-        # A run that exits cleanly but emits nothing parseable cannot be
-        # attributed, so it is always degraded.
-        degraded = bool(missing_result or (unstructured and not write_capable))
-
+        missing_result = result is None and not process_failed
         artifacts = cursor_result_artifacts(
             task, worker_id, report, adapter=self.name
         )
+        # Mirror Codex: prose without typed artifacts is unstructured. A
+        # write-capable coding run that reports in prose is *not* degraded —
+        # the PATCH is its evidence. A read-only / ask run with only prose is.
+        unstructured = (
+            not process_failed
+            and not missing_result
+            and not artifacts
+            and bool(report.strip())
+        )
+        degraded = bool(missing_result or (unstructured and not write_capable))
 
         verification = verification_artifact(
             task=task,
@@ -499,6 +558,7 @@ class FxAdapter(CliWorkerAdapter):
                 "model_requested": model_requested,
                 "model": reported_model,
                 "permission_mode": permission_mode,
+                "write_capable": write_capable,
                 "enforcement": prepared.extras.get("enforcement"),
                 "save_session": bool(prepared.extras.get("save_session")),
                 "resume_session_id": resume_session_id,
