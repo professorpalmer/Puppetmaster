@@ -939,13 +939,17 @@ def preflight_check(
     )
 
 
-# Adapters that shell out to a standalone CLI binary, with the env var that
-# overrides the default executable. Cursor (bundled SDK runner) and OpenAI
-# (HTTP) have no separate CLI to install, so they are absent here — their
-# readiness is purely a credentials question, answered by billing detection.
-_ADAPTER_CLI_DEFAULT: dict[str, "tuple[str, str]"] = {
-    "claude-code": ("CLAUDE_CODE_COMMAND", "claude"),
-    "codex": ("CODEX_COMMAND", "codex"),
+# Adapters that shell out to a standalone CLI binary: the env vars that
+# override the executable (first set wins, matching each adapter's own lookup)
+# and the default. Cursor (bundled SDK runner), OpenAI and agentic (HTTP) have no
+# separate CLI to install, so they are absent here — their readiness is purely a
+# credentials question, answered by billing detection.
+_ADAPTER_CLI_DEFAULT: dict[str, "tuple[tuple[str, ...], str]"] = {
+    "claude-code": (("CLAUDE_CODE_COMMAND",), "claude"),
+    "codex": (("CODEX_COMMAND",), "codex"),
+    "antigravity": (("AGY_COMMAND", "ANTIGRAVITY_COMMAND"), "agy"),
+    "hermes": (("HERMES_COMMAND",), "hermes"),
+    "fx": (("FX_COMMAND",), "fx"),
 }
 
 # Injectable executable resolver: name -> resolved path or None. Defaults to the
@@ -964,8 +968,8 @@ def adapter_cli_executable(
     if spec is None:
         return None
     env = env if env is not None else os.environ
-    env_var, default = spec
-    return env.get(env_var) or default
+    env_vars, default = spec
+    return next((env[name] for name in env_vars if env.get(name)), default)
 
 
 def _default_command_resolver(executable: str) -> Optional[str]:
