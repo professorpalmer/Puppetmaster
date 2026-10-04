@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import os
 import re
@@ -1667,10 +1668,13 @@ def _build_tools() -> list[McpTool]:
             name="puppetmaster_await_job",
             description=(
                 "Await sugar over the long-poll: block up to timeout_seconds for a job to "
-                "reach a terminal state (complete/failed), then return its status and final "
-                "summary. If it times out first, returns timed_out=true with the current "
-                "status so you can immediately call again to keep awaiting (the MCP turn "
-                "can't block forever). Prefer this over polling status in a loop."
+                "reach a terminal state (complete/failed), then return its status and a "
+                "compact completion digest (counts, deduped headlines, failed/degraded "
+                "tasks, summary_ref). For the full stitched text pass summary=\"full\", "
+                "or use puppetmaster_partial_summary / `puppetmaster show <job>`. If it "
+                "times out first, returns timed_out=true with the current status so you "
+                "can immediately call again to keep awaiting (the MCP turn can't block "
+                "forever). Prefer this over polling status in a loop."
             ),
             input_schema=await_schema(),
             handler=run_await_job,
@@ -4414,11 +4418,29 @@ def run_feed_follow(args: JsonObject) -> JsonObject:
     return {"content": [{"type": "text", "text": json.dumps(body, indent=2, default=str)}], "isError": False}
 
 
+AWAIT_SUMMARY_MODES = ("compact", "full", "none")
+
+
+def _await_summary_mode(args: JsonObject) -> str:
+    explicit = args.get("summary")
+    if explicit is not None:
+        mode = str(explicit).strip().lower()
+        if mode not in AWAIT_SUMMARY_MODES:
+            raise ValueError(f"summary must be one of {', '.join(AWAIT_SUMMARY_MODES)}")
+        return mode
+    env_mode = os.environ.get("PUPPETMASTER_AWAIT_SUMMARY", "").strip().lower()
+    return env_mode if env_mode in AWAIT_SUMMARY_MODES else "compact"
+
+
 def run_await_job(args: JsonObject) -> JsonObject:
     from puppetmaster.cli import await_job_state
     from puppetmaster.stitcher import Stitcher
 
     job_id = require_job_id(args)
+    try:
+        mode = _await_summary_mode(args)
+    except ValueError as exc:
+        return tool_error(str(exc))
     requested_timeout = float(args.get("timeout_seconds") or 25.0)
     timeout_seconds, was_capped = _capped_block_seconds(requested_timeout)
     poll_interval = float(args.get("poll_interval_seconds") or 0.25)
@@ -4435,15 +4457,28 @@ def run_await_job(args: JsonObject) -> JsonObject:
         timeout_seconds=timeout_seconds,
         poll_interval_seconds=poll_interval,
     )
-    summary = ""
-    if state["terminal"]:
+    body: JsonObject = {**state, "summary_mode": mode}
+    if not state["terminal"]:
+        body["summary"] = ""
+    elif mode != "none":
         summary_path = store.job_dir(job_id) / "summaries" / "stitched.md"
         if summary_path.is_file():
             summary = summary_path.read_text(encoding="utf-8")
         else:
+            summary_path = None
             summary = Stitcher(store).preview(job_id)
-
-    body = {**state, "summary": summary}
+        if mode == "full":
+            body["summary"] = summary
+        else:
+            body["summary_ref"] = {
+                "path": str(summary_path) if summary_path is not None else None,
+                "chars": len(summary),
+                "sha256": hashlib.sha256(summary.encode("utf-8")).hexdigest(),
+            }
+            try:
+                body["digest"] = Stitcher(store).digest(job_id)
+            except Exception as exc:
+                body["digest_error"] = f"{type(exc).__name__}: {exc}"[:200]
     if was_capped and not state["terminal"]:
         # Block shortened to stay under the client tool-timeout. The job is
         # still running; the caller should immediately await again.
@@ -5076,6 +5111,18 @@ def await_schema() -> JsonObject:
                 "enum": ["file", "sqlite"],
                 "default": "sqlite",
                 "description": "Coordination backend to open. Match the one used by your jobs.",
+            },
+            "summary": {
+                "type": "string",
+                "enum": list(AWAIT_SUMMARY_MODES),
+                "default": "compact",
+                "description": (
+                    "Completion payload shape. compact (default): counts, deduped "
+                    "headlines, exceptions, and a summary_ref to the full stitched "
+                    "text. full: the full stitched markdown under `summary`. none: "
+                    "status only. PUPPETMASTER_AWAIT_SUMMARY sets the default when "
+                    "omitted."
+                ),
             },
         }
     )
