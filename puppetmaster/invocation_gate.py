@@ -131,7 +131,7 @@ _FOLLOWUP_PATTERNS = [
     re.compile(r"\bfollow[-\s]?up\b"),
     re.compile(r"\bnow also\b"),
     re.compile(r"\bnow (change|update|tweak|adjust|make)\b"),
-    re.compile(r"\brevis(e|ion)\b"),
+    re.compile(r"\brevise\b"),
     re.compile(r"\bsame as before but\b"),
     re.compile(r"\bthe (previous|last|prior) (job|run|swarm|result|output)\b"),
     re.compile(r"\byou (just )?(built|made|generated|produced)\b"),
@@ -362,10 +362,10 @@ def should_delegate(
     3. Explicit delegate trigger — "use Puppetmaster" forces a swarm.
     4. Trivial carve-out — short + obviously-easy prompts stay inline.
     5. Last-mile — work on uncommitted changes routes to the in-place edit verb.
-    6. Follow-up fast path — a revision of prior job output with no broad
+    6. CodeGraph lookup — structural lookups delegate regardless of score.
+    7. Follow-up fast path — a revision of prior job output with no broad
        scope stays in the existing pilot (``PUPPETMASTER_FOLLOWUP_FAST_PATH=0``
        disables it).
-    7. CodeGraph lookup — structural lookups delegate regardless of score.
     8. Score threshold — delegate at/above the (conservative) bar.
     9. Hard scope override — broad multi-file scope delegates even just under
        the bar, because scope is the strongest swarm signal.
@@ -460,19 +460,6 @@ def should_delegate(
             _EDIT_VERB, score, role, ("last-mile",),
         ))
 
-    if (
-        not has_hard_scope
-        and len(prompt) <= _FOLLOWUP_MAX_CHARS
-        and _followup_fast_path_enabled(env)
-        and _matches_any(_FOLLOWUP_PATTERNS, lower)
-    ):
-        return finish(DelegationDecision(
-            False,
-            f"follow-up to prior job output (score {score}); continue in the "
-            f"existing pilot instead of starting fresh workers",
-            suggested_verb, score, role, ("followup",),
-        ))
-
     # CodeGraph lookups always delegate, regardless of score. A structural
     # "where is X / who calls Y / what implements Z" query is cheap, fast, and
     # strictly better than letting the host grep the tree — there is no
@@ -486,6 +473,19 @@ def should_delegate(
             f"CodeGraph lookup — delegate regardless of score ({score}); "
             f"structural lookup beats inline grep",
             suggested_verb, score, role, ("codegraph-lookup",),
+        ))
+
+    if (
+        not has_hard_scope
+        and len(prompt) <= _FOLLOWUP_MAX_CHARS
+        and _followup_fast_path_enabled(env)
+        and _matches_any(_FOLLOWUP_PATTERNS, lower)
+    ):
+        return finish(DelegationDecision(
+            False,
+            f"follow-up to prior job output (score {score}); continue in the "
+            f"existing pilot instead of starting fresh workers",
+            suggested_verb, score, role, ("followup",),
         ))
 
     if score < trivial_threshold and not has_hard_scope:

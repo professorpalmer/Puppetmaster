@@ -65,6 +65,17 @@ class FollowupFastPathGateTests(unittest.TestCase):
                 self.assertNotIn("followup", d.matched_signals)
                 self.assertEqual(d, should_delegate(prompt, env=_KILL))
 
+    def test_codegraph_lookup_about_prior_output_still_delegates(self):
+        d = should_delegate("where is the parser you just built called from?", env=_ENV)
+        self.assertTrue(d.should_delegate)
+        self.assertEqual(d.matched_signals, ("codegraph-lookup",))
+
+    def test_revision_as_a_noun_is_not_a_followup(self):
+        prompt = "implement the revision history API with tests"
+        d = should_delegate(prompt, env=_ENV)
+        self.assertNotIn("followup", d.matched_signals)
+        self.assertEqual(d, should_delegate(prompt, env=_KILL))
+
     def test_followup_over_length_cap_keeps_normal_policy(self):
         prompt = "now also add a --json flag to the command. " + ("x" * 600)
         d = should_delegate(prompt, env=_ENV)
