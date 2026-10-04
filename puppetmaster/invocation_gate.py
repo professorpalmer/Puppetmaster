@@ -53,6 +53,8 @@ _DISABLE_ENV_VARS = (
     "PUPPETMASTER_INVOCATION_GATE_DISABLED",
 )
 _THRESHOLD_ENV_VAR = "PUPPETMASTER_AUTO_INVOKE_THRESHOLD"
+_FOLLOWUP_ENV_VAR = "PUPPETMASTER_FOLLOWUP_FAST_PATH"
+_FOLLOWUP_MAX_CHARS = 600
 
 # ----- Intent signals ------------------------------------------------------
 
@@ -119,6 +121,20 @@ _LAST_MILE_PATTERNS = [
         r"(wrote|added|created|made|implemented|built|changed)\b"
     ),
     re.compile(r"\b(on top of|build on|building on) (my|the|these|those|what)\b"),
+]
+
+# Follow-up / revision signals: the prompt revises work a prior job already
+# produced. Re-delegating a small revision pays planning, launch, context and
+# merge cost that the pilot, which already holds the context, does not, so these
+# stay in the existing pilot unless broad scope says otherwise.
+_FOLLOWUP_PATTERNS = [
+    re.compile(r"\bfollow[-\s]?up\b"),
+    re.compile(r"\bnow also\b"),
+    re.compile(r"\bnow (change|update|tweak|adjust|make)\b"),
+    re.compile(r"\brevis(e|ion)\b"),
+    re.compile(r"\bsame as before but\b"),
+    re.compile(r"\bthe (previous|last|prior) (job|run|swarm|result|output)\b"),
+    re.compile(r"\byou (just )?(built|made|generated|produced)\b"),
 ]
 
 # Trivial signals — short, obviously-inline intents.
@@ -345,8 +361,13 @@ def should_delegate(
     2. Explicit inline opt-out — the user's word wins.
     3. Explicit delegate trigger — "use Puppetmaster" forces a swarm.
     4. Trivial carve-out — short + obviously-easy prompts stay inline.
-    5. Score threshold — delegate at/above the (conservative) bar.
-    6. Hard scope override — broad multi-file scope delegates even just under
+    5. Last-mile — work on uncommitted changes routes to the in-place edit verb.
+    6. Follow-up fast path — a revision of prior job output with no broad
+       scope stays in the existing pilot (``PUPPETMASTER_FOLLOWUP_FAST_PATH=0``
+       disables it).
+    7. CodeGraph lookup — structural lookups delegate regardless of score.
+    8. Score threshold — delegate at/above the (conservative) bar.
+    9. Hard scope override — broad multi-file scope delegates even just under
        the bar, because scope is the strongest swarm signal.
 
     Always returns a decision; never raises for normal input. Callers should
@@ -437,6 +458,19 @@ def should_delegate(
             f"in-place edit verb sees the dirty tree that an isolated-worktree "
             f"implement job (branched off HEAD) would miss",
             _EDIT_VERB, score, role, ("last-mile",),
+        ))
+
+    if (
+        not has_hard_scope
+        and len(prompt) <= _FOLLOWUP_MAX_CHARS
+        and _followup_fast_path_enabled(env)
+        and _matches_any(_FOLLOWUP_PATTERNS, lower)
+    ):
+        return finish(DelegationDecision(
+            False,
+            f"follow-up to prior job output (score {score}); continue in the "
+            f"existing pilot instead of starting fresh workers",
+            suggested_verb, score, role, ("followup",),
         ))
 
     # CodeGraph lookups always delegate, regardless of score. A structural
@@ -541,6 +575,13 @@ def _resolve_threshold(explicit: Optional[int], env: Mapping[str, str]) -> int:
         except ValueError:
             pass
     return DEFAULT_THRESHOLD
+
+
+def _followup_fast_path_enabled(env: Mapping[str, str]) -> bool:
+    raw = env.get(_FOLLOWUP_ENV_VAR)
+    if raw is None:
+        return True
+    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _matches_any(patterns, text: str) -> bool:

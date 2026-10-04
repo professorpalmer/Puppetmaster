@@ -73,6 +73,7 @@ Use native tooling directly for:
 - Trivial single-file edits with obvious intent (rename, add comment, fix typo).
 - Questions answerable from the current visible file or recent context.
 - Conversational follow-ups that don't change repo state.
+- Small follow-ups and revisions to work a Puppetmaster job already produced. Make them in the existing pilot; delegate only when the parallel work clearly outweighs planning, launch, context and merge cost. When a revision needs a prior worker's context, resume it with `resume_from` instead of a fresh session.
 - Anything explicitly framed as "just answer me" / "no swarm".
 
 ## Browser swarms (live-site QA)

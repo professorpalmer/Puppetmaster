@@ -153,6 +153,12 @@ RULE_BODY = textwrap.dedent(
     - Trivial single-file edits, typos, one-line fixes
     - Quick factual questions
     - Fast interactive iteration where the user is steering turn-by-turn
+    - Small follow-ups and revisions to work a Puppetmaster job already
+      produced. Make them in the existing pilot. Delegate a follow-up only
+      when its parallel work clearly outweighs planning, launch, context and
+      merge cost. When a revision genuinely needs a prior worker's context,
+      resume that worker with `resume_from` (job_id plus role or task_id)
+      instead of starting a fresh session.
 
     Routing those through Puppetmaster wastes tokens and latency.
 

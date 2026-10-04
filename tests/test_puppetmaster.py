@@ -25670,6 +25670,16 @@ class HookRunnerTests(unittest.TestCase):
     _TOOLS_ON = {"PUPPETMASTER_HOOK_ASSUME_TOOLS": "1"}
     _TOOLS_OFF = {"PUPPETMASTER_HOOK_ASSUME_TOOLS": "0"}
 
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        log_path = Path(tmp.name) / "invocation_decisions.jsonl"
+        patcher = patch(
+            "puppetmaster.hook_runner.decision_log_path", lambda env=None: log_path
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_user_prompt_injects_directive_when_delegating(self):
         from puppetmaster.hook_runner import handle_hook
 

@@ -23,14 +23,20 @@ exact JSON keys can track each host's evolving schema in one place.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import sys
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from puppetmaster.invocation_gate import DelegationDecision, gate_disabled, should_delegate
+
+DECISION_LOG_NAME = "invocation_decisions.jsonl"
+DECISION_LOG_MAX_BYTES = 5 * 1024 * 1024
 
 # Canonical event kinds. Host-specific event names normalize onto these.
 EVENT_USER_PROMPT = "user-prompt"
@@ -333,6 +339,47 @@ def _puppetmaster_tools_available(env: Optional[Mapping[str, str]] = None) -> bo
         return False
 
 
+def decision_log_path(env: Optional[Mapping[str, str]] = None) -> Path:
+    environ = env if env is not None else os.environ
+    home = (environ.get("PUPPETMASTER_HOME") or "").strip()
+    root = Path(home).expanduser() if home else Path.home() / ".puppetmaster"
+    return root / DECISION_LOG_NAME
+
+
+def record_decision(
+    decision: DelegationDecision,
+    prompt: str,
+    *,
+    env: Optional[Mapping[str, str]] = None,
+) -> None:
+    """Append one numbers-only gate decision. Never raises; never stores the prompt."""
+    try:
+        if gate_disabled(env):
+            return
+        from puppetmaster.fs_permissions import append_private_text
+
+        path = decision_log_path(env)
+        rec = {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "delegate": bool(decision.should_delegate),
+            "reason": decision.reason,
+            "signals": list(decision.matched_signals),
+            "score": decision.capability_score,
+            "role": decision.role,
+            "suggested_verb": decision.suggested_verb,
+            "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            "prompt_chars": len(prompt),
+        }
+        try:
+            if path.stat().st_size > DECISION_LOG_MAX_BYTES:
+                os.replace(path, path.with_name(path.name + ".1"))
+        except FileNotFoundError:
+            pass
+        append_private_text(path, json.dumps(rec) + "\n")
+    except Exception:
+        pass
+
+
 def handle_hook(
     payload: Mapping[str, Any],
     *,
@@ -380,6 +427,7 @@ def handle_hook(
     decision = replace(
         decision, suggested_verb=verb_for_host(decision.suggested_verb, host)
     )
+    record_decision(decision, prompt, env=env)
     if decision.should_delegate:
         return HookResponse(action="allow", context=decision.directive(), decision=decision)
     return HookResponse(action="allow", decision=decision)
