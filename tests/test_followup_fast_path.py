@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -178,6 +179,27 @@ class HookDecisionLogTests(unittest.TestCase):
         rotated = self.path.with_name(self.path.name + ".1")
         self.assertEqual(len(self.path.read_text(encoding="utf-8").splitlines()), 1)
         self.assertGreaterEqual(len(rotated.read_text(encoding="utf-8").splitlines()), 1)
+
+    def test_stale_size_from_a_second_hook_does_not_clobber_rotated_history(self):
+        rotated = self.path.with_name(self.path.name + ".1")
+        with patch.object(hook_runner, "DECISION_LOG_MAX_BYTES", 100):
+            self.path.write_text("x" * 500 + "\n", encoding="utf-8")
+            hook_runner._rotate_decision_log(self.path)
+            self.path.write_text("fresh\n", encoding="utf-8")
+            real_stat = Path.stat
+            stale = {"left": 1}
+
+            def stale_first_stat(path_self, *args, **kwargs):
+                result = real_stat(path_self, *args, **kwargs)
+                if path_self == self.path and stale["left"]:
+                    stale["left"] -= 1
+                    return os.stat_result((result.st_mode, 0, 0, 0, 0, 0, 10_000, 0, 0, 0))
+                return result
+
+            with patch.object(type(self.path), "stat", stale_first_stat):
+                hook_runner._rotate_decision_log(self.path)
+        self.assertEqual(rotated.read_text(encoding="utf-8"), "x" * 500 + "\n")
+        self.assertEqual(self.path.read_text(encoding="utf-8"), "fresh\n")
 
     def test_unwritable_path_is_swallowed(self):
         blocker = self.root / "blocker"
