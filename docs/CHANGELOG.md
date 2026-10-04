@@ -1,3 +1,43 @@
+## v1.28.0 — 2026-10-04
+
+**Small follow-ups stay in the pilot, a revision can resume its worker's session, and await returns a digest instead of the full summary.**
+
+- A pilot following the installed rules re-delegated small revisions of prior
+  job output to fresh workers, paying planning, launch and context cost for a
+  change it could make itself. The rules (and `AGENTS.md`) now list small
+  follow-ups under "stay inline", and the delegation gate keeps a follow-up in
+  the pilot (`followup` signal) unless the prompt has broad scope. It needs a
+  prior-work signal ("now change", "revise", "the previous run", "you just
+  built"), not a bare "tweak" or "revision", and a CodeGraph lookup about prior
+  output still delegates. `PUPPETMASTER_FOLLOWUP_FAST_PATH=0` disables the
+  carve-out. The user-prompt hook appends each decision to
+  `invocation_decisions.jsonl` under `PUPPETMASTER_HOME` with the prompt's
+  sha256 and length, never its text, and rotates at 5 MB.
+- A revision task always started a new provider session and resent the full
+  enriched context. It can now name `resume_from` (`job_id` plus `role` or
+  `task_id`, same state store) or `resume_session_id`. The orchestrator
+  resolves it once into `payload.resume`. Codex runs
+  `codex exec resume <thread>` (sandbox as `-c sandbox_mode`, never
+  `--ephemeral`); Claude Code runs `--resume <id> --fork-session`, so each
+  attempt gets its own session id. The resumed prompt skips memory, census and
+  CodeGraph enrichment. Each attempt is still a new task with its own receipts,
+  tagged `context:resumed`. A request that cannot resolve (missing job or role,
+  adapter mismatch, an ephemeral Codex source, a session missing from the CLI's
+  local store, a second task in one job resuming the same Codex thread, or a
+  reroute to another adapter) runs fresh with the reason in `payload.resume`. Claude Code receipts now record `session_id`; Codex sources
+  need `ephemeral: false` to be resumable. Start-swarm role objects accept
+  `resume_from`. Verified live on both CLIs: a resumed worker recalled a
+  codeword from its source session and a fresh control did not.
+- `puppetmaster_await_job` returned the full stitched summary, which repeats
+  the goal once per role and lists findings under both Promoted Memory and
+  Findings: 31 KB for a real 4-worker audit. It now returns a compact digest by
+  default (counts, deduped headlines with `reported_by`, conflicts, non-passed
+  tasks, and `summary_ref` with path, chars and sha256): 4.2 KB for the same
+  job. `summary="full"` returns the previous body, `summary="none"` returns
+  state only, and `PUPPETMASTER_AWAIT_SUMMARY` sets the default. An invalid mode
+  is rejected before the call blocks. The CLI `await` output and the TypeScript
+  client are unchanged.
+
 ## v1.27.42 — 2026-10-03
 
 **File-store workers survive Windows lock contention, and a flaky attach test asserts the real contract.**

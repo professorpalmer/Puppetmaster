@@ -10,6 +10,7 @@ from puppetmaster.failure import UNKNOWN, classify_codex_failure
 from puppetmaster.models import Artifact, ArtifactType, Task
 from puppetmaster.redaction import redact_secrets
 from puppetmaster.usage import selected_token_usage
+from puppetmaster.worker_resume import resolved_resume, task_resume_record
 
 from ._base import (
     CliInvocation,
@@ -141,25 +142,29 @@ class CodexAdapter(CliWorkerAdapter):
         resolved: str,
     ) -> Union[list[Artifact], CliInvocation]:
         base_prompt = task.payload.get("prompt") or task.instruction
-        prompt, codegraph_used = facade("enrich_prompt_with_codegraph")(
-            prompt_with_memory(
-                facade("with_repo_census")(
-                    with_job_brief(
-                        structured_prompt_for_task(
-                            task,
-                            prompt=base_prompt,
-                            final_message_note=True,
-                        ),
-                        task,
-                    ),
-                    cwd,
-                ),
+        resume_record = task_resume_record(task.payload, "codex")
+        resume = resolved_resume(resume_record, "codex")
+        task_prompt = with_job_brief(
+            structured_prompt_for_task(
                 task,
+                prompt=base_prompt,
+                final_message_note=True,
             ),
-            task_description=task.payload.get("codegraph_task") or task.instruction or goal,
-            cwd=cwd,
-            disabled=bool(task.payload.get("disable_codegraph", False)),
+            task,
         )
+        if resume is not None:
+            # The resumed thread already holds memory, census and CodeGraph context.
+            prompt, codegraph_used = task_prompt, False
+        else:
+            prompt, codegraph_used = facade("enrich_prompt_with_codegraph")(
+                prompt_with_memory(
+                    facade("with_repo_census")(task_prompt, cwd),
+                    task,
+                ),
+                task_description=task.payload.get("codegraph_task") or task.instruction or goal,
+                cwd=cwd,
+                disabled=bool(task.payload.get("disable_codegraph", False)),
+            )
         executable = _configured_codex_executable(task)
         command_base = _codex_command_base(task, resolved)
         if command_base is None:
@@ -170,17 +175,30 @@ class CodexAdapter(CliWorkerAdapter):
         bypass = bool(task.payload.get("dangerously_bypass_approvals_and_sandbox", False))
         ephemeral = bool(task.payload.get("ephemeral", True))
         skip_git_repo_check = bool(task.payload.get("skip_git_repo_check", True))
-        command = build_codex_exec_command(
-            executable=command_base,
-            model=model,
-            cwd=cwd,
-            sandbox=sandbox,
-            approval_policy=approval_policy,
-            ephemeral=ephemeral,
-            skip_git_repo_check=skip_git_repo_check,
-            dangerously_bypass=bypass,
-            extra_args=task.payload.get("extra_args", []),
-        )
+        if resume is not None:
+            ephemeral = False
+            command = build_codex_resume_command(
+                executable=command_base,
+                session_id=str(resume["session_id"]),
+                model=model,
+                sandbox=sandbox,
+                approval_policy=approval_policy,
+                skip_git_repo_check=skip_git_repo_check,
+                dangerously_bypass=bypass,
+                extra_args=task.payload.get("extra_args", []),
+            )
+        else:
+            command = build_codex_exec_command(
+                executable=command_base,
+                model=model,
+                cwd=cwd,
+                sandbox=sandbox,
+                approval_policy=approval_policy,
+                ephemeral=ephemeral,
+                skip_git_repo_check=skip_git_repo_check,
+                dangerously_bypass=bypass,
+                extra_args=task.payload.get("extra_args", []),
+            )
         write_capable = sandbox != "read-only" or bypass
         return CliInvocation(
             command=command,
@@ -195,6 +213,8 @@ class CodexAdapter(CliWorkerAdapter):
                 "approval_policy": approval_policy,
                 "bypass": bypass,
                 "ephemeral": ephemeral,
+                "resume": resume_record,
+                "resumed": resume is not None,
                 "write_capable": write_capable,
                 "extra_dirty_message": (
                     " Or pass payload.sandbox='read-only' for review-only tasks. For focused edits "
@@ -222,7 +242,7 @@ class CodexAdapter(CliWorkerAdapter):
         cwd: Path,
         timeout_seconds: int,
     ) -> StreamedProcess:
-        if not bool((task.payload or {}).get("native_steer")):
+        if prepared.extras.get("resumed") or not bool((task.payload or {}).get("native_steer")):
             return super()._invoke_cli(task, prepared, cwd, timeout_seconds)
         try:
             from puppetmaster.adapters.codex_session import run_codex_session
@@ -269,6 +289,9 @@ class CodexAdapter(CliWorkerAdapter):
         ephemeral = bool(prepared.extras.get("ephemeral", True))
         codegraph_used = bool(prepared.extras.get("codegraph_used"))
         write_capable = bool(prepared.extras.get("write_capable", True))
+        resume_record = prepared.extras.get("resume")
+        resume_fields = {"resume": resume_record} if resume_record else {}
+        resumed = bool(prepared.extras.get("resumed"))
         timeout_seconds = int(task.payload.get("timeout_seconds", self.default_timeout_seconds))
         cwd = Path(task.payload.get("cwd") or ".").resolve()
 
@@ -294,10 +317,11 @@ class CodexAdapter(CliWorkerAdapter):
                     check=task.instruction,
                     result="failed",
                     confidence=0.6,
-                    evidence=["adapter:codex", "timeout"],
+                    evidence=["adapter:codex", "timeout"] + (["context:resumed"] if resumed else []),
                     payload={
                         "failure": "timeout",
                         "returncode": None,
+                        **resume_fields,
                         "model": model,
                         "sandbox": sandbox,
                         "approval_policy": approval_policy,
@@ -340,7 +364,7 @@ class CodexAdapter(CliWorkerAdapter):
         usage = next(
             (
                 ev.get("usage", {})
-                for ev in events
+                for ev in reversed(events)
                 if ev.get("type") == "turn.completed" and isinstance(ev.get("usage"), dict)
             ),
             {},
@@ -415,6 +439,7 @@ class CodexAdapter(CliWorkerAdapter):
                     f"approval_policy:{approval_policy}",
                 ]
                 + (["context:codegraph"] if codegraph_used else [])
+                + (["context:resumed"] if resumed else [])
                 + (["bypass:dangerously-bypass-approvals-and-sandbox"] if bypass else [])
             ),
             payload={
@@ -424,6 +449,7 @@ class CodexAdapter(CliWorkerAdapter):
                 "approval_policy": approval_policy,
                 "ephemeral": ephemeral,
                 "thread_id": thread_id,
+                **resume_fields,
                 "stdout": _redacted_tail(completed.stdout, _STDOUT_TAIL_CHARS),
                 "stderr": _redacted_tail(completed.stderr, _STDOUT_TAIL_CHARS),
                 "stdout_capture": stdout_capture,
@@ -538,6 +564,41 @@ def build_codex_exec_command(
     return command
 
 
+def build_codex_resume_command(
+    *,
+    executable: Union[str, list[str]] = "codex",
+    session_id: str,
+    model: Optional[str] = None,
+    sandbox: str = "workspace-write",
+    approval_policy: str = "never",
+    skip_git_repo_check: bool = True,
+    dangerously_bypass: bool = False,
+    extra_args: object = None,
+) -> list[str]:
+    """Build the ``codex exec resume <thread_id>`` argv.
+
+    ``exec resume`` rejects ``--sandbox`` and ``-C``: the sandbox travels as a
+    ``-c sandbox_mode`` override and cwd comes from the subprocess. It never
+    takes ``--ephemeral``, so the resumed thread stays resumable for the next
+    revision. The prompt is read from stdin via the trailing ``-``.
+    """
+    command = command_parts(executable)
+    command.extend(["exec", "resume", str(session_id), "--json"])
+    command.extend(["-c", f'approval_policy="{approval_policy}"'])
+    if sandbox:
+        command.extend(["-c", f'sandbox_mode="{sandbox}"'])
+    if dangerously_bypass:
+        command.append("--dangerously-bypass-approvals-and-sandbox")
+    if skip_git_repo_check:
+        command.append("--skip-git-repo-check")
+    if model:
+        command.extend(["-m", str(model)])
+    if extra_args:
+        command.extend(command_parts(extra_args))
+    command.append("-")
+    return command
+
+
 def parse_codex_events(stdout: str) -> list[dict[str, Any]]:
     """Parse Codex's ``--json`` event stream from captured stdout.
 
@@ -562,13 +623,18 @@ def parse_codex_events(stdout: str) -> list[dict[str, Any]]:
 
 
 def last_codex_agent_message(events: list[dict[str, Any]]) -> str:
-    """Return the most recent ``item.completed`` of type ``agent_message``.
+    """Return the final turn's most recent ``item.completed`` ``agent_message``.
 
     Codex emits multiple ``item.completed`` events per turn (tool calls,
     reasoning summaries, the final agent message); we only want the final
-    user-visible reply.
+    user-visible reply. Items before the last ``turn.started`` (startup notices,
+    or anything a resumed thread echoes) are not this run's reply.
     """
-    for ev in reversed(events):
+    start = max(
+        (index for index, ev in enumerate(events) if ev.get("type") == "turn.started"),
+        default=-1,
+    )
+    for ev in reversed(events[start + 1:]):
         if ev.get("type") != "item.completed":
             continue
         item = ev.get("item") or {}

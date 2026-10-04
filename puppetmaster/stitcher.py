@@ -4,7 +4,7 @@ import re
 from collections import Counter
 from pathlib import Path
 from textwrap import indent
-from typing import Optional
+from typing import Any, Optional
 
 from puppetmaster.claim_conflicts import (
     conflicting_artifact_ids,
@@ -25,6 +25,23 @@ _PROMPT_ECHO_MARKERS = (
 _NON_PROMOTABLE_VERIFICATION_RESULTS = frozenset({"failed", "blocked", "degraded"})
 
 _PROMPT_ECHO_MAX_CHARS = 600
+
+_DIGEST_OK_RESULTS = frozenset(
+    {"pass", "passed", "ok", "accept", "accepted", "recorded", "designed", "skipped"}
+)
+
+
+def _verification_rank(artifact: Artifact) -> tuple[str, bool]:
+    """Order a task's verifications: newest first, and within one second a non-passing verdict wins."""
+    result = str((artifact.payload or {}).get("result") or "unknown").lower()
+    return (str(artifact.created_at or ""), result not in _DIGEST_OK_RESULTS)
+
+
+def _clip(value: Any, max_chars: int) -> str:
+    text = " ".join(str(value).split())
+    if len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 3)].rstrip() + "..."
 
 
 def _normalize_statement_text(statement: str) -> str:
@@ -134,18 +151,102 @@ class Stitcher:
             )
         return promoted
 
-    def _render_summary(
-        self,
-        title: str,
-        goal: str,
-        artifacts: list[Artifact],
-        memories: list[MemoryRecord],
-        *,
-        cwd: Optional[Path] = None,
-    ) -> str:
+    def digest(
+        self, job_id: str, *, limit: int = 8, max_chars: int = 240
+    ) -> dict[str, Any]:
+        """Compact completion digest built from the same deduped clusters as the summary."""
+        artifacts = self.store.list_artifacts(job_id)
+        grouped, counts, conflicts, ordinary_findings = self._sections(
+            artifacts, cwd=self._cwd_for_job(job_id)
+        )
+        sections = {
+            "findings": (ordinary_findings, "claim"),
+            "decisions": (grouped.get(str(ArtifactType.DECISION), []), "decision"),
+            "risks": (grouped.get(str(ArtifactType.RISK), []), "risk"),
+        }
+        digest: dict[str, Any] = {"counts": dict(sorted(counts.items()))}
+        truncated: dict[str, int] = {}
+        for name, (members, key) in sections.items():
+            clusters = sorted(
+                self._dedup_clusters(members, key) if members else [],
+                key=lambda pair: (-len(pair[1]), -pair[0].confidence),
+            )
+            digest[name] = [
+                {
+                    "text": _clip(rep.payload.get(key, rep.payload), max_chars),
+                    "confidence": round(rep.confidence, 3),
+                    "reported_by": len(cluster),
+                }
+                for rep, cluster in clusters[:limit]
+            ]
+            if len(clusters) > limit:
+                truncated[name] = len(clusters) - limit
+        if conflicts:
+            digest["conflicts"] = [
+                {
+                    "artifact_ids": list(conflict.artifact_ids),
+                    "reason": conflict.reason,
+                    "source_verification": conflict.source_verification,
+                    "claims": [_clip(claim, max_chars) for claim in conflict.claims],
+                }
+                for conflict in conflicts[:limit]
+            ]
+            if len(conflicts) > limit:
+                truncated["conflicts"] = len(conflicts) - limit
+        digest["exceptions"] = self._exceptions(
+            job_id, grouped.get(str(ArtifactType.VERIFICATION), []), max_chars
+        )
+        digest["truncated"] = truncated
+        return digest
+
+    def _exceptions(
+        self, job_id: str, verifications: list[Artifact], max_chars: int
+    ) -> list[dict[str, Any]]:
+        latest: dict[str, Artifact] = {}
+        for artifact in verifications:
+            current = latest.get(artifact.task_id)
+            if current is None or _verification_rank(artifact) >= _verification_rank(current):
+                latest[artifact.task_id] = artifact
+        exceptions: list[dict[str, Any]] = []
+        for task in self.store.list_tasks(job_id):
+            verification = latest.get(task.id)
+            if verification is None:
+                exceptions.append(
+                    {
+                        "task_id": task.id,
+                        "role": task.role,
+                        "result": str(task.status),
+                        "reason": "no verification artifact",
+                    }
+                )
+                continue
+            payload = verification.payload or {}
+            result = str(payload.get("result") or "unknown").lower()
+            if result in _DIGEST_OK_RESULTS:
+                continue
+            reason = (
+                payload.get("failure")
+                or payload.get("reason")
+                or self._provider_body_excerpt(payload)
+                or payload.get("check")
+                or ""
+            )
+            exceptions.append(
+                {
+                    "task_id": task.id,
+                    "role": task.role,
+                    "result": result,
+                    "reason": _clip(reason, min(max_chars, 160)),
+                }
+            )
+        return exceptions
+
+    @staticmethod
+    def _sections(
+        artifacts: list[Artifact], *, cwd: Optional[Path] = None
+    ) -> tuple[dict, Counter, list, list[Artifact]]:
         grouped = group_by_type(artifacts)
         counts = Counter(str(artifact.type) for artifact in artifacts)
-
         # Contradictory peers are detected before dedupe/render so incompatible
         # high-confidence findings leave ordinary Findings and surface under
         # Conflicts with downgraded confidence + source-verification status.
@@ -156,6 +257,20 @@ class Stitcher:
             for artifact in grouped.get(str(ArtifactType.FINDING), [])
             if artifact.id not in conflict_ids
         ]
+        return grouped, counts, conflicts, ordinary_findings
+
+    def _render_summary(
+        self,
+        title: str,
+        goal: str,
+        artifacts: list[Artifact],
+        memories: list[MemoryRecord],
+        *,
+        cwd: Optional[Path] = None,
+    ) -> str:
+        grouped, counts, conflicts, ordinary_findings = self._sections(
+            artifacts, cwd=cwd
+        )
 
         lines = [
             f"# {title}",

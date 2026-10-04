@@ -114,6 +114,7 @@ from .codex import (
     DEFAULT_CODEX_MODEL,
     CodexAdapter,
     build_codex_exec_command,
+    build_codex_resume_command,
     last_codex_agent_message,
     parse_codex_events,
 )
@@ -204,6 +205,7 @@ __all__ = [
     "build_antigravity_command",
     "build_claude_code_command",
     "build_codex_exec_command",
+    "build_codex_resume_command",
     "build_fx_command",
     "build_hermes_chat_command",
     "build_implement_prompt",

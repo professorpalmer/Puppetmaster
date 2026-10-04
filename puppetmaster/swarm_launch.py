@@ -148,6 +148,8 @@ def build_analysis_swarm_specs(
             payload["source_scope"] = list(role_spec.source_scope)
         if role_spec.negative_scope:
             payload["negative_scope"] = list(role_spec.negative_scope)
+        if role_spec.resume_from:
+            payload["resume_from"] = dict(role_spec.resume_from)
         if duplicated_legacy_roles:
             payload["duplication_warning"] = {
                 "message": "Multiple bare role names received the same goal; provide structured role instructions for decomposition.",
