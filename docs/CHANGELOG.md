@@ -1,6 +1,6 @@
 ## v1.28.2 — 2026-10-04
 
-**Auto-route no longer first-picks a model whose CLI is not installed.**
+**Auto-route no longer first-picks a model whose CLI is not installed, and artifact-shaped worker output keeps its headlines.**
 
 - `adapter_cli_present` only knew the `claude` and `codex` binaries, so every
   other adapter read as runnable. On a machine with an authenticated
@@ -12,6 +12,14 @@
   gates drop those adapters (`router.adapter_cli_missing`) when the binary is
   absent. Verified on a real auto-routed job: the router skipped Antigravity
   and passed on the first attempt.
+- Workers that mirror the stored artifact shape,
+  `{"type": "finding", "payload": {"claim": ...}}`, got the headline
+  "Unnamed item" and the fallback evidence `adapter:<name>`, with the real
+  claim and evidence buried under `payload`. Every finding from a real review
+  job came out that way, so the await digest and the stitched summary showed
+  only placeholders. The parser now lifts the nested payload when the item has
+  no top-level headline; top-level fields still win. Re-parsing that job's
+  items recovers all nine headlines and their file:line evidence.
 
 ## v1.28.1 — 2026-10-04
 
