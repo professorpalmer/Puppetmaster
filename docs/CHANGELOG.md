@@ -20,6 +20,10 @@
   only placeholders. The parser now lifts the nested payload when the item has
   no top-level headline; top-level fields still win. Re-parsing that job's
   items recovers all nine headlines and their file:line evidence.
+- `test_windows_attach_retries_transient_guard_open_denial` started its 1 s
+  attach deadline before building its store fixture, so a slow store setup on
+  a loaded Windows runner timed the read out before the retry under test ran.
+  The deadline now starts after setup (2 s budget).
 
 ## v1.28.1 — 2026-10-04
 
