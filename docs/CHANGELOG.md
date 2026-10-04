@@ -1,3 +1,18 @@
+## v1.28.2 — 2026-10-04
+
+**Auto-route no longer first-picks a model whose CLI is not installed.**
+
+- `adapter_cli_present` only knew the `claude` and `codex` binaries, so every
+  other adapter read as runnable. On a machine with an authenticated
+  Antigravity account but no `agy` on PATH, `models discover --write` added
+  four `antigravity/gemini-*` models, auto-route first-picked them, every
+  worker died with `missing_cli`, and the job failed after falling back. The
+  CLI table now covers `antigravity` (`AGY_COMMAND`, `ANTIGRAVITY_COMMAND`,
+  default `agy`), `hermes` and `fx`, so the existing first-pick and fallback
+  gates drop those adapters (`router.adapter_cli_missing`) when the binary is
+  absent. Verified on a real auto-routed job: the router skipped Antigravity
+  and passed on the first attempt.
+
 ## v1.28.1 — 2026-10-04
 
 **The test suite stops rewriting the developer's Pi and OMP configs, and decision-log rotation is serialized.**
