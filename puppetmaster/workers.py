@@ -83,6 +83,7 @@ class RoleSpec:
     instruction: str
     source_scope: Optional[list[str]] = None
     negative_scope: Optional[list[str]] = None
+    resume_from: Optional[dict] = None
 
 
 @dataclass(frozen=True)
@@ -116,12 +117,18 @@ def normalize_role_specs(roles: Optional[list[object]], goal: str) -> tuple[list
                 raise ValueError("structured roles require name and instruction")
             source = raw.get("source_scope") or raw.get("sources")
             negative = raw.get("negative_scope") or raw.get("exclude")
+            resume_from = raw.get("resume_from")
+            if resume_from is not None and not (
+                isinstance(resume_from, dict) and str(resume_from.get("job_id") or "").strip()
+            ):
+                raise ValueError("role resume_from requires an object with job_id")
             structured.append(
                 RoleSpec(
                     name,
                     instruction,
                     [str(item) for item in source] if isinstance(source, list) else None,
                     [str(item) for item in negative] if isinstance(negative, list) else None,
+                    dict(resume_from) if resume_from else None,
                 )
             )
             continue

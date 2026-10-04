@@ -1772,6 +1772,11 @@ class Orchestrator:
                         payload["acceptance_criteria"] = structured
                 except Exception:
                     pass
+            from puppetmaster.worker_resume import resolve_worker_resume
+
+            resume = resolve_worker_resume(self.store, payload, spec.adapter)
+            if resume is not None:
+                payload["resume"] = resume
             task = Task(
                 job_id=job.id,
                 role=spec.role,

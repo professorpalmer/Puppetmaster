@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -10,6 +11,7 @@ from puppetmaster.codegraph import enrich_prompt_with_codegraph
 from puppetmaster.failure import classify_claude_code_failure
 from puppetmaster.models import Artifact, ArtifactType, Task
 from puppetmaster.usage import token_usage
+from puppetmaster.worker_resume import resolved_resume, task_resume_record
 
 from ._base import (
     CliInvocation,
@@ -166,12 +168,18 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
         base_prompt = with_report_contract(
             f"{TASK_INSTRUCTION_HEADER}\n{raw_instruction}"
         )
-        prompt, codegraph_used = facade("enrich_prompt_with_codegraph")(
-            with_job_brief(prompt_with_memory(base_prompt, task), task),
-            task_description=task.payload.get("codegraph_task") or task.instruction or goal,
-            cwd=cwd,
-            disabled=bool(task.payload.get("disable_codegraph", False)),
-        )
+        resume_record = task_resume_record(task.payload, "claude-code")
+        resume = resolved_resume(resume_record, "claude-code")
+        if resume is not None:
+            # The resumed session already holds memory and CodeGraph context.
+            prompt, codegraph_used = with_job_brief(base_prompt, task), False
+        else:
+            prompt, codegraph_used = facade("enrich_prompt_with_codegraph")(
+                with_job_brief(prompt_with_memory(base_prompt, task), task),
+                task_description=task.payload.get("codegraph_task") or task.instruction or goal,
+                cwd=cwd,
+                disabled=bool(task.payload.get("disable_codegraph", False)),
+            )
         executable = (
             task.payload.get("executable")
             or os.environ.get("CLAUDE_CODE_COMMAND")
@@ -189,6 +197,9 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
         else:
             effective_permission_mode = "acceptEdits"
         write_capable = effective_permission_mode != "plan"
+        command_kwargs: dict[str, Any] = {}
+        if resume is not None:
+            command_kwargs["resume_session_id"] = str(resume["session_id"])
         command = facade("build_claude_code_command")(
             prompt=prompt,
             executable=[resolved, *command_base[1:]],
@@ -198,6 +209,7 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
             allowed_tools=implement_allowed_tools(task.payload, write_capable=write_capable),
             disallowed_tools=read_only_disallowed_tools(task.payload, write_capable=write_capable),
             extra_args=task.payload.get("extra_args", []),
+            **command_kwargs,
         )
         return CliInvocation(
             command=command,
@@ -209,6 +221,8 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
                 "codegraph_used": codegraph_used,
                 "model_note": model_note,
                 "permission_mode": effective_permission_mode,
+                "resume": resume_record,
+                "resumed": resume is not None,
                 "write_capable": write_capable,
                 "extra_dirty_message": (
                     " For focused edits on a dirty tree (docs, tests), use puppetmaster_edit — it edits "
@@ -245,6 +259,9 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
             prepared.extras.get("permission_mode")
             or task.payload.get("permission_mode", "acceptEdits")
         )
+        resume_record = prepared.extras.get("resume")
+        resume_fields = {"resume": resume_record} if resume_record else {}
+        resumed = bool(prepared.extras.get("resumed"))
         cwd = Path(task.payload.get("cwd") or ".").resolve()
         timeout_seconds = int(
             task.payload.get("timeout_seconds", self.default_timeout_seconds)
@@ -270,10 +287,12 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
                     check=task.instruction,
                     result="failed",
                     confidence=0.6,
-                    evidence=["adapter:claude-code", "timeout"],
+                    evidence=["adapter:claude-code", "timeout"] + (["context:resumed"] if resumed else []),
                     payload={
                         "failure": "timeout",
                         "returncode": None,
+                        "session_id": claude_session_id_from_stdout(stdout),
+                        **resume_fields,
                         "stdout": _redacted_tail(stdout, _STDOUT_TAIL_CHARS),
                         "stderr": _redacted_tail(stderr, _STDOUT_TAIL_CHARS),
                         "stdout_capture": stdout_capture,
@@ -338,11 +357,14 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
                     f"permission_mode:{permission_mode}",
                 ]
                 + (["context:codegraph"] if codegraph_used else [])
+                + (["context:resumed"] if resumed else [])
                 + (["bedrock:model-omitted"] if model_note else [])
             ),
             payload={
                 "failure": None if completed.returncode == 0 else classify_claude_code_failure(completed.stderr + completed.stdout),
                 "returncode": completed.returncode,
+                "session_id": claude_session_id_from_stdout(completed.stdout),
+                **resume_fields,
                 "stdout": _redacted_tail(completed.stdout, 12000),
                 "stderr": _redacted_tail(completed.stderr, _STDOUT_TAIL_CHARS),
                 "stdout_capture": stdout_capture,
@@ -441,6 +463,38 @@ def read_only_disallowed_tools(payload: dict, *, write_capable: bool) -> object:
     return list(dict.fromkeys([*names, *READ_ONLY_DENIED_TOOLS]))
 
 
+def claude_session_id_from_stdout(stdout: Optional[str]) -> Optional[str]:
+    """The provider ``session_id`` from ``--output-format json`` or ``stream-json`` stdout.
+
+    For stream-json the final ``result`` event wins over the ``system`` init
+    event, which carries the same id when the run completes.
+    """
+    text = "" if stdout is None else str(stdout)
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        payload = None
+    if isinstance(payload, dict):
+        session_id = payload.get("session_id")
+        return str(session_id) if session_id else None
+    found: Optional[str] = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or not event.get("session_id"):
+            continue
+        if event.get("type") == "result":
+            return str(event["session_id"])
+        if found is None and event.get("type") == "system":
+            found = str(event["session_id"])
+    return found
+
+
 def build_claude_code_command(
     *,
     prompt: Optional[str] = None,
@@ -451,8 +505,12 @@ def build_claude_code_command(
     allowed_tools: object = None,
     disallowed_tools: object = None,
     extra_args: object = None,
+    resume_session_id: Optional[str] = None,
 ) -> list[str]:
     """Build the non-interactive ``claude --print`` argv.
+
+    ``resume_session_id`` continues a prior session with ``--fork-session`` so
+    the earlier session record stays intact and this attempt gets its own id.
 
     ``--print`` with no prompt positional makes the CLI read its prompt from
     stdin, which the caller supplies via
@@ -464,6 +522,8 @@ def build_claude_code_command(
     """
     command = command_parts(executable)
     command.extend(["--print", "--output-format", output_format])
+    if resume_session_id:
+        command.extend(["--resume", str(resume_session_id), "--fork-session"])
     if model:
         command.extend(["--model", str(model)])
     if permission_mode:

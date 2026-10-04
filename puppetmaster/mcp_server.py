@@ -5250,6 +5250,23 @@ def goal_schema(default_goal: str) -> JsonObject:
     return schema
 
 
+RESUME_FROM_SCHEMA: JsonObject = {
+    "type": "object",
+    "required": ["job_id"],
+    "properties": {
+        "job_id": {"type": "string"},
+        "task_id": {"type": "string"},
+        "role": {"type": "string"},
+    },
+    "description": (
+        "Resume the provider session of a prior codex / claude-code worker in this "
+        "state store (by task_id, else role). The worker still runs as a new task "
+        "with its own receipts; when the session is unavailable it runs fresh and "
+        "records why."
+    ),
+}
+
+
 def swarm_schema() -> JsonObject:
     schema = goal_schema("Review this repo and produce structured artifacts.")
     schema["properties"].update(
@@ -5267,6 +5284,7 @@ def swarm_schema() -> JsonObject:
                                 "instruction": {"type": "string"},
                                 "source_scope": {"type": "array", "items": {"type": "string"}},
                                 "negative_scope": {"type": "array", "items": {"type": "string"}},
+                                "resume_from": RESUME_FROM_SCHEMA,
                             },
                         },
                     ]
