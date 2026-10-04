@@ -299,6 +299,56 @@ class StitcherDigestTests(unittest.TestCase):
                 self.assertTrue(item["text"].endswith("..."))
             self.assertEqual(digest["exceptions"][0]["reason"], "no verification artifact")
 
+    def _verification_digest(self, rows: list[tuple[str, str, str]]) -> list[dict]:
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            job = store.create_job("goal")
+            task = Task(job_id=job.id, role="impl", instruction="x", status=TaskStatus.COMPLETE)
+            store.save_tasks([task])
+            store.save_artifacts(
+                Artifact(
+                    id=artifact_id,
+                    job_id=job.id,
+                    task_id=task.id,
+                    type=ArtifactType.VERIFICATION,
+                    created_by="impl",
+                    confidence=0.9,
+                    evidence=["adapter:codex"],
+                    payload={"check": "x", "result": result, "failure": result},
+                    created_at=created_at,
+                )
+                for artifact_id, result, created_at in rows
+            )
+            return Stitcher(store).digest(job.id)["exceptions"]
+
+    def test_latest_verification_is_chosen_by_time_not_id(self) -> None:
+        retried = self._verification_digest(
+            [
+                ("art_ffff", "failed", "2026-10-04T10:00:00+00:00"),
+                ("art_0000", "passed", "2026-10-04T10:05:00+00:00"),
+            ]
+        )
+        self.assertEqual(retried, [])
+        regressed = self._verification_digest(
+            [
+                ("art_ffff", "passed", "2026-10-04T10:00:00+00:00"),
+                ("art_0000", "failed", "2026-10-04T10:05:00+00:00"),
+            ]
+        )
+        self.assertEqual([row["result"] for row in regressed], ["failed"])
+
+    def test_same_second_tie_reports_the_non_passing_verdict(self) -> None:
+        for ids in (("art_0000", "art_ffff"), ("art_ffff", "art_0000")):
+            with self.subTest(ids=ids):
+                exceptions = self._verification_digest(
+                    [
+                        (ids[0], "passed", "2026-10-04T10:00:00+00:00"),
+                        (ids[1], "blocked", "2026-10-04T10:00:00+00:00"),
+                    ]
+                )
+                self.assertEqual([row["result"] for row in exceptions], ["blocked"])
+
 
 if __name__ == "__main__":
     unittest.main()

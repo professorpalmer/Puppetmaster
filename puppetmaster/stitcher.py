@@ -31,6 +31,12 @@ _DIGEST_OK_RESULTS = frozenset(
 )
 
 
+def _verification_rank(artifact: Artifact) -> tuple[str, bool]:
+    """Order a task's verifications: newest first, and within one second a non-passing verdict wins."""
+    result = str((artifact.payload or {}).get("result") or "unknown").lower()
+    return (str(artifact.created_at or ""), result not in _DIGEST_OK_RESULTS)
+
+
 def _clip(value: Any, max_chars: int) -> str:
     text = " ".join(str(value).split())
     if len(text) <= max_chars:
@@ -198,7 +204,9 @@ class Stitcher:
     ) -> list[dict[str, Any]]:
         latest: dict[str, Artifact] = {}
         for artifact in verifications:
-            latest[artifact.task_id] = artifact
+            current = latest.get(artifact.task_id)
+            if current is None or _verification_rank(artifact) >= _verification_rank(current):
+                latest[artifact.task_id] = artifact
         exceptions: list[dict[str, Any]] = []
         for task in self.store.list_tasks(job_id):
             verification = latest.get(task.id)
