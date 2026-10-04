@@ -49,6 +49,30 @@ class WorkerReportArtifactsTest(unittest.TestCase):
         self.assertIsNotNone(artifact)
         self.assertIn("d.py:9", artifact.payload["claim"])
 
+    def test_artifact_shaped_items_lift_their_nested_payload(self) -> None:
+        items = [
+            {"type": "finding", "confidence": 0.9,
+             "payload": {"claim": "Digest picks verifications by random id", "evidence": ["stitcher.py:205"], "severity": "medium"}},
+            {"type": "risk", "payload": {"risk": "Rotation race", "mitigation": "Lock and re-check"}},
+            {"type": "decision", "payload": {"decision": "Conditional ship", "why": "Default path regression"}},
+        ]
+        artifacts = [cursor_artifact_from_item(self.task, "w1", item, adapter="claude-code") for item in items]
+        finding, risk, decision = artifacts
+        self.assertEqual(finding.payload["claim"], "Digest picks verifications by random id")
+        self.assertEqual(finding.evidence, ["stitcher.py:205"])
+        self.assertEqual(finding.payload["severity"], "medium")
+        self.assertNotIn("payload", finding.payload)
+        self.assertEqual(risk.payload["risk"], "Rotation race")
+        self.assertEqual(decision.payload["decision"], "Conditional ship")
+
+    def test_top_level_headline_wins_over_a_nested_payload(self) -> None:
+        artifact = cursor_artifact_from_item(
+            self.task, "w1",
+            {"type": "finding", "claim": "Top-level claim", "payload": {"claim": "Nested claim"}},
+            adapter="claude-code",
+        )
+        self.assertEqual(artifact.payload["claim"], "Top-level claim")
+
     def test_untyped_prose_still_falls_back_to_one_report(self) -> None:
         artifacts = implement_report_artifacts(self.task, "w1", "Fixed the parser.\n\nAll tests pass.", adapter="claude-code")
         findings = [a for a in artifacts if a.type == ArtifactType.FINDING]
