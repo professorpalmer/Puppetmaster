@@ -8,7 +8,8 @@
   follow-ups under "stay inline", and the delegation gate keeps a follow-up in
   the pilot (`followup` signal) unless the prompt has broad scope. It needs a
   prior-work signal ("now change", "revise", "the previous run", "you just
-  built"), not a bare "tweak". `PUPPETMASTER_FOLLOWUP_FAST_PATH=0` disables the
+  built"), not a bare "tweak" or "revision", and a CodeGraph lookup about prior
+  output still delegates. `PUPPETMASTER_FOLLOWUP_FAST_PATH=0` disables the
   carve-out. The user-prompt hook appends each decision to
   `invocation_decisions.jsonl` under `PUPPETMASTER_HOME` with the prompt's
   sha256 and length, never its text, and rotates at 5 MB.
@@ -21,8 +22,9 @@
   attempt gets its own session id. The resumed prompt skips memory, census and
   CodeGraph enrichment. Each attempt is still a new task with its own receipts,
   tagged `context:resumed`. A request that cannot resolve (missing job or role,
-  adapter mismatch, an ephemeral Codex source) runs fresh with the reason in
-  `payload.resume`. Claude Code receipts now record `session_id`; Codex sources
+  adapter mismatch, an ephemeral Codex source, a session missing from the CLI's
+  local store, a second task in one job resuming the same Codex thread, or a
+  reroute to another adapter) runs fresh with the reason in `payload.resume`. Claude Code receipts now record `session_id`; Codex sources
   need `ephemeral: false` to be resumable. Start-swarm role objects accept
   `resume_from`. Verified live on both CLIs: a resumed worker recalled a
   codeword from its source session and a fresh control did not.
