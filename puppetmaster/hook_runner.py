@@ -370,13 +370,23 @@ def record_decision(
             "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
             "prompt_chars": len(prompt),
         }
-        try:
-            if path.stat().st_size > DECISION_LOG_MAX_BYTES:
-                os.replace(path, path.with_name(path.name + ".1"))
-        except FileNotFoundError:
-            pass
+        _rotate_decision_log(path)
         append_private_text(path, json.dumps(rec) + "\n")
     except Exception:
+        pass
+
+
+def _rotate_decision_log(path: Path) -> None:
+    """Rotate past the size cap; the re-check under the lock stops a second hook from clobbering ``.1``."""
+    from puppetmaster.interprocess_lock import InterProcessFileLock
+
+    try:
+        if path.stat().st_size <= DECISION_LOG_MAX_BYTES:
+            return
+        with InterProcessFileLock.for_target(path, timeout=0.5):
+            if path.stat().st_size > DECISION_LOG_MAX_BYTES:
+                os.replace(path, path.with_name(path.name + ".1"))
+    except (OSError, TimeoutError):
         pass
 
 
