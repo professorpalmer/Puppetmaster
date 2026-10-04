@@ -228,6 +228,11 @@ def apply_hermetic_isolation(*, register_atexit: bool = True) -> None:
     # Store discovery and file claims live under the app state root; never
     # let the suite read or write the developer's real Puppetmaster state.
     os.environ["PUPPETMASTER_APP_STATE_ROOT"] = str(Path(_ISOLATION_TMP) / "app-state")
+    # Pi and OMP installers resolve ~ from HOME, which a patched Path.home does
+    # not cover; setup tests otherwise rewrite the developer's ~/.pi and ~/.omp.
+    for key, name in (("PI_CODING_AGENT_DIR", "pi-agent"), ("OMP_AGENT_DIR", "omp-agent")):
+        _ENV_BEFORE[key] = os.environ.get(key)
+        os.environ[key] = str(Path(_ISOLATION_TMP) / name)
     os.environ[ONLY_ENV] = ",".join(KNOWN_ADAPTERS)
     for key in _PIN_KEYS_TO_CLEAR:
         os.environ.pop(key, None)
