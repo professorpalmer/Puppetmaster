@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -21,7 +22,29 @@ from puppetmaster.adapters.codex import (
     parse_codex_events,
 )
 from puppetmaster.models import Artifact, ArtifactType, Task
-from puppetmaster.worker_resume import resolve_worker_resume
+from puppetmaster.worker_resume import (
+    claim_resumed_session,
+    resolve_worker_resume,
+    task_resume_record,
+)
+
+_SESSION_HOMES = tempfile.TemporaryDirectory()
+_SESSION_ENV = patch.dict(
+    "os.environ",
+    {
+        "CODEX_HOME": str(Path(_SESSION_HOMES.name) / "codex"),
+        "CLAUDE_CONFIG_DIR": str(Path(_SESSION_HOMES.name) / "claude"),
+    },
+)
+
+
+def setUpModule() -> None:
+    _SESSION_ENV.start()
+
+
+def tearDownModule() -> None:
+    _SESSION_ENV.stop()
+    _SESSION_HOMES.cleanup()
 
 CLEAN = {"sha": "s", "changed_files": [], "untracked_files": [], "diff": ""}
 THREAD_ID = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"
@@ -175,6 +198,57 @@ class ResolverTests(unittest.TestCase):
         record = resolve_worker_resume(store, {"resume_from": {"job_id": "job-prior"}}, "codex")
         self.assertEqual(record["status"], "unavailable")
         self.assertIn("db locked", record["reason"])
+
+
+class SessionStoreTests(unittest.TestCase):
+    def _store_root(self, adapter: str) -> Path:
+        base = Path(_SESSION_HOMES.name)
+        root = base / "codex" / "sessions" / "2026" / "10" / "04" if adapter == "codex" else base / "claude" / "projects" / "-repo"
+        root.mkdir(parents=True, exist_ok=True)
+        top = base / ("codex" if adapter == "codex" else "claude")
+        self.addCleanup(shutil.rmtree, top, True)
+        return root
+
+    def test_session_missing_from_local_store_is_unavailable(self) -> None:
+        self._store_root("claude-code")
+        record = resolve_worker_resume(None, {"resume_session_id": PRIOR_SESSION}, "claude-code")
+        self.assertEqual(record["status"], "unavailable")
+        self.assertIn("not in the local session store", record["reason"])
+
+    def test_session_present_in_local_store_resolves(self) -> None:
+        (self._store_root("claude-code") / f"{PRIOR_SESSION}.jsonl").write_text("{}\n")
+        (self._store_root("codex") / f"rollout-2026-10-04T09-00-00-{THREAD_ID}.jsonl").write_text("{}\n")
+        claude = resolve_worker_resume(None, {"resume_session_id": PRIOR_SESSION}, "claude-code")
+        codex = resolve_worker_resume(None, {"resume_session_id": THREAD_ID}, "codex")
+        self.assertEqual((claude["status"], codex["status"]), ("resolved", "resolved"))
+
+    def test_session_id_with_path_or_glob_characters_is_rejected(self) -> None:
+        for bad in ("../etc/passwd", "*", "abc/def", "a?b"):
+            with self.subTest(bad=bad):
+                record = resolve_worker_resume(None, {"resume_session_id": bad}, "codex")
+                self.assertEqual(record["status"], "unavailable")
+                self.assertIn("invalid codex session id", record["reason"])
+
+
+class ResumeRecordScopeTests(unittest.TestCase):
+    def test_reroute_to_another_adapter_reports_unavailable(self) -> None:
+        stamped = {"status": "resolved", "adapter": "codex", "session_id": THREAD_ID,
+                   "from_job_id": "job_a", "from_task_id": "task_a"}
+        record = task_resume_record({"resume": stamped}, "claude-code")
+        self.assertEqual(record["status"], "unavailable")
+        self.assertIn("now runs on 'claude-code'", record["reason"])
+        self.assertEqual(task_resume_record({"resume": stamped}, "codex"), stamped)
+
+    def test_only_one_task_per_job_may_continue_a_codex_thread(self) -> None:
+        claimed: dict = {}
+        record = {"status": "resolved", "adapter": "codex", "session_id": THREAD_ID}
+        self.assertEqual(claim_resumed_session(record, claimed, "r1"), record)
+        second = claim_resumed_session(record, claimed, "r2")
+        self.assertEqual(second["status"], "unavailable")
+        self.assertIn("already resumed by role 'r1'", second["reason"])
+        forked = {"status": "resolved", "adapter": "claude-code", "session_id": PRIOR_SESSION}
+        self.assertEqual(claim_resumed_session(forked, claimed, "r1"), forked)
+        self.assertEqual(claim_resumed_session(forked, claimed, "r2"), forked)
 
 
 class OrchestratorStampTests(unittest.TestCase):

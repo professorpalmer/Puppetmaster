@@ -1731,6 +1731,7 @@ class Orchestrator:
         specs = self._bind_explicit_model_pins(specs)
         self._enforce_platform_lock(job, specs)
         tasks_by_role: dict[str, Task] = {}
+        resumed_sessions: dict[str, str] = {}
         for spec in specs:
             payload = dict(spec.payload or {})
             from puppetmaster.failure_policy import normalize_failure_policy
@@ -1772,11 +1773,11 @@ class Orchestrator:
                         payload["acceptance_criteria"] = structured
                 except Exception:
                     pass
-            from puppetmaster.worker_resume import resolve_worker_resume
+            from puppetmaster.worker_resume import claim_resumed_session, resolve_worker_resume
 
             resume = resolve_worker_resume(self.store, payload, spec.adapter)
             if resume is not None:
-                payload["resume"] = resume
+                payload["resume"] = claim_resumed_session(resume, resumed_sessions, spec.role)
             task = Task(
                 job_id=job.id,
                 role=spec.role,

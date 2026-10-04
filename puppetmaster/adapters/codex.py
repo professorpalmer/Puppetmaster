@@ -627,8 +627,8 @@ def last_codex_agent_message(events: list[dict[str, Any]]) -> str:
 
     Codex emits multiple ``item.completed`` events per turn (tool calls,
     reasoning summaries, the final agent message); we only want the final
-    user-visible reply. ``exec resume`` replays the prior thread's items before
-    the new ``turn.started``, so only events after the last turn start count.
+    user-visible reply. Items before the last ``turn.started`` (startup notices,
+    or anything a resumed thread echoes) are not this run's reply.
     """
     start = max(
         (index for index, ev in enumerate(events) if ev.get("type") == "turn.started"),

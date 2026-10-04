@@ -9,11 +9,15 @@ retries reuse the same record instead of re-resolving.
 """
 from __future__ import annotations
 
+import os
+import re
+from pathlib import Path
 from typing import Any, Optional
 
 from puppetmaster.models import ArtifactType
 
 RESUMABLE_ADAPTERS = {"codex": "thread_id", "claude-code": "session_id"}
+_SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 
 
 def resume_requested(payload: Optional[dict]) -> bool:
@@ -30,8 +34,49 @@ def task_resume_record(payload: Optional[dict], adapter: str) -> Optional[dict]:
     payload = payload or {}
     record = payload.get("resume")
     if isinstance(record, dict):
+        if record.get("status") == "resolved" and record.get("adapter") != adapter:
+            return {
+                **record,
+                "status": "unavailable",
+                "reason": (
+                    f"task now runs on {adapter!r}; the resolved session belongs to "
+                    f"{record.get('adapter')!r}"
+                ),
+            }
         return record
     return resolve_worker_resume(None, payload, adapter)
+
+
+def claim_resumed_session(record: Optional[dict], claimed: dict, role: str) -> Optional[dict]:
+    """Allow one task per job to continue a codex thread; ``codex exec resume`` has no fork."""
+    if not isinstance(record, dict) or record.get("status") != "resolved" or record.get("adapter") != "codex":
+        return record
+    session_id = str(record.get("session_id"))
+    holder = claimed.get(session_id)
+    if holder is not None:
+        return {
+            **record,
+            "status": "unavailable",
+            "reason": (
+                f"codex thread {session_id} is already resumed by role {holder!r} in this "
+                "job; codex resume continues a thread in place"
+            ),
+        }
+    claimed[session_id] = role
+    return record
+
+
+def session_on_disk(adapter: str, session_id: str) -> Optional[bool]:
+    """Whether the CLI's local session store holds ``session_id``; None when there is no store to check."""
+    if adapter == "codex":
+        root = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "sessions"
+        pattern = f"*/*/*/rollout-*-{session_id}.jsonl"
+    else:
+        root = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
+        pattern = f"*/{session_id}.jsonl"
+    if not root.is_dir():
+        return None
+    return next(root.glob(pattern), None) is not None
 
 
 def resolved_resume(record: Optional[dict], adapter: str) -> Optional[dict]:
@@ -79,6 +124,19 @@ def _unavailable(payload: dict, reason: str) -> dict:
     return {"status": "unavailable", "reason": reason, **_request_echo(payload)}
 
 
+def _resolved_or_missing(
+    payload: dict, adapter: str, session_id: str, job_id: Optional[str], task_id: Optional[str]
+) -> dict:
+    if not _SESSION_ID.match(session_id):
+        return _unavailable(payload, f"invalid {adapter} session id {session_id!r}")
+    if session_on_disk(adapter, session_id) is False:
+        return _unavailable(
+            payload,
+            f"{adapter} session {session_id} is not in the local session store; it may have been pruned",
+        )
+    return _resolved(adapter, session_id, job_id, task_id)
+
+
 def _resolved(adapter: str, session_id: str, job_id: Optional[str], task_id: Optional[str]) -> dict:
     return {
         "status": "resolved",
@@ -101,7 +159,7 @@ def _resolve(store: Any, payload: dict, adapter: str) -> dict:
                 payload,
                 f"resume_adapter {requested_adapter!r} does not match task adapter {adapter!r}",
             )
-        return _resolved(adapter, explicit, None, None)
+        return _resolved_or_missing(payload, adapter, explicit, None, None)
 
     request = payload.get("resume_from")
     if not isinstance(request, dict) or not str(request.get("job_id") or "").strip():
@@ -156,4 +214,4 @@ def _resolve(store: Any, payload: dict, adapter: str) -> dict:
             payload,
             f"prior task {prior.id!r} recorded no {RESUMABLE_ADAPTERS[adapter]}",
         )
-    return _resolved(adapter, session_id, job_id, prior.id)
+    return _resolved_or_missing(payload, adapter, session_id, job_id, prior.id)
