@@ -1,3 +1,23 @@
+## v1.28.1 — 2026-10-04
+
+**The test suite stops rewriting the developer's Pi and OMP configs, and decision-log rotation is serialized.**
+
+- `SetupHooksStepTests` patched `Path.home`, but the Pi and OMP installers
+  resolve `~` from `HOME`, so every local suite run rewrote
+  `~/.omp/agent/mcp.json` and `~/.pi/agent/mcp.json` to the checkout's
+  interpreter and appended the checkout's `pi_package` to
+  `~/.pi/agent/settings.json`. One machine had 30 stale entries and a doctor
+  "Pi pilot incomplete" error with no Pi CLI installed. `hermetic_env` now
+  points `PI_CODING_AGENT_DIR` and `OMP_AGENT_DIR` into its sandbox, and a test
+  fails if either resolves outside it. To repair a config an earlier suite run
+  wrote, re-run `puppetmaster install-omp-mcp` (and `install-pi-mcp` if you use
+  Pi) from your installed Puppetmaster, and delete the stale `pi_package`
+  entries from `~/.pi/agent/settings.json` by hand.
+- Two hooks that both saw `invocation_decisions.jsonl` past 5 MB each rotated
+  it, and the second moved a fresh one-line log over the rotated history.
+  Rotation now takes the file's interprocess lock (0.5 s, skipped on timeout)
+  and re-checks the size under it. Appends stay lock-free.
+
 ## v1.28.0 — 2026-10-04
 
 **Small follow-ups stay in the pilot, a revision can resume its worker's session, and await returns a digest instead of the full summary.**
