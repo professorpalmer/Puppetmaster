@@ -917,6 +917,44 @@ class PuppetmasterTests(unittest.TestCase):
 
         self.assertEqual(results["file"], results["sqlite"])
 
+    def test_retrieve_memory_survives_a_query_longer_than_sqlite_expression_depth(self) -> None:
+        from puppetmaster.models import MemoryRecord
+
+        memory = MemoryRecord(
+            scope="swarm.findings",
+            statement="independent workers coordinate via the store",
+            evidence=["e"],
+            source_artifacts=[],
+            confidence=0.9,
+        )
+        # Over 1000 distinct terms: one OR clause per term exceeded SQLite's
+        # expression depth limit and failed the whole job launch.
+        filler = " ".join(f"filler{index:05d}" for index in range(3000))
+        results: dict[str, list] = {}
+        for backend in ("file", "sqlite"):
+            with self.subTest(backend=backend), TemporaryDirectory() as tmp:
+                store = self._store_for_backend(backend, Path(tmp) / ".puppetmaster")
+                store.init()
+                store.promote_memories([memory])
+                found = store.retrieve_memory(f"{filler} workers", limit=10)
+                self.assertEqual([item["id"] for item in found], [memory.id])
+                self.assertEqual(store.retrieve_memory(filler, limit=10), [])
+                results[backend] = [item["id"] for item in found]
+        self.assertEqual(results["file"], results["sqlite"])
+
+    def test_memory_is_not_retrieved_when_no_worker_wants_it(self) -> None:
+        from unittest.mock import patch
+        from puppetmaster.orchestrator import Orchestrator
+        from puppetmaster.workers import WorkerSpec
+
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            specs = [WorkerSpec(role="implement", instruction="i", adapter="local",
+                                payload={"disable_memory": True})]
+            with patch.object(store, "retrieve_memory", side_effect=AssertionError("queried")):
+                self.assertEqual(Orchestrator(store)._with_retrieved_memory(specs, "goal"), specs)
+
     def test_save_artifacts_emits_events_in_same_transaction(self) -> None:
         from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
 

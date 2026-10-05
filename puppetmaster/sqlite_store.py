@@ -2191,12 +2191,15 @@ class SQLiteSwarmStore(SwarmStore):
                 filter_clauses.append(f"json_extract(data, '$.{column}') = ?")
                 params.append(value)
         if terms:
-            for term in terms:
-                term_clauses.append("instr(lower(data), ?) > 0")
-                params.append(term)
-        clauses = list(filter_clauses)
-        if term_clauses:
-            clauses.append("(" + " OR ".join(term_clauses) + ")")
+            # One EXISTS over a JSON array of the terms, not one OR clause per
+            # term: SQLite caps expression depth at 1000, so a long goal made
+            # the whole job launch fail.
+            term_clauses.append(
+                "EXISTS (SELECT 1 FROM json_each(?) AS term "
+                "WHERE instr(lower(memory.data), term.value) > 0)"
+            )
+            params.append(json.dumps(sorted(terms)))
+        clauses = list(filter_clauses) + term_clauses
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         rows = self._all(
             f"SELECT data FROM memory{where} ORDER BY id", tuple(params)
