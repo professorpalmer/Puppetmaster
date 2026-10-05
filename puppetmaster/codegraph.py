@@ -226,12 +226,12 @@ def resolve_codegraph_invocation() -> list[str]:
         try:
             from puppetmaster.codegraph_repair import (
                 find_codegraph_install,
-                find_cursor_node,
+                find_runtime_node,
             )
 
             install = find_codegraph_install()
             js = _codegraph_js_entry(install) if install is not None else None
-            node = find_cursor_node()
+            node = find_runtime_node()
             if node is not None and js is not None:
                 return _windows_spawn_safe([str(node), str(js)])
         except Exception:
@@ -276,11 +276,11 @@ def _compute_cursor_codegraph_invocation() -> Optional[list[str]]:
     try:
         from puppetmaster.codegraph_repair import (
             find_codegraph_install,
-            find_cursor_node,
+            find_runtime_node,
         )
     except Exception:
         return None
-    node = find_cursor_node()
+    node = find_runtime_node()
     if node is None:
         return None
     install = find_codegraph_install()
@@ -1167,13 +1167,10 @@ def _decode_stream(stream: Any) -> str:
 # killed via ``kill -9``).
 
 
-def codegraph_lock_path(repo_root: Optional[Union[Path, str]] = None) -> Path:
+def codegraph_lock_path(repo_root: Union[Path, str]) -> Path:
     """Return the per-repo lock file used to serialize CodeGraph indexers.
 
-    Passing ``repo_root=None`` returns the legacy machine-wide lock path
-    for backwards compatibility with callers that haven't been updated
-    (tests, third-party tooling). Production callers should always pass
-    the target repo's root path so different repos can index in
+    Keyed on the target repo's root path so different repos can index in
     parallel.
     """
     base = os.environ.get("PUPPETMASTER_CODEGRAPH_LOCK_DIR")
@@ -1182,8 +1179,6 @@ def codegraph_lock_path(repo_root: Optional[Union[Path, str]] = None) -> Path:
     else:
         directory = _default_cache_root() / "puppetmaster"
     mkdir_private(directory)
-    if repo_root is None:
-        return directory / "codegraph-indexer.lock"
     resolved = Path(repo_root).expanduser().resolve()
     digest = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:12]
     safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", resolved.name).strip("-") or "repo"

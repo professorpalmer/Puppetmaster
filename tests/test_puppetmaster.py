@@ -4083,8 +4083,8 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertFalse(codegraph_native_sqlite_broken("Backend: native; nodes: 12345"))
         self.assertFalse(codegraph_native_sqlite_broken(""))
 
-    def test_repair_codegraph_finds_cursor_node_from_known_path(self) -> None:
-        """find_cursor_node walks the per-platform candidate list."""
+    def test_repair_codegraph_finds_runtime_node_from_known_path(self) -> None:
+        """find_runtime_node walks the per-platform candidate list."""
         from puppetmaster import codegraph_repair
 
         with TemporaryDirectory() as tmp:
@@ -4097,7 +4097,7 @@ class PuppetmasterTests(unittest.TestCase):
                 "_CURSOR_NODE_CANDIDATES_MAC",
                 (str(fake_node),),
             ), patch.object(codegraph_repair.sys, "platform", "darwin"):
-                resolved = codegraph_repair.find_cursor_node()
+                resolved = codegraph_repair.find_runtime_node()
             self.assertIsNotNone(resolved)
             self.assertEqual(str(resolved), str(fake_node))
 
@@ -4108,11 +4108,11 @@ class PuppetmasterTests(unittest.TestCase):
             fake = Path(tmp) / "node"
             fake.write_text("ok", encoding="utf-8")
             self.assertEqual(
-                codegraph_repair.find_cursor_node(str(fake)),
+                codegraph_repair.find_runtime_node(str(fake)),
                 fake,
             )
             self.assertIsNone(
-                codegraph_repair.find_cursor_node(str(Path(tmp) / "missing"))
+                codegraph_repair.find_runtime_node(str(Path(tmp) / "missing"))
             )
 
     def test_repair_codegraph_returns_failure_without_cursor_node(self) -> None:
@@ -4166,14 +4166,6 @@ class PuppetmasterTests(unittest.TestCase):
             ):
                 resolved = codegraph_repair.find_runtime_node()
             self.assertEqual(str(resolved), str(env_node))
-
-    def test_find_cursor_node_alias_points_at_runtime_node(self) -> None:
-        """The back-compat alias must resolve to the generalized function."""
-        from puppetmaster import codegraph_repair
-
-        self.assertIs(
-            codegraph_repair.find_cursor_node, codegraph_repair.find_runtime_node
-        )
 
     def test_find_codegraph_install_from_shim_when_npm_misses(self) -> None:
         """When `npm root -g` points at the wrong prefix, follow the shim.
@@ -5439,7 +5431,7 @@ class PuppetmasterTests(unittest.TestCase):
             (install / "dist" / "bin").mkdir(parents=True)
             (install / "dist" / "bin" / "codegraph.js").write_text("// stub", encoding="utf-8")
 
-            with patch.object(codegraph_repair, "find_cursor_node", return_value=node), patch.object(
+            with patch.object(codegraph_repair, "find_runtime_node", return_value=node), patch.object(
                 codegraph_repair, "find_codegraph_install", return_value=install
             ):
                 argv = codegraph_mod.resolve_codegraph_invocation()
@@ -5456,7 +5448,7 @@ class PuppetmasterTests(unittest.TestCase):
         codegraph_mod.reset_cursor_codegraph_invocation_cache()
         self.addCleanup(codegraph_mod.reset_cursor_codegraph_invocation_cache)
 
-        with patch.object(codegraph_repair, "find_cursor_node", return_value=None), patch.object(
+        with patch.object(codegraph_repair, "find_runtime_node", return_value=None), patch.object(
             codegraph_repair, "find_codegraph_install", return_value=None
         ), patch("puppetmaster.codegraph.shutil.which", return_value=None):
             argv = codegraph_mod.resolve_codegraph_invocation()
@@ -5474,7 +5466,7 @@ class PuppetmasterTests(unittest.TestCase):
         def fake_which(cmd):
             return "/usr/local/bin/npx" if cmd == "npx" else None
 
-        with patch.object(codegraph_repair, "find_cursor_node", return_value=None), patch.object(
+        with patch.object(codegraph_repair, "find_runtime_node", return_value=None), patch.object(
             codegraph_repair, "find_codegraph_install", return_value=None
         ), patch("puppetmaster.codegraph.shutil.which", side_effect=fake_which), patch.dict(
             os.environ, {}, clear=False
@@ -5531,7 +5523,7 @@ class PuppetmasterTests(unittest.TestCase):
             shim = install / "npm-shim.js"
             shim.write_text("// shim", encoding="utf-8")
 
-            with patch.object(codegraph_repair, "find_cursor_node", return_value=node), patch.object(
+            with patch.object(codegraph_repair, "find_runtime_node", return_value=node), patch.object(
                 codegraph_repair, "find_codegraph_install", return_value=install
             ), patch.dict(os.environ, {}, clear=False):
                 os.environ.pop("PUPPETMASTER_CODEGRAPH_NODE", None)
@@ -8681,9 +8673,6 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
                 self.assertNotEqual(lock_a, lock_b)
                 self.assertIn("ff-data-engineering", lock_a.name)
                 self.assertIn("ff-ios", lock_b.name)
-                # And legacy callers still get the global lock.
-                legacy = codegraph_mod.codegraph_lock_path()
-                self.assertEqual(legacy.name, "codegraph-indexer.lock")
             finally:
                 del os.environ["PUPPETMASTER_CODEGRAPH_LOCK_DIR"]
 
