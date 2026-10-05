@@ -28,7 +28,9 @@ from ._base import _should_emit_patch_artifact
 from ._facade import facade
 from ._prompts import (
     TASK_INSTRUCTION_HEADER,
+    build_cli_review_prompt,
     prompt_with_memory,
+    wants_review_contract,
     with_job_brief,
     with_report_contract,
 )
@@ -165,11 +167,17 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
         # Marker seam so memory / CodeGraph land before the per-task instruction
         # (static-first prefix caching). Report contract injects before the marker.
         raw_instruction = task.payload.get("prompt") or task.instruction
-        base_prompt = with_report_contract(
-            f"{TASK_INSTRUCTION_HEADER}\n{raw_instruction}"
-        )
         resume_record = task_resume_record(task.payload, "claude-code")
         resume = resolved_resume(resume_record, "claude-code")
+        if resume is not None and task.payload.get("resume_prompt"):
+            # The resumed session already holds the original task; send only what changed.
+            raw_instruction = str(task.payload["resume_prompt"])
+        if wants_review_contract(task.payload):
+            base_prompt = build_cli_review_prompt(task, prompt=raw_instruction)
+        else:
+            base_prompt = with_report_contract(
+                f"{TASK_INSTRUCTION_HEADER}\n{raw_instruction}"
+            )
         disable_codegraph = bool(task.payload.get("disable_codegraph", False))
         # A builder gets task-scoped CodeGraph context; the job-wide goal brief
         # only dilutes it.

@@ -1215,6 +1215,10 @@ def build_parser() -> argparse.ArgumentParser:
         # that records its own (possibly bumped) port. Not for direct use.
     )
 
+    from puppetmaster.cli.commands_flow import add_flow_parser
+
+    add_flow_parser(subcommands)
+
     await_cmd = subcommands.add_parser(
         "await",
         help=(

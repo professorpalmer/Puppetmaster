@@ -111,6 +111,18 @@ RULE_BODY = textwrap.dedent(
     and deny-redirect broad native exploration automatically. The kill switch
     is `PUPPETMASTER_AUTO_INVOKE_DISABLED=1`.
 
+    ## Multi-step pipelines: write one flow
+
+    When steps depend on each other's results (build, then check, then review
+    with repair, or the same task over many items), write ONE flow graph and
+    start it with `puppetmaster_flow` (action `run`), then end your turn or
+    call action `wait`. Puppetmaster walks it durably and wakes you only when
+    it is done, failed, stuck, interrupted or waiting at a gate; do not
+    launch, poll and hand off each step yourself. A node re-entered by a
+    failed check or review resumes its own session with only the feedback; a
+    `map` node fans out per-item flows; a follow-up continues a finished run
+    with `continue_from`. Reference: `docs/FLOWS.md`.
+
     ## Label every job you start (do it by default)
 
     When you start any job verb (`puppetmaster_start_*`, `puppetmaster_edit`,

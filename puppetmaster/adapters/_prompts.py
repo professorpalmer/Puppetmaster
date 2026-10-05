@@ -292,7 +292,8 @@ def structured_prompt_for_task(
         body,
         final_message_note=final_message_note,
         acceptance_criteria=acceptance_criteria_for_task(task),
-        terminal_verdict="review" in str(task.role or "").lower(),
+        terminal_verdict="review" in str(task.role or "").lower()
+        or bool((task.payload or {}).get("terminal_verdict")),
     )
 
 
@@ -381,6 +382,44 @@ def build_cli_implement_prompt(task: Task, *, prompt: object = None) -> str:
     if criteria:
         body = ensure_acceptance_criteria_in_text(body, criteria)
     return "\n".join([_PROMPT_ORIENTATION, "", *_CLI_BUILD_CONTRACT, "", TASK_INSTRUCTION_HEADER, body])
+
+
+_CLI_REVIEW_CONTRACT = (
+    "Review mode: you are a read-only reviewer. Do not edit files. Inspect the work "
+    "the task names: read the files and run read-only checks where they help.",
+    "Report each problem on its own line as `path:line - what is wrong`, most "
+    "important first. If you find none, say so plainly.",
+    "End your reply with exactly one line: `VERDICT: PASS - <summary>` or "
+    "`VERDICT: FAIL - <the most important problem>` or "
+    "`VERDICT: PARTIAL - <what you could not verify>`. Do not return findings JSON.",
+)
+
+
+def build_cli_review_prompt(task: Task, *, prompt: object = None) -> str:
+    """Review contract for a read-only CLI worker whose task needs a verdict.
+
+    The findings-JSON contract and a verdict line compete for the final
+    message; reviewers answered with JSON and no verdict, so a judge could
+    never route its run.
+    """
+    from puppetmaster.acceptance_criteria import (
+        acceptance_criteria_for_task,
+        ensure_acceptance_criteria_in_text,
+    )
+
+    body = str((task.payload.get("prompt") or task.instruction) if prompt is None else prompt or "")
+    criteria = acceptance_criteria_for_task(task)
+    if criteria:
+        body = ensure_acceptance_criteria_in_text(body, criteria)
+    return "\n".join([_PROMPT_ORIENTATION, "", *_CLI_REVIEW_CONTRACT, "", TASK_INSTRUCTION_HEADER, body])
+
+
+def wants_review_contract(payload: Optional[dict]) -> bool:
+    """A read-only worker asked for a terminal verdict reviews in free text."""
+    payload = payload or {}
+    read_only = bool(payload.get("read_only")) or payload.get("sandbox") == "read-only" or (
+        payload.get("permission_mode") == "plan")
+    return bool(payload.get("terminal_verdict")) and read_only
 
 
 _ANALYZE_JSON_ONLY_RETRY = (

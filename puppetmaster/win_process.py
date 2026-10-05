@@ -42,6 +42,8 @@ def _kernel32():
             ("CreateToolhelp32Snapshot", [wintypes.DWORD, wintypes.DWORD], wintypes.HANDLE),
             ("Process32FirstW", [wintypes.HANDLE, ctypes.c_void_p], wintypes.BOOL),
             ("Process32NextW", [wintypes.HANDLE, ctypes.c_void_p], wintypes.BOOL),
+            ("GetProcessTimes", [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4,
+             wintypes.BOOL),
         ):
             function = getattr(api, name)
             function.argtypes, function.restype = args, result
@@ -67,6 +69,23 @@ def pid_alive_windows(pid: int) -> bool:
         if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
             return True
         return exit_code.value == 259  # STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def process_identity_windows(pid: int) -> Optional[str]:
+    """The creation FILETIME, fixed for the life of the process (see ``proc_identity``)."""
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = _kernel32()
+    handle = kernel32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return None
+    try:
+        times = [wintypes.FILETIME() for _ in range(4)]
+        if not kernel32.GetProcessTimes(handle, *(ctypes.byref(value) for value in times)):
+            return None
+        return str((times[0].dwHighDateTime << 32) | times[0].dwLowDateTime)
     finally:
         kernel32.CloseHandle(handle)
 

@@ -137,6 +137,20 @@ class ResolverTests(unittest.TestCase):
             },
         )
 
+    def test_a_later_verdict_artifact_is_not_mistaken_for_the_receipt(self) -> None:
+        self.store.artifacts["job-prior"].append(
+            Artifact(
+                job_id="job-prior", task_id="t-codex", type=ArtifactType.VERIFICATION,
+                created_by="worker", confidence=1.0, evidence=["worker_verdict"],
+                payload={"adapter": "codex", "kind": "worker_verdict", "verdict": "PASS",
+                         "reason": "ok", "check": "c", "result": "passed"},
+                created_at="2026-10-04T02:00:00",
+            )
+        )
+        record = self.resolve({"resume_from": {"job_id": "job-prior", "task_id": "t-codex"}}, "codex")
+        self.assertEqual(record["status"], "resolved", record)
+        self.assertEqual(record["session_id"], THREAD_ID)
+
     def test_resolved_claude_code_by_role(self) -> None:
         record = self.resolve({"resume_from": {"job_id": "job-prior", "role": "review"}}, "claude-code")
         self.assertEqual(record["status"], "resolved")
@@ -498,6 +512,53 @@ class CodexBuildContractTests(unittest.TestCase):
         self.assertEqual(artifacts[0].payload["result"], "passed")
         kinds = [(a.type, (a.payload or {}).get("kind")) for a in artifacts]
         self.assertIn((ArtifactType.FINDING, None), kinds)
+
+
+class CodexReviewContractTests(unittest.TestCase):
+    """A read-only worker asked for a verdict reviews in free text, not findings JSON."""
+
+    def _task(self, **payload) -> Task:
+        return Task(job_id="job-review", role="check", instruction="Review pkg/a.py.", adapter="codex",
+                    payload={"cwd": str(Path.cwd()), "model": "gpt-5.4-mini", "sandbox": "read-only",
+                             "read_only": True, **payload})
+
+    def test_verdict_reviewer_gets_the_review_contract(self):
+        artifacts, kwargs, _, _ = _run_adapter(
+            CodexAdapter(), self._task(terminal_verdict=True),
+            _codex_events({"type": "thread.started", "thread_id": THREAD_ID}))
+        prompt = kwargs["stdin_data"]
+        self.assertIn("Review mode", prompt)
+        self.assertIn("path:line - what is wrong", prompt)
+        self.assertNotIn("submit_findings", prompt)
+
+    def test_free_text_review_with_a_verdict_passes_and_keeps_the_report(self):
+        stdout = _codex_events(
+            {"type": "thread.started", "thread_id": THREAD_ID},
+            {"type": "item.completed", "item": {"type": "agent_message",
+             "text": "pkg/a.py:3 - missing type hints\nVERDICT: FAIL - pkg/a.py:3 missing type hints"}},
+            {"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 5}},
+        )
+        artifacts, _, _, _ = _run_adapter(CodexAdapter(), self._task(terminal_verdict=True), stdout)
+        self.assertEqual(artifacts[0].payload["result"], "passed")
+        verdicts = [a.payload for a in artifacts if (a.payload or {}).get("kind") == "worker_verdict"]
+        self.assertEqual([v["verdict"] for v in verdicts], ["FAIL"])
+        self.assertTrue(any(a.type == ArtifactType.FINDING and "missing type hints" in (a.payload.get("report") or "")
+                            for a in artifacts))
+
+    def test_plain_read_only_analysis_is_unchanged(self):
+        artifacts, kwargs, _, _ = _run_adapter(
+            CodexAdapter(), self._task(),
+            _codex_events({"type": "thread.started", "thread_id": THREAD_ID}))
+        self.assertIn("submit_findings", kwargs["stdin_data"])
+        self.assertNotIn("Review mode", kwargs["stdin_data"])
+
+    def test_claude_verdict_reviewer_gets_the_review_contract(self):
+        task = Task(job_id="job-review", role="check", instruction="Review pkg/a.py.", adapter="claude-code",
+                    payload={"cwd": str(Path.cwd()), "permission_mode": "plan", "terminal_verdict": True})
+        _, kwargs, enrich, _ = _run_adapter(ClaudeCodeAdapter(), task, CLAUDE_RESULT)
+        prompt = enrich.call_args.args[0]
+        self.assertIn("Review mode", prompt)
+        self.assertNotIn("Reporting contract", prompt)
 
 
 class SessionLeaseTests(unittest.TestCase):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 import sqlite3
 import threading
 import time
@@ -691,7 +692,10 @@ class WorkerRuntime:
         lease_id: Optional[str] = None,
         lost: Optional[threading.Event] = None,
     ) -> None:
-        while not stop.wait(self._heartbeat_interval()):
+        interval = self._heartbeat_interval()
+        wait, contended = interval, 0
+        while not stop.wait(wait):
+            interval = self._heartbeat_interval()
             try:
                 run, renewed = self._heartbeat_run_and_lease(
                     run, task_id, lease_id, True
@@ -701,10 +705,15 @@ class WorkerRuntime:
 
                 if not _is_sqlite_lock_error(exc):
                     raise
-                # A failed reservation did not mutate either record. Let the
-                # next heartbeat determine whether the lease still belongs to
-                # this worker instead of killing the background thread.
+                # A failed reservation did not mutate either record. Retry
+                # sooner than a full interval: two renewals lost to write
+                # contention in a row used to expire a healthy worker's lease
+                # and restart its task. Back off with jitter so many workers
+                # retrying together do not add the contention they wait on.
+                contended += 1
+                wait = min(interval, 0.25 * (2 ** (contended - 1))) * random.uniform(0.5, 1.0)
                 continue
+            wait, contended = interval, 0
             if renewed is None:
                 (lost or self._lease_lost).set()
                 stop.set()

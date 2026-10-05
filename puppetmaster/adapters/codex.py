@@ -28,7 +28,9 @@ from ._facade import facade
 from ._prompts import (
     prompt_with_memory,
     build_cli_implement_prompt,
+    build_cli_review_prompt,
     structured_prompt_for_task,
+    wants_review_contract,
     with_job_brief,
 )
 from ._streaming import (
@@ -150,9 +152,13 @@ class CodexAdapter(CliWorkerAdapter):
         if resume is not None:
             resume_record, lease = _lease_codex_thread(resume_record)
             resume = resolved_resume(resume_record, "codex")
+        if resume is not None and task.payload.get("resume_prompt"):
+            # The thread already holds the original task; send only what changed.
+            base_prompt = str(task.payload["resume_prompt"])
         sandbox = str(task.payload.get("sandbox") or "workspace-write")
         bypass = bool(task.payload.get("dangerously_bypass_approvals_and_sandbox", False))
         write_capable = sandbox != "read-only" or bypass
+        review_mode = not write_capable and wants_review_contract(task.payload)
         disable_codegraph = bool(task.payload.get("disable_codegraph", False))
         if write_capable:
             # A builder gets task-scoped CodeGraph context; the job-wide census
@@ -162,6 +168,8 @@ class CodexAdapter(CliWorkerAdapter):
                 task,
                 shared_brief=disable_codegraph,
             )
+        elif review_mode:
+            task_prompt = with_job_brief(build_cli_review_prompt(task, prompt=base_prompt), task)
         else:
             task_prompt = with_job_brief(
                 structured_prompt_for_task(
@@ -235,6 +243,8 @@ class CodexAdapter(CliWorkerAdapter):
                 "resumed": resume is not None,
                 "session_lease": lease,
                 "write_capable": write_capable,
+                # Builders and verdict reviewers answer in free text, not findings JSON.
+                "report_mode": write_capable or review_mode,
                 "extra_dirty_message": (
                     " Or pass payload.sandbox='read-only' for review-only tasks. For focused edits "
                     "on a dirty tree (docs, tests), use puppetmaster_edit — it edits in place and "
@@ -308,6 +318,7 @@ class CodexAdapter(CliWorkerAdapter):
         ephemeral = bool(prepared.extras.get("ephemeral", True))
         codegraph_used = bool(prepared.extras.get("codegraph_used"))
         write_capable = bool(prepared.extras.get("write_capable", True))
+        report_mode = bool(prepared.extras.get("report_mode", write_capable))
         resume_record = prepared.extras.get("resume")
         resume_fields = {"resume": resume_record} if resume_record else {}
         resumed = bool(prepared.extras.get("resumed"))
@@ -436,10 +447,10 @@ class CodexAdapter(CliWorkerAdapter):
         # free-text report must still become an artifact.
         report_artifacts = [
             artifact for artifact in parsed_artifacts
-            if not write_capable or (artifact.payload or {}).get("kind") != "worker_verdict"
+            if not report_mode or (artifact.payload or {}).get("kind") != "worker_verdict"
         ]
         unstructured = not process_failed and not report_artifacts and bool(last_message.strip())
-        degraded = unstructured and not write_capable
+        degraded = unstructured and not report_mode
 
         verification = verification_artifact(
             task=task,
@@ -500,7 +511,7 @@ class CodexAdapter(CliWorkerAdapter):
             },
         )
         artifacts: list[Artifact] = [verification]
-        if unstructured and write_capable:
+        if unstructured and report_mode:
             # implement_report_artifacts re-parses the verdict itself.
             parsed_artifacts = []
             artifacts.extend(
