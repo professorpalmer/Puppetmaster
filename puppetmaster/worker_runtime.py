@@ -462,8 +462,6 @@ class WorkerRuntime:
         gate_eval = self._with_heartbeat(
             run, task, lambda: self._evaluate_gates(task, artifacts)
         )
-        if self._lease_lost.is_set():
-            return True
         for gate_artifact in gate_eval.artifacts:
             self.store.save_artifact(gate_artifact)
         if not gate_eval.passed:
@@ -504,12 +502,18 @@ class WorkerRuntime:
         return True
 
     def _with_heartbeat(self, run, task, work):
-        """Run ``work()`` while renewing the task lease; drain the renewal before returning."""
+        """Run ``work()`` while renewing the task lease; drain the renewal before returning.
+
+        A renewal that fails here (the lease already lapsed on a starved host)
+        only stops renewing: it must not abandon a finished task. Publication
+        stays fenced by owner and lease id in complete_task/update_task_status,
+        which reject the result only if another worker actually took the task.
+        """
         stop = threading.Event()
         heartbeat = threading.Thread(
             target=self._heartbeat_until_stopped,
             args=(run, task.id, stop),
-            kwargs={"lease_id": task.lease_id},
+            kwargs={"lease_id": task.lease_id, "lost": threading.Event()},
             daemon=True,
         )
         heartbeat.start()
@@ -683,6 +687,7 @@ class WorkerRuntime:
         task_id: str,
         stop: threading.Event,
         lease_id: Optional[str] = None,
+        lost: Optional[threading.Event] = None,
     ) -> None:
         while not stop.wait(self._heartbeat_interval()):
             try:
@@ -699,7 +704,7 @@ class WorkerRuntime:
                 # this worker instead of killing the background thread.
                 continue
             if renewed is None:
-                self._lease_lost.set()
+                (lost or self._lease_lost).set()
                 stop.set()
                 return
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 import unittest
 from tempfile import TemporaryDirectory
@@ -43,6 +44,36 @@ class GateLeaseHeartbeatTests(unittest.TestCase):
                 runtime.run_once()
 
             self.assertEqual(recovered, [])
+            self.assertEqual(store.list_tasks(job.id)[0].status, TaskStatus.COMPLETE)
+
+    def test_refused_gate_renewal_does_not_abandon_a_finished_task(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(tmp)
+            store.ensure_schema()
+            job = store.create_job("starved gate")
+            store.save_task(Task(job_id=job.id, role="implement", instruction="noop",
+                                 adapter="local", payload={"skip_preflight": True}))
+            runtime = WorkerRuntime(store, job.id, "implement", "w-1",
+                                    lease_seconds=30, heartbeat_seconds=0.05)
+            in_gates = threading.Event()
+            real_renew = runtime._heartbeat_run_and_lease
+
+            def renew(run, task_id, lease_id, opportunistic=False):
+                # On a starved host the lease lapses before gates run, so the
+                # gate-window renewal is refused although nobody took the task.
+                if in_gates.is_set():
+                    return run, None
+                return real_renew(run, task_id, lease_id, opportunistic)
+
+            def gates(task, artifacts):
+                in_gates.set()
+                time.sleep(0.4)
+                return GateEvaluation(passed=True, results=[], artifacts=[])
+
+            with patch.object(runtime, "_heartbeat_run_and_lease", side_effect=renew), \
+                    patch.object(runtime, "_evaluate_gates", side_effect=gates):
+                runtime.run_once()
+
             self.assertEqual(store.list_tasks(job.id)[0].status, TaskStatus.COMPLETE)
 
 
