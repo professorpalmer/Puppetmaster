@@ -248,10 +248,17 @@ class SQLiteSwarmStore(SwarmStore):
         # All helper attempts and lock backoffs share this availability budget.
         timeout = self.busy_timeout_ms / 1000.0
         attach_deadline = time.monotonic() + timeout * _SQLITE_LOCK_RETRY_ATTEMPTS if timeout > 0 else None
+        # The readonly open needs a quiet, checkpointed database, and the
+        # helper spends the whole attach budget waiting for one. A live writer
+        # cohort may never give it one (32 attachers starved). With both
+        # sidecars on disk, joining the WAL as the writer this worker is about
+        # to be creates no file.
+        join_live = self._live_wal_sidecars()
         for attempt in range(_SQLITE_LOCK_RETRY_ATTEMPTS):
             connection = None
             try:
-                connection = self._connect_readonly(attach_binding=True, attach_deadline=attach_deadline)
+                connection = (self._connect_attach() if join_live else
+                              self._connect_readonly(attach_binding=True, attach_deadline=attach_deadline))
                 version = self._assert_schema(connection)
                 from puppetmaster.identity import read_identity, StoreIdentityError
                 self._legacy_schema = str(version) != str(self.schema_version)
@@ -261,7 +268,7 @@ class SQLiteSwarmStore(SwarmStore):
                 self._incarnation = incarnation
                 break
             except sqlite3.OperationalError as exc:
-                from puppetmaster.readonly import ReadTimeout, ReadUnavailable
+                from puppetmaster.readonly import ReadTimeout, ReadUnavailable, _locked as readonly_locked
                 locked = _is_sqlite_lock_error(exc)
                 # A silent helper has used its response budget, not reported a
                 # SQLite lock. Do not multiply its startup allowance here.
@@ -277,6 +284,10 @@ class SQLiteSwarmStore(SwarmStore):
                     raise
                 if locked:
                     self._record_lock_error()
+                if locked or readonly_locked(exc):
+                    if not join_live and attempt + 1 < _SQLITE_LOCK_RETRY_ATTEMPTS and self._live_wal_sidecars():
+                        join_live = True
+                        continue
                 if attempt + 1 == _SQLITE_LOCK_RETRY_ATTEMPTS:
                     raise
                 if attach_deadline is None:
@@ -2318,6 +2329,25 @@ class SQLiteSwarmStore(SwarmStore):
             "quick_check": detail,
             "check_kind": "quick_check",
         }
+
+    def _live_wal_sidecars(self) -> bool:
+        return all(Path(f"{self.db_path}{suffix}").is_file() for suffix in ("-wal", "-shm"))
+
+    def _connect_attach(self) -> sqlite3.Connection:
+        """Open the existing DB read-write without creating it or setting
+        journal_mode; the supervisor owns both."""
+        connection = sqlite3.connect(
+            f"{self.db_path.resolve().as_uri()}?mode=rw",
+            uri=True,
+            timeout=self.busy_timeout_ms / 1000.0,
+        )
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute(f"PRAGMA busy_timeout = {int(self.busy_timeout_ms)}")
+        except Exception:
+            connection.close()
+            raise
+        return connection
 
     def _connect_readonly(self, *, attach_binding=False, attach_deadline=None) -> sqlite3.Connection:
         """Open the DB read-only without applying write-side durability PRAGMAs."""

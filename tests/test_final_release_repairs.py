@@ -78,7 +78,7 @@ class FinalReleaseRepairs(unittest.TestCase):
                         with self.assertRaises(StoreIdentityError):
                             getter(ref, 'absent')
 
-    def test_attach_waits_for_confirmed_reader_then_reads_checkpoint(self):
+    def test_helper_confirms_live_reader_and_attach_joins_it(self):
         with TemporaryDirectory() as tmp:
             supervisor = SQLiteSwarmStore(tmp)
             supervisor.ensure_schema()
@@ -125,7 +125,9 @@ class FinalReleaseRepairs(unittest.TestCase):
             with closing(holder), patch.object(readonly, 'time', SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep)), \
                     patch.object(worker, 'ensure_schema', side_effect=AssertionError('worker DDL')):
                 worker.attach()
-            self.assertTrue(released)
+            # A live reader means live sidecars: attach joins the WAL instead
+            # of waiting for the reader to leave.
+            self.assertFalse(released)
             self.assertLess(clock[0], 5)
             self.assertEqual(worker.incarnation, supervisor.incarnation)
 

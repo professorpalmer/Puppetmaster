@@ -1,5 +1,4 @@
 """Attach contention must not turn lock retries into interpreter startup storms."""
-import hashlib
 import json
 import sqlite3
 import sys
@@ -29,54 +28,39 @@ class NoAdmission:
 
 
 class AttachReaderContentionTests(unittest.TestCase):
-    @patch.object(readonly, 'ReaderAdmission', NoAdmission)
-    def test_concurrent_attaches_retry_without_respawning_or_mutation(self):
+    def test_concurrent_attaches_do_not_wait_for_a_quiet_database(self):
+        # Attach used the readonly helper, which needs zero live connections
+        # and a checkpointed WAL. 32 attachers behind live writers starved
+        # there. Attach now joins the WAL like the writer it is about to be.
         with TemporaryDirectory() as root:
             supervisor = SQLiteSwarmStore(root)
             supervisor.ensure_schema()
-            def snapshot():
-                return {p.name: (p.stat().st_ino, p.stat().st_mode, p.stat().st_mtime_ns, p.stat().st_ctime_ns,
-                                 hashlib.sha256(p.read_bytes()).hexdigest())
-                        for p in Path(root).iterdir() if p.is_file()}
-            before = snapshot()
             count = 32
             barrier = threading.Barrier(count)
-            collided = set()
-            mutex = threading.Lock()
-            all_collided = threading.Event()
-            receive = readonly.ReadConnection._receive
-            def observed(connection):
-                try:
-                    return receive(connection)
-                except Exception as exc:
-                    if readonly._locked(exc):
-                        with mutex:
-                            collided.add(threading.get_ident())
-                            if len(collided) == count:
-                                all_collided.set()
-                    raise
             def attach():
                 store = SQLiteSwarmStore(root)
                 barrier.wait(timeout=10)
                 store.attach()
                 return store._incarnation
-            # The helper holds the advisory lock; every contender must collide
-            # before release, independently of scheduler timing.
-            held = readonly.connect(supervisor)
+            # A live writer with uncheckpointed WAL frames: the helper path
+            # could not attach until it closed and checkpointed.
+            writer = supervisor.connect()
+            job = supervisor.create_job("live writer")
+            writer.execute("SELECT 1 FROM metadata").fetchall()
             started = time.monotonic()
-            with patch.object(readonly, '_Transport', wraps=readonly._Transport) as spawn, \
-                    patch.object(readonly.ReadConnection, '_receive', observed), \
-                    ThreadPoolExecutor(max_workers=count) as pool:
-                futures = [pool.submit(attach) for _ in range(count)]
-                try:
-                    self.assertTrue(all_collided.wait(10), len(collided))
-                finally:
-                    held.close()
-                self.assertEqual([f.result(timeout=15) for f in futures],
-                                 [supervisor._incarnation] * count)
-                self.assertEqual(spawn.call_count, count)
-            self.assertLess(time.monotonic() - started, 20)
-            self.assertEqual(snapshot(), before)
+            try:
+                with patch.object(readonly, '_Transport', wraps=readonly._Transport) as spawn, \
+                        ThreadPoolExecutor(max_workers=count) as pool:
+                    futures = [pool.submit(attach) for _ in range(count)]
+                    self.assertEqual([f.result(timeout=15) for f in futures],
+                                     [supervisor._incarnation] * count)
+                    self.assertEqual(spawn.call_count, 0)
+            finally:
+                writer.close()
+            self.assertLess(time.monotonic() - started, 10)
+            # The last close may checkpoint WAL frames into the file; content
+            # is what attach must not change.
+            self.assertEqual([j.id for j in SQLiteSwarmStore(root).list_jobs()], [job.id])
 
     @patch.object(readonly, 'ReaderAdmission', NoAdmission)
     def test_replacement_between_lock_retries_is_rejected(self):
