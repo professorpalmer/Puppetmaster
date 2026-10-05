@@ -886,6 +886,7 @@ class DurableCompletionTests(unittest.TestCase):
             # Model a killed lock holder: nobody releases it; only its TTL expires.
             lock = reopened.locks_dir / f"{reopened._safe_key(name)}.lock"
             reopened.write_json(lock, {"owner": "killed-publisher", "at": 0})
+            os.utime(lock, (0, 0))
             reopened.recover_stale_tasks(job.id)
             self.assertEqual(reopened.get_task_by_id(task.id).status, TaskStatus.COMPLETE)
             self.assertTrue(reopened._completion_records(job.id)[0]["done"])

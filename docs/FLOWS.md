@@ -70,6 +70,18 @@ problems are fixed.
 | `set` | `values` written into state (templated). | ok |
 | `end` | `status: pass|fail`, `summary` (templated). | ends the run |
 
+### Effort
+
+`effort` on an agent or judge node (`low`, `medium`, `high`, `xhigh`) sets its
+reasoning effort; adapters translate it (Codex `model_reasoning_effort`,
+Claude Code `--effort`). `defaults.effort` covers every node, and
+`defaults.lanes` maps roles to an effort, for example
+`{"explore": "low", "code": "medium", "judge": "high"}`; judges use the `judge`
+lane. A node's own `effort` wins over its lane, and a lane over
+`defaults.effort`. `escalate: true` (on a node or in `defaults`) raises a node's effort one step on each
+repair visit, so a cheap first build gets more reasoning only when a check or
+judge sends it back.
+
 ## Edges
 
 `{"from", "to", "when", "max"}`. The first matching edge in declaration order

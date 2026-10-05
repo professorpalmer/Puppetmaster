@@ -1,3 +1,46 @@
+## v1.30.0 — 2026-10-05
+
+**Closing the gaps the voxel study measured: pilots read less, Codex cost is
+priced honestly, large fan-outs attach without starving, craft-graded flows
+end in a rubric judge, and flow nodes take per-role reasoning effort.**
+
+- **Effort lanes.** Agent and judge nodes take `effort` (`low` through
+  `xhigh`); `defaults.lanes` maps explore, code and judge to an effort; and
+  `escalate` raises effort one step on each repair visit. On three real Codex
+  repair loops, a low-effort build with escalation matched the medium
+  baseline's pass path in similar time (71-83s vs 66-129s), so lanes ship
+  opt-in with no default change. See `docs/FLOWS.md`.
+- **Codex cache hits are priced as cache reads.** The Codex and Antigravity
+  adapters record `cached_input_tokens`, which usage selection never read, so
+  every cache hit was priced at the full input rate. A real build worker
+  (97,124 in, 92,160 cached) showed an API-equivalent \$0.1043; it is
+  \$0.0214. Frozen terminal receipts keep their recorded value.
+- **Pilot diet.** MCP `status` and `artifacts` now reply compact by default.
+  Compact status carries token and cost totals with a pointer to the full
+  receipt and drops routing bookkeeping from task payloads. On a one-task job,
+  status fell from 9.0 KB to 3.4 KB and artifacts from 24 KB to 4.2 KB; both
+  scale with task count. `compact: false` and `refs: false` return the full
+  payloads, and the CLI defaults are unchanged.
+- **SQLite attach joins a live WAL.** Worker attach used the readonly helper,
+  which only opens a database with no live connection and a checkpointed WAL,
+  and spent the whole 25s attach budget waiting for one. Behind a live writer
+  cohort that moment may never come; late attachers in the 32-worker stress
+  run timed out on Ubuntu. With both sidecars on disk, attach opens the
+  existing file read-write (no create, no `journal_mode`) and validates schema
+  and identity there. A quiet, legacy or damaged store still goes through the
+  helper untouched. 32 attachers behind a live writer took 25s each; they now
+  take 0.15s.
+- **File locks: waiters judge a fresh lock by `stat`.** On Windows a waiter
+  that opened the lock file to read its age blocked the owner's delete; the
+  owner's release swallowed the error and the lock leaked for its full TTL.
+  A lock modified well inside its TTL is now judged fresh without opening it.
+- **Installed pilot rules.** When a result is graded by craft (how it looks,
+  reads or feels) and not only by a test, a flow ends in a shell check that
+  produces the observable result and a judge whose task is a numbered rubric
+  from the request, with a bounded FAIL edge back to the build, per item under
+  `map`. The study's quality losses were craft and readability, and no run
+  rendered and judged its output.
+
 ## v1.29.1 — 2026-10-05
 
 **A long job goal no longer fails the launch in memory retrieval.**

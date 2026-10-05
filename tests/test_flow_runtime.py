@@ -1092,3 +1092,40 @@ class AdapterHookTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EffortLaneTests(Base):
+    def test_node_lane_and_graph_effort_precedence(self):
+        defaults = {"effort": "medium", "lanes": {"explore": "low", "judge": "high"}}
+        self.assertEqual(flow.node_effort({"kind": "agent", "role": "explore"}, defaults, 1), "low")
+        self.assertEqual(flow.node_effort({"kind": "judge"}, defaults, 1), "high")
+        self.assertEqual(flow.node_effort({"kind": "agent"}, defaults, 1), "medium")
+        self.assertEqual(flow.node_effort({"kind": "agent", "effort": "xhigh"}, defaults, 1), "xhigh")
+        self.assertIsNone(flow.node_effort({"kind": "agent"}, {}, 1))
+
+    def test_escalation_thinks_harder_on_each_repair_visit(self):
+        node = {"kind": "agent", "effort": "low", "escalate": True}
+        self.assertEqual([flow.node_effort(node, {}, visit) for visit in (1, 2, 3, 4, 5)],
+                         ["low", "medium", "high", "xhigh", "xhigh"])
+        self.assertEqual(flow.node_effort({"kind": "agent"}, {"escalate": True}, 2), "high")
+
+    def test_spec_pins_reasoning_effort_for_the_visit(self):
+        g = graph([agent("build", effort="low", escalate=True)], defaults={"adapter": "codex"})
+        run = flow.new_run(self.state, g, "goal", cwd=str(self.work))
+        executor = JobNodeExecutor(self.state)
+        self.assertEqual(executor._spec("build", run.graph["nodes"][0], run, "", 1).payload["reasoning_effort"], "low")
+        self.assertEqual(executor._spec("build", run.graph["nodes"][0], run, "fix x", 2).payload["reasoning_effort"], "medium")
+
+    def test_effort_validation(self):
+        bad = graph([agent("a", effort="max", escalate="yes")],
+                    defaults={"adapter": "codex", "lanes": {"review": "low"}, "effort": "huge"})
+        problems = flow.validate_graph(bad)
+        self.assertTrue(any("node 'a' effort" in p for p in problems))
+        self.assertTrue(any("escalate must be true or false" in p for p in problems))
+        self.assertTrue(any("defaults.lanes" in p for p in problems))
+        self.assertTrue(any("defaults effort" in p for p in problems))
+
+    def test_item_graph_lanes_merge_over_the_parent(self):
+        merged = flow._merged_defaults({"lanes": {"explore": "low"}, "adapter": "codex"}, {"lanes": {"judge": "high"}})
+        self.assertEqual(merged["lanes"], {"explore": "low", "judge": "high"})
+

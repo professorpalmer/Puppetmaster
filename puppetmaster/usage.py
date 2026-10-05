@@ -189,7 +189,9 @@ def select_usage_records(artifacts: Iterable[Artifact]) -> dict:
         records[task_id] = {
             "tokens_in": int(payload.get("tokens_in") or 0),
             "tokens_out": int(payload.get("tokens_out") or 0),
-            "tokens_cached": int(payload.get("tokens_cached") or 0),
+            # Codex and Antigravity name the input-inclusive cache hit
+            # cached_input_tokens; unread, every cache hit priced as fresh input.
+            "tokens_cached": int(payload.get("tokens_cached") or payload.get("cached_input_tokens") or 0),
             "real_cost_usd": payload.get("real_cost_usd"),
             "tokens_estimated": bool(payload.get("tokens_estimated")),
             "model": payload.get("model"),
