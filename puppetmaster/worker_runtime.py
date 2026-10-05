@@ -456,7 +456,14 @@ class WorkerRuntime:
         # Non-bypassable completion gates: an agent may not reach COMPLETE just
         # because it thinks it finished. Post-conditions (drift ratchet, required
         # diff, commit) are evaluated by the runtime; a failed gate is FAILED.
-        gate_eval = self._evaluate_gates(task, artifacts)
+        # A review gate is a live judge call that outlasts the lease, so keep
+        # renewing it while gates run; otherwise recovery reclaims the task and
+        # the verdict is dropped.
+        gate_eval = self._with_heartbeat(
+            run, task, lambda: self._evaluate_gates(task, artifacts)
+        )
+        if self._lease_lost.is_set():
+            return True
         for gate_artifact in gate_eval.artifacts:
             self.store.save_artifact(gate_artifact)
         if not gate_eval.passed:
@@ -495,6 +502,22 @@ class WorkerRuntime:
         )
         self._emit_live_task_span(updated, artifacts + gate_eval.artifacts)
         return True
+
+    def _with_heartbeat(self, run, task, work):
+        """Run ``work()`` while renewing the task lease; drain the renewal before returning."""
+        stop = threading.Event()
+        heartbeat = threading.Thread(
+            target=self._heartbeat_until_stopped,
+            args=(run, task.id, stop),
+            kwargs={"lease_id": task.lease_id},
+            daemon=True,
+        )
+        heartbeat.start()
+        try:
+            return work()
+        finally:
+            stop.set()
+            heartbeat.join()
 
     def _stamp_evaluator_metadata(self, task, artifacts: list) -> list:
         try:
