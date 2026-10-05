@@ -349,6 +349,40 @@ def build_implement_prompt(prompt: str) -> str:
     )
 
 
+_CLI_BUILD_CONTRACT = (
+    "Build mode: you are a full-edit worker in this repository. Deliver working "
+    "files, not a description of them: create and edit the files the task "
+    "assigns you, and leave every other file alone; other workers own them.",
+    "Work in a build-check loop: make the change, run the checks the task names "
+    "(or the most relevant tests), read the results and fix what fails. Passing "
+    "checks are the floor, not the finish: when the task asks for quality the "
+    "checks do not measure and time remains, improve it and run the checks again.",
+    _IMPLEMENT_REPORT_CONTRACT,
+    "Keep that report to a few lines and end it with exactly one line "
+    "`VERDICT: PASS - reason` (or FAIL / PARTIAL). Do not return findings JSON.",
+)
+
+
+def build_cli_implement_prompt(task: Task, *, prompt: object = None) -> str:
+    """Build contract for a write-capable CLI worker (Codex, Claude Code).
+
+    The analysis contract tells a worker its deliverable is a findings report.
+    A worker that is building files read that literally: it stopped once its
+    checks passed and spent its output on the report, so the files it was
+    asked to craft got less of the turn.
+    """
+    from puppetmaster.acceptance_criteria import (
+        acceptance_criteria_for_task,
+        ensure_acceptance_criteria_in_text,
+    )
+
+    body = str((task.payload.get("prompt") or task.instruction) if prompt is None else prompt or "")
+    criteria = acceptance_criteria_for_task(task)
+    if criteria:
+        body = ensure_acceptance_criteria_in_text(body, criteria)
+    return "\n".join([_PROMPT_ORIENTATION, "", *_CLI_BUILD_CONTRACT, "", TASK_INSTRUCTION_HEADER, body])
+
+
 _ANALYZE_JSON_ONLY_RETRY = (
     "\n\nIMPORTANT: your previous response did not submit the required structured "
     "output. Finish now by CALLING the `submit_findings` tool with an `artifacts` "
@@ -462,7 +496,7 @@ def _reanchor_acceptance_criteria(prompt: str, task: Task) -> str:
         return prompt
 
 
-def with_job_brief(prompt: str, task: Task) -> str:
+def with_job_brief(prompt: str, task: Task, *, shared_brief: bool = True) -> str:
     """Inject the job-stable shared CodeGraph / repo brief before the task.
 
     Reads bytes persisted at job start (see ``puppetmaster.job_brief``) so every
@@ -470,17 +504,21 @@ def with_job_brief(prompt: str, task: Task) -> str:
     via ``split_prompt_messages`` (distinct header from per-task CodeGraph).
     Best-effort; never raises. Kill switch: ``PUPPETMASTER_JOB_BRIEF=0``.
 
+    ``shared_brief=False`` skips that section (prewalk plan and criteria still
+    apply) for a worker that receives its own task-scoped CodeGraph context.
+
     Also applies :func:`with_prewalk_plan` so every implement-mode adapter that
     already funnels through this helper gets upstream plan injection for free.
     """
-    try:
-        from puppetmaster.job_brief import resolve_job_brief_for_task
+    if shared_brief:
+        try:
+            from puppetmaster.job_brief import resolve_job_brief_for_task
 
-        section = resolve_job_brief_for_task(task)
-        if section:
-            prompt = insert_before_task(prompt, section.strip("\n"))
-    except Exception:
-        pass
+            section = resolve_job_brief_for_task(task)
+            if section:
+                prompt = insert_before_task(prompt, section.strip("\n"))
+        except Exception:
+            pass
     prompt = with_prewalk_plan(prompt, task)
     return _reanchor_acceptance_criteria(prompt, task)
 
