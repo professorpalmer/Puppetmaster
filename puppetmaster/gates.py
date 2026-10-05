@@ -620,17 +620,70 @@ def parse_review_verdict(text: str) -> Optional[dict[str, Any]]:
     return None
 
 
+def _judge_payload(task: Task, judge: "ModelSpec", *, prompt: str, cwd: Path, timeout: int) -> dict[str, Any]:
+    """A read-only review payload for ``judge``, independent of the implementer's run.
+
+    Copying the implementer's payload made the judge write-capable (Claude Code
+    inherited ``permission_mode: acceptEdits``), so the clean-tree guard
+    blocked it on the dirty tree it was reviewing, or with ``allow_dirty`` it
+    could edit that tree; it could also inherit a ``resume`` record and
+    continue the implementer's session. Only the registry authority carries over.
+    """
+    implementer = task.payload or {}
+    defaults = getattr(judge, "payload_defaults", None)
+    payload: dict[str, Any] = dict(defaults) if isinstance(defaults, dict) else {}
+    for key in ("registry_path", "registry_digest"):
+        if implementer.get(key):
+            payload[key] = implementer[key]
+    payload.update(
+        {
+            "prompt": prompt,
+            "model": judge.adapter_model_name,
+            "cwd": str(cwd),
+            "mode": "analyze",
+            "implement": False,
+            "read_only": True,
+            "sandbox": "read-only",
+            "disable_memory": True,
+            "disable_codegraph": True,
+            "auto_route": False,
+            "timeout_seconds": timeout,
+        }
+    )
+    return payload
+
+
 def _verdict_from_artifacts(artifacts: list[Artifact]) -> Optional[dict[str, Any]]:
     """Scan a judge run's artifacts for the verdict marker. The marker may land
     in a parsed FINDING/VERIFICATION payload or in the raw captured stdout the
-    adapter stashes on its verification artifact — search all of it."""
+    adapter stashes on its verification artifact — search all of it, including
+    JSON-wrapped stdout (Claude Code's result object), whose escaped quotes
+    would otherwise hide the verdict JSON from the brace matcher."""
     for artifact in artifacts:
         for value in (artifact.payload or {}).values():
-            if isinstance(value, str) and _REVIEW_VERDICT_MARKER in value:
-                verdict = parse_review_verdict(value)
+            if not isinstance(value, str) or _REVIEW_VERDICT_MARKER not in value:
+                continue
+            for text in _verdict_texts(value):
+                verdict = parse_review_verdict(text)
                 if verdict is not None:
                     return verdict
     return None
+
+
+def _verdict_texts(value: str) -> list[str]:
+    texts = [value]
+    stripped = value.strip()
+    if stripped.startswith("{"):
+        try:
+            decoded = json.loads(stripped)
+        except ValueError:
+            decoded = None
+        if isinstance(decoded, dict):
+            texts.extend(
+                str(field) for field in decoded.values()
+                if isinstance(field, str) and _REVIEW_VERDICT_MARKER in field
+            )
+    return texts
 
 
 def default_judge_review(
@@ -668,18 +721,7 @@ def default_judge_review(
         judge_task = _replace(
             task,
             adapter=judge.adapter,
-            payload={
-                **(task.payload or {}),
-                "prompt": prompt,
-                "model": judge.adapter_model_name,
-                "cwd": str(cwd),
-                "mode": "analyze",
-                "implement": False,
-                "disable_memory": True,
-                "disable_codegraph": True,
-                "auto_route": False,
-                "timeout_seconds": timeout,
-            },
+            payload=_judge_payload(task, judge, prompt=prompt, cwd=cwd, timeout=timeout),
         )
         artifacts = get_adapter(judge.adapter).run(
             judge_task, prompt, concrete_judge_identity

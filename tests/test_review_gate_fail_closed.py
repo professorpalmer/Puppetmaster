@@ -648,3 +648,65 @@ class DispatchableJudgeSelectionTests(TestCase):
     def test_nothing_dispatchable_keeps_the_previous_choice(self) -> None:
         judge = self._judge(lambda adapter: False)
         self.assertEqual(judge.id, "antigravity/gemini-3-5-flash")
+
+
+class JudgeIsolationTests(TestCase):
+    """The judge runs read-only and independent of the implementer's payload."""
+
+    def _judge_spec(self) -> ModelSpec:
+        return ModelSpec(
+            id="claude-code/claude-sonnet-4-5",
+            adapter="claude-code",
+            adapter_model_name="claude-sonnet-4-5",
+            capability_score=82,
+            billing="plan",
+            payload_defaults={"extra_args": ["--effort", "medium"]},
+        )
+
+    def test_judge_payload_drops_implementer_write_and_resume_state(self) -> None:
+        from puppetmaster import gates
+
+        captured = {}
+
+        class FakeAdapter:
+            def run(self, task, goal, worker_id):
+                captured["payload"] = dict(task.payload)
+                return []
+
+        task = Task(
+            job_id="j", role="implement", adapter="claude-code", instruction="edit",
+            payload={
+                "cwd": "/repo", "mode": "implement", "permission_mode": "acceptEdits",
+                "allow_dirty": True, "review_loop": True,
+                "resume": {"status": "resolved", "adapter": "claude-code", "session_id": "s"},
+                "registry_path": "/reg/models.json", "registry_digest": "sha256:abc",
+            },
+        )
+        with patch.dict(os.environ, {"PUPPETMASTER_REVIEW_GATE": "1"}), \
+                patch("puppetmaster.adapters.get_adapter", return_value=FakeAdapter()):
+            gates.default_judge_review(prompt="p", judge=self._judge_spec(), cwd=Path("/repo"), timeout=30, task=task)
+
+        payload = captured["payload"]
+        for leaked in ("resume", "allow_dirty", "permission_mode", "review_loop"):
+            self.assertNotIn(leaked, payload)
+        self.assertTrue(payload["read_only"])
+        self.assertEqual(payload["sandbox"], "read-only")
+        self.assertEqual(payload["model"], "claude-sonnet-4-5")
+        self.assertEqual(payload["extra_args"], ["--effort", "medium"])
+        self.assertEqual((payload["registry_path"], payload["registry_digest"]), ("/reg/models.json", "sha256:abc"))
+
+    def test_verdict_is_read_from_json_wrapped_stdout(self) -> None:
+        import json as _json
+
+        from puppetmaster.gates import _verdict_from_artifacts
+        from puppetmaster.models import Artifact, ArtifactType
+
+        result = 'Looks fine.\nPUPPETMASTER_REVIEW_VERDICT {"pass": true, "severity": "none", "reasons": []}\nVERDICT: PASS - ok'
+        artifact = Artifact(
+            job_id="j", task_id="t", type=ArtifactType.VERIFICATION, created_by="judge",
+            confidence=0.9, evidence=["adapter:claude-code"],
+            payload={"check": "review", "result": "passed", "stdout": _json.dumps({"type": "result", "result": result})},
+        )
+        verdict = _verdict_from_artifacts([artifact])
+        self.assertIsNotNone(verdict)
+        self.assertIs(verdict["pass"], True)
