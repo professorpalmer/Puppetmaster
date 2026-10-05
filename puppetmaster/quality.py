@@ -207,6 +207,15 @@ def assess_run_quality(artifacts: Iterable[Artifact]) -> dict[str, Any]:
             **evaluator_summary,
         }
 
+    if _write_run_changed_nothing(artifacts):
+        return {
+            "quality": "degraded",
+            "reasons": ["write-capable run changed nothing (no diff, patch or commit)"],
+            "trustworthy": False,
+            "blocking_failures": [],
+            **evaluator_summary,
+        }
+
     return {
         "quality": "ok",
         "reasons": [],
@@ -214,3 +223,23 @@ def assess_run_quality(artifacts: Iterable[Artifact]) -> dict[str, Any]:
         "blocking_failures": [],
         **evaluator_summary,
     }
+
+
+_WRITE_PERMISSION_MODES = ("acceptEdits", "bypassPermissions")
+_WRITE_SANDBOXES = ("workspace-write", "danger-full-access")
+
+
+def _write_run_changed_nothing(artifacts: list[Artifact]) -> bool:
+    """A run its adapter allowed to edit, that reported no change of its own.
+
+    A refusal ("I can't proceed") is a finding, so it once read as a
+    delivered, trustworthy job.
+    """
+    if any(a.type == ArtifactType.PATCH for a in artifacts):
+        return False
+    receipts = [_payload(a) for a in artifacts if a.type == ArtifactType.VERIFICATION
+                and "worker_diff_present" in _payload(a)]
+    writable = [p for p in receipts if p.get("permission_mode") in _WRITE_PERMISSION_MODES
+                or p.get("sandbox") in _WRITE_SANDBOXES]
+    return bool(writable) and not any(p.get("worker_diff_present") or p.get("commit_sha")
+                                      for p in receipts)
