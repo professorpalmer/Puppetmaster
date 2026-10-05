@@ -24,9 +24,11 @@ DELEGATE_UPFRONT = "delegate_upfront"
 DONE_STATUSES = frozenset(("done", "completed", "complete"))
 PARALLEL_TAG = "[parallel]"
 
-# Provisional until the falloff sweep writes a calibration file: sol61 sizes
-# 1-4 (solo wins) and the Sep 16 n=1 runs (16 coupled regions capped solo at
-# 8/16 in 30 minutes).
+# Provisional until the falloff sweep writes a calibration file. The sealed
+# Sol 6.1 high voxel study (153 cells, PM 1.27.39) puts the first consistent
+# crossover at 16 regions, and it is a quality crossover: solo often finishes
+# in time but under the floor (64 grouped: solo 403 s, 0/3 qualified; native
+# 494 s, 3/3). A time projection cannot see that, so upfront_units carries it.
 DEFAULT_CALIBRATION: dict[str, Any] = {
     "solo_horizon_s": 1200.0,
     "solo_context_frac": 0.6,
@@ -34,7 +36,7 @@ DEFAULT_CALIBRATION: dict[str, Any] = {
     "upfront_units": 16,
     "handoff_overhead_s": 90.0,
     "late_fraction": 0.8,
-    "source": "built-in provisional default",
+    "source": "provisional: sealed sol61 voxel study, quality crossover at 16 regions",
 }
 
 
