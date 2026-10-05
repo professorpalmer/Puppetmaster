@@ -739,6 +739,27 @@ def _run_should_delegate_command(args) -> int:
         print(f"signals: {', '.join(decision.matched_signals)}")
     return 0
 
+def _run_sizing_command(args) -> int:
+    """Sizing gate: stay solo, hand off the remaining independent units, or fan out upfront."""
+    from puppetmaster import sizing
+
+    source = sys.stdin.read() if args.plan == "-" else Path(args.plan).read_text(encoding="utf-8")
+    units = sizing.parse_plan(json.loads(source or "[]"))
+    decision = sizing.decide(
+        units, elapsed_s=args.elapsed, context_frac=args.context_frac,
+        calibration=sizing.load_calibration(args.model or ""),
+    )
+    if args.json:
+        print(json.dumps({**decision.to_dict(), "advice": sizing.advice(decision)}, indent=2))
+        return 0
+    print(f"{decision.action}  ({decision.done_units}/{decision.total_units} done, "
+          f"{decision.remaining_independent} independent left)")
+    print(f"why:    {decision.reason}")
+    text = sizing.advice(decision)
+    if text:
+        print(text)
+    return 0
+
 def _run_invocation_gate_command(args) -> int:
     """Host-hook entry point. Reads stdin JSON, prints host verdict, exits 0."""
     from puppetmaster.hook_runner import run as run_hook
