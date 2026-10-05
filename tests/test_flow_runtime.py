@@ -258,6 +258,34 @@ class WalkerSemanticsTests(Base):
         self.assertEqual(len(calls), 1)
 
 
+class HonestEndTests(Base):
+    def test_failed_node_carried_to_an_implicit_end_fails_the_run(self):
+        g = graph([agent("build"), {"id": "done", "kind": "end"}], [{"from": "build", "to": "done"}])
+        run = self.start(g, Scripted({"build": [NodeOutcome(ok=False, error="task failed")]}))
+        self.assertEqual(run.status, "failed")
+        self.assertIn("build: task failed", run.reason)
+
+    def test_explicit_end_status_still_wins(self):
+        g = graph([agent("build"), {"id": "done", "kind": "end", "status": "pass"}],
+                  [{"from": "build", "to": "done"}])
+        run = self.start(g, Scripted({"build": [NodeOutcome(ok=False, error="task failed")]}))
+        self.assertEqual(run.status, "done")
+
+    def test_repaired_failure_does_not_fail_the_end(self):
+        g = graph([agent("build"), {"id": "check", "kind": "shell", "command": "x"},
+                   {"id": "done", "kind": "end"}],
+                  [{"from": "build", "to": "check"}, {"from": "check", "to": "build", "when": "fail", "max": 2},
+                   {"from": "check", "to": "done", "when": "ok"}])
+        run = self.start(g, Scripted({"check": [NodeOutcome(ok=False, error="red"), NodeOutcome(ok=True)]}))
+        self.assertEqual(run.status, "done", run.reason)
+
+    def test_mcp_flow_example_graph_validates(self):
+        from puppetmaster import mcp_server
+        text = mcp_server.flow_schema()["properties"]["graph"]["description"]
+        example = json.loads(text[text.index('{"id": "mods"'):text.index(". Full reference")])
+        self.assertEqual(flow.validate_graph(example), [])
+
+
 class TemplateAndSafetyTests(Base):
     def run_with(self, **state):
         return flow.FlowRun(run_id="flow_000000000000", graph={}, state=state, input="in")
@@ -648,7 +676,7 @@ class MapTests(Base):
         items = run.results["m"]["items"]
         self.assertTrue(items["a1"]["ok"])
         self.assertFalse(items["b2"]["ok"])
-        self.assertEqual(items["b2"]["status"], "done")
+        self.assertEqual(items["b2"]["status"], "failed")
         self.assertIn("build: task failed: gate write_scope", run.reason)
 
     def test_pass_fraction_policy(self):

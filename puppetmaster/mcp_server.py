@@ -4859,7 +4859,25 @@ def flow_schema() -> JsonObject:
                 "enum": ["validate", "save", "run", "status", "wait", "resume", "stop", "cut", "list"],
             },
             "graph": {
-                "description": "Graph object, a path to a graph JSON file, or a saved graph id.",
+                "description": (
+                    "Graph object, a path to a graph JSON file, or a saved graph id. Shape: "
+                    "{id, entry, defaults: {adapter (required: codex|claude-code|cursor|agentic), model?, "
+                    "effort?, lanes?, timeout_seconds?}, "
+                    "nodes: [...], edges: [{from, to, when?, max?}]}. Node fields by kind: "
+                    "agent {id, role: code|explore, task, files?}; judge {id, task} (ends in "
+                    "VERDICT: PASS|FAIL|PARTIAL); shell {id, command}; map {id, items, "
+                    "concurrency?, graph: <item graph using {{item}}>}; gate {id, question, "
+                    "options}; set {id, values}; end {id, status?: pass|fail}. Templates: "
+                    "{{input}} {{item}} {{out.<node>}} {{state.<k>}}. Example fan-out: "
+                    '{"id": "mods", "entry": "all", "defaults": {"adapter": "codex"}, "nodes": [{"id": "all", "kind": "map", '
+                    '"items": ["a", "b"], "concurrency": 8, "graph": {"entry": "build", '
+                    '"nodes": [{"id": "build", "kind": "agent", "files": ["mods/{{item}}.py"], '
+                    '"task": "Implement tasks/{{item}}.md"}, {"id": "check", "kind": "shell", '
+                    '"command": "python3 tests/check_{{item}}.py"}, {"id": "done", "kind": "end"}], '
+                    '"edges": [{"from": "build", "to": "check"}, {"from": "check", "to": "build", '
+                    '"when": "fail", "max": 2}, {"from": "check", "to": "done", "when": "ok"}]}}], '
+                    '"edges": []}. Full reference: docs/FLOWS.md.'
+                ),
                 "anyOf": [{"type": "object"}, {"type": "string"}],
             },
             "input": {"type": "string", "description": "The run's {{input}}."},
