@@ -1847,6 +1847,11 @@ def _main(argv: Optional[list[str]] = None) -> int:
     if args.command == "await":
         return _run_await_command(args, store)
 
+    if args.command == "flow":
+        from puppetmaster.cli.commands_flow import run_flow_command
+
+        return run_flow_command(args, state_dir)
+
     if args.command == "artifacts":
         from puppetmaster import reads_log
         from puppetmaster.validation import compact_artifact_ref

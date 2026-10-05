@@ -227,6 +227,9 @@ def _resolve(store: Any, payload: dict, adapter: str) -> dict:
         if artifact.task_id == prior.id
         and artifact.type == ArtifactType.VERIFICATION
         and (artifact.payload or {}).get("adapter") == adapter
+        # A worker's VERDICT line is stored as a verification artifact of the
+        # same adapter but carries no session id; it is not the receipt.
+        and (artifact.payload or {}).get("kind") != "worker_verdict"
     ]
     if not verifications:
         return _unavailable(payload, f"prior task {prior.id!r} has no {adapter} verification receipt")

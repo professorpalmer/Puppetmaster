@@ -23937,6 +23937,67 @@ class PuppetmasterGateTests(unittest.TestCase):
             self.assertFalse(stray.passed)
             self.assertIn("outside declared scope", stray.failed_reason)
 
+    def test_write_scope_gate_judges_the_runs_own_delta_not_earlier_dirty_work(self) -> None:
+        """A node after uncommitted earlier work is charged only with what it changed."""
+        from puppetmaster.gates import evaluate_task_gates
+        from puppetmaster.models import Artifact, ArtifactType
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            repo = Path(tmp) / "repo"
+            self._git_repo(repo)
+            (repo / "earlier.py").write_text("left by an earlier node\n")
+            (repo / "mine.py").write_text("x = 1\n")
+            task = self._task(write_scope=["mine.py"], cwd=str(repo))
+
+            def run_artifacts(files):
+                receipt = Artifact(job_id=task.job_id, task_id=task.id, type=ArtifactType.VERIFICATION,
+                                   created_by="w", confidence=0.9, evidence=["adapter:codex"],
+                                   payload={"check": "c", "result": "passed", "worker_diff_present": True,
+                                            "baseline_diff_present": True, "worker_delta_attributed": True})
+                patch = Artifact(job_id=task.job_id, task_id=task.id, type=ArtifactType.PATCH,
+                                 created_by="w", confidence=0.9, evidence=["adapter:codex"],
+                                 payload={"change": "c", "files": files, "worker_diff_present": True,
+                                          "worker_delta_attributed": True})
+                return [receipt, patch]
+
+            self.assertTrue(evaluate_task_gates(task, run_artifacts(["mine.py"]), store,
+                                                worker_id="w1", cwd=repo).passed)
+            stray = evaluate_task_gates(task, run_artifacts(["mine.py", "earlier.py"]), store,
+                                        worker_id="w1", cwd=repo)
+            self.assertFalse(stray.passed)
+            # Without attribution the gate still falls back to the whole tree.
+            self.assertFalse(evaluate_task_gates(task, [], store, worker_id="w1", cwd=repo).passed)
+            # "No diff measured" on a dirty tree is not "nothing changed".
+            unmeasured = [Artifact(job_id=task.job_id, task_id=task.id, type=ArtifactType.VERIFICATION,
+                                   created_by="w", confidence=0.9, evidence=["adapter:codex"],
+                                   payload={"check": "c", "result": "passed", "worker_diff_present": False,
+                                            "baseline_diff_present": True})]
+            self.assertFalse(evaluate_task_gates(task, unmeasured, store, worker_id="w1", cwd=repo).passed)
+
+    def test_write_scope_gate_honors_peer_scopes_from_other_jobs(self) -> None:
+        """Flow map items run one job each in a shared workspace; peers arrive in the payload."""
+        from puppetmaster.gates import evaluate_task_gates
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            repo = Path(tmp) / "repo"
+            self._git_repo(repo)
+            (repo / "shapes").mkdir()
+            for name in ("circle.py", "square.py"):
+                (repo / "shapes" / name).write_text("x = 1\n")
+            lone = self._task(write_scope=["shapes/circle.py"], cwd=str(repo))
+            self.assertFalse(evaluate_task_gates(lone, [], store, worker_id="w1", cwd=repo).passed)
+            peered = self._task(write_scope=["shapes/circle.py"], peer_write_scopes=["shapes/square.py"],
+                                cwd=str(repo))
+            self.assertTrue(evaluate_task_gates(peered, [], store, worker_id="w1", cwd=repo).passed)
+            # A peer path that overlaps the task's own scope is a collision, never excused.
+            from puppetmaster.gates import _sibling_scopes
+
+            overlapping = self._task(write_scope=["shapes/circle.py"],
+                                     peer_write_scopes=["shapes/square.py", "shapes/*"], cwd=str(repo))
+            self.assertEqual(_sibling_scopes(store, overlapping), ["shapes/square.py"])
+
     def test_predict_write_conflicts_flags_overlapping_scopes(self) -> None:
         """B3/C1: overlapping declared scopes are predicted before dispatch."""
         from puppetmaster.conflicts import predict_write_conflicts, scopes_overlap

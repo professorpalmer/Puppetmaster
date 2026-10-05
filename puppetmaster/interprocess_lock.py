@@ -25,6 +25,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from puppetmaster.proc_identity import own_identity, pid_reused
+
 
 _DEFAULT_TIMEOUT_SECONDS = 10.0
 _DEFAULT_STALE_AFTER_SECONDS = 120.0
@@ -96,7 +98,7 @@ class InterProcessFileLock:
         deadline = time.monotonic() + self.timeout
         token = secrets.token_hex(16)
         payload = json.dumps(
-            {"pid": os.getpid(), "created_at": time.time(), "token": token},
+            {"pid": os.getpid(), "created_at": time.time(), "token": token, "proc": own_identity()},
             separators=(",", ":"),
         ).encode("utf-8")
         while True:
@@ -107,7 +109,8 @@ class InterProcessFileLock:
                     0o600 if os.name != "nt" else 0o666,
                 )
             except FileExistsError:
-                self._recover_stale_owner()
+                if self._recover_stale_owner():
+                    continue
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
                         "timed out acquiring interprocess lock for " + str(self.target)
@@ -145,8 +148,14 @@ class InterProcessFileLock:
             except FileNotFoundError:
                 pass
 
-    def _recover_stale_owner(self) -> None:
-        """Remove only an orphaned lock, with a guard against reclaim races."""
+    def _recover_stale_owner(self) -> bool:
+        """Remove only an orphaned lock, with a guard against reclaim races.
+
+        The owner is gone when its pid is dead or now names a later process
+        (the lock records the owner's identity, see ``proc_identity``).
+        Returns True when the lock file was removed, so the caller can retry
+        at once.
+        """
         reclaim_path = self.path.with_name(self.path.name + ".reclaim")
         try:
             reclaim_fd = os.open(
@@ -155,7 +164,7 @@ class InterProcessFileLock:
                 0o600 if os.name != "nt" else 0o666,
             )
         except FileExistsError:
-            return
+            return False
         try:
             os.close(reclaim_fd)
             try:
@@ -171,7 +180,8 @@ class InterProcessFileLock:
                     created_at = self.path.stat().st_mtime
                 except OSError:
                     created_at = None
-            owner_alive = isinstance(pid, int) and _pid_is_alive(pid)
+            owner_alive = isinstance(pid, int) and _pid_is_alive(pid) and not pid_reused(
+                pid, data.get("proc") if isinstance(data, dict) else None)
             age = now - created_at if isinstance(created_at, (int, float)) else None
             recoverable = (isinstance(pid, int) and not owner_alive) or (
                 not isinstance(pid, int) and age is not None and age >= self.stale_after
@@ -181,6 +191,8 @@ class InterProcessFileLock:
                     self.path.unlink()
                 except FileNotFoundError:
                     pass
+                return True
+            return False
         finally:
             try:
                 reclaim_path.unlink()

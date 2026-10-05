@@ -469,64 +469,140 @@ class Orchestrator:
         record_orchestrator_heartbeat(self.store, job.id, started=True)
         self._begin_trace()
         try:
-            specs = self._with_retrieved_memory(launch_specs, goal, job_id=job.id)
-            specs = self._with_injected_skills(job, specs)
-            specs = self._with_output_style(specs)
-            self._announce_mode(job, specs)
-            self._ensure_plan_catalog(job, specs)
-            self._ensure_job_brief(job, goal, specs)
-            self.store.update_job_status(job.id, JobStatus.RUNNING)
-            tasks = self._create_tasks(job, specs)
-            self._maybe_record_already_answered(job, goal, specs, tasks)
-            self._run_workers_and_successors(
-                job, tasks, lease_seconds=lease_seconds, worker_mode=worker_mode
-            )
-            # Explicit failure edges are coordinator-owned. Apply them before
-            # fallback/review so retry/continue cannot be multiplied by those
-            # older recovery mechanisms, and let retry generations run.
-            for _ in range(11):
-                changed = self.store.apply_pending_failure_policies(job.id)
-                self.store.refresh_blocked_tasks(job.id)
-                retryable = [t for t in changed if t.status == TaskStatus.QUEUED]
-                if not retryable:
-                    break
-                self._run_workers_and_successors(
-                    job, retryable, lease_seconds=lease_seconds, worker_mode=worker_mode
-                )
-            if swarm_mode(specs) == "analysis":
-                self._enforce_analysis_no_worker_diff(job, tasks)
-            rerouted = self._auto_fallback(job, lease_seconds=lease_seconds, worker_mode=worker_mode)
-            rerouted += self._auto_escalate(job, lease_seconds=lease_seconds, worker_mode=worker_mode)
-            rerouted += self._quality_review_repair(
-                job, lease_seconds=lease_seconds, worker_mode=worker_mode
-            )
-            rerouted += self._auto_review_escalate(
-                job, lease_seconds=lease_seconds, worker_mode=worker_mode
-            )
-            artifacts = self.store.list_artifacts(job.id)
-
-            self.store.update_job_status(job.id, JobStatus.STITCHING)
-            summary = Stitcher(self.store).stitch(job.id)
-            completed = self.store.update_job_status(
-                job.id, self._final_job_status(job)
-            )
-            self._emit_hermes_spawn_tree(completed, artifacts, specs)
-            summary_path = self.store.job_dir(job.id) / "summaries" / "stitched.md"
-            self._emit_telemetry(completed, artifacts)
-            return RunResult(
-                job=completed,
-                artifacts=artifacts,
-                summary=summary,
-                summary_path=summary_path,
-                rerouted_tasks=rerouted,
-                mode=swarm_mode(specs),
-                acting=swarm_is_acting(specs),
-            )
+            specs, tasks = self._prepare_tasks(job, goal, launch_specs)
+            return self._drive(job, specs, tasks, lease_seconds=lease_seconds, worker_mode=worker_mode)
         except Exception:
             self.store.update_job_status(job.id, JobStatus.FAILED)
             raise
         finally:
             self._traceparent = None
+
+    def adopt(self, job_id: str, *, lease_seconds: int = 5, worker_mode: str = "subprocess",
+              poll_seconds: float = 1.0, specs: Optional[list[WorkerSpec]] = None,
+              stall_seconds: float = 300.0) -> RunResult:
+        """Finish a durable job whose coordinator died.
+
+        Workers that outlived the coordinator keep renewing their leases, so
+        wait for them rather than compete; recover tasks whose leases lapsed;
+        then drive whatever is still queued and stitch the result. A job that
+        already reached a terminal status is returned as is. ``specs`` creates
+        the tasks of a job whose coordinator died before creating them. A
+        RUNNING task that makes no progress for ``stall_seconds`` stops the
+        wait, so adoption can fail but never hang.
+        """
+        job = self.store.get_job(job_id)
+        if job.status in (JobStatus.COMPLETE, JobStatus.FAILED, JobStatus.CANCELLED):
+            return self._existing_result(job)
+        # Claim the job before waiting: the reaper reads a dead coordinator's
+        # heartbeat as a stalled job.
+        record_orchestrator_heartbeat(self.store, job_id, started=True)
+        last_change, last_view = time.monotonic(), None
+        while True:
+            record_orchestrator_heartbeat(self.store, job_id)
+            self.store.recover_stale_tasks(job_id)
+            tasks = self.store.list_tasks(job_id)
+            running = [task for task in tasks if task.status == TaskStatus.RUNNING]
+            if not running:
+                break
+            view = tuple((task.id, task.status, task.lease_expires_at, task.updated_at) for task in tasks)
+            if view != last_view:
+                last_view, last_change = view, time.monotonic()
+            elif time.monotonic() - last_change > stall_seconds:
+                self.store.emit(job_id, "job.adopt_stalled", {"running": [task.id for task in running]})
+                break
+            time.sleep(poll_seconds)
+        self._begin_trace()
+        try:
+            if not tasks and specs:
+                specs, tasks = self._prepare_tasks(job, job.goal, list(specs))
+            specs = specs or [
+                WorkerSpec(role=task.role, instruction=task.instruction, adapter=task.adapter,
+                           payload=dict(task.payload or {}))
+                for task in tasks
+            ]
+            pending = [task for task in tasks if task.status in (TaskStatus.QUEUED, TaskStatus.BLOCKED)]
+            self.store.emit(job_id, "job.adopted", {"pending": len(pending), "tasks": len(tasks)})
+            self.store.update_job_status(job.id, JobStatus.RUNNING)
+            return self._drive(job, specs, pending, lease_seconds=lease_seconds, worker_mode=worker_mode)
+        except Exception:
+            self.store.update_job_status(job.id, JobStatus.FAILED)
+            raise
+        finally:
+            self._traceparent = None
+
+    def _prepare_tasks(self, job: Job, goal: str,
+                       launch_specs: list[WorkerSpec]) -> tuple[list[WorkerSpec], list[Task]]:
+        """Give specs the memory, skills, style and brief of every launch, then create the tasks."""
+        specs = self._with_retrieved_memory(launch_specs, goal, job_id=job.id)
+        specs = self._with_injected_skills(job, specs)
+        specs = self._with_output_style(specs)
+        self._announce_mode(job, specs)
+        self._ensure_plan_catalog(job, specs)
+        self._ensure_job_brief(job, goal, specs)
+        self.store.update_job_status(job.id, JobStatus.RUNNING)
+        tasks = self._create_tasks(job, specs)
+        self._maybe_record_already_answered(job, goal, specs, tasks)
+        return specs, tasks
+
+    def _existing_result(self, job: Job) -> RunResult:
+        summary_path = self.store.job_dir(job.id) / "summaries" / "stitched.md"
+        summary = (
+            summary_path.read_text(encoding="utf-8")
+            if summary_path.is_file()
+            else Stitcher(self.store).preview(job.id)
+        )
+        return RunResult(
+            job=job, artifacts=self.store.list_artifacts(job.id),
+            summary=summary, summary_path=summary_path,
+        )
+
+    def _drive(self, job: Job, specs: list[WorkerSpec], tasks: list[Task], *,
+               lease_seconds: int, worker_mode: str) -> RunResult:
+        """Run a created job's tasks to a terminal status and stitch the result."""
+        self._run_workers_and_successors(
+            job, tasks, lease_seconds=lease_seconds, worker_mode=worker_mode
+        )
+        # Explicit failure edges are coordinator-owned. Apply them before
+        # fallback/review so retry/continue cannot be multiplied by those
+        # older recovery mechanisms, and let retry generations run.
+        for _ in range(11):
+            changed = self.store.apply_pending_failure_policies(job.id)
+            self.store.refresh_blocked_tasks(job.id)
+            retryable = [t for t in changed if t.status == TaskStatus.QUEUED]
+            if not retryable:
+                break
+            self._run_workers_and_successors(
+                job, retryable, lease_seconds=lease_seconds, worker_mode=worker_mode
+            )
+        if swarm_mode(specs) == "analysis":
+            self._enforce_analysis_no_worker_diff(job, tasks)
+        rerouted = self._auto_fallback(job, lease_seconds=lease_seconds, worker_mode=worker_mode)
+        rerouted += self._auto_escalate(job, lease_seconds=lease_seconds, worker_mode=worker_mode)
+        rerouted += self._quality_review_repair(
+            job, lease_seconds=lease_seconds, worker_mode=worker_mode
+        )
+        rerouted += self._auto_review_escalate(
+            job, lease_seconds=lease_seconds, worker_mode=worker_mode
+        )
+        artifacts = self.store.list_artifacts(job.id)
+
+        self.store.update_job_status(job.id, JobStatus.STITCHING)
+        summary = Stitcher(self.store).stitch(job.id)
+        completed = self.store.update_job_status(
+            job.id, self._final_job_status(job)
+        )
+        self._emit_hermes_spawn_tree(completed, artifacts, specs)
+        summary_path = self.store.job_dir(job.id) / "summaries" / "stitched.md"
+        self._emit_telemetry(completed, artifacts)
+        return RunResult(
+            job=completed,
+            artifacts=artifacts,
+            summary=summary,
+            summary_path=summary_path,
+            rerouted_tasks=rerouted,
+            mode=swarm_mode(specs),
+            acting=swarm_is_acting(specs),
+        )
 
     def _announce_mode(self, job: Job, specs: list[WorkerSpec]) -> str:
         """Emit a one-line banner classifying the swarm as edit vs analysis so a

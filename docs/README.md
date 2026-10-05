@@ -12,6 +12,7 @@ The full documentation set. Start at the [project README](../README.md) for the 
 | [WHY.md](WHY.md) | Design rationale: what shared-transcript subagents get wrong, what durable state fixes |
 | [CLAIMS.md](CLAIMS.md) | The four headline claims with reproducible receipts from [`bench/`](../bench/) |
 | [FEATURES.md](FEATURES.md) | Pilots (including Grok Bot remote MCP), adapters, and the full feature matrix |
+- [FLOWS.md](FLOWS.md) — flow graphs: one graph, one wake; resumable nodes and `map` fan-out
 | [COMPARISON.md](COMPARISON.md) | How it differs from LangGraph / CrewAI / Claude Agent SDK / native subagents + "pick X instead if…" |
 | [SECURITY.md](SECURITY.md) | Threat model: what it can do, what it touches, network egress, and how to run it safely |
 | [DAILY_DRIVER.md](DAILY_DRIVER.md) | Prompt recipes for review, swarm, implement, post-job inspection |

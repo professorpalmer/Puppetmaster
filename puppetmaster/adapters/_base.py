@@ -106,6 +106,10 @@ def diff_source_payload(before: dict, after: dict) -> dict[str, Any]:
     return {
         "baseline_diff_present": facade("snapshot_has_diff")(before),
         "worker_diff_present": worker_diff_present,
+        # True only when the run's own delta was computed from the tree it
+        # started on; ``worker_diff_present`` alone cannot tell "no change"
+        # from "not measured".
+        "worker_delta_attributed": worker_diff is not None,
     }
 
 

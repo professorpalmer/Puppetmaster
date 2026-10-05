@@ -1,3 +1,106 @@
+## v1.29.0 — 2026-10-05
+
+**Flow graphs: the pilot writes one graph and is woken only when it is done, failed, stuck, interrupted or waiting at a gate. Nodes are durable jobs that resume their own sessions; `map` fans out per-item flows.**
+
+In the sealed voxel study the pilot's own bookkeeping was a large share of
+Puppetmaster's loss. Writing manifests, launching, polling receipts and
+integrating by hand put the first worker at 92s against native's 43s. The
+post-graph integration took about 115s against 40s, and every follow-up
+started fresh workers that re-read 30-100k tokens. Flows move that control
+loop out of the pilot. The graph format (nodes, ordered first-match edges,
+per-edge loop budgets, verdict routing, gates, wake-on-event) follows a design
+from a friend's mass-orchestration runtime; Puppetmaster runs it on durable
+jobs.
+
+Measured on real Codex runs (`gpt-5.6-luna`):
+
+| Run | What happened | Time |
+| --- | --- | --- |
+| Repair loop | build, check, review FAIL, the builder resumes with the findings, review PASS | 75-87s |
+| Follow-up | `--continue` on that run; builder and judge resume their sessions (29k fresh input tokens, 437k cached) | 26-30s |
+| Map repair | 3 items in parallel, assemble, consistency FAIL, integrate, targeted item repair, PASS | 178-204s |
+| Crash | walker SIGKILLed mid-node; the worker finished and `flow resume` adopted its job: one job, one task, one claim | 25s |
+
+- **Commands.** `puppetmaster flow run|wait|status|resume|stop|cut|list|validate|save|show`
+  and the MCP tool `puppetmaster_flow`. One call starts a run; `wait` blocks
+  up to the MCP cap.
+  - Nodes: agent (code or explore), judge, parallel, map, shell, gate, set,
+    end.
+  - Edges route on `ok`/`fail`, a verdict, a gate answer, an output substring
+    or a state predicate. The first match in declaration order wins.
+  - A back-edge past its `max` makes the run `stuck` instead of looping, and
+    so does a judge with no verdict line, which never passes quietly.
+  - See [FLOWS.md](FLOWS.md).
+- **Exactly-once agent and judge nodes.** Each node visit is persisted before
+  it starts, and its job gets the launch key
+  `flow:<run>:<node>:<visit>:<attempt>`. A walker that dies leaves the run
+  `interrupted`. Resuming adopts the job it had started instead of launching
+  it again: `Orchestrator.adopt` claims the job's heartbeat, waits out live
+  workers (giving up on a task that stalls), recovers lapsed leases, and
+  drives what is left. A job that died before creating its tasks gets them
+  with the same memory, skills, style and brief as a launch.
+- **Session continuity.** These nodes resume their own Codex or Claude Code
+  session and are sent only the delta (the feedback or the follow-up):
+  - a node re-entered by a failed check or review;
+  - every node of a run started with `continue_from`.
+
+  A retry within the same visit is told its previous attempt stopped. Codex
+  nodes run non-ephemeral so their threads persist.
+- **`map` fan-out.** A list expands into per-item child flows, each walked by
+  its own process with bounded `concurrency`, so an item's judge starts as soon
+  as its own build passes.
+  - A `pass` policy (`all` or a fraction) decides the node, and the wake names
+    the failing items.
+  - An item passes only when the latest result of every work node in it
+    passed.
+  - A repair visit re-runs the items the feedback names (by key or owned file)
+    plus the items that failed. A follow-up re-runs the named items, or all of
+    them. Each continues its own child flow and receives only the feedback
+    lines about it.
+  - Item write scopes must be disjoint.
+  - Feedback that names a file no item owns is reported, not looped on.
+  - The pilot's context stays the same size at any item count.
+- **Review contract.** Read-only workers asked for a verdict
+  (`terminal_verdict`) get a review contract on Codex and Claude Code:
+  problems as `path:line - what`, then one `VERDICT:` line. They used to get
+  the findings-JSON contract, answer with JSON only, and leave a judge without
+  a verdict.
+- **Write-scope gate.**
+  - It now judges the run's own attributed delta (`worker_delta_attributed`)
+    instead of the whole dirty tree, which charged a node with every earlier
+    node's uncommitted work. It falls back to the live tree when no delta was
+    measured.
+  - Map items learn their peers' declared files (`peer_write_scopes`), so they
+    are not charged with each other's edits. A peer path that overlaps the
+    task's own scope is never excused.
+- **Shell nodes.**
+  - They run with a JSON context file (`$PM_FLOW_CONTEXT`). Substituted
+    template values must be inert in sh and cmd.exe or the node fails, so model
+    output can never become a command.
+  - A stop, a cut or the timeout kills the whole process tree.
+  - They are at-least-once: a resumed walker kills the command its dead
+    predecessor left running (when the pid still names it) and runs it again.
+- **Process identity.** Lock files, flow spawn markers and shell records now
+  store a process identity next to the pid (`proc_identity`: boot ticks on
+  Linux, `p_starttime` on macOS, the creation time on Windows). A dead owner's
+  pid that the OS has since given to another process no longer keeps a lock
+  held or a dead run looking alive. Lock recovery retries at once instead of
+  on the next poll.
+- **Stop and cut.** `stop` halts the run and cuts its in-flight tasks and item
+  flows; a node that finishes in the instant a stop lands is not recorded.
+  `cut` fails the node in flight so its `fail` edges take over; a cut map stops
+  its items and starts no more.
+- **Fixed.** Resuming a Codex task that had emitted a `VERDICT:` line picked
+  the verdict artifact as its receipt (same adapter, no thread id) and fell
+  back to a fresh session.
+- **Heartbeats.** A worker heartbeat lost to a SQLite lock error now retries
+  after 0.25s, backing off exponentially with jitter up to the heartbeat
+  interval. Before, the retry waited a full interval, and two renewals lost to
+  write contention could expire a healthy 5s lease and restart the task. Flow
+  nodes use 30s leases.
+- **Pilot rules.** Installed pilot rules point multi-step and fan-out work at
+  `puppetmaster_flow`.
+
 ## v1.28.6 — 2026-10-05
 
 **Codex build workers get a build contract instead of the findings-report contract, and builders drop the job-wide brief that diluted their task context.**

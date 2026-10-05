@@ -1,0 +1,189 @@
+# Flow graphs
+
+A flow is a graph the pilot writes **once**. Puppetmaster walks it in the
+background and wakes the pilot only when the run is done, failed, stuck,
+interrupted, or waiting at a gate. The pilot spends no model turns launching
+workers, polling, or handing work between them.
+
+Every agent and judge node runs as an ordinary durable Puppetmaster job, so it
+keeps leases, file claims, write-scope gates, receipts and crash recovery. The
+runtime adds three things a subagent tree does not have:
+
+- **Exactly-once nodes.** Each node visit is recorded before it starts and
+  launched with a deterministic key. A walker that dies mid-node adopts the job
+  it started when it resumes; it never buys the same work twice. (Shell nodes
+  are the exception: they are at-least-once, see below.)
+- **Session continuity.** A node that runs again resumes its own provider
+  session and receives only the delta: the judge's feedback, or a follow-up
+  request. This applies when a back-edge sends work back to it, and to every
+  node of a run started with `--continue`.
+- **`map` fan-out.** One node expands a list into per-item child flows. Each
+  walks in its own process with bounded concurrency. A repair visit re-runs
+  only the items the feedback names plus the items that failed. The pilot's
+  context is the same size at 4 items or 1,000.
+
+## A first flow
+
+```json
+{
+  "id": "fix-and-review",
+  "entry": "build",
+  "cwd": ".",
+  "defaults": {"adapter": "codex", "model": "gpt-5.6-luna"},
+  "nodes": [
+    {"id": "build", "kind": "agent", "role": "code", "files": ["pkg/stats.py"],
+     "task": "Implement pkg/stats.py so tests/test_stats.py passes."},
+    {"id": "check", "kind": "shell", "command": "python -m pytest -q tests/test_stats.py"},
+    {"id": "review", "kind": "judge", "task": "Review pkg/stats.py for edge cases and clarity."},
+    {"id": "done", "kind": "end", "summary": "stats accepted"}
+  ],
+  "edges": [
+    {"from": "build", "to": "check"},
+    {"from": "check", "to": "review", "when": "ok"},
+    {"from": "check", "to": "build", "when": "fail"},
+    {"from": "review", "to": "done", "when": "PASS"},
+    {"from": "review", "to": "build", "when": "FAIL", "max": 2}
+  ]
+}
+```
+
+```bash
+puppetmaster flow run fix-and-review.json --input "stats module"
+puppetmaster flow wait <run_id>
+```
+
+When `check` fails, `build` resumes its own session with the test output as
+feedback. When the judge says FAIL, `build` resumes again with the judge's
+`file:line` findings. The judge resumes too, and is asked to confirm its earlier
+problems are fixed.
+
+## Nodes
+
+| kind | what it does | ok / verdict |
+| --- | --- | --- |
+| `agent` | A worker job. `role: "code"` (default) edits within `files`; `role: "explore"` is read-only. Optional `adapter`, `model`, `timeout_seconds`, `payload`, `retries`, `saveAs`, `revise`, `resume`. | ok when the task completes; verdict from its final `VERDICT:` line |
+| `judge` | A read-only reviewer. It lists each problem as `path:line - what`, then ends with `VERDICT: PASS|FAIL|PARTIAL - reason`. A judge with no verdict makes the run `stuck`, never a quiet pass. | verdict routes the edges |
+| `parallel` | `branches: [ids]` of agent/judge nodes run as one job. Code branches need disjoint `files`. On a later visit only the failing or named branches re-run. | ok if all ok; verdict FAIL > PARTIAL > PASS |
+| `map` | `items` (a list, or a template such as `{{state.regions}}`) × a `node` template or an item `graph`. `key` (template) names items; `concurrency` (default 8); `pass` is `"all"` or a fraction such as `0.95`; `feedback` (template, e.g. `{{out.consistency}}`) chooses which output targets a repair visit. | ok when the pass policy is met |
+| `shell` | `command`, optional `cwd` and `timeoutMs`. Reads run data from the JSON file at `$PM_FLOW_CONTEXT`. A final `VERDICT:` line in its output routes like a judge. At-least-once: keep commands idempotent. | ok on exit 0 |
+| `gate` | Pauses with `question` and `options`; `flow resume <run> --answer=X` continues. Not allowed inside map items. | routes on `answer=X` |
+| `set` | `values` written into state (templated). | ok |
+| `end` | `status: pass|fail`, `summary` (templated). | ends the run |
+
+## Edges
+
+`{"from", "to", "when", "max"}`. The first matching edge in declaration order
+wins. `when` is one of:
+
+- `always` (the default), `ok`, `fail`
+- `PASS`, `FAIL`, `PARTIAL`: the node's verdict
+- `answer=X`: a gate's answer (case- and Unicode-insensitive)
+- `out~=text`: the node's output contains the text
+- `state.k OP v` with `= != >= <= > < ~=`; numbers compare numerically
+
+A back-edge (an edge that closes a cycle) may be taken at most `max` times,
+default `limits.maxLoops` (3). Past that the run is `stuck`. Forward edges are
+bounded only by `limits.maxSteps` (60). A failed node with no matching edge
+fails the run. A node with edges but no match makes the run `stuck`. A node
+with no edges ends the run.
+
+## Templates
+
+`{{input}}`, `{{prev}}` (the previous node's output), `{{answer}}`,
+`{{out.<node>}}`, `{{verdict.<node>}}`, `{{reason.<node>}}`,
+`{{files.<node>}}`, `{{state.<path>}}`, and inside a map item `{{item}}`,
+`{{item.<path>}}`, `{{index}}`, `{{key}}`. A field that is exactly one
+placeholder keeps its type, so `"files": "{{item.files}}"` stays a list.
+
+Shell commands only accept substituted values made of letters, digits and
+`_ . / : = @ + , -`. Anything else fails the node instead of running, because a
+model's output must never become a command. Read arbitrary data from
+`$PM_FLOW_CONTEXT` instead.
+
+## Mass fan-out with `map`
+
+```json
+{"id": "regions", "kind": "map", "items": "{{state.regions}}", "concurrency": 16,
+ "graph": {
+   "entry": "build",
+   "nodes": [
+     {"id": "build", "kind": "agent", "files": ["regions/{{item.id}}.py"],
+      "task": "Build region {{item.id}}: {{item.brief}}"},
+     {"id": "check", "kind": "shell", "command": "python judge.py --region {{item.id}}"},
+     {"id": "review", "kind": "judge", "task": "Review regions/{{item.id}}.py for craft."},
+     {"id": "ok", "kind": "end"}],
+   "edges": [
+     {"from": "build", "to": "check"},
+     {"from": "check", "to": "review", "when": "ok"},
+     {"from": "check", "to": "build", "when": "fail", "max": 2},
+     {"from": "review", "to": "ok", "when": "PASS"},
+     {"from": "review", "to": "build", "when": "FAIL", "max": 2}]}}
+```
+
+Each item's judge starts the moment that item's build passes its check; there
+is no barrier waiting for the slowest item. An item passes only when its flow
+is done and the latest result of every work node in it is ok: a build that
+failed a write-scope gate does not pass just because an unconditional edge
+carried the flow to its end. Prefer `"when": "ok"` on edges out of a build. Follow `map` with an assembled-result
+check and judge, and route the judge's FAIL back to `map`. On that visit only
+the items whose keys or files the judge names, plus any item that failed, run
+again. Each continues its own child flow, so its sessions resume with the
+judge's feedback. Item keys that are plain numbers never match by name, since
+`x.py:12` would otherwise select item `12`.
+
+Each re-run item receives only the feedback lines that mention its key or its
+files (all of the feedback when none do), so its repair delta stays small and
+inside its own files.
+
+Shared files no item owns (a package `__init__.py`, a registry, a manifest)
+need an owner too. Route the assembled judge's FAIL through an `integrate`
+agent whose `files` are those shared paths, then back to `map`. When feedback
+names a file no item owns, the map's wake says so instead of looping on it.
+
+## Follow-ups
+
+```bash
+puppetmaster flow run fix-and-review.json --continue <prior_run_id> --input "also handle empty input"
+```
+
+The new run inherits the prior run's sessions and results. Every node resumes
+its own session with the follow-up request instead of starting fresh, and a map
+re-runs only the items the request names, or all items, each resumed.
+
+## Running and waking
+
+| CLI | MCP `puppetmaster_flow` action |
+| --- | --- |
+| `flow validate <graph>` | `validate` |
+| `flow save <graph>` (reuse by id) | `save` |
+| `flow run <graph\|id> [--input] [--continue RUN] [--wait] [--foreground]` | `run` (always detached; `wait: true` blocks up to the MCP cap) |
+| `flow status <run> [--since N]` | `status` |
+| `flow wait <run> [--timeout S]` | `wait` |
+| `flow resume <run> [--answer=X] [--restart] [--reset-loops] [--extra-steps N]` | `resume` |
+| `flow stop <run>` | `stop` |
+| `flow cut <run> [--reason]` | `cut` |
+| `flow list` | `list` |
+
+Every action returns the same compact summary: status, reason, the steps since
+`since`, the last problem, usage, and `next_since` for the next call. Exit
+codes: 0 done, 4 waiting at a gate, 3 still running, 1 failed, stuck, stopped
+or interrupted, 2 invalid input.
+
+A walker that dies leaves the run `interrupted`; `flow resume` picks it up, and
+any job it had started is adopted rather than relaunched. A dead walker's pid
+that the OS has since given to another process does not keep the run looking
+alive: run locks, spawn markers and shell records store the process identity
+next to the pid.
+
+`stop` halts the run and cuts its in-flight tasks and item flows. A node that
+finishes in the instant a stop lands is not recorded, so `flow resume --restart`
+runs it again as a new attempt, which is a new job. `cut` fails only the node in
+flight, so its `fail` edges take over; a cut map also stops its item flows.
+
+Shell nodes are at-least-once. A command's exit status dies with its walker, so
+a resumed walker kills the command the dead walker left running (when the pid
+still names that command) and runs it again. A pid that now names another
+process is left alone.
+
+Runs live under `<state_dir>/flows/runs/<run_id>/`. Pass `--cwd` (CLI) or
+`cwd` (MCP) so the run's state follows the workspace.

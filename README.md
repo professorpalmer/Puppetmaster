@@ -149,6 +149,7 @@ The [docs index](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/
 
 - [GROK_BOT.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/GROK_BOT.md) — Grok Bot as remote MCP pilot (streamable HTTP; not a worker adapter)
 - [FEATURES.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/FEATURES.md) — adapters, pilots, and shipped features
+- [FLOWS.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/FLOWS.md) — flow graphs: write one graph, wake on done, gate or stuck; resumable nodes and `map` fan-out
 - [SECURITY.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/SECURITY.md) — safety and threat model
 - [DASHBOARD.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/DASHBOARD.md) — live job dashboard
 - [CONCURRENT_SESSIONS.md](https://github.com/professorpalmer/Puppetmaster/blob/main/docs/CONCURRENT_SESSIONS.md) — operating concurrent agent sessions, state scope, dashboard URLs, and worktrees

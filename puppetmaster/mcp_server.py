@@ -1275,6 +1275,7 @@ _TRACKABLE_SWARM_BLOCKED_TOOLS = frozenset(
         "puppetmaster_start_review",
         "puppetmaster_start_openai",
         "puppetmaster_start_prewalk",
+        "puppetmaster_flow",
         # Sync wait verbs also write jobs outside Marionette swarm_pending.
         "puppetmaster_cursor_implement",
         "puppetmaster_claude_implement",
@@ -1683,6 +1684,23 @@ def _build_tools() -> list[McpTool]:
             description="Return a live summary from current artifacts without waiting for final stitching.",
             input_schema=job_schema(required=True),
             handler=lambda args: run_cli(["show", require_job_id(args), "--partial"], args),
+        ),
+        McpTool(
+            name="puppetmaster_flow",
+            description=(
+                "Run a flow graph: write ONE graph of nodes (agent, judge, parallel, map, shell, "
+                "gate, set, end) and edges (when: ok|fail|PASS|FAIL|PARTIAL|answer=X|out~=X|"
+                "state.k>=v; per-edge max loop budget), start it with action=run, then end your "
+                "turn or call action=wait. The run wakes you only when it is done, failed, stuck, "
+                "interrupted or waiting at a gate; every agent/judge node is a durable "
+                "Puppetmaster job. Nodes re-entered by a back-edge, and nodes of a run started "
+                "with continue_from, resume their own provider session with only the delta. "
+                "A map node fans out per-item child flows with bounded concurrency. Actions: "
+                "validate, save, run, status, wait, resume (answer a gate, or restart=true), "
+                "stop, cut, list."
+            ),
+            input_schema=flow_schema(),
+            handler=run_flow_tool,
         ),
         McpTool(
             name="puppetmaster_await_job",
@@ -4824,6 +4842,62 @@ def restore_task_schema() -> JsonObject:
     schema["properties"]["task_id"] = {"type": "string"}
     schema["required"] = ["job_id", "task_id"]
     return schema
+
+
+def flow_schema() -> JsonObject:
+    return {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["validate", "save", "run", "status", "wait", "resume", "stop", "cut", "list"],
+            },
+            "graph": {
+                "description": "Graph object, a path to a graph JSON file, or a saved graph id.",
+                "anyOf": [{"type": "object"}, {"type": "string"}],
+            },
+            "input": {"type": "string", "description": "The run's {{input}}."},
+            "continue_from": {
+                "type": "string",
+                "description": "Prior run id: its nodes resume their own sessions with this input.",
+            },
+            "run_id": {"type": "string"},
+            "answer": {"type": "string", "description": "Answer for the gate a run waits at."},
+            "restart": {"type": "boolean", "description": "Reopen a failed, stuck or stopped run."},
+            "reset_loops": {"type": "boolean"},
+            "extra_steps": {"type": "integer", "minimum": 0},
+            "wait": {"type": "boolean", "description": "With action=run: block until the run wakes you."},
+            "since": {"type": "integer", "minimum": 0, "description": "Only steps after this index."},
+            "timeout_seconds": {"type": "number", "minimum": 0},
+            "reason": {"type": "string", "description": "With action=cut."},
+            "limit": {"type": "integer", "minimum": 1},
+            "cwd": {"type": "string", "description": "Workspace the graph runs in and whose state holds the run."},
+            "state_dir": {"type": "string"},
+            "backend": {"type": "string", "enum": ["sqlite", "file"]},
+        },
+        "required": ["action"],
+    }
+
+
+def run_flow_tool(args: JsonObject) -> JsonObject:
+    from puppetmaster.cli.commands_flow import flow_action
+
+    params = dict(args)
+    params.setdefault("cwd", cwd(args))
+    params["timeout"] = params.get("timeout_seconds")
+    action = str(params.get("action") or "")
+    # The MCP turn cannot block on a whole walk: walks always run detached.
+    params["background"] = True
+    params["foreground"] = False
+    try:
+        body, _ = flow_action(
+            mcp_state_dir(args), action, params,
+            backend=str(args.get("backend") or "sqlite"),
+            max_block_seconds=_resolve_max_block_seconds(),
+        )
+    except ValueError as exc:
+        return tool_error(str(exc))
+    return {"content": [{"type": "text", "text": json.dumps(body, indent=2, default=str)}]}
 
 
 def steer_schema() -> JsonObject:
