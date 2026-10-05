@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import concurrent.futures
-import hashlib
 import json
 import os
 import re
@@ -60,6 +59,7 @@ from puppetmaster.swarm_launch import (
 )
 from puppetmaster.update_check import pypi_update_note, version_is_newer
 from puppetmaster.worker_fence import nested_start_blocked
+from puppetmaster.cli.commands_jobs import AWAIT_SUMMARY_MODES, await_summary_mode
 from puppetmaster.cli.helpers import (
     allowed_model_ids_from_mapping,
     allowed_model_ids_list_from_mapping,
@@ -1227,11 +1227,31 @@ def server_update_note(*, now: Optional[float] = None) -> Optional[str]:
     return note
 
 
+def _note_in_content(result: dict, note: str) -> None:
+    """Repeat the stale-server note inside the JSON body clients actually read.
+
+    Some MCP clients (Codex) surface only ``content``, so a top-level field
+    alone let a pre-upgrade server answer with an old response contract
+    silently.
+    """
+    content = result.get("content")
+    if not isinstance(content, list) or not content or not isinstance(content[0], dict):
+        return
+    try:
+        body = json.loads(content[0].get("text") or "")
+    except (TypeError, ValueError):
+        return
+    if isinstance(body, dict) and "server_update_available" not in body:
+        body["server_update_available"] = note
+        content[0] = {**content[0], "text": json.dumps(body, indent=2)}
+
+
 def _attach_update_nudges(result: dict) -> None:
     """Push-style update awareness on tool responses (informational only)."""
     note = server_update_note()
     if note:
         result.setdefault("server_update_available", note)
+        _note_in_content(result, note)
     if result.get("isError"):
         pypi_note = pypi_update_note()
         if pypi_note:
@@ -4418,23 +4438,12 @@ def run_feed_follow(args: JsonObject) -> JsonObject:
     return {"content": [{"type": "text", "text": json.dumps(body, indent=2, default=str)}], "isError": False}
 
 
-AWAIT_SUMMARY_MODES = ("compact", "full", "none")
-
-
 def _await_summary_mode(args: JsonObject) -> str:
-    explicit = args.get("summary")
-    if explicit is not None:
-        mode = str(explicit).strip().lower()
-        if mode not in AWAIT_SUMMARY_MODES:
-            raise ValueError(f"summary must be one of {', '.join(AWAIT_SUMMARY_MODES)}")
-        return mode
-    env_mode = os.environ.get("PUPPETMASTER_AWAIT_SUMMARY", "").strip().lower()
-    return env_mode if env_mode in AWAIT_SUMMARY_MODES else "compact"
+    return await_summary_mode(args.get("summary"))
 
 
 def run_await_job(args: JsonObject) -> JsonObject:
-    from puppetmaster.cli import await_job_state
-    from puppetmaster.stitcher import Stitcher
+    from puppetmaster.cli import await_job_state, await_summary_body
 
     job_id = require_job_id(args)
     try:
@@ -4457,28 +4466,7 @@ def run_await_job(args: JsonObject) -> JsonObject:
         timeout_seconds=timeout_seconds,
         poll_interval_seconds=poll_interval,
     )
-    body: JsonObject = {**state, "summary_mode": mode}
-    if not state["terminal"]:
-        body["summary"] = ""
-    elif mode != "none":
-        summary_path = store.job_dir(job_id) / "summaries" / "stitched.md"
-        if summary_path.is_file():
-            summary = summary_path.read_text(encoding="utf-8")
-        else:
-            summary_path = None
-            summary = Stitcher(store).preview(job_id)
-        if mode == "full":
-            body["summary"] = summary
-        else:
-            body["summary_ref"] = {
-                "path": str(summary_path) if summary_path is not None else None,
-                "chars": len(summary),
-                "sha256": hashlib.sha256(summary.encode("utf-8")).hexdigest(),
-            }
-            try:
-                body["digest"] = Stitcher(store).digest(job_id)
-            except Exception as exc:
-                body["digest_error"] = f"{type(exc).__name__}: {exc}"[:200]
+    body: JsonObject = await_summary_body(store, job_id, state, mode)
     if was_capped and not state["terminal"]:
         # Block shortened to stay under the client tool-timeout. The job is
         # still running; the caller should immediately await again.

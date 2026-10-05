@@ -29099,6 +29099,25 @@ class McpServerUpdateNudgeTests(unittest.TestCase):
         self.assertIn("server_update_available", result)
         self.assertIn("0.9.64", result["server_update_available"])
 
+    def test_stale_note_reaches_the_json_content_body(self) -> None:
+        from types import SimpleNamespace
+
+        body = {"job_id": "job_x", "status": "complete"}
+        fake = {
+            "x": SimpleNamespace(
+                handler=lambda args: {"content": [{"type": "text", "text": json.dumps(body)}]}
+            )
+        }
+        with patch.object(self.mcp, "_tool_registry", return_value=fake), patch.object(
+            self.mcp, "_SERVER_RUNNING_VERSION", "0.9.63"
+        ), patch.object(
+            self.mcp, "installed_puppetmaster_version", return_value="0.9.64"
+        ):
+            result = self.mcp.call_tool("x", {})
+        parsed = json.loads(result["content"][0]["text"])
+        self.assertEqual(parsed["job_id"], "job_x")
+        self.assertIn("0.9.64", parsed["server_update_available"])
+
     def test_call_tool_clean_when_current(self) -> None:
         from types import SimpleNamespace
 

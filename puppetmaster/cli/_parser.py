@@ -1219,7 +1219,8 @@ def build_parser() -> argparse.ArgumentParser:
         "await",
         help=(
             "Block until a job reaches a terminal state (complete/failed), then "
-            "print its final summary. True blocking await for the CLI/SDK path."
+            "print a compact digest (or the full summary with --summary full). "
+            "True blocking await for the CLI/SDK path."
         ),
     )
     await_cmd.add_argument("job_id")
@@ -1234,6 +1235,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.25,
         help="How often to re-check job state while blocked. Default: 0.25.",
+    )
+    await_cmd.add_argument(
+        "--summary",
+        choices=("compact", "full", "none"),
+        default=None,
+        help=(
+            "compact (default): counts, exceptions, headlines and a pointer to the "
+            "stitched summary; full: the whole stitched summary; none: state only. "
+            "PUPPETMASTER_AWAIT_SUMMARY sets the default."
+        ),
     )
     await_cmd.add_argument("--json", action="store_true", help="Emit JSON.")
 

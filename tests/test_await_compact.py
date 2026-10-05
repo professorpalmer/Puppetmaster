@@ -57,7 +57,7 @@ DISTINCT_CLAIMS = {
 }
 
 
-class AwaitCompactTests(unittest.TestCase):
+class _AwaitFixture(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
@@ -157,6 +157,8 @@ class AwaitCompactTests(unittest.TestCase):
         result = call_tool("puppetmaster_await_job", args)
         return result, json.loads(result["content"][0]["text"])
 
+
+class AwaitCompactTests(_AwaitFixture):
     def test_default_compact_digest(self) -> None:
         job_id, tasks = self._fixture_job()
         result, body = self._await(job_id)
@@ -271,6 +273,53 @@ class AwaitCompactTests(unittest.TestCase):
         self.assertEqual(body["status"], "complete")
 
 
+class CliAwaitSummaryTests(_AwaitFixture):
+    """The CLI ``await`` shares the MCP summary contract."""
+
+    def _cli(self, job_id: str, *extra: str) -> tuple[int, str]:
+        import contextlib
+        import io
+
+        from puppetmaster.cli import main as cli_main
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = cli_main(
+                ["--state-dir", str(self.store.root), "--backend", "sqlite", "await", job_id,
+                 "--timeout-seconds", "1", *extra]
+            )
+        return rc, out.getvalue()
+
+    def test_cli_json_defaults_to_the_mcp_compact_body(self) -> None:
+        job_id, _ = self._fixture_job()
+        _, text = self._cli(job_id, "--json")
+        body = json.loads(text)
+        _, mcp = self._await(job_id)
+        self.assertEqual(body["summary_mode"], "compact")
+        self.assertNotIn("summary", body)
+        self.assertEqual(body["digest"], mcp["digest"])
+        self.assertEqual(body["summary_ref"], mcp["summary_ref"])
+
+    def test_cli_text_compact_lists_exceptions_and_points_at_the_summary(self) -> None:
+        job_id, _ = self._fixture_job()
+        _, text = self._cli(job_id)
+        self.assertIn("exception: redteam failed: rate_limit", text)
+        self.assertIn("stitched.md", text)
+        self.assertLess(len(text), len(self._cli(job_id, "--summary", "full")[1]))
+
+    def test_cli_full_prints_the_stitched_summary(self) -> None:
+        job_id, _ = self._fixture_job()
+        _, text = self._cli(job_id, "--summary", "full")
+        stitched = (self.store.job_dir(job_id) / "summaries" / "stitched.md").read_text(encoding="utf-8")
+        self.assertEqual(text.strip(), stitched.strip())
+
+    def test_cli_env_default_is_honored(self) -> None:
+        job_id, _ = self._fixture_job()
+        os.environ["PUPPETMASTER_AWAIT_SUMMARY"] = "full"
+        _, text = self._cli(job_id, "--json")
+        self.assertEqual(json.loads(text)["summary_mode"], "full")
+
+
 class StitcherDigestTests(unittest.TestCase):
     def test_truncation_and_clipping(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -348,6 +397,67 @@ class StitcherDigestTests(unittest.TestCase):
                     ]
                 )
                 self.assertEqual([row["result"] for row in exceptions], ["blocked"])
+
+    def _gate_digest(self, status: TaskStatus, gates: list) -> list:
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = SQLiteSwarmStore(Path(tmp.name) / ".puppetmaster")
+        store.init()
+        job = store.create_job("review gate digest")
+        task = Task(job_id=job.id, role="implement", instruction="edit", status=status)
+        store.save_tasks([task])
+        store.save_artifacts(
+            [
+                Artifact(
+                    job_id=job.id,
+                    task_id=task.id,
+                    type=ArtifactType.VERIFICATION,
+                    created_by="implement",
+                    confidence=0.9,
+                    evidence=["adapter:codex"],
+                    payload={"check": "codex_execution", "result": "passed", "adapter": "codex"},
+                    created_at="2026-10-05T10:00:00+00:00",
+                )
+            ]
+            + [
+                Artifact(
+                    job_id=job.id,
+                    task_id=task.id,
+                    type=ArtifactType.GATE,
+                    created_by="implement",
+                    confidence=0.9,
+                    evidence=["gate:review"],
+                    payload={"gate": "review", "kind": "review", "passed": passed, "reason": reason},
+                    created_at=created_at,
+                )
+                for passed, reason, created_at in gates
+            ]
+        )
+        return Stitcher(store).digest(job.id)["exceptions"]
+
+    def test_failed_review_gate_after_passing_receipt_is_an_exception(self) -> None:
+        exceptions = self._gate_digest(
+            TaskStatus.FAILED,
+            [(False, "assembly requirement failed", "2026-10-05T10:01:00+00:00")],
+        )
+        self.assertEqual(len(exceptions), 1)
+        self.assertEqual(exceptions[0]["result"], "failed")
+        self.assertIn("gate:review", exceptions[0]["reason"])
+        self.assertIn("assembly requirement failed", exceptions[0]["reason"])
+
+    def test_repaired_review_gate_clears_the_exception(self) -> None:
+        exceptions = self._gate_digest(
+            TaskStatus.COMPLETE,
+            [
+                (False, "missing tests", "2026-10-05T10:01:00+00:00"),
+                (True, "approved", "2026-10-05T10:03:00+00:00"),
+            ],
+        )
+        self.assertEqual(exceptions, [])
+
+    def test_failed_task_without_gate_still_reports_its_status(self) -> None:
+        exceptions = self._gate_digest(TaskStatus.FAILED, [])
+        self.assertEqual([row["result"] for row in exceptions], ["failed"])
 
 
 if __name__ == "__main__":

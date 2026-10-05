@@ -22,6 +22,7 @@ from puppetmaster.adapters.codex import (
     parse_codex_events,
 )
 from puppetmaster.models import Artifact, ArtifactType, Task
+from puppetmaster.session_lease import acquire_codex_thread
 from puppetmaster.worker_resume import (
     claim_resumed_session,
     resolve_worker_resume,
@@ -400,6 +401,71 @@ class CodexResumeTests(unittest.TestCase):
         enrich.assert_called_once()
         self.assertEqual(artifacts[0].payload["resume"], record)
         self.assertNotIn("context:resumed", artifacts[0].evidence)
+
+
+    def _resolved(self) -> dict:
+        return {"status": "resolved", "adapter": "codex", "session_id": THREAD_ID,
+                "from_job_id": "job-prior", "from_task_id": "t-codex"}
+
+    def test_thread_held_by_another_job_runs_fresh_before_any_model_call(self) -> None:
+        held = acquire_codex_thread(THREAD_ID)
+        self.assertIsNotNone(held)
+        try:
+            artifacts, kwargs, enrich, census = _run_adapter(
+                CodexAdapter(), self._task(resume=self._resolved()),
+                _codex_events({"type": "thread.started", "thread_id": NEW_SESSION}),
+            )
+        finally:
+            held.release()
+        self.assertNotIn("resume", kwargs["command"])
+        enrich.assert_called_once()
+        census.assert_called_once()
+        record = artifacts[0].payload["resume"]
+        self.assertEqual(record["status"], "unavailable")
+        self.assertIn("another live worker", record["reason"])
+        self.assertNotIn("context:resumed", artifacts[0].evidence)
+
+    def test_lease_is_released_after_the_run(self) -> None:
+        _run_adapter(CodexAdapter(), self._task(resume=self._resolved()), RESUMED_CODEX_STDOUT)
+        again = acquire_codex_thread(THREAD_ID)
+        self.assertIsNotNone(again)
+        again.release()
+
+    def test_lease_is_released_when_the_run_raises(self) -> None:
+        with patch("puppetmaster.adapters.resolve_command", side_effect=lambda name: f"/usr/bin/{name}"), patch(
+            "puppetmaster.adapters.worktree_guard", return_value=None
+        ), patch("puppetmaster.adapters.git_snapshot", return_value=CLEAN), patch(
+            "puppetmaster.adapters.run_streamed_subprocess", side_effect=RuntimeError("spawn failed")
+        ):
+            with self.assertRaises(RuntimeError):
+                CodexAdapter().run(self._task(resume=self._resolved()), "goal", "worker")
+        again = acquire_codex_thread(THREAD_ID)
+        self.assertIsNotNone(again)
+        again.release()
+
+
+class SessionLeaseTests(unittest.TestCase):
+    def test_second_holder_is_refused_until_release(self) -> None:
+        first = acquire_codex_thread(THREAD_ID)
+        self.assertIsNotNone(first)
+        self.assertIsNone(acquire_codex_thread(THREAD_ID))
+        first.release()
+        first.release()  # idempotent
+        second = acquire_codex_thread(THREAD_ID)
+        self.assertIsNotNone(second)
+        second.release()
+
+    def test_distinct_threads_do_not_contend(self) -> None:
+        first = acquire_codex_thread(THREAD_ID)
+        other = acquire_codex_thread(PRIOR_SESSION)
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(other)
+        first.release()
+        other.release()
+
+    def test_unsafe_thread_id_is_rejected(self) -> None:
+        with self.assertRaises(OSError):
+            acquire_codex_thread("../escape")
 
 
 CLAUDE_RESULT = json.dumps({

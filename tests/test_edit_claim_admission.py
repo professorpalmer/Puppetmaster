@@ -127,6 +127,36 @@ class EditAdmissionTests(unittest.TestCase):
                 finally:
                     holder.close()
 
+    def test_admission_reports_how_long_it_queued(self):
+        import threading
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, db = Path(directory), Path(directory) / "claims.sqlite3"
+            with patch("puppetmaster.edit_admission.default_file_claim_db_path", return_value=db):
+                with edit_admission(Store(), Task(payload={"cwd": str(root)}), "solo") as owner:
+                    self.assertLess(owner.waited_seconds, 0.2)
+                holder = edit_admission(Store(), Task(payload={"cwd": str(root)}), "holder")
+                threading.Timer(0.3, holder.close).start()
+                store = Store()
+                waiter = Task(id="task-2", payload={"cwd": str(root), "edit_admission_wait_seconds": 5})
+                with edit_admission(store, waiter, "waiter") as owner:
+                    self.assertGreaterEqual(owner.waited_seconds, 0.25)
+                acquired = [p for _, event, p in store.events if event == "edit_admission.acquired"]
+                self.assertEqual(acquired[0]["waited_seconds"], owner.waited_seconds)
+
+    def test_worker_receipts_carry_the_admission_wait(self):
+        from puppetmaster.models import Artifact, ArtifactType
+        from puppetmaster.worker_runtime import _with_admission_wait
+
+        receipt = Artifact(job_id="j", task_id="t", type=ArtifactType.VERIFICATION, created_by="w",
+                           confidence=0.9, evidence=["adapter:codex"], payload={"check": "c", "result": "passed"})
+        finding = Artifact(job_id="j", task_id="t", type=ArtifactType.FINDING, created_by="w",
+                           confidence=0.9, evidence=["a.py:1"], payload={"claim": "x"})
+        stamped_receipt, stamped_finding = _with_admission_wait([receipt, finding], 12.5)
+        self.assertEqual(stamped_receipt.payload["edit_admission_wait_seconds"], 12.5)
+        self.assertEqual(stamped_receipt.payload["result"], "passed")
+        self.assertIs(stamped_finding, finding)
+
     def test_default_wait_outlasts_the_adapter_wall_timeout(self):
         """A holder fences its claim for its WHOLE run, so the default wait has
         to cover that or a waiter fails while the holder is still working."""

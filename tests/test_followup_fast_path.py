@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from puppetmaster import hook_runner
+from puppetmaster import hook_runner, invocation_gate
 from puppetmaster.invocation_gate import should_delegate
 from puppetmaster.rules import render_agents_block
 
@@ -161,10 +161,12 @@ class HookDecisionLogTests(unittest.TestCase):
         rec = json.loads(lines[0])
         self.assertEqual(
             set(rec),
-            {"ts", "delegate", "reason", "signals", "score", "role",
+            {"ts", "delegate", "mode", "policy", "reason", "signals", "score", "role",
              "suggested_verb", "prompt_sha256", "prompt_chars"},
         )
         self.assertIs(rec["delegate"], False)
+        self.assertEqual(rec["mode"], "pilot")
+        self.assertEqual(rec["policy"], invocation_gate.GATE_POLICY_VERSION)
         self.assertEqual(rec["signals"], ["followup"])
         self.assertEqual(rec["prompt_chars"], len(prompt))
         self.assertEqual(len(rec["prompt_sha256"]), 64)
