@@ -648,3 +648,201 @@ class DispatchableJudgeSelectionTests(TestCase):
     def test_nothing_dispatchable_keeps_the_previous_choice(self) -> None:
         judge = self._judge(lambda adapter: False)
         self.assertEqual(judge.id, "antigravity/gemini-3-5-flash")
+
+
+class JudgeIsolationTests(TestCase):
+    """The judge runs read-only and independent of the implementer's payload."""
+
+    def _judge_spec(self) -> ModelSpec:
+        return ModelSpec(
+            id="claude-code/claude-sonnet-4-5",
+            adapter="claude-code",
+            adapter_model_name="claude-sonnet-4-5",
+            capability_score=82,
+            billing="plan",
+            payload_defaults={"extra_args": ["--effort", "medium"]},
+        )
+
+    def test_judge_payload_drops_implementer_write_and_resume_state(self) -> None:
+        from puppetmaster import gates
+
+        captured = {}
+
+        class FakeAdapter:
+            def run(self, task, goal, worker_id):
+                captured["payload"] = dict(task.payload)
+                return []
+
+        task = Task(
+            job_id="j", role="implement", adapter="claude-code", instruction="edit",
+            payload={
+                "cwd": "/repo", "mode": "implement", "permission_mode": "acceptEdits",
+                "allow_dirty": True, "review_loop": True,
+                "resume": {"status": "resolved", "adapter": "claude-code", "session_id": "s"},
+                "registry_path": "/reg/models.json", "registry_digest": "sha256:abc",
+            },
+        )
+        with patch.dict(os.environ, {"PUPPETMASTER_REVIEW_GATE": "1"}), \
+                patch("puppetmaster.adapters.get_adapter", return_value=FakeAdapter()):
+            gates.default_judge_review(prompt="p", judge=self._judge_spec(), cwd=Path("/repo"), timeout=30, task=task)
+
+        payload = captured["payload"]
+        for leaked in ("resume", "allow_dirty", "permission_mode", "review_loop"):
+            self.assertNotIn(leaked, payload)
+        self.assertTrue(payload["read_only"])
+        self.assertEqual(payload["sandbox"], "read-only")
+        self.assertEqual(payload["model"], "claude-sonnet-4-5")
+        self.assertEqual(payload["extra_args"], ["--effort", "medium"])
+        self.assertEqual((payload["registry_path"], payload["registry_digest"]), ("/reg/models.json", "sha256:abc"))
+
+    def test_verdict_is_read_from_json_wrapped_stdout(self) -> None:
+        import json as _json
+
+        from puppetmaster.gates import _verdict_from_artifacts
+        from puppetmaster.models import Artifact, ArtifactType
+
+        result = 'Looks fine.\nPUPPETMASTER_REVIEW_VERDICT {"pass": true, "severity": "none", "reasons": []}\nVERDICT: PASS - ok'
+        artifact = Artifact(
+            job_id="j", task_id="t", type=ArtifactType.VERIFICATION, created_by="judge",
+            confidence=0.9, evidence=["adapter:claude-code"],
+            payload={"check": "review", "result": "passed", "stdout": _json.dumps({"type": "result", "result": result})},
+        )
+        verdict = _verdict_from_artifacts([artifact])
+        self.assertIsNotNone(verdict)
+        self.assertIs(verdict["pass"], True)
+
+
+class CumulativeReviewDiffTests(TestCase):
+    """A repair is reviewed against the task's original base, not just its own attempt."""
+
+    def _git(self, repo: Path, *args: str) -> str:
+        return subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True).stdout.strip()
+
+    def test_repair_after_committed_work_reviews_the_whole_task(self) -> None:
+        import puppetmaster.gates as gates
+        from puppetmaster.gates import ReviewVerdict, evaluate_task_gates
+        from puppetmaster.models import Artifact, ArtifactType
+
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            self._git(repo, "init", "-q")
+            self._git(repo, "config", "user.email", "t@t")
+            self._git(repo, "config", "user.name", "t")
+            (repo / "a.py").write_text("x = 1\n", encoding="utf-8")
+            self._git(repo, "add", ".")
+            self._git(repo, "commit", "-qm", "base")
+            base = self._git(repo, "rev-parse", "HEAD")
+
+            store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+            store.ensure_schema()
+            job = store.create_job("cumulative review")
+            task = Task(job_id=job.id, role="implement", instruction="edit", adapter="claude-code",
+                        payload={"review": True, "cwd": str(repo), "mode": "implement", "allow_dirty": True})
+            store.save_task(task)
+            store.save_artifact(Artifact(
+                job_id=job.id, task_id=task.id, type=ArtifactType.VERIFICATION, created_by="worker",
+                confidence=0.9, evidence=["adapter:claude-code"],
+                payload={"adapter": "claude-code", "check": "edit", "result": "passed", "base_sha": base},
+            ))
+            (repo / "a.py").write_text("x = 2\n", encoding="utf-8")
+            self._git(repo, "commit", "-qam", "attempt 1 committed its work")
+            (repo / "new_test.py").write_text("assert True\n", encoding="utf-8")
+            self._git(repo, "add", "new_test.py")
+            self._git(repo, "commit", "-qm", "repair committed the rest")
+
+            seen = {}
+
+            def judge(**kwargs):
+                seen["prompt"] = kwargs["prompt"]
+                return ReviewVerdict(available=True, passed=True, severity="none", reasons=[], detail={})
+
+            with patch.object(gates, "resolve_judge_model", return_value=Mock(id="claude-code/claude-sonnet-4-5", adapter="claude-code")), \
+                    patch.object(gates, "_REVIEW_JUDGE", side_effect=judge):
+                evaluation = evaluate_task_gates(task, [], store, worker_id="w1", cwd=repo)
+
+            review = next(result for result in evaluation.results if result.kind == "review")
+            self.assertTrue(review.passed, review.reason)
+            self.assertIn("-x = 1", seen["prompt"])
+            self.assertIn("+x = 2", seen["prompt"])
+            self.assertIn("new_test.py", seen["prompt"])
+
+
+class ReviewScopeAndJudgeDefaultsTests(TestCase):
+    """Review only the task's own commits; a judge never inherits write permissions."""
+
+    def _git(self, repo: Path, *args: str) -> str:
+        return subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True).stdout.strip()
+
+    def _repo(self, tmp: str) -> Path:
+        repo = Path(tmp) / "repo"
+        repo.mkdir()
+        self._git(repo, "init", "-q")
+        self._git(repo, "config", "user.email", "t@t")
+        self._git(repo, "config", "user.name", "t")
+        (repo / "a.py").write_text("x = 1\n", encoding="utf-8")
+        self._git(repo, "add", ".")
+        self._git(repo, "commit", "-qm", "base")
+        return repo
+
+    def _verification(self, job_id: str, task_id: str, base: str, head: str, at: str):
+        from puppetmaster.models import Artifact, ArtifactType
+
+        return Artifact(
+            job_id=job_id, task_id=task_id, type=ArtifactType.VERIFICATION, created_by="worker",
+            confidence=0.9, evidence=["adapter:claude-code"],
+            payload={"adapter": "claude-code", "check": "edit", "result": "passed", "base_sha": base, "head_sha": head},
+            created_at=at,
+        )
+
+    def test_foreign_commit_between_attempts_disables_the_cumulative_range(self) -> None:
+        from puppetmaster.gates import _task_base_sha
+
+        with TemporaryDirectory() as tmp:
+            store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+            store.ensure_schema()
+            job = store.create_job("scope")
+            task = Task(job_id=job.id, role="implement", instruction="edit", adapter="claude-code", payload={})
+            store.save_task(task)
+            contiguous = [
+                self._verification(job.id, task.id, "aaa", "bbb", "2026-10-04T01:00:00+00:00"),
+                self._verification(job.id, task.id, "bbb", "ccc", "2026-10-04T01:05:00+00:00"),
+            ]
+            self.assertEqual(_task_base_sha(store, task, contiguous), "aaa")
+            gap = [
+                self._verification(job.id, task.id, "aaa", "bbb", "2026-10-04T01:00:00+00:00"),
+                self._verification(job.id, task.id, "fff", "ggg", "2026-10-04T01:05:00+00:00"),
+            ]
+            self.assertIsNone(_task_base_sha(store, task, gap))
+
+    def test_base_that_is_not_an_ancestor_is_not_diffed(self) -> None:
+        from puppetmaster.gates import _cumulative_diff
+
+        with TemporaryDirectory() as tmp:
+            repo = self._repo(tmp)
+            (repo / "a.py").write_text("x = 2\n", encoding="utf-8")
+            self._git(repo, "commit", "-qam", "dropped later")
+            dropped = self._git(repo, "rev-parse", "HEAD")
+            self._git(repo, "reset", "-q", "--hard", "HEAD~1")
+            (repo / "b.py").write_text("y = 1\n", encoding="utf-8")
+            self._git(repo, "add", ".")
+            self._git(repo, "commit", "-qm", "new line of history")
+            self.assertEqual(_cumulative_diff(repo, dropped), "")
+
+    def test_judge_keeps_same_adapter_executable_and_drops_write_defaults(self) -> None:
+        from puppetmaster.gates import _judge_payload
+
+        task = Task(job_id="j", role="implement", adapter="claude-code", instruction="edit",
+                    payload={"executable": "/opt/claude-beta/claude", "permission_mode": "acceptEdits"})
+        judge = ModelSpec(id="claude-code/claude-sonnet-4-5", adapter="claude-code",
+                          adapter_model_name="claude-sonnet-4-5", capability_score=82, billing="plan",
+                          payload_defaults={"permission_mode": "bypassPermissions", "allow_dirty": True,
+                                            "extra_args": ["--effort", "medium"]})
+        payload = _judge_payload(task, judge, prompt="p", cwd=Path("/repo"), timeout=30)
+        self.assertEqual(payload["executable"], "/opt/claude-beta/claude")
+        self.assertNotIn("permission_mode", payload)
+        self.assertNotIn("allow_dirty", payload)
+        self.assertEqual(payload["extra_args"], ["--effort", "medium"])
+        other = ModelSpec(id="codex/gpt-5-6-luna", adapter="codex", adapter_model_name="gpt-5.6-luna",
+                          capability_score=91, billing="plan")
+        self.assertNotIn("executable", _judge_payload(task, other, prompt="p", cwd=Path("/repo"), timeout=30))

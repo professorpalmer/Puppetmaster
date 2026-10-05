@@ -1,3 +1,43 @@
+## v1.28.4 — 2026-10-04
+
+**review_loop jobs reach COMPLETE: gates hold their lease, the judge runs read-only on the whole change, and a repaired review no longer blocks the run.**
+
+- The worker stopped its lease heartbeat when the CLI returned and then ran
+  completion gates. A review gate is a live judge call that outlasts the 5 s
+  lease, so stale-lease recovery could reclaim the task mid-review; the
+  approved completion was silently dropped and the task reran until
+  `max_attempts`. Gates now run inside their own heartbeat window. A renewal
+  refused there (the lease already lapsed on a starved host) only stops
+  renewing; publication stays fenced by owner and lease id, so a finished
+  task is never abandoned unless another worker actually took it.
+- The review judge inherited the implementer's payload. On Claude Code it
+  ran write-capable (`acceptEdits`), so on a first review the clean-tree guard
+  blocked it on the implementer's uncommitted diff and the gate reported
+  "judge produced no parseable verdict" (3 of 3 on a real Sonnet 4.5 judge).
+  On repairs it inherited `allow_dirty` and could edit the tree it was
+  judging, and since v1.28.3 it could inherit `resume` and continue the
+  implementer's session. The judge payload is now built from the judge's own
+  registry defaults plus a read-only review contract, and the verdict is also
+  read from JSON-wrapped stdout.
+- The review gate diffed the live tree against HEAD, so a repair after the
+  task's work was committed saw "no diff to review". It now reviews the
+  task's whole change since its earliest recorded base commit, including
+  untracked files.
+- `assess_run_quality` counted every failed gate, so a review that failed and
+  was then repaired and approved still left the run "blocked" and the CLI
+  exited 1. The latest result per task and gate now decides; within the same
+  second a failure wins.
+- `models discover --probe` saves the curated Claude catalog as an explicit
+  snapshot, and preflight treated it as authoritative, so a registered model
+  the shipped list did not know yet was blocked: every `claude-code/opus-5-5`
+  worker failed with "absent from the curated claude catalog". The Claude and
+  Codex CLIs cannot list their models, so a miss in their curated lists is now
+  advisory and the CLI decides; live catalogs and curated agentic catalogs
+  still block. The curated Claude list gains `claude-opus-5-5`.
+- Verified on real review_loop jobs (Haiku 4.5 implementer, live Sonnet 4.5
+  judge, rubric forcing a first rejection): 3 of 3 exited 0 with the task
+  complete after one repair, and the delivered code met the rubric.
+
 ## v1.28.3 — 2026-10-04
 
 **A review-loop repair resumes the rejected attempt's session, review judges are models that can run here, and Claude cache usage reaches receipts.**

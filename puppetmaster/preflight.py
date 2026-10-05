@@ -312,6 +312,16 @@ def _cached_catalog_membership(
             f"model {model!r} is absent from the {catalog_label}",
             ["preflight:cached_model_not_in_catalog"],
         )
+    if model not in available and explicit_curated and source in ("claude", "codex"):
+        # The Claude and Codex CLIs cannot list their models, so their curated
+        # lists ship with Puppetmaster and lag new releases; a registered model
+        # one does not know yet is not evidence of a bad id. The CLI decides.
+        return (
+            True,
+            f"model {model!r} is not in the {catalog_label}; curated lists lag "
+            "new releases, so the CLI decides",
+            ["preflight:curated_catalog_miss"],
+        )
     if model not in available:
         return (
             False,
