@@ -11,6 +11,12 @@
 - Memory is no longer queried when no worker spec wants it, so
   `disable_memory` avoids the query entirely instead of running it and
   discarding the result.
+- The repository census given to read-only workers skips hidden directories.
+  Tool state such as `.pm-jobs` and `.puppetmaster` sorted first and filled
+  the 100-path sample, so real source never appeared.
+- Installed pilot rules: an edit the pilot can already state exactly is made
+  inline, not handed to a worker. In the voxel study a pilot sent three fresh
+  workers to change one integer each.
 
 ## v1.29.0 — 2026-10-05
 

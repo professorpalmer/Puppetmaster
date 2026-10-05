@@ -28870,6 +28870,20 @@ class RepoFileCensusTests(unittest.TestCase):
         self.assertNotIn("__pycache__/junk.pyc", sample)
         self.assertEqual(total, 2)
 
+    def test_census_skips_hidden_tool_state(self) -> None:
+        from puppetmaster.adapters import repo_file_census
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "world.py").write_text("x", encoding="utf-8")
+            for hidden in (".pm-jobs/region_001", ".puppetmaster/jobs"):
+                (root / hidden).mkdir(parents=True)
+                for index in range(150):
+                    (root / hidden / f"receipt-{index}.json").write_text("{}", encoding="utf-8")
+            sample, total = repo_file_census(root)
+        # Hidden state sorts first; it must never crowd real source out of the sample.
+        self.assertEqual((sample, total), (["world.py"], 1))
+
     def test_census_empty_dir(self) -> None:
         from puppetmaster.adapters import repo_file_census
 

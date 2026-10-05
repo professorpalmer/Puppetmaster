@@ -163,6 +163,9 @@ RULE_BODY = textwrap.dedent(
     ## When NOT to use Puppetmaster (stay inline)
 
     - Trivial single-file edits, typos, one-line fixes
+    - Any edit you can already state exactly. If your instruction to a worker
+      would spell out the change, make the change yourself: a worker session
+      costs a full context load to apply it.
     - Quick factual questions
     - Fast interactive iteration where the user is steering turn-by-turn
     - Small follow-ups and revisions to work a Puppetmaster job already
