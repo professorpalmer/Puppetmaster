@@ -1621,17 +1621,16 @@ def repo_file_census(
     """Bounded, ground-truth listing of files in a worker's working directory.
 
     Returns ``(sample, total)`` — a sorted sample of at most ``limit``
-    repo-relative paths and the full file count. Prefers ``git ls-files`` (fast,
-    honours ``.gitignore``); falls back to a bounded ``os.walk`` for non-git
-    trees. Never raises: an unreadable/missing directory yields ``([], 0)``.
+    repo-relative paths and the full file count. Never raises: an
+    unreadable/missing directory yields ``([], 0)``.
 
     This is the anti-hallucination ground truth behind the analyze-prompt
     census — the cheapest, earliest analyze worker was asserting "the repository
     is empty" at full confidence when files plainly existed.
 
     Uses a bounded ``os.walk`` (never spawns a subprocess) that skips the same
-    VCS/build/cache directories CodeGraph freshness ignores, so the listing is
-    real source rather than tooling noise.
+    VCS/build/cache directories CodeGraph freshness ignores, plus every hidden
+    directory, so the listing is real source rather than tooling noise.
     """
     if not cwd:
         return [], 0
@@ -1648,7 +1647,9 @@ def _census_walk_files(root: Path) -> list[str]:
     found: list[str] = []
     try:
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if d not in _FRESHNESS_SKIP_DIRS]
+            # Hidden directories hold tool state (.pm-jobs, .puppetmaster, ...);
+            # sorted first, they crowded real source out of the sample.
+            dirnames[:] = [d for d in dirnames if d not in _FRESHNESS_SKIP_DIRS and not d.startswith(".")]
             for name in filenames:
                 found.append(os.path.relpath(os.path.join(dirpath, name), root))
                 if len(found) >= _CENSUS_WALK_CAP:

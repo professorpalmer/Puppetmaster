@@ -2345,6 +2345,8 @@ class Orchestrator:
         *,
         job_id: Optional[str] = None,
     ) -> list[WorkerSpec]:
+        if not any(_memory_injection_enabled(spec) for spec in specs):
+            return specs
         memory = self.store.retrieve_memory(
             goal,
             max_age_days=_memory_max_age_days(),
