@@ -444,6 +444,62 @@ class CodexResumeTests(unittest.TestCase):
         again.release()
 
 
+
+class CodexBuildContractTests(unittest.TestCase):
+    """Write-capable Codex workers get a build contract, not the findings contract."""
+
+    def _task(self, **payload) -> Task:
+        return Task(
+            job_id="job-build", role="builder", instruction="Build regions/a.py.", adapter="codex",
+            payload={"cwd": str(Path.cwd()), "model": "gpt-5.4-mini", **payload},
+        )
+
+    def _prompt(self, task: Task):
+        artifacts, kwargs, enrich, census = _run_adapter(
+            CodexAdapter(), task, _codex_events({"type": "thread.started", "thread_id": THREAD_ID})
+        )
+        return kwargs["stdin_data"], artifacts, enrich, census
+
+    def test_write_capable_worker_gets_the_build_contract(self) -> None:
+        prompt, _, enrich, census = self._prompt(self._task(sandbox="workspace-write"))
+        self.assertIn("Build mode", prompt)
+        self.assertIn("VERDICT: PASS", prompt)
+        self.assertNotIn("submit_findings", prompt)
+        self.assertNotIn("Your analysis target", prompt)
+        self.assertIn("Your task:\nBuild regions/a.py.", prompt)
+        census.assert_not_called()
+        enrich.assert_called_once()
+
+    def test_read_only_worker_keeps_the_analysis_contract(self) -> None:
+        prompt, _, _, census = self._prompt(self._task(sandbox="read-only"))
+        self.assertIn("submit_findings", prompt)
+        self.assertNotIn("Build mode", prompt)
+        census.assert_called_once()
+
+    def test_builder_skips_the_job_brief_only_when_it_gets_task_codegraph(self) -> None:
+        with patch("puppetmaster.job_brief.resolve_job_brief_for_task", return_value="JOB-BRIEF-SECTION"):
+            with_graph, _, _, _ = self._prompt(self._task(sandbox="workspace-write"))
+            without_graph, _, _, _ = self._prompt(
+                self._task(sandbox="workspace-write", disable_codegraph=True)
+            )
+            analysis, _, _, _ = self._prompt(self._task(sandbox="read-only"))
+        self.assertNotIn("JOB-BRIEF-SECTION", with_graph)
+        self.assertIn("JOB-BRIEF-SECTION", without_graph)
+        self.assertIn("JOB-BRIEF-SECTION", analysis)
+
+    def test_build_report_is_a_passed_receipt_with_its_verdict(self) -> None:
+        stdout = _codex_events(
+            {"type": "thread.started", "thread_id": THREAD_ID},
+            {"type": "item.completed", "item": {"type": "agent_message",
+             "text": "Built regions/a.py; judge passes 12/12.\nVERDICT: PASS - all checks pass"}},
+            {"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 5}},
+        )
+        artifacts, _, _, _ = _run_adapter(CodexAdapter(), self._task(sandbox="workspace-write"), stdout)
+        self.assertEqual(artifacts[0].payload["result"], "passed")
+        kinds = [(a.type, (a.payload or {}).get("kind")) for a in artifacts]
+        self.assertIn((ArtifactType.FINDING, None), kinds)
+
+
 class SessionLeaseTests(unittest.TestCase):
     def test_second_holder_is_refused_until_release(self) -> None:
         first = acquire_codex_thread(THREAD_ID)
@@ -499,6 +555,16 @@ class ClaudeCodeResumeTests(unittest.TestCase):
         verification = artifacts[0]
         self.assertEqual(verification.payload["session_id"], NEW_SESSION)
         self.assertNotIn("resume", verification.payload)
+
+    def test_builder_skips_the_job_brief_only_when_it_gets_task_codegraph(self) -> None:
+        def prompt_for(**payload):
+            with patch("puppetmaster.job_brief.resolve_job_brief_for_task", return_value="JOB-BRIEF-SECTION"):
+                _, kwargs, enrich, _ = _run_adapter(ClaudeCodeAdapter(), self._task(**payload), CLAUDE_RESULT)
+            return enrich.call_args.args[0]
+
+        self.assertNotIn("JOB-BRIEF-SECTION", prompt_for(permission_mode="acceptEdits"))
+        self.assertIn("JOB-BRIEF-SECTION", prompt_for(permission_mode="acceptEdits", disable_codegraph=True))
+        self.assertIn("JOB-BRIEF-SECTION", prompt_for(permission_mode="plan"))
 
     def test_resolved_resume_forks_and_skips_enrichment(self) -> None:
         record = {"status": "resolved", "adapter": "claude-code", "session_id": PRIOR_SESSION,

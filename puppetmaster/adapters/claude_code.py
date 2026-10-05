@@ -170,15 +170,19 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
         )
         resume_record = task_resume_record(task.payload, "claude-code")
         resume = resolved_resume(resume_record, "claude-code")
+        disable_codegraph = bool(task.payload.get("disable_codegraph", False))
+        # A builder gets task-scoped CodeGraph context; the job-wide goal brief
+        # only dilutes it.
+        shared_brief = disable_codegraph or not _claude_write_capable(task.payload)
         if resume is not None:
             # The resumed session already holds memory and CodeGraph context.
-            prompt, codegraph_used = with_job_brief(base_prompt, task), False
+            prompt, codegraph_used = with_job_brief(base_prompt, task, shared_brief=shared_brief), False
         else:
             prompt, codegraph_used = facade("enrich_prompt_with_codegraph")(
-                with_job_brief(prompt_with_memory(base_prompt, task), task),
+                with_job_brief(prompt_with_memory(base_prompt, task), task, shared_brief=shared_brief),
                 task_description=task.payload.get("codegraph_task") or task.instruction or goal,
                 cwd=cwd,
-                disabled=bool(task.payload.get("disable_codegraph", False)),
+                disabled=disable_codegraph,
             )
         executable = (
             task.payload.get("executable")
@@ -187,15 +191,7 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
         )
         command_base = command_parts(executable)
         model_for_cli, model_note = resolve_claude_code_model(task.payload)
-        read_only_intent = bool(task.payload.get("read_only")) or (
-            task.payload.get("sandbox") == "read-only"
-        )
-        if "permission_mode" in task.payload:
-            effective_permission_mode = str(task.payload["permission_mode"])
-        elif read_only_intent:
-            effective_permission_mode = "plan"
-        else:
-            effective_permission_mode = "acceptEdits"
+        effective_permission_mode = _claude_permission_mode(task.payload)
         write_capable = effective_permission_mode != "plan"
         command_kwargs: dict[str, Any] = {}
         if resume is not None:
@@ -536,3 +532,14 @@ def build_claude_code_command(
         command.extend(command_parts(extra_args))
     return command
 
+
+def _claude_permission_mode(payload: dict) -> str:
+    if "permission_mode" in payload:
+        return str(payload["permission_mode"])
+    if payload.get("read_only") or payload.get("sandbox") == "read-only":
+        return "plan"
+    return "acceptEdits"
+
+
+def _claude_write_capable(payload: dict) -> bool:
+    return _claude_permission_mode(payload) != "plan"

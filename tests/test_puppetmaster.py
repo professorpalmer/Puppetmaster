@@ -23912,6 +23912,31 @@ class PuppetmasterGateTests(unittest.TestCase):
             ok = evaluate_task_gates(task, [], store, worker_id="w1", cwd=repo)
             self.assertTrue(ok.passed)
 
+    def test_write_scope_gate_does_not_charge_sibling_or_cache_writes(self) -> None:
+        """Parallel siblings share the workspace: their declared files and bytecode caches are not this task's writes."""
+        from puppetmaster.gates import evaluate_task_gates
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            repo = Path(tmp) / "repo"
+            self._git_repo(repo)
+            (repo / "pkg").mkdir()
+            (repo / "pkg" / "__pycache__").mkdir()
+            for name in ("roman.py", "slug.py"):
+                (repo / "pkg" / name).write_text("x = 1\n")
+            (repo / "pkg" / "__pycache__" / "slug.cpython-311.pyc").write_bytes(b"\0")
+            mine = self._task(write_scope=["pkg/roman.py"], cwd=str(repo))
+            sibling = Task(job_id=mine.job_id, role="slug", instruction="x",
+                           payload={"write_scope": ["pkg/slug.py"]})
+            store.save_tasks([mine, sibling])
+
+            self.assertTrue(evaluate_task_gates(mine, [], store, worker_id="w1", cwd=repo).passed)
+
+            (repo / "stray.py").write_text("oops\n")
+            stray = evaluate_task_gates(mine, [], store, worker_id="w1", cwd=repo)
+            self.assertFalse(stray.passed)
+            self.assertIn("outside declared scope", stray.failed_reason)
+
     def test_predict_write_conflicts_flags_overlapping_scopes(self) -> None:
         """B3/C1: overlapping declared scopes are predicted before dispatch."""
         from puppetmaster.conflicts import predict_write_conflicts, scopes_overlap

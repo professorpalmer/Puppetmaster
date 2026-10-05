@@ -27,6 +27,7 @@ from ._git import git_snapshot
 from ._facade import facade
 from ._prompts import (
     prompt_with_memory,
+    build_cli_implement_prompt,
     structured_prompt_for_task,
     with_job_brief,
 )
@@ -149,26 +150,38 @@ class CodexAdapter(CliWorkerAdapter):
         if resume is not None:
             resume_record, lease = _lease_codex_thread(resume_record)
             resume = resolved_resume(resume_record, "codex")
-        task_prompt = with_job_brief(
-            structured_prompt_for_task(
+        sandbox = str(task.payload.get("sandbox") or "workspace-write")
+        bypass = bool(task.payload.get("dangerously_bypass_approvals_and_sandbox", False))
+        write_capable = sandbox != "read-only" or bypass
+        disable_codegraph = bool(task.payload.get("disable_codegraph", False))
+        if write_capable:
+            # A builder gets task-scoped CodeGraph context; the job-wide census
+            # and goal brief only dilute it.
+            task_prompt = with_job_brief(
+                build_cli_implement_prompt(task, prompt=base_prompt),
                 task,
-                prompt=base_prompt,
-                final_message_note=True,
-            ),
-            task,
-        )
+                shared_brief=disable_codegraph,
+            )
+        else:
+            task_prompt = with_job_brief(
+                structured_prompt_for_task(
+                    task,
+                    prompt=base_prompt,
+                    final_message_note=True,
+                ),
+                task,
+            )
         if resume is not None:
             # The resumed thread already holds memory, census and CodeGraph context.
             prompt, codegraph_used = task_prompt, False
         else:
+            if not write_capable:
+                task_prompt = facade("with_repo_census")(task_prompt, cwd)
             prompt, codegraph_used = facade("enrich_prompt_with_codegraph")(
-                prompt_with_memory(
-                    facade("with_repo_census")(task_prompt, cwd),
-                    task,
-                ),
+                prompt_with_memory(task_prompt, task),
                 task_description=task.payload.get("codegraph_task") or task.instruction or goal,
                 cwd=cwd,
-                disabled=bool(task.payload.get("disable_codegraph", False)),
+                disabled=disable_codegraph,
             )
         executable = _configured_codex_executable(task)
         command_base = _codex_command_base(task, resolved)
@@ -177,9 +190,7 @@ class CodexAdapter(CliWorkerAdapter):
                 lease.release()
             return self._missing_cli(task, worker_id, str(executable))
         model = str(task.payload.get("model") or DEFAULT_CODEX_MODEL)
-        sandbox = str(task.payload.get("sandbox") or "workspace-write")
         approval_policy = str(task.payload.get("approval_policy") or "never")
-        bypass = bool(task.payload.get("dangerously_bypass_approvals_and_sandbox", False))
         # A review-loop task may be repaired by resuming this thread, so keep it.
         ephemeral = bool(task.payload.get("ephemeral", not task.payload.get("review_loop")))
         skip_git_repo_check = bool(task.payload.get("skip_git_repo_check", True))
@@ -207,7 +218,6 @@ class CodexAdapter(CliWorkerAdapter):
                 dangerously_bypass=bypass,
                 extra_args=task.payload.get("extra_args", []),
             )
-        write_capable = sandbox != "read-only" or bypass
         return CliInvocation(
             command=command,
             sidecar_name="codex_exec",
@@ -422,7 +432,13 @@ class CodexAdapter(CliWorkerAdapter):
         ) if process_failed else None
         if turn_failed and failure == UNKNOWN:
             failure = "codex_turn_failed"
-        unstructured = not process_failed and not parsed_artifacts and bool(last_message.strip())
+        # For a build worker a bare terminal verdict is not a report; its
+        # free-text report must still become an artifact.
+        report_artifacts = [
+            artifact for artifact in parsed_artifacts
+            if not write_capable or (artifact.payload or {}).get("kind") != "worker_verdict"
+        ]
+        unstructured = not process_failed and not report_artifacts and bool(last_message.strip())
         degraded = unstructured and not write_capable
 
         verification = verification_artifact(
@@ -485,6 +501,8 @@ class CodexAdapter(CliWorkerAdapter):
         )
         artifacts: list[Artifact] = [verification]
         if unstructured and write_capable:
+            # implement_report_artifacts re-parses the verdict itself.
+            parsed_artifacts = []
             artifacts.extend(
                 implement_report_artifacts(task, worker_id, last_message, adapter="codex")
             )
