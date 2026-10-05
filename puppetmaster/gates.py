@@ -620,6 +620,16 @@ def parse_review_verdict(text: str) -> Optional[dict[str, Any]]:
     return None
 
 
+# Registry defaults may carry write permissions meant for workers; a judge never edits.
+_JUDGE_WRITE_KEYS = (
+    "permission_mode",
+    "dangerously_bypass_approvals_and_sandbox",
+    "allow_dirty",
+    "commit",
+    "write_scope",
+)
+
+
 def _judge_payload(task: Task, judge: "ModelSpec", *, prompt: str, cwd: Path, timeout: int) -> dict[str, Any]:
     """A read-only review payload for ``judge``, independent of the implementer's run.
 
@@ -632,9 +642,13 @@ def _judge_payload(task: Task, judge: "ModelSpec", *, prompt: str, cwd: Path, ti
     implementer = task.payload or {}
     defaults = getattr(judge, "payload_defaults", None)
     payload: dict[str, Any] = dict(defaults) if isinstance(defaults, dict) else {}
+    for key in _JUDGE_WRITE_KEYS:
+        payload.pop(key, None)
     for key in ("registry_path", "registry_digest"):
         if implementer.get(key):
             payload[key] = implementer[key]
+    if implementer.get("executable") and judge.adapter == task.adapter:
+        payload["executable"] = implementer["executable"]
     payload.update(
         {
             "prompt": prompt,
@@ -783,19 +797,35 @@ def _review_sampled(task_id: str, sample: float) -> bool:
 
 
 def _task_base_sha(store: "SwarmStore", task: Task, artifacts: list[Artifact]) -> Optional[str]:
-    """The commit the task started from: the earliest ``base_sha`` any of its attempts recorded."""
+    """The commit the task started from, when its attempts form one unbroken chain.
+
+    Each attempt records ``base_sha`` (HEAD before) and ``head_sha`` (HEAD
+    after). Only when every attempt started where the previous one ended is
+    the range from the first base the task's own work; a gap means someone
+    else moved HEAD in between, so return None and review the attempt alone.
+    """
     candidates = list(artifacts)
     try:
         candidates.extend(store.list_artifacts(task.job_id))
     except Exception:
         pass
-    recorded = sorted(
-        (str(artifact.created_at or ""), str((artifact.payload or {}).get("base_sha") or ""))
-        for artifact in candidates
-        if artifact.task_id == task.id
-        and str((artifact.payload or {}).get("base_sha") or "") not in ("", "uncommitted")
-    )
-    return recorded[0][1] if recorded else None
+    attempts: dict[tuple[str, str], str] = {}
+    for artifact in candidates:
+        payload = artifact.payload or {}
+        base = str(payload.get("base_sha") or "")
+        if artifact.task_id != task.id or base in ("", "uncommitted"):
+            continue
+        key = (base, str(payload.get("head_sha") or ""))
+        stamp = str(artifact.created_at or "")
+        if key not in attempts or stamp < attempts[key]:
+            attempts[key] = stamp
+    chain = [key for key, _ in sorted(attempts.items(), key=lambda item: (item[1], item[0]))]
+    if not chain:
+        return None
+    for (_, previous_head), (base, _) in zip(chain, chain[1:]):
+        if base != previous_head:
+            return None
+    return chain[0][0]
 
 
 def _cumulative_diff(cwd: Path, base_sha: str) -> str:
@@ -812,6 +842,9 @@ def _cumulative_diff(cwd: Path, base_sha: str) -> str:
     if not git_output(root, ["rev-parse", "--verify", "--quiet", f"{base_sha}^{{commit}}"]):
         return ""
     if git_output(root, ["rev-parse", "HEAD"]) == base_sha:
+        return ""
+    # A reset or rebased history would render dropped commits as reverse hunks.
+    if git_output(root, ["merge-base", base_sha, "HEAD"]) != base_sha:
         return ""
     diff = git_diff_output(root, ["diff", base_sha, "--binary"])
     untracked = git_untracked_diff(root, git_untracked_files(root))
