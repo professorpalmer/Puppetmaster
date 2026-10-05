@@ -123,6 +123,14 @@ RULE_BODY = textwrap.dedent(
     `map` node fans out per-item flows; a follow-up continues a finished run
     with `continue_from`. Reference: `docs/FLOWS.md`.
 
+    When the result is judged by craft (how it looks, reads or feels:
+    visuals, geometry, UI, prose) and not only by a test, end the flow in
+    armor: a `shell` check that produces the observable result (render, run,
+    screenshot), then a `judge` whose task is a numbered rubric taken from the
+    user's request, with its FAIL edge back to the build (`max` 2). Across
+    many items, put the check and judge inside the `map` item graph so each
+    item is repaired alone. Passing tests is not the bar a user grades.
+
     ## Label every job you start (do it by default)
 
     When you start any job verb (`puppetmaster_start_*`, `puppetmaster_edit`,
