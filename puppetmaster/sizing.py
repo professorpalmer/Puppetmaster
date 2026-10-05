@@ -100,25 +100,60 @@ def calibration_path(env: Optional[Mapping[str, str]] = None) -> Path:
     return puppetmaster_home() / "sizing-calibration.json"
 
 
+# Policy fields and the ranges a calibrated value must fall in. Anything
+# missing, null, non-finite or out of range keeps the provisional default.
+_POLICY_RANGES: dict[str, tuple[float, float]] = {
+    "solo_horizon_s": (1.0, 86400.0),
+    "solo_context_frac": (0.01, 1.0),
+    "min_independent_units": (2.0, 10000.0),
+    "upfront_units": (2.0, 10000.0),
+    "handoff_overhead_s": (0.0, 3600.0),
+    "late_fraction": (0.0, 1.0),
+}
+
+
+def _valid(field_name: str, value: Any) -> bool:
+    import math
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return False
+    low, high = _POLICY_RANGES[field_name]
+    return low <= float(value) <= high
+
+
 def load_calibration(model: str, *, path: Optional[Path] = None,
                      env: Optional[Mapping[str, str]] = None) -> dict:
-    """Merged calibration for ``model``: built-in default, file default, file model entry."""
+    """Policy calibration for ``model``, field by field.
+
+    The file is the actionable policy, not the falloff study's raw research
+    output: a study can leave a field unmeasured (null) and must not have it
+    read as zero. Each field takes the model entry, else the file default,
+    else the built-in provisional value, but only when it is a finite number
+    in range. ``provenance`` names where each field came from.
+    """
     merged = dict(DEFAULT_CALIBRATION)
+    provenance = {name: "provisional" for name in _POLICY_RANGES}
     target = path if path is not None else calibration_path(env)
     try:
         data = json.loads(target.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return merged
-    if not isinstance(data, dict):
-        return merged
-    if isinstance(data.get("default"), dict):
-        merged.update(data["default"])
-    models = data.get("models") if isinstance(data.get("models"), dict) else {}
-    wanted = _model_key(model)
-    for name, entry in models.items():
-        if _model_key(name) == wanted and isinstance(entry, dict):
-            merged.update(entry)
-            break
+        data = None
+    if isinstance(data, dict):
+        layers = [("file-default", data.get("default"))]
+        models = data.get("models") if isinstance(data.get("models"), dict) else {}
+        wanted = _model_key(model)
+        entry = next((value for name, value in models.items() if _model_key(name) == wanted), None)
+        layers.append(("calibrated", entry))
+        for label, layer in layers:
+            if not isinstance(layer, dict):
+                continue
+            for name in _POLICY_RANGES:
+                if _valid(name, layer.get(name)):
+                    merged[name] = layer[name]
+                    provenance[name] = label
+            if label == "calibrated" and isinstance(layer.get("source"), str):
+                merged["source"] = layer["source"]
+    merged["provenance"] = provenance
     return merged
 
 

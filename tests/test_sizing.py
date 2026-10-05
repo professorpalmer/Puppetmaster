@@ -76,8 +76,24 @@ class SizingInputTests(unittest.TestCase):
             self.assertEqual((cal["solo_horizon_s"], cal["upfront_units"]), (2400, 20))
             self.assertEqual(sizing.load_calibration("other", path=path)["solo_horizon_s"],
                              sizing.DEFAULT_CALIBRATION["solo_horizon_s"])
-            self.assertEqual(sizing.load_calibration("x", path=Path(tmp) / "missing.json"),
-                             sizing.DEFAULT_CALIBRATION)
+            missing = sizing.load_calibration("x", path=Path(tmp) / "missing.json")
+            self.assertEqual(missing["solo_horizon_s"], sizing.DEFAULT_CALIBRATION["solo_horizon_s"])
+            self.assertEqual(set(missing["provenance"].values()), {"provisional"})
+
+    def test_unmeasured_or_invalid_fields_stay_provisional(self):
+        # A falloff study may leave a field unmeasured; null must not crash or read as zero.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cal.json"
+            path.write_text(json.dumps({"models": {"gpt-6.1-sol": {
+                "solo_horizon_s": 900, "min_independent_units": None, "upfront_units": 0,
+                "solo_context_frac": "high", "late_fraction": True}}}))
+            cal = sizing.load_calibration("gpt-6.1-sol", path=path)
+            self.assertEqual(cal["provenance"]["solo_horizon_s"], "calibrated")
+            for name in ("min_independent_units", "upfront_units", "solo_context_frac", "late_fraction"):
+                self.assertEqual(cal["provenance"][name], "provisional")
+                self.assertEqual(cal[name], sizing.DEFAULT_CALIBRATION[name])
+            self.assertIn(sizing.decide(plan(16, 2), elapsed_s=240, calibration=cal).action,
+                          (sizing.HANDOFF, sizing.STAY_SOLO))
 
 
 if __name__ == "__main__":
