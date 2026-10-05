@@ -25,14 +25,16 @@ class GateLeaseHeartbeatTests(unittest.TestCase):
             job = store.create_job("gate lease")
             store.save_task(Task(job_id=job.id, role="implement", instruction="noop",
                                  adapter="local", payload={"skip_preflight": True}))
+            # Timestamps have one-second precision, so a 1 s lease can read as
+            # expired at a second boundary even when renewed; use 2 s.
             runtime = WorkerRuntime(store, job.id, "implement", "w-1",
-                                    lease_seconds=1, heartbeat_seconds=0.05)
+                                    lease_seconds=2, heartbeat_seconds=0.05)
             recovered = []
 
             def slow_review(task, artifacts):
-                # A live review judge outlasting the 1 s lease, with the
+                # A live review judge outlasting the 2 s lease, with the
                 # orchestrator's stale-lease recovery running mid-review.
-                time.sleep(1.6)
+                time.sleep(2.6)
                 recovered.extend(store.recover_stale_tasks(job.id))
                 time.sleep(0.2)
                 return GateEvaluation(passed=True, results=[], artifacts=[])
