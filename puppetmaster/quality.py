@@ -44,6 +44,28 @@ def _payload(artifact: Artifact) -> dict[str, Any]:
     return getattr(artifact, "payload", None) or {}
 
 
+def _latest_gate_results(artifacts: list[Artifact]) -> list[Artifact]:
+    """Drop gate results a later evaluation of the same gate on the same task superseded.
+
+    A review-loop task fails its review, is repaired, and passes on a later
+    attempt; the first rejection must not keep the delivered run blocked.
+    Within the same second a failing result wins, so a pass can never hide a
+    failure it did not follow.
+    """
+    latest: dict[tuple[str, str], Artifact] = {}
+    for artifact in artifacts:
+        if artifact.type != ArtifactType.GATE:
+            continue
+        payload = _payload(artifact)
+        key = (str(artifact.task_id), str(payload.get("gate") or payload.get("kind") or ""))
+        rank = (str(artifact.created_at or ""), payload.get("passed") is False)
+        current = latest.get(key)
+        if current is None or rank >= (str(current.created_at or ""), _payload(current).get("passed") is False):
+            latest[key] = artifact
+    keep = {id(artifact) for artifact in latest.values()}
+    return [a for a in artifacts if a.type != ArtifactType.GATE or id(a) in keep]
+
+
 def _is_blocked(artifact: Artifact) -> bool:
     payload = _payload(artifact)
     if payload.get("result") == "blocked":
@@ -134,7 +156,7 @@ def _objective_evaluator_summary(artifacts: list[Artifact]) -> dict[str, Any]:
 
 def assess_run_quality(artifacts: Iterable[Artifact]) -> dict[str, Any]:
     """Classify a finished run. See module docstring for verdict semantics."""
-    artifacts = list(artifacts)
+    artifacts = _latest_gate_results(list(artifacts))
     evaluator_summary = _objective_evaluator_summary(artifacts)
     reasons: list[str] = []
 
