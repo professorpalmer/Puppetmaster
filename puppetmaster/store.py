@@ -64,6 +64,9 @@ from puppetmaster.projections import connection as projection_connection
 
 _WINDOWS_LOCK_RETRIES = 10
 _WINDOWS_LOCK_BACKOFF_SECONDS = 0.02
+# A lock file modified this recently cannot be older than any TTL it was taken
+# with, so a waiter can call it fresh from ``stat`` alone (see _lock_is_stale).
+_LOCK_STAT_SLACK_SECONDS = 5.0
 _MEMORY_CAP = 200
 _SCOPE_WEIGHTS = {
     "swarm.findings": 1.0,
@@ -4020,8 +4023,18 @@ class SwarmStore(StoreContracts):
         """True only for a lock proven older than the TTL; None if it is gone.
 
         A vanished lock was released, not orphaned: unlinking the path then
-        would delete whichever owner re-acquired it in between.
+        would delete whichever owner re-acquired it in between. A lock modified
+        well inside the TTL is fresh by its stat alone; not opening it matters
+        on Windows, where a waiter's open handle blocks the owner's delete.
         """
+        try:
+            modified = path.stat().st_mtime
+        except FileNotFoundError:
+            return None
+        except OSError:
+            modified = None
+        if modified is not None and time.time() - modified < ttl_seconds - _LOCK_STAT_SLACK_SECONDS:
+            return False
         try:
             raw = path.read_text(encoding="utf-8").strip()
         except FileNotFoundError:

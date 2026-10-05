@@ -323,6 +323,21 @@ class ClaimContentionTests(unittest.TestCase):
 
 
 class FileLockReclaimTests(unittest.TestCase):
+    def test_waiter_does_not_open_a_fresh_lock(self):
+        # On Windows a waiter's open handle blocks the owner's delete, so the
+        # owner's release failed and the lock leaked for its whole TTL.
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp))
+            name = 'completion:job'
+            self.assertTrue(store.acquire_lock(name, 'owner', ttl_seconds=300))
+
+            def no_open(self_path, *args, **kwargs):
+                raise AssertionError('waiter opened %s' % self_path)
+            with patch.object(Path, 'read_text', no_open), patch.object(Path, 'read_bytes', no_open):
+                self.assertFalse(store.acquire_lock(name, 'waiter', ttl_seconds=300))
+            store.release_lock(name, owner='owner')
+            self.assertTrue(store.acquire_lock(name, 'waiter', ttl_seconds=300))
+
     def test_released_then_reacquired_lock_is_not_broken(self):
         # A lock that vanished between our O_EXCL failure and our staleness read
         # was released, not stale. Unlinking whatever is at the path then
@@ -333,6 +348,8 @@ class FileLockReclaimTests(unittest.TestCase):
             name = 'completion:job'
             self.assertTrue(store.acquire_lock(name, 'first', ttl_seconds=300))
             path = store.locks_dir / ('%s.lock' % store._safe_key(name))
+            # Old enough that the waiter must read the lock, not trust its stat.
+            os.utime(path, (0, 0))
             read_text = Path.read_text
 
             def handoff(self_path, *args, **kwargs):

@@ -27399,6 +27399,7 @@ class AuditFixTests(unittest.TestCase):
                 json.dumps({"owner": "dead-worker", "at": time.time() - 120}),
                 encoding="utf-8",
             )
+            os.utime(lock_path, (time.time() - 120, time.time() - 120))
             self.assertTrue(store.acquire_lock("task:task123", "worker-b", ttl_seconds=30))
 
     def test_gate_command_parses_string_without_shell(self) -> None:

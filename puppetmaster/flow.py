@@ -60,6 +60,9 @@ from puppetmaster.proc_identity import pid_reused, process_identity
 from puppetmaster.worker_verdict import parse_terminal_verdict
 
 NODE_KINDS = ("agent", "judge", "parallel", "map", "shell", "gate", "set", "end")
+# Reasoning effort, cheapest first; escalation walks up this ladder.
+EFFORTS = ("low", "medium", "high", "xhigh")
+LANES = ("explore", "code", "judge")
 _CONTROL_KINDS = ("set", "end")
 TERMINAL_STATUSES = ("done", "failed", "stuck", "stopped")
 WAKE_STATUSES = TERMINAL_STATUSES + ("waiting", "interrupted")
@@ -122,6 +125,15 @@ def validate_graph(graph: Any, *, child: bool = False, depth: int = 0,
     if "payload" in own_defaults and not isinstance(own_defaults["payload"], dict):
         problems.append("defaults.payload must be an object")
         own_defaults = {key: value for key, value in own_defaults.items() if key != "payload"}
+    problems.extend(_effort_problems(own_defaults, "defaults"))
+    lanes = own_defaults.get("lanes")
+    if lanes is not None:
+        if not isinstance(lanes, dict) or not set(lanes) <= set(LANES):
+            problems.append(f"defaults.lanes must map {', '.join(LANES)} to an effort")
+        else:
+            for lane, effort in lanes.items():
+                if effort not in EFFORTS:
+                    problems.append(f"defaults.lanes.{lane} must be one of {', '.join(EFFORTS)}")
     merged = _merged_defaults(defaults, own_defaults)
     nodes = graph.get("nodes")
     if not isinstance(nodes, list) or not nodes:
@@ -167,6 +179,34 @@ def validate_graph(graph: Any, *, child: bool = False, depth: int = 0,
     return problems
 
 
+def _effort_problems(obj: dict, where: str) -> list[str]:
+    problems = []
+    if "effort" in obj and obj["effort"] not in EFFORTS:
+        problems.append(f"{where} effort must be one of {', '.join(EFFORTS)}")
+    if "escalate" in obj and not isinstance(obj["escalate"], bool):
+        problems.append(f"{where} escalate must be true or false")
+    return problems
+
+
+def node_effort(node: dict, defaults: dict, visit: int) -> Optional[str]:
+    """Reasoning effort for one visit of an agent or judge node, or None (adapter default).
+
+    The node's own ``effort`` wins over its lane (explore, code, judge) in
+    ``defaults.lanes``, which wins over ``defaults.effort``. With ``escalate``,
+    each repair visit thinks one step harder than the last, so a first attempt
+    can run cheap and only work that failed a check pays for more.
+    """
+    lane = "judge" if node.get("kind") == "judge" else (
+        "explore" if node.get("role") == "explore" else "code")
+    lanes = defaults.get("lanes") if isinstance(defaults.get("lanes"), dict) else {}
+    effort = node.get("effort") or lanes.get(lane) or defaults.get("effort")
+    escalate = node.get("escalate", defaults.get("escalate", False))
+    if escalate is True and visit > 1:
+        base = EFFORTS.index(effort) if effort in EFFORTS else EFFORTS.index("medium")
+        effort = EFFORTS[min(base + visit - 1, len(EFFORTS) - 1)]
+    return effort if effort in EFFORTS else None
+
+
 def _node_problems(node: dict, defaults: dict, *, child: bool, depth: int) -> list[str]:
     nid, kind = node["id"], node.get("kind")
     if kind not in NODE_KINDS:
@@ -183,6 +223,7 @@ def _node_problems(node: dict, defaults: dict, *, child: bool, depth: int) -> li
         problems.append(f"node {nid!r} timeout_seconds must be a positive integer")
     if "payload" in node and not isinstance(node["payload"], dict):
         problems.append(f"node {nid!r} payload must be an object")
+    problems.extend(_effort_problems(node, f"node {nid!r}"))
     if kind in ("agent", "judge"):
         if not str(node.get("task") or "").strip():
             problems.append(f"{kind} {nid!r} needs a task")
@@ -298,10 +339,13 @@ def _positive_int(value: Any) -> bool:
 def _merged_defaults(parent: Optional[dict], own: Any) -> dict:
     merged = dict(parent or {})
     if isinstance(own, dict):
-        payload = {**(merged.get("payload") or {}), **(own.get("payload") or {})}
+        combined = {
+            key: {**(merged.get(key) or {}), **(own.get(key) or {})}
+            for key in ("payload", "lanes")
+            if isinstance(merged.get(key) or {}, dict) and isinstance(own.get(key) or {}, dict)
+        }
         merged.update(own)
-        if payload:
-            merged["payload"] = payload
+        merged.update({key: value for key, value in combined.items() if value})
     return merged
 
 
@@ -1349,6 +1393,9 @@ class JobNodeExecutor:
         timeout = node.get("timeout_seconds") or defaults.get("timeout_seconds")
         if timeout:
             payload["timeout_seconds"] = int(timeout)
+        effort = node_effort(node, defaults, visit)
+        if effort:
+            payload["reasoning_effort"] = effort
         # Keep provider sessions so a later visit or a follow-up run can resume them.
         payload["ephemeral"] = False
         payload["flow"] = {"run_id": run.run_id, "node": key, "visit": visit}
