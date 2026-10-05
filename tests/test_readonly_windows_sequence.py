@@ -202,10 +202,15 @@ class WindowsSequenceTests(unittest.TestCase):
             self.assertEqual([request['wal_snapshot'] for request in requests], [False, True])
             connection.close()
 
-    def assert_guard_open_denial_retried(self, **binding):
+    def assert_guard_open_denial_retried(self, attach_budget=None, **binding):
         with TemporaryDirectory() as tmp:
             store = SQLiteSwarmStore(tmp)
             store.ensure_schema()
+            # Start the clock after fixture setup: a slow ensure_schema on a
+            # loaded Windows runner used to spend the whole budget before the
+            # retry under test ran.
+            if attach_budget is not None:
+                binding['attach_deadline'] = time.monotonic() + attach_budget
             replies = iter([
                 json.dumps(dict(
                     session_closed=True,
@@ -246,8 +251,7 @@ class WindowsSequenceTests(unittest.TestCase):
             connection.close()
 
     def test_windows_attach_retries_transient_guard_open_denial(self):
-        self.assert_guard_open_denial_retried(
-            attach_binding=True, attach_deadline=time.monotonic() + 1)
+        self.assert_guard_open_denial_retried(attach_binding=True, attach_budget=2)
 
     def test_windows_launch_retries_transient_guard_open_denial(self):
         self.assert_guard_open_denial_retried(launch_binding=True)

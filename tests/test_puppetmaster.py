@@ -17322,6 +17322,19 @@ class AdapterCliPresenceTests(unittest.TestCase):
             self.assertTrue(adapter_cli_present(adapter, resolver=present))
             self.assertFalse(adapter_cli_present(adapter, resolver=absent))
 
+    def test_antigravity_hermes_and_fx_gate_on_resolvable_binary(self) -> None:
+        from puppetmaster.preflight import adapter_cli_executable, adapter_cli_present
+
+        # An authenticated Antigravity account with no agy binary used to read
+        # as runnable, so auto-route first-picked antigravity/* and every
+        # worker died with missing_cli.
+        expected = {"antigravity": "agy", "hermes": "hermes", "fx": "fx"}
+        for adapter, binary in expected.items():
+            with self.subTest(adapter=adapter):
+                self.assertEqual(adapter_cli_executable(adapter, env={}), binary)
+                self.assertTrue(adapter_cli_present(adapter, env={}, resolver=lambda name: f"/opt/bin/{name}"))
+                self.assertFalse(adapter_cli_present(adapter, env={}, resolver=lambda _name: None))
+
     def test_runtime_capabilities_keep_cursor_isolation_opt_in(self) -> None:
         from puppetmaster.adapters.registry import adapter_runtime_capabilities
 
@@ -17346,6 +17359,16 @@ class AdapterCliPresenceTests(unittest.TestCase):
         self.assertEqual(
             adapter_cli_executable("codex", env={"CODEX_COMMAND": "codex-next"}),
             "codex-next",
+        )
+        self.assertEqual(
+            adapter_cli_executable("antigravity", env={"ANTIGRAVITY_COMMAND": "/opt/agy2"}),
+            "/opt/agy2",
+        )
+        self.assertEqual(
+            adapter_cli_executable(
+                "antigravity", env={"AGY_COMMAND": "/opt/agy", "ANTIGRAVITY_COMMAND": "/opt/agy2"}
+            ),
+            "/opt/agy",
         )
 
 class BedrockModelResolutionTests(unittest.TestCase):

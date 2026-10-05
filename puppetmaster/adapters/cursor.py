@@ -655,6 +655,14 @@ def cursor_artifact_from_item(
 ) -> Optional[Artifact]:
     if not isinstance(item, dict):
         return None
+    # Workers also mirror the stored Artifact shape, {"type": ..., "payload":
+    # {"claim": ...}}; without lifting, the headline became "Unnamed item" and
+    # the real claim and evidence were buried under payload.
+    nested = item.get("payload")
+    if isinstance(nested, dict) and not any(
+        item.get(key) for key in ("claim", "risk", "decision", "finding")
+    ):
+        item = {**nested, **{key: value for key, value in item.items() if key != "payload"}}
     # Codex (and some free-text salvage paths) emit nested wrappers like
     # {"finding": {"claim": ...}} instead of {"type": "finding", "claim": ...}.
     # Unwrap ONLY when top-level type is absent — otherwise a typed artifact
