@@ -3668,14 +3668,15 @@ def run_job_cost(args: JsonObject) -> JsonObject:
 
 def run_status(args: JsonObject) -> JsonObject:
     command = ["status", require_job_id(args)]
-    if args.get("compact"):
+    # Pilots pay for every byte they read: compact unless asked otherwise.
+    if args.get("compact", True):
         command.append("--compact")
     return run_cli(command, args)
 
 
 def run_artifacts(args: JsonObject) -> JsonObject:
     command = ["artifacts", require_job_id(args)]
-    if args.get("refs"):
+    if args.get("refs", True):
         command.append("--refs")
     return run_cli(command, args)
 
@@ -4784,9 +4785,11 @@ def status_schema() -> JsonObject:
     schema["properties"]["compact"] = {
         "type": "boolean",
         "description": (
-            "Omit high-churn prompt bodies from status JSON and replace them "
-            "with deterministic char-count/SHA-256 refs."
+            "Default true. Replaces prompt bodies with char-count/SHA-256 refs, "
+            "the cost receipt with token and cost totals, and drops registry "
+            "bookkeeping from task payloads. false returns the full snapshot."
         ),
+        "default": True,
     }
     return schema
 
@@ -4796,10 +4799,13 @@ def artifacts_schema() -> JsonObject:
     schema["properties"]["refs"] = {
         "type": "boolean",
         "description": (
-            "When true, return compact artifact refs instead of full payloads "
+            "Default true: compact artifact refs instead of full payloads "
             "(id/type/task_id/sha256/confidence/created_at, concise "
-            "claim/check/decision, evidence summary, validation metadata)."
+            "claim/check/decision, evidence summary, validation metadata). "
+            "false returns full artifact bodies; prefer show for the stitched "
+            "summary."
         ),
+        "default": True,
     }
     return schema
 

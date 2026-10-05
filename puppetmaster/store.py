@@ -67,6 +67,11 @@ _WINDOWS_LOCK_BACKOFF_SECONDS = 0.02
 # A lock file modified this recently cannot be older than any TTL it was taken
 # with, so a waiter can call it fresh from ``stat`` alone (see _lock_is_stale).
 _LOCK_STAT_SLACK_SECONDS = 5.0
+# Routing provenance a pilot never acts on; full status still carries it.
+_STATUS_PAYLOAD_BOOKKEEPING = frozenset((
+    "billing_evidence", "billing_source", "registry_billing", "registry_digest",
+    "registry_path", "pinned_adapter_model_name", "router_model_id", "extra_args",
+))
 _MEMORY_CAP = 200
 _SCOPE_WEIGHTS = {
     "swarm.findings": 1.0,
@@ -3612,7 +3617,7 @@ class SwarmStore(StoreContracts):
     def _compact_status_payload(cls, payload: Any) -> Any:
         if not isinstance(payload, dict):
             return payload
-        compacted = dict(payload)
+        compacted = {k: v for k, v in payload.items() if k not in _STATUS_PAYLOAD_BOOKKEEPING}
         prompt = compacted.pop("prompt", None)
         if prompt is not None:
             compacted["prompt_ref"] = cls._compact_text_ref(prompt)
@@ -3624,7 +3629,29 @@ class SwarmStore(StoreContracts):
         goal = compacted.pop("goal", None)
         if goal is not None:
             compacted["goal_ref"] = cls._compact_text_ref(goal)
+        receipt = compacted.pop("cost_receipt", None)
+        if isinstance(receipt, dict):
+            compacted["cost_summary"] = cls._compact_cost_receipt(receipt, compacted.get("id"))
         return compacted
+
+    @staticmethod
+    def _compact_cost_receipt(receipt: dict[str, Any], job_id: Any) -> dict[str, Any]:
+        actual = receipt.get("actual_cost") if isinstance(receipt.get("actual_cost"), dict) else {}
+        tasks = [t for t in actual.get("tasks") or [] if isinstance(t, dict)]
+        def total(key: str) -> Any:
+            values = [t.get(key) for t in tasks if isinstance(t.get(key), (int, float))]
+            return round(sum(values), 6) if values else None
+        counterfactual = receipt.get("counterfactual") if isinstance(receipt.get("counterfactual"), dict) else {}
+        return {
+            "tokens_in": total("tokens_in"),
+            "tokens_out": total("tokens_out"),
+            "cache_read_tokens": total("cache_read_tokens"),
+            "marginal_cost_usd": actual.get("total_marginal_cost_usd"),
+            "api_equivalent_cost_usd": total("api_equivalent_cost_usd"),
+            "cost_basis": actual.get("cost_basis") or receipt.get("cost_basis"),
+            "avoided_usd": counterfactual.get("avoided_usd"),
+            "full": f"puppetmaster cost {job_id}",
+        }
 
     @classmethod
     def _compact_status_task(cls, task: dict[str, Any]) -> dict[str, Any]:

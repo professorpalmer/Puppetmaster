@@ -461,6 +461,48 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertFalse(result["isError"])
         self.assertEqual(captured["command"], ["status", "job_x", "--compact"])
 
+    def test_mcp_status_and_artifacts_default_compact_for_pilots(self) -> None:
+        from puppetmaster import mcp_server
+
+        commands = []
+
+        def fake_run_cli(command, args):
+            commands.append(command)
+            return {"content": [{"type": "text", "text": "{}"}], "isError": False}
+
+        with patch.object(mcp_server, "run_cli", side_effect=fake_run_cli):
+            mcp_server.run_status({"job_id": "job_x"})
+            mcp_server.run_status({"job_id": "job_x", "compact": False})
+            mcp_server.run_artifacts({"job_id": "job_x"})
+            mcp_server.run_artifacts({"job_id": "job_x", "refs": False})
+        self.assertEqual(commands, [
+            ["status", "job_x", "--compact"], ["status", "job_x"],
+            ["artifacts", "job_x", "--refs"], ["artifacts", "job_x"],
+        ])
+
+    def test_compact_status_summarizes_cost_receipt_and_drops_bookkeeping(self) -> None:
+        receipt = {
+            "actual_cost": {
+                "cost_basis": "measured_usage_x_registry_price",
+                "total_marginal_cost_usd": 0.0,
+                "tasks": [
+                    {"tokens_in": 100, "tokens_out": 7, "api_equivalent_cost_usd": 0.25},
+                    {"tokens_in": 50, "tokens_out": 3, "api_equivalent_cost_usd": 0.5},
+                ],
+            },
+            "counterfactual": {"avoided_usd": 1.5},
+            "bounded_economics": {"totals": {"x": 1}},
+        }
+        job = SwarmStore._compact_status_job({"id": "job_x", "goal": "g", "cost_receipt": receipt})
+        self.assertNotIn("cost_receipt", job)
+        self.assertEqual(job["cost_summary"]["tokens_in"], 150)
+        self.assertEqual(job["cost_summary"]["api_equivalent_cost_usd"], 0.75)
+        self.assertEqual(job["cost_summary"]["avoided_usd"], 1.5)
+        self.assertEqual(job["cost_summary"]["full"], "puppetmaster cost job_x")
+        payload = SwarmStore._compact_status_payload(
+            {"model": "m", "registry_digest": "d", "extra_args": ["-c"], "prompt": "p"})
+        self.assertEqual(set(payload), {"model", "prompt_ref"})
+
     def test_mcp_adapter_generates_config_for_custom_roles(self) -> None:
         with TemporaryDirectory() as tmp:
             before_process_count = len(ASYNC_PROCESSES)
