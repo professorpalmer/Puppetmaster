@@ -59,11 +59,12 @@ def usage_from_sdk(sdk_usage: Any) -> Optional[dict[str, int]]:
     if tokens_in is None and tokens_out is None:
         return None
     result = {"tokens_in": tokens_in or 0, "tokens_out": tokens_out or 0}
-    # Cursor's turn-ended usage also splits out cache read/write tokens. They're
-    # priced differently from fresh input, so preserve them for the cost axis
-    # instead of folding them into tokens_in (which would lie about pricing).
-    cache_read = first_count("cacheReadTokens", "cache_read_tokens")
-    cache_write = first_count("cacheWriteTokens", "cache_write_tokens")
+    # Cursor's turn-ended usage and Anthropic's (Claude Code) usage split out
+    # cache read/write tokens. They're priced differently from fresh input, so
+    # preserve them for the cost axis instead of folding them into tokens_in
+    # (which would lie about pricing).
+    cache_read = first_count("cacheReadTokens", "cache_read_tokens", "cache_read_input_tokens")
+    cache_write = first_count("cacheWriteTokens", "cache_write_tokens", "cache_creation_input_tokens")
     if cache_read is not None:
         result["cache_read_tokens"] = cache_read
     if cache_write is not None:
@@ -76,8 +77,8 @@ def selected_token_usage(usage, previous=None):
     aliases = {
         'tokens_in': ('inputTokens', 'input_tokens', 'promptTokens', 'prompt_tokens'),
         'tokens_out': ('outputTokens', 'output_tokens', 'completionTokens', 'completion_tokens'),
-        'cache_read_tokens': ('cacheReadTokens', 'cache_read_tokens'),
-        'cache_write_tokens': ('cacheWriteTokens', 'cache_write_tokens'),
+        'cache_read_tokens': ('cacheReadTokens', 'cache_read_tokens', 'cache_read_input_tokens'),
+        'cache_write_tokens': ('cacheWriteTokens', 'cache_write_tokens', 'cache_creation_input_tokens'),
     }
     usage = usage if isinstance(usage, dict) else {}
     estimated = usage.get('tokens_estimated', False)

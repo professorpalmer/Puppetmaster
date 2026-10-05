@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, List, Optional, Sequence
 
 from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus, now_iso
+from puppetmaster.worker_resume import repair_resume_record
 
 
 DEFAULT_REVIEW_LOOP_LIMIT = 3
@@ -91,6 +92,11 @@ def maybe_requeue_review_repair(store: Any, job_id: str) -> List[Task]:
         payload["allow_dirty"] = True
         payload["review_repair"] = True
         payload["review_reasons"] = reasons
+        resume = repair_resume_record(task, artifacts)
+        if resume is None:
+            payload.pop("resume", None)
+        else:
+            payload["resume"] = resume
         extra = ""
         if reasons:
             extra = "\n\nReviewer rejected the previous edit. Fix these:\n" + "\n".join(
@@ -116,6 +122,7 @@ def maybe_requeue_review_repair(store: Any, job_id: str) -> List[Task]:
                 "attempt": attempts + 1,
                 "limit": review_loop_limit(payload),
                 "reason_count": len(reasons),
+                "resumed": bool(resume and resume.get("status") == "resolved"),
             },
         )
         repaired.append(requeued)

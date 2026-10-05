@@ -596,3 +596,55 @@ class IndependentJudgeSelectionTests(TestCase):
 
             # Assert
             self.assertIsNone(judge)
+
+
+class DispatchableJudgeSelectionTests(TestCase):
+    """A review judge must be a model that can actually run on this host."""
+
+    @staticmethod
+    def _model(model_id: str, capability: int) -> ModelSpec:
+        adapter, adapter_model_name = model_id.split("/", 1)
+        return ModelSpec(
+            id=model_id,
+            adapter=adapter,
+            adapter_model_name=adapter_model_name,
+            capability_score=capability,
+            billing="plan",
+        )
+
+    def _judge(self, cli_present) -> object:
+        from types import SimpleNamespace
+
+        from puppetmaster.gates import resolve_judge_model
+
+        with TemporaryDirectory() as root:
+            registry = [
+                self._model("claude-code/haiku-4-5", 55),
+                self._model("antigravity/gemini-3-5-flash", 78),
+                self._model("claude-code/claude-sonnet-4-5", 82),
+            ]
+            registry_path = Path(root) / "models.json"
+            save_registry(registry, registry_path)
+            task = Task(
+                job_id="job-review",
+                role="implement",
+                instruction="edit",
+                payload={
+                    "router_model_id": "claude-code/haiku-4-5",
+                    "registry_path": str(registry_path),
+                    "registry_digest": registry_digest(registry),
+                },
+            )
+            healthy = SimpleNamespace(healthy=True, billing="plan")
+            with patch("puppetmaster.platform_lock.is_adapter_enabled", return_value=True), \
+                    patch("puppetmaster.platform_billing.detect_adapter_billing", return_value=healthy), \
+                    patch("puppetmaster.preflight.adapter_cli_present", side_effect=cli_present):
+                return resolve_judge_model(task, {})
+
+    def test_judge_skips_a_cheaper_model_whose_cli_is_missing(self) -> None:
+        judge = self._judge(lambda adapter: adapter != "antigravity")
+        self.assertEqual(judge.id, "claude-code/claude-sonnet-4-5")
+
+    def test_nothing_dispatchable_keeps_the_previous_choice(self) -> None:
+        judge = self._judge(lambda adapter: False)
+        self.assertEqual(judge.id, "antigravity/gemini-3-5-flash")

@@ -173,7 +173,8 @@ class CodexAdapter(CliWorkerAdapter):
         sandbox = str(task.payload.get("sandbox") or "workspace-write")
         approval_policy = str(task.payload.get("approval_policy") or "never")
         bypass = bool(task.payload.get("dangerously_bypass_approvals_and_sandbox", False))
-        ephemeral = bool(task.payload.get("ephemeral", True))
+        # A review-loop task may be repaired by resuming this thread, so keep it.
+        ephemeral = bool(task.payload.get("ephemeral", not task.payload.get("review_loop")))
         skip_git_repo_check = bool(task.payload.get("skip_git_repo_check", True))
         if resume is not None:
             ephemeral = False

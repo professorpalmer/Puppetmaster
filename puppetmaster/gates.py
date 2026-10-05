@@ -557,7 +557,13 @@ def resolve_judge_model(task: Task, spec: dict[str, Any]) -> Optional["ModelSpec
         return None
 
     floor = _implementer_capability(task, spec, registry)
-    candidates = registry
+    # A judge that cannot run here (missing CLI, unfunded platform, no provider
+    # key) fails the review closed. Never empty the field, though: on a host
+    # with nothing dispatchable, keep the old choice and let the call say why.
+    from puppetmaster.preflight import DispatchReadiness
+
+    ready = DispatchReadiness()
+    candidates = [s for s in registry if ready(s)] or registry
     if "different_model_family" in _independence_constraints(spec):
         implementer_id = str((task.payload or {}).get("router_model_id") or "")
         implementer = next((model for model in registry if model.id == implementer_id), None)
@@ -566,7 +572,7 @@ def resolve_judge_model(task: Task, spec: dict[str, Any]) -> Optional["ModelSpec
             return None
         candidates = [
             model
-            for model in registry
+            for model in candidates
             if (family := _model_family(model)) is not None
             and family != implementer_family
         ]

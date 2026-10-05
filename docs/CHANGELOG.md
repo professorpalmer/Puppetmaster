@@ -1,3 +1,28 @@
+## v1.28.3 — 2026-10-04
+
+**A review-loop repair resumes the rejected attempt's session, review judges are models that can run here, and Claude cache usage reaches receipts.**
+
+- A `review_loop` repair started a fresh worker that re-read memory, census
+  and CodeGraph context and re-explored the repo before applying the
+  reviewer's fix. The requeued task now resumes its own latest provider
+  session through the same resolver as `resume_from` (a missing or ephemeral
+  session records why it runs fresh). `review_repair_resume: false` turns it
+  off. Codex review-loop tasks default to persisted threads so they can be
+  resumed. Measured on real Haiku 4.5 implement jobs with a live
+  Sonnet 4.5 judge (3 runs per arm, one task): genuine repair attempts used a
+  median 6.1k fresh input tokens resumed vs 36.4k fresh, $0.074 vs $0.148
+  API-equivalent, 29.9 s vs 37.1 s, 7 vs 11 turns.
+- `resolve_judge_model` only filtered by platform lock, so on a host without
+  a Cursor key, agentic provider keys or the `agy` CLI it chose judges that
+  could not run and every review failed closed. `DispatchReadiness` is now one
+  predicate (platform lock, funded billing, installed CLI, provider key) for
+  review judges and review escalation; when nothing is dispatchable the
+  previous choice stands.
+- Claude Code reports cache usage as `cache_read_input_tokens` and
+  `cache_creation_input_tokens`, which the usage mappers did not read, so
+  claude-code receipts showed no cache tokens. Both mappers now take the
+  Anthropic names, and the cost axis prices them as cache reads and writes.
+
 ## v1.28.2 — 2026-10-04
 
 **Auto-route no longer first-picks a model whose CLI is not installed, and artifact-shaped worker output keeps its headlines.**

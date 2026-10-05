@@ -66,6 +66,36 @@ def claim_resumed_session(record: Optional[dict], claimed: dict, role: str) -> O
     return record
 
 
+def repair_resume_record(task: Any, artifacts: Any) -> Optional[dict]:
+    """Resume a review-repaired task's own latest provider session, or None to run fresh.
+
+    The repair is the same task continuing its own edit, so the record points at
+    the session that produced the rejected diff. A session that cannot be
+    resumed yields an ``unavailable`` record so the receipt says why it ran fresh.
+    """
+    payload = dict(getattr(task, "payload", None) or {})
+    adapter = str(getattr(task, "adapter", "") or "")
+    if payload.get("review_repair_resume") is False or adapter not in RESUMABLE_ADAPTERS:
+        return None
+    key = RESUMABLE_ADAPTERS[adapter]
+    receipts = [
+        artifact
+        for artifact in artifacts
+        if artifact.task_id == task.id
+        and artifact.type == ArtifactType.VERIFICATION
+        and (artifact.payload or {}).get("adapter") == adapter
+        and str((artifact.payload or {}).get(key) or "").strip()
+    ]
+    if not receipts:
+        return None
+    receipt = max(receipts, key=lambda artifact: str(artifact.created_at or "")).payload or {}
+    if adapter == "codex" and receipt.get("ephemeral") is True:
+        return _unavailable(payload, "the rejected codex attempt ran ephemeral and was not persisted")
+    return _resolved_or_missing(
+        payload, adapter, str(receipt[key]).strip(), getattr(task, "job_id", None), task.id
+    )
+
+
 def session_on_disk(adapter: str, session_id: str) -> Optional[bool]:
     """Whether the CLI's local session store holds ``session_id``; None when there is no store to check."""
     if adapter == "codex":
