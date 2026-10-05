@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
-from puppetmaster.invocation_gate import DelegationDecision, gate_disabled, should_delegate
+from puppetmaster.invocation_gate import DelegationDecision, gate_disabled, gate_policy, should_delegate
 
 DECISION_LOG_NAME = "invocation_decisions.jsonl"
 DECISION_LOG_MAX_BYTES = 5 * 1024 * 1024
@@ -362,6 +362,8 @@ def record_decision(
         rec = {
             "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "delegate": bool(decision.should_delegate),
+            "mode": "delegate" if decision.should_delegate else "pilot",
+            "policy": gate_policy(env),
             "reason": decision.reason,
             "signals": list(decision.matched_signals),
             "score": decision.capability_score,

@@ -47,6 +47,8 @@ class EditAdmissionOwner:
     _lost: threading.Event
     _heartbeat: Optional[threading.Thread] = None
     _closed: bool = False
+    # Seconds spent queued behind conflicting claims before admission.
+    waited_seconds: float = 0.0
 
     @property
     def lost(self) -> bool:
@@ -114,7 +116,8 @@ def edit_admission(store: Any, task: Any, worker_id: str) -> EditAdmissionOwner:
         ),
         "edit_admission_wait_seconds",
     )
-    deadline = time.monotonic() + timeout
+    started = time.monotonic()
+    deadline = started + timeout
     owner = "%s:%s:%s" % (worker_id, job_id, getattr(task, "id", "task"))
     while True:
         if _cancelled(store, task, payload):
@@ -136,7 +139,9 @@ def edit_admission(store: Any, task: Any, worker_id: str) -> EditAdmissionOwner:
             time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
     admission = _owner(store, task, worker_id, registry, cwd, tuple(claims), ttl=ttl)
-    _emit(store, job_id, "edit_admission.acquired", task, admission.claims, worker_id=worker_id)
+    admission.waited_seconds = round(time.monotonic() - started, 3)
+    _emit(store, job_id, "edit_admission.acquired", task, admission.claims, worker_id=worker_id,
+          waited_seconds=admission.waited_seconds)
     return admission
 
 

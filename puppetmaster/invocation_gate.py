@@ -53,6 +53,10 @@ _DISABLE_ENV_VARS = (
     "PUPPETMASTER_INVOCATION_GATE_DISABLED",
 )
 _THRESHOLD_ENV_VAR = "PUPPETMASTER_AUTO_INVOKE_THRESHOLD"
+# Identifies the decision rules in receipts so branch-taken rates are compared
+# within one policy. Bump when the delegate/pilot rules change.
+GATE_POLICY_VERSION = "1.28.5"
+
 _FOLLOWUP_ENV_VAR = "PUPPETMASTER_FOLLOWUP_FAST_PATH"
 _FOLLOWUP_MAX_CHARS = 600
 
@@ -575,6 +579,14 @@ def _resolve_threshold(explicit: Optional[int], env: Mapping[str, str]) -> int:
         except ValueError:
             pass
     return DEFAULT_THRESHOLD
+
+
+def gate_policy(env: Optional[Mapping[str, str]] = None) -> str:
+    """Policy id for receipts: the rule version plus any rule switched off by env."""
+    environ = env if env is not None else os.environ
+    if _followup_fast_path_enabled(environ):
+        return GATE_POLICY_VERSION
+    return f"{GATE_POLICY_VERSION}+followup_off"
 
 
 def _followup_fast_path_enabled(env: Mapping[str, str]) -> bool:

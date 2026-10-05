@@ -8,7 +8,7 @@ import time
 from dataclasses import replace
 from typing import TYPE_CHECKING, Optional
 
-from puppetmaster.models import AgentRun, JobStatus, TaskStatus, now_iso
+from puppetmaster.models import AgentRun, ArtifactType, JobStatus, TaskStatus, now_iso
 from puppetmaster.state import resolve_state_dir
 from puppetmaster.store_factory import create_store, create_worker_store
 from puppetmaster.workers import LocalWorker
@@ -267,6 +267,8 @@ class WorkerRuntime:
                                 task,
                                 self.store.get_job(self.job_id).goal,
                             )
+                        if admission.claims:
+                            artifacts = _with_admission_wait(artifacts, admission.waited_seconds)
                         if admission.lost:
                             from puppetmaster.adapters import verification_artifact
 
@@ -917,6 +919,22 @@ def main(argv: Optional[list[str]] = None) -> int:
     except BaseException as exc:  # noqa: BLE001 — last-resort trace before dying
         _write_startup_error(args.backend, state_dir, args.job_id, worker_id, exc)
         raise
+
+
+def _with_admission_wait(artifacts: list, waited_seconds: float) -> list:
+    """Stamp the edit-admission queue time on the worker's receipts.
+
+    Without it, time serialized behind another writer's claim reads as slow
+    model inference in wall-clock comparisons.
+    """
+    from dataclasses import replace
+
+    return [
+        replace(artifact, payload={**(artifact.payload or {}), "edit_admission_wait_seconds": waited_seconds})
+        if artifact.type == ArtifactType.VERIFICATION
+        else artifact
+        for artifact in artifacts
+    ]
 
 
 if __name__ == "__main__":

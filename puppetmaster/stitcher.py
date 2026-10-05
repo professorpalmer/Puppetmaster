@@ -11,7 +11,8 @@ from puppetmaster.claim_conflicts import (
     detect_contradictory_peers,
 )
 from puppetmaster.artifact_status import durable_admission_allowed, format_status_label
-from puppetmaster.models import Artifact, ArtifactType, MemoryRecord
+from puppetmaster.models import Artifact, ArtifactType, MemoryRecord, TaskStatus
+from puppetmaster.quality import latest_gate_results
 from puppetmaster.store import SwarmStore, group_by_type
 
 # Worker-prompt boilerplate echoed into VERIFICATION.check by adapter error paths.
@@ -194,14 +195,30 @@ class Stitcher:
             if len(conflicts) > limit:
                 truncated["conflicts"] = len(conflicts) - limit
         digest["exceptions"] = self._exceptions(
-            job_id, grouped.get(str(ArtifactType.VERIFICATION), []), max_chars
+            job_id,
+            grouped.get(str(ArtifactType.VERIFICATION), []),
+            latest_gate_results(grouped.get(str(ArtifactType.GATE), [])),
+            max_chars,
         )
         digest["truncated"] = truncated
         return digest
 
     def _exceptions(
-        self, job_id: str, verifications: list[Artifact], max_chars: int
+        self,
+        job_id: str,
+        verifications: list[Artifact],
+        gates: list[Artifact],
+        max_chars: int,
     ) -> list[dict[str, Any]]:
+        """Tasks needing triage: a non-passing receipt, a failed effective gate, or a failed status.
+
+        A worker can execute cleanly (passed receipt) and still fail its task on a
+        review gate; that task must not drop out of the digest.
+        """
+        failed_gates: dict[str, list[Artifact]] = {}
+        for gate in gates:
+            if (gate.payload or {}).get("passed") is False:
+                failed_gates.setdefault(gate.task_id, []).append(gate)
         latest: dict[str, Artifact] = {}
         for artifact in verifications:
             current = latest.get(artifact.task_id)
@@ -223,6 +240,25 @@ class Stitcher:
             payload = verification.payload or {}
             result = str(payload.get("result") or "unknown").lower()
             if result in _DIGEST_OK_RESULTS:
+                failed = failed_gates.get(task.id, [])
+                if not failed and task.status != TaskStatus.FAILED:
+                    continue
+                exceptions.append(
+                    {
+                        "task_id": task.id,
+                        "role": task.role,
+                        "result": str(task.status),
+                        "reason": _clip(
+                            "; ".join(
+                                f"gate:{(gate.payload or {}).get('gate') or (gate.payload or {}).get('kind')}"
+                                f" {(gate.payload or {}).get('reason') or 'failed'}"
+                                for gate in failed
+                            )
+                            or f"task {task.status} after a passing receipt",
+                            min(max_chars, 160),
+                        ),
+                    }
+                )
                 continue
             reason = (
                 payload.get("failure")

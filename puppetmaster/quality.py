@@ -44,7 +44,7 @@ def _payload(artifact: Artifact) -> dict[str, Any]:
     return getattr(artifact, "payload", None) or {}
 
 
-def _latest_gate_results(artifacts: list[Artifact]) -> list[Artifact]:
+def latest_gate_results(artifacts: list[Artifact]) -> list[Artifact]:
     """Drop gate results a later evaluation of the same gate on the same task superseded.
 
     A review-loop task fails its review, is repaired, and passes on a later
@@ -156,7 +156,7 @@ def _objective_evaluator_summary(artifacts: list[Artifact]) -> dict[str, Any]:
 
 def assess_run_quality(artifacts: Iterable[Artifact]) -> dict[str, Any]:
     """Classify a finished run. See module docstring for verdict semantics."""
-    artifacts = _latest_gate_results(list(artifacts))
+    artifacts = latest_gate_results(list(artifacts))
     evaluator_summary = _objective_evaluator_summary(artifacts)
     reasons: list[str] = []
 

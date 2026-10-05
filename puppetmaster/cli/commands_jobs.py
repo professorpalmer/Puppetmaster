@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import subprocess
 import os
@@ -350,28 +351,93 @@ def _run_wait_command(args, store) -> int:
         return 1
     return 0
 
+AWAIT_SUMMARY_MODES = ("compact", "full", "none")
+
+
+def await_summary_mode(explicit: Optional[str]) -> str:
+    """``explicit`` when given (validated), else $PUPPETMASTER_AWAIT_SUMMARY, else compact."""
+    if explicit is not None:
+        mode = str(explicit).strip().lower()
+        if mode not in AWAIT_SUMMARY_MODES:
+            raise ValueError(f"summary must be one of {', '.join(AWAIT_SUMMARY_MODES)}")
+        return mode
+    env_mode = os.environ.get("PUPPETMASTER_AWAIT_SUMMARY", "").strip().lower()
+    return env_mode if env_mode in AWAIT_SUMMARY_MODES else "compact"
+
+
+def await_summary_body(store, job_id: str, state: dict, mode: str) -> dict:
+    """Await response body: full stitched summary, compact digest + summary ref, or state only."""
+    body: dict = {**state, "summary_mode": mode}
+    if not state["terminal"]:
+        body["summary"] = ""
+        return body
+    if mode == "none":
+        return body
+    summary_path: Optional[Path] = store.job_dir(job_id) / "summaries" / "stitched.md"
+    if summary_path.is_file():
+        summary = summary_path.read_text(encoding="utf-8")
+    else:
+        summary_path = None
+        summary = Stitcher(store).preview(job_id)
+    if mode == "full":
+        body["summary"] = summary
+        return body
+    body["summary_ref"] = {
+        "path": str(summary_path) if summary_path is not None else None,
+        "chars": len(summary),
+        "sha256": hashlib.sha256(summary.encode("utf-8")).hexdigest(),
+    }
+    try:
+        body["digest"] = Stitcher(store).digest(job_id)
+    except Exception as exc:
+        body["digest_error"] = f"{type(exc).__name__}: {exc}"[:200]
+    return body
+
+
+def _render_compact_await(body: dict) -> str:
+    digest = body.get("digest") or {}
+    lines = [f"job {body.get('job_id')} finished: {body.get('status')}"]
+    counts = digest.get("counts") or {}
+    if counts:
+        lines.append("artifacts: " + ", ".join(f"{name}={count}" for name, count in counts.items()))
+    for row in digest.get("exceptions") or []:
+        lines.append(f"exception: {row.get('role')} {row.get('result')}: {row.get('reason')}")
+    for name in ("findings", "decisions", "risks", "conflicts"):
+        for item in digest.get(name) or []:
+            text = item.get("text") or item.get("reason") or ""
+            lines.append(f"{name[:-1]}: {text}")
+    if body.get("digest_error"):
+        lines.append(f"digest unavailable: {body['digest_error']}")
+    ref = body.get("summary_ref") or {}
+    if ref.get("path"):
+        lines.append(f"full summary: {ref['path']} ({ref.get('chars')} chars; --summary full prints it)")
+    return "\n".join(lines)
+
+
 def _run_await_command(args, store) -> int:
+    try:
+        mode = await_summary_mode(getattr(args, "summary", None))
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     state = await_job_state(
         store,
         args.job_id,
         timeout_seconds=args.timeout_seconds,
         poll_interval_seconds=args.poll_interval_seconds,
     )
-    summary = ""
-    if state["terminal"]:
-        summary_path = store.job_dir(args.job_id) / "summaries" / "stitched.md"
-        if summary_path.is_file():
-            summary = summary_path.read_text(encoding="utf-8")
-        else:
-            summary = Stitcher(store).preview(args.job_id)
+    body = await_summary_body(store, args.job_id, state, mode)
 
     if args.json:
-        print(json.dumps({**state, "summary": summary}, indent=2, default=str))
+        print(json.dumps(body, indent=2, default=str))
+    elif state["timed_out"]:
+        print(f"timed out after {args.timeout_seconds}s; job {args.job_id} is {state['status']}")
+    elif mode == "full":
+        print(body.get("summary") or f"job {args.job_id} finished: {state['status']}")
+    elif mode == "compact":
+        print(_render_compact_await(body))
     else:
-        if state["timed_out"]:
-            print(f"timed out after {args.timeout_seconds}s; job {args.job_id} is {state['status']}")
-        else:
-            print(summary or f"job {args.job_id} finished: {state['status']}")
+        print(f"job {args.job_id} finished: {state['status']}")
     if state["timed_out"]:
         return 1
     return 0 if (state.get("delivery") or {}).get("successful", False) else 1

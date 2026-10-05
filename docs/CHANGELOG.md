@@ -1,3 +1,36 @@
+## v1.28.5 — 2026-10-05
+
+**Concurrent jobs cannot resume the same Codex thread, failed review gates reach the compact digest, and receipts separate queueing from inference.**
+
+- `codex exec resume` continues a thread in place, and the duplicate-resumer
+  guard only covered tasks inside one job. Two jobs (often separate processes
+  with separate state directories) could resume one thread at once and
+  interleave turns. The Codex adapter now holds an OS file lock beside the
+  Codex session store for the whole run. A worker that loses the race runs
+  fresh before any model call, with `payload.resume.status = "unavailable"`
+  and the reason. The kernel releases the lock if the holder dies. Review
+  repairs that resume a Codex worker take the same lock.
+- The compact digest only checked VERIFICATION receipts, so a FAILED task
+  whose worker exited cleanly but failed its review gate showed
+  `exceptions: []`. Exceptions now also report failed effective gates (the
+  latest result per gate, so a repaired and approved review clears) and
+  failed task status.
+- CLI `puppetmaster await` takes `--summary compact|full|none` and defaults to
+  compact like MCP `puppetmaster_await_job`: counts, exceptions, headlines
+  and the stitched-summary path. `--summary full` or
+  `PUPPETMASTER_AWAIT_SUMMARY=full` restores the old output. Both share one
+  builder, so the JSON bodies match. Exit codes are unchanged.
+- A long-running MCP server on pre-upgrade code put its restart notice only
+  in a top-level field that Codex does not show, so it answered with the old
+  response contract silently. The notice now also goes inside the JSON body.
+  `puppetmaster mcp list` shows which servers run old code.
+- Worker receipts carry `edit_admission_wait_seconds` (also on the
+  `edit_admission.acquired` event), so time queued behind another writer's
+  claim is not mistaken for slow inference.
+- Delegation-gate decision log lines record `mode` (`pilot` or `delegate`)
+  and `policy` (rule version, plus `+followup_off` when the follow-up fast
+  path is disabled), so branch-taken rates compare within one policy.
+
 ## v1.28.4 — 2026-10-04
 
 **review_loop jobs reach COMPLETE: gates hold their lease, the judge runs read-only on the whole change, and a repaired review no longer blocks the run.**

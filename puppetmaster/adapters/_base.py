@@ -343,7 +343,28 @@ class CliWorkerAdapter(FullEditWorkerAdapter):
         )
         if isinstance(prepared, list):
             return prepared
+        try:
+            return self._run_prepared_cli(
+                task, goal, worker_id, cwd, prepared,
+                pre_guard=pre_guard, before=before, timeout_seconds=timeout_seconds,
+            )
+        finally:
+            lease = prepared.extras.get("session_lease")
+            if lease is not None:
+                lease.release()
 
+    def _run_prepared_cli(
+        self,
+        task: Task,
+        goal: str,
+        worker_id: str,
+        cwd: Path,
+        prepared: CliInvocation,
+        *,
+        pre_guard: bool,
+        before: dict,
+        timeout_seconds: int,
+    ) -> list[Artifact]:
         if not pre_guard:
             blocked, before = self._apply_pre_run_guards(task, worker_id, cwd, prepared)
             if blocked is not None:

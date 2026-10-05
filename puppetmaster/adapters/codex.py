@@ -10,6 +10,7 @@ from puppetmaster.failure import UNKNOWN, classify_codex_failure
 from puppetmaster.models import Artifact, ArtifactType, Task
 from puppetmaster.redaction import redact_secrets
 from puppetmaster.usage import selected_token_usage
+from puppetmaster.session_lease import SessionLease, acquire_codex_thread
 from puppetmaster.worker_resume import resolved_resume, task_resume_record
 
 from ._base import (
@@ -144,6 +145,10 @@ class CodexAdapter(CliWorkerAdapter):
         base_prompt = task.payload.get("prompt") or task.instruction
         resume_record = task_resume_record(task.payload, "codex")
         resume = resolved_resume(resume_record, "codex")
+        lease = None
+        if resume is not None:
+            resume_record, lease = _lease_codex_thread(resume_record)
+            resume = resolved_resume(resume_record, "codex")
         task_prompt = with_job_brief(
             structured_prompt_for_task(
                 task,
@@ -168,6 +173,8 @@ class CodexAdapter(CliWorkerAdapter):
         executable = _configured_codex_executable(task)
         command_base = _codex_command_base(task, resolved)
         if command_base is None:
+            if lease is not None:
+                lease.release()
             return self._missing_cli(task, worker_id, str(executable))
         model = str(task.payload.get("model") or DEFAULT_CODEX_MODEL)
         sandbox = str(task.payload.get("sandbox") or "workspace-write")
@@ -216,6 +223,7 @@ class CodexAdapter(CliWorkerAdapter):
                 "ephemeral": ephemeral,
                 "resume": resume_record,
                 "resumed": resume is not None,
+                "session_lease": lease,
                 "write_capable": write_capable,
                 "extra_dirty_message": (
                     " Or pass payload.sandbox='read-only' for review-only tasks. For focused edits "
@@ -648,3 +656,25 @@ def last_codex_agent_message(events: list[dict[str, Any]]) -> str:
             return str(text)
     return ""
 
+
+def _lease_codex_thread(record: dict) -> tuple[dict, Optional[SessionLease]]:
+    """Hold the resumed thread for this run, or fall back to a fresh session.
+
+    Contention is settled before any model call or side effect: the losing
+    worker runs fresh with an ``unavailable`` record saying why.
+    """
+    session_id = str(record.get("session_id"))
+    try:
+        lease = acquire_codex_thread(session_id)
+    except OSError as exc:
+        return {**record, "status": "unavailable", "reason": f"codex thread lease unavailable: {exc}"}, None
+    if lease is None:
+        return {
+            **record,
+            "status": "unavailable",
+            "reason": (
+                f"codex thread {session_id} is being resumed by another live worker; "
+                "codex resume continues a thread in place"
+            ),
+        }, None
+    return record, lease
