@@ -782,11 +782,59 @@ def _review_sampled(task_id: str, sample: float) -> bool:
     return bucket < sample
 
 
-def _collect_diff(artifacts: list[Artifact], cwd: Path) -> str:
-    """The change to review: the live working-tree diff, plus any PATCH-artifact
-    diffs (covers a committed implement run whose tree is already clean)."""
+def _task_base_sha(store: "SwarmStore", task: Task, artifacts: list[Artifact]) -> Optional[str]:
+    """The commit the task started from: the earliest ``base_sha`` any of its attempts recorded."""
+    candidates = list(artifacts)
+    try:
+        candidates.extend(store.list_artifacts(task.job_id))
+    except Exception:
+        pass
+    recorded = sorted(
+        (str(artifact.created_at or ""), str((artifact.payload or {}).get("base_sha") or ""))
+        for artifact in candidates
+        if artifact.task_id == task.id
+        and str((artifact.payload or {}).get("base_sha") or "") not in ("", "uncommitted")
+    )
+    return recorded[0][1] if recorded else None
+
+
+def _cumulative_diff(cwd: Path, base_sha: str) -> str:
+    """Working tree (committed, staged, unstaged and untracked) against ``base_sha``."""
+    from puppetmaster.adapters._git import (
+        git_diff_output,
+        git_output,
+        git_untracked_diff,
+        git_untracked_files,
+        git_worktree_root,
+    )
+
+    root = git_worktree_root(cwd)
+    if not git_output(root, ["rev-parse", "--verify", "--quiet", f"{base_sha}^{{commit}}"]):
+        return ""
+    if git_output(root, ["rev-parse", "HEAD"]) == base_sha:
+        return ""
+    diff = git_diff_output(root, ["diff", base_sha, "--binary"])
+    untracked = git_untracked_diff(root, git_untracked_files(root))
+    if untracked:
+        diff = (diff.rstrip("\n") + "\n" + untracked) if diff.strip() else untracked
+    return diff
+
+
+def _collect_diff(artifacts: list[Artifact], cwd: Path, *, base_sha: Optional[str] = None) -> str:
+    """The change to review: the whole task, not one attempt.
+
+    When the task's work was committed after its original base (a review-loop
+    repair that only finished or committed earlier edits), review everything
+    since that base; a repair with no new edits used to see an empty diff and
+    fail the required review. Otherwise the live working-tree diff, plus any
+    PATCH-artifact diffs (covers a committed implement run whose tree is
+    already clean)."""
     from puppetmaster.adapters import git_snapshot
 
+    if base_sha:
+        cumulative = _cumulative_diff(cwd, base_sha)
+        if cumulative.strip():
+            return cumulative
     diff = str(git_snapshot(cwd).get("diff") or "")
     if not diff.strip():
         chunks = [
@@ -867,7 +915,7 @@ def _gate_review(
         "review_required": required,
         "review_requested": requested,
     }
-    diff = _collect_diff(artifacts, cwd)
+    diff = _collect_diff(artifacts, cwd, base_sha=_task_base_sha(store, task, artifacts))
     artifact_fingerprint = "sha256:" + hashlib.sha256(diff.encode("utf-8")).hexdigest()
     if not diff.strip():
         passed = not required

@@ -710,3 +710,59 @@ class JudgeIsolationTests(TestCase):
         verdict = _verdict_from_artifacts([artifact])
         self.assertIsNotNone(verdict)
         self.assertIs(verdict["pass"], True)
+
+
+class CumulativeReviewDiffTests(TestCase):
+    """A repair is reviewed against the task's original base, not just its own attempt."""
+
+    def _git(self, repo: Path, *args: str) -> str:
+        return subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True).stdout.strip()
+
+    def test_repair_after_committed_work_reviews_the_whole_task(self) -> None:
+        import puppetmaster.gates as gates
+        from puppetmaster.gates import ReviewVerdict, evaluate_task_gates
+        from puppetmaster.models import Artifact, ArtifactType
+
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            self._git(repo, "init", "-q")
+            self._git(repo, "config", "user.email", "t@t")
+            self._git(repo, "config", "user.name", "t")
+            (repo / "a.py").write_text("x = 1\n", encoding="utf-8")
+            self._git(repo, "add", ".")
+            self._git(repo, "commit", "-qm", "base")
+            base = self._git(repo, "rev-parse", "HEAD")
+
+            store = SQLiteSwarmStore(Path(tmp) / ".puppetmaster")
+            store.ensure_schema()
+            job = store.create_job("cumulative review")
+            task = Task(job_id=job.id, role="implement", instruction="edit", adapter="claude-code",
+                        payload={"review": True, "cwd": str(repo), "mode": "implement", "allow_dirty": True})
+            store.save_task(task)
+            store.save_artifact(Artifact(
+                job_id=job.id, task_id=task.id, type=ArtifactType.VERIFICATION, created_by="worker",
+                confidence=0.9, evidence=["adapter:claude-code"],
+                payload={"adapter": "claude-code", "check": "edit", "result": "passed", "base_sha": base},
+            ))
+            (repo / "a.py").write_text("x = 2\n", encoding="utf-8")
+            self._git(repo, "commit", "-qam", "attempt 1 committed its work")
+            (repo / "new_test.py").write_text("assert True\n", encoding="utf-8")
+            self._git(repo, "add", "new_test.py")
+            self._git(repo, "commit", "-qm", "repair committed the rest")
+
+            seen = {}
+
+            def judge(**kwargs):
+                seen["prompt"] = kwargs["prompt"]
+                return ReviewVerdict(available=True, passed=True, severity="none", reasons=[], detail={})
+
+            with patch.object(gates, "resolve_judge_model", return_value=Mock(id="claude-code/claude-sonnet-4-5", adapter="claude-code")), \
+                    patch.object(gates, "_REVIEW_JUDGE", side_effect=judge):
+                evaluation = evaluate_task_gates(task, [], store, worker_id="w1", cwd=repo)
+
+            review = next(result for result in evaluation.results if result.kind == "review")
+            self.assertTrue(review.passed, review.reason)
+            self.assertIn("-x = 1", seen["prompt"])
+            self.assertIn("+x = 2", seen["prompt"])
+            self.assertIn("new_test.py", seen["prompt"])
