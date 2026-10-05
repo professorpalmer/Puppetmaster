@@ -6,7 +6,10 @@
   completion gates. A review gate is a live judge call that outlasts the 5 s
   lease, so stale-lease recovery could reclaim the task mid-review; the
   approved completion was silently dropped and the task reran until
-  `max_attempts`. Gates now run inside their own heartbeat window.
+  `max_attempts`. Gates now run inside their own heartbeat window. A renewal
+  refused there (the lease already lapsed on a starved host) only stops
+  renewing; publication stays fenced by owner and lease id, so a finished
+  task is never abandoned unless another worker actually took it.
 - The review judge inherited the implementer's payload. On Claude Code it
   ran write-capable (`acceptEdits`), so on a first review the clean-tree guard
   blocked it on the implementer's uncommitted diff and the gate reported
