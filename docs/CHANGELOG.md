@@ -1,3 +1,17 @@
+## v1.29.1 — 2026-10-05
+
+**A long job goal no longer fails the launch in memory retrieval.**
+
+- `retrieve_memory` on the SQLite store filtered candidate memories with one
+  OR'd `instr()` clause per distinct goal term. A goal with roughly a thousand
+  distinct words exceeded SQLite's expression depth limit, and the
+  `OperationalError` inside `Orchestrator.run` failed the job before any worker
+  started. One `EXISTS` over a JSON array of the terms selects the same rows at
+  constant depth.
+- Memory is no longer queried when no worker spec wants it, so
+  `disable_memory` avoids the query entirely instead of running it and
+  discarding the result.
+
 ## v1.29.0 — 2026-10-05
 
 **Flow graphs: the pilot writes one graph and is woken only when it is done, failed, stuck, interrupted or waiting at a gate. Nodes are durable jobs that resume their own sessions; `map` fans out per-item flows.**
