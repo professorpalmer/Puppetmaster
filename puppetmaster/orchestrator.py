@@ -1399,9 +1399,7 @@ class Orchestrator:
     def _reroute_failed_review(self, job: Job) -> int:
         """Re-queue each review-rejected task onto the cheapest strictly-stronger
         funded model. Returns the count re-queued (0 when nothing qualifies)."""
-        from puppetmaster.platform_billing import detect_adapter_billing
-        from puppetmaster.platform_lock import is_adapter_enabled
-        from puppetmaster.preflight import adapter_cli_present
+        from puppetmaster.preflight import DispatchReadiness
         from puppetmaster.routing_authority import load_bound_registry
         from puppetmaster.scorecards import effective_capability_score
         from puppetmaster.router import (
@@ -1415,15 +1413,7 @@ class Orchestrator:
         if not failed_review:
             return 0
 
-        billing_cache: dict[str, object] = {}
-
-        def _funded(adapter: str) -> object:
-            if adapter not in billing_cache:
-                try:
-                    billing_cache[adapter] = detect_adapter_billing(adapter)
-                except Exception:
-                    billing_cache[adapter] = None
-            return billing_cache[adapter]
+        ready = DispatchReadiness()
 
         rerouted = 0
         for task in self.store.list_tasks(job.id):
@@ -1449,18 +1439,9 @@ class Orchestrator:
                 continue
 
             allow_api = bool(payload.get("allow_api_billing", True))
-            candidates = []
-            for spec in registry:
-                if not is_adapter_enabled(spec.adapter):
-                    continue
-                status = _funded(spec.adapter)
-                if status is None or not getattr(status, "healthy", False):
-                    continue
-                if getattr(status, "billing", "unknown") == "api" and not allow_api:
-                    continue
-                if not adapter_cli_present(spec.adapter):
-                    continue
-                candidates.append(spec)
+            candidates = [
+                spec for spec in registry if ready(spec, allow_api_billing=allow_api)
+            ]
             if not candidates:
                 continue
 

@@ -997,3 +997,60 @@ def adapter_cli_present(
         return True
     resolve = resolver or _default_command_resolver
     return resolve(cli) is not None
+
+
+class DispatchReadiness:
+    """Whether a registry model could actually run right now on this host.
+
+    One predicate for every selector that picks a model outside the main router
+    (review judges, review escalation): platform lock, funded billing, an
+    installed CLI, and, for direct-API models, a usable provider key. Billing and
+    provider lookups are cached per instance because they shell out or read
+    auth files.
+    """
+
+    def __init__(self) -> None:
+        self._billing: dict = {}
+        self._providers: Optional[set] = None
+        self._providers_loaded = False
+
+    def _billing_for(self, adapter: str) -> object:
+        if adapter not in self._billing:
+            from puppetmaster import platform_billing
+
+            try:
+                self._billing[adapter] = platform_billing.detect_adapter_billing(adapter)
+            except Exception:
+                self._billing[adapter] = None
+        return self._billing[adapter]
+
+    def _ready_providers(self) -> Optional[set]:
+        if not self._providers_loaded:
+            self._providers_loaded = True
+            try:
+                from puppetmaster.providers import available_providers
+
+                self._providers = available_providers()
+            except Exception:
+                self._providers = None
+        return self._providers
+
+    def __call__(self, spec: Any, *, allow_api_billing: bool = True) -> bool:
+        from puppetmaster.platform_lock import is_adapter_enabled
+
+        adapter = str(getattr(spec, "adapter", "") or "")
+        if not is_adapter_enabled(adapter):
+            return False
+        status = self._billing_for(adapter)
+        if status is None or not getattr(status, "healthy", False):
+            return False
+        if getattr(status, "billing", "unknown") == "api" and not allow_api_billing:
+            return False
+        if not adapter_cli_present(adapter):
+            return False
+        if adapter == "agentic":
+            provider = (getattr(spec, "payload_defaults", None) or {}).get("provider")
+            providers = self._ready_providers()
+            if provider and providers is not None and provider not in providers:
+                return False
+        return True
