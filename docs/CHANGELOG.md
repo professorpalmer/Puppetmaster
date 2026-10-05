@@ -24,6 +24,13 @@
   was then repaired and approved still left the run "blocked" and the CLI
   exited 1. The latest result per task and gate now decides; within the same
   second a failure wins.
+- `models discover --probe` saves the curated Claude catalog as an explicit
+  snapshot, and preflight treated it as authoritative, so a registered model
+  the shipped list did not know yet was blocked: every `claude-code/opus-5-5`
+  worker failed with "absent from the curated claude catalog". The Claude and
+  Codex CLIs cannot list their models, so a miss in their curated lists is now
+  advisory and the CLI decides; live catalogs and curated agentic catalogs
+  still block. The curated Claude list gains `claude-opus-5-5`.
 - Verified on real review_loop jobs (Haiku 4.5 implementer, live Sonnet 4.5
   judge, rubric forcing a first rejection): 3 of 3 exited 0 with the task
   complete after one repair, and the delivered code met the rubric.
