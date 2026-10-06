@@ -35,6 +35,7 @@ disables them by deleting our entries (or setting
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import sys
 from dataclasses import dataclass, field
@@ -182,7 +183,35 @@ def render_claude_hooks(python: Optional[str] = None) -> dict:
                 "hooks": [{"type": "command", "command": _gate_command("claude", "pre-tool", python)}],
             }
         ],
+        "PostToolUse": [
+            {
+                "matcher": "TodoWrite",
+                "hooks": [{"type": "command", "command": _gate_command("claude", "post-tool", python)}],
+            }
+        ],
     }
+
+
+def render_codex_hooks(python: Optional[str] = None) -> dict:
+    """The Codex hook entries Puppetmaster owns ($CODEX_HOME/hooks.json)."""
+    return {
+        "UserPromptSubmit": [
+            {"hooks": [{"type": "command", "command": _gate_command("codex", "user-prompt", python)}]}
+        ],
+        "PostToolUse": [
+            {
+                "matcher": "update_plan",
+                "hooks": [{"type": "command", "command": _gate_command("codex", "post-tool", python)}],
+            }
+        ],
+    }
+
+
+def codex_hooks_path(home: Optional[Path] = None) -> Path:
+    explicit = os.environ.get("CODEX_HOME")
+    if explicit and home is None:
+        return Path(explicit).expanduser() / "hooks.json"
+    return (home or Path.home()) / ".codex" / "hooks.json"
 
 
 def merge_hook_maps(existing: dict, ours: dict) -> tuple[dict, bool]:
@@ -290,7 +319,22 @@ def _install_claude(base_dir: Path, *, scope: str, dry_run: bool, force: bool, p
     return HookOutcome("claude", str(path), "installed", f"wrote Claude {scope} UserPromptSubmit + PreToolUse(Grep|Glob|Task) hooks")
 
 
-_HOOK_TARGET_ADAPTERS = {"cursor": "cursor", "claude": "claude-code"}
+def _install_codex(home: Optional[Path], *, scope: str, dry_run: bool, force: bool,
+                   python: Optional[str]) -> HookOutcome:
+    if scope != "global":
+        return HookOutcome("codex", "", "skipped", "Codex reads hooks from $CODEX_HOME only; use --global")
+    path = codex_hooks_path(home)
+    existing = _read_json(path)
+    merged, changed = merge_hook_maps(existing, render_codex_hooks(python))
+    if not changed and not force:
+        return HookOutcome("codex", str(path), "unchanged", f"{path} already current")
+    if dry_run:
+        return HookOutcome("codex", str(path), "would_install", "would register Codex UserPromptSubmit + PostToolUse(update_plan) hooks")
+    _write_atomic(path, json.dumps(merged, indent=2) + "\n")
+    return HookOutcome("codex", str(path), "installed", "wrote Codex UserPromptSubmit + PostToolUse(update_plan) hooks")
+
+
+_HOOK_TARGET_ADAPTERS = {"cursor": "cursor", "claude": "claude-code", "codex": "codex"}
 
 
 # ---------------------------------------------------------------------------
@@ -467,6 +511,21 @@ def uninstall_hermes_hooks(
     return HookOutcome("hermes", label, "removed", f"removed Puppetmaster hooks from {label}")
 
 
+def _uninstall_codex(home: Optional[Path], *, scope: str, dry_run: bool) -> HookOutcome:
+    if scope != "global":
+        return HookOutcome("codex", "", "unchanged", "Codex hooks are global only")
+    path = codex_hooks_path(home)
+    if not path.is_file():
+        return HookOutcome("codex", str(path), "unchanged", f"no {path}")
+    stripped, changed = strip_hook_maps(_read_json(path))
+    if not changed:
+        return HookOutcome("codex", str(path), "unchanged", f"{path} has no Puppetmaster hooks")
+    if dry_run:
+        return HookOutcome("codex", str(path), "would_remove", f"would remove Puppetmaster hooks from {path}")
+    _write_atomic(path, json.dumps(stripped, indent=2) + "\n")
+    return HookOutcome("codex", str(path), "removed", f"removed Puppetmaster hooks from {path}")
+
+
 def install_hooks(
     *,
     cwd: Optional[Path] = None,
@@ -507,9 +566,10 @@ def install_hooks(
     else:
         selected = [
             target
-            for target in ("cursor", "claude")
-            if enabled_adapters is None
-            or _HOOK_TARGET_ADAPTERS[target] in enabled_adapters
+            for target in ("cursor", "claude", "codex")
+            if (target != "codex" or scope == "global")
+            and (enabled_adapters is None
+            or _HOOK_TARGET_ADAPTERS[target] in enabled_adapters)
         ]
         if not selected:
             result.outcomes.append(
@@ -527,6 +587,8 @@ def install_hooks(
             result.outcomes.append(_install_cursor(base, scope=scope, dry_run=dry_run, force=force, python=python))
         elif target == "claude":
             result.outcomes.append(_install_claude(base, scope=scope, dry_run=dry_run, force=force, python=python))
+        elif target == "codex":
+            result.outcomes.append(_install_codex(home, scope=scope, dry_run=dry_run, force=force, python=python))
         else:
             result.outcomes.append(HookOutcome(target, "", "error", f"unknown hook target: {target!r}"))
     return result
@@ -620,7 +682,7 @@ def uninstall_hooks(
     """
     result = HooksInstallResult()
     selected_scopes = list(scopes) if scopes is not None else ["project", "global"]
-    selected = list(targets) if targets else ["cursor", "claude"]
+    selected = list(targets) if targets else ["cursor", "claude", "codex"]
     for scope in selected_scopes:
         if scope not in VALID_HOOK_SCOPES:
             result.outcomes.append(HookOutcome("", "", "error", f"unknown hook scope: {scope!r}"))
@@ -635,6 +697,8 @@ def uninstall_hooks(
                 result.outcomes.append(
                     _uninstall_claude(base, scope=scope, dry_run=dry_run, python=python)
                 )
+            elif target == "codex":
+                result.outcomes.append(_uninstall_codex(home, scope=scope, dry_run=dry_run))
             else:
                 result.outcomes.append(
                     HookOutcome(target, "", "error", f"unknown hook target: {target!r}")

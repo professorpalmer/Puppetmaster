@@ -25875,11 +25875,19 @@ class HookRunnerTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def test_user_prompt_injects_directive_when_delegating(self):
+    def test_user_prompt_injects_only_for_an_explicit_trigger(self):
+        """Prompt wording cannot place a task against the solo falloff, so a
+        broad-sounding prompt no longer injects a delegate directive; naming
+        Puppetmaster still does. The sizing gate decides the rest from the plan."""
         from puppetmaster.hook_runner import handle_hook
 
-        r = handle_hook(
+        broad = handle_hook(
             {"prompt": "refactor the auth module across all files"},
+            host="cursor", event="beforeSubmitPrompt", env=self._TOOLS_ON,
+        )
+        self.assertEqual(broad.context, "")
+        r = handle_hook(
+            {"prompt": "Use Puppetmaster to refactor the auth module across all files"},
             host="cursor", event="beforeSubmitPrompt", env=self._TOOLS_ON,
         )
         self.assertEqual(r.action, "allow")
@@ -25993,18 +26001,18 @@ class HookRunnerTests(unittest.TestCase):
             "session_id": "s1",
             "cwd": "/repo",
             "extra": {
-                "user_message": "add a --verbose flag to the savings command and wire it through",
+                "user_message": "use puppetmaster to add a --verbose flag to the savings command and wire it through",
                 "is_first_turn": True,
             },
         }
         r = handle_hook(payload, host="hermes", event="pre_llm_call", env=self._TOOLS_ON)
         self.assertEqual(r.action, "allow")
         self.assertTrue(r.decision.should_delegate)
-        self.assertEqual(r.decision.suggested_verb, "puppetmaster_edit")
+        self.assertNotIn("swarm", r.decision.suggested_verb)
         out = r.to_host_json("hermes")
         self.assertIn("context", out)
         self.assertIn("Puppetmaster", out["context"])
-        self.assertIn("puppetmaster_edit", out["context"])
+        self.assertIn("not a fan-out swarm", out["context"])
         self.assertNotIn("cursor", out["context"])
 
     def test_hermes_pre_llm_call_noop_for_trivial_edit(self):
@@ -26111,7 +26119,7 @@ class HookRunnerTests(unittest.TestCase):
     def test_run_reads_stdin_and_emits_json(self):
         from puppetmaster.hook_runner import run
 
-        stdin = io.StringIO(json.dumps({"prompt": "audit the whole repo for races"}))
+        stdin = io.StringIO(json.dumps({"prompt": "Use Puppetmaster to audit the whole repo for races"}))
         stdout = io.StringIO()
         rc = run(
             ["--host", "cursor", "--event", "user-prompt"],
