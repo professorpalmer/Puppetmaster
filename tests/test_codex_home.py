@@ -70,9 +70,13 @@ class AuthSyncTests(unittest.TestCase):
         self.env = {"CODEX_HOME": str(self.user)}
 
     def test_prepare_copies_auth_and_agents_never_symlinks(self):
+        from puppetmaster.rules import merge_block_into_text, render_agents_block
+
+        merged = merge_block_into_text("no emojis\n", render_agents_block())[0]
+        (self.user / "AGENTS.md").write_text(merged)
         home = codex_home.prepare(self.env, root=self.worker)
         self.assertFalse((home / "auth.json").is_symlink())
-        self.assertEqual((home / "AGENTS.md").read_text(), "no emojis")
+        self.assertEqual((home / "AGENTS.md").read_text().strip(), "no emojis")
         self.assertNotIn("mcp_servers", (home / "config.toml").read_text())
 
     def test_refreshed_worker_login_syncs_back_only_if_user_unchanged(self):

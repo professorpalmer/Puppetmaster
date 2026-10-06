@@ -137,7 +137,12 @@ def prepare(env: Optional[dict] = None, *, root: Optional[Path] = None) -> Optio
             _write_atomic(home / "config.toml", lean)
         agents = source / "AGENTS.md"
         if agents.is_file():
-            data = agents.read_bytes()
+            from puppetmaster.rules import strip_block_from_text
+
+            # The user's own rules apply to workers; Puppetmaster's
+            # orchestration block tells a pilot to delegate and only costs
+            # a bounded worker context.
+            data = strip_block_from_text(agents.read_text(encoding="utf-8"))[0].encode("utf-8")
             if _digest(home / "AGENTS.md") != hashlib.sha256(data).hexdigest():
                 _write_atomic(home / "AGENTS.md", data, 0o644)
         user_auth = _digest(source / "auth.json")
