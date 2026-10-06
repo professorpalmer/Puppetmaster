@@ -1,3 +1,34 @@
+## v1.32.4 — 2026-10-06
+
+**Resumed Codex runs report their own usage.** From Codex's live finding:
+`codex exec resume` reports session-cumulative `turn.completed` usage, and that
+total omits the request made just before a compaction. Neither the total nor
+the total minus the previous run is the attempt's usage.
+
+- **Usage comes from the rollout's per-request records.** Puppetmaster records
+  the resumed session's turn ids before launch. After the run it sums the
+  unique `response_id` usage records of the one new turn. The
+  `turn_token_usage` / `thread_token_usage` snapshots only cross-check the sum.
+  On a real 53-request resumed run, this matches the request sum exactly
+  (input 5,229,089, cached 5,059,968, output 29,635, reasoning 8,659). The SDK
+  reported 11,986,684 input.
+- **Receipts say where counters came from.** Codex receipts now carry:
+  - `usage_scope` (`attempt` / `unknown`);
+  - `usage_provenance` (`rollout_token_usage_records` /
+    `sdk_turn_completed`);
+  - `rollout_turn_id` and `rollout_request_count`;
+  - `usage_partial_fields` and `usage_conflicts`, which flag snapshot
+    mismatches and cached > input;
+  - the SDK's own numbers as `sdk_*`, with `sdk_usage_scope`
+    (`session_cumulative` on resume).
+- **Unknown stays unknown.** A resumed run with no rollout, no new turn, or
+  more than one new turn reports NULL counters and `usage_unlinked_reason`.
+  It never reports a session total, and its ledger row does not settle as
+  final. An unknown per-request counter leaves that field NULL. A cold run
+  without `turn.completed` usage reports NULL `tokens_in`, not 0.
+- Cold runs keep their attempt-local SDK usage unless a linked rollout sum
+  replaces it.
+
 ## v1.32.3 — 2026-10-06
 
 **Failures keep their cause.** Three fixes from Codex's live findings:

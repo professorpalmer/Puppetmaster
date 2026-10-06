@@ -35,6 +35,8 @@ _SESSION_ENV = patch.dict(
     {
         "CODEX_HOME": str(Path(_SESSION_HOMES.name) / "codex"),
         "CLAUDE_CONFIG_DIR": str(Path(_SESSION_HOMES.name) / "claude"),
+        # The lean worker home lives under PUPPETMASTER_HOME; keep the real one out.
+        "PUPPETMASTER_HOME": str(Path(_SESSION_HOMES.name) / "pm"),
     },
 )
 
@@ -468,7 +470,11 @@ class CodexResumeTests(unittest.TestCase):
         self.assertEqual(verification.payload["thread_id"], THREAD_ID)
         self.assertFalse(verification.payload["ephemeral"])
         self.assertEqual(verification.payload["last_message"], "NEW ANSWER")
-        self.assertEqual(verification.payload["cached_input_tokens"], 38272)
+        # Resumed SDK usage is session-cumulative: kept as sdk_*, never the attempt's counters.
+        self.assertEqual(verification.payload["sdk_cached_input_tokens"], 38272)
+        self.assertEqual(verification.payload["sdk_usage_scope"], "session_cumulative")
+        self.assertIsNone(verification.payload["cached_input_tokens"])
+        self.assertEqual(verification.payload["usage_scope"], "unknown")
 
     def test_fresh_argv_is_unchanged(self) -> None:
         artifacts, kwargs, enrich, census = _run_adapter(
