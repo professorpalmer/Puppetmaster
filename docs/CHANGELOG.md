@@ -1,4 +1,8 @@
-## Unreleased
+## v1.32.1 — 2026-10-06
+
+**Attempt-bound evidence.** Every capture of a worker attempt, including the
+ones written after its call returns, stays with that attempt, and every launch
+leaves an immutable dispatch receipt.
 
 **Final captures stay with their attempt.** Captures an adapter writes after
 its call returns (stdout/stderr tails, Codex events and last message, timeout
