@@ -260,7 +260,23 @@ class Invocation:
         if self.recorded:
             self._write("record_usage_observation", observation)
 
-    def stdout(self, stdout):
+    def stdout(self, stdout, attempt_usage=None):
+        if isinstance(attempt_usage, dict):
+            # The adapter derived this attempt's own usage (a resumed Codex
+            # turn.completed is session-cumulative). Unlinked usage stays
+            # unknown and never settles as final.
+            linked = attempt_usage.get("usage_scope") == "attempt"
+            counts = attempt_usage.get("usage") if linked else None
+            counts = counts if isinstance(counts, dict) else {}
+            self.observe({
+                "input_tokens": counts.get("input_tokens"),
+                "cached_input_tokens": counts.get("cached_input_tokens"),
+                "cache_write_tokens": counts.get("cache_write_input_tokens"),
+                "output_tokens": counts.get("output_tokens"),
+            }, key="codex:rollout", source=attempt_usage.get("usage_provenance"),
+                final=linked, cost_basis=(
+                "api_equivalent" if self.billing == "plan" else
+                "api" if self.billing == "api" else "unknown"))
         if not isinstance(stdout, str):
             return
         try:
@@ -277,6 +293,8 @@ class Invocation:
                 continue
             if event.get("type") in ("turn.failed", "error"):
                 self.outcome_complete = False
+            if isinstance(attempt_usage, dict):
+                continue
             if not isinstance(event.get("usage"), dict) and "total_cost_usd" not in event:
                 continue
             data = dict(event.get("usage") or {})
@@ -303,7 +321,7 @@ class _UnboundInvocation:
     def observe(self, *args, **kwargs):
         pass
 
-    def stdout(self, stdout):
+    def stdout(self, stdout, attempt_usage=None):
         pass
 
 
@@ -360,7 +378,7 @@ def invoke_cli(call, *, accounting_adapter=None, accounting_model=None, **kwargs
                 (type(getattr(result, "returncode", None)) is int and result.returncode != 0)):
             capture.outcome_complete = False
         try:
-            capture.stdout(result.stdout)
+            capture.stdout(result.stdout, getattr(result, "attempt_usage", None))
         except Exception as exc:
             if isinstance(capture, Invocation):
                 capture._error("consumption.capture_failed", "stdout", type(exc).__name__)

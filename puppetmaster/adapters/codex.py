@@ -15,6 +15,8 @@ from puppetmaster.session_lease import SessionLease, acquire_codex_thread
 from puppetmaster.worker_attribution import attribution_payload, codex_event_references
 from puppetmaster.worker_resume import resolved_resume, task_resume_record
 
+from . import codex_rollout
+
 from ._base import (
     CliInvocation,
     CliWorkerAdapter,
@@ -298,19 +300,24 @@ class CodexAdapter(CliWorkerAdapter):
     ) -> StreamedProcess:
         if prepared.extras.get("resumed") or not bool((task.payload or {}).get("native_steer")):
             home = self._worker_home(prepared)
-            if home is None:
-                return super()._invoke_cli(task, prepared, cwd, timeout_seconds)
             from puppetmaster import codex_home
 
-            env = dict(prepared.env) if prepared.env is not None else inject_worker_cli_env(
-                apply_worktree_ports(os.environ.copy(), cwd))
-            env["CODEX_HOME"] = str(home)
-            prepared.env = env
+            if home is not None:
+                env = dict(prepared.env) if prepared.env is not None else inject_worker_cli_env(
+                    apply_worktree_ports(os.environ.copy(), cwd))
+                env["CODEX_HOME"] = str(home)
+                prepared.env = env
+            rollout_home = home if home is not None else codex_home.user_home(prepared.env)
+            resume_record = prepared.extras.get("resume") if prepared.extras.get("resumed") else None
+            baseline = _rollout_baseline(rollout_home, resume_record)
             try:
-                return super()._invoke_cli(task, prepared, cwd, timeout_seconds)
+                result = super()._invoke_cli(task, prepared, cwd, timeout_seconds)
             finally:
-                if home == codex_home.worker_home_root():
+                if home is not None and home == codex_home.worker_home_root():
                     codex_home.sync_back()
+            result.attempt_usage = _rollout_attempt_usage(
+                rollout_home, resume_record, baseline, result.stdout)
+            return result
         try:
             from puppetmaster.adapters.codex_session import run_codex_session
             from puppetmaster.state import resolve_state_dir
@@ -450,10 +457,10 @@ class CodexAdapter(CliWorkerAdapter):
             ),
             {},
         )
-        tokens_in = int(usage.get("input_tokens") or 0)
-        tokens_out = int(usage.get("output_tokens") or 0)
-        cached_tokens = int(usage.get("cached_input_tokens") or 0)
-        reasoning_tokens = int(usage.get("reasoning_output_tokens") or 0)
+        accounting = _attempt_accounting(getattr(completed, "attempt_usage", None), usage, resumed)
+        counts = accounting.pop("usage")
+        tokens_in = counts["input_tokens"]
+        tokens_out = counts["output_tokens"]
 
         last_message = last_codex_agent_message(events)
         turn_failed = any(ev.get("type") == "turn.failed" for ev in events)
@@ -543,12 +550,14 @@ class CodexAdapter(CliWorkerAdapter):
                 "dispatch_receipt": getattr(completed, "dispatch_receipt", None),
                 "last_message": _redacted_tail(last_message, _STDOUT_TAIL_CHARS),
                 "last_message_capture": last_message_capture,
-                **selected_token_usage(usage),
+                **selected_token_usage(_selected_input(counts, usage, accounting)),
                 "tokens_in": tokens_in,
                 "tokens_out": tokens_out,
-                "tokens_total": tokens_in + tokens_out,
-                "cached_input_tokens": cached_tokens,
-                "reasoning_output_tokens": reasoning_tokens,
+                "tokens_total": None if tokens_in is None or tokens_out is None else tokens_in + tokens_out,
+                "cached_input_tokens": counts["cached_input_tokens"],
+                "cache_write_input_tokens": counts["cache_write_input_tokens"],
+                "reasoning_output_tokens": counts["reasoning_output_tokens"],
+                **accounting,
                 "turn_failed": turn_failed,
                 "turn_failure_message": turn_failure_message,
                 "cwd": str(cwd),
@@ -608,6 +617,85 @@ class CodexAdapter(CliWorkerAdapter):
 # The stdin prompt positional. ``--`` ends option parsing first: ``--image``
 # is variadic and would otherwise take the bare ``-`` as another image path.
 STDIN_PROMPT = ("--", "-")
+
+
+def _attempt_accounting(attempt: object, sdk_usage: dict, resumed: bool) -> dict:
+    """This attempt's counters plus where they came from.
+
+    The SDK's ``turn.completed`` usage is kept beside them under ``sdk_*`` and
+    labeled with its own scope; it is never added to or subtracted from the
+    attempt counters.
+    """
+    sdk = {field: codex_rollout.count(sdk_usage.get(field)) for field in codex_rollout.FIELDS}
+    if isinstance(attempt, dict):
+        out = {key: value for key, value in attempt.items()}
+        out["usage"] = dict(attempt.get("usage") or {})
+        out.setdefault("usage_unlinked_reason", None)
+    elif not resumed:
+        out = {
+            "usage_scope": "attempt",
+            "usage_provenance": "sdk_turn_completed" if sdk_usage else None,
+            "usage_unlinked_reason": None if sdk_usage else "sdk_usage_missing",
+            "rollout_turn_id": None,
+            "rollout_request_count": None,
+            "usage": dict(sdk),
+            "usage_partial_fields": sorted(f for f, v in sdk.items() if v is None),
+            "usage_conflicts": [],
+        }
+    else:
+        out = codex_rollout.unlinked("rollout_not_read")
+    out["sdk_usage_scope"] = "session_cumulative" if resumed else "attempt"
+    out.update({"sdk_" + field: value for field, value in sdk.items()})
+    return out
+
+
+def _selected_input(counts: dict, sdk_usage: dict, accounting: dict) -> dict:
+    """Presence-preserving input/output counts; an estimate flag only rides SDK counts."""
+    selected = {k: counts[k] for k in ("input_tokens", "output_tokens") if counts[k] is not None}
+    if accounting.get("usage_provenance") == "sdk_turn_completed" and "tokens_estimated" in sdk_usage:
+        selected["tokens_estimated"] = sdk_usage["tokens_estimated"]
+    return selected
+
+
+def _resumed_session_id(resume_record: object) -> Optional[str]:
+    sid = resume_record.get("session_id") if isinstance(resume_record, dict) else None
+    return str(sid) if sid else None
+
+
+def _rollout_baseline(home: Path, resume_record: object) -> Optional[frozenset]:
+    """Turn ids already in the resumed session's rollout before this attempt."""
+    sid = _resumed_session_id(resume_record)
+    if sid is None:
+        return None
+    try:
+        return codex_rollout.turn_ids(codex_rollout.rollout_path(home, sid))
+    except Exception:
+        return None
+
+
+def _rollout_attempt_usage(
+    home: Path, resume_record: object, baseline: Optional[frozenset], stdout: str,
+) -> Optional[dict]:
+    """This attempt's usage from its rollout records, or None to keep the SDK's.
+
+    A resumed run always answers (linked or NULL with a reason): its
+    ``turn.completed`` usage is session-cumulative. A cold run's SDK usage is
+    already attempt-local, so it is replaced only by a linked rollout sum.
+    """
+    sid = _resumed_session_id(resume_record)
+    try:
+        if sid is not None:
+            return codex_rollout.attempt_usage(
+                codex_rollout.rollout_path(home, sid), baseline or frozenset())
+        thread_id = observed_thread_id(parse_codex_events(stdout or ""))
+        path = codex_rollout.rollout_path(home, thread_id)
+        if path is None:
+            return None
+        found = codex_rollout.attempt_usage(path, frozenset())
+        return found if found.get("usage_scope") == "attempt" else None
+    except Exception:
+        # Best effort: accounting never fails a worker run.
+        return codex_rollout.unlinked("rollout_unreadable") if sid is not None else None
 
 
 def observed_thread_id(events: list[dict], resume: object = None) -> Optional[str]:

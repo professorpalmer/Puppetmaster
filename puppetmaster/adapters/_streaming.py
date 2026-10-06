@@ -210,6 +210,9 @@ class StreamedProcess:
     attempt_id: Optional[str] = None
     # What was actually launched (see _write_dispatch_receipt).
     dispatch_receipt: Optional[str] = None
+    # This attempt's own token usage when the adapter can separate it from a
+    # session-cumulative counter (see adapters/codex_rollout.py).
+    attempt_usage: Optional[dict] = None
 
 
 def _kill_process_tree(process: "subprocess.Popen", started_new_session: bool) -> None:
