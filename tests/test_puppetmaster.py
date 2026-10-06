@@ -23025,6 +23025,15 @@ class PuppetmasterFrictionFixTests(unittest.TestCase):
         self.assertEqual(payload["max_cost_usd"], 0.5)
         self.assertEqual(payload["min_capability"], 70)
 
+        # An allowlist alone still routes within it. Without routing, a
+        # direct claude implement allowed only claude-code/opus-5-5 ran the
+        # adapter's default claude-opus-5.
+        pinned = Namespace(auto_route=False, allowed_models=["claude-code/opus-5-5"])
+        payload = routing_payload_from_args(pinned, adapter="claude-code")
+        self.assertTrue(payload["auto_route"])
+        self.assertEqual(payload["allowed_adapters"], ["claude-code"])
+        self.assertEqual(payload["allowed_model_ids"], ["claude-code/opus-5-5"])
+
     def test_direct_single_adapter_cli_sets_disable_memory_payload(self) -> None:
         captured = []
 

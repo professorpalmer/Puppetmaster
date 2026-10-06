@@ -305,7 +305,11 @@ def routing_payload_from_args(args, *, adapter: str) -> dict:
     Pins ``allowed_adapters`` to the invoked adapter so routing only picks a
     *model* within that platform — a direct ``cursor`` run never silently hops
     to claude-code."""
-    if not getattr(args, "auto_route", False):
+    allowed_models = allowed_models_cli_list(args)
+    # An allowlist is a constraint, not a hint: without routing, a direct
+    # adapter run ignored it and used the adapter's default model (a run
+    # allowed only claude-code/opus-5-5 ran claude-opus-5).
+    if not getattr(args, "auto_route", False) and not allowed_models:
         return {}
     payload: dict[str, Any] = {"auto_route": True, "allowed_adapters": [adapter]}
     if getattr(args, "routing_policy", None):
@@ -314,7 +318,6 @@ def routing_payload_from_args(args, *, adapter: str) -> dict:
         payload["max_cost_usd"] = args.max_cost_usd
     if getattr(args, "min_capability", None) is not None:
         payload["min_capability"] = args.min_capability
-    allowed_models = allowed_models_cli_list(args)
     if allowed_models:
         payload["allowed_model_ids"] = allowed_models
     return payload
