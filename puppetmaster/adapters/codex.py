@@ -5,7 +5,8 @@ import os
 from pathlib import Path
 from typing import Any, Optional, Union
 
-from puppetmaster.codegraph import enrich_prompt_with_codegraph
+from puppetmaster.codegraph import enrich_prompt_with_codegraph, inject_worker_cli_env
+from puppetmaster.ports import apply_worktree_ports
 from puppetmaster.failure import UNKNOWN, classify_codex_failure
 from puppetmaster.models import Artifact, ArtifactType, Task
 from puppetmaster.redaction import redact_secrets
@@ -264,6 +265,28 @@ class CodexAdapter(CliWorkerAdapter):
             return None, facade("git_snapshot")(cwd)
         return super()._apply_pre_run_guards(task, worker_id, cwd, prepared)
 
+    @staticmethod
+    def _worker_home(prepared: CliInvocation) -> Optional[Path]:
+        """The CODEX_HOME this run uses, or None for the inherited one (see codex_home)."""
+        from puppetmaster import codex_home
+
+        if not codex_home.enabled():
+            return None
+        resume = prepared.extras.get("resume") if prepared.extras.get("resumed") else None
+        if isinstance(resume, dict) and resume.get("session_id"):
+            # A thread resumes in the home that holds it.
+            found = codex_home.home_for_session(str(resume["session_id"]))
+            return found if found == codex_home.worker_home_root() else None
+        try:
+            home = codex_home.prepare()
+        except (OSError, TimeoutError):
+            return None
+        if home is not None and prepared.command and prepared.command[-1] == "-":
+            # Bounded workers never fork subagents, and must not accrue memories.
+            prepared.command = [*prepared.command[:-1], "--disable", "memories",
+                                "--disable", "multi_agent", "-"]
+        return home
+
     def _invoke_cli(
         self,
         task: Task,
@@ -272,7 +295,20 @@ class CodexAdapter(CliWorkerAdapter):
         timeout_seconds: int,
     ) -> StreamedProcess:
         if prepared.extras.get("resumed") or not bool((task.payload or {}).get("native_steer")):
-            return super()._invoke_cli(task, prepared, cwd, timeout_seconds)
+            home = self._worker_home(prepared)
+            if home is None:
+                return super()._invoke_cli(task, prepared, cwd, timeout_seconds)
+            from puppetmaster import codex_home
+
+            env = dict(prepared.env) if prepared.env is not None else inject_worker_cli_env(
+                apply_worktree_ports(os.environ.copy(), cwd))
+            env["CODEX_HOME"] = str(home)
+            prepared.env = env
+            try:
+                return super()._invoke_cli(task, prepared, cwd, timeout_seconds)
+            finally:
+                if home == codex_home.worker_home_root():
+                    codex_home.sync_back()
         try:
             from puppetmaster.adapters.codex_session import run_codex_session
             from puppetmaster.state import resolve_state_dir
