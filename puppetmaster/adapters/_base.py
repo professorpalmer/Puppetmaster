@@ -410,6 +410,7 @@ class CliWorkerAdapter(FullEditWorkerAdapter):
                         "stderr": _redacted_tail(completed.stderr, _STDOUT_TAIL_CHARS),
                         "live_log": completed.live_log_path,
                         "attempt_id": getattr(completed, "attempt_id", None),
+                        "dispatch_receipt": getattr(completed, "dispatch_receipt", None),
                         **diff_source_payload(before, after),
                     },
                 )

@@ -317,8 +317,12 @@ class ClaimContentionTests(unittest.TestCase):
                     results = list(pool.map(run, range(4)))
                 self.assertEqual(sum(results), 4, (iteration, store.backend_name))
                 tasks = store.list_tasks(job.id)
-                self.assertTrue(all(t.status == TaskStatus.COMPLETE and t.attempts == 1 for t in tasks))
                 events = [e for e in store.read_events(job.id) if e['event'] == 'task.claimed']
+                # Name every task's state on failure: a Windows runner once
+                # left one task off COMPLETE/attempts=1 with no other trace.
+                self.assertTrue(all(t.status == TaskStatus.COMPLETE and t.attempts == 1 for t in tasks),
+                                (store.backend_name, [(t.id, str(t.status), t.attempts) for t in tasks],
+                                 [(e.get('task_id'), (e.get('payload') or {}).get('worker_id')) for e in events]))
                 self.assertEqual(len(events), 4)
 
 

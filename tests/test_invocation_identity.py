@@ -223,6 +223,69 @@ class InvocationIdentityTests(unittest.TestCase):
             env={}, stdin_data=None, pid=1))
         self.assertEqual(first.read_bytes(), before)
 
+    def receipt_args(self, directory, stdin):
+        return dict(task=self.task, sidecar_name="echo", command=["agent"], cwd=None,
+                    env={}, stdin_data=stdin, pid=os.getpid())
+
+    def test_a_repeated_receipt_call_changes_neither_receipt_nor_stdin_copy(self):
+        import json
+
+        from puppetmaster.adapters._streaming import _write_dispatch_receipt
+
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            first = _write_dispatch_receipt(directory, **self.receipt_args(directory, "first prompt"))
+            body = json.loads(Path(first).read_text())
+            copy = Path(body["stdin"]["redacted_copy"])
+            before = (Path(first).read_bytes(), copy.read_bytes())
+            self.assertIsNone(_write_dispatch_receipt(
+                directory, **self.receipt_args(directory, "a different prompt")))
+            self.assertEqual((Path(first).read_bytes(), copy.read_bytes()), before)
+            self.assertEqual(copy.read_text(), "first prompt")
+
+    def test_racing_receipt_calls_leave_one_consistent_bundle(self):
+        import hashlib
+        import json
+        import threading
+
+        from puppetmaster.adapters._streaming import _write_dispatch_receipt
+
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            start = threading.Barrier(8)
+            won = []
+
+            def call(n):
+                start.wait()
+                result = _write_dispatch_receipt(directory, **self.receipt_args(directory, f"prompt {n}"))
+                if result:
+                    won.append(n)
+
+            threads = [threading.Thread(target=call, args=(n,)) for n in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(10)
+            self.assertEqual(len(won), 1)
+            body = json.loads((directory / "echo.dispatch.json").read_text())
+            copy = Path(body["stdin"]["redacted_copy"]).read_text()
+            self.assertEqual(copy, f"prompt {won[0]}")
+            self.assertEqual(body["stdin"]["sha256"], hashlib.sha256(copy.encode()).hexdigest())
+
+    def test_a_leftover_stdin_copy_is_never_overwritten(self):
+        import json
+
+        from puppetmaster.adapters._streaming import _write_dispatch_receipt
+
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / "echo.stdin.txt").write_text("leftover")
+            receipt = _write_dispatch_receipt(directory, **self.receipt_args(directory, "new prompt"))
+            body = json.loads(Path(receipt).read_text())
+            self.assertIsNone(body["stdin"]["redacted_copy"])
+            self.assertEqual(body["stdin"]["chars"], len("new prompt"))
+            self.assertEqual((directory / "echo.stdin.txt").read_text(), "leftover")
+
     def test_unbound_calls_keep_the_task_directory(self):
         completed = run_streamed_subprocess(
             command=[sys.executable, "-c", "print('direct')"], env=None, task=self.task,

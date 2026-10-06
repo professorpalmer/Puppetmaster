@@ -27,7 +27,6 @@ _APPLIED = False
 _ENV_BEFORE: dict[str, Optional[str]] = {}
 _ISOLATION_TMP: Optional[str] = None
 _ORIG_TESTCASE_RUN = None
-_ORIG_COORDINATION_PATH = None
 _ATEXIT_REGISTERED = False
 # How many tests left a registry behind at the sentinel path (see
 # ``reap_leaked_registry``). Exposed for the harness's own tests.
@@ -237,7 +236,13 @@ def apply_hermetic_isolation(*, register_atexit: bool = True) -> None:
     for key, name in (("PI_CODING_AGENT_DIR", "pi-agent"), ("OMP_AGENT_DIR", "omp-agent")):
         _ENV_BEFORE[key] = os.environ.get(key)
         os.environ[key] = str(Path(_ISOLATION_TMP) / name)
-    _isolate_reader_coordination(Path(_ISOLATION_TMP) / "readers")
+    # Production serializes readonly-helper spawns machine-wide through one
+    # lock root shared by every Puppetmaster process of the user. Parallel
+    # test processes, their CLI children and a running Marionette would stall
+    # each other's reads. The env var reaches child processes too.
+    _ENV_BEFORE["PUPPETMASTER_READER_COORDINATION_DIR"] = os.environ.get(
+        "PUPPETMASTER_READER_COORDINATION_DIR")
+    os.environ["PUPPETMASTER_READER_COORDINATION_DIR"] = str(Path(_ISOLATION_TMP) / "readers")
     os.environ[ONLY_ENV] = ",".join(KNOWN_ADAPTERS)
     for key in _PIN_KEYS_TO_CLEAR:
         os.environ.pop(key, None)
@@ -319,28 +324,6 @@ def apply_hermetic_isolation(*, register_atexit: bool = True) -> None:
         _ATEXIT_REGISTERED = True
 
 
-def _isolate_reader_coordination(root: Path) -> None:
-    """Give this test process its own readonly-helper coordination locks.
-
-    Production serializes helper spawns machine-wide through one lock under
-    /tmp, shared by every Puppetmaster process of the user. Parallel test
-    processes (and a running Marionette) would queue behind each other's
-    spawns and miss the short budgets the readonly tests set.
-    """
-    global _ORIG_COORDINATION_PATH
-    from puppetmaster import readonly_admission
-
-    if _ORIG_COORDINATION_PATH is None:
-        _ORIG_COORDINATION_PATH = readonly_admission._coordination_path
-
-    def isolated(path, selected=None):
-        root.mkdir(mode=0o700, exist_ok=True)
-        key = readonly_admission._key(readonly_admission._identity(path, selected))
-        return root / (key + ".lock")
-
-    readonly_admission._coordination_path = isolated
-
-
 def restore_hermetic_isolation() -> None:
     """Undo :func:`apply_hermetic_isolation` (pytest unconfigure / atexit)."""
     global _APPLIED, _ISOLATION_TMP, _ORIG_TESTCASE_RUN
@@ -357,13 +340,6 @@ def restore_hermetic_isolation() -> None:
         else:
             os.environ[key] = value
     _ENV_BEFORE.clear()
-
-    global _ORIG_COORDINATION_PATH
-    if _ORIG_COORDINATION_PATH is not None:
-        from puppetmaster import readonly_admission
-
-        readonly_admission._coordination_path = _ORIG_COORDINATION_PATH
-        _ORIG_COORDINATION_PATH = None
 
     if _ISOLATION_TMP is not None:
         shutil.rmtree(_ISOLATION_TMP, ignore_errors=True)

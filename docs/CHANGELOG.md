@@ -1,3 +1,25 @@
+## v1.32.2 — 2026-10-06
+
+**Receipts stay immutable under repeats and races.**
+
+- A live-WAL observer read that opens just as the last writer checkpoints
+  and removes the WAL pair is retried as a cohort turnover. 1.32.0 surfaced
+  it as a hard `unable to open database file`.
+- A dispatch receipt's linked stdin copy is immutable too. 1.32.1 wrote the
+  copy before claiming the receipt, so a repeated or racing call for the same
+  attempt and sidecar was refused a receipt but still rewrote the first
+  receipt's stdin copy. The receipt is now claimed exclusively first, and the
+  copy is created exclusively; a leftover copy is never overwritten (the
+  receipt then records `redacted_copy: null` and keeps the hash). Reported by
+  Codex.
+- The output-limit verification payload names its `dispatch_receipt` too
+  (1.32.1 carried it on every other CLI verification payload).
+- `PUPPETMASTER_READER_COORDINATION_DIR` overrides the machine-wide root for
+  readonly-helper spawn coordination. The test suite sets it, so its child
+  processes are isolated too, not only the test process.
+- The concurrent-wake event test checks the wake against a 10 s timeout with
+  a 5 s bound; a loaded Windows runner once took 1.125 s against the old 1 s.
+
 ## v1.32.1 — 2026-10-06
 
 **Attempt-bound evidence.** Every capture of a worker attempt, including the
