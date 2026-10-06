@@ -65,12 +65,6 @@ _NON_CHAT_MARKERS = (
     "marengo",
 )
 
-_ANTHROPIC_BEDROCK_VERSION = "bedrock-2023-05-31"
-# InvokeModel requires application/json for Anthropic Claude (not the
-# amazon.bedrock.anthropic.messages-v1+json media type).
-_ANTHROPIC_MESSAGES_CONTENT_TYPE = "application/json"
-
-
 @dataclass(frozen=True)
 class BedrockCredentials:
     """Resolved AWS auth for a Bedrock InvokeModel call.
@@ -296,7 +290,7 @@ def sigv4_sign_headers(
     host = parsed.netloc
     # SigV4 canonical URI double-encodes path segments (``:`` -> ``%3A`` on the
     # wire becomes ``%253A`` in the canonical request). ``quote(..., safe="/")``
-    # re-encodes any ``%`` already present from ``invoke_model_url``.
+    # re-encodes any ``%`` already present from ``converse_model_url``.
     raw_path = parsed.path or "/"
     canonical_uri = urllib.parse.quote(raw_path, safe="/")
     canonical_query = parsed.query or ""
@@ -353,12 +347,6 @@ def sigv4_sign_headers(
     if session_token:
         out["X-Amz-Security-Token"] = session_token
     return out
-
-
-def invoke_model_url(base_url: str, model_id: str) -> str:
-    """Bedrock Runtime ``InvokeModel`` URL for ``model_id`` (legacy Anthropic path)."""
-    encoded = urllib.parse.quote(model_id, safe="")
-    return f"{base_url.rstrip('/')}/model/{encoded}/invoke"
 
 
 def converse_model_url(base_url: str, model_id: str) -> str:
@@ -582,39 +570,6 @@ def build_converse_body(
     if isinstance(amrf, dict) and amrf:
         body["additionalModelRequestFields"] = dict(amrf)
     return apply_bedrock_converse_cache_points(body)
-
-
-def build_anthropic_invoke_body(
-    *,
-    messages: list[dict],
-    tools: Optional[list[dict]],
-    extra: dict,
-) -> dict:
-    """Anthropic Messages JSON body for Bedrock ``InvokeModel`` (no ``model``)."""
-    from puppetmaster.providers import _to_anthropic_messages, _to_anthropic_tool
-
-    system_parts = [
-        m["content"] for m in messages if m.get("role") == "system" and m.get("content")
-    ]
-    convo = [m for m in messages if m.get("role") != "system"]
-    body: dict[str, Any] = {
-        "anthropic_version": _ANTHROPIC_BEDROCK_VERSION,
-        "messages": _to_anthropic_messages(convo),
-        "max_tokens": int(
-            extra.get("max_tokens") or extra.get("max_completion_tokens") or 4096
-        ),
-    }
-    if system_parts:
-        body["system"] = "\n\n".join(str(p) for p in system_parts)
-    if tools:
-        body["tools"] = [_to_anthropic_tool(t) for t in tools]
-    force_tool = extra.get("force_tool")
-    if force_tool and tools:
-        body["tool_choice"] = {"type": "tool", "name": str(force_tool)}
-    for key in ("temperature", "top_p", "stop_sequences"):
-        if key in extra:
-            body[key] = extra[key]
-    return body
 
 
 def _post_bedrock(
@@ -845,41 +800,6 @@ def list_chat_model_ids(
         seen.add(mid)
         out.append(mid)
     return out
-
-
-def _assistant_turn_from_anthropic(data: dict):
-    from puppetmaster.providers import AssistantTurn
-
-    text_parts: list[str] = []
-    tool_calls: list[dict] = []
-    for block in data.get("content") or []:
-        if not isinstance(block, dict):
-            continue
-        if block.get("type") == "text":
-            text_parts.append(str(block.get("text") or ""))
-        elif block.get("type") == "tool_use":
-            tool_calls.append({
-                "id": block.get("id") or "",
-                "name": block.get("name") or "",
-                "arguments": block.get("input") or {},
-            })
-    usage = data.get("usage") or {}
-    prompt_tokens = int(usage.get("input_tokens") or 0)
-    completion_tokens = int(usage.get("output_tokens") or 0)
-    return AssistantTurn(
-        text="".join(text_parts).strip(),
-        tool_calls=tool_calls,
-        finish_reason=str(data.get("stop_reason") or ""),
-        accounting_usage=usage,
-        usage={
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-            "cached_tokens": int(usage.get("cache_read_input_tokens") or 0),
-            "cache_write_tokens": int(usage.get("cache_creation_input_tokens") or 0),
-        },
-        raw=data,
-    )
 
 
 def _assistant_turn_from_converse(data: dict):

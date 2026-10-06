@@ -632,7 +632,8 @@ def parse_cursor_artifact_payload(result_text: object) -> Optional[Any]:
 # item may use any of them and is never dropped; an untyped (wrapped or
 # inferred) item must carry a strict primary key, else it is malformed.
 _STRICT_HEADLINE_KEYS = ("claim", "summary")
-_HEADLINE_KEYS = ("claim", "summary", "title", "headline", "symptom", "issue", "problem", "description", "detail")
+_HEADLINE_KEYS = ("claim", "summary", "title", "headline", "symptom", "issue", "problem", "description",
+                  "detail", "content", "text", "body", "message")
 
 
 def _item_headline(payload: dict, *primary: str, declared: bool) -> Optional[str]:

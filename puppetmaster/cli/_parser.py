@@ -486,7 +486,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--global",
         dest="rules_global",
         action="store_true",
-        help="Also write user-level rules (~/.codex/instructions.md, ~/.claude/CLAUDE.md, ~/.hermes/SOUL.md) when those tools are detected.",
+        help="Also write user-level rules ($CODEX_HOME/AGENTS.md, ~/.claude/CLAUDE.md, ~/.hermes/SOUL.md) when those tools are detected.",
     )
     install_rules_parser.add_argument(
         "--force",
@@ -3191,6 +3191,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     delegate_cmd.add_argument("--json", action="store_true", help="Emit JSON.")
     _add_playbook_argument(delegate_cmd)
+
+    sizing_cmd = subcommands.add_parser(
+        "sizing",
+        help=(
+            "Sizing gate: from a plan (units with status and independent) and the "
+            "elapsed time, decide stay_solo, handoff, or delegate_upfront against "
+            "the model's calibrated solo horizon. Pure, local, no LLM."
+        ),
+    )
+    sizing_cmd.add_argument("plan", help="Plan JSON file, or - for stdin.")
+    sizing_cmd.add_argument("--elapsed", type=float, default=0.0, help="Seconds since the work began.")
+    sizing_cmd.add_argument("--context-frac", type=float, default=0.0,
+                            help="Pilot prompt tokens / model context window.")
+    sizing_cmd.add_argument("--model", default="", help="Pilot model id for calibration lookup.")
+    sizing_cmd.add_argument("--json", action="store_true", help="Emit JSON.")
 
     gate_hook = subcommands.add_parser(
         "invocation-gate",

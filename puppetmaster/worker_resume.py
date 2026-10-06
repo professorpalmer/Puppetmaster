@@ -99,8 +99,12 @@ def repair_resume_record(task: Any, artifacts: Any) -> Optional[dict]:
 def session_on_disk(adapter: str, session_id: str) -> Optional[bool]:
     """Whether the CLI's local session store holds ``session_id``; None when there is no store to check."""
     if adapter == "codex":
-        root = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "sessions"
-        pattern = f"*/*/*/rollout-*-{session_id}.jsonl"
+        from puppetmaster import codex_home
+
+        homes = codex_home.session_homes()
+        if not any((home / "sessions").is_dir() for home in homes):
+            return None
+        return codex_home.home_for_session(session_id) is not None
     else:
         root = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
         pattern = f"*/{session_id}.jsonl"

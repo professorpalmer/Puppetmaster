@@ -15,9 +15,7 @@ import re
 from typing import Any, Iterable, Optional
 
 PROVIDER_SLUG = "openai-codex"
-API_KEY_ENV = "OPENAI_CODEX_TOKEN"
 BASE_URL = "https://chatgpt.com/backend-api/codex"
-BASE_URL_ENV = "OPENAI_CODEX_BASE_URL"
 USER_AGENT = "codex_cli_rs/0.0.0 (Puppetmaster)"
 
 

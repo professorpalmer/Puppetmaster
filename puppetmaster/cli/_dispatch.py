@@ -139,6 +139,7 @@ from puppetmaster.cli.commands_gate import (
     _run_route_command,
     _run_savings_command,
     _run_should_delegate_command,
+    _run_sizing_command,
 )
 from puppetmaster.cli.commands_cell import (
     _run_cell_inspect_command,
@@ -780,6 +781,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
 
     if args.command == "should-delegate":
         return _run_should_delegate_command(args)
+
+    if args.command == "sizing":
+        return _run_sizing_command(args)
 
     if args.command == "invocation-gate":
         return _run_invocation_gate_command(args)

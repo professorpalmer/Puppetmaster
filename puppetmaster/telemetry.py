@@ -340,7 +340,6 @@ def record_job_trace(
 
 
 def record_task_span(
-    job_goal: str,
     task: Task,
     artifacts: list[Artifact],
     *,

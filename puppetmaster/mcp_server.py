@@ -1355,9 +1355,13 @@ def _build_tools() -> list[McpTool]:
     return [
         McpTool(
             name="puppetmaster_doctor",
-            description="Check Puppetmaster runtime, SQLite state, and provider adapter setup.",
-            input_schema=base_schema(),
-            handler=lambda args: run_cli(["doctor"], args),
+            description=(
+                "Check Puppetmaster runtime, SQLite state, and provider adapter setup. "
+                "Replies with counts and only the checks that are not ok; pass "
+                "compact=false for every check."
+            ),
+            input_schema=compact_schema(base_schema()),
+            handler=run_doctor_tool,
         ),
         McpTool(
             name="puppetmaster_route_task",
@@ -1370,7 +1374,7 @@ def _build_tools() -> list[McpTool]:
                 "delegate/inline gate: if a task scores as non-trivial here, prefer a "
                 "Puppetmaster swarm over grinding through it inline."
             ),
-            input_schema=route_task_schema(),
+            input_schema=compact_schema(route_task_schema()),
             handler=run_route_task,
         ),
         McpTool(
@@ -3558,6 +3562,44 @@ def list_models_schema() -> JsonObject:
     return schema
 
 
+_ROUTE_COMPACT_KEYS = ("model_id", "adapter", "adapter_model_name", "billing", "policy",
+                       "capability_needed", "capability_score", "estimated_cost_usd",
+                       "nominal_cost_usd", "reason", "role")
+
+
+def compact_schema(schema: JsonObject) -> JsonObject:
+    schema = dict(schema)
+    schema["properties"] = {**schema.get("properties", {}), "compact": {
+        "type": "boolean", "default": True,
+        "description": "Default true: the short answer. false returns the full detail.",
+    }}
+    return schema
+
+
+def run_doctor_tool(args: JsonObject) -> JsonObject:
+    if not args.get("compact", True):
+        return run_cli(["doctor"], args)
+    result = run_cli(["doctor", "--json"], args)
+    try:
+        body = json.loads(result["content"][0]["text"])
+        checks = json.loads(body.get("stdout") or "[]")
+    except (KeyError, IndexError, TypeError, ValueError):
+        return result
+    if not isinstance(checks, list):
+        return result
+    counts: dict[str, int] = {}
+    for check in checks:
+        status = str((check or {}).get("status") or "unknown")
+        counts[status] = counts.get(status, 0) + 1
+    attention = [{"name": check.get("name"), "status": check.get("status"),
+                  "detail": str(check.get("detail") or "")[:300]}
+                 for check in checks if isinstance(check, dict)
+                 and check.get("status") not in ("ok", "optional")]
+    # Same envelope hosts already parse; stdout carries the compact report.
+    body["stdout"] = json.dumps({"counts": counts, "attention": attention}, indent=2) + "\n"
+    return {**result, "content": [{"type": "text", "text": json.dumps(body, indent=2)}]}
+
+
 def run_route_task(args: JsonObject) -> JsonObject:
     """Run the router and return the decision as a JSON content block."""
     from puppetmaster.model_registry import default_registry_path, load_registry
@@ -3621,6 +3663,11 @@ def run_route_task(args: JsonObject) -> JsonObject:
 
     payload = decision.to_artifact_payload()
     payload["registry_path"] = str(registry_path)
+    if args.get("compact", True):
+        # A pilot reads every byte: the pick, its price and why. The rejected
+        # list ran to several KB and is one compact=false away.
+        payload = {key: payload.get(key) for key in _ROUTE_COMPACT_KEYS if key in payload}
+        payload["rejected_count"] = len(decision.to_artifact_payload().get("rejected") or [])
     return {
         "content": [{"type": "text", "text": json.dumps(payload, indent=2)}],
         "isError": False,
@@ -4859,7 +4906,28 @@ def flow_schema() -> JsonObject:
                 "enum": ["validate", "save", "run", "status", "wait", "resume", "stop", "cut", "list"],
             },
             "graph": {
-                "description": "Graph object, a path to a graph JSON file, or a saved graph id.",
+                "description": (
+                    "Graph object, a path to a graph JSON file, or a saved graph id. Shape: "
+                    "{id, entry, defaults: {adapter (required: codex|claude-code|cursor|agentic), model?, "
+                    "effort?, lanes?, timeout_seconds?}, "
+                    "nodes: [...], edges: [{from, to, when?, max?}]}. Node fields by kind: "
+                    "agent {id, role: code|explore, task, files?}; judge {id, task} (ends in "
+                    "VERDICT: PASS|FAIL|PARTIAL); shell {id, command}; map {id, items, "
+                    "concurrency?, graph: <item graph using {{item}}>}; gate {id, question, "
+                    "options}; set {id, values}; end {id, status?: pass|fail}. Map items may be "
+                    "objects: group many small units per item ({{item.units}}, {{item.files}}) "
+                    "so a few workers each own several, and set concurrency to the item count. "
+                    "Templates: "
+                    "{{input}} {{item}} {{out.<node>}} {{state.<k>}}. Example fan-out: "
+                    '{"id": "mods", "entry": "all", "defaults": {"adapter": "codex"}, "nodes": [{"id": "all", "kind": "map", '
+                    '"items": ["a", "b"], "concurrency": 8, "graph": {"entry": "build", '
+                    '"nodes": [{"id": "build", "kind": "agent", "files": ["mods/{{item}}.py"], '
+                    '"task": "Implement tasks/{{item}}.md"}, {"id": "check", "kind": "shell", '
+                    '"command": "python3 tests/check_{{item}}.py"}, {"id": "done", "kind": "end"}], '
+                    '"edges": [{"from": "build", "to": "check"}, {"from": "check", "to": "build", '
+                    '"when": "fail", "max": 2}, {"from": "check", "to": "done", "when": "ok"}]}}], '
+                    '"edges": []}. Full reference: docs/FLOWS.md.'
+                ),
                 "anyOf": [{"type": "object"}, {"type": "string"}],
             },
             "input": {"type": "string", "description": "The run's {{input}}."},

@@ -49,6 +49,14 @@ class WorkerReportArtifactsTest(unittest.TestCase):
         self.assertIsNotNone(artifact)
         self.assertIn("d.py:9", artifact.payload["claim"])
 
+    def test_a_finding_written_as_content_keeps_its_text_as_the_headline(self) -> None:
+        # A Marionette audit swarm: 111 findings arrived as {"type": "finding",
+        # "content": "FINDING: ..."} and all collapsed into "Unnamed item".
+        artifact = cursor_artifact_from_item(
+            self.task, "w", {"type": "finding", "content": "FINDING: harness/todo.py:111 TodoError"},
+            adapter="claude-code")
+        self.assertEqual(artifact.payload["claim"], "FINDING: harness/todo.py:111 TodoError")
+
     def test_artifact_shaped_items_lift_their_nested_payload(self) -> None:
         items = [
             {"type": "finding", "confidence": 0.9,

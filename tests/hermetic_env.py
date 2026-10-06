@@ -228,6 +228,9 @@ def apply_hermetic_isolation(*, register_atexit: bool = True) -> None:
     # Store discovery and file claims live under the app state root; never
     # let the suite read or write the developer's real Puppetmaster state.
     os.environ["PUPPETMASTER_APP_STATE_ROOT"] = str(Path(_ISOLATION_TMP) / "app-state")
+    # ~/.puppetmaster holds the Codex worker home (a copy of the user's login)
+    # and prefix-warm marks; a test must never write either.
+    os.environ["PUPPETMASTER_HOME"] = str(Path(_ISOLATION_TMP) / "puppetmaster-home")
     # Pi and OMP installers resolve ~ from HOME, which a patched Path.home does
     # not cover; setup tests otherwise rewrite the developer's ~/.pi and ~/.omp.
     for key, name in (("PI_CODING_AGENT_DIR", "pi-agent"), ("OMP_AGENT_DIR", "omp-agent")):

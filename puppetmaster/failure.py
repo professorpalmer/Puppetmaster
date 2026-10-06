@@ -31,9 +31,6 @@ SDK_NOT_INSTALLED = "sdk_not_installed"
 RUN_STATUS_ERROR = "run_status_error"
 UNKNOWN = "unknown"
 
-# Legacy alias still referenced in stitcher remediation and older artifacts.
-MISSING_API_KEY = NOT_AUTHENTICATED
-
 Checker = Callable[[str], bool]
 Rule = Tuple[Checker, str]
 

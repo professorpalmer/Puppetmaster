@@ -5,7 +5,8 @@ import os
 from pathlib import Path
 from typing import Any, Optional, Union
 
-from puppetmaster.codegraph import enrich_prompt_with_codegraph
+from puppetmaster.codegraph import enrich_prompt_with_codegraph, inject_worker_cli_env
+from puppetmaster.ports import apply_worktree_ports
 from puppetmaster.failure import UNKNOWN, classify_codex_failure
 from puppetmaster.models import Artifact, ArtifactType, Task
 from puppetmaster.redaction import redact_secrets
@@ -46,7 +47,6 @@ from .cursor import (
     implement_report_artifacts,
 )
 
-DEFAULT_CODEX_MODEL = "gpt-5.4-mini"
 _CODEX_NPM_ENTRYPOINT = Path("node_modules") / "@openai" / "codex" / "bin" / "codex.js"
 
 
@@ -197,7 +197,8 @@ class CodexAdapter(CliWorkerAdapter):
             if lease is not None:
                 lease.release()
             return self._missing_cli(task, worker_id, str(executable))
-        model = str(task.payload.get("model") or DEFAULT_CODEX_MODEL)
+        # Unpinned: the user's configured Codex model, else Codex's own default.
+        model = str(task.payload.get("model") or _codex_home().configured_model())
         approval_policy = str(task.payload.get("approval_policy") or "never")
         # A review-loop task may be repaired by resuming this thread, so keep it.
         ephemeral = bool(task.payload.get("ephemeral", not task.payload.get("review_loop")))
@@ -264,6 +265,29 @@ class CodexAdapter(CliWorkerAdapter):
             return None, facade("git_snapshot")(cwd)
         return super()._apply_pre_run_guards(task, worker_id, cwd, prepared)
 
+    @staticmethod
+    def _worker_home(prepared: CliInvocation) -> Optional[Path]:
+        """The CODEX_HOME this run uses, or None for the inherited one (see codex_home)."""
+        from puppetmaster import codex_home
+
+        if not codex_home.enabled():
+            return None
+        resume = prepared.extras.get("resume") if prepared.extras.get("resumed") else None
+        if isinstance(resume, dict) and resume.get("session_id"):
+            # A thread resumes in the home that holds it.
+            found = codex_home.home_for_session(str(resume["session_id"]))
+            return found if found == codex_home.worker_home_root() else None
+        try:
+            home = codex_home.prepare()
+        except Exception:
+            # Best effort: any failure runs the worker in the user's own home.
+            return None
+        if home is not None and prepared.command and prepared.command[-1] == "-":
+            # Bounded workers never fork subagents, and must not accrue memories.
+            prepared.command = [*prepared.command[:-1], "--disable", "memories",
+                                "--disable", "multi_agent", "-"]
+        return home
+
     def _invoke_cli(
         self,
         task: Task,
@@ -272,7 +296,20 @@ class CodexAdapter(CliWorkerAdapter):
         timeout_seconds: int,
     ) -> StreamedProcess:
         if prepared.extras.get("resumed") or not bool((task.payload or {}).get("native_steer")):
-            return super()._invoke_cli(task, prepared, cwd, timeout_seconds)
+            home = self._worker_home(prepared)
+            if home is None:
+                return super()._invoke_cli(task, prepared, cwd, timeout_seconds)
+            from puppetmaster import codex_home
+
+            env = dict(prepared.env) if prepared.env is not None else inject_worker_cli_env(
+                apply_worktree_ports(os.environ.copy(), cwd))
+            env["CODEX_HOME"] = str(home)
+            prepared.env = env
+            try:
+                return super()._invoke_cli(task, prepared, cwd, timeout_seconds)
+            finally:
+                if home == codex_home.worker_home_root():
+                    codex_home.sync_back()
         try:
             from puppetmaster.adapters.codex_session import run_codex_session
             from puppetmaster.state import resolve_state_dir
@@ -285,7 +322,7 @@ class CodexAdapter(CliWorkerAdapter):
                 command_prefix=prepared.command[:1],
                 cwd=cwd,
                 prompt=str(prepared.extras.get("prompt") or task.instruction or ""),
-                model=str(prepared.extras.get("model") or DEFAULT_CODEX_MODEL),
+                model=str(prepared.extras.get("model") or _codex_home().configured_model()) or None,
                 sandbox=str(prepared.extras.get("sandbox") or "workspace-write"),
                 timeout=float(timeout_seconds),
                 pending_steering=pending,
@@ -311,7 +348,7 @@ class CodexAdapter(CliWorkerAdapter):
         after: dict,
         completed: StreamedProcess,
     ) -> list[Artifact]:
-        model = str(prepared.extras.get("model") or DEFAULT_CODEX_MODEL)
+        model = str(prepared.extras.get("model") or "codex-default")
         sandbox = str(prepared.extras.get("sandbox") or "workspace-write")
         approval_policy = str(prepared.extras.get("approval_policy") or "never")
         bypass = bool(prepared.extras.get("bypass"))
@@ -707,3 +744,9 @@ def _lease_codex_thread(record: dict) -> tuple[dict, Optional[SessionLease]]:
             ),
         }, None
     return record, lease
+
+
+def _codex_home():
+    from puppetmaster import codex_home
+
+    return codex_home

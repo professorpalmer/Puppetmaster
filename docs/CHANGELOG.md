@@ -1,3 +1,87 @@
+## v1.31.0 — 2026-10-05
+
+**Fan-out cost parity: Codex workers no longer pay ~12k tokens of user context
+each, pilots read less, flows never report a pass that built nothing, and a
+sizing gate decides when to fan out at all.**
+
+Measured on an 8-module fan-out probe (Codex gpt-6.1-sol high, the same model
+and effort for every lane, every output passing its checks), interleaved with
+native subagent runs: Puppetmaster 92.3 s and 92.7 s against native 105.7 s
+and 100.1 s, with estimated input cost (fresh plus 0.1x cached) 17-31% below
+native's. Two reps on a small synthetic fan-out; it is a direction, not a
+benchmark result.
+
+- **Codex pilots finally get Puppetmaster's rules.** `install-rules --global`
+  wrote `~/.codex/instructions.md`, which current Codex never reads; it loads
+  `$CODEX_HOME/AGENTS.md` (verified with a marker word: AGENTS.md answered,
+  instructions.md did not). So no Codex pilot ever saw the flow, inline-edit
+  or craft-armor guidance. The block now goes into `$CODEX_HOME/AGENTS.md`
+  (your own content there is kept), and an old block is moved out of
+  `instructions.md`. Re-run `puppetmaster install-rules --global`.
+- **Installed pilot rules: solo first, fan out when it pays.** The rules told
+  every pilot to start a Puppetmaster verb for any work touching 3+ files,
+  to graph every directory first and to run doctor once per session; on the
+  same probes that is what lost to native subagents (16 small modules
+  through CodeGraph init, doctor, route_task and a 4-wave fan-out; a
+  three-edit follow-up delegated). The block (about 6k characters, from
+  10k) now says to work solo unless parallel workers clearly finish sooner
+  or better, and when fanning out to use one flow with grouped map items,
+  per-unit checks and craft armor. CodeGraph is for exploring unfamiliar
+  code, doctor for failures. The worker exemption and trigger convention
+  are unchanged.
+- **Unpinned Codex workers run your configured model.** The built-in
+  default was `gpt-5.4-mini`; on an account without it every node of an
+  unpinned flow failed `model_unavailable`. Workers now use the top-level
+  `model` from your Codex config, or no `-m` at all.
+- **Lean CODEX_HOME for Codex workers.** Each fresh `codex exec` sends, on
+  its first call, a developer/environment block built from CODEX_HOME (the
+  skills list, memories, plugin recommendations, multi-agent instructions)
+  whose per-turn metadata differs per process, so it is never a prompt-cache
+  hit: about 12.4k fresh input tokens per worker, against about 3.3k for a
+  native subagent that forks an already-cached parent thread. Workers now run
+  in `~/.puppetmaster/codex-worker-home` (the user's config minus MCP
+  servers, plugins, marketplaces, memories, hooks and notify; model, service
+  tier, providers, profiles and projects kept; global AGENTS.md kept;
+  memories and multi_agent disabled): about 2.6k fresh on the first call.
+  `auth.json` is copied, never symlinked, and a worker-refreshed login is
+  copied back only if the user's own file is unchanged. Resumed threads run
+  in the home that holds them. Your AGENTS.md is kept without Puppetmaster's
+  pilot block, and an unreadable file never blocks a launch.
+  `PUPPETMASTER_CODEX_LEAN_HOME=0` opts out. In
+  the probe, total worker fresh input fell from 89-112k to 45-67k.
+- **Sizing gate** (`puppetmaster/sizing.py`, `puppetmaster sizing`): from a
+  plan (units with status, `[parallel]` marking independent ones) and measured
+  progress, decide `stay_solo`, `handoff` (solo is projected to overrun its
+  horizon in time or context, and handing the remaining independent units to
+  a flow map finishes sooner) or `delegate_upfront` (mass independent work).
+  Calibration is a per-model policy file; every field is validated, and an
+  unmeasured or invalid one stays at its labeled provisional value, with
+  per-field provenance. The provisional upfront bar (16 independent units)
+  follows the sealed voxel study's first consistent quality crossover, not a
+  measured Puppetmaster result.
+- **Flows: a failed node never ends in a pass.** A node that failed (a gate,
+  a rejected pin) carried by an unconditional edge to an implicit end
+  reported the run done/pass, so the pilot was woken with nothing built. The
+  run now fails with the failing nodes named; an explicit end status still
+  wins. A launch that raised before creating its task (an unregistered model
+  pin) now surfaces its real error instead of "no task for <role>".
+- **`puppetmaster_flow` documents itself.** The graph parameter carries the
+  node shapes, the required adapter, templates and a validated fan-out
+  example; a pilot in the probe had read flow.py source to learn the format.
+- **Pilot diet.** MCP `puppetmaster_doctor` replies with counts and only the
+  checks that are not ok (6.0 KB to about 2 KB), and
+  `puppetmaster_route_task` with the pick, price and reason (7.3 KB to
+  458 bytes); `compact: false` returns the full reply.
+- **Honest delivery.** A write-capable run that changed nothing (no diff,
+  patch or commit) is `degraded`, not delivered: a worker's "I can't proceed"
+  had made a job look successful.
+- **Findings written as `content`** keep their text as the headline; an
+  audit swarm's 111 findings had collapsed into one "Unnamed item".
+- **Dead code.** A two-swarm audit found about 270 lines of verified-dead
+  code (unused helpers, superseded Bedrock Anthropic-body builders,
+  compatibility aliases, a legacy machine-wide CodeGraph lock path). All
+  low-risk items are removed; medium-risk ones wait on feature decisions.
+
 ## v1.30.0 — 2026-10-05
 
 **Closing the gaps the voxel study measured: pilots read less, Codex cost is

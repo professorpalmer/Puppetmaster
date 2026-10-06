@@ -118,20 +118,13 @@ class FollowupFastPathGateTests(unittest.TestCase):
 
 
 class FollowupRulesDirectiveTests(unittest.TestCase):
-    def test_directive_has_followup_bullet_and_old_bullets(self):
-        text = render_agents_block()
-        self.assertIn("## When NOT to use Puppetmaster (stay inline)", text)
-        self.assertIn("- Trivial single-file edits, typos, one-line fixes", text)
-        self.assertIn("- Quick factual questions", text)
-        self.assertIn(
-            "- Fast interactive iteration where the user is steering turn-by-turn",
-            text,
-        )
-        self.assertIn("- Small follow-ups and revisions to work a Puppetmaster job", text)
-        self.assertIn("resume that worker with `resume_from`", text)
-        section = text.split("## When NOT to use Puppetmaster (stay inline)", 1)[1]
-        section = section.split("## Fallback", 1)[0]
-        self.assertLess(section.index("Fast interactive"), section.index("Small follow-ups"))
+    def test_directive_keeps_small_work_and_followups_in_the_pilot(self):
+        text = " ".join(render_agents_block().split())
+        self.assertIn("## Solo first; fan out when it pays", text)
+        self.assertIn("Many small units you could write in a few minutes are still solo work.", text)
+        self.assertIn("Exact edits, typos, small follow-ups and revisions: make them yourself.", text)
+        self.assertIn("resume the worker with `resume_from`", text)
+        self.assertIn("continue its flow run with `continue_from`", text)
 
 
 class HookDecisionLogTests(unittest.TestCase):

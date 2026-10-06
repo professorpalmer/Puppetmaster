@@ -900,10 +900,3 @@ def dispatch(name: str, args: dict, out_dir: Optional[str] = None) -> Optional[s
     if name == "browser_screenshot":
         return screenshot(out_dir)
     return None
-
-
-BROWSER_TOOL_NAMES = (
-    "browser_navigate", "browser_snapshot", "browser_click", "browser_type",
-    "browser_scroll", "browser_back", "browser_get_text", "browser_network",
-    "browser_screenshot", "browser_auth_handoff",
-)

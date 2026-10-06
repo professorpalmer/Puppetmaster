@@ -144,12 +144,6 @@ def find_runtime_node(explicit: Optional[str] = None) -> Optional[Path]:
     return None
 
 
-# Back-compat alias: this function used to be Cursor-only. The MCP/CLI repair
-# path and tests still import ``find_cursor_node``; keep the old name pointing at
-# the generalized resolver so every harness benefits without an API break.
-find_cursor_node = find_runtime_node
-
-
 def _codegraph_install_from_shim() -> Optional[Path]:
     """Resolve the install dir by following the ``codegraph`` shim on PATH.
 

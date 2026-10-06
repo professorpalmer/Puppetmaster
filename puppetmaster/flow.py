@@ -914,6 +914,12 @@ def _walk(state_dir: Path, run: FlowRun, execute: NodeExecutor) -> FlowRun:
             run.state[str(node["saveAs"])] = outcome.output
         if kind == "end":
             status = node.get("status", "pass")
+            failed = [] if "status" in node else _failed_work(run)
+            if failed:
+                # An unconditional edge carried a failed node to an implicit
+                # end; reporting that run as a pass woke the pilot with
+                # nothing built. An explicit status still wins.
+                return _finish(state_dir, run, "failed", "; ".join(failed)[:600])
             return _finish(state_dir, run, "done" if status == "pass" else "failed",
                            render(node.get("summary") or status, run, prev))
         nxt = _pick_edge(graph, node, outcome, run, max_loops, loops)
@@ -1303,7 +1309,9 @@ class JobNodeExecutor:
                     outcome = NodeOutcome(ok=False, error=error or "job was not created")
                 else:
                     outcome = task_outcome(store, job_id, spec.role)
-                    if error and not outcome.ok and not outcome.error:
+                    if error and not outcome.ok and (not outcome.error or outcome.task_id is None):
+                        # A launch that raised before creating the task is the
+                        # cause; "no task for <role>" only hid it.
                         outcome.error = error
                     if outcome.task_id:
                         run.sessions[key] = {"job_id": job_id, "task_id": outcome.task_id,
@@ -1907,6 +1915,16 @@ def _child_graph_shape(node: dict) -> Any:
 _WORK_KINDS = ("agent", "judge", "parallel", "map", "shell")
 
 
+def _failed_work(run: FlowRun) -> list[str]:
+    """Work nodes whose latest result failed. An earlier visit's FAIL that a
+    later visit superseded does not count; a final FAIL or PARTIAL verdict does."""
+    kinds = {node["id"]: node.get("kind") for node in run.graph.get("nodes") or []}
+    return [f"{node_id}: {(result.get('error') or result.get('reason') or result.get('verdict') or 'failed')[:160]}"
+            for node_id, result in run.results.items()
+            if kinds.get(node_id) in _WORK_KINDS
+            and (not result.get("ok") or result.get("verdict") in ("FAIL", "PARTIAL"))]
+
+
 def _item_result(child: FlowRun) -> dict:
     """An item passes only when its flow is done and every work node's latest result passed.
 
@@ -1914,13 +1932,7 @@ def _item_result(child: FlowRun) -> dict:
     edge carries the flow on to its end; that must not count as a pass.
     """
     done = child.status == "done"
-    kinds = {node["id"]: node.get("kind") for node in child.graph.get("nodes") or []}
-    # The latest result per node decides: an earlier visit's FAIL that a later
-    # visit superseded does not count, but a final FAIL or PARTIAL verdict does.
-    failed = [f"{node_id}: {(result.get('error') or result.get('reason') or result.get('verdict') or 'failed')[:160]}"
-              for node_id, result in child.results.items()
-              if kinds.get(node_id) in _WORK_KINDS
-              and (not result.get("ok") or result.get("verdict") in ("FAIL", "PARTIAL"))]
+    failed = _failed_work(child)
     ok = done and not failed
     verdict = "PASS" if ok else "FAIL"
     reason = "" if ok else ("; ".join(failed) if done else child.reason)

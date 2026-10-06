@@ -461,6 +461,26 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertFalse(result["isError"])
         self.assertEqual(captured["command"], ["status", "job_x", "--compact"])
 
+    def test_mcp_doctor_compact_reports_counts_and_attention_only(self) -> None:
+        from puppetmaster import mcp_server
+
+        checks = [{"name": "python", "status": "ok", "detail": "3.14"},
+                  {"name": "codex", "status": "warn", "detail": "stale catalog"},
+                  {"name": "pi", "status": "optional", "detail": "not installed"}]
+        body = {"stdout": json.dumps(checks), "returncode": 0}
+        reply = {"content": [{"type": "text", "text": json.dumps(body)}], "isError": False}
+        with patch.object(mcp_server, "run_cli", return_value=reply) as cli:
+            result = mcp_server.run_doctor_tool({})
+        self.assertEqual(cli.call_args.args[0], ["doctor", "--json"])
+        envelope = json.loads(result["content"][0]["text"])
+        self.assertEqual(envelope["returncode"], 0)
+        data = json.loads(envelope["stdout"])
+        self.assertEqual(data["counts"], {"ok": 1, "warn": 1, "optional": 1})
+        self.assertEqual([c["name"] for c in data["attention"]], ["codex"])
+        with patch.object(mcp_server, "run_cli", return_value=reply) as cli:
+            mcp_server.run_doctor_tool({"compact": False})
+        self.assertEqual(cli.call_args.args[0], ["doctor"])
+
     def test_mcp_status_and_artifacts_default_compact_for_pilots(self) -> None:
         from puppetmaster import mcp_server
 
@@ -4083,8 +4103,8 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertFalse(codegraph_native_sqlite_broken("Backend: native; nodes: 12345"))
         self.assertFalse(codegraph_native_sqlite_broken(""))
 
-    def test_repair_codegraph_finds_cursor_node_from_known_path(self) -> None:
-        """find_cursor_node walks the per-platform candidate list."""
+    def test_repair_codegraph_finds_runtime_node_from_known_path(self) -> None:
+        """find_runtime_node walks the per-platform candidate list."""
         from puppetmaster import codegraph_repair
 
         with TemporaryDirectory() as tmp:
@@ -4097,7 +4117,7 @@ class PuppetmasterTests(unittest.TestCase):
                 "_CURSOR_NODE_CANDIDATES_MAC",
                 (str(fake_node),),
             ), patch.object(codegraph_repair.sys, "platform", "darwin"):
-                resolved = codegraph_repair.find_cursor_node()
+                resolved = codegraph_repair.find_runtime_node()
             self.assertIsNotNone(resolved)
             self.assertEqual(str(resolved), str(fake_node))
 
@@ -4108,11 +4128,11 @@ class PuppetmasterTests(unittest.TestCase):
             fake = Path(tmp) / "node"
             fake.write_text("ok", encoding="utf-8")
             self.assertEqual(
-                codegraph_repair.find_cursor_node(str(fake)),
+                codegraph_repair.find_runtime_node(str(fake)),
                 fake,
             )
             self.assertIsNone(
-                codegraph_repair.find_cursor_node(str(Path(tmp) / "missing"))
+                codegraph_repair.find_runtime_node(str(Path(tmp) / "missing"))
             )
 
     def test_repair_codegraph_returns_failure_without_cursor_node(self) -> None:
@@ -4166,14 +4186,6 @@ class PuppetmasterTests(unittest.TestCase):
             ):
                 resolved = codegraph_repair.find_runtime_node()
             self.assertEqual(str(resolved), str(env_node))
-
-    def test_find_cursor_node_alias_points_at_runtime_node(self) -> None:
-        """The back-compat alias must resolve to the generalized function."""
-        from puppetmaster import codegraph_repair
-
-        self.assertIs(
-            codegraph_repair.find_cursor_node, codegraph_repair.find_runtime_node
-        )
 
     def test_find_codegraph_install_from_shim_when_npm_misses(self) -> None:
         """When `npm root -g` points at the wrong prefix, follow the shim.
@@ -5439,7 +5451,7 @@ class PuppetmasterTests(unittest.TestCase):
             (install / "dist" / "bin").mkdir(parents=True)
             (install / "dist" / "bin" / "codegraph.js").write_text("// stub", encoding="utf-8")
 
-            with patch.object(codegraph_repair, "find_cursor_node", return_value=node), patch.object(
+            with patch.object(codegraph_repair, "find_runtime_node", return_value=node), patch.object(
                 codegraph_repair, "find_codegraph_install", return_value=install
             ):
                 argv = codegraph_mod.resolve_codegraph_invocation()
@@ -5456,7 +5468,7 @@ class PuppetmasterTests(unittest.TestCase):
         codegraph_mod.reset_cursor_codegraph_invocation_cache()
         self.addCleanup(codegraph_mod.reset_cursor_codegraph_invocation_cache)
 
-        with patch.object(codegraph_repair, "find_cursor_node", return_value=None), patch.object(
+        with patch.object(codegraph_repair, "find_runtime_node", return_value=None), patch.object(
             codegraph_repair, "find_codegraph_install", return_value=None
         ), patch("puppetmaster.codegraph.shutil.which", return_value=None):
             argv = codegraph_mod.resolve_codegraph_invocation()
@@ -5474,7 +5486,7 @@ class PuppetmasterTests(unittest.TestCase):
         def fake_which(cmd):
             return "/usr/local/bin/npx" if cmd == "npx" else None
 
-        with patch.object(codegraph_repair, "find_cursor_node", return_value=None), patch.object(
+        with patch.object(codegraph_repair, "find_runtime_node", return_value=None), patch.object(
             codegraph_repair, "find_codegraph_install", return_value=None
         ), patch("puppetmaster.codegraph.shutil.which", side_effect=fake_which), patch.dict(
             os.environ, {}, clear=False
@@ -5531,7 +5543,7 @@ class PuppetmasterTests(unittest.TestCase):
             shim = install / "npm-shim.js"
             shim.write_text("// shim", encoding="utf-8")
 
-            with patch.object(codegraph_repair, "find_cursor_node", return_value=node), patch.object(
+            with patch.object(codegraph_repair, "find_runtime_node", return_value=node), patch.object(
                 codegraph_repair, "find_codegraph_install", return_value=install
             ), patch.dict(os.environ, {}, clear=False):
                 os.environ.pop("PUPPETMASTER_CODEGRAPH_NODE", None)
@@ -8681,9 +8693,6 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
                 self.assertNotEqual(lock_a, lock_b)
                 self.assertIn("ff-data-engineering", lock_a.name)
                 self.assertIn("ff-ios", lock_b.name)
-                # And legacy callers still get the global lock.
-                legacy = codegraph_mod.codegraph_lock_path()
-                self.assertEqual(legacy.name, "codegraph-indexer.lock")
             finally:
                 del os.environ["PUPPETMASTER_CODEGRAPH_LOCK_DIR"]
 
@@ -14903,23 +14912,20 @@ class InstallRulesTests(unittest.TestCase):
         self.assertTrue(block.startswith(BEGIN_MARKER))
         self.assertTrue(block.rstrip().endswith(END_MARKER))
         self.assertIn("# Puppetmaster orchestration", block)
-        self.assertIn("Delegate-first gate", block)
+        self.assertIn("Solo first; fan out when it pays", block)
 
-    def test_rules_mandate_codegraph_first_exploration(self):
-        """The managed rules must push CodeGraph as hard as delegation:
-        graph every directory touched, explore the graph not the tree, and
-        use partial graphs + narrow native search for unsupported languages
-        instead of re-crawling covered code."""
+    def test_rules_use_codegraph_for_unfamiliar_code_not_as_a_ritual(self):
+        """CodeGraph replaces crawling unfamiliar code; on a small repo or files
+        the pilot already knows it is only latency."""
         from puppetmaster.rules import RULE_BODY, render_cursor_mdc
 
         for content in (RULE_BODY, render_cursor_mdc()):
             flattened = " ".join(content.split())
-            self.assertIn("CodeGraph-first exploration (must obey)", flattened)
-            self.assertIn("graph every directory you interact with", flattened)
+            self.assertIn("CodeGraph for unfamiliar code", flattened)
             self.assertIn("puppetmaster_codegraph_init", flattened)
             self.assertIn("puppetmaster_codegraph_status", flattened)
-            self.assertIn("Partial coverage is still coverage", flattened)
-            self.assertIn("never re-crawl directories the graph already covers", flattened)
+            self.assertIn("ask the graph instead of crawling the tree", flattened)
+            self.assertIn("Skip it for a small repository", flattened)
 
     def test_rules_exempt_puppetmaster_workers_from_delegation(self):
         """A Puppetmaster worker runs as a plain agent CLI with no
@@ -14941,8 +14947,8 @@ class InstallRulesTests(unittest.TestCase):
             self.assertIn("no `puppetmaster_*` MCP tools", flattened)
             self.assertLess(
                 flattened.index("Are you a Puppetmaster worker?"),
-                flattened.index("Delegate-first gate"),
-                msg="the worker exemption must precede the delegate-first gate",
+                flattened.index("Solo first; fan out when it pays"),
+                msg="the worker exemption must precede the delegation guidance",
             )
 
     def test_hand_maintained_rules_exempt_puppetmaster_workers(self):

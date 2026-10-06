@@ -54,7 +54,7 @@ python -m puppetmaster install-hermes-mcp           # ~/.hermes/config.yaml
 python -m puppetmaster install-pi-mcp              # ~/.pi/agent mcp.json + pi-package (pilot, not a worker)
 python -m puppetmaster install-omp-mcp             # ~/.omp/agent/mcp.json (OMP/oh-my-pi TUI, not a worker)
 python -m puppetmaster install-rules                # write .cursor/rules/puppetmaster.mdc + AGENTS.md
-python -m puppetmaster install-rules --global       # also ~/.codex/instructions.md and ~/.claude/CLAUDE.md
+python -m puppetmaster install-rules --global       # also $CODEX_HOME/AGENTS.md and ~/.claude/CLAUDE.md
 ```
 
 All of these installers resolve `sys.executable`, run a `tools/list`

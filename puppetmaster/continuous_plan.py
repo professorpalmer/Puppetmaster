@@ -14,7 +14,6 @@ PLANNER_ROLES = frozenset({"planner", "subplanner"})
 WORK_LANE = "work"
 SNAPSHOT_LANE = "snapshot"
 REASON_INTENT_SPEC = "intent_spec_required"
-DEFAULT_FANOUT_MIN = 8
 DEFAULT_FANOUT_MAX = 20
 DEFAULT_MAX_ITERATIONS = 4
 INTENT_KIND = "intent_spec"
@@ -90,12 +89,6 @@ def is_planner_task(task: Any) -> bool:
     if _role_of(task) in PLANNER_ROLES:
         return True
     return bool(_payload(task).get("continuous_planner"))
-
-
-def is_snapshot_task(task: Any) -> bool:
-    if _role_of(task) == "snapshot":
-        return True
-    return str(_payload(task).get("lane") or "").strip().lower() == SNAPSHOT_LANE
 
 
 def parent_task_id_of(task: Any) -> Optional[str]:

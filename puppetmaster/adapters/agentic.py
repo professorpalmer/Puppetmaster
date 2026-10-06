@@ -212,10 +212,6 @@ _VERIFY_TIMEOUT_SECONDS = 300
 # results even under budget; kill with PUPPETMASTER_HISTORY_COMPACT=0.
 DEFAULT_CONTEXT_TOKEN_BUDGET = 120_000
 
-# Back-compat aliases (older callers/tests referenced the analyze-tier defaults).
-DEFAULT_MAX_TURNS = DEFAULT_ANALYZE_MAX_TURNS
-DEFAULT_TIMEOUT_SECONDS = DEFAULT_ANALYZE_TIMEOUT_SECONDS
-
 _TOOL_OUTPUT_LIMIT = 12000  # artifact stdout tail / excerpt cap (not model-facing)
 _SEARCH_FILE_CAP = 400  # files scanned per search_code call
 _SEARCH_HIT_CAP = 60
@@ -495,10 +491,7 @@ class AgenticAdapter(FullEditWorkerAdapter):
         (OPENAI_CODEX_TOKEN). Exact ``agentic/openai/`` and
         ``agentic/openai-api/`` identities keep the declared API provider.
         """
-        from puppetmaster.openai_codex import (
-            PROVIDER_SLUG as CODEX_PROVIDER,
-            refuse_openai_api_provider,
-        )
+        from puppetmaster.openai_codex import refuse_openai_api_provider
 
         provider = str(task.payload.get("provider") or "openai").strip().lower()
         model = str(task.payload.get("model") or "").strip()
@@ -1104,7 +1097,6 @@ class AgenticAdapter(FullEditWorkerAdapter):
         keys: list[Optional[str]] = list(key_pool) if key_pool else [None]
         key_index = 0
         attempt = 0
-        last: Optional[ProviderError] = None
         breaker = get_provider_circuit_breaker()
         call_extra = dict(extra)
         tool_choice_stripped = False
@@ -1126,7 +1118,6 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 # Admission happens before provider_chat, so it must use the
                 # same rotation path as a live 429.  Otherwise an exhausted A
                 # could incorrectly prevent an available B from being tried.
-                last = exc
                 if exc.status == 429 and key_index + 1 < len(keys):
                     key_index += 1
                     continue
@@ -1170,7 +1161,6 @@ class AgenticAdapter(FullEditWorkerAdapter):
                     recorded = True
                     return turn
                 except ProviderError as exc:
-                    last = exc
                     breaker.record_failure(admission_key, exc)
                     recorded = True
                     # Muse / Meta (and any future auto-only model) reject named
@@ -1206,8 +1196,6 @@ class AgenticAdapter(FullEditWorkerAdapter):
             finally:
                 if not recorded:
                     breaker.release_admission(admission_key)
-        assert last is not None
-        raise last
 
     def _agent_loop(
         self, task: Task, cwd: Path, provider: str, model: str, system_prompt: str,

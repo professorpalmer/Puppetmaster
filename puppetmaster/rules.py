@@ -15,15 +15,15 @@ patterns" rule files into the conventions each host respects:
 - ``AGENTS.md`` (the cross-tool convention at https://agents.md/ now
   respected by Codex, Claude Code, and several other agents — workspace
   scope only)
-- ``~/.codex/instructions.md`` (Codex user-level instructions, global
-  scope)
+- ``$CODEX_HOME/AGENTS.md`` (Codex user-level guidance, global scope;
+  default ``~/.codex``. Codex ignores ``instructions.md``)
 - ``~/.claude/CLAUDE.md`` (Claude Code user-level instructions, global
   scope)
 - ``~/.hermes/SOUL.md`` (NousResearch Hermes global system-prompt file,
   injected into every Hermes session — global scope; honors ``$HERMES_HOME``)
 
 For the multi-line markdown targets (``AGENTS.md``, ``CLAUDE.md``,
-``instructions.md``), the writer uses an HTML-comment-delimited block
+``SOUL.md``), the writer uses an HTML-comment-delimited block
 so re-running ``install-rules`` replaces only the Puppetmaster block
 and leaves any other content in the file untouched. The user can
 disable the rule by deleting the marked block; we never overwrite
@@ -52,12 +52,10 @@ RULE_BODY = textwrap.dedent(
     """\
     # Puppetmaster orchestration
 
-    Puppetmaster is an MCP-based agent orchestrator with structured worker
-    swarms, durable SQLite state, tiered model routing, and zero-token
-    follow-ups via stored artifacts. When Puppetmaster's MCP server is
-    registered (`puppetmaster install-cursor-mcp` or
-    `puppetmaster install-codex-mcp`), the `puppetmaster_*` MCP tools are
-    available in this environment.
+    Puppetmaster runs durable worker jobs and flow graphs for you through the
+    `puppetmaster_*` MCP tools: workers that survive restarts, per-item check
+    and repair, cheap worker models under an expensive pilot, and follow-ups
+    that resume a worker's own session.
 
     ## Are you a Puppetmaster worker? (check this first)
 
@@ -70,120 +68,79 @@ RULE_BODY = textwrap.dedent(
     environment, or your prompt contains a `Puppetmaster artifact contract:`
     block, a `Role: <role>` + `Goal: <goal>` header, or an instruction to
     finish by calling `submit_findings` / `submit_report`. Nested job starts
-    (`python -m puppetmaster swarm`, MCP start verbs) are refused while that
-    env is set. Override: `PUPPETMASTER_ALLOW_NESTED=1`. Workers run as plain
-    agent CLIs with **no `puppetmaster_*` MCP tools**, so delegating is
-    impossible; attempting it spends the whole context window and returns a
-    clarifying question instead of findings. Explore with your own native
-    tools — that is the job you were spawned for.
+    are refused while that env is set (override:
+    `PUPPETMASTER_ALLOW_NESTED=1`). Workers run as plain agent CLIs with **no
+    `puppetmaster_*` MCP tools**, so delegating is impossible. Use your own
+    native tools.
 
     ## Trigger convention (must obey)
 
-    When the user says **"Use Puppetmaster to …"**, **"PM this …"**, or
+    When the user says **"Use Puppetmaster to ..."**, **"PM this ..."**, or
     otherwise names Puppetmaster for a task, route that work through the
-    `puppetmaster_*` MCP tools — do not answer inline.
+    `puppetmaster_*` MCP tools rather than answering inline.
 
-    ## Delegate-first gate (default path)
+    ## Solo first; fan out when it pays
 
-    Before attempting multi-step work inline, start a Puppetmaster verb
-    (`puppetmaster_start_cursor_swarm`, `puppetmaster_start_swarm`,
-    `puppetmaster_start_implement`, or the matching sync verbs) when the
-    task is any of:
+    Do the work yourself unless parallel workers clearly finish sooner or
+    better. One session that holds the whole problem beats any fan-out on
+    small work: every worker pays a fixed start (its own context, reading,
+    checks) and you pay to integrate. Fan out when the work splits into
+    independent units that each take a worker minutes, or when there is more
+    of it than you can finish well in one session (you are running long, or
+    your context is filling with work that does not depend on itself). Many
+    small units you could write in a few minutes are still solo work.
 
-    - Multi-file (3+ files) or cross-cutting refactor/migration
-    - An audit, review, or "find all X" search
-    - Work whose result will be reused later in this or a future session
+    - Exact edits, typos, small follow-ups and revisions: make them yourself.
+      If your instruction to a worker would spell out the change, it is
+      cheaper to make it.
+    - A revision that needs a prior worker's context: continue its flow run
+      with `continue_from`, or resume the worker with `resume_from`, instead
+      of starting fresh sessions.
+    - Marionette decides this for you from your plan and measured pace; on
+      other hosts, `puppetmaster sizing` gives the same decision.
 
-    Swarms and reviews run read-only analysis; building goes through
-    implement. Recall prior results with `puppetmaster_artifacts <job_id>`
-    at zero token cost.
+    ## Fan out with one flow
 
-    Reach for a Puppetmaster verb **before** native broad search/exploration:
-    prefer `puppetmaster_codegraph_search` / `_context` over a repo-wide
-    `Grep`/`Glob`/`find`, and a swarm over the built-in `Task` tool, for any
-    multi-file investigation. When unsure whether a task qualifies, run the
-    classifier-backed gate — `puppetmaster_route_task` (or
-    `puppetmaster should-delegate "<prompt>"`) — which returns a delegate /
-    inline verdict and a suggested verb with zero LLM cost.
+    Write ONE flow graph and start it with `puppetmaster_flow` (action
+    `run`), then call action `wait` (or end your turn). Puppetmaster walks it
+    durably and wakes you only when it is done, failed, stuck, interrupted or
+    waiting at a gate; do not launch, poll and hand off each step yourself.
+    The tool description has the node shapes and a fan-out example.
 
-    For deterministic enforcement, the user can install host hooks
-    (`puppetmaster install-hooks`) that inject this directive on prompt submit
-    and deny-redirect broad native exploration automatically. The kill switch
-    is `PUPPETMASTER_AUTO_INVOKE_DISABLED=1`.
-
-    ## Multi-step pipelines: write one flow
-
-    When steps depend on each other's results (build, then check, then review
-    with repair, or the same task over many items), write ONE flow graph and
-    start it with `puppetmaster_flow` (action `run`), then end your turn or
-    call action `wait`. Puppetmaster walks it durably and wakes you only when
-    it is done, failed, stuck, interrupted or waiting at a gate; do not
-    launch, poll and hand off each step yourself. A node re-entered by a
-    failed check or review resumes its own session with only the feedback; a
-    `map` node fans out per-item flows; a follow-up continues a finished run
-    with `continue_from`. Reference: `docs/FLOWS.md`.
-
-    When the result is judged by craft (how it looks, reads or feels:
-    visuals, geometry, UI, prose) and not only by a test, end the flow in
-    armor: a `shell` check that produces the observable result (render, run,
-    screenshot), then a `judge` whose task is a numbered rubric taken from the
-    user's request, with its FAIL edge back to the build (`max` 2). Across
-    many items, put the check and judge inside the `map` item graph so each
-    item is repaired alone. Passing tests is not the bar a user grades.
+    - **Size workers to the work.** Group many small units into a few `map`
+      items (each an object with its unit names and files; 16 small modules:
+      3-5 workers) and set concurrency to the number of items so they all
+      run at once. Give a unit its own worker only when it is minutes of work.
+    - **Check each unit.** Put the unit's own check (`shell`) after its build
+      with a `fail` edge back to the build (`max` 2), inside the map item, so
+      each unit is repaired alone.
+    - **Armor for craft.** When the result is judged by how it looks, reads
+      or feels (visuals, geometry, UI, prose) and not only by a test, add a
+      `shell` step that produces the observable result (render, run,
+      screenshot) and a `judge` whose task is a numbered rubric from the
+      user's request, with its FAIL edge back to the build (`max` 2).
+      Passing tests is not the bar a user grades.
+    - Leave the model unpinned unless the user named one: workers then run
+      the model you are configured with.
 
     ## Label every job you start (do it by default)
 
     When you start any job verb (`puppetmaster_start_*`, `puppetmaster_edit`,
-    or the matching sync verbs), pass a short human-readable `label` (3–6
+    or the matching sync verbs), pass a short human-readable `label` (3-6
     words, e.g. `"auth refactor audit"`). It becomes the job's headline on the
-    dashboard and in `puppetmaster_jobs`, so runs stay scannable instead of
-    reading as bare `job_<hash>` ids. Omit it only for throwaway one-off runs;
-    when absent, Puppetmaster falls back to a title derived from the goal.
+    dashboard and in `puppetmaster_jobs`.
 
-    ## CodeGraph-first exploration (must obey)
+    ## CodeGraph for unfamiliar code
 
-    CodeGraph is the default way to explore code — graph every directory you
-    interact with, then explore the graph instead of crawling the tree:
-
-    1. **Graph it first.** Before exploring any directory (the workspace root
-       or a subtree you're diving into), check `puppetmaster_codegraph_status`;
-       if it has no `.codegraph/`, run `puppetmaster_codegraph_init`
-       (`index: true`) — it returns immediately and indexes in the background.
-       Do not start grepping while you wait.
-    2. **Ask the graph, not the tree.** Resolve "where is X / what calls Y /
-       what implements Z" with `puppetmaster_codegraph_search` /
-       `_context` / `_affected` / `_files`, then `Read` only the files it
-       points to.
-    3. **Partial coverage is still coverage.** CodeGraph indexes the languages
-       it supports; unsupported files simply don't enter the graph. When part
-       of the tree is ungraphable, still answer from the graph for everything
-       it covers and scope native search narrowly to the ungraphed paths
-       only — never re-crawl directories the graph already covers, and reuse
-       that shared context instead of letting multiple workers/agents each
-       re-explore the same graphed code.
-
-    Native search is fine for plain-text matches (log strings, config values,
-    comments), a single known file path, or when the user says "just grep".
-    If a codegraph MCP call returns a transport error, fall back to the CLI
-    passthrough `python -m puppetmaster codegraph …` — never a bare
-    `codegraph` from the shell (Node ABI mismatch).
-
-    ## When NOT to use Puppetmaster (stay inline)
-
-    - Trivial single-file edits, typos, one-line fixes
-    - Any edit you can already state exactly. If your instruction to a worker
-      would spell out the change, make the change yourself: a worker session
-      costs a full context load to apply it.
-    - Quick factual questions
-    - Fast interactive iteration where the user is steering turn-by-turn
-    - Small follow-ups and revisions to work a Puppetmaster job already
-      produced. Make them in the existing pilot. Delegate a follow-up only
-      when its parallel work clearly outweighs planning, launch, context and
-      merge cost. When a revision genuinely needs a prior worker's context,
-      resume that worker with `resume_from` (job_id plus role or task_id)
-      instead of starting a fresh session.
-
-    Routing those through Puppetmaster wastes tokens and latency.
+    When you must find where something is, what calls it or what a change
+    affects in code you have not read, ask the graph instead of crawling the
+    tree: `puppetmaster_codegraph_status`, then `puppetmaster_codegraph_init`
+    (`index: true`) if there is no index, then `puppetmaster_codegraph_search`
+    / `_context` / `_affected`, and read only the files it points to. Skip it
+    for a small repository you can list at a glance, for files you already
+    know, and for plain-text matches (log strings, config values). If a
+    codegraph MCP call fails, use `python -m puppetmaster codegraph ...`,
+    never a bare `codegraph` from the shell.
 
     ## Fallback
 
@@ -193,48 +150,22 @@ RULE_BODY = textwrap.dedent(
     that no job was created. Use native tooling only when no Puppetmaster job
     exists and the task itself permits inline work.
 
-    ## Usage
+    ## Other verbs
 
-    1. `puppetmaster_route_task <prompt> --role <role>` — dry-run that
-       returns the chosen model, estimated cost, and reasoning. Use
-       whenever spend matters or the task is ambiguous.
-    2. `puppetmaster_start_cursor_swarm` / `puppetmaster_start_swarm` for
-       read-only analysis; `puppetmaster_start_implement` /
-       `puppetmaster_start_claude_implement` / `puppetmaster_start_codex` /
-       `puppetmaster_start_agentic` for full-edit builds. For keys-only
-       portability (no external agent CLI), prefer `puppetmaster_agentic` /
-       `puppetmaster_start_agentic` when you have a provider API key but no
-       vendor CLI installed.
-    3. `puppetmaster_edit "<instruction>"` — a SINGLE focused in-place edit:
-       cheapest sufficient model, CodeGraph to locate the site, edits the
-       working tree directly, returns the diff synchronously, captures a
-       reviewable PATCH. Prefer it over an inline single-file edit when the
-       change benefits from CodeGraph or cheap-model routing; reserve
-       `puppetmaster_start_implement` for coupled multi-file features (isolated
-       worktree). Because it edits the live tree in place, `edit` is also the
-       right verb for **last-mile work that builds on uncommitted changes**
-       ("finish the module I just wrote", "add tests for the code I just
-       added") — `puppetmaster_start_implement` branches off HEAD in a clean
-       worktree and would never see that uncommitted work. Keep truly trivial
-       edits (typo/rename/comment) inline.
-    4. `puppetmaster_artifacts <job_id>` — read structured outputs at zero
-       token cost (results persist in SQLite). Prefer refs; use
-       `puppetmaster_effort_index` for an effort that spanned jobs.
-    5. Every asynchronous `start_*` response is a resumable contract: follow
-       its returned `monitor_with` tool using the exact `job_ref`, backend, and
-       cursor. If MCP disconnects, resume that same job through the CLI
-       fallback; do not launch an unrelated replacement. Treat only
-       `delivery.verdict == "delivered"` as success; cancelled, stalled,
-       degraded, empty, blocked, or stale work is not successful delivery.
-    6. `puppetmaster_dashboard [job_id]` — when the user asks to see/open
-       the job dashboard, call this (it starts the local server if needed)
-       and open the returned URL in a browser tab for them. CLI fallback:
-       `python -m puppetmaster dashboard [job_id]`.
-    7. `puppetmaster_doctor` — sanity-check Puppetmaster's runtime
-       dependencies once per session.
-
-    If `puppetmaster_doctor` reports critical failures, surface them to
-    the user before continuing.
+    - `puppetmaster_start_swarm` for read-only analysis across several
+      lenses; `puppetmaster_edit` for one focused in-place edit that builds on
+      uncommitted work; `puppetmaster_start_implement` for one coupled change
+      in an isolated worktree. With a provider API key but no vendor CLI
+      (keys-only), use `puppetmaster_agentic` / `puppetmaster_start_agentic`.
+    - Every asynchronous `start_*` response is a resumable contract: follow
+      its returned `monitor_with` tool with the exact `job_ref`. Treat only
+      `delivery.verdict == "delivered"` as success.
+    - `puppetmaster_artifacts <job_id>` reads stored results at zero token
+      cost; `puppetmaster_route_task` previews the routed model and price when
+      spend matters; `puppetmaster_dashboard` opens the job dashboard when the
+      user asks.
+    - `puppetmaster_doctor` when a Puppetmaster call fails or behaves
+      unexpectedly; surface critical failures to the user. Not a ritual.
     """
 )
 
@@ -439,7 +370,7 @@ def hermes_soul_path(env: Optional[Mapping[str, str]] = None) -> Path:
 
     ``SOUL.md`` is the file Hermes injects into *every* session's system
     prompt, so it is the correct global-bias surface for Hermes — the
-    counterpart to ``~/.claude/CLAUDE.md`` / ``~/.codex/instructions.md`` for
+    counterpart to ``~/.claude/CLAUDE.md`` / ``$CODEX_HOME/AGENTS.md`` for
     the other hosts. Honors ``$HERMES_HOME`` (the same override Hermes and the
     MCP installer read) and falls back to ``~/.hermes/SOUL.md``.
     """
@@ -521,17 +452,36 @@ def _install_agents_md_workspace(
     )
 
 
+def codex_global_rules_path() -> Path:
+    """Codex's user-level guidance file: ``$CODEX_HOME/AGENTS.md``.
+
+    Codex 0.160 loads AGENTS.md from CODEX_HOME and ignores instructions.md;
+    rules written there never reached a Codex pilot (verified with a marker
+    word: AGENTS.md answered, instructions.md did not).
+    """
+    home = os.environ.get("CODEX_HOME")
+    return (Path(home).expanduser() if home else Path.home() / ".codex") / "AGENTS.md"
+
+
+def _legacy_codex_rules_path() -> Path:
+    home = os.environ.get("CODEX_HOME")
+    return (Path(home).expanduser() if home else Path.home() / ".codex") / "instructions.md"
+
+
 def _install_codex_global(*, dry_run: bool, force: bool) -> TargetOutcome:
-    target_path = Path.home() / ".codex" / "instructions.md"
+    target_path = codex_global_rules_path()
     new_block = render_agents_block()
     existing = target_path.read_text(encoding="utf-8") if target_path.exists() else ""
     merged, action = merge_block_into_text(existing, new_block)
-    if action == "unchanged" and not force:
+    legacy = _legacy_codex_rules_path()
+    legacy_text = legacy.read_text(encoding="utf-8") if legacy.exists() else ""
+    stripped_legacy, legacy_action = strip_block_from_text(legacy_text)
+    if action == "unchanged" and legacy_action == "unchanged" and not force:
         return TargetOutcome(
             target="codex_global",
             path=str(target_path),
             status="unchanged",
-            reason="~/.codex/instructions.md already has an up-to-date block",
+            reason=f"{target_path} already has an up-to-date block",
         )
     if dry_run:
         return TargetOutcome(
@@ -541,11 +491,14 @@ def _install_codex_global(*, dry_run: bool, force: bool) -> TargetOutcome:
             reason=f"would update {target_path} (applies to every codex session)",
         )
     _write_atomic(target_path, merged)
+    if legacy_action != "unchanged":
+        # Move an old block out of the file Codex never read.
+        _write_or_delete_markdown(legacy, stripped_legacy, dry_run=False)
     return TargetOutcome(
         target="codex_global",
         path=str(target_path),
         status="installed",
-        reason="wrote ~/.codex/instructions.md (applies to every codex session)",
+        reason=f"wrote {target_path} (applies to every codex session)",
     )
 
 
@@ -663,11 +616,11 @@ def install_rules(
             elif _detect_codex_cli():
                 result.messages.append(
                     "codex detected but disabled by the platform lock — "
-                    "skipping ~/.codex/instructions.md"
+                    "skipping $CODEX_HOME/AGENTS.md"
                 )
             else:
                 result.messages.append(
-                    "codex CLI not detected — skipping ~/.codex/instructions.md "
+                    "codex CLI not detected — skipping $CODEX_HOME/AGENTS.md "
                     "(install `codex` and re-run with --global to enable)"
                 )
             if _detect_claude_cli() and _adapter_enabled("claude-code"):
@@ -870,10 +823,10 @@ def uninstall_rules(
         elif target == "codex_global":
             result.outcomes.append(
                 _uninstall_markdown_block_file(
-                    Path.home() / ".codex" / "instructions.md",
+                    codex_global_rules_path(),
                     target="codex_global",
                     dry_run=dry_run,
-                    label="~/.codex/instructions.md",
+                    label=str(codex_global_rules_path()),
                 )
             )
         elif target == "hermes_global":

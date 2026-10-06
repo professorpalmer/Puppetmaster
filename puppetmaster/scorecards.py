@@ -453,17 +453,6 @@ def resolve_score_authority(
     )
 
 
-def source_rank(authority: ScoreAuthority) -> int:
-    """Higher rank outruns a stale editorial prior. Qualified cards stay first."""
-    if authority.source == SCORE_SOURCE_ROLE_CARD:
-        return 2
-    if authority.source == SCORE_SOURCE_LOCAL_RECEIPT:
-        return 1
-    if authority.decayed:
-        return -1
-    return 0
-
-
 def is_capability_sufficient(authority: ScoreAuthority, need: int) -> bool:
     """A live local receipt already did this role here; it meets the need."""
     if authority.source == SCORE_SOURCE_LOCAL_RECEIPT and receipt_is_live(authority.receipt):

@@ -16,7 +16,6 @@ from typing import Any, Optional
 
 from puppetmaster.mcp_registry import installed_puppetmaster_version
 
-PYPI_DIST_NAME = "puppetmaster-ai"
 PYPI_JSON_URL = "https://pypi.org/pypi/puppetmaster-ai/json"
 PYPI_UPDATE_CHECK_ENV = "PUPPETMASTER_PYPI_UPDATE_CHECK"
 PYPI_UPDATE_CHECK_TTL_SECONDS = 6 * 3600  # PyPI releases are infrequent
