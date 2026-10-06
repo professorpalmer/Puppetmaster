@@ -12,6 +12,9 @@
   still fails closed).
 - A CLI run whose job failed exits 1 even when its artifacts only rate
   "degraded"; a Hermes run that hit a provider 401 used to exit 0.
+- `preflight --live` fails an adapter whose CLI is not installed (credentials
+  alone read as ready, then the worker died `missing_cli`), and Hermes now gets
+  a real one-shot probe, so a provider 401 blocks instead of passing unprobed.
 
 **Each invocation keeps its own captures.** A task's live and stdout captures
 now go under `tasks/<task>/invocations/<nonce>/` while an invocation is open,

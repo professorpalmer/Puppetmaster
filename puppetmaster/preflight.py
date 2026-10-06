@@ -426,6 +426,12 @@ def _default_prober(adapter: str, model: Optional[str]) -> "tuple[int, str, str]
             cmd += ["exec", "Reply with: ok"]
             if model:
                 cmd += ["-m", model]
+        elif adapter == "hermes":
+            # Hermes exits non-zero when its provider refuses (401, quota).
+            cmd = shlex.split(os.environ.get("HERMES_COMMAND", "hermes"))
+            cmd += ["chat", "-q", "Reply with: ok", "-Q"]
+            if model:
+                cmd += ["-m", model]
         else:
             return (0, "", "no live probe for adapter")
         completed = subprocess.run(
@@ -894,6 +900,16 @@ def preflight_check(
     # ``--live`` CLI flag. A probe that itself can't run (e.g. missing optional
     # tooling) does not block — only an actual billing/auth/quota rejection does.
     result_model = catalog_model if adapter == "cursor" else model
+    if live and prober is None and not adapter_cli_present(adapter, env=env):
+        # Credentials outlive an uninstalled CLI; a worker would die missing_cli.
+        return PreflightResult(
+            ok=False,
+            adapter=adapter,
+            model=result_model,
+            billing=status.billing,
+            reason=f"live probe failed: {adapter_cli_executable(adapter, env)} is not installed",
+            evidence=[*status.evidence, "live_probe:missing_cli"],
+        )
     if live:
         try:
             probe = live_probe(
