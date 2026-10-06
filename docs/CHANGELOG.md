@@ -1,4 +1,6 @@
-## Unreleased
+## v1.32.2 — 2026-10-06
+
+**Receipts stay immutable under repeats and races.**
 
 - A dispatch receipt's linked stdin copy is immutable too. 1.32.1 wrote the
   copy before claiming the receipt, so a repeated or racing call for the same
