@@ -187,7 +187,10 @@ class ReadonlyWriteRaceTests(unittest.TestCase):
                 responses = {}
 
                 def race(c):
-                    response = receive(c)
+                    # The clock is mocked; the real helper only has to answer.
+                    real_get = c.responses.get
+                    with patch.object(c.responses, 'get', lambda timeout=None: real_get(timeout=30)):
+                        response = receive(c)
                     if not c._opened:
                         c._opened = True
                         c._control('release', True)
@@ -390,7 +393,11 @@ class ReadonlyWriteRaceTests(unittest.TestCase):
                         self.assertLessEqual(c.timeout, .1)
                         with patch.object(c.responses, 'get', side_effect=queue.Empty):
                             return receive(c)
-                    response = receive(c)
+                    # The clock is mocked; the real helper only has to answer
+                    # at all, not within the 100ms busy budget of wall time.
+                    real_get = c.responses.get
+                    with patch.object(c.responses, 'get', lambda timeout=None: real_get(timeout=30)):
+                        response = receive(c)
                     if not c._opened and (not failed or outcome in ('exhausted', 'aba', 'replacement')):
                         c._opened = True
                         c._control('release', True)
