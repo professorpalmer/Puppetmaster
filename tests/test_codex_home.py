@@ -83,7 +83,7 @@ class AuthSyncTests(unittest.TestCase):
         from puppetmaster.rules import merge_block_into_text, render_agents_block
 
         merged = merge_block_into_text("no emojis\n", render_agents_block())[0]
-        (self.user / "AGENTS.md").write_text(merged)
+        (self.user / "AGENTS.md").write_text(merged, encoding="utf-8")
         home = codex_home.prepare(self.env, root=self.worker)
         self.assertFalse((home / "auth.json").is_symlink())
         self.assertEqual((home / "AGENTS.md").read_text().strip(), "no emojis")
@@ -99,6 +99,11 @@ class AuthSyncTests(unittest.TestCase):
         (home / "auth.json").write_text(json.dumps({"refresh": "r3"}))
         self.assertFalse(codex_home.sync_back(self.env, root=self.worker))
         self.assertIn("user-new", (self.user / "auth.json").read_text())
+
+    def test_non_utf8_agents_is_copied_as_is(self):
+        (self.user / "AGENTS.md").write_bytes(b"caf\xe9 rules\n")
+        home = codex_home.prepare(self.env, root=self.worker)
+        self.assertEqual((home / "AGENTS.md").read_bytes(), b"caf\xe9 rules\n")
 
     def test_no_user_login_means_no_lean_home(self):
         (self.user / "auth.json").unlink()

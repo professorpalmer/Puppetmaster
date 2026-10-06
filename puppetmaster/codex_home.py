@@ -142,7 +142,11 @@ def prepare(env: Optional[dict] = None, *, root: Optional[Path] = None) -> Optio
             # The user's own rules apply to workers; Puppetmaster's
             # orchestration block tells a pilot to delegate and only costs
             # a bounded worker context.
-            data = strip_block_from_text(agents.read_text(encoding="utf-8"))[0].encode("utf-8")
+            raw = agents.read_bytes()
+            try:
+                data = strip_block_from_text(raw.decode("utf-8"))[0].encode("utf-8")
+            except UnicodeDecodeError:
+                data = raw  # not UTF-8 (a cp1252 file on Windows): copy it as is
             if _digest(home / "AGENTS.md") != hashlib.sha256(data).hexdigest():
                 _write_atomic(home / "AGENTS.md", data, 0o644)
         user_auth = _digest(source / "auth.json")
@@ -200,7 +204,7 @@ def configured_model(env: Optional[dict] = None) -> str:
     """
     try:
         text = (user_home(env) / "config.toml").read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, ValueError):
         return ""
     for line in text.splitlines():
         stripped = line.strip()

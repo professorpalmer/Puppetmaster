@@ -279,7 +279,8 @@ class CodexAdapter(CliWorkerAdapter):
             return found if found == codex_home.worker_home_root() else None
         try:
             home = codex_home.prepare()
-        except (OSError, TimeoutError):
+        except Exception:
+            # Best effort: any failure runs the worker in the user's own home.
             return None
         if home is not None and prepared.command and prepared.command[-1] == "-":
             # Bounded workers never fork subagents, and must not accrue memories.
