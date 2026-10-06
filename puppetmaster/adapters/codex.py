@@ -12,6 +12,7 @@ from puppetmaster.models import Artifact, ArtifactType, Task
 from puppetmaster.redaction import redact_secrets
 from puppetmaster.usage import selected_token_usage
 from puppetmaster.session_lease import SessionLease, acquire_codex_thread
+from puppetmaster.worker_attribution import attribution_payload, codex_event_references
 from puppetmaster.worker_resume import resolved_resume, task_resume_record
 
 from ._base import (
@@ -362,6 +363,12 @@ class CodexAdapter(CliWorkerAdapter):
         timeout_seconds = int(task.payload.get("timeout_seconds", self.default_timeout_seconds))
         cwd = Path(task.payload.get("cwd") or ".").resolve()
 
+        events = parse_codex_events(completed.stdout)
+        # Codex names the files it edited and the commands it ran, so the
+        # write_scope gate can tell this run's writes from a concurrent
+        # writer's in a shared checkout.
+        attribution = attribution_payload(codex_event_references(events, cwd), before)
+
         if completed.timed_out:
             stdout = completed.stdout
             stderr = completed.stderr
@@ -403,6 +410,7 @@ class CodexAdapter(CliWorkerAdapter):
                         "changed_files": after["changed_files"],
                         "untracked_files": after["untracked_files"],
                         **diff_source_payload(before, after),
+                        **attribution,
                     },
                 )
             ]
@@ -427,7 +435,6 @@ class CodexAdapter(CliWorkerAdapter):
                 )
             return artifacts
 
-        events = parse_codex_events(completed.stdout)
         usage = next(
             (
                 ev.get("usage", {})
@@ -544,6 +551,7 @@ class CodexAdapter(CliWorkerAdapter):
                 "changed_files": after["changed_files"],
                 "untracked_files": after["untracked_files"],
                 **diff_source_payload(before, after),
+                **attribution,
                 "failure": failure,
             },
         )

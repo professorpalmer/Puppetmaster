@@ -11,6 +11,10 @@ from puppetmaster.codegraph import enrich_prompt_with_codegraph
 from puppetmaster.failure import classify_claude_code_failure
 from puppetmaster.models import Artifact, ArtifactType, Task
 from puppetmaster.usage import token_usage
+from puppetmaster.worker_attribution import (
+    attribution_payload,
+    claude_tool_use_references,
+)
 from puppetmaster.worker_resume import resolved_resume, task_resume_record
 
 from ._base import (
@@ -270,6 +274,13 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
         timeout_seconds = int(
             task.payload.get("timeout_seconds", self.default_timeout_seconds)
         )
+        # Tool-use blocks name the files this run edited and the commands it
+        # ran, so the write_scope gate can tell its writes from a concurrent
+        # writer's in a shared checkout. The default json output format carries
+        # none, and then the gate keeps judging the whole delta.
+        attribution = attribution_payload(
+            claude_tool_use_references(completed.stdout, cwd), before
+        )
         if completed.timed_out:
             stdout = completed.stdout
             stderr = completed.stderr
@@ -308,6 +319,7 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
                         "changed_files": after["changed_files"],
                         "untracked_files": after["untracked_files"],
                         **diff_source_payload(before, after),
+                        **attribution,
                     },
                 )
             ]
@@ -382,6 +394,7 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
                 "changed_files": after["changed_files"],
                 "untracked_files": after["untracked_files"],
                 **diff_source_payload(before, after),
+                **attribution,
                 **usage,
             },
         )
