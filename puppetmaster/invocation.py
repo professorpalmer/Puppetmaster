@@ -20,6 +20,9 @@ from puppetmaster.models import now_iso, new_id
 _scope = ContextVar("execution_accounting", default=None)
 _dispatch_guard = ContextVar("invocation_dispatch_guard", default=None)
 _current = ContextVar("current_invocation", default=None)
+# The last invocation that closed in this execution scope: final captures are
+# written after the call returns and still belong to that attempt.
+_settled = ContextVar("settled_invocation", default=None)
 _log = logging.getLogger(__name__)
 
 
@@ -37,21 +40,31 @@ def check_external_dispatch():
 
 
 def current_attempt(task):
-    """The open invocation's immutable attempt id for ``task``, or None."""
+    """The attempt id ``task``'s captures belong to, or None.
+
+    The open invocation's, else the one that last closed in this execution
+    scope, so the captures written after the call returns stay with it.
+    """
+    task_id = getattr(task, "id", None)
     capture = _current.get()
-    if capture is None or capture.task.id != getattr(task, "id", None):
-        return None
-    return capture.attempt.attempt_id
+    if capture is not None:
+        return capture.attempt.attempt_id if capture.task.id == task_id else None
+    settled = _settled.get()
+    if settled is not None and settled[0] == task_id:
+        return settled[1]
+    return None
 
 
 @contextmanager
 def execution_scope(store, run, task, *, lease_lost=None):
     token = _scope.set((store, run, task, lease_lost))
+    settled_token = _settled.set(None)
     from puppetmaster.cancellation import cancellation_scope
     try:
         with cancellation_scope(store, task):
             yield
     finally:
+        _settled.reset(settled_token)
         _scope.reset(token)
 
 
@@ -322,6 +335,7 @@ def invocation(*, adapter=None, model=None, billing=None, source=None):
         completed = True
     finally:
         _current.reset(current_token)
+        _settled.set((capture.task.id, capture.attempt.attempt_id))
         _dispatch_guard.reset(guard_token)
         if not capture.observations:
             capture.observe(source=f"{source or capture.attempt.adapter}:usage_unavailable")

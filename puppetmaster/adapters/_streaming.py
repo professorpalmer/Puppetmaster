@@ -113,16 +113,70 @@ def capture_subprocess_stdout(
 
 
 def capture_dir(state_dir: Path, task: Task) -> Path:
-    """Where a task's captures go: per invocation while one is open.
+    """Where a task's captures go: under the attempt they belong to.
 
     Two invocations of one run (a retry, a fresh fallback after an unavailable
-    resume) must not truncate each other's capture.
+    resume) must not overwrite each other's captures, including the final ones
+    an adapter writes after its call returns.
     """
     base = state_dir / "jobs" / task.job_id / "tasks" / task.id
     attempt = current_attempt(task)
     if attempt is None:
         return base
     return base / "invocations" / attempt.rsplit(":", 1)[-1]
+
+
+# Non-secret references a dispatch receipt may record: the homes and config
+# roots that decide what the child loaded, and Puppetmaster's own identities.
+_RECEIPT_ENV_KEYS = (
+    "CODEX_HOME", "CLAUDE_CONFIG_DIR", "HERMES_HOME", "XDG_CONFIG_HOME", "HOME",
+    "PUPPETMASTER_HOME", "PUPPETMASTER_STATE_DIR", "PUPPETMASTER_PROCESS_OWNER",
+    "PUPPETMASTER_WORKER", "PUPPETMASTER_JOB_ID", "PUPPETMASTER_TASK_ID",
+)
+
+
+def _write_dispatch_receipt(directory: Optional[Path], *, task: Task, sidecar_name: str,
+                            command: list[str], cwd: Optional[str], env: dict,
+                            stdin_data: Optional[str], pid: int) -> Optional[str]:
+    """Record what was actually launched, once, beside the attempt's captures.
+
+    The receipt is created exclusively and never rewritten. It holds the final
+    argv and stdin (both secret-redacted; stdin also by SHA-256 of the exact
+    bytes), allowlisted home/config references, and the child's and this
+    process's pid with kernel start identity. Best effort: a failure never
+    blocks the run.
+    """
+    if directory is None:
+        return None
+    import hashlib
+    import json
+
+    from puppetmaster.models import now_iso
+    from puppetmaster.proc_identity import process_identity
+
+    try:
+        receipt = directory / f"{sidecar_name}.dispatch.json"
+        stdin_path = None
+        stdin_meta = None
+        if stdin_data is not None:
+            stdin_path = directory / f"{sidecar_name}.stdin.txt"
+            write_private_text(stdin_path, redact_secrets(stdin_data) or "")
+            stdin_meta = {"sha256": hashlib.sha256(stdin_data.encode("utf-8")).hexdigest(),
+                          "chars": len(stdin_data), "redacted_copy": str(stdin_path)}
+        body = {
+            "attempt_id": current_attempt(task), "job_id": task.job_id, "task_id": task.id,
+            "launched_at": now_iso(), "argv": [redact_secrets(str(arg)) or "" for arg in command],
+            "cwd": str(cwd) if cwd is not None else None, "stdin": stdin_meta,
+            "env": {key: env[key] for key in _RECEIPT_ENV_KEYS if env.get(key)},
+            "pid": pid, "process": process_identity(pid),
+            "parent_pid": os.getpid(), "parent_process": process_identity(os.getpid()),
+        }
+        fd = open_private(receipt, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+        with open(fd, "w", encoding="utf-8") as handle:
+            json.dump(body, handle, indent=2)
+        return str(receipt)
+    except Exception:
+        return None
 
 
 @dataclass
@@ -143,6 +197,8 @@ class StreamedProcess:
     output_limit_hit: bool = False
     # The invocation ledger row this process belongs to (see invocation.py).
     attempt_id: Optional[str] = None
+    # What was actually launched (see _write_dispatch_receipt).
+    dispatch_receipt: Optional[str] = None
 
 
 def _kill_process_tree(process: "subprocess.Popen", started_new_session: bool) -> None:
@@ -335,9 +391,14 @@ def run_streamed_subprocess(
             stderr=message,
             timed_out=False,
             live_log_path=str(live_path) if live_path is not None else None,
-        attempt_id=current_attempt(task),
+            attempt_id=current_attempt(task),
             spawn_error=message,
         )
+
+    dispatch_receipt = _write_dispatch_receipt(
+        live_path.parent if live_path is not None else None, task=task,
+        sidecar_name=sidecar_name, command=command, cwd=cwd, env=env,
+        stdin_data=stdin_data, pid=process.pid)
 
     from puppetmaster.win_process import cleanup_owned_process
 
@@ -464,6 +525,7 @@ def run_streamed_subprocess(
         timed_out=timed_out,
         live_log_path=str(live_path) if live_path is not None else None,
         attempt_id=current_attempt(task),
+        dispatch_receipt=dispatch_receipt,
         elapsed_seconds=_time.monotonic() - started,
         output_limit_hit=output_limit_hit.is_set(),
     )

@@ -19,6 +19,7 @@ from ._streaming import (
     _STDOUT_TAIL_CHARS,
     _redacted_tail,
     _resolve_sidecar_state_dir,
+    capture_dir,
     capture_subprocess_stdout,
     run_streamed_subprocess,
 )
@@ -525,7 +526,7 @@ def _spool_patch_sidecar(*, task: Task, sidecar_name: str, diff: str) -> Optiona
     if state_dir is None:
         return None
     try:
-        sidecar_dir = state_dir / "jobs" / task.job_id / "tasks" / task.id
+        sidecar_dir = capture_dir(state_dir, task)
         mkdir_private(sidecar_dir)
         sidecar_path = sidecar_dir / f"{sidecar_name}.patch"
         write_private_text(sidecar_path, diff)

@@ -1,3 +1,31 @@
+## v1.32.1 — 2026-10-06
+
+**Attempt-bound evidence.** Every capture of a worker attempt, including the
+ones written after its call returns, stays with that attempt, and every launch
+leaves an immutable dispatch receipt.
+
+**Final captures stay with their attempt.** Captures an adapter writes after
+its call returns (stdout/stderr tails, Codex events and last message, timeout
+captures, patch sidecars) now land under the attempt that produced them,
+`tasks/<task>/invocations/<nonce>/`, like the live log. In 1.32.0 they still
+went to the flat task directory, where a second attempt of the same task
+overwrote them and left the first attempt's verification pointing at the
+second attempt's bytes. The attempt stays bound until the next invocation
+opens or the worker's execution scope ends.
+
+**Dispatch receipts.** Every CLI worker launch writes
+`<sidecar>.dispatch.json` beside its attempt's captures, once and never
+rewritten: the final argv and stdin (secret-redacted; stdin also as the
+SHA-256 of the exact bytes, with a redacted copy), allowlisted home and config
+references (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`, `HERMES_HOME`, Puppetmaster's
+own ids; no other environment), and the child's and parent's pid with kernel
+start identity. Verification payloads name it as `dispatch_receipt`.
+
+**Test isolation.** The test suites now use their own readonly-helper
+coordination locks. Production serializes helper spawns machine-wide through
+one lock under `/tmp`, so parallel test processes and a running Marionette
+stalled each other's reads.
+
 ## v1.32.0 — 2026-10-06
 
 **Solo first everywhere, honest attribution, and a leaner core.** Pilots on
