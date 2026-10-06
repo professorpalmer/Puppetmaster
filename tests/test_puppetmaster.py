@@ -22972,6 +22972,26 @@ class PuppetmasterFrictionFixTests(unittest.TestCase):
         self.assertIn("patch_artifact_emitted=False", outcome)
         self.assertIn("commit_present=False", outcome)
 
+    def test_finalize_cli_run_fails_a_failed_job_with_degraded_artifacts(self) -> None:
+        """A worker that exited non-zero leaves a failed job; the CLI must not exit 0."""
+        from dataclasses import replace
+
+        from puppetmaster.cli import finalize_cli_run
+        from puppetmaster.orchestrator import RunResult
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            job = replace(store.create_job("goal"), status=JobStatus.FAILED)
+            artifact = Artifact(
+                job_id=job.id, task_id="t1", type=ArtifactType.VERIFICATION,
+                created_by="w1", confidence=0.9, evidence=["adapter:hermes"],
+                payload={"check": "run", "result": "failed"},
+            )
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                rc = finalize_cli_run(RunResult(job=job, artifacts=[artifact], summary="",
+                                                summary_path=Path(tmp) / "s.md", mode="edit"))
+        self.assertEqual(rc, 1)
+
     # --- #6: codegraph global-flag hoisting ----------------------------
     def test_hoist_global_codegraph_flags(self) -> None:
         from puppetmaster.cli import _hoist_global_codegraph_flags

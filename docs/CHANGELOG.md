@@ -1,5 +1,18 @@
 ## Unreleased
 
+**Direct adapter verbs fixed by a live smoke of every adapter.**
+
+- `puppetmaster codex` (and the MCP `puppetmaster_codex` tool, which runs it)
+  no longer defaults to `gpt-5.4-mini`. That stale pin failed closed against
+  current registries; unpinned runs now use the model in your Codex config.
+- `puppetmaster agentic` without `--model` routes within the agentic registry.
+  It used to fail `no_model`, and the failure re-route then raised "task is
+  missing durable registry_path authority" over the real error. Re-routing now
+  skips work the router never placed (a routed task that lost its registry
+  still fails closed).
+- A CLI run whose job failed exits 1 even when its artifacts only rate
+  "degraded"; a Hermes run that hit a provider 401 used to exit 0.
+
 **Each invocation keeps its own captures.** A task's live and stdout captures
 now go under `tasks/<task>/invocations/<nonce>/` while an invocation is open,
 so a second invocation in the same run (a retry, a fresh session after an
@@ -7,7 +20,8 @@ unavailable resume) no longer truncates the first one's capture. CLI
 verification payloads carry `attempt_id` beside `live_log`, naming the
 immutable ledger row (`list_attempts`) that the invocation's usage
 observations already key on; completion intents reach it through their
-artifacts. Codex workers also end their options with `--` before the stdin
+artifacts. (The agentic worker records one ledger invocation per provider
+turn; those link to their run by `run_id`.) Codex workers also end their options with `--` before the stdin
 prompt, because `--image` is variadic and took a bare `-` as an image path.
 
 **Flow hosts can own shell and walker processes.** `JobNodeExecutor(popen=...)`

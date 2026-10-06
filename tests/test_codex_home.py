@@ -131,5 +131,15 @@ class WorkerFlagsTests(unittest.TestCase):
             ["--image", "a.png", "--disable", "memories", "--disable", "multi_agent", "--", "-"])
 
 
+class UnpinnedCliTests(unittest.TestCase):
+    def test_codex_verb_pins_no_model_unless_asked(self) -> None:
+        from puppetmaster.cli._parser import build_parser
+
+        parser = build_parser()
+        self.assertIsNone(parser.parse_args(["codex", "x"]).model)
+        self.assertEqual(parser.parse_args(["codex", "x", "--model", "gpt-6.1-sol"]).model,
+                         "gpt-6.1-sol")
+
+
 if __name__ == "__main__":
     unittest.main()

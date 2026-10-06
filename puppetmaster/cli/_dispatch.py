@@ -1053,7 +1053,6 @@ def _main(argv: Optional[list[str]] = None) -> int:
         payload: dict[str, Any] = {
             "prompt": args.prompt,
             "cwd": args.cwd,
-            "model": args.model,
             "sandbox": args.sandbox,
             "approval_policy": args.approval_policy,
             "timeout_seconds": args.timeout_seconds,
@@ -1061,6 +1060,8 @@ def _main(argv: Optional[list[str]] = None) -> int:
             "allow_non_worktree": args.allow_non_worktree,
             "dangerously_bypass_approvals_and_sandbox": args.dangerously_bypass_approvals_and_sandbox,
         }
+        if args.model:
+            payload["model"] = args.model
         if args.executable:
             payload["executable"] = args.executable
         if args.disable_codegraph:
@@ -1221,6 +1222,10 @@ def _main(argv: Optional[list[str]] = None) -> int:
         if args.disable_memory:
             payload["disable_memory"] = True
         payload.update(routing_payload_from_args(args, adapter="agentic"))
+        if "model" not in payload and not payload.get("auto_route"):
+            # The agentic worker has no default model of its own: unpinned, it
+            # routes within the agentic registry instead of failing no_model.
+            payload.update({"auto_route": True, "allowed_adapters": ["agentic"]})
         payload.update(quality_payload_from_args(args))
         payload = maybe_stamp_payload(payload, args.prompt, args)
         result = cli.Orchestrator(store).run(

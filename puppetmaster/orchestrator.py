@@ -1025,6 +1025,10 @@ class Orchestrator:
             # (auto_route + router_model_id) may still fall back to another model.
             if _payload_has_explicit_model_pin(payload):
                 continue
+            # Work the router never placed has no bound registry to re-route
+            # within; its own outcome stands.
+            if not payload.get("registry_path") and not payload.get("router_model_id"):
+                continue
             registry_path, bound_registry, registry_epoch = load_bound_registry(
                 payload
             )
@@ -1255,6 +1259,10 @@ class Orchestrator:
             # user pinned by hand (including stamped Cursor pins that also set
             # router_model_id for cost/audit).
             if _payload_has_explicit_model_pin(payload):
+                continue
+            # Work the router never placed has no bound registry to re-route
+            # within; its own outcome stands.
+            if not payload.get("registry_path") and not payload.get("router_model_id"):
                 continue
             registry_path, bound_registry, registry_epoch = load_bound_registry(
                 payload
@@ -1503,6 +1511,10 @@ class Orchestrator:
             # Only re-route work the router placed — never override a hand-pinned
             # model (the user chose it deliberately).
             if _payload_has_explicit_model_pin(payload):
+                continue
+            # Work the router never placed has no bound registry to re-route
+            # within; its own outcome stands.
+            if not payload.get("registry_path") and not payload.get("router_model_id"):
                 continue
             registry_path, bound_registry, registry_epoch = load_bound_registry(
                 payload

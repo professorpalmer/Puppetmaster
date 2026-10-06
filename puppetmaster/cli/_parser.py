@@ -1539,10 +1539,10 @@ def build_parser() -> argparse.ArgumentParser:
     codex.add_argument("--cwd", default=str(Path.cwd()), help="Workspace for Codex.")
     codex.add_argument(
         "--model",
-        default="gpt-5.4-mini",
+        default=None,
         help=(
-            "Model passed to `codex exec -m` (gpt-5.6-sol, gpt-5.6-terra, "
-            "gpt-5.6-luna, gpt-5.5, gpt-5.4, gpt-5.4-mini, ...)."
+            "Model passed to `codex exec -m`. Default: the model in your Codex "
+            "config.toml, else Codex's own default."
         ),
     )
     codex.add_argument(

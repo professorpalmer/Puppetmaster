@@ -200,6 +200,13 @@ def finalize_cli_run(result: Any) -> int:
 
     verdict = assess_run_quality(result.artifacts)
     quality = verdict["quality"]
+    status = str(getattr(result.job, "status", "") or "")
+    if status in {"failed", "cancelled", "stalled"}:
+        # The job's own terminal state outranks artifact quality: a worker that
+        # failed with a verification artifact still left a failed job.
+        print(f"puppetmaster: job {result.job.id} {status}. Not reporting success.",
+              file=sys.stderr)
+        return 1
     if quality == "ok":
         return 0
 

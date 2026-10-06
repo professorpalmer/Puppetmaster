@@ -5702,7 +5702,7 @@ def codex_schema() -> JsonObject:
             "model": {
                 "type": "string",
                 "description": (
-                    "Optional Codex model name. Defaults to gpt-5.4-mini when omitted."
+                    "Optional Codex model name. Omitted: the model in your Codex config."
                 ),
             },
             "sandbox": {
