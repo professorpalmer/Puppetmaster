@@ -10,6 +10,13 @@ observations already key on; completion intents reach it through their
 artifacts. Codex workers also end their options with `--` before the stdin
 prompt, because `--image` is variadic and took a bare `-` as an image path.
 
+**Flow hosts can own shell and walker processes.** `JobNodeExecutor(popen=...)`
+takes a factory with `subprocess.Popen`'s signature. Shell nodes and the
+default walker spawn launch through it, always in a new session (process group
+on Windows), so a host can bind the exact process group to its own runtime and
+deadline before the command runs; stop, cut and timeout still kill that group.
+Without a factory nothing changes.
+
 **Unwired half-built code removed.** Each of these had no production caller;
 the tests that only exercised them are gone or moved to local helpers.
 

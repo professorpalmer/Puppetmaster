@@ -1199,8 +1199,12 @@ def run_summary(run: FlowRun, *, since: int = 0) -> dict:
 
 
 def spawn_background_walk(state_dir: Path, run_id: str, *, answer: Optional[str] = None,
-                          restart: bool = False) -> int:
-    """Walk the run in a detached process; the caller returns at once."""
+                          restart: bool = False, popen: Optional[Callable[..., Any]] = None) -> int:
+    """Walk the run in a detached process; the caller returns at once.
+
+    ``popen`` replaces ``subprocess.Popen`` (same signature); see JobNodeExecutor.
+    """
+    popen = popen or subprocess.Popen
     run = load_run(state_dir, run_id)
     command = [sys.executable, "-m", "puppetmaster", "--state-dir", str(state_dir),
                "--backend", run.backend, "flow", "resume", run_id]
@@ -1220,11 +1224,11 @@ def spawn_background_walk(state_dir: Path, run_id: str, *, answer: Optional[str]
             # host's job object so the walker outlives the pilot that started it.
             flags = 0x00000008 | 0x00000200
             try:
-                process = subprocess.Popen(command, creationflags=flags | 0x01000000, **kwargs)
+                process = popen(command, creationflags=flags | 0x01000000, **kwargs)
             except OSError:
-                process = subprocess.Popen(command, creationflags=flags, **kwargs)
+                process = popen(command, creationflags=flags, **kwargs)
         else:
-            process = subprocess.Popen(command, start_new_session=True, **kwargs)
+            process = popen(command, start_new_session=True, **kwargs)
     _marker(state_dir, run_id, "walker.pid").write_text(json.dumps({
         "pid": process.pid, "at": time.time(), "proc": process_identity(process.pid)}), encoding="utf-8")
     return process.pid
@@ -1258,14 +1262,25 @@ def _item_counts(items: dict) -> dict:
 
 
 class JobNodeExecutor:
-    """Run agent, judge, parallel and map nodes as Puppetmaster jobs; shell locally."""
+    """Run agent, judge, parallel and map nodes as Puppetmaster jobs; shell locally.
+
+    ``popen`` is the process factory for shell nodes and the default walker
+    spawn: it takes ``subprocess.Popen``'s arguments and returns a Popen-like
+    object (``pid``, ``poll``, ``wait``, ``kill``, ``returncode``). A host uses
+    it to bind each new process group to its own runtime before the command
+    runs. The keyword arguments always start a new session (process group on
+    Windows), so the group a host binds is the one stop and timeout kill.
+    """
 
     def __init__(self, state_dir: Path, *, backend: str = "sqlite", worker_mode: str = "subprocess",
-                 spawn: Optional[Callable[[Path, str], Any]] = None, poll_seconds: float = 1.0) -> None:
+                 spawn: Optional[Callable[[Path, str], Any]] = None, poll_seconds: float = 1.0,
+                 popen: Optional[Callable[..., Any]] = None) -> None:
         self.state_dir = Path(state_dir)
         self.backend = backend
         self.worker_mode = worker_mode
-        self.spawn = spawn or (lambda state_dir, run_id: spawn_background_walk(state_dir, run_id))
+        self.popen = popen or subprocess.Popen
+        self.spawn = spawn or (lambda state_dir, run_id: spawn_background_walk(
+            state_dir, run_id, popen=self.popen))
         self.poll_seconds = poll_seconds
 
     def __call__(self, node: dict, run: FlowRun, prev: str) -> NodeOutcome:
@@ -1662,7 +1677,7 @@ class JobNodeExecutor:
         else:
             kwargs["start_new_session"] = True
         with open(log, "wb") as sink:
-            process = subprocess.Popen(command, stdout=sink, stderr=subprocess.STDOUT, **kwargs)
+            process = self.popen(command, stdout=sink, stderr=subprocess.STDOUT, **kwargs)
             inflight["shell"] = {"pid": process.pid, "proc": process_identity(process.pid)}
             save_run(self.state_dir, run)
             deadline = time.monotonic() + timeout
