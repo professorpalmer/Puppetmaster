@@ -164,6 +164,8 @@ RULE_BODY = textwrap.dedent(
 
     Native search is fine for plain-text matches (log strings, config values,
     comments), a single known file path, or when the user says "just grep".
+    When you already know the files a change touches (a follow-up to work
+    you just did), skip the graph and read them directly.
     If a codegraph MCP call returns a transport error, fall back to the CLI
     passthrough `python -m puppetmaster codegraph …` — never a bare
     `codegraph` from the shell (Node ABI mismatch).
@@ -230,8 +232,8 @@ RULE_BODY = textwrap.dedent(
        the job dashboard, call this (it starts the local server if needed)
        and open the returned URL in a browser tab for them. CLI fallback:
        `python -m puppetmaster dashboard [job_id]`.
-    7. `puppetmaster_doctor` — sanity-check Puppetmaster's runtime
-       dependencies once per session.
+    7. `puppetmaster_doctor` — run it when a Puppetmaster call fails or
+       behaves unexpectedly, not as a ritual before every task.
 
     If `puppetmaster_doctor` reports critical failures, surface them to
     the user before continuing.
