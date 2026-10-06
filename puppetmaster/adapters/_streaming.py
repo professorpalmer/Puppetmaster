@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from puppetmaster.fs_permissions import mkdir_private, open_private, write_private_text
+from puppetmaster.invocation import current_attempt
 from puppetmaster.models import Task, new_id
 from puppetmaster.redaction import redact_secrets
 from puppetmaster.worker_fence import stamp_worker_env
@@ -100,7 +101,7 @@ def capture_subprocess_stdout(
         result["stdout_sidecar_path"] = None
         return result
     try:
-        sidecar_dir = state_dir / "jobs" / task.job_id / "tasks" / task.id
+        sidecar_dir = capture_dir(state_dir, task)
         mkdir_private(sidecar_dir)
         sidecar_path = sidecar_dir / f"{sidecar_name}.log"
         write_private_text(sidecar_path, text)
@@ -109,6 +110,19 @@ def capture_subprocess_stdout(
         result["stdout_sidecar_path"] = None
         result["stdout_sidecar_error"] = repr(exc)
     return result
+
+
+def capture_dir(state_dir: Path, task: Task) -> Path:
+    """Where a task's captures go: per invocation while one is open.
+
+    Two invocations of one run (a retry, a fresh fallback after an unavailable
+    resume) must not truncate each other's capture.
+    """
+    base = state_dir / "jobs" / task.job_id / "tasks" / task.id
+    attempt = current_attempt(task)
+    if attempt is None:
+        return base
+    return base / "invocations" / attempt.rsplit(":", 1)[-1]
 
 
 @dataclass
@@ -127,6 +141,8 @@ class StreamedProcess:
     # rather than an empty-but-successful run.
     spawn_error: Optional[str] = None
     output_limit_hit: bool = False
+    # The invocation ledger row this process belongs to (see invocation.py).
+    attempt_id: Optional[str] = None
 
 
 def _kill_process_tree(process: "subprocess.Popen", started_new_session: bool) -> None:
@@ -207,7 +223,7 @@ def run_streamed_subprocess(
     live_path: Optional[Path] = None
     if state_dir is not None:
         try:
-            sidecar_dir = state_dir / "jobs" / task.job_id / "tasks" / task.id
+            sidecar_dir = capture_dir(state_dir, task)
             mkdir_private(sidecar_dir)
             live_path = sidecar_dir / f"{sidecar_name}_live.log"
             live_handle = open(
@@ -319,6 +335,7 @@ def run_streamed_subprocess(
             stderr=message,
             timed_out=False,
             live_log_path=str(live_path) if live_path is not None else None,
+        attempt_id=current_attempt(task),
             spawn_error=message,
         )
 
@@ -446,6 +463,7 @@ def run_streamed_subprocess(
         ),
         timed_out=timed_out,
         live_log_path=str(live_path) if live_path is not None else None,
+        attempt_id=current_attempt(task),
         elapsed_seconds=_time.monotonic() - started,
         output_limit_hit=output_limit_hit.is_set(),
     )

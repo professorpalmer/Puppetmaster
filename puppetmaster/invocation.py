@@ -19,6 +19,7 @@ from puppetmaster.models import now_iso, new_id
 
 _scope = ContextVar("execution_accounting", default=None)
 _dispatch_guard = ContextVar("invocation_dispatch_guard", default=None)
+_current = ContextVar("current_invocation", default=None)
 _log = logging.getLogger(__name__)
 
 
@@ -33,6 +34,14 @@ def check_external_dispatch():
     guard = _dispatch_guard.get()
     if guard is not None:
         guard()
+
+
+def current_attempt(task):
+    """The open invocation's immutable attempt id for ``task``, or None."""
+    capture = _current.get()
+    if capture is None or capture.task.id != getattr(task, "id", None):
+        return None
+    return capture.attempt.attempt_id
 
 
 @contextmanager
@@ -306,11 +315,13 @@ def invocation(*, adapter=None, model=None, billing=None, source=None):
     capture.recorded = capture._write("record_attempt", capture.attempt)
     completed = False
     guard_token = _dispatch_guard.set(capture.check_dispatch_lease)
+    current_token = _current.set(capture)
     try:
         capture.check_dispatch_lease()
         yield capture
         completed = True
     finally:
+        _current.reset(current_token)
         _dispatch_guard.reset(guard_token)
         if not capture.observations:
             capture.observe(source=f"{source or capture.attempt.adapter}:usage_unavailable")

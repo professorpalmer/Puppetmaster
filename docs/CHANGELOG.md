@@ -1,5 +1,15 @@
 ## Unreleased
 
+**Each invocation keeps its own captures.** A task's live and stdout captures
+now go under `tasks/<task>/invocations/<nonce>/` while an invocation is open,
+so a second invocation in the same run (a retry, a fresh session after an
+unavailable resume) no longer truncates the first one's capture. CLI
+verification payloads carry `attempt_id` beside `live_log`, naming the
+immutable ledger row (`list_attempts`) that the invocation's usage
+observations already key on; completion intents reach it through their
+artifacts. Codex workers also end their options with `--` before the stdin
+prompt, because `--image` is variadic and took a bare `-` as an image path.
+
 **Unwired half-built code removed.** Each of these had no production caller;
 the tests that only exercised them are gone or moved to local helpers.
 
