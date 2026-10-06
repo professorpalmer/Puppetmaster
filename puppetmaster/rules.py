@@ -15,15 +15,15 @@ patterns" rule files into the conventions each host respects:
 - ``AGENTS.md`` (the cross-tool convention at https://agents.md/ now
   respected by Codex, Claude Code, and several other agents — workspace
   scope only)
-- ``~/.codex/instructions.md`` (Codex user-level instructions, global
-  scope)
+- ``$CODEX_HOME/AGENTS.md`` (Codex user-level guidance, global scope;
+  default ``~/.codex``. Codex ignores ``instructions.md``)
 - ``~/.claude/CLAUDE.md`` (Claude Code user-level instructions, global
   scope)
 - ``~/.hermes/SOUL.md`` (NousResearch Hermes global system-prompt file,
   injected into every Hermes session — global scope; honors ``$HERMES_HOME``)
 
 For the multi-line markdown targets (``AGENTS.md``, ``CLAUDE.md``,
-``instructions.md``), the writer uses an HTML-comment-delimited block
+``SOUL.md``), the writer uses an HTML-comment-delimited block
 so re-running ``install-rules`` replaces only the Puppetmaster block
 and leaves any other content in the file untouched. The user can
 disable the rule by deleting the marked block; we never overwrite
@@ -439,7 +439,7 @@ def hermes_soul_path(env: Optional[Mapping[str, str]] = None) -> Path:
 
     ``SOUL.md`` is the file Hermes injects into *every* session's system
     prompt, so it is the correct global-bias surface for Hermes — the
-    counterpart to ``~/.claude/CLAUDE.md`` / ``~/.codex/instructions.md`` for
+    counterpart to ``~/.claude/CLAUDE.md`` / ``$CODEX_HOME/AGENTS.md`` for
     the other hosts. Honors ``$HERMES_HOME`` (the same override Hermes and the
     MCP installer read) and falls back to ``~/.hermes/SOUL.md``.
     """
@@ -521,17 +521,36 @@ def _install_agents_md_workspace(
     )
 
 
+def codex_global_rules_path() -> Path:
+    """Codex's user-level guidance file: ``$CODEX_HOME/AGENTS.md``.
+
+    Codex 0.160 loads AGENTS.md from CODEX_HOME and ignores instructions.md;
+    rules written there never reached a Codex pilot (verified with a marker
+    word: AGENTS.md answered, instructions.md did not).
+    """
+    home = os.environ.get("CODEX_HOME")
+    return (Path(home).expanduser() if home else Path.home() / ".codex") / "AGENTS.md"
+
+
+def _legacy_codex_rules_path() -> Path:
+    home = os.environ.get("CODEX_HOME")
+    return (Path(home).expanduser() if home else Path.home() / ".codex") / "instructions.md"
+
+
 def _install_codex_global(*, dry_run: bool, force: bool) -> TargetOutcome:
-    target_path = Path.home() / ".codex" / "instructions.md"
+    target_path = codex_global_rules_path()
     new_block = render_agents_block()
     existing = target_path.read_text(encoding="utf-8") if target_path.exists() else ""
     merged, action = merge_block_into_text(existing, new_block)
-    if action == "unchanged" and not force:
+    legacy = _legacy_codex_rules_path()
+    legacy_text = legacy.read_text(encoding="utf-8") if legacy.exists() else ""
+    stripped_legacy, legacy_action = strip_block_from_text(legacy_text)
+    if action == "unchanged" and legacy_action == "unchanged" and not force:
         return TargetOutcome(
             target="codex_global",
             path=str(target_path),
             status="unchanged",
-            reason="~/.codex/instructions.md already has an up-to-date block",
+            reason=f"{target_path} already has an up-to-date block",
         )
     if dry_run:
         return TargetOutcome(
@@ -541,11 +560,14 @@ def _install_codex_global(*, dry_run: bool, force: bool) -> TargetOutcome:
             reason=f"would update {target_path} (applies to every codex session)",
         )
     _write_atomic(target_path, merged)
+    if legacy_action != "unchanged":
+        # Move an old block out of the file Codex never read.
+        _write_or_delete_markdown(legacy, stripped_legacy, dry_run=False)
     return TargetOutcome(
         target="codex_global",
         path=str(target_path),
         status="installed",
-        reason="wrote ~/.codex/instructions.md (applies to every codex session)",
+        reason=f"wrote {target_path} (applies to every codex session)",
     )
 
 
@@ -663,11 +685,11 @@ def install_rules(
             elif _detect_codex_cli():
                 result.messages.append(
                     "codex detected but disabled by the platform lock — "
-                    "skipping ~/.codex/instructions.md"
+                    "skipping $CODEX_HOME/AGENTS.md"
                 )
             else:
                 result.messages.append(
-                    "codex CLI not detected — skipping ~/.codex/instructions.md "
+                    "codex CLI not detected — skipping $CODEX_HOME/AGENTS.md "
                     "(install `codex` and re-run with --global to enable)"
                 )
             if _detect_claude_cli() and _adapter_enabled("claude-code"):
@@ -870,10 +892,10 @@ def uninstall_rules(
         elif target == "codex_global":
             result.outcomes.append(
                 _uninstall_markdown_block_file(
-                    Path.home() / ".codex" / "instructions.md",
+                    codex_global_rules_path(),
                     target="codex_global",
                     dry_run=dry_run,
-                    label="~/.codex/instructions.md",
+                    label=str(codex_global_rules_path()),
                 )
             )
         elif target == "hermes_global":

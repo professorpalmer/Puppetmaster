@@ -486,7 +486,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--global",
         dest="rules_global",
         action="store_true",
-        help="Also write user-level rules (~/.codex/instructions.md, ~/.claude/CLAUDE.md, ~/.hermes/SOUL.md) when those tools are detected.",
+        help="Also write user-level rules ($CODEX_HOME/AGENTS.md, ~/.claude/CLAUDE.md, ~/.hermes/SOUL.md) when those tools are detected.",
     )
     install_rules_parser.add_argument(
         "--force",

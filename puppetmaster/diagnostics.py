@@ -402,7 +402,7 @@ def _agent_rules_check(root: Path) -> Check:
         root / ".cursor" / "rules" / "puppetmaster.mdc",
         root / "AGENTS.md",
         root / "CLAUDE.md",
-        Path.home() / ".codex" / "instructions.md",
+        Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "AGENTS.md",
         Path.home() / ".claude" / "CLAUDE.md",
     ]
     rule_present_paths: list[Path] = []

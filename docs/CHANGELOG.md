@@ -11,6 +11,13 @@ and 100.1 s, with estimated input cost (fresh plus 0.1x cached) 17-31% below
 native's. Two reps on a small synthetic fan-out; it is a direction, not a
 benchmark result.
 
+- **Codex pilots finally get Puppetmaster's rules.** `install-rules --global`
+  wrote `~/.codex/instructions.md`, which current Codex never reads; it loads
+  `$CODEX_HOME/AGENTS.md` (verified with a marker word: AGENTS.md answered,
+  instructions.md did not). So no Codex pilot ever saw the flow, inline-edit
+  or craft-armor guidance. The block now goes into `$CODEX_HOME/AGENTS.md`
+  (your own content there is kept), and an old block is moved out of
+  `instructions.md`. Re-run `puppetmaster install-rules --global`.
 - **Lean CODEX_HOME for Codex workers.** Each fresh `codex exec` sends, on
   its first call, a developer/environment block built from CODEX_HOME (the
   skills list, memories, plugin recommendations, multi-agent instructions)
