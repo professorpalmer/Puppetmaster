@@ -23,12 +23,15 @@ delegate directive from prompt wording; naming Puppetmaster still does.
 terminal `VERDICT: PASS|FAIL|PARTIAL`. A write-capable run that reports FAIL,
 PARTIAL or no verdict is degraded with the reason.
 
-**Readonly observer reads join a live WAL.** On POSIX a live store is read by
-joining its committed WAL snapshot (`mode=ro`, no byte-range lock), fenced by
-device/inode over the main file and both sidecars, so dashboard and CLI reads
-no longer fail or make writers SQLITE_BUSY while a job runs. A cohort missing
-a sidecar still fails closed. In live mode the promise is "never changes
-database content" (a WAL reader records read marks in `-shm`).
+**Readonly observer reads join a live WAL.** A live store is read by joining
+its committed WAL snapshot (`mode=ro`, no byte-range lock), so dashboard, CLI
+and ownership reads no longer fail or make writers SQLITE_BUSY while a job
+runs. On POSIX the helper decides this itself and fences the read by
+device/inode over the main file and both sidecars; on Windows the retry into
+the snapshot, which used to be for worker attach only, now covers observer
+reads too. A cohort missing a sidecar still fails closed. In live mode the
+promise is "never changes database content" (a WAL reader records read marks
+in `-shm`).
 
 **write_scope charges a worker only for writes it plausibly made.** The
 worker's own event stream (Codex `file_change` and command paths, Claude Code
