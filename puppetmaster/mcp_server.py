@@ -4914,7 +4914,10 @@ def flow_schema() -> JsonObject:
                     "agent {id, role: code|explore, task, files?}; judge {id, task} (ends in "
                     "VERDICT: PASS|FAIL|PARTIAL); shell {id, command}; map {id, items, "
                     "concurrency?, graph: <item graph using {{item}}>}; gate {id, question, "
-                    "options}; set {id, values}; end {id, status?: pass|fail}. Templates: "
+                    "options}; set {id, values}; end {id, status?: pass|fail}. Map items may be "
+                    "objects: group many small units per item ({{item.units}}, {{item.files}}) "
+                    "so a few workers each own several, and set concurrency to the item count. "
+                    "Templates: "
                     "{{input}} {{item}} {{out.<node>}} {{state.<k>}}. Example fan-out: "
                     '{"id": "mods", "entry": "all", "defaults": {"adapter": "codex"}, "nodes": [{"id": "all", "kind": "map", '
                     '"items": ["a", "b"], "concurrency": 8, "graph": {"entry": "build", '

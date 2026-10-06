@@ -123,6 +123,13 @@ RULE_BODY = textwrap.dedent(
     `map` node fans out per-item flows; a follow-up continues a finished run
     with `continue_from`. Reference: `docs/FLOWS.md`.
 
+    Size workers to the work. Every worker pays a fixed start (its own
+    context and checks), so many small units go to a few workers that each
+    own a group of them (16 small modules: 3-5 workers), and all of them run
+    at once; a unit big enough to take one worker several minutes gets its
+    own. In a flow, make each `map` item a group (an object with its unit
+    names and files) and set concurrency to the number of items.
+
     When the result is judged by craft (how it looks, reads or feels:
     visuals, geometry, UI, prose) and not only by a test, end the flow in
     armor: a `shell` check that produces the observable result (render, run,
