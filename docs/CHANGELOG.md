@@ -1,5 +1,12 @@
 ## Unreleased
 
+- A dispatch receipt's linked stdin copy is immutable too. 1.32.1 wrote the
+  copy before claiming the receipt, so a repeated or racing call for the same
+  attempt and sidecar was refused a receipt but still rewrote the first
+  receipt's stdin copy. The receipt is now claimed exclusively first, and the
+  copy is created exclusively; a leftover copy is never overwritten (the
+  receipt then records `redacted_copy: null` and keeps the hash). Reported by
+  Codex.
 - The output-limit verification payload names its `dispatch_receipt` too
   (1.32.1 carried it on every other CLI verification payload).
 - `PUPPETMASTER_READER_COORDINATION_DIR` overrides the machine-wide root for

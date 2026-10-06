@@ -140,11 +140,13 @@ def _write_dispatch_receipt(directory: Optional[Path], *, task: Task, sidecar_na
                             stdin_data: Optional[str], pid: int) -> Optional[str]:
     """Record what was actually launched, once, beside the attempt's captures.
 
-    The receipt is created exclusively and never rewritten. It holds the final
-    argv and stdin (both secret-redacted; stdin also by SHA-256 of the exact
-    bytes), allowlisted home/config references, and the child's and this
-    process's pid with kernel start identity. Best effort: a failure never
-    blocks the run.
+    The receipt is claimed exclusively before anything else is written, so a
+    repeated or racing call for the same attempt and sidecar changes nothing:
+    neither the receipt nor the stdin copy it links is ever rewritten. It holds
+    the final argv and stdin (both secret-redacted; stdin also by SHA-256 of
+    the exact bytes), allowlisted home/config references, and the child's and
+    this process's pid with kernel start identity (null when unknown). Best
+    effort: a failure never blocks the run.
     """
     if directory is None:
         return None
@@ -154,25 +156,34 @@ def _write_dispatch_receipt(directory: Optional[Path], *, task: Task, sidecar_na
     from puppetmaster.models import now_iso
     from puppetmaster.proc_identity import process_identity
 
+    receipt = directory / f"{sidecar_name}.dispatch.json"
     try:
-        receipt = directory / f"{sidecar_name}.dispatch.json"
-        stdin_path = None
-        stdin_meta = None
-        if stdin_data is not None:
-            stdin_path = directory / f"{sidecar_name}.stdin.txt"
-            write_private_text(stdin_path, redact_secrets(stdin_data) or "")
-            stdin_meta = {"sha256": hashlib.sha256(stdin_data.encode("utf-8")).hexdigest(),
-                          "chars": len(stdin_data), "redacted_copy": str(stdin_path)}
-        body = {
-            "attempt_id": current_attempt(task), "job_id": task.job_id, "task_id": task.id,
-            "launched_at": now_iso(), "argv": [redact_secrets(str(arg)) or "" for arg in command],
-            "cwd": str(cwd) if cwd is not None else None, "stdin": stdin_meta,
-            "env": {key: env[key] for key in _RECEIPT_ENV_KEYS if env.get(key)},
-            "pid": pid, "process": process_identity(pid),
-            "parent_pid": os.getpid(), "parent_process": process_identity(os.getpid()),
-        }
         fd = open_private(receipt, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+    except OSError:
+        return None
+    try:
         with open(fd, "w", encoding="utf-8") as handle:
+            stdin_meta = None
+            if stdin_data is not None:
+                stdin_meta = {"sha256": hashlib.sha256(stdin_data.encode("utf-8")).hexdigest(),
+                              "chars": len(stdin_data), "redacted_copy": None}
+                stdin_path = directory / f"{sidecar_name}.stdin.txt"
+                try:
+                    copy_fd = open_private(stdin_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+                except OSError:
+                    pass  # A leftover copy is not this launch's; never overwrite it.
+                else:
+                    with open(copy_fd, "w", encoding="utf-8") as copy:
+                        copy.write(redact_secrets(stdin_data) or "")
+                    stdin_meta["redacted_copy"] = str(stdin_path)
+            body = {
+                "attempt_id": current_attempt(task), "job_id": task.job_id, "task_id": task.id,
+                "launched_at": now_iso(), "argv": [redact_secrets(str(arg)) or "" for arg in command],
+                "cwd": str(cwd) if cwd is not None else None, "stdin": stdin_meta,
+                "env": {key: env[key] for key in _RECEIPT_ENV_KEYS if env.get(key)},
+                "pid": pid, "process": process_identity(pid),
+                "parent_pid": os.getpid(), "parent_process": process_identity(os.getpid()),
+            }
             json.dump(body, handle, indent=2)
         return str(receipt)
     except Exception:
