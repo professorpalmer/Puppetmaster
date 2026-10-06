@@ -225,8 +225,8 @@ def render_cursor_mdc() -> str:
     user message, not just when a glob matches.
     """
     description = (
-        "Delegate multi-file refactors, audits, and reusable work to "
-        "Puppetmaster MCP swarms; obey 'Use Puppetmaster to …' triggers."
+        "Work solo until parallel workers clearly pay, then fan out with one "
+        "Puppetmaster flow; obey 'Use Puppetmaster to …' triggers."
     )
     frontmatter = (
         "---\n"
