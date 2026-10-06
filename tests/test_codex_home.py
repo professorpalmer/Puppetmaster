@@ -57,6 +57,16 @@ class LeanConfigTests(unittest.TestCase):
         tomllib.loads(lean)
 
 
+class ConfiguredModelTests(unittest.TestCase):
+    def test_reads_top_level_model_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "config.toml").write_text(CONFIG)
+            self.assertEqual(codex_home.configured_model({"CODEX_HOME": tmp}), "gpt-6.1-sol")
+            Path(tmp, "config.toml").write_text('[profiles.x]\nmodel = "other"\n')
+            self.assertEqual(codex_home.configured_model({"CODEX_HOME": tmp}), "")
+            self.assertEqual(codex_home.configured_model({"CODEX_HOME": tmp + "/missing"}), "")
+
+
 class AuthSyncTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

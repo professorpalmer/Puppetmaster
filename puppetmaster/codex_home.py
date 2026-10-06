@@ -189,3 +189,24 @@ def home_for_session(session_id: str, env: Optional[dict] = None) -> Optional[Pa
         if root.is_dir() and next(root.glob(f"*/*/*/rollout-*-{session_id}.jsonl"), None) is not None:
             return home
     return None
+
+
+def configured_model(env: Optional[dict] = None) -> str:
+    """The top-level ``model`` in the user's Codex config, or ''.
+
+    An unpinned Codex worker runs the model the user's own Codex would pick;
+    a hard-coded fallback went stale (gpt-5.4-mini returned model_unavailable
+    and failed every node of an unpinned flow).
+    """
+    try:
+        text = (user_home(env) / "config.toml").read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            break
+        match = re.match(r'model\s*=\s*"([^"]+)"', stripped)
+        if match:
+            return match.group(1)
+    return ""

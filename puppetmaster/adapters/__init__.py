@@ -111,7 +111,6 @@ from .claude_code import (
     resolve_claude_code_model,
 )
 from .codex import (
-    DEFAULT_CODEX_MODEL,
     CodexAdapter,
     build_codex_exec_command,
     build_codex_resume_command,
@@ -181,7 +180,6 @@ __all__ = [
     "DEFAULT_ANTIGRAVITY_EFFORT",
     "DEFAULT_ANTIGRAVITY_MODEL",
     "DEFAULT_CLAUDE_CODE_MODEL",
-    "DEFAULT_CODEX_MODEL",
     "DEFAULT_HERMES_ANALYZE_TOOLSETS",
     "DEFAULT_HERMES_IMPLEMENT_TOOLSETS",
     "DEFAULT_OPENAI_BASE_URL",

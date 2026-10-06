@@ -47,7 +47,6 @@ from .cursor import (
     implement_report_artifacts,
 )
 
-DEFAULT_CODEX_MODEL = "gpt-5.4-mini"
 _CODEX_NPM_ENTRYPOINT = Path("node_modules") / "@openai" / "codex" / "bin" / "codex.js"
 
 
@@ -198,7 +197,8 @@ class CodexAdapter(CliWorkerAdapter):
             if lease is not None:
                 lease.release()
             return self._missing_cli(task, worker_id, str(executable))
-        model = str(task.payload.get("model") or DEFAULT_CODEX_MODEL)
+        # Unpinned: the user's configured Codex model, else Codex's own default.
+        model = str(task.payload.get("model") or _codex_home().configured_model())
         approval_policy = str(task.payload.get("approval_policy") or "never")
         # A review-loop task may be repaired by resuming this thread, so keep it.
         ephemeral = bool(task.payload.get("ephemeral", not task.payload.get("review_loop")))
@@ -321,7 +321,7 @@ class CodexAdapter(CliWorkerAdapter):
                 command_prefix=prepared.command[:1],
                 cwd=cwd,
                 prompt=str(prepared.extras.get("prompt") or task.instruction or ""),
-                model=str(prepared.extras.get("model") or DEFAULT_CODEX_MODEL),
+                model=str(prepared.extras.get("model") or _codex_home().configured_model()) or None,
                 sandbox=str(prepared.extras.get("sandbox") or "workspace-write"),
                 timeout=float(timeout_seconds),
                 pending_steering=pending,
@@ -347,7 +347,7 @@ class CodexAdapter(CliWorkerAdapter):
         after: dict,
         completed: StreamedProcess,
     ) -> list[Artifact]:
-        model = str(prepared.extras.get("model") or DEFAULT_CODEX_MODEL)
+        model = str(prepared.extras.get("model") or "codex-default")
         sandbox = str(prepared.extras.get("sandbox") or "workspace-write")
         approval_policy = str(prepared.extras.get("approval_policy") or "never")
         bypass = bool(prepared.extras.get("bypass"))
@@ -743,3 +743,9 @@ def _lease_codex_thread(record: dict) -> tuple[dict, Optional[SessionLease]]:
             ),
         }, None
     return record, lease
+
+
+def _codex_home():
+    from puppetmaster import codex_home
+
+    return codex_home
