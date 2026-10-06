@@ -1,3 +1,14 @@
+## Unreleased
+
+**Final captures stay with their attempt.** Captures an adapter writes after
+its call returns (stdout/stderr tails, Codex events and last message, timeout
+captures, patch sidecars) now land under the attempt that produced them,
+`tasks/<task>/invocations/<nonce>/`, like the live log. In 1.32.0 they still
+went to the flat task directory, where a second attempt of the same task
+overwrote them and left the first attempt's verification pointing at the
+second attempt's bytes. The attempt stays bound until the next invocation
+opens or the worker's execution scope ends.
+
 ## v1.32.0 — 2026-10-06
 
 **Solo first everywhere, honest attribution, and a leaner core.** Pilots on

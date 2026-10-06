@@ -113,10 +113,11 @@ def capture_subprocess_stdout(
 
 
 def capture_dir(state_dir: Path, task: Task) -> Path:
-    """Where a task's captures go: per invocation while one is open.
+    """Where a task's captures go: under the attempt they belong to.
 
     Two invocations of one run (a retry, a fresh fallback after an unavailable
-    resume) must not truncate each other's capture.
+    resume) must not overwrite each other's captures, including the final ones
+    an adapter writes after its call returns.
     """
     base = state_dir / "jobs" / task.job_id / "tasks" / task.id
     attempt = current_attempt(task)
