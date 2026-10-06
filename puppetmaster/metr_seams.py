@@ -19,21 +19,12 @@ from puppetmaster.artifact_status import (
 )
 from puppetmaster.models import ArtifactType, now_iso
 
-WAIT_EXTERNAL = "waiting_external"
-WAIT_USER = "waiting_user"
-WAIT_REASONS = frozenset({WAIT_EXTERNAL, WAIT_USER})
-
-HOLD_STATE = "hold"
-VETO_STATE = "veto"
-
 REASON_WORKER_PROTOCOL = "worker_protocol_refused"
 REASON_GATE_FAILED = "gate_failed"
 REASON_CROSS_JOB = "cross_job_refused"
 REASON_PARENT_MISMATCH = "parent_mismatch"
 REASON_NEW_JOB = "new_job_refused"
 REASON_SUBGRAPH_WRITER = "subgraph_writer_refused"
-REASON_SUBGRAPH_HOLD = "subgraph_hold"
-REASON_SUBGRAPH_VETO = "subgraph_veto"
 REASON_WORKER_JOB_COMPLETE = "worker_job_complete_refused"
 
 ACTOR_WORKER = "worker"
@@ -105,15 +96,6 @@ def normalize_actor(actor: Optional[str]) -> str:
 
 def is_worker_actor(actor: Optional[str]) -> bool:
     return normalize_actor(actor) == ACTOR_WORKER
-
-
-def normalize_wait_reason(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    raw = str(value).strip().lower().replace("-", "_")
-    if raw in WAIT_REASONS:
-        return raw
-    return None
 
 
 def _payload_of(value: Any) -> dict[str, Any]:

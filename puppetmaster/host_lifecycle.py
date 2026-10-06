@@ -135,13 +135,6 @@ def record_host_start(store: Any) -> Optional[HostStartRecord]:
         _write_boot_record(store, root, record)
         _register_clean_shutdown(root)
         fanned_out, skipped = _fanout_host_event(store, kind, record)
-        if kind == HOST_EVENT_RECOVERED:
-            try:
-                from puppetmaster.run_journal import recover_stale_journals
-
-                recover_stale_journals(store, reason="host.recovered")
-            except Exception:
-                pass
         result = HostStartRecord(
             kind=kind,
             reason=reason,

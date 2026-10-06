@@ -236,14 +236,6 @@ class Job:
     # omit both fields and remain fully readable.
     launch_key: Optional[str] = None
     launch_fingerprint: Optional[str] = None
-    # v1.22.37 additive METR seams. Coordinator outlives workers: persist the
-    # original contract (criteria + granted authority) and wait/hold state.
-    # Older records omit these keys and remain fully readable.
-    acceptance_criteria: Optional[list[str]] = None
-    granted_authority: Optional[Any] = None
-    wait_reason: Optional[str] = None
-    subgraph_owner: Optional[str] = None
-    subgraph_hold: Optional[str] = None
     # Coordinator-stamped selected-model economics at cost-final status.
     # Older records omit the key. JSON on the job row only — not a new
     # ArtifactType or store table. STALLED must not keep a receipt.
@@ -553,11 +545,6 @@ def job_from_dict(data: dict[str, Any]) -> Job:
         completed_at=data.get("completed_at"),
         launch_key=data.get("launch_key"),
         launch_fingerprint=data.get("launch_fingerprint"),
-        acceptance_criteria=data.get("acceptance_criteria"),
-        granted_authority=data.get("granted_authority"),
-        wait_reason=data.get("wait_reason"),
-        subgraph_owner=data.get("subgraph_owner"),
-        subgraph_hold=data.get("subgraph_hold"),
         cost_receipt=raw_receipt if isinstance(raw_receipt, dict) else None,
     )
 

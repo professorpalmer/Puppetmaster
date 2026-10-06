@@ -14,11 +14,8 @@ from typing import Any, Callable, Optional
 
 from puppetmaster.metr_seams import (
     ACTOR_COORDINATOR,
-    HOLD_STATE,
     HOST_SCM_ACTION_KINDS,
     HOST_SCM_KINDS,
-    VETO_STATE,
-    WAIT_USER,
     load_host_document,
     record_host_observation,
     save_host_document,
@@ -26,7 +23,6 @@ from puppetmaster.metr_seams import (
 from puppetmaster.models import ArtifactType, JobStatus, TaskStatus, is_terminal_job_status
 
 OUTCOME_ACCOUNTED = "accounted"
-OUTCOME_SUPPRESSED = "suppressed"
 OUTCOME_SKIPPED = "skipped"
 
 ATTENTION_QUEUED = "queued"
@@ -239,7 +235,6 @@ def observe_scm(
     facts = facts_from_snapshot(snapshot)
     job = store.get_job(job_id)
     parent = _follow_up_parent(store, job_id) if enqueue else None
-    suppress_reason = _suppress_reason(job)
     skip_reason = _skip_reason(job)
     for fact in facts:
         observation = record_host_observation(
@@ -260,7 +255,6 @@ def observe_scm(
             fact,
             parent_task_id=parent.id if parent is not None else None,
             enqueue=enqueue,
-            suppress_reason=suppress_reason,
             skip_reason=skip_reason,
             actor=actor,
         )
@@ -285,8 +279,6 @@ def derive_attention(store: Any, job_id: str) -> str:
     job = store.get_job(job_id)
     if is_terminal_job_status(job.status):
         return ATTENTION_DONE
-    if job.wait_reason == WAIT_USER or job.subgraph_hold in {HOLD_STATE, VETO_STATE}:
-        return ATTENTION_NEEDS_YOU
     latest = _latest_scm_kinds(store, job_id)
     if latest.get("ci_failed") or latest.get("changes_requested") or latest.get("conflicting"):
         return ATTENTION_NEEDS_YOU
@@ -320,17 +312,6 @@ def _latest_scm_kinds(store: Any, job_id: str) -> dict[str, bool]:
     return active
 
 
-def _suppress_reason(job: Any) -> Optional[str]:
-    hold = getattr(job, "subgraph_hold", None)
-    if hold == HOLD_STATE:
-        return "hold"
-    if hold == VETO_STATE:
-        return "veto"
-    if getattr(job, "wait_reason", None) == WAIT_USER:
-        return WAIT_USER
-    return None
-
-
 def _skip_reason(job: Any) -> Optional[str]:
     if is_terminal_job_status(job.status):
         return "job_terminal"
@@ -354,7 +335,6 @@ def _react(
     *,
     parent_task_id: Optional[str],
     enqueue: bool,
-    suppress_reason: Optional[str],
     skip_reason: Optional[str],
     actor: str,
 ) -> dict[str, Any]:
@@ -368,22 +348,6 @@ def _react(
             "outcome": OUTCOME_ACCOUNTED,
             "reason": "deduped",
             "task_id": prior.get("task_id"),
-        }
-    if suppress_reason:
-        _stamp_reaction(
-            store,
-            job_id,
-            fact,
-            outcome=OUTCOME_SUPPRESSED,
-            task_id=None,
-            reason=suppress_reason,
-        )
-        return {
-            "key": fact.key,
-            "kind": fact.kind,
-            "outcome": OUTCOME_SUPPRESSED,
-            "reason": suppress_reason,
-            "task_id": None,
         }
     if skip_reason or not enqueue:
         reason = skip_reason or "no_enqueue"

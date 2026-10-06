@@ -141,11 +141,6 @@ from puppetmaster.cli.commands_gate import (
     _run_should_delegate_command,
     _run_sizing_command,
 )
-from puppetmaster.cli.commands_cell import (
-    _run_cell_inspect_command,
-    _run_cell_status_command,
-    _run_cell_tick_command,
-)
 
 
 
@@ -1826,15 +1821,6 @@ def _main(argv: Optional[list[str]] = None) -> int:
 
     if args.command == "effort-index":
         return _run_effort_index_command(args, store)
-
-    if args.command == "cell-status":
-        return _run_cell_status_command(args, store)
-
-    if args.command == "cell-inspect":
-        return _run_cell_inspect_command(args, store)
-
-    if args.command == "cell-tick":
-        return _run_cell_tick_command(args, store)
 
     if args.command == "gate":
         return _run_gate_command(args, store)

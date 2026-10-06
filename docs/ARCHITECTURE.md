@@ -38,8 +38,6 @@ flowchart TD
 
 The default backend is SQLite with WAL enabled. It stores jobs, tasks, runs, artifacts, memory, and events in the resolved Puppetmaster state directory.
 
-Named cells (v1.22.24) sit **beside** that store as `<state>/cells/<id>.sqlite` files: serial inbox, hibernate flag, and next alarm. They reuse the lease idea from tasks; they do not replace SwarmStore or task claiming.
-
 By default that directory is outside the target repository, under per-user app state:
 
 ```text
@@ -67,10 +65,6 @@ execute** so crash recovery stays idempotent.
 | `interrupt` | Scoped durable cancellation |
 | `respond_input` | Answer a pending gate / question |
 
-Run journals (`puppetmaster.run_journal`) sit beside liveness: a mid-stream
-journal is stamped `aborted` on `host.recovered`. Resume attempts are budgeted
-so auto-revive cannot loop forever.
-
 WorkspaceScope (`puppetmaster.workspace_scope`) freezes the primary store root
 for the engine process. Auth / profile / `--state-dir` changes must not silently
 swap roots mid-process; cross-project attach remains allowed.
@@ -79,7 +73,7 @@ swap roots mid-process; cross-project attach remains allowed.
 
 MCP and CLI are the orchestration **engine**. Marionette, Automaton, and Discord
 OS are **viewports** — they may start and supervise jobs, but they must not own
-command-ledger / run-journal / lease truth that belongs in the store.
+command-ledger / lease truth that belongs in the store.
 
 Research notes: [research/harness.md](research/harness.md),
 [research/acp.md](research/acp.md),

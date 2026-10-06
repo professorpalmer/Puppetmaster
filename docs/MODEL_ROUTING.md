@@ -55,9 +55,7 @@ stamps tags / optional effort per lane. Kill switches:
 `PUPPETMASTER_GENERATION_FILTER=0`, `PUPPETMASTER_PARETO_RECOMMEND=0`.
 
 Routing artifacts explain a selection; structural artifact presence is process
-health evidence, not semantic quality. For provider-neutral paired grading,
-strongest-eligible baselines, uncertainty, bounded non-inferiority claims, and
-opt-in shadow evidence, see [Routing-quality evaluation](routing-quality-evaluation.md).
+health evidence, not semantic quality.
 
 ## Role scorecards (v1.22.8+)
 

@@ -621,8 +621,7 @@ class WorkerRecoveryOwnershipTests(unittest.TestCase):
         store.list_jobs.return_value = [job]
         store.claim_next_task.return_value = None
         daemon = WorkerDaemon(store, roles=["implement"], job_id=job.id)
-        with mock.patch("puppetmaster.cell.interned_poll", return_value=[]):
-            self.assertFalse(daemon.run_once())
+        self.assertFalse(daemon.run_once())
         store.recover_stale_tasks.assert_not_called()
         store.refresh_blocked_tasks.assert_not_called()
 

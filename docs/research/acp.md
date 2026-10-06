@@ -30,12 +30,11 @@ fix 2026-09-09). Useful as a **negative** and hardening checklist.
 | `session/prompt` pending future | Adapter stream + attempt ledger; do not quiet-fake complete |
 | `session/cancel` | Scoped durable cancellation (`store_contracts`) + interrupt command |
 | Steer mailbox | Session command ledger `steer` → follow-up / planner enqueue |
-| Done / aborted stamps | Run journal terminal kinds + `host.recovered` |
-| Stall watchdog | `liveness.reap_stalled_jobs` + journal resume budget |
+| Stall watchdog | `liveness.reap_stalled_jobs` |
 
 Puppetmaster MCP/CLI remains the **engine**. Marionette / Automaton / Discord
 OS are **viewports** — they must not own orchestration truth that the store /
-command ledger / run journal already hold.
+command ledger already hold.
 
 ## Explicitly skipped
 

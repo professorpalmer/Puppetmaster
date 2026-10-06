@@ -27,7 +27,6 @@ import re
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
-from math import isfinite
 from pathlib import Path
 from typing import Iterable, Mapping, Optional
 
@@ -526,96 +525,7 @@ def _validated_explicit_token_estimate(value: object, *, field_name: str) -> int
     return value
 
 
-@dataclass(frozen=True)
-class TokenEstimateCalibration:
-    """Explicit, immutable estimate correction derived from measured usage."""
-
-    adapter: str
-    model_id: str
-    canonical_role: str
-    source: str
-    sample_count: int
-    multiplier: float
-
-    def to_artifact_payload(self) -> dict:
-        return {
-            "adapter": self.adapter,
-            "model_id": self.model_id,
-            "canonical_role": self.canonical_role,
-            "source": self.source,
-            "sample_count": self.sample_count,
-            "multiplier": self.multiplier,
-        }
-
-
-def calibration_from_measurements(
-    measurements: Iterable[Mapping[str, object]],
-    *,
-    adapter: str,
-    model_id: str,
-    role: str,
-    source: str,
-) -> TokenEstimateCalibration:
-    """Build a read-only calibration value from attributable measurements.
-
-    The multiplier is the aggregate measured-input / aggregate estimated-input
-    ratio.  Aggregate weighting avoids a tiny request influencing the result as
-    much as a large request.  Approximate records explicitly marked
-    ``actual_tokens_measured=False`` are excluded; invalid rows are ignored and
-    an all-invalid input fails instead of inventing a neutral multiplier.
-
-    This function only returns data.  It never writes routing overrides or
-    mutates model scores/policy, so applying measured history remains an
-    explicit choice at the call site.
-    """
-    adapter_text = str(adapter or "").strip()
-    model_text = str(model_id or "").strip()
-    source_text = str(source or "").strip()
-    if not adapter_text or not model_text or not source_text:
-        raise ValueError("calibration adapter, model_id, and source are required")
-
-    estimated_total = 0
-    actual_total = 0
-    sample_count = 0
-    for row in measurements:
-        if not isinstance(row, Mapping):
-            continue
-        if row.get("actual_tokens_measured") is False:
-            continue
-        estimated = row.get("estimated_tokens_in")
-        actual = row.get("actual_tokens_in")
-        if (
-            isinstance(estimated, bool)
-            or not isinstance(estimated, (int, float))
-            or isinstance(actual, bool)
-            or not isinstance(actual, (int, float))
-            or not isfinite(float(estimated))
-            or not isfinite(float(actual))
-            or estimated <= 0
-            or actual <= 0
-        ):
-            continue
-        estimated_total += int(estimated)
-        actual_total += int(actual)
-        sample_count += 1
-    if sample_count == 0 or estimated_total <= 0:
-        raise ValueError("calibration requires at least one measured token sample")
-
-    return TokenEstimateCalibration(
-        adapter=adapter_text,
-        model_id=model_text,
-        canonical_role=normalize_routing_role(role),
-        source=source_text,
-        sample_count=sample_count,
-        multiplier=actual_total / estimated_total,
-    )
-
-
-def estimate_tokens_in(
-    task: TaskSignals,
-    *,
-    calibration: Optional[TokenEstimateCalibration] = None,
-) -> int:
+def estimate_tokens_in(task: TaskSignals) -> int:
     if task.estimated_tokens_in is not None:
         base = _validated_explicit_token_estimate(
             task.estimated_tokens_in,
@@ -629,8 +539,6 @@ def estimate_tokens_in(
     if isinstance(enrichment, bool) or not isinstance(enrichment, int):
         enrichment = 0
     estimate = max(0, int(base)) + max(0, enrichment)
-    if calibration is not None:
-        estimate = int(round(estimate * calibration.multiplier))
     return max(0, estimate)
 
 
@@ -683,7 +591,6 @@ class RoutingDecision:
     sample_count: Optional[int] = None
     predicted_quality: Optional[float] = None
     predicted_latency_p50_ms: Optional[float] = None
-    token_estimate_calibration: Optional[TokenEstimateCalibration] = None
     # Optional counterfactual evidence. This is deliberately metadata on the
     # already-computed production decision; it never supplies dispatch fields.
     shadow_routing: Optional[dict] = None
@@ -735,10 +642,6 @@ class RoutingDecision:
             payload["predicted_quality"] = self.predicted_quality
         if self.predicted_latency_p50_ms is not None:
             payload["predicted_latency_p50_ms"] = self.predicted_latency_p50_ms
-        if self.token_estimate_calibration is not None:
-            payload["token_estimate_calibration"] = (
-                self.token_estimate_calibration.to_artifact_payload()
-            )
         if self.shadow_routing is not None:
             payload["shadow_routing"] = dict(self.shadow_routing)
         return payload
@@ -762,7 +665,6 @@ def _route_task_once(
     registry: Iterable[ModelSpec],
     *,
     policy: Optional[str] = None,
-    calibration: Optional[TokenEstimateCalibration] = None,
     local_receipts: Optional[Iterable] = None,
     generation_presence: Optional[Iterable[ModelSpec]] = None,
     community_observations: Optional[Iterable] = None,
@@ -801,23 +703,6 @@ def _route_task_once(
     base_tokens_in = estimate_tokens_in(task)
     tokens_out = estimate_tokens_out(task)
     need = classify_capability_needed(task)
-
-    def _candidate_calibration(
-        spec: ModelSpec,
-    ) -> Optional[TokenEstimateCalibration]:
-        if calibration is None:
-            return None
-        if calibration.canonical_role != canonical_role:
-            return None
-        if calibration.adapter != spec.adapter or calibration.model_id != spec.id:
-            return None
-        return calibration
-
-    def _tokens_in_for(spec: ModelSpec) -> int:
-        scoped = _candidate_calibration(spec)
-        if scoped is None:
-            return base_tokens_in
-        return estimate_tokens_in(task, calibration=scoped)
 
     # Auto-add vision tags when the instruction needs vision. The user
     # can still pin explicit tags via TaskSignals.required_tags; we
@@ -948,7 +833,7 @@ def _route_task_once(
     # attractive but impossible model can never win.
     after_context: list[ModelSpec] = []
     for spec in after_tags:
-        candidate_tokens_in = _tokens_in_for(spec)
+        candidate_tokens_in = base_tokens_in
         required_context = candidate_tokens_in + tokens_out
         window = spec.context_window
         if window > 0 and required_context > window:
@@ -975,7 +860,7 @@ def _route_task_once(
     # ranking below.
     after_cost: list[ModelSpec] = []
     for spec in after_context:
-        est = spec.marginal_cost_usd(_tokens_in_for(spec), tokens_out)
+        est = spec.marginal_cost_usd(base_tokens_in, tokens_out)
         if (
             task.explicit_max_cost_usd is not None
             and est > task.explicit_max_cost_usd
@@ -1103,7 +988,7 @@ def _route_task_once(
         )
 
     _baseline_model = max(after_cost, key=_cap)
-    _baseline_tokens_in = _tokens_in_for(_baseline_model)
+    _baseline_tokens_in = base_tokens_in
     _baseline_cost = _baseline_model.marginal_cost_usd(
         _baseline_tokens_in, tokens_out
     )
@@ -1121,7 +1006,7 @@ def _route_task_once(
         return 0 if spec.is_plan_billed else 1
 
     def _routing_cost(spec: ModelSpec) -> float:
-        return spec.routing_cost_usd(_tokens_in_for(spec), tokens_out)
+        return spec.routing_cost_usd(base_tokens_in, tokens_out)
 
     sufficient = [s for s in after_cost if _sufficient(s)]
     if task.strict_capability and not sufficient:
@@ -1188,11 +1073,10 @@ def _route_task_once(
             else:
                 rejected.append((spec, f"community gate selected {pick.id}"))
         return _decision(
-            pick, policy, need, _tokens_in_for(pick), tokens_out, reason, rejected,
+            pick, policy, need, base_tokens_in, tokens_out, reason, rejected,
             _baseline_cost, _baseline_id, _baseline_nominal,
             allowed_model_ids=_allowed_for_artifact,
             role=task.role,
-            calibration=_candidate_calibration(pick),
             local_receipts=receipts,
             candidates=after_cost,
             order_source=SCORE_SOURCE_COMMUNITY_OBSERVATION,
@@ -1215,12 +1099,11 @@ def _route_task_once(
                 if spec.id != pick.id:
                     rejected.append((spec, f"not preferred (soft); kept {pick.id}"))
             return _decision(
-                pick, policy, need, _tokens_in_for(pick), tokens_out, reason, rejected,
+                pick, policy, need, base_tokens_in, tokens_out, reason, rejected,
                 _baseline_cost, _baseline_id, _baseline_nominal,
                 allowed_model_ids=_allowed_for_artifact,
                 role=task.role,
-                calibration=_candidate_calibration(pick),
-                local_receipts=receipts,
+                    local_receipts=receipts,
                 candidates=after_cost,
                 order_source=SCORE_SOURCE_PREFERENCE,
             )
@@ -1252,12 +1135,11 @@ def _route_task_once(
                         (spec, f"cache affinity kept sibling {pick.id}")
                     )
             return _decision(
-                pick, policy, need, _tokens_in_for(pick), tokens_out, reason, rejected,
+                pick, policy, need, base_tokens_in, tokens_out, reason, rejected,
                 _baseline_cost, _baseline_id, _baseline_nominal,
                 allowed_model_ids=_allowed_for_artifact,
                 role=task.role,
-                calibration=_candidate_calibration(pick),
-                local_receipts=receipts,
+                    local_receipts=receipts,
                 candidates=after_cost,
             )
 
@@ -1309,11 +1191,10 @@ def _route_task_once(
                 if spec.id != pick.id:
                     rejected.append((spec, f"lower capability_score {_cap(spec)}"))
         return _decision(
-            pick, policy, need, _tokens_in_for(pick), tokens_out, reason, rejected,
+            pick, policy, need, base_tokens_in, tokens_out, reason, rejected,
             _baseline_cost, _baseline_id, _baseline_nominal,
             allowed_model_ids=_allowed_for_artifact,
             role=task.role,
-            calibration=_candidate_calibration(pick),
             local_receipts=receipts,
             candidates=after_cost,
         )
@@ -1342,11 +1223,10 @@ def _route_task_once(
             if spec.id != pick.id:
                 rejected.append((spec, f"absolute-cheapest alternative {pick.id} chosen"))
         return _decision(
-            pick, policy, need, _tokens_in_for(pick), tokens_out, reason, rejected,
+            pick, policy, need, base_tokens_in, tokens_out, reason, rejected,
             _baseline_cost, _baseline_id, _baseline_nominal,
             allowed_model_ids=_allowed_for_artifact,
             role=task.role,
-            calibration=_candidate_calibration(pick),
             local_receipts=receipts,
             candidates=after_cost,
         )
@@ -1363,11 +1243,10 @@ def _route_task_once(
             if spec.id != pick.id:
                 rejected.append((spec, f"higher-capability {pick.id} chosen"))
         return _decision(
-            pick, policy, need, _tokens_in_for(pick), tokens_out, reason, rejected,
+            pick, policy, need, base_tokens_in, tokens_out, reason, rejected,
             _baseline_cost, _baseline_id, _baseline_nominal,
             allowed_model_ids=_allowed_for_artifact,
             role=task.role,
-            calibration=_candidate_calibration(pick),
             local_receipts=receipts,
             candidates=after_cost,
         )
@@ -1412,11 +1291,10 @@ def _route_task_once(
             if spec.id != pick.id:
                 rejected.append((spec, "escalation candidate"))
         return _decision(
-            pick, policy, need, _tokens_in_for(pick), tokens_out, reason, rejected,
+            pick, policy, need, base_tokens_in, tokens_out, reason, rejected,
             _baseline_cost, _baseline_id, _baseline_nominal,
             allowed_model_ids=_allowed_for_artifact,
             role=task.role,
-            calibration=_candidate_calibration(pick),
             local_receipts=receipts,
             candidates=after_cost,
         )
@@ -1494,11 +1372,10 @@ def _route_task_once(
                     (spec, f"lower capability_score {_cap(spec)}")
                 )
     return _decision(
-        pick, policy, need, _tokens_in_for(pick), tokens_out, reason, rejected,
+        pick, policy, need, base_tokens_in, tokens_out, reason, rejected,
         _baseline_cost, _baseline_id, _baseline_nominal,
         allowed_model_ids=_allowed_for_artifact,
         role=task.role,
-        calibration=_candidate_calibration(pick),
         local_receipts=receipts,
         candidates=after_cost,
     )
@@ -1509,7 +1386,6 @@ def route_task(
     registry: Iterable[ModelSpec],
     *,
     policy: Optional[str] = None,
-    calibration: Optional[TokenEstimateCalibration] = None,
     shadow_policy: Optional[str] = None,
     local_receipts: Optional[Iterable] = None,
     generation_presence: Optional[Iterable[ModelSpec]] = None,
@@ -1538,7 +1414,6 @@ def route_task(
         task,
         models,
         policy=policy,
-        calibration=calibration,
         local_receipts=local_receipts,
         generation_presence=generation_presence,
         community_observations=community_observations,
@@ -1557,7 +1432,6 @@ def route_task(
         task,
         models,
         policy=shadow_policy,
-        calibration=calibration,
         local_receipts=local_receipts,
         generation_presence=generation_presence,
         community_observations=community_observations,
@@ -1634,7 +1508,6 @@ def _decision(
     baseline_nominal_cost_usd: float = 0.0,
     allowed_model_ids: Optional[list[str]] = None,
     role: str = "",
-    calibration: Optional[TokenEstimateCalibration] = None,
     local_receipts: Optional[Iterable] = None,
     candidates: Optional[Iterable[ModelSpec]] = None,
     order_source: Optional[str] = None,
@@ -1668,7 +1541,6 @@ def _decision(
         role=role,
         canonical_role=canonical_role,
         taxonomy_version=taxonomy["taxonomy_version"],
-        token_estimate_calibration=calibration,
         **score_fields,
     )
 
