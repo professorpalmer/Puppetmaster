@@ -315,3 +315,29 @@ class Issue136Tests(unittest.TestCase):
                 run=lambda cmd: (0, 'x' * 8192 + 'Logged in using ChatGPT SECRET', ''))
             self.assertEqual(result.billing, 'unknown')
             self.assertNotIn('SECRET', str(result))
+
+
+class CodexLoginStatusTests(unittest.TestCase):
+    """Only Codex saying so means logged out; a failed check is unverified."""
+
+    def status(self, result):
+        # A custom command owns its credential context, so only the probe decides.
+        return detect_codex_billing(codex_command="codex-test", run=lambda _: result)
+
+    def test_failed_timed_out_or_unrecognized_checks_are_unverified(self):
+        for result, cause in (((1, "", "boom"), "exit 1"), ((124, "", "timed out"), "timed out"),
+                              ((0, "status: ok", ""), "unrecognized output")):
+            with self.subTest(cause=cause):
+                status = self.status(result)
+                self.assertFalse(status.healthy)
+                self.assertIn("codex_login:unverified", status.evidence)
+                self.assertIn(f"codex_login_status:{cause}", status.evidence)
+                self.assertNotIn("not logged in", status.detail)
+
+    def test_explicit_logout_and_login_are_unchanged(self):
+        logged_out = self.status((1, "Not logged in", ""))
+        self.assertIn("codex_login:none", logged_out.evidence)
+        self.assertFalse(logged_out.healthy)
+        plan = self.status((0, "Logged in using ChatGPT", ""))
+        self.assertTrue(plan.healthy)
+        self.assertEqual(plan.billing, "plan")

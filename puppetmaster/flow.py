@@ -410,10 +410,15 @@ class NodeOutcome:
     usage: dict[str, Any] = field(default_factory=dict)
     task_id: Optional[str] = None
     items: Optional[dict] = None
+    # Durable worker logs that explain a failed launch (startup tracebacks).
+    logs: list[str] = field(default_factory=list)
 
     def brief(self) -> dict:
-        return {"ok": self.ok, "verdict": self.verdict, "reason": self.reason,
-                "error": self.error, "files": self.files, "task_id": self.task_id}
+        brief = {"ok": self.ok, "verdict": self.verdict, "reason": self.reason,
+                 "error": self.error, "files": self.files, "task_id": self.task_id}
+        if self.logs:
+            brief["logs"] = self.logs
+        return brief
 
 
 def edge_matches(when: str, outcome: NodeOutcome, state: dict) -> bool:
@@ -903,6 +908,8 @@ def _walk(state_dir: Path, run: FlowRun, execute: NodeExecutor) -> FlowRun:
                      "usage": outcome.usage, "preview": (outcome.output or "")[:300]})
         if outcome.items is not None:
             step["items"] = _item_counts(outcome.items)
+        if outcome.logs:
+            step["logs"] = outcome.logs
         run.steps.append(step)
         _add_usage(run.usage, outcome.usage)
         run.outputs[node["id"]] = (outcome.output or "")[-_OUTPUT_CHARS:]
@@ -1261,6 +1268,15 @@ def _item_counts(items: dict) -> dict:
 # Node execution on Puppetmaster jobs
 
 
+def _startup_logs(store, job_id: str, role: str) -> list[str]:
+    """The durable startup-failure logs a worker of ``role`` left for this job."""
+    try:
+        task_dir = store.job_dir(job_id) / "tasks"
+        return sorted(str(path) for path in task_dir.glob(f"startup_error-worker-{role}-*.log"))
+    except OSError:
+        return []
+
+
 class JobNodeExecutor:
     """Run agent, judge, parallel and map nodes as Puppetmaster jobs; shell locally.
 
@@ -1324,10 +1340,12 @@ class JobNodeExecutor:
                     outcome = NodeOutcome(ok=False, error=error or "job was not created")
                 else:
                     outcome = task_outcome(store, job_id, spec.role)
-                    if error and not outcome.ok and (not outcome.error or outcome.task_id is None):
-                        # A launch that raised before creating the task is the
-                        # cause; "no task for <role>" only hid it.
-                        outcome.error = error
+                    if error and not outcome.ok:
+                        # The launch error is the cause; the task's own state
+                        # ("no task for <role>", "task queued") only hid it.
+                        state = outcome.error
+                        outcome.error = error if not state or state == error else f"{error} [task: {state}]"
+                        outcome.logs = _startup_logs(store, job_id, spec.role)
                     if outcome.task_id:
                         run.sessions[key] = {"job_id": job_id, "task_id": outcome.task_id,
                                              "adapter": spec.adapter, "run_id": run.run_id,
@@ -1351,7 +1369,8 @@ class JobNodeExecutor:
             return NodeOutcome(ok=bool(branch.get("ok")), output=branch.get("output") or "",
                                verdict=branch.get("verdict"), reason=branch.get("reason") or "",
                                error=branch.get("error"), files=branch.get("files") or [],
-                               job_ids=jobs, usage=branch.get("usage") or {}, task_id=branch.get("task_id"))
+                               job_ids=jobs, usage=branch.get("usage") or {}, task_id=branch.get("task_id"),
+                               logs=branch.get("logs") or [])
         branches = [done[key] for key, _ in members]
         oks = [bool(branch.get("ok")) for branch in branches]
         transport = any(not branch.get("ok") and branch.get("verdict") is None for branch in branches)
@@ -1505,7 +1524,10 @@ class JobNodeExecutor:
             try:
                 orchestrator.adopt(job_id, lease_seconds=lease, worker_mode=self.worker_mode, specs=specs)
             except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"
+                adopt_error = f"{type(exc).__name__}: {exc}"
+                # Keep the launch's own error first: adoption failing too must
+                # not replace the cause the launch already reported.
+                error = adopt_error if error is None else f"{error}; then adopting the job: {adopt_error}"
         return job_id, error, store
 
     @staticmethod

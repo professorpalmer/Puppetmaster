@@ -1,3 +1,24 @@
+## Unreleased
+
+Three fixes from Codex's live findings:
+
+- **Flows keep a failed launch's cause.** When a worker died at startup, the
+  node reported the task's state ("task queued") or the error from adopting
+  the half-started job, and dropped the launch error. The step now reports the
+  launch error first, then the task state and any adoption error, and lists the
+  worker's durable startup logs (`startup_error-worker-<role>-*.log`) in
+  `logs`. A successful flow is unchanged.
+- **A failed Codex login check is not a logout.** `codex login status` exiting
+  non-zero, timing out, or printing output Puppetmaster does not recognize now
+  reads as unverified (`codex_login:unverified` plus the cause), not "not
+  logged in". It still is not dispatchable; only Codex saying so is a logout.
+- **A Codex timeout keeps its thread.** The timeout receipt now records
+  `thread_id` and `ephemeral`, so a follow-up can resume a persisted thread that
+  timed out instead of starting fresh. The id is recorded only when the stream
+  shows exactly one `thread.started` id (and, on a resumed run, the one
+  resumed); the resolver still checks the session is on disk. The timeout stays
+  a failure.
+
 ## v1.32.2 — 2026-10-06
 
 **Receipts stay immutable under repeats and races.**

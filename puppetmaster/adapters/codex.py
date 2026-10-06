@@ -372,6 +372,9 @@ class CodexAdapter(CliWorkerAdapter):
         if completed.timed_out:
             stdout = completed.stdout
             stderr = completed.stderr
+            # A persisted thread survives the timeout; record it so a follow-up
+            # can resume it. The resolver still checks the session is on disk.
+            timeout_thread_id = observed_thread_id(events, resume_record if resumed else None)
             stdout_capture = capture_subprocess_stdout(
                 text=stdout,
                 task=task,
@@ -396,6 +399,8 @@ class CodexAdapter(CliWorkerAdapter):
                         "failure": "timeout",
                         "returncode": None,
                         **resume_fields,
+                        "ephemeral": ephemeral,
+                        "thread_id": timeout_thread_id,
                         "model": model,
                         "sandbox": sandbox,
                         "approval_policy": approval_policy,
@@ -460,10 +465,7 @@ class CodexAdapter(CliWorkerAdapter):
             ),
             "",
         )
-        thread_id = next(
-            (ev.get("thread_id") for ev in events if ev.get("type") == "thread.started"),
-            None,
-        )
+        thread_id = observed_thread_id(events, resume_record if resumed else None)
 
         stdout_capture = capture_subprocess_stdout(
             text=completed.stdout,
@@ -606,6 +608,23 @@ class CodexAdapter(CliWorkerAdapter):
 # The stdin prompt positional. ``--`` ends option parsing first: ``--image``
 # is variadic and would otherwise take the bare ``-`` as another image path.
 STDIN_PROMPT = ("--", "-")
+
+
+def observed_thread_id(events: list[dict], resume: object = None) -> Optional[str]:
+    """The one thread this run started, or None when missing or ambiguous.
+
+    Several distinct ``thread.started`` ids, or a resumed run reporting a thread
+    other than the one it resumed, record nothing rather than a guess.
+    """
+    ids = {str(ev["thread_id"]) for ev in events
+           if ev.get("type") == "thread.started" and ev.get("thread_id")}
+    if len(ids) != 1:
+        return None
+    thread_id = ids.pop()
+    expected = resume.get("session_id") if isinstance(resume, dict) else None
+    if expected and str(expected) != thread_id:
+        return None
+    return thread_id
 
 
 def build_codex_exec_command(

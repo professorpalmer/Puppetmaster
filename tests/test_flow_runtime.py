@@ -583,6 +583,37 @@ class JobIntegrationTests(Base):
         self.assertIn("not safe in a shell command", run.steps[-1]["error"])
 
 
+class LaunchErrorTests(Base):
+    """A worker that dies at startup is reported with its cause and its log."""
+
+    def test_a_startup_failure_keeps_the_launch_error_task_state_and_log(self):
+        from puppetmaster.orchestrator import Orchestrator
+        from puppetmaster.store_factory import create_store
+
+        def failing_run(orch, goal, *, specs, on_job_created=None, **kwargs):
+            store = create_store("sqlite", self.state)
+            job = store.create_job(goal)
+            if on_job_created:
+                on_job_created(job)
+            for spec in specs:
+                store.save_task(Task(job_id=job.id, role=spec.role, instruction=spec.instruction,
+                                     adapter=spec.adapter, payload=spec.payload))
+            log = store.job_dir(job.id) / "tasks" / f"startup_error-worker-{specs[0].role}-4242.log"
+            log.parent.mkdir(parents=True, exist_ok=True)
+            log.write_text("ReadUnavailable: unable to open database: reader timed out", encoding="utf-8")
+            raise RuntimeError(f"worker {specs[0].role!r} failed with exit code 1")
+
+        g = graph([agent("build")])
+        with patch.object(Orchestrator, "run", failing_run):
+            run = self.start(g, JobNodeExecutor(self.state, worker_mode="inline", poll_seconds=0.05))
+        self.assertEqual(run.status, "failed")
+        step = run.steps[0]
+        self.assertIn("RuntimeError: worker 'build' failed with exit code 1", step["error"])
+        self.assertIn("[task:", step["error"])
+        self.assertEqual(len(step["logs"]), 1)
+        self.assertIn("reader timed out", Path(step["logs"][0]).read_text())
+
+
 class ProcessFactoryTests(Base):
     """A host-supplied popen binds every shell and walker process it creates."""
 
