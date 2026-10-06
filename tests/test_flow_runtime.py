@@ -635,7 +635,10 @@ class ProcessFactoryTests(Base):
 
         def popen(args, **kwargs):
             calls.append(args)
-            return subprocess.Popen([sys.executable, "-c", "pass"], **kwargs)
+            process = subprocess.Popen([sys.executable, "-c", "pass"], **kwargs)
+            # Windows cannot delete walker.log while the child holds it open.
+            self.addCleanup(process.wait)
+            return process
         run = flow.new_run(self.state, graph([agent("a")]), cwd=str(self.work))
         JobNodeExecutor(self.state, popen=popen).spawn(self.state, run.run_id)
         self.assertEqual(calls[0][-3:], ["flow", "resume", run.run_id])

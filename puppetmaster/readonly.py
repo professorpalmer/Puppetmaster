@@ -497,8 +497,11 @@ class ReadConnection:
                     # closed its failed session. Do not fork a startup herd.
                     if not getattr(exc, 'session_closed', False):
                         raise
+                    # Windows joins a live WAL's committed snapshot on the
+                    # retry (POSIX decides inside the helper): attach and
+                    # observer reads alike, so neither waits on a writer.
                     wal_snapshot = (wal_snapshot or
-                        attach_binding and os.name == 'nt' and
+                        not launch_binding and os.name == 'nt' and
                         getattr(exc, 'wal_snapshot', False))
                     self._release_permit()
                     time.sleep(min(.01 if write_race else .05, remaining))

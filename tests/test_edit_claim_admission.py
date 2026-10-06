@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import sqlite3
+from contextlib import closing
 import tempfile
 import time
 import unittest
@@ -39,7 +40,7 @@ def _claim_paths(db: Path, root: Path) -> list[str]:
     """Live claim paths for ``root``, read straight from the claims table."""
     registry = FileClaimRegistry(db)
     identity = registry.repository_identity(root)[0]
-    with sqlite3.connect(str(db)) as connection:
+    with closing(sqlite3.connect(str(db))) as connection:
         rows = connection.execute(
             "SELECT path FROM file_claims WHERE repo_identity=? ORDER BY path",
             (identity,),
