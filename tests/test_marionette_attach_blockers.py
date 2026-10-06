@@ -2,7 +2,6 @@ from contextlib import closing
 """Marionette attach-proof shape and historical scope authority regressions."""
 import hashlib
 import json
-import os
 import shutil
 import sqlite3
 import sys
@@ -248,7 +247,7 @@ class MarionetteBlockerTests(unittest.TestCase):
             create_store('sqlite', store.root, mode='attach')
             self.assertEqual(fingerprint(store.root), before)
 
-    def test_live_wal_unavailable_then_checkpointed_commits_preserve_source(self):
+    def test_live_wal_joins_then_checkpointed_commits_preserve_source(self):
         from contextlib import closing
         for store, job in self.stores():
             path = store.root / ('state.sqlite3' if store.backend_name == 'sqlite' else 'metadata.sqlite3')
@@ -267,24 +266,28 @@ class MarionetteBlockerTests(unittest.TestCase):
                 writer.execute(f"INSERT INTO {table} VALUES('uncommitted',?)", ('x' * 1000000,))
                 self.assertGreater(Path(str(path) + '-wal').stat().st_size, committed_wal_size)
                 before = locked_fingerprint(store.root)
-                from puppetmaster.readonly import connect, ReadUnavailable
-                # This fixture never releases its writer during attach. Exercise
-                # real rejection with a short budget; virtual-clock tests cover
-                # exhaustion of the full production deadline.
+                from puppetmaster.readonly import connect
+                # This fixture never releases its writer. Attach and ordinary
+                # observer reads both join its committed WAL snapshot instead
+                # of waiting for a checkpoint; the uncommitted row stays
+                # invisible and writers keep the source to themselves.
                 with patch.object(SQLiteSwarmStore, 'busy_timeout_ms', 100):
-                    if os.name == 'nt' or store.backend_name == 'sqlite':
-                        # Worker attach joins the live WAL (Windows: on both
-                        # backends); the uncommitted row stays invisible.
-                        attached = create_store(store.backend_name, store.root, mode='attach')
+                    attached = create_store(store.backend_name, store.root, mode='attach')
+                    if store.backend_name == 'sqlite':
                         self.assertEqual(attached._incarnation, store._incarnation)
                     else:
-                        with self.assertRaises(ReadUnavailable):
-                            create_store(store.backend_name, store.root, mode='attach')
-                page = store.list_job_summaries()
-                self.assertEqual(page.outcome, 'unavailable')
-                self.assertEqual(page.retry_after_ms, 100)
-                self.assertFalse(page.items)
-                self.assertEqual(locked_fingerprint(store.root), before)
+                        self.assertEqual(attached.incarnation, store.incarnation)
+                    page = store.list_job_summaries()
+                self.assertEqual(page.outcome, 'complete')
+                self.assertEqual([item.id for item in page.items], [job.id])
+                # A WAL reader records read marks in the -shm index. Database
+                # content -- the main file and the WAL -- stays byte-identical,
+                # and no file is created, repaired, or removed.
+                current = locked_fingerprint(store.root)
+                self.assertEqual(set(current), set(before))
+                content = [name for name in before if not name.endswith('-shm')]
+                self.assertEqual({name: current[name] for name in content},
+                                 {name: before[name] for name in content})
                 writer.rollback()
             # After the writer closes and checkpoints, only committed facts are
             # readable. No full-store snapshot or sidecars are created.

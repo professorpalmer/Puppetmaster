@@ -136,17 +136,16 @@ class HelperInvalidationTests(unittest.TestCase):
                     pass
                 self.transport = self.reader._readonly_transport
 
-    def test_live_and_missing_wal_remain_unavailable(self):
+    def test_live_wal_is_read_and_missing_wal_stays_unavailable(self):
         with closing(sqlite3.connect(self.store.db_path)) as writer:
             writer.execute("INSERT INTO jobs(id,data) VALUES('wal_job','{}')")
             writer.commit()
-            for missing in (False, True):
-                with self.subTest(missing=missing):
-                    from contextlib import nullcontext
-                    damage = damaged_sidecars(writer, self.store.db_path) if missing else nullcontext()
-                    with damage:
-                        with self.assertRaises(readonly.ReadUnavailable):
-                            state.state_owns_job(self.store.root, 'wal_job', _reader=self.reader)
+            # A complete live WAL is read through its committed snapshot; a
+            # cohort missing a sidecar stays unavailable and is never rebuilt.
+            self.assertTrue(state.state_owns_job(self.store.root, 'wal_job', _reader=self.reader))
+            with damaged_sidecars(writer, self.store.db_path):
+                with self.assertRaises(readonly.ReadUnavailable):
+                    state.state_owns_job(self.store.root, 'wal_job', _reader=self.reader)
         self.assertTrue(state.state_owns_job(self.store.root, 'wal_job', _reader=self.reader))
 
 
