@@ -14912,23 +14912,20 @@ class InstallRulesTests(unittest.TestCase):
         self.assertTrue(block.startswith(BEGIN_MARKER))
         self.assertTrue(block.rstrip().endswith(END_MARKER))
         self.assertIn("# Puppetmaster orchestration", block)
-        self.assertIn("Delegate-first gate", block)
+        self.assertIn("Solo first; fan out when it pays", block)
 
-    def test_rules_mandate_codegraph_first_exploration(self):
-        """The managed rules must push CodeGraph as hard as delegation:
-        graph every directory touched, explore the graph not the tree, and
-        use partial graphs + narrow native search for unsupported languages
-        instead of re-crawling covered code."""
+    def test_rules_use_codegraph_for_unfamiliar_code_not_as_a_ritual(self):
+        """CodeGraph replaces crawling unfamiliar code; on a small repo or files
+        the pilot already knows it is only latency."""
         from puppetmaster.rules import RULE_BODY, render_cursor_mdc
 
         for content in (RULE_BODY, render_cursor_mdc()):
             flattened = " ".join(content.split())
-            self.assertIn("CodeGraph-first exploration (must obey)", flattened)
-            self.assertIn("graph every directory you interact with", flattened)
+            self.assertIn("CodeGraph for unfamiliar code", flattened)
             self.assertIn("puppetmaster_codegraph_init", flattened)
             self.assertIn("puppetmaster_codegraph_status", flattened)
-            self.assertIn("Partial coverage is still coverage", flattened)
-            self.assertIn("never re-crawl directories the graph already covers", flattened)
+            self.assertIn("ask the graph instead of crawling the tree", flattened)
+            self.assertIn("Skip it for a small repository", flattened)
 
     def test_rules_exempt_puppetmaster_workers_from_delegation(self):
         """A Puppetmaster worker runs as a plain agent CLI with no
@@ -14950,8 +14947,8 @@ class InstallRulesTests(unittest.TestCase):
             self.assertIn("no `puppetmaster_*` MCP tools", flattened)
             self.assertLess(
                 flattened.index("Are you a Puppetmaster worker?"),
-                flattened.index("Delegate-first gate"),
-                msg="the worker exemption must precede the delegate-first gate",
+                flattened.index("Solo first; fan out when it pays"),
+                msg="the worker exemption must precede the delegation guidance",
             )
 
     def test_hand_maintained_rules_exempt_puppetmaster_workers(self):

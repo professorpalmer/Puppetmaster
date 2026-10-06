@@ -96,7 +96,7 @@ class WorkerFenceTests(unittest.TestCase):
             self.assertIn("PUPPETMASTER_WORKER", flattened)
             self.assertLess(
                 flattened.index("PUPPETMASTER_WORKER"),
-                flattened.index("Delegate-first gate"),
+                flattened.index("Solo first; fan out when it pays"),
             )
 
     def test_hand_maintained_rules_name_the_env_flag(self) -> None:
