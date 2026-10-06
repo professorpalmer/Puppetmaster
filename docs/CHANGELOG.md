@@ -1,3 +1,63 @@
+## v1.31.0 — 2026-10-05
+
+**Fan-out cost parity: Codex workers no longer pay ~12k tokens of user context
+each, pilots read less, flows never report a pass that built nothing, and a
+sizing gate decides when to fan out at all.**
+
+Measured on an 8-module fan-out probe (Codex gpt-6.1-sol high, the same model
+and effort for every lane, every output passing its checks), interleaved with
+native subagent runs: Puppetmaster 92.3 s and 92.7 s against native 105.7 s
+and 100.1 s, with estimated input cost (fresh plus 0.1x cached) 17-31% below
+native's. Two reps on a small synthetic fan-out; it is a direction, not a
+benchmark result.
+
+- **Lean CODEX_HOME for Codex workers.** Each fresh `codex exec` sends, on
+  its first call, a developer/environment block built from CODEX_HOME (the
+  skills list, memories, plugin recommendations, multi-agent instructions)
+  whose per-turn metadata differs per process, so it is never a prompt-cache
+  hit: about 12.4k fresh input tokens per worker, against about 3.3k for a
+  native subagent that forks an already-cached parent thread. Workers now run
+  in `~/.puppetmaster/codex-worker-home` (the user's config minus MCP
+  servers, plugins, marketplaces, memories, hooks and notify; model, service
+  tier, providers, profiles and projects kept; global AGENTS.md kept;
+  memories and multi_agent disabled): about 2.6k fresh on the first call.
+  `auth.json` is copied, never symlinked, and a worker-refreshed login is
+  copied back only if the user's own file is unchanged. Resumed threads run
+  in the home that holds them. `PUPPETMASTER_CODEX_LEAN_HOME=0` opts out. In
+  the probe, total worker fresh input fell from 89-112k to 45-67k.
+- **Sizing gate** (`puppetmaster/sizing.py`, `puppetmaster sizing`): from a
+  plan (units with status, `[parallel]` marking independent ones) and measured
+  progress, decide `stay_solo`, `handoff` (solo is projected to overrun its
+  horizon in time or context, and handing the remaining independent units to
+  a flow map finishes sooner) or `delegate_upfront` (mass independent work).
+  Calibration is a per-model policy file; every field is validated, and an
+  unmeasured or invalid one stays at its labeled provisional value, with
+  per-field provenance. The provisional upfront bar (16 independent units)
+  follows the sealed voxel study's first consistent quality crossover, not a
+  measured Puppetmaster result.
+- **Flows: a failed node never ends in a pass.** A node that failed (a gate,
+  a rejected pin) carried by an unconditional edge to an implicit end
+  reported the run done/pass, so the pilot was woken with nothing built. The
+  run now fails with the failing nodes named; an explicit end status still
+  wins. A launch that raised before creating its task (an unregistered model
+  pin) now surfaces its real error instead of "no task for <role>".
+- **`puppetmaster_flow` documents itself.** The graph parameter carries the
+  node shapes, the required adapter, templates and a validated fan-out
+  example; a pilot in the probe had read flow.py source to learn the format.
+- **Pilot diet.** MCP `puppetmaster_doctor` replies with counts and only the
+  checks that are not ok (6.0 KB to about 2 KB), and
+  `puppetmaster_route_task` with the pick, price and reason (7.3 KB to
+  458 bytes); `compact: false` returns the full reply.
+- **Honest delivery.** A write-capable run that changed nothing (no diff,
+  patch or commit) is `degraded`, not delivered: a worker's "I can't proceed"
+  had made a job look successful.
+- **Findings written as `content`** keep their text as the headline; an
+  audit swarm's 111 findings had collapsed into one "Unnamed item".
+- **Dead code.** A two-swarm audit found about 270 lines of verified-dead
+  code (unused helpers, superseded Bedrock Anthropic-body builders,
+  compatibility aliases, a legacy machine-wide CodeGraph lock path). All
+  low-risk items are removed; medium-risk ones wait on feature decisions.
+
 ## v1.30.0 — 2026-10-05
 
 **Closing the gaps the voxel study measured: pilots read less, Codex cost is
