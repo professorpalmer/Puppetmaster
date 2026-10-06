@@ -2,6 +2,9 @@
 
 **Receipts stay immutable under repeats and races.**
 
+- A live-WAL observer read that opens just as the last writer checkpoints
+  and removes the WAL pair is retried as a cohort turnover. 1.32.0 surfaced
+  it as a hard `unable to open database file`.
 - A dispatch receipt's linked stdin copy is immutable too. 1.32.1 wrote the
   copy before claiming the receipt, so a repeated or racing call for the same
   attempt and sidecar was refused a receipt but still rewrote the first

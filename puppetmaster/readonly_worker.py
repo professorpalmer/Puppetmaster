@@ -487,10 +487,23 @@ def main(path, *, wal_snapshot=False):
                 filename = c.execute('PRAGMA database_list').fetchone()[2]
                 if Path(filename).as_uri() + '?mode=ro&immutable=1' != uri:
                     raise OSError('SQLite resolved the descriptor to a pathname')
-            c.execute('PRAGMA foreign_keys=ON')
-            c.execute('PRAGMA synchronous=NORMAL')
-            c.execute('BEGIN')
-            c.execute('SELECT rootpage FROM sqlite_master LIMIT 1').fetchone()
+            try:
+                c.execute('PRAGMA foreign_keys=ON')
+                c.execute('PRAGMA synchronous=NORMAL')
+                c.execute('BEGIN')
+                c.execute('SELECT rootpage FROM sqlite_master LIMIT 1').fetchone()
+            except sqlite3.OperationalError:
+                # The last writer can checkpoint and delete the WAL pair between
+                # the cohort check and this open; a read-only open then cannot
+                # create -shm (SQLITE_CANTOPEN). That is a cohort turnover.
+                state = cohort_state() if pathname_bound else 'ok'
+                if state == 'ok':
+                    raise
+                emit(dict(kind='unavailable',
+                          error=('unable to open database: live sidecars; retry after checkpoint'
+                                 if state == 'cohort' else 'unable to open database: source changed'),
+                          code=5 if state == 'cohort' else None))
+                return
             state = cohort_state() if wal_snapshot else (
                 'ok' if _stamps_after_open(path) == before else 'replaced')
             if state == 'cohort':

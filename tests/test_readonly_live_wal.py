@@ -85,6 +85,54 @@ class LiveWalObserverReadTests(unittest.TestCase):
                     fresh.execute("SELECT value FROM metadata WHERE key='during_read'").fetchone()[0],
                     '1')
 
+    def test_writer_closing_between_cohort_check_and_open_is_a_retry(self):
+        import io
+
+        from puppetmaster import readonly_worker as worker
+
+        def read(path):
+            responses = []
+            requests = io.StringIO('{"sql":"SELECT value FROM sample","parameters":[]}\n')
+            with patch.object(worker.sys, 'stdin', requests), \
+                    patch.object(worker, 'emit', side_effect=responses.append):
+                worker.main(path)
+            return responses
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'source.sqlite3'
+            writer = sqlite3.connect(path, isolation_level=None)
+            self.addCleanup(writer.close)
+            writer.execute('PRAGMA journal_mode=WAL')
+            writer.execute('PRAGMA wal_autocheckpoint=0')
+            writer.execute('CREATE TABLE sample(value)')
+            writer.execute("INSERT INTO sample VALUES ('committed')")
+            wal = Path(str(path) + '-wal')
+            self.assertTrue(wal.exists())
+            real_connect = worker.sqlite3.connect
+
+            class Vanished:
+                """The open the helper started as the last writer left: the WAL
+                pair is gone mid-open and SQLite reports CANTOPEN."""
+                def __init__(self, database):
+                    writer.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+                    writer.close()
+                    for suffix in ('-wal', '-shm'):
+                        Path(str(path) + suffix).unlink(missing_ok=True)
+                    self.inner = real_connect(database, uri=True)
+
+                def execute(self, *args):
+                    raise sqlite3.OperationalError('unable to open database file')
+
+                def close(self):
+                    self.inner.close()
+
+            with patch.object(worker.sqlite3, 'connect', side_effect=lambda database, **_: Vanished(database)):
+                responses = read(path)
+            self.assertEqual(responses[-1].get('kind'), 'unavailable', responses)
+            self.assertIn('live sidecars', responses[-1]['error'])
+            # The client retries this; the now-quiet source reads normally.
+            self.assertEqual(read(path)[-1]['rows'], [('committed',)])
+
     def test_quiet_source_still_uses_the_immutable_descriptor_path(self):
         with TemporaryDirectory() as tmp:
             store = SQLiteSwarmStore(tmp)
