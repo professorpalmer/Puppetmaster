@@ -126,7 +126,11 @@ class LiveWalObserverReadTests(unittest.TestCase):
                 def close(self):
                     self.inner.close()
 
-            with patch.object(worker.sqlite3, 'connect', side_effect=lambda database, **_: Vanished(database)):
+            # In-process, this test's own descriptor churn would trip the Linux
+            # fd attestation, which has its own tests; this one is about the
+            # open-phase error.
+            with patch.object(worker.sqlite3, 'connect', side_effect=lambda database, **_: Vanished(database)), \
+                    patch.object(worker, 'attest_linux_database', lambda *a, **k: None):
                 responses = read(path)
             self.assertEqual(responses[-1].get('kind'), 'unavailable', responses)
             self.assertIn('live sidecars', responses[-1]['error'])
