@@ -1,6 +1,6 @@
-## Unreleased
+## v1.32.3 — 2026-10-06
 
-Three fixes from Codex's live findings:
+**Failures keep their cause.** Three fixes from Codex's live findings:
 
 - **Flows keep a failed launch's cause.** When a worker died at startup, the
   node reported the task's state ("task queued") or the error from adopting
