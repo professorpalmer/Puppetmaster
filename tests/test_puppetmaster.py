@@ -1207,14 +1207,16 @@ class PuppetmasterTests(unittest.TestCase):
                 try:
                     start = time.monotonic()
                     events = store.wait_for_events(
-                        "job-x", since=0, timeout_seconds=2.0, poll_interval=0.02
+                        "job-x", since=0, timeout_seconds=10.0, poll_interval=0.02
                     )
                     elapsed = time.monotonic() - start
                 finally:
                     emitter.join()
 
                 self.assertEqual([e["event"] for e in events], ["arrived"])
-                self.assertLess(elapsed, 1.0)
+                # Woke on the event, not the timeout; the margin absorbs a
+                # loaded CI runner (a Windows leg once took 1.125s).
+                self.assertLess(elapsed, 5.0)
 
     def test_artifact_feed_since_resumes_with_cursor(self) -> None:
         with TemporaryDirectory() as tmp:

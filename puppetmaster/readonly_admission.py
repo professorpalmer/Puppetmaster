@@ -191,7 +191,10 @@ def _safe(path, mode):
 
 
 def _coordination_path(path, selected=None):
-    root = Path('/tmp') / ('puppetmaster-readers-' + str(os.getuid()))
+    # One root for every Puppetmaster process of the user, so helper spawns
+    # serialize machine-wide. Test suites point it at their own directory.
+    override = os.environ.get('PUPPETMASTER_READER_COORDINATION_DIR')
+    root = Path(override) if override else Path('/tmp') / ('puppetmaster-readers-' + str(os.getuid()))
     root.mkdir(mode=0o700, exist_ok=True)
     _safe(root, stat.S_ISDIR)
     return root / (_key(_identity(path, selected)) + '.lock')

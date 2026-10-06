@@ -1,3 +1,13 @@
+## Unreleased
+
+- The output-limit verification payload names its `dispatch_receipt` too
+  (1.32.1 carried it on every other CLI verification payload).
+- `PUPPETMASTER_READER_COORDINATION_DIR` overrides the machine-wide root for
+  readonly-helper spawn coordination. The test suite sets it, so its child
+  processes are isolated too, not only the test process.
+- The concurrent-wake event test checks the wake against a 10 s timeout with
+  a 5 s bound; a loaded Windows runner once took 1.125 s against the old 1 s.
+
 ## v1.32.1 — 2026-10-06
 
 **Attempt-bound evidence.** Every capture of a worker attempt, including the
