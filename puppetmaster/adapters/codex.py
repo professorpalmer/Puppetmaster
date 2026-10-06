@@ -283,10 +283,10 @@ class CodexAdapter(CliWorkerAdapter):
         except Exception:
             # Best effort: any failure runs the worker in the user's own home.
             return None
-        if home is not None and prepared.command and prepared.command[-1] == "-":
+        if home is not None and prepared.command[-2:] == list(STDIN_PROMPT):
             # Bounded workers never fork subagents, and must not accrue memories.
-            prepared.command = [*prepared.command[:-1], "--disable", "memories",
-                                "--disable", "multi_agent", "-"]
+            prepared.command = [*prepared.command[:-2], "--disable", "memories",
+                                "--disable", "multi_agent", *STDIN_PROMPT]
         return home
 
     def _invoke_cli(
@@ -599,6 +599,11 @@ class CodexAdapter(CliWorkerAdapter):
         return artifacts
 
 
+# The stdin prompt positional. ``--`` ends option parsing first: ``--image``
+# is variadic and would otherwise take the bare ``-`` as another image path.
+STDIN_PROMPT = ("--", "-")
+
+
 def build_codex_exec_command(
     *,
     executable: Union[str, list[str]] = "codex",
@@ -643,7 +648,7 @@ def build_codex_exec_command(
     # Read the prompt from stdin. Never pass a prompt positional as well: codex
     # then appends the piped text as a separate `<stdin>` block instead of
     # treating it as the instruction.
-    command.append("-")
+    command.extend(STDIN_PROMPT)
     return command
 
 
@@ -663,7 +668,7 @@ def build_codex_resume_command(
     ``exec resume`` rejects ``--sandbox`` and ``-C``: the sandbox travels as a
     ``-c sandbox_mode`` override and cwd comes from the subprocess. It never
     takes ``--ephemeral``, so the resumed thread stays resumable for the next
-    revision. The prompt is read from stdin via the trailing ``-``.
+    revision. The prompt is read from stdin via the trailing ``-- -``.
     """
     command = command_parts(executable)
     command.extend(["exec", "resume", str(session_id), "--json"])
@@ -678,7 +683,7 @@ def build_codex_resume_command(
         command.extend(["-m", str(model)])
     if extra_args:
         command.extend(command_parts(extra_args))
-    command.append("-")
+    command.extend(STDIN_PROMPT)
     return command
 
 

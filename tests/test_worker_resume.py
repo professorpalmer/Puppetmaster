@@ -335,6 +335,33 @@ RESUMED_CODEX_STDOUT = _codex_events(
 )
 
 
+class CodexImageStdinTests(unittest.TestCase):
+    """``--image`` is variadic: a bare trailing ``-`` would be read as an image."""
+
+    IMAGES = ["--image", "shot one.png", "--image", "two.png"]
+
+    def _split(self, command: list[str]) -> tuple[list[str], list[str]]:
+        cut = command.index("--")
+        return command[:cut], command[cut + 1:]
+
+    def test_fresh_and_resume_end_options_before_the_stdin_prompt(self) -> None:
+        for command in (
+            build_codex_exec_command(executable="codex", model="m", extra_args=self.IMAGES),
+            build_codex_resume_command(executable="codex", session_id=THREAD_ID,
+                                       model="m", extra_args=self.IMAGES),
+        ):
+            options, positionals = self._split(command)
+            self.assertEqual(positionals, ["-"])
+            self.assertEqual(options[-4:], self.IMAGES)
+            self.assertEqual(options.count("shot one.png"), 1)
+            self.assertNotIn("-", options)
+
+    def test_text_only_prompt_still_reads_stdin(self) -> None:
+        command = build_codex_exec_command(executable="codex", model="m")
+        self.assertEqual(command[-2:], ["--", "-"])
+        self.assertEqual(command.count("-"), 1)
+
+
 class CodexResumeTests(unittest.TestCase):
     def test_resume_argv_is_exact(self) -> None:
         command = build_codex_resume_command(
@@ -345,7 +372,7 @@ class CodexResumeTests(unittest.TestCase):
             command,
             ["codex", "exec", "resume", THREAD_ID, "--json",
              "-c", 'approval_policy="never"', "-c", 'sandbox_mode="read-only"',
-             "--skip-git-repo-check", "-m", "gpt-5.4-mini", "-"],
+             "--skip-git-repo-check", "-m", "gpt-5.4-mini", "--", "-"],
         )
         self.assertNotIn("-C", command)
         self.assertNotIn("--sandbox", command)

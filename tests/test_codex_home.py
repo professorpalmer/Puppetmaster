@@ -113,5 +113,23 @@ class AuthSyncTests(unittest.TestCase):
         self.assertFalse(codex_home.enabled({"PUPPETMASTER_CODEX_LEAN_HOME": "0"}))
 
 
+class WorkerFlagsTests(unittest.TestCase):
+    def test_lean_home_disables_land_before_the_stdin_prompt(self) -> None:
+        from unittest.mock import patch
+
+        from puppetmaster.adapters._base import CliInvocation
+        from puppetmaster.adapters.codex import CodexAdapter, build_codex_exec_command
+
+        command = build_codex_exec_command(
+            executable="codex", model="m", extra_args=["--image", "a.png"])
+        prepared = CliInvocation(command=command, sidecar_name="x")
+        with patch.object(codex_home, "enabled", return_value=True), \
+                patch.object(codex_home, "prepare", return_value=Path("/lean")):
+            self.assertEqual(CodexAdapter._worker_home(prepared), Path("/lean"))
+        self.assertEqual(
+            prepared.command[-8:],
+            ["--image", "a.png", "--disable", "memories", "--disable", "multi_agent", "--", "-"])
+
+
 if __name__ == "__main__":
     unittest.main()
