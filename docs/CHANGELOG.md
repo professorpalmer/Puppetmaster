@@ -1,3 +1,133 @@
+## v1.32.0 — 2026-10-06
+
+**Solo first everywhere, honest attribution, and a leaner core.** Pilots on
+Claude Code and Codex get the same sizing gate Marionette has; observer reads
+stop blocking writers; write_scope charges a worker only for its own writes;
+every adapter verb was smoke-tested live; about 4,400 lines of unwired code
+are gone.
+
+**Sizing gate measures a unit before it fans out.** A unit count alone no
+longer hands off: before any unit is done the gate stays solo unless the
+calibration carries a per-unit cost (`per_unit_s`) at or above `min_unit_s`
+(provisional 20 s). Once a unit is done it uses the measured pace; many
+substantial units hand off as the quality crossover when that finishes
+sooner, and small units stay solo.
+
+**Host hooks: sizing advice on plan updates.** `install-hooks` writes a Claude
+Code `PostToolUse(TodoWrite)` hook and a Codex `$CODEX_HOME/hooks.json`
+(`--target codex`). When the plan grows past the solo falloff the pilot gets
+the gate's decision once per turn. The user-prompt hook no longer injects a
+delegate directive from prompt wording; naming Puppetmaster still does.
+
+**Edit workers state a verdict.** The implement report contract asks for a
+terminal `VERDICT: PASS|FAIL|PARTIAL`. A write-capable run that reports FAIL,
+PARTIAL or no verdict is degraded with the reason.
+
+**Readonly observer reads join a live WAL.** A live store is read by joining
+its committed WAL snapshot (`mode=ro`, no byte-range lock), so dashboard, CLI
+and ownership reads no longer fail or make writers SQLITE_BUSY while a job
+runs. On POSIX the helper decides this itself and fences the read by
+device/inode over the main file and both sidecars; on Windows the retry into
+the snapshot, which used to be for worker attach only, now covers observer
+reads too. A cohort missing a sidecar still fails closed. In live mode the
+promise is "never changes database content" (a WAL reader records read marks
+in `-shm`).
+
+**write_scope charges a worker only for writes it plausibly made.** The
+worker's own event stream (Codex `file_change` and command paths, Claude Code
+edit tools) decides attribution; a path that was already dirty and that the
+worker never names is excused as a concurrent change. A host appending to an
+untracked file in the repo root no longer fails every lane.
+
+**A model allowlist on a direct adapter run routes within it.** An allowlist
+used to be ignored without `--auto-route`, so a run allowed only
+`claude-code/opus-5-5` ran the adapter default.
+
+**Rules are solo-first in every surface**: installed rules, repo `AGENTS.md`
+and the Cursor rule description.
+
+
+**Direct adapter verbs fixed by a live smoke of every adapter.**
+
+- `puppetmaster codex` (and the MCP `puppetmaster_codex` tool, which runs it)
+  no longer defaults to `gpt-5.4-mini`. That stale pin failed closed against
+  current registries; unpinned runs now use the model in your Codex config.
+- `puppetmaster agentic` without `--model` routes within the agentic registry.
+  It used to fail `no_model`, and the failure re-route then raised "task is
+  missing durable registry_path authority" over the real error. Re-routing now
+  skips work the router never placed (a routed task that lost its registry
+  still fails closed).
+- A CLI run whose job failed exits 1 even when its artifacts only rate
+  "degraded"; a Hermes run that hit a provider 401 used to exit 0.
+- `preflight --live` fails an adapter whose CLI is not installed (credentials
+  alone read as ready, then the worker died `missing_cli`), and Hermes now gets
+  a real one-shot probe, so a provider 401 blocks instead of passing unprobed.
+
+**Each invocation keeps its own captures.** A task's live and stdout captures
+now go under `tasks/<task>/invocations/<nonce>/` while an invocation is open,
+so a second invocation in the same run (a retry, a fresh session after an
+unavailable resume) no longer truncates the first one's capture. CLI
+verification payloads carry `attempt_id` beside `live_log`, naming the
+immutable ledger row (`list_attempts`) that the invocation's usage
+observations already key on; completion intents reach it through their
+artifacts. (The agentic worker records one ledger invocation per provider
+turn; those link to their run by `run_id`.) Codex workers also end their options with `--` before the stdin
+prompt, because `--image` is variadic and took a bare `-` as an image path.
+
+**Flow hosts can own shell and walker processes.** `JobNodeExecutor(popen=...)`
+takes a factory with `subprocess.Popen`'s signature. Shell nodes and the
+default walker spawn launch through it, always in a new session (process group
+on Windows), so a host can bind the exact process group to its own runtime and
+deadline before the command runs; stop, cut and timeout still kill that group.
+Without a factory nothing changes.
+
+**Unwired half-built code removed.** Each of these had no production caller;
+the tests that only exercised them are gone or moved to local helpers.
+
+- Gist admission loses `admit_gist`, `reject_gist`, `build_pending_gist` and
+  the Wave-2 selective unfold (`unfold_shared_context`,
+  `format_unfolded_for_injection`, `normalize_context_level`, the
+  `CONTEXT_LEVEL_*` constants). `maybe_admit_finding_as_gist` was always the
+  real admission path, so no pending gist ever existed in production and
+  nothing was admitted or rejected through that API; it also no longer copies
+  the `summary_ref` / `raw_ref` unfold pointers. Peer injection filtering
+  (`is_admitted_for_shared_context`, `filter_shared_context_artifacts`) is
+  unchanged, including its refusal of non-admitted and coordination-protocol
+  gists.
+- **Two breaking key removals.** `status_snapshot()["outcome"]` no longer
+  carries `diff_present`; it was a pure alias of `patch_artifact_emitted`
+  (added in the diff-source outcome change below), which remains. The MCP
+  start response no longer carries `pid` / `pid_deprecated`; `launcher_pid`
+  and `orchestrator_pid` carry the same value and `pid_note` already told
+  callers not to track by pid.
+- Also removed: `receipt.record_host_delivery_observation` (call
+  `metr_seams.record_host_observation`), `working_set.read_artifact_index`
+  (the writer stays), the unused `session_commands` mappers
+  (`can_composer_cancel`, `map_interrupt_to_cancellation`,
+  `map_run_to_task_admission` — the ledger itself stays),
+  `FileClaimRegistry.list_active` and `.sweep_expired` (expiry is already
+  lazy inside acquisition; `audit_records` stays),
+  `_delta_stream.iter_deltas` (the `deltas` CLI is the real reader),
+  `output_style.resolve_output_style` / `apply_output_style` (superseded by
+  `resolve_output` + `directive_for`),
+  `adapters.registry.adapter_runtime_capabilities` with the
+  `state_isolation` / `catalog_source` ClassVars, `ports.reserve_port` /
+  `_port_is_free` (probe-then-bind is racy; `apply_worktree_ports` hints are
+  what production uses), `state.ensure_state_dir` (call
+  `fs_permissions.mkdir_private`), `rate_limit_state.is_quota_admission_error`
+  and `provider_health.assert_no_secrets_in_health_state` (a test oracle, now
+  a test helper).
+- Five whole subsystems: named cells (`cell.py`, the `cell-status` /
+  `cell-inspect` / `cell-tick` verbs and MCP `puppetmaster_cell_status`; no
+  production code ever created a cell), the run journal (`run_journal.py`),
+  the METR coordinator writers in the store (`bind_job_contract`,
+  `set_job_wait_reason`, `hold_subgraph`, `veto_subgraph`, `resume_subgraph`,
+  `set_task_wait_reason`, `claim_subgraph_writer`) with the never-true
+  hold/veto/owner branches they fed and the `Job` fields only they set (older
+  job JSON with those keys still loads), the routing-quality evaluation
+  runner and its corpus, and the router's token-estimate calibration (measured
+  sizing lives in the sizing gate's calibration file).
+
 ## v1.31.0 — 2026-10-05
 
 **Fan-out cost parity: Codex workers no longer pay ~12k tokens of user context

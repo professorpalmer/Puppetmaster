@@ -627,26 +627,3 @@ def probe_bedrock_runtime(
         report["ok"] = False
         return report
 
-
-def assert_no_secrets_in_health_state(store: Optional[ProviderHealthStore] = None) -> None:
-    """Raise ``AssertionError`` if any persisted row looks like secret material."""
-    import re
-
-    health_store = store or get_provider_health_store()
-    secretish = (
-        "aws_secret",
-        "secret_access",
-        "session_token",
-        "bearer_token",
-        "aws_access_key",
-    )
-    # Raw IAM access-key ids look like AKIA… / ASIA… (not hex fingerprints).
-    access_key_re = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
-    for row in health_store.dump_rows():
-        blob = " ".join(str(v) for v in row.values())
-        lower = blob.lower()
-        for marker in secretish:
-            if marker in lower:
-                raise AssertionError(f"secret-like material in health state: {marker}")
-        if access_key_re.search(blob):
-            raise AssertionError("raw access key id persisted in health state")

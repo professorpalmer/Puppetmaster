@@ -18,7 +18,6 @@ from puppetmaster.delivery import delivery_verdict
 from puppetmaster.models import Artifact, ArtifactType, JobStatus, Task
 from puppetmaster.orchestrator import Orchestrator
 from puppetmaster.adapters._streaming import run_streamed_subprocess
-from puppetmaster.adapters.registry import adapter_runtime_capabilities
 from puppetmaster.mcp_server import goal_schema, mcp_state_dir
 from puppetmaster import mcp_server
 from puppetmaster.model_registry import starter_registry
@@ -227,13 +226,13 @@ class OperatorContractTests(unittest.TestCase):
             self.assertTrue(completed.output_limit_hit)
             self.assertIn("max_output_bytes exceeded", completed.stderr)
 
-    def test_runtime_capabilities_do_not_claim_unimplemented_limits(self) -> None:
-        self.assertNotIn(
-            "output_bytes", adapter_runtime_capabilities("local")["enforced_runtime_limits"]
-        )
-        self.assertIn(
-            "output_bytes", adapter_runtime_capabilities("codex")["enforced_runtime_limits"]
-        )
+    def test_goal_schema_does_not_claim_unimplemented_limits(self) -> None:
+        # Captured-output limits are a streamed-CLI boundary; `local` has none.
+        from puppetmaster.adapters._base import CliWorkerAdapter
+        from puppetmaster.adapters.registry import get_adapter
+
+        self.assertNotIsInstance(get_adapter("local"), CliWorkerAdapter)
+        self.assertIsInstance(get_adapter("codex"), CliWorkerAdapter)
         schema = goal_schema("goal")
         self.assertIn("max_output_bytes", schema["properties"])
         self.assertNotIn("max_total_tokens", schema["properties"])

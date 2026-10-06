@@ -13,7 +13,6 @@ if _HERMETIC_DIR not in sys.path:
     sys.path.insert(0, _HERMETIC_DIR)
 import hermetic_env  # noqa: F401  # process-wide host-env isolation
 
-from puppetmaster.gist_admission import build_pending_gist, reject_gist
 from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
 from puppetmaster.metr_seams import load_host_document
 from puppetmaster.negative_claims import (
@@ -187,56 +186,6 @@ class FailedGateEnqueueTests(unittest.TestCase):
             self.assertEqual(len(retry), 1)
             self.assertEqual(retry[0].instruction, claim)
             self.assertEqual(len(store.list_tasks(job.id)), 2)
-
-
-class RejectedGistEnqueueTests(unittest.TestCase):
-    def test_reject_gist_stamps_fingerprint_and_second_enqueue_skips(self) -> None:
-        with TemporaryDirectory() as tmp:
-            store = SwarmStore(Path(tmp) / ".puppetmaster")
-            store.init()
-            job = store.create_job("negative gist")
-            parent = _parent(store, job.id)
-            pending = build_pending_gist(
-                job_id=job.id,
-                task_id=parent.id,
-                created_by="worker-gist",
-                claim="compact discovery must not retry",
-                source_artifact_ids=["finding-src", "verify-src"],
-            )
-            store.save_artifact(pending)
-            rejected = reject_gist(store, pending, verifier_result={"result": "rejected"})
-            self.assertEqual(rejected.payload["admission"], "rejected")
-            negative = rejected.payload.get("negative_claim") or {}
-            self.assertEqual(negative.get("kind"), "gist")
-            self.assertEqual(negative.get("claim"), "compact discovery must not retry")
-            self.assertEqual(negative.get("scope"), "finding-src,verify-src")
-            self.assertEqual(
-                negative.get("fingerprint"),
-                negative_claim_fingerprint(
-                    "compact discovery must not retry", "finding-src,verify-src"
-                ),
-            )
-
-            finding = _finding(
-                job.id,
-                parent.id,
-                extra={
-                    "source_artifact_ids": ["finding-src", "verify-src"],
-                    "enqueue_subtasks": [
-                        {
-                            "role": "explore",
-                            "instruction": "compact discovery must not retry",
-                            "scope": "finding-src,verify-src",
-                        }
-                    ],
-                },
-            )
-            created = store.maybe_enqueue_follow_ups_from_artifact(
-                finding, parent_task_id=parent.id, created_by="worker-1"
-            )
-            self.assertEqual(created, [])
-            self.assertIn(REASON_NEGATIVE_CLAIM, _refused_reasons(store, job.id))
-            self.assertEqual(len(store.list_tasks(job.id)), 1)
 
 
 class CiFailedSkipTests(unittest.TestCase):

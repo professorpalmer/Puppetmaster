@@ -5,11 +5,16 @@ can run a *command* at lifecycle events and feed it JSON on stdin; whatever the
 command prints on stdout is interpreted by the host. This module is that
 command's brain:
 
-* **user-prompt** events (Cursor ``beforeSubmitPrompt`` / Claude
-  ``UserPromptSubmit``): run :func:`invocation_gate.should_delegate` on the
-  prompt and, when it fires, inject a "delegate now with <verb>" directive into
-  the model's context *before it starts working*. We never block the prompt —
-  injection beats refusal for a prompt the user just typed.
+* **user-prompt** events (Cursor ``beforeSubmitPrompt`` / Claude and Codex
+  ``UserPromptSubmit``): record when the turn started (the sizing gate's
+  clock), and inject a "use Puppetmaster" directive only when the user named
+  Puppetmaster ("Use Puppetmaster to ...", "PM this"). Prompt wording cannot
+  tell where a task sits against the solo falloff, so nothing else delegates
+  here. We never block the prompt.
+* **post-tool** events (Claude ``PostToolUse`` on ``TodoWrite``; Codex
+  ``PostToolUse`` on ``update_plan``): run :mod:`puppetmaster.sizing` on the
+  plan and the turn's elapsed time; on a projected solo overrun, inject the
+  handoff advice once per turn.
 * **pre-tool** events (Cursor ``beforeShellExecution`` / ``beforeReadFile`` /
   ``preToolUse``; Claude ``PreToolUse``): when the model reaches for a broad
   native exploration tool (Grep/Glob/built-in Task/repo-wide shell search), we
@@ -41,6 +46,9 @@ DECISION_LOG_MAX_BYTES = 5 * 1024 * 1024
 # Canonical event kinds. Host-specific event names normalize onto these.
 EVENT_USER_PROMPT = "user-prompt"
 EVENT_PRE_TOOL = "pre-tool"
+EVENT_POST_TOOL = "post-tool"
+_PLAN_TOOLS = {"todowrite", "update_plan", "todo_write", "todo"}
+_POST_TOOL_ALIASES = {"post-tool", "posttooluse", "post_tool", "aftertooluse", "post_tool_call"}
 
 _USER_PROMPT_ALIASES = {
     "user-prompt", "userpromptsubmit", "beforesubmitprompt", "user_prompt",
@@ -139,10 +147,12 @@ class HookResponse:
     reason: str = ""
     context: str = ""
     decision: Optional[DelegationDecision] = None
+    event_name: str = "UserPromptSubmit"
 
     def to_host_json(self, host: str) -> dict:
         host = (host or "").lower()
-        if host == "claude":
+        if host in ("claude", "codex"):
+            # Codex hooks read Claude Code's hookSpecificOutput shape.
             return self._claude_json()
         if host == "hermes":
             return self._hermes_json()
@@ -175,7 +185,7 @@ class HookResponse:
         out: dict[str, Any] = {"continue": True}
         if self.context:
             out["hookSpecificOutput"] = {
-                "hookEventName": "UserPromptSubmit",
+                "hookEventName": self.event_name,
                 "additionalContext": self.context,
             }
         return out
@@ -207,6 +217,8 @@ def normalize_event(event: str) -> str:
     key = (event or "").strip().lower().replace("_", "").replace("-", "")
     if key in {a.replace("_", "").replace("-", "") for a in _USER_PROMPT_ALIASES}:
         return EVENT_USER_PROMPT
+    if key in {a.replace("_", "").replace("-", "") for a in _POST_TOOL_ALIASES}:
+        return EVENT_POST_TOOL
     if key in {a.replace("_", "").replace("-", "") for a in _PRE_TOOL_ALIASES}:
         return EVENT_PRE_TOOL
     # Unknown → treat as user-prompt (inject-only, never blocks).
@@ -414,6 +426,9 @@ def handle_hook(
 
     kind = normalize_event(event)
 
+    if kind == EVENT_POST_TOOL:
+        return _sizing_response(payload, env=env)
+
     if kind == EVENT_PRE_TOOL:
         tool_name, tool_input = extract_tool(payload)
         redirect, verb = classify_tool(tool_name, tool_input)
@@ -431,7 +446,8 @@ def handle_hook(
             )
         return HookResponse(action="allow")
 
-    # user-prompt: inject a directive when the gate fires; never block.
+    # user-prompt: start the sizing clock; inject only an explicit trigger.
+    _mark_turn_start(payload, env=env)
     prompt = extract_prompt(payload)
     if not prompt:
         return HookResponse(action="allow")
@@ -440,9 +456,62 @@ def handle_hook(
         decision, suggested_verb=verb_for_host(decision.suggested_verb, host)
     )
     record_decision(decision, prompt, env=env)
-    if decision.should_delegate:
+    if decision.should_delegate and "explicit-trigger" in decision.matched_signals:
         return HookResponse(action="allow", context=decision.directive(), decision=decision)
     return HookResponse(action="allow", decision=decision)
+
+
+def _turn_state_path(payload: Mapping[str, Any], env: Optional[Mapping[str, str]]) -> Path:
+    session = str(payload.get("session_id") or payload.get("sessionId")
+                  or payload.get("conversation_id") or "default")
+    digest = hashlib.sha256(session.encode("utf-8")).hexdigest()[:24]
+    return _puppetmaster_home(env) / "sizing-turns" / f"{digest}.json"
+
+
+def _puppetmaster_home(env: Optional[Mapping[str, str]]) -> Path:
+    env = os.environ if env is None else env
+    home = (env.get("PUPPETMASTER_HOME") or "").strip()
+    return Path(home).expanduser() if home else Path.home() / ".puppetmaster"
+
+
+def _mark_turn_start(payload: Mapping[str, Any], *, env: Optional[Mapping[str, str]]) -> None:
+    try:
+        import time
+
+        path = _turn_state_path(payload, env)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"started": time.time()}), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _sizing_response(payload: Mapping[str, Any], *, env: Optional[Mapping[str, str]]) -> HookResponse:
+    """Advise a handoff once per turn when solo is projected to overrun."""
+    import time
+
+    tool_name, tool_input = extract_tool(payload)
+    if str(tool_name or "").strip().lower() not in _PLAN_TOOLS:
+        return HookResponse(action="allow", event_name="PostToolUse")
+    path = _turn_state_path(payload, env)
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return HookResponse(action="allow", event_name="PostToolUse")
+    if not isinstance(state, dict) or state.get("advised") or not state.get("started"):
+        return HookResponse(action="allow", event_name="PostToolUse")
+    from puppetmaster import sizing
+
+    units = sizing.parse_plan(tool_input if isinstance(tool_input, (dict, list)) else {})
+    decision = sizing.decide(units, elapsed_s=time.time() - float(state["started"]),
+                             calibration=sizing.load_calibration(str(payload.get("model") or ""), env=env))
+    advice = sizing.advice(decision)
+    if not advice:
+        return HookResponse(action="allow", event_name="PostToolUse")
+    try:
+        path.write_text(json.dumps({**state, "advised": True}), encoding="utf-8")
+    except OSError:
+        pass
+    return HookResponse(action="allow", context=advice, event_name="PostToolUse")
 
 
 def run(argv: Optional[list[str]] = None, *, stdin=None, stdout=None, env=None) -> int:

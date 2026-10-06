@@ -46,7 +46,7 @@ from puppetmaster.conflicts import predict_write_conflicts, scopes_overlap  # no
 from puppetmaster.gates import evaluate_task_gates  # noqa: E402
 from puppetmaster.models import Artifact, ArtifactType, JobStatus, Task  # noqa: E402
 from puppetmaster.orchestrator import Orchestrator  # noqa: E402
-from puppetmaster.ports import _port_is_free, reserve_port, worktree_port_base  # noqa: E402
+from puppetmaster.ports import worktree_port_base  # noqa: E402
 from puppetmaster.sqlite_store import SQLiteSwarmStore  # noqa: E402
 from puppetmaster.store import SwarmStore  # noqa: E402
 
@@ -250,49 +250,17 @@ def scenario_b1_ports(quick: bool) -> Result:
         if parallelism == 16:
             collision_rate_16 = rate
 
-    # Bulletproof path: reserve_port must bump past a live listener on the hint
-    # and hand back an actually-bindable port — the real fix for the residual
-    # hash-collision tail. Stress it across many occupied hints concurrently.
-    import socket as _socket
-    reserve_failures = 0
-    reserve_trials = 40 if quick else 200
-
-    def _reserve_under_contention(i: int) -> None:
-        nonlocal reserve_failures
-        wt = base / f"reserve-{i}"
-        hint = worktree_port_base(wt)
-        listener = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-        listener.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
-        try:
-            listener.bind(("127.0.0.1", hint))
-            listener.listen(1)
-        except OSError:
-            listener.close()
-            return  # couldn't occupy the hint here; skip this trial
-        try:
-            reserved = reserve_port(wt)
-            if reserved == hint or not _port_is_free(reserved):
-                reserve_failures += 1
-        finally:
-            listener.close()
-
-    with ThreadPoolExecutor(max_workers=16) as pool:
-        list(pool.map(_reserve_under_contention, range(reserve_trials)))
-
-    passed = deterministic and in_range and collision_rate_16 < 0.10 and reserve_failures == 0
+    passed = deterministic and in_range and collision_rate_16 < 0.10
     detail = (
         f"deterministic over {population} paths, range<32768, "
-        f"hint collision {collision_rate_16:.1%} at 16 worktrees, "
-        f"reserve_port resolved {reserve_trials} contended hints cleanly"
+        f"hint collision {collision_rate_16:.1%} at 16 worktrees"
         if passed else
         f"deterministic={deterministic} in_range={in_range} "
-        f"collision_rate_16={collision_rate_16:.1%} reserve_failures={reserve_failures}"
+        f"collision_rate_16={collision_rate_16:.1%}"
     )
     return Result("B1 per-worktree port allocation", passed, detail, {
         "population": population,
         "hint_collision_rate_16_worktrees": round(collision_rate_16, 4),
-        "reserve_port_contended_trials": reserve_trials,
-        "reserve_port_failures": reserve_failures,
     })
 
 
@@ -360,10 +328,13 @@ def _blocked(job_id: str) -> Artifact:
 
 def scenario_a2f2_status(quick: bool) -> Result:
     cases = {
-        "empty": ([], {"diff_present": False, "commit_present": False}),
-        "patch_only": ([_patch], {"diff_present": True, "commit_present": False}),
-        "patch_and_commit": ([_patch, _commit_gate], {"diff_present": True, "commit_present": True}),
-        "blocked": ([_blocked], {"diff_present": False, "commit_present": False}),
+        "empty": ([], {"patch_artifact_emitted": False, "commit_present": False}),
+        "patch_only": ([_patch], {"patch_artifact_emitted": True, "commit_present": False}),
+        "patch_and_commit": (
+            [_patch, _commit_gate],
+            {"patch_artifact_emitted": True, "commit_present": True},
+        ),
+        "blocked": ([_blocked], {"patch_artifact_emitted": False, "commit_present": False}),
     }
     failures: list[str] = []
     with TemporaryDirectory() as tmp:

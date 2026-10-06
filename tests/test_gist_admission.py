@@ -15,12 +15,9 @@ from tempfile import TemporaryDirectory
 from typing import List, Optional
 
 from puppetmaster.gist_admission import (
-    admit_gist,
-    build_pending_gist,
     filter_shared_context_artifacts,
     is_admitted_for_shared_context,
     maybe_admit_finding_as_gist,
-    reject_gist,
 )
 from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
 from puppetmaster.prewalk import format_upstream_artifacts_for_injection
@@ -115,42 +112,6 @@ class GistAdmissionFilterTests(unittest.TestCase):
         stale = replace(finding, payload=payload, sha256=None)
         self.assertFalse(is_admitted_for_shared_context(stale))
         self.assertEqual(filter_shared_context_artifacts([stale]), [])
-
-
-class GistAdmissionEventTests(unittest.TestCase):
-    def test_event_emission_on_admit_and_reject(self) -> None:
-        with TemporaryDirectory() as tmp:
-            store = SwarmStore(Path(tmp) / ".puppetmaster")
-            store.init()
-            job = store.create_job("gist events")
-            pending = build_pending_gist(
-                job_id=job.id,
-                task_id="task-1",
-                created_by="worker-gist",
-                claim="needs review",
-                source_artifact_ids=["art-src"],
-            )
-            store.save_artifact(pending)
-
-            admitted = admit_gist(store, pending, verifier_result={"result": "accepted"})
-            self.assertEqual(admitted.payload["admission"], "admitted")
-            events = store.read_events(job.id)
-            admitted_events = [e for e in events if e.get("event") == "gist.admitted"]
-            self.assertEqual(len(admitted_events), 1)
-            self.assertEqual(
-                admitted_events[0]["payload"]["artifact_id"], admitted.id
-            )
-
-            rejected = reject_gist(
-                store, admitted, verifier_result={"result": "rejected"}
-            )
-            self.assertEqual(rejected.payload["admission"], "rejected")
-            events = store.read_events(job.id)
-            rejected_events = [e for e in events if e.get("event") == "gist.rejected"]
-            self.assertEqual(len(rejected_events), 1)
-            self.assertEqual(
-                rejected_events[0]["payload"]["artifact_id"], rejected.id
-            )
 
 
 class MaybeAdmitFindingTests(unittest.TestCase):

@@ -65,7 +65,7 @@ QUERIES = [
     },
     {
         "question": "Where is per-worktree port allocation done and how is a free port reserved?",
-        "grep_terms": ["worktree_port_base", "reserve_port"],
+        "grep_terms": ["worktree_port_base", "worktree_port_env"],
     },
     {
         "question": "How does delete_job guard against deleting unsafe paths?",

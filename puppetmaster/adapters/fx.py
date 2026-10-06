@@ -249,10 +249,6 @@ class FxAdapter(CliWorkerAdapter):
 
     name = "fx"
     default_timeout_seconds = 900
-    # fx owns mutable state under ~/.fx/sessions, history.jsonl, and usage.jsonl.
-    # Long-lived isolated state that PM can safely sandbox per run does not exist,
-    # so isolation is declared "none" rather than inferred.
-    state_isolation = "none"
 
     def run(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
         return self._run_cli_lifecycle(task, goal, worker_id)
@@ -530,6 +526,7 @@ class FxAdapter(CliWorkerAdapter):
                 "stderr_capture": stderr_capture,
                 "report_capture": report_capture,
                 "live_log": completed.live_log_path,
+                "attempt_id": getattr(completed, "attempt_id", None),
                 "final_output": _redacted_tail(report, _STDOUT_TAIL_CHARS),
                 "tokens_in": tokens_in,
                 "tokens_out": tokens_out,
@@ -625,6 +622,7 @@ class FxAdapter(CliWorkerAdapter):
                     "stdout_capture": stdout_capture,
                     "stderr_capture": stderr_capture,
                     "live_log": completed.live_log_path,
+                    "attempt_id": getattr(completed, "attempt_id", None),
                     "timeout_seconds": timeout_seconds,
                     "base_sha": before["sha"],
                     "head_sha": after["sha"],

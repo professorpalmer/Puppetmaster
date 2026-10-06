@@ -1,4 +1,23 @@
-"""Private bounded SQL reader process; stdin/stdout are a local JSON protocol."""
+"""Private bounded SQL reader process; stdin/stdout are a local JSON protocol.
+
+Two open modes, chosen from what the source looks like when the session starts:
+
+* **Quiet source** (no live connection, fully checkpointed WAL): the session
+  takes SQLite's shared byte range exclusively and opens the main file through
+  an ``immutable=1`` descriptor URI. Nothing on disk is touched at all.
+* **Live source** (a live connection, or uncheckpointed WAL frames): the
+  session joins the committed WAL snapshot through a ``mode=ro`` pathname open
+  and takes no byte-range lock, so writers keep committing while it reads.
+  A WAL reader records read marks in the ``-shm`` index, so the promise in this
+  mode is *never changes database content*, not *touches no file*: the main
+  database bytes and the WAL are never written, and a ``mode=ro`` connection
+  never checkpoints. Missing or damaged sidecars are never created, repaired,
+  or recovered here -- they fail closed as unavailable.
+
+Live mode has no descriptor-bound open to lean on, so a device/inode fence over
+the main file and both sidecars runs before and after every statement; a
+replaced or renamed source is refused instead of read.
+"""
 import ctypes
 import json
 import os
@@ -111,6 +130,30 @@ def stamps(path):
     return result
 
 
+def wal_index_number(header, start, stop):
+    return int.from_bytes(header[start:stop], sys.byteorder)
+
+
+def wal_index_header(path):
+    """Return the validated constant-size WAL-index header, else None."""
+    try:
+        with open(str(path) + '-shm', 'rb') as index:
+            header = index.read(100)
+    except OSError:
+        return None
+    if len(header) != 100 or header[:48] != header[48:96] or header[12] != 1:
+        return None
+    if wal_index_number(header, 0, 4) != 3007000:
+        return None
+    first = second = 0
+    for offset in range(0, 40, 8):
+        first = (first + wal_index_number(header, offset, offset + 4) + second) & 0xffffffff
+        second = (second + wal_index_number(header, offset + 4, offset + 8) + first) & 0xffffffff
+    if (first, second) != (wal_index_number(header, 40, 44), wal_index_number(header, 44, 48)):
+        return None
+    return header
+
+
 def checkpointed_sidecars(path, before, journal):
     """Constant-size WAL-index proof, under an exclusive main-file lock.
 
@@ -127,20 +170,25 @@ def checkpointed_sidecars(path, before, journal):
         return True
     if before[2] is None:
         return False
-    with open(str(path) + '-shm', 'rb') as index:
-        header = index.read(100)
-    if len(header) != 100 or header[:48] != header[48:96] or header[12] != 1:
+    header = wal_index_header(path)
+    if header is None:
         return False
-    number = lambda start, stop: int.from_bytes(header[start:stop], sys.byteorder)
-    if number(0, 4) != 3007000:
+    return wal_index_number(header, 16, 20) == wal_index_number(header, 96, 100)
+
+
+def joinable_wal(path, before, journal):
+    """Can a read-only connection join this source's committed WAL snapshot?
+
+    Only a complete, structurally sound cohort qualifies: the main header says
+    WAL, no rollback journal is present, and both a non-empty -wal and a valid
+    -shm index already exist. A reader never creates, repairs, or recovers a
+    sidecar, so an incomplete cohort stays unavailable.
+    """
+    if journal != b'\x02\x02' or before[3] is not None:
         return False
-    first = second = 0
-    for offset in range(0, 40, 8):
-        first = (first + number(offset, offset + 4) + second) & 0xffffffff
-        second = (second + number(offset + 4, offset + 8) + first) & 0xffffffff
-    if (first, second) != (number(40, 44), number(44, 48)):
+    if before[1] is None or before[2] is None or before[1][2] < 32:
         return False
-    return number(16, 20) == number(96, 100)
+    return wal_index_header(path) is not None
 
 
 def open_windows_source(path):
@@ -230,14 +278,18 @@ def linux_fd_snapshot():
     return result
 
 
-def attest_linux_database(before, source_fd):
-    """Prove the sole new descriptor belongs to the validated main database.
+def attest_linux_database(before, source_fd, *, sidecars=()):
+    """Prove every new descriptor belongs to the validated source cohort.
 
     SQLite's built-in immutable Unix VFS opens main during connect and keeps
     that fd until close. No queries/callbacks run between the snapshots. An
     extra descriptor (even another fd for A), a missing fd, or reuse of an
     existing number for a different identity makes attribution ambiguous.
     Do not select a matching A fd out of several: SQLite might be using B.
+
+    A WAL join passes the validated -wal/-shm identities as ``sidecars``, since
+    a snapshot read legitimately opens those too. Main must still appear, and
+    any descriptor outside the cohort is still foreign.
     """
     after = linux_fd_snapshot()
     if any(after.get(fd) != identity for fd, identity in before.items()):
@@ -245,7 +297,13 @@ def attest_linux_database(before, source_fd):
     opened = [identity for fd, identity in after.items() if fd not in before]
     source = os.fstat(source_fd)
     expected = (source.st_dev, source.st_ino, stat.S_IFREG)
-    if not stat.S_ISREG(source.st_mode) or opened != [expected]:
+    if sidecars:
+        cohort = {expected, *((dev, ino, stat.S_IFREG) for dev, ino in sidecars)}
+        attested = (expected in opened and
+                    all(identity in cohort for identity in opened))
+    else:
+        attested = opened == [expected]
+    if not stat.S_ISREG(source.st_mode) or not attested:
         raise OSError('SQLite fd attestation: missing, ambiguous, or foreign main descriptor')
 
 
@@ -259,9 +317,10 @@ def main(path, *, wal_snapshot=False):
     if before[0] is None:
         emit(dict(kind='unavailable', error='unable to open database: source missing'))
         return
-    # A writable descriptor is used only for an exclusive advisory lock. No
-    # source bytes are written. This excludes new WAL openers during the read,
-    # so our lock cannot strand a writer's final checkpoint/sidecar cleanup.
+    # A writable descriptor is used only for a quiet source's exclusive
+    # advisory lock, which excludes new WAL openers during the read so our lock
+    # cannot strand a writer's final checkpoint/sidecar cleanup. No source
+    # bytes are written through it in either mode.
     if os.name == 'nt':
         try:
             source = open_windows_source(path)
@@ -277,11 +336,6 @@ def main(path, *, wal_snapshot=False):
             source = path.open('rb')
             exclusive = False
     with source:
-        # Probe before locking: closing any descriptor for this inode releases
-        # this process's POSIX record locks. /dev/fd stat on macOS describes a
-        # device node, so validate an opened descriptor instead.
-        uri = (path.resolve().as_uri() + ('?mode=ro' if wal_snapshot else '?mode=ro&immutable=1') if os.name == 'nt'
-               else descriptor_uri(source.fileno()))
         descriptor_before = source_stamp(fd=source.fileno())
         if wal_snapshot:
             bound = descriptor_before[:2] == before[0][:2]
@@ -294,7 +348,13 @@ def main(path, *, wal_snapshot=False):
             emit(dict(kind='unavailable', error='unable to open database: source changed',
                       same_store_write=same_store_write(before[0], descriptor_before)))
             return
+        header = None
+        # Set when the source turns out to be live. POSIX then joins the
+        # committed WAL snapshot if the sidecar cohort allows it, and only
+        # emits this refusal when it does not.
+        live = None
         if os.name == 'nt':
+            uri = path.resolve().as_uri() + ('?mode=ro' if wal_snapshot else '?mode=ro&immutable=1')
             if not wal_snapshot:
                 import msvcrt
                 from ctypes import wintypes
@@ -332,46 +392,95 @@ def main(path, *, wal_snapshot=False):
                 return
             class Lock(ctypes.Structure):
                 _fields_ = fields
+            # pread leaves the file position alone, so the shared read below
+            # still sees these same bytes. The journal mode decides whether a
+            # live source is joinable, which is known before any locking.
+            header = os.pread(source.fileno(), 100, 0)
             query = Lock()
             query.type, query.start, query.length = fcntl.F_WRLCK, 1073741826, 510
             answer = Lock.from_buffer_copy(fcntl.fcntl(source, fcntl.F_GETLK, bytes(query)))
             if answer.type != fcntl.F_UNLCK:
-                emit(dict(kind='OperationalError' if answer.type == fcntl.F_WRLCK else 'unavailable',
-                          error='database is locked' if answer.type == fcntl.F_WRLCK else 'unable to open database: active reader; sidecars may be missing',
-                          code=5))  # SQLITE_BUSY, also on Python before 3.11.
+                live = dict(kind='OperationalError' if answer.type == fcntl.F_WRLCK else 'unavailable',
+                            error='database is locked' if answer.type == fcntl.F_WRLCK else 'unable to open database: active reader; sidecars may be missing',
+                            code=5)  # SQLITE_BUSY, also on Python before 3.11.
+            else:
+                # Select the descriptor before locking: closing any descriptor
+                # for this inode releases this process's POSIX record locks, and
+                # this probe opens and closes one. /dev/fd stat on macOS
+                # describes a device node, so validate an opened descriptor.
+                uri = descriptor_uri(source.fileno())
+                try:
+                    fcntl.lockf(source, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB, 510, 1073741826)
+                except BlockingIOError:
+                    live = dict(kind='OperationalError', error='database is locked')
+        if live is None:
+            after = _stamps_after_open(path)
+            if not wal_snapshot and after != before:
+                emit(dict(kind='unavailable', error='unable to open database: source changed',
+                          launch_topology_change=after[0] == before[0] and after[1:] != before[1:],
+                          same_store_write=same_store_write(before[0], after[0])))
                 return
-            try:
-                fcntl.lockf(source, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB, 510, 1073741826)
-            except BlockingIOError:
-                emit(dict(kind='OperationalError', error='database is locked'))
+            if header is None:
+                header = source.read(100)
+            if not wal_snapshot and not checkpointed_sidecars(path, before, header[18:20]):
+                # A validated WAL/index with uncheckpointed frames is concrete
+                # write contention, even if the writer dropped its byte-range
+                # lock between the lock probe and this checkpoint proof.
+                live = dict(kind='unavailable',
+                            error='unable to open database: live sidecars; retry after checkpoint',
+                            code=5)
+        if live is not None:
+            if os.name == 'nt' or not joinable_wal(path, before, header[18:20]):
+                emit(live)
                 return
-        after = _stamps_after_open(path)
-        if not wal_snapshot and after != before:
-            emit(dict(kind='unavailable', error='unable to open database: source changed',
-                      launch_topology_change=after[0] == before[0] and after[1:] != before[1:],
-                      same_store_write=same_store_write(before[0], after[0])))
-            return
-        header = source.read(100)
-        if not wal_snapshot and not checkpointed_sidecars(path, before, header[18:20]):
-            # A validated WAL/index with uncheckpointed frames is concrete
-            # write contention, even if the writer dropped its byte-range lock
-            # between the lock probe and this checkpoint proof.
-            emit(dict(kind='unavailable',
-                      error='unable to open database: live sidecars; retry after checkpoint',
-                      code=5))
-            return
-        after = _stamps_after_open(path)
-        if not wal_snapshot and after != before:
-            emit(dict(kind='unavailable', error='unable to open database: source changed',
-                      launch_topology_change=after[0] == before[0] and after[1:] != before[1:]))
-            return
+            # Join the committed WAL snapshot rather than refuse. Holding the
+            # shared range exclusively would make every writer connection BUSY,
+            # so drop it; unlocking a range we never took is a no-op.
+            fcntl.lockf(source, fcntl.LOCK_UN, 510, 1073741826)
+            wal_snapshot = True
+            uri = path.resolve().as_uri() + '?mode=ro'
+        if not wal_snapshot:
+            after = _stamps_after_open(path)
+            if after != before:
+                emit(dict(kind='unavailable', error='unable to open database: source changed',
+                          launch_topology_change=after[0] == before[0] and after[1:] != before[1:]))
+                return
         linux = os.name != 'nt' and sys.platform.startswith('linux')
+        pathname_bound = wal_snapshot and os.name != 'nt'
+        sidecars = tuple(side[:2] for side in before[1:3]) if pathname_bound else ()
+        def cohort_state():
+            """'ok', 'cohort' (the WAL pair moved), or 'replaced' (new main).
+
+            A pathname open has no descriptor-bound main file to lean on, so
+            every statement revalidates the identities the snapshot was chosen
+            from. A sidecar that moved is a retryable cohort change, not proof
+            that the selected database was replaced.
+            """
+            if not pathname_bound:
+                return 'ok'
+            try:
+                current = stamps(path)
+            except OSError:
+                return 'cohort'
+            if current[0] is None or current[0][:2] != descriptor_before[:2]:
+                return 'replaced'
+            if ([None if side is None else side[:2] for side in current[1:3]] !=
+                    [None if side is None else side[:2] for side in before[1:3]]):
+                return 'cohort'
+            return 'ok'
+
+        def unchanged():
+            if pathname_bound:
+                return cohort_state() == 'ok'
+            current = source_stamp(fd=source.fileno())
+            return (current[:2] == descriptor_before[:2] if wal_snapshot
+                    else current == descriptor_before)
         opened_before = linux_fd_snapshot() if linux else None
         c = sqlite3.connect(uri, uri=True)
         try:
             if linux:
-                attest_linux_database(opened_before, source.fileno())
-            elif os.name != 'nt':
+                attest_linux_database(opened_before, source.fileno(), sidecars=sidecars)
+            elif os.name != 'nt' and not wal_snapshot:
                 # Some Unix VFS builds resolve /proc/self/fd symlinks back to
                 # a replaceable pathname. Such an open is not descriptor-bound.
                 # Never expose rows or retry against the source name in that case.
@@ -382,13 +491,18 @@ def main(path, *, wal_snapshot=False):
             c.execute('PRAGMA synchronous=NORMAL')
             c.execute('BEGIN')
             c.execute('SELECT rootpage FROM sqlite_master LIMIT 1').fetchone()
-            if not wal_snapshot and _stamps_after_open(path) != before:
+            state = cohort_state() if wal_snapshot else (
+                'ok' if _stamps_after_open(path) == before else 'replaced')
+            if state == 'cohort':
+                # The writer cohort turned over before the snapshot was read.
+                # Retry and re-evaluate the source rather than fail the caller.
+                emit(dict(kind='unavailable',
+                          error='unable to open database: live sidecars; retry after checkpoint',
+                          code=5))
+                return
+            if state != 'ok':
                 emit(dict(kind='unavailable', error='unable to open database: source changed'))
                 return
-            def unchanged():
-                current = source_stamp(fd=source.fileno())
-                return (current[:2] == descriptor_before[:2] if wal_snapshot
-                        else current == descriptor_before)
             emit(dict(journal='wal' if header[18:20] == b'\x02\x02' else 'delete'))
             def event(name, args):
                 emit(dict(event=name, args=args))

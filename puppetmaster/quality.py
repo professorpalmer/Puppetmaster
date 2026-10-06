@@ -207,6 +207,16 @@ def assess_run_quality(artifacts: Iterable[Artifact]) -> dict[str, Any]:
             **evaluator_summary,
         }
 
+    unfinished = _write_run_unfinished(artifacts)
+    if unfinished:
+        return {
+            "quality": "degraded",
+            "reasons": [unfinished],
+            "trustworthy": False,
+            "blocking_failures": [],
+            **evaluator_summary,
+        }
+
     if _write_run_changed_nothing(artifacts):
         return {
             "quality": "degraded",
@@ -227,6 +237,29 @@ def assess_run_quality(artifacts: Iterable[Artifact]) -> dict[str, Any]:
 
 _WRITE_PERMISSION_MODES = ("acceptEdits", "bypassPermissions")
 _WRITE_SANDBOXES = ("workspace-write", "danger-full-access")
+
+
+def _write_run_unfinished(artifacts: list[Artifact]) -> str:
+    """Why a write-capable run is not a finished delivery, or ''.
+
+    The build contract asks every edit worker to end with VERDICT
+    PASS|FAIL|PARTIAL. A worker that did 2 of 26 assigned items reported
+    "Committed." with no verdict and the job read as delivered.
+    """
+    receipts = [_payload(a) for a in artifacts if a.type == ArtifactType.VERIFICATION
+                and "worker_diff_present" in _payload(a)]
+    if not any(p.get("permission_mode") in _WRITE_PERMISSION_MODES
+               or p.get("sandbox") in _WRITE_SANDBOXES for p in receipts):
+        return ""
+    verdicts = [_payload(a) for a in artifacts if a.type == ArtifactType.VERIFICATION
+                and _payload(a).get("kind") == "worker_verdict"]
+    if not verdicts:
+        return "unverified: the edit worker did not report whether it finished (no VERDICT)"
+    verdict = str(verdicts[-1].get("verdict") or "").upper()
+    if verdict in ("FAIL", "PARTIAL"):
+        reason = str(verdicts[-1].get("reason") or "").strip()
+        return f"worker reported {verdict}" + (f": {reason[:200]}" if reason else "")
+    return ""
 
 
 def _write_run_changed_nothing(artifacts: list[Artifact]) -> bool:

@@ -34,7 +34,6 @@ from puppetmaster.working_set import (
     ARTIFACT_INDEX_FILENAME,
     WORKING_SET_BRIEF_LINE,
     maybe_reuse_artifacts,
-    read_artifact_index,
     rebuild_artifact_index,
     reuse_fingerprint,
     stamp_fresh_validation,
@@ -44,6 +43,16 @@ from puppetmaster.working_set import (
 
 
 INSTRUCTION = "Find the retry bug in src/a.py"
+
+
+def read_artifact_index(job_dir: Path) -> list[dict]:
+    """Test-local reader for the artifact index the writer produces."""
+    path = Path(job_dir) / ARTIFACT_INDEX_FILENAME
+    if not path.is_file():
+        return []
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    items = raw.get("artifacts") if isinstance(raw, dict) else raw
+    return [item for item in (items or []) if isinstance(item, dict)]
 
 
 def _git_init_with_file(root: Path, rel: str, content: str) -> None:

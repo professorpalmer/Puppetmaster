@@ -1,10 +1,17 @@
 """Fenced, non-mutating SQLite reads in an isolated descriptor owner.
 
-No database copies. Ordinary reads reject live sidecars. After Windows proves
-an active WAL cohort, worker attach may join its existing WAL snapshot under a
-deny-delete source handle. Isolation
-matters: closing *any* source fd in the caller could release locks held by
-another SQLite connection in that process.
+No database copies. A quiet source is read through an immutable descriptor
+that touches no file at all. A live one -- a live connection, or uncheckpointed
+WAL frames -- is read by joining its committed WAL snapshot through a
+``mode=ro`` open, so observers neither block writers nor fail while a job
+writes. The guarantee in that mode is *never changes database content* rather
+than *touches no file*: a WAL reader records read marks in the ``-shm`` index,
+while the main database bytes and the WAL itself stay untouched and a
+``mode=ro`` connection never checkpoints. Incomplete or damaged sidecars are
+never created or repaired here; they stay unavailable.
+
+Isolation matters: closing *any* source fd in the caller could release locks
+held by another SQLite connection in that process.
 """
 from __future__ import annotations
 
@@ -490,8 +497,11 @@ class ReadConnection:
                     # closed its failed session. Do not fork a startup herd.
                     if not getattr(exc, 'session_closed', False):
                         raise
+                    # Windows joins a live WAL's committed snapshot on the
+                    # retry (POSIX decides inside the helper): attach and
+                    # observer reads alike, so neither waits on a writer.
                     wal_snapshot = (wal_snapshot or
-                        attach_binding and os.name == 'nt' and
+                        not launch_binding and os.name == 'nt' and
                         getattr(exc, 'wal_snapshot', False))
                     self._release_permit()
                     time.sleep(min(.01 if write_race else .05, remaining))

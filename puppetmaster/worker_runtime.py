@@ -775,11 +775,6 @@ class WorkerDaemon:
             time.sleep(self.poll_seconds)
 
     def run_once(self) -> bool:
-        # Interned poll: wake cells whose persisted alarm is due. Cells are
-        # additive to task leases and never replace claim_next_task.
-        from puppetmaster.cell import interned_poll
-
-        interned_poll(self.store)
         for job in self._running_jobs():
             for role in self.roles:
                 runtime = WorkerRuntime(

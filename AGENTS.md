@@ -26,22 +26,27 @@ own grep/read loop; that is your job.
 The rest of this file addresses an **interactive agent working with the user**,
 which has the MCP tools available. **Pi** is in that class: a TUI/pilot via the bundled `@puppetmaster/pi-pilot` package (`puppetmaster install-pi-mcp` / `setup --platforms pi`). **OMP / oh-my-pi** is the same class via native MCP (`puppetmaster install-omp-mcp` / `setup --platforms omp` or `ohmypi`; writes `~/.omp/agent/mcp.json`). Use start_implement / start_agentic / start_prewalk, consume artifacts, nuke the job. Do not lease `pi` or `omp` as a worker.
 
-## Default subagent runtime: Puppetmaster
+## Puppetmaster is the fan-out runtime, not the default for everything
 
-When this repo is open — and you are *not* a Puppetmaster worker (see above) —
-**Puppetmaster's MCP tools are the primary path for fanning out work**. Do not
-roll your own grep/read exploration loops or invoke ad-hoc subagents when a
-Puppetmaster swarm is available.
+When this repo is open, and you are *not* a Puppetmaster worker (see above),
+do the work yourself unless parallel workers clearly finish sooner or better.
+When work does fan out, Puppetmaster is the path, not ad-hoc subagents.
 
-## When to start a Puppetmaster swarm (do this by default)
+## When to start a Puppetmaster swarm
 
-For any request that involves more than a single trivial change, start a Puppetmaster swarm **before** spending tokens on your own exploration:
+Start one when the work splits into independent units that each take a
+worker minutes, or when there is more of it than one session can finish well:
 
-- Broad repo investigation, audit, or risk analysis ("review this", "find issues", "what could break").
-- Multi-file refactors, migrations, or cross-cutting cleanups.
-- Debugging that requires tracing call graphs, data flow, or test coverage across multiple files.
-- Planning the next implementation slice when scope or risks are unclear.
-- Comparing approaches, surfacing trade-offs, or producing decision artifacts.
+- Broad repo investigation, audit, or risk analysis across many areas, where
+  independent read-only lenses run in parallel.
+- Many independent modules or files to build or change (group small units
+  into a few workers; give a unit its own worker only when it is minutes of
+  work). Use one flow (`puppetmaster_flow`) with a `map`, per-unit checks and,
+  for craft-graded output, a render check plus a rubric judge.
+- Comparing approaches when independent candidates help.
+
+Work yourself for small changes, exact edits, follow-ups to work you just did,
+and coupled changes one session can hold.
 
 Default routing:
 

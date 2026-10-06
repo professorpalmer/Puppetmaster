@@ -440,15 +440,6 @@ def quota_admission_error(key: str, *, reset_at: Optional[float] = None) -> "Any
     )
 
 
-def is_quota_admission_error(error: Any) -> bool:
-    """True when ``error`` was raised by harvested-quota admission."""
-    return (
-        getattr(error, "reason", None) == RATE_LIMIT
-        and getattr(error, "status", None) == 429
-        and (getattr(error, "body", None) or "") == QUOTA_EXHAUSTED_BODY
-    )
-
-
 def admit_or_raise(admission_key: str, *, now: Optional[float] = None) -> None:
     """Raise a recoverable rate-limit error when harvested remaining is zero."""
     if not admission_enabled():

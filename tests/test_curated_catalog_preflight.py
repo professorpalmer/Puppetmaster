@@ -51,5 +51,28 @@ class CuratedCatalogPreflightTests(unittest.TestCase):
         self.assertIn("claude-opus-5-5", [entry["model"] for entry in curated_catalog("claude-code")])
 
 
+class LivePreflightCliTests(unittest.TestCase):
+    def test_live_preflight_blocks_an_adapter_whose_cli_is_missing(self) -> None:
+        healthy = BillingStatus(adapter="antigravity", billing="plan", healthy=True,
+                                detail="signed in", evidence=[])
+        env = {"AGY_COMMAND": "/nonexistent/agy-for-test"}
+        result = preflight_check("antigravity", live=True, env=env, billing_status=healthy)
+        self.assertFalse(result.ok)
+        self.assertIn("not installed", result.reason)
+        static = preflight_check("antigravity", env=env, billing_status=healthy)
+        self.assertTrue(static.ok)
+
+    def test_hermes_live_probe_makes_a_real_call_and_a_401_blocks(self) -> None:
+        import subprocess
+
+        from puppetmaster.preflight import live_probe
+
+        refused = subprocess.CompletedProcess([], 1, "", "HTTP 401: User not found.")
+        with patch("subprocess.run", return_value=refused) as run:
+            result = live_probe("hermes")
+        self.assertEqual(run.call_args[0][0][-4:], ["chat", "-q", "Reply with: ok", "-Q"])
+        self.assertFalse(result.ok)
+
+
 if __name__ == "__main__":
     unittest.main()

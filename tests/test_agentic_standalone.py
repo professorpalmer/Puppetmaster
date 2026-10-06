@@ -26,6 +26,12 @@ from puppetmaster import providers
 from puppetmaster.models import ArtifactType, Task
 
 
+def _read_deltas(path: Path) -> list[dict]:
+    """Read a complete NDJSON delta file the durable writer produced."""
+    with open(path, "r", encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
 class AgenticReasoningEffortTests(unittest.TestCase):
     def _extra(
         self,
@@ -2208,7 +2214,7 @@ class AgenticLoopTests(unittest.TestCase):
     def test_durable_delta_writer_roundtrip_and_no_statedir(self) -> None:
         import os
         from puppetmaster.adapters._delta_stream import (
-            DurableDeltaWriter, iter_deltas, delta_file_path,
+            DurableDeltaWriter, delta_file_path,
         )
 
         task = _task({})
@@ -2226,7 +2232,7 @@ class AgenticLoopTests(unittest.TestCase):
             writer.emit("text", "answer")
             writer.close()
             path = delta_file_path(Path(state.name), task.job_id, task.id)
-            records = list(iter_deltas(path))
+            records = _read_deltas(path)
         self.assertEqual([r["kind"] for r in records], ["reasoning", "text"])
         self.assertEqual("".join(r["text"] for r in records), "think answer")
         self.assertTrue(all(r["worker_id"] == "w1" for r in records))
@@ -2234,7 +2240,7 @@ class AgenticLoopTests(unittest.TestCase):
     def test_durable_delta_stream_persists_a_run(self) -> None:
         import os
         from puppetmaster.adapters import agentic
-        from puppetmaster.adapters._delta_stream import iter_deltas, delta_file_path
+        from puppetmaster.adapters._delta_stream import delta_file_path
         from puppetmaster.providers import AssistantTurn
 
         work = tempfile.TemporaryDirectory()
@@ -2264,7 +2270,7 @@ class AgenticLoopTests(unittest.TestCase):
 
         path = delta_file_path(Path(state.name), task.job_id, task.id)
         self.assertTrue(path.exists())
-        records = list(iter_deltas(path))
+        records = _read_deltas(path)
         self.assertEqual("".join(r["text"] for r in records), "hello")
 
     def test_run_deltas_follow_streams_persisted_records(self) -> None:

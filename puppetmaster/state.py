@@ -11,7 +11,6 @@ import sys
 from pathlib import Path
 from typing import Optional, Union
 
-from puppetmaster.fs_permissions import mkdir_private
 from puppetmaster.readonly import ReadUnavailable
 
 
@@ -22,13 +21,6 @@ def state_identity(path: Union[Path, str]) -> str:
     """Return a stable opaque identity for a resolved state directory."""
     resolved = str(Path(path).expanduser().resolve())
     return "state_" + hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:16]
-
-
-def ensure_state_dir(path: Union[Path, str]) -> Path:
-    """Create ``path`` (and parents) with owner-only directory permissions."""
-    resolved = Path(path)
-    mkdir_private(resolved)
-    return resolved
 
 
 def resolve_state_dir(value: Optional[Union[Path, str]] = None, cwd: Optional[Path] = None) -> Path:

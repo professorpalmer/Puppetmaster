@@ -1042,29 +1042,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     effort_index.add_argument("--json", action="store_true", help="Emit JSON.")
 
-    cell_status = subcommands.add_parser(
-        "cell-status",
-        help=(
-            "Inspect a named cell (Durable Object slice): sqlite path, "
-            "inbox depth, hibernating flag, next alarm. Omit the id to list."
-        ),
-    )
-    cell_status.add_argument("cell_id", nargs="?", help="Cell id (job or effort name).")
-    cell_status.add_argument("--json", action="store_true", help="Emit JSON.")
-
-    cell_inspect = subcommands.add_parser(
-        "cell-inspect",
-        help="Dump a cell's inspectable sqlite inbox (path + rows a human can open with sqlite3).",
-    )
-    cell_inspect.add_argument("cell_id", help="Cell id to inspect.")
-    cell_inspect.add_argument("--json", action="store_true", help="Emit JSON.")
-
-    cell_tick = subcommands.add_parser(
-        "cell-tick",
-        help="Process due cell alarms (same work as the interned daemon poll).",
-    )
-    cell_tick.add_argument("--json", action="store_true", help="Emit JSON.")
-
     gate = subcommands.add_parser(
         "gate",
         help=(
@@ -1562,10 +1539,10 @@ def build_parser() -> argparse.ArgumentParser:
     codex.add_argument("--cwd", default=str(Path.cwd()), help="Workspace for Codex.")
     codex.add_argument(
         "--model",
-        default="gpt-5.4-mini",
+        default=None,
         help=(
-            "Model passed to `codex exec -m` (gpt-5.6-sol, gpt-5.6-terra, "
-            "gpt-5.6-luna, gpt-5.5, gpt-5.4, gpt-5.4-mini, ...)."
+            "Model passed to `codex exec -m`. Default: the model in your Codex "
+            "config.toml, else Codex's own default."
         ),
     )
     codex.add_argument(
@@ -3232,15 +3209,15 @@ def build_parser() -> argparse.ArgumentParser:
     install_hooks_parser.add_argument(
         "--target",
         default=None,
-        help=f"Comma-separated subset. Valid: {', '.join(sorted(VALID_HOOK_TARGETS))}. Default: both.",
+        help=f"Comma-separated subset. Valid: {', '.join(sorted(VALID_HOOK_TARGETS))}. Default: every enabled host (codex only with --global).",
     )
     install_hooks_parser.add_argument(
         "--global",
         dest="global_scope",
         action="store_true",
         help=(
-            "Install user-level hooks (~/.cursor/hooks.json, ~/.claude/settings.json) "
-            "that cover every repo you open, instead of just this workspace."
+            "Install user-level hooks (~/.cursor/hooks.json, ~/.claude/settings.json, "
+            "$CODEX_HOME/hooks.json) that cover every repo you open, instead of just this workspace."
         ),
     )
     install_hooks_parser.add_argument("--force", action="store_true", help="Rewrite even if current.")

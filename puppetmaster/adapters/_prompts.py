@@ -35,7 +35,10 @@ _IMPLEMENT_REPORT_CONTRACT = (
     "Reporting contract: when you are done, end your final message with a short "
     "report — what you changed and why, the files you touched, and exactly what "
     "you ran to verify it. Puppetmaster persists that report as a durable "
-    "artifact; without it the run looks like it did nothing."
+    "artifact; without it the run looks like it did nothing. Make the report's "
+    "final line exactly one of `VERDICT: PASS - <what you did and checked>`, "
+    "`VERDICT: FAIL - <what still fails>` or `VERDICT: PARTIAL - <what you did "
+    "not finish>`; if you skipped any part of the task, the verdict is PARTIAL."
 )
 
 

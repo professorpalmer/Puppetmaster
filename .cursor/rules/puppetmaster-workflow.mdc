@@ -22,22 +22,23 @@ that is your job.
 The rest of this file addresses an interactive agent working with the user,
 which does have the MCP tools.
 
-# Puppetmaster is the Default Subagent Runtime
+# Puppetmaster is the fan-out runtime
 
-When this repo is open — and you are *not* a Puppetmaster worker (see above) —
-Puppetmaster's MCP tools are the **primary** path for fanning out work. Do not
-roll your own grep/read exploration loops or invoke ad-hoc subagents when a
-Puppetmaster swarm is available.
+When this repo is open, and you are *not* a Puppetmaster worker (see above),
+work solo unless parallel workers clearly finish sooner or better. When work
+fans out, Puppetmaster is the path, not ad-hoc subagents.
 
-## When you MUST start a Puppetmaster swarm (no permission needed)
+## When to start a Puppetmaster swarm
 
-For any user request that involves more than a single trivial change, start a Puppetmaster swarm **before** spending tokens on your own exploration:
+Start one when the work splits into independent units that each take a worker
+minutes, or when there is more of it than one session can finish well:
 
-- Broad repo investigation, audit, or risk analysis ("review this", "find issues", "what could break").
-- Multi-file refactors, migrations, or cross-cutting cleanups.
-- Debugging that requires tracing call graphs, data flow, or test coverage across multiple files.
-- Planning the next implementation slice when scope or risks are unclear.
-- Comparing approaches, surfacing trade-offs, or producing decision artifacts.
+- Broad investigation, audit, or risk analysis across many areas
+  (independent read-only lenses in parallel).
+- Many independent modules or files to build or change: one flow
+  (`puppetmaster_flow`) with grouped `map` items, per-unit checks and, for
+  craft-graded output, a render check plus a rubric judge.
+- Comparing approaches when independent candidates help.
 
 The default routing is:
 
@@ -51,6 +52,7 @@ Start tools return a `job_id` immediately. Do **not** wait inside one long MCP c
 
 Use native Cursor tooling directly for:
 
+- Small or coupled changes one session can hold, exact edits, and follow-ups to work you just did.
 - Trivial single-file edits with obvious intent (rename, add comment, fix typo).
 - Questions answerable from the current visible file or recent context.
 - Conversational follow-ups that don't change repo state.
@@ -87,9 +89,9 @@ Puppetmaster auto-injects CodeGraph context into every Cursor and Claude Code wo
 
 For quick, direct repo lookups without spinning up a swarm, prefer the bundled tools: `puppetmaster_codegraph_search`, `puppetmaster_codegraph_context`, `puppetmaster_codegraph_affected`, `puppetmaster_codegraph_files`, `puppetmaster_codegraph_status`. If CodeGraph isn't initialized in the target repo, call `puppetmaster_codegraph_init` once before using the other CodeGraph tools.
 
-## Why this is the default
+## Why Puppetmaster for fan-out
 
-Puppetmaster workers run as independent OS subprocesses with durable SQLite-backed state, leases, and structured JSON artifacts. That gives you parallelism, replayable runs, and a stitched summary instead of a single long transcript. Defaulting to this path keeps the main session lean and the work auditable.
+Puppetmaster workers run as independent OS subprocesses with durable SQLite-backed state, leases, and structured JSON artifacts: parallelism, per-unit repair, replayable runs, and a stitched summary instead of a single long transcript. Small work stays in one session, which beats any fan-out there.
 
 ## When MCP fails: fall back to the CLI, don't give up
 

@@ -12,6 +12,7 @@ from puppetmaster.models import Artifact, ArtifactType, Task
 from puppetmaster.redaction import redact_secrets
 from puppetmaster.usage import selected_token_usage
 from puppetmaster.session_lease import SessionLease, acquire_codex_thread
+from puppetmaster.worker_attribution import attribution_payload, codex_event_references
 from puppetmaster.worker_resume import resolved_resume, task_resume_record
 
 from ._base import (
@@ -282,10 +283,10 @@ class CodexAdapter(CliWorkerAdapter):
         except Exception:
             # Best effort: any failure runs the worker in the user's own home.
             return None
-        if home is not None and prepared.command and prepared.command[-1] == "-":
+        if home is not None and prepared.command[-2:] == list(STDIN_PROMPT):
             # Bounded workers never fork subagents, and must not accrue memories.
-            prepared.command = [*prepared.command[:-1], "--disable", "memories",
-                                "--disable", "multi_agent", "-"]
+            prepared.command = [*prepared.command[:-2], "--disable", "memories",
+                                "--disable", "multi_agent", *STDIN_PROMPT]
         return home
 
     def _invoke_cli(
@@ -362,6 +363,12 @@ class CodexAdapter(CliWorkerAdapter):
         timeout_seconds = int(task.payload.get("timeout_seconds", self.default_timeout_seconds))
         cwd = Path(task.payload.get("cwd") or ".").resolve()
 
+        events = parse_codex_events(completed.stdout)
+        # Codex names the files it edited and the commands it ran, so the
+        # write_scope gate can tell this run's writes from a concurrent
+        # writer's in a shared checkout.
+        attribution = attribution_payload(codex_event_references(events, cwd), before)
+
         if completed.timed_out:
             stdout = completed.stdout
             stderr = completed.stderr
@@ -397,12 +404,14 @@ class CodexAdapter(CliWorkerAdapter):
                         "stdout_capture": stdout_capture,
                         "stderr_capture": stderr_capture,
                         "live_log": completed.live_log_path,
+                        "attempt_id": getattr(completed, "attempt_id", None),
                         "timeout_seconds": timeout_seconds,
                         "base_sha": before["sha"],
                         "head_sha": after["sha"],
                         "changed_files": after["changed_files"],
                         "untracked_files": after["untracked_files"],
                         **diff_source_payload(before, after),
+                        **attribution,
                     },
                 )
             ]
@@ -427,7 +436,6 @@ class CodexAdapter(CliWorkerAdapter):
                 )
             return artifacts
 
-        events = parse_codex_events(completed.stdout)
         usage = next(
             (
                 ev.get("usage", {})
@@ -528,6 +536,7 @@ class CodexAdapter(CliWorkerAdapter):
                 "stdout_capture": stdout_capture,
                 "stderr_capture": stderr_capture,
                 "live_log": completed.live_log_path,
+                "attempt_id": getattr(completed, "attempt_id", None),
                 "last_message": _redacted_tail(last_message, _STDOUT_TAIL_CHARS),
                 "last_message_capture": last_message_capture,
                 **selected_token_usage(usage),
@@ -544,6 +553,7 @@ class CodexAdapter(CliWorkerAdapter):
                 "changed_files": after["changed_files"],
                 "untracked_files": after["untracked_files"],
                 **diff_source_payload(before, after),
+                **attribution,
                 "failure": failure,
             },
         )
@@ -591,6 +601,11 @@ class CodexAdapter(CliWorkerAdapter):
         return artifacts
 
 
+# The stdin prompt positional. ``--`` ends option parsing first: ``--image``
+# is variadic and would otherwise take the bare ``-`` as another image path.
+STDIN_PROMPT = ("--", "-")
+
+
 def build_codex_exec_command(
     *,
     executable: Union[str, list[str]] = "codex",
@@ -635,7 +650,7 @@ def build_codex_exec_command(
     # Read the prompt from stdin. Never pass a prompt positional as well: codex
     # then appends the piped text as a separate `<stdin>` block instead of
     # treating it as the instruction.
-    command.append("-")
+    command.extend(STDIN_PROMPT)
     return command
 
 
@@ -655,7 +670,7 @@ def build_codex_resume_command(
     ``exec resume`` rejects ``--sandbox`` and ``-C``: the sandbox travels as a
     ``-c sandbox_mode`` override and cwd comes from the subprocess. It never
     takes ``--ephemeral``, so the resumed thread stays resumable for the next
-    revision. The prompt is read from stdin via the trailing ``-``.
+    revision. The prompt is read from stdin via the trailing ``-- -``.
     """
     command = command_parts(executable)
     command.extend(["exec", "resume", str(session_id), "--json"])
@@ -670,7 +685,7 @@ def build_codex_resume_command(
         command.extend(["-m", str(model)])
     if extra_args:
         command.extend(command_parts(extra_args))
-    command.append("-")
+    command.extend(STDIN_PROMPT)
     return command
 
 

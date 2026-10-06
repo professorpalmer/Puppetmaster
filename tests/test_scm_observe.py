@@ -1,4 +1,4 @@
-"""Host SCM observe: independent reactions, suppress ≠ delivered, derived attention."""
+"""Host SCM observe: independent reactions, dedupe, derived attention."""
 from __future__ import annotations
 
 import json
@@ -16,7 +16,6 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 from puppetmaster.metr_seams import (
-    WAIT_USER,
     load_host_document,
     record_host_observation,
 )
@@ -30,7 +29,6 @@ from puppetmaster.scm_observe import (
     ATTENTION_WORKING,
     OUTCOME_ACCOUNTED,
     OUTCOME_SKIPPED,
-    OUTCOME_SUPPRESSED,
     SCMSnapshot,
     derive_attention,
     facts_from_snapshot,
@@ -175,29 +173,6 @@ class ObserveScmTests(unittest.TestCase):
             )
             self.assertEqual(len(store.list_tasks(job.id)), 4)
 
-    def test_waiting_user_suppresses_and_retries_later(self):
-        with TemporaryDirectory() as tmp:
-            store = SwarmStore(Path(tmp) / ".puppetmaster")
-            store.init()
-            job = store.create_job("scm")
-            _parent(store, job.id)
-            store.set_job_wait_reason(job.id, WAIT_USER, actor="coordinator")
-            snap = snapshot_from_gh_payload(
-                _payload(statusCheckRollup=[{"name": "tests", "conclusion": "FAILURE"}])
-            )
-            first = observe_scm(store, job.id, snap)
-            self.assertEqual(first["reactions"][0]["outcome"], OUTCOME_SUPPRESSED)
-            self.assertEqual(first["reactions"][0]["reason"], WAIT_USER)
-            self.assertEqual(len(store.list_tasks(job.id)), 1)
-            document = load_host_document(store, job.id)
-            key = first["reactions"][0]["key"]
-            self.assertEqual(document["reactions"][key]["outcome"], OUTCOME_SUPPRESSED)
-
-            store.set_job_wait_reason(job.id, None, actor="coordinator")
-            second = observe_scm(store, job.id, snap)
-            self.assertEqual(second["reactions"][0]["outcome"], OUTCOME_ACCOUNTED)
-            self.assertEqual(len(store.list_tasks(job.id)), 2)
-
     def test_signature_change_re_enqueues(self):
         with TemporaryDirectory() as tmp:
             store = SwarmStore(Path(tmp) / ".puppetmaster")
@@ -222,26 +197,6 @@ class ObserveScmTests(unittest.TestCase):
             changed = observe_scm(store, job.id, second_snap)
             self.assertEqual(changed["reactions"][0]["reason"], "enqueued")
             self.assertEqual(len(store.list_tasks(job.id)), 3)
-
-    def test_hold_and_veto_suppress(self):
-        with TemporaryDirectory() as tmp:
-            store = SwarmStore(Path(tmp) / ".puppetmaster")
-            store.init()
-            job = store.create_job("scm")
-            _parent(store, job.id)
-            store.hold_subgraph(job.id, actor="coordinator")
-            snap = snapshot_from_gh_payload(
-                _payload(statusCheckRollup=[{"name": "tests", "conclusion": "FAILURE"}])
-            )
-            held = observe_scm(store, job.id, snap)
-            self.assertEqual(held["reactions"][0]["outcome"], OUTCOME_SUPPRESSED)
-            self.assertEqual(held["reactions"][0]["reason"], "hold")
-            self.assertEqual(len(store.list_tasks(job.id)), 1)
-            store.resume_subgraph(job.id, actor="coordinator")
-            store.veto_subgraph(job.id, actor="coordinator")
-            vetoed = observe_scm(store, job.id, snap)
-            self.assertEqual(vetoed["reactions"][0]["reason"], "veto")
-            self.assertEqual(len(store.list_tasks(job.id)), 1)
 
     def test_terminal_job_records_but_does_not_enqueue(self):
         with TemporaryDirectory() as tmp:
@@ -302,9 +257,6 @@ class ObserveScmTests(unittest.TestCase):
             parent = _parent(store, job.id)
             store.update_job_status(job.id, JobStatus.RUNNING, actor="coordinator")
             self.assertEqual(derive_attention(store, job.id), ATTENTION_WORKING)
-            store.set_job_wait_reason(job.id, WAIT_USER, actor="coordinator")
-            self.assertEqual(derive_attention(store, job.id), ATTENTION_NEEDS_YOU)
-            store.set_job_wait_reason(job.id, None, actor="coordinator")
             store.save_artifact(
                 Artifact(
                     job_id=job.id,

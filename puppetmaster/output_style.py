@@ -90,19 +90,6 @@ def normalize_style(value: Optional[str]) -> Optional[str]:
     return token if token in _VALID_STYLES else None
 
 
-def resolve_output_style(
-    payload_value: Optional[str], env_value: Optional[str]
-) -> Optional[str]:
-    """Resolve the active style for a spec. Explicit payload wins over env.
-
-    A payload that names a *disabled* value (e.g. ``"off"``) suppresses the env
-    default for that one spec, mirroring the tri-state skill/memory opt-in.
-    """
-    if payload_value is not None:
-        return normalize_style(payload_value)
-    return normalize_style(env_value)
-
-
 def directive_for(style: Optional[str]) -> str:
     """Render the directive block for a resolved style (empty string if off)."""
     resolved = normalize_style(style)
@@ -112,14 +99,6 @@ def directive_for(style: Optional[str]) -> str:
     lines = [_HEADER.format(style=resolved)]
     lines.extend(f"- {rule}" for rule in rules)
     return "\n".join(lines)
-
-
-def apply_output_style(instruction: str, style: Optional[str]) -> str:
-    """Prepend the directive to a worker instruction. No-op when disabled."""
-    directive = directive_for(style)
-    if not directive:
-        return instruction
-    return f"{directive}\n\n{instruction}"
 
 
 def normalize_custom_text(value: Optional[str]) -> Optional[str]:

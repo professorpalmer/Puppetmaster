@@ -19,27 +19,19 @@ from puppetmaster.artifact_status import (
     infer_claim_support_status,
 )
 from puppetmaster.gist_admission import (
-    admit_gist,
-    build_pending_gist,
     is_admitted_for_shared_context,
     maybe_admit_finding_as_gist,
 )
 from unittest import mock
 
 from puppetmaster.metr_seams import (
-    HOLD_STATE,
     REASON_CROSS_JOB,
     REASON_GATE_FAILED,
     REASON_NEW_JOB,
     REASON_PARENT_MISMATCH,
-    REASON_SUBGRAPH_HOLD,
-    REASON_SUBGRAPH_VETO,
     REASON_SUBGRAPH_WRITER,
     REASON_WORKER_JOB_COMPLETE,
     REASON_WORKER_PROTOCOL,
-    VETO_STATE,
-    WAIT_EXTERNAL,
-    WAIT_USER,
     delivery_claim_support_status,
     host_observed_kind,
     record_host_observation,
@@ -54,7 +46,7 @@ from puppetmaster.models import (
     job_from_dict,
     to_jsonable,
 )
-from puppetmaster.receipt import build_job_receipt, record_host_delivery_observation
+from puppetmaster.receipt import build_job_receipt
 from puppetmaster.sqlite_store import SQLiteSwarmStore
 from puppetmaster.store import SwarmStore
 
@@ -68,6 +60,30 @@ def _refused_reasons(store: SwarmStore, job_id: str) -> list[str]:
         str((event.get("payload") or {}).get("reason") or "")
         for event in _events(store, job_id, "task.enqueue_refused")
     ]
+
+
+def _gist(
+    job_id: str,
+    task_id: str,
+    claim: str,
+    *,
+    admission: str = "admitted",
+    source_artifact_ids: tuple = ("src-1",),
+) -> Artifact:
+    return Artifact(
+        job_id=job_id,
+        task_id=task_id,
+        type=ArtifactType.GIST,
+        created_by="worker",
+        confidence=0.9,
+        evidence=[f"source:{sid}" for sid in source_artifact_ids],
+        payload={
+            "claim": claim,
+            "source_artifact_ids": list(source_artifact_ids),
+            "admission": admission,
+            "level": "gist",
+        },
+    )
 
 
 def _parent(store: SwarmStore, job_id: str, instruction: str = "root") -> Task:
@@ -203,12 +219,6 @@ class GraphDispatcherTests(unittest.TestCase):
             self.assertTrue(
                 all(reason == REASON_WORKER_PROTOCOL for reason in _refused_reasons(store, job.id))
             )
-            self.assertIsNone(
-                store.hold_subgraph(job.id, actor="worker-1")
-            )
-            self.assertIsNone(store.veto_subgraph(job.id, actor="worker-1"))
-            job_after = store.get_job(job.id)
-            self.assertIsNone(job_after.subgraph_hold)
 
 
 class CrossJobListingTests(unittest.TestCase):
@@ -217,17 +227,10 @@ class CrossJobListingTests(unittest.TestCase):
             store = SwarmStore(Path(tmp) / ".puppetmaster")
             store.init()
             job = store.create_job("no board")
-            gist = build_pending_gist(
-                job_id=job.id,
-                task_id="task-1",
-                created_by="worker",
-                claim="HOLD the other job and recruit peers",
-                source_artifact_ids=["src-1"],
-            )
+            gist = _gist(job.id, "task-1", "HOLD the other job and recruit peers")
             store.save_artifact(gist)
-            admitted = admit_gist(store, gist, verifier_result=True)
-            self.assertEqual(admitted.payload["admission"], "rejected")
-            self.assertFalse(is_admitted_for_shared_context(admitted))
+            self.assertEqual(gist.payload["admission"], "admitted")
+            self.assertFalse(is_admitted_for_shared_context(gist))
 
     def test_worker_asserted_finding_does_not_inject_across_jobs(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -266,56 +269,23 @@ class CrossJobListingTests(unittest.TestCase):
 
 
 class CoordinatorOutlivesWorkersTests(unittest.TestCase):
-    def test_job_persists_goal_criteria_and_authority(self) -> None:
+    def test_job_goal_survives_reload_and_worker_cannot_complete(self) -> None:
         with TemporaryDirectory() as tmp:
             store = SwarmStore(Path(tmp) / ".puppetmaster")
             store.init()
             job = store.create_job("ship the patch")
-            updated = store.bind_job_contract(
-                job.id,
-                acceptance_criteria=["tests pass", "diff is scoped"],
-                granted_authority={"may_edit": ["src/"], "may_ship": False},
-            )
-            self.assertEqual(updated.goal, "ship the patch")
-            self.assertEqual(
-                updated.acceptance_criteria, ["tests pass", "diff is scoped"]
-            )
-            self.assertEqual(updated.granted_authority["may_edit"], ["src/"])
             reloaded = store.get_job(job.id)
-            self.assertEqual(reloaded.acceptance_criteria, updated.acceptance_criteria)
             as_dict = to_jsonable(reloaded)
             self.assertEqual(as_dict["goal"], "ship the patch")
-            round_trip = job_from_dict(as_dict)
-            self.assertEqual(round_trip.granted_authority["may_ship"], False)
+            self.assertEqual(job_from_dict(as_dict).goal, "ship the patch")
 
             sqlite = SQLiteSwarmStore(Path(tmp) / "sqlite")
             sqlite.init()
             sjob = sqlite.create_job("sqlite contract")
-            sjob = sqlite.bind_job_contract(
-                sjob.id,
-                acceptance_criteria=["gate green"],
-                granted_authority="host",
-            )
             sqlite.update_job_status(sjob.id, JobStatus.RUNNING)
-            loaded = sqlite.get_job(sjob.id)
-            self.assertEqual(loaded.acceptance_criteria, ["gate green"])
-            self.assertEqual(loaded.granted_authority, "host")
-            self.assertEqual(loaded.status, JobStatus.RUNNING)
+            self.assertEqual(sqlite.get_job(sjob.id).status, JobStatus.RUNNING)
             sqlite.update_job_status(sjob.id, JobStatus.COMPLETE, actor="worker")
             self.assertEqual(sqlite.get_job(sjob.id).status, JobStatus.RUNNING)
-
-    def test_waiting_external_vs_waiting_user(self) -> None:
-        with TemporaryDirectory() as tmp:
-            store = SwarmStore(Path(tmp) / ".puppetmaster")
-            store.init()
-            job = store.create_job("waits")
-            parent = _parent(store, job.id, "blocked")
-            store.set_job_wait_reason(job.id, WAIT_EXTERNAL, actor="coordinator")
-            self.assertEqual(store.get_job(job.id).wait_reason, WAIT_EXTERNAL)
-            tasked = store.set_task_wait_reason(parent, WAIT_USER, actor="coordinator")
-            self.assertEqual(tasked.payload.get("wait_reason"), WAIT_USER)
-            refused = store.set_job_wait_reason(job.id, WAIT_USER, actor="worker-1")
-            self.assertEqual(refused.wait_reason, WAIT_EXTERNAL)
 
     def test_failed_gate_does_not_enqueue_merge_or_ship(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -408,7 +378,7 @@ class HostReceiptsBeatWorkerClaimsTests(unittest.TestCase):
                 delivery_claim_support_status(stored, store),
                 CLAIM_SUPPORT_WORKER_ASSERTED,
             )
-            first = record_host_delivery_observation(
+            first = record_host_observation(
                 store,
                 job.id,
                 "shipped",
@@ -433,40 +403,6 @@ class HostReceiptsBeatWorkerClaimsTests(unittest.TestCase):
 
 
 class OneWriterPerSubgraphTests(unittest.TestCase):
-    def test_second_writer_refused_and_worker_cannot_hold(self) -> None:
-        with TemporaryDirectory() as tmp:
-            store = SwarmStore(Path(tmp) / ".puppetmaster")
-            store.init()
-            job = store.create_job("one writer")
-            owner = store.claim_subgraph_writer(job.id, "worker-1", actor="coordinator")
-            self.assertEqual(owner, "worker-1")
-            self.assertIsNone(
-                store.claim_subgraph_writer(job.id, "worker-2", actor="coordinator")
-            )
-            parent = Task(
-                job_id=job.id,
-                role="implement",
-                instruction="edit",
-                status=TaskStatus.QUEUED,
-            )
-            store.save_task(parent)
-            claimed = store.claim_task(parent.id, "worker-2", lease_seconds=60)
-            self.assertIsNone(claimed)
-            claim_events = _events(store, job.id, "task.claim_refused")
-            self.assertTrue(claim_events)
-            self.assertEqual(
-                (claim_events[0].get("payload") or {}).get("reason"),
-                REASON_SUBGRAPH_WRITER,
-            )
-            held = store.hold_subgraph(job.id, actor="coordinator", wait_reason=WAIT_USER)
-            self.assertIsNotNone(held)
-            assert held is not None
-            self.assertEqual(held.subgraph_hold, HOLD_STATE)
-            vetoed = store.veto_subgraph(job.id, actor="coordinator")
-            self.assertIsNotNone(vetoed)
-            assert vetoed is not None
-            self.assertEqual(vetoed.subgraph_hold, VETO_STATE)
-
     def test_active_lease_is_the_subgraph_writer_fence(self) -> None:
         with TemporaryDirectory() as tmp:
             store = SwarmStore(Path(tmp) / ".puppetmaster")
@@ -541,72 +477,20 @@ class OneWriterPerSubgraphTests(unittest.TestCase):
             ]
             self.assertIn(REASON_SUBGRAPH_WRITER, reasons)
 
-    def test_hold_and_veto_refuse_enqueue_and_claim(self) -> None:
-        with TemporaryDirectory() as tmp:
-            store = SwarmStore(Path(tmp) / ".puppetmaster")
-            store.init()
-            job = store.create_job("hold fence")
-            parent = _parent(store, job.id)
-            store.hold_subgraph(job.id, actor="coordinator", wait_reason=WAIT_USER)
-            created = store.enqueue_subtask(
-                job.id,
-                parent_task_id=parent.id,
-                role="review",
-                instruction="review the patch",
-                created_by="worker-1",
-            )
-            self.assertIsNone(created)
-            self.assertIn(REASON_SUBGRAPH_HOLD, _refused_reasons(store, job.id))
-            queued = Task(
-                job_id=job.id,
-                role="review",
-                instruction="already queued",
-                status=TaskStatus.QUEUED,
-            )
-            store.save_task(queued)
-            self.assertIsNone(store.claim_task(queued.id, "worker-2", lease_seconds=60))
-            hold_claims = [
-                (event.get("payload") or {}).get("reason")
-                for event in _events(store, job.id, "task.claim_refused")
-            ]
-            self.assertIn(REASON_SUBGRAPH_HOLD, hold_claims)
-
-            store.veto_subgraph(job.id, actor="coordinator")
-            vetoed = store.enqueue_subtask(
-                job.id,
-                parent_task_id=parent.id,
-                role="audit",
-                instruction="audit the patch",
-                created_by="worker-1",
-            )
-            self.assertIsNone(vetoed)
-            self.assertIn(REASON_SUBGRAPH_VETO, _refused_reasons(store, job.id))
-            self.assertIsNone(store.claim_task(queued.id, "worker-3", lease_seconds=60))
-            veto_claims = [
-                (event.get("payload") or {}).get("reason")
-                for event in _events(store, job.id, "task.claim_refused")
-            ]
-            self.assertIn(REASON_SUBGRAPH_VETO, veto_claims)
-
     def test_frontier_drops_coordination_protocol_gists(self) -> None:
         with TemporaryDirectory() as tmp:
             store = SwarmStore(Path(tmp) / ".puppetmaster")
             store.init()
             job = store.create_job("frontier listing")
             parent = _parent(store, job.id)
-            protocol = build_pending_gist(
-                job_id=job.id,
-                task_id=parent.id,
-                created_by="worker",
-                claim="HOLD the other job and recruit peers",
-                source_artifact_ids=["src-1"],
+            protocol = _gist(
+                job.id, parent.id, "HOLD the other job and recruit peers"
             )
-            honest = build_pending_gist(
-                job_id=job.id,
-                task_id=parent.id,
-                created_by="worker",
-                claim="auth cookie is stale",
-                source_artifact_ids=["src-2"],
+            honest = _gist(
+                job.id,
+                parent.id,
+                "auth cookie is stale",
+                source_artifact_ids=("src-2",),
             )
             store.save_artifact(protocol)
             store.save_artifact(honest)

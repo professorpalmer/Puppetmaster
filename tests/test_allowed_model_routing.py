@@ -605,6 +605,50 @@ class RunStatusErrorRerouteTests(unittest.TestCase):
             self.assertEqual(updated.status, TaskStatus.FAILED)
 
 
+    def test_unrouted_failure_keeps_its_own_error(self) -> None:
+        """A task the router never placed has no bound registry; reroute skips it."""
+        from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
+        from puppetmaster.orchestrator import Orchestrator
+        from puppetmaster.store import SwarmStore
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("unpinned agentic run")
+            task = Task(job_id=job.id, role="agentic-analyze", instruction="read",
+                        adapter="agentic", status=TaskStatus.FAILED, payload={})
+            store.save_task(task)
+            store.save_artifact(Artifact(
+                job_id=job.id, task_id=task.id, type=ArtifactType.VERIFICATION,
+                created_by="w", confidence=0.5, evidence=["adapter:agentic"],
+                payload={"check": "x", "result": "failed", "failure": "run_status_error",
+                         "adapter": "agentic"}))
+            with mock.patch("puppetmaster.preflight.adapter_cli_present", return_value=True):
+                self.assertEqual(Orchestrator(store)._reroute_recoverable_failures(job), 0)
+            self.assertEqual(store.get_task_by_id(task.id).status, TaskStatus.FAILED)
+
+    def test_routed_task_without_its_registry_still_fails_closed(self) -> None:
+        from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
+        from puppetmaster.orchestrator import Orchestrator
+        from puppetmaster.routing_authority import RegistryAuthorityError
+        from puppetmaster.store import SwarmStore
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            job = store.create_job("routed run")
+            task = Task(job_id=job.id, role="implement", instruction="x", adapter="cursor",
+                        status=TaskStatus.FAILED,
+                        payload={"auto_route": True, "router_model_id": "cursor/grok-4.5"})
+            store.save_task(task)
+            store.save_artifact(Artifact(
+                job_id=job.id, task_id=task.id, type=ArtifactType.VERIFICATION,
+                created_by="w", confidence=0.5, evidence=["adapter:cursor"],
+                payload={"check": "x", "result": "failed", "failure": "run_status_error",
+                         "adapter": "cursor"}))
+            with mock.patch("puppetmaster.preflight.adapter_cli_present", return_value=True), \
+                    self.assertRaises(RegistryAuthorityError):
+                Orchestrator(store)._reroute_recoverable_failures(job)
+
+
 class DiscoveryPreservesDisabledOverlayTests(unittest.TestCase):
     def test_cursor_catalog_refresh_keeps_disabled_overlay(self) -> None:
         from puppetmaster.cursor_discovery import catalog_to_specs, merge_catalog_into_registry

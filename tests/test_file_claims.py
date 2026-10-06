@@ -113,13 +113,6 @@ class FileClaimRegistryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.registry.acquire(self.root, ".git/config", "worker-a", 60)
 
-    def test_active_listing_is_bounded_and_excludes_expired(self) -> None:
-        for index in range(3):
-            self.registry.acquire(self.root, "file-%d" % index, "worker", 60)
-        self.assertEqual(2, len(self.registry.list_active(self.root, limit=2)))
-        with self.assertRaises(ValueError):
-            self.registry.list_active(self.root, limit=0)
-
     def test_separate_registry_instances_share_sqlite_serialization(self) -> None:
         first = self.registry.acquire(self.root, "tracked.txt", "worker-a", 60)
         other = FileClaimRegistry(self.registry.db_path, clock=lambda: self.now)
@@ -156,15 +149,17 @@ class FileClaimRegistryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "escapes"):
             self.registry.acquire(self.root, "escape.txt", "worker-a", 60)
 
-    def test_validation_and_sweep(self) -> None:
+    def test_validation_and_lazy_expiry(self) -> None:
         with self.assertRaises(ValueError):
             self.registry.acquire(self.root, "tracked.txt", "", 60)
         with self.assertRaises(ValueError):
             self.registry.acquire(self.root, "tracked.txt", "worker", 0)
         self.registry.acquire(self.root, "tracked.txt", "worker", 1)
         self.now += 1
-        self.assertEqual(1, self.registry.sweep_expired(self.root))
-        self.assertEqual("expired", self.registry.audit_records()[-1].event)
+        # Expiry is lazy: the next acquisition reaps and audits the stale row.
+        self.registry.acquire(self.root, "tracked.txt", "worker-b", 60)
+        events = [record.event for record in self.registry.audit_records()]
+        self.assertIn("expired", events)
 
 
 def _competing_claim(db_path: str, repo: str, owner: str, result: object) -> None:

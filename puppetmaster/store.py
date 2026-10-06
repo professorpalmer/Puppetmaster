@@ -530,242 +530,6 @@ class SwarmStore(StoreContracts):
             cost_receipt=cost_receipt,
         )
 
-    def bind_job_contract(
-        self,
-        job_id: str,
-        *,
-        acceptance_criteria: Optional[list[str]] = None,
-        granted_authority: Optional[Any] = None,
-        wait_reason: Optional[str] = None,
-    ) -> Job:
-        """Persist original goal/criteria/authority (additive; coordinator)."""
-        from puppetmaster.metr_seams import normalize_wait_reason
-
-        job = self.get_job(job_id)
-        updates: dict[str, Any] = {}
-        if acceptance_criteria is not None:
-            updates["acceptance_criteria"] = [
-                str(item) for item in acceptance_criteria if str(item).strip()
-            ]
-        if granted_authority is not None:
-            updates["granted_authority"] = granted_authority
-        if wait_reason is not None:
-            updates["wait_reason"] = normalize_wait_reason(wait_reason)
-        if not updates:
-            return job
-        updated = replace(job, **updates)
-        self.save_job(updated)
-        self.emit(job_id, "job.contract", {key: updates[key] for key in updates})
-        return updated
-
-    def set_job_wait_reason(
-        self,
-        job_id: str,
-        wait_reason: Optional[str],
-        *,
-        actor: Optional[str] = None,
-    ) -> Job:
-        from puppetmaster.metr_seams import (
-            REASON_WORKER_PROTOCOL,
-            is_worker_actor,
-            normalize_wait_reason,
-        )
-
-        job = self.get_job(job_id)
-        if is_worker_actor(actor):
-            self.emit(
-                job_id,
-                "task.enqueue_refused",
-                {
-                    "reason": REASON_WORKER_PROTOCOL,
-                    "protocol": "wait_reason",
-                    "actor": actor,
-                },
-            )
-            return job
-        updated = replace(job, wait_reason=normalize_wait_reason(wait_reason))
-        self.save_job(updated)
-        self.emit(
-            job_id,
-            "job.wait_reason",
-            {"wait_reason": updated.wait_reason, "actor": actor or "coordinator"},
-        )
-        return updated
-
-    def hold_subgraph(
-        self,
-        job_id: str,
-        *,
-        actor: Optional[str] = None,
-        wait_reason: str = "waiting_user",
-        note: Optional[str] = None,
-    ) -> Optional[Job]:
-        from puppetmaster.metr_seams import (
-            HOLD_STATE,
-            REASON_WORKER_PROTOCOL,
-            WAIT_USER,
-            is_worker_actor,
-            normalize_wait_reason,
-        )
-
-        job = self.get_job(job_id)
-        if is_worker_actor(actor):
-            self.emit(
-                job_id,
-                "task.enqueue_refused",
-                {
-                    "reason": REASON_WORKER_PROTOCOL,
-                    "protocol": "HOLD",
-                    "actor": actor,
-                },
-            )
-            return None
-        updated = replace(
-            job,
-            subgraph_hold=HOLD_STATE,
-            wait_reason=normalize_wait_reason(wait_reason) or WAIT_USER,
-        )
-        self.save_job(updated)
-        self.emit(
-            job_id,
-            "subgraph.hold",
-            {
-                "actor": actor or "coordinator",
-                "wait_reason": updated.wait_reason,
-                "note": note,
-            },
-        )
-        return updated
-
-    def veto_subgraph(
-        self,
-        job_id: str,
-        *,
-        actor: Optional[str] = None,
-        note: Optional[str] = None,
-    ) -> Optional[Job]:
-        from puppetmaster.metr_seams import (
-            REASON_WORKER_PROTOCOL,
-            VETO_STATE,
-            is_worker_actor,
-        )
-
-        job = self.get_job(job_id)
-        if is_worker_actor(actor):
-            self.emit(
-                job_id,
-                "task.enqueue_refused",
-                {
-                    "reason": REASON_WORKER_PROTOCOL,
-                    "protocol": "VETO",
-                    "actor": actor,
-                },
-            )
-            return None
-        updated = replace(job, subgraph_hold=VETO_STATE)
-        self.save_job(updated)
-        self.emit(
-            job_id,
-            "subgraph.veto",
-            {"actor": actor or "coordinator", "note": note},
-        )
-        return updated
-
-    def resume_subgraph(
-        self,
-        job_id: str,
-        *,
-        actor: Optional[str] = None,
-    ) -> Optional[Job]:
-        from puppetmaster.metr_seams import (
-            REASON_WORKER_PROTOCOL,
-            is_worker_actor,
-        )
-
-        job = self.get_job(job_id)
-        if is_worker_actor(actor):
-            self.emit(
-                job_id,
-                "task.enqueue_refused",
-                {
-                    "reason": REASON_WORKER_PROTOCOL,
-                    "protocol": "resume",
-                    "actor": actor,
-                },
-            )
-            return None
-        updated = replace(job, subgraph_hold=None, wait_reason=None)
-        self.save_job(updated)
-        self.emit(job_id, "subgraph.resume", {"actor": actor or "coordinator"})
-        return updated
-
-
-    def set_task_wait_reason(
-        self,
-        task: Task,
-        wait_reason: Optional[str],
-        *,
-        actor: Optional[str] = None,
-    ) -> Task:
-        """Stamp payload.wait_reason (waiting_external vs waiting_user)."""
-        from puppetmaster.metr_seams import normalize_wait_reason
-
-        payload = dict(task.payload or {})
-        normalized = normalize_wait_reason(wait_reason)
-        if normalized is None:
-            payload.pop("wait_reason", None)
-        else:
-            payload["wait_reason"] = normalized
-        updated = replace(task, payload=payload, updated_at=now_iso())
-        self.save_task(updated)
-        self.emit(
-            task.job_id,
-            "task.wait_reason",
-            {
-                "task_id": task.id,
-                "wait_reason": normalized,
-                "actor": actor or "coordinator",
-            },
-        )
-        return updated
-
-    def claim_subgraph_writer(
-        self,
-        job_id: str,
-        writer_id: str,
-        *,
-        actor: Optional[str] = None,
-    ) -> Optional[str]:
-        """First writer wins. A second writer is refused. Reuses job record."""
-        from puppetmaster.metr_seams import REASON_SUBGRAPH_WRITER
-
-        job = self.get_job(job_id)
-        owner = job.subgraph_owner
-        writer = str(writer_id or "").strip()
-        if not writer:
-            return None
-        if owner and owner != writer:
-            self.emit(
-                job_id,
-                "subgraph.writer_refused",
-                {
-                    "reason": REASON_SUBGRAPH_WRITER,
-                    "owner": owner,
-                    "writer_id": writer,
-                    "actor": actor,
-                },
-            )
-            return None
-        if owner == writer:
-            return owner
-        self.save_job(replace(job, subgraph_owner=writer))
-        self.emit(
-            job_id,
-            "subgraph.owner",
-            {"owner": writer, "actor": actor or "coordinator"},
-        )
-        return writer
-
     @staticmethod
     def _task_saved_payload(task: Task) -> dict[str, Any]:
         return {
@@ -851,11 +615,7 @@ class SwarmStore(StoreContracts):
         refused.
         """
         from puppetmaster.metr_seams import (
-            HOLD_STATE,
-            REASON_SUBGRAPH_HOLD,
-            REASON_SUBGRAPH_VETO,
             REASON_WORKER_PROTOCOL,
-            VETO_STATE,
             is_coordination_protocol_payload,
             is_worker_actor,
         )
@@ -891,24 +651,6 @@ class SwarmStore(StoreContracts):
                     extra={"role": role_text, "actor": origin or "worker"},
                 )
                 return None
-        try:
-            job = self.get_job(job_id)
-        except Exception:
-            job = None
-        if job is not None and job.subgraph_hold == HOLD_STATE:
-            self._emit_enqueue_refused(
-                job_id,
-                REASON_SUBGRAPH_HOLD,
-                parent_task_id=parent_task_id,
-            )
-            return None
-        if job is not None and job.subgraph_hold == VETO_STATE:
-            self._emit_enqueue_refused(
-                job_id,
-                REASON_SUBGRAPH_VETO,
-                parent_task_id=parent_task_id,
-            )
-            return None
 
         depth_limit = (
             self.max_enqueue_depth if max_depth is None else max(0, int(max_depth))
@@ -997,6 +739,10 @@ class SwarmStore(StoreContracts):
             )
             return None
 
+        try:
+            job = self.get_job(job_id)
+        except Exception:
+            job = None
         if job is not None and job.budget_policy is not None:
             try:
                 check_admission(
@@ -1375,11 +1121,7 @@ class SwarmStore(StoreContracts):
     ) -> bool:
         """Shared claim decision logic. Returns True when the claim attempt must abort."""
         from puppetmaster.metr_seams import (
-            HOLD_STATE,
-            REASON_SUBGRAPH_HOLD,
-            REASON_SUBGRAPH_VETO,
             REASON_SUBGRAPH_WRITER,
-            VETO_STATE,
             foreign_active_writer,
         )
 
@@ -1438,49 +1180,6 @@ class SwarmStore(StoreContracts):
             )
             return True
         if task.status == TaskStatus.RUNNING and not self.is_task_stale(task):
-            return True
-        try:
-            job = self.get_job(task.job_id)
-        except Exception:
-            job = None
-        if job is not None and job.subgraph_hold == HOLD_STATE:
-            self.emit(
-                task.job_id,
-                "task.claim_refused",
-                {
-                    "reason": REASON_SUBGRAPH_HOLD,
-                    "task_id": task.id,
-                    "worker_id": worker_id,
-                },
-            )
-            return True
-        if job is not None and job.subgraph_hold == VETO_STATE:
-            self.emit(
-                task.job_id,
-                "task.claim_refused",
-                {
-                    "reason": REASON_SUBGRAPH_VETO,
-                    "task_id": task.id,
-                    "worker_id": worker_id,
-                },
-            )
-            return True
-        if (
-            job is not None
-            and job.subgraph_owner
-            and worker_id
-            and job.subgraph_owner != worker_id
-        ):
-            self.emit(
-                task.job_id,
-                "task.claim_refused",
-                {
-                    "reason": REASON_SUBGRAPH_WRITER,
-                    "task_id": task.id,
-                    "owner": job.subgraph_owner,
-                    "worker_id": worker_id,
-                },
-            )
             return True
         if worker_id:
             # Lease state must be live. claim_next_task's in-memory task_map is
@@ -3831,8 +3530,6 @@ class SwarmStore(StoreContracts):
             "trustworthy": verdict["trustworthy"],
             "reasons": verdict.get("reasons", []),
             "artifact_count": len(artifacts),
-            # Legacy alias for patch_artifact_emitted; older consumers key on it.
-            "diff_present": patch_artifact_emitted,
             "baseline_diff_present": baseline_diff_present,
             "worker_diff_present": worker_diff_present,
             "patch_artifact_emitted": patch_artifact_emitted,

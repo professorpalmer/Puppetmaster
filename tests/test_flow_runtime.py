@@ -583,6 +583,67 @@ class JobIntegrationTests(Base):
         self.assertIn("not safe in a shell command", run.steps[-1]["error"])
 
 
+class ProcessFactoryTests(Base):
+    """A host-supplied popen binds every shell and walker process it creates."""
+
+    def factory(self):
+        launched = []
+
+        def popen(args, **kwargs):
+            process = subprocess.Popen(args, **kwargs)
+            group = os.getpgid(process.pid) if os.name != "nt" else None
+            launched.append({"args": args, "kwargs": kwargs, "pid": process.pid, "group": group})
+            return process
+        return launched, popen
+
+    def test_shell_nodes_launch_through_the_factory_and_keep_their_behavior(self):
+        launched, popen = self.factory()
+        g = graph([{"id": "ok", "kind": "shell",
+                    "command": f'"{sys.executable}" -c "print(\'VERDICT: PASS - ran\')"'}])
+        run = self.start(g, JobNodeExecutor(self.state, worker_mode="inline", poll_seconds=0.05,
+                                            popen=popen))
+        self.assertEqual(run.status, "done")
+        self.assertEqual(run.steps[0]["verdict"], "PASS")
+        self.assertEqual(len(launched), 1)
+        self.assertTrue(launched[0]["kwargs"].get("start_new_session") or os.name == "nt")
+        if os.name != "nt":
+            self.assertEqual(launched[0]["group"], launched[0]["pid"])
+
+    @unittest.skipIf(os.name == "nt", "process groups are POSIX here")
+    def test_a_detached_child_stays_in_the_bound_group_and_dies_on_timeout(self):
+        launched, popen = self.factory()
+        marker = self.work / "child.pid"
+        g = graph([{"id": "slow", "kind": "shell", "timeoutMs": 800,
+                    "command": f"sleep 30 & echo $! > '{marker}'; sleep 30"}])
+        run = self.start(g, JobNodeExecutor(self.state, worker_mode="inline", poll_seconds=0.05,
+                                            popen=popen))
+        self.assertEqual(run.status, "failed")
+        self.assertIn("timed out", run.steps[0]["error"])
+        child = int(marker.read_text().strip())
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("the backgrounded child outlived its node")
+
+    def test_the_default_walker_spawn_uses_the_factory(self):
+        calls = []
+
+        def popen(args, **kwargs):
+            calls.append(args)
+            process = subprocess.Popen([sys.executable, "-c", "pass"], **kwargs)
+            # Windows cannot delete walker.log while the child holds it open.
+            self.addCleanup(process.wait)
+            return process
+        run = flow.new_run(self.state, graph([agent("a")]), cwd=str(self.work))
+        JobNodeExecutor(self.state, popen=popen).spawn(self.state, run.run_id)
+        self.assertEqual(calls[0][-3:], ["flow", "resume", run.run_id])
+
+
 class MapTests(Base):
     def setUp(self):
         super().setUp()

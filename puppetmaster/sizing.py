@@ -34,6 +34,7 @@ DEFAULT_CALIBRATION: dict[str, Any] = {
     "solo_context_frac": 0.6,
     "min_independent_units": 4,
     "upfront_units": 16,
+    "min_unit_s": 20.0,
     "handoff_overhead_s": 90.0,
     "late_fraction": 0.8,
     "source": "provisional: sealed sol61 voxel study, quality crossover at 16 regions",
@@ -107,6 +108,8 @@ _POLICY_RANGES: dict[str, tuple[float, float]] = {
     "solo_context_frac": (0.01, 1.0),
     "min_independent_units": (2.0, 10000.0),
     "upfront_units": (2.0, 10000.0),
+    "min_unit_s": (0.0, 3600.0),
+    "per_unit_s": (0.1, 3600.0),
     "handoff_overhead_s": (0.0, 3600.0),
     "late_fraction": (0.0, 1.0),
 }
@@ -175,10 +178,16 @@ def decide(units: Sequence[Unit], *, elapsed_s: float, context_frac: float = 0.0
     if independent < int(cal["min_independent_units"]):
         return result(STAY_SOLO, f"{independent} independent units remain; "
                                  f"fewer than {int(cal['min_independent_units'])} never fan out")
+    substantial_s = float(cal["min_unit_s"])
+    many = sum(unit.independent for unit in units) >= int(cal["upfront_units"])
     if done == 0:
-        if independent >= int(cal["upfront_units"]):
-            return result(DELEGATE_UPFRONT, f"{independent} independent units before any work "
-                                            f"(upfront bar {int(cal['upfront_units'])})")
+        # A unit count alone cannot tell 16 one-minute modules (solo work)
+        # from 16 voxel regions (where solo falls under the quality floor).
+        # Only a calibrated per-unit cost may fan out before any unit is done.
+        prior = cal.get("per_unit_s")
+        if many and isinstance(prior, (int, float)) and prior >= substantial_s:
+            return result(DELEGATE_UPFRONT, f"{independent} independent units at a calibrated "
+                                            f"~{prior:.0f}s each before any work")
         return result(STAY_SOLO, "no unit finished yet; measuring solo pace")
     if done / total >= float(cal["late_fraction"]):
         return result(STAY_SOLO, f"{done}/{total} done; too late for a handoff to pay")
@@ -193,6 +202,11 @@ def decide(units: Sequence[Unit], *, elapsed_s: float, context_frac: float = 0.0
     numbers = dict(projected_solo_s=round(projected_solo, 1),
                    projected_parallel_s=round(float(elapsed_s) + remaining_parallel, 1),
                    projected_context_frac=None if projected_context is None else round(projected_context, 3))
+    if many and per_unit >= substantial_s and remaining_parallel < remaining_solo:
+        # The quality crossover: many substantial independent units, where
+        # solo tends to finish in time but under the floor.
+        return result(HANDOFF, f"{independent} substantial independent units remain "
+                               f"(~{per_unit:.0f}s each); past the quality crossover", **numbers)
     over_time = projected_solo > float(cal["solo_horizon_s"])
     over_context = projected_context is not None and projected_context > float(cal["solo_context_frac"])
     if not (over_time or over_context):

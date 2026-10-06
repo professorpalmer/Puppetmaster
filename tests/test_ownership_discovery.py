@@ -57,7 +57,9 @@ class OwnershipDiscoveryTests(unittest.TestCase):
             with patch.object(readonly, 'connect', side_effect=changing):
                 self.assertEqual(self.resolve(), self.owner.root)
 
-    def test_requested_live_wal_is_unavailable_even_without_job_directory(self):
+    def test_requested_live_wal_is_read_even_without_job_directory(self):
+        # Observer reads join a live WAL's committed snapshot, so a store a job
+        # is writing to is found by its rows, not refused as unavailable.
         with closing(sqlite3.connect(self.owner.db_path)) as writer:
             writer.execute("UPDATE jobs SET data=data")
             writer.commit()
@@ -65,15 +67,17 @@ class OwnershipDiscoveryTests(unittest.TestCase):
             writer.execute("INSERT INTO jobs VALUES ('another', '{}')")
             writer.commit()
             self.owner.job_dir(self.job.id).rename(self.root / 'hidden-job')
-            with self.assertRaises(readonly.ReadUnavailable):
-                self.resolve()
-            self.assertIsNone(state.find_state_dir_for_job(self.job.id))
+            self.assertEqual(self.resolve(), self.owner.root)
+            self.assertEqual(state.find_state_dir_for_job(self.job.id), self.owner.root)
 
-    def test_unavailable_global_duplicate_is_uncertifiable_in_weak_mode(self):
+    def test_live_global_duplicate_is_ambiguous_in_weak_mode(self):
+        # The live duplicate is readable now, so weak mode sees two owners and
+        # refuses to guess instead of ignoring the unreadable one.
         with closing(sqlite3.connect(self.other.db_path)) as writer:
             writer.execute('INSERT INTO jobs VALUES (?, ?)', (self.job.id, '{}'))
             writer.commit()
-            self.assertEqual(self.resolve(), self.owner.root)
+            with self.assertRaisesRegex(ValueError, "ambiguous job_id"):
+                self.resolve()
 
     def test_unknown_candidate_cannot_be_ignored(self):
         self.other.db_path.write_bytes(b'not a database')
@@ -90,14 +94,14 @@ class OwnershipDiscoveryTests(unittest.TestCase):
         with self.assertRaises(StoreIdentityError):
             self.resolve(job_ref=ref)
 
-    def test_strict_ref_and_explicit_store_do_not_probe_live_target(self):
+    def test_strict_ref_and_explicit_store_read_a_live_target(self):
         ref = self.owner.job_ref(self.job.id).as_dict()
         with closing(sqlite3.connect(self.owner.db_path)) as writer:
             writer.execute("INSERT INTO jobs VALUES ('live', '{}')")
             writer.commit()
             for kwargs in ({'job_ref': ref}, {'state_dir': self.owner.root}):
-                with self.subTest(kwargs=kwargs), self.assertRaises(readonly.ReadUnavailable):
-                    self.resolve(**kwargs)
+                with self.subTest(kwargs=kwargs):
+                    self.assertEqual(self.resolve(**kwargs), self.owner.root)
 
     def test_inline_plan_never_needs_global_discovery(self):
         task = Task(job_id=self.job.id, role='implement', instruction='work', payload={
@@ -176,14 +180,12 @@ class OwnershipDiscoveryTests(unittest.TestCase):
                 writer.execute("INSERT INTO jobs VALUES ('live', '{}')")
                 writer.commit()
                 def snapshot():
+                    # A live-WAL reader may record read marks in -shm; the
+                    # database and its WAL must not change.
                     return {p.name: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_ctime_ns)
-                            for p in store.root.glob('state.sqlite3*')}
+                            for p in store.root.glob('state.sqlite3*') if not p.name.endswith('-shm')}
                 before = snapshot()
-                if store is self.owner:
-                    with self.assertRaises(readonly.ReadUnavailable):
-                        self.resolve()
-                else:
-                    self.assertEqual(self.resolve(), self.owner.root)
+                self.assertEqual(self.resolve(), self.owner.root)
                 self.assertEqual(snapshot(), before)
 
     def test_readable_duplicate_owners_remain_ambiguous(self):
@@ -201,7 +203,9 @@ class OwnershipDiscoveryTests(unittest.TestCase):
         with closing(sqlite3.connect(self.owner.db_path)) as writer:
             writer.execute("INSERT INTO jobs VALUES ('live', '{}')")
             writer.commit()
-            with self.assertRaises(readonly.ReadUnavailable):
+            # A live caller target is readable now; with the job in a second
+            # store too, resolution refuses to pick one.
+            with self.assertRaisesRegex(ValueError, "ambiguous job_id"):
                 self.resolve()
 
     def test_dashboard_fallback_with_continuously_changing_global_store(self):

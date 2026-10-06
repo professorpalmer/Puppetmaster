@@ -48,11 +48,6 @@ from ._base import _should_emit_patch_artifact
 
 class CursorAdapter(CliWorkerAdapter):
     name = "cursor"
-    # cursor_sdk_runner.mjs allocates a private temporary SQLite state root
-    # for every worker process. Do not generalize this to other harnesses
-    # unless their SDK/CLI state contract has been verified.
-    state_isolation = "per-worker-sdk-state"
-    catalog_source = "cursor"
 
     def run(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
         # Two execution modes share the same Cursor SDK runner. ``analyze`` (the
@@ -201,6 +196,7 @@ class CursorAdapter(CliWorkerAdapter):
                         "stderr": _redacted_tail(completed.stderr, _STDOUT_TAIL_CHARS),
                         "timeout_seconds": timeout_seconds,
                         "live_log": completed.live_log_path,
+                        "attempt_id": getattr(completed, "attempt_id", None),
                         "base_sha": before["sha"],
                         "head_sha": after["sha"],
                         "changed_files": after["changed_files"],
@@ -258,6 +254,7 @@ class CursorAdapter(CliWorkerAdapter):
                     "stdout_capture": stdout_capture,
                     "stderr_capture": stderr_capture,
                     "live_log": completed.live_log_path,
+                    "attempt_id": getattr(completed, "attempt_id", None),
                     "model": model,
                     "cwd": str(cwd),
                     "cursor_status": cursor_status,
@@ -366,6 +363,7 @@ class CursorAdapter(CliWorkerAdapter):
                         "model": model,
                         "failure": "timeout",
                         "live_log": completed.live_log_path,
+                        "attempt_id": getattr(completed, "attempt_id", None),
                     },
                 )
             ]

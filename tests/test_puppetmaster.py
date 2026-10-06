@@ -382,12 +382,10 @@ class PuppetmasterTests(unittest.TestCase):
             payload = json.loads(result["content"][0]["text"])
 
             self.assertIn("job_", payload["job_id"])
-            self.assertIn("pid", payload)
-            # The launcher pid is now labeled honestly and monitoring is pointed
+            # The launcher pid is labeled honestly and monitoring is pointed
             # at job_id rather than the misleading supervisor pid (C2).
-            self.assertEqual(payload["launcher_pid"], payload["pid"])
+            self.assertNotIn("pid", payload)
             self.assertEqual(payload["orchestrator_pid"], payload["launcher_pid"])
-            self.assertTrue(payload["pid_deprecated"])
             self.assertEqual(payload["monitor_with"]["job_id"], payload["job_id"])
             self.assertEqual(
                 payload["monitor_with"]["arguments"]["job_ref"], payload["job_ref"]
@@ -7230,6 +7228,59 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
         self.assertEqual(verification.payload["adapter"], "codex")
         self.assertEqual(verification.payload["result"], "passed")
         self.assertEqual(verification.payload["live_log"], "/tmp/codex_exec_live.log")
+
+    def test_codex_verification_records_what_the_worker_referenced(self) -> None:
+        """The write_scope gate needs the paths this run's own events named."""
+        from puppetmaster.worker_attribution import (
+            BASELINE_DIRTY_KEY,
+            REFERENCED_PATHS_KEY,
+        )
+
+        events_stdout = "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "th_attr"}),
+                json.dumps({"type": "item.completed", "item": {
+                    "type": "file_change",
+                    "changes": [{"path": "pkg/roman.py", "kind": "update"}],
+                }}),
+                json.dumps({"type": "item.completed", "item": {
+                    "type": "command_execution", "command": "python -m pytest tests/test_roman.py -q",
+                }}),
+                json.dumps({"type": "item.completed", "item": {
+                    "type": "agent_message", "text": "Edited pkg/roman.py.",
+                }}),
+                json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}}),
+            ]
+        )
+        streamed = StreamedProcess(
+            returncode=0, stdout=events_stdout, stderr="", timed_out=False, live_log_path=None,
+        )
+        task = Task(
+            id="t-codex-attr",
+            job_id="job-codex-attr",
+            role="codex-implement",
+            adapter="codex",
+            instruction="Edit pkg/roman.py.",
+            payload={"cwd": str(Path.cwd()), "sandbox": "workspace-write",
+                     "allow_dirty": True, "disable_codegraph": True},
+        )
+        before = {"sha": "s", "changed_files": ["pkg/roman.py"],
+                  "untracked_files": ["events.jsonl"], "diff": "x"}
+        after = {"sha": "s", "changed_files": [], "untracked_files": [], "diff": ""}
+        with patch("puppetmaster.adapters.resolve_command", return_value="/usr/bin/codex"), patch(
+            "puppetmaster.adapters.worktree_guard", return_value=None
+        ), patch(
+            "puppetmaster.adapters.git_snapshot", side_effect=[before, after]
+        ), patch(
+            "puppetmaster.adapters.run_streamed_subprocess", return_value=streamed
+        ):
+            artifacts = CodexAdapter().run(task, "goal", "worker")
+
+        payload = artifacts[0].payload
+        self.assertEqual(
+            payload[REFERENCED_PATHS_KEY], ["pkg/roman.py", "tests/test_roman.py"]
+        )
+        self.assertEqual(payload[BASELINE_DIRTY_KEY], ["events.jsonl", "pkg/roman.py"])
 
     def test_codex_write_capable_prose_is_report_not_degraded(self) -> None:
         """A workspace-write Codex run that reports in prose did its job — the
@@ -17421,18 +17472,6 @@ class AdapterCliPresenceTests(unittest.TestCase):
                 self.assertTrue(adapter_cli_present(adapter, env={}, resolver=lambda name: f"/opt/bin/{name}"))
                 self.assertFalse(adapter_cli_present(adapter, env={}, resolver=lambda _name: None))
 
-    def test_runtime_capabilities_keep_cursor_isolation_opt_in(self) -> None:
-        from puppetmaster.adapters.registry import adapter_runtime_capabilities
-
-        self.assertEqual(
-            adapter_runtime_capabilities("cursor")["state_isolation"],
-            "per-worker-sdk-state",
-        )
-        self.assertEqual(
-            adapter_runtime_capabilities("codex")["state_isolation"],
-            "none",
-        )
-
     def test_executable_honors_env_override(self) -> None:
         from puppetmaster.preflight import adapter_cli_executable
 
@@ -22933,6 +22972,26 @@ class PuppetmasterFrictionFixTests(unittest.TestCase):
         self.assertIn("patch_artifact_emitted=False", outcome)
         self.assertIn("commit_present=False", outcome)
 
+    def test_finalize_cli_run_fails_a_failed_job_with_degraded_artifacts(self) -> None:
+        """A worker that exited non-zero leaves a failed job; the CLI must not exit 0."""
+        from dataclasses import replace
+
+        from puppetmaster.cli import finalize_cli_run
+        from puppetmaster.orchestrator import RunResult
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            job = replace(store.create_job("goal"), status=JobStatus.FAILED)
+            artifact = Artifact(
+                job_id=job.id, task_id="t1", type=ArtifactType.VERIFICATION,
+                created_by="w1", confidence=0.9, evidence=["adapter:hermes"],
+                payload={"check": "run", "result": "failed"},
+            )
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                rc = finalize_cli_run(RunResult(job=job, artifacts=[artifact], summary="",
+                                                summary_path=Path(tmp) / "s.md", mode="edit"))
+        self.assertEqual(rc, 1)
+
     # --- #6: codegraph global-flag hoisting ----------------------------
     def test_hoist_global_codegraph_flags(self) -> None:
         from puppetmaster.cli import _hoist_global_codegraph_flags
@@ -22971,6 +23030,15 @@ class PuppetmasterFrictionFixTests(unittest.TestCase):
         self.assertEqual(payload["routing_policy"], "cheap")
         self.assertEqual(payload["max_cost_usd"], 0.5)
         self.assertEqual(payload["min_capability"], 70)
+
+        # An allowlist alone still routes within it. Without routing, a
+        # direct claude implement allowed only claude-code/opus-5-5 ran the
+        # adapter's default claude-opus-5.
+        pinned = Namespace(auto_route=False, allowed_models=["claude-code/opus-5-5"])
+        payload = routing_payload_from_args(pinned, adapter="claude-code")
+        self.assertTrue(payload["auto_route"])
+        self.assertEqual(payload["allowed_adapters"], ["claude-code"])
+        self.assertEqual(payload["allowed_model_ids"], ["claude-code/opus-5-5"])
 
     def test_direct_single_adapter_cli_sets_disable_memory_payload(self) -> None:
         captured = []
@@ -23825,6 +23893,109 @@ class PuppetmasterLoudFailureTests(unittest.TestCase):
             events = [e["event"] for e in store.read_events(job.id)]
             self.assertIn("worker.timed_out", events)
 
+class WorkerAttributionTests(unittest.TestCase):
+    """Reading a worker's own event stream for write attribution."""
+
+    def test_codex_events_name_edited_files_and_command_paths(self) -> None:
+        from puppetmaster.worker_attribution import (
+            codex_event_references,
+            path_is_referenced,
+        )
+
+        events = [
+            {"type": "thread.started", "thread_id": "t1"},
+            {"type": "turn.started"},
+            {"type": "item.completed", "item": {
+                "type": "file_change",
+                "changes": [{"path": "pkg/roman.py", "kind": "update"}],
+            }},
+            {"type": "item.completed", "item": {
+                "type": "command_execution", "command": "echo done >>events.jsonl",
+            }},
+            {"type": "item.completed", "item": {
+                "type": "command_execution", "command": "python -m pytest tests -q",
+            }},
+            {"type": "turn.completed", "usage": {"input_tokens": 1}},
+        ]
+        refs = codex_event_references(events)
+        self.assertEqual(refs.paths, ["events.jsonl", "pkg/roman.py"])
+        self.assertTrue(path_is_referenced("pkg/roman.py", refs))
+        self.assertTrue(path_is_referenced("events.jsonl", refs))
+        # A bare directory argument is not a write target.
+        self.assertFalse(path_is_referenced("tests", refs))
+        self.assertFalse(path_is_referenced("other.py", refs))
+
+    def test_path_tokens_keeps_only_path_like_arguments(self) -> None:
+        from puppetmaster.worker_attribution import path_tokens
+
+        self.assertEqual(path_tokens("echo hi >> logs/run.jsonl"), ["logs/run.jsonl"])
+        self.assertEqual(path_tokens(["cat", "events.jsonl"]), ["events.jsonl"])
+        self.assertEqual(path_tokens("sh -c 'cat >>events.jsonl'"), ["events.jsonl"])
+        self.assertEqual(
+            path_tokens('bash -lc "printf x >> artifacts/events.jsonl"'),
+            ["artifacts/events.jsonl"],
+        )
+        self.assertEqual(path_tokens("python -m pytest tests -q"), [])
+
+    def test_codex_absolute_file_change_path_is_repo_relative(self) -> None:
+        from puppetmaster.worker_attribution import codex_event_references
+
+        with TemporaryDirectory() as tmp:
+            cwd = Path(tmp).resolve()
+            events = [{"type": "item.completed", "item": {
+                "type": "file_change",
+                "changes": [{"path": str(cwd / "pkg" / "roman.py")}],
+            }}]
+            refs = codex_event_references(events, cwd)
+            self.assertEqual(refs.paths, ["pkg/roman.py"])
+
+    def test_no_codex_event_stream_means_no_evidence(self) -> None:
+        from puppetmaster.worker_attribution import codex_event_references
+
+        self.assertIsNone(codex_event_references([]))
+        self.assertIsNone(codex_event_references([{"type": "thread.started"}]))
+
+    def test_claude_tool_use_blocks_name_files_and_commands(self) -> None:
+        from puppetmaster.worker_attribution import (
+            claude_tool_use_references,
+            path_is_referenced,
+        )
+
+        stream = "\n".join([
+            json.dumps({"type": "system", "session_id": "s1"}),
+            json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "Edit", "input": {"file_path": "pkg/roman.py"}},
+                {"type": "tool_use", "name": "Bash", "input": {"command": "cat events.jsonl"}},
+            ]}}),
+            json.dumps({"type": "result", "session_id": "s1"}),
+        ])
+        refs = claude_tool_use_references(stream)
+        self.assertEqual(refs.paths, ["events.jsonl", "pkg/roman.py"])
+        self.assertTrue(path_is_referenced("events.jsonl", refs))
+        # The default json output format carries no tool use: no evidence.
+        self.assertIsNone(
+            claude_tool_use_references(json.dumps({"type": "result", "result": "done"}))
+        )
+
+    def test_baseline_untracked_directory_covers_paths_beneath_it(self) -> None:
+        from puppetmaster.worker_attribution import path_was_dirty_before
+
+        self.assertTrue(path_was_dirty_before("logs/run.jsonl", ["logs/"]))
+        self.assertFalse(path_was_dirty_before("src/app.py", ["logs/"]))
+
+    def test_attribution_payload_is_empty_without_a_stream(self) -> None:
+        from puppetmaster.worker_attribution import (
+            BASELINE_DIRTY_KEY,
+            attribution_payload,
+            WorkerReferences,
+        )
+
+        before = {"changed_files": ["a.py"], "untracked_files": ["./events.jsonl"]}
+        self.assertEqual(attribution_payload(None, before), {})
+        payload = attribution_payload(WorkerReferences(paths=["a.py"]), before)
+        self.assertEqual(payload[BASELINE_DIRTY_KEY], ["a.py", "events.jsonl"])
+
+
 class PuppetmasterGateTests(unittest.TestCase):
     """Non-bypassable completion gates (#2 commit, #11 drift ratchet)."""
 
@@ -24061,6 +24232,113 @@ class PuppetmasterGateTests(unittest.TestCase):
                                             "baseline_diff_present": True})]
             self.assertFalse(evaluate_task_gates(task, unmeasured, store, worker_id="w1", cwd=repo).passed)
 
+    def _attributed_run(self, task, files, *, referenced=None, baseline=None, extra=None):
+        """Artifacts for a run whose adapter attributed its own delta."""
+        from puppetmaster.models import Artifact, ArtifactType
+        from puppetmaster.worker_attribution import (
+            BASELINE_DIRTY_KEY,
+            REFERENCED_PATHS_KEY,
+        )
+
+        attribution = {}
+        if referenced is not None or baseline is not None:
+            attribution = {
+                REFERENCED_PATHS_KEY: list(referenced or []),
+                BASELINE_DIRTY_KEY: list(baseline or []),
+                **(extra or {}),
+            }
+        receipt = Artifact(job_id=task.job_id, task_id=task.id, type=ArtifactType.VERIFICATION,
+                           created_by="w", confidence=0.9, evidence=["adapter:codex"],
+                           payload={"check": "c", "result": "passed", "worker_diff_present": True,
+                                    "worker_delta_attributed": True, **attribution})
+        patch = Artifact(job_id=task.job_id, task_id=task.id, type=ArtifactType.PATCH,
+                         created_by="w", confidence=0.9, evidence=["adapter:codex"],
+                         payload={"change": "c", "files": list(files),
+                                  "worker_diff_present": True, "worker_delta_attributed": True})
+        return [receipt, patch]
+
+    def test_write_scope_gate_reports_a_concurrent_writers_change(self) -> None:
+        """A file dirty before the run that the worker never named is not its write."""
+        from puppetmaster.gates import evaluate_task_gates
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            repo = Path(tmp) / "repo"
+            self._git_repo(repo)
+            (repo / "events.jsonl").write_text('{"host": 1}\n')
+            (repo / "mine.py").write_text("x = 1\n")
+            task = self._task(write_scope=["mine.py"], cwd=str(repo))
+
+            # The host process kept appending to events.jsonl during the window.
+            concurrent = self._attributed_run(
+                task, ["mine.py", "events.jsonl"],
+                referenced=["mine.py"], baseline=["events.jsonl"],
+            )
+            result = evaluate_task_gates(task, concurrent, store, worker_id="w1", cwd=repo)
+            self.assertTrue(result.passed)
+            detail = next(r.detail for r in result.results if r.kind == "write_scope")
+            self.assertEqual(detail["concurrent_changes"], ["events.jsonl"])
+
+            # A command the worker ran named it: still its write, still a failure.
+            from puppetmaster.worker_attribution import codex_event_references
+
+            ran_it = codex_event_references([{"type": "item.completed", "item": {
+                "type": "command_execution", "command": "echo done >> events.jsonl",
+            }}])
+            touched = self._attributed_run(
+                task, ["mine.py", "events.jsonl"],
+                referenced=ran_it.paths, baseline=["events.jsonl"],
+            )
+            blamed = evaluate_task_gates(task, touched, store, worker_id="w1", cwd=repo)
+            self.assertFalse(blamed.passed)
+            self.assertIn("outside declared scope", blamed.failed_reason)
+
+            # A file_change outside scope is the worker's write even when dirty first.
+            edited_it = codex_event_references([{"type": "item.completed", "item": {
+                "type": "file_change", "changes": [{"path": "events.jsonl"}],
+            }}])
+            edited = self._attributed_run(
+                task, ["mine.py", "events.jsonl"],
+                referenced=edited_it.paths, baseline=["events.jsonl"],
+            )
+            self.assertFalse(
+                evaluate_task_gates(task, edited, store, worker_id="w1", cwd=repo).passed
+            )
+
+            # A new out-of-scope file is never excused: nothing proves another writer.
+            (repo / "new.py").write_text("y = 2\n")
+            fresh = self._attributed_run(
+                task, ["mine.py", "new.py"], referenced=["mine.py"], baseline=["events.jsonl"],
+            )
+            self.assertFalse(
+                evaluate_task_gates(task, fresh, store, worker_id="w1", cwd=repo).passed
+            )
+
+            # No event stream to consult -> today's behavior.
+            unattributed = self._attributed_run(task, ["mine.py", "events.jsonl"])
+            self.assertFalse(
+                evaluate_task_gates(task, unattributed, store, worker_id="w1", cwd=repo).passed
+            )
+
+    def test_write_scope_gate_ignores_truncated_worker_evidence(self) -> None:
+        """Evidence with a hole in it cannot excuse a write."""
+        from puppetmaster.gates import evaluate_task_gates
+        from puppetmaster.worker_attribution import TRUNCATED_KEY
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            repo = Path(tmp) / "repo"
+            self._git_repo(repo)
+            (repo / "events.jsonl").write_text("{}\n")
+            task = self._task(write_scope=["mine.py"], cwd=str(repo))
+            artifacts = self._attributed_run(
+                task, ["events.jsonl"], referenced=["mine.py"], baseline=["events.jsonl"],
+                extra={TRUNCATED_KEY: True},
+            )
+            self.assertFalse(
+                evaluate_task_gates(task, artifacts, store, worker_id="w1", cwd=repo).passed
+            )
+
     def test_write_scope_gate_honors_peer_scopes_from_other_jobs(self) -> None:
         """Flow map items run one job each in a shared workspace; peers arrive in the payload."""
         from puppetmaster.gates import evaluate_task_gates
@@ -24171,28 +24449,6 @@ class PuppetmasterGateTests(unittest.TestCase):
             self.assertEqual(pinned["PUPPETMASTER_PORT_BASE"], str(base_a))
             apply_worktree_ports(pinned, a, override_port=True)
             self.assertEqual(pinned["PORT"], str(base_a))
-
-    def test_reserve_port_skips_busy_ports(self) -> None:
-        """B1 bulletproof path: reserve_port bumps past a live listener (EADDRINUSE)."""
-        import socket
-        from puppetmaster.ports import reserve_port, worktree_port_base, _port_is_free
-
-        with TemporaryDirectory() as wt:
-            hint = worktree_port_base(wt)
-            # Occupy the hinted port with a real listener.
-            busy = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            busy.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                busy.bind(("127.0.0.1", hint))
-                busy.listen(1)
-                reserved = reserve_port(wt)
-                # Must not hand back the occupied port, and must be bindable.
-                self.assertNotEqual(reserved, hint)
-                self.assertTrue(_port_is_free(reserved))
-            except OSError:
-                self.skipTest("could not bind the hinted port in this environment")
-            finally:
-                busy.close()
 
     def test_committed_gate_excludes_generated_artifacts(self) -> None:
         """C2: configured generated artifacts are kept out of the auto-commit."""
@@ -25097,7 +25353,7 @@ class PuppetmasterLifecycleTests(unittest.TestCase):
             snap = store.status_snapshot(job.id)
             self.assertIn("outcome", snap)
             self.assertEqual(snap["outcome"]["quality"], "empty")
-            self.assertFalse(snap["outcome"]["diff_present"])
+            self.assertFalse(snap["outcome"]["patch_artifact_emitted"])
             self.assertFalse(snap["outcome"]["baseline_diff_present"])
             self.assertFalse(snap["outcome"]["worker_diff_present"])
             self.assertFalse(snap["outcome"]["patch_artifact_emitted"])
@@ -25114,7 +25370,7 @@ class PuppetmasterLifecycleTests(unittest.TestCase):
                 },
             ))
             snap = store.status_snapshot(job.id)
-            self.assertFalse(snap["outcome"]["diff_present"])
+            self.assertFalse(snap["outcome"]["patch_artifact_emitted"])
             self.assertTrue(snap["outcome"]["baseline_diff_present"])
             self.assertFalse(snap["outcome"]["worker_diff_present"])
             self.assertFalse(snap["outcome"]["patch_artifact_emitted"])
@@ -25136,7 +25392,7 @@ class PuppetmasterLifecycleTests(unittest.TestCase):
                 payload={"gate": "committed", "kind": "committed", "passed": True},
             ))
             snap = store.status_snapshot(job.id)
-            self.assertTrue(snap["outcome"]["diff_present"])
+            self.assertTrue(snap["outcome"]["patch_artifact_emitted"])
             self.assertTrue(snap["outcome"]["baseline_diff_present"])
             self.assertTrue(snap["outcome"]["worker_diff_present"])
             self.assertTrue(snap["outcome"]["patch_artifact_emitted"])
@@ -25875,11 +26131,19 @@ class HookRunnerTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def test_user_prompt_injects_directive_when_delegating(self):
+    def test_user_prompt_injects_only_for_an_explicit_trigger(self):
+        """Prompt wording cannot place a task against the solo falloff, so a
+        broad-sounding prompt no longer injects a delegate directive; naming
+        Puppetmaster still does. The sizing gate decides the rest from the plan."""
         from puppetmaster.hook_runner import handle_hook
 
-        r = handle_hook(
+        broad = handle_hook(
             {"prompt": "refactor the auth module across all files"},
+            host="cursor", event="beforeSubmitPrompt", env=self._TOOLS_ON,
+        )
+        self.assertEqual(broad.context, "")
+        r = handle_hook(
+            {"prompt": "Use Puppetmaster to refactor the auth module across all files"},
             host="cursor", event="beforeSubmitPrompt", env=self._TOOLS_ON,
         )
         self.assertEqual(r.action, "allow")
@@ -25993,18 +26257,18 @@ class HookRunnerTests(unittest.TestCase):
             "session_id": "s1",
             "cwd": "/repo",
             "extra": {
-                "user_message": "add a --verbose flag to the savings command and wire it through",
+                "user_message": "use puppetmaster to add a --verbose flag to the savings command and wire it through",
                 "is_first_turn": True,
             },
         }
         r = handle_hook(payload, host="hermes", event="pre_llm_call", env=self._TOOLS_ON)
         self.assertEqual(r.action, "allow")
         self.assertTrue(r.decision.should_delegate)
-        self.assertEqual(r.decision.suggested_verb, "puppetmaster_edit")
+        self.assertNotIn("swarm", r.decision.suggested_verb)
         out = r.to_host_json("hermes")
         self.assertIn("context", out)
         self.assertIn("Puppetmaster", out["context"])
-        self.assertIn("puppetmaster_edit", out["context"])
+        self.assertIn("not a fan-out swarm", out["context"])
         self.assertNotIn("cursor", out["context"])
 
     def test_hermes_pre_llm_call_noop_for_trivial_edit(self):
@@ -26111,7 +26375,7 @@ class HookRunnerTests(unittest.TestCase):
     def test_run_reads_stdin_and_emits_json(self):
         from puppetmaster.hook_runner import run
 
-        stdin = io.StringIO(json.dumps({"prompt": "audit the whole repo for races"}))
+        stdin = io.StringIO(json.dumps({"prompt": "Use Puppetmaster to audit the whole repo for races"}))
         stdout = io.StringIO()
         rc = run(
             ["--host", "cursor", "--event", "user-prompt"],
@@ -27893,13 +28157,13 @@ class SecurityHardeningTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name != "nt", "POSIX-only permission check")
     def test_sensitive_state_dirs_created_owner_only(self) -> None:
-        from puppetmaster.fs_permissions import supports_posix_modes
-        from puppetmaster.state import ensure_state_dir
+        from puppetmaster.fs_permissions import mkdir_private, supports_posix_modes
 
         if not supports_posix_modes():
             self.skipTest("POSIX modes unavailable")
         with TemporaryDirectory() as tmp:
-            state_dir = ensure_state_dir(Path(tmp) / "nested" / "state")
+            state_dir = Path(tmp) / "nested" / "state"
+            mkdir_private(state_dir)
             mode = state_dir.stat().st_mode & 0o777
             self.assertEqual(mode, 0o700)
 
@@ -30110,14 +30374,14 @@ class OutputStyleTests(unittest.TestCase):
         for disabled in (None, "", "off", "none", "false", "garbage"):
             self.assertIsNone(normalize_style(disabled))
 
-    def test_resolve_payload_wins_over_env(self) -> None:
-        from puppetmaster.output_style import resolve_output_style
+    def test_resolve_output_falls_back_to_the_env_tier(self) -> None:
+        from puppetmaster.output_style import resolve_output
 
-        self.assertEqual(resolve_output_style("lithic", "terse"), "lithic")
-        # An explicit disabled payload suppresses the env default for that spec.
-        self.assertIsNone(resolve_output_style("off", "terse"))
-        # No payload → fall back to env.
-        self.assertEqual(resolve_output_style(None, "terse"), "terse")
+        label, directive = resolve_output(
+            payload_style=None, payload_text=None, env_style="terse", env_text=None
+        )
+        self.assertEqual(label, "terse")
+        self.assertIn("OUTPUT STYLE (terse)", directive)
 
     def test_directive_tiers_and_uncertainty_rule(self) -> None:
         from puppetmaster.output_style import directive_for
@@ -30134,14 +30398,6 @@ class OutputStyleTests(unittest.TestCase):
         self.assertIn("Drop articles", lithic)
         # Reasoning is explicitly preserved.
         self.assertIn("not reasoning", terse)
-
-    def test_apply_is_noop_when_disabled_and_prepends_when_on(self) -> None:
-        from puppetmaster.output_style import apply_output_style
-
-        self.assertEqual(apply_output_style("do the thing", None), "do the thing")
-        applied = apply_output_style("do the thing", "terse")
-        self.assertTrue(applied.endswith("do the thing"))
-        self.assertIn("OUTPUT STYLE (terse)", applied)
 
     def test_orchestrator_seam_respects_env_and_payload(self) -> None:
         from puppetmaster.output_style import OUTPUT_STYLE_ENV

@@ -261,12 +261,6 @@ def reap_stalled_jobs(
         if not verdict.dead:
             continue
         store.update_job_status(job.id, JobStatus.STALLED)
-        try:
-            from puppetmaster.run_journal import journal_for_store
-
-            journal_for_store(store, job.id).stamp_aborted(reason=f"stalled:{verdict.reason}")
-        except Exception:
-            pass
         store.emit(
             job.id,
             "job.stalled",

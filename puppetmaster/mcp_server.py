@@ -1945,17 +1945,6 @@ def _build_tools() -> list[McpTool]:
             handler=run_effort_index,
         ),
         McpTool(
-            name="puppetmaster_cell_status",
-            description=(
-                "Inspect a named cell (Durable Object slice on local sqlite): "
-                "returns path, inbox_depth, hibernating, and next_alarm. "
-                "The cell file is a regular sqlite3 database a human can open. "
-                "Additive inspect tool — does not change job/harness/SSE shapes."
-            ),
-            input_schema=cell_status_schema(),
-            handler=run_cell_status,
-        ),
-        McpTool(
             name="puppetmaster_gate",
             description=(
                 "Replay the non-bypassable completion gates against a working tree, outside "
@@ -4413,14 +4402,6 @@ def run_effort_index(args: JsonObject) -> JsonObject:
     return run_cli(command, args)
 
 
-def run_cell_status(args: JsonObject) -> JsonObject:
-    command = ["cell-status", "--json"]
-    cell_id = args.get("cell_id")
-    if isinstance(cell_id, str) and cell_id.strip():
-        command.append(cell_id.strip())
-    return run_cli(command, args)
-
-
 def run_gate(args: JsonObject) -> JsonObject:
     command = ["gate", "--json"]
     if isinstance(args.get("gate_cwd"), str) and args["gate_cwd"].strip():
@@ -4636,11 +4617,9 @@ def start_cli(command: list[str], args: JsonObject) -> JsonObject:
         # `launcher_pid` is the detached launcher/orchestrator process, NOT the
         # durable worker doing the edits — that worker is a downstream child with
         # its own (shorter) lifetime and pid. Don't monitor progress by this pid;
-        # use `job_id` with status/logs/feed. `pid` is kept as a back-compat alias.
+        # use `job_id` with status/logs/feed.
         "orchestrator_pid": process.pid,
         "launcher_pid": process.pid,
-        "pid": process.pid,
-        "pid_deprecated": True,
         "pid_note": (
             "launcher_pid is the orchestrator launcher, not the worker; "
             "track progress via job_id (status/logs/feed), not this pid"
@@ -5106,22 +5085,6 @@ def effort_index_schema() -> JsonObject:
             "all_projects": {
                 "type": "boolean",
                 "description": "Index every project state dir (usual for a multi-worktree effort).",
-            },
-        }
-    )
-    return schema
-
-
-def cell_status_schema() -> JsonObject:
-    schema = base_schema()
-    schema["properties"].update(
-        {
-            "cell_id": {
-                "type": "string",
-                "description": (
-                    "Named cell id (typically a job id or effort id). "
-                    "Omit to list cells in the state dir."
-                ),
             },
         }
     )
@@ -5739,7 +5702,7 @@ def codex_schema() -> JsonObject:
             "model": {
                 "type": "string",
                 "description": (
-                    "Optional Codex model name. Defaults to gpt-5.4-mini when omitted."
+                    "Optional Codex model name. Omitted: the model in your Codex config."
                 ),
             },
             "sandbox": {

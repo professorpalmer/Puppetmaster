@@ -30,7 +30,6 @@ from puppetmaster.rate_limit_state import (
     get_rate_limit_store,
     harvest_enabled,
     harvesting_rate_limits,
-    is_quota_admission_error,
     record_from_headers,
     reset_rate_limit_store_cache,
 )
@@ -153,8 +152,8 @@ class RateLimitStoreAdmissionTests(unittest.TestCase):
         self.assertIsNotNone(record)
         with self.assertRaises(ProviderError) as ctx:
             admit_or_raise(key, now=now + 1)
-        self.assertTrue(is_quota_admission_error(ctx.exception))
         self.assertTrue(is_admission_blocked_error(ctx.exception))
+        self.assertEqual(ctx.exception.status, 429)
         self.assertEqual(ctx.exception.body, QUOTA_EXHAUSTED_BODY)
         # After reset, admission opens again.
         admit_or_raise(key, now=now + 200)
