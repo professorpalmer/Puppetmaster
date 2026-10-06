@@ -44,7 +44,7 @@ from typing import Iterable, Mapping, Optional, Sequence
 
 _GATE_MARKER = "puppetmaster invocation-gate"
 
-VALID_HOOK_TARGETS = {"cursor", "claude"}
+VALID_HOOK_TARGETS = {"cursor", "claude", "codex"}
 VALID_HOOK_SCOPES = {"project", "global"}
 
 

@@ -3232,15 +3232,15 @@ def build_parser() -> argparse.ArgumentParser:
     install_hooks_parser.add_argument(
         "--target",
         default=None,
-        help=f"Comma-separated subset. Valid: {', '.join(sorted(VALID_HOOK_TARGETS))}. Default: both.",
+        help=f"Comma-separated subset. Valid: {', '.join(sorted(VALID_HOOK_TARGETS))}. Default: every enabled host (codex only with --global).",
     )
     install_hooks_parser.add_argument(
         "--global",
         dest="global_scope",
         action="store_true",
         help=(
-            "Install user-level hooks (~/.cursor/hooks.json, ~/.claude/settings.json) "
-            "that cover every repo you open, instead of just this workspace."
+            "Install user-level hooks (~/.cursor/hooks.json, ~/.claude/settings.json, "
+            "$CODEX_HOME/hooks.json) that cover every repo you open, instead of just this workspace."
         ),
     )
     install_hooks_parser.add_argument("--force", action="store_true", help="Rewrite even if current.")
