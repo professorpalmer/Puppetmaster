@@ -1,4 +1,48 @@
-## Unreleased
+## v1.32.0 — 2026-10-06
+
+**Solo first everywhere, honest attribution, and a leaner core.** Pilots on
+Claude Code and Codex get the same sizing gate Marionette has; observer reads
+stop blocking writers; write_scope charges a worker only for its own writes;
+every adapter verb was smoke-tested live; about 4,400 lines of unwired code
+are gone.
+
+**Sizing gate measures a unit before it fans out.** A unit count alone no
+longer hands off: before any unit is done the gate stays solo unless the
+calibration carries a per-unit cost (`per_unit_s`) at or above `min_unit_s`
+(provisional 20 s). Once a unit is done it uses the measured pace; many
+substantial units hand off as the quality crossover when that finishes
+sooner, and small units stay solo.
+
+**Host hooks: sizing advice on plan updates.** `install-hooks` writes a Claude
+Code `PostToolUse(TodoWrite)` hook and a Codex `$CODEX_HOME/hooks.json`
+(`--target codex`). When the plan grows past the solo falloff the pilot gets
+the gate's decision once per turn. The user-prompt hook no longer injects a
+delegate directive from prompt wording; naming Puppetmaster still does.
+
+**Edit workers state a verdict.** The implement report contract asks for a
+terminal `VERDICT: PASS|FAIL|PARTIAL`. A write-capable run that reports FAIL,
+PARTIAL or no verdict is degraded with the reason.
+
+**Readonly observer reads join a live WAL.** On POSIX a live store is read by
+joining its committed WAL snapshot (`mode=ro`, no byte-range lock), fenced by
+device/inode over the main file and both sidecars, so dashboard and CLI reads
+no longer fail or make writers SQLITE_BUSY while a job runs. A cohort missing
+a sidecar still fails closed. In live mode the promise is "never changes
+database content" (a WAL reader records read marks in `-shm`).
+
+**write_scope charges a worker only for writes it plausibly made.** The
+worker's own event stream (Codex `file_change` and command paths, Claude Code
+edit tools) decides attribution; a path that was already dirty and that the
+worker never names is excused as a concurrent change. A host appending to an
+untracked file in the repo root no longer fails every lane.
+
+**A model allowlist on a direct adapter run routes within it.** An allowlist
+used to be ignored without `--auto-route`, so a run allowed only
+`claude-code/opus-5-5` ran the adapter default.
+
+**Rules are solo-first in every surface**: installed rules, repo `AGENTS.md`
+and the Cursor rule description.
+
 
 **Direct adapter verbs fixed by a live smoke of every adapter.**
 
@@ -70,6 +114,16 @@ the tests that only exercised them are gone or moved to local helpers.
   `fs_permissions.mkdir_private`), `rate_limit_state.is_quota_admission_error`
   and `provider_health.assert_no_secrets_in_health_state` (a test oracle, now
   a test helper).
+- Five whole subsystems: named cells (`cell.py`, the `cell-status` /
+  `cell-inspect` / `cell-tick` verbs and MCP `puppetmaster_cell_status`; no
+  production code ever created a cell), the run journal (`run_journal.py`),
+  the METR coordinator writers in the store (`bind_job_contract`,
+  `set_job_wait_reason`, `hold_subgraph`, `veto_subgraph`, `resume_subgraph`,
+  `set_task_wait_reason`, `claim_subgraph_writer`) with the never-true
+  hold/veto/owner branches they fed and the `Job` fields only they set (older
+  job JSON with those keys still loads), the routing-quality evaluation
+  runner and its corpus, and the router's token-estimate calibration (measured
+  sizing lives in the sizing gate's calibration file).
 
 ## v1.31.0 — 2026-10-05
 
