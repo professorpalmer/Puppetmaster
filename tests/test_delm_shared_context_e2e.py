@@ -18,14 +18,7 @@ import hermetic_env  # noqa: F401
 import unittest
 
 from puppetmaster.dashboard import build_job_snapshot, make_handler
-from puppetmaster.gist_admission import (
-    CONTEXT_LEVEL_GIST,
-    CONTEXT_LEVEL_RAW,
-    CONTEXT_LEVEL_SUMMARY,
-    format_unfolded_for_injection,
-    maybe_admit_finding_as_gist,
-    unfold_shared_context,
-)
+from puppetmaster.gist_admission import maybe_admit_finding_as_gist
 from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
 from puppetmaster.prewalk import format_upstream_artifacts_for_injection
 from puppetmaster.sqlite_store import SQLiteSwarmStore
@@ -124,25 +117,6 @@ class DelmSharedContextE2ETests(unittest.TestCase):
             self.assertTrue(selected_ids)
             self.assertNotIn("unverified rumor", injected)
             self.assertNotIn("enqueue_subtasks", injected)
-
-            gist_view = unfold_shared_context(
-                store, gist, level=CONTEXT_LEVEL_GIST
-            )
-            summary_view = unfold_shared_context(
-                store, gist, level=CONTEXT_LEVEL_SUMMARY
-            )
-            raw_view = unfold_shared_context(store, gist, level=CONTEXT_LEVEL_RAW)
-            self.assertEqual(
-                gist_view.get("body"), "Peers must only see admitted gists"
-            )
-            self.assertTrue(summary_view.get("body"))
-            self.assertTrue(
-                any(
-                    source.get("id") == finding.id
-                    for source in raw_view.get("sources") or []
-                )
-            )
-            self.assertIn("Gist:", format_unfolded_for_injection(gist_view))
 
             created = store.maybe_enqueue_follow_ups_from_artifact(
                 finding, parent_task_id=explore.id, created_by="worker-explore"

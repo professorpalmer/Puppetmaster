@@ -21,8 +21,6 @@ from puppetmaster.session_commands import (
     SessionCommandKind,
     SessionCommandStatus,
     evaluate_command,
-    map_interrupt_to_cancellation,
-    map_run_to_task_admission,
 )
 
 
@@ -104,7 +102,7 @@ class EvaluateCommandTests(unittest.TestCase):
 
 
 class JobCommandLedgerTests(unittest.TestCase):
-    def test_mark_before_execute_and_mappings(self) -> None:
+    def test_mark_before_execute_then_replay_skips(self) -> None:
         with TemporaryDirectory() as tmp:
             ledger = JobCommandLedger(tmp, "job_demo")
             run = ledger.append(
@@ -124,26 +122,19 @@ class JobCommandLedgerTests(unittest.TestCase):
                 ledger.apply_disposition(entry, disposition)
             self.assertIn(run.id, ledger.processed_ids())
             self.assertIn(interrupt.id, ledger.processed_ids())
-            mapped = map_run_to_task_admission(run)
-            self.assertEqual(mapped["goal"], "ship it")
-            cancel = map_interrupt_to_cancellation(interrupt)
-            self.assertEqual(cancel["request_id"], interrupt.id)
             # Replay is Skip after mark-processed.
             again = ledger.evaluate_pending(now_ms=run.issued_at_ms + 20)
             kinds = {disposition for _entry, disposition in again}
             self.assertEqual(kinds, {CommandDisposition.SKIP})
 
-    def test_composer_cancel_own_pending_only(self) -> None:
-        from puppetmaster.session_commands import can_composer_cancel
-
+    def test_rewrite_status_is_visible_to_listing(self) -> None:
         with TemporaryDirectory() as tmp:
             ledger = JobCommandLedger(Path(tmp), "job_x")
             entry = ledger.append(SessionCommandKind.STEER, issued_by="device-a", payload={})
-            self.assertTrue(can_composer_cancel(entry, "device-a"))
-            self.assertFalse(can_composer_cancel(entry, "device-b"))
+            self.assertEqual(entry.status, SessionCommandStatus.PENDING)
             ledger.rewrite_status(entry.id, SessionCommandStatus.APPLIED)
             updated = ledger.list_entries()[0]
-            self.assertFalse(can_composer_cancel(updated, "device-a"))
+            self.assertEqual(updated.status, SessionCommandStatus.APPLIED)
 
 
 if __name__ == "__main__":

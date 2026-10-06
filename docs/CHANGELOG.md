@@ -1,3 +1,42 @@
+## Unreleased
+
+**Unwired half-built code removed.** Each of these had no production caller;
+the tests that only exercised them are gone or moved to local helpers.
+
+- Gist admission loses `admit_gist`, `reject_gist`, `build_pending_gist` and
+  the Wave-2 selective unfold (`unfold_shared_context`,
+  `format_unfolded_for_injection`, `normalize_context_level`, the
+  `CONTEXT_LEVEL_*` constants). `maybe_admit_finding_as_gist` was always the
+  real admission path, so no pending gist ever existed in production and
+  nothing was admitted or rejected through that API; it also no longer copies
+  the `summary_ref` / `raw_ref` unfold pointers. Peer injection filtering
+  (`is_admitted_for_shared_context`, `filter_shared_context_artifacts`) is
+  unchanged, including its refusal of non-admitted and coordination-protocol
+  gists.
+- **Two breaking key removals.** `status_snapshot()["outcome"]` no longer
+  carries `diff_present`; it was a pure alias of `patch_artifact_emitted`
+  (added in the diff-source outcome change below), which remains. The MCP
+  start response no longer carries `pid` / `pid_deprecated`; `launcher_pid`
+  and `orchestrator_pid` carry the same value and `pid_note` already told
+  callers not to track by pid.
+- Also removed: `receipt.record_host_delivery_observation` (call
+  `metr_seams.record_host_observation`), `working_set.read_artifact_index`
+  (the writer stays), the unused `session_commands` mappers
+  (`can_composer_cancel`, `map_interrupt_to_cancellation`,
+  `map_run_to_task_admission` — the ledger itself stays),
+  `FileClaimRegistry.list_active` and `.sweep_expired` (expiry is already
+  lazy inside acquisition; `audit_records` stays),
+  `_delta_stream.iter_deltas` (the `deltas` CLI is the real reader),
+  `output_style.resolve_output_style` / `apply_output_style` (superseded by
+  `resolve_output` + `directive_for`),
+  `adapters.registry.adapter_runtime_capabilities` with the
+  `state_isolation` / `catalog_source` ClassVars, `ports.reserve_port` /
+  `_port_is_free` (probe-then-bind is racy; `apply_worktree_ports` hints are
+  what production uses), `state.ensure_state_dir` (call
+  `fs_permissions.mkdir_private`), `rate_limit_state.is_quota_admission_error`
+  and `provider_health.assert_no_secrets_in_health_state` (a test oracle, now
+  a test helper).
+
 ## v1.31.0 — 2026-10-05
 
 **Fan-out cost parity: Codex workers no longer pay ~12k tokens of user context

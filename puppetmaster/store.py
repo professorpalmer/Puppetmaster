@@ -3831,8 +3831,6 @@ class SwarmStore(StoreContracts):
             "trustworthy": verdict["trustworthy"],
             "reasons": verdict.get("reasons", []),
             "artifact_count": len(artifacts),
-            # Legacy alias for patch_artifact_emitted; older consumers key on it.
-            "diff_present": patch_artifact_emitted,
             "baseline_diff_present": baseline_diff_present,
             "worker_diff_present": worker_diff_present,
             "patch_artifact_emitted": patch_artifact_emitted,

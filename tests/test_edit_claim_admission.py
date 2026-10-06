@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -34,6 +35,18 @@ class Store:
         self.events.append((job_id, event, payload))
 
 
+def _claim_paths(db: Path, root: Path) -> list[str]:
+    """Live claim paths for ``root``, read straight from the claims table."""
+    registry = FileClaimRegistry(db)
+    identity = registry.repository_identity(root)[0]
+    with sqlite3.connect(str(db)) as connection:
+        rows = connection.execute(
+            "SELECT path FROM file_claims WHERE repo_identity=? ORDER BY path",
+            (identity,),
+        ).fetchall()
+    return [str(row[0]) for row in rows]
+
+
 class EditAdmissionTests(unittest.TestCase):
     def test_declared_scope_and_release(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -46,7 +59,7 @@ class EditAdmissionTests(unittest.TestCase):
                     self.assertEqual(("src",), tuple(c.path for c in owner.claims))
                     self.assertTrue(owner.check())
                     self.assertEqual(task.generation, owner.generation)
-                self.assertEqual([], FileClaimRegistry(db).list_active(root))
+                self.assertEqual([], _claim_paths(db, root))
             self.assertEqual("edit_admission.released", store.events[-1][1])
 
     def test_read_only_matrix_does_not_claim_and_unknown_is_conservative(self):
@@ -173,7 +186,7 @@ class EditAdmissionTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "boom"):
                     with edit_admission(Store(), task, "worker"):
                         raise RuntimeError("boom")
-                self.assertEqual([], FileClaimRegistry(db).list_active(root))
+                self.assertEqual([], _claim_paths(db, root))
 
 
 if __name__ == "__main__":

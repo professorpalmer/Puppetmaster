@@ -23,7 +23,6 @@ PathLike = Union[str, Path]
 _MAX_OWNER_LENGTH = 256
 _MAX_TTL_SECONDS = 365 * 24 * 60 * 60
 _BUSY_TIMEOUT_MS = 2_000
-_MAX_LIST_LIMIT = 1_000
 
 
 class FileClaimConflict(RuntimeError):
@@ -138,25 +137,6 @@ class FileClaimRegistry:
                 claimed.append(_claim_from_row(row))
             return claimed
 
-    def list_active(self, repo: Optional[PathLike] = None, *, limit: int = 100) -> list[FileClaim]:
-        """List at most ``limit`` live claims for CLI/operator inspection."""
-        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= _MAX_LIST_LIMIT:
-            raise ValueError("limit must be between 1 and %d" % _MAX_LIST_LIMIT)
-        identity = self.repository_identity(repo)[0] if repo is not None else None
-        now = self._now()
-        with self._connection() as connection:
-            if identity is None:
-                rows = connection.execute(
-                    "SELECT * FROM file_claims ORDER BY repo_identity, path LIMIT ?", (limit,)
-                ).fetchall()
-            else:
-                rows = connection.execute(
-                    "SELECT * FROM file_claims WHERE repo_identity=? ORDER BY path LIMIT ?",
-                    (identity, limit),
-                ).fetchall()
-        return [_claim_from_row(row) for row in rows
-                if bool(row["managed"]) or not _expired(row, now)]
-
     def renew(
         self, repo: PathLike, path: PathLike, claim_id: str,
         ttl_seconds: Optional[float] = None,
@@ -215,23 +195,6 @@ class FileClaimRegistry:
                             str(row["owner"]), None, now)
                 released += 1
         return released
-
-    def sweep_expired(self, repo: Optional[PathLike] = None) -> int:
-        """Delete claims idle past their latest renewal and audit each expiry."""
-        identity = self.repository_identity(repo)[0] if repo is not None else None
-        now = self._now()
-        expired = 0
-        with self._transaction() as connection:
-            query = "SELECT * FROM file_claims" + (" WHERE repo_identity=?" if identity else "")
-            for row in connection.execute(query, (() if identity is None else (identity,))).fetchall():
-                if bool(row["managed"]) or not _expired(row, now):
-                    continue
-                connection.execute("DELETE FROM file_claims WHERE repo_identity=? AND path=?",
-                                   (row["repo_identity"], row["path"]))
-                self._audit(connection, "expired", str(row["repo_identity"]), str(row["path"]),
-                            str(row["claim_id"]), str(row["owner"]), None, now)
-                expired += 1
-        return expired
 
     def audit_records(self) -> list[FileClaimAuditRecord]:
         """Return durable audit metadata, never file contents."""

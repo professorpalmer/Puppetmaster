@@ -23,7 +23,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Optional
 
 from puppetmaster.fs_permissions import mkdir_private, open_private
 from puppetmaster.models import Task
@@ -100,54 +100,3 @@ class DurableDeltaWriter:
             except OSError:
                 pass
             self._handle = None
-
-
-def iter_deltas(
-    path: Path,
-    *,
-    follow: bool = False,
-    idle_timeout_seconds: float = 0.0,
-    poll_interval_seconds: float = 0.1,
-) -> Iterator[dict]:
-    """Yield delta records from an NDJSON delta file.
-
-    Reads all currently-available records first. When ``follow`` is set it then
-    tails the file for appended records until ``idle_timeout_seconds`` elapses
-    with no new data (0 waits indefinitely) or the reader is interrupted. Safe
-    to start before the file exists -- it waits for the worker to create it.
-    """
-    poll = max(0.02, poll_interval_seconds)
-    offset = 0
-    idle_deadline = (
-        time.monotonic() + idle_timeout_seconds if idle_timeout_seconds > 0 else None
-    )
-    while True:
-        produced = False
-        try:
-            with open(path, "r", encoding="utf-8", errors="replace") as handle:
-                handle.seek(offset)
-                for line in handle:
-                    if not line.endswith("\n"):
-                        break  # partial trailing line -- reread from offset next pass
-                    offset += len(line.encode("utf-8"))
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        record = json.loads(line)
-                    except ValueError:
-                        continue
-                    produced = True
-                    yield record
-        except FileNotFoundError:
-            pass
-        if not follow:
-            return
-        if produced and idle_timeout_seconds > 0:
-            idle_deadline = time.monotonic() + idle_timeout_seconds
-        if idle_deadline is not None and time.monotonic() >= idle_deadline:
-            return
-        try:
-            time.sleep(poll)
-        except KeyboardInterrupt:
-            return

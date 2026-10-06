@@ -382,12 +382,10 @@ class PuppetmasterTests(unittest.TestCase):
             payload = json.loads(result["content"][0]["text"])
 
             self.assertIn("job_", payload["job_id"])
-            self.assertIn("pid", payload)
-            # The launcher pid is now labeled honestly and monitoring is pointed
+            # The launcher pid is labeled honestly and monitoring is pointed
             # at job_id rather than the misleading supervisor pid (C2).
-            self.assertEqual(payload["launcher_pid"], payload["pid"])
+            self.assertNotIn("pid", payload)
             self.assertEqual(payload["orchestrator_pid"], payload["launcher_pid"])
-            self.assertTrue(payload["pid_deprecated"])
             self.assertEqual(payload["monitor_with"]["job_id"], payload["job_id"])
             self.assertEqual(
                 payload["monitor_with"]["arguments"]["job_ref"], payload["job_ref"]
@@ -17474,18 +17472,6 @@ class AdapterCliPresenceTests(unittest.TestCase):
                 self.assertTrue(adapter_cli_present(adapter, env={}, resolver=lambda name: f"/opt/bin/{name}"))
                 self.assertFalse(adapter_cli_present(adapter, env={}, resolver=lambda _name: None))
 
-    def test_runtime_capabilities_keep_cursor_isolation_opt_in(self) -> None:
-        from puppetmaster.adapters.registry import adapter_runtime_capabilities
-
-        self.assertEqual(
-            adapter_runtime_capabilities("cursor")["state_isolation"],
-            "per-worker-sdk-state",
-        )
-        self.assertEqual(
-            adapter_runtime_capabilities("codex")["state_isolation"],
-            "none",
-        )
-
     def test_executable_honors_env_override(self) -> None:
         from puppetmaster.preflight import adapter_cli_executable
 
@@ -24444,28 +24430,6 @@ class PuppetmasterGateTests(unittest.TestCase):
             apply_worktree_ports(pinned, a, override_port=True)
             self.assertEqual(pinned["PORT"], str(base_a))
 
-    def test_reserve_port_skips_busy_ports(self) -> None:
-        """B1 bulletproof path: reserve_port bumps past a live listener (EADDRINUSE)."""
-        import socket
-        from puppetmaster.ports import reserve_port, worktree_port_base, _port_is_free
-
-        with TemporaryDirectory() as wt:
-            hint = worktree_port_base(wt)
-            # Occupy the hinted port with a real listener.
-            busy = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            busy.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                busy.bind(("127.0.0.1", hint))
-                busy.listen(1)
-                reserved = reserve_port(wt)
-                # Must not hand back the occupied port, and must be bindable.
-                self.assertNotEqual(reserved, hint)
-                self.assertTrue(_port_is_free(reserved))
-            except OSError:
-                self.skipTest("could not bind the hinted port in this environment")
-            finally:
-                busy.close()
-
     def test_committed_gate_excludes_generated_artifacts(self) -> None:
         """C2: configured generated artifacts are kept out of the auto-commit."""
         from puppetmaster.gates import evaluate_task_gates
@@ -25369,7 +25333,7 @@ class PuppetmasterLifecycleTests(unittest.TestCase):
             snap = store.status_snapshot(job.id)
             self.assertIn("outcome", snap)
             self.assertEqual(snap["outcome"]["quality"], "empty")
-            self.assertFalse(snap["outcome"]["diff_present"])
+            self.assertFalse(snap["outcome"]["patch_artifact_emitted"])
             self.assertFalse(snap["outcome"]["baseline_diff_present"])
             self.assertFalse(snap["outcome"]["worker_diff_present"])
             self.assertFalse(snap["outcome"]["patch_artifact_emitted"])
@@ -25386,7 +25350,7 @@ class PuppetmasterLifecycleTests(unittest.TestCase):
                 },
             ))
             snap = store.status_snapshot(job.id)
-            self.assertFalse(snap["outcome"]["diff_present"])
+            self.assertFalse(snap["outcome"]["patch_artifact_emitted"])
             self.assertTrue(snap["outcome"]["baseline_diff_present"])
             self.assertFalse(snap["outcome"]["worker_diff_present"])
             self.assertFalse(snap["outcome"]["patch_artifact_emitted"])
@@ -25408,7 +25372,7 @@ class PuppetmasterLifecycleTests(unittest.TestCase):
                 payload={"gate": "committed", "kind": "committed", "passed": True},
             ))
             snap = store.status_snapshot(job.id)
-            self.assertTrue(snap["outcome"]["diff_present"])
+            self.assertTrue(snap["outcome"]["patch_artifact_emitted"])
             self.assertTrue(snap["outcome"]["baseline_diff_present"])
             self.assertTrue(snap["outcome"]["worker_diff_present"])
             self.assertTrue(snap["outcome"]["patch_artifact_emitted"])
@@ -28173,13 +28137,13 @@ class SecurityHardeningTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name != "nt", "POSIX-only permission check")
     def test_sensitive_state_dirs_created_owner_only(self) -> None:
-        from puppetmaster.fs_permissions import supports_posix_modes
-        from puppetmaster.state import ensure_state_dir
+        from puppetmaster.fs_permissions import mkdir_private, supports_posix_modes
 
         if not supports_posix_modes():
             self.skipTest("POSIX modes unavailable")
         with TemporaryDirectory() as tmp:
-            state_dir = ensure_state_dir(Path(tmp) / "nested" / "state")
+            state_dir = Path(tmp) / "nested" / "state"
+            mkdir_private(state_dir)
             mode = state_dir.stat().st_mode & 0o777
             self.assertEqual(mode, 0o700)
 
@@ -30390,14 +30354,14 @@ class OutputStyleTests(unittest.TestCase):
         for disabled in (None, "", "off", "none", "false", "garbage"):
             self.assertIsNone(normalize_style(disabled))
 
-    def test_resolve_payload_wins_over_env(self) -> None:
-        from puppetmaster.output_style import resolve_output_style
+    def test_resolve_output_falls_back_to_the_env_tier(self) -> None:
+        from puppetmaster.output_style import resolve_output
 
-        self.assertEqual(resolve_output_style("lithic", "terse"), "lithic")
-        # An explicit disabled payload suppresses the env default for that spec.
-        self.assertIsNone(resolve_output_style("off", "terse"))
-        # No payload → fall back to env.
-        self.assertEqual(resolve_output_style(None, "terse"), "terse")
+        label, directive = resolve_output(
+            payload_style=None, payload_text=None, env_style="terse", env_text=None
+        )
+        self.assertEqual(label, "terse")
+        self.assertIn("OUTPUT STYLE (terse)", directive)
 
     def test_directive_tiers_and_uncertainty_rule(self) -> None:
         from puppetmaster.output_style import directive_for
@@ -30414,14 +30378,6 @@ class OutputStyleTests(unittest.TestCase):
         self.assertIn("Drop articles", lithic)
         # Reasoning is explicitly preserved.
         self.assertIn("not reasoning", terse)
-
-    def test_apply_is_noop_when_disabled_and_prepends_when_on(self) -> None:
-        from puppetmaster.output_style import apply_output_style
-
-        self.assertEqual(apply_output_style("do the thing", None), "do the thing")
-        applied = apply_output_style("do the thing", "terse")
-        self.assertTrue(applied.endswith("do the thing"))
-        self.assertIn("OUTPUT STYLE (terse)", applied)
 
     def test_orchestrator_seam_respects_env_and_payload(self) -> None:
         from puppetmaster.output_style import OUTPUT_STYLE_ENV

@@ -4636,11 +4636,9 @@ def start_cli(command: list[str], args: JsonObject) -> JsonObject:
         # `launcher_pid` is the detached launcher/orchestrator process, NOT the
         # durable worker doing the edits — that worker is a downstream child with
         # its own (shorter) lifetime and pid. Don't monitor progress by this pid;
-        # use `job_id` with status/logs/feed. `pid` is kept as a back-compat alias.
+        # use `job_id` with status/logs/feed.
         "orchestrator_pid": process.pid,
         "launcher_pid": process.pid,
-        "pid": process.pid,
-        "pid_deprecated": True,
         "pid_note": (
             "launcher_pid is the orchestrator launcher, not the worker; "
             "track progress via job_id (status/logs/feed), not this pid"

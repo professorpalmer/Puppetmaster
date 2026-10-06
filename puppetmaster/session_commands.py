@@ -142,13 +142,6 @@ class SessionCommandEntry:
         )
 
 
-def can_composer_cancel(entry: SessionCommandEntry, device_id: str) -> bool:
-    return (
-        entry.status == SessionCommandStatus.PENDING
-        and entry.issued_by == device_id
-    )
-
-
 @dataclass(frozen=True)
 class EvaluationContext:
     is_processed: Callable[[str], bool]
@@ -184,32 +177,6 @@ def evaluate_command(
         if not is_current and cx.turn_is_past(turn_id):
             return CommandDisposition.SUPERSEDED
     return CommandDisposition.EXECUTE
-
-
-def map_interrupt_to_cancellation(entry: SessionCommandEntry) -> dict[str, Any]:
-    """Describe how an interrupt command binds to store cancellation."""
-    if entry.kind != SessionCommandKind.INTERRUPT:
-        raise ValueError("map_interrupt_to_cancellation requires interrupt")
-    return {
-        "command_id": entry.id,
-        "request_id": entry.mapped_request_id or entry.id,
-        "reason": "session_command.interrupt",
-        "based_on": asdict(entry.based_on) if entry.based_on else None,
-    }
-
-
-def map_run_to_task_admission(entry: SessionCommandEntry) -> dict[str, Any]:
-    """Describe how a run command admits work into the task/artifact plane."""
-    if entry.kind != SessionCommandKind.RUN:
-        raise ValueError("map_run_to_task_admission requires run")
-    payload = dict(entry.payload)
-    return {
-        "command_id": entry.id,
-        "message_id": payload.get("message_id"),
-        "goal": payload.get("goal") or payload.get("prompt") or "",
-        "role": payload.get("role"),
-        "adapter": payload.get("adapter"),
-    }
 
 
 class JobCommandLedger:

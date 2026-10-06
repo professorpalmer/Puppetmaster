@@ -739,8 +739,8 @@ def list_all_projects_snapshot(*, backend: str = "sqlite", limit: int = 200) -> 
     for project_dir in list_project_state_dirs():
         short = project_slug(project_dir.name)
         try:
-            # create_store stays inside the try: SwarmStore.__init__ runs
-            # ensure_state_dir, which can legitimately raise a per-project
+            # create_store stays inside the try: SwarmStore.__init__ creates
+            # the state directory, which can legitimately raise a per-project
             # OSError (unwritable or vanished directory).
             store = viewer_store(backend, project_dir)
             for job in store.list_jobs():
@@ -1655,10 +1655,9 @@ def _dashboard_server_class():
         # second project's dashboard prints its URL, opens a browser tab, and
         # never receives a request (it serves the first project's jobs
         # instead). Disabling it on Windows turns the collision into a real,
-        # detectable EADDRINUSE/EACCES (mirrors puppetmaster/ports.py's
-        # _port_is_free, which guards the same inversion). On POSIX we keep
-        # it: there it only permits rebinding a TIME_WAIT socket, which is
-        # what makes an immediate restart after Ctrl-C work.
+        # detectable EADDRINUSE/EACCES. On POSIX we keep it: there it only
+        # permits rebinding a TIME_WAIT socket, which is what makes an
+        # immediate restart after Ctrl-C work.
         allow_reuse_address = 0 if os.name == "nt" else 1
 
     return _DashboardServer
@@ -1674,11 +1673,9 @@ def bind_dashboard_server(
     ``port=0`` (OS-assigned ephemeral port, used by tests) always succeeds on
     the first attempt.
 
-    ``ports.reserve_port()`` is not used here: it binds a probe socket, closes
-    it, and returns — a TOCTOU window (documented on that function) that
-    another process can win before this call binds for real. The only sound
-    fix is retrying the bind on the real server socket, which is what this
-    does.
+    Probing a port and then binding it is unsound: the probe closes its socket
+    and another process can win the gap. The only sound fix is retrying the
+    bind on the real server socket, which is what this does.
     """
     if not 0 <= port <= 65535:
         # Caught before the bind loop below: an out-of-range port (e.g. a

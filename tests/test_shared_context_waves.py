@@ -13,74 +13,11 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from puppetmaster.gist_admission import (
-    CONTEXT_LEVEL_GIST,
-    CONTEXT_LEVEL_RAW,
-    CONTEXT_LEVEL_SUMMARY,
-    format_unfolded_for_injection,
-    unfold_shared_context,
-)
 from puppetmaster.attempts import ExecutionAttempt
 from puppetmaster.budget import BudgetLiability, BudgetPolicy
 from puppetmaster.models import Artifact, ArtifactType, Task, TaskStatus
 from puppetmaster.sqlite_store import SQLiteSwarmStore
 from puppetmaster.store import SwarmStore
-
-
-class SelectiveUnfoldTests(unittest.TestCase):
-    def test_unfold_gist_summary_and_raw(self) -> None:
-        with TemporaryDirectory() as tmp:
-            store = SwarmStore(Path(tmp) / ".puppetmaster")
-            store.init()
-            job = store.create_job("unfold")
-            source = Artifact(
-                job_id=job.id,
-                task_id="task-src",
-                type=ArtifactType.FINDING,
-                created_by="worker",
-                confidence=0.9,
-                evidence=["file.py:10"],
-                payload={"claim": "full finding body with detail"},
-            )
-            store.save_artifact(source)
-            gist = Artifact(
-                job_id=job.id,
-                task_id="task-src",
-                type=ArtifactType.GIST,
-                created_by="worker",
-                confidence=0.9,
-                evidence=[f"source:{source.id}"],
-                payload={
-                    "claim": "compact claim",
-                    "source_artifact_ids": [source.id],
-                    "admission": "admitted",
-                    "level": "gist",
-                    "summary_ref": source.id,
-                },
-            )
-            store.save_artifact(gist)
-
-            gist_view = unfold_shared_context(
-                store, gist, level=CONTEXT_LEVEL_GIST
-            )
-            self.assertEqual(gist_view["level"], "gist")
-            self.assertEqual(gist_view["body"], "compact claim")
-            self.assertIn("Gist: compact claim", format_unfolded_for_injection(gist_view))
-
-            summary_view = unfold_shared_context(
-                store, gist, level=CONTEXT_LEVEL_SUMMARY
-            )
-            self.assertEqual(summary_view["level"], "summary")
-            self.assertIn("full finding body", summary_view["body"])
-            self.assertIn(
-                "Summary:", format_unfolded_for_injection(summary_view)
-            )
-
-            raw_view = unfold_shared_context(store, gist, level=CONTEXT_LEVEL_RAW)
-            self.assertEqual(raw_view["level"], "raw")
-            self.assertEqual(len(raw_view["sources"]), 1)
-            self.assertEqual(raw_view["sources"][0]["id"], source.id)
-            self.assertIn("Source (", format_unfolded_for_injection(raw_view))
 
 
 class AdaptiveEnqueueTests(unittest.TestCase):

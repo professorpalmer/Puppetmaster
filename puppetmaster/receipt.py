@@ -180,19 +180,6 @@ def _host_observations(store: Any, job_id: str, artifacts: list[Artifact]) -> di
     }
 
 
-def record_host_delivery_observation(
-    store: Any,
-    job_id: str,
-    kind: str,
-    *,
-    evidence: Optional[list[str]] = None,
-) -> dict[str, Any]:
-    """Idempotent host observation of shipped/merged/released/landed."""
-    from puppetmaster.metr_seams import record_host_observation
-
-    return record_host_observation(store, job_id, kind, evidence=evidence)
-
-
 def _elapsed_seconds(created_at: str, completed_at: Optional[str]) -> Optional[float]:
     if not created_at or not completed_at:
         return None

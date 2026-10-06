@@ -408,26 +408,6 @@ def write_artifact_index(
         return None
 
 
-def read_artifact_index(job_dir: Union[Path, str, None]) -> List[dict]:
-    """Read compact artifact refs from ``job_dir``. Empty list on miss."""
-    if job_dir is None:
-        return []
-    try:
-        path = artifact_index_path(job_dir)
-        if not path.is_file():
-            return []
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(raw, list):
-            return [item for item in raw if isinstance(item, dict)]
-        if isinstance(raw, dict):
-            items = raw.get("artifacts")
-            if isinstance(items, list):
-                return [item for item in items if isinstance(item, dict)]
-        return []
-    except Exception:
-        return []
-
-
 def rebuild_artifact_index(
     job_dir: Union[Path, str],
     store: Any,

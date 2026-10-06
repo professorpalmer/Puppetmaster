@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -18,6 +19,28 @@ if _HERMETIC_DIR not in sys.path:
     sys.path.insert(0, _HERMETIC_DIR)
 import hermetic_env  # noqa: F401
 from puppetmaster.model_registry import registry_digest
+
+# Raw IAM access-key ids look like AKIA… / ASIA… (not hex fingerprints).
+_ACCESS_KEY_RE = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
+_SECRETISH_MARKERS = (
+    "aws_secret",
+    "secret_access",
+    "session_token",
+    "bearer_token",
+    "aws_access_key",
+)
+
+
+def assert_no_secrets_in_health_state(store) -> None:
+    """Raise ``AssertionError`` if any persisted row looks like secret material."""
+    for row in store.dump_rows():
+        blob = " ".join(str(value) for value in row.values())
+        lower = blob.lower()
+        for marker in _SECRETISH_MARKERS:
+            if marker in lower:
+                raise AssertionError(f"secret-like material in health state: {marker}")
+        if _ACCESS_KEY_RE.search(blob):
+            raise AssertionError("raw access key id persisted in health state")
 
 
 class BedrockInvokeHealthTests(unittest.TestCase):
@@ -143,7 +166,6 @@ class BedrockInvokeHealthTests(unittest.TestCase):
         from puppetmaster.model_registry import ModelSpec
         from puppetmaster.provider_health import (
             ProviderHealthStore,
-            assert_no_secrets_in_health_state,
             reset_provider_health_store_cache,
         )
         from puppetmaster.providers import ProviderError
@@ -492,7 +514,6 @@ class BedrockInvokeHealthTests(unittest.TestCase):
 
     def test_no_secrets_in_state(self) -> None:
         from puppetmaster import bedrock, providers
-        from puppetmaster.provider_health import assert_no_secrets_in_health_state
 
         canned = {
             "output": {

@@ -48,11 +48,6 @@ from ._base import _should_emit_patch_artifact
 
 class CursorAdapter(CliWorkerAdapter):
     name = "cursor"
-    # cursor_sdk_runner.mjs allocates a private temporary SQLite state root
-    # for every worker process. Do not generalize this to other harnesses
-    # unless their SDK/CLI state contract has been verified.
-    state_isolation = "per-worker-sdk-state"
-    catalog_source = "cursor"
 
     def run(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
         # Two execution modes share the same Cursor SDK runner. ``analyze`` (the
