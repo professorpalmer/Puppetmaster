@@ -461,6 +461,26 @@ class PuppetmasterTests(unittest.TestCase):
         self.assertFalse(result["isError"])
         self.assertEqual(captured["command"], ["status", "job_x", "--compact"])
 
+    def test_mcp_doctor_compact_reports_counts_and_attention_only(self) -> None:
+        from puppetmaster import mcp_server
+
+        checks = [{"name": "python", "status": "ok", "detail": "3.14"},
+                  {"name": "codex", "status": "warn", "detail": "stale catalog"},
+                  {"name": "pi", "status": "optional", "detail": "not installed"}]
+        body = {"stdout": json.dumps(checks), "returncode": 0}
+        reply = {"content": [{"type": "text", "text": json.dumps(body)}], "isError": False}
+        with patch.object(mcp_server, "run_cli", return_value=reply) as cli:
+            result = mcp_server.run_doctor_tool({})
+        self.assertEqual(cli.call_args.args[0], ["doctor", "--json"])
+        envelope = json.loads(result["content"][0]["text"])
+        self.assertEqual(envelope["returncode"], 0)
+        data = json.loads(envelope["stdout"])
+        self.assertEqual(data["counts"], {"ok": 1, "warn": 1, "optional": 1})
+        self.assertEqual([c["name"] for c in data["attention"]], ["codex"])
+        with patch.object(mcp_server, "run_cli", return_value=reply) as cli:
+            mcp_server.run_doctor_tool({"compact": False})
+        self.assertEqual(cli.call_args.args[0], ["doctor"])
+
     def test_mcp_status_and_artifacts_default_compact_for_pilots(self) -> None:
         from puppetmaster import mcp_server
 
