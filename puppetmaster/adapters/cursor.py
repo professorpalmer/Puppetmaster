@@ -197,6 +197,7 @@ class CursorAdapter(CliWorkerAdapter):
                         "timeout_seconds": timeout_seconds,
                         "live_log": completed.live_log_path,
                         "attempt_id": getattr(completed, "attempt_id", None),
+                        "dispatch_receipt": getattr(completed, "dispatch_receipt", None),
                         "base_sha": before["sha"],
                         "head_sha": after["sha"],
                         "changed_files": after["changed_files"],
@@ -255,6 +256,7 @@ class CursorAdapter(CliWorkerAdapter):
                     "stderr_capture": stderr_capture,
                     "live_log": completed.live_log_path,
                     "attempt_id": getattr(completed, "attempt_id", None),
+                    "dispatch_receipt": getattr(completed, "dispatch_receipt", None),
                     "model": model,
                     "cwd": str(cwd),
                     "cursor_status": cursor_status,
@@ -364,6 +366,7 @@ class CursorAdapter(CliWorkerAdapter):
                         "failure": "timeout",
                         "live_log": completed.live_log_path,
                         "attempt_id": getattr(completed, "attempt_id", None),
+                        "dispatch_receipt": getattr(completed, "dispatch_receipt", None),
                     },
                 )
             ]

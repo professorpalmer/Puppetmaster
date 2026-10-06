@@ -48,11 +48,13 @@ class EchoAdapter(CliWorkerAdapter):
                          "live_log": completed.live_log_path,
                          "attempt_id": completed.attempt_id,
                          "final": final["stdout_sidecar_path"], "patch": patch,
-                         "words": words, "timed_out": completed.timed_out}))
+                         "words": words, "timed_out": completed.timed_out,
+                         "dispatch_receipt": completed.dispatch_receipt}))
         return artifacts
 
     def _launch(self, *, task, words, code):
         return run_streamed_subprocess(
+            stdin_data=f"prompt for {words} sk-ant-api03-{'x' * 40}\n",
             command=[sys.executable, "-c",
                      f"import sys, time; print({words!r}, flush=True); time.sleep({code} == 9 and 30 or 0); sys.exit({code})"],
             env=None, task=task, sidecar_name="echo", timeout_seconds=self.timeout_seconds)
@@ -186,6 +188,40 @@ class InvocationIdentityTests(unittest.TestCase):
         self.run_task(EchoAdapter([("scoped", 0)]))
         loose = capture_subprocess_stdout(text="x" * 40000, task=self.task, sidecar_name="loose")
         self.assertEqual(Path(loose["stdout_sidecar_path"]).parent.name, self.task.id)
+
+    def test_each_attempt_writes_one_immutable_dispatch_receipt(self):
+        import hashlib
+        import json
+
+        from puppetmaster.adapters._streaming import _write_dispatch_receipt
+
+        self.run_task(EchoAdapter([("first", 0), ("second", 0)]))
+        payloads = self.verifications()
+        receipts = [p["dispatch_receipt"] for p in payloads]
+        self.assertEqual(len(set(receipts)), 2)
+        for payload in payloads:
+            body = json.loads(Path(payload["dispatch_receipt"]).read_text())
+            self.assertEqual(body["attempt_id"], payload["attempt_id"])
+            self.assertIn(payload["attempt_id"].rsplit(":", 1)[-1], payload["dispatch_receipt"])
+            stdin = f"prompt for {payload['words']} sk-ant-api03-{'x' * 40}\n"
+            self.assertEqual(body["stdin"]["sha256"], hashlib.sha256(stdin.encode()).hexdigest())
+            copy = Path(body["stdin"]["redacted_copy"]).read_text()
+            self.assertIn(f"prompt for {payload['words']}", copy)
+            self.assertNotIn("x" * 40, copy)
+            self.assertNotIn("x" * 40, json.dumps(body))
+            self.assertEqual(body["argv"][0], sys.executable)
+            self.assertIsInstance(body["pid"], int)
+            self.assertEqual(body["parent_pid"], os.getpid())
+            self.assertTrue(set(body["env"]) <= {
+                "CODEX_HOME", "CLAUDE_CONFIG_DIR", "HERMES_HOME", "XDG_CONFIG_HOME", "HOME",
+                "PUPPETMASTER_HOME", "PUPPETMASTER_STATE_DIR", "PUPPETMASTER_PROCESS_OWNER",
+                "PUPPETMASTER_WORKER", "PUPPETMASTER_JOB_ID", "PUPPETMASTER_TASK_ID"})
+        first = Path(receipts[0])
+        before = first.read_bytes()
+        self.assertIsNone(_write_dispatch_receipt(
+            first.parent, task=self.task, sidecar_name="echo", command=["other"], cwd=None,
+            env={}, stdin_data=None, pid=1))
+        self.assertEqual(first.read_bytes(), before)
 
     def test_unbound_calls_keep_the_task_directory(self):
         completed = run_streamed_subprocess(
