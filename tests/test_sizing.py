@@ -26,17 +26,30 @@ class SizingDecisionTests(unittest.TestCase):
         decision = sizing.decide(plan(16, 2, independent=False), elapsed_s=240)
         self.assertEqual(decision.action, sizing.STAY_SOLO)
 
-    def test_mass_independent_work_fans_out_upfront(self):
-        self.assertEqual(sizing.decide(plan(16, 0), elapsed_s=0).action, sizing.DELEGATE_UPFRONT)
-        self.assertEqual(sizing.decide(plan(8, 0), elapsed_s=0).action, sizing.STAY_SOLO)
+    def test_unit_count_alone_never_fans_out_before_measuring(self):
+        self.assertEqual(sizing.decide(plan(16, 0), elapsed_s=0).action, sizing.STAY_SOLO)
+        calibrated = dict(sizing.DEFAULT_CALIBRATION, per_unit_s=40.0)
+        self.assertEqual(sizing.decide(plan(16, 0), elapsed_s=0, calibration=calibrated).action,
+                         sizing.DELEGATE_UPFRONT)
+        tiny = dict(sizing.DEFAULT_CALIBRATION, per_unit_s=4.0)
+        self.assertEqual(sizing.decide(plan(16, 0), elapsed_s=0, calibration=tiny).action,
+                         sizing.STAY_SOLO)
+
+    def test_many_tiny_units_stay_solo_and_substantial_ones_hand_off(self):
+        # 16 small modules: solo wrote them in ~70 s (about 4 s each).
+        self.assertEqual(sizing.decide(plan(16, 3), elapsed_s=12).action, sizing.STAY_SOLO)
+        # 16 voxel regions at ~40 s each: past the quality crossover.
+        decision = sizing.decide(plan(16, 2), elapsed_s=80)
+        self.assertEqual(decision.action, sizing.HANDOFF)
+        self.assertIn("quality crossover", decision.reason)
 
     def test_projected_time_overrun_hands_off(self):
-        # Sep 16: 16 coupled-group regions capped solo at 8/16 in 30 minutes.
-        decision = sizing.decide(plan(16, 2), elapsed_s=240)
+        # Below the quality crossover (12 units), a projected time overrun still hands off.
+        decision = sizing.decide(plan(12, 2), elapsed_s=240)
         self.assertEqual(decision.action, sizing.HANDOFF)
         self.assertGreater(decision.projected_solo_s, 1200)
         self.assertLess(decision.projected_parallel_s, decision.projected_solo_s)
-        self.assertIn("14 remaining independent units", sizing.advice(decision))
+        self.assertIn("10 remaining independent units", sizing.advice(decision))
 
     def test_solo_that_will_finish_keeps_going(self):
         self.assertEqual(sizing.decide(plan(8, 4), elapsed_s=200).action, sizing.STAY_SOLO)
@@ -49,7 +62,7 @@ class SizingDecisionTests(unittest.TestCase):
     def test_late_or_unprofitable_handoff_stays_solo(self):
         self.assertEqual(sizing.decide(plan(10, 8), elapsed_s=2000).action, sizing.STAY_SOLO)
         slow_handoff = dict(sizing.DEFAULT_CALIBRATION, handoff_overhead_s=5000)
-        decision = sizing.decide(plan(16, 2), elapsed_s=240, calibration=slow_handoff)
+        decision = sizing.decide(plan(12, 2), elapsed_s=240, calibration=slow_handoff)
         self.assertEqual(decision.action, sizing.STAY_SOLO)
         self.assertIn("would not finish sooner", decision.reason)
 
