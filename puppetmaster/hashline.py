@@ -140,13 +140,6 @@ class SnapshotStore:
                 return snap.text
         return None
 
-    def verify_live(self, path: str, tag: str, live_text: str) -> bool:
-        """True when live normalized content matches the tag's recorded snapshot."""
-        recorded = self.resolve(path, tag)
-        if recorded is None:
-            return False
-        return normalize_text(live_text) == recorded and content_tag(live_text) == tag.upper()
-
     def invalidate(self, path: str) -> None:
         self._versions.pop(path.replace("\\", "/"), None)
 
@@ -181,7 +174,6 @@ class Section:
     path: str
     tag: str
     ops: List[Op]
-    header_line: int = 1
 
 
 @dataclass
@@ -240,7 +232,6 @@ def parse_patch(patch: str) -> List[Section]:
                 path=header.group("path").strip(),
                 tag=header.group("tag").upper(),
                 ops=[],
-                header_line=line_num,
             )
             continue
 

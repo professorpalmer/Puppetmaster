@@ -249,7 +249,6 @@ class McpEnvResolution:
     messages: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     secret_keys: set[str] = field(default_factory=set)
-    requested_keys: set[str] = field(default_factory=set)
     uses_env_file: bool = False
 
     @property
@@ -430,7 +429,6 @@ def resolve_mcp_env(
     direct, direct_errors = _parse_direct_env(request.direct)
     resolution.errors.extend(direct_errors)
     requested.update(direct)
-    resolution.requested_keys = set(requested)
 
     existing = dict(existing_env or {})
     if request.force:

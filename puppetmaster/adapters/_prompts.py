@@ -602,20 +602,6 @@ def _load_job_artifacts_for_task(task: Task) -> list:
     return list(store.list_artifacts(job_id))
 
 
-def _load_upstream_artifacts_via_edges(task: Task, *, record_consumes: bool = False) -> list:
-    """Resolve only artifacts produced by upstream tasks through graph edges.
-
-    Returns an empty list when no produces edges exist (compatibility fallback
-    to whole-job artifact load). Consumes edges are recorded only when the
-    caller passes ``record_consumes=True`` for artifacts that will actually be
-    injected.
-    """
-    store = _open_store_for_task(task)
-    if store is None:
-        return []
-    return list(store.resolve_artifacts_via_edges(task, record_consumes=record_consumes))
-
-
 def _prewalk_injection_body(
     prompt: str,
     artifacts: list,

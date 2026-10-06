@@ -215,23 +215,6 @@ def ensure_acceptance_criteria_in_text(
     return body + "\n\n" + block
 
 
-def attach_acceptance_criteria_to_task_payload(task: Any) -> Any:
-    """Return a task copy with ``payload.acceptance_criteria`` populated.
-
-    Leaves ``instruction`` unchanged. Safe no-op when nothing to attach.
-    """
-    from dataclasses import replace
-
-    criteria = acceptance_criteria_for_task(task)
-    if not criteria:
-        return task
-    payload = dict(getattr(task, "payload", None) or {})
-    if normalize_acceptance_criteria(payload.get("acceptance_criteria")):
-        return task
-    payload["acceptance_criteria"] = list(criteria)
-    return replace(task, payload=payload)
-
-
 _UNKNOWN_EVIDENCE_SENTINELS = frozenset(
     {
         "",

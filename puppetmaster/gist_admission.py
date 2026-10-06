@@ -14,8 +14,6 @@ from typing import Any, Iterable, List, Optional, Sequence, Union
 from puppetmaster.artifact_status import durable_admission_allowed
 from puppetmaster.models import Artifact, ArtifactType
 
-AdmissionStatus = str  # "pending" | "admitted" | "rejected"
-
 GIST_ADMISSION_PENDING = "pending"
 GIST_ADMISSION_ADMITTED = "admitted"
 GIST_ADMISSION_REJECTED = "rejected"

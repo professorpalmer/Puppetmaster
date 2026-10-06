@@ -782,12 +782,6 @@ def _run_proxy_command(args) -> int:
         return 1
     return 0
 
-def _routing_estimate_rows(artifacts) -> tuple[list[dict], dict[str, dict], float]:
-    """Compatibility wrapper. Prefer ``puppetmaster.cost.routing_estimate_rows``."""
-    from puppetmaster.cost import routing_estimate_rows
-
-    return routing_estimate_rows(artifacts)
-
 
 def _format_cost_usd(value: Any, *, prefix: str = "") -> str:
     """Render a dollar figure; never coerce JSON null into numeric zero."""

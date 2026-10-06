@@ -589,7 +589,6 @@ class WorkerRuntime:
                 "TRACEPARENT"
             )
             record_task_span(
-                self.store.get_job(self.job_id).goal,
                 task,
                 artifacts,
                 traceparent=traceparent,

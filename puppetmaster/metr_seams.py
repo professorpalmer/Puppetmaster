@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Optional, Sequence
 
 from puppetmaster.artifact_status import (
     CLAIM_SUPPORT_INDEPENDENT,
@@ -25,7 +25,6 @@ WAIT_REASONS = frozenset({WAIT_EXTERNAL, WAIT_USER})
 
 HOLD_STATE = "hold"
 VETO_STATE = "veto"
-SUBGRAPH_HOLD_STATES = frozenset({HOLD_STATE, VETO_STATE})
 
 REASON_WORKER_PROTOCOL = "worker_protocol_refused"
 REASON_GATE_FAILED = "gate_failed"
@@ -252,15 +251,6 @@ def artifact_is_failed_gate(artifact: Any) -> bool:
     return payload.get("passed") is False
 
 
-def is_worker_asserted_finding(artifact: Any) -> bool:
-    kind = getattr(artifact, "type", None)
-    name = str(getattr(kind, "value", kind) or "").strip().lower()
-    if name not in {"finding", "gist", "decision", "risk"}:
-        return False
-    status = infer_claim_support_status(artifact)
-    return status != CLAIM_SUPPORT_INDEPENDENT
-
-
 def independently_supported_artifact(artifact: Any) -> bool:
     return infer_claim_support_status(artifact) == CLAIM_SUPPORT_INDEPENDENT
 
@@ -279,33 +269,6 @@ def is_cross_job_injectable(
     if for_job_id and artifact_job and str(artifact_job) != str(for_job_id):
         return independently_supported_artifact(artifact)
     return True
-
-
-def filter_cross_job_listing(
-    artifacts: Iterable[Any],
-    *,
-    for_job_id: Optional[str] = None,
-) -> list[Any]:
-    """Drop coordination-protocol rows and worker-asserted cross-job leaks."""
-    kept: list[Any] = []
-    for artifact in artifacts:
-        if is_coordination_protocol_payload(artifact):
-            continue
-        artifact_job = getattr(artifact, "job_id", None)
-        if isinstance(artifact, dict):
-            artifact_job = artifact.get("job_id") or artifact_job
-        if for_job_id and artifact_job and str(artifact_job) != str(for_job_id):
-            if not independently_supported_artifact(artifact):
-                continue
-        elif for_job_id is None:
-            # Effort-index / listing across jobs: only host-admitted findings/gists.
-            kind = getattr(artifact, "type", None)
-            name = str(getattr(kind, "value", kind) or "").strip().lower()
-            if name in {"finding", "gist", "decision", "risk"}:
-                if not independently_supported_artifact(artifact):
-                    continue
-        kept.append(artifact)
-    return kept
 
 
 def is_worker_delivery_claim(artifact: Any) -> bool:

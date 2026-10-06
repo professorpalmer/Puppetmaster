@@ -545,7 +545,7 @@ def run_deltas_follow(
                         except ValueError:
                             continue
                         produced = True
-                        _emit_delta(record, task_dir.name, as_json=as_json)
+                        _emit_delta(record, as_json=as_json)
                 offsets[delta_path] = offset
             except OSError:
                 continue
@@ -569,7 +569,7 @@ def run_deltas_follow(
     except KeyboardInterrupt:
         return 0
 
-def _emit_delta(record: dict, task_name: str, *, as_json: bool) -> None:
+def _emit_delta(record: dict, *, as_json: bool) -> None:
     if as_json:
         print(json.dumps(record, default=str), flush=True)
         return

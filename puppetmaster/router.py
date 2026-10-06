@@ -52,7 +52,6 @@ from puppetmaster.scorecards import (
     receipt_quality_tuple,
     resolve_score_authority,
     role_card_override_note,
-    source_rank,
 )
 
 logger = logging.getLogger(__name__)
@@ -1094,8 +1093,8 @@ def _route_task_once(
 
     def _quality_key(spec: ModelSpec):
         # Capability stays the quality number. Sibling decay is what makes
-        # a stale editorial 90 lose to a live receipt; source_rank is not a
-        # global first key (that would leak a receipt across adapters).
+        # a stale editorial 90 lose to a live receipt; the authority source is
+        # not a global first key (that would leak a receipt across adapters).
         auth = _authority(spec)
         return (
             _cap(spec),

@@ -35,7 +35,6 @@ MIN_SAMPLE = 5
 MIN_SCORE_FLOOR = 10
 # Escalated-away / low-confidence rates that trip the "under-provisioned" flag.
 UNDER_PROVISIONED_RATE = 0.4
-SEVERE_RATE = 0.6
 # A model whose typical task needed this much less capability than its score is
 # "possibly over-used" (informational only).
 OVER_USE_GAP = 20
@@ -555,7 +554,6 @@ def build_audit_report(
                 actual_cost_fn(r.model_id, r.actual_tokens_in, r.actual_tokens_out)
                 for r in reconciled
             )
-        recon_est_spend = sum(r.est_cost_usd for r in reconciled)
         # Headline calibration uses measured (SDK) runs only so char/4
         # approximations cannot skew token/cost drift.
         est_tokens_m = sum(r.est_tokens_total for r in measured_recs)

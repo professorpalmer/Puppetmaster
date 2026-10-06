@@ -49,16 +49,6 @@ RESEARCH_KIND_HYPOTHESIS = "hypothesis"
 RESEARCH_KIND_BEST = "best"
 RESEARCH_KIND_VERIFICATION = "verification"
 
-RESEARCH_KINDS = frozenset(
-    {
-        RESEARCH_KIND_RESULT,
-        RESEARCH_KIND_INSIGHT,
-        RESEARCH_KIND_HYPOTHESIS,
-        RESEARCH_KIND_BEST,
-        RESEARCH_KIND_VERIFICATION,
-    }
-)
-
 RESEARCH_RUNNER_ROLE = "research-runner"
 DEFAULT_LAB_LABEL = "autoresearch-lab"
 TOY_HARNESS_ID = "toy-compression"
