@@ -18,6 +18,21 @@ benchmark result.
   or craft-armor guidance. The block now goes into `$CODEX_HOME/AGENTS.md`
   (your own content there is kept), and an old block is moved out of
   `instructions.md`. Re-run `puppetmaster install-rules --global`.
+- **Installed pilot rules: solo first, fan out when it pays.** The rules told
+  every pilot to start a Puppetmaster verb for any work touching 3+ files,
+  to graph every directory first and to run doctor once per session; on the
+  same probes that is what lost to native subagents (16 small modules
+  through CodeGraph init, doctor, route_task and a 4-wave fan-out; a
+  three-edit follow-up delegated). The block (about 6k characters, from
+  10k) now says to work solo unless parallel workers clearly finish sooner
+  or better, and when fanning out to use one flow with grouped map items,
+  per-unit checks and craft armor. CodeGraph is for exploring unfamiliar
+  code, doctor for failures. The worker exemption and trigger convention
+  are unchanged.
+- **Unpinned Codex workers run your configured model.** The built-in
+  default was `gpt-5.4-mini`; on an account without it every node of an
+  unpinned flow failed `model_unavailable`. Workers now use the top-level
+  `model` from your Codex config, or no `-m` at all.
 - **Lean CODEX_HOME for Codex workers.** Each fresh `codex exec` sends, on
   its first call, a developer/environment block built from CODEX_HOME (the
   skills list, memories, plugin recommendations, multi-agent instructions)
@@ -30,7 +45,9 @@ benchmark result.
   memories and multi_agent disabled): about 2.6k fresh on the first call.
   `auth.json` is copied, never symlinked, and a worker-refreshed login is
   copied back only if the user's own file is unchanged. Resumed threads run
-  in the home that holds them. `PUPPETMASTER_CODEX_LEAN_HOME=0` opts out. In
+  in the home that holds them. Your AGENTS.md is kept without Puppetmaster's
+  pilot block, and an unreadable file never blocks a launch.
+  `PUPPETMASTER_CODEX_LEAN_HOME=0` opts out. In
   the probe, total worker fresh input fell from 89-112k to 45-67k.
 - **Sizing gate** (`puppetmaster/sizing.py`, `puppetmaster sizing`): from a
   plan (units with status, `[parallel]` marking independent ones) and measured
