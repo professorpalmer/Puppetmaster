@@ -247,12 +247,15 @@ class AdmissionTests(unittest.TestCase):
         import subprocess
         import sys
         import time
-        from puppetmaster.readonly_admission import ReaderAdmission
+        from puppetmaster.readonly_admission import ReaderAdmission, _coordination_path
         with TemporaryDirectory() as root:
+            # The child must contend on this process's (test-isolated) lock file.
             process = subprocess.Popen([sys.executable, '-c',
-                'import sys,time; from puppetmaster.readonly_admission import ReaderAdmission; '
-                'p=ReaderAdmission(sys.argv[1],time.monotonic()+5); print("ready",flush=True); '
-                'sys.stdin.read()', root], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+                'import sys,time; from pathlib import Path; from puppetmaster import readonly_admission as a; '
+                'a._coordination_path=lambda path, selected=None: Path(sys.argv[2]); '
+                'p=a.ReaderAdmission(sys.argv[1],time.monotonic()+5); print("ready",flush=True); '
+                'sys.stdin.read()', root, str(_coordination_path(root))],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
             try:
                 self.assertEqual(process.stdout.readline().strip(), 'ready')
                 with self.assertRaises(readonly.ReadTimeout):
