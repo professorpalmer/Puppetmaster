@@ -437,12 +437,16 @@ def detect_codex_billing(
             ),
             evidence=["codex_login:chatgpt", f"auth_context:{ctx.label}"],
         )
+    # Only Codex saying so means logged out. A failed, timed-out or unrecognized
+    # status check is unverified: still not dispatchable, but not a logout.
+    cause = ("timed out" if returncode == 124 else
+             f"exit {returncode}" if returncode != 0 else "unrecognized output")
     return BillingStatus(
         adapter="codex",
         billing="unknown",
         healthy=False,
-        detail="Codex is not logged in (run `codex login`).",
-        evidence=["codex_login:none", f"auth_context:{ctx.label}"],
+        detail=f"Codex login status could not be verified (`codex login status`: {cause}).",
+        evidence=["codex_login:unverified", f"codex_login_status:{cause}", f"auth_context:{ctx.label}"],
     )
 
 

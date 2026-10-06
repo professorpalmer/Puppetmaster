@@ -306,8 +306,9 @@ class OrchestratorStampTests(unittest.TestCase):
         self.assertNotEqual(saved.id, prior.id)
 
 
-def _run_adapter(adapter, task: Task, stdout: str):
-    streamed = StreamedProcess(returncode=0, stdout=stdout, stderr="")
+def _run_adapter(adapter, task: Task, stdout: str, *, timed_out: bool = False):
+    streamed = StreamedProcess(returncode=None if timed_out else 0, stdout=stdout, stderr="",
+                               timed_out=timed_out)
     with patch("puppetmaster.adapters.resolve_command", side_effect=lambda name: f"/usr/bin/{name}"), patch(
         "puppetmaster.adapters.worktree_guard", return_value=None
     ), patch("puppetmaster.adapters.git_snapshot", side_effect=[CLEAN, CLEAN]), patch(
@@ -333,6 +334,59 @@ RESUMED_CODEX_STDOUT = _codex_events(
     {"type": "item.completed", "item": {"type": "agent_message", "text": "NEW ANSWER"}},
     {"type": "turn.completed", "usage": {"input_tokens": 56144, "cached_input_tokens": 38272, "output_tokens": 50}},
 )
+
+
+class CodexTimeoutThreadTests(unittest.TestCase):
+    """A persisted thread survives a timeout; a follow-up can resume it."""
+
+    STARTED = {"type": "thread.started", "thread_id": THREAD_ID}
+
+    def _task(self, **payload) -> Task:
+        return Task(job_id="job-prior", role="build", instruction="Build it.", adapter="codex",
+                    payload={"cwd": str(Path.cwd()), "model": "gpt-6.1-sol", "ephemeral": False,
+                             **payload})
+
+    def _timeout(self, *events: dict, **payload):
+        task = self._task(**payload)
+        artifacts, _, _, _ = _run_adapter(CodexAdapter(), task, _codex_events(*events), timed_out=True)
+        verification = next(a for a in artifacts if a.payload.get("failure") == "timeout")
+        return task, verification
+
+    def test_timeout_records_the_one_observed_thread_and_a_follow_up_resolves_it(self) -> None:
+        task, verification = self._timeout(self.STARTED, {"type": "turn.started"})
+        self.assertEqual(verification.payload["result"], "failed")
+        self.assertEqual(verification.payload["thread_id"], THREAD_ID)
+        self.assertIs(verification.payload["ephemeral"], False)
+        store = FakeStore()
+        store.add("job-prior", task, verification.payload)
+        with patch("puppetmaster.worker_resume.session_on_disk", return_value=True):
+            record = resolve_worker_resume(
+                store, {"resume_from": {"job_id": "job-prior", "task_id": task.id}}, "codex")
+        self.assertEqual(record["status"], "resolved")
+        self.assertEqual(record["session_id"], THREAD_ID)
+
+    def test_a_follow_up_still_checks_the_session_is_on_disk(self) -> None:
+        task, verification = self._timeout(self.STARTED)
+        store = FakeStore()
+        store.add("job-prior", task, verification.payload)
+        with patch("puppetmaster.worker_resume.session_on_disk", return_value=False):
+            record = resolve_worker_resume(
+                store, {"resume_from": {"job_id": "job-prior", "task_id": task.id}}, "codex")
+        self.assertEqual(record["status"], "unavailable")
+
+    def test_missing_ambiguous_or_conflicting_threads_record_none(self) -> None:
+        other = {"type": "thread.started", "thread_id": "11111111-2222-3333-4444-555555555555"}
+        resumed = {"status": "resolved", "adapter": "codex", "session_id": THREAD_ID}
+        for events, payload in (((), {}), ((self.STARTED, other), {}),
+                                ((other,), {"resume": resumed})):
+            with self.subTest(events=len(events), resumed=bool(payload)):
+                _, verification = self._timeout(*events, **payload)
+                self.assertIsNone(verification.payload["thread_id"])
+                self.assertEqual(verification.payload["failure"], "timeout")
+
+    def test_an_ephemeral_timeout_says_so(self) -> None:
+        _, verification = self._timeout(self.STARTED, ephemeral=True)
+        self.assertIs(verification.payload["ephemeral"], True)
 
 
 class CodexImageStdinTests(unittest.TestCase):
