@@ -16,6 +16,12 @@ renders/integrated (1), 1 more; 5 never named by this worker's own events`,
 with `out_of_scope_dirs` and `out_of_scope_unnamed` in the gate detail.
 Enforcement is unchanged.
 
+**A refused Cursor catalog cache write keeps the fetched catalog.** On
+Windows, replacing the shared catalog cache fails while another start is
+reading it without the lock. 1.33.2 then dropped the catalog it had just
+fetched, and that start fell back to the SDK's own rate-limited model check.
+The cache write is now best effort, and the start keeps its catalog.
+
 ## v1.33.2 — 2026-10-07
 
 **Parallel Cursor SDK workers share one model catalog.** The Cursor SDK
