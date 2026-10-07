@@ -55,6 +55,15 @@ class CatalogCacheTests(unittest.TestCase):
         self.assertEqual({json.dumps(json.loads(r)) for r in results},
                          {json.dumps([{"id": "composer-2.5"}, {"id": "grok-4.6", "aliases": ["grok-4-6"]}])})
 
+    def test_a_cache_write_refused_by_an_open_reader_keeps_the_fetched_catalog(self):
+        # Windows refuses os.replace while a lock-free reader holds the cache open.
+        with patch("puppetmaster.cursor_discovery.os.replace",
+                   side_effect=PermissionError(13, "Access is denied")):
+            self.assertIsNotNone(self.catalog("composer-2.5"))
+        self.assertEqual(self.calls, 1)
+        self.assertIsNotNone(self.catalog("composer-2.5"))
+        self.assertEqual(self.calls, 2)
+
     def test_alias_is_accepted_and_unknown_model_falls_back_to_the_sdk(self):
         self.assertIsNotNone(self.catalog("grok-4-6"))
         self.assertIsNone(self.catalog("model-added-after-refresh"))

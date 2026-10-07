@@ -501,6 +501,22 @@ def _read_catalog_cache(path: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _write_catalog_cache(path: Path, data: dict) -> None:
+    """Best effort: this start keeps its fetched catalog even if the cache write fails.
+
+    On Windows, replacing the cache fails while a lock-free reader has it open.
+    """
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def _fresh(data: dict, now: float) -> bool:
     fetched = data.get("fetched_at")
     failed = data.get("failed_at")
@@ -546,9 +562,7 @@ def local_model_catalog_json(
                             for m in models if isinstance(m.get("id"), str)]}
                     except CursorDiscoveryError:
                         data = {"failed_at": clock()}
-                    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-                    tmp.write_text(json.dumps(data), encoding="utf-8")
-                    os.replace(tmp, path)
+                    _write_catalog_cache(path, data)
         except (OSError, TimeoutError):
             return None
     models = data.get("models")

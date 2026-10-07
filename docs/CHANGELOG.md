@@ -1,3 +1,34 @@
+## v1.33.3 — 2026-10-07
+
+**A unit's generated outputs belong in its declared files.** Flow map items
+share one checkout, so a write_scope gate charges a worker for every new file
+that appears during its window and that no peer declared. Renders or reports
+that a unit's own check writes, if undeclared, failed the gate of whichever
+worker saw them, even though that worker never wrote them. The flow tool
+description, installed rules and `docs/FLOWS.md` now say to declare each
+unit's output directory as a glob (`renders/{{item.id}}/*`), keep those
+directories disjoint, and give shared assembly outputs to one integrate agent
+after the map. Gitignored outputs are never judged.
+
+The gate failure now says where and whether: `wrote 6 file(s) outside
+declared scope: renders/region_000 (2), renders/region_003 (2),
+renders/integrated (1), 1 more; 5 never named by this worker's own events`,
+with `out_of_scope_dirs` and `out_of_scope_unnamed` in the gate detail.
+Enforcement is unchanged.
+
+**A refused Cursor catalog cache write keeps the fetched catalog.** On
+Windows, replacing the shared catalog cache fails while another start is
+reading it without the lock. 1.33.2 then dropped the catalog it had just
+fetched, and that start fell back to the SDK's own rate-limited model check.
+The cache write is now best effort, and the start keeps its catalog.
+
+**Windows file locks treat a delete-pending lock file as busy.** When one
+holder released a Puppetmaster file lock while a contender still had the file
+open, Windows refused the next O_EXCL create with `PermissionError`, not
+`FileExistsError`. The error escaped the lock, and 16 parallel Cursor starts
+lost their shared catalog to it. The lock now waits and retries, as it does
+for a held lock. On POSIX, a `PermissionError` still raises.
+
 ## v1.33.2 — 2026-10-07
 
 **Parallel Cursor SDK workers share one model catalog.** The Cursor SDK

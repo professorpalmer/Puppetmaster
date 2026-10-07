@@ -4896,6 +4896,9 @@ def flow_schema() -> JsonObject:
                     "options}; set {id, values}; end {id, status?: pass|fail}. Map items may be "
                     "objects: group many small units per item ({{item.units}}, {{item.files}}) "
                     "so a few workers each own several, and set concurrency to the item count. "
+                    "A unit's files are everything it writes, including what its own checks generate "
+                    "(its render or report dir as a glob, e.g. renders/{{item}}/*); gitignored outputs "
+                    "are not judged, and shared assembly outputs belong to one integrate agent after the map. "
                     "Templates: "
                     "{{input}} {{item}} {{out.<node>}} {{state.<k>}}. Example fan-out: "
                     '{"id": "mods", "entry": "all", "defaults": {"adapter": "codex"}, "nodes": [{"id": "all", "kind": "map", '

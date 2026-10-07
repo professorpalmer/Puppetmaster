@@ -24265,6 +24265,37 @@ class PuppetmasterGateTests(unittest.TestCase):
                                   "worker_diff_present": True, "worker_delta_attributed": True})
         return [receipt, patch]
 
+    def test_write_scope_failure_names_where_and_whether_the_worker_named_it(self) -> None:
+        # The N16 canary shape: region sources in scope, renders nobody declared.
+        from puppetmaster.gates import evaluate_task_gates
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            repo = Path(tmp) / "repo"
+            self._git_repo(repo)
+            own = ["regions/region_000.py"]
+            task = self._task(write_scope=own, cwd=str(repo))
+            renders = [f"renders/region_{n:03}/1709/u/{v}.png" for n in (0, 3) for v in ("front", "top")]
+            stray = own + renders + ["renders/integrated/world_top.png", "scene.json"]
+            result = evaluate_task_gates(
+                task, self._attributed_run(task, stray, referenced=own + ["scene.json"]),
+                store, worker_id="w1", cwd=repo)
+            self.assertFalse(result.passed)
+            detail = next(r.detail for r in result.results if r.kind == "write_scope")
+            self.assertEqual(detail["out_of_scope_dirs"],
+                             {"renders/region_000": 2, "renders/region_003": 2,
+                              "renders/integrated": 1, "scene.json": 1})
+            self.assertEqual(detail["out_of_scope_unnamed"], 5)
+            self.assertIn("6 file(s) outside declared scope: renders/region_000 (2)", result.failed_reason)
+            self.assertIn("5 never named by this worker's own events", result.failed_reason)
+
+            # Declaring the unit's generated output directory clears its own renders.
+            declared = self._task(write_scope=own + ["renders/region_000/*"], cwd=str(repo))
+            rerun = evaluate_task_gates(
+                declared, self._attributed_run(declared, own + renders[:2], referenced=own),
+                store, worker_id="w1", cwd=repo)
+            self.assertTrue(rerun.passed)
+
     def test_write_scope_gate_reports_a_concurrent_writers_change(self) -> None:
         """A file dirty before the run that the worker never named is not its write."""
         from puppetmaster.gates import evaluate_task_gates

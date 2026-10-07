@@ -31,6 +31,7 @@ from puppetmaster.proc_identity import own_identity, pid_reused
 _DEFAULT_TIMEOUT_SECONDS = 10.0
 _DEFAULT_STALE_AFTER_SECONDS = 120.0
 _POLL_SECONDS = 0.05
+_WINDOWS = os.name == "nt"
 
 
 def _lock_path_for(target: Path) -> Path:
@@ -128,8 +129,12 @@ class InterProcessFileLock:
                     os.O_WRONLY | os.O_CREAT | os.O_EXCL,
                     0o600 if os.name != "nt" else 0o666,
                 )
-            except FileExistsError:
-                if self._recover_stale_owner():
+            except (FileExistsError, PermissionError) as exc:
+                # Windows: a just-released lock file stays delete-pending while a
+                # contender still has it open, and creating it then is refused.
+                if isinstance(exc, PermissionError) and not _WINDOWS:
+                    raise
+                if isinstance(exc, FileExistsError) and self._recover_stale_owner():
                     continue
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
@@ -182,6 +187,10 @@ class InterProcessFileLock:
             )
         except FileExistsError:
             return False
+        except PermissionError:
+            if not _WINDOWS:
+                raise
+            return False  # a peer's reclaim file is delete-pending
         try:
             os.close(reclaim_fd)
             try:

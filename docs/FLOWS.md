@@ -132,7 +132,7 @@ model's output must never become a command. Read arbitrary data from
  "graph": {
    "entry": "build",
    "nodes": [
-     {"id": "build", "kind": "agent", "files": ["regions/{{item.id}}.py"],
+     {"id": "build", "kind": "agent", "files": ["regions/{{item.id}}.py", "renders/{{item.id}}/*"],
       "task": "Build region {{item.id}}: {{item.brief}}"},
      {"id": "check", "kind": "shell", "command": "python judge.py --region {{item.id}}"},
      {"id": "review", "kind": "judge", "task": "Review regions/{{item.id}}.py for craft."},
@@ -160,8 +160,18 @@ Each re-run item receives only the feedback lines that mention its key or its
 files (all of the feedback when none do), so its repair delta stays small and
 inside its own files.
 
+A unit's `files` are everything it writes, including what its own check
+generates: here `renders/{{item.id}}/*` for the renders its check writes. The
+write-scope gate compares the tree before and after each worker, and in a
+shared checkout that window also holds its siblings' writes. A path some
+item declared belongs to that item's gate; an undeclared output is charged
+to whichever worker's gate sees it. Keep per-unit output directories
+disjoint, and do not give every unit one broad shared output glob: that
+reintroduces contention. Gitignored outputs are never judged.
+
 Shared files no item owns (a package `__init__.py`, a registry, a manifest)
-need an owner too. Route the assembled judge's FAIL through an `integrate`
+need an owner too, and so do shared assembly outputs (an integrated render,
+a combined scene file). Route the assembled judge's FAIL through an `integrate`
 agent whose `files` are those shared paths, then back to `map`. When feedback
 names a file no item owns, the map's wake says so instead of looping on it.
 
