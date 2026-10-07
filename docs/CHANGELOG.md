@@ -1,3 +1,17 @@
+## Unreleased
+
+**Catalog effort defaults are not caller pins on an explicit model.** From
+Codex's 1.33.0 review: pinning a model whose registry entry carries an effort
+in `payload_defaults` (`reasoning_effort`, or an effort in `extra_args` /
+`params`) recorded that effort as the caller's (`requested_reasoning_effort`
+set, source `caller`). It therefore beat `PUPPETMASTER_WORKER_EFFORT`, and
+under `enforce` it refused a task the caller never pinned. Auto-routed tasks
+already kept the two apart. Effort provenance is now stamped from the caller
+payload where catalog defaults merge, so such a task runs the operator or
+swarm default with `requested_reasoning_effort` null, as documented. Without
+an operator setting, an explicitly pinned model with a catalog effort now
+runs `medium`, like a routed one.
+
 ## v1.33.0 — 2026-10-07
 
 **Operators can set the worker effort.** From Codex's fixed-profile

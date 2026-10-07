@@ -128,6 +128,21 @@ class StockTaskTests(Base):
                          ("xhigh", "caller"))
         self.assertEqual(payloads["cold"]["reasoning_effort"], "high")
 
+    def test_catalog_effort_on_an_explicit_model_is_not_a_caller_pin(self) -> None:
+        # The registry entry the flow pins carries effort defaults in both forms.
+        save_registry([ModelSpec(id="codex/sol", adapter="codex", adapter_model_name="sol",
+                                 capability_score=100, billing="plan",
+                                 payload_defaults={"reasoning_effort": "low",
+                                                   "extra_args": ["-c", "model_reasoning_effort=low"]})],
+                      self.registry)
+        for env, effort, source in (({}, "medium", "swarm_default"), (HIGH, "high", "operator_default"),
+                                    (ENFORCE_HIGH, "high", "operator_enforced")):
+            for name, payload in self.tasks(env).items():
+                with self.subTest(env=env, task=name):
+                    self.assertEqual((payload["reasoning_effort"], payload["requested_reasoning_effort"],
+                                      payload["reasoning_effort_source"]), (effort, None, source))
+                    self.assertEqual(payload["extra_args"], ["-c", f"model_reasoning_effort={effort}"])
+
     def test_enforced_profile_refuses_a_conflicting_node_before_launch(self) -> None:
         self.run.graph["nodes"][1]["effort"] = "low"
         with self.assertRaisesRegex(WorkerEffortError, "requested low"):
