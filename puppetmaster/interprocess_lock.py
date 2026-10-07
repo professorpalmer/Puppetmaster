@@ -37,6 +37,26 @@ def _lock_path_for(target: Path) -> Path:
     return target.parent / ("." + target.name + ".lock")
 
 
+def _unlink(path: Path, timeout: float = 2.0) -> None:
+    """Remove ``path``; a missing file is already removed.
+
+    Windows refuses to delete a file another process has open, and every
+    contender opens the lock file to read its owner. Those reads last
+    microseconds, so a sharing violation is retried until ``timeout``.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            path.unlink()
+            return
+        except FileNotFoundError:
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(_POLL_SECONDS / 5)
+
+
 def _pid_is_alive(pid: int) -> bool:
     """Delegate to the shared Windows-safe probe after imports settle.
 
@@ -143,10 +163,7 @@ class InterProcessFileLock:
         except (OSError, json.JSONDecodeError):
             return
         if isinstance(data, dict) and data.get("token") == token:
-            try:
-                self.path.unlink()
-            except FileNotFoundError:
-                pass
+            _unlink(self.path)
 
     def _recover_stale_owner(self) -> bool:
         """Remove only an orphaned lock, with a guard against reclaim races.
@@ -187,14 +204,8 @@ class InterProcessFileLock:
                 not isinstance(pid, int) and age is not None and age >= self.stale_after
             )
             if recoverable:
-                try:
-                    self.path.unlink()
-                except FileNotFoundError:
-                    pass
+                _unlink(self.path)
                 return True
             return False
         finally:
-            try:
-                reclaim_path.unlink()
-            except FileNotFoundError:
-                pass
+            _unlink(reclaim_path)

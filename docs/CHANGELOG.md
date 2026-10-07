@@ -20,6 +20,12 @@ that runs every worker at high had to put an effort pin in its prompts.
 - An invalid or incomplete setting fails task creation with the reason.
   Without the setting, behavior is unchanged.
 
+**Windows lock release survives a concurrent reader.** Releasing an
+interprocess lock (the flow run lock, policy writer locks) failed with
+`WinError 32` when a contender had the lock file open to read its owner, and
+the error ended the flow walk. Releasing and stale recovery now retry that
+sharing violation briefly.
+
 ## v1.32.5 — 2026-10-06
 
 **Accounting keeps doubtful facts doubtful, and a traceback is not a logout.**
