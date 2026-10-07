@@ -1498,7 +1498,14 @@ def stamp_model_billing(
     source = merged.get("billing_source")
     explicit = same and merged.get("billing") in ("plan", "api") and source in (None, "explicit")
     # Resolve override authority from the caller, then probe the launch payload.
+    caller = merged
     merged = {**(spec.payload_defaults or {}), **merged}
+    if spec.payload_defaults:
+        # Catalog effort defaults are not caller pins: stamp provenance from
+        # the caller payload before the merge hides which keys were whose.
+        from puppetmaster.swarm_reasoning import apply_swarm_reasoning
+
+        apply_swarm_reasoning(merged, caller, adapter=spec.adapter)
     billing = merged["billing"] if explicit else original.billing
     source = "explicit" if explicit else "registry"
     if billing not in ("plan", "api"):

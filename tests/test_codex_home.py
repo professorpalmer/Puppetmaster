@@ -124,11 +124,121 @@ class WorkerFlagsTests(unittest.TestCase):
             executable="codex", model="m", extra_args=["--image", "a.png"])
         prepared = CliInvocation(command=command, sidecar_name="x")
         with patch.object(codex_home, "enabled", return_value=True), \
-                patch.object(codex_home, "prepare", return_value=Path("/lean")):
+                patch.object(codex_home, "prepare", return_value=Path("/lean")), \
+                patch.object(codex_home, "ensure_system_skills") as ensure:
             self.assertEqual(CodexAdapter._worker_home(prepared), Path("/lean"))
+        ensure.assert_called_once_with(Path("/lean"), ["codex"])
         self.assertEqual(
             prepared.command[-8:],
             ["--image", "a.png", "--disable", "memories", "--disable", "multi_agent", "--", "-"])
+
+    def test_a_resumed_thread_gets_the_bundle_check_but_keeps_its_flags(self) -> None:
+        from unittest.mock import patch
+
+        from puppetmaster.adapters._base import CliInvocation
+        from puppetmaster.adapters.codex import CodexAdapter
+
+        command = ["node", "codex.js", "exec", "resume", "thread-1", "--json", "--", "-"]
+        prepared = CliInvocation(command=list(command), sidecar_name="x",
+                                 extras={"resumed": True, "resume": {"session_id": "thread-1"}})
+        with patch.object(codex_home, "enabled", return_value=True), \
+                patch.object(codex_home, "home_for_session", return_value=Path("/lean")), \
+                patch.object(codex_home, "worker_home_root", return_value=Path("/lean")), \
+                patch.object(codex_home, "prepare") as prepare, \
+                patch.object(codex_home, "ensure_system_skills") as ensure:
+            self.assertEqual(CodexAdapter._worker_home(prepared), Path("/lean"))
+        prepare.assert_not_called()
+        ensure.assert_called_once_with(Path("/lean"), ["node", "codex.js"])
+        self.assertEqual(prepared.command, command)
+
+
+# Stand-in for stock ``codex debug prompt-input``: installs the builtin bundle
+# into $CODEX_HOME/skills/.system (files first, marker last) and counts runs.
+FAKE_CODEX = """import os, sys
+from pathlib import Path
+home = Path(os.environ["CODEX_HOME"])
+assert sys.argv[1:3] == ["debug", "prompt-input"], sys.argv
+assert not any(k.endswith("_API_KEY") for k in os.environ), "credentials reached the seed"
+with open(os.environ["FAKE_CODEX_RUNS"], "a") as runs:
+    runs.write("run\\n")
+if os.environ.get("FAKE_CODEX_FAIL"):
+    sys.exit(3)
+root = home / "skills" / ".system"
+for name in ("imagegen", "openai-docs", "review-agent", "skill-creator", "skill-installer"):
+    (root / name).mkdir(parents=True, exist_ok=True)
+    (root / name / "SKILL.md").write_text(name + os.environ.get("FAKE_CODEX_VERSION", "1"))
+(root / ".codex-system-skills.marker").write_text("v" + os.environ.get("FAKE_CODEX_VERSION", "1"))
+"""
+
+
+class SystemSkillsTests(unittest.TestCase):
+    def setUp(self):
+        from unittest.mock import patch
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.home = root / "worker"
+        self.home.mkdir()
+        self.launcher = root / "codex.py"
+        self.launcher.write_text(FAKE_CODEX)
+        self.runs = root / "runs"
+        env = patch.dict(os.environ, {"FAKE_CODEX_RUNS": str(self.runs), "OPENAI_API_KEY": "sk-not-real"})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def ensure(self) -> bool:
+        return codex_home.ensure_system_skills(self.home, [sys.executable, str(self.launcher)])
+
+    def run_count(self) -> int:
+        return len(self.runs.read_text().splitlines()) if self.runs.exists() else 0
+
+    def files(self) -> dict:
+        root = self.home / "skills" / ".system"
+        return {p.relative_to(root).as_posix(): p.read_text() for p in root.rglob("*") if p.is_file()}
+
+    def test_installs_once_then_trusts_the_record(self):
+        self.assertTrue(self.ensure())
+        self.assertEqual(len(self.files()), 6)
+        self.assertTrue(self.ensure())
+        self.assertEqual(self.run_count(), 1)
+        self.assertEqual([p.name for p in (self.home / "skills").iterdir()], [".system"])
+
+    def test_a_damaged_bundle_with_a_current_marker_is_reinstalled(self):
+        self.ensure()
+        installed = self.files()
+        for name in ("imagegen", "review-agent"):
+            for path in (self.home / "skills" / ".system" / name).iterdir():
+                path.unlink()
+        self.assertTrue(self.ensure())
+        self.assertEqual(self.files(), installed)
+        self.assertEqual(self.run_count(), 2)
+
+    def test_an_upgraded_codex_reseeds(self):
+        from unittest.mock import patch
+
+        self.ensure()
+        stat = self.launcher.stat()
+        os.utime(self.launcher, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10**9))
+        with patch.dict(os.environ, {"FAKE_CODEX_VERSION": "2"}):
+            self.assertTrue(self.ensure())
+        self.assertEqual(self.files()[".codex-system-skills.marker"], "v2")
+
+    def test_a_failing_bootstrap_leaves_the_home_to_stock_codex(self):
+        from unittest.mock import patch
+
+        with patch.dict(os.environ, {"FAKE_CODEX_FAIL": "1"}):
+            self.assertFalse(self.ensure())
+        self.assertFalse((self.home / "skills").exists())
+        self.assertTrue(self.ensure())
+
+    def test_parallel_starts_install_once(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(8) as pool:
+            self.assertTrue(all(pool.map(lambda _: self.ensure(), range(8))))
+        self.assertEqual(self.run_count(), 1)
+        self.assertEqual(len(self.files()), 6)
 
 
 class UnpinnedCliTests(unittest.TestCase):

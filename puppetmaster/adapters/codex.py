@@ -276,16 +276,23 @@ class CodexAdapter(CliWorkerAdapter):
         if not codex_home.enabled():
             return None
         resume = prepared.extras.get("resume") if prepared.extras.get("resumed") else None
-        if isinstance(resume, dict) and resume.get("session_id"):
+        resuming = isinstance(resume, dict) and bool(resume.get("session_id"))
+        if resuming:
             # A thread resumes in the home that holds it.
             found = codex_home.home_for_session(str(resume["session_id"]))
-            return found if found == codex_home.worker_home_root() else None
-        try:
-            home = codex_home.prepare()
-        except Exception:
-            # Best effort: any failure runs the worker in the user's own home.
-            return None
-        if home is not None and prepared.command[-2:] == list(STDIN_PROMPT):
+            home = found if found == codex_home.worker_home_root() else None
+        else:
+            try:
+                home = codex_home.prepare()
+            except Exception:
+                # Best effort: any failure runs the worker in the user's own home.
+                return None
+        if home is not None and "exec" in prepared.command:
+            try:
+                codex_home.ensure_system_skills(home, prepared.command[:prepared.command.index("exec")])
+            except Exception:
+                pass  # Best effort: stock Codex still installs the bundle itself.
+        if home is not None and not resuming and prepared.command[-2:] == list(STDIN_PROMPT):
             # Bounded workers never fork subagents, and must not accrue memories.
             prepared.command = [*prepared.command[:-2], "--disable", "memories",
                                 "--disable", "multi_agent", *STDIN_PROMPT]

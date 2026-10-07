@@ -1,3 +1,32 @@
+## v1.33.1 — 2026-10-07
+
+**Parallel Codex workers no longer break the worker home's builtin skills.**
+From Codex's N16 canary: stock Codex reinstalls its builtin skill bundle
+(`skills/.system`) at startup when the bundle's marker is missing or stale,
+by removing the directory and writing it again. Parallel workers starting in
+one fresh or newly upgraded worker home all did that at once. The last one
+wrote the marker over a partial bundle, and no later start repaired it (a
+stock reproduction with 16 parallel starts left 41, 1 and 1 of 49 files).
+Puppetmaster now installs the bundle once per Codex binary before a worker
+starts in the lean home, fresh or resumed. It runs stock
+`codex debug prompt-input` in a private, credential-free home and swaps the
+result in under the home lock. A bundle that no longer matches the recorded
+install is reinstalled, so an already damaged home repairs itself. Workers
+find a current marker and skip their own install. Jobs are not serialized:
+only the sub-second install is.
+
+**Catalog effort defaults are not caller pins on an explicit model.** From
+Codex's 1.33.0 review: pinning a model whose registry entry carries an effort
+in `payload_defaults` (`reasoning_effort`, or an effort in `extra_args` /
+`params`) recorded that effort as the caller's (`requested_reasoning_effort`
+set, source `caller`). It therefore beat `PUPPETMASTER_WORKER_EFFORT`, and
+under `enforce` it refused a task the caller never pinned. Auto-routed tasks
+already kept the two apart. Effort provenance is now stamped from the caller
+payload where catalog defaults merge, so such a task runs the operator or
+swarm default with `requested_reasoning_effort` null, as documented. Without
+an operator setting, an explicitly pinned model with a catalog effort now
+runs `medium`, like a routed one.
+
 ## v1.33.0 — 2026-10-07
 
 **Operators can set the worker effort.** From Codex's fixed-profile

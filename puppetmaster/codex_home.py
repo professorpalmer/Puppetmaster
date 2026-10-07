@@ -15,12 +15,26 @@ auth.json is copied, never symlinked: Codex refreshes a ChatGPT login by
 atomically replacing auth.json, which would orphan the user's refresh token.
 A worker's refreshed auth.json is copied back only if the user's own file has
 not changed since it was copied in.
+
+Stock Codex installs its builtin skill bundle into ``skills/.system`` at
+startup when the bundle's marker is missing or stale: it removes the
+directory and writes it again. Parallel workers starting in one fresh home
+all do that at once, and the last one writes the marker over a partial
+bundle that no later start repairs (49 files became 41 or 1 in a stock
+reproduction). :func:`ensure_system_skills` installs the bundle once per
+Codex binary, with stock ``codex debug prompt-input`` in a private home that
+has no credentials, and swaps it into the worker home under the home lock.
+Workers then find a current marker and skip the install.
 """
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional
@@ -172,6 +186,95 @@ def sync_back(env: Optional[dict] = None, *, root: Optional[Path] = None) -> boo
             return True
     except (OSError, TimeoutError):
         return False
+
+
+_SYSTEM_SKILLS = Path("skills") / ".system"
+_SYSTEM_RECORD = ".system-skills.json"
+# Stock install takes well under a second; stay inside the lock's stale window.
+_SEED_TIMEOUT_SECONDS = _LOCK_STALE_SECONDS / 2
+
+
+def _binary_identity(command: list[str]) -> Optional[str]:
+    """Path, size and mtime of the Codex launcher, enough to notice an upgrade."""
+    if not command:
+        return None
+    launcher = command[-1]
+    found = launcher if Path(launcher).is_file() else shutil.which(launcher)
+    if not found:
+        return None
+    try:
+        path = Path(found).resolve()
+        stat = path.stat()
+    except OSError:
+        return None
+    return json.dumps([*command[:-1], str(path), stat.st_size, stat.st_mtime_ns])
+
+
+def _bundle_digest(home: Path) -> Optional[str]:
+    root = home / _SYSTEM_SKILLS
+    if not root.is_dir():
+        return None
+    digest = hashlib.sha256()
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        digest.update(path.relative_to(root).as_posix().encode("utf-8") + b"\0")
+        digest.update((_digest(path) or "").encode("ascii") + b"\0")
+    return digest.hexdigest()
+
+
+def _system_skills_current(home: Path, identity: str) -> bool:
+    try:
+        record = json.loads((home / _SYSTEM_RECORD).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return (isinstance(record, dict) and record.get("codex") == identity
+            and record.get("bundle") == _bundle_digest(home))
+
+
+def ensure_system_skills(home: Path, command: list[str]) -> bool:
+    """Install stock Codex's builtin skill bundle into ``home`` once, race-free.
+
+    ``command`` is the Codex launcher (``["codex"]`` or ``["node", "codex.js"]``).
+    The bundle comes from the same binary, so its marker is current and every
+    worker start skips its own install. Best effort: False leaves the home to
+    stock Codex.
+    """
+    identity = _binary_identity(command)
+    if identity is None:
+        return False
+    if _system_skills_current(home, identity):
+        return True
+    with _Lock(home / ".sync.lock"):
+        if _system_skills_current(home, identity):
+            return True
+        with tempfile.TemporaryDirectory(prefix="pm-codex-seed-") as tmp:
+            seed = Path(tmp)
+            env = {key: value for key, value in os.environ.items() if not key.endswith("_API_KEY")}
+            env["CODEX_HOME"] = str(seed)
+            try:
+                subprocess.run([*command, "debug", "prompt-input", "."], cwd=seed, env=env,
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=_SEED_TIMEOUT_SECONDS, check=True)
+            except (OSError, subprocess.SubprocessError):
+                return False
+            bundle = seed / _SYSTEM_SKILLS
+            if not any(bundle.glob(".*marker")):
+                return False
+            target = home / _SYSTEM_SKILLS
+            target.parent.mkdir(parents=True, exist_ok=True)
+            staged = target.with_name(f".system.{os.getpid()}.new")
+            retired = target.with_name(f".system.{os.getpid()}.old")
+            shutil.rmtree(staged, ignore_errors=True)
+            try:
+                shutil.copytree(bundle, staged)
+                if target.exists():
+                    os.replace(target, retired)
+                os.replace(staged, target)
+            finally:
+                shutil.rmtree(staged, ignore_errors=True)
+                shutil.rmtree(retired, ignore_errors=True)
+        _write_atomic(home / _SYSTEM_RECORD, json.dumps(
+            {"codex": identity, "bundle": _bundle_digest(home)}).encode("utf-8"))
+    return True
 
 
 def _read(path: Path) -> Optional[str]:
