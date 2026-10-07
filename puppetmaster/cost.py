@@ -75,6 +75,10 @@ class TaskCost:
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
     api_equivalent_cost_usd: Optional[float] = None
+    # Billable counters the usage record did not know, or got inconsistent.
+    # Either one leaves registry pricing unpriced (plan marginal $0 still settles).
+    usage_unknown: list = field(default_factory=list)
+    usage_invalid: list = field(default_factory=list)
 
 
 @dataclass
@@ -373,13 +377,15 @@ def price_job(artifacts: Iterable[Artifact], registry: list) -> JobCost:
         estimated = record["tokens_estimated"]
         real_cost_f = _real_cost_usd(record["real_cost_usd"])
         plan_billed = effective_billing == "plan"
+        # Rates times an unknown or inconsistent count is not a valuation.
+        valuable = spec is not None and not record.get("usage_unknown") and not record.get("usage_invalid")
         nominal_cost = (
             _cost_with_cache_discount(
                 spec, tokens_in, tokens_out, tokens_cached,
                 cache_read_tokens=record.get("cache_read_tokens"),
                 cache_write_tokens=record.get("cache_write_tokens"),
             )
-            if spec is not None
+            if valuable
             else 0.0
         )
 
@@ -393,7 +399,7 @@ def price_job(artifacts: Iterable[Artifact], registry: list) -> JobCost:
             cost = real_cost_f
             priced = True
             billing = effective_billing or "reported"
-        elif spec is not None:
+        elif valuable:
             billing = effective_billing
             cost = nominal_cost
             priced = True
@@ -416,8 +422,12 @@ def price_job(artifacts: Iterable[Artifact], registry: list) -> JobCost:
             cache_read_tokens=record.get("cache_read_tokens", 0),
             cache_write_tokens=record.get("cache_write_tokens", 0),
         )
-        if spec is not None:
-            result.tasks[-1] = replace(result.tasks[-1], api_equivalent_cost_usd=round(nominal_cost, 6))
+        result.tasks[-1] = replace(
+            result.tasks[-1],
+            api_equivalent_cost_usd=round(nominal_cost, 6) if valuable else None,
+            usage_unknown=list(record.get("usage_unknown") or ()),
+            usage_invalid=list(record.get("usage_invalid") or ()),
+        )
     return _finalize_job_cost(result)
 
 

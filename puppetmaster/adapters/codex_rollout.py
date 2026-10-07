@@ -87,26 +87,40 @@ def attempt_usage(path: Optional[Path], baseline: Optional[frozenset]) -> dict:
         return unlinked("rollout_no_new_turn" if not new else "rollout_ambiguous_turns")
     turn = new[0]
     requests = {}
+    disputed = set()
+    elsewhere = set()
     snapshot = None
     for record in _records(path):
         payload = record["payload"]
-        if record.get("type") != "token_usage_record" or str(payload.get("turn_id")) != turn:
-            continue
         response_id = payload.get("response_id")
         usage = payload.get("usage")
-        if not response_id or not isinstance(usage, dict):
+        if record.get("type") != "token_usage_record" or not response_id or not isinstance(usage, dict):
             continue
-        # A replayed record is the same request, not a second one.
-        requests.setdefault(str(response_id), usage)
+        if str(payload.get("turn_id")) != turn:
+            elsewhere.add(str(response_id))
+            continue
+        # An identical replay is the same request, counted once. A replay with
+        # different counters leaves those counters unknown, in either order.
+        first = requests.setdefault(str(response_id), usage)
+        disputed.update(f for f in FIELDS if count(first.get(f)) != count(usage.get(f)))
         if isinstance(payload.get("turn_token_usage"), dict):
             snapshot = payload["turn_token_usage"]
     if not requests:
         return unlinked("rollout_turn_without_requests", turn=turn)
-    total = _sum(list(requests.values()))
-    partial = sorted(f for f, v in total.items() if v is None)
     conflicts = []
+    if disputed:
+        conflicts.append("response_id_replay_conflict")
+    if elsewhere & set(requests):
+        # The same request is also attributed to another turn: no counter of
+        # this turn is attempt-local evidence.
+        conflicts.append("response_id_in_other_turn")
+        disputed.update(FIELDS)
+    total = _sum(list(requests.values()))
+    for field in disputed:
+        total[field] = None
+    partial = sorted(f for f, v in total.items() if v is None)
     if snapshot is not None:
-        conflicts = sorted(
+        conflicts += sorted(
             f for f in FIELDS
             if total[f] is not None and count(snapshot.get(f)) is not None
             and count(snapshot.get(f)) != total[f]
@@ -121,6 +135,7 @@ def attempt_usage(path: Optional[Path], baseline: Optional[frozenset]) -> dict:
         "rollout_request_count": len(requests),
         "usage": total,
         "usage_partial_fields": partial,
+        "usage_disputed_fields": sorted(disputed),
         "usage_conflicts": conflicts,
     }
 
@@ -134,5 +149,6 @@ def unlinked(reason: str, turn: Optional[str] = None) -> dict:
         "rollout_request_count": 0,
         "usage": {field: None for field in FIELDS},
         "usage_partial_fields": list(FIELDS),
+        "usage_disputed_fields": [],
         "usage_conflicts": [],
     }

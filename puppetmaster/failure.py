@@ -6,6 +6,7 @@ verification artifacts).
 """
 from __future__ import annotations
 
+import re
 from typing import Callable, Optional, Sequence, Tuple
 
 # Canonical failure category strings (artifact payload ``failure`` field).
@@ -49,6 +50,43 @@ def _all(*substrings: str) -> Checker:
     return check
 
 
+def _matches(pattern: str) -> Checker:
+    compiled = re.compile(pattern)
+
+    def check(lowered: str) -> bool:
+        return compiled.search(lowered) is not None
+
+    return check
+
+
+# An explicit credential diagnosis, never a bare "auth"/"login" substring: those
+# also occur in symbols, paths and quoted source (``production_authority``).
+_AUTH_DIAGNOSIS = (
+    r"\b(?:auth|authentication|authorization|login|log in|sign in|token)"
+    r"[ _-]?(?:error|failed|failure|required|expired|revoked|invalid)\b"
+    r"|\b(?:please |re-?)(?:authenticate|log ?in|sign ?in)\b"
+    r"|\binvalid[ _-](?:api[ _-]key|token|credentials?)\b"
+)
+
+# Python traceback frames: ``File "...", line N, in name`` and the quoted
+# source/caret lines under it. They name code, not the failure.
+_TRACEBACK_FRAME = re.compile(r'^\s*File "[^"\n]*", line \d+(?:, in [^\n]*)?$')
+
+
+def _without_traceback_frames(text: str) -> str:
+    kept = []
+    in_frame = False
+    for line in text.splitlines():
+        if _TRACEBACK_FRAME.match(line):
+            in_frame = True
+            continue
+        if in_frame and line.startswith("    "):
+            continue
+        in_frame = False
+        kept.append(line)
+    return "\n".join(kept)
+
+
 def _model_unavailable(lowered: str) -> bool:
     return "model" in lowered and (
         "unavailable" in lowered
@@ -61,7 +99,7 @@ def _model_unavailable(lowered: str) -> bool:
 
 
 def _classify(output: str, rules: Sequence[Rule], *, default: str = UNKNOWN) -> str:
-    lowered = (output or "").lower()
+    lowered = _without_traceback_frames(output or "").lower()
     for checker, category in rules:
         if checker(lowered):
             return category
@@ -70,12 +108,13 @@ def _classify(output: str, rules: Sequence[Rule], *, default: str = UNKNOWN) -> 
 
 _BASE_RULES: Tuple[Rule, ...] = (
     (_any("command not found"), MISSING_CLI),
-    (_any("not logged in", "codex login", "missing bearer", "401", "unauthorized"), NOT_AUTHENTICATED),
+    (_any("not logged in", "codex login", "missing bearer", "unauthorized"), NOT_AUTHENTICATED),
+    (_matches(r"(?<![\w.])401(?![\w.])"), NOT_AUTHENTICATED),
     (_any("api key", "not authenticated", "authentication", "please login", "hermes login", "missing credentials"), NOT_AUTHENTICATED),
     (_all("verification", "failed"), NOT_AUTHENTICATED),
     (_all("verification", "required"), NOT_AUTHENTICATED),
     (_any("cursor_api_key"), NOT_AUTHENTICATED),
-    (_any("auth", "login"), NOT_AUTHENTICATED),
+    (_matches(_AUTH_DIAGNOSIS), NOT_AUTHENTICATED),
     (_any("context length", "maximum context", "context window"), CONTEXT_LENGTH_EXCEEDED),
     (_any("rate limit", "429"), RATE_LIMIT),
     (_any("billing", "quota", "credit"), BILLING_OR_QUOTA),

@@ -211,7 +211,32 @@ def select_usage_records(artifacts: Iterable[Artifact]) -> dict:
         for key in ("cache_read_tokens", "cache_write_tokens"):
             if key in payload:
                 records[task_id][key] = int(payload.get(key) or 0)
+        records[task_id].update(_billable_presence(payload))
     return records
+
+
+def _billable_presence(payload: dict) -> dict:
+    """Which billable counters are unknown or inconsistent.
+
+    The int fields above fold NULL to 0 for volume rollups; pricing must not.
+    Input and output are always billable. A cache counter is billable when the
+    adapter reported the key (absent means the adapter has no cache split).
+    """
+    def known(key: str) -> bool:
+        value = payload.get(key)
+        return type(value) is int and value >= 0
+
+    unknown = [key for key in ("tokens_in", "tokens_out") if not known(key)]
+    for key in ("tokens_cached", "cached_input_tokens", "cache_read_tokens", "cache_write_tokens"):
+        if key in payload and not known(key):
+            unknown.append(key)
+    invalid = []
+    split = "cache_read_tokens" in payload or "cache_write_tokens" in payload
+    cached = payload.get("tokens_cached", payload.get("cached_input_tokens"))
+    if not split and known("tokens_in") and type(cached) is int and cached > payload["tokens_in"]:
+        # Legacy cached input is a subset of input.
+        invalid.append("cached_exceeds_input")
+    return {"usage_unknown": unknown, "usage_invalid": invalid}
 
 
 def aggregate_token_usage(artifacts: Iterable[Artifact]) -> dict[str, Any]:

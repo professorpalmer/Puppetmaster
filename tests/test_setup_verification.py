@@ -394,7 +394,7 @@ class OwnershipUtilityTests(unittest.TestCase):
                 process.kill.assert_called_once()
                 self.assertEqual(process.wait.call_count, 2)
                 self.assertGreater(process.wait.call_args.kwargs['timeout'], 0)
-                self.assertLessEqual(process.wait.call_args.kwargs['timeout'], 3)
+                self.assertLessEqual(process.wait.call_args.kwargs['timeout'], 3 + 1e-9)  # one-ulp float rounding of (t + 3) - t
 
     @unittest.skipUnless(os.name == "posix", "requires POSIX process-group signals")
     def test_exhausted_cleanup_deadline_still_kills_group_and_leader(self):
@@ -500,7 +500,7 @@ class WindowsOwnershipTests(unittest.TestCase):
                 self.assertGreaterEqual(job_type.return_value.terminate.call_count, 1)
                 process.kill.assert_called_once()
                 self.assertEqual(process.wait.call_count, 2)
-                self.assertLessEqual(process.wait.call_args.kwargs['timeout'], 3)
+                self.assertLessEqual(process.wait.call_args.kwargs['timeout'], 3 + 1e-9)  # one-ulp float rounding of (t + 3) - t
 
     def test_toolhelp_denied_descendant_continues_to_remaining_pids(self):
         from puppetmaster import win_process

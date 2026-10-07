@@ -494,7 +494,8 @@ class CodexAdapter(CliWorkerAdapter):
         parsed_artifacts = cursor_result_artifacts(task, worker_id, last_message, adapter="codex")
         process_failed = completed.returncode != 0 or turn_failed
         failure = classify_codex_failure(
-            completed.stderr + "\n" + completed.stdout + "\n" + turn_failure_message
+            completed.stderr + "\n" + codex_diagnostic_text(completed.stdout, events)
+            + "\n" + turn_failure_message
         ) if process_failed else None
         if turn_failed and failure == UNKNOWN:
             failure = "codex_turn_failed"
@@ -640,6 +641,7 @@ def _attempt_accounting(attempt: object, sdk_usage: dict, resumed: bool) -> dict
             "rollout_request_count": None,
             "usage": dict(sdk),
             "usage_partial_fields": sorted(f for f, v in sdk.items() if v is None),
+            "usage_disputed_fields": [],
             "usage_conflicts": [],
         }
     else:
@@ -819,6 +821,18 @@ def parse_codex_events(stdout: str) -> list[dict[str, Any]]:
         if isinstance(parsed, dict):
             events.append(parsed)
     return events
+
+
+def codex_diagnostic_text(stdout: str, events: list[dict[str, Any]]) -> str:
+    """The parts of a ``--json`` stdout that diagnose a failure.
+
+    Non-JSON lines (CLI banners and errors) and ``error`` event messages.
+    ``item.*`` events are the worker's own transcript: an edit to a login
+    module is not a logout.
+    """
+    lines = [raw for raw in (stdout or "").splitlines() if not raw.strip().startswith("{")]
+    lines.extend(str(ev.get("message") or "") for ev in events if ev.get("type") == "error")
+    return "\n".join(lines)
 
 
 def last_codex_agent_message(events: list[dict[str, Any]]) -> str:

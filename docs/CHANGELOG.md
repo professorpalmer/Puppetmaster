@@ -1,3 +1,39 @@
+## v1.32.5 — 2026-10-06
+
+**Accounting keeps doubtful facts doubtful, and a traceback is not a logout.**
+Four fixes from Codex's 1.32.4 findings:
+
+- **A replayed request with different counters is disputed.** Codex usage
+  summed the first record seen for each `response_id`, so reversing two
+  conflicting replays changed the total. An identical replay still counts
+  once. A conflicting replay leaves each disagreeing counter NULL, in either
+  order, and is listed in `usage_disputed_fields` with the conflict
+  `response_id_replay_conflict`. A `response_id` also recorded under another
+  turn is not attempt-local evidence: every counter is NULL and the conflict
+  is `response_id_in_other_turn`. On 371 real turns in 251 local rollouts,
+  neither conflict appears and the 53-request resumed run sums as before.
+- **Usage quality reaches the ledger.** Ledger usage observations carry
+  `quality` flags (`partial:<field>`, `disputed:<field>`, `conflict:<name>`,
+  `unlinked:<reason>`), so a ledger-only consumer sees the anomalies the
+  verification artifact records. An empty `quality` is not written, so
+  unflagged records stay readable by older releases. Finality is unchanged.
+- **Pricing does not price unknown counts.** Registry pricing folded a NULL
+  billable counter to 0 and priced cached > input. A task with an unknown
+  input, output or reported cache counter, or with cached input above input,
+  is now unpriced. Its `api_equivalent_cost_usd` is NULL, and
+  `usage_unknown` / `usage_invalid` name the cause. Plan marginal cost still
+  settles at $0, and a reported provider cost still prices.
+- **Authentication needs an explicit diagnosis.** A bare `auth` or `login`
+  anywhere in the output classified a failure as `not_authenticated`, so a
+  traceback through `production_authority` read as a logout, and an
+  auto-routed task fell back to another model. The classifier now needs an
+  explicit diagnosis: not logged in, 401, unauthorized, an auth / login /
+  token error, failure, expiry or revocation, a request to re-authenticate,
+  or an invalid key. It ignores traceback frame and quoted source lines. The
+  Codex adapter also stopped classifying the worker's own transcript
+  (`item.*` events). It classifies stderr, non-JSON stdout lines and `error`
+  events.
+
 ## v1.32.4 — 2026-10-06
 
 **Resumed Codex runs report their own usage.** From Codex's live finding:
