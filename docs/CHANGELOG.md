@@ -1,4 +1,4 @@
-## Unreleased
+## v1.33.2 — 2026-10-07
 
 **Parallel Cursor SDK workers share one model catalog.** The Cursor SDK
 checks a local agent's model against `GET /v1/models` before every start.
