@@ -16,6 +16,7 @@ import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from puppetmaster.interprocess_lock import InterProcessFileLock
 from puppetmaster.proc_identity import own_identity, pid_reused, process_identity
@@ -101,6 +102,29 @@ class LockOwnerIdentityTests(unittest.TestCase):
         self.plant(child.pid, None)
         with self.assertRaises(TimeoutError):
             self.lock.acquire()
+
+    def test_release_waits_out_a_reader_holding_the_lock_file(self):
+        # Windows refuses to delete a file a contender has open to read its owner.
+        self.lock.acquire()
+        if os.name == "nt":
+            reader = open(self.lock.path, "rb")
+            threading.Timer(0.3, reader.close).start()
+        else:
+            real_unlink, calls = Path.unlink, []
+
+            def busy_then_real(path, *args, **kwargs):
+                calls.append(path)
+                if len(calls) < 3:
+                    raise PermissionError(32, "being used by another process")
+                return real_unlink(path, *args, **kwargs)
+
+            patcher = patch.object(Path, "unlink", busy_then_real)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.lock.release()
+        self.assertFalse(self.lock.path.exists())
+        with self.lock:
+            pass
 
 
 if __name__ == "__main__":

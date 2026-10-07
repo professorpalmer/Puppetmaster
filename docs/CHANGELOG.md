@@ -1,3 +1,31 @@
+## v1.33.0 — 2026-10-07
+
+**Operators can set the worker effort.** From Codex's fixed-profile
+experiments: an unpinned worker always requested `medium`, so a benchmark
+that runs every worker at high had to put an effort pin in its prompts.
+
+- `PUPPETMASTER_WORKER_EFFORT` (`low`, `medium`, `high`, `xhigh`) replaces the
+  `medium` default for unpinned workers, in the process that creates the
+  tasks (MCP server, CLI, flow walker). An explicit caller effort (task
+  payload, flow node, lane or `defaults.effort`) still wins.
+- `PUPPETMASTER_WORKER_EFFORT_POLICY=enforce` runs every worker at that
+  effort. A flow naming a different effort, lane or `escalate` fails
+  validation. Any other conflicting pin is refused at task creation, before
+  launch.
+- Every worker task records `reasoning_effort`, `requested_reasoning_effort`
+  and `reasoning_effort_source` (`caller`, `operator_default`,
+  `operator_enforced`, `swarm_default`). The setting covers cold and resumed
+  workers and flow judges, and the stamp happens before launch, so the
+  recorded request matches the CLI argv.
+- An invalid or incomplete setting fails task creation with the reason.
+  Without the setting, behavior is unchanged.
+
+**Windows lock release survives a concurrent reader.** Releasing an
+interprocess lock (the flow run lock, policy writer locks) failed with
+`WinError 32` when a contender had the lock file open to read its owner, and
+the error ended the flow walk. Releasing and stale recovery now retry that
+sharing violation briefly.
+
 ## v1.32.5 — 2026-10-06
 
 **Accounting keeps doubtful facts doubtful, and a traceback is not a logout.**
@@ -3236,7 +3264,7 @@ forward reliability fix for the detach handshake only.
 - Kill switch: `PUPPETMASTER_TOOL_BATCH_PARALLEL=0`.
 # Changelog
 
-## Unreleased
+## v1.33.0 — 2026-10-07
 
 ## v1.19.6
 

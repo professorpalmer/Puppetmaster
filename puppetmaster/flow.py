@@ -57,11 +57,11 @@ from typing import Any, Callable, Optional
 
 from puppetmaster.models import ArtifactType, JobStatus, TaskStatus, now_iso
 from puppetmaster.proc_identity import pid_reused, process_identity
+from puppetmaster.swarm_reasoning import EFFORTS, WorkerEffortError, operator_effort_profile
 from puppetmaster.worker_verdict import parse_terminal_verdict
 
 NODE_KINDS = ("agent", "judge", "parallel", "map", "shell", "gate", "set", "end")
 # Reasoning effort, cheapest first; escalation walks up this ladder.
-EFFORTS = ("low", "medium", "high", "xhigh")
 LANES = ("explore", "code", "judge")
 _CONTROL_KINDS = ("set", "end")
 TERMINAL_STATUSES = ("done", "failed", "stuck", "stopped")
@@ -185,6 +185,20 @@ def _effort_problems(obj: dict, where: str) -> list[str]:
         problems.append(f"{where} effort must be one of {', '.join(EFFORTS)}")
     if "escalate" in obj and not isinstance(obj["escalate"], bool):
         problems.append(f"{where} escalate must be true or false")
+    try:
+        profile = operator_effort_profile()
+    except WorkerEffortError as exc:
+        return problems + [str(exc)]
+    if profile.enforced:
+        # Refuse at validation, not at the node that would launch it.
+        requested = [obj.get("effort")]
+        if isinstance(obj.get("lanes"), dict):
+            requested.extend(obj["lanes"].values())
+        for effort in requested:
+            if effort in EFFORTS and effort != profile.effort:
+                problems.append(f"{where} effort {effort} conflicts with the enforced worker effort {profile.effort}")
+        if obj.get("escalate") is True:
+            problems.append(f"{where} escalate conflicts with the enforced worker effort {profile.effort}")
     return problems
 
 

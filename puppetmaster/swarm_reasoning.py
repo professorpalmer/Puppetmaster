@@ -4,12 +4,63 @@ Callers pin effort on the task payload. Catalog High+Fast / payload_defaults
 are not pins. ``merge_routing_payload`` stamps the default and overlays each
 adapter dialect. GPT-5.6 Completions ``none`` stays a wire constraint in
 ``providers._openai_api_chat``, not a pin.
+
+An operator can replace the medium default for unpinned workers with
+``PUPPETMASTER_WORKER_EFFORT``. With ``PUPPETMASTER_WORKER_EFFORT_POLICY=enforce``
+every worker runs that effort and a conflicting caller pin is refused.
 """
 from __future__ import annotations
 
+import os
+from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
 DEFAULT_SWARM_REASONING_EFFORT = "medium"
+EFFORTS = ("low", "medium", "high", "xhigh")
+WORKER_EFFORT_ENV = "PUPPETMASTER_WORKER_EFFORT"
+WORKER_EFFORT_POLICY_ENV = "PUPPETMASTER_WORKER_EFFORT_POLICY"
+_POLICIES = ("default", "enforce")
+
+
+class WorkerEffortError(ValueError):
+    """The operator effort setting is invalid or refuses the caller's pin."""
+
+
+@dataclass(frozen=True)
+class WorkerEffortProfile:
+    """The operator's effort for workers; ``effort`` None means no setting."""
+
+    effort: Optional[str] = None
+    enforced: bool = False
+
+    def resolve(self, pinned: Optional[str]) -> tuple[str, str]:
+        """(effective effort, source) for a caller pin or None."""
+        if self.enforced:
+            if pinned is not None and pinned != self.effort:
+                raise WorkerEffortError(
+                    f"{WORKER_EFFORT_POLICY_ENV}=enforce runs every worker at "
+                    f"{self.effort}; the caller requested {pinned}")
+            return self.effort, "operator_enforced"
+        if pinned is not None:
+            return pinned, "caller"
+        if self.effort is not None:
+            return self.effort, "operator_default"
+        return DEFAULT_SWARM_REASONING_EFFORT, "swarm_default"
+
+
+def operator_effort_profile(env: Optional[Mapping[str, str]] = None) -> WorkerEffortProfile:
+    """Parse the operator setting; an invalid or incomplete value raises."""
+    env = os.environ if env is None else env
+    raw = env.get(WORKER_EFFORT_ENV, "").strip()
+    policy = env.get(WORKER_EFFORT_POLICY_ENV, "").strip().lower() or "default"
+    effort = raw.lower() or None
+    if effort is not None and effort not in EFFORTS:
+        raise WorkerEffortError(f"{WORKER_EFFORT_ENV}={raw!r} must be one of {', '.join(EFFORTS)}")
+    if policy not in _POLICIES:
+        raise WorkerEffortError(f"{WORKER_EFFORT_POLICY_ENV} must be one of {', '.join(_POLICIES)}")
+    if policy == "enforce" and effort is None:
+        raise WorkerEffortError(f"{WORKER_EFFORT_POLICY_ENV}=enforce needs {WORKER_EFFORT_ENV}")
+    return WorkerEffortProfile(effort, policy == "enforce")
 
 
 def _normalize_effort(value: object) -> Optional[str]:
@@ -170,8 +221,22 @@ def apply_swarm_reasoning(
     merged: dict[str, Any],
     caller_payload: Optional[Mapping[str, Any]],
     adapter: Optional[str] = None,
+    profile: Optional[WorkerEffortProfile] = None,
 ) -> dict[str, Any]:
-    """Stamp medium unless the caller pinned; overlay adapter dialect."""
-    pin = caller_pinned_effort(caller_payload)
-    effort = pin or DEFAULT_SWARM_REASONING_EFFORT
+    """Stamp the caller's pin or the operator/swarm default; overlay adapter dialect.
+
+    Records ``requested_reasoning_effort`` (the caller pin or None) and
+    ``reasoning_effort_source`` (caller, operator_default, operator_enforced,
+    swarm_default) beside the effective ``reasoning_effort``.
+    """
+    profile = operator_effort_profile() if profile is None else profile
+    caller_payload = caller_payload or {}
+    if caller_payload.get("reasoning_effort_source") in (None, "caller"):
+        pin = caller_pinned_effort(caller_payload)
+    else:
+        # A payload this function already stamped: its effort is not a pin.
+        pin = _normalize_effort(caller_payload.get("requested_reasoning_effort"))
+    effort, source = profile.resolve(pin)
+    merged["requested_reasoning_effort"] = pin
+    merged["reasoning_effort_source"] = source
     return overlay_adapter_dialect(merged, effort, adapter)

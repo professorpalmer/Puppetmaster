@@ -53,6 +53,9 @@ _PIN_KEYS_TO_CLEAR = (
     # A provider the developer disconnected in Marionette Settings must not
     # change what the suite sees either — tests that care set it themselves.
     "PUPPETMASTER_DISABLED_PROVIDERS",
+    # An operator worker-effort profile would replace the medium default.
+    "PUPPETMASTER_WORKER_EFFORT",
+    "PUPPETMASTER_WORKER_EFFORT_POLICY",
 )
 
 

@@ -2589,15 +2589,21 @@ class PuppetmasterTests(unittest.TestCase):
 
             thread = threading.Thread(target=run_job)
             thread.start()
-            deadline = time.monotonic() + 2
-            while time.monotonic() < deadline and store.latest_job() is None:
+            # Wait for the queued task, not just the job row: on a loaded
+            # runner the task can land after a short daemon idle window, and
+            # the job then waits forever for a worker.
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                job = store.latest_job()
+                if job is not None and store.list_tasks(job.id):
+                    break
                 time.sleep(0.01)
 
             processed = WorkerDaemon(
                 store,
                 roles=["explore"],
                 worker_id="daemon-test",
-            ).run(max_tasks=1, max_idle_seconds=2)
+            ).run(max_tasks=1, max_idle_seconds=10)
             # Generous budget on purpose: this only bounds how long we wait for
             # an already-finished job's thread to be reaped, so a large value
             # masks nothing (a genuine hang still fails, just later) while a
