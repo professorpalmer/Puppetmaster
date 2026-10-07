@@ -1,5 +1,23 @@
 ## Unreleased
 
+**Parallel Cursor SDK workers share one model catalog.** The Cursor SDK
+checks a local agent's model against `GET /v1/models` before every start.
+That endpoint allows 30 requests per minute per account, and 81 fan-out
+worker starts on this machine failed with "exceeded the rate limit of 30
+requests per minute for the get_models endpoint". The SDK reads
+`CURSOR_SDK_LOCAL_MODEL_CATALOG_JSON` instead when it is set.
+
+Puppetmaster now caches the catalog per API key. The cache file is named by
+a key hash and never holds the key. One process at a time refreshes it,
+every 10 minutes, and a failed refresh backs off for a minute. Implement,
+analyze and readiness-probe starts receive the cached list.
+
+The SDK still validates the model. A model missing from the cached list (for
+example one added to the plan since the last refresh), an opt-out with
+`PUPPETMASTER_AUTODISCOVER=0`, or a failed refresh leaves the SDK to fetch
+the list itself, as before. Live check: 40 parallel real SDK starts made one
+catalog request in total and none was rate limited.
+
 **A resumed Claude Code run is not charged the whole session's cost.** Claude
 Code's `total_cost_usd` is the session's cost to date, including on
 `--resume --fork-session`. Live check: three resumes reported $0.0613, then
