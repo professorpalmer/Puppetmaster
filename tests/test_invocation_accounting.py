@@ -323,6 +323,18 @@ class RuntimeAccountingContract:
         self.assertEqual(by_basis["plan_marginal"].cost_usd, 0)
         self.assertEqual(by_basis["plan_marginal"].cost_state, "measured")
 
+    def test_session_cumulative_cost_is_not_this_attempts_cost(self):
+        # A resumed Claude Code run reports the session's total_cost_usd to
+        # date; its token usage is this invocation's own.
+        self.store.save_task(replace(self.task, payload={"billing": "api"}))
+        event = {"type": "result", "usage": {"input_tokens": 5, "output_tokens": 2}, "total_cost_usd": 0.4}
+        self.run_adapter(CliAdapter(lambda task: StreamedProcess(
+            0, json.dumps(event), "", session_cumulative_cost=True)))
+        raw = next(o for o in self.records()[1] if o.observation_id == "stdout:0")
+        self.assertEqual((raw.tokens_in, raw.tokens_out), (5, 2))
+        self.assertIsNone(raw.cost_usd)
+        self.assertEqual(raw.cost_state, "unknown")
+
     def test_cli_billing_vocabulary(self):
         for billing, basis, cost in (("api", "api", 0.4),
                                      ("unknown", "unknown", None)):

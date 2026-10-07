@@ -1,3 +1,46 @@
+## v1.33.2 — 2026-10-07
+
+**Parallel Cursor SDK workers share one model catalog.** The Cursor SDK
+checks a local agent's model against `GET /v1/models` before every start.
+That endpoint allows 30 requests per minute per account, and 81 fan-out
+worker starts on this machine failed with "exceeded the rate limit of 30
+requests per minute for the get_models endpoint". The SDK reads
+`CURSOR_SDK_LOCAL_MODEL_CATALOG_JSON` instead when it is set.
+
+Puppetmaster now caches the catalog per API key. The cache file is named by
+a key hash and never holds the key. One process at a time refreshes it,
+every 10 minutes, and a failed refresh backs off for a minute. Implement,
+analyze and readiness-probe starts receive the cached list.
+
+The SDK still validates the model. A model missing from the cached list (for
+example one added to the plan since the last refresh), an opt-out with
+`PUPPETMASTER_AUTODISCOVER=0`, or a failed refresh leaves the SDK to fetch
+the list itself, as before. Live check: 40 parallel real SDK starts made one
+catalog request in total and none was rate limited.
+
+**A resumed Claude Code run is not charged the whole session's cost.** Claude
+Code's `total_cost_usd` is the session's cost to date, including on
+`--resume --fork-session`. Live check: three resumes reported $0.0613, then
+$0.0670, then $0.0725, each the previous total plus that call's own $0.0055.
+Its usage counts are the invocation's own. The usage ledger recorded that
+total as a resumed attempt's cost, the Claude counterpart of the Codex resume
+fix in 1.32.4. A resumed Claude Code attempt now records its own tokens with
+the cost unknown, priced from those tokens like any unpriced attempt.
+
+**Claude Code, Cursor and Antigravity failures are classified from
+diagnostics, not the worker's transcript.** As with Codex in 1.32.5, these
+adapters classified stderr plus their whole JSON stdout, which is the
+worker's own output. A failed worker that discussed a 401 handler, rate
+limits or network timeouts could read as logged out, rate limited or
+offline, and auto-routed work then fell back to another model. A shared
+`json_output_diagnostic` keeps non-JSON lines and each adapter's error
+fields only:
+- Claude: error results and `error` codes;
+- Cursor: status, errors, and the result only on `status: error`;
+- Antigravity: `error` and `status`.
+
+Hermes still classifies its plain-text stdout, where its real errors appear.
+
 ## v1.33.1 — 2026-10-07
 
 **Parallel Codex workers no longer break the worker home's builtin skills.**

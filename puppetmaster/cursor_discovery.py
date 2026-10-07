@@ -18,10 +18,12 @@ tests) and reconciles the result with the registry.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import subprocess
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Mapping, Optional
@@ -471,3 +473,95 @@ def model_in_catalog(model_name: str, catalog: list[dict]) -> bool:
     exposes — turning a mid-run "invalid model" into a clean preflight block.
     """
     return any(str(item.get("id")) == model_name for item in catalog)
+
+
+# The Cursor SDK validates a local agent's model against GET /v1/models before
+# every start, and that endpoint allows 30 requests per minute per account: a
+# fan-out of SDK workers starting together failed with "exceeded the rate
+# limit of 30 requests per minute for the get_models endpoint". The SDK reads
+# CURSOR_SDK_LOCAL_MODEL_CATALOG_JSON instead when it is set, so workers share
+# one cached list, refreshed by one process at a time.
+LOCAL_CATALOG_ENV = "CURSOR_SDK_LOCAL_MODEL_CATALOG_JSON"
+_CATALOG_TTL_SECONDS = 600.0
+_CATALOG_RETRY_SECONDS = 60.0
+
+
+def _catalog_cache_path(api_key: str) -> Path:
+    from puppetmaster.community_observations import puppetmaster_home
+
+    digest = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
+    return puppetmaster_home() / "cursor-model-catalog" / f"{digest}.json"
+
+
+def _read_catalog_cache(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _fresh(data: dict, now: float) -> bool:
+    fetched = data.get("fetched_at")
+    failed = data.get("failed_at")
+    return ((isinstance(fetched, (int, float)) and now - fetched < _CATALOG_TTL_SECONDS
+             and isinstance(data.get("models"), list))
+            or (isinstance(failed, (int, float)) and now - failed < _CATALOG_RETRY_SECONDS))
+
+
+def local_model_catalog_json(
+    model_id: Optional[str],
+    *,
+    env: Optional[Mapping[str, str]] = None,
+    fetch: Optional[Callable[[], list[dict]]] = None,
+    now: Optional[Callable[[], float]] = None,
+) -> Optional[str]:
+    """The SDK's local model catalog for one worker start, or None to let the SDK fetch.
+
+    None when the key is missing, the catalog cannot be refreshed, or
+    ``model_id`` is not in it: a model added to the plan since the last
+    refresh must not be refused by a stale list.
+    """
+    env = env if env is not None else os.environ
+    api_key = str(env.get("CURSOR_API_KEY") or "").strip()
+    if not api_key or not model_id:
+        return None
+    if fetch is None and str(env.get("PUPPETMASTER_AUTODISCOVER", "1")).lower() in ("0", "false", "no"):
+        return None  # catalog calls are opted out; the SDK validates on its own
+    clock = now or time.time
+    path = _catalog_cache_path(api_key)
+    data = _read_catalog_cache(path)
+    if not _fresh(data, clock()):
+        from puppetmaster.interprocess_lock import InterProcessFileLock
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with InterProcessFileLock.for_target(path, timeout=60):
+                data = _read_catalog_cache(path)
+                if not _fresh(data, clock()):
+                    try:
+                        models = (fetch or (lambda: fetch_cursor_catalog(env=env)))()
+                        data = {"fetched_at": clock(), "models": [
+                            {"id": m["id"], **({"aliases": m["aliases"]} if m.get("aliases") else {})}
+                            for m in models if isinstance(m.get("id"), str)]}
+                    except CursorDiscoveryError:
+                        data = {"failed_at": clock()}
+                    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+                    tmp.write_text(json.dumps(data), encoding="utf-8")
+                    os.replace(tmp, path)
+        except (OSError, TimeoutError):
+            return None
+    models = data.get("models")
+    if not isinstance(models, list) or not any(
+            m.get("id") == model_id or model_id in (m.get("aliases") or ()) for m in models):
+        return None
+    return json.dumps(models)
+
+
+def with_local_model_catalog(environment: dict, model_id: Optional[str]) -> dict:
+    """Give one SDK start the shared catalog (see :func:`local_model_catalog_json`)."""
+    if not environment.get(LOCAL_CATALOG_ENV):
+        catalog = local_model_catalog_json(model_id or "default", env=environment)
+        if catalog is not None:
+            environment[LOCAL_CATALOG_ENV] = catalog
+    return environment

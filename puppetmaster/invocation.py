@@ -277,7 +277,7 @@ class Invocation:
         if self.recorded:
             self._write("record_usage_observation", observation)
 
-    def stdout(self, stdout, attempt_usage=None):
+    def stdout(self, stdout, attempt_usage=None, session_cumulative_cost=False):
         if isinstance(attempt_usage, dict):
             # The adapter derived this attempt's own usage (a resumed Codex
             # turn.completed is session-cumulative). Unlinked usage stays
@@ -315,7 +315,7 @@ class Invocation:
             if not isinstance(event.get("usage"), dict) and "total_cost_usd" not in event:
                 continue
             data = dict(event.get("usage") or {})
-            if "total_cost_usd" in event:
+            if "total_cost_usd" in event and not session_cumulative_cost:
                 data["total_cost_usd"] = event["total_cost_usd"]
             terminal = event.get("type") == "result" or (
                 event.get("type") == "turn.completed" and bool(data)
@@ -338,7 +338,7 @@ class _UnboundInvocation:
     def observe(self, *args, **kwargs):
         pass
 
-    def stdout(self, stdout, attempt_usage=None):
+    def stdout(self, stdout, attempt_usage=None, session_cumulative_cost=False):
         pass
 
 
@@ -395,7 +395,8 @@ def invoke_cli(call, *, accounting_adapter=None, accounting_model=None, **kwargs
                 (type(getattr(result, "returncode", None)) is int and result.returncode != 0)):
             capture.outcome_complete = False
         try:
-            capture.stdout(result.stdout, getattr(result, "attempt_usage", None))
+            capture.stdout(result.stdout, getattr(result, "attempt_usage", None),
+                           session_cumulative_cost=getattr(result, "session_cumulative_cost", False) is True)
         except Exception as exc:
             if isinstance(capture, Invocation):
                 capture._error("consumption.capture_failed", "stdout", type(exc).__name__)

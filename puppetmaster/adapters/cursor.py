@@ -8,7 +8,8 @@ from typing import Any, Optional, Union
 
 from puppetmaster.cursor_sdk_home import cursor_runner
 from puppetmaster.codegraph import enrich_prompt_with_codegraph, inject_worker_cli_env
-from puppetmaster.failure import classify_cursor_failure
+from puppetmaster.cursor_discovery import with_local_model_catalog
+from puppetmaster.failure import classify_cursor_failure, cursor_diagnosis, json_output_diagnostic
 from puppetmaster.models import Artifact, ArtifactType, Task
 from puppetmaster.ports import apply_worktree_ports
 from puppetmaster.redaction import redact_secrets
@@ -156,6 +157,7 @@ class CursorAdapter(CliWorkerAdapter):
             cursor_input,
             sort_keys=True,
         )
+        with_local_model_catalog(environment, cursor_input["model"])
         return facade("run_streamed_subprocess")(
             command=prepared.command,
             env=environment,
@@ -222,7 +224,7 @@ class CursorAdapter(CliWorkerAdapter):
                 )
             return artifacts
 
-        failure = classify_cursor_failure(completed.stderr + completed.stdout)
+        failure = classify_cursor_failure(completed.stderr + "\n" + json_output_diagnostic(completed.stdout, cursor_diagnosis))
         cursor_status, result_text = cursor_result_text(completed.stdout)
         usage = token_usage(
             sdk_usage=sdk_usage_from_stdout(completed.stdout),
@@ -321,6 +323,7 @@ class CursorAdapter(CliWorkerAdapter):
             cursor_input,
             sort_keys=True,
         )
+        with_local_model_catalog(environment, model)
         timeout_seconds = int(task.payload.get("timeout_seconds", 300))
         from puppetmaster.invocation import invoke_cli
 
@@ -370,7 +373,7 @@ class CursorAdapter(CliWorkerAdapter):
                     },
                 )
             ]
-        failure = classify_cursor_failure(completed.stderr + completed.stdout)
+        failure = classify_cursor_failure(completed.stderr + "\n" + json_output_diagnostic(completed.stdout, cursor_diagnosis))
         status, result_text = cursor_result_text(completed.stdout)
         usage = token_usage(
             sdk_usage=sdk_usage_from_stdout(completed.stdout),

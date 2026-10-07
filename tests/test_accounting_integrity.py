@@ -136,5 +136,55 @@ class AuthClassificationTests(unittest.TestCase):
                          "not_authenticated")
 
 
+
+class TranscriptIsNotDiagnosisTests(unittest.TestCase):
+    """Claude Code, Cursor and Antigravity stdout is the worker's own JSON output."""
+
+    CHATTER = ("Fixed the 401 handler and the login flow; added rate limit backoff, "
+               "a network timeout and an api key check. Billing quota tests pass.")
+
+    def test_claude_code_transcript_is_not_a_failure_class(self) -> None:
+        from puppetmaster.failure import (claude_code_diagnosis, classify_claude_code_failure,
+                                          json_output_diagnostic)
+
+        def classify(*events):
+            stdout = "\n".join(json.dumps(e) for e in events)
+            return classify_claude_code_failure("\n" + json_output_diagnostic(stdout, claude_code_diagnosis))
+
+        said = {"type": "assistant", "message": {"content": [{"type": "text", "text": self.CHATTER}]}}
+        tool = {"type": "user", "message": {"content": [{"type": "tool_result", "content": "permission denied"}]}}
+        self.assertEqual(classify(said, tool, {"type": "result", "subtype": "error_max_turns", "is_error": True}),
+                         "unknown")
+        self.assertEqual(classify(said, {"type": "result", "subtype": "success", "is_error": False,
+                                         "result": self.CHATTER}), "unknown")
+        self.assertEqual(classify(said, {"type": "result", "subtype": "success", "is_error": True,
+                                         "result": "Invalid API key · Please run /login"}), "not_authenticated")
+        self.assertEqual(classify({"type": "assistant", "error": "rate_limit", "message": {}}), "rate_limit")
+
+    def test_cursor_result_text_counts_only_on_error_status(self) -> None:
+        from puppetmaster.failure import classify_cursor_failure, cursor_diagnosis, json_output_diagnostic
+
+        def classify(payload):
+            return classify_cursor_failure("\n" + json_output_diagnostic(json.dumps(payload), cursor_diagnosis))
+
+        self.assertEqual(classify({"status": "finished", "result": self.CHATTER}), "unknown")
+        self.assertEqual(classify({"status": "error", "result": "", "usage": None}), "run_status_error")
+
+    def test_antigravity_response_is_not_a_diagnosis(self) -> None:
+        from puppetmaster.failure import (antigravity_diagnosis, classify_antigravity_failure,
+                                          json_output_diagnostic)
+
+        def classify(payload):
+            return classify_antigravity_failure(
+                "\n" + json_output_diagnostic(json.dumps(payload), antigravity_diagnosis))
+
+        self.assertEqual(classify({"status": "ERROR", "response": self.CHATTER}), "unknown")
+        self.assertEqual(classify({"status": "ERROR", "error": "not authenticated"}), "not_authenticated")
+
+    def test_plain_text_lines_still_diagnose(self) -> None:
+        from puppetmaster.failure import claude_code_diagnosis, json_output_diagnostic
+
+        self.assertIn("Not logged in", json_output_diagnostic("Not logged in · Please run /login", claude_code_diagnosis))
+
 if __name__ == "__main__":
     unittest.main()

@@ -6,8 +6,9 @@ verification artifacts).
 """
 from __future__ import annotations
 
+import json
 import re
-from typing import Callable, Optional, Sequence, Tuple
+from typing import Any, Callable, Iterable, Optional, Sequence, Tuple
 
 # Canonical failure category strings (artifact payload ``failure`` field).
 NOT_AUTHENTICATED = "not_authenticated"
@@ -169,6 +170,62 @@ _ADAPTER_EXTRA_RULES: dict[str, Tuple[Rule, ...]] = {
 def classify_adapter_failure(adapter: str, output: str) -> str:
     extra = _ADAPTER_EXTRA_RULES.get(adapter, ())
     return _classify(output, (*extra, *_BASE_RULES))
+
+
+def json_output_diagnostic(stdout: Optional[str],
+                           diagnosis: Callable[[dict], Iterable[Any]]) -> str:
+    """The parts of a JSON (or JSON-lines) stdout that diagnose a failure.
+
+    Non-JSON lines are CLI banners and errors, and are kept. A JSON event is
+    the worker's own output (an agent message, a tool call, a final answer)
+    unless ``diagnosis`` names its error fields: an edit to a login module is
+    not a logout, and a worker discussing rate limits did not hit one.
+    """
+    lines: list[str] = []
+    for raw in (stdout or "").splitlines():
+        if not raw.strip().startswith("{"):
+            lines.append(raw)
+            continue
+        try:
+            event = json.loads(raw)
+        except ValueError:
+            continue  # a truncated transcript event, not a diagnosis
+        if isinstance(event, dict):
+            lines.extend(str(part) for part in diagnosis(event) if part)
+    return "\n".join(lines)
+
+
+def _error_text(value: Any) -> str:
+    if isinstance(value, dict):
+        value = value.get("message") or value.get("type")
+    if not isinstance(value, str):
+        return ""
+    # An error code (``rate_limit``, ``authentication_failed``) reads as words.
+    return value.replace("_", " ") if re.fullmatch(r"[a-z_]+", value) else value
+
+
+def claude_code_diagnosis(event: dict) -> list:
+    """stream-json / json events: error results and explicit error fields."""
+    parts = [_error_text(event.get("error"))]
+    if event.get("type") == "result" and event.get("is_error"):
+        parts += [event.get("subtype"), event.get("result")]
+        parts += [_error_text(item) for item in event.get("errors") or ()]
+    return parts
+
+
+def cursor_diagnosis(event: dict) -> list:
+    """The SDK bridge result: its status and errors; the result text only on error."""
+    status = event.get("status")
+    parts = [f"status: {status}" if status is not None else "",
+             _error_text(event.get("error")), _error_text(event.get("message"))]
+    if str(status).lower() == "error":
+        parts.append(event.get("result"))
+    return parts
+
+
+def antigravity_diagnosis(event: dict) -> list:
+    """agy JSON output: its error and status, never the response."""
+    return [_error_text(event.get("error")), event.get("status")]
 
 
 def classify_antigravity_failure(output: str) -> str:

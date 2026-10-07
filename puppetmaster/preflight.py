@@ -478,6 +478,9 @@ def _probe_cursor(
             "cwd": base_env.get("PWD") or os.getcwd(),
         }
     )
+    from puppetmaster.cursor_discovery import with_local_model_catalog
+
+    with_local_model_catalog(base_env, model)
     node = base_env.get("PUPPETMASTER_NODE", "node")
     runner_path = runner or cursor_runner()
     popen_kwargs: dict = {}

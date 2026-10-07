@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Optional, Union
 
 from puppetmaster.codegraph import enrich_prompt_with_codegraph
-from puppetmaster.failure import classify_claude_code_failure
+from puppetmaster.failure import claude_code_diagnosis, classify_claude_code_failure, json_output_diagnostic
 from puppetmaster.models import Artifact, ArtifactType, Task
 from puppetmaster.usage import token_usage
 from puppetmaster.worker_attribution import (
@@ -250,6 +250,19 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
             return None, facade("git_snapshot")(cwd)
         return super()._apply_pre_run_guards(task, worker_id, cwd, prepared)
 
+    def _invoke_cli(
+        self,
+        task: Task,
+        prepared: CliInvocation,
+        cwd: Path,
+        timeout_seconds: int,
+    ) -> StreamedProcess:
+        result = super()._invoke_cli(task, prepared, cwd, timeout_seconds)
+        # A resumed (forked) session's result reports the session's cost to
+        # date; its usage counts are this run's own.
+        result.session_cumulative_cost = bool(prepared.extras.get("resumed"))
+        return result
+
     def _finalize_cli_run(
         self,
         task: Task,
@@ -379,7 +392,7 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
                 + (["bedrock:model-omitted"] if model_note else [])
             ),
             payload={
-                "failure": None if completed.returncode == 0 else classify_claude_code_failure(completed.stderr + completed.stdout),
+                "failure": None if completed.returncode == 0 else classify_claude_code_failure(completed.stderr + "\n" + json_output_diagnostic(completed.stdout, claude_code_diagnosis)),
                 "returncode": completed.returncode,
                 "session_id": claude_session_id_from_stdout(completed.stdout),
                 **resume_fields,
