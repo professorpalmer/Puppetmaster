@@ -82,6 +82,19 @@ lane. A node's own `effort` wins over its lane, and a lane over
 repair visit, so a cheap first build gets more reasoning only when a check or
 judge sends it back.
 
+A node with no effort (from itself, its lane or `defaults`) runs the worker
+default: `medium`, or the operator's `PUPPETMASTER_WORKER_EFFORT` (`low`,
+`medium`, `high`, `xhigh`) when the MCP server or CLI that creates the tasks
+has it set. Any effort the graph names still wins over that default. With
+`PUPPETMASTER_WORKER_EFFORT_POLICY=enforce`, every worker runs the operator
+effort: a graph naming a different effort, a lane or `escalate` fails
+validation, and any other conflicting pin is refused before launch. Each task
+records `reasoning_effort` (effective), `requested_reasoning_effort` (the
+caller's pin or null) and `reasoning_effort_source` (`caller`,
+`operator_default`, `operator_enforced` or `swarm_default`). The setting
+applies to every worker task, not only flows: agents, judges, and resumed
+sessions alike. An invalid value fails task creation with the reason.
+
 ## Edges
 
 `{"from", "to", "when", "max"}`. The first matching edge in declaration order

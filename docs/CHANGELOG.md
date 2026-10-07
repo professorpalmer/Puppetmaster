@@ -1,3 +1,25 @@
+## Unreleased
+
+**Operators can set the worker effort.** From Codex's fixed-profile
+experiments: an unpinned worker always requested `medium`, so a benchmark
+that runs every worker at high had to put an effort pin in its prompts.
+
+- `PUPPETMASTER_WORKER_EFFORT` (`low`, `medium`, `high`, `xhigh`) replaces the
+  `medium` default for unpinned workers, in the process that creates the
+  tasks (MCP server, CLI, flow walker). An explicit caller effort (task
+  payload, flow node, lane or `defaults.effort`) still wins.
+- `PUPPETMASTER_WORKER_EFFORT_POLICY=enforce` runs every worker at that
+  effort. A flow naming a different effort, lane or `escalate` fails
+  validation. Any other conflicting pin is refused at task creation, before
+  launch.
+- Every worker task records `reasoning_effort`, `requested_reasoning_effort`
+  and `reasoning_effort_source` (`caller`, `operator_default`,
+  `operator_enforced`, `swarm_default`). The setting covers cold and resumed
+  workers and flow judges, and the stamp happens before launch, so the
+  recorded request matches the CLI argv.
+- An invalid or incomplete setting fails task creation with the reason.
+  Without the setting, behavior is unchanged.
+
 ## v1.32.5 — 2026-10-06
 
 **Accounting keeps doubtful facts doubtful, and a traceback is not a logout.**
