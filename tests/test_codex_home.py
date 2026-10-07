@@ -224,6 +224,29 @@ class SystemSkillsTests(unittest.TestCase):
             self.assertTrue(self.ensure())
         self.assertEqual(self.files()[".codex-system-skills.marker"], "v2")
 
+    def test_a_failed_swap_keeps_the_existing_bundle_and_retries(self):
+        from unittest.mock import patch
+
+        self.ensure()
+        installed = self.files()
+        stat = self.launcher.stat()
+        os.utime(self.launcher, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10**9))
+        real_replace = os.replace
+
+        def refuse_install(src, dst):
+            if Path(src).name.endswith(".new"):
+                raise OSError(5, "Access is denied")
+            return real_replace(src, dst)
+
+        with patch.dict(os.environ, {"FAKE_CODEX_VERSION": "2"}), \
+                patch("puppetmaster.codex_home.os.replace", refuse_install):
+            self.assertFalse(self.ensure())
+        self.assertEqual(self.files(), installed)
+        self.assertEqual([p.name for p in (self.home / "skills").iterdir()], [".system"])
+        with patch.dict(os.environ, {"FAKE_CODEX_VERSION": "2"}):
+            self.assertTrue(self.ensure())
+        self.assertEqual(self.files()[".codex-system-skills.marker"], "v2")
+
     def test_a_failing_bootstrap_leaves_the_home_to_stock_codex(self):
         from unittest.mock import patch
 

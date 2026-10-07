@@ -268,10 +268,18 @@ def ensure_system_skills(home: Path, command: list[str]) -> bool:
                 shutil.copytree(bundle, staged)
                 if target.exists():
                     os.replace(target, retired)
-                os.replace(staged, target)
+                try:
+                    os.replace(staged, target)
+                except OSError:
+                    if retired.exists():
+                        os.replace(retired, target)
+                    raise
+            except OSError:
+                return False  # the record stays stale, so the next start retries
             finally:
                 shutil.rmtree(staged, ignore_errors=True)
-                shutil.rmtree(retired, ignore_errors=True)
+                if target.exists():
+                    shutil.rmtree(retired, ignore_errors=True)
         _write_atomic(home / _SYSTEM_RECORD, json.dumps(
             {"codex": identity, "bundle": _bundle_digest(home)}).encode("utf-8"))
     return True

@@ -1,3 +1,13 @@
+## v1.33.4 — 2026-10-07
+
+**A failed Codex skill-bundle swap keeps the old bundle.** When the worker
+home's builtin skill bundle was replaced (after a Codex upgrade or a damaged
+bundle), a failure of the final rename deleted the original bundle in
+cleanup. The home then had no bundle at all. The original now goes back in
+place, the call returns False, and the next start retries the install. The
+original is deleted only after a new bundle is in place. Found by Codex
+fault injection, not seen in a real run.
+
 ## v1.33.3 — 2026-10-07
 
 **A unit's generated outputs belong in its declared files.** Flow map items
