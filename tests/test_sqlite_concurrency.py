@@ -46,8 +46,19 @@ def _attach_claim_complete_worker(
         "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
     )
     try:
-        store = SQLiteSwarmStore(state_dir)
-        store.attach()
+        from puppetmaster.worker_runtime import _transient_attach_failure
+
+        # A real worker exits WORKER_ATTACH_FAILED_EXIT on a transient attach
+        # failure (claiming nothing) and the supervisor respawns it; model
+        # that bounded respawn. A replaced store or missing schema still fails.
+        for respawn in range(5):
+            store = SQLiteSwarmStore(state_dir)
+            try:
+                store.attach()
+                break
+            except Exception as exc:  # noqa: BLE001
+                if respawn == 4 or not _transient_attach_failure(exc):
+                    raise
         runtime = WorkerRuntime(
             store=store,
             job_id=job_id,
