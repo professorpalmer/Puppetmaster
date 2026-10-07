@@ -22,6 +22,13 @@ reading it without the lock. 1.33.2 then dropped the catalog it had just
 fetched, and that start fell back to the SDK's own rate-limited model check.
 The cache write is now best effort, and the start keeps its catalog.
 
+**Windows file locks treat a delete-pending lock file as busy.** When one
+holder released a Puppetmaster file lock while a contender still had the file
+open, Windows refused the next O_EXCL create with `PermissionError`, not
+`FileExistsError`. The error escaped the lock, and 16 parallel Cursor starts
+lost their shared catalog to it. The lock now waits and retries, as it does
+for a held lock. On POSIX, a `PermissionError` still raises.
+
 ## v1.33.2 — 2026-10-07
 
 **Parallel Cursor SDK workers share one model catalog.** The Cursor SDK

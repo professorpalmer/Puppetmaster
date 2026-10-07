@@ -369,5 +369,40 @@ class FileLockReclaimTests(unittest.TestCase):
             self.assertEqual(store._lock_owner(path), 'second')
 
 
+class InterProcessLockDeletePendingTests(unittest.TestCase):
+    def _refuse_once(self):
+        real_open = os.open
+        calls = []
+
+        def fake_open(path, flags, *args):
+            calls.append(path)
+            if len(calls) == 1:
+                raise PermissionError(13, 'Access is denied', str(path))
+            return real_open(path, flags, *args)
+        return fake_open, calls
+
+    def test_windows_delete_pending_lock_file_is_contention(self):
+        # Windows refuses to create a released lock file while a contender
+        # still has it open; 16 parallel Cursor starts lost their catalog to it.
+        from puppetmaster import interprocess_lock
+        with TemporaryDirectory() as tmp:
+            fake_open, calls = self._refuse_once()
+            with patch.object(interprocess_lock, '_WINDOWS', True), \
+                    patch.object(interprocess_lock.os, 'open', fake_open):
+                with interprocess_lock.InterProcessFileLock.for_target(Path(tmp) / 'cache.json', timeout=5):
+                    pass
+            self.assertEqual(len(calls), 2)
+
+    def test_posix_permission_error_still_raises(self):
+        from puppetmaster import interprocess_lock
+        with TemporaryDirectory() as tmp:
+            fake_open, _calls = self._refuse_once()
+            with patch.object(interprocess_lock, '_WINDOWS', False), \
+                    patch.object(interprocess_lock.os, 'open', fake_open):
+                with self.assertRaises(PermissionError):
+                    with interprocess_lock.InterProcessFileLock.for_target(Path(tmp) / 'cache.json'):
+                        pass
+
+
 if __name__ == '__main__':
     unittest.main()
