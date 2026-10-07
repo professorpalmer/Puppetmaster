@@ -397,15 +397,47 @@ def _gate_write_scope(
             out_of_scope.append(path)
     concurrent_fields = {"concurrent_changes": concurrent} if concurrent else {}
     if out_of_scope:
+        reason, detail = _out_of_scope_reason(out_of_scope, references)
         return GateResult(
-            name, "write_scope", False,
-            f"wrote {len(out_of_scope)} file(s) outside declared scope",
-            {"out_of_scope": out_of_scope, "scope": scope, **concurrent_fields},
+            name, "write_scope", False, reason,
+            {"out_of_scope": out_of_scope, "scope": scope, **detail, **concurrent_fields},
         )
     return GateResult(
         name, "write_scope", True, "all writes within declared scope",
         {"scope": scope, "changed_files": sorted(changed), **concurrent_fields},
     )
+
+
+def _out_of_scope_reason(
+    out_of_scope: list[str], references: Optional["WorkerReferences"],
+) -> tuple[str, dict]:
+    """Say where the stray writes are and whether this worker named them.
+
+    A path the worker's own events never named is a generated output (a
+    render, a report) or another writer's file in a shared checkout; the fix
+    is to declare its directory in the unit's files, gitignore it, or give
+    shared outputs one owner. A named path is the worker's own stray edit.
+    """
+    from collections import Counter
+
+    from puppetmaster.worker_attribution import path_is_referenced
+
+    dirs = Counter("/".join(path.split("/")[:2]) if "/" in path else path for path in out_of_scope)
+    where = ", ".join(f"{d} ({n})" for d, n in dirs.most_common(3))
+    if len(dirs) > 3:
+        where += f", {len(dirs) - 3} more"
+    reason = f"wrote {len(out_of_scope)} file(s) outside declared scope: {where}"
+    detail: dict = {"out_of_scope_dirs": dict(dirs)}
+    if references is not None:
+        unnamed = [path for path in out_of_scope if not path_is_referenced(path, references)]
+        detail["out_of_scope_unnamed"] = len(unnamed)
+        if unnamed:
+            reason += (
+                f"; {len(unnamed)} never named by this worker's own events: generated outputs "
+                "(declare their directory in the unit's files, or gitignore them) or another "
+                "writer's files (give shared outputs one owner)"
+            )
+    return reason, detail
 
 
 def _worker_attribution(

@@ -1,3 +1,21 @@
+## v1.33.3 — 2026-10-07
+
+**A unit's generated outputs belong in its declared files.** Flow map items
+share one checkout, so a write_scope gate charges a worker for every new file
+that appears during its window and that no peer declared. Renders or reports
+that a unit's own check writes, if undeclared, failed the gate of whichever
+worker saw them, even though that worker never wrote them. The flow tool
+description, installed rules and `docs/FLOWS.md` now say to declare each
+unit's output directory as a glob (`renders/{{item.id}}/*`), keep those
+directories disjoint, and give shared assembly outputs to one integrate agent
+after the map. Gitignored outputs are never judged.
+
+The gate failure now says where and whether: `wrote 6 file(s) outside
+declared scope: renders/region_000 (2), renders/region_003 (2),
+renders/integrated (1), 1 more; 5 never named by this worker's own events`,
+with `out_of_scope_dirs` and `out_of_scope_unnamed` in the gate detail.
+Enforcement is unchanged.
+
 ## v1.33.2 — 2026-10-07
 
 **Parallel Cursor SDK workers share one model catalog.** The Cursor SDK
