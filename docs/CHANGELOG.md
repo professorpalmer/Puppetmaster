@@ -1,4 +1,4 @@
-## Unreleased
+## v1.33.1 — 2026-10-07
 
 **Parallel Codex workers no longer break the worker home's builtin skills.**
 From Codex's N16 canary: stock Codex reinstalls its builtin skill bundle
