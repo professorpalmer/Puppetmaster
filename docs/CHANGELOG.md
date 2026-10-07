@@ -1,4 +1,4 @@
-## Unreleased
+## v1.33.0 — 2026-10-07
 
 **Operators can set the worker effort.** From Codex's fixed-profile
 experiments: an unpinned worker always requested `medium`, so a benchmark
@@ -3258,7 +3258,7 @@ forward reliability fix for the detach handshake only.
 - Kill switch: `PUPPETMASTER_TOOL_BATCH_PARALLEL=0`.
 # Changelog
 
-## Unreleased
+## v1.33.0 — 2026-10-07
 
 ## v1.19.6
 
