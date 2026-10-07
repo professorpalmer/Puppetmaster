@@ -686,6 +686,17 @@ class ClaudeCodeResumeTests(unittest.TestCase):
             payload={"cwd": str(Path.cwd()), "allow_dirty": True, **payload},
         )
 
+    def test_only_a_resumed_run_reports_session_cumulative_cost(self) -> None:
+        from puppetmaster.adapters._base import CliInvocation
+
+        for resumed in (False, True):
+            with self.subTest(resumed=resumed), patch(
+                    "puppetmaster.adapters._base.facade",
+                    return_value=lambda **kw: StreamedProcess(0, CLAUDE_RESULT, "")):
+                prepared = CliInvocation(command=["claude"], sidecar_name="x", extras={"resumed": resumed})
+                result = ClaudeCodeAdapter()._invoke_cli(self._task(), prepared, Path.cwd(), 5)
+            self.assertIs(result.session_cumulative_cost, resumed)
+
     def test_command_adds_resume_and_fork_only_when_given(self) -> None:
         fresh = build_claude_code_command(executable="claude", permission_mode="acceptEdits")
         self.assertNotIn("--resume", fresh)

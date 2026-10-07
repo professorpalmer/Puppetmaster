@@ -1,3 +1,28 @@
+## Unreleased
+
+**A resumed Claude Code run is not charged the whole session's cost.** Claude
+Code's `total_cost_usd` is the session's cost to date, including on
+`--resume --fork-session`. Live check: three resumes reported $0.0613, then
+$0.0670, then $0.0725, each the previous total plus that call's own $0.0055.
+Its usage counts are the invocation's own. The usage ledger recorded that
+total as a resumed attempt's cost, the Claude counterpart of the Codex resume
+fix in 1.32.4. A resumed Claude Code attempt now records its own tokens with
+the cost unknown, priced from those tokens like any unpriced attempt.
+
+**Claude Code, Cursor and Antigravity failures are classified from
+diagnostics, not the worker's transcript.** As with Codex in 1.32.5, these
+adapters classified stderr plus their whole JSON stdout, which is the
+worker's own output. A failed worker that discussed a 401 handler, rate
+limits or network timeouts could read as logged out, rate limited or
+offline, and auto-routed work then fell back to another model. A shared
+`json_output_diagnostic` keeps non-JSON lines and each adapter's error
+fields only:
+- Claude: error results and `error` codes;
+- Cursor: status, errors, and the result only on `status: error`;
+- Antigravity: `error` and `status`.
+
+Hermes still classifies its plain-text stdout, where its real errors appear.
+
 ## v1.33.1 — 2026-10-07
 
 **Parallel Codex workers no longer break the worker home's builtin skills.**

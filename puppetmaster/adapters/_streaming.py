@@ -213,6 +213,9 @@ class StreamedProcess:
     # This attempt's own token usage when the adapter can separate it from a
     # session-cumulative counter (see adapters/codex_rollout.py).
     attempt_usage: Optional[dict] = None
+    # The process reported a session-to-date cost, not this attempt's (a
+    # resumed Claude Code run's ``total_cost_usd``); its token counts are its own.
+    session_cumulative_cost: bool = False
 
 
 def _kill_process_tree(process: "subprocess.Popen", started_new_session: bool) -> None:

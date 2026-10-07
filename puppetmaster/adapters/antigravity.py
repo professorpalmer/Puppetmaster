@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Mapping, Optional, Union
 
-from puppetmaster.failure import classify_antigravity_failure
+from puppetmaster.failure import antigravity_diagnosis, classify_antigravity_failure, json_output_diagnostic
 from puppetmaster.models import Artifact, ArtifactType, Task
 from puppetmaster.swarm_reasoning import DEFAULT_SWARM_REASONING_EFFORT
 
@@ -299,7 +299,7 @@ class AntigravityAdapter(CliWorkerAdapter):
         process_failed = completed.returncode != 0 or agy_status == "ERROR"
         classified_failure = None
         if process_failed:
-            combined_err = f"{completed.stderr}\n{completed.stdout}\n{agy_error}"
+            combined_err = "\n".join((completed.stderr, json_output_diagnostic(completed.stdout, antigravity_diagnosis), agy_error))
             classified_failure = classify_antigravity_failure(combined_err)
 
         stdout_capture = capture_subprocess_stdout(
