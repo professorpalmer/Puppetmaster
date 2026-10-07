@@ -96,6 +96,31 @@ class AttemptUsageTests(RolloutFixture):
         self.assertEqual(found["rollout_request_count"], 2)
         self.assertEqual(found["usage"]["input_tokens"], 2200)
 
+    def test_conflicting_replay_is_disputed_in_either_order(self) -> None:
+        first, changed = _usage(1200, 1000, 60, 20), _usage(1300, 1000, 60, 25)
+        found = []
+        for order in ((first, changed), (changed, first)):
+            self.path.unlink(missing_ok=True)
+            self.write(_started("t1"), _record("t1", "r1", _usage(1000, 800, 50, 10)),
+                       *(_record("t1", "r2", usage) for usage in order))
+            found.append(codex_rollout.attempt_usage(self.path, frozenset()))
+        self.assertEqual(found[0], found[1])
+        usage = found[0]["usage"]
+        self.assertIsNone(usage["input_tokens"])
+        self.assertIsNone(usage["reasoning_output_tokens"])
+        self.assertEqual((usage["cached_input_tokens"], usage["output_tokens"]), (1800, 110))
+        self.assertEqual(found[0]["usage_disputed_fields"], ["input_tokens", "reasoning_output_tokens"])
+        self.assertIn("response_id_replay_conflict", found[0]["usage_conflicts"])
+        self.assertEqual(found[0]["rollout_request_count"], 2)
+
+    def test_same_response_id_in_another_turn_is_not_attempt_local(self) -> None:
+        self.write(*COLD, _started("t2"), _record("t2", "r2", _usage(1200, 1000, 60, 20)),
+                   _record("t2", "r9", _usage(10, 0, 1)))
+        found = codex_rollout.attempt_usage(self.path, frozenset({"t1"}))
+        self.assertEqual(set(found["usage"].values()), {None})
+        self.assertIn("response_id_in_other_turn", found["usage_conflicts"])
+        self.assertEqual(found["usage_disputed_fields"], sorted(codex_rollout.FIELDS))
+
     def test_unknown_counter_stays_null_and_partial(self) -> None:
         missing = _usage(500, 100, 20)
         del missing["reasoning_output_tokens"]
@@ -147,6 +172,18 @@ class LedgerTests(unittest.TestCase):
         (row,) = self._observed(codex_rollout.unlinked("rollout_missing"))
         self.assertFalse(row["final"])
         self.assertEqual(set(row["data"].values()), {None})
+
+    def test_quality_flags_reach_the_ledger_row(self) -> None:
+        attempt = {"usage_scope": "attempt", "usage_provenance": "rollout_token_usage_records",
+                   "usage": _usage(100, 300, 5), "usage_partial_fields": ["reasoning_output_tokens"],
+                   "usage_disputed_fields": ["input_tokens"],
+                   "usage_conflicts": ["response_id_replay_conflict", "cached_exceeds_input"]}
+        (row,) = self._observed(attempt)
+        self.assertEqual(set(row["quality"]), {
+            "partial:reasoning_output_tokens", "disputed:input_tokens",
+            "conflict:response_id_replay_conflict", "conflict:cached_exceeds_input"})
+        (row,) = self._observed(codex_rollout.unlinked("rollout_missing"))
+        self.assertIn("unlinked:rollout_missing", row["quality"])
 
     def test_attempt_usage_suppresses_cumulative_stdout_usage(self) -> None:
         stdout = json.dumps({"type": "turn.completed", "usage": _usage(9000, 8000, 300)})

@@ -2875,7 +2875,7 @@ class SwarmStore(StoreContracts):
                     if canonical_record(existing) != canonical_record(record):
                         raise LedgerConflictError("ledger key already has different content")
                     return False
-                self.write_json(path, record)
+                self.write_json(path, json.loads(canonical_record(record)))
                 return True
             finally:
                 self.release_lock(name, owner=owner)

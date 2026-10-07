@@ -94,6 +94,21 @@ def usage_fields(data):
     ))
 
 
+def usage_quality(accounting):
+    """Ledger quality flags for an adapter's attempt-usage accounting."""
+    flags = []
+    for prefix, key in (("partial", "usage_partial_fields"),
+                        ("disputed", "usage_disputed_fields"),
+                        ("conflict", "usage_conflicts")):
+        values = accounting.get(key)
+        if isinstance(values, (list, tuple)):
+            flags.extend(f"{prefix}:{value}" for value in values if isinstance(value, str) and value)
+    reason = accounting.get("usage_unlinked_reason")
+    if isinstance(reason, str) and reason:
+        flags.append(f"unlinked:{reason}")
+    return tuple(flags)
+
+
 class Invocation:
     def __init__(self, scope, adapter, model):
         self.store, run, task, self.lease_lost = scope
@@ -207,9 +222,10 @@ class Invocation:
         except Exception:
             pass
 
-    def observe(self, data=None, *, key="return", source=None, cost_basis="unknown", final=False):
+    def observe(self, data=None, *, key="return", source=None, cost_basis="unknown", final=False,
+                quality=()):
         try:
-            self._observe(data, key=key, source=source, cost_basis=cost_basis)
+            self._observe(data, key=key, source=source, cost_basis=cost_basis, quality=quality)
             if final:
                 self.authoritative[key] = self.observations[key]
         except Exception as exc:
@@ -218,7 +234,7 @@ class Invocation:
             self.outcome_complete = False
             self._error("consumption.capture_failed", "observe", type(exc).__name__)
 
-    def _observe(self, data, *, key, source, cost_basis):
+    def _observe(self, data, *, key, source, cost_basis, quality=()):
         data = data if isinstance(data, dict) else {}
         cost = next((data[k] for k in ("real_cost_usd", "cost_usd", "cost", "total_cost_usd")
                      if type(data.get(k)) in (int, float) and
@@ -238,6 +254,7 @@ class Invocation:
             cost_state=("unknown" if cost is None else
                         "estimated" if basis == "api_equivalent" or data.get("cost_state") == "estimated"
                         else "measured"),
+            quality=tuple(quality),
         )
         previous = self.observations.setdefault(key, observation)
         if previous != observation:
@@ -274,7 +291,7 @@ class Invocation:
                 "cache_write_tokens": counts.get("cache_write_input_tokens"),
                 "output_tokens": counts.get("output_tokens"),
             }, key="codex:rollout", source=attempt_usage.get("usage_provenance"),
-                final=linked, cost_basis=(
+                final=linked, quality=usage_quality(attempt_usage), cost_basis=(
                 "api_equivalent" if self.billing == "plan" else
                 "api" if self.billing == "api" else "unknown"))
         if not isinstance(stdout, str):

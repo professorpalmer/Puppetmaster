@@ -503,6 +503,8 @@ export interface ProcessOutcomeObservation {
   readonly cost_basis: "unknown" | "api" | "plan_marginal" | "api_equivalent";
   readonly returncode?: number | null;
   readonly timed_out?: boolean | null;
+  /** Source data-quality flags (partial:/disputed:/conflict:/unlinked:); absent when none. */
+  readonly quality?: readonly string[];
 }
 
 export interface AttemptConsumptionReport {
@@ -563,6 +565,7 @@ export interface ObservationFacts {
   readonly cost_basis: "unknown" | "api" | "plan_marginal" | "api_equivalent";
   readonly returncode: number | null;
   readonly timed_out: boolean | null;
+  readonly quality?: readonly string[];
 }
 
 export type HistoricalRef = {

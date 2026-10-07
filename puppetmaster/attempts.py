@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import asdict, dataclass
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 
 from puppetmaster.models import AgentRun
 
@@ -78,11 +78,20 @@ class UsageObservation:
     cost_basis: str = "unknown"
     returncode: Optional[int] = None
     timed_out: Optional[bool] = None
+    # Source data-quality flags (``partial:<field>``, ``disputed:<field>``,
+    # ``conflict:<name>``): the counters are what the source reported, these
+    # say which of them a valuation must not trust.
+    quality: Tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for value in (self.job_id, self.attempt_id, self.observation_id,
                       self.source, self.observed_at):
             _identity(value)
+        if not isinstance(self.quality, (list, tuple)):
+            raise ValueError("quality must be a sequence of flags")
+        for flag in self.quality:
+            _identity(flag)
+        object.__setattr__(self, "quality", tuple(sorted(set(self.quality))))
         if self.returncode is not None and (type(self.returncode) is not int or not -(2**63) <= self.returncode < 2**63):
             raise ValueError("returncode must be an integer or None")
         if self.timed_out is not None and type(self.timed_out) is not bool:
@@ -113,6 +122,13 @@ class UsageObservation:
 
 
 def canonical_record(record: Union[ExecutionAttempt, UsageObservation]) -> str:
-    """Stable sorted JSON, explicit nulls, no nonfinite numbers; no redaction loss."""
-    return json.dumps(asdict(record), sort_keys=True, separators=(",", ":"),
+    """Stable sorted JSON, explicit nulls, no nonfinite numbers; no redaction loss.
+
+    An empty ``quality`` is omitted so unflagged records stay readable by
+    releases that predate the field.
+    """
+    data = asdict(record)
+    if not data.get("quality", True):
+        del data["quality"]
+    return json.dumps(data, sort_keys=True, separators=(",", ":"),
                       ensure_ascii=True, allow_nan=False)
