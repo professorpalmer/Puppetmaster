@@ -74,6 +74,20 @@ class BudgetAdmissionError(ValueError):
     """A configured cap is exhausted or its liability is indeterminate."""
 
 
+class BudgetBusy(RuntimeError):
+    """Another writer holds the job's budget lock; trying again later can succeed."""
+
+
+class BudgetUnsettled(BudgetAdmissionError):
+    """Indeterminate only because an earlier attempt has not settled yet.
+
+    It can clear without any change to the policy: when the earlier attempt
+    reports, the total becomes known. A caller may wait and try again. An
+    unknown allowance of the attempt itself, or a settled unknown, is a plain
+    ``BudgetAdmissionError``: no wait can make that total known.
+    """
+
+
 def budget_totals(records):
     """Separate complete totals from known subtotals; unknown is never zero."""
     liabilities = []
@@ -125,10 +139,16 @@ def check_admission(policy, records):
             continue
         value = totals[metric] if metric == "attempts" else totals[metric]["total"]
         if value is None:
+            settled = [record for record in records if record["state"] != "pending_reconciliation"]
+            unsettled_only = budget_totals(settled)[metric]["total"] is not None
+            if unsettled_only:
+                raise BudgetUnsettled(
+                    f"{cap}: indeterminate: an earlier attempt of this job has no settled {metric} "
+                    "(it runs now, or it ended without a final report). Under this cap, the job "
+                    "admits a new attempt only after each earlier attempt settles")
             raise BudgetAdmissionError(
-                f"{cap}: indeterminate: an earlier attempt of this job has no settled {metric} "
-                "(it runs now, or it ended without a final report). Under this cap, the job "
-                "admits a new attempt only after each earlier attempt settles")
+                f"{cap}: indeterminate: an attempt of this job has no bounded {metric} (no "
+                "allowance, or it settled without a report), so the total can never be known")
         if value > limit:
             raise BudgetAdmissionError(
                 f"{cap}: exhausted: this attempt brings the total to {value:g}, above the cap of {limit:g}")
@@ -263,14 +283,15 @@ def budget_cli_flags(policy: Optional[BudgetPolicy]) -> list[str]:
 
 
 # A pilot read the elapsed cap as a wall deadline and set 240 s for four
-# parallel 180 s workers; three were refused. Say what the cap adds up.
+# parallel 180 s workers. Say what the cap adds up.
 _SCHEMA_NOTES = {
     "max_elapsed_seconds": (
         " It adds up worker-seconds over all attempts, not wall time: four "
         "parallel 180 s workers need 720. Each attempt reserves its "
         "timeout_seconds. While an earlier attempt has no settled elapsed time, "
-        "a new attempt is refused (it fails, it does not wait), so under this "
-        "cap the job runs its attempts one at a time."
+        "a new attempt waits for it (payload.budget_admission_wait_seconds, "
+        "default 900), so under this cap the job runs its attempts one at a "
+        "time. An exhausted cap fails at once."
     ),
 }
 

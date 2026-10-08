@@ -10,10 +10,23 @@ through the shared invocation boundary before dispatching external work.
 `max_tokens_out`, `max_attempts`, and `max_elapsed_seconds`. Seconds mean summed
 invocation elapsed time, not wall time since job creation. Four parallel workers
 with `timeout_seconds` 180 thus need a cap of 720, not 180 or 240. While an
-earlier attempt has no settled elapsed time, the job total is indeterminate. A
-new attempt is then refused (the task fails, it does not wait), so a job under
-this cap runs its attempts one at a time. Use a wall-clock timeout per worker,
-not this cap, to bound how long parallel work takes. Token counts are the
+earlier attempt has no settled elapsed time, the job total is indeterminate.
+
+Admission has three outcomes:
+
+| Case | Error | Result |
+| --- | --- | --- |
+| The total is known and within each cap | none | The attempt is admitted. |
+| Only earlier attempts that have not settled make a total unknown | `BudgetUnsettled` | The attempt waits and tries again each second. It fails after `payload.budget_admission_wait_seconds` (default 900), on a lost lease, or on a cut. |
+| A cap is exhausted, or an unknown can never settle (no allowance, or a settled unknown) | `BudgetAdmissionError` | The attempt fails at once. |
+
+Thus a job under this cap runs its attempts one at a time, and its parallel
+workers queue instead of failing. A wait holds no lock: each try takes the
+dispatch lock, and reserve, adopt and the pending mark stay one atomic step,
+so a sibling never counts a reservation beside an unsettled attempt. A child
+enqueue is not refused for an unsettled sibling, because its dispatch waits.
+Use a wall-clock timeout per worker, not this cap, to bound how long parallel
+work takes. Token counts are the
 invocation's input/output counts; cache counters are not added again. All limits
 are optional, finite and nonnegative. An empty policy imposes no caps. Configure
 a policy before dispatch; changing policy through ordinary job writes is not a

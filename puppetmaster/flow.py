@@ -427,12 +427,16 @@ class NodeOutcome:
     items: Optional[dict] = None
     # Durable worker logs that explain a failed launch (startup tracebacks).
     logs: list[str] = field(default_factory=list)
+    # A judge's view of the files it reviewed: digest, count and per-file hashes.
+    reviewed: Optional[dict] = None
 
     def brief(self) -> dict:
         brief = {"ok": self.ok, "verdict": self.verdict, "reason": self.reason,
                  "error": self.error, "files": self.files, "task_id": self.task_id}
         if self.logs:
             brief["logs"] = self.logs
+        if self.reviewed:
+            brief["reviewed"] = self.reviewed
         return brief
 
 
@@ -966,6 +970,8 @@ def _walk(state_dir: Path, run: FlowRun, execute: NodeExecutor) -> FlowRun:
         if kind == "end":
             status = node.get("status", "pass")
             failed = [] if "status" in node else _failed_work(run)
+            if status == "pass" and not failed:
+                failed = _stale_reviews(run)
             if failed:
                 # An unconditional edge carried a failed node to an implicit
                 # end; reporting that run as a pass woke the pilot with
@@ -1496,6 +1502,9 @@ class JobNodeExecutor:
         todo = [(key, node) for key, node in members
                 if not (done.get(key) or {}).get("ok") and (done.get(key) or {}).get("attempt") != attempt]
         if todo:
+            review = None
+            if any(node["kind"] == "judge" for _, node in todo):
+                review = self._prepare_review(run, prev)
             specs = [self._spec(key, node, run, prev, visit) for key, node in todo]
             launch_key = f"flow:{run.run_id}:{run.current}:{visit}:{attempt}"
             goal = specs[0].instruction if len(specs) == 1 else (run.input or specs[0].instruction)
@@ -1523,6 +1532,8 @@ class JobNodeExecutor:
                 if combine and node["kind"] == "judge" and outcome.ok and outcome.verdict is None:
                     outcome.verdict = "PARTIAL"  # a judge branch without a verdict never counts as a pass
                     outcome.reason = outcome.reason or "judge gave no verdict"
+                if review is not None and node["kind"] == "judge":
+                    _bind_review(outcome, review, run.graph["cwd"])
                 done[key] = {**outcome.brief(), "output": outcome.output[-_OUTPUT_CHARS:],
                              "usage": outcome.usage, "job_id": job_id, "attempt": attempt}
                 if combine:
@@ -1536,7 +1547,7 @@ class JobNodeExecutor:
                                verdict=branch.get("verdict"), reason=branch.get("reason") or "",
                                error=branch.get("error"), files=branch.get("files") or [],
                                job_ids=jobs, usage=branch.get("usage") or {}, task_id=branch.get("task_id"),
-                               logs=branch.get("logs") or [])
+                               logs=branch.get("logs") or [], reviewed=branch.get("reviewed"))
         branches = [done[key] for key, _ in members]
         oks = [bool(branch.get("ok")) for branch in branches]
         transport = any(not branch.get("ok") and branch.get("verdict") is None for branch in branches)
@@ -1664,6 +1675,37 @@ class JobNodeExecutor:
         context = f"\n\nContext from the previous step:\n{prev}" if prev and prev != run.input else ""
         return ("\n\n".join(parts) + f"{context}\n\nYour earlier work in this session is on "
                 f"disk. Do the work above, rerun the checks, and finish.\n\n{_BUILD_VERDICT}")
+
+    def _prepare_review(self, run: FlowRun, prev: str) -> Optional[dict]:
+        """Wait until no live writer overlaps the reviewed files, then snapshot them.
+
+        A judge that reviews while another worker still writes its files can
+        pass a source that changes right after (Codex benchmark: four PASS
+        votes, then a stop-missed repair worker edited the helper). The wait
+        is bounded by ``defaults.review_wait_seconds`` (900 s) and a stop.
+        Returns None when no code node of the run declares ``files``.
+        """
+        scope = _review_scope(run, prev)
+        if not scope:
+            return None
+        cwd = run.graph["cwd"]
+        defaults = run.graph.get("defaults") or {}
+        deadline = time.monotonic() + float(defaults.get("review_wait_seconds", DEFAULT_REVIEW_WAIT_SECONDS))
+        waited_for: list = []
+        while True:
+            holders = _live_writers(cwd, scope)
+            if not holders or time.monotonic() >= deadline or _interruption(self.state_dir, run):
+                break
+            if not waited_for:
+                waited_for = [{"path": path, "owner": owner} for path, owner in holders[:5]]
+                run.inflight["review_waits_for"] = waited_for
+                save_run(self.state_dir, run)
+            time.sleep(self.poll_seconds)
+        state = _source_state(cwd, scope)
+        state["scope"] = scope
+        if holders:
+            state["writers_still_live"] = [{"path": path, "owner": owner} for path, owner in holders[:5]]
+        return state
 
     def _launch(self, run: FlowRun, specs: list, launch_key: str, goal: str):
         from puppetmaster.orchestrator import Orchestrator
@@ -2149,6 +2191,111 @@ def _child_graph_shape(node: dict) -> Any:
 
 
 _WORK_KINDS = ("agent", "judge", "parallel", "map", "shell")
+
+
+DEFAULT_REVIEW_WAIT_SECONDS = 900.0
+_REVIEW_FILE_LIMIT = 200
+_GLOB_CHARS = set("*?[")
+
+
+def _review_scope(run: FlowRun, prev: str) -> list[str]:
+    """The files a judge of this run reviews: what its code nodes may write."""
+    scope: set[str] = set()
+    for node in run.graph.get("nodes") or []:
+        if node.get("kind") != "agent" or node.get("role") == "explore" or not node.get("files"):
+            continue
+        files = render_value(node["files"], run, prev)
+        if isinstance(files, str):
+            files = [line.strip() for line in files.splitlines() if line.strip()]
+        scope.update(str(path) for path in files or [])
+    return sorted(scope)
+
+
+def _scope_roots(scope: list[str]) -> list[str]:
+    """Claim keys for scope entries: a glob stands for its directory prefix."""
+    roots = []
+    for entry in scope:
+        parts = []
+        for part in Path(entry).parts:
+            if _GLOB_CHARS & set(part):
+                break
+            parts.append(part)
+        roots.append(str(Path(*parts)) if parts else ".")
+    return sorted(set(roots))
+
+
+def _live_writers(cwd: str, scope: list[str]) -> list[tuple[str, str]]:
+    try:
+        from puppetmaster.file_claims import FileClaimRegistry, default_file_claim_db_path
+
+        return FileClaimRegistry(default_file_claim_db_path()).live_writers(cwd, _scope_roots(scope))
+    except Exception:
+        return []  # no claim registry here: nothing to wait for
+
+
+def _source_state(cwd: str, scope: list[str]) -> dict:
+    """Digest of the files that match ``scope``; per-file hashes when there are few."""
+    import hashlib
+
+    root = Path(cwd)
+    found: set[Path] = set()
+    for entry in scope:
+        if _GLOB_CHARS & set(entry):
+            found.update(path for path in root.glob(entry) if path.is_file())
+            continue
+        path = root / entry
+        if path.is_file():
+            found.add(path)
+        elif path.is_dir():
+            found.update(item for item in path.rglob("*") if item.is_file())
+    hashes = {}
+    for path in sorted(found):
+        try:
+            hashes[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+        except OSError:
+            hashes[path.relative_to(root).as_posix()] = "unreadable"
+    digest = hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest()[:16]
+    state: dict[str, Any] = {"digest": digest, "count": len(hashes)}
+    if len(hashes) <= _REVIEW_FILE_LIMIT:
+        state["hashes"] = hashes
+    return state
+
+
+def _changed_paths(before: dict, after: dict) -> list[str]:
+    old, new = before.get("hashes"), after.get("hashes")
+    if old is None or new is None:
+        return ["(too many files to list)"]
+    return sorted(path for path in set(old) | set(new) if old.get(path) != new.get(path))
+
+
+def _bind_review(outcome: NodeOutcome, review: dict, cwd: str) -> None:
+    """Record what the judge reviewed; a PASS on files that changed meanwhile is not a pass."""
+    after = _source_state(cwd, review["scope"])
+    after["scope"] = review["scope"]
+    if outcome.verdict == "PASS" and after["digest"] != review["digest"]:
+        changed = _changed_paths(review, after)
+        outcome.verdict = "PARTIAL"
+        outcome.reason = ("the reviewed files changed during the review, review again: "
+                          + ", ".join(changed[:10]))
+    elif outcome.verdict == "PASS" and review.get("writers_still_live"):
+        outcome.verdict = "PARTIAL"
+        outcome.reason = ("a writer still held the reviewed files when the review started: "
+                          + ", ".join(w["owner"] for w in review["writers_still_live"]))
+    outcome.reviewed = after
+
+
+def _stale_reviews(run: FlowRun) -> list[str]:
+    """PASS votes whose reviewed files changed before the run ended."""
+    stale = []
+    for node_id, result in run.results.items():
+        reviewed = result.get("reviewed")
+        if result.get("verdict") != "PASS" or not reviewed:
+            continue
+        now = _source_state(run.graph["cwd"], reviewed["scope"])
+        if now["digest"] != reviewed["digest"]:
+            stale.append(f"{node_id}: stale review, files changed after its PASS: "
+                         + ", ".join(_changed_paths(reviewed, now)[:10]))
+    return stale
 
 
 def _failed_work(run: FlowRun) -> list[str]:

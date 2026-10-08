@@ -1,3 +1,43 @@
+## v1.39.0 — 2026-10-08
+
+**Parallel workers under a job cap queue instead of failing.** Before, an
+attempt failed admission when only an earlier attempt of the same job had not
+reported yet. Four parallel workers under an elapsed cap thus gave one run and
+three failures. Now:
+
+- `BudgetUnsettled` (a `BudgetAdmissionError`) marks the case that can clear:
+  only unsettled earlier attempts make a total unknown. The attempt waits and
+  tries again each second. The wait ends after
+  `payload.budget_admission_wait_seconds` (default 900), on a lost lease, or
+  on a cut.
+- An exhausted cap, or an unknown that can never settle (no allowance, or a
+  settled unknown), still fails at once.
+- Reserve, adopt and the pending mark stay one atomic step under the dispatch
+  lock, so a sibling never counts a reservation beside an unsettled attempt.
+  The cap rules do not change.
+- `BudgetBusy` (a `RuntimeError`) marks a held budget lock on the file store.
+  Two workers that admitted at the same moment could fail with "budget busy";
+  the wait now retries it.
+- A child enqueue is not refused for an unsettled sibling.
+
+**A judge's PASS binds to the files that it reviewed.** In a Codex benchmark,
+four judges passed, and then a repair worker that a stop had missed edited
+the shared helper. When the code nodes of a run declare `files`:
+
+1. A judge waits until no live edit claim of another worker overlaps those
+   files (`defaults.review_wait_seconds`, default 900).
+2. Its result records `reviewed` (digest, count, per-file hashes). A PASS on
+   files that changed during the review becomes PARTIAL, with the paths.
+3. At a passing end, a reviewed file that changed after its PASS ends the run
+   `failed` ("stale review").
+
+Live proof: a judge waited 69 s for a Codex writer that held the checkout,
+started 1 s after the writer released its claim, and recorded the hash of the
+writer's final text.
+
+**Edit-admission renewals are recorded at most each 10 s.** The renewal rate
+does not change.
+
 ## v1.38.0 — 2026-10-08
 
 **A flow stop now reaches a worker that queues for edit admission, and the

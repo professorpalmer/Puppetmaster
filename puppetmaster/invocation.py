@@ -24,6 +24,10 @@ _current = ContextVar("current_invocation", default=None)
 # written after the call returns and still belong to that attempt.
 _settled = ContextVar("settled_invocation", default=None)
 _log = logging.getLogger(__name__)
+# A worker waits this long for unsettled sibling attempts before its budget
+# admission fails, and checks again at this interval.
+DEFAULT_BUDGET_WAIT_SECONDS = 900.0
+BUDGET_WAIT_POLL_SECONDS = 1.0
 
 
 def check_external_dispatch():
@@ -143,6 +147,11 @@ class Invocation:
             values.setdefault("plan_marginal_usd", 0)
             values.setdefault("cost_state", "known")
         allowance = BudgetLiability(**values)
+        self._when_settled(lambda: self._dispatch(allowance))
+
+    def _dispatch(self, allowance):
+        """Reserve, adopt and mark pending under one lock: a sibling sees this
+        attempt as unsettled, never as a reservation it can count beside."""
         with self.store.budget_dispatch_scope(self.attempt.job_id):
             self.store.reserve_dispatch(self.attempt, allowance)
             if self.lease_lost is not None and self.lease_lost():
@@ -162,6 +171,45 @@ class Invocation:
             if lost_after_adoption:
                 raise BudgetAdmissionError("budget dispatch blocked: worker lease lost")
             self.check_dispatch_lease()
+
+    def _when_settled(self, dispatch):
+        """Run ``dispatch``; wait while only an unsettled earlier attempt blocks it.
+
+        Parallel workers under a cap used to fail when a sibling had not
+        reported yet. Now they queue: each try takes the dispatch lock, and
+        the wait between tries does not. An exhausted cap, or an unknown that
+        can never settle, still fails at once. The wait ends at
+        ``payload.budget_admission_wait_seconds`` (default 900 s), on a lost
+        lease, or on a cut.
+        """
+        from puppetmaster.budget import BudgetBusy, BudgetUnsettled
+        from puppetmaster.cancellation import check_cancellation
+
+        payload = self.task.payload or {}
+        limit = float(payload.get("budget_admission_wait_seconds", DEFAULT_BUDGET_WAIT_SECONDS))
+        started = time.monotonic()
+        reported = None
+        while True:
+            try:
+                dispatch()
+                return
+            except (BudgetUnsettled, BudgetBusy) as exc:
+                # A busy lock is a sibling admitting or settling right now.
+                waited = time.monotonic() - started
+                if waited >= limit:
+                    raise type(exc)(f"{exc} (waited {waited:.0f}s)") from exc
+                if reported is None or time.monotonic() - reported >= 10:
+                    reported = time.monotonic()
+                    try:
+                        self.store.emit(self.attempt.job_id, "budget_admission.waiting", {
+                            "task_id": self.task.id, "attempt_id": self.attempt.attempt_id,
+                            "waited_seconds": round(waited, 1), "reason": str(exc)})
+                    except Exception:
+                        pass
+            check_cancellation()
+            if self.lease_lost is not None and self.lease_lost():
+                raise BudgetAdmissionError("budget dispatch blocked: worker lease lost")
+            time.sleep(BUDGET_WAIT_POLL_SECONDS)
 
     def check_dispatch_lease(self):
         if self.budgeted and self.lease_lost is not None and self.lease_lost():

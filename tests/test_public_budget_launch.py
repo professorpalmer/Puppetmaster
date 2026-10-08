@@ -138,7 +138,11 @@ class PublicBudgetLaunchTests(unittest.TestCase):
             task = Task(job_id=job_id, role="codex", instruction="retry",
                         adapter="codex", payload=payload)
             store.save_task(task)
-            with self.assertRaises(BudgetAdmissionError), \
+            # The second attempt waits for the first to settle; it never does
+            # here, so the wait ends and admission still fails closed.
+            with self.assertRaisesRegex(BudgetAdmissionError, "waited"), \
+                    patch("puppetmaster.invocation.DEFAULT_BUDGET_WAIT_SECONDS", 0.2), \
+                    patch("puppetmaster.invocation.BUDGET_WAIT_POLL_SECONDS", 0.05), \
                     execution_scope(store, SimpleNamespace(id="run-2"), task):
                 with invocation():
                     self.fail("pending unknown liability admitted a second invocation")
