@@ -1,3 +1,27 @@
+## v1.34.0 — 2026-10-08
+
+**The pilot can claim the shared files that it writes during a flow run.**
+Codex found this in a canary on 1.33.3. The pilot created
+`preview_world.py` after the disjoint region workers launched. The shared
+tree showed the new file in the delta of each worker that ran at that time.
+It was not in any declared scope and was not dirty before the run, so the
+write_scope gate failed the workers. The tree cannot show who wrote a file,
+and a script that a worker runs also writes files that the worker never
+names. Thus the gate cannot exempt every new file that the worker did not
+name.
+
+- A new flow action, `claim` (`puppetmaster flow claim <run_id> <paths...>`,
+  or MCP `action: "claim"` with `paths`), records the pilot's own paths or
+  globs. A claim holds for the full run, including its map items.
+- A worker gate does not charge a claimed path that the worker's own events
+  never named, and lists it under `pilot_claimed`. A claimed path that the
+  worker named still fails. A new file that nobody claimed or declared
+  still fails.
+- A Puppetmaster worker process cannot make a claim.
+- The flow tool description, the installed rules, and `docs/FLOWS.md` tell
+  the pilot to claim a file before it writes in the checkout of a running
+  flow.
+
 ## v1.33.6 — 2026-10-07
 
 An audit checked each fix from 1.32.3 to 1.33.5 against all nine adapters.

@@ -4882,7 +4882,15 @@ def flow_schema() -> JsonObject:
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["validate", "save", "run", "status", "wait", "resume", "stop", "cut", "list"],
+                "enum": ["validate", "save", "run", "status", "wait", "resume", "stop", "cut", "list",
+                         "claim"],
+                "description": (
+                    "claim (with run_id and paths): before you write a shared file in the checkout "
+                    "of a running flow (a preview, a combined scene), claim its path or glob. A "
+                    "worker's write_scope gate then does not charge it for that file unless the "
+                    "worker named the file itself. An unclaimed new file fails the gate of each "
+                    "worker that saw it."
+                ),
             },
             "graph": {
                 "description": (
@@ -4926,6 +4934,8 @@ def flow_schema() -> JsonObject:
             "since": {"type": "integer", "minimum": 0, "description": "Only steps after this index."},
             "timeout_seconds": {"type": "number", "minimum": 0},
             "reason": {"type": "string", "description": "With action=cut."},
+            "paths": {"type": "array", "items": {"type": "string"},
+                      "description": "With action=claim: paths or globs relative to the checkout."},
             "limit": {"type": "integer", "minimum": 1},
             "cwd": {"type": "string", "description": "Workspace the graph runs in and whose state holds the run."},
             "state_dir": {"type": "string"},
