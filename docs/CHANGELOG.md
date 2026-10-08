@@ -1,3 +1,34 @@
+## v1.35.0 — 2026-10-08
+
+**The Puppetmaster hooks claim the pilot's file edits during a flow.** In
+1.34.0, the pilot had to call `claim` before it wrote a shared file. Codex
+saw the same failure again in a second canary, with three files from the
+pilot. A rule cannot make a pilot remember each claim. Now the host does it.
+
+- A new claim hook (`python -m puppetmaster.claim_hook`) runs after each file
+  edit by the pilot:
+  - Claude Code: `PostToolUse` on `Write|Edit|MultiEdit|NotebookEdit`.
+  - Codex: `PostToolUse` on `apply_patch`. The hook reads the file headers
+    of the patch.
+  - Cursor: `afterFileEdit`.
+- `puppetmaster install-hooks` adds the hook for each host. Codex runs a new
+  hook only after you review it once.
+- A flow walker writes a small entry for each top run that it walks
+  (`walking-flows/` under the app state root) and removes it when the walk
+  ends. The hook finds the walking runs over the edited file with one
+  directory listing, and claims the path relative to the checkout root.
+- The hook does nothing when no flow walks. It does nothing in a
+  Puppetmaster worker (`PUPPETMASTER_WORKER=1`), so a worker's writes stay
+  visible to its gate. It never fails the host and writes nothing to stdout.
+- Cost: about 40 ms per pilot edit with no walk, about 65 ms with a walk,
+  and no model call. Workers do no extra work.
+- An edit hook cannot see a file that a shell command writes. The pilot must
+  still claim such a file. The rules and the flow tool description say this.
+
+Proof: real Codex `apply_patch` and real Claude Code `Write` and `Edit`
+calls, with the rendered hooks, claimed their files in a walking run. A
+Claude Code session with `PUPPETMASTER_WORKER=1` claimed nothing.
+
 ## v1.34.0 — 2026-10-08
 
 **The pilot can claim the shared files that it writes during a flow run.**

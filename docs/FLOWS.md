@@ -192,6 +192,22 @@ name the path. If they name it, the worker wrote the file, and the gate
 still fails. A claim covers only the paths and globs that it names. Another
 new file that nobody claimed or declared still fails the gate.
 
+The Puppetmaster hooks make these claims for you. After each file edit by
+the pilot, the claim hook (`python -m puppetmaster.claim_hook`) claims the
+file in each flow that walks over that checkout:
+
+| Host | Hook event | Tools |
+| --- | --- | --- |
+| Claude Code | `PostToolUse` | `Write`, `Edit`, `MultiEdit`, `NotebookEdit` |
+| Codex | `PostToolUse` | `apply_patch` |
+| Cursor | `afterFileEdit` | file edits |
+
+To install the hooks, run `puppetmaster install-hooks` (add `--global` for
+Codex). Codex runs a new hook only after you review it once. The hook does
+nothing when no flow walks, and it does nothing in a Puppetmaster worker. It
+takes about 40 ms per edit and makes no model call. An edit hook cannot see
+a file that a shell command writes. Claim such a file yourself.
+
 ## Follow-ups
 
 ```bash
