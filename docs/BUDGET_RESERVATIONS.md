@@ -8,7 +8,12 @@ through the shared invocation boundary before dispatching external work.
 
 `puppetmaster.budget.BudgetPolicy` supports separate `max_usd`, `max_tokens_in`,
 `max_tokens_out`, `max_attempts`, and `max_elapsed_seconds`. Seconds mean summed
-invocation elapsed time, not wall time since job creation. Token counts are the
+invocation elapsed time, not wall time since job creation. Four parallel workers
+with `timeout_seconds` 180 thus need a cap of 720, not 180 or 240. While an
+earlier attempt has no settled elapsed time, the job total is indeterminate. A
+new attempt is then refused (the task fails, it does not wait), so a job under
+this cap runs its attempts one at a time. Use a wall-clock timeout per worker,
+not this cap, to bound how long parallel work takes. Token counts are the
 invocation's input/output counts; cache counters are not added again. All limits
 are optional, finite and nonnegative. An empty policy imposes no caps. Configure
 a policy before dispatch; changing policy through ordinary job writes is not a

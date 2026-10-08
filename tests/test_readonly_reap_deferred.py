@@ -33,6 +33,18 @@ def _stubborn_transport() -> _Transport:
     transport.process = subprocess.Popen([sys.executable, "-c", _STUBBORN], stdin=subprocess.PIPE,
                                          stdout=subprocess.PIPE, text=True)
     transport.process.stdout.readline()
+    # SIGKILL can land before the post-kill wait(timeout=0) on a fast runner,
+    # and then nothing is deferred. Time out the TERM wait and the KILL wait of
+    # the first close. Later waits are real, so the next sweep reaps for real.
+    real_wait, waits = transport.process.wait, []
+
+    def wait(timeout=None):
+        waits.append(timeout)
+        if len(waits) <= 2:
+            raise subprocess.TimeoutExpired("reader", timeout)
+        return real_wait(timeout=timeout)
+
+    transport.process.wait = wait
     return transport
 
 

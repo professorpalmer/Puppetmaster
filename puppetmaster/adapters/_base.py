@@ -16,6 +16,7 @@ from puppetmaster.redaction import redact_secrets
 from ._facade import facade
 from ._streaming import (
     StreamedProcess,
+    OUTPUT_LIMIT_COUNTED_STREAM,
     _STDOUT_TAIL_CHARS,
     _redacted_tail,
     _resolve_sidecar_state_dir,
@@ -406,6 +407,7 @@ class CliWorkerAdapter(FullEditWorkerAdapter):
                         "failure": "runtime_budget_exceeded",
                         "limit": "max_output_bytes",
                         "max_output_bytes": task.payload.get("max_output_bytes"),
+                        "counted_stream": OUTPUT_LIMIT_COUNTED_STREAM,
                         "returncode": completed.returncode,
                         "stderr": _redacted_tail(completed.stderr, _STDOUT_TAIL_CHARS),
                         "live_log": completed.live_log_path,

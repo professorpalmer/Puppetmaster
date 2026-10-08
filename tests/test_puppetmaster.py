@@ -26050,7 +26050,7 @@ class InvocationGateTests(unittest.TestCase):
         directive = d.directive()
         self.assertIn("puppetmaster_codegraph_search", directive)
         self.assertIn("CodeGraph", directive)
-        self.assertNotIn("fan it out to a swarm", directive)
+        self.assertNotIn("read-only analysis only", directive)
 
     def test_conceptual_question_stays_inline_not_a_lookup(self):
         """A conceptual "what is X" / "what does the flag do" question is NOT a
@@ -26113,7 +26113,7 @@ class InvocationGateTests(unittest.TestCase):
         directive = d.directive()
         self.assertIn("clean checkout", directive)
         self.assertIn("not a", directive.lower())
-        self.assertNotIn("fan it out to a swarm", directive)
+        self.assertNotIn("read-only analysis only", directive)
 
     def test_focused_edit_directive_steers_to_edit_verb(self):
         """A focused edit's directive must point at the lightweight ``edit`` verb
@@ -26125,7 +26125,7 @@ class InvocationGateTests(unittest.TestCase):
         directive = d.directive()
         self.assertIn("puppetmaster_edit", directive)
         self.assertIn("single", directive.lower())
-        self.assertNotIn("fan it out to a swarm", directive)
+        self.assertNotIn("read-only analysis only", directive)
 
     def test_review_directive_uses_configured_reviewer_framing(self):
         """Review routing names the user-selected platform and does not assume Cursor."""
@@ -26134,7 +26134,7 @@ class InvocationGateTests(unittest.TestCase):
         d = should_delegate("audit the auth module for security issues across the repo")
         self.assertEqual(d.suggested_verb, "puppetmaster_start_review")
         self.assertIn("configured default reviewer platform", d.directive())
-        self.assertNotIn("fan it out to a swarm", d.directive())
+        self.assertNotIn("read-only analysis only", d.directive())
 
     def test_trivial_add_comment_stays_inline_despite_broadened_implement(self):
         """Broadening implement detection to include 'add' must not start
@@ -26187,6 +26187,48 @@ class InvocationGateTests(unittest.TestCase):
         self.assertFalse(d.should_delegate)
         self.assertIn("trivial", d.matched_signals)
 
+    def test_explicit_trigger_routes_by_shape_not_swarm_first(self):
+        """An explicit trigger with no specific intent must offer the stock
+        flow path for builds, not a read-only swarm before the build."""
+        from puppetmaster.invocation_gate import should_delegate
+
+        d = should_delegate("Use Puppetmaster for the modular voxel world in this repo.")
+        self.assertEqual(d.capability_score, 100)
+        directive = d.directive()
+        self.assertIn("puppetmaster_flow", directive)
+        self.assertIn("fail edge back to its build", directive)
+        self.assertIn("puppetmaster_start_implement", directive)
+        self.assertIn("read-only analysis only", directive)
+        self.assertNotIn("This warrants a read-only analysis pass", directive)
+
+    def test_repair_task_reaches_a_code_worker(self):
+        """A repair task is a write task. Its directive names a code worker and
+        the flow path for independent units."""
+        from puppetmaster.invocation_gate import should_delegate
+
+        d = should_delegate(
+            "Use Puppetmaster (its MCP tools) for useful parallel work. "
+            "Repair an unfinished modular voxel world."
+        )
+        self.assertEqual(d.role, "implement")
+        directive = d.directive()
+        self.assertIn("puppetmaster_flow", directive)
+        self.assertNotIn("read-only analysis only", directive)
+
+    def test_the_leading_verb_beats_a_stray_word_in_attached_data(self):
+        """The benchmark prompt starts with "Repair"; "plan" appears only in a
+        JSON token 1800 characters later. The earliest match decides."""
+        from puppetmaster.invocation_gate import infer_role_and_verb
+
+        prompt = ("Use Puppetmaster. Repair an unfinished modular voxel world. "
+                  + "Each region has a contract. " * 60
+                  + '{"diagnostic": "guided-plan; not proof"}')
+        self.assertEqual(infer_role_and_verb(prompt)[0], "implement")
+        self.assertEqual(infer_role_and_verb("plan the migration, then build it")[0], "plan")
+        # A security mention anywhere still selects the safety lens.
+        self.assertEqual(infer_role_and_verb("build the login form; check it for vuln")[0],
+                         "security-review")
+
     def test_last_mile_directive_calls_out_uncommitted_work(self):
         """The injected directive for last-mile work must explain that ``edit``
         sees the live tree (uncommitted changes) where ``start_implement`` would
@@ -26197,7 +26239,7 @@ class InvocationGateTests(unittest.TestCase):
         directive = d.directive()
         self.assertIn("puppetmaster_edit", directive)
         self.assertIn("uncommitted", directive.lower())
-        self.assertNotIn("fan it out to a swarm", directive)
+        self.assertNotIn("read-only analysis only", directive)
 
 class HookRunnerTests(unittest.TestCase):
     """Tests for host hook payload → response translation."""

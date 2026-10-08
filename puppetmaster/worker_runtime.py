@@ -286,6 +286,9 @@ class WorkerRuntime:
                                 )
                             ]
                 except EditAdmissionTimeout as exc:
+                    from puppetmaster.edit_admission import EditAdmissionCancelled
+
+                    outcome = "cancelled" if isinstance(exc, EditAdmissionCancelled) else "timeout"
                     from puppetmaster.adapters import verification_artifact
 
                     worker_run = AgentRun(
@@ -304,9 +307,9 @@ class WorkerRuntime:
                             check="edit_admission",
                             result="blocked",
                             confidence=1.0,
-                            evidence=["edit_admission:timeout"],
+                            evidence=[f"edit_admission:{outcome}"],
                             payload={
-                                "failure": "edit_admission_timeout",
+                                "failure": f"edit_admission_{outcome}",
                                 "reason": str(exc),
                             },
                         )

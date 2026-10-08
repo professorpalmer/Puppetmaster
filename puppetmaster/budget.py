@@ -262,13 +262,27 @@ def budget_cli_flags(policy: Optional[BudgetPolicy]) -> list[str]:
             for part in ("--budget-" + field.replace("_", "-"), str(value))]
 
 
+# A pilot read the elapsed cap as a wall deadline and set 240 s for four
+# parallel 180 s workers; three were refused. Say what the cap adds up.
+_SCHEMA_NOTES = {
+    "max_elapsed_seconds": (
+        " It adds up worker-seconds over all attempts, not wall time: four "
+        "parallel 180 s workers need 720. Each attempt reserves its "
+        "timeout_seconds. While an earlier attempt has no settled elapsed time, "
+        "a new attempt is refused (it fails, it does not wait), so under this "
+        "cap the job runs its attempts one at a time."
+    ),
+}
+
+
 def budget_schema_properties() -> dict:
     return {
         "budget_" + field: {
             "type": "integer" if kind is int else "number",
             "exclusiveMinimum": 0,
             "description": ("Cumulative job-total " + field +
-                            "; independent of per-call routing max_cost_usd."),
+                            "; independent of per-call routing max_cost_usd."
+                            + _SCHEMA_NOTES.get(field, "")),
         }
         for field, kind in BUDGET_FIELDS.items()
     }

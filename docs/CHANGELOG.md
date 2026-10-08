@@ -1,3 +1,74 @@
+## v1.38.0 — 2026-10-08
+
+**A flow stop now reaches a worker that queues for edit admission, and the
+reply says when the stop has taken effect.** In a Codex benchmark, a pilot
+stopped a map run. A repair worker that queued behind another job's claim
+got admission after the stop, launched Codex, and edited files for five
+minutes. Three defects stacked:
+
+1. `cut_task` saved its `failure_cut` marker before its cancellation request.
+   The request failed once (the store was busy), and each retry saw the
+   marker and returned `pending` with no request. The store had the marker,
+   but no cancellation target and no receipt. A retry now finishes a
+   half-done cut. `_cut_jobs` cuts each task separately and writes each
+   failure to the walker log, where before it dropped all errors.
+2. The edit-admission wait ran before the task's cancellation scope, so it
+   could not see a task cut. The wait now runs in that scope, checks every
+   0.5 s, and exits without a launch.
+3. Each waiting worker wrote an `edit_admission.waiting` event every 50 ms
+   (16,465 rows in the benchmark store). The wait now writes one event per
+   change of holder, and one each 10 s.
+
+Stop and cut are cooperative. Their reply, and the summary of each stopped
+run, now has `settled`, `open_work` (child runs and tasks that can still
+write), and a `note` while work is open. `wait` on a stopped run returns when
+that work settles, and cuts the open tasks again while it waits.
+
+**The elapsed budget text says what the cap adds up.** `budget_max_elapsed_seconds`
+counts worker-seconds over all attempts, not wall time. Four parallel 180 s
+workers need 720. While an earlier attempt has no settled elapsed time, a new
+attempt is refused (it does not wait). The cap rules do not change.
+
+The three fixes below were prepared as 1.37.1 and ship in this release.
+
+**The explicit-trigger hook now routes by the shape of the work.** A prompt
+that names Puppetmaster but has no specific intent got the directive "This
+warrants a read-only analysis pass ... fan it out to a swarm". A benchmark
+pilot with a repair task thus ran a planning swarm first and never used a
+flow. This contradicts the installed rules ("Fan out with one flow"). The
+directive now gives three routes:
+
+1. Independent units that each need a build and a check: one
+   `puppetmaster_flow` graph with a `map` node, a check per item, and a fail
+   edge back to its build.
+2. One coupled change: `puppetmaster_start_implement`.
+3. Read-only analysis only: `puppetmaster_start_swarm`.
+
+The write directive now gives routes 1 and 2 with equal weight. Before, it
+said "a single implementation task" first.
+
+Role inference also changed. "repair" and "finish" now count as write verbs.
+The earliest match in the prompt now selects the role. Before, the first
+pattern in list order won. The benchmark prompt starts with "Repair", but
+the word "plan" in a JSON token about 1,800 characters later selected the
+planning role. A security mention anywhere still selects the security role.
+
+**`max_output_bytes` says what it counts.** The cap counts the whole worker
+CLI output stream (stdout plus stderr). This includes JSON events, tool calls,
+and tool output, not only the answer. Small caps stopped all five benchmark
+attempts before their time limits. The MCP and CLI help now say this. Each
+blocked receipt has a `counted_stream` field.
+
+**A continued flow sends the updated task.** With `continue_from`, a changed
+node task, and no input, the job goal had the new task, but the resumed
+worker got an empty `Follow-up request:`. The worker repeated its old work.
+Each flow session now records a digest of its rendered task (`task_sha`). A
+resumed node in a continued run gets:
+
+- the follow-up input, when there is input;
+- the updated task, when the task changed or the session has no digest;
+- the task again, when there is no input and the task did not change.
+
 ## v1.37.0 — 2026-10-08
 
 **New output style: `ste` (ASD-STE100 Simplified Technical English).**
