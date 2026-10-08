@@ -30486,6 +30486,22 @@ class OutputStyleTests(unittest.TestCase):
         # Reasoning is explicitly preserved.
         self.assertIn("not reasoning", terse)
 
+    def test_ste_tier_reaches_workers_and_keeps_exact_spans(self) -> None:
+        from puppetmaster.output_style import OUTPUT_STYLE_ENV, directive_for, normalize_style
+
+        self.assertEqual(normalize_style(" STE "), "ste")
+        ste = directive_for("ste")
+        self.assertIn("ASD-STE100", ste)
+        self.assertIn("can, must, will", ste)
+        self.assertIn("stay exactly as they are", ste)
+        self.assertNotIn("Drop articles", ste)
+        with TemporaryDirectory() as tmp:
+            orch = Orchestrator(SwarmStore(Path(tmp) / ".puppetmaster"))
+            with patch.dict(os.environ, {OUTPUT_STYLE_ENV: "ste"}):
+                (out,) = orch._with_output_style([WorkerSpec(role="explore", instruction="map the repo")])
+        self.assertIn("OUTPUT STYLE (ste)", out.instruction)
+        self.assertEqual(out.payload.get("output_style"), "ste")
+
     def test_orchestrator_seam_respects_env_and_payload(self) -> None:
         from puppetmaster.output_style import OUTPUT_STYLE_ENV
 

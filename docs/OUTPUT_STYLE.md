@@ -17,7 +17,7 @@ style feature, not a cost lever.
 Globally, via env:
 
 ```bash
-export PUPPETMASTER_OUTPUT_STYLE=terse   # or: lithic
+export PUPPETMASTER_OUTPUT_STYLE=terse   # or: lithic, ste
 ```
 
 Per task, via the spec payload (wins over the env for that one spec):
@@ -30,7 +30,7 @@ Precedence mirrors the skill/memory opt-in: an explicit `payload.output_style`
 overrides the env, and a disabled value (`"off"`, `"none"`, `""`) opts a single
 spec out even when the env default is on.
 
-## The two tiers
+## The three tiers
 
 ### `terse` (safe; recommended when on)
 
@@ -60,6 +60,23 @@ paths, and quoted strings byte-exact.
 The extra savings are marginal and the prose reads worse, so reserve `lithic`
 for machine-consumed worker artifacts. Don't put a human-facing stitched summary
 in `lithic`.
+
+### `ste` (controlled language; opt-in)
+
+ASD-STE100 Simplified Technical English. It emulates the shape of the
+standard, not its dictionary:
+
+- One thought per sentence. The condition comes before the command.
+- Procedural sentences have a maximum of 20 words. Descriptive sentences have
+  a maximum of 25 words.
+- Active voice and simple tenses. The helping verbs are can, must, and will.
+- No contractions, semicolons, or "-ing" forms (except in technical names).
+- Noun clusters have a maximum of three words.
+- Code, identifiers, commands, paths, quoted text, and official names stay
+  exact. JSON keeps its schema.
+
+Use `ste` when people read the output as instructions or reports and must
+not misread them. It does not cut tokens like `terse`.
 
 ## Bring your own rules (custom directive)
 
