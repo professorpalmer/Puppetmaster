@@ -256,6 +256,23 @@ def descriptor_uri(fd):
     raise OSError('no usable SQLite descriptor namespace')
 
 
+def connect_descriptor(uri, attempts=5):
+    """Open a macOS /dev/fd URI, retrying SQLite's spurious CANTOPEN.
+
+    Under load SQLite now and then fails to open /dev/fd/N with
+    "unable to open database file" while the descriptor and the source are
+    unchanged; the same open then succeeds at once. Any other error, or one
+    that persists, still raises.
+    """
+    for attempt in range(attempts):
+        try:
+            return sqlite3.connect(uri, uri=True)
+        except sqlite3.OperationalError as exc:
+            if str(exc) != 'unable to open database file' or attempt == attempts - 1:
+                raise
+            time.sleep(.005 * (attempt + 1))
+
+
 def linux_fd_snapshot():
     """Inventory live descriptors without opening/closing any database fd.
 
@@ -476,7 +493,7 @@ def main(path, *, wal_snapshot=False):
             return (current[:2] == descriptor_before[:2] if wal_snapshot
                     else current == descriptor_before)
         opened_before = linux_fd_snapshot() if linux else None
-        c = sqlite3.connect(uri, uri=True)
+        c = connect_descriptor(uri) if sys.platform == 'darwin' and not wal_snapshot else sqlite3.connect(uri, uri=True)
         try:
             if linux:
                 attest_linux_database(opened_before, source.fileno(), sidecars=sidecars)
