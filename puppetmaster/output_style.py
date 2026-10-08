@@ -5,15 +5,18 @@ are a minority of an agentic bill (turns, tool output, and cache dominate), so
 the win here is primarily **readability and latency**, with a modest cost bonus
 on output-heavy roles. Treat it as a style feature, not a cost lever.
 
-Two tiers, both off by default:
+Three tiers, all off by default:
 
 - ``terse``  — drop ceremony, filler, hedging, and restatement; one claim per
   line; state uncertainty as fact. Safe; readable. Recommended default when on.
 - ``lithic`` — ``terse`` plus telegraphic glue-dropping (articles/copulas).
   Aggressive; marginal extra savings; can read poorly and occasionally drop a
   disambiguating word. Opt-in, best for machine-consumed worker artifacts.
+- ``ste``    — ASD-STE100 Simplified Technical English: short sentences, one
+  thought each, active voice, a closed set of helping verbs. For readers who
+  want controlled-language prose. Code and quoted text stay exact.
 
-Enable globally with ``PUPPETMASTER_OUTPUT_STYLE=terse|lithic`` or per task with
+Enable globally with ``PUPPETMASTER_OUTPUT_STYLE=terse|lithic|ste`` or per task with
 ``payload.output_style``; an explicit payload value always wins over the env.
 Only *form* is compressed — every fact, number, name, path, condition, and
 caveat is preserved (lossless on content, lossy only on form).
@@ -44,8 +47,9 @@ OUTPUT_STYLE_FILE_ENV = "PUPPETMASTER_OUTPUT_STYLE_FILE"
 
 TERSE = "terse"
 LITHIC = "lithic"
+STE = "ste"
 CUSTOM = "custom"
-_VALID_STYLES = (TERSE, LITHIC)
+_VALID_STYLES = (TERSE, LITHIC, STE)
 _DISABLED_VALUES = {"", "off", "none", "0", "false", "no"}
 
 # The safe tier. Cuts form, keeps signal. The uncertainty rule deliberately
@@ -73,6 +77,31 @@ _LITHIC_EXTRA = (
     "byte-exact.",
 )
 
+# ASD-STE100 shape, not its dictionary. Machine-exact spans stay exact.
+_STE_RULES = (
+    "One thought per sentence. Put the condition before the command.",
+    "Procedural sentences: maximum 20 words. Descriptive sentences: maximum 25 "
+    "words. Paragraphs: maximum six sentences.",
+    "Use the active voice. Use the imperative in procedures.",
+    'Use simple tenses. Do not use "has" or "have" with a past participle.',
+    "Helping verbs: can, must, will. Do not use should, would, may, might, "
+    "could, or shall.",
+    "Do not use contractions or semicolons.",
+    'Do not use "-ing" forms, except in technical names.',
+    "Use one word for one meaning and one name for one thing.",
+    "Noun clusters: maximum three words.",
+    "Use a vertical list for a procedure with several steps or for several items.",
+    "Do not mix procedural and descriptive text in one paragraph.",
+    "Code, identifiers, commands, paths, quoted text, and official names stay "
+    "exactly as they are. JSON and other machine formats keep their schema.",
+    "Keep every fact, number, name, path, condition, and caveat.",
+)
+
+_STE_HEADER = (
+    "OUTPUT STYLE (ste): write all prose in ASD-STE100 Simplified Technical "
+    "English. This constrains form, not reasoning.\nRules:"
+)
+
 _HEADER = (
     "OUTPUT STYLE ({style}): emit essential tokens only. This constrains form, "
     "not reasoning — think as fully as needed, then write tight. Compression is "
@@ -81,7 +110,7 @@ _HEADER = (
 
 
 def normalize_style(value: Optional[str]) -> Optional[str]:
-    """Map a raw style value to ``terse`` / ``lithic`` / ``None`` (disabled)."""
+    """Map a raw style value to ``terse`` / ``lithic`` / ``ste`` / ``None`` (disabled)."""
     if value is None:
         return None
     token = str(value).strip().lower()
@@ -95,6 +124,8 @@ def directive_for(style: Optional[str]) -> str:
     resolved = normalize_style(style)
     if resolved is None:
         return ""
+    if resolved == STE:
+        return "\n".join([_STE_HEADER, *(f"- {rule}" for rule in _STE_RULES)])
     rules = _TERSE_RULES + (_LITHIC_EXTRA if resolved == LITHIC else ())
     lines = [_HEADER.format(style=resolved)]
     lines.extend(f"- {rule}" for rule in rules)

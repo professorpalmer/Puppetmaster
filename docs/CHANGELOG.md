@@ -1,3 +1,20 @@
+## v1.37.0 — 2026-10-08
+
+**New output style: `ste` (ASD-STE100 Simplified Technical English).**
+`PUPPETMASTER_OUTPUT_STYLE=ste`, or `payload.output_style: "ste"` for one
+task, tells workers to write controlled-language prose:
+
+- one thought per sentence, with the condition before the command;
+- a maximum of 20 words in a procedural sentence and 25 in a descriptive
+  sentence;
+- active voice, simple tenses, and only can, must, and will as helping verbs;
+- no contractions, semicolons, or "-ing" forms (except in technical names).
+
+Code, identifiers, paths, quoted text, and official names stay exact. JSON
+keeps its schema. The style emulates the shape of the standard, not its
+dictionary. It constrains form, not reasoning. `docs/OUTPUT_STYLE.md` has
+the full rule set.
+
 ## v1.36.0 — 2026-10-08
 
 **An operator can keep the sessions of all fresh Codex workers.** A Codex

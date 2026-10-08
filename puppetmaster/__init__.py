@@ -1,4 +1,4 @@
 """Puppetmaster: distributed agent workers with stitched shared memory."""
 
 __all__ = ["__version__"]
-__version__ = "1.36.0"
+__version__ = "1.37.0"
