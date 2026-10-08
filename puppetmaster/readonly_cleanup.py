@@ -87,7 +87,11 @@ class CleanupRegistry:
             try:
                 self.close(token, deadline=deadline)
             except BaseException as exc:
-                logging.getLogger(__name__).warning('Readonly cleanup retained: %s', exc)
+                from puppetmaster.readonly import ReapDeferred
+
+                # A deferred reap is the next sweep's work, not a lost helper.
+                level = logging.DEBUG if isinstance(exc, ReapDeferred) else logging.WARNING
+                logging.getLogger(__name__).log(level, 'Readonly cleanup retained: %s', exc)
 
     def maintain(self, limit=8, deadline=None):
         self._close_tokens(self._collect(lambda owner: owner.retired, limit), deadline)
