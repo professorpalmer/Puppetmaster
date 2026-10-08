@@ -50,7 +50,7 @@ def hook(payload: dict, env=None) -> None:
 
 class EditedPathTests(unittest.TestCase):
     def test_each_host_payload_names_its_paths(self):
-        cwd = Path("/work/repo")
+        cwd = Path(os.path.abspath("/work/repo"))
         self.assertEqual(claim_hook.edited_paths(claude_write(cwd / "a.py", cwd)), [cwd / "a.py"])
         notebook = {"cwd": str(cwd), "tool_input": {"notebook_path": "nb.ipynb"}}
         self.assertEqual(claim_hook.edited_paths(notebook), [cwd / "nb.ipynb"])
@@ -59,8 +59,8 @@ class EditedPathTests(unittest.TestCase):
         codex = {"cwd": str(cwd), "tool_input": {"command": patch_text}}
         self.assertEqual(claim_hook.edited_paths(codex),
                          [cwd / "new.py", cwd / "old.py", cwd / "moved.py", cwd / "gone.py"])
-        cursor = {"hook_event_name": "afterFileEdit", "file_path": "/work/repo/c.py", "edits": []}
-        self.assertEqual(claim_hook.edited_paths(cursor), [Path("/work/repo/c.py")])
+        cursor = {"hook_event_name": "afterFileEdit", "file_path": str(cwd / "c.py"), "edits": []}
+        self.assertEqual(claim_hook.edited_paths(cursor), [cwd / "c.py"])
 
     def test_a_shell_command_is_not_an_edit(self):
         bash = {"cwd": "/w", "tool_input": {"command": "python render.py > out.json"}}
