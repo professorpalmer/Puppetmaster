@@ -217,6 +217,11 @@ def overlay_adapter_dialect(
     return payload
 
 
+# Adapters with no per-run effort control: fx reads effort only from its own
+# settings.json, and local runs no model.
+NO_EFFORT_ADAPTERS = frozenset({"fx", "local"})
+
+
 def apply_swarm_reasoning(
     merged: dict[str, Any],
     caller_payload: Optional[Mapping[str, Any]],
@@ -227,7 +232,8 @@ def apply_swarm_reasoning(
 
     Records ``requested_reasoning_effort`` (the caller pin or None) and
     ``reasoning_effort_source`` (caller, operator_default, operator_enforced,
-    swarm_default) beside the effective ``reasoning_effort``.
+    swarm_default) beside the effective ``reasoning_effort``. An adapter in
+    ``NO_EFFORT_ADAPTERS`` gets ``adapter_unsupported`` and no effective effort.
     """
     profile = operator_effort_profile() if profile is None else profile
     caller_payload = caller_payload or {}
@@ -238,5 +244,14 @@ def apply_swarm_reasoning(
         pin = _normalize_effort(caller_payload.get("requested_reasoning_effort"))
     effort, source = profile.resolve(pin)
     merged["requested_reasoning_effort"] = pin
+    if adapter in NO_EFFORT_ADAPTERS:
+        if profile.enforced:
+            raise WorkerEffortError(
+                f"{WORKER_EFFORT_POLICY_ENV}=enforce cannot run a {adapter} worker: "
+                f"{adapter} has no per-run effort control")
+        # Record that no effort reached the worker, not the one we would have asked for.
+        merged.pop("reasoning_effort", None)
+        merged["reasoning_effort_source"] = "adapter_unsupported"
+        return merged
     merged["reasoning_effort_source"] = source
     return overlay_adapter_dialect(merged, effort, adapter)

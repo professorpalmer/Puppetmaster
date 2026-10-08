@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 from typing import Any, Optional, Union
 
+from puppetmaster.failure import classify_fx_failure
 from puppetmaster.codegraph import enrich_prompt_with_codegraph, inject_worker_cli_env
 from puppetmaster.models import Artifact, ArtifactType, Task
 from puppetmaster.ports import apply_worktree_ports
@@ -543,7 +544,7 @@ class FxAdapter(CliWorkerAdapter):
                 "failure": (
                     "fx_unparseable_result"
                     if missing_result
-                    else "fx_exit_code"
+                    else (classify_fx_failure(completed.stderr, result) or "fx_exit_code")
                     if process_failed
                     else None
                 ),
@@ -616,6 +617,10 @@ class FxAdapter(CliWorkerAdapter):
                 payload={
                     "failure": "timeout",
                     "returncode": None,
+                    # fx writes its JSON (and session_id) only at the end; a resumed
+                    # run keeps the session it resumed so a follow-up can continue it.
+                    "session_id": prepared.extras.get("resume_session_id"),
+                    "resume_session_id": prepared.extras.get("resume_session_id"),
                     "model_requested": model_requested,
                     "permission_mode": permission_mode,
                     "stdout": _redacted_tail(completed.stdout, _STDOUT_TAIL_CHARS),
