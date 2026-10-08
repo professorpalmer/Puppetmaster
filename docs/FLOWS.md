@@ -175,6 +175,23 @@ a combined scene file). Route the assembled judge's FAIL through an `integrate`
 agent whose `files` are those shared paths, then back to `map`. When feedback
 names a file no item owns, the map's wake says so instead of looping on it.
 
+The pilot is also a writer in the checkout. A new file that the pilot writes
+during a map (a preview, a scratch scene) appears in the delta of each
+worker that runs at that time. The shared tree cannot show who wrote it, so
+the gate charges it to each of those workers. Before you write such a file,
+claim it:
+
+```bash
+puppetmaster flow claim <run_id> preview_world.py
+```
+
+The MCP tool uses `action: "claim"` with `run_id` and `paths`. A claim holds
+for the full run, including its map items. A worker gate then lists the path
+under `pilot_claimed` and does not fail. The worker's own events must not
+name the path. If they name it, the worker wrote the file, and the gate
+still fails. A claim covers only the paths and globs that it names. Another
+new file that nobody claimed or declared still fails the gate.
+
 ## Follow-ups
 
 ```bash

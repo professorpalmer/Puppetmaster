@@ -115,7 +115,8 @@ RULE_BODY = textwrap.dedent(
       with a `fail` edge back to the build (`max` 2), inside the map item, so
       each unit is repaired alone. A unit's `files` include what its own check
       generates (its render or report dir as a glob); shared assembly outputs
-      belong to one integrate agent after the map.
+      belong to one integrate agent after the map. Before you write a file in
+      the checkout while the map runs, claim it (flow action `claim`).
     - **Armor for craft.** When the result is judged by how it looks, reads
       or feels (visuals, geometry, UI, prose) and not only by a test, add a
       `shell` step that produces the observable result (render, run,

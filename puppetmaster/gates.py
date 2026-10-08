@@ -239,7 +239,8 @@ def _evaluate_one(
         if kind == "committed":
             return _gate_committed(name, spec, cwd)
         if kind == "write_scope":
-            return _gate_write_scope(name, spec, artifacts, cwd, _sibling_scopes(store, task))
+            return _gate_write_scope(name, spec, artifacts, cwd, _sibling_scopes(store, task),
+                                     _pilot_claims(store, task))
         if kind == "review":
             return _gate_review(name, spec, task, artifacts, store, cwd, worker_id)
         return GateResult(name, str(kind), False, f"unknown gate kind: {kind!r}")
@@ -292,6 +293,16 @@ def _as_list(value: Any) -> list:
     return list(value) if isinstance(value, (list, tuple)) else []
 
 
+def _pilot_claims(store: "SwarmStore", task: Task) -> list[str]:
+    """Paths the pilot claimed in the flow run that launched this task (``flow claim``)."""
+    run_id = ((task.payload or {}).get("flow") or {}).get("run_id")
+    if not run_id:
+        return []
+    from puppetmaster.flow import pilot_claims
+
+    return pilot_claims(Path(store.root), str(run_id))
+
+
 def _sibling_scopes(store: "SwarmStore", task: Task) -> list[str]:
     """Write-scope globs declared by the task's peers sharing its workspace.
 
@@ -328,6 +339,7 @@ def _gate_write_scope(
     artifacts: list[Artifact],
     cwd: Path,
     sibling_scopes: Optional[list[str]] = None,
+    pilot_claims: Optional[list[str]] = None,
 ) -> GateResult:
     """Enforce a task's declared write-scope (B3/C1).
 
@@ -341,7 +353,11 @@ def _gate_write_scope(
     the adapter attributed the run's own delta, only that delta is judged, and
     when it also recorded what the worker's own events referenced, a path that
     was already dirty before the run and that the worker never named is
-    reported as a concurrent change instead of a failure.
+    reported as a concurrent change instead of a failure. So is a path the
+    pilot claimed for its own writes in the flow run (``flow claim``) that
+    the worker never named. A new unclaimed file is still charged: without a
+    writer's claim, the shared tree cannot tell the pilot's file from the
+    worker's.
     """
     import fnmatch
     from puppetmaster.adapters import git_snapshot
@@ -384,18 +400,21 @@ def _gate_write_scope(
     references, baseline = _worker_attribution(artifacts)
     out_of_scope: list[str] = []
     concurrent: list[str] = []
+    claimed: list[str] = []
     for path in candidates:
-        if (
-            references is not None
-            and not path_is_referenced(path, references)
-            and path_was_dirty_before(path, baseline)
-        ):
+        unnamed = references is not None and not path_is_referenced(path, references)
+        if unnamed and path_was_dirty_before(path, baseline):
             # Already dirty when the worker started and never named by its own
             # events: another writer in this checkout owns it.
             concurrent.append(path)
+        elif unnamed and covered(path, pilot_claims or []):
+            # The pilot claimed it as its own write, and the worker never named it.
+            claimed.append(path)
         else:
             out_of_scope.append(path)
     concurrent_fields = {"concurrent_changes": concurrent} if concurrent else {}
+    if claimed:
+        concurrent_fields["pilot_claimed"] = claimed
     if out_of_scope:
         reason, detail = _out_of_scope_reason(out_of_scope, references)
         return GateResult(

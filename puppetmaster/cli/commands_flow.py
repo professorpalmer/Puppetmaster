@@ -64,6 +64,10 @@ def add_flow_parser(subcommands: Any) -> None:
     cut = with_cwd(actions.add_parser("cut", help="Fail the node in flight; its fail edges take over."))
     cut.add_argument("run_id")
     cut.add_argument("--reason", default="")
+    claim = with_cwd(actions.add_parser(
+        "claim", help="Claim shared paths the pilot writes while the run works in its checkout."))
+    claim.add_argument("run_id")
+    claim.add_argument("paths", nargs="+", help="Paths or globs relative to the checkout.")
 
     listing = with_cwd(actions.add_parser("list", help="Recent runs."))
     listing.add_argument("--limit", type=int, default=20)
@@ -100,6 +104,8 @@ def flow_action(state_dir: Path, action: str, params: dict, *, backend: str = "s
             "nested flow start refused (PUPPETMASTER_WORKER=1): this process is already a "
             "Puppetmaster worker. Override: PUPPETMASTER_ALLOW_NESTED=1"
         )
+    if action == "claim" and is_worker_process():
+        raise ValueError("a Puppetmaster worker cannot claim paths; claims are the pilot's own writes")
     base = params.get("cwd")
     if action == "validate":
         problems = flow.validate_graph(flow.load_graph(state_dir, params["graph"], base=base))
@@ -153,6 +159,10 @@ def flow_action(state_dir: Path, action: str, params: dict, *, backend: str = "s
     if action == "cut":
         run = flow.cut_node(state_dir, run_id, str(params.get("reason") or ""))
         return _summary(state_dir, run), _exit(run.status)
+    if action == "claim":
+        paths = params.get("paths")
+        return {"run_id": run_id, "claims": flow.claim_paths(
+            state_dir, run_id, [paths] if isinstance(paths, str) else list(paths or []))}, EXIT_DONE
     raise ValueError(f"unknown flow action {action!r}")
 
 

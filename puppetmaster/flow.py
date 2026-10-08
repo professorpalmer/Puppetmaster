@@ -1142,6 +1142,54 @@ def cut_node(state_dir: Path, run_id: str, reason: str = "") -> FlowRun:
     return run
 
 
+def _root_run_id(state_dir: Path, run_id: str) -> str:
+    """The top run of a map item's child run (claims are kept once per checkout run)."""
+    seen = set()
+    while run_id not in seen:
+        seen.add(run_id)
+        parent = (load_run(state_dir, run_id).parent or {}).get("run_id")
+        if not parent:
+            return run_id
+        run_id = str(parent)
+    raise FlowError(f"flow run {run_id} has a parent cycle")
+
+
+def claim_paths(state_dir: Path, run_id: str, paths: list) -> list[str]:
+    """Record shared paths the pilot writes while the run works in its checkout.
+
+    A worker's write_scope gate does not charge the worker for a claimed path
+    unless the worker's own events named it. Claims add up and last for the
+    run. Returns every claim of the run.
+    """
+    from puppetmaster.fs_permissions import write_private_text
+    from puppetmaster.interprocess_lock import InterProcessFileLock
+
+    new = [str(path).strip() for path in paths or [] if str(path).strip()]
+    if not new:
+        raise FlowError("claim needs one or more paths or globs")
+    target = _marker(state_dir, _root_run_id(state_dir, run_id), "pilot_claims.json")
+    with InterProcessFileLock.for_target(target, timeout=10):
+        claims = sorted(set(_read_claims(target)) | set(new))
+        write_private_text(target, json.dumps(claims), lock=False)
+    return claims
+
+
+def pilot_claims(state_dir: Path, run_id: str) -> list[str]:
+    """Every path or glob the pilot claimed in this run's checkout; [] if none."""
+    try:
+        return _read_claims(_marker(state_dir, _root_run_id(state_dir, run_id), "pilot_claims.json"))
+    except FlowError:
+        return []
+
+
+def _read_claims(path: Path) -> list[str]:
+    try:
+        claims = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [str(item) for item in claims if isinstance(item, str)] if isinstance(claims, list) else []
+
+
 def cut_reason(state_dir: Path, run: FlowRun) -> Optional[str]:
     """The reason of a cut aimed at the visit in flight, else None."""
     try:

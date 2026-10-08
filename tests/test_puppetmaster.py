@@ -24265,6 +24265,54 @@ class PuppetmasterGateTests(unittest.TestCase):
                                   "worker_diff_present": True, "worker_delta_attributed": True})
         return [receipt, patch]
 
+    def test_a_pilot_preview_written_during_a_map_needs_a_claim_not_a_worker_failure(self) -> None:
+        # Codex canary on 1.33.3: the pilot created preview_world.py after two
+        # disjoint region workers launched; both gates charged them for it.
+        from puppetmaster import flow
+        from puppetmaster.cli.commands_flow import flow_action
+        from puppetmaster.gates import evaluate_task_gates
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            repo = Path(tmp) / "repo"
+            self._git_repo(repo)
+            root = flow.FlowRun(run_id="flow_" + "a" * 12, graph={"id": "regions", "cwd": str(repo)})
+            flow.save_run(store.root, root)
+            workers = []
+            for n in (0, 1):
+                child = flow.FlowRun(run_id=f"flow_{n:012x}", graph={"id": "item", "cwd": str(repo)},
+                                     parent={"run_id": root.run_id, "node": "all", "key": f"all/{n}"})
+                flow.save_run(store.root, child)
+                own = [f"regions/region_{n:03}.py", f"renders/region_{n:03}/*"]
+                task = self._task(write_scope=own, cwd=str(repo), flow={"run_id": child.run_id})
+                files = [own[0], f"renders/region_{n:03}/top.png", "preview_world.py"]
+                workers.append((task, files, own))
+
+            def gates(referenced_extra=(), extra_files=()):
+                return [evaluate_task_gates(
+                    task, self._attributed_run(task, [*files, *extra_files],
+                                               referenced=[own[0], *referenced_extra]),
+                    store, worker_id="w1", cwd=repo) for task, files, own in workers]
+
+            # Unclaimed, the shared tree cannot tell the pilot's file from a worker's.
+            self.assertTrue(all("preview_world.py" in r.failed_reason for r in gates()))
+
+            body, _ = flow_action(store.root, "claim", {"run_id": root.run_id, "paths": ["preview_world.py"]})
+            self.assertEqual(body["claims"], ["preview_world.py"])
+            for result in gates():
+                self.assertTrue(result.passed, result.failed_reason)
+                detail = next(r.detail for r in result.results if r.kind == "write_scope")
+                self.assertEqual(detail["pilot_claimed"], ["preview_world.py"])
+
+            # A worker that names the claimed file wrote it: still out of scope.
+            self.assertFalse(any(r.passed for r in gates(referenced_extra=["preview_world.py"])))
+            # A claim covers only what it names; another new unnamed file still fails.
+            self.assertTrue(all("notes.txt" in r.failed_reason for r in gates(extra_files=["notes.txt"])))
+
+            with patch.dict(os.environ, {"PUPPETMASTER_WORKER": "1"}):
+                with self.assertRaisesRegex(ValueError, "cannot claim"):
+                    flow_action(store.root, "claim", {"run_id": root.run_id, "paths": ["x"]})
+
     def test_write_scope_failure_names_where_and_whether_the_worker_named_it(self) -> None:
         # The N16 canary shape: region sources in scope, renders nobody declared.
         from puppetmaster.gates import evaluate_task_gates
