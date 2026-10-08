@@ -154,7 +154,8 @@ _ADAPTER_EXTRA_RULES: dict[str, Tuple[Rule, ...]] = {
     ),
     "hermes": (
         (_all("no such file or directory", "hermes"), MISSING_CLI),
-        (_any("no provider", "provider credentials"), NOT_AUTHENTICATED),
+        (_any("no provider", "provider credentials", "no inference provider is configured",
+              "no api key found for provider", "provider resolution failed"), NOT_AUTHENTICATED),
     ),
     "openai": (),
     "antigravity": (
@@ -226,6 +227,33 @@ def cursor_diagnosis(event: dict) -> list:
 def antigravity_diagnosis(event: dict) -> list:
     """agy JSON output: its error and status, never the response."""
     return [_error_text(event.get("error")), event.get("status")]
+
+
+def hermes_diagnostic(stdout: Optional[str], stderr: Optional[str]) -> str:
+    """The parts of a ``hermes chat -Q`` run that diagnose a failure.
+
+    Once a turn ran, Hermes prints only the worker's answer to stdout, writes
+    backend errors to stderr, and ends stderr with ``session_id: ...``. Before
+    a turn (credential or provider setup), its own diagnostics go to stdout.
+    """
+    stderr = stderr or ""
+    if re.search(r"^session_id: ", stderr, re.MULTILINE):
+        return stderr
+    return stderr + "\n" + (stdout or "")
+
+
+def classify_fx_failure(stderr: str, result: Optional[dict]) -> Optional[str]:
+    """A failure class from fx's stderr and its typed JSON fields, or None.
+
+    The final answer in fx's JSON is the worker's own text and is never read.
+    """
+    result = result if isinstance(result, dict) else {}
+    error = result.get("error")
+    if isinstance(result.get("auth_failure"), dict) or error == "MissingCredentials":
+        return NOT_AUTHENTICATED
+    code = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", error).lower() if isinstance(error, str) else ""
+    failure = classify_adapter_failure("fx", "\n".join(part for part in (stderr or "", code) if part))
+    return None if failure == UNKNOWN else failure
 
 
 def classify_antigravity_failure(output: str) -> str:

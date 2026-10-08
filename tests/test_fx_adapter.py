@@ -616,6 +616,32 @@ class FxLifecycleTests(unittest.TestCase):
         self.assertEqual(verification.payload["result"], "failed")
         self.assertEqual(verification.payload["failure"], "fx_exit_code")
 
+    def _run(self, stdout: str, *, returncode: int = 0, timed_out: bool = False, **payload):
+        before, after, completed = self._patch_facade(stdout, returncode=returncode, timed_out=timed_out)
+        with mock.patch("puppetmaster.adapters.resolve_command", return_value="/usr/bin/fx"), \
+             mock.patch("puppetmaster.adapters.with_repo_census", side_effect=lambda p, cwd: p), \
+             mock.patch("puppetmaster.adapters.enrich_prompt_with_codegraph", return_value=("prompt", False)), \
+             mock.patch("puppetmaster.adapters.worktree_guard", return_value=None), \
+             mock.patch("puppetmaster.adapters.snapshot_has_diff", side_effect=_snapshot_has_diff), \
+             mock.patch("puppetmaster.adapters.git_snapshot",
+                        side_effect=lambda cwd, base_tree=None: after if base_tree else before), \
+             mock.patch("puppetmaster.adapters.run_streamed_subprocess", return_value=completed), \
+             mock.patch("puppetmaster.adapters.fx.capture_subprocess_stdout", side_effect=lambda **kw: None):
+            artifacts = FxAdapter().run(_task(cwd="/tmp", **payload), "goal", "worker_1")
+        return next(a for a in artifacts if a.type == ArtifactType.VERIFICATION).payload
+
+    def test_a_typed_fx_error_is_classified_and_the_answer_is_not(self) -> None:
+        limited = REAL_FX_RESULT.replace('"exit_code":0', '"exit_code":1,"error":"RateLimitExceeded"')
+        self.assertEqual(self._run(limited, returncode=1)["failure"], "rate_limit")
+        chatty = REAL_FX_RESULT.replace('"exit_code":0', '"exit_code":1').replace(
+            '"final_output":"OK"', '"final_output":"login is not authenticated after a 429"')
+        self.assertEqual(self._run(chatty, returncode=1)["failure"], "fx_exit_code")
+
+    def test_a_resumed_timeout_keeps_the_session_for_a_follow_up(self) -> None:
+        payload = self._run("", timed_out=True, resume_session_id="sess_123")
+        self.assertEqual((payload["failure"], payload["session_id"]), ("timeout", "sess_123"))
+        self.assertIsNone(self._run("", timed_out=True)["session_id"])
+
     def test_requested_model_is_forwarded_via_environment_not_argv(self) -> None:
         before, after, completed = self._patch_facade(REAL_FX_RESULT)
         adapter = FxAdapter()

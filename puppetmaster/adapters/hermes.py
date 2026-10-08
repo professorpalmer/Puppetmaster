@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional, Union
 
 from puppetmaster.codegraph import enrich_prompt_with_codegraph, scrub_foreign_interpreter_env
-from puppetmaster.failure import classify_hermes_failure
+from puppetmaster.failure import classify_hermes_failure, hermes_diagnostic
 from puppetmaster.models import Artifact, ArtifactType, Task
 from puppetmaster.ports import apply_worktree_ports
 from puppetmaster.redaction import redact_secrets
@@ -587,7 +587,7 @@ class HermesAdapter(CliWorkerAdapter):
                     "failure": (
                         None
                         if not process_failed
-                        else classify_hermes_failure(completed.stderr + completed.stdout)
+                        else classify_hermes_failure(hermes_diagnostic(completed.stdout, completed.stderr))
                     ),
                     "returncode": completed.returncode,
                     "stdout": _redacted_tail(completed.stdout, 12000),
@@ -843,7 +843,7 @@ class HermesAdapter(CliWorkerAdapter):
                         else (
                             "empty_or_unstructured_hermes_result"
                             if degraded
-                            else classify_hermes_failure(completed.stderr + completed.stdout)
+                            else classify_hermes_failure(hermes_diagnostic(completed.stdout, completed.stderr))
                         )
                     ),
                     **usage,

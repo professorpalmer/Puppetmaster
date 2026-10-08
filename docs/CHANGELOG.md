@@ -1,3 +1,36 @@
+## v1.33.6 — 2026-10-07
+
+An audit checked each fix from 1.32.3 to 1.33.5 against all nine adapters.
+It found these gaps.
+
+**A worker effort that an adapter cannot apply is not recorded as applied.**
+fx reads its effort only from its own `settings.json`. The `local` adapter
+runs no model. Before this release, both adapters recorded the operator
+effort (for example `high`, `operator_enforced`), but no effort reached the
+worker. These adapters now record `reasoning_effort_source:
+adapter_unsupported` and no effective effort. With
+`PUPPETMASTER_WORKER_EFFORT_POLICY=enforce`, task creation refuses such a
+worker before launch.
+
+**fx failures get a failure class.** Before this release, every failed fx run
+reported `fx_exit_code`, so routing could not see a rate limit or a logout.
+Puppetmaster now reads the class from fx stderr, the typed `error` code
+(`RateLimitExceeded` becomes `rate_limit`), and `auth_failure` or
+`MissingCredentials` (both become `not_authenticated`). It never reads the
+answer of the worker. An error that has no class stays `fx_exit_code`.
+
+**Hermes failures do not read the answer of the worker.** After a turn,
+Hermes writes only the answer to stdout and writes errors to stderr. The
+classifier read both, so an answer that mentioned a 401 or a rate limit could
+give a wrong class. When stderr has the `session_id:` line of a completed
+turn, the classifier now reads only stderr. Setup failures still go to
+stdout and still classify. The real Hermes messages "No inference provider
+is configured" and "No API key found for provider" are now
+`not_authenticated`. Before this release, they gave no class.
+
+**A resumed fx run that times out keeps its session.** The timeout receipt
+records the session that the run resumed, so a follow-up can continue it.
+
 ## v1.33.5 — 2026-10-07
 
 **A spurious macOS descriptor open no longer fails a metadata read.** On

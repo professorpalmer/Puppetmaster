@@ -75,6 +75,22 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual((cleared["reasoning_effort"], cleared["reasoning_effort_source"]), ("medium", "swarm_default"))
 
 
+    def test_an_adapter_without_effort_control_records_none_applied(self) -> None:
+        # fx reads effort only from its own settings.json; nothing PM sends reaches it.
+        for profile, caller in ((WorkerEffortProfile(), {}), (WorkerEffortProfile("high"), {}),
+                                (WorkerEffortProfile("high"), {"reasoning_effort": "low"})):
+            with self.subTest(profile=profile, caller=caller):
+                merged = apply_swarm_reasoning({"reasoning_effort": "low"}, caller, adapter="fx", profile=profile)
+                self.assertNotIn("reasoning_effort", merged)
+                self.assertEqual(merged["reasoning_effort_source"], "adapter_unsupported")
+                self.assertEqual(merged["requested_reasoning_effort"], caller.get("reasoning_effort"))
+                again = apply_swarm_reasoning(dict(merged), merged, adapter="fx", profile=profile)
+                self.assertEqual(again["reasoning_effort_source"], "adapter_unsupported")
+
+    def test_enforce_refuses_an_adapter_without_effort_control(self) -> None:
+        with self.assertRaisesRegex(WorkerEffortError, "fx has no per-run effort control"):
+            apply_swarm_reasoning({}, {}, adapter="fx", profile=WorkerEffortProfile("high", True))
+
 class StockTaskTests(Base):
     """Flow agent, judge and resumed visits through the real task creation."""
 
