@@ -150,6 +150,22 @@ Keep secrets in a private env file (`chmod 600`) instead of inline MCP config. `
 
 Defaults are tuned for non-interactive automation: `approval_policy="never"`, `--sandbox workspace-write`, `--ephemeral`, `--skip-git-repo-check`. Use `payload.sandbox="read-only"` for explore / plan tasks that should never touch the worktree. Opt in to `payload.dangerously_bypass_approvals_and_sandbox=true` only when the surrounding environment is already externally sandboxed.
 
+A fresh Codex worker runs `--ephemeral` unless one of these rules applies.
+The first rule that applies wins:
+
+| Rule | Result | `ephemeral_source` |
+| --- | --- | --- |
+| The worker resumes a thread | Session kept | `resume` |
+| `payload.ephemeral` is set (by the caller or the selected model's registry defaults) | That value | `payload` |
+| `payload.review_loop` is true | Session kept | `review_loop` |
+| `PUPPETMASTER_CODEX_EPHEMERAL=0` or `1` | That value | `operator_default` |
+| None of these | `--ephemeral` | `default` |
+
+Set `PUPPETMASTER_CODEX_EPHEMERAL=0` to keep the sessions of all fresh Codex
+workers, including unpinned starts, which get no registry defaults. Any
+other value than `0` or `1` fails the launch. Each Codex receipt records
+`ephemeral` and `ephemeral_source`.
+
 If the adapter returns `failure=not_authenticated`, run `printenv OPENAI_API_KEY | codex login --with-api-key` once.
 If it returns `failure=dirty_worktree`, run from a clean tree, or set `payload.allow_dirty=true`, or downgrade to `payload.sandbox="read-only"`.
 If it returns `failure=missing_cli`, install the CLI with `npm install -g @openai/codex`.
