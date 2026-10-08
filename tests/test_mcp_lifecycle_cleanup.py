@@ -198,3 +198,75 @@ class McpLifecycleCleanupTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReusedPidTests(unittest.TestCase):
+    """A server that died without its exit hook leaves its tracking file. The
+    OS can give its pid to an unrelated process; cleanup must not kill that one."""
+
+    def setUp(self) -> None:
+        import subprocess
+        import sys
+
+        self._temporary_directory = TemporaryDirectory()
+        self.addCleanup(self._temporary_directory.cleanup)
+        environment = patch.dict(os.environ, {"PUPPETMASTER_MCP_REGISTRY_DIR": self._temporary_directory.name})
+        environment.start()
+        self.addCleanup(environment.stop)
+        # A real process that stands in for whatever now holds the pid.
+        self.child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(self.child.wait)
+        self.addCleanup(self.child.kill)
+
+    def track(self, **fields) -> Path:
+        from puppetmaster import mcp_registry
+
+        path = mcp_registry.register(pid=self.child.pid, workspace="/w")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data.update(last_heartbeat=time.time() - 3600, last_inbound_at=time.time() - 3600, **fields)
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return path
+
+    def test_kill_stale_leaves_a_reused_pid_alone(self) -> None:
+        from puppetmaster import mcp_registry
+
+        path = self.track(identity="an-earlier-process")
+        self.assertFalse(mcp_registry.list_entries()[0].is_alive())
+        self.assertEqual(mcp_registry.kill_stale(self_pid=os.getpid(), grace_seconds=0), [])
+        self.assertIsNone(self.child.poll())
+        self.assertEqual([e.pid for e in mcp_registry.prune_dead()], [self.child.pid])
+        self.assertFalse(path.exists())
+
+    def test_kill_stale_needs_a_recorded_identity(self) -> None:
+        from puppetmaster import mcp_registry
+
+        self.track(identity=None)
+        self.assertEqual(mcp_registry.kill_stale(self_pid=os.getpid(), grace_seconds=0), [])
+        self.assertIsNone(self.child.poll())
+
+    def test_kill_stale_stops_the_registered_server(self) -> None:
+        from puppetmaster import mcp_registry
+
+        self.track()  # register recorded the child's real identity
+        killed = mcp_registry.kill_stale(self_pid=os.getpid(), grace_seconds=0)
+        self.assertEqual([e.pid for e in killed], [self.child.pid])
+        self.assertIsNotNone(self.child.wait(timeout=10))
+
+    def test_kill_selected_signals_an_unproven_pid_only_when_named(self) -> None:
+        from puppetmaster import mcp_registry
+
+        self.track(identity=None)
+        by_workspace = mcp_registry.kill_selected(workspace="/w", self_pid=os.getpid(), grace_seconds=0)
+        self.assertEqual(by_workspace.killed, [])
+        self.assertEqual(by_workspace.refused[0]["reason"], "identity_unknown")
+        self.assertIsNone(self.child.poll())
+        by_pid = mcp_registry.kill_selected(pids=[self.child.pid], self_pid=os.getpid(), grace_seconds=0)
+        self.assertEqual([e.pid for e in by_pid.killed], [self.child.pid])
+
+    def test_kill_selected_skips_a_reused_pid(self) -> None:
+        from puppetmaster import mcp_registry
+
+        self.track(identity="an-earlier-process")
+        result = mcp_registry.kill_selected(pids=[self.child.pid], self_pid=os.getpid(), grace_seconds=0)
+        self.assertEqual(result.killed, [])
+        self.assertIsNone(self.child.poll())

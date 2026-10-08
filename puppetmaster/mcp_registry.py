@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from puppetmaster.fs_permissions import mkdir_private, write_private_text
+from puppetmaster.proc_identity import own_identity, pid_reused, process_identity
 
 
 # How often a running server bumps its heartbeat.
@@ -79,9 +80,19 @@ class McpServerEntry:
     parent_pid: Optional[int] = None
     parent_process: Optional[str] = None
     path: Optional[str] = None  # absolute path to the tracking file
+    identity: Optional[str] = None  # process start identity at register time
 
     def is_alive(self) -> bool:
-        return _pid_alive(self.pid)
+        """True while the pid still names the server that registered it."""
+        return _pid_alive(self.pid) and not pid_reused(self.pid, self.identity)
+
+    def provably_this_server(self) -> bool:
+        """True only when the kernel confirms the pid is the registered server.
+
+        A server that died without its exit hook leaves its file, and the OS
+        can give its pid to an unrelated process. A signal needs this proof.
+        """
+        return bool(self.identity) and process_identity(self.pid) == self.identity
 
     def is_stale(self, *, now: Optional[float] = None, stale_after_seconds: float = DEFAULT_STALE_AFTER_SECONDS) -> bool:
         current = now if now is not None else time.time()
@@ -188,6 +199,7 @@ def register(
         "version": version,
         "parent_pid": actual_parent_pid,
         "parent_process": actual_parent_process,
+        "identity": own_identity() if actual_pid == os.getpid() else process_identity(actual_pid),
     }
     path = registry_dir() / f"{actual_pid}.json"
     _atomic_write(path, payload)
@@ -290,6 +302,7 @@ def list_entries(*, include_stale: bool = True) -> list[McpServerEntry]:
                 parent_pid=_coerce_optional_int(data.get("parent_pid")),
                 parent_process=_coerce_optional_str(data.get("parent_process")),
                 path=str(child),
+                identity=_coerce_optional_str(data.get("identity")),
             )
         except (KeyError, TypeError, ValueError):
             continue
@@ -333,9 +346,7 @@ def kill_stale(
     targets: list[McpServerEntry] = []
     now = time.time()
     for entry in list_entries():
-        if not entry.is_alive():
-            continue
-        if entry.pid == me:
+        if entry.pid == me or not entry.provably_this_server():
             continue
         if entry.is_stale(now=now, stale_after_seconds=stale_after_seconds):
             targets.append(entry)
@@ -350,7 +361,7 @@ def kill_stale(
     if grace_seconds > 0:
         time.sleep(grace_seconds)
     for entry in targets:
-        if not _pid_alive(entry.pid):
+        if not entry.provably_this_server():
             if entry.path:
                 deregister(Path(entry.path))
             continue
@@ -418,6 +429,13 @@ def kill_selected(
         if entry.pid == me:
             refused.append({"pid": entry.pid, "workspace": entry.workspace, "reason": "self"})
             continue
+        if not entry.provably_this_server() and (entry.identity or requested_pids is None):
+            # is_alive already skipped a reused pid. This is an identity the
+            # kernel cannot confirm now, or a file from before identities were
+            # recorded; only a pid the caller names can signal the latter.
+            refused.append({"pid": entry.pid, "workspace": entry.workspace,
+                            "reason": "identity_unconfirmed" if entry.identity else "identity_unknown"})
+            continue
         if entry.active_tool_calls > 0:
             refused.append(
                 {
@@ -440,7 +458,7 @@ def kill_selected(
     if grace_seconds > 0 and targets:
         time.sleep(grace_seconds)
     for entry in targets:
-        if not _pid_alive(entry.pid):
+        if not entry.is_alive():
             if entry.path:
                 deregister(Path(entry.path))
             continue

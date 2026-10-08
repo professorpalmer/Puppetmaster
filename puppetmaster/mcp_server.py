@@ -4126,6 +4126,7 @@ def run_dashboard(args: JsonObject) -> JsonObject:
         resolve_mobile_host,
         stop_background_dashboard,
         stop_dashboard_pid,
+        tracked_dashboard_pid,
         write_dashboard_runfile,
         write_qr_png,
     )
@@ -4177,9 +4178,7 @@ def run_dashboard(args: JsonObject) -> JsonObject:
     # mismatch correctly fails and a new, properly-bound server gets spawned.
     tracked = read_dashboard_runfile(state_dir)
     already_running = False
-    previous_pid = None
-    if tracked and pid_alive(int(tracked.get("pid") or 0)):
-        previous_pid = int(tracked.get("pid") or 0)
+    previous_pid = tracked_dashboard_pid(tracked) or None
     if (
         tracked
         and normalize_dashboard_host(tracked.get("host", host)) == normalize_dashboard_host(host)
@@ -4286,7 +4285,7 @@ def run_dashboard(args: JsonObject) -> JsonObject:
         host = child_info.get("host", host)
         bound_port = int(child_info.get("port") or port)
         if previous_pid and previous_pid != process.pid:
-            stop_dashboard_pid(previous_pid)
+            stop_dashboard_pid(previous_pid, (tracked or {}).get("identity"))
     elif mobile and pid is None:
         # The pre-check above already set pid when it found the match; this
         # only covers reuse discovered via the literal-port probe instead

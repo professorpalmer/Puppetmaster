@@ -31,6 +31,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from puppetmaster.models import Job, JobStatus, TaskStatus, now_iso, parse_iso
+from puppetmaster.proc_identity import own_identity, pid_reused
 from puppetmaster.store import SwarmStore
 
 # How long a job may show no progress (no fresh orchestrator heartbeat, no new
@@ -69,6 +70,7 @@ def record_orchestrator_heartbeat(
         existing = _read_record(store, job_id) if not started else None
         record = {
             "pid": os.getpid(),
+            "identity": own_identity(),
             "host": socket.gethostname(),
             "started_at": (existing or {}).get("started_at") or now_iso(),
             "heartbeat_at": now_iso(),
@@ -86,6 +88,11 @@ def _read_record(store: SwarmStore, job_id: str) -> Optional[dict]:
         return store.read_json(path)
     except Exception:
         return None
+
+
+def _driver_alive(pid: int, record: dict) -> bool:
+    """True while the recorded orchestrator runs; a reused pid is not it."""
+    return _pid_alive(pid) and not pid_reused(pid, record.get("identity"))
 
 
 def _pid_alive(pid: int) -> bool:
@@ -170,7 +177,7 @@ def assess_job_liveness(
     * The orchestrator pid was recorded *on this host* and that process is gone.
     * No task holds a live lease AND nothing has happened (no heartbeat, no
       event) for longer than ``stall_after_seconds`` — covers a wedged or
-      pid-recycled driver where the pid check alone wouldn't fire.
+      driver whose pid was recycled before it recorded an identity.
     """
     now = now or datetime.now(timezone.utc)
     record = _read_record(store, job.id)
@@ -178,7 +185,7 @@ def assess_job_liveness(
 
     if record and record.get("host") == socket.gethostname():
         pid = record.get("pid")
-        if isinstance(pid, int) and not _pid_alive(pid):
+        if isinstance(pid, int) and not _driver_alive(pid, record):
             return LivenessVerdict(dead=True, reason="orchestrator_pid_gone")
 
     if _has_live_lease(tasks, now):
@@ -209,7 +216,7 @@ def liveness_summary(
     tasks = store.list_tasks(job.id)
     pid = record.get("pid") if isinstance(record.get("pid"), int) else None
     same_host = record.get("host") == socket.gethostname()
-    pid_alive = bool(pid and same_host and _pid_alive(pid))
+    pid_alive = bool(pid and same_host and _driver_alive(pid, record))
     idle_seconds = int((now - _latest_activity(store, job, record)).total_seconds())
     live_lease = _has_live_lease(tasks, now)
 

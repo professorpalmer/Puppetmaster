@@ -84,6 +84,7 @@ _SCOPE_WEIGHTS = {
 _DEFAULT_SCOPE_WEIGHT = 0.7
 _GRAPH_EDGES_MARKER = ".graph_edges_materialized"
 _CONSUMES_JOURNAL_PREFIX = ".consumes_journal_"
+_BUDGET_LOCK_WAIT_SECONDS = 10.0
 
 
 class ActiveTaskLeaseError(RuntimeError):
@@ -2909,8 +2910,14 @@ class SwarmStore(StoreContracts):
             return
         owner = new_id("budget")
         name = f"budget:{job_id}"
-        if not self.acquire_lock(name, owner, ttl_seconds=300):
-            raise BudgetBusy("budget busy; retry")
+        # Holders keep the lock for milliseconds, but a sibling that waits for
+        # admission takes it each second. Failing at the first contention
+        # could drop a settlement, and the waiter then waited out its limit.
+        deadline = time.monotonic() + _BUDGET_LOCK_WAIT_SECONDS
+        while not self.acquire_lock(name, owner, ttl_seconds=300):
+            if time.monotonic() >= deadline:
+                raise BudgetBusy("budget busy; retry")
+            time.sleep(0.01)
         held.add(job_id)
         try:
             yield

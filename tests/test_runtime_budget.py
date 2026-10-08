@@ -445,10 +445,11 @@ with execution_scope(store, SimpleNamespace(id='crashed-run'), task):
 class FileRuntimeBudgetTests(BudgetRuntimeContract, unittest.TestCase):
     def test_contender_between_reservation_and_adoption(self):
         self.configure(BudgetPolicy(max_attempts=1))
-        reserved, contender_tried, winner_done = Event(), Event(), Event()
+        reserved, contender_tried, winner_adopted = Event(), Event(), Event()
         winner = self.store_type(self.root)
         contender = self.store_type(self.root)
         reserve = winner.reserve_dispatch
+        adopt = winner.adopt_dispatch
         acquire = contender.acquire_lock
         records = contender._budget_records
 
@@ -463,8 +464,18 @@ class FileRuntimeBudgetTests(BudgetRuntimeContract, unittest.TestCase):
             contender_tried.set()
             return result
 
+        def mark_adopted(*args, **kwargs):
+            result = adopt(*args, **kwargs)
+            winner_adopted.set()
+            return result
+
         def hold_contender_lock(*args, **kwargs):
-            self.assertTrue(winner_done.wait(5))
+            # A contender that reads the records between the winner's
+            # reservation and its adoption blocks here, and the winner (which
+            # still needs the lock to adopt) then times out. The budget lock
+            # waits for its holder, so the contender reads after adoption and
+            # must not wait for the winner's settlement, which needs the lock.
+            self.assertTrue(winner_adopted.wait(5))
             return records(*args, **kwargs)
 
         def call(store, index):
@@ -474,11 +485,9 @@ class FileRuntimeBudgetTests(BudgetRuntimeContract, unittest.TestCase):
                         return True
             except (BudgetAdmissionError, RuntimeError) as exc:
                 return str(exc)
-            finally:
-                if store is winner:
-                    winner_done.set()
 
         with mock.patch.object(winner, 'reserve_dispatch', side_effect=pause_after_reservation), \
+                mock.patch.object(winner, 'adopt_dispatch', side_effect=mark_adopted), \
                 mock.patch.object(contender, 'acquire_lock', side_effect=signal_acquisition), \
                 mock.patch.object(contender, '_budget_records', side_effect=hold_contender_lock), \
                 ThreadPoolExecutor(max_workers=2) as pool:
