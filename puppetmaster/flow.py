@@ -802,11 +802,35 @@ def walk(state_dir: Path, run_id: str, *, execute: Optional[NodeExecutor] = None
             return run
         run.pid = os.getpid()
         save_run(state_dir, run)
+        if run.parent is None:
+            _mark_walking(state_dir, run)
         executor = execute or JobNodeExecutor(state_dir, backend=run.backend, worker_mode=run.worker_mode)
         return _walk(state_dir, run, executor)
     finally:
         _clear_marker(state_dir, run_id, "walker.pid")
+        _unmark_walking(run_id)
         lock.release()
+
+
+def _mark_walking(state_dir: Path, run: FlowRun) -> None:
+    from puppetmaster.fs_permissions import write_private_text
+    from puppetmaster.state import walking_runs_dir
+
+    try:
+        write_private_text(walking_runs_dir() / f"{run.run_id}.json",
+                           json.dumps({"state_dir": str(Path(state_dir).resolve()),
+                                       "cwd": run.graph.get("cwd")}), lock=False)
+    except OSError:
+        pass
+
+
+def _unmark_walking(run_id: str) -> None:
+    from puppetmaster.state import walking_runs_dir
+
+    try:
+        (walking_runs_dir() / f"{run_id}.json").unlink()
+    except OSError:
+        pass
 
 
 def prepare_resume(state_dir: Path, run_id: str, *, answer: Optional[str] = None,

@@ -4885,8 +4885,10 @@ def flow_schema() -> JsonObject:
                 "enum": ["validate", "save", "run", "status", "wait", "resume", "stop", "cut", "list",
                          "claim"],
                 "description": (
-                    "claim (with run_id and paths): before you write a shared file in the checkout "
-                    "of a running flow (a preview, a combined scene), claim its path or glob. A "
+                    "claim (with run_id and paths): claim a shared file that you write in the checkout "
+                    "of a running flow (a preview, a combined scene). With the Puppetmaster hooks "
+                    "installed, your file edits are claimed for you; claim what your own commands "
+                    "write. A "
                     "worker's write_scope gate then does not charge it for that file unless the "
                     "worker named the file itself. An unclaimed new file fails the gate of each "
                     "worker that saw it."

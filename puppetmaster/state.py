@@ -40,6 +40,16 @@ def default_state_dir(cwd: Optional[Path] = None) -> Path:
     return project_state_dir_for(workspace)
 
 
+def walking_runs_dir() -> Path:
+    """One small file per top flow run that a walker walks now.
+
+    The file holds the state dir and the checkout of the run. The pilot claim
+    hook (:mod:`puppetmaster.claim_hook`) finds the runs over a file with one
+    directory listing, for every state dir.
+    """
+    return app_state_root() / "walking-flows"
+
+
 def projects_root() -> Path:
     """Return the parent directory holding every project-scoped state dir."""
     return app_state_root() / "projects"

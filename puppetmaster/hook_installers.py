@@ -15,6 +15,11 @@ Targets:
 * ``.claude/settings.json`` — Claude Code hooks: ``UserPromptSubmit`` (inject)
   and ``PreToolUse`` matched on ``Grep|Glob|Task`` (deny-redirect).
 
+Every target also gets the pilot claim hook (``<python> -m
+puppetmaster.claim_hook``, see :mod:`puppetmaster.claim_hook`) after each file
+edit. While a flow walks, it claims the file that the pilot wrote, so the
+write_scope gate does not charge that file to a worker.
+
 Each target has two **scopes**, differing only in the base directory the same
 subpath hangs off:
 
@@ -43,6 +48,8 @@ from pathlib import Path
 from typing import Iterable, Mapping, Optional, Sequence
 
 _GATE_MARKER = "puppetmaster invocation-gate"
+_CLAIM_MARKER = "puppetmaster.claim_hook"
+_OWNED_MARKERS = (_GATE_MARKER, _CLAIM_MARKER)
 
 VALID_HOOK_TARGETS = {"cursor", "claude", "codex"}
 VALID_HOOK_SCOPES = {"project", "global"}
@@ -98,16 +105,21 @@ def _gate_command(host: str, event: str, python: Optional[str] = None) -> str:
     return f"{exe} -m puppetmaster invocation-gate --host {host} --event {event}"
 
 
+def _claim_command(python: Optional[str] = None) -> str:
+    return f"{_shell_safe_executable(python or sys.executable or 'python3')} -m {_CLAIM_MARKER}"
+
+
 def _is_ours(entry: object) -> bool:
-    """True if a hook entry is one we wrote (matched by the gate command)."""
-    return _GATE_MARKER in json.dumps(entry)
+    """True if a hook entry is one we wrote (matched by the gate or claim command)."""
+    text = json.dumps(entry)
+    return any(marker in text for marker in _OWNED_MARKERS)
 
 
 def _collect_owned_commands(node: object) -> list[str]:
     found: list[str] = []
     if isinstance(node, dict):
         command = node.get("command")
-        if isinstance(command, str) and _GATE_MARKER in command:
+        if isinstance(command, str) and any(marker in command for marker in _OWNED_MARKERS):
             found.append(command)
         for value in node.values():
             found.extend(_collect_owned_commands(value))
@@ -168,6 +180,7 @@ def render_cursor_hooks(python: Optional[str] = None) -> dict:
         "beforeSubmitPrompt": [{"command": _gate_command("cursor", "user-prompt", python)}],
         "beforeShellExecution": [{"command": _gate_command("cursor", "pre-tool", python)}],
         "beforeReadFile": [{"command": _gate_command("cursor", "pre-tool", python)}],
+        "afterFileEdit": [{"command": _claim_command(python)}],
     }
 
 
@@ -187,7 +200,11 @@ def render_claude_hooks(python: Optional[str] = None) -> dict:
             {
                 "matcher": "TodoWrite",
                 "hooks": [{"type": "command", "command": _gate_command("claude", "post-tool", python)}],
-            }
+            },
+            {
+                "matcher": "Write|Edit|MultiEdit|NotebookEdit",
+                "hooks": [{"type": "command", "command": _claim_command(python)}],
+            },
         ],
     }
 
@@ -202,7 +219,11 @@ def render_codex_hooks(python: Optional[str] = None) -> dict:
             {
                 "matcher": "update_plan",
                 "hooks": [{"type": "command", "command": _gate_command("codex", "post-tool", python)}],
-            }
+            },
+            {
+                "matcher": "apply_patch",
+                "hooks": [{"type": "command", "command": _claim_command(python)}],
+            },
         ],
     }
 
@@ -316,7 +337,7 @@ def _install_claude(base_dir: Path, *, scope: str, dry_run: bool, force: bool, p
     if dry_run:
         return HookOutcome("claude", str(path), "would_install", f"would register Claude {scope} UserPromptSubmit + PreToolUse deny-redirect hooks")
     _write_atomic(path, json.dumps(merged, indent=2) + "\n")
-    return HookOutcome("claude", str(path), "installed", f"wrote Claude {scope} UserPromptSubmit + PreToolUse(Grep|Glob|Task) hooks")
+    return HookOutcome("claude", str(path), "installed", f"wrote Claude {scope} UserPromptSubmit + PreToolUse(Grep|Glob|Task) + PostToolUse(TodoWrite, file edits) hooks")
 
 
 def _install_codex(home: Optional[Path], *, scope: str, dry_run: bool, force: bool,
@@ -329,9 +350,9 @@ def _install_codex(home: Optional[Path], *, scope: str, dry_run: bool, force: bo
     if not changed and not force:
         return HookOutcome("codex", str(path), "unchanged", f"{path} already current")
     if dry_run:
-        return HookOutcome("codex", str(path), "would_install", "would register Codex UserPromptSubmit + PostToolUse(update_plan) hooks")
+        return HookOutcome("codex", str(path), "would_install", "would register Codex UserPromptSubmit + PostToolUse(update_plan, apply_patch) hooks")
     _write_atomic(path, json.dumps(merged, indent=2) + "\n")
-    return HookOutcome("codex", str(path), "installed", "wrote Codex UserPromptSubmit + PostToolUse(update_plan) hooks")
+    return HookOutcome("codex", str(path), "installed", "wrote Codex UserPromptSubmit + PostToolUse(update_plan, apply_patch) hooks; Codex runs a new hook only after you review it once")
 
 
 _HOOK_TARGET_ADAPTERS = {"cursor": "cursor", "claude": "claude-code", "codex": "codex"}
