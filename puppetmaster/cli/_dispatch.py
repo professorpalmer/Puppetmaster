@@ -247,6 +247,7 @@ def _start_background_dashboard(
         pid_alive,
         read_dashboard_runfile,
         stop_dashboard_pid,
+        tracked_dashboard_pid,
         write_dashboard_runfile,
     )
 
@@ -280,9 +281,7 @@ def _start_background_dashboard(
     # `--background` doesn't spawn a redundant second server for the same
     # project (and clobber the runfile the first one is still using).
     existing = read_dashboard_runfile(state_dir)
-    previous_pid = None
-    if existing and pid_alive(int(existing.get("pid") or 0)):
-        previous_pid = int(existing.get("pid") or 0)
+    previous_pid = tracked_dashboard_pid(existing) or None
     if (
         existing
         and normalize_dashboard_host(existing.get("host", host)) == normalize_dashboard_host(host)
@@ -420,7 +419,7 @@ def _start_background_dashboard(
     if previous_pid and previous_pid != process.pid:
         # Host/port retarget started a replacement; don't leave the old
         # listener up with no runfile pointing at it.
-        stop_dashboard_pid(previous_pid)
+        stop_dashboard_pid(previous_pid, (existing or {}).get("identity"))
     print(f"Dashboard running in the background (pid {process.pid}).")
     _announce_background_dashboard(args, bound_host, bound_port, source)
     print("Stop it with: python -m puppetmaster dashboard --stop")

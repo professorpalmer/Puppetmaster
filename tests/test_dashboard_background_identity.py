@@ -32,7 +32,21 @@ from unittest.mock import MagicMock, patch
 import puppetmaster.dashboard as dash
 
 
-class BackgroundDashboardIdentityTests(unittest.TestCase):
+class _TrustRunfilePid:
+    """These tests gate reuse by host, port and project, not by process
+    identity: a fake runfile pid counts as the tracked dashboard while the
+    mocked ``pid_alive`` says it is alive. ``TrackedDashboardPidTests`` covers
+    the identity check itself."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        patcher = patch.object(dash, "tracked_dashboard_pid", side_effect=lambda info: (
+            int(info.get("pid") or 0) if info and dash.pid_alive(int(info.get("pid") or 0)) else 0))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
+class BackgroundDashboardIdentityTests(_TrustRunfilePid, unittest.TestCase):
     def _args(self, **overrides) -> argparse.Namespace:
         defaults = dict(
             port=None,
@@ -350,7 +364,7 @@ class BackgroundDashboardIdentityTests(unittest.TestCase):
                     source="tailscale", allow_external=True,
                 )
         popen.assert_called_once()
-        stop_old.assert_called_once_with(1111)
+        stop_old.assert_called_once_with(1111, None)
         self.assertEqual(rc, 0)
 
     def test_mcp_dashboard_own_runfile_reuse_is_host_gated(self) -> None:
@@ -389,7 +403,7 @@ class BackgroundDashboardIdentityTests(unittest.TestCase):
                 "puppetmaster_dashboard", {"cwd": "/tmp", "mobile": True}
             )
         popen.assert_called_once()
-        stop_old.assert_called_once_with(3333)
+        stop_old.assert_called_once_with(3333, None)
         body = json.loads(result["content"][0]["text"])
         self.assertTrue(body["started"])
         self.assertEqual(body["host"], "100.64.0.7")
@@ -509,7 +523,7 @@ class BackgroundDashboardIdentityTests(unittest.TestCase):
         self.assertTrue(body["started"])
 
 
-class ExplicitPortReuseGateTests(unittest.TestCase):
+class ExplicitPortReuseGateTests(_TrustRunfilePid, unittest.TestCase):
     """§F1 -- an explicit --port is a promise the caller may depend on (a
     script, a bookmark, a reverse proxy). Pre-fix, the own-runfile
     pre-check consulted neither `auto_port` nor whether the tracked port
@@ -684,7 +698,7 @@ class ExplicitPortReuseGateTests(unittest.TestCase):
         self.assertEqual(body["port"], 18805)
 
 
-class HostNormalizationReuseTests(unittest.TestCase):
+class HostNormalizationReuseTests(_TrustRunfilePid, unittest.TestCase):
     """§F2 -- a tracked runfile always records the literal address the
     child bound (e.g. "127.0.0.1"), never a loopback alias. Comparing that
     raw string against a fresh request's host *spelling* -- "localhost" --
@@ -775,6 +789,42 @@ class HostNormalizationReuseTests(unittest.TestCase):
         popen.assert_not_called()
         body = json.loads(result["content"][0]["text"])
         self.assertTrue(body["already_running"])
+
+
+class TrackedDashboardPidTests(unittest.TestCase):
+    """A dashboard that died without clearing its runfile leaves a pid the OS
+    can give to an unrelated process. The stop paths must not signal it."""
+
+    def test_a_reused_pid_is_not_the_dashboard(self) -> None:
+        info = {"pid": os.getpid(), "identity": "an-earlier-process", "host": "127.0.0.1", "port": 1}
+        self.assertEqual(dash.tracked_dashboard_pid(info), 0)
+        with patch("os.kill") as kill:
+            self.assertFalse(dash.stop_dashboard_pid(os.getpid(), "an-earlier-process"))
+        # Only the signal-0 liveness probe, never a real signal.
+        self.assertEqual({c.args[1] for c in kill.call_args_list} - {0}, set())
+
+    def test_the_recorded_identity_is_the_dashboard(self) -> None:
+        from puppetmaster.proc_identity import own_identity
+
+        info = {"pid": os.getpid(), "identity": own_identity(), "host": "127.0.0.1", "port": 1}
+        self.assertEqual(dash.tracked_dashboard_pid(info), os.getpid())
+
+    def test_a_runfile_without_identity_needs_the_server_to_vouch(self) -> None:
+        info = {"pid": os.getpid(), "host": "127.0.0.1", "port": 8787}
+        with patch.object(dash, "dashboard_identity", return_value=None):
+            self.assertEqual(dash.tracked_dashboard_pid(info), 0)
+        with patch.object(dash, "dashboard_identity", return_value={"pid": os.getpid()}):
+            self.assertEqual(dash.tracked_dashboard_pid(info), os.getpid())
+
+    def test_stop_background_leaves_a_reused_pid_alone(self) -> None:
+        with TemporaryDirectory() as tmp:
+            dash.write_dashboard_runfile(tmp, {"pid": os.getpid(), "identity": "an-earlier-process",
+                                               "host": "127.0.0.1", "port": 1, "url": "u"})
+            with patch("os.kill") as kill:
+                result = dash.stop_background_dashboard(tmp)
+            self.assertEqual({c.args[1] for c in kill.call_args_list} - {0}, set())
+            self.assertIn("another process", result["reason"])
+            self.assertIsNone(dash.read_dashboard_runfile(tmp))
 
 
 class DashboardArgvDerivationTests(unittest.TestCase):

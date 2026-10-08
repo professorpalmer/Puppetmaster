@@ -156,8 +156,8 @@ class FileClaimRegistry:
                 "UPDATE file_claims SET renewed_at=?, ttl_seconds=? WHERE repo_identity=? AND path=?",
                 (now, duration, repo_identity, normalized),
             )
-            self._audit(connection, "renewed", repo_identity, normalized, claim_id,
-                        str(row["owner"]), str(row["owner"]), now)
+            # No audit row: a holder renews each ttl/3, and one row per renewal
+            # grew a user's claims database to 445 MB.
             return True
 
     def release(self, repo: PathLike, path: PathLike, claim_id: str) -> bool:
@@ -212,13 +212,12 @@ class FileClaimRegistry:
 
         A judge waits on this before it reviews: a review that runs while a
         writer holds an overlapping claim can pass files that change after it.
-        A managed claim whose owner process is dead is not a live writer.
+        A managed claim whose owner process is dead is released, not returned.
         """
         repo_identity, normalized_paths = self._claim_keys(repo, paths)
         with self._transaction() as connection:
             rows = self._live_overlapping_rows(connection, repo_identity, normalized_paths, self._now())
-        return [(str(row["path"]), str(row["owner"])) for row in rows
-                if not bool(row["managed"]) or _managed_owner_live(row)]
+        return [(str(row["path"]), str(row["owner"])) for row in rows]
 
     def repository_identity(self, repo: PathLike) -> tuple[str, Path]:
         """Return canonical Git common-dir identity and this worktree's root."""
@@ -286,6 +285,15 @@ class FileClaimRegistry:
             ):
                 if name not in columns:
                     connection.execute("ALTER TABLE file_claims ADD COLUMN %s %s" % (name, definition))
+            # Before 1.40 each renewal wrote an audit row (1.4 million rows,
+            # 445 MB on one machine). Drop them once and give the space back.
+            connection.execute("DELETE FROM file_claim_audit WHERE event='renewed'")
+            connection.commit()
+            if connection.execute("PRAGMA freelist_count").fetchone()[0] > 10000:
+                try:
+                    connection.execute("VACUUM")
+                except sqlite3.OperationalError:
+                    pass  # another process holds the database; the next start tries again
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -323,14 +331,15 @@ class FileClaimRegistry:
             if not any(_paths_overlap(path, requested) for requested in paths):
                 continue
             if bool(row["managed"]):
-                if not _managed_owner_live(row):
-                    connection.execute(
-                        "UPDATE file_claims SET state='quarantined' WHERE repo_identity=? AND path=?",
-                        (identity, path),
-                    )
-                    self._audit(connection, "quarantined", identity, path, str(row["claim_id"]),
-                                str(row["owner"]), str(row["owner"]), now)
-                rows.append(row)
+                if _managed_owner_live(row):
+                    rows.append(row)
+                    continue
+                # The owner process is gone (or its pid now names another
+                # process), so nothing can write under this claim or release
+                # it. Keeping it blocked every later writer of the path forever.
+                connection.execute("DELETE FROM file_claims WHERE repo_identity=? AND path=?", (identity, path))
+                self._audit(connection, "owner_dead", identity, path, str(row["claim_id"]),
+                            str(row["owner"]), None, now)
             elif _expired(row, now):
                 connection.execute("DELETE FROM file_claims WHERE repo_identity=? AND path=?", (identity, path))
                 self._audit(connection, "expired", identity, path, str(row["claim_id"]),
@@ -432,27 +441,29 @@ def _expired(row: sqlite3.Row, now: float) -> bool:
 
 
 def process_start_identity(pid: Optional[int] = None) -> Optional[str]:
-    """Return a best-effort identity that prevents PID reuse from fencing."""
+    """The kernel start identity of ``pid`` (default: this process), or None."""
+    from puppetmaster.proc_identity import own_identity, process_identity
+
     target = int(pid or os.getpid())
     if target <= 0:
         return None
-    try:
-        stat = Path("/proc/%d/stat" % target).read_text(encoding="utf-8")
-        return stat.rsplit(")", 1)[1].split()[19]
-    except (OSError, IndexError, ValueError):
-        return None
+    return own_identity() if target == os.getpid() else process_identity(target)
 
 
 def _managed_owner_live(row: sqlite3.Row) -> bool:
+    """True while the recorded owner process still runs.
+
+    The start identity tells the owner from a later process that got its pid.
+    Before 1.40 it was read only on Linux, so older rows elsewhere have none.
+    """
+    from puppetmaster.liveness import _pid_alive
+
     pid = row["owner_pid"]
-    if pid is None:
+    if pid is None or not _pid_alive(int(pid)):
         return False
-    try:
-        os.kill(int(pid), 0)
-    except (OSError, ValueError):
-        return False
-    recorded = row["owner_start_identity"]
-    return recorded is None or recorded == process_start_identity(int(pid))
+    from puppetmaster.proc_identity import pid_reused
+
+    return not pid_reused(int(pid), row["owner_start_identity"])
 
 
 def _claim_from_row(row: sqlite3.Row) -> FileClaim:

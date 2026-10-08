@@ -166,6 +166,12 @@ Each running Puppetmaster MCP server registers itself in
 heartbeat from a background thread, so dead and stale entries are
 detectable without grepping `ps`.
 
+Each entry also records the process start identity (1.40.0+). `--kill-stale`
+signals a pid only when the kernel confirms that it is still the registered
+server. A pid that the OS gave to another process counts as dead, and
+`mcp cleanup` removes its entry. An entry from before 1.40.0 has no identity:
+`--kill-stale` leaves it, and `mcp cleanup --pid <pid>` stops it.
+
 ## CodeGraph reports `database is locked` from MCP, but works fine in the terminal
 
 This is the most common gotcha on macOS Cursor installs. CodeGraph's

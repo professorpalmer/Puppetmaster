@@ -34,6 +34,7 @@ from typing import Any, Callable, Optional, Union
 from puppetmaster.dashboard_ui import load_dashboard_fragments
 from puppetmaster.artifact_status import format_status_label, status_fields
 from puppetmaster.models import Artifact, ArtifactType, Job, Task
+from puppetmaster.proc_identity import own_identity, pid_reused
 from puppetmaster.store import SwarmStore
 from puppetmaster.cost import build_cost_report
 from puppetmaster.consumption import build_attempt_consumption_report
@@ -1586,16 +1587,37 @@ def dashboard_serves(
     return bool(identity.get("all_projects")) == bool(all_projects)
 
 
-def stop_dashboard_pid(pid: int) -> bool:
+def tracked_dashboard_pid(info: Optional[dict]) -> int:
+    """The runfile's pid while it still names the dashboard that wrote it, else 0.
+
+    A dashboard that died without clearing its runfile leaves a pid that the
+    OS can give to an unrelated process. The runfile records the process
+    start identity; a runfile without one must have its server answer
+    ``/api/meta`` with that pid.
+    """
+    if not info:
+        return 0
+    pid = int(info.get("pid") or 0)
+    if not pid_alive(pid):
+        return 0
+    identity = info.get("identity")
+    if identity:
+        return 0 if pid_reused(pid, identity) else pid
+    meta = dashboard_identity(str(info.get("host") or "127.0.0.1"), int(info.get("port") or 0))
+    return pid if meta and meta.get("pid") == pid else 0
+
+
+def stop_dashboard_pid(pid: int, identity: Optional[str] = None) -> bool:
     """Best-effort SIGTERM of a previously tracked dashboard pid.
 
     Used when a retarget (``--mobile`` after loopback, or a new ``--port``)
     starts a replacement server: the old listener would otherwise stay up
-    untracked once the runfile points at the new child.
+    untracked once the runfile points at the new child. Pass the pid from
+    ``tracked_dashboard_pid`` and the runfile identity.
     """
     import signal
 
-    if not pid or not pid_alive(pid):
+    if not pid or not pid_alive(pid) or pid_reused(pid, identity):
         return False
     try:
         os.kill(pid, signal.SIGTERM)
@@ -1618,12 +1640,15 @@ def stop_background_dashboard(state_dir: Union[Path, str]) -> dict:
 
     pid = int(info.get("pid") or 0)
     result: dict = {"stopped": False, "pid": pid, "url": info.get("url")}
-    if pid_alive(pid):
+    if tracked_dashboard_pid(info):
         try:
             os.kill(pid, signal.SIGTERM)
             result["stopped"] = True
         except OSError as exc:
             result["reason"] = f"could not signal pid {pid}: {exc}"
+    elif pid_alive(pid):
+        result["stopped"] = True
+        result["reason"] = "the pid now names another process (cleared stale runfile)"
     else:
         result["stopped"] = True
         result["reason"] = "process was not running (cleared stale runfile)"
@@ -1822,6 +1847,7 @@ def serve(
                 runfile_state_dir,
                 {
                     "pid": os.getpid(),
+                    "identity": own_identity(),
                     "host": host,
                     "port": bound_port,
                     "url": url,

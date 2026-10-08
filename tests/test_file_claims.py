@@ -53,7 +53,7 @@ class FileClaimRegistryTests(unittest.TestCase):
         replacement = self.registry.acquire(self.root, "tracked.txt", "worker-b", 10)
         self.assertNotEqual(claim.claim_id, replacement.claim_id)
         self.assertFalse(self.registry.release(self.root, "tracked.txt", claim.claim_id))
-        self.assertEqual(["acquired", "renewed", "expired", "acquired"],
+        self.assertEqual(["acquired", "expired", "acquired"],
                          [record.event for record in self.registry.audit_records()])
 
     def test_forced_steal_invalidates_old_fencing_token_and_audits_owners(self) -> None:
@@ -193,3 +193,78 @@ class FileClaimProcessTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReusedOwnerPidTests(unittest.TestCase):
+    """A managed claim whose owner died while its pid went to another process
+    must not block edit admission or a review wait (it waited the full 900 s)."""
+
+    def setUp(self) -> None:
+        import sys
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = Path(tmp.name) / "repo"
+        self.repo.mkdir()
+        self.registry = FileClaimRegistry(Path(tmp.name) / "claims.sqlite3")
+        self.other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(self.other.wait)
+        self.addCleanup(self.other.kill)
+
+    def claim(self, identity):
+        return self.registry.acquire(self.repo, "a.py", "worker-dead", 600, managed=True,
+                                     owner_pid=self.other.pid, owner_start_identity=identity)
+
+    def test_a_reused_owner_pid_does_not_hold_the_claim(self) -> None:
+        self.claim("an-earlier-process")
+        self.assertEqual(self.registry.live_writers(self.repo, ["a.py"]), [])
+        self.registry.acquire(self.repo, "a.py", "worker-new", 600)
+
+    def test_the_recorded_owner_holds_the_claim(self) -> None:
+        from puppetmaster.file_claims import process_start_identity
+
+        identity = process_start_identity(self.other.pid)
+        self.assertIsNotNone(identity)
+        self.claim(identity)
+        self.assertEqual([owner for _, owner in self.registry.live_writers(self.repo, ["a.py"])],
+                         ["worker-dead"])
+        with self.assertRaises(FileClaimConflict):
+            self.registry.acquire(self.repo, "a.py", "worker-new", 600)
+
+
+class DeadOwnerTests(unittest.TestCase):
+    """A worker that dies without release (SIGKILL, crash, reboot) left a
+    managed claim that blocked every later writer of the path forever."""
+
+    def test_a_dead_owner_claim_is_released_and_audited(self) -> None:
+        import sys
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            registry = FileClaimRegistry(Path(tmp) / "claims.sqlite3")
+            dead = subprocess.Popen([sys.executable, "-c", "pass"])
+            dead.wait()
+            registry.acquire_many(repo, ["."], "worker-dead", 2.0, managed=True, owner_pid=dead.pid)
+            self.assertEqual(registry.live_writers(repo, ["a.py"]), [])
+            claim = registry.acquire(repo, "a.py", "worker-next", 2.0, managed=True, owner_pid=os.getpid())
+            self.assertEqual(claim.owner, "worker-next")
+            events = [(r.event, r.old_owner) for r in registry.audit_records()]
+            self.assertIn(("owner_dead", "worker-dead"), events)
+
+    def test_renewal_writes_no_audit_row_and_old_rows_are_dropped(self) -> None:
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            db = Path(tmp) / "claims.sqlite3"
+            registry = FileClaimRegistry(db)
+            claim = registry.acquire(repo, "a.py", "worker", 60)
+            for _ in range(5):
+                self.assertTrue(registry.renew(repo, "a.py", claim.claim_id))
+            self.assertEqual([r.event for r in registry.audit_records()], ["acquired"])
+            with sqlite3.connect(db) as connection:
+                connection.execute("INSERT INTO file_claim_audit(event,repo_identity,path,claim_id,occurred_at) "
+                                   "VALUES('renewed','r','a.py','c',0)")
+            self.assertEqual([r.event for r in FileClaimRegistry(db).audit_records()], ["acquired"])

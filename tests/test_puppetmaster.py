@@ -22845,6 +22845,28 @@ class PuppetmasterFrictionFixTests(unittest.TestCase):
         self.assertIn("puppetmaster_edit", names)
 
     # --- #2 / #4: stalled-job reaper -----------------------------------
+    def test_reaper_does_not_take_a_reused_pid_for_the_orchestrator(self) -> None:
+        from puppetmaster.liveness import reap_stalled_jobs
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            job = store.create_job("goal")
+            store.update_job_status(job.id, JobStatus.RUNNING)
+            # This process is alive, but it is not the process that recorded
+            # the heartbeat: the pid was given to it later.
+            store.write_json(
+                store.job_dir(job.id) / "orchestrator.json",
+                {
+                    "pid": os.getpid(),
+                    "identity": "an-earlier-process",
+                    "host": __import__("socket").gethostname(),
+                    "started_at": seconds_from_now(-30),
+                    "heartbeat_at": seconds_from_now(-30),
+                },
+            )
+            reaped = reap_stalled_jobs(store)
+            self.assertEqual([r["reason"] for r in reaped], ["orchestrator_pid_gone"])
+
     def test_reaper_marks_dead_orchestrator_job_stalled(self) -> None:
         from puppetmaster.liveness import reap_stalled_jobs
 

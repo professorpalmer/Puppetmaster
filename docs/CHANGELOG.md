@@ -1,3 +1,35 @@
+## v1.40.0 — 2026-10-08
+
+**No stored pid is signalled or trusted after the OS gives it to another
+process.** A process that dies without cleanup leaves its pid in a file, and
+the OS can later give that pid to an unrelated process. An audit of every
+place that kills or trusts a stored pid found four that did not check:
+
+| Place | Before | Now |
+| --- | --- | --- |
+| MCP server registry (`mcp cleanup --kill-stale`, `uninstall`) | A stale file whose pid was reused: the unrelated process got SIGTERM, then SIGKILL | `register` records the process start identity. `kill_stale` signals only a pid that the kernel confirms is the registered server. `kill_selected` skips a reused pid, and signals a file without an identity only when the caller names its pid |
+| Background dashboard runfile (`dashboard --stop`, retarget) | SIGTERM to whatever held the recorded pid | The runfile records the identity (`tracked_dashboard_pid`). A runfile without one needs `/api/meta` to report that pid |
+| Edit-claim owners | The owner identity was read only on Linux. On Windows the liveness probe was `os.kill(pid, 0)` | `proc_identity` on all platforms, and the Windows-safe probe |
+| Orchestrator heartbeat (`orchestrator.json`) | A reused pid kept a dead job "alive" until the stall timeout | The heartbeat records the identity. A reused pid is `orchestrator_pid_gone` at once |
+
+Flow walkers, shell nodes, lock files and local models already checked identity.
+
+**A dead edit-claim owner no longer fences its paths forever.** A worker that
+died without release (SIGKILL, crash, reboot) left a managed claim that
+blocked every later edit worker on those paths. Each later worker waited out
+its admission wait and failed. The quarantine update was rolled back with the
+conflict, so the claim stayed. Now a claim whose owner process is gone, or
+whose pid names another process, is released, and the audit records
+`owner_dead`. Files that the dead writer changed stay in the tree for the
+next worker. One Mac had four such claims, the oldest from 2026-09-16, three of
+them on a whole repository (`.`).
+
+**The claims database no longer grows with each renewal.** Each claim renewal
+(each ttl/3, about every 0.7 s per holder) wrote an audit row. One Mac had
+1,367,553 of them, in a 445 MB file. Renewals write no audit row now. The
+first start of 1.40 drops the old renewal rows and compacts the file. On a
+copy of that file this took 0.48 s, and the file went to 1.9 MB.
+
 ## v1.39.0 — 2026-10-08
 
 **Parallel workers under a job cap queue instead of failing.** Before, an
