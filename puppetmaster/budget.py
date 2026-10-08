@@ -249,6 +249,25 @@ def stamp_payload_budget_allowance(policy, payload, *, adapter):
     return payload
 
 
+def rebill_allowance(allowance: Mapping[str, object], billing: Optional[str]) -> dict:
+    """Move a stamped allowance to the billing that routing chose.
+
+    A launch stamps the allowance before routing knows the billing, so it says
+    "unknown". The worker refuses an allowance whose billing differs from its
+    own. Keep the bounds; a plan route has a known zero marginal charge, and
+    other charges do not carry over.
+    """
+    billing = billing or "unknown"
+    if allowance.get("billing", "unknown") == billing:
+        return dict(allowance)
+    values = {key: allowance[key] for key in ("tokens_in", "tokens_out", "elapsed_seconds")
+              if allowance.get(key) is not None}
+    values["billing"] = billing
+    if billing == "plan":
+        values.update(plan_marginal_usd=0, cost_state="known")
+    return values
+
+
 def budget_policy_from_inputs(values: Mapping[str, object]) -> Optional[BudgetPolicy]:
     """Validate public job-total inputs; omission preserves legacy launches.
 

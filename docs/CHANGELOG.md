@@ -35,6 +35,25 @@ Live proof: a judge waited 69 s for a Codex writer that held the checkout,
 started 1 s after the writer released its claim, and recorded the hash of the
 writer's final text.
 
+**Routed workers under a job cap start again.** A launch stamps the budget
+allowance before routing chooses the model, so its billing was "unknown".
+Routing then set the task billing to "plan" or "api", and each routed worker
+under any job cap failed before dispatch: "budget allowance billing conflicts
+with invocation". This was also in 1.38.0. Routing now moves the allowance to
+the routed billing (`rebill_allowance`). The bounds stay, a plan route has a
+known zero marginal charge, and other charges do not carry over. A
+`budget_max_usd` cap on a routed launch is still refused at launch, because
+the billing is not known then.
+
+Live proof: two routed Codex workers under a 300 s elapsed cap with a 120 s
+timeout each. The second worker waited from 16:55:40 until the first settled
+at 16:55:59, then ran. The job completed. The same launch on 1.38.0 failed
+both workers in one second.
+
+**Test hygiene.** The flow tests wait for a detached walker to free
+`walker.log` before they delete their root (Windows WinError 32). The gate
+lease test uses a 4 s lease; a 2 s lease lapsed once on a CPU-starved runner.
+
 **Edit-admission renewals are recorded at most each 10 s.** The renewal rate
 does not change.
 

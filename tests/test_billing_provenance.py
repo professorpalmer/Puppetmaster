@@ -249,6 +249,30 @@ class BillingProvenanceTests(unittest.TestCase):
         self.assertEqual(stamp_model_billing({'model': 'gpt-6-astra'})['billing'], 'unknown')
         self.assertEqual(stamp_model_billing({'billing': 'invalid'}, plan)['billing'], 'plan')
 
+    def test_a_stamped_allowance_follows_the_routed_billing(self):
+        # A launch stamps the allowance before routing, as billing "unknown".
+        # Routing then set billing "plan", and every routed worker under a job
+        # cap failed: "budget allowance billing conflicts with invocation".
+        from puppetmaster.budget import BudgetLiability, stamp_payload_budget_allowance
+        plan = ModelSpec(id='codex/one', adapter='codex', adapter_model_name='one', billing='plan')
+        api = ModelSpec(id='agentic/two', adapter='agentic', adapter_model_name='two', billing='api')
+        def route(payload, spec):
+            return merge_routing_payload(payload, SimpleNamespace(model=spec, policy='balanced',
+                capability_needed=50, estimated_cost_usd=0, allowed_model_ids=None))
+        stamped = stamp_payload_budget_allowance(BudgetPolicy(max_elapsed_seconds=300),
+                                                 {'auto_route': True, 'timeout_seconds': 120},
+                                                 adapter='codex')
+        self.assertEqual(stamped['budget_allowance']['billing'], 'unknown')
+        first = route(stamped, plan)
+        self.assertEqual(first['budget_allowance'], {'billing': 'plan', 'plan_marginal_usd': 0,
+                                                     'cost_state': 'known', 'elapsed_seconds': 120.0})
+        fallback = route(first, api)
+        self.assertEqual(fallback['budget_allowance'], {'billing': 'api', 'elapsed_seconds': 120.0})
+        for payload in (first, fallback):
+            BudgetLiability(**payload['budget_allowance'])
+            self.assertEqual(payload['budget_allowance']['billing'], payload['billing'])
+        self.assertNotIn('budget_allowance', route({'auto_route': True}, plan))
+
     def test_reroute_takes_the_new_models_provider_binding(self):
         # A rate-limited opencode-go route fell back to an OpenRouter model, but
         # the first route's injected provider stayed in the payload, so the
