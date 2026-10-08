@@ -1,3 +1,33 @@
+## v1.35.1 — 2026-10-08
+
+**A helper reap that misses its teardown budget is no longer reported as a
+lost helper.** Each read connection first sweeps one idle readonly helper,
+with a budget of 50 ms. Under load, a helper did not exit within 50 ms
+after SIGTERM. It then got SIGKILL and a wait of 0 s, so the reap timed
+out, and the registry logged the warning "Readonly cleanup retained: reader
+teardown timed out". The registry kept the token, and its next sweep reaped
+the process (20 of 20 in a reproduction). Thus nothing leaked, but the
+warning looked like a leak.
+
+- `close()` now raises `ReapDeferred` (a `ReadTimeout`) when the helper got
+  SIGKILL but was not reaped within the budget.
+- The registry logs `ReapDeferred` at debug level. Every other teardown
+  failure stays a warning.
+- New tests use a real child process that ignores SIGTERM. They show the
+  deferred reap, the debug log, and the reap by the next sweep.
+
+**A budget refusal now names its case.** The text was
+"max_elapsed_seconds: indeterminate or exhausted" for both cases. In a
+Codex canary, three of four parallel workers failed with it, and the cause
+was not clear from the text.
+
+- "indeterminate" now says that an earlier attempt of the job has no
+  settled value, because it runs now or ended without a final report. Under
+  a cap, the job admits a new attempt only after each earlier attempt
+  settles.
+- "exhausted" now gives the new total and the cap.
+- The admission rules do not change.
+
 ## v1.35.0 — 2026-10-08
 
 **The Puppetmaster hooks claim the pilot's file edits during a flow.** In

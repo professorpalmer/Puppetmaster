@@ -44,6 +44,14 @@ class ReadTimeout(ReadUnavailable):
     """The helper exhausted its response budget without reporting contention."""
 
 
+class ReapDeferred(ReadTimeout):
+    """The helper got SIGKILL but was not reaped within the teardown budget.
+
+    The registry keeps the token, and its next sweep reaps the process. This is
+    the expected result of a tight budget under load, not a lost helper.
+    """
+
+
 _read_deadline = ContextVar('readonly_deadline', default=None)
 
 
@@ -219,7 +227,7 @@ class _Transport:
                 try:
                     self.process.wait(timeout=remaining())
                 except subprocess.TimeoutExpired as exc:
-                    raise ReadTimeout('reader teardown timed out') from exc
+                    raise ReapDeferred('reader teardown timed out') from exc
             if self.process.poll() is None:
                 raise ReadUnavailable('reader process remains alive')
         self.state = max(self.state, _TransportState.REAPED)
