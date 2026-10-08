@@ -24,6 +24,14 @@ whose pid names another process, is released, and the audit records
 next worker. One Mac had four such claims, the oldest from 2026-09-16, three of
 them on a whole repository (`.`).
 
+**A settlement no longer fails on a busy budget lock (file store).** The file
+store's job budget lock failed at the first contention, but in 1.39 a worker
+that waits for admission takes that lock each second. A settlement that met
+it raised `BudgetBusy`, so the earlier attempt stayed unsettled and the waiter
+waited out its 900 s limit. The lock now waits up to 10 s for its holder,
+which keeps it for milliseconds. A test found this in 2 of 8 full-suite runs;
+after the fix, 0 of 6.
+
 **The claims database no longer grows with each renewal.** Each claim renewal
 (each ttl/3, about every 0.7 s per holder) wrote an audit row. One Mac had
 1,367,553 of them, in a 445 MB file. Renewals write no audit row now. The
