@@ -264,7 +264,13 @@ class DeadOwnerTests(unittest.TestCase):
             for _ in range(5):
                 self.assertTrue(registry.renew(repo, "a.py", claim.claim_id))
             self.assertEqual([r.event for r in registry.audit_records()], ["acquired"])
-            with sqlite3.connect(db) as connection:
-                connection.execute("INSERT INTO file_claim_audit(event,repo_identity,path,claim_id,occurred_at) "
-                                   "VALUES('renewed','r','a.py','c',0)")
+            # sqlite3's context manager commits but does not close; Windows then
+            # cannot delete the open file.
+            connection = sqlite3.connect(db)
+            try:
+                with connection:
+                    connection.execute("INSERT INTO file_claim_audit(event,repo_identity,path,claim_id,occurred_at) "
+                                       "VALUES('renewed','r','a.py','c',0)")
+            finally:
+                connection.close()
             self.assertEqual([r.event for r in FileClaimRegistry(db).audit_records()], ["acquired"])
