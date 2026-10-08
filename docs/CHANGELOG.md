@@ -16,6 +16,18 @@ warning looked like a leak.
 - New tests use a real child process that ignores SIGTERM. They show the
   deferred reap, the debug log, and the reap by the next sweep.
 
+**A budget refusal now names its case.** The text was
+"max_elapsed_seconds: indeterminate or exhausted" for both cases. In a
+Codex canary, three of four parallel workers failed with it, and the cause
+was not clear from the text.
+
+- "indeterminate" now says that an earlier attempt of the job has no
+  settled value, because it runs now or ended without a final report. Under
+  a cap, the job admits a new attempt only after each earlier attempt
+  settles.
+- "exhausted" now gives the new total and the cap.
+- The admission rules do not change.
+
 ## v1.35.0 — 2026-10-08
 
 **The Puppetmaster hooks claim the pilot's file edits during a flow.** In

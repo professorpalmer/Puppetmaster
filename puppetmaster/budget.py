@@ -124,8 +124,14 @@ def check_admission(policy, records):
         if limit is None:
             continue
         value = totals[metric] if metric == "attempts" else totals[metric]["total"]
-        if value is None or value > limit:
-            raise BudgetAdmissionError(f"{cap}: indeterminate or exhausted")
+        if value is None:
+            raise BudgetAdmissionError(
+                f"{cap}: indeterminate: an earlier attempt of this job has no settled {metric} "
+                "(it runs now, or it ended without a final report). Under this cap, the job "
+                "admits a new attempt only after each earlier attempt settles")
+        if value > limit:
+            raise BudgetAdmissionError(
+                f"{cap}: exhausted: this attempt brings the total to {value:g}, above the cap of {limit:g}")
 
 
 BUDGET_FIELDS = {

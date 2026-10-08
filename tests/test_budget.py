@@ -283,6 +283,33 @@ class BudgetContract:
         self.assertEqual(reopened._budget_records(self.job.id), [])
 
 
+class AdmissionMessageTests(unittest.TestCase):
+    """The refusal names its case: an unsettled earlier attempt, or a cap that is spent."""
+
+    @staticmethod
+    def record(state, liability=None, elapsed=240.0):
+        return {"state": state, "liability": liability,
+                "allowance": asdict(BudgetLiability(elapsed_seconds=elapsed))}
+
+    def test_an_unsettled_earlier_attempt_is_indeterminate_not_exhausted(self):
+        from puppetmaster.budget import check_admission
+
+        pending = self.record("pending_reconciliation", asdict(BudgetLiability()))
+        with self.assertRaisesRegex(BudgetAdmissionError,
+                                    "max_elapsed_seconds: indeterminate: an earlier attempt"):
+            check_admission(BudgetPolicy(max_elapsed_seconds=1800), [pending, self.record("reserved")])
+
+    def test_a_spent_cap_says_exhausted_with_the_numbers(self):
+        from puppetmaster.budget import check_admission
+
+        with self.assertRaisesRegex(BudgetAdmissionError,
+                                    "max_elapsed_seconds: exhausted: .* total to 480, above the cap of 320"):
+            check_admission(BudgetPolicy(max_elapsed_seconds=320),
+                            [self.record("dispatching"), self.record("reserved")])
+        check_admission(BudgetPolicy(max_elapsed_seconds=480),
+                        [self.record("dispatching"), self.record("reserved")])
+
+
 class FileBudgetTests(BudgetContract, unittest.TestCase):
     def test_contention(self):
         key = f"budget:{self.job.id}"
