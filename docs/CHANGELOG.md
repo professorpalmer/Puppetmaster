@@ -11,6 +11,10 @@ tables. Marionette refused such a read as a changed view (409). The helper
 now retries this one error up to five times. Any other error, or one that
 persists, still raises. Under the same load, 9600 reads gave no failures.
 
+**`await` with `summary: none` returns the state only.** While a job was not
+terminal, the reply also had an empty `summary` key in this mode. It now
+has no `summary` key until the job is terminal and the mode asks for one.
+
 ## v1.33.4 — 2026-10-07
 
 **A failed Codex skill-bundle swap keeps the old bundle.** When the worker
