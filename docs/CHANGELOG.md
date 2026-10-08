@@ -1,3 +1,23 @@
+## v1.36.0 — 2026-10-08
+
+**An operator can keep the sessions of all fresh Codex workers.** A Codex
+benchmark needs the raw session of each worker. The registry setting
+`payload_defaults.ephemeral=false` applies only when Puppetmaster selects
+that registry model. An unpinned Codex start with routing off uses the
+configured Codex model with no registry defaults, so it ran `--ephemeral`.
+
+- New: `PUPPETMASTER_CODEX_EPHEMERAL=0` keeps the session of each fresh Codex
+  worker, and `1` makes each fresh worker ephemeral. Another value fails the
+  launch.
+- Precedence: a resume keeps its session. Then an explicit
+  `payload.ephemeral` wins, then a review loop keeps its session, then the
+  operator setting. Without the setting, the default does not change.
+- Each Codex receipt records `ephemeral_source`: `resume`, `payload`,
+  `review_loop`, `operator_default`, or `default`.
+- Fix: the app-server path (`native_steer`) always started an ephemeral
+  thread, even when the receipt said that the session was kept. It now
+  starts the thread that the receipt reports.
+
 ## v1.35.1 — 2026-10-08
 
 **A helper reap that misses its teardown budget is no longer reported as a

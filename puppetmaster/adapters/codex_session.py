@@ -79,13 +79,13 @@ def _usage(params: Any) -> Tuple[Optional[int], Optional[int], Optional[int]]:
 def run_codex_session(
     command_prefix: Union[str, Sequence[str]], cwd: Union[str, Path], prompt: str,
     model: Optional[str] = None, sandbox: str = "workspace-write", config: Optional[Dict[str, Any]] = None,
-    effort: Optional[str] = None, timeout: float = 600, env: Optional[Dict[str, str]] = None,
+    effort: Optional[str] = None, ephemeral: bool = True, timeout: float = 600, env: Optional[Dict[str, str]] = None,
     log: Optional[Callable[[str], None]] = None, event_sink: Optional[Callable[[Dict[str, Any]], None]] = None,
     cancellation_check: Optional[Callable[[], bool]] = None,
     pending_steering: Optional[Callable[[], Iterable[Any]]] = None,
     protocol_log_path: Optional[Union[str, Path]] = None,
 ) -> CodexSessionResult:
-    """Run one ephemeral app-server thread and optionally steer its active turn.
+    """Run one app-server thread (ephemeral by default) and optionally steer its active turn.
 
     ``pending_steering`` yields ``(id, text, acknowledge)`` tuples or mappings
     with those names.  ``acknowledge`` receives ``(id, state, details)`` where
@@ -180,7 +180,7 @@ def run_codex_session(
                     continue
                 if obj.get("id") == init:
                     emit({"jsonrpc":"2.0", "method":"initialized", "params":{}})
-                    thread = request("thread/start", {"model":model,"cwd":str(Path(cwd).resolve()),"sandbox":sandbox,"approvalPolicy":"never","ephemeral":True,"config":config or {}})
+                    thread = request("thread/start", {"model":model,"cwd":str(Path(cwd).resolve()),"sandbox":sandbox,"approvalPolicy":"never","ephemeral":bool(ephemeral),"config":config or {}})
                     waiting[thread] = ("thread", None)
                 elif tag == "thread":
                     payload = obj.get("result", {}); result.thread_id = payload.get("thread", {}).get("id") if isinstance(payload, dict) else None

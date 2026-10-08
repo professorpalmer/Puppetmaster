@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Mapping, Optional, Union
 
 from puppetmaster.codegraph import enrich_prompt_with_codegraph, inject_worker_cli_env
 from puppetmaster.ports import apply_worktree_ports
@@ -203,11 +203,9 @@ class CodexAdapter(CliWorkerAdapter):
         # Unpinned: the user's configured Codex model, else Codex's own default.
         model = str(task.payload.get("model") or _codex_home().configured_model())
         approval_policy = str(task.payload.get("approval_policy") or "never")
-        # A review-loop task may be repaired by resuming this thread, so keep it.
-        ephemeral = bool(task.payload.get("ephemeral", not task.payload.get("review_loop")))
+        ephemeral, ephemeral_source = worker_ephemeral(task.payload or {}, resumed=resume is not None)
         skip_git_repo_check = bool(task.payload.get("skip_git_repo_check", True))
         if resume is not None:
-            ephemeral = False
             command = build_codex_resume_command(
                 executable=command_base,
                 session_id=str(resume["session_id"]),
@@ -243,6 +241,7 @@ class CodexAdapter(CliWorkerAdapter):
                 "approval_policy": approval_policy,
                 "bypass": bypass,
                 "ephemeral": ephemeral,
+                "ephemeral_source": ephemeral_source,
                 "resume": resume_record,
                 "resumed": resume is not None,
                 "session_lease": lease,
@@ -339,6 +338,7 @@ class CodexAdapter(CliWorkerAdapter):
                 prompt=str(prepared.extras.get("prompt") or task.instruction or ""),
                 model=str(prepared.extras.get("model") or _codex_home().configured_model()) or None,
                 sandbox=str(prepared.extras.get("sandbox") or "workspace-write"),
+                ephemeral=bool(prepared.extras.get("ephemeral", True)),
                 timeout=float(timeout_seconds),
                 pending_steering=pending,
             )
@@ -368,6 +368,7 @@ class CodexAdapter(CliWorkerAdapter):
         approval_policy = str(prepared.extras.get("approval_policy") or "never")
         bypass = bool(prepared.extras.get("bypass"))
         ephemeral = bool(prepared.extras.get("ephemeral", True))
+        ephemeral_source = str(prepared.extras.get("ephemeral_source") or "default")
         codegraph_used = bool(prepared.extras.get("codegraph_used"))
         write_capable = bool(prepared.extras.get("write_capable", True))
         report_mode = bool(prepared.extras.get("report_mode", write_capable))
@@ -414,6 +415,7 @@ class CodexAdapter(CliWorkerAdapter):
                         "returncode": None,
                         **resume_fields,
                         "ephemeral": ephemeral,
+                        "ephemeral_source": ephemeral_source,
                         "thread_id": timeout_thread_id,
                         "model": model,
                         "sandbox": sandbox,
@@ -547,6 +549,7 @@ class CodexAdapter(CliWorkerAdapter):
                 "sandbox": sandbox,
                 "approval_policy": approval_policy,
                 "ephemeral": ephemeral,
+                "ephemeral_source": ephemeral_source,
                 "thread_id": thread_id,
                 **resume_fields,
                 "stdout": _redacted_tail(completed.stdout, _STDOUT_TAIL_CHARS),
@@ -722,6 +725,39 @@ def observed_thread_id(events: list[dict], resume: object = None) -> Optional[st
     if expected and str(expected) != thread_id:
         return None
     return thread_id
+
+
+CODEX_EPHEMERAL_ENV = "PUPPETMASTER_CODEX_EPHEMERAL"
+
+
+def worker_ephemeral(payload: Mapping[str, Any], *, resumed: bool,
+                     env: Optional[Mapping[str, str]] = None) -> tuple[bool, str]:
+    """Whether a Codex worker runs ``--ephemeral``, and the source of that choice.
+
+    The first rule that applies wins:
+
+    1. ``resume``: a resumed thread stays resumable, so never ephemeral.
+    2. ``payload``: an explicit ``ephemeral`` from the caller, or from the
+       defaults of the selected registry model.
+    3. ``review_loop``: a review-loop task keeps its thread for a repair.
+    4. ``operator_default``: ``PUPPETMASTER_CODEX_EPHEMERAL`` (``0`` or ``1``).
+       It covers unpinned starts, which get no registry defaults.
+    5. ``default``: ephemeral.
+    """
+    if resumed:
+        return False, "resume"
+    if payload.get("ephemeral") is not None:
+        return bool(payload["ephemeral"]), "payload"
+    if payload.get("review_loop"):
+        return False, "review_loop"
+    raw = ((os.environ if env is None else env).get(CODEX_EPHEMERAL_ENV) or "").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False, "operator_default"
+    if raw in ("1", "true", "yes", "on"):
+        return True, "operator_default"
+    if raw:
+        raise ValueError(f"{CODEX_EPHEMERAL_ENV} must be 0 or 1, not {raw!r}")
+    return True, "default"
 
 
 def build_codex_exec_command(
