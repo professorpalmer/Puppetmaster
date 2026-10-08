@@ -138,7 +138,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-output-bytes",
         type=_positive_int,
-        help="Hard limit for captured worker stdout+stderr where the adapter supports streaming.",
+        help=(
+            "Hard limit, in bytes, for the whole worker CLI output stream "
+            "(stdout+stderr), where the adapter streams. The count includes "
+            "JSON events, tool calls, and tool output, not only the answer. "
+            "Small caps stop most coding workers early."
+        ),
     )
 
     for name in ("origin", "project_id", "session_id"):

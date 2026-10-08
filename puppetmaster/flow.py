@@ -42,6 +42,7 @@ What the runtime adds beyond walking:
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import re
@@ -476,6 +477,11 @@ def aggregate_verdict(verdicts: list[Optional[str]], oks: list[bool]) -> Optiona
 
 
 _MISSING = object()
+
+
+def _task_digest(task: str) -> str:
+    """Identity of a rendered node task, so a resumed session can tell that it changed."""
+    return hashlib.sha256(task.encode("utf-8")).hexdigest()[:16]
 
 
 def render(template: Any, run: "FlowRun", prev: str = "", *, shell: bool = False) -> str:
@@ -1435,7 +1441,8 @@ class JobNodeExecutor:
                     if outcome.task_id:
                         run.sessions[key] = {"job_id": job_id, "task_id": outcome.task_id,
                                              "adapter": spec.adapter, "run_id": run.run_id,
-                                             "visit": visit, "attempt": attempt}
+                                             "visit": visit, "attempt": attempt,
+                                             "task_sha": _task_digest(render(node["task"], run, prev))}
                     scope = spec.payload.get("write_scope")
                     if scope:
                         # A shared workspace's snapshot also holds siblings' edits.
@@ -1566,9 +1573,24 @@ class JobNodeExecutor:
             return (f"Revision {visit} of your task. Your earlier work in this session is already on "
                     f"disk.\n\nFeedback to act on:\n{feedback}\n\nFix what the feedback asks, rerun "
                     f"the checks, and finish.\n\n{_BUILD_VERDICT}")
+        # A continued run can change the node task, give no input, or both. The
+        # resumed session saw only its old task, so send the current one when
+        # it changed (or is unknown), or when there is no request to act on.
+        request = run.input.strip()
+        base = render(node["task"], run, prev)
+        recorded = (session or {}).get("task_sha")
+        parts = [f"Follow-up request:\n{run.input}"] if request else []
+        if recorded != _task_digest(base) or not request:
+            if recorded is None:
+                label = "Your current task (it can differ from your earlier task):"
+            elif recorded != _task_digest(base):
+                label = "Your task changed. The updated task:"
+            else:
+                label = "Do the same task again. Confirm that it is done and fix what is not:"
+            parts.append(f"{label}\n{base}")
         context = f"\n\nContext from the previous step:\n{prev}" if prev and prev != run.input else ""
-        return (f"Follow-up request:\n{run.input}{context}\n\nYour earlier work in this session is on "
-                f"disk. Make this change, rerun the checks, and finish.\n\n{_BUILD_VERDICT}")
+        return ("\n\n".join(parts) + f"{context}\n\nYour earlier work in this session is on "
+                f"disk. Do the work above, rerun the checks, and finish.\n\n{_BUILD_VERDICT}")
 
     def _launch(self, run: FlowRun, specs: list, launch_key: str, goal: str):
         from puppetmaster.orchestrator import Orchestrator

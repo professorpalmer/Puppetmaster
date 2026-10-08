@@ -952,6 +952,42 @@ class ReviewFixTests(Base):
         self.assertIn("also handle empty input", build.payload["resume_prompt"])
         self.assertNotIn("previous attempt", review.payload["resume_prompt"])
 
+    def test_a_continued_run_with_a_changed_task_and_no_input_sends_the_task(self):
+        """Codex 1.35.0 report: the updated node task reached the job goal, but
+        the resumed worker got an empty "Follow-up request:" on stdin."""
+        first = flow.new_run(self.state, graph([agent("build", task="add the login page")]), "",
+                             cwd=str(self.work))
+        executor = JobNodeExecutor(self.state)
+        first.inflight = {"node": "build", "visit": 1, "attempt": 0, "job_ids": []}
+        with patch.object(JobNodeExecutor, "_launch", return_value=("j_build", None, None)), \
+                patch.object(flow, "task_outcome",
+                             return_value=flow.NodeOutcome(ok=True, task_id="t_build")):
+            executor(first.graph["nodes"][0], first, "")
+        self.assertIn("task_sha", first.sessions["build"])
+        flow._finish(self.state, first, "done", "ok")
+
+        def follow_prompt(task, text=""):
+            g = graph([agent("build", task=task)])
+            follow = flow.new_run(self.state, g, text, continue_from=first.run_id, cwd=str(self.work))
+            return executor._spec("build", follow.graph["nodes"][0], follow, "", 1).payload["resume_prompt"]
+
+        changed = follow_prompt("add the account-notification settings page")
+        self.assertIn("Your task changed. The updated task:\nadd the account-notification settings page", changed)
+        self.assertNotIn("Follow-up request:", changed)
+
+        same = follow_prompt("add the login page")
+        self.assertIn("Do the same task again", same)
+        self.assertIn("add the login page", same)
+
+        request_only = follow_prompt("add the login page", "also handle empty input")
+        self.assertIn("Follow-up request:\nalso handle empty input", request_only)
+        self.assertNotIn("Your task changed", request_only)
+        self.assertNotIn("Do the same task again", request_only)
+
+        both = follow_prompt("add the signup page", "reuse the form helper")
+        self.assertIn("Follow-up request:\nreuse the form helper", both)
+        self.assertIn("The updated task:\nadd the signup page", both)
+
     def test_item_files_are_limited_to_its_scope(self):
         run = flow.new_run(self.state, graph([agent("build", files=["src/a.py"])]), cwd=str(self.work))
         run.inflight = {"node": "build", "visit": 1, "attempt": 0, "job_ids": []}

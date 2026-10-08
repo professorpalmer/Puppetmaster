@@ -1,3 +1,45 @@
+## v1.37.1 — 2026-10-08
+
+Three fixes from the Codex benchmark trace.
+
+**The explicit-trigger hook now routes by the shape of the work.** A prompt
+that names Puppetmaster but has no specific intent got the directive "This
+warrants a read-only analysis pass ... fan it out to a swarm". A benchmark
+pilot with a repair task thus ran a planning swarm first and never used a
+flow. This contradicts the installed rules ("Fan out with one flow"). The
+directive now gives three routes:
+
+1. Independent units that each need a build and a check: one
+   `puppetmaster_flow` graph with a `map` node, a check per item, and a fail
+   edge back to its build.
+2. One coupled change: `puppetmaster_start_implement`.
+3. Read-only analysis only: `puppetmaster_start_swarm`.
+
+The write directive now gives routes 1 and 2 with equal weight. Before, it
+said "a single implementation task" first.
+
+Role inference also changed. "repair" and "finish" now count as write verbs.
+The earliest match in the prompt now selects the role. Before, the first
+pattern in list order won. The benchmark prompt starts with "Repair", but
+the word "plan" in a JSON token about 1,800 characters later selected the
+planning role. A security mention anywhere still selects the security role.
+
+**`max_output_bytes` says what it counts.** The cap counts the whole worker
+CLI output stream (stdout plus stderr). This includes JSON events, tool calls,
+and tool output, not only the answer. Small caps stopped all five benchmark
+attempts before their time limits. The MCP and CLI help now say this. Each
+blocked receipt has a `counted_stream` field.
+
+**A continued flow sends the updated task.** With `continue_from`, a changed
+node task, and no input, the job goal had the new task, but the resumed
+worker got an empty `Follow-up request:`. The worker repeated its old work.
+Each flow session now records a digest of its rendered task (`task_sha`). A
+resumed node in a continued run gets:
+
+- the follow-up input, when there is input;
+- the updated task, when the task changed or the session has no digest;
+- the task again, when there is no input and the task did not change.
+
 ## v1.37.0 — 2026-10-08
 
 **New output style: `ste` (ASD-STE100 Simplified Technical English).**

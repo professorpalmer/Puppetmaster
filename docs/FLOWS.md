@@ -16,7 +16,9 @@ runtime adds three things a subagent tree does not have:
 - **Session continuity.** A node that runs again resumes its own provider
   session and receives only the delta: the judge's feedback, or a follow-up
   request. This applies when a back-edge sends work back to it, and to every
-  node of a run started with `--continue`.
+  node of a run started with `--continue`. In a continued run, a node whose
+  task text changed also gets the updated task. A continued run with no
+  input sends each node its current task again.
 - **`map` fan-out.** One node expands a list into per-item child flows. Each
   walks in its own process with bounded concurrency. A repair visit re-runs
   only the items the feedback names plus the items that failed. The pilot's

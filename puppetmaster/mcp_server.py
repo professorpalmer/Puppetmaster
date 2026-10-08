@@ -4925,7 +4925,10 @@ def flow_schema() -> JsonObject:
             "input": {"type": "string", "description": "The run's {{input}}."},
             "continue_from": {
                 "type": "string",
-                "description": "Prior run id: its nodes resume their own sessions with this input.",
+                "description": (
+                    "Prior run id: its nodes resume their own sessions with this input. "
+                    "A node whose task changed also gets the updated task."
+                ),
             },
             "run_id": {"type": "string"},
             "answer": {"type": "string", "description": "Answer for the gate a run waits at."},
@@ -5345,7 +5348,15 @@ def goal_schema(default_goal: str) -> JsonObject:
             },
             "max_output_bytes": {
                 "type": "integer",
-                "description": "Optional captured-output hard limit; exceeded runs are blocked.",
+                "description": (
+                    "Optional hard limit, in bytes, for the whole worker CLI "
+                    "output stream (stdout plus stderr). The count includes "
+                    "structured JSON events, tool calls, and tool output, not "
+                    "only the final answer. A run that goes above it stops at "
+                    "once and is blocked. A normal coding worker can write "
+                    "megabytes, so small caps stop most runs early. Leave it "
+                    "unset unless it guards against a runaway worker."
+                ),
             },
             "cursor_api_key": {
                 "type": "string",

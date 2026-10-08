@@ -17,6 +17,9 @@ _STDOUT_HEAD_CHARS = 1000
 
 
 _STDOUT_TAIL_CHARS = 8000
+# What max_output_bytes counts. A blocked receipt names it, because callers
+# read the cap as an answer-size limit and set it far too small.
+OUTPUT_LIMIT_COUNTED_STREAM = "worker CLI stdout+stderr: JSON events, tool calls, and tool output"
 
 
 def _coerce_text(value: object) -> str:

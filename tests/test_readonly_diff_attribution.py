@@ -73,6 +73,9 @@ class ReadonlyDiffAttributionTests(unittest.TestCase):
                         self.assertTrue(verifications)
                         if outcome == "success":
                             self.assertEqual(verifications[0].payload["result"], "passed")
+                        if outcome == "budget":
+                            # The receipt says what the cap counts: the whole CLI stream.
+                            self.assertIn("tool output", verifications[0].payload["counted_stream"])
                         if not write_capable:
                             for artifact in verifications:
                                 for field in ("worker_diff_present", "base_sha", "head_sha", "changed_files", "untracked_files"):

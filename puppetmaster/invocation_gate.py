@@ -155,7 +155,8 @@ _TRIVIAL_PATTERNS = [
 ]
 
 # Role inference → (canonical role for the classifier, suggested Puppetmaster
-# verb the host should reach for). Order matters: first match wins.
+# verb the host should reach for). The first entry (security) wins anywhere;
+# for the rest, the earliest match in the prompt wins and list order breaks ties.
 _ROLE_INFERENCE = [
     (re.compile(r"\b(security|vuln|exploit|cve)\b"), "security-review", "puppetmaster_start_review"),
     (re.compile(r"\b(audit|review|risk|find issues|what could break)\b"), "review", "puppetmaster_start_review"),
@@ -171,7 +172,7 @@ _ROLE_INFERENCE = [
         re.compile(
             r"\b(refactor|migrat(e|ion)|implement|build|create|add|writ(e|ing)|"
             r"wire[-\s]?up|set[-\s]?up|scaffold|integrat(e|ion)|port|patch|fix|"
-            r"rewrite|endpoint|feature|hook up)\b"
+            r"rewrite|repair|finish|endpoint|feature|hook up)\b"
         ),
         "implement",
         "puppetmaster_start_implement",
@@ -276,14 +277,17 @@ class DelegationDecision:
             )
         elif verb in _IMPLEMENT_VERBS:
             body = (
-                f"[Puppetmaster] This is a single implementation task (capability "
-                f"{self.capability_score}, {self.reason}). Delegate it to ONE "
-                f"implement worker in a clean checkout via `{verb}` (isolate=true "
-                f"gives it its own worktree and branch) — not a "
-                f"fan-out swarm. A single worker keeps the change coherent and "
-                f"captures a PATCH artifact; parallel editors stack commits that "
-                f"are unaware of each other. Reserve swarms for the "
-                f"explore/review/audit passes around the feature. {tail}"
+                f"[Puppetmaster] This is a build task (capability "
+                f"{self.capability_score}, {self.reason}). Choose the verb by its "
+                f"shape: (1) one coupled change: ONE implement worker in a clean "
+                f"checkout via `{verb}` (isolate=true gives it its own worktree and "
+                f"branch), not a fan-out swarm, because parallel editors of one "
+                f"change stack commits that are unaware of each other; (2) "
+                f"independent units that each need a build and a check: ONE "
+                f"`puppetmaster_flow` graph with a `map` node, each item with its "
+                f"own shell check and a fail edge back to its build. Do not run a "
+                f"read-only swarm before the build; reserve swarms for the "
+                f"explore/review/audit passes around it. {tail}"
             )
         elif verb in _CODEGRAPH_VERBS:
             body = (
@@ -304,13 +308,22 @@ class DelegationDecision:
                 f"{tail}"
             )
         else:
+            # The prompt named Puppetmaster but matched no specific intent, so
+            # its shape is unknown here. Route by shape, as the installed rules
+            # do. A read-only swarm before a build delays the build and does
+            # not check it.
             body = (
-                f"[Puppetmaster] This warrants a read-only analysis pass (capability "
-                f"{self.capability_score}, {self.reason}). Call `{verb}` to fan it out "
-                f"to a swarm; recall results with puppetmaster_artifacts at zero token "
-                f"cost. For the implementation itself, follow up with a single "
-                f"`puppetmaster_start_implement` worker rather than editing in the "
-                f"swarm. {tail}"
+                f"[Puppetmaster] Route this through Puppetmaster (capability "
+                f"{self.capability_score}, {self.reason}). Choose the verb by the "
+                f"shape of the work: (1) independent units that each need a build "
+                f"and a check: write ONE `puppetmaster_flow` graph with a `map` "
+                f"node, each item with its own shell check and a fail edge back to "
+                f"its build (add a render step and a judge when the result is "
+                f"judged by how it looks); (2) one coupled change: "
+                f"`puppetmaster_start_implement`; (3) read-only analysis only: "
+                f"`{verb}`, then recall results with puppetmaster_artifacts. Do not "
+                f"run a read-only swarm before a build unless the build needs its "
+                f"findings. {tail}"
             )
         return self._with_playbook_directive(body)
 
@@ -341,9 +354,19 @@ def infer_role_and_verb(prompt: str) -> tuple[str, str]:
     multi-role swarm, the safe daily-driver entry point.
     """
     lower = prompt.lower()
-    for pattern, role, verb in _ROLE_INFERENCE:
-        if pattern.search(lower):
-            return role, verb
+    # A security mention anywhere wins: it selects the safety lens. Otherwise
+    # the earliest match wins, so the leading verb of a long task prompt
+    # decides, not a stray word deep in its attached data ("guided-plan").
+    security, *rest = _ROLE_INFERENCE
+    if security[0].search(lower):
+        return security[1], security[2]
+    best = None
+    for rank, (pattern, role, verb) in enumerate(rest):
+        match = pattern.search(lower)
+        if match and (best is None or (match.start(), rank) < best[0]):
+            best = ((match.start(), rank), role, verb)
+    if best:
+        return best[1], best[2]
     return "explore", _DEFAULT_VERB
 
 
