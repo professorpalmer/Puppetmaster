@@ -105,6 +105,9 @@ class CutDuringAdmissionTests(unittest.TestCase):
         waiting = [e for e in self.store.read_events(self.job.id) if e.get("event") == "edit_admission.waiting"]
         # About 20 polls in a second; one holder gives one event.
         self.assertEqual(len(waiting), 1)
+        # The holder renewed about three times in that second, with no event rows.
+        renewed = [e for e in self.store.read_events(self.job.id) if e.get("event") == "edit_admission.renewed"]
+        self.assertEqual(renewed, [])
 
 
 class StopSettlesTests(unittest.TestCase):
