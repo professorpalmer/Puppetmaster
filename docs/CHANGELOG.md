@@ -1,6 +1,35 @@
-## v1.37.1 — 2026-10-08
+## v1.38.0 — 2026-10-08
 
-Three fixes from the Codex benchmark trace.
+**A flow stop now reaches a worker that queues for edit admission, and the
+reply says when the stop has taken effect.** In a Codex benchmark, a pilot
+stopped a map run. A repair worker that queued behind another job's claim
+got admission after the stop, launched Codex, and edited files for five
+minutes. Three defects stacked:
+
+1. `cut_task` saved its `failure_cut` marker before its cancellation request.
+   The request failed once (the store was busy), and each retry saw the
+   marker and returned `pending` with no request. The store had the marker,
+   but no cancellation target and no receipt. A retry now finishes a
+   half-done cut. `_cut_jobs` cuts each task separately and writes each
+   failure to the walker log, where before it dropped all errors.
+2. The edit-admission wait ran before the task's cancellation scope, so it
+   could not see a task cut. The wait now runs in that scope, checks every
+   0.5 s, and exits without a launch.
+3. Each waiting worker wrote an `edit_admission.waiting` event every 50 ms
+   (16,465 rows in the benchmark store). The wait now writes one event per
+   change of holder, and one each 10 s.
+
+Stop and cut are cooperative. Their reply, and the summary of each stopped
+run, now has `settled`, `open_work` (child runs and tasks that can still
+write), and a `note` while work is open. `wait` on a stopped run returns when
+that work settles, and cuts the open tasks again while it waits.
+
+**The elapsed budget text says what the cap adds up.** `budget_max_elapsed_seconds`
+counts worker-seconds over all attempts, not wall time. Four parallel 180 s
+workers need 720. While an earlier attempt has no settled elapsed time, a new
+attempt is refused (it does not wait). The cap rules do not change.
+
+The three fixes below were prepared as 1.37.1 and ship in this release.
 
 **The explicit-trigger hook now routes by the shape of the work.** A prompt
 that names Puppetmaster but has no specific intent got the directive "This

@@ -2169,6 +2169,7 @@ class SwarmStore(StoreContracts):
     ) -> dict[str, Any]:
         """Persist a lease-bound cut request; RUNNING work stops cooperatively."""
         from dataclasses import asdict
+        from puppetmaster.contracts import TaskBinding
         from puppetmaster.store_contracts import task_binding
 
         owner = new_id("cut")
@@ -2184,16 +2185,24 @@ class SwarmStore(StoreContracts):
                 return {"outcome": "stale_binding", "binding": asdict(binding)}
             existing = (task.payload or {}).get("failure_cut")
             if isinstance(existing, dict):
-                return {"outcome": existing.get("outcome", "pending"), **existing}
-            if task_is_terminal(task.status):
+                # The marker is saved before the cancellation request. If that
+                # request failed (a busy store), a retry must finish it: an
+                # early return here left the worker uncancelled for good.
+                rid = str(existing.get("request_id") or "")
+                if not rid or self.get_cancellation_receipt(self.job_ref(job_id), rid) is not None:
+                    return {"outcome": existing.get("outcome", "pending"), **existing}
+                marker = existing
+                binding = TaskBinding(**marker["binding"])
+            elif task_is_terminal(task.status):
                 return {"outcome": "already_terminal", "binding": asdict(binding)}
-            rid = request_id or f"failure-cut-{task.id}-{task.generation}"
-            marker = {
-                "request_id": rid,
-                "binding": asdict(binding),
-                "outcome": "pending" if task.status == TaskStatus.RUNNING else "observed",
-            }
-            self.save_task(replace(task, payload={**task.payload, "failure_cut": marker}))
+            else:
+                rid = request_id or f"failure-cut-{task.id}-{task.generation}"
+                marker = {
+                    "request_id": rid,
+                    "binding": asdict(binding),
+                    "outcome": "pending" if task.status == TaskStatus.RUNNING else "observed",
+                }
+                self.save_task(replace(task, payload={**task.payload, "failure_cut": marker}))
             receipt = self.request_cancellation(self.job_ref(job_id), rid, [binding])
         finally:
             self.release_lock(lock_name, owner=owner)

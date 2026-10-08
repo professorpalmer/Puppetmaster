@@ -155,10 +155,10 @@ def flow_action(state_dir: Path, action: str, params: dict, *, backend: str = "s
         return _summary(state_dir, run), _exit(run.status)
     if action == "stop":
         run = flow.request_stop(state_dir, run_id)
-        return _summary(state_dir, run), _exit(run.status)
+        return _with_open_work(state_dir, run, _summary(state_dir, run)), _exit(run.status)
     if action == "cut":
         run = flow.cut_node(state_dir, run_id, str(params.get("reason") or ""))
-        return _summary(state_dir, run), _exit(run.status)
+        return _with_open_work(state_dir, run, _summary(state_dir, run)), _exit(run.status)
     if action == "claim":
         paths = params.get("paths")
         return {"run_id": run_id, "claims": flow.claim_paths(
@@ -171,6 +171,22 @@ def _summary(state_dir: Path, run: Any, since: int = 0) -> dict:
 
     body = flow.run_summary(run, since=since)
     body["state_dir"] = str(state_dir)
+    if run.status == "stopped":
+        _with_open_work(state_dir, run, body)
+    return body
+
+
+def _with_open_work(state_dir: Path, run: Any, body: dict) -> dict:
+    """Say whether the stop or cut has taken effect; a cooperative request is not."""
+    from puppetmaster import flow
+
+    work = flow.open_work(state_dir, run)
+    body["settled"] = not work
+    if work:
+        body["open_work"] = work[:20]
+        body["note"] = ("Stop and cut are cooperative. The work in open_work can still "
+                        "write files. Call wait on this run: it returns when that work "
+                        "settles. Do not treat these workers as stopped before then.")
     return body
 
 

@@ -5,6 +5,7 @@ therefore closes admission only after the adapter process has stopped.
 """
 from __future__ import annotations
 
+from contextlib import ExitStack
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -27,10 +28,18 @@ from .file_claims import (
 # wait could only ever fire while the holder was still legitimately working --
 # turning "queue behind a writer" into a failed task and a failed swarm.
 DEFAULT_ADMISSION_WAIT_SECONDS = 900.0
+# A queued worker checks for a cut at this interval, and reports that it still
+# waits at most this often (and on each change of holder).
+_CANCEL_CHECK_SECONDS = 0.5
+_WAITING_EVENT_SECONDS = 10.0
 
 
 class EditAdmissionTimeout(TimeoutError):
     """The bounded wait elapsed before a conflicting claim was available."""
+
+
+class EditAdmissionCancelled(EditAdmissionTimeout):
+    """The task was cut (or its job cancelled) while it waited; nothing launched."""
 
 
 @dataclass
@@ -119,24 +128,44 @@ def edit_admission(store: Any, task: Any, worker_id: str) -> EditAdmissionOwner:
     started = time.monotonic()
     deadline = started + timeout
     owner = "%s:%s:%s" % (worker_id, job_id, getattr(task, "id", "task"))
-    while True:
-        if _cancelled(store, task, payload):
-            raise EditAdmissionTimeout("edit admission cancelled while waiting")
-        try:
-            claims = registry.acquire_many(
-                cwd, normalized, owner, ttl, managed=True, owner_pid=os.getpid(),
-                owner_start_identity=process_start_identity(),
-            )
-            break
-        except FileClaimConflict as exc:
-            _emit(store, job_id, "edit_admission.waiting", task, (), worker_id=worker_id,
-                  path=exc.path, owner=exc.owner)
-            if time.monotonic() >= deadline:
-                raise EditAdmissionTimeout(
-                    "timed out waiting for edit admission: %s (held by %s, waited %.0fs)"
-                    % (exc.path, getattr(exc, "owner", "unknown"), timeout)
+    with ExitStack() as scope:
+        # The wait comes before the execution scope, so open the task's own
+        # cancellation scope here: a flow stop cuts this task generation, and
+        # outside the scope that cut was invisible until after admission.
+        if getattr(store, "cancellation_pending", None) is not None:
+            try:
+                from puppetmaster.cancellation import cancellation_scope
+                scope.enter_context(cancellation_scope(store, task))
+            except Exception:
+                pass
+        next_check = reported = 0.0
+        holder = None
+        while True:
+            now = time.monotonic()
+            if now >= next_check:
+                next_check = now + _CANCEL_CHECK_SECONDS
+                if _cancelled(store, task, payload):
+                    raise EditAdmissionCancelled("edit admission cancelled while waiting")
+            try:
+                claims = registry.acquire_many(
+                    cwd, normalized, owner, ttl, managed=True, owner_pid=os.getpid(),
+                    owner_start_identity=process_start_identity(),
                 )
-            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+                break
+            except FileClaimConflict as exc:
+                # One event per holder change or interval, not one per 50 ms
+                # poll: thousands of rows per waiter loaded the store that a
+                # stop must write to.
+                if (exc.path, exc.owner) != holder or now - reported >= _WAITING_EVENT_SECONDS:
+                    holder, reported = (exc.path, exc.owner), now
+                    _emit(store, job_id, "edit_admission.waiting", task, (), worker_id=worker_id,
+                          path=exc.path, owner=exc.owner, waited_seconds=round(now - started, 1))
+                if time.monotonic() >= deadline:
+                    raise EditAdmissionTimeout(
+                        "timed out waiting for edit admission: %s (held by %s, waited %.0fs)"
+                        % (exc.path, getattr(exc, "owner", "unknown"), timeout)
+                    )
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
     admission = _owner(store, task, worker_id, registry, cwd, tuple(claims), ttl=ttl)
     admission.waited_seconds = round(time.monotonic() - started, 3)

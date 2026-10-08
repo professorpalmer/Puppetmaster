@@ -1701,7 +1701,9 @@ def _build_tools() -> list[McpTool]:
                 "with continue_from, resume their own provider session with only the delta. "
                 "A map node fans out per-item child flows with bounded concurrency. Actions: "
                 "validate, save, run, status, wait, resume (answer a gate, or restart=true), "
-                "stop, cut, list."
+                "stop, cut, list. Stop and cut are cooperative: their reply has settled=false "
+                "and open_work while workers can still write; call wait, which returns when "
+                "that work settles."
             ),
             input_schema=flow_schema(),
             handler=run_flow_tool,

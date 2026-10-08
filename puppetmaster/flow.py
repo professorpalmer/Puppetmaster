@@ -1251,14 +1251,87 @@ def _cut_inflight(state_dir: Path, run: FlowRun) -> None:
     _cut_jobs(state_dir, run.backend, list(inflight.get("job_ids") or []))
 
 
+_OPEN_TASK_STATUSES = (TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.BLOCKED)
+
+
+def open_work(state_dir: Path, run: FlowRun) -> list[dict]:
+    """Work of the run's in-flight node, at any depth, that can still write.
+
+    A stop is cooperative. The run can show ``stopped`` while a worker of its
+    node, or of a map item's child run, still runs. Each entry is a child run
+    that is not terminal, or a task that is queued, running, or blocked.
+    """
+    from puppetmaster.store_factory import create_store
+
+    found: list[dict] = []
+    pending, seen = [run], set()
+    while pending:
+        current = pending.pop()
+        if current.run_id in seen:
+            continue
+        seen.add(current.run_id)
+        inflight = current.inflight or {}
+        for child_id in (inflight.get("children") or {}).values():
+            try:
+                child = load_run(state_dir, child_id)
+            except FlowError:
+                continue
+            if child.status not in TERMINAL_STATUSES:
+                found.append({"run_id": child.run_id, "status": child.status})
+            pending.append(child)
+        job_ids = list(inflight.get("job_ids") or [])
+        if not job_ids:
+            continue
+        try:
+            store = create_store(current.backend, state_dir)
+            for job_id in job_ids:
+                for task in store.list_tasks(job_id):
+                    if task.status in _OPEN_TASK_STATUSES:
+                        found.append({"run_id": current.run_id, "job_id": job_id, "task_id": task.id,
+                                      "role": task.role, "status": str(task.status.value)})
+        except Exception as exc:
+            found.append({"run_id": current.run_id, "error": f"{type(exc).__name__}: {exc}"})
+    return found
+
+
+def _recut_open_work(state_dir: Path, work: list[dict]) -> None:
+    """Cut again what a stopped run left open; ``cut_task`` is idempotent.
+
+    The in-flight watch ends with the walker, so a cut that failed on a busy
+    store got no retry after the stop.
+    """
+    by_run: dict[str, list[str]] = {}
+    for entry in work:
+        if entry.get("job_id"):
+            by_run.setdefault(entry["run_id"], []).append(entry["job_id"])
+    for run_id, job_ids in by_run.items():
+        try:
+            backend = load_run(state_dir, run_id).backend
+        except FlowError:
+            continue
+        _cut_jobs(state_dir, backend, sorted(set(job_ids)))
+
+
 def wait_for_event(state_dir: Path, run_id: str, timeout_seconds: float = 0.0,
                    poll_seconds: float = 0.5) -> FlowRun:
-    """Block until the run finishes, gets stuck, waits at a gate, or loses its walker."""
+    """Block until the run finishes, gets stuck, waits at a gate, or loses its walker.
+
+    A stopped run wakes only when its open work settles (or at the timeout):
+    ``stopped`` alone does not prove that its workers stopped writing.
+    """
     deadline = time.monotonic() + timeout_seconds if timeout_seconds > 0 else None
+    recut_at = 0.0
     while True:
         run = refresh_liveness(state_dir, run_id)
         if run.status in WAKE_STATUSES:
-            return run
+            if run.status != "stopped":
+                return run
+            work = open_work(state_dir, run)
+            if not work:
+                return run
+            if time.monotonic() >= recut_at:
+                recut_at = time.monotonic() + 5
+                _recut_open_work(state_dir, work)
         if deadline is not None and time.monotonic() >= deadline:
             return run
         time.sleep(poll_seconds)
@@ -1888,16 +1961,34 @@ class _InflightWatch:
 
 
 def _cut_jobs(state_dir: Path, backend: str, job_ids: list[str]) -> None:
+    """Cut each open task of these jobs. A failed cut is retried by the next call.
+
+    The in-flight watch calls this each second while a stop or cut is in
+    effect, and ``cut_task`` finishes a half-done cut, so a busy store only
+    delays the cut. Each failure goes to stderr (the walker log): a cut that
+    fails with no trace leaves a worker that runs on after a stop.
+    """
     try:
         from puppetmaster.store_factory import create_store
 
         store = create_store(backend, state_dir)
-        for job_id in job_ids:
-            for task in store.list_tasks(job_id):
-                if task.status in (TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.BLOCKED):
-                    store.cut_task(job_id, task.id)
-    except Exception:
-        pass  # best effort: the walker still halts at its next stop check
+    except Exception as exc:
+        print(f"[flow] cut: store unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return
+    for job_id in job_ids:
+        try:
+            tasks = store.list_tasks(job_id)
+        except Exception as exc:
+            print(f"[flow] cut: cannot list {job_id}: {type(exc).__name__}: {exc}", file=sys.stderr)
+            continue
+        for task in tasks:
+            if task.status not in (TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.BLOCKED):
+                continue
+            try:
+                store.cut_task(job_id, task.id)
+            except Exception as exc:
+                print(f"[flow] cut of {job_id}/{task.id} failed, will retry: {type(exc).__name__}: {exc}",
+                      file=sys.stderr)
 
 
 def _in_scope(path: str, scope: list) -> bool:
