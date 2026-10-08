@@ -15,6 +15,8 @@ from typing import Any, Iterable, Mapping, Optional, Union
 
 from puppetmaster.budget import (
     BudgetAdmissionError,
+    BudgetBusy,
+    BudgetUnsettled,
     BudgetConflictError,
     BudgetLiability,
     BudgetPolicy,
@@ -749,6 +751,8 @@ class SwarmStore(StoreContracts):
                     job.budget_policy,
                     self.budget_snapshot(job_id)["reservations"],
                 )
+            except BudgetUnsettled:
+                pass  # its dispatch waits for the running siblings to settle
             except BudgetAdmissionError as exc:
                 self._emit_enqueue_refused(
                     job_id,
@@ -2906,7 +2910,7 @@ class SwarmStore(StoreContracts):
         owner = new_id("budget")
         name = f"budget:{job_id}"
         if not self.acquire_lock(name, owner, ttl_seconds=300):
-            raise RuntimeError("budget busy; retry")
+            raise BudgetBusy("budget busy; retry")
         held.add(job_id)
         try:
             yield

@@ -12,6 +12,7 @@ import hermetic_env  # noqa: F401  # process-wide host-env isolation
 import contextlib
 import io
 import json
+import shutil
 import subprocess
 import threading
 import time
@@ -59,10 +60,32 @@ class Scripted:
         return item
 
 
+def _remove_when_free(tmp: TemporaryDirectory) -> None:
+    """Delete a test root once detached walkers let go of it.
+
+    A background walker releases the run lock before its process exits. On
+    Windows its open walker.log blocks the delete until then (WinError 32).
+    """
+    try:
+        tmp.cleanup()
+        return
+    except PermissionError:
+        pass
+    # Python 3.9 cleanup() is a no-op after its first call, so retry rmtree.
+    deadline = time.monotonic() + 30
+    while os.path.exists(tmp.name):
+        try:
+            shutil.rmtree(tmp.name)
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.2)
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self._tmp = TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(_remove_when_free, self._tmp)
         self.root = Path(self._tmp.name)
         self.state = self.root / "state"
         self.state.mkdir()

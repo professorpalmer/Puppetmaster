@@ -183,11 +183,16 @@ def _owner(store, task, worker_id, registry, cwd, claims, ttl=2.0):
     )
     if claims:
         def renew_loop() -> None:
+            reported = time.monotonic()
             while not stop.wait(max(0.05, ttl / 3.0)):
                 if not owner.check():
                     _emit(store, owner.job_id, "edit_admission.lost", task, claims)
                     return
-                _emit(store, owner.job_id, "edit_admission.renewed", task, claims)
+                # Renew each ttl/3, but record it at most each interval: one
+                # row per renewal was about 1.5 store writes a second per holder.
+                if time.monotonic() - reported >= _WAITING_EVENT_SECONDS:
+                    reported = time.monotonic()
+                    _emit(store, owner.job_id, "edit_admission.renewed", task, claims)
         owner._heartbeat = threading.Thread(target=renew_loop, name="edit-admission", daemon=True)
         owner._heartbeat.start()
     return owner

@@ -207,6 +207,19 @@ class FileClaimRegistry:
             occurred_at=float(row["occurred_at"]),
         ) for row in rows]
 
+    def live_writers(self, repo: PathLike, paths: Iterable[PathLike]) -> list[tuple[str, str]]:
+        """``(path, owner)`` of each live claim that overlaps ``paths``.
+
+        A judge waits on this before it reviews: a review that runs while a
+        writer holds an overlapping claim can pass files that change after it.
+        A managed claim whose owner process is dead is not a live writer.
+        """
+        repo_identity, normalized_paths = self._claim_keys(repo, paths)
+        with self._transaction() as connection:
+            rows = self._live_overlapping_rows(connection, repo_identity, normalized_paths, self._now())
+        return [(str(row["path"]), str(row["owner"])) for row in rows
+                if not bool(row["managed"]) or _managed_owner_live(row)]
+
     def repository_identity(self, repo: PathLike) -> tuple[str, Path]:
         """Return canonical Git common-dir identity and this worktree's root."""
         return _repository_identity(repo)

@@ -83,7 +83,11 @@ class BudgetRuntimeContract:
                         state = self.snapshot()['reservations'][0]['state']
                         if not terminated or not turn.accounting_usage:
                             self.assertEqual(state, 'pending_reconciliation')
-                            with self.assertRaises(BudgetAdmissionError):
+                            # An unsettled attempt never settles here: the next one
+                            # waits for it, then still fails closed.
+                            with self.assertRaisesRegex(BudgetAdmissionError, "waited"), \
+                                    mock.patch('puppetmaster.invocation.DEFAULT_BUDGET_WAIT_SECONDS', 0.2), \
+                                    mock.patch('puppetmaster.invocation.BUDGET_WAIT_POLL_SECONDS', 0.05):
                                 with invocation():
                                     self.fail('truncated stream reopened capped admission')
                         else:

@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
-from puppetmaster.budget import BudgetPolicy, stamp_payload_budget_allowance
+from puppetmaster.budget import BudgetPolicy, rebill_allowance, stamp_payload_budget_allowance
 from puppetmaster.hermes_spawn_tree import emit_spawn_tree
 from puppetmaster.liveness import record_orchestrator_heartbeat
 from puppetmaster.models import (
@@ -233,6 +233,8 @@ def merge_routing_payload(
         caller,
         adapter=getattr(decision.model, "adapter", None),
     )
+    if merged.get("budget_allowance"):
+        merged["budget_allowance"] = rebill_allowance(merged["budget_allowance"], merged.get("billing"))
     return merged
 
 

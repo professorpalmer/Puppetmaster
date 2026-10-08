@@ -210,6 +210,26 @@ nothing when no flow walks, and it does nothing in a Puppetmaster worker. It
 takes about 40 ms per edit and makes no model call. An edit hook cannot see
 a file that a shell command writes. Claim such a file yourself.
 
+## Reviews bind to the final source
+
+A judge's PASS is about the files that it read. When the code nodes of a run
+declare `files`, each judge of that run does three things:
+
+1. Before it starts, it waits until no live edit claim of another worker
+   overlaps those files. The wait ends after `defaults.review_wait_seconds`
+   (default 900) or on a stop. If a writer still holds a claim at that time,
+   a PASS becomes PARTIAL.
+2. It records `reviewed` in its result: a digest of the files, their count,
+   and (up to 200 files) a hash for each file. If the files changed during
+   the review, a PASS becomes PARTIAL, and the reason names the changed paths.
+3. When the run reaches a passing end, each PASS digest is checked again. If
+   a reviewed file changed after the PASS, the run ends `failed` with a
+   "stale review" reason that names the paths.
+
+A judge in a map item reviews only that item's files, so the builds of the
+other items do not make it wait. A run whose code nodes declare no `files`
+has no binding.
+
 ## Follow-ups
 
 ```bash
