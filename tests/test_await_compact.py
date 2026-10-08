@@ -151,7 +151,9 @@ class _AwaitFixture(unittest.TestCase):
             "state_dir": str(self.store.root),
             "backend": "sqlite",
             "job_id": job_id,
-            "timeout_seconds": 1,
+            # A complete job returns at once; a loaded Windows runner needed
+            # more than 1 s before the store read was available.
+            "timeout_seconds": 10,
         }
         args.update(extra)
         result = call_tool("puppetmaster_await_job", args)
@@ -220,6 +222,13 @@ class AwaitCompactTests(_AwaitFixture):
         for key in ("summary", "digest", "summary_ref"):
             self.assertNotIn(key, body)
         self.assertEqual(body["status"], "complete")
+
+    def test_none_stays_state_only_while_the_job_runs(self) -> None:
+        from puppetmaster.cli import await_summary_body
+
+        state = {"job_id": "job_x", "status": "running", "terminal": False, "timed_out": True}
+        self.assertNotIn("summary", await_summary_body(self.store, "job_x", state, "none"))
+        self.assertEqual(await_summary_body(self.store, "job_x", state, "compact")["summary"], "")
 
     def test_env_override_and_explicit_arg_wins(self) -> None:
         job_id, _ = self._fixture_job()

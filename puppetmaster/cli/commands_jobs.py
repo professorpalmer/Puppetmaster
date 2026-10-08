@@ -368,10 +368,10 @@ def await_summary_mode(explicit: Optional[str]) -> str:
 def await_summary_body(store, job_id: str, state: dict, mode: str) -> dict:
     """Await response body: full stitched summary, compact digest + summary ref, or state only."""
     body: dict = {**state, "summary_mode": mode}
+    if mode == "none":
+        return body
     if not state["terminal"]:
         body["summary"] = ""
-        return body
-    if mode == "none":
         return body
     summary_path: Optional[Path] = store.job_dir(job_id) / "summaries" / "stitched.md"
     if summary_path.is_file():

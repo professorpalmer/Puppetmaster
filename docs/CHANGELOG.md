@@ -1,3 +1,20 @@
+## v1.33.5 — 2026-10-07
+
+**A spurious macOS descriptor open no longer fails a metadata read.** On
+macOS the read helper opens a quiet store through `/dev/fd/N`. Under load,
+SQLite now and then fails that open with "unable to open database file",
+although the descriptor and the source are unchanged and the same open
+succeeds at once. About 1 in 1600 reads at 16-way load failed this way.
+`list_job_summaries` and the other projection reads then returned a bare
+`unavailable` page with no retry hint, the same answer as a store with no
+tables. Marionette refused such a read as a changed view (409). The helper
+now retries this one error up to five times. Any other error, or one that
+persists, still raises. Under the same load, 9600 reads gave no failures.
+
+**`await` with `summary: none` returns the state only.** While a job was not
+terminal, the reply also had an empty `summary` key in this mode. It now
+has no `summary` key until the job is terminal and the mode asks for one.
+
 ## v1.33.4 — 2026-10-07
 
 **A failed Codex skill-bundle swap keeps the old bundle.** When the worker
