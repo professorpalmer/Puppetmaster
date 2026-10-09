@@ -1,3 +1,30 @@
+## v1.41.0 — 2026-10-08
+
+**The savings comparison uses the current standard frontier model.** The
+reference was the highest-capability priced model. Capability scores
+saturate at the top of a registry, so many models tied, and the registry order
+picked one. On one Mac that was Claude Opus 5, two generations old and more
+expensive than Opus 5.5.
+
+- The default reference is now `claude-opus-5-5`
+  (`DEFAULT_COUNTERFACTUAL_MODEL`), under any adapter that prices it. An
+  API-billed entry wins, because it carries the live metered rate.
+- Disabled and retired models are not a reference while another model is left.
+- `PUPPETMASTER_COUNTERFACTUAL_MODEL` still wins.
+- The static catalog prices `claude-opus-5-5` at $4 / $20 per million tokens
+  (was $5 / $25), the live list price.
+
+**A frozen job receipt compares against the current reference.**
+`build_cost_report` priced the comparison once, when the job ended, and froze
+it with the receipt. Jobs from different months then named different
+references, and a total across them was `mixed_reference` (no figure). Now the
+receipt's actual cost and task rows stay frozen, and only the comparison is
+priced again from the frozen token counts. The stored receipt does not change.
+
+On a copy of one Mac's store (971 jobs): before, three references (Opus 5,
+GPT-5.6 Sol, Gemini 3.1 Pro) and `mixed_reference`. After, one reference
+(`agentic/anthropic/claude-opus-5.5`) over 248 priced jobs.
+
 ## v1.40.0 — 2026-10-08
 
 **No stored pid is signalled or trusted after the OS gives it to another

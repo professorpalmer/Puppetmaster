@@ -24,6 +24,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from puppetmaster.model_registry import model_identity_tokens, normalize_model_token
+
 COST_OPTIMIZING_POLICIES = frozenset({"balanced", "cheap"})
 
 
@@ -240,6 +242,13 @@ def build_metrics(
 
 COUNTERFACTUAL_MODEL_ENV = "PUPPETMASTER_COUNTERFACTUAL_MODEL"
 
+# The default reference: the current standard frontier model, the one a team
+# would otherwise run for this work. Capability scores saturate at the top of
+# the registry, so "highest capability" alone ties across generations and the
+# registry order picks an old model. Update this name when a new standard
+# flagship ships, as with the curated lists in static_catalog.
+DEFAULT_COUNTERFACTUAL_MODEL = "claude-opus-5-5"
+
 
 @dataclass
 class Counterfactual:
@@ -268,10 +277,15 @@ def resolve_counterfactual_model(registry: list):
     """Pick the reference model for the counterfactual.
 
     1. ``$PUPPETMASTER_COUNTERFACTUAL_MODEL`` (a registry model id) wins.
-    2. Otherwise the highest-capability model that has a real per-token price
+    2. Otherwise ``DEFAULT_COUNTERFACTUAL_MODEL`` when the registry has it with
+       a per-token price, under any adapter.
+    3. Otherwise the highest-capability model that has a real per-token price
        (so the counterfactual reflects metered-API spend, not a $0 plan model).
-    3. Falls back to the highest-capability model overall if nothing is priced.
+    4. Falls back to the highest-capability model overall if nothing is priced.
 
+    Disabled models (retired ones included) are skipped while any other
+    model is left.
+    Among equals, an API-billed entry wins: it carries the live metered rate.
     Returns ``None`` only for an empty registry.
     """
     if not registry:
@@ -281,14 +295,27 @@ def resolve_counterfactual_model(registry: list):
         for m in registry:
             if getattr(m, "id", None) == env.strip():
                 return m
+    live = [m for m in registry if getattr(m, "enabled", True)] or list(registry)
     priced = [
         m
-        for m in registry
+        for m in live
         if (getattr(m, "input_per_mtok_usd", 0) or 0) > 0
         or (getattr(m, "output_per_mtok_usd", 0) or 0) > 0
     ]
-    pool = priced or registry
-    return max(pool, key=lambda m: getattr(m, "capability_score", 0))
+
+    def is_api(m) -> bool:
+        return getattr(m, "billing", "") == "api"
+
+    default = normalize_model_token(DEFAULT_COUNTERFACTUAL_MODEL)
+    named = [
+        m for m in priced
+        if default in model_identity_tokens(getattr(m, "adapter_model_name", "") or "")
+        or default in model_identity_tokens(getattr(m, "id", "") or "")
+    ]
+    if named:
+        return max(named, key=is_api)
+    pool = priced or live
+    return max(pool, key=lambda m: (getattr(m, "capability_score", 0), is_api(m)))
 
 
 def compute_counterfactual(
