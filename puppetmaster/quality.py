@@ -239,6 +239,13 @@ _WRITE_PERMISSION_MODES = ("acceptEdits", "bypassPermissions")
 _WRITE_SANDBOXES = ("workspace-write", "danger-full-access")
 
 
+def _write_capable(payload: dict[str, Any]) -> bool:
+    """A receipt its adapter allowed to edit: the shared key, or a legacy mode."""
+    return (payload.get("write_capable") is True
+            or payload.get("permission_mode") in _WRITE_PERMISSION_MODES
+            or payload.get("sandbox") in _WRITE_SANDBOXES)
+
+
 def _write_run_unfinished(artifacts: list[Artifact]) -> str:
     """Why a write-capable run is not a finished delivery, or ''.
 
@@ -248,8 +255,7 @@ def _write_run_unfinished(artifacts: list[Artifact]) -> str:
     """
     receipts = [_payload(a) for a in artifacts if a.type == ArtifactType.VERIFICATION
                 and "worker_diff_present" in _payload(a)]
-    if not any(p.get("permission_mode") in _WRITE_PERMISSION_MODES
-               or p.get("sandbox") in _WRITE_SANDBOXES for p in receipts):
+    if not any(_write_capable(p) for p in receipts):
         return ""
     verdicts = [_payload(a) for a in artifacts if a.type == ArtifactType.VERIFICATION
                 and _payload(a).get("kind") == "worker_verdict"]
@@ -272,7 +278,5 @@ def _write_run_changed_nothing(artifacts: list[Artifact]) -> bool:
         return False
     receipts = [_payload(a) for a in artifacts if a.type == ArtifactType.VERIFICATION
                 and "worker_diff_present" in _payload(a)]
-    writable = [p for p in receipts if p.get("permission_mode") in _WRITE_PERMISSION_MODES
-                or p.get("sandbox") in _WRITE_SANDBOXES]
-    return bool(writable) and not any(p.get("worker_diff_present") or p.get("commit_sha")
+    return any(_write_capable(p) for p in receipts) and not any(p.get("worker_diff_present") or p.get("commit_sha")
                                       for p in receipts)

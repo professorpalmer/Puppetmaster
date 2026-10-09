@@ -3095,7 +3095,7 @@ class PuppetmasterTests(unittest.TestCase):
             artifacts = CursorAdapter().run(task, "goal", "worker-cursor")
 
         cursor_input = json.loads(run.call_args.kwargs["env"]["PUPPETMASTER_CURSOR_INPUT"])
-        self.assertIn("Implement mode", cursor_input["prompt"])
+        self.assertIn("Build mode", cursor_input["prompt"])
         types = [a.type for a in artifacts]
         self.assertIn(ArtifactType.VERIFICATION, types)
         self.assertIn(ArtifactType.PATCH, types)
@@ -17464,12 +17464,12 @@ class AdapterCliPresenceTests(unittest.TestCase):
     def test_cli_less_adapters_are_always_present(self) -> None:
         from puppetmaster.preflight import adapter_cli_executable, adapter_cli_present
 
-        # cursor (bundled SDK runner) and openai (HTTP) have no CLI to install.
-        for adapter in ("cursor", "openai"):
-            self.assertIsNone(adapter_cli_executable(adapter))
-            self.assertTrue(
-                adapter_cli_present(adapter, resolver=lambda _name: None)
-            )
+        # openai (HTTP) has no CLI to install.
+        self.assertIsNone(adapter_cli_executable("openai"))
+        self.assertTrue(adapter_cli_present("openai", resolver=lambda _name: None))
+        # The Cursor SDK runner needs node on PATH.
+        self.assertEqual(adapter_cli_executable("cursor"), "node")
+        self.assertFalse(adapter_cli_present("cursor", resolver=lambda _name: None))
 
     def test_claude_and_codex_gate_on_resolvable_binary(self) -> None:
         from puppetmaster.preflight import adapter_cli_executable, adapter_cli_present

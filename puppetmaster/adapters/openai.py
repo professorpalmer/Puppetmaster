@@ -9,6 +9,7 @@ from typing import Any
 
 from puppetmaster.codegraph import enrich_prompt_with_codegraph
 from puppetmaster.failure import NOT_AUTHENTICATED, classify_openai_failure
+from puppetmaster.invocation import current_attempt
 from puppetmaster.models import Artifact, ArtifactType, Task
 from puppetmaster.openai_security import (
     DEFAULT_OPENAI_BASE_URL,
@@ -32,6 +33,11 @@ from ._streaming import (
 from .cursor import cursor_result_artifacts
 
 DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"
+
+
+def _count(value: object) -> Any:
+    """A reported token count, or None when absent or not a non-negative int."""
+    return value if type(value) is int and value >= 0 else None
 
 
 class OpenAIAdapter:
@@ -194,6 +200,7 @@ class OpenAIAdapter:
                     payload={
                         "returncode": exc.code,
                         "model": model,
+                        "attempt_id": current_attempt(task),
                         "failure": classify_openai_failure(err_body, exc.code),
                         "stderr": _redacted_tail(err_body, 8000),
                     },
@@ -212,6 +219,7 @@ class OpenAIAdapter:
                     payload={
                         "returncode": None,
                         "model": model,
+                        "attempt_id": current_attempt(task),
                         "failure": "timeout",
                         "stderr": f"OpenAI request exceeded {timeout_seconds}s",
                     },
@@ -230,6 +238,7 @@ class OpenAIAdapter:
                     payload={
                         "returncode": None,
                         "model": model,
+                        "attempt_id": current_attempt(task),
                         "failure": "network_error",
                         "stderr": str(exc),
                     },
@@ -251,6 +260,7 @@ class OpenAIAdapter:
                     payload={
                         "returncode": status_code,
                         "model": model,
+                        "attempt_id": current_attempt(task),
                         "failure": "malformed_response",
                         "stderr": _redacted_tail(raw_body, 8000),
                     },
@@ -265,10 +275,15 @@ class OpenAIAdapter:
         finish_reason = (
             choices[0].get("finish_reason") if isinstance(choices, list) and choices else None
         )
-        usage = data.get("usage") or {}
-        prompt_tokens = int(usage.get("prompt_tokens") or 0)
-        completion_tokens = int(usage.get("completion_tokens") or 0)
-        total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        details = usage.get("prompt_tokens_details")
+        cached_tokens = _count(details.get("cached_tokens")) if isinstance(details, dict) else None
+        # An unreported count is unknown (unpriced), not a measured zero.
+        prompt_tokens = _count(usage.get("prompt_tokens"))
+        completion_tokens = _count(usage.get("completion_tokens"))
+        total_tokens = _count(usage.get("total_tokens"))
+        if total_tokens is None and prompt_tokens is not None and completion_tokens is not None:
+            total_tokens = prompt_tokens + completion_tokens
 
         parsed_artifacts = cursor_result_artifacts(task, worker_id, result_text, adapter="openai")
         degraded = not parsed_artifacts and bool(result_text)
@@ -297,6 +312,7 @@ class OpenAIAdapter:
             payload={
                 "returncode": status_code,
                 "model": model,
+                "attempt_id": current_attempt(task),
                 "finish_reason": finish_reason,
                 "stdout": result_text[-_STDOUT_TAIL_CHARS:],
                 "stderr": "",
@@ -304,6 +320,8 @@ class OpenAIAdapter:
                 "tokens_in": prompt_tokens,
                 "tokens_out": completion_tokens,
                 "tokens_total": total_tokens,
+                # Input-inclusive cache reads, priced at the cache rate.
+                **({"tokens_cached": cached_tokens} if cached_tokens is not None else {}),
                 "failure": (
                     "empty_or_unstructured_openai_result"
                     if degraded

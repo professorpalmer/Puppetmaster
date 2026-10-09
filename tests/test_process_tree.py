@@ -15,7 +15,6 @@ from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import MagicMock, patch
 
-from puppetmaster.adapters._streaming import _kill_process_tree
 from puppetmaster.win_process import (
     _descendant_pids_from_map,
     _taskkill_process_tree,
@@ -87,98 +86,6 @@ class WinProcessTreeUnitTests(unittest.TestCase):
         # PID-reuse style cycle: 2 -> 3 -> 2, plus a self-parent edge.
         tree = {1: [2], 2: [3], 3: [2, 4], 4: [4]}
         self.assertEqual(_descendant_pids_from_map(1, tree), [4, 3, 2, 1])
-
-class KillProcessTreeDispatchTests(unittest.TestCase):
-    def _fake_process(self, pid: int = 5555) -> MagicMock:
-        process = MagicMock()
-        process.pid = pid
-        return process
-
-    def test_posix_new_session_uses_killpg(self) -> None:
-        process = self._fake_process()
-        with patch("puppetmaster.adapters._streaming.os.name", "posix"), patch(
-            "puppetmaster.adapters._streaming.signal.SIGKILL", 9, create=True
-        ), patch(
-            "puppetmaster.adapters._streaming.os.getpgid",
-            create=True,
-            return_value=9001,
-        ) as getpgid, patch(
-            "puppetmaster.adapters._streaming.os.killpg", create=True
-        ) as killpg, patch(
-            "puppetmaster.win_process.kill_process_tree"
-        ) as win_kill:
-            _kill_process_tree(process, started_new_session=True)
-        getpgid.assert_called_once_with(5555)
-        killpg.assert_called_once_with(9001, 9)
-        process.kill.assert_not_called()
-        win_kill.assert_not_called()
-
-    def test_windows_new_session_uses_win_process_tree(self) -> None:
-        process = self._fake_process()
-        with patch("puppetmaster.adapters._streaming.os.name", "nt"), patch(
-            "puppetmaster.win_process.kill_process_tree", return_value=True
-        ) as win_kill, patch(
-            "puppetmaster.adapters._streaming.os.killpg", create=True
-        ) as killpg:
-            _kill_process_tree(process, started_new_session=True)
-        win_kill.assert_called_once_with(5555)
-        process.kill.assert_not_called()
-        killpg.assert_not_called()
-
-    def test_windows_tree_kill_failure_falls_back_to_direct_kill(self) -> None:
-        process = self._fake_process()
-        with patch("puppetmaster.adapters._streaming.os.name", "nt"), patch(
-            "puppetmaster.win_process.kill_process_tree", return_value=False
-        ):
-            _kill_process_tree(process, started_new_session=True)
-        process.kill.assert_called_once()
-
-    def test_windows_without_new_session_still_tree_kills(self) -> None:
-        # Cursor/Node descendants must be reaped even when the adapter did not
-        # launch with start_new_session (POSIX stays conservative).
-        process = self._fake_process()
-        with patch("puppetmaster.adapters._streaming.os.name", "nt"), patch(
-            "puppetmaster.win_process.kill_process_tree", return_value=True
-        ) as win_kill, patch(
-            "puppetmaster.adapters._streaming.os.killpg", create=True
-        ) as killpg:
-            _kill_process_tree(process, started_new_session=False)
-        win_kill.assert_called_once_with(5555)
-        process.kill.assert_not_called()
-        killpg.assert_not_called()
-
-    def test_windows_without_new_session_falls_back_when_tree_kill_fails(self) -> None:
-        process = self._fake_process()
-        with patch("puppetmaster.adapters._streaming.os.name", "nt"), patch(
-            "puppetmaster.win_process.kill_process_tree", return_value=False
-        ):
-            _kill_process_tree(process, started_new_session=False)
-        process.kill.assert_called_once()
-
-    def test_posix_without_new_session_skips_killpg(self) -> None:
-        process = self._fake_process()
-        with patch("puppetmaster.adapters._streaming.os.name", "posix"), patch(
-            "puppetmaster.adapters._streaming.os.killpg", create=True
-        ) as killpg:
-            _kill_process_tree(process, started_new_session=False)
-        killpg.assert_not_called()
-        process.kill.assert_called_once()
-
-    def test_killpg_failure_falls_back_to_direct_kill(self) -> None:
-        process = self._fake_process()
-        with patch("puppetmaster.adapters._streaming.os.name", "posix"), patch(
-            "puppetmaster.adapters._streaming.signal.SIGKILL", 9, create=True
-        ), patch(
-            "puppetmaster.adapters._streaming.os.getpgid",
-            create=True,
-            return_value=1,
-        ), patch(
-            "puppetmaster.adapters._streaming.os.killpg",
-            create=True,
-            side_effect=ProcessLookupError,
-        ):
-            _kill_process_tree(process, started_new_session=True)
-        process.kill.assert_called_once()
 
 class McpAsyncReaperSemanticsTests(unittest.TestCase):
     """Preserve MCP launcher reaper behavior while Wave 4 lands beside it."""

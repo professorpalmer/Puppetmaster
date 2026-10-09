@@ -16,7 +16,7 @@ from typing import Any, Optional
 
 from puppetmaster.models import ArtifactType
 
-RESUMABLE_ADAPTERS = {"codex": "thread_id", "claude-code": "session_id"}
+RESUMABLE_ADAPTERS = {"codex": "thread_id", "claude-code": "session_id", "fx": "session_id"}
 _SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 
 
@@ -105,9 +105,11 @@ def session_on_disk(adapter: str, session_id: str) -> Optional[bool]:
         if not any((home / "sessions").is_dir() for home in homes):
             return None
         return codex_home.home_for_session(session_id) is not None
-    else:
-        root = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
-        pattern = f"*/{session_id}.jsonl"
+    if adapter != "claude-code":
+        # fx keeps no local session store that Puppetmaster can read.
+        return None
+    root = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
+    pattern = f"*/{session_id}.jsonl"
     if not root.is_dir():
         return None
     return next(root.glob(pattern), None) is not None

@@ -17,6 +17,7 @@ from puppetmaster.failure import classify_fx_failure
 from puppetmaster.codegraph import enrich_prompt_with_codegraph, inject_worker_cli_env
 from puppetmaster.models import Artifact, ArtifactType, Task
 from puppetmaster.ports import apply_worktree_ports
+from puppetmaster.worker_resume import resolved_resume, task_resume_record
 
 from ._base import (
     CliInvocation,
@@ -30,6 +31,7 @@ from ._base import (
 from ._base import _should_emit_patch_artifact
 from ._facade import facade
 from ._prompts import (
+    build_cli_implement_prompt,
     prompt_with_memory,
     structured_prompt_for_task,
     with_job_brief,
@@ -40,7 +42,7 @@ from ._streaming import (
     _redacted_tail,
     capture_subprocess_stdout,
 )
-from .cursor import cursor_result_artifacts
+from .cursor import cursor_result_artifacts, implement_report_artifacts
 
 # fx resolves its own default model from ~/.fx/settings.json. A hardcoded default
 # here would silently override that user-owned configuration, so the adapter has
@@ -220,19 +222,31 @@ def _last_json_object_slice(text: str) -> Optional[str]:
     return None
 
 
-def fx_usage_from_result(result: Optional[dict]) -> tuple[int, int]:
-    """``(tokens_in, tokens_out)`` from fx's reported usage, or zeroes."""
-    if not isinstance(result, dict):
-        return 0, 0
-    usage = result.get("usage")
+def fx_reported_usage(result: Optional[dict]) -> tuple[Optional[int], Optional[int]]:
+    """``(tokens_in, tokens_out)`` from fx's reported usage; None for a count fx did not report."""
+    usage = result.get("usage") if isinstance(result, dict) else None
     if not isinstance(usage, dict):
-        return 0, 0
+        return None, None
     tokens_in = usage.get("input_tokens")
     tokens_out = usage.get("output_tokens")
     return (
-        int(tokens_in) if isinstance(tokens_in, int) and not isinstance(tokens_in, bool) else 0,
-        int(tokens_out) if isinstance(tokens_out, int) and not isinstance(tokens_out, bool) else 0,
+        int(tokens_in) if isinstance(tokens_in, int) and not isinstance(tokens_in, bool) else None,
+        int(tokens_out) if isinstance(tokens_out, int) and not isinstance(tokens_out, bool) else None,
     )
+
+
+def fx_resume(payload: dict) -> tuple[Optional[str], Optional[dict]]:
+    """The session id to resume and the resume record the receipt carries.
+
+    An orchestrator-stamped ``payload["resume"]`` decides, so the run does what
+    the task record says. A direct caller without a stamp passes its own id.
+    """
+    if isinstance(payload.get("resume"), dict):
+        record = task_resume_record(payload, "fx")
+        resume = resolved_resume(record, "fx")
+        return (str(resume["session_id"]) if resume else None), record
+    raw = payload.get("resume_session_id")
+    return (str(raw) if raw else None), None
 
 
 def fx_report_text(result: Optional[dict], stdout: str) -> str:
@@ -315,25 +329,37 @@ class FxAdapter(CliWorkerAdapter):
                 )
             ]
 
+        permission_mode = resolve_fx_permission_mode(task)
+        read_only_intent = resolve_fx_read_only_intent(task)
+        # Attribution contract (matches claude-code / codex / antigravity):
+        # analysis / no-edit payloads and the interactive `ask` posture never
+        # claim repository diffs. fx still runs `--auto` when read-only because
+        # `--ask` would deadlock without a TTY; enforcement stays prompt-only.
+        write_capable = (not read_only_intent) and permission_mode != "ask"
+
         base_prompt = task.payload.get("prompt") or task.instruction
-        prompt, codegraph_used = facade("enrich_prompt_with_codegraph")(
-            prompt_with_memory(
-                facade("with_repo_census")(
-                    with_job_brief(
-                        structured_prompt_for_task(
-                            task,
-                            prompt=base_prompt,
-                            final_message_note=True,
-                        ),
-                        task,
-                    ),
-                    cwd,
-                ),
+        disable_codegraph = bool(task.payload.get("disable_codegraph", False))
+        if write_capable:
+            # A builder gets task-scoped CodeGraph context; the job-wide census
+            # and goal brief only dilute it.
+            task_prompt = with_job_brief(
+                build_cli_implement_prompt(task, prompt=base_prompt),
                 task,
-            ),
+                shared_brief=disable_codegraph,
+            )
+        else:
+            task_prompt = facade("with_repo_census")(
+                with_job_brief(
+                    structured_prompt_for_task(task, prompt=base_prompt, final_message_note=True),
+                    task,
+                ),
+                cwd,
+            )
+        prompt, codegraph_used = facade("enrich_prompt_with_codegraph")(
+            prompt_with_memory(task_prompt, task),
             task_description=task.payload.get("codegraph_task") or task.instruction or goal,
             cwd=cwd,
-            disabled=bool(task.payload.get("disable_codegraph", False)),
+            disabled=disable_codegraph,
         )
 
         executable = resolve_fx_executable(task)
@@ -342,25 +368,22 @@ class FxAdapter(CliWorkerAdapter):
             return self._missing_cli(task, worker_id, str(executable))
         command_base = [resolved, *command_base[1:]]
 
-        permission_mode = resolve_fx_permission_mode(task)
-        read_only_intent = resolve_fx_read_only_intent(task)
-        # Attribution contract (matches claude-code / codex / antigravity):
-        # analysis / no-edit payloads and the interactive `ask` posture never
-        # claim repository diffs. fx still runs `--auto` when read-only because
-        # `--ask` would deadlock without a TTY; enforcement stays prompt-only.
-        write_capable = (not read_only_intent) and permission_mode != "ask"
         if not write_capable:
             prompt = f"{_FX_READ_ONLY_PREAMBLE}\n\n{prompt}"
         model = task.payload.get("model") or DEFAULT_FX_MODEL
-        save_session = bool(task.payload.get("save_session", False))
-        resume_session_id = task.payload.get("resume_session_id")
+        # A flow node asks for a kept session with ephemeral=false.
+        save_session = (
+            bool(task.payload.get("save_session", False))
+            or task.payload.get("ephemeral") is False
+        )
+        resume_session_id, resume_record = fx_resume(task.payload)
         system_prompt = task.payload.get("system_prompt")
         command = build_fx_command(
             executable=command_base,
             permission_mode=permission_mode,
             no_save=not save_session,
             system_prompt=str(system_prompt) if system_prompt else None,
-            resume_session_id=str(resume_session_id) if resume_session_id else None,
+            resume_session_id=resume_session_id,
             extra_args=task.payload.get("extra_args", []),
         )
 
@@ -385,7 +408,8 @@ class FxAdapter(CliWorkerAdapter):
                 "write_capable": write_capable,
                 "read_only_intent": read_only_intent,
                 "save_session": save_session,
-                "resume_session_id": str(resume_session_id) if resume_session_id else None,
+                "resume_session_id": resume_session_id,
+                "resume_record": resume_record,
                 "enforcement": "prompt-only" if not write_capable else "cli",
                 "depth": depth + 1,
                 "mcp_disabled": mcp_disabled,
@@ -439,7 +463,7 @@ class FxAdapter(CliWorkerAdapter):
             )
 
         result = parse_fx_result(completed.stdout)
-        tokens_in, tokens_out = fx_usage_from_result(result)
+        tokens_in, tokens_out = fx_reported_usage(result)
         report = fx_report_text(result, completed.stdout)
         session_id = ""
         reported_model = None
@@ -481,7 +505,8 @@ class FxAdapter(CliWorkerAdapter):
             else permission_mode != "ask"
         )
         missing_result = result is None and not process_failed
-        artifacts = cursor_result_artifacts(
+        # A builder's prose report survives as a FINDING.
+        artifacts = (implement_report_artifacts if write_capable else cursor_result_artifacts)(
             task, worker_id, report, adapter=self.name
         )
         # Mirror Codex: prose without typed artifacts is unstructured. A
@@ -518,6 +543,7 @@ class FxAdapter(CliWorkerAdapter):
                 "enforcement": prepared.extras.get("enforcement"),
                 "save_session": bool(prepared.extras.get("save_session")),
                 "resume_session_id": resume_session_id,
+                **_resume_fields(prepared),
                 "session_id": session_id or None,
                 "worker_depth": prepared.extras.get("depth"),
                 "mcp_disabled": bool(prepared.extras.get("mcp_disabled")),
@@ -532,8 +558,8 @@ class FxAdapter(CliWorkerAdapter):
                 "final_output": _redacted_tail(report, _STDOUT_TAIL_CHARS),
                 "tokens_in": tokens_in,
                 "tokens_out": tokens_out,
-                "tokens_total": tokens_in + tokens_out,
-                "usage_reported": result is not None,
+                "tokens_total": None if tokens_in is None or tokens_out is None else tokens_in + tokens_out,
+                "usage_reported": isinstance(result, dict) and isinstance(result.get("usage"), dict),
                 "result_missing": missing_result,
                 "cwd": str(cwd),
                 "base_sha": before["sha"],
@@ -621,8 +647,10 @@ class FxAdapter(CliWorkerAdapter):
                     # run keeps the session it resumed so a follow-up can continue it.
                     "session_id": prepared.extras.get("resume_session_id"),
                     "resume_session_id": prepared.extras.get("resume_session_id"),
+                    **_resume_fields(prepared),
                     "model_requested": model_requested,
                     "permission_mode": permission_mode,
+                    "write_capable": bool(prepared.extras.get("write_capable")),
                     "stdout": _redacted_tail(completed.stdout, _STDOUT_TAIL_CHARS),
                     "stderr": _redacted_tail(completed.stderr, _STDOUT_TAIL_CHARS),
                     "stdout_capture": stdout_capture,
@@ -659,3 +687,8 @@ class FxAdapter(CliWorkerAdapter):
                 )
             )
         return artifacts
+
+
+def _resume_fields(prepared: CliInvocation) -> dict:
+    record = prepared.extras.get("resume_record")
+    return {"resume": record} if record else {}

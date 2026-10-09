@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from puppetmaster.invocation_gate import DelegationDecision, gate_disabled, gate_policy, should_delegate
+from puppetmaster.worker_fence import is_worker_process
 
 DECISION_LOG_NAME = "invocation_decisions.jsonl"
 DECISION_LOG_MAX_BYTES = 5 * 1024 * 1024
@@ -414,6 +415,10 @@ def handle_hook(
     """Core hook policy. Same payload/event → same response (modulo whether a
     Puppetmaster MCP server is alive, which is what makes steering safe)."""
     if gate_disabled(env):
+        return HookResponse(action="allow")
+    # A worker loads the user's global hooks too. They steer the pilot, and a
+    # worker has no Puppetmaster tools to be steered toward.
+    if is_worker_process(env):
         return HookResponse(action="allow")
 
     # If no Puppetmaster MCP server is alive, the hook is a complete no-op: it

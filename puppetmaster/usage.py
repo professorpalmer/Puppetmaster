@@ -38,11 +38,12 @@ def _coerce_int(value: Any) -> Optional[int]:
     return int(value)
 
 
-def usage_from_sdk(sdk_usage: Any) -> Optional[dict[str, int]]:
+def usage_from_sdk(sdk_usage: Any) -> Optional[dict[str, Optional[int]]]:
     """Normalize a Cursor/Claude SDK usage object into in/out token counts.
 
     Returns ``None`` when no usable token counts are present, so the caller can
-    fall back to an approximation.
+    fall back to an approximation. A side the SDK did not report stays
+    ``None`` (unknown), so pricing cannot read it as a measured zero.
     """
     if not isinstance(sdk_usage, dict):
         return None
@@ -58,7 +59,7 @@ def usage_from_sdk(sdk_usage: Any) -> Optional[dict[str, int]]:
     tokens_out = first_count("outputTokens", "output_tokens", "completionTokens", "completion_tokens")
     if tokens_in is None and tokens_out is None:
         return None
-    result = {"tokens_in": tokens_in or 0, "tokens_out": tokens_out or 0}
+    result = {"tokens_in": tokens_in, "tokens_out": tokens_out}
     # Cursor's turn-ended usage and Anthropic's (Claude Code) usage split out
     # cache read/write tokens. They're priced differently from fresh input, so
     # preserve them for the cost axis instead of folding them into tokens_in

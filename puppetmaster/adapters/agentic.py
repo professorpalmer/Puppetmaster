@@ -46,6 +46,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -56,8 +57,8 @@ from puppetmaster.codegraph import (
     codegraph_ready,
     enrich_prompt_with_codegraph,
 )
-from puppetmaster.cancellation import JobCancelled, is_cancelled
-from puppetmaster.models import Artifact, ArtifactType, Task
+from puppetmaster.cancellation import JobCancelled, check_cancellation, is_cancelled
+from puppetmaster.models import Artifact, ArtifactType, Task, new_id
 from puppetmaster.worker_verdict import parse_structured_verdict, worker_verdict_artifact
 from puppetmaster.provider_circuit import (
     get_provider_circuit_breaker,
@@ -94,8 +95,15 @@ from puppetmaster.tool_batch import (
 )
 from puppetmaster.tool_offload import offload_tool_output, read_offload_blob
 
+from puppetmaster.worker_attribution import (
+    path_references,
+    attribution_payload,
+    normalize_path,
+    path_tokens,
+)
 from ._base import (
     FullEditWorkerAdapter,
+    diff_source_payload,
     make_patch_artifact,
     verification_artifact,
     _should_emit_patch_artifact,
@@ -440,6 +448,8 @@ class AgenticAdapter(FullEditWorkerAdapter):
         # the start of each agent loop so tags never leak across jobs.
         self._hashline_store = SnapshotStore()
         self._fs_cache: dict[str, tuple[int, int, str]] = {}
+        # task id -> raw paths this run's write tools and shell commands named.
+        self._referenced_paths: dict[str, list[str]] = {}
 
     def _reset_session_caches(self) -> None:
         self._hashline_store = SnapshotStore()
@@ -814,6 +824,7 @@ class AgenticAdapter(FullEditWorkerAdapter):
         blocked, before = self.guard_full_edit_run(task, worker_id, "agentic", cwd)
         if blocked is not None:
             return blocked
+        self._referenced_paths[task.id] = []
 
         base_prompt = with_report_contract(task.payload.get("prompt") or task.instruction)
         prompt, codegraph_used = facade("enrich_prompt_with_codegraph")(
@@ -899,6 +910,7 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 worker_id=worker_id, provider=provider, model=model,
             )
         except ProviderError as exc:
+            self._referenced_paths.pop(task.id, None)
             after = facade("git_snapshot")(cwd, base_tree=str(before.get("tree") or "") or None)
             detail = redact_secrets(exc.body or str(exc)) or str(exc)
             failure = exc.failure
@@ -925,6 +937,9 @@ class AgenticAdapter(FullEditWorkerAdapter):
 
         final_text, usage, turns, mutated, stop_reason, _submitted, _submitted_criteria = loop
         after = facade("git_snapshot")(cwd, base_tree=str(before.get("tree") or "") or None)
+        attribution = attribution_payload(path_references([
+            normalize_path(path, cwd) for path in self._referenced_paths.pop(task.id, [])
+        ]), before)
         has_work = _should_emit_patch_artifact(before, after)
         # A change that fails the repo's own verification (in gating mode) is not
         # a clean pass -- an edit whose tests are red is a regression, not a done
@@ -971,6 +986,9 @@ class AgenticAdapter(FullEditWorkerAdapter):
                     "turns": turns, "stop_reason": stop_reason, "has_work": has_work,
                     "changed_files": after.get("changed_files", []),
                     "untracked_files": after.get("untracked_files", []),
+                    "write_capable": True,
+                    **diff_source_payload(before, after),
+                    **attribution,
                     **usage,
                     "verification_command": verify_state["command"],
                     "verification_mode": verify_state["mode"],
@@ -1687,10 +1705,14 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 # Model returned prose/tools without submit — stop retrying.
                 break
 
+        # A turn without provider usage is unknown (NULL), never a measured 0.
+        facts = selected_usage["selected_facts"] if selected_usage is not None else {}
         usage_out = {
             **(selected_usage if selected_usage is not None else selected_token_usage({})),
-            "tokens_in": usage_total["prompt_tokens"],
-            "tokens_out": usage_total["completion_tokens"],
+            "tokens_in": None if "tokens_in" in facts and facts["tokens_in"] is None
+            else usage_total["prompt_tokens"],
+            "tokens_out": None if "tokens_out" in facts and facts["tokens_out"] is None
+            else usage_total["completion_tokens"],
             "tokens_total": usage_total["total_tokens"],
             "total_tool_calls": total_tool_calls,
             "mutating_tool_attempts": mutating_tool_attempts,
@@ -2139,16 +2161,16 @@ class AgenticAdapter(FullEditWorkerAdapter):
         if blocked is not None:
             return False, f"refused destructive verification command (matched {blocked})"
         try:
-            proc = subprocess.run(
-                command, shell=True, cwd=str(cwd), capture_output=True,
-                text=True, timeout=_VERIFY_TIMEOUT_SECONDS,
-            )
-        except subprocess.TimeoutExpired:
-            return False, f"verification timed out ({_VERIFY_TIMEOUT_SECONDS}s): {command}"
+            returncode, stdout, stderr, interrupted = _run_owned_shell(
+                command, cwd, _VERIFY_TIMEOUT_SECONDS)
         except Exception as exc:  # noqa: BLE001 - report, never crash the worker
             return False, f"verification could not run: {type(exc).__name__}: {exc}"
-        out = (proc.stdout or "") + (("\n[stderr]\n" + proc.stderr) if proc.stderr else "")
-        return proc.returncode == 0, out
+        if interrupted == "timeout":
+            return False, f"verification timed out ({_VERIFY_TIMEOUT_SECONDS}s): {command}"
+        if interrupted == "cancelled":
+            return False, f"verification cancelled: {command}"
+        out = stdout + (("\n[stderr]\n" + stderr) if stderr else "")
+        return returncode == 0, out
 
     def _execute_tool(
         self, name: str, args: dict, cwd: Path, implement: bool, task: Task
@@ -2168,16 +2190,21 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 return self._tool_graph_search(args, cwd, task)
             if name == "graph_context":
                 return self._tool_graph_context(args, cwd, task)
+            # The write_scope gate charges this run only for paths it names.
+            referenced = self._referenced_paths.setdefault(task.id, []) if implement else []
+            if name in ("write_file", "edit_file", "delete_file") and implement:
+                referenced.append(str(args.get("path", "")))
             if name == "write_file" and implement:
                 return self._tool_write_file(args, cwd)
             if name == "edit_file" and implement:
                 return self._tool_edit_file(args, cwd)
             if name == "apply_hashline" and implement and hashline_enabled():
-                return self._tool_apply_hashline(args, cwd)
+                return self._tool_apply_hashline(args, cwd, touched=referenced)
             if name == "delete_file" and implement:
                 return self._tool_delete_file(args, cwd)
             if name == "run_terminal":
                 if implement and self._terminal_enabled(task):
+                    referenced.extend(path_tokens(args.get("command")))
                     return self._tool_run_terminal(args, cwd, analyze_readonly=False)
                 if (not implement) and self._analyze_terminal_enabled(task):
                     return self._tool_run_terminal(args, cwd, analyze_readonly=True)
@@ -2503,7 +2530,9 @@ class AgenticAdapter(FullEditWorkerAdapter):
             )
         return f"edited {rel} ({n} replacement{'s' if n != 1 else ''})"
 
-    def _tool_apply_hashline(self, args: dict, cwd: Path) -> str:
+    def _tool_apply_hashline(
+        self, args: dict, cwd: Path, touched: Optional[list] = None
+    ) -> str:
         patch = str(args.get("patch", ""))
         if not patch.strip():
             return "error: empty hashline patch"
@@ -2511,6 +2540,8 @@ class AgenticAdapter(FullEditWorkerAdapter):
             result = apply_patch(cwd, patch, self._hashline_store)
         except Exception as exc:  # surface parse/stale/bounds cleanly to the model
             return f"error: {type(exc).__name__}: {exc}"
+        if touched is not None:
+            touched.extend(str(path) for path in result.touched)
         for path in result.touched:
             self._invalidate_fs_cache(path)
         return format_apply_success(result)
@@ -2546,31 +2577,14 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 f"(matched guardrail: {blocked}). Narrow the command to a "
                 "specific, reversible action."
             )
-        try:
-            # UTF-8 always: Windows locale (cp1252) otherwise UnicodeDecodeError
-            # on perfectly valid ``git show`` output and the worker reports
-            # "could not execute" for a command that actually ran.
-            proc = subprocess.run(
-                command,
-                shell=True,
-                cwd=str(cwd),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=_TERMINAL_TIMEOUT_SECONDS,
-                env={
-                    **os.environ,
-                    "GIT_PAGER": "cat",
-                    "PAGER": "cat",
-                    "GIT_TERMINAL_PROMPT": "0",
-                    "PYTHONUTF8": "1",
-                },
-            )
-        except subprocess.TimeoutExpired:
+        returncode, stdout, stderr, interrupted = _run_owned_shell(
+            command, cwd, _TERMINAL_TIMEOUT_SECONDS)
+        if interrupted == "timeout":
             return f"error: command timed out ({_TERMINAL_TIMEOUT_SECONDS}s)"
-        out = (proc.stdout or "") + (("\n[stderr]\n" + proc.stderr) if proc.stderr else "")
-        return f"exit={proc.returncode}\n{out}"
+        if interrupted == "cancelled":
+            return "error: command cancelled"
+        out = stdout + (("\n[stderr]\n" + stderr) if stderr else "")
+        return f"exit={returncode}\n{out}"
 
     def _tool_web_fetch(self, args: dict) -> str:
         import urllib.request
@@ -2689,6 +2703,59 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 "stderr_excerpt": redact_secrets(detail or "")[:2000],
             },
         )
+
+
+def _run_owned_shell(
+    command: str, cwd: Path, timeout: float
+) -> "tuple[Optional[int], str, str, Optional[str]]":
+    """Run ``command`` as an owned process tree: ``(returncode, stdout, stderr, interrupted)``.
+
+    ``interrupted`` is ``"timeout"`` or ``"cancelled"``, and then the whole tree
+    is killed. Output goes to files, not pipes, so a grandchild that keeps a
+    pipe open cannot block the read (the Windows ``communicate()`` hang).
+    """
+    from puppetmaster.win_process import cleanup_owned_process, close_owned_process, popen_owned
+
+    owner = new_id("process")
+    env = {
+        **os.environ,
+        "GIT_PAGER": "cat",
+        "PAGER": "cat",
+        "GIT_TERMINAL_PROMPT": "0",
+        "PYTHONUTF8": "1",
+        "PUPPETMASTER_PROCESS_OWNER": owner,
+    }
+    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        process = popen_owned(
+            command, shell=True, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
+            stdout=out, stderr=err, start_new_session=os.name != "nt",
+        )
+        deadline = time.monotonic() + timeout
+        interrupted: Optional[str] = None
+        try:
+            while True:
+                try:
+                    process.wait(timeout=0.25)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                if time.monotonic() >= deadline:
+                    interrupted = "timeout"
+                    break
+                try:
+                    check_cancellation()
+                except JobCancelled:
+                    interrupted = "cancelled"
+                    break
+        finally:
+            if interrupted is not None or process.poll() is None:
+                cleanup_owned_process(process, owner, time.monotonic() + 5)
+            close_owned_process(process)
+        out.seek(0)
+        err.seek(0)
+        stdout = out.read().decode("utf-8", errors="replace")
+        stderr = err.read().decode("utf-8", errors="replace")
+    return process.returncode, stdout, stderr, interrupted
 
 
 def _rel(path: Path, cwd: Path) -> str:

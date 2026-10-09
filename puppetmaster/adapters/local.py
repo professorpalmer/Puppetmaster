@@ -216,6 +216,8 @@ class ShellAdapter:
                 cwd=str(Path(cwd)) if cwd else None,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout_seconds,
                 check=False,
             )
@@ -231,6 +233,7 @@ class ShellAdapter:
                     evidence=[f"command:{' '.join(command)}", "timeout"],
                     payload={
                         "returncode": None,
+                        "failure": "timeout",
                         "stdout": _redacted_tail(exc.stdout, 4000),
                         "stderr": _redacted_tail(exc.stderr, 4000),
                         "timeout_seconds": timeout_seconds,

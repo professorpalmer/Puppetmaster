@@ -369,6 +369,15 @@ _LIVE_AUTH_MARKERS = (
 )
 
 
+# Adapter classes that block a probe, in the probe's own vocabulary. A
+# rate limit counts as plan exhaustion, as the marker path does.
+_LIVE_PROBE_CLASS = {
+    "not_authenticated": "auth",
+    "forbidden": "auth",
+    "rate_limit": "billing_or_quota",
+}
+
+
 def classify_live_probe(adapter: str, returncode: int, output: str) -> Optional[str]:
     """Classify a live-probe result into a failure class, or None if it passed.
 
@@ -383,6 +392,7 @@ def classify_live_probe(adapter: str, returncode: int, output: str) -> Optional[
         from puppetmaster.adapters import (
             classify_claude_code_failure,
             classify_codex_failure,
+            classify_hermes_failure,
             classify_openai_failure,
         )
 
@@ -392,12 +402,14 @@ def classify_live_probe(adapter: str, returncode: int, output: str) -> Optional[
             klass = classify_codex_failure(output)
         elif adapter == "openai":
             klass = classify_openai_failure(output)
+        elif adapter == "hermes":
+            klass = classify_hermes_failure(output)
         else:
             klass = None
     except Exception:
         klass = None
     if klass and klass != "unknown":
-        return klass
+        return _LIVE_PROBE_CLASS.get(klass, klass)
     if any(m in lowered for m in _LIVE_BILLING_MARKERS):
         return "billing_or_quota"
     if any(m in lowered for m in _LIVE_AUTH_MARKERS):
@@ -979,6 +991,8 @@ _ADAPTER_CLI_DEFAULT: dict[str, "tuple[tuple[str, ...], str]"] = {
     "antigravity": (("AGY_COMMAND", "ANTIGRAVITY_COMMAND"), "agy"),
     "hermes": (("HERMES_COMMAND",), "hermes"),
     "fx": (("FX_COMMAND",), "fx"),
+    # The Cursor SDK runner is a node script.
+    "cursor": ((), "node"),
 }
 
 # Injectable executable resolver: name -> resolved path or None. Defaults to the

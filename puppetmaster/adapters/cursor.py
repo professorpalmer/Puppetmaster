@@ -31,7 +31,7 @@ from ._base import (
 )
 from ._facade import facade
 from ._prompts import (
-    build_implement_prompt,
+    build_cli_implement_prompt,
     prompt_with_memory,
     structured_prompt_for_task,
     with_job_brief,
@@ -44,7 +44,12 @@ from ._streaming import (
     capture_subprocess_stdout,
     run_streamed_subprocess,
 )
-from ._base import _should_emit_patch_artifact
+from ._base import (
+    _should_emit_patch_artifact,
+    output_limit_artifact,
+    payload_output_limit,
+    resume_receipt_fields,
+)
 
 
 class CursorAdapter(CliWorkerAdapter):
@@ -115,7 +120,7 @@ class CursorAdapter(CliWorkerAdapter):
         model = task.payload.get("model", "default")
         prompt, codegraph_used = facade("enrich_prompt_with_codegraph")(
             prompt_with_memory(
-                with_job_brief(build_implement_prompt(base_prompt), task),
+                with_job_brief(build_cli_implement_prompt(task, prompt=base_prompt), task),
                 task,
             ),
             task_description=task.payload.get("codegraph_task") or task.instruction or goal,
@@ -164,6 +169,7 @@ class CursorAdapter(CliWorkerAdapter):
             task=task,
             sidecar_name=prepared.sidecar_name,
             timeout_seconds=timeout_seconds,
+            max_output_bytes=payload_output_limit(task),
         )
 
     def _finalize_cli_run(
@@ -194,6 +200,8 @@ class CursorAdapter(CliWorkerAdapter):
                     payload={
                         "failure": "timeout",
                         "returncode": None,
+                        "write_capable": True,
+                        **resume_receipt_fields(task),
                         "stdout": _redacted_tail(completed.stdout, _STDOUT_TAIL_CHARS),
                         "stderr": _redacted_tail(completed.stderr, _STDOUT_TAIL_CHARS),
                         "timeout_seconds": timeout_seconds,
@@ -252,6 +260,8 @@ class CursorAdapter(CliWorkerAdapter):
                 payload={
                     "failure": None if completed.returncode == 0 else failure,
                     "returncode": completed.returncode,
+                    "write_capable": True,
+                    **resume_receipt_fields(task),
                     "stdout": _redacted_tail(completed.stdout, 12000),
                     "stderr": _redacted_tail(completed.stderr, _STDOUT_TAIL_CHARS),
                     "stdout_capture": stdout_capture,
@@ -336,7 +346,12 @@ class CursorAdapter(CliWorkerAdapter):
             task=task,
             sidecar_name="cursor_analyze",
             timeout_seconds=timeout_seconds,
+            max_output_bytes=payload_output_limit(task),
         )
+        # The byte cap also sets timed_out, so check it first.
+        blocked = output_limit_artifact(task, worker_id, "cursor", completed)
+        if blocked is not None:
+            return [blocked]
         if completed.timed_out:
             stdout = completed.stdout
             stderr = completed.stderr
@@ -367,6 +382,7 @@ class CursorAdapter(CliWorkerAdapter):
                         "stderr_capture": stderr_capture,
                         "model": model,
                         "failure": "timeout",
+                        **resume_receipt_fields(task),
                         "live_log": completed.live_log_path,
                         "attempt_id": getattr(completed, "attempt_id", None),
                         "dispatch_receipt": getattr(completed, "dispatch_receipt", None),
@@ -433,6 +449,10 @@ class CursorAdapter(CliWorkerAdapter):
                     "stderr": _redacted_tail(completed.stderr, _STDOUT_TAIL_CHARS),
                     "stdout_capture": stdout_capture,
                     "stderr_capture": stderr_capture,
+                    "live_log": completed.live_log_path,
+                    "attempt_id": getattr(completed, "attempt_id", None),
+                    "dispatch_receipt": getattr(completed, "dispatch_receipt", None),
+                    **resume_receipt_fields(task),
                     "model": model,
                     "cursor_status": status,
                     "failure": (

@@ -23,6 +23,7 @@ from ._base import _should_emit_patch_artifact
 from ._facade import facade
 from ._prompts import (
     TASK_INSTRUCTION_HEADER,
+    build_cli_implement_prompt,
     prompt_with_memory,
     with_job_brief,
     with_report_contract,
@@ -33,6 +34,7 @@ from ._streaming import (
     _redacted_tail,
     capture_subprocess_stdout,
 )
+from .codex_rollout import count
 from .cursor import implement_report_artifacts
 
 DEFAULT_ANTIGRAVITY_MODEL = "gemini-3.7-flash"
@@ -136,6 +138,37 @@ def _workspace_add_dir(cwd: Optional[Path]) -> Optional[str]:
     return resolved
 
 
+def observed_conversation_id(stdout: str) -> Optional[str]:
+    """The one conversation a partial stream-json run names, or None.
+
+    Several distinct ids record nothing rather than a guess.
+    """
+    ids: set[str] = set()
+    for raw in (stdout or "").splitlines():
+        line = raw.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        for scope in (event, *(v for v in event.values() if isinstance(v, dict))):
+            if scope.get("conversation_id"):
+                ids.add(str(scope["conversation_id"]))
+    return ids.pop() if len(ids) == 1 else None
+
+
+def _whole_json(stdout: str) -> Optional[dict]:
+    """The stdout as one JSON object, or None."""
+    try:
+        parsed = json.loads((stdout or "").strip())
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def _unwrap_agy_envelope(parsed: object) -> dict[str, object]:
     """Normalize a json envelope or a stream-json ``result`` event."""
     if not isinstance(parsed, dict):
@@ -196,14 +229,23 @@ class AntigravityAdapter(CliWorkerAdapter):
         resolved: str,
     ) -> Union[list[Artifact], CliInvocation]:
         raw_instruction = str(task.payload.get("prompt") or task.instruction or "")
-        base_prompt = with_report_contract(
-            f"{TASK_INSTRUCTION_HEADER}\n{raw_instruction}"
-        )
+        mode = resolve_antigravity_mode(task.payload)
+        write_capable = mode != "plan"
+        disable_codegraph = bool(task.payload.get("disable_codegraph", False))
+        if write_capable:
+            base_prompt = build_cli_implement_prompt(task, prompt=raw_instruction)
+        else:
+            base_prompt = with_report_contract(
+                f"{TASK_INSTRUCTION_HEADER}\n{raw_instruction}"
+            )
+        # A builder gets task-scoped CodeGraph context; the job-wide census
+        # and goal brief only dilute it.
+        shared_brief = disable_codegraph or not write_capable
         prompt, codegraph_used = facade("enrich_prompt_with_codegraph")(
-            with_job_brief(prompt_with_memory(base_prompt, task), task),
+            with_job_brief(prompt_with_memory(base_prompt, task), task, shared_brief=shared_brief),
             task_description=str(task.payload.get("codegraph_task") or task.instruction or goal),
             cwd=cwd,
-            disabled=bool(task.payload.get("disable_codegraph", False)),
+            disabled=disable_codegraph,
         )
         executable = (
             task.payload.get("executable")
@@ -213,8 +255,6 @@ class AntigravityAdapter(CliWorkerAdapter):
         )
         command_base = command_parts(executable)
         model, effort = resolve_antigravity_model(task.payload)
-        mode = resolve_antigravity_mode(task.payload)
-        write_capable = mode != "plan"
         dangerously_skip = resolve_antigravity_skip_permissions(
             task.payload, mode=mode
         )
@@ -279,28 +319,39 @@ class AntigravityAdapter(CliWorkerAdapter):
         model = str(prepared.extras.get("model") or DEFAULT_ANTIGRAVITY_MODEL)
         effort = prepared.extras.get("effort")
         mode = str(prepared.extras.get("mode") or "accept-edits")
+        write_capable = bool(prepared.extras.get("write_capable", mode != "plan"))
         codegraph_used = bool(prepared.extras.get("codegraph_used"))
         cwd = Path(task.payload.get("cwd") or ".").resolve()
 
         if completed.timed_out:
-            return self._handle_timeout(task, worker_id, before, after, completed, model, mode)
+            return self._handle_timeout(
+                task, worker_id, before, after, completed, model, mode, write_capable)
 
         parsed_json = self._parse_agy_output(completed.stdout)
         response_text = str(parsed_json.get("response") or completed.stdout or "").strip()
         agy_status = str(parsed_json.get("status") or "")
         agy_error = str(parsed_json.get("error") or "")
         conversation_id = str(parsed_json.get("conversation_id") or "")
-        usage_data = parsed_json.get("usage") if isinstance(parsed_json.get("usage"), dict) else {}
+        usage_present = isinstance(parsed_json.get("usage"), dict)
+        usage_data = parsed_json["usage"] if usage_present else {}
 
-        tokens_in = int(usage_data.get("input_tokens") or 0)
-        tokens_out = int(usage_data.get("output_tokens") or 0)
-        reasoning_tokens = int(usage_data.get("thinking_tokens") or 0)
-        cached_tokens = int(usage_data.get("cache_read_tokens") or 0)
+        # A missing or non-integer counter is unknown (NULL), never a measured 0.
+        tokens_in = count(usage_data.get("input_tokens"))
+        tokens_out = count(usage_data.get("output_tokens"))
+        reasoning_tokens = count(usage_data.get("thinking_tokens"))
+        cached_tokens = count(usage_data.get("cache_read_tokens"))
 
         process_failed = completed.returncode != 0 or agy_status == "ERROR"
         classified_failure = None
         if process_failed:
-            combined_err = "\n".join((completed.stderr, json_output_diagnostic(completed.stdout, antigravity_diagnosis), agy_error))
+            envelope = _whole_json(completed.stdout)
+            if envelope is None:
+                diagnostic = json_output_diagnostic(completed.stdout, antigravity_diagnosis)
+            else:
+                # A pretty-printed envelope spans lines; its response is not a diagnosis.
+                diagnostic = "\n".join(
+                    str(part) for part in antigravity_diagnosis(_unwrap_agy_envelope(envelope)) if part)
+            combined_err = "\n".join((completed.stderr, diagnostic, agy_error))
             classified_failure = classify_antigravity_failure(combined_err)
 
         stdout_capture = capture_subprocess_stdout(
@@ -326,6 +377,7 @@ class AntigravityAdapter(CliWorkerAdapter):
                 "returncode": completed.returncode,
                 "model": model,
                 "mode": mode,
+                "write_capable": write_capable,
                 "effort": effort,
                 "conversation_id": conversation_id,
                 "agy_status": agy_status,
@@ -340,7 +392,8 @@ class AntigravityAdapter(CliWorkerAdapter):
                 "cwd": str(cwd),
                 "tokens_in": tokens_in,
                 "tokens_out": tokens_out,
-                "tokens_total": tokens_in + tokens_out,
+                "tokens_total": None if tokens_in is None or tokens_out is None else tokens_in + tokens_out,
+                "usage_unlinked_reason": None if usage_present else "usage_missing",
                 "cached_input_tokens": cached_tokens,
                 "reasoning_output_tokens": reasoning_tokens,
                 "base_sha": before["sha"],
@@ -379,6 +432,7 @@ class AntigravityAdapter(CliWorkerAdapter):
         completed: StreamedProcess,
         model: str,
         mode: str,
+        write_capable: bool,
     ) -> list[Artifact]:
         timeout_seconds = int(task.payload.get("timeout_seconds", self.default_timeout_seconds))
         stdout_capture = capture_subprocess_stdout(
@@ -401,6 +455,9 @@ class AntigravityAdapter(CliWorkerAdapter):
                     "returncode": None,
                     "model": model,
                     "mode": mode,
+                    "write_capable": write_capable,
+                    # Not resumed yet; recorded so an operator can find the conversation.
+                    "conversation_id": observed_conversation_id(completed.stdout),
                     "stdout": _redacted_tail(completed.stdout, _STDOUT_TAIL_CHARS),
                     "stderr": _redacted_tail(completed.stderr, _STDOUT_TAIL_CHARS),
                     "stdout_capture": stdout_capture,
