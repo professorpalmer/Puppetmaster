@@ -116,8 +116,8 @@ CURATED_CATALOGS: dict[str, list[dict]] = {
         {
             "model": "claude-opus-5-5",
             "capability": 100,
-            "input": 5.0,
-            "output": 25.0,
+            "input": 4.0,
+            "output": 20.0,
             "context": 1_000_000,
             "tags": ["tools",
                 "claude",

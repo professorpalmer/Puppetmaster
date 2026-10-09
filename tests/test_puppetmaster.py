@@ -22210,6 +22210,45 @@ class SavingsLedgerTests(unittest.TestCase):
         self.assertAlmostEqual(cf.avoided_usd, 35.0, places=4)
         self.assertEqual(cf.tasks, 1)
 
+    def test_counterfactual_default_reference_beats_a_capability_tie(self) -> None:
+        from puppetmaster.savings import resolve_counterfactual_model
+        from puppetmaster.model_registry import ModelSpec
+
+        def spec(model_id, name, score, inp, out, billing, **kw):
+            return ModelSpec(id=model_id, adapter=model_id.split("/", 1)[0], adapter_model_name=name,
+                             capability_score=score, input_per_mtok_usd=inp,
+                             output_per_mtok_usd=out, billing=billing, **kw)
+
+        # Capability saturates at 100 across generations; registry order used
+        # to pick the oldest flagship (Opus 5) as the comparison.
+        registry = [
+            spec("cursor/claude-opus-5", "claude-opus-5", 100, 5.0, 25.0, "plan"),
+            spec("cursor/claude-fable-5", "claude-fable-5", 100, 10.0, 50.0, "plan"),
+            spec("claude-code/opus-5-5", "claude-opus-5-5", 100, 5.0, 25.0, "plan"),
+            spec("agentic/anthropic/claude-opus-5.5", "anthropic/claude-opus-5.5", 99, 4.0, 20.0, "api"),
+        ]
+        # The named current standard wins; its API entry carries the live rate.
+        self.assertEqual(resolve_counterfactual_model(registry).id, "agentic/anthropic/claude-opus-5.5")
+        self.assertEqual(resolve_counterfactual_model(registry[:3]).id, "claude-code/opus-5-5")
+
+    def test_counterfactual_reference_skips_disabled_and_retired_models(self) -> None:
+        from puppetmaster.savings import resolve_counterfactual_model
+        from puppetmaster.model_registry import ModelSpec
+
+        registry = [
+            ModelSpec(id="claude-code/opus-5-5", adapter="claude-code", adapter_model_name="claude-opus-5-5",
+                      capability_score=100, input_per_mtok_usd=4.0, output_per_mtok_usd=20.0,
+                      billing="api", enabled=False),
+            ModelSpec(id="api/old", adapter="openai", adapter_model_name="old",
+                      capability_score=100, input_per_mtok_usd=5.0, output_per_mtok_usd=25.0,
+                      billing="api", enabled=False, retired=True,
+                      retirement_reason="superseded", retirement_authority="test"),
+            ModelSpec(id="api/live", adapter="openai", adapter_model_name="live",
+                      capability_score=90, input_per_mtok_usd=2.0, output_per_mtok_usd=10.0,
+                      billing="api"),
+        ]
+        self.assertEqual(resolve_counterfactual_model(registry).id, "api/live")
+
     def test_counterfactual_unpriced_reference_is_zero(self) -> None:
         from puppetmaster.savings import RoutingRecord, compute_counterfactual
         from puppetmaster.model_registry import ModelSpec

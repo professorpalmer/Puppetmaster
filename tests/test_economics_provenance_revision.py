@@ -74,7 +74,12 @@ class EconomicsProvenanceTests(unittest.TestCase):
                 receipt = terminal.get_job(job.id).cost_receipt
                 self.assertEqual(receipt['actual_cost']['total_marginal_cost_usd'], expected)
                 self.assertEqual(receipt['actual_cost']['tasks'][0]['billing'], billing)
-                self.assertEqual(build_cost_report(terminal, job.id, [model]), receipt)
+                report = build_cost_report(terminal, job.id, [model])
+                # Only the comparison is priced again on the current registry.
+                report.pop('counterfactual')
+                frozen = dict(receipt)
+                frozen.pop('counterfactual')
+                self.assertEqual(report, frozen)
 
     def test_removed_model_route_revision_overrides_pin_and_legacy_stays_unknown(self):
         usage = Artifact(job_id='j', task_id='t', type=ArtifactType.VERIFICATION,

@@ -211,15 +211,37 @@ def _write_receipt(store, job_id: str, status: JobStatus, receipt):
     )
 
 
+def _frozen_part(report: dict) -> dict:
+    """The receipt without its counterfactual, which is priced at read time."""
+    return {key: value for key, value in report.items() if key != "counterfactual"}
+
+
 def _assert_immune_to_registry_churn(
     test, store, job_id: str, registry_path: Path, first: dict, registries
 ) -> None:
+    from puppetmaster.savings import resolve_counterfactual_model
+
     for registry in registries:
         save_registry(registry, registry_path)
-        test.assertEqual(build_cost_report(store, job_id, registry=registry), first)
+        report = build_cost_report(store, job_id, registry=registry)
+        test.assertEqual(_frozen_part(report), _frozen_part(first))
+        counterfactual = report["counterfactual"]
+        if first["counterfactual"] is None:
+            test.assertIsNone(counterfactual)
+            continue
+        # The comparison follows today's reference; the cost it compares stays frozen.
+        test.assertEqual(
+            counterfactual["reference_model_id"], resolve_counterfactual_model(registry).id
+        )
+        test.assertEqual(
+            counterfactual["actual_cost_usd"], first["actual_cost"]["total_marginal_cost_usd"]
+        )
     mutated = build_cost_report(store, job_id, registry=registries[-1])
     mutated["actual_cost"]["total_marginal_cost_usd"] = 99.0
-    test.assertEqual(build_cost_report(store, job_id, registry=registries[-1]), first)
+    test.assertEqual(
+        _frozen_part(build_cost_report(store, job_id, registry=registries[-1])),
+        _frozen_part(first),
+    )
 
 
 def _stamp(store, job_id: str, status: JobStatus, registry_path: Path):
@@ -400,6 +422,29 @@ class TerminalReceiptLifecycleTests(unittest.TestCase):
             )
             self.assertEqual(store.get_job(job.id).status, JobStatus.COMPLETE)
 
+    def test_frozen_receipt_compares_against_the_current_reference(self) -> None:
+        for backend in _BACKENDS:
+            with self.subTest(backend=backend):
+                with _harness(backend) as (store, registry_path):
+                    job, _task = _seed_priced_job(store, registry_path, _registry())
+                    stamped = build_cost_report(store, job.id, registry=_registry())
+                    self.assertEqual(stamped["counterfactual"]["reference_model_id"], "flagship-model")
+                    current = list(_registry()) + [
+                        _spec("claude-code/opus-5-5", "claude-opus-5-5", 100, 4.0, 20.0),
+                    ]
+                    report = build_cost_report(store, job.id, registry=current)
+                    self.assertEqual(_frozen_part(report), _frozen_part(stamped))
+                    counterfactual = report["counterfactual"]
+                    self.assertEqual(counterfactual["reference_model_id"], "claude-code/opus-5-5")
+                    # 1M in @ $4 + 1M out @ $20 against the frozen $18 actual.
+                    self.assertAlmostEqual(counterfactual["naive_cost_usd"], 24.0, places=6)
+                    self.assertAlmostEqual(counterfactual["actual_cost_usd"], 18.0, places=6)
+                    self.assertAlmostEqual(counterfactual["avoided_usd"], 6.0, places=6)
+                    self.assertTrue(counterfactual["actual_priced"])
+                    # Nothing was written: the stored receipt keeps its stamp.
+                    stored = store.get_job(job.id).cost_receipt
+                    self.assertEqual(stored["counterfactual"]["reference_model_id"], "flagship-model")
+
     def test_terminal_receipt_stable_across_registry_churn(self) -> None:
         for backend in _BACKENDS:
             with self.subTest(backend=backend):
@@ -478,7 +523,8 @@ class TerminalReceiptLifecycleTests(unittest.TestCase):
                     save_registry(_cheaper_mid(), registry_path)
                     _stamp(store, job.id, JobStatus.COMPLETE, registry_path)
                     self.assertEqual(
-                        build_cost_report(store, job.id, registry=_cheaper_mid()), first
+                        _frozen_part(build_cost_report(store, job.id, registry=_cheaper_mid())),
+                        _frozen_part(first),
                     )
 
     def test_worker_completion_does_not_stamp_receipt(self) -> None:

@@ -23,9 +23,10 @@ avoided figure ≈ the naive figure.
 ``build_cost_report`` is the structured payload behind
 ``puppetmaster cost <job_id> --json``. CLI, MCP ``puppetmaster_job_cost``, and
 Marionette all consume that one function. A coordinator-stamped
-``Job.cost_receipt`` is returned detached after a cost-final completion.
-Pre-upgrade final jobs without a valid receipt get a labeled artifact-only
-report that ignores current registry rates. Stalled and active jobs may
+``Job.cost_receipt`` is returned detached after a cost-final completion. Only
+its counterfactual is priced again, on the current reference. Pre-upgrade
+final jobs without a valid receipt get a labeled artifact-only report that
+ignores current registry rates. Stalled and active jobs may
 reprice against the current registry and say so.
 """
 from __future__ import annotations
@@ -441,16 +442,23 @@ def job_counterfactual(job_cost: JobCost, registry: list) -> Optional[Counterfac
     full reference rate, including exclusive split cache reads and writes.
     Legacy cached tokens are already included in tokens_in.
     """
-    reference = resolve_counterfactual_model(registry)
+    return _counterfactual(
+        resolve_counterfactual_model(registry),
+        [
+            (task.tokens_in + task.cache_read_tokens + task.cache_write_tokens, task.tokens_out)
+            for task in job_cost.tasks
+        ],
+        job_cost.total_marginal_cost_usd,
+    )
+
+
+def _counterfactual(
+    reference, token_rows: list[tuple[int, int]], actual: float
+) -> Optional[Counterfactual]:
+    """Price ``(input, output)`` token rows on ``reference`` against ``actual``."""
     if reference is None:
         return None
-    naive = 0.0
-    for task in job_cost.tasks:
-        naive += reference.estimate_cost_usd(
-            task.tokens_in + task.cache_read_tokens + task.cache_write_tokens,
-            task.tokens_out,
-        )
-    actual = job_cost.total_marginal_cost_usd
+    naive = sum(reference.estimate_cost_usd(tokens_in, tokens_out) for tokens_in, tokens_out in token_rows)
     in_price = getattr(reference, "input_per_mtok_usd", 0) or 0
     out_price = getattr(reference, "output_per_mtok_usd", 0) or 0
     return Counterfactual(
@@ -459,8 +467,40 @@ def job_counterfactual(job_cost: JobCost, registry: list) -> Optional[Counterfac
         naive_cost_usd=round(naive, 6),
         actual_cost_usd=round(actual, 6),
         avoided_usd=round(naive - actual, 6),
-        tasks=len(job_cost.tasks),
+        tasks=len(token_rows),
     )
+
+
+def _receipt_counterfactual(receipt: dict, registry: list) -> Optional[dict]:
+    """Today's comparison for a frozen receipt.
+
+    The receipt freezes what the work cost. The comparison is a view: it
+    prices the same frozen per-task tokens on the current reference, so every
+    job in a total compares against one model, and a reference change does
+    not leave old jobs on a retired flagship.
+    """
+    actual = receipt.get("actual_cost")
+    rows = actual.get("tasks") if isinstance(actual, dict) else None
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        return receipt.get("counterfactual")
+    total = actual.get("total_marginal_cost_usd")
+    actual_priced = bool(rows) and not actual.get("unpriced_tasks") and total is not None
+    counterfactual = _counterfactual(
+        resolve_counterfactual_model(registry),
+        [
+            (
+                int(row.get("tokens_in") or 0)
+                + int(row.get("cache_read_tokens") or 0)
+                + int(row.get("cache_write_tokens") or 0),
+                int(row.get("tokens_out") or 0),
+            )
+            for row in rows
+        ],
+        float(total) if actual_priced else 0.0,
+    )
+    if counterfactual is None:
+        return receipt.get("counterfactual")
+    return _counterfactual_fields(counterfactual, actual_priced)
 
 
 
@@ -576,8 +616,13 @@ def _counterfactual_payload(job_cost: JobCost, registry: list) -> Optional[dict]
     counterfactual = job_counterfactual(job_cost, registry)
     if counterfactual is None:
         return None
+    return _counterfactual_fields(
+        counterfactual, bool(job_cost.tasks) and job_cost.unpriced_tasks == 0
+    )
+
+
+def _counterfactual_fields(counterfactual: Counterfactual, actual_priced: bool) -> dict:
     payload = asdict(counterfactual)
-    actual_priced = bool(job_cost.tasks) and job_cost.unpriced_tasks == 0
     payload["actual_priced"] = actual_priced
     if not actual_priced:
         payload["actual_cost_usd"] = None
@@ -622,6 +667,15 @@ def _report_envelope(
     }
 
 
+def _registry_or_current(registry: Optional[list]) -> list:
+    if registry is not None:
+        return registry
+    try:
+        return load_registry(default_registry_path()) or []
+    except Exception:
+        return []
+
+
 def build_current_registry_cost_report(
     job_id: str,
     artifacts: Iterable[Artifact],
@@ -633,11 +687,7 @@ def build_current_registry_cost_report(
     completion receipt and to label stalled/active jobs that have none.
     """
     artifacts = list(artifacts)
-    if registry is None:
-        try:
-            registry = load_registry(default_registry_path()) or []
-        except Exception:
-            registry = []
+    registry = _registry_or_current(registry)
     job_cost = price_job(artifacts, registry)
     return _report_envelope(
         job_id,
@@ -760,9 +810,10 @@ def build_cost_report(store: Any, job_id: str, registry: Optional[list] = None) 
     """Structured report behind ``puppetmaster cost <job_id> --json``.
 
     Shared by the CLI, the MCP ``puppetmaster_job_cost`` tool, and Marionette.
-    A valid cost-final ``Job.cost_receipt`` is returned detached (no recompute,
-    no write). Pre-upgrade final jobs without one get a labeled artifact-only
-    report. Stalled and active jobs get a labeled current-registry reprice.
+    A valid cost-final ``Job.cost_receipt`` is returned detached (no write).
+    Its measured cost stays frozen; its counterfactual is priced again on the
+    current reference from the frozen task tokens. Pre-upgrade final jobs
+    without one get a labeled artifact-only report. Stalled and active jobs get a labeled current-registry reprice.
     """
     job = None
     if store is not None:
@@ -776,7 +827,9 @@ def build_cost_report(store: Any, job_id: str, registry: Optional[list] = None) 
         and is_cost_final_job_status(job.status)
         and valid_terminal_cost_receipt(receipt, job_id)
     ):
-        return copy.deepcopy(receipt)
+        report = copy.deepcopy(receipt)
+        report["counterfactual"] = _receipt_counterfactual(report, _registry_or_current(registry))
+        return report
 
     artifacts = store.list_artifacts(job_id) if store is not None else []
     if job is not None and is_cost_final_job_status(job.status):
