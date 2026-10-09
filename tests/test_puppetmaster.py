@@ -6393,12 +6393,12 @@ class PuppetmasterTests(unittest.TestCase):
             "model_unavailable",
         )
 
-    def test_claude_code_adapter_defaults_to_opus_5(self) -> None:
+    def test_claude_code_adapter_defaults_to_opus_5_5(self) -> None:
         """With no model pinned (and no router stamp), the claude-code adapter
-        must default to claude-opus-5 rather than the CLI's own default."""
+        must default to claude-opus-5-5 rather than the CLI's own default."""
         from puppetmaster.adapters import DEFAULT_CLAUDE_CODE_MODEL
 
-        self.assertEqual(DEFAULT_CLAUDE_CODE_MODEL, "claude-opus-5")
+        self.assertEqual(DEFAULT_CLAUDE_CODE_MODEL, "claude-opus-5-5")
 
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -6433,7 +6433,7 @@ print('{"result":"ok"}')
                 "puppetmaster.adapters.build_claude_code_command", side_effect=fake_build
             ):
                 ClaudeCodeAdapter().run(task, "goal", "worker")
-            self.assertEqual(captured["model"], "claude-opus-5")
+            self.assertEqual(captured["model"], "claude-opus-5-5")
 
             # Explicit model still wins over the default.
             captured.clear()
@@ -9493,13 +9493,13 @@ class ModelRouterTests(unittest.TestCase):
         )
         self.assertIn("effort:high", grok.tags)
         self.assertIn("param:fast", grok.tags)
-        # Sol-class rung: above Grok 4.5, level with GPT-5.6 Sol, still under
-        # the Opus 5 / Fable 5 tip.
+        # Sol-class rung: above Grok 4.5, level with GPT-6.1 Sol (StrongOrc
+        # ranking-v1: 0.681 vs 0.653 TES), still under the Opus / Fable tip.
         self.assertGreater(
             grok.capability_score, registry["cursor/grok-4-5"].capability_score
         )
         self.assertEqual(
-            grok.capability_score, registry["cursor/gpt-5-6-sol"].capability_score
+            grok.capability_score, registry["openai/gpt-6-1-sol"].capability_score
         )
         self.assertLess(
             grok.capability_score, registry["cursor/claude-opus-5"].capability_score
@@ -10440,7 +10440,7 @@ class ModelRouterTests(unittest.TestCase):
         )
         self.assertEqual(
             by_id["cursor/grok-4-6"].capability_score,
-            by_id["cursor/gpt-5-6-sol"].capability_score,
+            by_id["openai/gpt-6-1-sol"].capability_score,
         )
         self.assertLess(
             by_id["cursor/grok-4-6"].capability_score,
@@ -10502,9 +10502,9 @@ class ModelRouterTests(unittest.TestCase):
             "detailed-vision", by_id["claude-code/opus-4-6"].tags
         )
 
-    def test_starter_registry_routes_hardest_task_to_opus_5(self) -> None:
-        """The absolute-hardest tasks must route to everyday frontier Opus 5
-        (near-Fable at half price), not saturate on Opus 4.8 or burn Fable."""
+    def test_starter_registry_routes_hardest_task_to_opus_5_5(self) -> None:
+        """The absolute-hardest tasks must route to everyday frontier Opus 5.5
+        ($4/$20, below Opus 5), not saturate on Opus 4.8 or burn Fable."""
         from puppetmaster.model_registry import starter_registry
         from puppetmaster.router import TaskSignals, route_task
 
@@ -10516,12 +10516,14 @@ class ModelRouterTests(unittest.TestCase):
             role="security-review",
         )
         decision = route_task(signal, starter_registry(), policy="balanced")
-        self.assertEqual(decision.model.id, "cursor/claude-opus-5")
-        # Opus 4.8 and pricier Fable should be rejected: flagship preferred,
-        # cost-aware tip prefers Opus 5 over Fable at equal capability.
+        self.assertEqual(decision.model.id, "claude-code/opus-5-5")
+        # Opus 4.8, the older Opus 5 and pricier Fable should be rejected:
+        # cost-aware tip prefers Opus 5.5 at equal capability.
         rejected_ids = {spec.id for spec, _ in decision.rejected}
         self.assertIn("claude-code/opus-4-8", rejected_ids)
+        self.assertIn("cursor/claude-opus-5", rejected_ids)
         self.assertIn("cursor/claude-fable-5", rejected_ids)
+        self.assertIn("claude-code/fable-5-1", rejected_ids)
         self.assertIn("cursor/grok-4-5", rejected_ids)
         self.assertIn("cursor/grok-4-6", rejected_ids)
 
@@ -10573,16 +10575,19 @@ class ModelRouterTests(unittest.TestCase):
         self.assertIn("cursor/claude-fable-5", rejected_ids)
         self.assertIn("cursor/grok-4-5", rejected_ids)
 
-    def test_starter_registry_routes_easy_task_to_composer(self) -> None:
+    def test_starter_registry_routes_easy_task_to_cheapest_tier(self) -> None:
+        """Easy work goes to the cheapest sufficient model: Haiku 5.5
+        ($0.10/$0.50) when Claude Code is present, GPT-5.6 Luna ($0.20/$1.20)
+        on Cursor alone."""
         from puppetmaster.model_registry import starter_registry
         from puppetmaster.router import TaskSignals, route_task
 
-        decision = route_task(
-            TaskSignals(instruction="format these files", role="verify-runtime"),
-            starter_registry(),
-            policy="balanced",
-        )
-        self.assertEqual(decision.model.id, "cursor/composer-2-5")
+        signal = TaskSignals(instruction="format these files", role="verify-runtime")
+        decision = route_task(signal, starter_registry(), policy="balanced")
+        self.assertEqual(decision.model.id, "claude-code/haiku-5-5")
+        cursor_only = [s for s in starter_registry() if s.adapter == "cursor"]
+        decision = route_task(signal, cursor_only, policy="balanced")
+        self.assertEqual(decision.model.id, "cursor/gpt-5-6-luna")
 
     def test_balanced_tie_break_picks_lower_capability_when_costs_equal(self) -> None:
         from puppetmaster.model_registry import ModelSpec
@@ -13067,8 +13072,11 @@ class OpenAIAdapterTests(unittest.TestCase):
             sonnet5 = entries["claude-sonnet-5"]
             sonnet45 = entries["claude-sonnet-4-5"]
             self.assertEqual(sonnet5["context"], 1_000_000)
-            self.assertEqual(sonnet5["input"], 3.0)
-            self.assertEqual(sonnet5["output"], 15.0)
+            self.assertEqual(sonnet5["input"], 2.0)
+            self.assertEqual(sonnet5["output"], 10.0)
+            for current in ("claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"):
+                self.assertIn(current, entries, f"{catalog_name} missing {current}")
+                self.assertEqual(entries[current]["context"], 1_000_000)
             self.assertIn("long-context", sonnet5["tags"])
             self.assertGreater(sonnet5["capability"], sonnet45["capability"])
             if catalog_name == "claude-code":
@@ -13120,8 +13128,8 @@ class OpenAIAdapterTests(unittest.TestCase):
         sol = registry["openai/gpt-5-6-sol"]
         self.assertEqual(sol.adapter, "openai")
         self.assertEqual(sol.adapter_model_name, "gpt-5.6-sol")
-        self.assertEqual(sol.input_per_mtok_usd, 5.0)
-        self.assertEqual(sol.output_per_mtok_usd, 30.0)
+        self.assertEqual(sol.input_per_mtok_usd, 2.0)
+        self.assertEqual(sol.output_per_mtok_usd, 10.0)
         self.assertEqual(sol.context_window, 1_050_000)
         self.assertGreater(sol.capability_score, registry["openai/gpt-5-5"].capability_score)
 
@@ -13132,15 +13140,22 @@ class OpenAIAdapterTests(unittest.TestCase):
 
         terra = registry["openai/gpt-5-6-terra"]
         self.assertEqual(terra.adapter_model_name, "gpt-5.6-terra")
-        self.assertEqual(terra.input_per_mtok_usd, 2.5)
-        self.assertEqual(terra.output_per_mtok_usd, 15.0)
-        self.assertEqual(terra.capability_score, 97)
+        self.assertEqual(terra.input_per_mtok_usd, 2.0)
+        self.assertEqual(terra.output_per_mtok_usd, 12.0)
+        self.assertEqual(terra.capability_score, 95)
 
         luna = registry["openai/gpt-5-6-luna"]
         self.assertEqual(luna.adapter_model_name, "gpt-5.6-luna")
-        self.assertEqual(luna.input_per_mtok_usd, 1.0)
-        self.assertEqual(luna.output_per_mtok_usd, 6.0)
+        self.assertEqual(luna.input_per_mtok_usd, 0.2)
+        self.assertEqual(luna.output_per_mtok_usd, 1.2)
         self.assertEqual(luna.capability_score, 90)
+
+        # GPT-6 ranks above GPT-5.6, and only Astra shares the 100 tip.
+        sol61 = registry["openai/gpt-6-1-sol"]
+        self.assertEqual(sol61.adapter_model_name, "gpt-6.1-sol")
+        self.assertGreater(sol61.capability_score, sol.capability_score)
+        self.assertEqual(registry["codex/gpt-6-1-sol"].capability_score, 99)
+        self.assertEqual(registry["openai/gpt-6-astra"].capability_score, 100)
 
         codex_sol = registry["codex/gpt-5-6-sol"]
         self.assertEqual(codex_sol.adapter_model_name, "gpt-5.6-sol")

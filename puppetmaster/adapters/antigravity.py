@@ -38,6 +38,7 @@ from .cursor import implement_report_artifacts
 DEFAULT_ANTIGRAVITY_MODEL = "gemini-3.7-flash"
 DEFAULT_ANTIGRAVITY_EFFORT = DEFAULT_SWARM_REASONING_EFFORT
 MODELS_REQUIRING_EFFORT = (
+    "gemini-3.8-flash",
     "gemini-3.7-flash",
     "gemini-3.6-flash",
     "gemini-3.1-pro",

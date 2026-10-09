@@ -42,6 +42,12 @@ from puppetmaster.role_preferences import (
     first_soft_preferred,
     load_role_preferences,
 )
+from puppetmaster.swarm_reasoning import (
+    DEFAULT_SWARM_REASONING_EFFORT,
+    WorkerEffortError,
+    caller_pinned_effort,
+    operator_effort_profile,
+)
 from puppetmaster.scorecards import (
     SCORE_SOURCE_COMMUNITY_OBSERVATION,
     SCORE_SOURCE_PREFERENCE,
@@ -316,6 +322,9 @@ class TaskSignals:
 
     instruction: str
     role: str = "explore"
+    # The caller's effort pin, if any. The worker runs it, else the operator
+    # or swarm default; community observations join on that effective effort.
+    reasoning_effort: Optional[str] = None
     payload_size_chars: int = 0
     explicit_min_capability: Optional[int] = None
     # Ceiling on the classifier output (cost guardrail). Unlike
@@ -1045,7 +1054,14 @@ def _route_task_once(
                 f"{need} for role {canonical_role!r}."
             )
 
-    community_pick = community_gate(sufficient, canonical_role, observation_rows)
+    try:
+        run_effort = operator_effort_profile().resolve(task.reasoning_effort)[0]
+    except WorkerEffortError:
+        # Launch refuses this pin; routing still needs a join key.
+        run_effort = task.reasoning_effort or DEFAULT_SWARM_REASONING_EFFORT
+    community_pick = community_gate(
+        sufficient, canonical_role, observation_rows, run_effort
+    )
     if community_pick is not None:
         pick = community_pick
         reason = (
@@ -1053,11 +1069,11 @@ def _route_task_once(
             f"role {canonical_role}"
             + _overlay_note(pick)
         )
-        winner_obs = match_observation(pick, canonical_role, observation_rows)
+        winner_obs = match_observation(pick, canonical_role, observation_rows, run_effort)
         for spec in after_cost:
             if spec.id == pick.id:
                 continue
-            other = match_observation(spec, canonical_role, observation_rows)
+            other = match_observation(spec, canonical_role, observation_rows, run_effort)
             if other is None:
                 rejected.append(
                     (spec, "no matching community observation")
@@ -1672,6 +1688,7 @@ def signals_from_worker_spec(spec, *, instruction_override: Optional[str] = None
         billing_payload={key: payload[key] for key in ("model", "router_model_id", "billing", "billing_source", "openai_api_key", "executable") if key in payload},
         billing_adapter=getattr(spec, "adapter", None),
         role=getattr(spec, "role", "explore") or "explore",
+        reasoning_effort=caller_pinned_effort(payload),
         payload_size_chars=payload_size_chars,
         explicit_min_capability=payload.get("min_capability"),
         explicit_max_capability=payload.get("max_capability"),
