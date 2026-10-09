@@ -54,9 +54,11 @@ class StopReceiptTests(unittest.TestCase):
             store.save_task(task)
 
             # worker_runtime exports the state dir; the dispatch receipt lands there.
+            # A dummy key passes the auth preflight on a host with no Claude login.
             ready = root / "ready"
             env = patch.dict(os.environ, {"PUPPETMASTER_STATE_DIR": str(root / "state"),
-                                          "PM_TEST_READY": str(ready)})
+                                          "PM_TEST_READY": str(ready),
+                                          "ANTHROPIC_API_KEY": "test-key-not-real"})
             env.start()
             self.addCleanup(env.stop)
             runtime = WorkerRuntime(store, job.id, "build", "worker-build-1", lease_seconds=30)

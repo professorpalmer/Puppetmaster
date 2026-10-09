@@ -713,7 +713,8 @@ def starter_registry() -> list[ModelSpec]:
                 "detailed-vision",
             ],
             notes=(
-                "Everyday frontier on Cursor. Anthropic Claude Opus 5 via the "
+                "Previous everyday frontier on Cursor, superseded by "
+                "cursor/claude-opus-5-5. Anthropic Claude Opus 5 via the "
                 "Cursor SDK (API id claude-opus-5, released 2026-07-24). "
                 "Near-Fable 5 intelligence at half Fable's token price "
                 "($5/$25 vs $10/$50 per MTok) and the same price as Opus 4.8. "
@@ -915,6 +916,108 @@ def starter_registry() -> list[ModelSpec]:
                 "Absolute tip flagship. Anthropic Claude Fable 5.1 via the Claude "
                 "Code CLI (API id claude-fable-5-1, released 2026-09-01). $10/$50 "
                 "per MTok, 2.5x Opus 5.5. Reserve it for the most ambitious work."
+            ),
+        ),
+        ModelSpec(
+            id="cursor/claude-haiku-5-5",
+            adapter="cursor",
+            adapter_model_name="claude-haiku-5-5",
+            capability_score=80,
+            input_per_mtok_usd=0.1,
+            output_per_mtok_usd=0.5,
+            context_window=0,
+            billing="plan",
+            tags=[
+                "tools",
+                "cursor",
+                "cheap",
+                "fast",
+                "vision",
+                "reading",
+                "code",
+                "long-context",
+            ],
+            notes=(
+                "Cheap/fast tier on Cursor. Anthropic Claude Haiku 5.5 via the "
+                "Cursor SDK (live catalog id claude-haiku-5-5). Plan-billed; the "
+                "rates are nominal list prices for ranking."
+            ),
+        ),
+        ModelSpec(
+            id="cursor/claude-sonnet-5-5",
+            adapter="cursor",
+            adapter_model_name="claude-sonnet-5-5",
+            capability_score=99,
+            input_per_mtok_usd=2.0,
+            output_per_mtok_usd=10.0,
+            context_window=0,
+            billing="plan",
+            tags=[
+                "tools",
+                "cursor",
+                "balanced",
+                "frontier",
+                "vision",
+                "reasoning",
+                "code",
+                "long-context",
+            ],
+            notes=(
+                "Balanced frontier tier on Cursor. Anthropic Claude Sonnet 5.5 via "
+                "the Cursor SDK (live catalog id claude-sonnet-5-5). Plan-billed; "
+                "the rates are nominal list prices for ranking."
+            ),
+        ),
+        ModelSpec(
+            id="cursor/claude-opus-5-5",
+            adapter="cursor",
+            adapter_model_name="claude-opus-5-5",
+            capability_score=100,
+            input_per_mtok_usd=4.0,
+            output_per_mtok_usd=20.0,
+            context_window=0,
+            billing="plan",
+            tags=[
+                "tools",
+                "cursor",
+                "frontier",
+                "reasoning",
+                "code",
+                "long-context",
+                "vision",
+                "detailed-vision",
+            ],
+            notes=(
+                "Everyday frontier on Cursor. Anthropic Claude Opus 5.5 via the "
+                "Cursor SDK (live catalog id claude-opus-5-5). Plan-billed; the "
+                "rates are nominal list prices for ranking. Supersedes "
+                "cursor/claude-opus-5."
+            ),
+        ),
+        ModelSpec(
+            id="cursor/claude-fable-5-1",
+            adapter="cursor",
+            adapter_model_name="claude-fable-5-1",
+            capability_score=100,
+            input_per_mtok_usd=10.0,
+            output_per_mtok_usd=50.0,
+            context_window=0,
+            billing="plan",
+            tags=[
+                "tools",
+                "cursor",
+                "frontier",
+                "mythos-class",
+                "reasoning",
+                "code",
+                "long-context",
+                "vision",
+                "detailed-vision",
+            ],
+            notes=(
+                "Absolute tip on Cursor. Anthropic Claude Fable 5.1 via the Cursor "
+                "SDK (live catalog id claude-fable-5-1). Plan-billed; the rates are "
+                "nominal list prices for ranking. Supersedes cursor/claude-fable-5."
             ),
         ),
         # OpenAI tier — uses the openai adapter directly with OPENAI_API_KEY,

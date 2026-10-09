@@ -9255,6 +9255,22 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
             self.assertEqual(code, 1)
             self.assertIn("missing.json", stderr.getvalue())
 
+
+@contextlib.contextmanager
+def _claude_code_billing(posture: str):
+    """Set the Claude Code billing posture, so routing does not read the host login."""
+    from puppetmaster import platform_billing
+    from puppetmaster.platform_billing import BillingStatus
+
+    def detect(adapter, **_kwargs):
+        billing = posture if adapter == "claude-code" else "unknown"
+        return BillingStatus(adapter=adapter, billing=billing, healthy=True, detail="test", evidence=[])
+
+    platform_billing.clear_billing_cache()
+    with patch.object(platform_billing, "detect_adapter_billing", detect):
+        yield
+    platform_billing.clear_billing_cache()
+
 class ModelRouterTests(unittest.TestCase):
     """Tests for the user-owned LLM model registry and routing engine.
 
@@ -10515,8 +10531,10 @@ class ModelRouterTests(unittest.TestCase):
             ),
             role="security-review",
         )
-        decision = route_task(signal, starter_registry(), policy="balanced")
-        self.assertEqual(decision.model.id, "claude-code/opus-5-5")
+        for claude_code in ("plan", "unknown"):
+            with self.subTest(claude_code=claude_code), _claude_code_billing(claude_code):
+                decision = route_task(signal, starter_registry(), policy="balanced")
+                self.assertEqual(decision.model.adapter_model_name, "claude-opus-5-5")
         # Opus 4.8, the older Opus 5 and pricier Fable should be rejected:
         # cost-aware tip prefers Opus 5.5 at equal capability.
         rejected_ids = {spec.id for spec, _ in decision.rejected}
@@ -10576,18 +10594,20 @@ class ModelRouterTests(unittest.TestCase):
         self.assertIn("cursor/grok-4-5", rejected_ids)
 
     def test_starter_registry_routes_easy_task_to_cheapest_tier(self) -> None:
-        """Easy work goes to the cheapest sufficient model: Haiku 5.5
-        ($0.10/$0.50) when Claude Code is present, GPT-5.6 Luna ($0.20/$1.20)
-        on Cursor alone."""
+        """Easy work goes to the cheapest sufficient model, Haiku 5.5
+        ($0.10/$0.50). Claude Code and Cursor both serve it, so the result is
+        Haiku 5.5 with or without a Claude Code login."""
         from puppetmaster.model_registry import starter_registry
         from puppetmaster.router import TaskSignals, route_task
 
         signal = TaskSignals(instruction="format these files", role="verify-runtime")
-        decision = route_task(signal, starter_registry(), policy="balanced")
-        self.assertEqual(decision.model.id, "claude-code/haiku-5-5")
+        for claude_code in ("plan", "unknown"):
+            with self.subTest(claude_code=claude_code), _claude_code_billing(claude_code):
+                decision = route_task(signal, starter_registry(), policy="balanced")
+                self.assertEqual(decision.model.adapter_model_name, "claude-haiku-5-5")
         cursor_only = [s for s in starter_registry() if s.adapter == "cursor"]
         decision = route_task(signal, cursor_only, policy="balanced")
-        self.assertEqual(decision.model.id, "cursor/gpt-5-6-luna")
+        self.assertEqual(decision.model.id, "cursor/claude-haiku-5-5")
 
     def test_balanced_tie_break_picks_lower_capability_when_costs_equal(self) -> None:
         from puppetmaster.model_registry import ModelSpec

@@ -6,6 +6,9 @@ GPT-6.1 Sol, GPT-6 Astra, and Gemini 3.8 Flash on each adapter that serves
 them, at live list prices. GPT-5.6, Gemini, Sonnet 5 and Opus 4.8 prices follow
 the live list. The Claude Code default model is `claude-opus-5-5`. Codex OAuth
 accepts the GPT-6 ids. Antigravity sends `--effort` to `gemini-3.8-flash`.
+The starter registry adds the Claude 5.5 family and Fable 5.1 on Cursor, which
+the live Cursor catalog serves. Without a Claude Code login, plan-billed
+Cursor now runs Opus 5.5 for the hardest work, not Opus 5.
 
 **The router reads the real StrongOrc board.** The package now holds the
 official StrongOrc ranking-v1 worker rates
