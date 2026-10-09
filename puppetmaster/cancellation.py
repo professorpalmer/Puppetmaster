@@ -55,6 +55,10 @@ class JobCancelled(Exception):
     def __init__(self, job_id: str) -> None:
         super().__init__(f"job {job_id} cancelled")
         self.job_id = job_id
+        # What the stopped attempt left: attempt id, dispatch receipt, live
+        # log, elapsed seconds and the single observed session id. The stream
+        # layer fills it so the stop receipt keeps the attempt's linkage.
+        self.partial: dict = {}
 
 
 def request_cancel(job_id: str) -> None:

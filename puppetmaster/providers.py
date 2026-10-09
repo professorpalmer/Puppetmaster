@@ -1086,7 +1086,11 @@ def _anthropic_chat(
                 "arguments": block.get("input") or {},
             })
     usage = data.get("usage") or {}
-    prompt_tokens = int(usage.get("input_tokens") or 0)
+    cached_tokens = int(usage.get("cache_read_input_tokens") or 0)
+    cache_write_tokens = int(usage.get("cache_creation_input_tokens") or 0)
+    # Messages input_tokens is the uncached slice only. Legacy tokens_cached is
+    # a subset of tokens_in, so fold cache reads and writes in (as Converse does).
+    prompt_tokens = int(usage.get("input_tokens") or 0) + cached_tokens + cache_write_tokens
     completion_tokens = int(usage.get("output_tokens") or 0)
     return AssistantTurn(
         text="".join(text_parts).strip(),
@@ -1097,8 +1101,8 @@ def _anthropic_chat(
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
-            "cached_tokens": int(usage.get("cache_read_input_tokens") or 0),
-            "cache_write_tokens": int(usage.get("cache_creation_input_tokens") or 0),
+            "cached_tokens": cached_tokens,
+            "cache_write_tokens": cache_write_tokens,
         },
         raw=data,
     )
@@ -1361,9 +1365,10 @@ def _anthropic_chat_stream(
             if etype == "message_start":
                 msg_usage = ((event.get("message") or {}).get("usage") or {})
                 accounting_usage.update(msg_usage)
-                prompt_tokens = int(msg_usage.get("input_tokens") or 0)
                 cached_tokens = int(msg_usage.get("cache_read_input_tokens") or 0)
                 cache_write_tokens = int(msg_usage.get("cache_creation_input_tokens") or 0)
+                # Uncached slice plus cache reads and writes, as in _anthropic_chat.
+                prompt_tokens = int(msg_usage.get("input_tokens") or 0) + cached_tokens + cache_write_tokens
             elif etype == "content_block_start":
                 idx = int(event.get("index") or 0)
                 block = event.get("content_block") or {}

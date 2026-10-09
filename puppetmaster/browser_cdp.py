@@ -31,6 +31,7 @@ import atexit
 import base64
 import hashlib
 import json
+import logging
 import os
 import shutil
 import signal
@@ -42,6 +43,8 @@ import threading
 import time
 import urllib.request
 from typing import Any, Optional
+
+_LOG = logging.getLogger(__name__)
 
 _SNAPSHOT_LIMIT = 12000
 _TEXT_LIMIT = 12000
@@ -410,7 +413,15 @@ class _Session:
             }
             if os.name != "nt":
                 popen_kw["start_new_session"] = True
-            self.proc = subprocess.Popen(args, **popen_kw)
+            if preferred is None and owns_profile:
+                # Only this worker uses this Chrome. A Windows Job Object owns
+                # its whole tree, so teardown also kills the child processes.
+                from puppetmaster.win_process import popen_owned
+                self.proc = popen_owned(args, **popen_kw)
+            else:
+                # A shared Chrome must outlive this worker: KILL_ON_JOB_CLOSE
+                # would kill it when this process exits.
+                self.proc = subprocess.Popen(args, **popen_kw)
         except Exception as e:
             return "failed to launch Chrome: %s" % e
         ws_url = _wait_for_page_ws(port, 20)
@@ -469,14 +480,15 @@ class _Session:
         port = self.port if reap else None
         self.proc = None
         self.owns_proc = False
-        if reap:
-            _stop_chrome_proc(proc, port=port)
-        if self.owns_profile:
-            try:
-                if self.profile_dir and os.path.isdir(self.profile_dir):
-                    shutil.rmtree(self.profile_dir, ignore_errors=True)
-            except Exception:
-                pass
+        exited = _stop_chrome_proc(proc, port=port) if reap else True
+        if self.owns_profile and self.profile_dir and os.path.isdir(self.profile_dir):
+            if not exited:
+                _LOG.warning("Chrome did not exit; kept profile %s", self.profile_dir)
+            else:
+                try:
+                    shutil.rmtree(self.profile_dir)
+                except OSError as exc:
+                    _LOG.warning("could not remove Chrome profile %s: %s", self.profile_dir, exc)
         self.owns_profile = False
 
 
@@ -488,12 +500,20 @@ def _stop_chrome_proc(proc, port=None, timeout=8.0):
 
     Chrome is a process group. Dropping the Popen handle after a fire-and-forget
     terminate leaves the debug port bound, so a headed relaunch cannot reuse it.
+    Returns False when the owned process did not exit.
     """
     if proc is None and not port:
-        return
+        return True
     pid = getattr(proc, "pid", None) if proc is not None else None
 
     def _signal_tree(sig_term):
+        job = getattr(proc, "_puppetmaster_job", None)
+        if job is not None:
+            try:
+                job.terminate()
+                return
+            except OSError:
+                pass
         if os.name != "nt" and pid:
             try:
                 os.killpg(int(pid), signal.SIGTERM if sig_term else signal.SIGKILL)
@@ -529,7 +549,7 @@ def _stop_chrome_proc(proc, port=None, timeout=8.0):
                     proc.wait(timeout=0.2)
                 except Exception:
                     pass
-            return
+            return True
         time.sleep(0.1)
     _signal_tree(False)
     if proc is not None:
@@ -537,6 +557,11 @@ def _stop_chrome_proc(proc, port=None, timeout=8.0):
             proc.wait(timeout=2)
         except Exception:
             pass
+        try:
+            return proc.poll() is not None
+        except Exception:
+            return False
+    return True
 
 
 def reset_session(keep_profile: bool = True) -> None:

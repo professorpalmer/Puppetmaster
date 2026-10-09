@@ -253,5 +253,34 @@ def apply_swarm_reasoning(
         merged.pop("reasoning_effort", None)
         merged["reasoning_effort_source"] = "adapter_unsupported"
         return merged
+    if adapter == "antigravity":
+        slug_effort, takes_flag = _antigravity_effort_channel(merged.get("model"))
+        if slug_effort is not None:
+            # The slug carries the effort (gemini-3.7-flash-high); agy gets no --effort.
+            if profile.enforced and slug_effort != effort:
+                raise WorkerEffortError(
+                    f"{WORKER_EFFORT_POLICY_ENV}=enforce runs every worker at {effort}; "
+                    f"model {merged.get('model')} runs {slug_effort}")
+            merged["reasoning_effort"] = slug_effort
+            merged["reasoning_effort_source"] = "model_slug"
+            return merged
+        if not takes_flag:
+            if profile.enforced:
+                raise WorkerEffortError(
+                    f"{WORKER_EFFORT_POLICY_ENV}=enforce cannot run antigravity model "
+                    f"{merged.get('model')}: it takes no effort")
+            merged.pop("reasoning_effort", None)
+            merged["reasoning_effort_source"] = "adapter_unsupported"
+            return merged
     merged["reasoning_effort_source"] = source
     return overlay_adapter_dialect(merged, effort, adapter)
+
+
+def _antigravity_effort_channel(model: object) -> tuple[Optional[str], bool]:
+    """(effort the slug encodes, whether agy takes --effort) for an agy model."""
+    from puppetmaster.adapters.antigravity import DEFAULT_ANTIGRAVITY_MODEL, MODELS_REQUIRING_EFFORT
+
+    name = str(model or DEFAULT_ANTIGRAVITY_MODEL).lower()
+    if _slug_encodes_effort(name):
+        return name.rsplit("-", 1)[1], False
+    return None, any(prefix in name for prefix in MODELS_REQUIRING_EFFORT)

@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sys
+import uuid
 from pathlib import Path
 from typing import Any, Optional, Union
 
@@ -23,6 +24,7 @@ from ._base import (
     build_patch_payload,
     command_parts,
     diff_source_payload,
+    failure_verification,
     make_patch_artifact,
     missing_cli_artifact,
     tool_list,
@@ -32,6 +34,7 @@ from ._base import _should_emit_patch_artifact
 from ._facade import facade
 from ._prompts import (
     TASK_INSTRUCTION_HEADER,
+    build_cli_implement_prompt,
     build_cli_review_prompt,
     prompt_with_memory,
     wants_review_contract,
@@ -50,7 +53,7 @@ from .cursor import (
     sdk_usage_from_stdout,
 )
 
-DEFAULT_CLAUDE_CODE_MODEL = "claude-opus-5"
+DEFAULT_CLAUDE_CODE_MODEL = "claude-opus-5-5"
 
 
 _BEDROCK_MODEL_ID = re.compile(
@@ -99,7 +102,9 @@ def resolve_claude_code_model(
     Bedrock we never forward a non-Bedrock short name (precisely what the CLI
     rejects). Precedence: an explicit Bedrock override (``payload.bedrock_model``
     or ``ANTHROPIC_MODEL``) > a requested id already Bedrock-shaped > omit
-    ``--model`` with a clear, actionable note.
+    ``--model`` with a clear, actionable note. An exact pin
+    (``payload.pinned_model``) never takes ``ANTHROPIC_MODEL``; a pin that is
+    not a Bedrock id returns ``None`` and the adapter refuses the launch.
     """
     payload = payload or {}
     env = env if env is not None else os.environ
@@ -111,11 +116,22 @@ def resolve_claude_code_model(
     if not _claude_bedrock_enabled(env, home_path):
         return str(requested), None
 
-    override = payload.get("bedrock_model") or env.get("ANTHROPIC_MODEL")
+    pinned = payload.get("pinned_model")
+    override = payload.get("bedrock_model") or (None if pinned else env.get("ANTHROPIC_MODEL"))
     if override:
         return str(override), None
     if is_bedrock_model_id(requested):
         return str(requested), None
+    if pinned:
+        return (
+            None,
+            (
+                f"CLAUDE_CODE_USE_BEDROCK is on and the task pinned {str(pinned)!r}, "
+                f"but {str(requested)!r} is not a Bedrock model id. A pinned model is "
+                "never replaced. Pin a Bedrock inference-profile id or set "
+                "payload.bedrock_model."
+            ),
+        )
     return (
         None,
         (
@@ -178,6 +194,8 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
             raw_instruction = str(task.payload["resume_prompt"])
         if wants_review_contract(task.payload):
             base_prompt = build_cli_review_prompt(task, prompt=raw_instruction)
+        elif _claude_write_capable(task.payload):
+            base_prompt = build_cli_implement_prompt(task, prompt=raw_instruction)
         else:
             base_prompt = with_report_contract(
                 f"{TASK_INSTRUCTION_HEADER}\n{raw_instruction}"
@@ -203,16 +221,32 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
         )
         command_base = command_parts(executable)
         model_for_cli, model_note = resolve_claude_code_model(task.payload)
+        if model_for_cli is None and task.payload.get("pinned_model"):
+            return [
+                failure_verification(
+                    task, worker_id, "claude-code",
+                    ["adapter:claude-code", "status:pin-refused"],
+                    "model_unavailable", str(model_note),
+                )
+            ]
         effective_permission_mode = _claude_permission_mode(task.payload)
         write_capable = effective_permission_mode != "plan"
-        command_kwargs: dict[str, Any] = {}
+        # Our own id, so a run that times out before its result still names
+        # its session for a follow-up. The resolver checks it is on disk.
+        session_id = str(uuid.uuid4())
+        command_kwargs: dict[str, Any] = {"session_id": session_id}
         if resume is not None:
             command_kwargs["resume_session_id"] = str(resume["session_id"])
+        # A write-capable run streams its tool use, which the write_scope gate
+        # reads to tell its writes from a concurrent writer's.
+        output_format = task.payload.get("output_format") or (
+            "stream-json" if write_capable else "json"
+        )
         command = facade("build_claude_code_command")(
             prompt=prompt,
             executable=[resolved, *command_base[1:]],
             model=model_for_cli,
-            output_format=task.payload.get("output_format", "json"),
+            output_format=output_format,
             permission_mode=cli_permission_mode(effective_permission_mode),
             allowed_tools=implement_allowed_tools(task.payload, write_capable=write_capable),
             disallowed_tools=read_only_disallowed_tools(task.payload, write_capable=write_capable),
@@ -231,6 +265,7 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
                 "permission_mode": effective_permission_mode,
                 "resume": resume_record,
                 "resumed": resume is not None,
+                "session_id": session_id,
                 "write_capable": write_capable,
                 "extra_dirty_message": (
                     " For focused edits on a dirty tree (docs, tests), use puppetmaster_edit — it edits "
@@ -283,6 +318,8 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
         resume_record = prepared.extras.get("resume")
         resume_fields = {"resume": resume_record} if resume_record else {}
         resumed = bool(prepared.extras.get("resumed"))
+        write_capable = bool(prepared.extras.get("write_capable", True))
+        launched_session = prepared.extras.get("session_id")
         cwd = Path(task.payload.get("cwd") or ".").resolve()
         timeout_seconds = int(
             task.payload.get("timeout_seconds", self.default_timeout_seconds)
@@ -319,8 +356,9 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
                     payload={
                         "failure": "timeout",
                         "returncode": None,
-                        "session_id": claude_session_id_from_stdout(stdout),
+                        "session_id": claude_session_id_from_stdout(stdout) or launched_session,
                         **resume_fields,
+                        "write_capable": write_capable,
                         "stdout": _redacted_tail(stdout, _STDOUT_TAIL_CHARS),
                         "stderr": _redacted_tail(stderr, _STDOUT_TAIL_CHARS),
                         "stdout_capture": stdout_capture,
@@ -370,18 +408,31 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
             task=task,
             sidecar_name="claude_stderr",
         )
+        # The final result event: the whole stdout of ``json``, the last line
+        # of ``stream-json``.
+        result_event = claude_result_event(completed.stdout)
+        result_json = json.dumps(result_event) if result_event is not None else completed.stdout
         usage = token_usage(
-            sdk_usage=sdk_usage_from_stdout(completed.stdout),
+            sdk_usage=sdk_usage_from_stdout(result_json),
             prompt_text=prompt,
             output_text=completed.stdout,
         )
+        # A cold run's total_cost_usd is this attempt's own; a resumed (forked)
+        # session reports the session's cost to date. On a subscription it is
+        # a notional API price, not spend.
+        provider_cost = (result_event or {}).get("total_cost_usd")
+        if (task.payload.get("billing") == "api" and not resumed
+                and isinstance(provider_cost, (int, float)) and not isinstance(provider_cost, bool)):
+            usage["real_cost_usd"] = float(provider_cost)
+        # The CLI can end on an error result; the exit code alone does not say so.
+        succeeded = completed.returncode == 0 and not (result_event or {}).get("is_error")
         verification = verification_artifact(
             task=task,
             worker_id=worker_id,
             adapter="claude-code",
             check=task.instruction,
-            result="passed" if completed.returncode == 0 else "failed",
-            confidence=0.9 if completed.returncode == 0 else 0.55,
+            result="passed" if succeeded else "failed",
+            confidence=0.9 if succeeded else 0.55,
             evidence=(
                 [
                     "adapter:claude-code",
@@ -392,10 +443,11 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
                 + (["bedrock:model-omitted"] if model_note else [])
             ),
             payload={
-                "failure": None if completed.returncode == 0 else classify_claude_code_failure(completed.stderr + "\n" + json_output_diagnostic(completed.stdout, claude_code_diagnosis)),
+                "failure": None if succeeded else classify_claude_code_failure(completed.stderr + "\n" + json_output_diagnostic(completed.stdout, claude_code_diagnosis)),
                 "returncode": completed.returncode,
-                "session_id": claude_session_id_from_stdout(completed.stdout),
+                "session_id": claude_session_id_from_stdout(completed.stdout) or launched_session,
                 **resume_fields,
+                "write_capable": write_capable,
                 "stdout": _redacted_tail(completed.stdout, 12000),
                 "stderr": _redacted_tail(completed.stderr, _STDOUT_TAIL_CHARS),
                 "stdout_capture": stdout_capture,
@@ -416,8 +468,8 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
             },
         )
         artifacts = [verification]
-        if completed.returncode == 0:
-            _, result_text = cursor_result_text(completed.stdout)
+        if succeeded:
+            _, result_text = cursor_result_text(result_json)
             artifacts.extend(
                 implement_report_artifacts(
                     task, worker_id, result_text, adapter="claude-code"
@@ -430,13 +482,13 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
                     task_id=task.id,
                     type=ArtifactType.PATCH,
                     created_by=worker_id,
-                    confidence=0.8 if completed.returncode == 0 else 0.5,
+                    confidence=0.8 if succeeded else 0.5,
                     evidence=["adapter:claude-code", f"base:{before['sha']}"],
                     payload=build_patch_payload(
                         task=task,
                         before=before,
                         after=after,
-                        status="applied" if completed.returncode == 0 else "failed",
+                        status="applied" if succeeded else "failed",
                         change="Claude Code modified repository files.",
                         sidecar_name="claude_implement",
                     ),
@@ -529,6 +581,29 @@ def claude_session_id_from_stdout(stdout: Optional[str]) -> Optional[str]:
     return found
 
 
+def claude_result_event(stdout: Optional[str]) -> Optional[dict]:
+    """The final ``result`` event from ``json`` or ``stream-json`` stdout."""
+    text = "" if stdout is None else str(stdout)
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        payload = None
+    if isinstance(payload, dict):
+        return payload
+    found: Optional[dict] = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "result":
+            found = event
+    return found
+
+
 def build_claude_code_command(
     *,
     prompt: Optional[str] = None,
@@ -540,11 +615,15 @@ def build_claude_code_command(
     disallowed_tools: object = None,
     extra_args: object = None,
     resume_session_id: Optional[str] = None,
+    session_id: Optional[str] = None,
 ) -> list[str]:
     """Build the non-interactive ``claude --print`` argv.
 
     ``resume_session_id`` continues a prior session with ``--fork-session`` so
     the earlier session record stays intact and this attempt gets its own id.
+    ``session_id`` names that id (or a cold run's id) up front. The CLI accepts
+    ``--session-id`` with ``--resume`` only together with ``--fork-session``.
+    ``stream-json`` with ``--print`` needs ``--verbose``.
 
     ``--print`` with no prompt positional makes the CLI read its prompt from
     stdin, which the caller supplies via
@@ -556,8 +635,12 @@ def build_claude_code_command(
     """
     command = command_parts(executable)
     command.extend(["--print", "--output-format", output_format])
+    if output_format == "stream-json":
+        command.append("--verbose")
     if resume_session_id:
         command.extend(["--resume", str(resume_session_id), "--fork-session"])
+    if session_id:
+        command.extend(["--session-id", str(session_id)])
     if model:
         command.extend(["--model", str(model)])
     if permission_mode:

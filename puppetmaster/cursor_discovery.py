@@ -49,7 +49,15 @@ _DEFAULT_DISCOVERED_CAPABILITY = 60
 # seed so plan-discovered frontier models rank at their true capability.
 _CURSOR_FRONTIER_KIN_ALIASES: dict[str, str] = {
     "fable-5": "claude-fable-5",
+    "fable-5.1": "claude-fable-5-1",
+    "fable-5-1": "claude-fable-5-1",
     "opus-5": "claude-opus-5",
+    "opus-5.5": "claude-opus-5-5",
+    "opus-5-5": "claude-opus-5-5",
+    "sonnet-5.5": "claude-sonnet-5-5",
+    "sonnet-5-5": "claude-sonnet-5-5",
+    "haiku-5.5": "claude-haiku-5-5",
+    "haiku-5-5": "claude-haiku-5-5",
 }
 
 # Public Cursor nominal usage rates (USD per million tokens). These are not
@@ -63,10 +71,23 @@ _CURSOR_NOMINAL_RATES: dict[str, tuple[float, float]] = {
     "opus-5": (5.0, 25.0),
     "claude-fable-5": (10.0, 50.0),
     "fable-5": (10.0, 50.0),
+    "claude-opus-5-5": (4.0, 20.0),
+    "opus-5.5": (4.0, 20.0),
+    "claude-fable-5-1": (10.0, 50.0),
+    "fable-5.1": (10.0, 50.0),
+    "claude-sonnet-5-5": (2.0, 10.0),
+    "sonnet-5.5": (2.0, 10.0),
     "gpt-5": (1.25, 10.0),
-    "gpt-5.6-luna": (1.0, 6.0),
-    "gpt-5.6-terra": (2.5, 15.0),
-    "gpt-5.6-sol": (5.0, 30.0),
+    "grok-4.7": (2.0, 6.0),
+    "gpt-5.6-luna": (0.2, 1.2),
+    "gpt-5.6-terra": (2.0, 12.0),
+    "gpt-5.6-sol": (2.0, 10.0),
+    "gpt-6-luna": (0.1, 0.5),
+    "gpt-6-sol": (2.0, 10.0),
+    "gpt-6.1-sol": (2.0, 10.0),
+    "gpt-6-astra": (10.0, 50.0),
+    "claude-haiku-5-5": (0.1, 0.5),
+    "haiku-5.5": (0.1, 0.5),
 }
 
 

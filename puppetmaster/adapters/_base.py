@@ -389,34 +389,15 @@ class CliWorkerAdapter(FullEditWorkerAdapter):
                 after = {**after, "write_capable": False}
             else:
                 setattr(after, "write_capable", False)
-        # Strict identity: unittest MagicMock is truthy, so a mock that never
-        # set output_limit_hit must not look like a real budget stop. Timeouts
-        # stay timeouts (result=failed) unless the streamed run actually tripped
-        # the byte ceiling.
-        if getattr(completed, "output_limit_hit", False) is True:
-            artifacts = [
-                verification_artifact(
-                    task=task,
-                    worker_id=worker_id,
-                    adapter=self.name,
-                    check=task.instruction,
-                    result="blocked",
-                    confidence=1.0,
-                    evidence=["runtime_budget:max_output_bytes"],
-                    payload={
-                        "failure": "runtime_budget_exceeded",
-                        "limit": "max_output_bytes",
-                        "max_output_bytes": task.payload.get("max_output_bytes"),
-                        "counted_stream": OUTPUT_LIMIT_COUNTED_STREAM,
-                        "returncode": completed.returncode,
-                        "stderr": _redacted_tail(completed.stderr, _STDOUT_TAIL_CHARS),
-                        "live_log": completed.live_log_path,
-                        "attempt_id": getattr(completed, "attempt_id", None),
-                        "dispatch_receipt": getattr(completed, "dispatch_receipt", None),
-                        **diff_source_payload(before, after),
-                    },
-                )
-            ]
+        blocked = output_limit_artifact(
+            task, worker_id, self.name, completed,
+            extra={
+                "write_capable": prepared.extras.get("write_capable", True) is not False,
+                **diff_source_payload(before, after),
+            },
+        )
+        if blocked is not None:
+            artifacts = [blocked]
             if _should_emit_patch_artifact(before, after):
                 artifacts.append(
                     Artifact(
@@ -498,13 +479,7 @@ class CliWorkerAdapter(FullEditWorkerAdapter):
             task=task,
             sidecar_name=prepared.sidecar_name,
             timeout_seconds=timeout_seconds,
-            max_output_bytes=(
-                int(task.payload["max_output_bytes"])
-                if isinstance(task.payload.get("max_output_bytes"), int)
-                and not isinstance(task.payload.get("max_output_bytes"), bool)
-                and int(task.payload["max_output_bytes"]) > 0
-                else None
-            ),
+            max_output_bytes=payload_output_limit(task),
             **kwargs,
         )
 
@@ -553,6 +528,52 @@ class WorkerAdapter(Protocol):
 
     def run(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
         """Execute a task and return structured artifacts."""
+
+
+def payload_output_limit(task: Task) -> Optional[int]:
+    """The positive ``max_output_bytes`` cap on the task, or ``None``."""
+    value = task.payload.get("max_output_bytes")
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
+
+
+def resume_receipt_fields(task: Task) -> dict[str, Any]:
+    """The resume record, so a fresh run says why a requested resume did not happen."""
+    record = task.payload.get("resume")
+    return {"resume": record} if isinstance(record, dict) else {}
+
+
+def output_limit_artifact(
+    task: Task, worker_id: str, adapter: str, completed: Any, extra: Optional[dict] = None
+) -> Optional[Artifact]:
+    """The blocked receipt for a run that the byte cap stopped, else ``None``."""
+    # Strict identity: a MagicMock that never set output_limit_hit is truthy.
+    # A timeout stays a timeout unless the run tripped the byte ceiling.
+    if getattr(completed, "output_limit_hit", False) is not True:
+        return None
+    return verification_artifact(
+        task=task,
+        worker_id=worker_id,
+        adapter=adapter,
+        check=task.instruction,
+        result="blocked",
+        confidence=1.0,
+        evidence=["runtime_budget:max_output_bytes"],
+        payload={
+            "failure": "runtime_budget_exceeded",
+            "limit": "max_output_bytes",
+            "max_output_bytes": task.payload.get("max_output_bytes"),
+            "counted_stream": OUTPUT_LIMIT_COUNTED_STREAM,
+            "returncode": completed.returncode,
+            "stderr": _redacted_tail(completed.stderr, _STDOUT_TAIL_CHARS),
+            "live_log": completed.live_log_path,
+            "attempt_id": getattr(completed, "attempt_id", None),
+            "dispatch_receipt": getattr(completed, "dispatch_receipt", None),
+            **resume_receipt_fields(task),
+            **(extra or {}),
+        },
+    )
 
 
 def verification_artifact(

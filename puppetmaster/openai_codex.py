@@ -99,6 +99,9 @@ def merge_request_headers(
 CODEX_WIRE_MODELS = frozenset(
     {
         "gpt-6-astra",
+        "gpt-6.1-sol",
+        "gpt-6-sol",
+        "gpt-6-luna",
         "gpt-5.3-codex",
         "gpt-5",
         "gpt-5.4",
@@ -111,9 +114,9 @@ CODEX_WIRE_MODELS = frozenset(
     }
 )
 
-# gpt-5.6-luna-pro / gpt-5.6-sol-pro / gpt-5.6-terra-pro → base tier id.
+# gpt-5.6-luna-pro / gpt-6.1-sol-pro / gpt-6-astra-pro → base tier id.
 _PRO_TIER_RE = re.compile(
-    r"^(gpt-5(?:\.\d+)?-(?:luna|sol|terra))-pro$",
+    r"^(gpt-[56](?:\.\d+)?-(?:luna|sol|terra|astra))-pro$",
     re.IGNORECASE,
 )
 

@@ -28,7 +28,7 @@ from puppetmaster.adapters.fx import (
     _FX_READ_ONLY_PREAMBLE,
     build_fx_command,
     fx_report_text,
-    fx_usage_from_result,
+    fx_reported_usage,
     parse_fx_result,
     resolve_fx_permission_mode,
     resolve_fx_read_only_intent,
@@ -227,17 +227,17 @@ class FxResultParsingTests(unittest.TestCase):
 
     def test_usage_maps_onto_pm_token_fields(self) -> None:
         parsed = parse_fx_result(REAL_FX_RESULT)
-        self.assertEqual(fx_usage_from_result(parsed), (19859, 2))
+        self.assertEqual(fx_reported_usage(parsed), (19859, 2))
 
-    def test_usage_is_zero_without_a_result(self) -> None:
-        self.assertEqual(fx_usage_from_result(None), (0, 0))
-        self.assertEqual(fx_usage_from_result({"usage": {}}), (0, 0))
+    def test_usage_is_unknown_without_a_result(self) -> None:
+        self.assertEqual(fx_reported_usage(None), (None, None))
+        self.assertEqual(fx_reported_usage({"usage": {}}), (None, None))
 
     def test_usage_rejects_bool_and_string_tokens(self) -> None:
         # Bools are ints in Python; a truthy flag must not read as a token count.
         self.assertEqual(
-            fx_usage_from_result({"usage": {"input_tokens": True, "output_tokens": "7"}}),
-            (0, 0),
+            fx_reported_usage({"usage": {"input_tokens": True, "output_tokens": "7"}}),
+            (None, None),
         )
 
     def test_report_prefers_final_output(self) -> None:

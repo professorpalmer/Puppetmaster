@@ -9,6 +9,7 @@ import time
 from dataclasses import replace
 from typing import TYPE_CHECKING, Optional
 
+from puppetmaster.cancellation import JobCancelled
 from puppetmaster.models import AgentRun, ArtifactType, JobStatus, TaskStatus, now_iso
 from puppetmaster.state import resolve_state_dir
 from puppetmaster.store_factory import create_store, create_worker_store
@@ -62,7 +63,26 @@ class WorkerRuntime:
         )
         if task is None:
             return False
+        try:
+            return self._run_claimed(task)
+        finally:
+            self._settle_cut(task.id)
 
+    def _settle_cut(self, task_id: str) -> None:
+        """Settle a cut that asked this task to stop, once it left RUNNING.
+
+        The orchestrator that settles cuts on its next pass may be gone (a
+        stopped flow), so the marker stayed "pending" on a terminal task.
+        """
+        try:
+            current = self.store.get_task_by_id(task_id)
+            marker = (current.payload or {}).get("failure_cut")
+            if isinstance(marker, dict) and current.status != TaskStatus.RUNNING:
+                self.store.finalize_pending_cuts(self.job_id)
+        except Exception:
+            pass
+
+    def _run_claimed(self, task) -> bool:
         # Lease loss belongs to the previous claim, not this new execution.
         # Its heartbeat has been joined before run_once can return.
         self._lease_lost.clear()
@@ -407,6 +427,8 @@ class WorkerRuntime:
                 completed_at=now_iso(),
             )
             self.store.save_run(failed_run)
+            if isinstance(execution_error, JobCancelled):
+                self._record_cancelled_attempt(task, execution_error)
             self.store.update_task_status(task, TaskStatus.FAILED, worker_id=self.worker_id)
             self.store.emit(
                 self.job_id,
@@ -506,6 +528,41 @@ class WorkerRuntime:
         )
         self._emit_live_task_span(updated, artifacts + gate_eval.artifacts)
         return True
+
+    def _record_cancelled_attempt(self, task, exc: JobCancelled) -> None:
+        """Write the stop receipt: a cancelled turn, never a completed one.
+
+        It keeps the cut attempt's dispatch and capture linkage and the one
+        observed session id. Usage is unknown (NULL), with a reason.
+        """
+        from puppetmaster.adapters import verification_artifact
+
+        partial = dict(getattr(exc, "partial", None) or {})
+        evidence = ["cancellation:stopped"]
+        if partial.get("dispatch_receipt"):
+            evidence.append(f"dispatch:{partial['dispatch_receipt']}")
+        try:
+            self.store.save_artifact(verification_artifact(
+                task=task,
+                worker_id=self.worker_id,
+                adapter=task.adapter,
+                check="cancellation",
+                result="cancelled",
+                confidence=1.0,
+                evidence=evidence,
+                payload={
+                    "failure": "cancelled",
+                    "turn_completed": False,
+                    "usage_known": False,
+                    "usage_unknown_reason": "stopped_before_final_usage",
+                    "tokens_in": None,
+                    "tokens_out": None,
+                    "real_cost_usd": None,
+                    **partial,
+                },
+            ))
+        except Exception:
+            pass
 
     def _with_heartbeat(self, run, task, work):
         """Run ``work()`` while renewing the task lease; drain the renewal before returning.

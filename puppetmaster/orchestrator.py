@@ -26,7 +26,7 @@ from puppetmaster.models import (
 )
 from puppetmaster.stitcher import Stitcher
 from puppetmaster.store import SwarmStore
-from puppetmaster.swarm_reasoning import apply_swarm_reasoning
+from puppetmaster.swarm_reasoning import NO_EFFORT_ADAPTERS, apply_swarm_reasoning
 from puppetmaster.worker_fence import stamp_worker_env
 from puppetmaster.worker_runtime import WorkerRuntime
 from puppetmaster.workers import (
@@ -1692,7 +1692,9 @@ class Orchestrator:
             artifacts = self.store.list_artifacts(job.id)
         for index, artifact in enumerate(artifacts):
             failure = (artifact.payload or {}).get("failure")
-            if not failure:
+            # A RISK artifact (agentic auth_failed:401) explains the failure; it
+            # must not hide the attempt's recoverable class.
+            if not failure or artifact.type == ArtifactType.RISK:
                 continue
             task_id = artifact.task_id
             candidate = (artifact.created_at, index, failure)
@@ -1823,6 +1825,11 @@ class Orchestrator:
                 from puppetmaster.model_registry import stamp_model_billing
 
                 payload = stamp_model_billing(payload)
+                apply_swarm_reasoning(payload, payload, adapter=spec.adapter)
+            elif spec.adapter in NO_EFFORT_ADAPTERS:
+                # No per-run effort control: record adapter_unsupported, and
+                # let an enforced operator effort refuse the task, as routed
+                # fx/local tasks already do.
                 apply_swarm_reasoning(payload, payload, adapter=spec.adapter)
             # Optional acceptance_criteria: structured field wins; else parse an
             # explicit "Acceptance criteria:" block. Instruction text is unchanged.
@@ -2418,11 +2425,15 @@ class Orchestrator:
                 result.append(spec)
                 continue
             label, directive = resolved
+            payload = {**spec.payload, "output_style": label}
+            if isinstance(payload.get("prompt"), str) and payload["prompt"]:
+                # Adapters send payload.prompt in place of instruction.
+                payload["prompt"] = f"{directive}\n\n{payload['prompt']}"
             result.append(
                 replace(
                     spec,
                     instruction=f"{directive}\n\n{spec.instruction}",
-                    payload={**spec.payload, "output_style": label},
+                    payload=payload,
                 )
             )
         return result

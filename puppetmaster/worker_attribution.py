@@ -120,7 +120,7 @@ def codex_event_references(
             )
     if not structured:
         return None
-    return _references(paths)
+    return path_references(paths)
 
 
 def claude_tool_use_references(
@@ -148,7 +148,7 @@ def claude_tool_use_references(
         )
     if not found:
         return None
-    return _references(paths)
+    return path_references(paths)
 
 
 def attribution_payload(
@@ -194,7 +194,7 @@ def path_was_dirty_before(path: str, baseline: list[str]) -> bool:
     return False
 
 
-def _references(paths: list[str]) -> WorkerReferences:
+def path_references(paths: list[str]) -> WorkerReferences:
     unique = sorted({path for path in paths if path})
     return WorkerReferences(
         paths=unique[:_MAX_REFERENCED_PATHS],

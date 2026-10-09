@@ -1,3 +1,75 @@
+## v1.42.0 — 2026-10-09
+
+**Current model lists on every adapter.** The static catalogs and the starter
+registry add Claude Haiku 5.5, Sonnet 5.5 and Fable 5.1, GPT-6 Luna and Sol,
+GPT-6.1 Sol, GPT-6 Astra, and Gemini 3.8 Flash on each adapter that serves
+them, at live list prices. GPT-5.6, Gemini, Sonnet 5 and Opus 4.8 prices follow
+the live list. The Claude Code default model is `claude-opus-5-5`. Codex OAuth
+accepts the GPT-6 ids. Antigravity sends `--effort` to `gemini-3.8-flash`.
+The starter registry adds the Claude 5.5 family and Fable 5.1 on Cursor, which
+the live Cursor catalog serves. Without a Claude Code login, plan-billed
+Cursor now runs Opus 5.5 for the hardest work, not Opus 5.
+
+**The router reads the real StrongOrc board.** The package now holds the
+official StrongOrc ranking-v1 worker rates
+(`puppetmaster/baselines/strongorc-ranking-v1.json`, built by
+`scripts/strongorc_bundle.py`: 16 models, 190 entries, 95% Wilson intervals).
+The router uses it when the user has no observation store.
+
+- An observation joins on the effort that the worker runs (caller pin, else
+  operator default, else medium). Catalog `payload_defaults` effort never
+  reaches the worker, so it no longer joins.
+- An adapter with no effort control joins only an effort-free observation.
+- One observed candidate alone does not change routing. The gate needs two.
+- The synthetic `docs/baselines/strongorc-observations-v1.json` is gone.
+
+**A stopped worker keeps a terminal receipt, and its cut settles.** A Codex
+benchmark on 1.40.0 stopped a flow while two workers ran. Both tasks ended
+`failed` with `failure_cut.outcome: pending` and no artifact. Root cause: the
+stream layer re-raised the cancel and dropped the captured attempt, and no pass
+settled the cut after the worker exited. Now:
+
+- The stopped attempt writes one VERIFICATION receipt: `check: cancellation`,
+  `result: cancelled`, `turn_completed: false`, `usage_known: false`,
+  `usage_unknown_reason: stopped_before_final_usage`. Token and cost counters
+  are null, not 0.
+- The receipt carries `attempt_id`, the dispatch receipt, the live log, the
+  return code, a redacted stderr tail, and the session or thread id when the
+  stream showed exactly one.
+- When the worker exits, the runtime settles the cut: the task is `skipped`
+  and `failure_cut.outcome` is `observed`.
+- Proof: a real child process under `WorkerRuntime` (`tests/test_stop_receipt.py`).
+
+**Adapter parity.** An audit compared each adapter with the fixes that other
+adapters already had. Each fix below started with a test that failed.
+
+| Adapter | Fixed |
+| --- | --- |
+| Codex app-server (`native_steer`) | Starts as an owned process group with UTF-8 output and tree teardown. Runs the dispatch check before launch and honors job cancel. Gets the full command base (`npx codex`, `node codex.js`). Gets the decided effort on `turn/start`. Records the thread id, a dispatch receipt and a protocol log. Enforces `max_output_bytes`. Reports token usage as `attempt_usage`. Failure classification never reads the transcript |
+| Claude Code | An exact pin on Bedrock is never replaced by `ANTHROPIC_MODEL`; a non-Bedrock pin stops with `model_unavailable`. Each run passes its own `--session-id` (a resume passes `--resume <id> --fork-session --session-id <new>`; checked on the real CLI). `real_cost_usd` only for `billing: api`. Write-capable runs get the build contract and `stream-json`, so receipts carry `worker_referenced_paths`. `is_error` fails a run that exits 0. Hooks do nothing inside a worker |
+| Agentic | `run_terminal` and the verify command run as owned process groups with timeout, cancel and UTF-8 output. Chrome that only one worker uses is owned and torn down. Anthropic `tokens_in` includes cache reads and writes. A turn with no usage is null, not 0. Implement receipts carry `write_capable`, diff source and referenced paths. A 401 RISK artifact no longer hides the recoverable `not_authenticated` failure |
+| Cursor, Hermes | `max_output_bytes` is enforced on implement and analyze, with the blocked receipt. Receipts carry the resume record and `write_capable`. Write-capable runs get the build contract. SDK usage keeps a missing side as null |
+| Antigravity | Timeout receipts record the conversation id seen in the stream. Token counters are strict (null when missing). Receipts record `write_capable`. Accept-edits runs get the build contract. A pretty-printed envelope no longer reads as a logout. Effort records what agy runs: the slug effort (`model_slug`), or `adapter_unsupported` for a model without `--effort`; an enforced effort refuses a mismatch |
+| fx | Resume works (`session_id`). Usage that fx does not report is null. Timeout receipts record `write_capable`. Write-capable runs get the build contract |
+| fx, local (unrouted) | Record `reasoning_effort_source: adapter_unsupported`; an enforced effort refuses them, as for routed tasks |
+| OpenAI, shell | OpenAI receipts carry `attempt_id` and `tokens_cached`. The shell adapter reads UTF-8 output and marks a timeout `failure: timeout` |
+| All | `quality.py` reads `write_capable: true` as write-capable. The output-style directive also reaches a `payload.prompt`. The output-cap parse and blocked receipt live once in `_base.py`. The failure classifier maps HTTP 402 and 404, ignores Node stack frames and request ids, and drops bare auth words. Live probes classify logout and rate limits. Preflight gates Cursor on `node` |
+
+Removed: `_kill_process_tree` (no runtime caller) and `fx_usage_from_result`
+(it reported unknown usage as 0).
+
+Not done in this release:
+
+- Shell adapter group kill on timeout and job cancel (two tests depend on the
+  current process model).
+- Claude Code `--setting-sources project,local`: it drops the user `env`
+  block, where Bedrock users keep their AWS settings.
+- Cursor prompt through stdin, not an environment variable (needs
+  `cursor_sdk_runner.mjs`), and Cursor tool-event attribution.
+- Hermes claim hook (needs evidence of its `post_tool_call` payload).
+- Binding fx model pins to the registry: no catalog lists fx models, and fx
+  resolves `FX_MODEL` itself, so a binding would refuse every fx pin.
+
 ## v1.41.0 — 2026-10-08
 
 **The savings comparison uses the current standard frontier model.** The

@@ -2814,7 +2814,7 @@ def build_parser() -> argparse.ArgumentParser:
         "path",
         nargs="?",
         default=None,
-        help="Observation bundle JSON path (default: docs/baselines/strongorc-observations-v1.json).",
+        help="Observation bundle JSON path (default: the packaged StrongOrc ranking-v1 bundle).",
     )
     models_import_obs.add_argument(
         "--store-path",

@@ -254,14 +254,14 @@ class CommunityGateRoutingTests(unittest.TestCase):
             _obs(
                 registry_id=luna.id,
                 adapter="codex",
-                effort="low",
+                effort="high",
                 pass_rate=0.40,
                 ci_low=0.20,
                 ci_high=0.48,
             ),
         ]
         decision = route_task(
-            _signal(),
+            _signal(reasoning_effort="high"),
             [sol, luna],
             policy="cheap",
             community_observations=observations,
@@ -290,14 +290,14 @@ class CommunityGateRoutingTests(unittest.TestCase):
             _obs(
                 registry_id=luna.id,
                 adapter="codex",
-                effort="low",
+                effort="high",
                 pass_rate=0.49,
                 ci_low=0.28,
                 ci_high=0.68,
             ),
         ]
         decision = route_task(
-            _signal(),
+            _signal(reasoning_effort="high"),
             [sol, luna],
             policy="cheap",
             community_observations=observations,
@@ -415,14 +415,14 @@ class CommunityGateRoutingTests(unittest.TestCase):
                 registry_id=luna.id,
                 adapter="codex",
                 role="implement",
-                effort="low",
+                effort="high",
                 pass_rate=0.40,
                 ci_low=0.20,
                 ci_high=0.48,
             ),
         ]
         decision = route_task(
-            _signal(role="explore", instruction="explore the repo"),
+            _signal(role="explore", instruction="explore the repo", reasoning_effort="high"),
             [sol, luna],
             policy="cheap",
             community_observations=observations,
@@ -431,7 +431,8 @@ class CommunityGateRoutingTests(unittest.TestCase):
         self.assertEqual(decision.model.id, luna.id)
         self.assertNotEqual(decision.score_source, "community_observation")
 
-    def test_cursor_params_effort_matches(self) -> None:
+    def test_join_uses_the_effort_the_worker_runs(self) -> None:
+        """Catalog params are not a pin: the worker runs the effective effort."""
         from puppetmaster.community_observations import match_observation
 
         spec = _spec(
@@ -456,9 +457,46 @@ class CommunityGateRoutingTests(unittest.TestCase):
                     provider="cursor",
                 )
             ],
+            "xhigh",
         )
         self.assertIsNotNone(hit)
         self.assertEqual(hit.effort, "xhigh")
+        row = _obs(registry_id="cursor/grok-4-6", adapter="cursor", effort="xhigh", provider="cursor")
+        self.assertIsNone(match_observation(spec, "implement", [row], "medium"))
+        fx = _spec(id="fx/m", adapter="fx", adapter_model_name="m")
+        self.assertIsNone(match_observation(fx, "implement", [_obs(registry_id="fx/m", adapter="fx", effort="medium")], "medium"))
+
+    def test_catalog_effort_does_not_join_an_unpinned_worker(self) -> None:
+        """A spec whose catalog says high runs medium when nothing pins effort."""
+        from puppetmaster.router import route_task
+
+        sol, luna = _sol_high(), _luna_low()
+        observations = [
+            _obs(registry_id=sol.id, adapter="codex", effort="high", pass_rate=0.95, ci_low=0.85, ci_high=0.99),
+            _obs(registry_id=luna.id, adapter="codex", effort="low", pass_rate=0.10, ci_low=0.02, ci_high=0.20),
+        ]
+        decision = route_task(_signal(), [sol, luna], policy="cheap",
+                              community_observations=observations, role_preferences={})
+        self.assertEqual(decision.model.id, luna.id)
+        self.assertNotEqual(decision.score_source, "community_observation")
+
+    def test_lone_observation_does_not_override_routing(self) -> None:
+        from puppetmaster.router import route_task
+
+        sol, luna = _sol_high(), _luna_low()
+        observations = [_obs(registry_id=sol.id, adapter="codex", effort="medium", pass_rate=0.07, ci_low=0.02, ci_high=0.2)]
+        decision = route_task(_signal(), [sol, luna], policy="cheap",
+                              community_observations=observations, role_preferences={})
+        self.assertEqual(decision.model.id, luna.id)
+        self.assertNotEqual(decision.score_source, "community_observation")
+
+    def test_task_signals_carry_the_caller_effort_pin(self) -> None:
+        from puppetmaster.workers import WorkerSpec
+        from puppetmaster.router import signals_from_worker_spec
+
+        signals = signals_from_worker_spec(WorkerSpec(role="implement", instruction="x", adapter="codex",
+                                                    payload={"reasoning_effort": "high"}))
+        self.assertEqual(signals.reasoning_effort, "high")
 
     def test_orchestrator_track_rejected_for_worker_role(self) -> None:
         from puppetmaster.community_observations import parse_observation_bundle

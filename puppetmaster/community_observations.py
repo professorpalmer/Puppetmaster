@@ -2,7 +2,11 @@
 
 These are not role-card capability numbers and never write
 ``capability_score``. The router joins them at route time on exact
-identity and applies a publication-style gate (mean delta plus CI).
+identity and the effort the worker will run, and applies a
+publication-style gate (mean delta plus CI).
+
+The packaged StrongOrc ranking-v1 bundle applies when the user has no
+observation store of their own.
 """
 from __future__ import annotations
 
@@ -12,7 +16,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from puppetmaster.scorecards import spec_effort
+from puppetmaster.swarm_reasoning import NO_EFFORT_ADAPTERS
 
 
 WORKER_ROLES = frozenset({"implement", "explore", "review", "audit", "plan"})
@@ -27,6 +31,7 @@ REQUIRED_IDENTITY_FIELDS = (
     "harness",
 )
 _STORE_NAME = "community-observations.json"
+_PACKAGED_BUNDLE = Path(__file__).resolve().parent / "baselines" / "strongorc-ranking-v1.json"
 
 
 @dataclass(frozen=True)
@@ -60,15 +65,8 @@ def default_community_observations_path() -> Path:
 
 
 def default_example_bundle_path() -> Path:
-    here = Path(__file__).resolve()
-    candidates = [
-        here.parents[1] / "docs" / "baselines" / "strongorc-observations-v1.json",
-        Path.cwd() / "docs" / "baselines" / "strongorc-observations-v1.json",
-    ]
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-    return candidates[0]
+    """The packaged StrongOrc ranking-v1 bundle (``models import-observations`` default)."""
+    return _PACKAGED_BUNDLE
 
 
 def _require_text(entry: dict, field: str) -> str:
@@ -152,7 +150,9 @@ def load_community_observations(
 ) -> list[CommunityObservation]:
     resolved = path or default_community_observations_path()
     if not resolved.is_file():
-        return []
+        if path is not None:
+            return []
+        resolved = _PACKAGED_BUNDLE
     try:
         raw = json.loads(resolved.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -206,42 +206,22 @@ def import_observations(
     return observations, report
 
 
-def spec_observation_effort(spec: Any) -> str:
-    """Join key: reasoning_effort, Cursor params effort, or Codex extra_args."""
-    from_defaults = spec_effort(spec)
-    if from_defaults:
-        return from_defaults
-    defaults = getattr(spec, "payload_defaults", None) or {}
-    params = defaults.get("params") or []
-    if isinstance(params, list):
-        for item in params:
-            if isinstance(item, dict) and str(item.get("id") or "") == "effort":
-                value = str(item.get("value") or "").strip()
-                if value:
-                    return value
-    extra = defaults.get("extra_args") or []
-    if not isinstance(extra, list):
-        return ""
-    for index, item in enumerate(extra):
-        text = str(item)
-        if text.startswith("model_reasoning_effort="):
-            return text.split("=", 1)[1].strip()
-        if text == "-c" and index + 1 < len(extra):
-            nxt = str(extra[index + 1])
-            if nxt.startswith("model_reasoning_effort="):
-                return nxt.split("=", 1)[1].strip()
-    return ""
-
-
 def match_observation(
     spec: Any,
     role: str,
     observations: Iterable[CommunityObservation],
+    effort: str,
 ) -> Optional[CommunityObservation]:
-    """Exact id + adapter + effort + role. No family-name smear."""
+    """Exact id + adapter + role + the effort the worker runs. No family-name smear.
+
+    ``effort`` is the effective worker effort (caller pin, else the operator
+    or swarm default). Catalog ``payload_defaults`` effort is not a pin and
+    does not reach the worker, so it is not a join key. An adapter without
+    per-run effort control runs no effort and joins no effort row.
+    """
     wanted_id = str(getattr(spec, "id", "") or "")
     wanted_adapter = str(getattr(spec, "adapter", "") or "")
-    wanted_effort = spec_observation_effort(spec)
+    wanted_effort = "" if wanted_adapter in NO_EFFORT_ADAPTERS else effort
     wanted_role = (role or "").strip()
     if not wanted_id or not wanted_adapter or not wanted_role:
         return None
@@ -295,18 +275,21 @@ def community_gate(
     candidates: Iterable[Any],
     role: str,
     observations: Iterable[CommunityObservation],
+    effort: str,
 ) -> Optional[Any]:
-    """Return the unique gated winner among candidates, or None."""
+    """Return the unique gated winner among candidates, or None.
+
+    A winner must beat at least one other observed candidate. A lone
+    observation compares against nothing, so it does not override routing.
+    """
     observed: list[tuple[Any, CommunityObservation]] = []
     materialized = list(observations)
     for spec in candidates:
-        hit = match_observation(spec, role, materialized)
+        hit = match_observation(spec, role, materialized, effort)
         if hit is not None:
             observed.append((spec, hit))
-    if not observed:
+    if len(observed) < 2:
         return None
-    if len(observed) == 1:
-        return observed[0][0]
     for spec, row in observed:
         if all(
             observation_beats(row, other)

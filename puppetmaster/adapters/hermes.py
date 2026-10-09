@@ -31,12 +31,11 @@ from ._base import (
 from ._facade import facade
 from ._prompts import (
     _ANALYZE_JSON_ONLY_RETRY,
-    build_implement_prompt,
+    build_cli_implement_prompt,
     prompt_with_memory,
     prompt_with_skills,
     structured_prompt_for_task,
     with_job_brief,
-    with_report_contract,
 )
 from ._streaming import (
     StreamedProcess,
@@ -47,6 +46,7 @@ from ._streaming import (
     run_streamed_subprocess,
 )
 from ._base import _should_emit_patch_artifact
+from ._base import output_limit_artifact, payload_output_limit, resume_receipt_fields
 from .cursor import cursor_result_artifacts, implement_report_artifacts
 
 DEFAULT_HERMES_ANALYZE_TOOLSETS = "file,web,vision"
@@ -419,11 +419,11 @@ class HermesAdapter(CliWorkerAdapter):
         cwd: Path,
         resolved: str,
     ) -> Union[list[Artifact], CliInvocation]:
-        base_prompt = with_report_contract(task.payload.get("prompt") or task.instruction)
+        base_prompt = task.payload.get("prompt") or task.instruction
         prompt, codegraph_used = facade("enrich_prompt_with_codegraph")(
             prompt_with_skills(
                 prompt_with_memory(
-                    with_job_brief(build_implement_prompt(base_prompt), task),
+                    with_job_brief(build_cli_implement_prompt(task, prompt=base_prompt), task),
                     task,
                 ),
                 task,
@@ -484,6 +484,7 @@ class HermesAdapter(CliWorkerAdapter):
                 timeout_seconds=timeout_seconds,
                 cwd=str(cwd),
                 start_new_session=True,
+                max_output_bytes=payload_output_limit(task),
             )
 
     def _finalize_cli_run(
@@ -522,6 +523,8 @@ class HermesAdapter(CliWorkerAdapter):
                     payload={
                         "failure": "timeout",
                         "returncode": None,
+                        "write_capable": True,
+                        **resume_receipt_fields(task),
                         "stdout": _redacted_tail(completed.stdout, _STDOUT_TAIL_CHARS),
                         "stderr": _redacted_tail(completed.stderr, _STDOUT_TAIL_CHARS),
                         "stdout_capture": stdout_capture,
@@ -590,6 +593,8 @@ class HermesAdapter(CliWorkerAdapter):
                         else classify_hermes_failure(hermes_diagnostic(completed.stdout, completed.stderr))
                     ),
                     "returncode": completed.returncode,
+                    "write_capable": True,
+                    **resume_receipt_fields(task),
                     "stdout": _redacted_tail(completed.stdout, 12000),
                     "stderr": _redacted_tail(completed.stderr, _STDOUT_TAIL_CHARS),
                     "stdout_capture": stdout_capture,
@@ -711,9 +716,14 @@ class HermesAdapter(CliWorkerAdapter):
                     timeout_seconds=timeout_seconds,
                     cwd=str(cwd),
                     start_new_session=True,
+                    max_output_bytes=payload_output_limit(task),
                 )
 
         completed = _invoke_hermes(prompt, "hermes_analyze")
+        # The byte cap also sets timed_out, so check it first.
+        blocked = output_limit_artifact(task, worker_id, "hermes", completed)
+        if blocked is not None:
+            return [blocked]
         if completed.timed_out:
             stdout_capture = capture_subprocess_stdout(
                 text=completed.stdout,
@@ -737,6 +747,7 @@ class HermesAdapter(CliWorkerAdapter):
                     payload={
                         "failure": "timeout",
                         "returncode": None,
+                        **resume_receipt_fields(task),
                         "stdout": _redacted_tail(completed.stdout, _STDOUT_TAIL_CHARS),
                         "stderr": _redacted_tail(completed.stderr, _STDOUT_TAIL_CHARS),
                         "stdout_capture": stdout_capture,
@@ -834,6 +845,7 @@ class HermesAdapter(CliWorkerAdapter):
                     "live_log": completed.live_log_path,
                     "attempt_id": getattr(completed, "attempt_id", None),
                     "dispatch_receipt": getattr(completed, "dispatch_receipt", None),
+                    **resume_receipt_fields(task),
                     "model": task.payload.get("model"),
                     "provider": task.payload.get("provider"),
                     "cwd": str(cwd),

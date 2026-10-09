@@ -84,6 +84,8 @@ def run_codex_session(
     cancellation_check: Optional[Callable[[], bool]] = None,
     pending_steering: Optional[Callable[[], Iterable[Any]]] = None,
     protocol_log_path: Optional[Union[str, Path]] = None,
+    max_output_bytes: Optional[int] = None,
+    on_spawn: Optional[Callable[[List[str], Dict[str, str], int], None]] = None,
 ) -> CodexSessionResult:
     """Run one app-server thread (ephemeral by default) and optionally steer its active turn.
 
@@ -91,7 +93,15 @@ def run_codex_session(
     with those names.  ``acknowledge`` receives ``(id, state, details)`` where
     state is queued, accepted, or failed.  A response to ``turn/steer`` means
     delivery acceptance only; it never claims that the model applied text.
+
+    The app-server runs as an owned process (see ``win_process.popen_owned``),
+    so teardown also stops the shell commands it started. Output past
+    ``max_output_bytes`` ends the session with status ``output_limit``.
+    ``on_spawn`` receives the launched argv, env and pid.
     """
+    from puppetmaster.models import new_id
+    from puppetmaster.win_process import cleanup_owned_process, close_owned_process, popen_owned
+
     command = [command_prefix] if isinstance(command_prefix, str) else list(command_prefix)
     command += ["app-server", "--listen", "stdio://"]
     child_env = dict(os.environ)
@@ -99,13 +109,22 @@ def run_codex_session(
     # A nested worker must not discover/re-enter the parent MCP transport.
     child_env["PUPPETMASTER_WORKER"] = "1"
     child_env["PUPPETMASTER_AUTO_INVOKE_DISABLED"] = "1"
-    proc = subprocess.Popen(command, cwd=str(Path(cwd).resolve()), env=child_env, stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+    owner = new_id("process")
+    child_env["PUPPETMASTER_PROCESS_OWNER"] = owner
+    proc = popen_owned(command, cwd=str(Path(cwd).resolve()), env=child_env, stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+        bufsize=1, start_new_session=True)
+    if on_spawn:
+        on_spawn(list(command), child_env, proc.pid)
     inbox: "queue.Queue[Tuple[str, Optional[str]]]" = queue.Queue()
     captured: List[str] = []
+    output_bytes = [0]
+    output_lock = threading.Lock()
     def reader(name: str, stream: Any) -> None:
         try:
             for line in iter(stream.readline, ""):
+                with output_lock:
+                    output_bytes[0] += len(line.encode("utf-8", errors="replace"))
                 inbox.put((name, line))
         finally:
             inbox.put((name, None))
@@ -147,6 +166,8 @@ def run_codex_session(
                     else: mid, text, ack = pending[0], pending[1], pending[2] if len(pending) > 2 else None
                     result.queued_steering.append(str(mid)); acknowledge(ack, str(mid), "queued", "queued for active turn")
                     request("turn/steer", {"threadId":result.thread_id,"expectedTurnId":active_turn,"input":[{"type":"text","text":str(text)}],"clientUserMessageId":str(mid)}, str(mid), ack)
+            if max_output_bytes and output_bytes[0] > max_output_bytes:
+                result.status = "output_limit"; result.error = f"output exceeded {max_output_bytes} bytes"; break
             try: source, line = inbox.get(timeout=min(.05, max(.001, deadline-time.monotonic())))
             except queue.Empty: continue
             if line is None:
@@ -207,10 +228,9 @@ def run_codex_session(
     except (OSError, ValueError) as exc:
         result.status = "failed"; result.error = str(exc)
     finally:
-        if proc.poll() is None:
-            proc.terminate()
-            try: proc.wait(timeout=2)
-            except subprocess.TimeoutExpired: proc.kill(); proc.wait()
+        # The group and owner nonce also reach the shell commands the turn started.
+        cleanup_owned_process(proc, owner, time.monotonic() + 3)
+        close_owned_process(proc)
         for stream in (proc.stdin, proc.stdout, proc.stderr):
             if stream is not None:
                 try: stream.close()

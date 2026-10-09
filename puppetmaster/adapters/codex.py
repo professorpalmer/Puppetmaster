@@ -200,6 +200,8 @@ class CodexAdapter(CliWorkerAdapter):
             if lease is not None:
                 lease.release()
             return self._missing_cli(task, worker_id, str(executable))
+        # The command builders append to the list that command_parts returns.
+        app_server_base = list(command_base)
         # Unpinned: the user's configured Codex model, else Codex's own default.
         model = str(task.payload.get("model") or _codex_home().configured_model())
         approval_policy = str(task.payload.get("approval_policy") or "never")
@@ -235,6 +237,7 @@ class CodexAdapter(CliWorkerAdapter):
             subprocess_kwargs={"stdin_data": prompt},
             extras={
                 "prompt": prompt,
+                "command_base": app_server_base,
                 "codegraph_used": codegraph_used,
                 "model": model,
                 "sandbox": sandbox,
@@ -324,34 +327,82 @@ class CodexAdapter(CliWorkerAdapter):
             result.attempt_usage = _rollout_attempt_usage(
                 rollout_home, resume_record, baseline, result.stdout)
             return result
-        try:
-            from puppetmaster.adapters.codex_session import run_codex_session
-            from puppetmaster.state import resolve_state_dir
-            from puppetmaster.steering import native_steer_items
-            from puppetmaster.store_factory import create_store
+        from puppetmaster.cancellation import JobCancelled, is_cancelled
+        from puppetmaster.invocation import check_external_dispatch
 
-            store = create_store("sqlite", resolve_state_dir())
-            pending = lambda: native_steer_items(store, task)
-            result = run_codex_session(
-                command_prefix=prepared.command[:1],
-                cwd=cwd,
-                prompt=str(prepared.extras.get("prompt") or task.instruction or ""),
-                model=str(prepared.extras.get("model") or _codex_home().configured_model()) or None,
-                sandbox=str(prepared.extras.get("sandbox") or "workspace-write"),
-                ephemeral=bool(prepared.extras.get("ephemeral", True)),
-                timeout=float(timeout_seconds),
-                pending_steering=pending,
-            )
-            text = "\n".join(result.messages)
-            return StreamedProcess(
-                returncode=0 if result.status == "completed" else 1,
-                stdout=text,
-                stderr=result.error or "",
-                timed_out=result.status == "timeout",
-                spawn_error=None if result.status != "failed" or text else result.error,
-            )
+        check_external_dispatch()
+        try:
+            return self._invoke_app_server(task, prepared, cwd, timeout_seconds,
+                                           cancelled=lambda: is_cancelled(task.job_id))
+        except JobCancelled:
+            raise
         except Exception:
             return super()._invoke_cli(task, prepared, cwd, timeout_seconds)
+
+    def _invoke_app_server(self, task: Task, prepared: CliInvocation, cwd: Path,
+                           timeout_seconds: int, cancelled) -> StreamedProcess:
+        """Run the native_steer turn and report it as a ``codex exec --json`` stream."""
+        from puppetmaster.adapters.codex_session import run_codex_session
+        from puppetmaster.cancellation import JobCancelled
+        from puppetmaster.state import resolve_state_dir
+        from puppetmaster.steering import native_steer_items
+        from puppetmaster.store_factory import create_store
+        from puppetmaster.swarm_reasoning import caller_pinned_effort
+        from puppetmaster.fs_permissions import mkdir_private
+        from puppetmaster.invocation import current_attempt
+        from ._streaming import _resolve_sidecar_state_dir, _write_dispatch_receipt, capture_dir
+
+        store = create_store("sqlite", resolve_state_dir())
+        pending = lambda: native_steer_items(store, task)
+        prompt = str(prepared.extras.get("prompt") or task.instruction or "")
+        env = prepared.env
+        if env is None:
+            env = inject_worker_cli_env(apply_worktree_ports(os.environ.copy(), cwd))
+        state_dir = _resolve_sidecar_state_dir()
+        log_dir = capture_dir(state_dir, task) if state_dir is not None else None
+        log_path = None
+        if log_dir is not None:
+            mkdir_private(log_dir)
+            log_path = log_dir / "codex_app_server.log"
+        receipt: dict = {}
+
+        def spawned(command: list, child_env: dict, pid: int) -> None:
+            receipt["path"] = _write_dispatch_receipt(
+                log_dir, task=task, sidecar_name="codex_app_server", command=command,
+                cwd=str(cwd), env=child_env, stdin_data=prompt, pid=pid)
+
+        budget = task.payload.get("max_output_bytes")
+        result = run_codex_session(
+            command_prefix=prepared.extras.get("command_base") or prepared.command[:1],
+            cwd=cwd,
+            prompt=prompt,
+            model=str(prepared.extras.get("model") or _codex_home().configured_model()) or None,
+            sandbox=str(prepared.extras.get("sandbox") or "workspace-write"),
+            effort=caller_pinned_effort(task.payload),
+            ephemeral=bool(prepared.extras.get("ephemeral", True)),
+            timeout=float(timeout_seconds),
+            env=env,
+            cancellation_check=cancelled,
+            pending_steering=pending,
+            protocol_log_path=log_path,
+            max_output_bytes=budget if isinstance(budget, int) and not isinstance(budget, bool) and budget > 0 else None,
+            on_spawn=spawned,
+        )
+        if result.status == "cancelled":
+            raise JobCancelled(task.job_id)
+        output_limit = result.status == "output_limit"
+        return StreamedProcess(
+            returncode=0 if result.status == "completed" else 1,
+            stdout=_app_server_events(result),
+            stderr=result.error or "",
+            timed_out=result.status == "timeout" or output_limit,
+            live_log_path=str(log_path) if log_path is not None else None,
+            spawn_error=None if result.status != "failed" or result.messages else result.error,
+            output_limit_hit=output_limit,
+            attempt_id=current_attempt(task),
+            dispatch_receipt=receipt.get("path"),
+            attempt_usage=_app_server_attempt_usage(result),
+        )
 
     def _finalize_cli_run(
         self,
@@ -413,6 +464,7 @@ class CodexAdapter(CliWorkerAdapter):
                     payload={
                         "failure": "timeout",
                         "returncode": None,
+                        "write_capable": write_capable,
                         **resume_fields,
                         "ephemeral": ephemeral,
                         "ephemeral_source": ephemeral_source,
@@ -545,6 +597,7 @@ class CodexAdapter(CliWorkerAdapter):
             ),
             payload={
                 "returncode": completed.returncode,
+                "write_capable": write_capable,
                 "model": model,
                 "sandbox": sandbox,
                 "approval_policy": approval_policy,
@@ -659,6 +712,49 @@ def _attempt_accounting(attempt: object, sdk_usage: dict, resumed: bool) -> dict
     out["sdk_usage_scope"] = "session_cumulative" if resumed else "attempt"
     out.update({"sdk_" + field: value for field, value in sdk.items()})
     return out
+
+
+def _app_server_events(result: Any) -> str:
+    """An app-server session as ``codex exec --json`` events.
+
+    The finalizer then reads the thread id, the last agent message and a
+    failure the same way for both paths. Agent text stays inside ``item.*``
+    events, so failure classification never reads the transcript.
+    """
+    events: list[dict] = []
+    if result.thread_id:
+        events.append({"type": "thread.started", "thread_id": result.thread_id})
+    events.append({"type": "turn.started"})
+    events.extend({"type": "item.completed", "item": {"type": "agent_message", "text": text}}
+                  for text in result.messages)
+    if result.status == "failed":
+        events.append({"type": "turn.failed", "error": {"message": result.error or ""}})
+    elif result.status == "completed":
+        events.append({"type": "turn.completed"})
+    return "\n".join(json.dumps(event) for event in events) + "\n"
+
+
+def _app_server_attempt_usage(result: Any) -> Optional[dict]:
+    """The app-server's token counts as attempt usage, or None when it sent none.
+
+    native_steer runs only cold, so the thread total is this attempt's own.
+    """
+    usage = {field: None for field in codex_rollout.FIELDS}
+    usage.update(input_tokens=result.input_tokens, output_tokens=result.output_tokens,
+                 cached_input_tokens=result.cached_input_tokens)
+    if all(value is None for value in usage.values()):
+        return None
+    return {
+        "usage_scope": "attempt",
+        "usage_provenance": "app_server_token_usage",
+        "usage_unlinked_reason": None,
+        "rollout_turn_id": None,
+        "rollout_request_count": None,
+        "usage": usage,
+        "usage_partial_fields": sorted(field for field, value in usage.items() if value is None),
+        "usage_disputed_fields": [],
+        "usage_conflicts": [],
+    }
 
 
 def _selected_input(counts: dict, sdk_usage: dict, accounting: dict) -> dict:

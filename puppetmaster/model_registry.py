@@ -458,8 +458,8 @@ def starter_registry() -> list[ModelSpec]:
             adapter="cursor",
             adapter_model_name="gpt-5.6-luna",
             capability_score=85,
-            input_per_mtok_usd=1.0,
-            output_per_mtok_usd=6.0,
+            input_per_mtok_usd=0.2,
+            output_per_mtok_usd=1.2,
             context_window=1_050_000,
             billing="plan",
             tags=["tools", "cursor", "affordable", "balanced", "fast", "vision", "code"],
@@ -477,8 +477,8 @@ def starter_registry() -> list[ModelSpec]:
             adapter="cursor",
             adapter_model_name="gpt-5.6-terra",
             capability_score=94,
-            input_per_mtok_usd=2.5,
-            output_per_mtok_usd=15.0,
+            input_per_mtok_usd=2.0,
+            output_per_mtok_usd=12.0,
             context_window=1_050_000,
             billing="plan",
             tags=["tools", "cursor", "expensive", "quality", "vision", "code", "reasoning"],
@@ -492,9 +492,9 @@ def starter_registry() -> list[ModelSpec]:
             id="cursor/gpt-5-6-sol",
             adapter="cursor",
             adapter_model_name="gpt-5.6-sol",
-            capability_score=99,
-            input_per_mtok_usd=5.0,
-            output_per_mtok_usd=30.0,
+            capability_score=96,
+            input_per_mtok_usd=2.0,
+            output_per_mtok_usd=10.0,
             context_window=1_050_000,
             billing="plan",
             tags=["tools", "cursor", "very-expensive", "frontier", "vision", "code", "reasoning"],
@@ -713,7 +713,8 @@ def starter_registry() -> list[ModelSpec]:
                 "detailed-vision",
             ],
             notes=(
-                "Everyday frontier on Cursor. Anthropic Claude Opus 5 via the "
+                "Previous everyday frontier on Cursor, superseded by "
+                "cursor/claude-opus-5-5. Anthropic Claude Opus 5 via the "
                 "Cursor SDK (API id claude-opus-5, released 2026-07-24). "
                 "Near-Fable 5 intelligence at half Fable's token price "
                 "($5/$25 vs $10/$50 per MTok) and the same price as Opus 4.8. "
@@ -742,7 +743,8 @@ def starter_registry() -> list[ModelSpec]:
                 "long-context",
             ],
             notes=(
-                "Everyday frontier flagship. Anthropic Claude Opus 5 via the "
+                "Previous everyday flagship, superseded by claude-code/opus-5-5. "
+                "Anthropic Claude Opus 5 via the "
                 "Claude Code CLI (API id claude-opus-5, released 2026-07-24). "
                 "Near-Fable 5 on coding/knowledge work at Opus 4.8's $5/$25 "
                 "per-MTok price (half of Fable 5). No 30-day data-retention "
@@ -801,7 +803,8 @@ def starter_registry() -> list[ModelSpec]:
                 "long-context",
             ],
             notes=(
-                "Absolute tip flagship. Anthropic Claude Fable 5 via the Claude "
+                "Previous tip flagship, superseded by claude-code/fable-5-1. "
+                "Anthropic Claude Fable 5 via the Claude "
                 "Code CLI (API id claude-fable-5, released 2026-06-09). "
                 "Priced at $10/$50 per MTok — 2x Opus 5 for marginal gains on "
                 "the hardest work. Everyday tip-of-stack should prefer "
@@ -811,16 +814,406 @@ def starter_registry() -> list[ModelSpec]:
                 "when absent."
             ),
         ),
+        ModelSpec(
+            id="claude-code/haiku-5-5",
+            adapter="claude-code",
+            adapter_model_name="claude-haiku-5-5",
+            capability_score=80,
+            input_per_mtok_usd=0.1,
+            output_per_mtok_usd=0.5,
+            context_window=1_000_000,
+            billing="unknown",
+            tags=[
+                "tools",
+                "claude",
+                "cheap",
+                "fast",
+                "vision",
+                "reading",
+                "code",
+                "long-context",
+            ],
+            notes=(
+                "Cheap/fast tier. Anthropic Claude Haiku 5.5 via the Claude Code "
+                "CLI (API id claude-haiku-5-5, released 2026-10-07). $0.10/$0.50 "
+                "per MTok, a tenth of Haiku 4.5 on input, with a 1M context. "
+                "Leading small model on independent indexes, still well below "
+                "Sonnet 5.5 on agentic coding."
+            ),
+        ),
+        ModelSpec(
+            id="claude-code/sonnet-5-5",
+            adapter="claude-code",
+            adapter_model_name="claude-sonnet-5-5",
+            capability_score=99,
+            input_per_mtok_usd=2.0,
+            output_per_mtok_usd=10.0,
+            context_window=1_000_000,
+            billing="unknown",
+            tags=[
+                "tools",
+                "claude",
+                "balanced",
+                "frontier",
+                "vision",
+                "reasoning",
+                "code",
+                "long-context",
+            ],
+            notes=(
+                "Balanced frontier tier. Anthropic Claude Sonnet 5.5 via the "
+                "Claude Code CLI (API id claude-sonnet-5-5, released 2026-09-28). "
+                "Within a few points of Opus 5.5 on most published tests at "
+                "$2/$10 per MTok, so cost-aware policies prefer it below the tip."
+            ),
+        ),
+        ModelSpec(
+            id="claude-code/opus-5-5",
+            adapter="claude-code",
+            adapter_model_name="claude-opus-5-5",
+            capability_score=100,
+            input_per_mtok_usd=4.0,
+            output_per_mtok_usd=20.0,
+            context_window=1_000_000,
+            billing="unknown",
+            tags=[
+                "tools",
+                "claude",
+                "frontier",
+                "vision",
+                "detailed-vision",
+                "reasoning",
+                "code",
+                "long-context",
+            ],
+            notes=(
+                "Everyday frontier flagship. Anthropic Claude Opus 5.5 via the "
+                "Claude Code CLI (API id claude-opus-5-5). $4/$20 per MTok, below "
+                "Opus 5. The default claude-code model and the savings reference."
+            ),
+        ),
+        ModelSpec(
+            id="claude-code/fable-5-1",
+            adapter="claude-code",
+            adapter_model_name="claude-fable-5-1",
+            capability_score=100,
+            input_per_mtok_usd=10.0,
+            output_per_mtok_usd=50.0,
+            context_window=1_000_000,
+            billing="unknown",
+            tags=[
+                "tools",
+                "claude",
+                "frontier",
+                "mythos-class",
+                "vision",
+                "detailed-vision",
+                "reasoning",
+                "code",
+                "long-context",
+            ],
+            notes=(
+                "Absolute tip flagship. Anthropic Claude Fable 5.1 via the Claude "
+                "Code CLI (API id claude-fable-5-1, released 2026-09-01). $10/$50 "
+                "per MTok, 2.5x Opus 5.5. Reserve it for the most ambitious work."
+            ),
+        ),
+        ModelSpec(
+            id="cursor/claude-haiku-5-5",
+            adapter="cursor",
+            adapter_model_name="claude-haiku-5-5",
+            capability_score=80,
+            input_per_mtok_usd=0.1,
+            output_per_mtok_usd=0.5,
+            context_window=0,
+            billing="plan",
+            tags=[
+                "tools",
+                "cursor",
+                "cheap",
+                "fast",
+                "vision",
+                "reading",
+                "code",
+                "long-context",
+            ],
+            notes=(
+                "Cheap/fast tier on Cursor. Anthropic Claude Haiku 5.5 via the "
+                "Cursor SDK (live catalog id claude-haiku-5-5). Plan-billed; the "
+                "rates are nominal list prices for ranking."
+            ),
+        ),
+        ModelSpec(
+            id="cursor/claude-sonnet-5-5",
+            adapter="cursor",
+            adapter_model_name="claude-sonnet-5-5",
+            capability_score=99,
+            input_per_mtok_usd=2.0,
+            output_per_mtok_usd=10.0,
+            context_window=0,
+            billing="plan",
+            tags=[
+                "tools",
+                "cursor",
+                "balanced",
+                "frontier",
+                "vision",
+                "reasoning",
+                "code",
+                "long-context",
+            ],
+            notes=(
+                "Balanced frontier tier on Cursor. Anthropic Claude Sonnet 5.5 via "
+                "the Cursor SDK (live catalog id claude-sonnet-5-5). Plan-billed; "
+                "the rates are nominal list prices for ranking."
+            ),
+        ),
+        ModelSpec(
+            id="cursor/claude-opus-5-5",
+            adapter="cursor",
+            adapter_model_name="claude-opus-5-5",
+            capability_score=100,
+            input_per_mtok_usd=4.0,
+            output_per_mtok_usd=20.0,
+            context_window=0,
+            billing="plan",
+            tags=[
+                "tools",
+                "cursor",
+                "frontier",
+                "reasoning",
+                "code",
+                "long-context",
+                "vision",
+                "detailed-vision",
+            ],
+            notes=(
+                "Everyday frontier on Cursor. Anthropic Claude Opus 5.5 via the "
+                "Cursor SDK (live catalog id claude-opus-5-5). Plan-billed; the "
+                "rates are nominal list prices for ranking. Supersedes "
+                "cursor/claude-opus-5."
+            ),
+        ),
+        ModelSpec(
+            id="cursor/claude-fable-5-1",
+            adapter="cursor",
+            adapter_model_name="claude-fable-5-1",
+            capability_score=100,
+            input_per_mtok_usd=10.0,
+            output_per_mtok_usd=50.0,
+            context_window=0,
+            billing="plan",
+            tags=[
+                "tools",
+                "cursor",
+                "frontier",
+                "mythos-class",
+                "reasoning",
+                "code",
+                "long-context",
+                "vision",
+                "detailed-vision",
+            ],
+            notes=(
+                "Absolute tip on Cursor. Anthropic Claude Fable 5.1 via the Cursor "
+                "SDK (live catalog id claude-fable-5-1). Plan-billed; the rates are "
+                "nominal list prices for ranking. Supersedes cursor/claude-fable-5."
+            ),
+        ),
         # OpenAI tier — uses the openai adapter directly with OPENAI_API_KEY,
         # bypassing Cursor's SDK entirely. Pricing and model IDs are
         # the publicly-listed GPT-5.4 / GPT-5.5 / GPT-5.6 catalog.
         ModelSpec(
+            id="openai/gpt-6-luna",
+            adapter="openai",
+            adapter_model_name="gpt-6-luna",
+            capability_score=88,
+            input_per_mtok_usd=0.1,
+            output_per_mtok_usd=0.5,
+            context_window=1_050_000,
+            billing="api",
+            tags=[
+                "tools",
+                "openai",
+                "balanced",
+                "vision",
+                "reasoning",
+                "code",
+                "long-context",
+            ],
+            notes=(
+                "OpenAI GPT-6 Luna (released 2026-09-22). Cheap tier at $0.10/$0.50 "
+                "per MTok, about GPT-5.6 Terra level on independent indexes."
+            ),
+        ),
+        ModelSpec(
+            id="openai/gpt-6-sol",
+            adapter="openai",
+            adapter_model_name="gpt-6-sol",
+            capability_score=97,
+            input_per_mtok_usd=2.0,
+            output_per_mtok_usd=10.0,
+            context_window=1_050_000,
+            billing="api",
+            tags=[
+                "tools",
+                "openai",
+                "quality",
+                "vision",
+                "reasoning",
+                "code",
+                "long-context",
+            ],
+            notes=(
+                "OpenAI GPT-6 Sol (released 2026-09-22). $2/$10 per MTok. "
+                "Superseded by gpt-6.1-sol at the same price."
+            ),
+        ),
+        ModelSpec(
+            id="openai/gpt-6-1-sol",
+            adapter="openai",
+            adapter_model_name="gpt-6.1-sol",
+            capability_score=99,
+            input_per_mtok_usd=2.0,
+            output_per_mtok_usd=10.0,
+            context_window=1_050_000,
+            billing="api",
+            tags=[
+                "tools",
+                "openai",
+                "frontier",
+                "vision",
+                "reasoning",
+                "code",
+                "long-context",
+            ],
+            notes=(
+                "OpenAI GPT-6.1 Sol (released 2026-09-29). One index point below "
+                "GPT-6 Astra at a fifth of its price ($2/$10 per MTok)."
+            ),
+        ),
+        ModelSpec(
+            id="openai/gpt-6-astra",
+            adapter="openai",
+            adapter_model_name="gpt-6-astra",
+            capability_score=100,
+            input_per_mtok_usd=10.0,
+            output_per_mtok_usd=50.0,
+            context_window=1_050_000,
+            billing="api",
+            tags=[
+                "tools",
+                "openai",
+                "frontier",
+                "vision",
+                "reasoning",
+                "code",
+                "long-context",
+            ],
+            notes=(
+                "OpenAI GPT-6 Astra (released 2026-09-03), the OpenAI flagship. "
+                "$10/$50 per MTok. Prefer gpt-6.1-sol unless the work needs Astra."
+            ),
+        ),
+        ModelSpec(
+            id="codex/gpt-6-luna",
+            adapter="codex",
+            adapter_model_name="gpt-6-luna",
+            capability_score=89,
+            input_per_mtok_usd=0.1,
+            output_per_mtok_usd=0.5,
+            context_window=1_050_000,
+            tags=[
+                "tools",
+                "codex",
+                "balanced",
+                "vision",
+                "reasoning",
+                "code",
+                "agent-loop",
+                "long-context",
+            ],
+            notes=(
+                "OpenAI Codex CLI driving gpt-6-luna. One step above openai/gpt-6-luna "
+                "for the in-CLI agent loop."
+            ),
+        ),
+        ModelSpec(
+            id="codex/gpt-6-sol",
+            adapter="codex",
+            adapter_model_name="gpt-6-sol",
+            capability_score=98,
+            input_per_mtok_usd=2.0,
+            output_per_mtok_usd=10.0,
+            context_window=1_050_000,
+            tags=[
+                "tools",
+                "codex",
+                "quality",
+                "vision",
+                "reasoning",
+                "code",
+                "agent-loop",
+                "long-context",
+            ],
+            notes=(
+                "OpenAI Codex CLI driving gpt-6-sol. One step above openai/gpt-6-sol "
+                "for the in-CLI agent loop."
+            ),
+        ),
+        ModelSpec(
+            id="codex/gpt-6-1-sol",
+            adapter="codex",
+            adapter_model_name="gpt-6.1-sol",
+            capability_score=99,
+            input_per_mtok_usd=2.0,
+            output_per_mtok_usd=10.0,
+            context_window=1_050_000,
+            tags=[
+                "tools",
+                "codex",
+                "frontier",
+                "vision",
+                "reasoning",
+                "code",
+                "agent-loop",
+                "long-context",
+            ],
+            notes=(
+                "OpenAI Codex CLI driving gpt-6.1-sol. One step above openai/gpt-6-1-sol "
+                "for the in-CLI agent loop."
+            ),
+        ),
+        ModelSpec(
+            id="codex/gpt-6-astra",
+            adapter="codex",
+            adapter_model_name="gpt-6-astra",
+            capability_score=100,
+            input_per_mtok_usd=10.0,
+            output_per_mtok_usd=50.0,
+            context_window=1_050_000,
+            tags=[
+                "tools",
+                "codex",
+                "frontier",
+                "vision",
+                "reasoning",
+                "code",
+                "agent-loop",
+                "long-context",
+            ],
+            notes=(
+                "OpenAI Codex CLI driving gpt-6-astra. One step above openai/gpt-6-astra "
+                "for the in-CLI agent loop."
+            ),
+        ),
+        ModelSpec(
             id="openai/gpt-5-6-sol",
             adapter="openai",
             adapter_model_name="gpt-5.6-sol",
-            capability_score=99,
-            input_per_mtok_usd=5.0,
-            output_per_mtok_usd=30.0,
+            capability_score=96,
+            input_per_mtok_usd=2.0,
+            output_per_mtok_usd=10.0,
             context_window=1_050_000,
             billing="api",
             tags=["tools", 
@@ -844,9 +1237,9 @@ def starter_registry() -> list[ModelSpec]:
             id="openai/gpt-5-6",
             adapter="openai",
             adapter_model_name="gpt-5.6",
-            capability_score=99,
-            input_per_mtok_usd=5.0,
-            output_per_mtok_usd=30.0,
+            capability_score=96,
+            input_per_mtok_usd=2.0,
+            output_per_mtok_usd=10.0,
             context_window=1_050_000,
             billing="api",
             tags=["tools", 
@@ -868,9 +1261,9 @@ def starter_registry() -> list[ModelSpec]:
             id="openai/gpt-5-6-terra",
             adapter="openai",
             adapter_model_name="gpt-5.6-terra",
-            capability_score=97,
-            input_per_mtok_usd=2.5,
-            output_per_mtok_usd=15.0,
+            capability_score=95,
+            input_per_mtok_usd=2.0,
+            output_per_mtok_usd=12.0,
             context_window=1_050_000,
             billing="api",
             tags=["tools", 
@@ -893,8 +1286,8 @@ def starter_registry() -> list[ModelSpec]:
             adapter="openai",
             adapter_model_name="gpt-5.6-luna",
             capability_score=90,
-            input_per_mtok_usd=1.0,
-            output_per_mtok_usd=6.0,
+            input_per_mtok_usd=0.2,
+            output_per_mtok_usd=1.2,
             context_window=1_050_000,
             billing="api",
             tags=["tools", "openai", "balanced", "fast", "vision", "code", "long-context"],
@@ -909,7 +1302,7 @@ def starter_registry() -> list[ModelSpec]:
             id="openai/gpt-5-5",
             adapter="openai",
             adapter_model_name="gpt-5.5",
-            capability_score=96,
+            capability_score=95,
             input_per_mtok_usd=5.0,
             output_per_mtok_usd=30.0,
             context_window=1_000_000,
@@ -974,8 +1367,8 @@ def starter_registry() -> list[ModelSpec]:
             adapter="openai",
             adapter_model_name="gpt-5.4-nano",
             capability_score=52,
-            input_per_mtok_usd=0.15,
-            output_per_mtok_usd=0.9,
+            input_per_mtok_usd=0.2,
+            output_per_mtok_usd=1.25,
             context_window=400_000,
             billing="api",
             tags=["tools", "openai", "cheap", "fast", "reading"],
@@ -989,9 +1382,9 @@ def starter_registry() -> list[ModelSpec]:
             id="codex/gpt-5-6-sol",
             adapter="codex",
             adapter_model_name="gpt-5.6-sol",
-            capability_score=100,
-            input_per_mtok_usd=5.0,
-            output_per_mtok_usd=30.0,
+            capability_score=97,
+            input_per_mtok_usd=2.0,
+            output_per_mtok_usd=10.0,
             context_window=1_050_000,
             tags=["tools", 
                 "codex",
@@ -1013,9 +1406,9 @@ def starter_registry() -> list[ModelSpec]:
             id="codex/gpt-5-6-terra",
             adapter="codex",
             adapter_model_name="gpt-5.6-terra",
-            capability_score=98,
-            input_per_mtok_usd=2.5,
-            output_per_mtok_usd=15.0,
+            capability_score=96,
+            input_per_mtok_usd=2.0,
+            output_per_mtok_usd=12.0,
             context_window=1_050_000,
             tags=["tools", 
                 "codex",
@@ -1038,8 +1431,8 @@ def starter_registry() -> list[ModelSpec]:
             adapter="codex",
             adapter_model_name="gpt-5.6-luna",
             capability_score=91,
-            input_per_mtok_usd=1.0,
-            output_per_mtok_usd=6.0,
+            input_per_mtok_usd=0.2,
+            output_per_mtok_usd=1.2,
             context_window=1_050_000,
             tags=["tools", "codex", "balanced", "vision", "code", "agent-loop", "long-context"],
             notes=(
@@ -1052,7 +1445,7 @@ def starter_registry() -> list[ModelSpec]:
             id="codex/gpt-5-5",
             adapter="codex",
             adapter_model_name="gpt-5.5",
-            capability_score=97,
+            capability_score=96,
             input_per_mtok_usd=5.0,
             output_per_mtok_usd=30.0,
             context_window=1_000_000,

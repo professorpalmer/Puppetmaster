@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import re
+
 import os
-import signal
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -221,41 +222,16 @@ class StreamedProcess:
     session_cumulative_cost: bool = False
 
 
-def _kill_process_tree(process: "subprocess.Popen", started_new_session: bool) -> None:
-    """Best-effort kill of a timed-out child *and its descendants*.
+_SESSION_KEY_RE = re.compile(r'"(?:session_id|sessionId|thread_id|threadId)"\s*:\s*"([^"\s]{6,200})"')
 
-    Adapters that launch with ``start_new_session=True`` (e.g. Hermes) put the
-    child in its own process group; grandchildren survive a bare
-    ``process.kill()`` of the direct child. On POSIX we signal the whole group
-    only when we created that session — otherwise a conservative direct kill
-    avoids touching unrelated processes that share the worker's group.
 
-    On Windows there is no ``killpg`` equivalent and Cursor/Node grandchildren
-    are routinely spawned without ``start_new_session``. Always attempt a
-    tree-kill via ``taskkill /T`` (or a Toolhelp snapshot) — see
-    ``puppetmaster.win_process``. Direct-child ``process.kill()`` remains the
-    final fallback on every platform.
+def single_observed_session_id(stdout: str) -> Optional[str]:
+    """The one session or thread id a CLI stream named, else None.
+
+    Two different ids mean the stream is ambiguous, so none is recorded.
     """
-    if started_new_session and os.name == "posix":
-        try:
-            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-            return
-        except (ProcessLookupError, PermissionError, OSError):
-            # Group already gone or unkillable — fall through to the direct kill.
-            pass
-    elif os.name == "nt":
-        try:
-            from puppetmaster.win_process import kill_process_tree
-
-            if process.pid and kill_process_tree(process.pid):
-                return
-        except Exception:
-            # Tree kill unavailable or failed — fall through to the direct kill.
-            pass
-    try:
-        process.kill()
-    except Exception:
-        pass
+    seen = set(_SESSION_KEY_RE.findall(stdout or ""))
+    return seen.pop() if len(seen) == 1 else None
 
 
 def run_streamed_subprocess(
@@ -491,6 +467,7 @@ def run_streamed_subprocess(
 
     from puppetmaster.cancellation import check_cancellation, JobCancelled
     timed_out = False
+    cancelled: Optional[JobCancelled] = None
     try:
         deadline = _time.monotonic() + timeout_seconds
         while True:
@@ -503,9 +480,13 @@ def run_streamed_subprocess(
                 break
             except subprocess.TimeoutExpired:
                 continue
-    except JobCancelled:
+    except JobCancelled as exc:
         cleanup()
-        raise
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        cancelled = exc
     except subprocess.TimeoutExpired:
         timed_out = True
         # Kill the whole process group when we launched a new session, so
@@ -534,6 +515,20 @@ def run_streamed_subprocess(
                 live_handle.close()
             except Exception:
                 pass
+
+    if cancelled is not None:
+        # A stop is not a completed turn, but the attempt it cut keeps its
+        # linkage: the stop receipt names the same dispatch and capture.
+        cancelled.partial = {
+            "attempt_id": current_attempt(task),
+            "dispatch_receipt": dispatch_receipt,
+            "live_log_path": str(live_path) if live_path is not None else None,
+            "elapsed_seconds": round(_time.monotonic() - started, 3),
+            "returncode": process.returncode,
+            "session_id": single_observed_session_id("".join(stdout_lines)),
+            "stderr_tail": _redacted_tail("".join(stderr_lines), _STDOUT_TAIL_CHARS),
+        }
+        raise cancelled
 
     return StreamedProcess(
         returncode=process.returncode,

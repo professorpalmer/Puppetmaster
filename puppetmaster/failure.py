@@ -63,15 +63,19 @@ def _matches(pattern: str) -> Checker:
 # An explicit credential diagnosis, never a bare "auth"/"login" substring: those
 # also occur in symbols, paths and quoted source (``production_authority``).
 _AUTH_DIAGNOSIS = (
-    r"\b(?:auth|authentication|authorization|login|log in|sign in|token)"
-    r"[ _-]?(?:error|failed|failure|required|expired|revoked|invalid)\b"
+    r"\b(?:auth|authentication|authorization|login|log in|sign in|token|api[ _-]key)"
+    r"[ _-]?(?:error|failed|failure|required|expired|revoked|invalid|missing)\b"
     r"|\b(?:please |re-?)(?:authenticate|log ?in|sign ?in)\b"
-    r"|\binvalid[ _-](?:api[ _-]key|token|credentials?)\b"
+    r"|\b(?:invalid|incorrect|missing|no)[ _-](?:api[ _-]key|token|credentials?)\b"
+    r"|\binvalid authentication\b"
+    r"|\b(?:login|account|provider|credentials?) verification (?:failed|required)\b"
 )
 
 # Python traceback frames: ``File "...", line N, in name`` and the quoted
 # source/caret lines under it. They name code, not the failure.
 _TRACEBACK_FRAME = re.compile(r'^\s*File "[^"\n]*", line \d+(?:, in [^\n]*)?$')
+# Node ``error.stack`` frames: ``    at fn (/path/index.js:401:17)``.
+_NODE_STACK_FRAME = re.compile(r"^\s+at .*:\d+:\d+\)?$")
 
 
 def _without_traceback_frames(text: str) -> str:
@@ -84,6 +88,8 @@ def _without_traceback_frames(text: str) -> str:
         if in_frame and line.startswith("    "):
             continue
         in_frame = False
+        if _NODE_STACK_FRAME.match(line):
+            continue
         kept.append(line)
     return "\n".join(kept)
 
@@ -111,13 +117,12 @@ _BASE_RULES: Tuple[Rule, ...] = (
     (_any("command not found"), MISSING_CLI),
     (_any("not logged in", "codex login", "missing bearer", "unauthorized"), NOT_AUTHENTICATED),
     (_matches(r"(?<![\w.])401(?![\w.])"), NOT_AUTHENTICATED),
-    (_any("api key", "not authenticated", "authentication", "please login", "hermes login", "missing credentials"), NOT_AUTHENTICATED),
-    (_all("verification", "failed"), NOT_AUTHENTICATED),
-    (_all("verification", "required"), NOT_AUTHENTICATED),
+    (_any("not authenticated", "please login", "hermes login", "missing credentials"), NOT_AUTHENTICATED),
     (_any("cursor_api_key"), NOT_AUTHENTICATED),
     (_matches(_AUTH_DIAGNOSIS), NOT_AUTHENTICATED),
     (_any("context length", "maximum context", "context window"), CONTEXT_LENGTH_EXCEEDED),
-    (_any("rate limit", "429"), RATE_LIMIT),
+    (_any("rate limit"), RATE_LIMIT),
+    (_matches(r"(?<![\w.])429(?![\w.])"), RATE_LIMIT),
     (_any("billing", "quota", "credit"), BILLING_OR_QUOTA),
     (_any("model_not_found"), MODEL_UNAVAILABLE),
     (_model_unavailable, MODEL_UNAVAILABLE),
@@ -337,12 +342,20 @@ def classify_provider_failure(
 
     if http_status == 401:
         return NOT_AUTHENTICATED
+    if http_status == 402:
+        return BILLING_OR_QUOTA
     if http_status == 403:
         return FORBIDDEN
+    if http_status == 404:
+        return MODEL_UNAVAILABLE
     if http_status == 429:
         return RATE_LIMIT
     if http_status is not None and 500 <= http_status < 600:
         return SERVER_ERROR
+    if http_status is not None and 400 <= http_status < 500:
+        failure = classify_adapter_failure("openai", body)
+        if failure != UNKNOWN:
+            return failure
 
     category_by_reason = {
         "not_authenticated": NOT_AUTHENTICATED,
