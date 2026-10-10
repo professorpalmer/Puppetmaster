@@ -6,34 +6,36 @@ That is the integration path for using Puppetmaster from the Agent surface inste
 
 ## What It Adds
 
-Puppetmaster exposes these MCP tools:
+`tools/list` shows a core set of 24 tools by default. Every tool schema goes
+into each request the client sends, so a smaller list makes every pilot turn
+cheaper. The core set covers all work: the generic verbs take an `adapter`.
 
-- `puppetmaster_doctor`
-- `puppetmaster_cursor_review`
-- `puppetmaster_start_cursor_review`
-- `puppetmaster_cursor_plan`
-- `puppetmaster_start_cursor_plan`
-- `puppetmaster_claude_implement`
-- `puppetmaster_start_claude_implement`
-- `puppetmaster_start_swarm`
-- `puppetmaster_start_cursor_swarm`
-- `puppetmaster_start_browser_swarm`
-- `puppetmaster_last_job`
-- `puppetmaster_status`
-- `puppetmaster_logs`
-- `puppetmaster_live_artifacts`
-- `puppetmaster_live_artifacts_follow`
-- `puppetmaster_partial_summary`
-- `puppetmaster_artifacts`
-- `puppetmaster_effort_index`
-- `puppetmaster_show`
-- `puppetmaster_dashboard`
-- `puppetmaster_codegraph_search`
-- `puppetmaster_codegraph_context`
-- `puppetmaster_codegraph_affected`
-- `puppetmaster_codegraph_files`
-- `puppetmaster_codegraph_status`
-- `puppetmaster_codegraph_init`
+- Run work: `puppetmaster_flow`, `puppetmaster_start_implement`,
+  `puppetmaster_edit`, `puppetmaster_start_swarm`, `puppetmaster_start_review`
+- Follow a job: `puppetmaster_await_job`, `puppetmaster_live_artifacts_follow`,
+  `puppetmaster_status`, `puppetmaster_logs`, `puppetmaster_show`,
+  `puppetmaster_artifacts`, `puppetmaster_steer`, `puppetmaster_cut_task`,
+  `puppetmaster_last_job`, `puppetmaster_list_job_summaries`
+- Setup and cost: `puppetmaster_doctor`, `puppetmaster_route_task`,
+  `puppetmaster_dashboard`
+- CodeGraph: `puppetmaster_codegraph_search`, `puppetmaster_codegraph_context`,
+  `puppetmaster_codegraph_affected`, `puppetmaster_codegraph_files`,
+  `puppetmaster_codegraph_status`, `puppetmaster_codegraph_init`
+
+Use the generic verbs with an `adapter` for a specific platform. For example,
+`puppetmaster_start_implement` with `adapter: "codex"` replaces
+`puppetmaster_start_codex`, and `adapter: "agentic"` is the keys-only path.
+
+Set `PUPPETMASTER_MCP_TOOLS` in the MCP server environment to change the list:
+
+- `all`: every tool, including the adapter-specific verbs
+  (`puppetmaster_start_cursor_swarm`, `puppetmaster_codex`, and others),
+  `puppetmaster_start_browser_swarm`, `puppetmaster_start_prewalk`, and the
+  maintenance tools (`puppetmaster_gc`, `puppetmaster_mcp_cleanup`, ...).
+- A comma list, for example `start_browser_swarm,gc`: the core set plus those
+  tools. An unknown name is an error.
+
+A tool that is not listed still answers a call by its name.
 
 Cursor's Agent can call those tools during a chat, so you can ask it to run a Puppetmaster review, plan, or Claude Code implementation from inside Cursor.
 

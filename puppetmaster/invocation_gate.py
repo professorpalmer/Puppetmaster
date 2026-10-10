@@ -160,7 +160,7 @@ _TRIVIAL_PATTERNS = [
 _ROLE_INFERENCE = [
     (re.compile(r"\b(security|vuln|exploit|cve)\b"), "security-review", "puppetmaster_start_review"),
     (re.compile(r"\b(audit|review|risk|find issues|what could break)\b"), "review", "puppetmaster_start_review"),
-    (re.compile(r"\b(architect|design|approach|trade[-\s]?off|plan|scope)\b"), "plan", "puppetmaster_start_cursor_plan"),
+    (re.compile(r"\b(architect|design|approach|trade[-\s]?off|plan|scope)\b"), "plan", "puppetmaster_start_swarm"),
     # Implementation intent → a SINGLE implement worker, never a fan-out swarm.
     # Broadened beyond the old narrow verb list because plain feature work
     # ("add a CSV export endpoint", "create the webhook handler", "wire up

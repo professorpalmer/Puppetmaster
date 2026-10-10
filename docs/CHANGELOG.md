@@ -1,3 +1,32 @@
+## v1.43.0 — 2026-10-10
+
+**The MCP server lists a core set of 24 tools by default.** A client sends
+every listed tool schema in each request, so the list is a fixed cost on every
+pilot turn. In the r50 cold pair, the PM pilot's first input was 29,034 tokens
+against 8,547 for native, and most of that difference came from 62 tool
+schemas. The list is now 24 tools: about 13,300 tokens against 48,700 by an
+o200k count of the raw JSON (54,419 characters against 195,158).
+
+- The core set: `flow`, `start_implement`, `edit`, `start_swarm`,
+  `start_review`, the job follow tools (`await_job`, `live_artifacts_follow`,
+  `status`, `logs`, `show`, `artifacts`, `steer`, `cut_task`, `last_job`,
+  `list_job_summaries`), `doctor`, `route_task`, `dashboard`, and six
+  CodeGraph tools.
+- The adapter-specific verbs (`codex`, `start_codex`, `agentic`,
+  `start_agentic`, `claude_implement`, `cursor_implement`, `start_cursor_swarm`,
+  `cursor_review`, `cursor_plan`, `openai`, and their start forms) are not
+  listed. Use the generic verbs with `adapter`. `start_browser_swarm`,
+  `start_prewalk` and the maintenance tools are not listed either.
+- `PUPPETMASTER_MCP_TOOLS=all` lists every tool. A comma list such as
+  `start_browser_swarm,gc` adds tools to the core set. An unknown name is an
+  error. A tool that is not listed still answers a call by its name.
+- The `job_ref` parameter schema is an object with its two required fields.
+  `JobRef` already parses every rule at the boundary, and the strict schema
+  repeated that parse in each job tool.
+- The installed rules, the prompt hook, the skills and the docs name only
+  listed tools. The hook suggests `start_swarm` for plan prompts on every host.
+- The remote server (`serve-remote`) keeps its own scope filter.
+
 ## v1.42.3 — 2026-10-10
 
 **A list template inside `files` no longer makes every map item overlap.**

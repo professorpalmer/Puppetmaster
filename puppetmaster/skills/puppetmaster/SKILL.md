@@ -71,7 +71,7 @@ isolated worktree.
 Chief and Marionette consume **artifacts / refs / show / effort-index**. Never
 read worker transcripts.
 
-- **Size** with `route_task` / `auto_route` / `start_prewalk`.
+- **Size** with `route_task` / `auto_route`.
 - **Spawn** a disposable Puppetmaster job (swarm roles optional). Persist
   artifacts, then die. No long-lived role bots.
 - **Recall** with `effort_index` (omit `effort_id` for the latest tagged
@@ -125,12 +125,12 @@ CodeGraph first, then read only the files it points to. Verbs: `codegraph_search
 
 Consume **artifacts / refs / show / effort-index**, never worker transcripts.
 
-1. Size the worker with `route_task` / `auto_route` / `start_prewalk`.
+1. Size the worker with `route_task` / `auto_route`.
 2. Spawn a Puppetmaster job (one disposable worker; swarm is optional).
 3. Persist typed artifacts. The worker dies. No long-lived role bots.
-4. Recall with `artifacts` (`refs=true`), `show`, or `effort-index` /
-   `puppetmaster_effort_index` (latest tagged effort when `effort_id` is
-   omitted; filter with `type` / `query`). Expand a payload only when needed.
+4. Recall with `artifacts` (`refs=true`), `show`, or the CLI `effort-index`
+   (latest tagged effort when `effort_id` is omitted; filter with `type` /
+   `query`). Expand a payload only when needed.
 5. Optional one-shot `gate` / tests on the worker worktree.
 
 `rollup` is the jobs/cost/tokens ledger. `effort-index` is queryable memory.

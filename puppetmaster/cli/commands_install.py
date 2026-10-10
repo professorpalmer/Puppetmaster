@@ -1286,7 +1286,7 @@ def _setup_next_steps(enabled_adapters: set[str], host_pilots: Optional[set[str]
             "agentic: set a provider API key (OPENAI_API_KEY, ANTHROPIC_API_KEY, "
             "GEMINI_API_KEY, GOOGLE_API_KEY, or OPENROUTER_API_KEY). No external "
             "CLI or host restart — drive via `puppetmaster agentic` or "
-            "`puppetmaster_agentic` / `puppetmaster_start_agentic` MCP verbs."
+            "pass `adapter: \"agentic\"` to the MCP start verbs."
         )
     if not steps:
         # Lock excludes every host-backed adapter: only the local/file demo mode

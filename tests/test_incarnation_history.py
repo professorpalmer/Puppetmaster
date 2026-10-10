@@ -381,8 +381,13 @@ class IncarnationHistoryTests(unittest.TestCase):
             parsed = build_parser().parse_args(args[3:])
             self.assertEqual(json.loads(parsed.job_ref), ref.as_dict())
         schema = job_schema()['properties']['job_ref']
-        self.assertEqual(schema['properties']['version']['enum'], [1,2])
-        self.assertIn('incarnation', schema['oneOf'][0]['required'])
+        self.assertEqual(schema['required'], ['job_id', 'state_id'])
+        # The schema is loose; JobRef parses the shape at the boundary.
+        from puppetmaster.models import JobRef
+        with self.assertRaises(ValueError):
+            JobRef(**{**ref.as_dict(), 'version': 2, 'incarnation': None})
+        with self.assertRaises(ValueError):
+            JobRef(job_id='j', state_id='s', version=1, incarnation=str(__import__('uuid').uuid4()))
 
     def test_child_attach_refuses_replaced_launch_identity(self):
         from puppetmaster.identity import prepare_launch

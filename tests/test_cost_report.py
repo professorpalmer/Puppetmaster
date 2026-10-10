@@ -1071,11 +1071,14 @@ class CostCliHumanTests(unittest.TestCase):
             self.assertNotIn("actual measured spend", text)
 
     def test_job_cost_mcp_description_is_neutral(self) -> None:
+        from unittest import mock
+
         from puppetmaster.mcp_server import handle_message
 
-        response = handle_message(
-            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
-        )
+        with mock.patch.dict("os.environ", {"PUPPETMASTER_MCP_TOOLS": "all"}):
+            response = handle_message(
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+            )
         tools = {
             tool["name"]: tool["description"]
             for tool in response["result"]["tools"]

@@ -78,12 +78,12 @@ _PRE_TOOL_ALIASES = {
 # non-blocking prompt-submit directive, which never blocks the native tool.
 _ASSUME_TOOLS_ENV = "PUPPETMASTER_HOOK_ASSUME_TOOLS"
 
-# Cursor-specific verbs translated for non-Cursor hosts. The ``*_cursor_*``
-# verbs require the Cursor SDK platform; recommending them on a Claude Code or
-# Codex host points the model at a tool it cannot run (field-reported: the
-# hook denied Claude's Agent tool and suggested ``puppetmaster_start_cursor_swarm``
-# on a machine with no Cursor installed, wedging the turn). The generic verbs
-# route to whatever platform the lock enables, so they are safe everywhere.
+# Cursor-specific verbs translated to the generic verbs. The ``*_cursor_*``
+# verbs require the Cursor SDK platform, and since 1.43 the MCP server does not
+# list them by default on any host (field-reported: the hook suggested
+# ``puppetmaster_start_cursor_swarm`` on a machine with no Cursor installed,
+# wedging the turn). The generic verbs route to whatever platform the lock
+# enables, so they are safe everywhere.
 _HOST_PORTABLE_VERBS = {
     "puppetmaster_start_cursor_swarm": "puppetmaster_start_swarm",
     "puppetmaster_start_cursor_review": "puppetmaster_start_review",
@@ -93,13 +93,7 @@ _HOST_PORTABLE_VERBS = {
 
 
 def verb_for_host(verb: str, host: str) -> str:
-    """Return a verb the ``host`` agent can actually invoke.
-
-    Cursor hosts keep the cursor-specific daily drivers; every other host gets
-    the platform-routing equivalent instead of a verb it may not have.
-    """
-    if (host or "").strip().lower() == "cursor":
-        return verb
+    """Return a verb the ``host`` agent can actually invoke: the listed generic verb."""
     return _HOST_PORTABLE_VERBS.get(verb, verb)
 
 # NOTE on native search/glob tools (Grep/Glob/codebase_search): we deliberately
