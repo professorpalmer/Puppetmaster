@@ -1,3 +1,12 @@
+## v1.42.2 — 2026-10-10
+
+**An incomplete swarm says which task failed and why.** The error was only
+"swarm exited with incomplete tasks". Now it names each unfinished task with
+its role, id and status, and the last failure that its worker recorded in a
+`worker.failed_task` or `worker.gate_failed` event (at most 300 characters).
+A rare Windows CI failure gave only the bare message, so its cause was not
+known. The next failure explains itself.
+
 ## v1.42.1 — 2026-10-10
 
 **Recursive write-scope globs cover direct children.** The write-scope gate

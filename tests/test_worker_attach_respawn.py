@@ -115,5 +115,28 @@ class WorkerAttachRespawnTests(unittest.TestCase):
         self.assertEqual(len(respawns), 2)
 
 
+class IncompleteTasksErrorTests(unittest.TestCase):
+    def test_error_names_each_unfinished_task_and_its_recorded_failure(self) -> None:
+        # Windows CI ended this suite with only "swarm exited with incomplete
+        # tasks"; the worker's failed_task event held the reason and was lost.
+        from dataclasses import replace
+
+        from puppetmaster.models import Task
+
+        with TemporaryDirectory() as tmp:
+            store = SwarmStore(Path(tmp) / ".puppetmaster")
+            store.init()
+            job = store.create_job("two roles")
+            done = Task(job_id=job.id, role="explore", instruction="x")
+            failed = Task(job_id=job.id, role="review", instruction="y")
+            store.save_tasks([replace(done, status=TaskStatus.COMPLETE),
+                              replace(failed, status=TaskStatus.FAILED)])
+            store.emit(job.id, "worker.failed_task",
+                       {"task_id": failed.id, "role": "review", "error": "PermissionError: lock busy"})
+            error = Orchestrator(store)._incomplete_tasks_error(job, {done.id, failed.id})
+        self.assertEqual(str(error), f"swarm exited with incomplete tasks: review {failed.id} failed "
+                                     "(PermissionError: lock busy)")
+
+
 if __name__ == "__main__":
     unittest.main()

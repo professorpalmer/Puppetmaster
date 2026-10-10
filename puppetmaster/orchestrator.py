@@ -1733,6 +1733,33 @@ class Orchestrator:
                 return True
         return False
 
+    def _incomplete_tasks_error(self, job: Job, allowed_task_ids: set[str]) -> RuntimeError:
+        """Name each unfinished task with its status and the last failure a worker recorded.
+
+        The bare message hid why a task ended FAILED: the worker's own
+        ``worker.failed_task`` / ``worker.gate_failed`` event held the reason.
+        """
+        reasons: dict[str, str] = {}
+        try:
+            for event in self.store.read_events(job.id):
+                if event.get("event") not in ("worker.failed_task", "worker.gate_failed"):
+                    continue
+                payload = event.get("payload") or {}
+                task_id = str(payload.get("task_id") or "")
+                reason = payload.get("error") or payload.get("failure") or payload.get("reason") or event["event"]
+                if task_id:
+                    reasons[task_id] = str(reason)[:300]
+        except Exception:
+            pass
+        parts = [
+            f"{task.role} {task.id} {task.status.value}"
+            + (f" ({reasons[task.id]})" if task.id in reasons else "")
+            for task in self.store.list_tasks(job.id)
+            if task.id in allowed_task_ids and task.status not in SATISFIED_TASK_STATUSES
+        ]
+        message = "swarm exited with incomplete tasks"
+        return RuntimeError(f"{message}: {'; '.join(parts)}" if parts else message)
+
     def _should_fail_closed(self, job: Job, allowed_task_ids: set[str]) -> bool:
         """Terminal-point verdict: should the orchestrator raise (fail the job)?
 
@@ -2696,7 +2723,7 @@ class Orchestrator:
             ]
         if not tasks:
             if self._should_fail_closed(job, allowed_task_ids):
-                raise RuntimeError("swarm exited with incomplete tasks")
+                raise self._incomplete_tasks_error(job, allowed_task_ids)
             return
 
         self._maybe_gate_conflict_auditor(job)
@@ -2708,7 +2735,7 @@ class Orchestrator:
         ]
         if not tasks:
             if self._should_fail_closed(job, allowed_task_ids):
-                raise RuntimeError("swarm exited with incomplete tasks")
+                raise self._incomplete_tasks_error(job, allowed_task_ids)
             return
 
         roles = sorted({task.role for task in tasks})
@@ -2761,7 +2788,7 @@ class Orchestrator:
                         worker_mode=worker_mode,
                     )
                 elif self._should_fail_closed(job, allowed_task_ids):
-                    raise RuntimeError("swarm exited with incomplete tasks")
+                    raise self._incomplete_tasks_error(job, allowed_task_ids)
         finally:
             for _role, process in processes:
                 if process.poll() is None:
@@ -2793,7 +2820,7 @@ class Orchestrator:
                 ]
                 if not ready_tasks:
                     if self._should_fail_closed(job, allowed_task_ids):
-                        raise RuntimeError("swarm exited with incomplete tasks")
+                        raise self._incomplete_tasks_error(job, allowed_task_ids)
                     # Either fully complete, or only recoverable adapter-billing
                     # failures remain — hand back to the auto-fallback sweep.
                     return
@@ -2804,7 +2831,7 @@ class Orchestrator:
                 )
                 if completed == 0:
                     if self._should_fail_closed(job, allowed_task_ids):
-                        raise RuntimeError("swarm exited with incomplete tasks")
+                        raise self._incomplete_tasks_error(job, allowed_task_ids)
                     # No progress and only recoverable failures left — stop spinning
                     # and let auto_fallback re-route on a funded adapter.
                     return
