@@ -197,7 +197,8 @@ class ReleaseBlockerTests(unittest.TestCase):
             task, run = self.task_run(store, job)
             with self.assertRaises(StoreIdentityError):
                 selected.request_cancellation(legacy, 'request', [task_binding(task)])
-        self.assertEqual(job_schema()['properties']['job_ref']['properties']['version']['enum'], [1,2])
+        # The schema does not restrict the version: a legacy ref passes to JobRef.
+        self.assertNotIn('properties', job_schema()['properties']['job_ref'])
 
     def test_legacy_effect_cancel_and_completion_replay_preserve_persisted_identity(self):
         for store, job, ref in self.stores():

@@ -69,7 +69,7 @@ python -m puppetmaster agentic "Audit the auth module for risks" --mode analyze 
 python -m puppetmaster agentic "Fix the README typo" --mode implement --provider openai --model gpt-5.4-mini
 ```
 
-No host restart, no MCP registration into an external agent — call `puppetmaster agentic` from the CLI or `puppetmaster_agentic` / `puppetmaster_start_agentic` from any MCP client that has Puppetmaster wired.
+No host restart, no MCP registration into an external agent — call `puppetmaster agentic` from the CLI, or pass `adapter: "agentic"` to `puppetmaster_start_implement` / `puppetmaster_start_swarm` from any MCP client that has Puppetmaster wired.
 
 `puppetmaster cursor` and `puppetmaster claude` default to `--worker-mode inline` for daily-driver speed. That skips an extra Puppetmaster Python worker subprocess while preserving job state, task leases, artifacts, stitching, and the provider's own process boundary. Pass `--worker-mode subprocess` when strict worker process isolation matters more than latency.
 

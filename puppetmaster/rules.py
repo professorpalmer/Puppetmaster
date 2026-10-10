@@ -160,7 +160,7 @@ RULE_BODY = textwrap.dedent(
       lenses; `puppetmaster_edit` for one focused in-place edit that builds on
       uncommitted work; `puppetmaster_start_implement` for one coupled change
       in an isolated worktree. With a provider API key but no vendor CLI
-      (keys-only), use `puppetmaster_agentic` / `puppetmaster_start_agentic`.
+      (keys-only), pass `adapter: "agentic"` to these verbs.
     - Every asynchronous `start_*` response is a resumable contract: follow
       its returned `monitor_with` tool with the exact `job_ref`. Treat only
       `delivery.verdict == "delivered"` as success.

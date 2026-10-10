@@ -1166,7 +1166,7 @@ def handle_message(message: JsonObject) -> Optional[JsonObject]:
                 },
             }
         elif method == "tools/list":
-            result = {"tools": [tool_to_json(tool) for tool in tools()]}
+            result = {"tools": [tool_to_json(tool) for tool in listed_tools()]}
         elif method == "tools/call":
             params = message.get("params") or {}
             result = call_tool(str(params.get("name", "")), params.get("arguments") or {})
@@ -1342,6 +1342,63 @@ def tools() -> list[McpTool]:
     if _TOOLS_CACHE is None:
         _TOOLS_CACHE = _build_tools()
     return _TOOLS_CACHE
+
+
+# tools/list sends every listed tool's schema in the client's first request,
+# so each extra tool costs every pilot turn input tokens. The core set covers
+# all work: the generic verbs take any adapter. A hidden tool stays callable.
+CORE_TOOLS = frozenset({
+    "puppetmaster_flow",
+    "puppetmaster_start_implement",
+    "puppetmaster_edit",
+    "puppetmaster_start_swarm",
+    "puppetmaster_start_review",
+    "puppetmaster_await_job",
+    "puppetmaster_live_artifacts_follow",
+    "puppetmaster_status",
+    "puppetmaster_logs",
+    "puppetmaster_show",
+    "puppetmaster_artifacts",
+    "puppetmaster_steer",
+    "puppetmaster_cut_task",
+    "puppetmaster_last_job",
+    "puppetmaster_list_job_summaries",
+    "puppetmaster_doctor",
+    "puppetmaster_route_task",
+    "puppetmaster_dashboard",
+    "puppetmaster_codegraph_search",
+    "puppetmaster_codegraph_context",
+    "puppetmaster_codegraph_affected",
+    "puppetmaster_codegraph_files",
+    "puppetmaster_codegraph_status",
+    "puppetmaster_codegraph_init",
+})
+
+
+def listed_tools() -> list[McpTool]:
+    """The tools ``tools/list`` shows, from ``PUPPETMASTER_MCP_TOOLS``.
+
+    Unset or ``core``: the core set. ``all``: every tool. Otherwise a comma
+    list of tool names (with or without the ``puppetmaster_`` prefix) added
+    to the core set. An unknown name is an error, not a silent no-op.
+    """
+    raw = os.environ.get("PUPPETMASTER_MCP_TOOLS", "").strip()
+    if raw.lower() == "all":
+        return tools()
+    wanted = set(CORE_TOOLS)
+    if raw and raw.lower() != "core":
+        names = {
+            name if name.startswith("puppetmaster_") else f"puppetmaster_{name}"
+            for name in (part.strip() for part in raw.split(","))
+            if name and name.lower() != "core"
+        }
+        unknown = sorted(names - set(_tool_registry()))
+        if unknown:
+            raise ValueError(
+                f"PUPPETMASTER_MCP_TOOLS names unknown tools: {', '.join(unknown)}"
+            )
+        wanted |= names
+    return [tool for tool in tools() if tool.name in wanted]
 
 
 def _tool_registry() -> dict[str, McpTool]:
@@ -1715,7 +1772,7 @@ def _build_tools() -> list[McpTool]:
                 "reach a terminal state (complete/failed), then return its status and a "
                 "compact completion digest (counts, deduped headlines, failed/degraded "
                 "tasks, summary_ref). For the full stitched text pass summary=\"full\", "
-                "or use puppetmaster_partial_summary / `puppetmaster show <job>`. If it "
+                "or use puppetmaster_show / `puppetmaster show <job>`. If it "
                 "times out first, returns timed_out=true with the current status so you "
                 "can immediately call again to keep awaiting (the MCP turn can't block "
                 "forever). Prefer this over polling status in a loop."
@@ -4764,20 +4821,12 @@ def base_schema() -> JsonObject:
 def job_schema(required: bool = False) -> JsonObject:
     schema = base_schema()
     schema["properties"]["job_id"] = {"type": "string", "description": "Puppetmaster job id."}
+    # models.JobRef parses the fields at the boundary. A strict schema here
+    # repeated that parse in every job tool's listing.
     schema["properties"]["job_ref"] = {
         "type": "object",
-        "description": "Opaque continuation identity returned by an asynchronous start.",
-        "properties": {
-            "job_id": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[\\x00-\\x7f]+$"},
-            "state_id": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[\\x00-\\x7f]+$"},
-            "version": {"type": "integer", "enum": [1, 2]},
-            "incarnation": {"type": "string", "format": "uuid", "minLength": 36, "maxLength": 36},
-        },
+        "description": "The job_ref an asynchronous start returned. Pass it back unchanged.",
         "required": ["job_id", "state_id"],
-        "oneOf": [
-            {"required": ["version", "incarnation"], "properties": {"version": {"const": 2}}},
-            {"properties": {"version": {"const": 1}}, "not": {"required": ["incarnation"]}},
-        ],
     }
     if required:
         schema["anyOf"] = [{"required": ["job_id"]}, {"required": ["job_ref"]}]
@@ -6312,7 +6361,6 @@ def bounded_metadata_schema(*, changes=False, economics=False):
     if economics:
         schema['required'] = ['job_ref']
         props['job_ref']['required'] = ['job_id', 'state_id', 'version', 'incarnation']
-        props['job_ref']['properties']['version'] = {'const': 2}
         props['expected_summary_revision'] = {'type': 'integer', 'minimum': 0, 'maximum': 9007199254740991}
     else:
         props.update(job_scope_schema_properties())

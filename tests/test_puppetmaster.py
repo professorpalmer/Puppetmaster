@@ -274,7 +274,8 @@ class PuppetmasterTests(unittest.TestCase):
         self.addCleanup(_codegraph_mod.reset_cursor_codegraph_invocation_cache)
 
     def test_mcp_lists_puppetmaster_agent_tools(self) -> None:
-        response = handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        with patch.dict(os.environ, {"PUPPETMASTER_MCP_TOOLS": "all"}):
+            response = handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         tool_names = {tool["name"] for tool in response["result"]["tools"]}
 
         self.assertIn("puppetmaster_doctor", tool_names)
@@ -12671,13 +12672,19 @@ class ModelRouterTests(unittest.TestCase):
         self.assertEqual(catalog, [])
 
     def test_rules_mention_agentic_keys_only_verbs(self) -> None:
+        import re
+
+        from puppetmaster.mcp_server import CORE_TOOLS, tools
         from puppetmaster.rules import RULE_BODY, render_agents_block, render_cursor_mdc
 
+        hidden = {tool.name for tool in tools()} - set(CORE_TOOLS)
         for content in (RULE_BODY, render_cursor_mdc(), render_agents_block()):
             flattened = " ".join(content.split())
-            self.assertIn("puppetmaster_agentic", flattened)
-            self.assertIn("puppetmaster_start_agentic", flattened)
+            self.assertIn('adapter: "agentic"', flattened)
             self.assertIn("keys-only", flattened)
+            # Rules name only tools the server lists by default.
+            named = set(re.findall(r"puppetmaster_[a-z_]+", flattened))
+            self.assertEqual(sorted(named & hidden), [])
 
     def test_model_payload_defaults_for_effort_agentic(self) -> None:
         from puppetmaster.cli.commands_models import model_payload_defaults_for_effort
@@ -26151,7 +26158,7 @@ class InvocationGateTests(unittest.TestCase):
     def test_role_inference_maps_to_verbs(self):
         from puppetmaster.invocation_gate import infer_role_and_verb
 
-        self.assertEqual(infer_role_and_verb("design the caching layer")[1], "puppetmaster_start_cursor_plan")
+        self.assertEqual(infer_role_and_verb("design the caching layer")[1], "puppetmaster_start_swarm")
         self.assertEqual(infer_role_and_verb("where is ClientError defined")[1], "puppetmaster_codegraph_search")
 
     def test_codegraph_lookups_delegate_regardless_of_score(self):
@@ -26494,9 +26501,10 @@ class HookRunnerTests(unittest.TestCase):
             verb_for_host("puppetmaster_codegraph_search", "claude"),
             "puppetmaster_codegraph_search",
         )
+        # Cursor hosts too: the cursor verbs are not listed by default.
         self.assertEqual(
             verb_for_host("puppetmaster_start_cursor_swarm", "cursor"),
-            "puppetmaster_start_cursor_swarm",
+            "puppetmaster_start_swarm",
         )
         # Hermes is not Cursor → gets the platform-portable verb, never a
         # cursor-specific one it can't invoke.

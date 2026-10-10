@@ -15,7 +15,9 @@ import unittest
 
 from puppetmaster.diagnostics import adapter_status
 from puppetmaster.mcp_remote import IMPLEMENT_TOOL_NAMES, filtered_tools
-from puppetmaster.mcp_server import handle_message, tools
+from unittest import mock
+
+from puppetmaster.mcp_server import CORE_TOOLS, call_tool, handle_message, listed_tools, tools
 from puppetmaster.platform_lock import KNOWN_ADAPTERS
 
 
@@ -63,8 +65,27 @@ FORBIDDEN_ADAPTERS = frozenset({"grok-bot", "grok_bot", "grokbot"})
 
 
 class StdioMcpSurfaceGuards(unittest.TestCase):
+    def test_stdio_tools_list_is_the_core_set_by_default(self) -> None:
+        with mock.patch.dict("os.environ", {"PUPPETMASTER_MCP_TOOLS": ""}):
+            response = handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        names = {tool["name"] for tool in response["result"]["tools"]}
+        self.assertEqual(names, set(CORE_TOOLS))
+        # A hidden tool still answers a call by name.
+        with mock.patch.dict("os.environ", {"PUPPETMASTER_MCP_TOOLS": ""}):
+            result = call_tool("puppetmaster_mcp_status", {})
+        self.assertFalse(result.get("isError"), result)
+
+    def test_mcp_tools_env_adds_named_tools_and_refuses_unknown(self) -> None:
+        with mock.patch.dict("os.environ", {"PUPPETMASTER_MCP_TOOLS": "codex, puppetmaster_gc"}):
+            names = {tool.name for tool in listed_tools()}
+        self.assertEqual(names, set(CORE_TOOLS) | {"puppetmaster_codex", "puppetmaster_gc"})
+        with mock.patch.dict("os.environ", {"PUPPETMASTER_MCP_TOOLS": "codex,no_such_tool"}):
+            with self.assertRaisesRegex(ValueError, "puppetmaster_no_such_tool"):
+                listed_tools()
+
     def test_stdio_tools_list_includes_doctor_and_implement(self) -> None:
-        response = handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        with mock.patch.dict("os.environ", {"PUPPETMASTER_MCP_TOOLS": "all"}):
+            response = handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         assert response is not None
         names = {tool["name"] for tool in response["result"]["tools"]}
         missing = sorted(REQUIRED_STDIO_TOOLS - names)
@@ -104,7 +125,7 @@ class StdioMcpSurfaceGuards(unittest.TestCase):
         names = {tool["name"] for tool in payload["result"]["tools"]}
         self.assertIn("puppetmaster_doctor", names)
         self.assertIn("puppetmaster_start_implement", names)
-        self.assertEqual(len(names), len(tools()))
+        self.assertEqual(len(names), len(listed_tools()))
 
     def test_remote_supervise_is_strict_subset_of_stdio(self) -> None:
         stdio = {tool.name for tool in tools()}

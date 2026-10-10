@@ -12,11 +12,11 @@ transcripts; size the runtime; nuke the job.
 ## Verbs
 
 - Coupled multi-file feature: `puppetmaster_start_implement`
-- Keys-only contained path: `puppetmaster_start_agentic`
-- Size / preflight the work: `puppetmaster_start_prewalk` or `puppetmaster_route_task`
-- Recall: `puppetmaster_effort_index` then `puppetmaster_show`
+- Keys-only contained path: `puppetmaster_start_implement` with `adapter: "agentic"`
+- Size / preflight the work: `puppetmaster_route_task`
+- Recall: `puppetmaster_show`
 - Status: `puppetmaster_status` / `puppetmaster_artifacts` with refs
-- Done: `puppetmaster_gc` the finished job. Do not keep workers alive.
+- Done: `puppetmaster gc` the finished job. Do not keep workers alive.
 
 Do not read worker transcripts. Prefer compact refs and `show`.
  
