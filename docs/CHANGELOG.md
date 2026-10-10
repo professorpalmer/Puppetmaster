@@ -16,6 +16,17 @@ tokens) before the run stopped as `stuck`.
   `["state"]["item"]["regions"]`. The pilot's second graph had to search the
   whole context file for the list.
 
+**Windows fixes found by the release CI.**
+
+- The lean Codex worker home uses the shared `InterProcessFileLock` for
+  `.sync.lock`. Its own lock raised `PermissionError` when a parallel start
+  created the lock file while another start deleted it (Windows keeps the
+  file delete-pending). A dead owner is now also reclaimed by process
+  identity, not only by file age.
+- `test_a_long_wait_reports_the_holder_not_each_poll` releases the holder
+  only after the waiter reports its wait. Under load, a fixed 1 s timer could
+  release the holder before the waiter met it.
+
 ## v1.43.0 — 2026-10-10
 
 **The MCP server lists a core set of 24 tools by default.** A client sends
