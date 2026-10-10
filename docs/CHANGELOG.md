@@ -1,3 +1,16 @@
+## v1.42.3 — 2026-10-10
+
+**A list template inside `files` no longer makes every map item overlap.**
+A pilot graph used `"files": ["{{item.files}}"]` with a list of paths per
+item. The list rendered inside the list, and the scope check read it as one
+string that starts with `[`. That is a glob with no literal prefix, so the map
+refused four disjoint groups as "overlapping files", and the pilot had to
+build a second graph. The same text was the build worker's write scope. Now
+`render_files` flattens nested lists and splits text templates by line for the
+map scope check, the worker write scope and the judge review scope. Real
+overlap is still refused, and the error now names the two entries that
+overlap.
+
 ## v1.42.2 — 2026-10-10
 
 **An incomplete swarm says which task failed and why.** The error was only

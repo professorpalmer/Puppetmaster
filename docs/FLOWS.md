@@ -121,6 +121,9 @@ with no edges ends the run.
 `{{files.<node>}}`, `{{state.<path>}}`, and inside a map item `{{item}}`,
 `{{item.<path>}}`, `{{index}}`, `{{key}}`. A field that is exactly one
 placeholder keeps its type, so `"files": "{{item.files}}"` stays a list.
+In `files`, a list placeholder inside a list is flattened:
+`["{{item.files}}", "reports/{{item.id}}/*"]` gives the item's paths plus the
+report glob.
 
 Shell commands only accept substituted values made of letters, digits and
 `_ . / : = @ + , -`. Anything else fails the node instead of running, because a

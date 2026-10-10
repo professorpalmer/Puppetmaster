@@ -526,6 +526,29 @@ def render_value(value: Any, run: "FlowRun", prev: str = "") -> Any:
     return value
 
 
+def render_files(value: Any, run: "FlowRun", prev: str = "") -> list[str]:
+    """A node's ``files`` as flat paths.
+
+    ``["{{item.files}}"]`` renders to a list inside a list, and a text
+    template renders to one path per line. Each must give the paths, not
+    ``str()`` of a list: that starts with ``[``, a glob with no literal
+    prefix, so it overlapped every other scope.
+    """
+    paths: list[str] = []
+    for entry in _flat(render_value(value, run, prev)):
+        if isinstance(entry, str):
+            paths.extend(line.strip() for line in entry.splitlines() if line.strip())
+        elif entry is not None:
+            paths.append(str(entry))
+    return paths
+
+
+def _flat(value: Any) -> list:
+    if isinstance(value, (list, tuple)):
+        return [leaf for entry in value for leaf in _flat(entry)]
+    return [value]
+
+
 def _resolve(name: str, run: "FlowRun", prev: str) -> Any:
     if name == "input":
         return run.input
@@ -1591,11 +1614,9 @@ class JobNodeExecutor:
                     task = f"{task}\n\n{revision}"
         else:
             payload.update(_WRITE)
-            files = render_value(node.get("files"), run, prev)
-            if isinstance(files, str):
-                files = [line.strip() for line in files.splitlines() if line.strip()]
+            files = render_files(node.get("files"), run, prev)
             if files:
-                payload["write_scope"] = [str(path) for path in files]
+                payload["write_scope"] = files
             peers = (run.parent or {}).get("peer_scopes")
             if peers:
                 # Sibling map items edit the same workspace in their own jobs.
@@ -2155,8 +2176,14 @@ def _check_disjoint(node_id: str, scopes: dict[str, list[str]]) -> None:
             globbed.append((key, paths))
     for key, paths in globbed:
         for other, other_paths in scopes.items():
-            if other != key and scopes_overlap(paths, other_paths):
-                raise FlowError(f"map {node_id!r} items {key!r} and {other!r} have overlapping files")
+            if other == key:
+                continue
+            pair = next(((a, b) for a in paths for b in other_paths if scopes_overlap([a], [b])), None)
+            if pair:
+                raise FlowError(
+                    f"map {node_id!r} items {key!r} and {other!r} have overlapping files: "
+                    f"{pair[0]!r} and {pair[1]!r}"
+                )
 
 
 def _item_scopes(child_graph: dict, keys: list[str], items: list) -> dict[str, list[str]]:
@@ -2167,10 +2194,7 @@ def _item_scopes(child_graph: dict, keys: list[str], items: list) -> dict[str, l
         owned: list[str] = []
         for item_node in child_graph.get("nodes") or []:
             if item_node.get("kind") == "agent" and item_node.get("role", "code") == "code":
-                files = render_value(item_node.get("files"), probe)
-                if isinstance(files, str):
-                    files = [line.strip() for line in files.splitlines() if line.strip()]
-                owned.extend(str(path) for path in files or [])
+                owned.extend(render_files(item_node.get("files"), probe))
         scopes[key] = owned
     return scopes
 
@@ -2199,10 +2223,7 @@ def _review_scope(run: FlowRun, prev: str) -> list[str]:
     for node in run.graph.get("nodes") or []:
         if node.get("kind") != "agent" or node.get("role") == "explore" or not node.get("files"):
             continue
-        files = render_value(node["files"], run, prev)
-        if isinstance(files, str):
-            files = [line.strip() for line in files.splitlines() if line.strip()]
-        scope.update(str(path) for path in files or [])
+        scope.update(render_files(node["files"], run, prev))
     return sorted(scope)
 
 
