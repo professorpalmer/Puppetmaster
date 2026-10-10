@@ -1,3 +1,21 @@
+## v1.43.1 — 2026-10-10
+
+**A refused shell template fails the run at once and does not rebuild.** In
+the R55 control, a map item's check command used `{{item.regions}}`, a list.
+Puppetmaster refused the value as unsafe for a shell, which is correct. But
+the refusal counted as a failed check, so the `fail` edge sent the item back
+to `build` twice, and correct code was built three times (about 935,000 input
+tokens) before the run stopped as `stuck`.
+
+- A refused template is a `GraphError`: the run fails as
+  `graph-error "<node>"` with no retry and no repair edge.
+- A map checks the `item`, `index` and `key` values in its shell commands
+  before it starts any worker. `state` values are left to the run, because a
+  `set` node can still change them.
+- The error names the key path in `PM_FLOW_CONTEXT`, for example
+  `["state"]["item"]["regions"]`. The pilot's second graph had to search the
+  whole context file for the list.
+
 ## v1.43.0 — 2026-10-10
 
 **The MCP server lists a core set of 24 tools by default.** A client sends
