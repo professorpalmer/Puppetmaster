@@ -171,6 +171,12 @@ to whichever worker's gate sees it. Keep per-unit output directories
 disjoint, and do not give every unit one broad shared output glob: that
 reintroduces contention. Gitignored outputs are never judged.
 
+Task scopes, sibling scopes and pilot claims use one match rule. A glob
+matches as Python `fnmatch` does, so `*` can also match `/`. A `**/` segment
+also matches zero directories: `renders/r1/**/*` covers `renders/r1/a.json`
+and `renders/r1/x/a.json`, but not `renders/r2/a.json`. A plain path matches
+itself.
+
 Shared files no item owns (a package `__init__.py`, a registry, a manifest)
 need an owner too, and so do shared assembly outputs (an integrated render,
 a combined scene file). Route the assembled judge's FAIL through an `integrate`

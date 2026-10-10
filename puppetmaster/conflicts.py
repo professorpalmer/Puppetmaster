@@ -15,10 +15,54 @@ a silent collision) and never needs to enumerate the filesystem.
 
 from __future__ import annotations
 
+import fnmatch
 from pathlib import PurePosixPath
 from typing import Iterable, Sequence
 
 _WILDCARD_CHARS = set("*?[")
+
+
+def _zero_directory_forms(glob: str) -> set[str]:
+    """``glob`` plus each form with one or more ``**/`` segments removed.
+
+    fnmatch reads ``**/`` as "something, then a slash", so it never matches
+    zero directories: ``a/**/*`` missed ``a/file``. Each removed segment is
+    the zero-directory case of the usual recursive-glob meaning.
+    """
+    forms = {glob}
+    pending = [glob]
+    while pending:
+        current = pending.pop()
+        start = 0
+        while True:
+            index = current.find("**/", start)
+            if index < 0:
+                break
+            if index == 0 or current[index - 1] == "/":
+                shorter = current[:index] + current[index + 3:]
+                if shorter not in forms:
+                    forms.add(shorter)
+                    pending.append(shorter)
+            start = index + 1
+    return forms
+
+
+def path_in_scope(path: str, globs: Iterable[str]) -> bool:
+    """True when ``path`` is inside a write scope.
+
+    One contract for task scopes, sibling scopes and pilot claims. A glob
+    matches as fnmatch does (``*`` can cross ``/``), ``**/`` can also match
+    zero directories, and a plain path matches itself or ``path/``.
+    """
+    for glob in globs:
+        text = str(glob)
+        if not text.strip():
+            continue
+        if path == text.rstrip("/"):
+            return True
+        if any(fnmatch.fnmatch(path, form) for form in _zero_directory_forms(text)):
+            return True
+    return False
 
 
 def _glob_prefix(glob: str) -> str:
