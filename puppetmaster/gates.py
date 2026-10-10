@@ -359,8 +359,8 @@ def _gate_write_scope(
     writer's claim, the shared tree cannot tell the pilot's file from the
     worker's.
     """
-    import fnmatch
     from puppetmaster.adapters import git_snapshot
+    from puppetmaster.conflicts import path_in_scope as covered
     from puppetmaster.worker_attribution import path_is_referenced, path_was_dirty_before
 
     scope = [str(g) for g in (spec.get("scope") or spec.get("globs") or []) if str(g).strip()]
@@ -386,9 +386,6 @@ def _gate_write_scope(
             changed.update((artifact.payload or {}).get("untracked_files") or [])
 
     changed = _expand_untracked_dirs(changed, cwd)
-
-    def covered(path: str, globs: list[str]) -> bool:
-        return any(fnmatch.fnmatch(path, glob) or path == glob.rstrip("/") for glob in globs)
 
     candidates = sorted(
         path

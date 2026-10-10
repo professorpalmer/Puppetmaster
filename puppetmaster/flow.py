@@ -56,6 +56,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from puppetmaster.conflicts import path_in_scope
 from puppetmaster.models import ArtifactType, JobStatus, TaskStatus, now_iso
 from puppetmaster.proc_identity import pid_reused, process_identity
 from puppetmaster.swarm_reasoning import EFFORTS, WorkerEffortError, operator_effort_profile
@@ -1528,7 +1529,7 @@ class JobNodeExecutor:
                     scope = spec.payload.get("write_scope")
                     if scope:
                         # A shared workspace's snapshot also holds siblings' edits.
-                        outcome.files = [path for path in outcome.files if _in_scope(path, scope)]
+                        outcome.files = [path for path in outcome.files if path_in_scope(path, scope)]
                 if combine and node["kind"] == "judge" and outcome.ok and outcome.verdict is None:
                     outcome.verdict = "PARTIAL"  # a judge branch without a verdict never counts as a pass
                     outcome.reason = outcome.reason or "judge gave no verdict"
@@ -2031,12 +2032,6 @@ def _cut_jobs(state_dir: Path, backend: str, job_ids: list[str]) -> None:
             except Exception as exc:
                 print(f"[flow] cut of {job_id}/{task.id} failed, will retry: {type(exc).__name__}: {exc}",
                       file=sys.stderr)
-
-
-def _in_scope(path: str, scope: list) -> bool:
-    import fnmatch
-
-    return any(fnmatch.fnmatch(path, str(glob)) or path == str(glob).rstrip("/") for glob in scope)
 
 
 def _kill_tree(pid: int) -> bool:

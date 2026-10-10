@@ -1,3 +1,15 @@
+## v1.42.1 — 2026-10-10
+
+**Recursive write-scope globs cover direct children.** The write-scope gate
+and the flow file filter used `fnmatch`, which reads `**/` as "something,
+then a slash". So `renders/region_001/**/*` rejected the worker's own
+`renders/region_001/revision_3_validation.json`. A real canary worker
+returned PASS, and the gate failed it on four files in its declared scope.
+Now `**/` also matches zero directories. A neighboring region stays outside
+the scope. Task scopes, sibling scopes, pilot claims and the flow file
+filter share one matcher, `conflicts.path_in_scope`. A glob that passed
+before still passes.
+
 ## v1.42.0 — 2026-10-09
 
 **Current model lists on every adapter.** The static catalogs and the starter

@@ -24409,6 +24409,41 @@ class PuppetmasterGateTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "cannot claim"):
                     flow_action(store.root, "claim", {"run_id": root.run_id, "paths": ["x"]})
 
+    def test_recursive_scope_covers_direct_children_but_not_a_neighbor(self) -> None:
+        # PM 1.42 r35 canary: renders/region_001/**/* rejected the worker's own
+        # renders/region_001/revision_3_validation.json (fnmatch "**/" needs a dir).
+        from puppetmaster.gates import _gate_write_scope, evaluate_task_gates
+
+        with TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            repo = Path(tmp) / "repo"
+            self._git_repo(repo)
+            own = ["renders/region_001/**/*"]
+            task = self._task(write_scope=own, cwd=str(repo))
+            inside = ["renders/region_001/revision_3_validation.json",
+                      "renders/region_001/check/revision_3_validation.json"]
+            result = evaluate_task_gates(task, self._attributed_run(task, inside, referenced=inside),
+                                         store, worker_id="w1", cwd=repo)
+            self.assertTrue(result.passed, result.failed_reason)
+
+            neighbor = ["renders/region_005/revision_3_validation.json", "renders/region_0010/x.json"]
+            result = evaluate_task_gates(task, self._attributed_run(task, neighbor, referenced=neighbor),
+                                         store, worker_id="w1", cwd=repo)
+            self.assertFalse(result.passed)
+            self.assertIn("renders/region_005", result.failed_reason)
+            self.assertIn("renders/region_0010", result.failed_reason)
+
+            # Sibling scopes and pilot claims use the same match contract.
+            sibling_file = "renders/region_005/revision_3_validation.json"
+            sibling = _gate_write_scope("s", {"scope": own}, self._attributed_run(task, [sibling_file]),
+                                        repo, sibling_scopes=["renders/region_005/**/*"])
+            self.assertTrue(sibling.passed, sibling.detail)
+            claimed = _gate_write_scope("c", {"scope": own},
+                                        self._attributed_run(task, ["notes/a.md"], referenced=[], baseline=[]),
+                                        repo, pilot_claims=["notes/**/*"])
+            self.assertTrue(claimed.passed, claimed.detail)
+            self.assertEqual(claimed.detail["pilot_claimed"], ["notes/a.md"])
+
     def test_write_scope_failure_names_where_and_whether_the_worker_named_it(self) -> None:
         # The N16 canary shape: region sources in scope, renders nobody declared.
         from puppetmaster.gates import evaluate_task_gates
