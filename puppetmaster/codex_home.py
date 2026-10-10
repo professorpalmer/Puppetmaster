@@ -35,9 +35,10 @@ import re
 import shutil
 import subprocess
 import tempfile
-import time
 from pathlib import Path
 from typing import Optional
+
+from puppetmaster.interprocess_lock import InterProcessFileLock
 
 # Tables a bounded worker must not inherit: they cost context or reach out.
 _DROPPED_TABLE = re.compile(r"^\[\[?\s*(mcp_servers|plugins|marketplaces|memories|hooks)\b")
@@ -106,32 +107,8 @@ def _write_atomic(path: Path, data: bytes, mode: int = 0o600) -> None:
     os.replace(tmp, path)
 
 
-class _Lock:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-
-    def __enter__(self) -> "_Lock":
-        deadline = time.monotonic() + 10
-        while True:
-            try:
-                os.close(os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
-                return self
-            except FileExistsError:
-                try:
-                    if time.time() - self.path.stat().st_mtime > _LOCK_STALE_SECONDS:
-                        self.path.unlink()
-                        continue
-                except OSError:
-                    continue
-                if time.monotonic() > deadline:
-                    raise TimeoutError(f"codex worker home lock busy: {self.path}")
-                time.sleep(0.05)
-
-    def __exit__(self, *exc: object) -> None:
-        try:
-            self.path.unlink()
-        except OSError:
-            pass
+def _sync_lock(home: Path) -> InterProcessFileLock:
+    return InterProcessFileLock.for_target(home / "sync", stale_after=_LOCK_STALE_SECONDS)
 
 
 def prepare(env: Optional[dict] = None, *, root: Optional[Path] = None) -> Optional[Path]:
@@ -141,7 +118,7 @@ def prepare(env: Optional[dict] = None, *, root: Optional[Path] = None) -> Optio
         return None
     home = root or worker_home_root()
     home.mkdir(parents=True, exist_ok=True)
-    with _Lock(home / ".sync.lock"):
+    with _sync_lock(home):
         try:
             config = (source / "config.toml").read_text(encoding="utf-8")
         except OSError:
@@ -176,7 +153,7 @@ def sync_back(env: Optional[dict] = None, *, root: Optional[Path] = None) -> boo
     source = user_home(env)
     home = root or worker_home_root()
     try:
-        with _Lock(home / ".sync.lock"):
+        with _sync_lock(home):
             synced = _read(home / ".auth.synced")
             worker = _digest(home / "auth.json")
             if not synced or worker in (None, synced) or _digest(source / "auth.json") != synced:
@@ -243,7 +220,7 @@ def ensure_system_skills(home: Path, command: list[str]) -> bool:
         return False
     if _system_skills_current(home, identity):
         return True
-    with _Lock(home / ".sync.lock"):
+    with _sync_lock(home):
         if _system_skills_current(home, identity):
             return True
         with tempfile.TemporaryDirectory(prefix="pm-codex-seed-") as tmp:

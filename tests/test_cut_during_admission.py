@@ -97,17 +97,35 @@ class CutDuringAdmissionTests(unittest.TestCase):
         db = self.root / "claims.sqlite3"
         with patch("puppetmaster.edit_admission.default_file_claim_db_path", return_value=db):
             holder = edit_admission(self.store, self.claimed("holder"), "holder")
-            threading.Timer(1.0, holder.close).start()
             waiter = self.claimed("repair")
-            waiter.payload["edit_admission_wait_seconds"] = 10
-            with edit_admission(self.store, waiter, "worker-repair") as owner:
-                self.assertGreaterEqual(owner.waited_seconds, 0.9)
-        waiting = [e for e in self.store.read_events(self.job.id) if e.get("event") == "edit_admission.waiting"]
+            waiter.payload["edit_admission_wait_seconds"] = 30
+            waited = {}
+
+            def wait():
+                with edit_admission(self.store, waiter, "worker-repair") as owner:
+                    waited["seconds"] = owner.waited_seconds
+
+            thread = threading.Thread(target=wait)
+            thread.start()
+            # Release only after the waiter met the holder, so a slow start
+            # under load cannot skip the wait.
+            deadline = time.monotonic() + 20
+            while not self._waiting_events() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            time.sleep(1.0)
+            holder.close()
+            thread.join(timeout=20)
+        self.assertFalse(thread.is_alive())
+        self.assertGreaterEqual(waited["seconds"], 0.9)
+        waiting = self._waiting_events()
         # About 20 polls in a second; one holder gives one event.
         self.assertEqual(len(waiting), 1)
         # The holder renewed about three times in that second, with no event rows.
         renewed = [e for e in self.store.read_events(self.job.id) if e.get("event") == "edit_admission.renewed"]
         self.assertEqual(renewed, [])
+
+    def _waiting_events(self):
+        return [e for e in self.store.read_events(self.job.id) if e.get("event") == "edit_admission.waiting"]
 
 
 class StopSettlesTests(unittest.TestCase):

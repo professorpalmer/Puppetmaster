@@ -929,6 +929,36 @@ class ReviewFixTests(Base):
         with self.assertRaisesRegex(flow.FlowError, "overlapping files: 'renders/region_000/\\*' and 'renders/\\*'"):
             flow._check_disjoint("m", flow._item_scopes(shape, ["group_00", "group_01"], items))
 
+    def test_an_unsafe_item_value_in_a_map_shell_fails_before_any_worker(self):
+        # R55: the check used {{item.regions}} (a list). Each refusal took the
+        # fail edge back to build, so correct code was rebuilt twice.
+        spawned = []
+        g = graph([{"id": "m", "kind": "map",
+                    "items": [{"id": "g0", "regions": ["region_000", "region_004"]}],
+                    "graph": {"entry": "build",
+                              "nodes": [{"id": "build", "kind": "agent", "task": "t", "files": ["src/{{item.id}}.py"]},
+                                        {"id": "check", "kind": "shell",
+                                         "command": "python3 judge.py {{item.regions}}"}],
+                              "edges": [{"from": "build", "to": "check"},
+                                        {"from": "check", "to": "build", "when": "fail", "max": 2}]}}])
+        run = self.start(g, JobNodeExecutor(self.state, spawn=lambda *a: spawned.append(a), poll_seconds=0.01))
+        self.assertEqual(run.status, "failed")
+        self.assertIn("graph-error", run.reason)
+        self.assertIn('["state"]["item"]["regions"]', run.reason)
+        self.assertEqual(spawned, [])
+
+    def test_an_unsafe_shell_value_at_run_time_takes_no_repair_edge(self):
+        g = graph([{"id": "seed", "kind": "set", "values": {"x": "a b"}},
+                   {"id": "check", "kind": "shell", "command": "echo {{state.x}}"},
+                   {"id": "fix", "kind": "set", "values": {"fixed": "yes"}}],
+                  [{"from": "seed", "to": "check"},
+                   {"from": "check", "to": "fix", "when": "fail"}])
+        run = self.start(g, JobNodeExecutor(self.state))
+        self.assertEqual(run.status, "failed")
+        self.assertTrue(run.reason.startswith('graph-error "check"'), run.reason)
+        self.assertIn('["state"]["x"]', run.reason)
+        self.assertNotIn("fixed", run.state)
+
     def test_stop_kills_a_long_shell_command_promptly(self):
         g = graph([{"id": "slow", "kind": "shell", "command": f'"{sys.executable}" -c "import time;time.sleep(60)"'}])
         run = flow.new_run(self.state, g, cwd=str(self.work))

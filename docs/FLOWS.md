@@ -126,9 +126,13 @@ In `files`, a list placeholder inside a list is flattened:
 report glob.
 
 Shell commands only accept substituted values made of letters, digits and
-`_ . / : = @ + , -`. Anything else fails the node instead of running, because a
-model's output must never become a command. Read arbitrary data from
-`$PM_FLOW_CONTEXT` instead.
+`_ . / : = @ + , -`. Anything else fails the run at once, because a model's
+output must never become a command, and a repair edge cannot change a
+template. A map checks its items' shell commands before it starts any worker.
+Read a list or other data from the JSON file at `$PM_FLOW_CONTEXT` instead:
+`input`, `prev`, `outputs`, `results` and `state`. Inside a map item, the item
+is at `["state"]["item"]`, for example
+`json.load(open(os.environ["PM_FLOW_CONTEXT"]))["state"]["item"]["regions"]`.
 
 ## Mass fan-out with `map`
 

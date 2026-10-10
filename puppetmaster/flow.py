@@ -106,6 +106,11 @@ class FlowError(ValueError):
     """A graph or run request that cannot be honored."""
 
 
+class GraphError(FlowError):
+    """A node that cannot run as the graph wrote it. No repair edge can fix it,
+    so the run fails at once: a rebuild cannot change a template."""
+
+
 # --------------------------------------------------------------------------
 # Validation
 
@@ -426,6 +431,8 @@ class NodeOutcome:
     usage: dict[str, Any] = field(default_factory=dict)
     task_id: Optional[str] = None
     items: Optional[dict] = None
+    # The graph cannot run as written: the run fails without a repair edge.
+    graph_error: bool = False
     # Durable worker logs that explain a failed launch (startup tracebacks).
     logs: list[str] = field(default_factory=list)
     # A judge's view of the files it reviewed: digest, count and per-file hashes.
@@ -501,10 +508,7 @@ def render(template: Any, run: "FlowRun", prev: str = "", *, shell: bool = False
             return match.group(0)
         text = _text(resolved)
         if shell and not _SHELL_SAFE.fullmatch(text):
-            raise FlowError(
-                f"{{{{{match.group(1)}}}}} is not safe in a shell command; "
-                "read it from the PM_FLOW_CONTEXT file instead"
-            )
+            raise GraphError(_unsafe_shell_message(match.group(1)))
         return text
 
     return _TEMPLATE.sub(value, str(template))
@@ -547,6 +551,27 @@ def _flat(value: Any) -> list:
     if isinstance(value, (list, tuple)):
         return [leaf for entry in value for leaf in _flat(entry)]
     return [value]
+
+
+def _unsafe_shell_message(name: str) -> str:
+    """Say where the command can read ``name`` instead: its key path in PM_FLOW_CONTEXT."""
+    head, _, rest = name.partition(".")
+    if head in ("input", "prev") and not rest:
+        keys = [head]
+    elif head == "out" and rest:
+        keys = ["outputs", rest]
+    elif head in ("verdict", "reason") and rest:
+        keys = ["results", rest, head]
+    elif head == "state" and rest:
+        keys = ["state", *rest.split(".")]
+    elif head in ("item", "index", "key"):
+        keys = ["state", *name.split(".")]
+    else:
+        keys = []
+    where = (' at json.load(open(os.environ["PM_FLOW_CONTEXT"]))'
+             + "".join(f'["{key}"]' for key in keys)) if keys else ""
+    return (f"{{{{{name}}}}} is not safe in a shell command; read it from the "
+            f"PM_FLOW_CONTEXT JSON file{where}")
 
 
 def _resolve(name: str, run: "FlowRun", prev: str) -> Any:
@@ -1012,6 +1037,10 @@ def _walk(state_dir: Path, run: FlowRun, execute: NodeExecutor) -> FlowRun:
 
 def _pick_edge(graph: dict, node: dict, outcome: NodeOutcome, run: FlowRun,
                max_loops: int, loops: set[int]):
+    if outcome.graph_error:
+        # A fail edge would rebuild work that is not at fault (a voxel run
+        # rebuilt correct code twice for a refused shell template).
+        return ("failed", f'graph-error "{node["id"]}": {outcome.error}')
     if node["kind"] == "judge" and outcome.ok and outcome.verdict is None:
         # A judge that forgets its verdict line is stuck, never a quiet pass.
         return ("stuck", f'no-edge: judge "{node["id"]}" gave no verdict')
@@ -1047,6 +1076,9 @@ def _execute_with_retries(state_dir: Path, node: dict, run: FlowRun,
     while True:
         try:
             outcome = execute(node, run, prev)
+        except GraphError as exc:
+            outcome = NodeOutcome(ok=False, error=str(exc), graph_error=True)
+            break
         except FlowError as exc:
             outcome = NodeOutcome(ok=False, error=str(exc))
         except Exception as exc:  # a node that raises is a failed node, not a dead walker
@@ -1831,6 +1863,7 @@ class JobNodeExecutor:
         depth = int((run.parent or {}).get("depth", 0)) + 1
         scopes = _item_scopes(child_graph, keys, items)
         _check_disjoint(node["id"], scopes)
+        _check_item_shell(child_graph, keys, items)
         interrupted = _interruption(self.state_dir, run)
         if interrupted and not children:
             return NodeOutcome(ok=False, error=interrupted)
@@ -2159,6 +2192,28 @@ def child_graph_for(node: dict, run: FlowRun) -> dict:
         "nodes": shape["nodes"],
         "edges": shape.get("edges") or [],
     }
+
+
+def _check_item_shell(child_graph: dict, keys: list[str], items: list) -> None:
+    """Refuse an unsafe item value in a shell command before any worker starts.
+
+    Only ``item``, ``index`` and ``key`` are fixed for the whole item run; a
+    ``state`` value can still change through a ``set`` node, so it is left
+    to the run.
+    """
+    for index, (key, item) in enumerate(zip(keys, items)):
+        probe = FlowRun(run_id="flow_000000000000", graph={}, state={"item": item, "index": index, "key": key})
+        for item_node in child_graph.get("nodes") or []:
+            if item_node.get("kind") != "shell":
+                continue
+            for field_name in ("command", "cwd"):
+                for match in _TEMPLATE.finditer(str(item_node.get(field_name) or "")):
+                    name = match.group(1)
+                    if name.partition(".")[0] not in ("item", "index", "key"):
+                        continue
+                    if not _SHELL_SAFE.fullmatch(_text(_resolve(name, probe, ""))):
+                        raise GraphError(f"map item {key!r} shell {item_node.get('id')!r}: "
+                                         + _unsafe_shell_message(name))
 
 
 def _check_disjoint(node_id: str, scopes: dict[str, list[str]]) -> None:
