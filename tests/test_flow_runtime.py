@@ -911,6 +911,24 @@ class ReviewFixTests(Base):
         self.assertEqual(run.status, "failed")
         self.assertIn("both own 'x.py'", run.steps[0]["error"])
 
+    def test_list_files_in_a_list_template_keep_disjoint_items_apart(self):
+        # A real pilot graph: "files": ["{{item.files}}"] with list items. The
+        # inner list became the string "['regions/...', ...]", whose glob
+        # prefix is empty, so every pair of items "overlapped".
+        items = [
+            {"id": "group_00", "files": ["regions/region_000.py", "renders/region_000/*", "reports/group_00/*"]},
+            {"id": "group_01", "files": ["regions/region_001.py", "renders/region_001/*", "reports/group_01/*"]},
+        ]
+        child = self.item_map(items, "{{item.files}}")["nodes"][0]
+        shape = flow._child_graph_shape(child)
+        scopes = flow._item_scopes(shape, ["group_00", "group_01"], items)
+        self.assertEqual(scopes["group_00"], items[0]["files"])
+        flow._check_disjoint("m", scopes)
+
+        items[1]["files"].append("renders/*")
+        with self.assertRaisesRegex(flow.FlowError, "overlapping files: 'renders/region_000/\\*' and 'renders/\\*'"):
+            flow._check_disjoint("m", flow._item_scopes(shape, ["group_00", "group_01"], items))
+
     def test_stop_kills_a_long_shell_command_promptly(self):
         g = graph([{"id": "slow", "kind": "shell", "command": f'"{sys.executable}" -c "import time;time.sleep(60)"'}])
         run = flow.new_run(self.state, g, cwd=str(self.work))
