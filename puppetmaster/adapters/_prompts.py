@@ -353,18 +353,32 @@ def build_implement_prompt(prompt: str) -> str:
     )
 
 
-_CLI_BUILD_CONTRACT = (
-    "Build mode: you are a full-edit worker in this repository. Deliver working "
-    "files, not a description of them: create and edit the files the task "
-    "assigns you, and leave every other file alone; other workers own them.",
+_BUILD_LOOP = (
     "Work in a build-check loop: make the change, run the checks the task names "
-    "(or the most relevant tests), read the results and fix what fails. Passing "
-    "checks are the floor, not the finish: when the task asks for quality the "
-    "checks do not measure and time remains, improve it and run the checks again.",
-    _IMPLEMENT_REPORT_CONTRACT,
-    "Keep that report to a few lines and end it with exactly one line "
-    "`VERDICT: PASS - reason` (or FAIL / PARTIAL). Do not return findings JSON.",
+    "(or the most relevant tests), read the results and fix what fails. "
 )
+
+# How a build worker knows it is done. ``improve`` is the default; ``criteria``
+# is the opt-in ``finish`` setting (a flow node or ``defaults``).
+FINISH_INSTRUCTIONS = {
+    "improve": "Passing checks are the floor, not the finish: when the task asks for quality the "
+               "checks do not measure and time remains, improve it and run the checks again.",
+    "criteria": "Done means: every acceptance criterion is met and every named check passes. "
+                "When both are true, stop and write the report. Do not make more changes for "
+                "quality that no criterion names.",
+}
+
+
+def _cli_build_contract(finish: str = "improve") -> tuple:
+    return (
+        "Build mode: you are a full-edit worker in this repository. Deliver working "
+        "files, not a description of them: create and edit the files the task "
+        "assigns you, and leave every other file alone; other workers own them.",
+        _BUILD_LOOP + FINISH_INSTRUCTIONS[finish],
+        _IMPLEMENT_REPORT_CONTRACT,
+        "Keep that report to a few lines and end it with exactly one line "
+        "`VERDICT: PASS - reason` (or FAIL / PARTIAL). Do not return findings JSON.",
+    )
 
 
 def build_cli_implement_prompt(task: Task, *, prompt: object = None) -> str:
@@ -384,7 +398,8 @@ def build_cli_implement_prompt(task: Task, *, prompt: object = None) -> str:
     criteria = acceptance_criteria_for_task(task)
     if criteria:
         body = ensure_acceptance_criteria_in_text(body, criteria)
-    return "\n".join([_PROMPT_ORIENTATION, "", *_CLI_BUILD_CONTRACT, "", TASK_INSTRUCTION_HEADER, body])
+    finish = "criteria" if task.payload.get("finish") == "criteria" else "improve"
+    return "\n".join([_PROMPT_ORIENTATION, "", *_cli_build_contract(finish), "", TASK_INSTRUCTION_HEADER, body])
 
 
 _CLI_REVIEW_CONTRACT = (

@@ -56,6 +56,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from puppetmaster.adapters._prompts import FINISH_INSTRUCTIONS
 from puppetmaster.conflicts import path_in_scope
 from puppetmaster.models import ArtifactType, JobStatus, TaskStatus, now_iso
 from puppetmaster.proc_identity import pid_reused, process_identity
@@ -188,6 +189,8 @@ def validate_graph(graph: Any, *, child: bool = False, depth: int = 0,
 
 def _effort_problems(obj: dict, where: str) -> list[str]:
     problems = []
+    if "finish" in obj and obj["finish"] not in FINISH_INSTRUCTIONS:
+        problems.append(f"{where} finish must be one of {', '.join(FINISH_INSTRUCTIONS)}")
     if "effort" in obj and obj["effort"] not in EFFORTS:
         problems.append(f"{where} effort must be one of {', '.join(EFFORTS)}")
     if "escalate" in obj and not isinstance(obj["escalate"], bool):
@@ -1659,6 +1662,8 @@ class JobNodeExecutor:
                 # unavailable or turned off) must still see what to fix.
                 task = f"{task}\n\n{revision}"
             task = f"{task}\n\n{_BUILD_VERDICT}"
+            if (node.get("finish") or defaults.get("finish")) == "criteria":
+                payload["finish"] = "criteria"
         payload["cwd"] = run.graph["cwd"]
         model = node.get("model") or defaults.get("model")
         if model:

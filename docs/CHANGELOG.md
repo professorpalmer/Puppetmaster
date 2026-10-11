@@ -1,3 +1,18 @@
+## v1.43.2 — 2026-10-11
+
+**Opt-in `finish: "criteria"` for flow build workers.** The build contract
+tells a Codex or Claude Code build worker: "Passing checks are the floor, not
+the finish: when the task asks for quality the checks do not measure and time
+remains, improve it and run the checks again." A study that tells the worker to
+stop after success gave it two conflicting orders.
+
+- `finish` on an agent node or in `defaults`: `improve` (default) or
+  `criteria`. With `criteria`, that one sentence becomes: done means every
+  acceptance criterion is met and every named check passes, then stop.
+- Validation refuses any other value. Judges and explore agents never get it.
+- With `finish` off, the worker prompt is byte-identical to 1.43.1 (frozen
+  test, and a comparison against the 1.43.1 release tree).
+
 ## v1.43.1 — 2026-10-10
 
 **A refused shell template fails the run at once and does not rebuild.** In

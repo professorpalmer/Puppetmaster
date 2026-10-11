@@ -72,6 +72,17 @@ problems are fixed.
 | `set` | `values` written into state (templated). | ok |
 | `end` | `status: pass|fail`, `summary` (templated). | ends the run |
 
+### Finish
+
+A build worker (Codex, Claude Code) is told when it is done. The default,
+`finish: "improve"`, says passing checks are the floor: when the task asks for
+quality the checks do not measure and time remains, the worker improves the
+work and runs the checks again. `finish: "criteria"` (on an agent node or in
+`defaults`) replaces that one sentence: the work is done when every acceptance
+criterion is met and every named check passes, and the worker then stops. Put
+the criteria in the task as an `Acceptance criteria:` block of numbered lines.
+Judges and explore agents ignore `finish`.
+
 ### Effort
 
 `effort` on an agent or judge node (`low`, `medium`, `high`, `xhigh`) sets its
