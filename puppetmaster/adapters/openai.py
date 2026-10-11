@@ -51,6 +51,10 @@ class OpenAIAdapter:
     name = "openai"
     accounts_invocations = True
 
+    def timeout_for(self, task: Task) -> int:
+        """The timeout ``run`` applies to ``task``; the supervisor waits at least this long."""
+        return int(task.payload.get("timeout_seconds", 300))
+
     def run(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
         base_prompt = task.payload.get("prompt") or task.instruction
         cwd = task.payload.get("cwd")
@@ -80,7 +84,7 @@ class OpenAIAdapter:
         organization = task.payload.get("openai_organization") or os.environ.get(
             "OPENAI_ORG_ID"
         )
-        timeout_seconds = int(task.payload.get("timeout_seconds", 300))
+        timeout_seconds = self.timeout_for(task)
         evidence_base = [
             "adapter:openai",
             f"model:{model}",

@@ -162,6 +162,18 @@ def _resolved_output_style(spec: WorkerSpec) -> Optional[tuple[str, str]]:
     )
 
 
+def _adapter_timeout(task: Task) -> Optional[int]:
+    """The timeout the task's adapter applies when the task sets none, or None."""
+    from puppetmaster.adapters.registry import get_adapter
+
+    try:
+        adapter = get_adapter(task.adapter)
+    except ValueError:
+        return None
+    resolve = getattr(adapter, "timeout_for", None)
+    return int(resolve(task)) if callable(resolve) else None
+
+
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None:
@@ -3074,11 +3086,23 @@ class Orchestrator:
 
     @staticmethod
     def _worker_wait_timeout(tasks: list[Task]) -> int:
-        task_timeouts = [
-            int(task.payload.get("timeout_seconds", 30))
-            for task in tasks
-            if isinstance(task.payload.get("timeout_seconds", 30), int)
-        ]
+        """The supervisor's base wait: never shorter than a worker's own timeout.
+
+        An explicit ``timeout_seconds`` is used as given. Without one, the bound
+        is what the task's adapter applies (Codex 600 s): the old 30 s guess made
+        the base 90 s and the hard cap 270 s, so the supervisor killed workers
+        before their adapter timed out.
+        """
+        task_timeouts = []
+        for task in tasks:
+            explicit = task.payload.get("timeout_seconds")
+            if "timeout_seconds" in task.payload:
+                if isinstance(explicit, int) and not isinstance(explicit, bool):
+                    task_timeouts.append(explicit)
+                continue
+            resolved = _adapter_timeout(task)
+            if resolved is not None:
+                task_timeouts.append(resolved)
         return max([60, *task_timeouts]) + 30
 
     def _ensure_store_schema(self) -> None:

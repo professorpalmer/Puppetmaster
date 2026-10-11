@@ -1,3 +1,20 @@
+## v1.43.3 — 2026-10-11
+
+**A worker with no `timeout_seconds` is no longer killed before its adapter
+times out.** The supervisor guessed 30 s for an omitted timeout, so its base
+wait was 90 s and its hard cap 270 s. Codex and Claude Code apply 600 s. In
+the R68 study, four real Codex build workers were killed at 270 s and recorded
+`worker_timeout`.
+
+- Each adapter reports the timeout it applies (`timeout_for(task)`), and its
+  own run code uses the same value. Without `timeout_seconds`, the supervisor
+  waits for that value: Codex 630 s base and 1890 s cap.
+- An explicit `timeout_seconds` or `max_timeout_seconds` is used as before.
+- Cursor and Hermes timeout reports named 900 s while their CLI path applied
+  600 s. They now report the applied value.
+- No completion or usage is recorded from a supervisor timeout. That path is
+  unchanged.
+
 ## v1.43.2 — 2026-10-11
 
 **Opt-in `finish: "criteria"` for flow build workers.** The build contract

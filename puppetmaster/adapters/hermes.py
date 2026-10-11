@@ -498,7 +498,7 @@ class HermesAdapter(CliWorkerAdapter):
         completed: StreamedProcess,
     ) -> list[Artifact]:
         codegraph_used = bool(prepared.extras.get("codegraph_used"))
-        timeout_seconds = int(task.payload.get("timeout_seconds", 900))
+        timeout_seconds = self.timeout_for(task)
         if completed.timed_out:
             stdout_capture = capture_subprocess_stdout(
                 text=completed.stdout,
@@ -661,7 +661,7 @@ class HermesAdapter(CliWorkerAdapter):
             cwd=cwd,
             disabled=bool(task.payload.get("disable_codegraph", False)),
         )
-        timeout_seconds = int(task.payload.get("timeout_seconds", 600))
+        timeout_seconds = self.timeout_for(task)
         executable = task.payload.get("executable") or os.environ.get("HERMES_COMMAND") or "hermes"
         command_base = command_parts(executable)
         resolved = facade("resolve_command")(command_base[0])

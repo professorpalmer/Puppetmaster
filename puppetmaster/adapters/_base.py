@@ -317,6 +317,10 @@ class CliWorkerAdapter(FullEditWorkerAdapter):
 
     accounts_invocations = True
 
+    def timeout_for(self, task: Task) -> int:
+        """The longest timeout this adapter applies to ``task``; the supervisor waits at least this long."""
+        return int(task.payload.get("timeout_seconds", self.default_timeout_seconds))
+
     def _run_cli_lifecycle(
         self,
         task: Task,
@@ -326,9 +330,7 @@ class CliWorkerAdapter(FullEditWorkerAdapter):
         pre_guard: bool = False,
     ) -> list[Artifact]:
         cwd = Path(task.payload.get("cwd") or ".").resolve()
-        timeout_seconds = int(
-            task.payload.get("timeout_seconds", self.default_timeout_seconds)
-        )
+        timeout_seconds = self.timeout_for(task)
         before: dict = {}
         if pre_guard:
             blocked, before = self._early_run_guard(task, worker_id, cwd)

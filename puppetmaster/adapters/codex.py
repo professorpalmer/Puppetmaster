@@ -426,7 +426,7 @@ class CodexAdapter(CliWorkerAdapter):
         resume_record = prepared.extras.get("resume")
         resume_fields = {"resume": resume_record} if resume_record else {}
         resumed = bool(prepared.extras.get("resumed"))
-        timeout_seconds = int(task.payload.get("timeout_seconds", self.default_timeout_seconds))
+        timeout_seconds = self.timeout_for(task)
         cwd = Path(task.payload.get("cwd") or ".").resolve()
 
         events = parse_codex_events(completed.stdout)

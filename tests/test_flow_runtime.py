@@ -1416,3 +1416,35 @@ class FinishTests(Base):
                                              defaults={"adapter": "codex", "finish": "done"}))
         self.assertTrue(any("node 'a' finish must be one of improve, criteria" in p for p in problems))
         self.assertTrue(any("defaults finish must be one of" in p for p in problems))
+
+
+class SupervisorTimeoutTests(Base):
+    """A flow build node with no ``timeout_seconds`` must outlive its adapter.
+
+    R68 (1.43.2): the supervisor guessed 30 s for an omitted timeout, so the
+    base was 90 s and the hard cap 270 s, while Codex applies 600 s. Four real
+    build workers were killed at 270 s before their adapter could time out.
+    """
+
+    def _bounds(self, node):
+        from puppetmaster.orchestrator import Orchestrator
+
+        g = graph([node], defaults={"adapter": "codex"})
+        run = flow.new_run(self.state, g, "goal", cwd=str(self.work))
+        spec = JobNodeExecutor(self.state)._spec(node["id"], run.graph["nodes"][0], run, "", 1)
+        task = Task(job_id="j", role=spec.role, instruction=spec.instruction,
+                    adapter=spec.adapter, payload=dict(spec.payload))
+        base = Orchestrator._worker_wait_timeout([task])
+        return task, base, Orchestrator._worker_hard_cap([task], base)
+
+    def test_omitted_timeout_waits_for_the_codex_adapter(self):
+        from puppetmaster.adapters.codex import CodexAdapter
+
+        task, base, cap = self._bounds(agent("build", files=["a.py"]))
+        self.assertNotIn("timeout_seconds", task.payload)
+        self.assertEqual((base, cap), (630, 1890))
+        self.assertGreater(base, CodexAdapter().timeout_for(task))
+
+    def test_explicit_timeout_stays_strict(self):
+        _, base, cap = self._bounds(agent("build", files=["a.py"], timeout_seconds=120))
+        self.assertEqual((base, cap), (150, 450))
