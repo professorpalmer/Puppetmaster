@@ -1356,3 +1356,63 @@ class EffortLaneTests(Base):
         merged = flow._merged_defaults({"lanes": {"explore": "low"}, "adapter": "codex"}, {"lanes": {"judge": "high"}})
         self.assertEqual(merged["lanes"], {"explore": "low", "judge": "high"})
 
+
+
+# The 1.43.1 build contract, frozen: ``finish`` off must send exactly this.
+_BUILD_CONTRACT_1_43_1 = (
+    "Build mode: you are a full-edit worker in this repository. Deliver working "
+    "files, not a description of them: create and edit the files the task "
+    "assigns you, and leave every other file alone; other workers own them.",
+    "Work in a build-check loop: make the change, run the checks the task names "
+    "(or the most relevant tests), read the results and fix what fails. Passing "
+    "checks are the floor, not the finish: when the task asks for quality the "
+    "checks do not measure and time remains, improve it and run the checks again.",
+)
+
+
+class FinishTests(Base):
+    def _prompt(self, payload):
+        from puppetmaster.adapters._prompts import build_cli_implement_prompt
+
+        return build_cli_implement_prompt(Task(job_id="j", role="code", instruction="Build x.", payload=payload))
+
+    def test_finish_off_is_byte_identical_to_1_43_1(self):
+        from puppetmaster.adapters import _prompts
+
+        expected = "\n".join([
+            _prompts._PROMPT_ORIENTATION, "", *_BUILD_CONTRACT_1_43_1,
+            _prompts._IMPLEMENT_REPORT_CONTRACT,
+            "Keep that report to a few lines and end it with exactly one line "
+            "`VERDICT: PASS - reason` (or FAIL / PARTIAL). Do not return findings JSON.",
+            "", _prompts.TASK_INSTRUCTION_HEADER, "Build x.",
+        ])
+        self.assertEqual(self._prompt({}), expected)
+        self.assertEqual(self._prompt({"finish": "improve"}), expected)
+
+    def test_finish_criteria_changes_only_the_finish_sentence(self):
+        from puppetmaster.adapters._prompts import FINISH_INSTRUCTIONS
+
+        off, on = self._prompt({}), self._prompt({"finish": "criteria"})
+        self.assertEqual(off.replace(FINISH_INSTRUCTIONS["improve"], FINISH_INSTRUCTIONS["criteria"]), on)
+        self.assertNotIn("time remains", on)
+        self.assertIn("stop and write the report", on)
+
+    def test_finish_reaches_build_workers_only(self):
+        g = graph([agent("build", finish="criteria"), judge("review"), agent("plain")],
+                  defaults={"adapter": "codex"})
+        run = flow.new_run(self.state, g, "goal", cwd=str(self.work))
+        executor = JobNodeExecutor(self.state)
+        nodes = {node["id"]: node for node in run.graph["nodes"]}
+        self.assertEqual(executor._spec("build", nodes["build"], run, "", 1).payload["finish"], "criteria")
+        self.assertNotIn("finish", executor._spec("review", nodes["review"], run, "", 1).payload)
+        self.assertNotIn("finish", executor._spec("plain", nodes["plain"], run, "", 1).payload)
+
+        g = graph([agent("build")], defaults={"adapter": "codex", "finish": "criteria"})
+        run = flow.new_run(self.state, g, "goal", cwd=str(self.work))
+        self.assertEqual(executor._spec("build", run.graph["nodes"][0], run, "", 1).payload["finish"], "criteria")
+
+    def test_finish_validation(self):
+        problems = flow.validate_graph(graph([agent("a", finish="polish")],
+                                             defaults={"adapter": "codex", "finish": "done"}))
+        self.assertTrue(any("node 'a' finish must be one of improve, criteria" in p for p in problems))
+        self.assertTrue(any("defaults finish must be one of" in p for p in problems))
