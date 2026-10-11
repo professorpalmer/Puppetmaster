@@ -458,6 +458,14 @@ class AgenticAdapter(FullEditWorkerAdapter):
     def _invalidate_fs_cache(self, path: Path) -> None:
         self._fs_cache.pop(str(path.resolve()), None)
 
+    def timeout_for(self, task: Task) -> int:
+        """The timeout ``run`` applies to ``task``; the supervisor waits at least this long."""
+        implement = bool(task.payload.get("mode") == "implement" or task.payload.get("implement"))
+        return int(task.payload.get(
+            "timeout_seconds",
+            DEFAULT_IMPLEMENT_TIMEOUT_SECONDS if implement else DEFAULT_ANALYZE_TIMEOUT_SECONDS,
+        ))
+
     def run(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
         implement = bool(
             task.payload.get("mode") == "implement" or task.payload.get("implement")
@@ -1260,10 +1268,7 @@ class AgenticAdapter(FullEditWorkerAdapter):
             "max_turns",
             DEFAULT_IMPLEMENT_MAX_TURNS if implement else DEFAULT_ANALYZE_MAX_TURNS,
         ))
-        timeout = int(task.payload.get(
-            "timeout_seconds",
-            DEFAULT_IMPLEMENT_TIMEOUT_SECONDS if implement else DEFAULT_ANALYZE_TIMEOUT_SECONDS,
-        ))
+        timeout = self.timeout_for(task)
         token_budget = task.payload.get("token_budget")
         token_budget = int(token_budget) if token_budget else None
         submit_reserve = _submit_reserve_fraction()

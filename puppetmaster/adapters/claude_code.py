@@ -321,9 +321,7 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
         write_capable = bool(prepared.extras.get("write_capable", True))
         launched_session = prepared.extras.get("session_id")
         cwd = Path(task.payload.get("cwd") or ".").resolve()
-        timeout_seconds = int(
-            task.payload.get("timeout_seconds", self.default_timeout_seconds)
-        )
+        timeout_seconds = self.timeout_for(task)
         # Tool-use blocks name the files this run edited and the commands it
         # ran, so the write_scope gate can tell its writes from a concurrent
         # writer's in a shared checkout. The default json output format carries

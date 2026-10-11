@@ -186,7 +186,7 @@ class CursorAdapter(CliWorkerAdapter):
         codegraph_used = bool(prepared.extras.get("codegraph_used"))
         model = prepared.extras.get("model", "default")
         cwd = Path(prepared.extras.get("cwd") or ".")
-        timeout_seconds = int(task.payload.get("timeout_seconds", 900))
+        timeout_seconds = self.timeout_for(task)
         if completed.timed_out:
             artifacts: list[Artifact] = [
                 verification_artifact(

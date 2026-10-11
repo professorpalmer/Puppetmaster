@@ -444,9 +444,7 @@ class FxAdapter(CliWorkerAdapter):
         permission_mode = str(prepared.extras.get("permission_mode") or "auto")
         resume_session_id = prepared.extras.get("resume_session_id")
         codegraph_used = bool(prepared.extras.get("codegraph_used"))
-        timeout_seconds = int(
-            task.payload.get("timeout_seconds", self.default_timeout_seconds)
-        )
+        timeout_seconds = self.timeout_for(task)
         cwd = Path(task.payload.get("cwd") or ".").resolve()
 
         if completed.timed_out:

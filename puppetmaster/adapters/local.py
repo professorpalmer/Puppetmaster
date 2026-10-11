@@ -203,12 +203,16 @@ class LocalAdapter:
 class ShellAdapter:
     name = "shell"
 
+    def timeout_for(self, task: Task) -> int:
+        """The timeout ``run`` applies to ``task``; the supervisor waits at least this long."""
+        return int(task.payload.get("timeout_seconds", 30))
+
     def run(self, task: Task, goal: str, worker_id: str) -> list[Artifact]:
         command = task.payload.get("command")
         if not isinstance(command, list) or not all(isinstance(part, str) for part in command):
             raise ValueError("shell adapter requires payload.command as a list of strings")
 
-        timeout_seconds = int(task.payload.get("timeout_seconds", 30))
+        timeout_seconds = self.timeout_for(task)
         cwd = task.payload.get("cwd")
         try:
             completed = facade("subprocess").run(

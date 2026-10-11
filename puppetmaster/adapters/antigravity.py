@@ -258,9 +258,7 @@ class AntigravityAdapter(CliWorkerAdapter):
         dangerously_skip = resolve_antigravity_skip_permissions(
             task.payload, mode=mode
         )
-        timeout_seconds = int(
-            task.payload.get("timeout_seconds", self.default_timeout_seconds)
-        )
+        timeout_seconds = self.timeout_for(task)
         stdin_data = antigravity_stdin_data(
             _with_agy_workspace_path(prompt, cwd)
         )
@@ -434,7 +432,7 @@ class AntigravityAdapter(CliWorkerAdapter):
         mode: str,
         write_capable: bool,
     ) -> list[Artifact]:
-        timeout_seconds = int(task.payload.get("timeout_seconds", self.default_timeout_seconds))
+        timeout_seconds = self.timeout_for(task)
         stdout_capture = capture_subprocess_stdout(
             text=completed.stdout, task=task, sidecar_name="antigravity_stdout_timeout"
         )
