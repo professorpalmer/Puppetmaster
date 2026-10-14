@@ -383,7 +383,9 @@ class CliWorkerAdapter(FullEditWorkerAdapter):
             accounting_adapter=self.name,
             accounting_model=prepared.extras.get("model"),
         )
-        after = facade("git_snapshot")(cwd, base_tree=str(before.get("tree") or "") or None)
+        after = facade("git_snapshot")(
+            cwd, base_tree=str(before.get("tree") or "") or None, base_manifest=before.get("manifest"),
+        )
         # Snapshot deltas can belong to a concurrent writer. Only adapters
         # declared write-capable may attribute them to this invocation.
         if prepared.extras.get("write_capable", True) is False:

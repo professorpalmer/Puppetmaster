@@ -456,7 +456,7 @@ class FxLifecycleTests(unittest.TestCase):
              mock.patch("puppetmaster.adapters.snapshot_has_diff", side_effect=_snapshot_has_diff), \
              mock.patch(
                  "puppetmaster.adapters.git_snapshot",
-                 side_effect=lambda cwd, base_tree=None: after if base_tree else before,
+                 side_effect=lambda cwd, base_tree=None, **_: after if base_tree else before,
              ), \
              mock.patch(
                  "puppetmaster.adapters.run_streamed_subprocess", return_value=completed
@@ -496,7 +496,7 @@ class FxLifecycleTests(unittest.TestCase):
              mock.patch("puppetmaster.adapters.snapshot_has_diff", side_effect=_snapshot_has_diff), \
              mock.patch(
                  "puppetmaster.adapters.git_snapshot",
-                 side_effect=lambda cwd, base_tree=None: after if base_tree else before,
+                 side_effect=lambda cwd, base_tree=None, **_: after if base_tree else before,
              ), \
              mock.patch(
                  "puppetmaster.adapters.run_streamed_subprocess", return_value=completed
@@ -542,7 +542,7 @@ class FxLifecycleTests(unittest.TestCase):
              mock.patch("puppetmaster.adapters.snapshot_has_diff", side_effect=_snapshot_has_diff), \
              mock.patch(
                  "puppetmaster.adapters.git_snapshot",
-                 side_effect=lambda cwd, base_tree=None: after if base_tree else before,
+                 side_effect=lambda cwd, base_tree=None, **_: after if base_tree else before,
              ), \
              mock.patch(
                  "puppetmaster.adapters.run_streamed_subprocess", return_value=completed
@@ -571,7 +571,7 @@ class FxLifecycleTests(unittest.TestCase):
              mock.patch("puppetmaster.adapters.snapshot_has_diff", side_effect=_snapshot_has_diff), \
              mock.patch(
                  "puppetmaster.adapters.git_snapshot",
-                 side_effect=lambda cwd, base_tree=None: after if base_tree else before,
+                 side_effect=lambda cwd, base_tree=None, **_: after if base_tree else before,
              ), \
              mock.patch(
                  "puppetmaster.adapters.run_streamed_subprocess", return_value=completed
@@ -601,7 +601,7 @@ class FxLifecycleTests(unittest.TestCase):
              mock.patch("puppetmaster.adapters.snapshot_has_diff", side_effect=_snapshot_has_diff), \
              mock.patch(
                  "puppetmaster.adapters.git_snapshot",
-                 side_effect=lambda cwd, base_tree=None: after if base_tree else before,
+                 side_effect=lambda cwd, base_tree=None, **_: after if base_tree else before,
              ), \
              mock.patch(
                  "puppetmaster.adapters.run_streamed_subprocess", return_value=completed
@@ -624,7 +624,7 @@ class FxLifecycleTests(unittest.TestCase):
              mock.patch("puppetmaster.adapters.worktree_guard", return_value=None), \
              mock.patch("puppetmaster.adapters.snapshot_has_diff", side_effect=_snapshot_has_diff), \
              mock.patch("puppetmaster.adapters.git_snapshot",
-                        side_effect=lambda cwd, base_tree=None: after if base_tree else before), \
+                        side_effect=lambda cwd, base_tree=None, **_: after if base_tree else before), \
              mock.patch("puppetmaster.adapters.run_streamed_subprocess", return_value=completed), \
              mock.patch("puppetmaster.adapters.fx.capture_subprocess_stdout", side_effect=lambda **kw: None):
             artifacts = FxAdapter().run(_task(cwd="/tmp", **payload), "goal", "worker_1")
@@ -661,7 +661,7 @@ class FxLifecycleTests(unittest.TestCase):
              mock.patch("puppetmaster.adapters.snapshot_has_diff", side_effect=_snapshot_has_diff), \
              mock.patch(
                  "puppetmaster.adapters.git_snapshot",
-                 side_effect=lambda cwd, base_tree=None: after if base_tree else before,
+                 side_effect=lambda cwd, base_tree=None, **_: after if base_tree else before,
              ), \
              mock.patch("puppetmaster.adapters.run_streamed_subprocess", side_effect=_spy), \
              mock.patch(

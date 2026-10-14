@@ -27,6 +27,8 @@ class GitSnapshot:
     worker_changed_files: Optional[list[str]] = None
     worker_untracked_files: Optional[list[str]] = None
     worker_diff: Optional[str] = None
+    # Outside a Git work tree: path -> [size, mtime_ns], or None past the walk bound.
+    manifest: Optional[dict] = None
 
     def get(self, key: str, default: Any = None) -> Any:
         if not hasattr(self, key):
@@ -74,7 +76,9 @@ def _run_git(cwd: Path, args: list[str], *, strip: bool = True) -> str:
     return stdout if completed.returncode == 0 else ""
 
 
-def git_snapshot(cwd: Path, *, base_tree: Optional[str] = None) -> GitSnapshot:
+def git_snapshot(
+    cwd: Path, *, base_tree: Optional[str] = None, base_manifest: Optional[dict] = None,
+) -> GitSnapshot:
     """Capture a diff-attributable snapshot of the working tree.
 
     Captures changes **against HEAD** (not just working-tree-vs-index) so that
@@ -141,7 +145,28 @@ def git_snapshot(cwd: Path, *, base_tree: Optional[str] = None) -> GitSnapshot:
             worker_untracked_files=[path for path in untracked if path in worker_changed_set],
             worker_diff=worker_diff,
         )
+    if not inside:
+        snapshot = _with_directory_delta(snapshot, cwd, base_manifest)
     return snapshot
+
+
+def _with_directory_delta(snapshot: GitSnapshot, cwd: Path, base_manifest: Optional[dict]) -> GitSnapshot:
+    """Without Git, a manifest stands in for the tree; with a base it attributes the delta."""
+    from dataclasses import replace
+
+    from ._dir_manifest import delta_status_text, directory_manifest, manifest_delta
+
+    manifest = directory_manifest(cwd)
+    snapshot = replace(snapshot, manifest=manifest)
+    if base_manifest is None or manifest is None:
+        return snapshot
+    delta = manifest_delta(base_manifest, manifest)
+    return replace(
+        snapshot,
+        worker_changed_files=sorted(delta["added"] + delta["modified"] + delta["deleted"]),
+        worker_untracked_files=delta["added"],
+        worker_diff=delta_status_text(delta),
+    )
 
 
 def git_worktree_root(cwd: Path) -> Path:
@@ -285,9 +310,34 @@ def worktree_guard(
     sandboxed/non-repo runs."""
     if before.get("is_worktree", True):
         return None
-    if task.payload.get("allow_non_worktree", False):
-        return None
     from ._base import verification_artifact
+
+    if task.payload.get("allow_non_worktree", False):
+        if not task.payload.get("write_scope") or before.get("manifest") is not None:
+            return None
+        # A scope gate judges the run's delta. Without Git the delta comes from
+        # the directory manifest; a walk past its bound leaves nothing to judge.
+        return [
+            verification_artifact(
+                task=task,
+                worker_id=worker_id,
+                adapter=adapter,
+                check=task.instruction,
+                result="blocked",
+                confidence=0.85,
+                evidence=[f"adapter:{adapter}", "status:scope-unobservable"],
+                payload={
+                    "failure": "scope_unobservable",
+                    "message": (
+                        f"{adapter} cannot observe this run's changes: cwd is not a git work tree "
+                        "and the directory has more files than the change manifest covers, so "
+                        "the declared write_scope cannot be checked. Fix: run `git init` in the "
+                        "directory, point cwd at a smaller directory, or drop write_scope."
+                    ),
+                    "cwd": str(cwd),
+                },
+            )
+        ]
 
     return [
         verification_artifact(
@@ -305,7 +355,7 @@ def worktree_guard(
                     "so Puppetmaster can gate on a clean tree and attribute the resulting "
                     "diff. Fix: run `git init` in the directory (restores diff capture), "
                     "point cwd at an existing repo, or set allow_non_worktree=true "
-                    "(CLI: --allow-non-worktree) to run without diff attribution."
+                    "(CLI: --allow-non-worktree) to run with a file manifest instead of a git diff."
                 ),
                 "cwd": str(cwd),
             },

@@ -561,7 +561,8 @@ class JobIntegrationTests(Base):
         self.assertIsNotNone(real_run)
 
     def test_parallel_reruns_only_the_branch_the_feedback_names(self):
-        flaky = self.work / "flaky"
+        # Outside the workspace: a counter in it is a write outside b's scope.
+        flaky = self.root / "flaky"
         b_code = ("import pathlib;p=pathlib.Path(%r);n=int(p.read_text()) if p.exists() else 0;"
                   "p.write_text(str(n+1));print('VERDICT: PASS - b ok' if n else 'VERDICT: FAIL - b broken')"
                   % str(flaky))

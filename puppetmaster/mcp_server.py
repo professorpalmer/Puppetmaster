@@ -2519,7 +2519,7 @@ def _full_edit_workspace(args: JsonObject) -> Optional[JsonObject]:
         "cwd is not inside a git work tree, and full-edit runs need one for "
         "clean-tree gating and diff attribution. Fix: run `git init` in the "
         "directory (restores diff capture), point cwd at an existing repo, or "
-        "pass allow_non_worktree=true to run without diff attribution.",
+        "pass allow_non_worktree=true to run with a file manifest instead of a git diff.",
         {"failure": "not_a_worktree", "cwd": directory},
     )
 
