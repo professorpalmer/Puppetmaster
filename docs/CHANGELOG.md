@@ -1,3 +1,33 @@
+## v1.43.4 — 2026-10-14
+
+**A write-scope gate in a directory without Git no longer passes a run it
+could not observe.** In R109 (1.43.2), a worker with `allow_non_worktree` and
+an explicit `write_scope` wrote a test outside its scope. The gate reported
+`passed: true`, `changed_files: []`. Outside Git, the Git snapshot lists no
+changes, and the gate read that as "no writes".
+
+- Without Git, the worker snapshot records a directory manifest (size and
+  mtime of each file) before launch. After the worker stops, the compared
+  manifest gives the run's attributed delta: additions, edits, deletions and
+  renames (a rename is a delete plus an add). `.git`, `node_modules`,
+  bytecode and tool caches, and the live `PUPPETMASTER_STATE_DIR` are not
+  counted. The walk stops at 50,000 files.
+- The gate fails with `observation: unavailable` when it has no attributed
+  delta and the directory is not a Git work tree. An unobserved run never
+  passes.
+- A scoped task in a directory without Git whose manifest cannot be taken
+  (more files than the bound) is refused before launch with
+  `failure: scope_unobservable`. Unscoped jobs without Git run as before.
+- The worker prompt lists the declared `write_scope` paths (Codex, Claude
+  Code, Cursor, Hermes, fx, Antigravity, agentic). R109's prompt did not name
+  the requested test file. Without a scope, the prompt is unchanged.
+- A shell node with a `write_scope` (a flow `shell` agent with `files`) now
+  snapshots before and after its command, like the other adapters. Before, its
+  writes outside Git were never observed. Shell checks with no scope take no
+  snapshot.
+- Git paths, sibling scopes, dirty-file attribution and pilot claims are
+  unchanged.
+
 ## v1.43.3 — 2026-10-11
 
 **A worker with no `timeout_seconds` is no longer killed before its adapter

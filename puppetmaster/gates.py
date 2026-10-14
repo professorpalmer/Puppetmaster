@@ -372,6 +372,7 @@ def _gate_write_scope(
         and (artifact.payload or {}).get("worker_delta_attributed") is True
         for artifact in artifacts
     )
+    observed = attributed
     if attributed:
         # The adapter diffed the tree it started from against the tree it left,
         # so this run's own changes are known. Judging the whole dirty tree
@@ -379,6 +380,8 @@ def _gate_write_scope(
         changed = set()
     else:
         snapshot = git_snapshot(cwd)
+        # Outside Git the snapshot lists no changes whether or not any exist.
+        observed = bool(snapshot.get("is_worktree", False))
         changed = set(snapshot.get("changed_files") or []) | set(snapshot.get("untracked_files") or [])
     for artifact in artifacts:
         if artifact.type == ArtifactType.PATCH:
@@ -417,6 +420,13 @@ def _gate_write_scope(
         return GateResult(
             name, "write_scope", False, reason,
             {"out_of_scope": out_of_scope, "scope": scope, **detail, **concurrent_fields},
+        )
+    if not observed:
+        return GateResult(
+            name, "write_scope", False,
+            "change observation unavailable: cwd is not a git work tree and the run has no "
+            "attributed delta, so writes outside the scope cannot be ruled out",
+            {"scope": scope, "observation": "unavailable", "changed_files": sorted(changed)},
         )
     return GateResult(
         name, "write_scope", True, "all writes within declared scope",

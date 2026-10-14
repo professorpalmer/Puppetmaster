@@ -6,7 +6,12 @@ from pathlib import Path
 from puppetmaster.models import Artifact, ArtifactType, Task
 from puppetmaster.redaction import redact_secrets
 
-from ._base import verification_artifact
+from ._base import (
+    _should_emit_patch_artifact,
+    diff_source_payload,
+    make_patch_artifact,
+    verification_artifact,
+)
 from ._facade import facade
 from ._streaming import _redacted_tail
 
@@ -214,6 +219,9 @@ class ShellAdapter:
 
         timeout_seconds = self.timeout_for(task)
         cwd = task.payload.get("cwd")
+        # A scoped shell node is a writer: its scope gate judges the delta it made.
+        observe = Path(cwd or ".").resolve() if task.payload.get("write_scope") else None
+        before = facade("git_snapshot")(observe) if observe else None
         try:
             completed = facade("subprocess").run(
                 command,
@@ -268,6 +276,18 @@ class ShellAdapter:
                     },
                 )
             ]
+        attribution: dict = {}
+        patch: list[Artifact] = []
+        if before is not None:
+            after = facade("git_snapshot")(
+                observe, base_tree=str(before.get("tree") or "") or None, base_manifest=before.get("manifest"),
+            )
+            attribution = diff_source_payload(before, after)
+            if _should_emit_patch_artifact(before, after):
+                patch.append(make_patch_artifact(
+                    task, worker_id, before, after, adapter="shell", status="applied",
+                    change="Shell command changed files.", sidecar_name="shell",
+                ))
         return [
             verification_artifact(
                 task=task,
@@ -281,8 +301,10 @@ class ShellAdapter:
                     "returncode": completed.returncode,
                     "stdout": _redacted_tail(completed.stdout, 4000),
                     "stderr": _redacted_tail(completed.stderr, 4000),
+                    **attribution,
                 },
-            )
+            ),
+            *patch,
         ]
 
 

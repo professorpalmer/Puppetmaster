@@ -130,6 +130,7 @@ from ._prompts import (
     structured_prompt_for_task,
     with_job_brief,
     with_report_contract,
+    write_scope_section,
 )
 from .cursor import (
     cursor_artifact_from_item,
@@ -835,6 +836,9 @@ class AgenticAdapter(FullEditWorkerAdapter):
         self._referenced_paths[task.id] = []
 
         base_prompt = with_report_contract(task.payload.get("prompt") or task.instruction)
+        scope_lines = write_scope_section(task)
+        if scope_lines:
+            base_prompt = "\n".join([*scope_lines, base_prompt])
         prompt, codegraph_used = facade("enrich_prompt_with_codegraph")(
             prompt_with_skills(
                 prompt_with_memory(
@@ -919,7 +923,9 @@ class AgenticAdapter(FullEditWorkerAdapter):
             )
         except ProviderError as exc:
             self._referenced_paths.pop(task.id, None)
-            after = facade("git_snapshot")(cwd, base_tree=str(before.get("tree") or "") or None)
+            after = facade("git_snapshot")(
+                cwd, base_tree=str(before.get("tree") or "") or None, base_manifest=before.get("manifest"),
+            )
             detail = redact_secrets(exc.body or str(exc)) or str(exc)
             failure = exc.failure
             if (provider or "").lower() == "bedrock":
@@ -944,7 +950,9 @@ class AgenticAdapter(FullEditWorkerAdapter):
             return arts
 
         final_text, usage, turns, mutated, stop_reason, _submitted, _submitted_criteria = loop
-        after = facade("git_snapshot")(cwd, base_tree=str(before.get("tree") or "") or None)
+        after = facade("git_snapshot")(
+            cwd, base_tree=str(before.get("tree") or "") or None, base_manifest=before.get("manifest"),
+        )
         attribution = attribution_payload(path_references([
             normalize_path(path, cwd) for path in self._referenced_paths.pop(task.id, [])
         ]), before)

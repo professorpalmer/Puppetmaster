@@ -381,6 +381,24 @@ def _cli_build_contract(finish: str = "improve") -> tuple:
     )
 
 
+def write_scope_section(task: Task) -> list[str]:
+    """The declared write scope as prompt lines; empty when the task has none.
+
+    The scope gate fails a run that writes outside these paths. A worker that
+    never saw them could not aim for them (R109: the declared test and report
+    filenames were absent from the prompt).
+    """
+    scope = [str(glob) for glob in (task.payload.get("write_scope") or []) if str(glob).strip()]
+    if not scope:
+        return []
+    return [
+        "Write scope: create, edit, or delete only paths that match these entries. "
+        "A change outside them fails the task.",
+        *(f"- {glob}" for glob in scope),
+        "",
+    ]
+
+
 def build_cli_implement_prompt(task: Task, *, prompt: object = None) -> str:
     """Build contract for a write-capable CLI worker (Codex, Claude Code).
 
@@ -399,7 +417,10 @@ def build_cli_implement_prompt(task: Task, *, prompt: object = None) -> str:
     if criteria:
         body = ensure_acceptance_criteria_in_text(body, criteria)
     finish = "criteria" if task.payload.get("finish") == "criteria" else "improve"
-    return "\n".join([_PROMPT_ORIENTATION, "", *_cli_build_contract(finish), "", TASK_INSTRUCTION_HEADER, body])
+    return "\n".join([
+        _PROMPT_ORIENTATION, "", *_cli_build_contract(finish), "", *write_scope_section(task),
+        TASK_INSTRUCTION_HEADER, body,
+    ])
 
 
 _CLI_REVIEW_CONTRACT = (
