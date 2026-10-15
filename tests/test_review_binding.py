@@ -126,10 +126,26 @@ class ReviewBindingTests(Base):
 
         self.assertEqual(self.start(g, execute).status, "done")
 
+    def test_a_judge_after_a_map_binds_to_its_own_files(self):
+        # Codex R138: the world judge after a map of builds declared
+        # files: ["regions/*.py"], but the root graph has no code agent, so
+        # its PASS carried no reviewed digest, count or scope.
+        item_graph = graph([agent("build", files=["{{item.files}}"])])
+        g = graph([{"id": "groups", "kind": "map", "items": [{"files": ["src/a.py"]}], "graph": item_graph},
+                   {"id": "assemble", "kind": "shell", "command": "true"},
+                   judge("world", files=["src/*.py"])],
+                  [{"from": "groups", "to": "assemble"}, {"from": "assemble", "to": "world"}])
+        run = flow.new_run(self.state, g, cwd=str(self.work))
+        world = run.graph["nodes"][2]
+        review = JobNodeExecutor(self.state)._prepare_review(run, "", [world])
+        self.assertEqual(review["scope"], ["src/*.py"])
+        self.assertEqual(review["count"], 1)
+        self.assertIn("src/a.py", review["hashes"])
+
     def test_no_declared_files_means_no_binding(self):
         g = graph([agent("build"), judge("review")], [{"from": "build", "to": "review"}])
         run = flow.new_run(self.state, g, cwd=str(self.work))
-        self.assertIsNone(JobNodeExecutor(self.state)._prepare_review(run, ""))
+        self.assertIsNone(JobNodeExecutor(self.state)._prepare_review(run, "", [run.graph["nodes"][1]]))
 
 
 if __name__ == "__main__":

@@ -1,3 +1,22 @@
+## v1.43.5 — 2026-10-15
+
+**A judge binds its review to its own `files`.** In the Codex R138 cohort
+(1.43.4), the world judge after a map of group builds declared
+`files: ["regions/*.py"]`. Its root result had no `reviewed` digest, count or
+scope. The review scope came only from code agents in the judge's own graph,
+and the root graph has a map, a shell and a judge, but no code agent. The
+group judges inside the map items had digests. The world judge did not.
+
+- A judge's review scope is now its own rendered `files` plus the `files` of
+  the code agents in its run. Before, a judge's own `files` were not used.
+- A world judge with `files` now waits for live writers on those files,
+  records `reviewed`, turns a PASS on files that changed during the review
+  into PARTIAL, and a later change to them fails the run as a stale review.
+  These are the same rules that the item judges already used.
+- A judge inside a map item adds its own `files` to the item build scope.
+- A judge with no `files` in a run whose code nodes declare no `files` still
+  has no binding.
+
 ## v1.43.4 — 2026-10-14
 
 **A write-scope gate in a directory without Git no longer passes a run it
