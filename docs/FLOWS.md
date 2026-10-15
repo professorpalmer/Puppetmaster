@@ -236,8 +236,8 @@ a file that a shell command writes. Claim such a file yourself.
 
 ## Reviews bind to the final source
 
-A judge's PASS is about the files that it read. When the code nodes of a run
-declare `files`, each judge of that run does three things:
+A judge's PASS is about the files that it read. When the judge or the code
+nodes of its run declare `files`, the judge does three things:
 
 1. Before it starts, it waits until no live edit claim of another worker
    overlaps those files. The wait ends after `defaults.review_wait_seconds`
@@ -251,8 +251,10 @@ declare `files`, each judge of that run does three things:
    "stale review" reason that names the paths.
 
 A judge in a map item reviews only that item's files, so the builds of the
-other items do not make it wait. A run whose code nodes declare no `files`
-has no binding.
+other items do not make it wait. A judge after a map (a world review) has no
+code node in its own graph, so give it `files` for the assembled source. A
+judge with no `files` in a run whose code nodes declare no `files` has no
+binding.
 
 ## Follow-ups
 

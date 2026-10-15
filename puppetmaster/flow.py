@@ -1562,8 +1562,9 @@ class JobNodeExecutor:
                 if not (done.get(key) or {}).get("ok") and (done.get(key) or {}).get("attempt") != attempt]
         if todo:
             review = None
-            if any(node["kind"] == "judge" for _, node in todo):
-                review = self._prepare_review(run, prev)
+            judges = [node for _, node in todo if node["kind"] == "judge"]
+            if judges:
+                review = self._prepare_review(run, prev, judges)
             specs = [self._spec(key, node, run, prev, visit) for key, node in todo]
             launch_key = f"flow:{run.run_id}:{run.current}:{visit}:{attempt}"
             goal = specs[0].instruction if len(specs) == 1 else (run.input or specs[0].instruction)
@@ -1735,16 +1736,17 @@ class JobNodeExecutor:
         return ("\n\n".join(parts) + f"{context}\n\nYour earlier work in this session is on "
                 f"disk. Do the work above, rerun the checks, and finish.\n\n{_BUILD_VERDICT}")
 
-    def _prepare_review(self, run: FlowRun, prev: str) -> Optional[dict]:
+    def _prepare_review(self, run: FlowRun, prev: str, judges: list) -> Optional[dict]:
         """Wait until no live writer overlaps the reviewed files, then snapshot them.
 
         A judge that reviews while another worker still writes its files can
         pass a source that changes right after (Codex benchmark: four PASS
         votes, then a stop-missed repair worker edited the helper). The wait
         is bounded by ``defaults.review_wait_seconds`` (900 s) and a stop.
-        Returns None when no code node of the run declares ``files``.
+        Returns None when neither a judge nor a code node of the run declares
+        ``files``.
         """
-        scope = _review_scope(run, prev)
+        scope = _review_scope(run, prev, judges)
         if not scope:
             return None
         cwd = run.graph["cwd"]
@@ -2277,9 +2279,15 @@ _REVIEW_FILE_LIMIT = 200
 _GLOB_CHARS = set("*?[")
 
 
-def _review_scope(run: FlowRun, prev: str) -> list[str]:
-    """The files a judge of this run reviews: what its code nodes may write."""
+def _review_scope(run: FlowRun, prev: str, judges: list) -> list[str]:
+    """The files a judge reviews: its own ``files`` and what the run's code nodes may write.
+
+    A judge after a map has no code node in its own graph (Codex R138 world
+    review), so its own ``files`` are its only scope.
+    """
     scope: set[str] = set()
+    for judge in judges:
+        scope.update(render_files(judge.get("files"), run, prev))
     for node in run.graph.get("nodes") or []:
         if node.get("kind") != "agent" or node.get("role") == "explore" or not node.get("files"):
             continue
