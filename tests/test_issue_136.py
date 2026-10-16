@@ -284,7 +284,7 @@ class Issue136Tests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             (Path(tmp) / 'auth.json').write_text('{"auth_mode":"chatgpt"}')
             for code, output, expected in cases:
-                with self.subTest(code=code, expected=expected), patch.dict(os.environ, {'CODEX_HOME':tmp}, clear=True):
+                with self.subTest(code=code, expected=expected), patch.dict(os.environ, {'CODEX_HOME':tmp, 'PUPPETMASTER_BILLING_TTL_SECONDS':'0'}, clear=True):
                     status = detect_codex_billing(codex_command='custom-codex',
                         run=lambda cmd: (code, output, 'SECRET'))
                     self.assertEqual(status.billing, expected)

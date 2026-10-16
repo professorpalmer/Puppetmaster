@@ -373,6 +373,55 @@ def _read_codex_auth(path: Path, label: str) -> "Optional[BillingStatus]":
     return None
 
 
+def _login_probe_key(command: list[str], ctx: AuthContext) -> str:
+    import hashlib
+
+    scope = [command, ctx.env.get("CODEX_HOME") or "", str(ctx.home or ""), ctx.label]
+    return hashlib.sha256(json.dumps(scope).encode("utf-8")).hexdigest()[:24]
+
+
+def _login_probe_path(key: str) -> Path:
+    from puppetmaster.state import app_state_root
+
+    return app_state_root() / "billing-probes" / f"{key}.json"
+
+
+def _shared_login_probe(key: Optional[str]) -> Optional[BillingStatus]:
+    """A healthy ``login status`` result another process recorded within the TTL.
+
+    Every worker process ran its own ``codex login status`` before launch. With
+    a custom Codex command (a wrapper that verifies itself on each start, as in
+    the Codex R138 benchmark) that probe cost seconds on every node visit.
+    """
+    ttl = _default_billing_ttl_seconds()
+    if key is None or ttl <= 0:
+        return None
+    try:
+        record = json.loads(_login_probe_path(key).read_text(encoding="utf-8"))
+        if 0 <= time.time() - float(record["at"]) < ttl:
+            return BillingStatus(adapter="codex", billing=str(record["billing"]), healthy=True,
+                                 detail=str(record["detail"]), evidence=list(record["evidence"]))
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
+def _share_login_probe(key: Optional[str], status: BillingStatus) -> BillingStatus:
+    """Record a healthy probe for other processes; a failed one is never shared."""
+    if key is None or _default_billing_ttl_seconds() <= 0:
+        return status
+    try:
+        from puppetmaster.fs_permissions import write_private_text
+
+        path = _login_probe_path(key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_private_text(path, json.dumps({"at": time.time(), "billing": status.billing,
+                                             "detail": status.detail, "evidence": status.evidence}))
+    except OSError:
+        pass
+    return status
+
+
 def detect_codex_billing(
     run: Optional[CommandRunner] = None,
     codex_command: Optional[object] = None,
@@ -396,6 +445,10 @@ def detect_codex_billing(
         if from_file is not None:
             return replace(from_file, evidence=[*from_file.evidence, f"auth_context:{ctx.label}"])
     command.extend(["login", "status"])
+    probe_key = _login_probe_key(command, ctx) if run is None else None
+    shared = _shared_login_probe(probe_key)
+    if shared is not None:
+        return shared
     returncode, stdout, stderr = (run(command) if run is not None
                                   else _default_runner(command, env=ctx.env))
     text = f"{stdout[:8192]}\n{stderr[:8192]}".lower()
@@ -416,7 +469,7 @@ def detect_codex_billing(
             evidence=["codex_login:none", f"auth_context:{ctx.label}"],
         )
     if returncode == 0 and "logged in" in text and "api key" in text:
-        return BillingStatus(
+        return _share_login_probe(probe_key, BillingStatus(
             adapter="codex",
             billing="api",
             healthy=True,
@@ -425,9 +478,9 @@ def detect_codex_billing(
                 "per-token to that account (out-of-pocket)."
             ),
             evidence=["codex_login:api_key", f"auth_context:{ctx.label}"],
-        )
+        ))
     if returncode == 0 and "logged in" in text and "chatgpt" in text:
-        return BillingStatus(
+        return _share_login_probe(probe_key, BillingStatus(
             adapter="codex",
             billing="plan",
             healthy=True,
@@ -436,7 +489,7 @@ def detect_codex_billing(
                 "covered by that plan."
             ),
             evidence=["codex_login:chatgpt", f"auth_context:{ctx.label}"],
-        )
+        ))
     # Only Codex saying so means logged out. A failed, timed-out or unrecognized
     # status check is unverified: still not dispatchable, but not a logout.
     cause = ("timed out" if returncode == 124 else

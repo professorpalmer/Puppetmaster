@@ -41,7 +41,8 @@ def add_flow_parser(subcommands: Any) -> None:
     run.add_argument("--wait", action="store_true", help="Block until the run wakes the pilot.")
     run.add_argument("--timeout", type=float, default=0.0, help="With --wait: give up after N seconds.")
     run.add_argument("--foreground", action="store_true", help="Walk in this process instead of a detached one.")
-    run.add_argument("--worker-mode", choices=["subprocess", "inline"], default="subprocess")
+    run.add_argument("--worker-mode", choices=["subprocess", "inline"], default="inline",
+                     help="inline (default): workers run as threads in the walker. subprocess: one process per worker.")
 
     status = with_cwd(actions.add_parser("status", help="Compact run summary."))
     status.add_argument("run_id")
@@ -120,7 +121,7 @@ def flow_action(state_dir: Path, action: str, params: dict, *, backend: str = "s
         graph = flow.load_graph(state_dir, params["graph"], base=base)
         run = flow.new_run(state_dir, graph, str(params.get("input") or ""),
                            continue_from=params.get("continue_from"), cwd=params.get("cwd"),
-                           backend=backend, worker_mode=str(params.get("worker_mode") or "subprocess"))
+                           backend=backend, worker_mode=str(params.get("worker_mode") or "inline"))
         if params.get("foreground"):
             run = flow.walk(state_dir, run.run_id)
         else:
