@@ -155,15 +155,17 @@ class CodexAdapter(CliWorkerAdapter):
         if resume is not None:
             resume_record, lease = _lease_codex_thread(resume_record)
             resume = resolved_resume(resume_record, "codex")
-        if resume is not None and task.payload.get("resume_prompt"):
-            # The thread already holds the original task; send only what changed.
-            base_prompt = str(task.payload["resume_prompt"])
+        # A flow revisit: the thread already holds the original task, its contract,
+        # write scope and criteria. Send only what changed.
+        delta = str(task.payload["resume_prompt"]) if resume is not None and task.payload.get("resume_prompt") else ""
         sandbox = str(task.payload.get("sandbox") or "workspace-write")
         bypass = bool(task.payload.get("dangerously_bypass_approvals_and_sandbox", False))
         write_capable = sandbox != "read-only" or bypass
         review_mode = not write_capable and wants_review_contract(task.payload)
         disable_codegraph = bool(task.payload.get("disable_codegraph", False))
-        if write_capable:
+        if delta:
+            task_prompt = delta
+        elif write_capable:
             # A builder gets task-scoped CodeGraph context; the job-wide census
             # and goal brief only dilute it.
             task_prompt = with_job_brief(

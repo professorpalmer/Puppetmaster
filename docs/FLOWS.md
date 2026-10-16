@@ -83,6 +83,29 @@ criterion is met and every named check passes, and the worker then stops. Put
 the criteria in the task as an `Acceptance criteria:` block of numbered lines.
 Judges and explore agents ignore `finish`.
 
+### What builders and judges see
+
+A flow adds run context to worker tasks. Each item below is on by default.
+
+- **Gate preview.** A build agent sees the shell commands and judge tasks
+  that come after it on its success edges, in order, up to the next agent,
+  map or end. It runs those checks itself and checks its work against the
+  review before it reports. Set `preview: false` on the agent node to turn
+  this off.
+- **Review delta.** A judge on a later visit sees which of its reviewed files
+  changed since its last review and which did not. Its earlier findings on
+  unchanged files stand.
+- **Unit evidence.** A judge after a map sees the item reviews of that map:
+  each item judge's PASS, the files it covered, and if those files changed
+  since. The judge spends its review on how the units fit together. It
+  reviews a unit again when that unit's review is not current. Set
+  `evidence: false` on the judge node to turn this off.
+
+In a local replica of the Codex R138 graph (16 regions in 4 groups,
+`gpt-6.1-sol` high), first-visit review failures went from 3 of 4 groups
+(1.43.4, one run) to 0, 1, 2 and 0 of 4 (four runs). The world review went
+from 165 s to 52 to 87 s.
+
 ### Effort
 
 `effort` on an agent or judge node (`low`, `medium`, `high`, `xhigh`) sets its
@@ -272,7 +295,7 @@ re-runs only the items the request names, or all items, each resumed.
 | --- | --- |
 | `flow validate <graph>` | `validate` |
 | `flow save <graph>` (reuse by id) | `save` |
-| `flow run <graph\|id> [--input] [--continue RUN] [--wait] [--foreground]` | `run` (always detached; `wait: true` blocks up to the MCP cap) |
+| `flow run <graph\|id> [--input] [--continue RUN] [--wait] [--foreground] [--worker-mode inline\|subprocess]` | `run` (always detached; `wait: true` blocks up to the MCP cap) |
 | `flow status <run> [--since N]` | `status` |
 | `flow wait <run> [--timeout S]` | `wait` |
 | `flow resume <run> [--answer=X] [--restart] [--reset-loops] [--extra-steps N]` | `resume` |
@@ -284,6 +307,12 @@ Every action returns the same compact summary: status, reason, the steps since
 `since`, the last problem, usage, and `next_since` for the next call. Exit
 codes: 0 done, 4 waiting at a gate, 3 still running, 1 failed, stuck, stopped
 or interrupted, 2 invalid input.
+
+Workers run as threads inside the walker by default (`--worker-mode inline`).
+This removes one worker process start per node visit. The walker's process
+group holds every worker and its CLI, so a stop of that group stops them all.
+`--worker-mode subprocess` starts one process per worker. Those processes can
+outlive a walker that dies alone.
 
 A walker that dies leaves the run `interrupted`; `flow resume` picks it up, and
 any job it had started is adopted rather than relaunched. A dead walker's pid

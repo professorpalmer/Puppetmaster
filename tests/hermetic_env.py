@@ -231,6 +231,19 @@ def apply_hermetic_isolation(*, register_atexit: bool = True) -> None:
     # Store discovery and file claims live under the app state root; never
     # let the suite read or write the developer's real Puppetmaster state.
     os.environ["PUPPETMASTER_APP_STATE_ROOT"] = str(Path(_ISOLATION_TMP) / "app-state")
+    # A test that clears os.environ (patch.dict(..., clear=True)) drops that
+    # override; the real root must still stay out of reach.
+    import puppetmaster.state as _state
+
+    _real_app_state_root = _state.app_state_root
+    _isolated_root = Path(_ISOLATION_TMP) / "app-state"
+
+    def _isolated_app_state_root() -> Path:
+        if os.environ.get(_state.APP_STATE_ROOT_ENV):
+            return _real_app_state_root()
+        return _isolated_root
+
+    _state.app_state_root = _isolated_app_state_root
     # ~/.puppetmaster holds the Codex worker home (a copy of the user's login)
     # and prefix-warm marks; a test must never write either.
     os.environ["PUPPETMASTER_HOME"] = str(Path(_ISOLATION_TMP) / "puppetmaster-home")

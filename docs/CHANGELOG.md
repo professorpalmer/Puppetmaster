@@ -1,3 +1,52 @@
+## v1.44.0 — 2026-10-15
+
+**Flows send less work through each repair.** In the Codex R138 cohort
+(1.43.4), PM took 2.38 times the native work time. A local replica of that
+graph (16 regions in 4 groups, `gpt-6.1-sol` high) showed where the time
+went. Three of four group reviews failed on their first visit. Each repair
+re-sent the full build contract, so the builder started the task again. The
+world review read all 144 views again after 16 current unit reviews.
+
+- **Gate preview.** A build agent sees the shell commands and judge tasks
+  that come after it on its success edges. It runs those checks and checks
+  its work against the review before it reports. `preview: false` on the
+  node turns it off.
+- **Bare resume delta.** When a flow resumes a Codex or Claude Code session,
+  the adapter sends only the flow's delta. Before, it wrapped the delta in
+  the full build or review contract, write scope and criteria again. The
+  resumed session already holds them, and the repeat made the builder start
+  the task again.
+- **Review delta.** A judge on a later visit sees which reviewed files
+  changed since its last review and which did not.
+- **Unit evidence.** A judge after a map sees each item review: verdict,
+  files and if those files changed since. It spends its review on how the
+  units fit together. `evidence: false` on the judge node turns it off.
+  Item results now carry `reviews`.
+- **Inline workers by default.** `flow run` starts workers as threads in the
+  walker (`--worker-mode inline`). This removes one worker process start per
+  node visit. `--worker-mode subprocess` is still available.
+- **Shared login probe.** A Codex billing check with a custom
+  `CODEX_COMMAND` ran `<command> login status` in every worker process. A
+  healthy result is now shared through the app state dir for the billing
+  TTL (`PUPPETMASTER_BILLING_TTL_SECONDS`, 0 turns it off). Failed probes are
+  not shared, and no raw output is stored.
+- Graph validation refuses a `preview` or `evidence` value that is not true
+  or false.
+
+Replica results (local, wall time and API-equivalent cost):
+
+| Arm | Runs | Wall (s) | Cost (USD) |
+| --- | --- | --- | --- |
+| Native subagents | 3 | 311, 326, 363 | 2.30, 2.24, 2.38 |
+| PM 1.43.4 | 1 | 553 | 3.62 |
+| PM 1.44.0 | 4 | 323, 357, 614, 675 | 2.14, 2.27, 2.85, 3.41 |
+
+A run with no first-visit review FAIL matches native. A FAIL on the hardest
+group (windmills and arches) still costs about 300 s. The PM group judges
+also failed 3 of 4 groups of the final native output in both native runs
+they read. A native reviewer is a fork of its builder; a PM judge is an
+independent session.
+
 ## v1.43.5 — 2026-10-15
 
 **A judge binds its review to its own `files`.** In the Codex R138 cohort

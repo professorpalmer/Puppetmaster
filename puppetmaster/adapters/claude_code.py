@@ -189,10 +189,12 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
         raw_instruction = task.payload.get("prompt") or task.instruction
         resume_record = task_resume_record(task.payload, "claude-code")
         resume = resolved_resume(resume_record, "claude-code")
-        if resume is not None and task.payload.get("resume_prompt"):
-            # The resumed session already holds the original task; send only what changed.
-            raw_instruction = str(task.payload["resume_prompt"])
-        if wants_review_contract(task.payload):
+        delta = str(task.payload["resume_prompt"]) if resume is not None and task.payload.get("resume_prompt") else ""
+        if delta:
+            # A flow revisit: the session already holds the original task, its
+            # contract, write scope and criteria. Send only what changed.
+            base_prompt = delta
+        elif wants_review_contract(task.payload):
             base_prompt = build_cli_review_prompt(task, prompt=raw_instruction)
         elif _claude_write_capable(task.payload):
             base_prompt = build_cli_implement_prompt(task, prompt=raw_instruction)
@@ -206,7 +208,8 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
         shared_brief = disable_codegraph or not _claude_write_capable(task.payload)
         if resume is not None:
             # The resumed session already holds memory and CodeGraph context.
-            prompt, codegraph_used = with_job_brief(base_prompt, task, shared_brief=shared_brief), False
+            prompt = base_prompt if delta else with_job_brief(base_prompt, task, shared_brief=shared_brief)
+            codegraph_used = False
         else:
             prompt, codegraph_used = facade("enrich_prompt_with_codegraph")(
                 with_job_brief(prompt_with_memory(base_prompt, task), task, shared_brief=shared_brief),

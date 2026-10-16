@@ -247,6 +247,9 @@ def _node_problems(node: dict, defaults: dict, *, child: bool, depth: int) -> li
         problems.append(f"node {nid!r} timeout_seconds must be a positive integer")
     if "payload" in node and not isinstance(node["payload"], dict):
         problems.append(f"node {nid!r} payload must be an object")
+    for key in ("preview", "evidence"):
+        if key in node and not isinstance(node[key], bool):
+            problems.append(f"node {nid!r} {key} must be true or false")
     problems.extend(_effort_problems(node, f"node {nid!r}"))
     if kind in ("agent", "judge"):
         if not str(node.get("task") or "").strip():
@@ -668,7 +671,7 @@ class FlowRun:
     inflight: Optional[dict] = None
     pid: Optional[int] = None
     backend: str = "sqlite"
-    worker_mode: str = "subprocess"
+    worker_mode: str = "inline"
     parent: Optional[dict] = None
     continued_from: Optional[str] = None
     created_at: str = field(default_factory=now_iso)
@@ -795,7 +798,7 @@ def load_graph(state_dir: Path, ref: Any, *, base: Optional[str] = None) -> dict
 def new_run(state_dir: Path, graph: dict, input_text: str = "", *,
             state: Optional[dict] = None, parent: Optional[dict] = None,
             continue_from: Optional[str] = None, cwd: Optional[str] = None,
-            backend: str = "sqlite", worker_mode: str = "subprocess") -> FlowRun:
+            backend: str = "sqlite", worker_mode: str = "inline") -> FlowRun:
     """Create a run. ``continue_from`` carries a prior run's sessions so its nodes resume."""
     child = parent is not None
     depth = int((parent or {}).get("depth", 0))
@@ -1518,7 +1521,7 @@ class JobNodeExecutor:
     Windows), so the group a host binds is the one stop and timeout kill.
     """
 
-    def __init__(self, state_dir: Path, *, backend: str = "sqlite", worker_mode: str = "subprocess",
+    def __init__(self, state_dir: Path, *, backend: str = "sqlite", worker_mode: str = "inline",
                  spawn: Optional[Callable[[Path, str], Any]] = None, poll_seconds: float = 1.0,
                  popen: Optional[Callable[..., Any]] = None) -> None:
         self.state_dir = Path(state_dir)
@@ -1643,6 +1646,9 @@ class JobNodeExecutor:
             payload.update(_READ_ONLY)
             payload["terminal_verdict"] = True
             if judge:
+                evidence = _unit_review_evidence(run) if node.get("evidence", True) else ""
+                if evidence:
+                    task = f"{task}\n\n{evidence}"
                 task = f"{task}\n\n{_JUDGE_VERDICT}"
             else:
                 revision = self._revision_context(run, prev, visit)
@@ -1662,6 +1668,9 @@ class JobNodeExecutor:
                 # A resumed session gets the delta alone; a fresh start (resume
                 # unavailable or turned off) must still see what to fix.
                 task = f"{task}\n\n{revision}"
+            preview = _gate_preview(run, node, prev) if node.get("preview", True) else ""
+            if preview:
+                task = f"{task}\n\n{preview}"
             task = f"{task}\n\n{_BUILD_VERDICT}"
             if (node.get("finish") or defaults.get("finish")) == "criteria":
                 payload["finish"] = "criteria"
@@ -1709,9 +1718,10 @@ class JobNodeExecutor:
             return ("Your previous attempt at this task stopped before it finished. Your work so far "
                     f"is on disk; continue the task and finish.\n\n{task}")
         if node["kind"] == "judge":
+            changes = _review_changes(run, node)
             return ("The work changed since your last review. Review it again against the same "
-                    "task: confirm the problems you flagged are fixed and look for regressions.\n\n"
-                    f"{task}")
+                    "task: confirm the problems you flagged are fixed and look for regressions."
+                    f"{changes}\n\n{task}")
         if visit > 1:
             feedback = prev.strip() or "(the previous step gave no details)"
             return (f"Revision {visit} of your task. Your earlier work in this session is already on "
@@ -2279,6 +2289,91 @@ _REVIEW_FILE_LIMIT = 200
 _GLOB_CHARS = set("*?[")
 
 
+_SUCCESS_WHEN = ("always", "ok", "PASS")
+_LEFT_OPEN = re.compile(r"\{\{[^{}]*\}\}")
+
+
+def _gate_preview(run: FlowRun, node: dict, prev: str) -> str:
+    """The checks and reviews that judge this build next, so the builder can meet them first.
+
+    Codex R138: every cold repair visit followed a review FAIL on a criterion
+    the builder could have checked itself. A repair costs a new build visit
+    and a new review; a builder that runs the same checks first does not.
+    Follows success edges from ``node`` to the next agent, map or end.
+    """
+    nodes = {item["id"]: item for item in run.graph.get("nodes") or []}
+    edges = run.graph.get("edges") or []
+    steps: list[str] = []
+    seen = {node["id"]}
+    current = node["id"]
+    while True:
+        nxt = next((edge["to"] for edge in edges if edge.get("from") == current
+                    and edge.get("when", "always") in _SUCCESS_WHEN and edge.get("to") not in seen), None)
+        target = nodes.get(nxt) if nxt else None
+        if target is None or target["kind"] not in ("shell", "judge"):
+            break
+        seen.add(nxt)
+        if target["kind"] == "shell":
+            steps.append(f"Command: {_LEFT_OPEN.sub('(output of the steps above)', render(target['command'], run, prev))}")
+        else:
+            steps.append("Review:\n" + _LEFT_OPEN.sub("(output of the steps above)", render(target["task"], run, prev)))
+        current = nxt
+    if not steps:
+        return ""
+    listed = "\n\n".join(f"{index}. {step}" for index, step in enumerate(steps, 1))
+    return ("After you finish, your result goes through these steps in this order:\n\n"
+            f"{listed}\n\nRun the commands yourself and check your result against the review "
+            "before you finish. Do not write the review.")
+
+
+def _unit_review_evidence(run: FlowRun) -> str:
+    """Current unit reviews from this run's maps, for a judge that reviews the assembly."""
+    lines = []
+    for node in run.graph.get("nodes") or []:
+        if node.get("kind") != "map":
+            continue
+        for key, item in ((run.results.get(node["id"]) or {}).get("items") or {}).items():
+            for review in item.get("reviews") or []:
+                reviewed = review.get("reviewed") or {}
+                scope = reviewed.get("scope")
+                if review.get("verdict") != "PASS" or not scope:
+                    continue
+                current = _source_state(run.graph["cwd"], scope)["digest"] == reviewed.get("digest")
+                state = "current: no file changed since" if current else "NOT current: files changed since"
+                lines.append(f"- {key}: {review['node']} PASS on {reviewed.get('count')} files "
+                             f"({', '.join(scope[:6])}{', ...' if len(scope) > 6 else ''}); {state}")
+    if not lines:
+        return ""
+    return ("Unit reviews in this run:\n" + "\n".join(lines) + "\n\nA current unit review covers "
+            "its own files. Spend your review on what unit reviews cannot see: how the units fit "
+            "together, the shared seams and connections, and the assembled result. Review a "
+            "unit's files again when its review is not current or the assembled result shows a "
+            "problem in that unit.")
+
+
+def _review_changes(run: FlowRun, node: dict) -> str:
+    """Which reviewed files changed since this judge's last review, from its recorded hashes."""
+    reviewed = (run.results.get(node["id"]) or {}).get("reviewed") or {}
+    old, scope = reviewed.get("hashes"), reviewed.get("scope")
+    if old is None or not scope:
+        return ""
+    new = _source_state(run.graph["cwd"], scope).get("hashes")
+    if new is None:
+        return ""
+    changed = sorted(path for path in set(old) | set(new) if old.get(path) != new.get(path))
+    same = sorted(path for path in old if path in new and old[path] == new[path])
+
+    def listed(paths: list[str]) -> str:
+        return ", ".join(paths[:40]) + (f" (+{len(paths) - 40} more)" if len(paths) > 40 else "")
+
+    text = f"\n\nChanged since your last review: {listed(changed) or 'nothing'}."
+    if same:
+        text += (f"\nUnchanged since your last review: {listed(same)}. Your earlier findings on "
+                 "unchanged files stand; check the changed files, the problems you flagged, and "
+                 "regressions that the changes could cause.")
+    return text
+
+
 def _review_scope(run: FlowRun, prev: str, judges: list) -> list[str]:
     """The files a judge reviews: its own ``files`` and what the run's code nodes may write.
 
@@ -2405,8 +2500,12 @@ def _item_result(child: FlowRun) -> dict:
     reason = "" if ok else ("; ".join(failed) if done else child.reason)
     files = sorted({path for result in child.results.values() for path in result.get("files") or []})
     last = child.outputs.get(child.steps[-1]["node"], "") if child.steps else ""
+    reviews = [{"node": node_id, "verdict": result.get("verdict"),
+                "reviewed": {key: result["reviewed"][key] for key in ("digest", "count", "scope")
+                             if key in result["reviewed"]}}
+               for node_id, result in child.results.items() if result.get("reviewed")]
     return {"run_id": child.run_id, "status": child.status, "ok": ok, "verdict": verdict,
-            "reason": reason[:300], "files": files, "output": last[-400:]}
+            "reason": reason[:300], "files": files, "output": last[-400:], "reviews": reviews}
 
 
 def _map_outcome(node: dict, items: dict[str, dict], usage: dict) -> NodeOutcome:
