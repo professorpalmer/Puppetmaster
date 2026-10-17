@@ -1,3 +1,39 @@
+## v1.45.0 — 2026-10-17
+
+**A follow-up can keep unchanged map items.** In the Codex R157 cohort (PM
+1.44.0, N16 grouped, `gpt-6.1-sol` high), every follow-up rebuilt and
+reviewed all four groups. The request named only the revised regions, so the
+unchanged groups spent build and review time on revalidation. In one
+repetition an unchanged group held the map finish at 202 s.
+
+- **Opt-in `reuse` on a map.** `reuse: {"inputs": ..., "names": ...}`. The
+  map records a fingerprint of each finished item: its task (item graph and
+  item value), the digest of its declared inputs, and the digest of its own
+  files. On the first map visit of a follow-up run, an item that the request
+  does not name keeps its prior result when that result passed and the
+  task, inputs, own files and every review digest still match. A missing
+  input, a missing fingerprint, a changed file or a failed prior result makes
+  the item run. A request that names no item runs every item.
+- **Names.** `reuse.names` adds names that identify an item in a request,
+  for example the regions of a group. The key and the item files still
+  count.
+- **Recorded.** Each item records `reuse` with the reason. A reused item
+  also records the item run that built it and that run's parent. The map
+  output and the step item counts show reused and run items. A reused item
+  adds no usage to the new run.
+- **Checked again at the end.** A passing end checks each reused item again.
+  A changed input, own file or reviewed file fails the run as a stale reuse.
+  A run that ends because no edge leaves a passing node now gets the same
+  checks, and the stale-review check too (before, only an `end` node did).
+- **Never reused.** An item with no review, an item graph that reads the
+  request (`{{input}}`), and an item that a request cannot name (a short or
+  all-digit key with no alias and no files) always run.
+- A trailing `**` in a review or input scope names the files below it. Before
+  Python 3.13 it matched only directories and hashed no file.
+- A map without `reuse` works as before. Replay of the three R157 pairs
+  (real graphs and follow-up requests, fake workers): two of four groups
+  reused in each pair, the same with the item list reversed.
+
 ## v1.44.0 — 2026-10-15
 
 **Flows send less work through each repair.** In the Codex R138 cohort

@@ -289,6 +289,58 @@ The new run inherits the prior run's sessions and results. Every node resumes
 its own session with the follow-up request instead of starting fresh, and a map
 re-runs only the items the request names, or all items, each resumed.
 
+### Reuse unchanged items
+
+A map can opt in to `reuse`. On a follow-up run, an unchanged item then keeps
+its prior result and does not build or review again:
+
+```json
+{"id": "groups", "kind": "map", "items": "{{state.groups}}",
+ "reuse": {"inputs": "{{item.inputs}}", "names": "{{item.regions}}"},
+ "graph": {"...": "..."}}
+```
+
+- `inputs` (required): the files each item's result depends on, for example
+  its contracts and the shared checker and rubric. Do not list files that
+  change in every phase, such as phase records: they make every item run.
+- `names` (optional): more names that identify an item in a follow-up
+  request, in addition to its key and its files.
+
+When the map finishes an item, it records a fingerprint of that item: its
+task (item graph and item value), the digest of its inputs, and the digest
+of its own files. On the first map visit of a follow-up run:
+
+1. When the request names no item, every item runs. Such a request can apply
+   to every item.
+2. An item that the request names runs. A request names an item by its key,
+   a `names` alias, a file in its declared scope, or a file it changed. A map
+   `feedback` template can name more items.
+3. Any other item is reused only when its prior result passed, its task is
+   the same, every declared input exists and is unchanged, its own files are
+   unchanged, it has at least one review, and each review is a PASS whose
+   files are unchanged. Otherwise it runs. An item without a recorded
+   fingerprint runs.
+4. An item never reuses when its item graph reads the request (`{{input}}`,
+   or `{{prev}}` in its entry node). An item never reuses when a request
+   cannot name it: a one-character or all-digit key with no `names` alias
+   and no files.
+
+The position of an item counts only when an item template reads `index` or
+`state.index`, or a node mentions `PM_FLOW_CONTEXT`. A reordered list then
+keeps reuse. A trailing `**` in `inputs` names every file below it. Each item records `reuse`: `reused` and the
+reason, and for a reused item the item run that built it (`source_run`) and
+its parent run (`source_parent`). Chained reuse keeps the original source. The
+map output counts reused and run items. A reused item adds no usage to the
+new run. Nodes after the map, such as a world review, run as usual.
+
+When the run reaches a passing end, or ends because no edge leaves a passing
+node, each reused item is checked again: a
+changed input, own file or reviewed file fails the run with a "reused result
+is stale" reason.
+
+A cold run with `reuse` only records fingerprints. A map without `reuse`
+works as before, and drops reuse records from earlier runs.
+
 ## Running and waking
 
 | CLI | MCP `puppetmaster_flow` action |
