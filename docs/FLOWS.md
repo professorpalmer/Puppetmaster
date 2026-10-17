@@ -100,6 +100,13 @@ A flow adds run context to worker tasks. Each item below is on by default.
   since. The judge spends its review on how the units fit together. It
   reviews a unit again when that unit's review is not current. Set
   `evidence: false` on the judge node to turn this off.
+- **Item frame.** A build agent inside a map item learns its item key, that
+  the map waits for every item before later steps, and the files that the
+  other items own. A check or review line that fails only in another item's
+  files is not its failure: it names that line in its report and gives the
+  verdict of its own work. On a follow-up it learns that the request is for
+  the whole map. The frame is always on. The item's own checks and review,
+  and the steps after the map, still judge the result.
 
 In a local replica of the Codex R138 graph (16 regions in 4 groups,
 `gpt-6.1-sol` high), first-visit review failures went from 3 of 4 groups
@@ -285,7 +292,12 @@ binding.
 puppetmaster flow run fix-and-review.json --continue <prior_run_id> --input "also handle empty input"
 ```
 
-The new run inherits the prior run's sessions and results. Every node resumes
+The new run inherits the prior run's sessions and results. Each inherited
+result records `inherited_from`: the run that produced it (the first one in a
+chain). The run summary lists each inherited result that this run did not
+produce again under `inherited`, with its verdict and, for a review, if its
+files are still `current`. An inherited PASS describes the prior run's files,
+not this run's. Every node resumes
 its own session with the follow-up request instead of starting fresh, and a map
 re-runs only the items the request names, or all items, each resumed.
 

@@ -1,3 +1,27 @@
+## v1.45.1 — 2026-10-17
+
+**A map item's builder owns only its own verdict.** In the Codex R163 study
+(PM 1.45.0, reuse on, follow-up), the group_03 builder ran the world check
+while the group_01 builder still worked. The check failed only in group_01's
+regions, the builder ended FAIL, and that FAIL failed the item although its
+own fresh review passed. The run stopped at the map before the new world
+review.
+
+- **Item frame.** A build agent inside a map item now learns its item key,
+  that the map waits for every item before later steps, and the files that
+  other items own (up to 20). A check or review line that fails only in
+  another item's files is not its failure. On a follow-up it learns that the
+  request is for the whole map. A resumed builder gets the frame before its
+  `revise` text. Before, peer scopes went only to the write-scope gate.
+- **Inherited results show their origin.** A continued run marks each copied
+  result with `inherited_from` (the first run in a chain). The run summary
+  lists `inherited` results that this run did not produce again, with the
+  verdict and, for a review, if its files are still `current`. In R163 the
+  failed run still held the cold world PASS with no such mark.
+- Unchanged: an item still fails on a build FAIL, and a world failure after
+  the map still fails the run. New tests cover a fast item and a slow peer:
+  the world review runs only after both builds.
+
 ## v1.45.0 — 2026-10-17
 
 **A follow-up can keep unchanged map items.** In the Codex R157 cohort (PM
