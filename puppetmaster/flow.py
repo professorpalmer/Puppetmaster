@@ -830,6 +830,10 @@ def new_run(state_dir: Path, graph: dict, input_text: str = "", *,
             raise FlowError(f"cannot continue {continue_from}: it is still {prior.status}")
         sessions = copy.deepcopy(prior.sessions)
         results = copy.deepcopy(prior.results)
+        for result in results.values():
+            # A result this run does not produce again is the prior run's,
+            # not evidence about this run's files. Chains keep the first origin.
+            result.setdefault("inherited_from", prior.run_id)
         seeded.update(prior.state)
         backend, worker_mode = prior.backend, prior.worker_mode
     seeded.update(state or {})
@@ -1436,6 +1440,10 @@ def run_summary(run: FlowRun, *, since: int = 0) -> dict:
     }
     if run.gate:
         summary["gate"] = run.gate
+    inherited = _inherited_results(run)
+    if inherited:
+        summary["inherited"] = inherited
+
     def problem(step: dict) -> bool:
         return not step.get("ok") or step.get("verdict") in ("FAIL", "PARTIAL")
 
@@ -1447,6 +1455,27 @@ def run_summary(run: FlowRun, *, since: int = 0) -> dict:
             summary["last_problem"] = {key: failing[key] for key in ("node", "verdict", "reason", "error")
                                        if failing.get(key)}
     return summary
+
+
+def _inherited_results(run: FlowRun) -> dict[str, dict]:
+    """Results copied from an earlier run that this run did not produce again.
+
+    Codex R163: a follow-up stopped at its map, and the run still held the
+    cold world review's PASS with no mark that it described older files.
+    """
+    inherited = {}
+    for node_id, result in run.results.items():
+        origin = result.get("inherited_from")
+        if not origin:
+            continue
+        entry: dict[str, Any] = {"from": origin}
+        if result.get("verdict"):
+            entry["verdict"] = result["verdict"]
+        reviewed = result.get("reviewed")
+        if reviewed and reviewed.get("scope"):
+            entry["current"] = _source_state(run.graph["cwd"], reviewed["scope"])["digest"] == reviewed.get("digest")
+        inherited[node_id] = entry
+    return inherited
 
 
 def spawn_background_walk(state_dir: Path, run_id: str, *, answer: Optional[str] = None,
@@ -1684,6 +1713,9 @@ class JobNodeExecutor:
             preview = _gate_preview(run, node, prev) if node.get("preview", True) else ""
             if preview:
                 task = f"{task}\n\n{preview}"
+            frame = _item_frame(run)
+            if frame:
+                task = f"{task}\n\n{frame}"
             task = f"{task}\n\n{_BUILD_VERDICT}"
             if (node.get("finish") or defaults.get("finish")) == "criteria":
                 payload["finish"] = "criteria"
@@ -1704,6 +1736,9 @@ class JobNodeExecutor:
         if session and node.get("resume", True) is not False:
             payload["resume_from"] = {"job_id": session["job_id"], "task_id": session["task_id"]}
             payload["resume_prompt"] = self._delta(node, run, prev, visit, task, session=session)
+            frame = "" if read_only else _item_frame(run)
+            if frame and frame not in payload["resume_prompt"]:
+                payload["resume_prompt"] = f"{frame}\n\n{payload['resume_prompt']}"
         return WorkerSpec(role=key, instruction=task,
                           adapter=node.get("adapter") or defaults["adapter"], payload=payload)
 
@@ -2325,6 +2360,38 @@ _SUCCESS_WHEN = ("always", "ok", "PASS")
 _LEFT_OPEN = re.compile(r"\{\{[^{}]*\}\}")
 
 
+_PEER_LIMIT = 20
+
+
+def _item_frame(run: FlowRun) -> str:
+    """Where a map item's builder stands: its peers build at the same time, and its verdict is its own.
+
+    Codex R163 (PM 1.45.0): a group builder ran the world check before a
+    peer group finished its revision. The check failed only in the peer's
+    regions, the builder ended FAIL, and that FAIL failed the item although
+    its own review passed. Nothing told the builder that peers were still
+    building or that their files were not its work.
+    """
+    parent = run.parent or {}
+    if not parent.get("key"):
+        return ""
+    peers = list(parent.get("peer_scopes") or [])
+    lines = [f"You build item {parent['key']} of map {parent.get('node')}. The map waits for every item "
+             "before later steps check the whole result."]
+    if peers:
+        shown = ", ".join(peers[:_PEER_LIMIT]) + (f", and {len(peers) - _PEER_LIMIT} more"
+                                                  if len(peers) > _PEER_LIMIT else "")
+        lines.append(f"Other items build at the same time in this workspace and own: {shown}.")
+    lines.append("Base your verdict on your own files and on the checks of your own work. A check or "
+                 "review line that fails only in files that another item owns is not your failure: do "
+                 "not end FAIL or PARTIAL for it. Name it in one line of your report and end with the "
+                 "result of your own work.")
+    if run.continued_from:
+        lines.append("The follow-up request is for the whole map. Do only the parts of it that concern "
+                     "your item.")
+    return " ".join(lines)
+
+
 def _gate_preview(run: FlowRun, node: dict, prev: str) -> str:
     """The checks and reviews that judge this build next, so the builder can meet them first.
 
@@ -2542,8 +2609,11 @@ _READS_REQUEST = re.compile(r"\{\{\s*input\b")
 def _reads_request(child_graph: dict) -> bool:
     """An item graph whose templates read the request: its result follows each new request.
 
-    ``prev`` is the request only in the entry node's first visit; its
-    ``revise`` template renders on a repair visit, where ``prev`` is feedback.
+    ``{{input}}`` anywhere, or ``{{prev}}`` in the entry node's task, puts the
+    request into the item's own task. ``revise`` does not count: it is the
+    message to a resumed session (a repair, or a follow-up where its ``prev``
+    carries the request), and every builder that runs on a follow-up gets the
+    request in some form. Which items the request concerns is the naming rule.
     """
     entry = next((node for node in child_graph.get("nodes") or [] if node.get("id") == child_graph.get("entry")),
                  {})
