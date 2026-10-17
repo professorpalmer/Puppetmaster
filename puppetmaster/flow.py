@@ -329,6 +329,14 @@ def _map_problems(node: dict, defaults: dict, depth: int) -> list[str]:
         problems.append(f"map {nid!r} concurrency must be a positive integer")
     if "feedback" in node and not isinstance(node["feedback"], str):
         problems.append(f"map {nid!r} feedback must be a template string")
+    if "reuse" in node:
+        reuse = node["reuse"]
+        if not isinstance(reuse, dict) or set(reuse) - {"inputs", "names"}:
+            problems.append(f"map {nid!r} reuse must be an object with inputs and optional names")
+        elif not reuse.get("inputs") or not isinstance(reuse["inputs"], (str, list)):
+            problems.append(f"map {nid!r} reuse needs inputs: the files each item's result depends on")
+        elif "names" in reuse and not isinstance(reuse["names"], (str, list)):
+            problems.append(f"map {nid!r} reuse names must be a template or a list")
     policy = node.get("pass", "all")
     if not (policy == "all" or (isinstance(policy, (int, float)) and not isinstance(policy, bool)
                                 and 0 < policy <= 1)):
@@ -1026,7 +1034,7 @@ def _walk(state_dir: Path, run: FlowRun, execute: NodeExecutor) -> FlowRun:
             status = node.get("status", "pass")
             failed = [] if "status" in node else _failed_work(run)
             if status == "pass" and not failed:
-                failed = _stale_reviews(run)
+                failed = _stale_reviews(run) + _stale_reuse(run)
             if failed:
                 # An unconditional edge carried a failed node to an implicit
                 # end; reporting that run as a pass woke the pilot with
@@ -1036,6 +1044,9 @@ def _walk(state_dir: Path, run: FlowRun, execute: NodeExecutor) -> FlowRun:
                            render(node.get("summary") or status, run, prev))
         nxt = _pick_edge(graph, node, outcome, run, max_loops, loops)
         if isinstance(nxt, tuple):
+            failed = _stale_reviews(run) + _stale_reuse(run) if nxt[0] == "done" else []
+            if failed:
+                return _finish(state_dir, run, "failed", "; ".join(failed)[:600])
             return _finish(state_dir, run, *nxt)
         run.current = nxt
         save_run(state_dir, run)
@@ -1494,6 +1505,8 @@ def _item_counts(items: dict) -> dict:
     for item in items.values():
         status = item.get("status") or "?"
         counts[status] = counts.get(status, 0) + 1
+        if (item.get("reuse") or {}).get("reused"):
+            counts["reused"] = counts.get("reused", 0) + 1
     return counts
 
 
@@ -1867,7 +1880,12 @@ class JobNodeExecutor:
         else:
             feedback = _feedback(run, prev) if visit > 1 else run.input
         if "kept" not in inflight:
-            chosen = (select_targets(keys, prior, feedback, repair=visit > 1) if repeat else set(keys))
+            if repeat and visit == 1 and run.continued_from and node.get("reuse"):
+                inflight["reuse"] = _reuse_decisions(node, run, keys, items, prior,
+                                                     feedback if node.get("feedback") else "")
+                chosen = {key for key in keys if not inflight["reuse"][key]["reused"]}
+            else:
+                chosen = select_targets(keys, prior, feedback, repair=visit > 1) if repeat else set(keys)
             inflight["kept"] = [key for key in keys if key not in chosen]
             inflight["chosen"] = [key for key in keys if key in chosen]
             if repeat:
@@ -1905,10 +1923,24 @@ class JobNodeExecutor:
             save_run(self.state_dir, run)
         self._drive_children(run, node, children)
         merged: dict[str, dict] = {key: prior[key] for key in inflight.get("kept") or [] if key in prior}
+        decisions = inflight.get("reuse") or {}
+        for key in merged:
+            if (decisions.get(key) or {}).get("reused"):
+                merged[key] = {**merged[key], "reuse": _reuse_record(merged[key], decisions[key], run)}
+            elif (merged[key].get("reuse") or {}).get("checked_in") != run.run_id:
+                # A record from an earlier run describes that run, not this one.
+                merged[key] = {name: value for name, value in merged[key].items() if name != "reuse"}
         usage: dict[str, Any] = {}
         for key, child_id in children.items():
             child = load_run(self.state_dir, child_id)
             merged[key] = _item_result(child)
+            if node.get("reuse"):
+                index = keys.index(key)
+                merged[key]["fingerprint"] = _item_fingerprint(node, run, child_graph, key, items[index], index,
+                                                               scopes.get(key) or [], merged[key]["files"])
+            if key in decisions:
+                merged[key]["reuse"] = {"reused": False, "reason": decisions[key]["reason"]}
+            # Only work this phase ran is charged; a reused item adds no usage.
             _add_usage(usage, child.usage)
         ordered = {key: merged[key] for key in keys if key in merged}
         outcome = _map_outcome(node, ordered, usage)
@@ -2412,6 +2444,11 @@ def _live_writers(cwd: str, scope: list[str]) -> list[tuple[str, str]]:
         return []  # no claim registry here: nothing to wait for
 
 
+def _glob_pattern(entry: str) -> str:
+    """Before Python 3.13 a trailing ``**`` matches only directories; ``**/*`` names the files below them."""
+    return entry + "/*" if entry == "**" or entry.endswith("/**") else entry
+
+
 def _source_state(cwd: str, scope: list[str]) -> dict:
     """Digest of the files that match ``scope``; per-file hashes when there are few."""
     import hashlib
@@ -2420,7 +2457,7 @@ def _source_state(cwd: str, scope: list[str]) -> dict:
     found: set[Path] = set()
     for entry in scope:
         if _GLOB_CHARS & set(entry):
-            found.update(path for path in root.glob(entry) if path.is_file())
+            found.update(path for path in root.glob(_glob_pattern(entry)) if path.is_file())
             continue
         path = root / entry
         if path.is_file():
@@ -2477,6 +2514,185 @@ def _stale_reviews(run: FlowRun) -> list[str]:
     return stale
 
 
+# --------------------------------------------------------------------------
+# Continuation reuse: a map item whose task, inputs, outputs and reviews did
+# not change keeps its result instead of building and reviewing again.
+
+
+def _item_probe(run: FlowRun, key: str, item: Any, index: int) -> FlowRun:
+    return FlowRun(run_id="flow_000000000000", graph={"cwd": run.graph["cwd"]},
+                   state={"item": item, "index": index, "key": key})
+
+
+def _task_fingerprint(child_graph: dict, item: Any, index: int) -> str:
+    """The item's task: its item graph and item value. The position counts only
+    when a template or a shell context file can read ``index``, so reordering the
+    list keeps it."""
+    shape = {name: value for name, value in child_graph.items() if name not in ("id", "cwd")}
+    payload: dict[str, Any] = {"graph": shape, "item": item}
+    if _READS_INDEX.search(json.dumps(shape, sort_keys=True, default=str)):
+        payload["index"] = index
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+
+
+_READS_INDEX = re.compile(r"\{\{\s*(?:state\.)?index\b|PM_FLOW_CONTEXT")
+_READS_REQUEST = re.compile(r"\{\{\s*input\b")
+
+
+def _reads_request(child_graph: dict) -> bool:
+    """An item graph whose templates read the request: its result follows each new request.
+
+    ``prev`` is the request only in the entry node's first visit; its
+    ``revise`` template renders on a repair visit, where ``prev`` is feedback.
+    """
+    entry = next((node for node in child_graph.get("nodes") or [] if node.get("id") == child_graph.get("entry")),
+                 {})
+    first = {name: value for name, value in entry.items() if name != "revise"}
+    return bool(_READS_REQUEST.search(json.dumps(child_graph.get("nodes"), default=str))
+                or re.search(r"\{\{\s*prev\b", json.dumps(first, default=str)))
+
+
+def _missing_files(cwd: str, scope: list[str]) -> list[str]:
+    """Declared entries that match no file: a path that is absent or a glob that matches nothing."""
+    root = Path(cwd)
+    missing = []
+    for entry in scope:
+        if _GLOB_CHARS & set(entry):
+            found = any(path.is_file() for path in root.glob(_glob_pattern(entry)))
+        else:
+            found = (root / entry).exists()
+        if not found:
+            missing.append(entry)
+    return missing
+
+
+def _item_fingerprint(node: dict, run: FlowRun, child_graph: dict, key: str, item: Any, index: int,
+                      scope: list[str], files: list[str]) -> dict:
+    """What an item's result depends on, recorded when the item finishes."""
+    cwd = run.graph["cwd"]
+    inputs = render_files(node["reuse"]["inputs"], _item_probe(run, key, item, index))
+    outputs = sorted(set(scope) | set(files))
+    return {"task": _task_fingerprint(child_graph, item, index),
+            "inputs": {**_source_state(cwd, inputs), "scope": inputs, "missing": _missing_files(cwd, inputs)},
+            "outputs": {**_source_state(cwd, outputs), "scope": outputs}}
+
+
+def _nameable(name: str) -> bool:
+    """``a`` and ``12`` collide with prose and line numbers, so they are not matched by name."""
+    return len(name) >= 2 and not name.isdigit()
+
+
+def _mentions(text: str, names: list[str]) -> bool:
+    for name in names:
+        if "/" in name or "." in name:
+            if name in text:
+                return True
+        elif _nameable(name) and re.search(
+                rf"(?<![A-Za-z0-9_-]){re.escape(name)}(?![A-Za-z0-9_-])", text):
+            return True
+    return False
+
+
+def _reuse_decisions(node: dict, run: FlowRun, keys: list[str], items: list, prior: dict[str, dict],
+                     feedback: str) -> dict[str, dict]:
+    """Per item: reuse its prior result, or run it, and why.
+
+    A follow-up request applies to the items it names (by key, declared or
+    changed file, or a ``reuse.names`` alias); a map ``feedback`` template can
+    name more. A request that names no item can apply to every item, so then
+    every item runs. An unnamed item is reused only when its prior result
+    passed and its task, declared inputs, own files and every review digest
+    still match.
+    """
+    child_graph = child_graph_for(node, run)
+    scopes = _item_scopes(child_graph, keys, items)
+    names: dict[str, list[str]] = {}
+    for index, (key, item) in enumerate(zip(keys, items)):
+        aliases = render_files(node["reuse"].get("names") or [], _item_probe(run, key, item, index))
+        names[key] = [key] + aliases + list(scopes.get(key) or []) + list((prior.get(key) or {}).get("files") or [])
+    named = {key for key in keys if _mentions(run.input or "", names[key])}
+    if named and feedback:
+        named |= {key for key in keys if _mentions(feedback, names[key])}
+    decisions: dict[str, dict] = {}
+    for index, (key, item) in enumerate(zip(keys, items)):
+        if not named:
+            reason = "the request names no item, so it can apply to every item"
+        elif key in named:
+            reason = "the request names this item"
+        elif len(names[key]) == 1 and not _nameable(key):
+            reason = "a request cannot name this item: give it a key of two or more letters or reuse.names"
+        elif _reads_request(child_graph):
+            reason = "its item graph reads the request"
+        else:
+            reason = _reuse_problem(node, run, child_graph, key, item, index, prior.get(key))
+        decisions[key] = {"reused": reason is None,
+                          "reason": reason or "task, inputs, files and reviews unchanged"}
+    return decisions
+
+
+def _reuse_problem(node: dict, run: FlowRun, child_graph: dict, key: str, item: Any, index: int,
+                   prior: Optional[dict]) -> Optional[str]:
+    """Why an item's prior result cannot stand; None when it can."""
+    if not prior or not prior.get("ok") or prior.get("verdict") != "PASS" or prior.get("status") != "done":
+        return "its prior result did not pass"
+    fingerprint = prior.get("fingerprint") or {}
+    if not all(fingerprint.get(part) for part in ("task", "inputs", "outputs")):
+        return "no recorded fingerprint"
+    if fingerprint["task"] != _task_fingerprint(child_graph, item, index):
+        return "its task, item or item graph changed"
+    cwd = run.graph["cwd"]
+    inputs = render_files(node["reuse"]["inputs"], _item_probe(run, key, item, index))
+    if inputs != fingerprint["inputs"].get("scope"):
+        return "its declared inputs changed"
+    missing = _missing_files(cwd, inputs) or fingerprint["inputs"].get("missing")
+    if missing:
+        return "declared input missing: " + ", ".join(missing[:5])
+    if not fingerprint["outputs"].get("count"):
+        return "no recorded output files"
+    return _drift(cwd, fingerprint, prior.get("reviews") or [])
+
+
+def _drift(cwd: str, fingerprint: dict, reviews: list[dict]) -> Optional[str]:
+    """A changed input, output or reviewed file since the fingerprint; None when all match."""
+    for part, label in (("inputs", "input"), ("outputs", "output")):
+        recorded = fingerprint[part]
+        now = _source_state(cwd, recorded["scope"])
+        if now["digest"] != recorded.get("digest"):
+            return f"{label} files changed: " + ", ".join(_changed_paths(recorded, now)[:5])
+    if not reviews:
+        return "no review evidence: an item needs a judge to be reused"
+    for review in reviews:
+        reviewed = review.get("reviewed") or {}
+        if review.get("verdict") != "PASS" or not reviewed.get("digest") or not reviewed.get("scope"):
+            return f"review {review.get('node')} has no current PASS"
+        if _source_state(cwd, reviewed["scope"])["digest"] != reviewed["digest"]:
+            return f"files reviewed by {review.get('node')} changed since its PASS"
+    return None
+
+
+def _reuse_record(prior: dict, decision: dict, run: FlowRun) -> dict:
+    """Where a reused result came from: the item run that built it, kept across chained reuse."""
+    earlier = prior.get("reuse") or {}
+    if earlier.get("reused"):
+        source_run, source_parent = earlier.get("source_run"), earlier.get("source_parent")
+    else:
+        source_run, source_parent = prior.get("run_id"), run.continued_from
+    return {"reused": True, "reason": decision["reason"], "source_run": source_run,
+            "source_parent": source_parent, "checked_in": run.run_id, "checked_at": now_iso()}
+
+
+def _stale_reuse(run: FlowRun) -> list[str]:
+    """Reused items whose inputs, files or reviewed files changed before the run ended."""
+    stale = []
+    for node_id, result in run.results.items():
+        for key, item in (result.get("items") or {}).items():
+            if (item.get("reuse") or {}).get("reused"):
+                problem = _drift(run.graph["cwd"], item.get("fingerprint") or {}, item.get("reviews") or [])
+                if problem:
+                    stale.append(f"{node_id}/{key}: reused result is stale: {problem}")
+    return stale
+
+
 def _failed_work(run: FlowRun) -> list[str]:
     """Work nodes whose latest result failed. An earlier visit's FAIL that a
     later visit superseded does not count; a final FAIL or PARTIAL verdict does."""
@@ -2515,6 +2731,13 @@ def _map_outcome(node: dict, items: dict[str, dict], usage: dict) -> NodeOutcome
     met = len(passed) == total if policy == "all" else (total == 0 or len(passed) / total >= float(policy))
     failing = [key for key in items if key not in passed]
     lines = [f"map {node['id']}: {len(passed)}/{total} items passed"]
+    reused = [key for key, item in items.items() if (item.get("reuse") or {}).get("reused")]
+    if reused:
+        lines[0] += f" ({len(reused)} reused, {total - len(reused)} ran)"
+    for key, item in items.items():
+        if item.get("reuse"):
+            verb = "reused" if item["reuse"]["reused"] else "ran"
+            lines.append(f"- {key}: {verb}: {item['reuse']['reason']}")
     for key in failing[:20]:
         item = items[key]
         lines.append(f"- {key}: {item.get('status')} {item.get('reason') or item.get('verdict') or ''}".rstrip())
