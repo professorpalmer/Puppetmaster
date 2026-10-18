@@ -86,7 +86,11 @@ def source_stamp(path=None, *, fd=None):
             write = (last.write - epoch) * 100
             if (first.write, first.change) == (last.write, last.change) and st.st_mtime_ns == write:
                 return (st.st_dev, st.st_ino, st.st_size, write, (last.change - epoch) * 100)
-        raise OSError('source metadata did not stabilize')
+        # A live writer moved the metadata on every sample. That is source
+        # contention, which binding reads retry. It is not a new file.
+        error = OSError('source metadata did not stabilize')
+        error.source_open_contention = True
+        raise error
     finally:
         if owned:
             os.close(fd)
@@ -620,7 +624,9 @@ def serve(path=None):
                     error='unable to open database: source changed or unavailable: ' + str(exc),
                     source_open_contention=getattr(exc, 'source_open_contention', False),
                 )
-                if response['source_open_contention']:
+                # Only an open can retry in this helper. After the open, the
+                # parent sends statements and release, not a new open.
+                if response['source_open_contention'] and not opened:
                     emit(response)
                 else:
                     output(response)

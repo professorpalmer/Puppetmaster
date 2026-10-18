@@ -58,8 +58,62 @@ class WindowsSequenceTests(unittest.TestCase):
         self.assertEqual(calls, 1)
 
     def test_native_metadata_retry_is_bounded(self):
-        with self.assertRaisesRegex(OSError, 'metadata did not stabilize'):
+        with self.assertRaisesRegex(OSError, 'metadata did not stabilize') as raised:
             self.native_stamp([(10, 20), (10, 21)] * 8, [(100, 10)] * 8)
+        # A writer moved the metadata on every sample: contention, not a new file.
+        self.assertTrue(readonly._source_open_contention(raised.exception))
+
+    def test_attach_retries_metadata_that_did_not_stabilize(self):
+        # Seen on a starved Windows runner: the parent's queued-source stamp
+        # raised this OSError, and attach failed outside every retry path.
+        with TemporaryDirectory() as tmp:
+            SQLiteSwarmStore(tmp).ensure_schema()
+            store = SQLiteSwarmStore(tmp)
+            original = readonly._source_stamp
+            calls = []
+
+            def unstable_once(target):
+                calls.append(target)
+                if len(calls) == 1:
+                    with patch.object(worker.os, 'name', 'nt'):
+                        self.native_stamp([(10, 20), (10, 21)] * 8, [(100, 10)] * 8)
+                return original(target)
+            with patch.object(readonly, '_source_stamp', unstable_once):
+                store.attach()
+            self.assertTrue(store._attached)
+            self.assertGreater(len(calls), 1)
+
+    def test_contention_after_open_ends_the_helper_session(self):
+        # Only an open can retry in one helper. A statement that meets moving
+        # metadata reports it, and the helper exits before the next request.
+        import contextlib
+        with TemporaryDirectory() as tmp:
+            SQLiteSwarmStore(tmp).ensure_schema()
+            path = Path(tmp) / 'state.sqlite3'
+            original = worker.source_stamp
+            descriptor_calls = []
+
+            def stamp(target=None, *, fd=None):
+                if fd is not None:
+                    descriptor_calls.append(fd)
+                    if len(descriptor_calls) > 1:
+                        error = OSError('source metadata did not stabilize')
+                        error.source_open_contention = True
+                        raise error
+                return original(target, fd=fd)
+            requests = io.StringIO(
+                json.dumps(dict(open=str(path))) + '\n' +
+                json.dumps(dict(sql='SELECT 1', parameters=[])) + '\n' +
+                json.dumps(dict(control='release', value=True)) + '\n')
+            out = io.StringIO()
+            with patch.object(worker, 'source_stamp', stamp), patch.object(sys, 'stdin', requests), \
+                    contextlib.redirect_stdout(out):
+                worker.serve()
+            replies = [json.loads(line) for line in out.getvalue().splitlines()]
+            self.assertEqual(replies[0], dict(ready=True))
+            self.assertIn('journal', replies[1])
+            self.assertIn('metadata did not stabilize', replies[2]['error'])
+            self.assertEqual(len(replies), 3)
 
     def test_numeric_lock_codes_are_authoritative(self):
         for code in (5, 6, 261, 262, 517):

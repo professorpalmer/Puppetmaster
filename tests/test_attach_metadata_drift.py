@@ -71,6 +71,10 @@ class AttachMetadataDriftTests(unittest.TestCase):
             StoreIdentityError("store removed or replaced since selection; explicitly reopen")))
         self.assertFalse(_transient_attach_failure(SqliteSchemaError("no schema")))
         self.assertTrue(_transient_attach_failure(StoreMetadataDrift("drift")))
+        unstable = OSError("source metadata did not stabilize")
+        unstable.source_open_contention = True
+        self.assertTrue(_transient_attach_failure(unstable))
+        self.assertFalse(_transient_attach_failure(OSError("other")))
         import sqlite3
         self.assertTrue(_transient_attach_failure(sqlite3.OperationalError("database is locked")))
 

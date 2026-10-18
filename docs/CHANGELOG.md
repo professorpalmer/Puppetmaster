@@ -1,5 +1,29 @@
 ## Unreleased
 
+**Metadata that a live writer keeps in motion is source contention.** On a
+starved Windows runner, 6 of 200 attach loops failed with `source metadata
+did not stabilize`. `source_stamp` takes 8 samples of size, LastWriteTime
+and ChangeTime. When a writer moves them on every sample, it raises an
+`OSError`. That error had no contention mark, so it escaped every retry
+path. In the parent, attach raised it at once. In the helper, the session
+ended with `source changed or unavailable`. A worker then exited 1, not 75,
+so the supervisor did not respawn it and the job failed.
+
+- The error now carries `source_open_contention`, like a share violation.
+  Attach and launch bindings retry it inside their budget. Ordinary reads
+  still fail fast.
+- `_transient_attach_failure` counts source contention as transient, so a
+  worker that still meets it at the end of the budget exits 75.
+- The helper retries source contention only before its session opens.
+  After the open, the parent sends statements and `release`, not a new
+  `open`. Before, a share violation after the open made the helper wait for
+  an `open` and crash with `KeyError` on the next request.
+- The other failures on that runner were correct results after the 25 s
+  attach budget: 57 `ReadTimeout` (Windows admits one reader per store at a
+  time) and 21 `source changed` that the helper could not prove to be a
+  write. A worker respawns on both. Synthetic CPU, disk-flush and parallel
+  load (5 lanes, 0 failures) did not reproduce that runner.
+
 **Two Windows CI tests wait like the clients they model.** Product code is
 unchanged.
 
