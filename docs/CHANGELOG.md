@@ -1,3 +1,26 @@
+## Unreleased
+
+**Two Windows CI tests wait like the clients they model.** Product code is
+unchanged.
+
+- `test_concurrent_replay` failed on a Windows CI run with
+  `StoreMetadataDrift`. The first open saw a write and retried. On the retry
+  the ChangeTime of `state.sqlite3` moved, but its size and LastWriteTime did
+  not, and the metadata fence refused the binding. A Windows probe saw the same
+  ChangeTime-only move under live writers, with no rename or chmod. The fence
+  cannot tell this move from a rename away and back, so it stays. A worker
+  that hits it exits 75, and the supervisor respawns it (1.27.40). The test
+  runs 8 workers in one process, so each writer now respawns its attach like
+  the supervisor does (`_ATTACH_RESPAWN_LIMIT`).
+- `test_cli_json_defaults_to_the_mcp_compact_body` got `status: unavailable`
+  after `--timeout-seconds 1`: no store read was available in 1 s on a loaded
+  runner. The CLI await tests now wait 10 s, like the MCP await tests (1.33.5).
+  The job is complete, so the read returns at once.
+- The compact body of a job that is not terminal keeps `summary: ""`. The
+  TypeScript client types `summary` as a string and reads it on a timeout.
+- An unproven `source changed` still fails closed. A proven same-store write
+  already has a bounded retry in the helper.
+
 ## v1.45.1 — 2026-10-17
 
 **A map item's builder owns only its own verdict.** In the Codex R163 study
