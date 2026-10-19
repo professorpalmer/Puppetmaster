@@ -13,7 +13,7 @@ from puppetmaster.redaction import redact_secrets
 from puppetmaster.usage import selected_token_usage
 from puppetmaster.session_lease import SessionLease, acquire_codex_thread
 from puppetmaster.worker_attribution import attribution_payload, codex_event_references
-from puppetmaster.worker_resume import resolved_resume, task_resume_record
+from puppetmaster.worker_resume import is_fork, resolved_resume, task_resume_record
 
 from . import codex_rollout
 
@@ -152,7 +152,9 @@ class CodexAdapter(CliWorkerAdapter):
         resume_record = task_resume_record(task.payload, "codex")
         resume = resolved_resume(resume_record, "codex")
         lease = None
-        if resume is not None:
+        fork = resume is not None and is_fork(resume)
+        if resume is not None and not fork:
+            # A fork leaves its source thread as it was; only an in-place resume holds it.
             resume_record, lease = _lease_codex_thread(resume_record)
             resume = resolved_resume(resume_record, "codex")
         # A flow revisit: the thread already holds the original task, its contract,
@@ -213,6 +215,7 @@ class CodexAdapter(CliWorkerAdapter):
             command = build_codex_resume_command(
                 executable=command_base,
                 session_id=str(resume["session_id"]),
+                fork=fork,
                 model=model,
                 sandbox=sandbox,
                 approval_policy=approval_policy,
@@ -249,6 +252,7 @@ class CodexAdapter(CliWorkerAdapter):
                 "ephemeral_source": ephemeral_source,
                 "resume": resume_record,
                 "resumed": resume is not None,
+                "fork": fork,
                 "session_lease": lease,
                 "write_capable": write_capable,
                 # Builders and verdict reviewers answer in free text, not findings JSON.
@@ -296,7 +300,8 @@ class CodexAdapter(CliWorkerAdapter):
                 codex_home.ensure_system_skills(home, prepared.command[:prepared.command.index("exec")])
             except Exception:
                 pass  # Best effort: stock Codex still installs the bundle itself.
-        if home is not None and not resuming and prepared.command[-2:] == list(STDIN_PROMPT):
+        if home is not None and (not resuming or prepared.extras.get("fork")) \
+                and prepared.command[-2:] == list(STDIN_PROMPT):
             # Bounded workers never fork subagents, and must not accrue memories.
             prepared.command = [*prepared.command[:-2], "--disable", "memories",
                                 "--disable", "multi_agent", *STDIN_PROMPT]
@@ -428,6 +433,8 @@ class CodexAdapter(CliWorkerAdapter):
         resume_record = prepared.extras.get("resume")
         resume_fields = {"resume": resume_record} if resume_record else {}
         resumed = bool(prepared.extras.get("resumed"))
+        # A fork reports its own new thread, never the one it copied.
+        expected_thread = resume_record if resumed and not prepared.extras.get("fork") else None
         timeout_seconds = self.timeout_for(task)
         cwd = Path(task.payload.get("cwd") or ".").resolve()
 
@@ -442,7 +449,7 @@ class CodexAdapter(CliWorkerAdapter):
             stderr = completed.stderr
             # A persisted thread survives the timeout; record it so a follow-up
             # can resume it. The resolver still checks the session is on disk.
-            timeout_thread_id = observed_thread_id(events, resume_record if resumed else None)
+            timeout_thread_id = observed_thread_id(events, expected_thread)
             stdout_capture = capture_subprocess_stdout(
                 text=stdout,
                 task=task,
@@ -535,7 +542,7 @@ class CodexAdapter(CliWorkerAdapter):
             ),
             "",
         )
-        thread_id = observed_thread_id(events, resume_record if resumed else None)
+        thread_id = observed_thread_id(events, expected_thread)
 
         stdout_capture = capture_subprocess_stdout(
             text=completed.stdout,
@@ -794,6 +801,12 @@ def _rollout_attempt_usage(
     """
     sid = _resumed_session_id(resume_record)
     try:
+        if sid is not None and is_fork(resume_record):
+            # The fork's rollout copies the source's turns; its own is the new one.
+            path = codex_rollout.rollout_path(home, observed_thread_id(parse_codex_events(stdout or "")))
+            if path is None:
+                return codex_rollout.unlinked("fork_rollout_not_found")
+            return codex_rollout.attempt_usage(path, baseline or frozenset())
         if sid is not None:
             return codex_rollout.attempt_usage(
                 codex_rollout.rollout_path(home, sid), baseline or frozenset())
@@ -910,6 +923,7 @@ def build_codex_resume_command(
     *,
     executable: Union[str, list[str]] = "codex",
     session_id: str,
+    fork: bool = False,
     model: Optional[str] = None,
     sandbox: str = "workspace-write",
     approval_policy: str = "never",
@@ -923,9 +937,11 @@ def build_codex_resume_command(
     ``-c sandbox_mode`` override and cwd comes from the subprocess. It never
     takes ``--ephemeral``, so the resumed thread stays resumable for the next
     revision. The prompt is read from stdin via the trailing ``-- -``.
+    ``fork`` builds ``codex exec fork <thread_id>`` (same options): a new
+    thread that starts from a copy of the source, which stays as it was.
     """
     command = command_parts(executable)
-    command.extend(["exec", "resume", str(session_id), "--json"])
+    command.extend(["exec", "fork" if fork else "resume", str(session_id), "--json"])
     command.extend(["-c", f'approval_policy="{approval_policy}"'])
     if sandbox:
         command.extend(["-c", f'sandbox_mode="{sandbox}"'])

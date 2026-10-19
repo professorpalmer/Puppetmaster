@@ -1,4 +1,30 @@
-## Unreleased
+## v1.46.0 — 2026-10-18
+
+**Map builders can fork one shared session.** Codex R169 and R179 (PM
+1.45.1, N16 grouped, Sol 6.1 high): each cold group builder started a fresh
+session and read the same contracts, rubric, world API and checks again. A
+builder took 178-261 s for 4 regions. Native built all 16 regions in about
+350 s, and its builders start from the pilot's context.
+
+- A map takes `fork: {"from": "<agent node>"}`. When that node has a recorded
+  session, each item's code builder forks it on its first visit
+  (`payload.fork_from`). A repair visit resumes the builder's own fork.
+  Judges never fork. Validation refuses a `fork` that is not
+  `{"from": <agent node>}`.
+- `fork_from` has the shape of `resume_from`. The resolved record carries
+  `mode: "fork"`. `resume_from` wins when both are present.
+- Codex runs `codex exec fork <id>`. It takes no thread lease, because a
+  fork leaves the source thread as it was. Any number of tasks can fork one
+  thread. The fork gets the full build contract (no resume delta), the
+  write sandbox, and `--disable memories --disable multi_agent`.
+- The receipt records the fork's own `thread_id`. Attempt usage comes from
+  the fork's own rollout. The SDK `turn.completed` total includes the copied
+  source turns, so it stays `session_cumulative`.
+- Claude Code already resumes with `--fork-session`, so a fork needs no
+  adapter change there.
+- Live probe: the fork's rollout counts 70,921 input tokens (43,264 cached)
+  where the SDK total says 126,420. The cache covers only the system prefix,
+  so each fork pays once for the copied history at the uncached rate.
 
 **Metadata that a live writer keeps in motion is source contention.** On a
 starved Windows runner, 6 of 200 attach loops failed with `source metadata

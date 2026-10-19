@@ -264,6 +264,37 @@ nothing when no flow walks, and it does nothing in a Puppetmaster worker. It
 takes about 40 ms per edit and makes no model call. An edit hook cannot see
 a file that a shell command writes. Claim such a file yourself.
 
+### Builders fork one shared session
+
+A fresh builder in each item reads the same shared inputs (contracts, rubric,
+API, checks) before it writes a line. A map can opt in to `fork`: one agent
+node reads the shared inputs once, and each item's builder starts from a copy
+of that session.
+
+```json
+{"id": "prime", "kind": "agent", "role": "explore",
+ "task": "Read brief.md, the contracts and the checks. Do not edit files. Summarize what a builder needs."},
+{"id": "groups", "kind": "map", "items": "{{state.groups}}", "fork": {"from": "prime"},
+ "graph": {"...": "..."}}
+```
+
+With an edge `prime -> groups`:
+
+1. `fork.from` must name an agent node. Use a read-only role (`explore`) so
+   the source session writes no files.
+2. On its first visit, each item's code builder forks the source session.
+   Codex runs `codex exec fork`, which leaves the source thread as it was,
+   so all items can fork it at the same time. Claude Code always forks.
+3. A repair visit resumes the builder's own forked session, not the source.
+4. Judges never fork. A review never shares a builder's context.
+5. When the source node has no recorded session (it did not run, or it ran
+   on an adapter without sessions), builders start fresh as before.
+
+The forked session counts its own turn only. The copied history is not
+cached for the new session, so each fork pays once for the source's input
+tokens at the uncached rate. Keep the source turn short: read and summarize,
+do not explore.
+
 ## Reviews bind to the final source
 
 A judge's PASS is about the files that it read. When the judge or the code
