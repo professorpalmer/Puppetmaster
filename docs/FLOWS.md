@@ -289,6 +289,9 @@ With an edge `prime -> groups`:
 4. Judges never fork. A review never shares a builder's context.
 5. When the source node has no recorded session (it did not run, or it ran
    on an adapter without sessions), builders start fresh as before.
+6. A map inside an item (for example, one builder per region inside each
+   group) passes the source on to its own builders unless it declares its
+   own `fork`.
 
 The forked session counts its own turn only. The copied history is not
 cached for the new session, so each fork pays once for the source's input

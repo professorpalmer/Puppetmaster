@@ -233,6 +233,47 @@ class FlowForkTests(unittest.TestCase):
             child = flow.load_run(self.state, item["run_id"])
             self.assertEqual(child.parent["fork_from"], {"job_id": "job-prime", "task_id": "t-prime"})
 
+    def test_a_nested_map_passes_the_fork_source_to_its_builders(self):
+        inner = {"entry": "build",
+                 "nodes": [{"id": "build", "kind": "agent", "task": "Build {{item}}.", "files": ["regions/{{item}}.py"]},
+                           {"id": "built", "kind": "end", "status": "pass"}],
+                 "edges": [{"from": "build", "to": "built", "when": "ok"}]}
+        groups = graph()["nodes"][1]
+        groups["items"] = [{"id": "group_00", "regions": ["r0", "r1"]}]
+        groups["graph"] = {"entry": "regions",
+                           "nodes": [{"id": "regions", "kind": "map", "items": "{{item.regions}}", "graph": inner},
+                                     {"id": "done", "kind": "end", "status": "pass"}],
+                           "edges": [{"from": "regions", "to": "done", "when": "ok"}]}
+        g = graph()
+        g["nodes"][1] = groups
+
+        def execute(node, run, prev):
+            return NodeOutcome(ok=True, verdict="PASS", output="ok", files=[f"regions/{run.state['item']}.py"])
+
+        def spawn(state_dir, run_id):
+            thread = threading.Thread(target=flow.walk, args=(state_dir, run_id), kwargs={"execute": route})
+            thread.start()
+            self.addCleanup(thread.join, 10)
+
+        executor = JobNodeExecutor(self.state, spawn=spawn, poll_seconds=0.02)
+
+        def route(node, run, prev):
+            return executor(node, run, prev) if node["kind"] == "map" else execute(node, run, prev)
+
+        run = flow.new_run(self.state, g, "", cwd=str(self.work))
+        run.sessions["prime"] = {"job_id": "job-prime", "task_id": "t-prime", "adapter": "codex"}
+        flow.save_run(self.state, run)
+        run = flow.walk(self.state, run.run_id, execute=route)
+        self.assertEqual(run.status, "done", run.reason)
+        regions = [flow.load_run(self.state, path.parent.name) for path in self.state.glob("flows/runs/*/run.json")]
+        regions = [child for child in regions if (child.parent or {}).get("key") in ("r0", "r1")]
+        self.assertEqual(len(regions), 2)
+        for child in regions:
+            self.assertEqual(child.parent["fork_from"], {"job_id": "job-prime", "task_id": "t-prime"})
+            node = child.graph["nodes"][0]
+            spec = JobNodeExecutor(self.state)._spec("build", node, child, child.input, 1)
+            self.assertEqual(spec.payload["fork_from"], {"job_id": "job-prime", "task_id": "t-prime"})
+
 
 if __name__ == "__main__":
     unittest.main()
