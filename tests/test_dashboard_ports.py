@@ -115,7 +115,10 @@ class BindDashboardServerTests(unittest.TestCase):
         self.addCleanup(occupied.close)
         httpd = bind_dashboard_server("127.0.0.1", port, _handler())
         self.addCleanup(httpd.server_close)
-        self.assertEqual(httpd.server_address[1], port + 1)
+        # The next free port, not always port + 1: on a busy CI runner another
+        # process can hold port + 1 (Ubuntu 3.9: bound port + 2).
+        self.assertGreater(httpd.server_address[1], port)
+        self.assertLess(httpd.server_address[1], port + 20)
 
     @unittest.skipUnless(os.name == "nt", "Windows-only: SO_REUSEADDR hijack")
     def test_two_serves_on_same_port_do_not_both_bind(self) -> None:

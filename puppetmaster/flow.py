@@ -1949,11 +1949,14 @@ class JobNodeExecutor:
         if interrupted and not children:
             return NodeOutcome(ok=False, error=interrupted)
         created = False
-        fork_from = _fork_source(node, run)
+        # A nested map without its own fork passes the outer map's source on.
+        fork_from = _fork_source(node, run) if "fork" in node else (run.parent or {}).get("fork_from")
         for index, (key, item) in enumerate(zip(keys, items)):
             if interrupted or key not in inflight["chosen"] or key in children:
                 continue
-            peers = sorted({path for other, owned in scopes.items() if other != key for path in owned})
+            # A nested map's items also write beside the outer map's other items.
+            peers = sorted({path for other, owned in scopes.items() if other != key for path in owned}
+                           | set((run.parent or {}).get("peer_scopes") or []))
             continued = (prior.get(key) or {}).get("run_id") if repeat else None
             owned_files = list(scopes.get(key) or []) + list((prior.get(key) or {}).get("files") or [])
             child_input = item_feedback(feedback, key, owned_files) if repeat else run.input
@@ -2346,6 +2349,14 @@ def _item_scopes(child_graph: dict, keys: list[str], items: list) -> dict[str, l
         for item_node in child_graph.get("nodes") or []:
             if item_node.get("kind") == "agent" and item_node.get("role", "code") == "code":
                 owned.extend(render_files(item_node.get("files"), probe))
+            elif item_node.get("kind") == "map":
+                # An item that fans out again owns what its own items write.
+                inner = render_value(item_node.get("items"), probe, "")
+                if isinstance(inner, list):
+                    inner_keys = [item_key(item_node, value, at) for at, value in enumerate(inner)]
+                    shape = _child_graph_shape(item_node)
+                    for paths in _item_scopes(shape if isinstance(shape, dict) else {}, inner_keys, inner).values():
+                        owned.extend(paths)
         scopes[key] = owned
     return scopes
 

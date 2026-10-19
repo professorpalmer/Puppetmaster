@@ -1,3 +1,22 @@
+## v1.46.1 — 2026-10-19
+
+**A map inside a map item knows the outer items' writers.** R179 replica,
+one builder per region inside each of the four groups: a region builder in
+group_00 wrote only its own files, but its write-scope gate charged it with
+79 render files from builders in the other groups. Its item failed although
+the builder passed.
+
+- An outer item's scope now includes what the items of its own inner maps
+  write (`_item_scopes`). The outer map's disjoint check covers them too.
+- A nested map gives its items the outer peer scopes as well as its own
+  sibling scopes (`parent.peer_scopes`). A concurrent writer in another
+  outer item is then a peer, not this worker's write.
+- A nested map without its own `fork` passes the outer map's fork source to
+  its items. Region builders under a forking group map fork the shared
+  session; before, they started fresh.
+- Test only: the dashboard port test accepts the next free port, not always
+  port + 1 (another process held port + 1 on an Ubuntu 3.9 runner).
+
 ## v1.46.0 — 2026-10-18
 
 **Map builders can fork one shared session.** Codex R169 and R179 (PM

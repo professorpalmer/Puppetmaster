@@ -100,6 +100,48 @@ class ItemFrameTests(Base):
         self.assertNotIn("You build item", self.spec(top, "build").instruction)
 
 
+class NestedPeerTests(Base):
+    """R179 replica, one builder per region inside each group: a region builder's write-scope
+    gate charged it with 79 render files that builders in the other groups wrote meanwhile."""
+
+    def test_a_nested_map_item_knows_the_outer_peers(self):
+        inner = {"entry": "build",
+                 "nodes": [{"id": "build", "kind": "agent", "task": "Build {{item}}.", "files": ["regions/{{item}}.py"]},
+                           {"id": "built", "kind": "end", "status": "pass"}],
+                 "edges": [{"from": "build", "to": "built", "when": "ok"}]}
+        groups = {"id": "groups", "kind": "map", "concurrency": 2,
+                  "items": [{"id": "group_00", "regions": ["r0", "r1"]}, {"id": "group_01", "regions": ["r2", "r3"]}],
+                  "graph": {"entry": "regions",
+                            "nodes": [{"id": "regions", "kind": "map", "items": "{{item.regions}}", "graph": inner},
+                                      {"id": "done", "kind": "end", "status": "pass"}],
+                            "edges": [{"from": "regions", "to": "done", "when": "ok"}]}}
+        graph = {"id": "nested-flow", "entry": "groups", "defaults": {"adapter": "codex"},
+                 "nodes": [groups, {"id": "done", "kind": "end", "status": "pass"}],
+                 "edges": [{"from": "groups", "to": "done", "when": "ok"}]}
+
+        def execute(node, run, prev):
+            return NodeOutcome(ok=True, verdict="PASS", output="built", files=[f"regions/{run.state['item']}.py"])
+
+        def spawn(state_dir, run_id):
+            thread = threading.Thread(target=flow.walk, args=(state_dir, run_id), kwargs={"execute": route})
+            thread.start()
+            self.addCleanup(thread.join, 10)
+
+        executor = JobNodeExecutor(self.state, spawn=spawn, poll_seconds=0.02)
+
+        def route(node, run, prev):
+            return executor(node, run, prev) if node["kind"] == "map" else execute(node, run, prev)
+
+        run = flow.new_run(self.state, graph, "", cwd=str(self.work))
+        run = flow.walk(self.state, run.run_id, execute=route)
+        self.assertEqual(run.status, "done", run.reason)
+        peers = {run_.parent["key"]: set(run_.parent["peer_scopes"]) for run_ in map(
+            lambda path: flow.load_run(self.state, path.parent.name), self.state.glob("flows/runs/*/run.json"))
+                 if (run_.parent or {}).get("key") in ("r0", "r1", "r2", "r3")}
+        self.assertEqual(peers["r0"], {"regions/r1.py", "regions/r2.py", "regions/r3.py"})
+        self.assertEqual(peers["r3"], {"regions/r0.py", "regions/r1.py", "regions/r2.py"})
+
+
 class BarrierTests(Base):
     """A fast item's local PASS never stands in for the world check after the join."""
 
