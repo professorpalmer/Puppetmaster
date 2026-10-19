@@ -165,6 +165,9 @@ def validate_graph(graph: Any, *, child: bool = False, depth: int = 0,
     for node in by_id.values():
         if node.get("kind") == "parallel":
             problems.extend(_parallel_problems(node, by_id))
+        source = (node.get("fork") or {}).get("from") if node.get("kind") == "map" else None
+        if isinstance(source, str) and (by_id.get(source) or {}).get("kind") != "agent":
+            problems.append(f"map {node['id']!r} fork from {source!r} is not an agent node")
     edges = graph.get("edges", [])
     if not isinstance(edges, list):
         return problems + ["edges must be a list"]
@@ -337,6 +340,10 @@ def _map_problems(node: dict, defaults: dict, depth: int) -> list[str]:
             problems.append(f"map {nid!r} reuse needs inputs: the files each item's result depends on")
         elif "names" in reuse and not isinstance(reuse["names"], (str, list)):
             problems.append(f"map {nid!r} reuse names must be a template or a list")
+    if "fork" in node:
+        fork = node["fork"]
+        if not isinstance(fork, dict) or set(fork) != {"from"} or not isinstance(fork.get("from"), str):
+            problems.append(f"map {nid!r} fork must be an object with from: the agent node to fork")
     policy = node.get("pass", "all")
     if not (policy == "all" or (isinstance(policy, (int, float)) and not isinstance(policy, bool)
                                 and 0 < policy <= 1)):
@@ -1739,6 +1746,10 @@ class JobNodeExecutor:
             frame = "" if read_only else _item_frame(run)
             if frame and frame not in payload["resume_prompt"]:
                 payload["resume_prompt"] = f"{frame}\n\n{payload['resume_prompt']}"
+        elif not read_only and (run.parent or {}).get("fork_from") and node.get("role", "code") == "code":
+            # A builder starts from the map's shared session (inputs already read);
+            # judges stay fresh, so a review never shares a builder's context.
+            payload["fork_from"] = dict(run.parent["fork_from"])
         return WorkerSpec(role=key, instruction=task,
                           adapter=node.get("adapter") or defaults["adapter"], payload=payload)
 
@@ -1938,6 +1949,7 @@ class JobNodeExecutor:
         if interrupted and not children:
             return NodeOutcome(ok=False, error=interrupted)
         created = False
+        fork_from = _fork_source(node, run)
         for index, (key, item) in enumerate(zip(keys, items)):
             if interrupted or key not in inflight["chosen"] or key in children:
                 continue
@@ -1948,7 +1960,7 @@ class JobNodeExecutor:
             child = new_run(self.state_dir, child_graph, child_input,
                             state={"item": item, "index": index, "key": key},
                             parent={"run_id": run.run_id, "node": node["id"], "key": key, "depth": depth,
-                                    "peer_scopes": peers},
+                                    "peer_scopes": peers, "fork_from": fork_from},
                             continue_from=continued, backend=run.backend, worker_mode=run.worker_mode)
             children[key] = child.run_id
             created = True
@@ -2358,6 +2370,15 @@ _GLOB_CHARS = set("*?[")
 
 _SUCCESS_WHEN = ("always", "ok", "PASS")
 _LEFT_OPEN = re.compile(r"\{\{[^{}]*\}\}")
+
+
+def _fork_source(node: dict, run: FlowRun) -> Optional[dict]:
+    """The session a map's builders fork from: ``fork.from``'s, once that node has run."""
+    source = (node.get("fork") or {}).get("from")
+    session = run.sessions.get(source) if source else None
+    if not session or not session.get("task_id"):
+        return None
+    return {"job_id": session["job_id"], "task_id": session["task_id"]}
 
 
 _PEER_LIMIT = 20

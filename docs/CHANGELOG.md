@@ -1,3 +1,76 @@
+## v1.46.0 — 2026-10-18
+
+**Map builders can fork one shared session.** Codex R169 and R179 (PM
+1.45.1, N16 grouped, Sol 6.1 high): each cold group builder started a fresh
+session and read the same contracts, rubric, world API and checks again. A
+builder took 178-261 s for 4 regions. Native built all 16 regions in about
+350 s, and its builders start from the pilot's context.
+
+- A map takes `fork: {"from": "<agent node>"}`. When that node has a recorded
+  session, each item's code builder forks it on its first visit
+  (`payload.fork_from`). A repair visit resumes the builder's own fork.
+  Judges never fork. Validation refuses a `fork` that is not
+  `{"from": <agent node>}`.
+- `fork_from` has the shape of `resume_from`. The resolved record carries
+  `mode: "fork"`. `resume_from` wins when both are present.
+- Codex runs `codex exec fork <id>`. It takes no thread lease, because a
+  fork leaves the source thread as it was. Any number of tasks can fork one
+  thread. The fork gets the full build contract (no resume delta), the
+  write sandbox, and `--disable memories --disable multi_agent`.
+- The receipt records the fork's own `thread_id`. Attempt usage comes from
+  the fork's own rollout. The SDK `turn.completed` total includes the copied
+  source turns, so it stays `session_cumulative`.
+- Claude Code already resumes with `--fork-session`, so a fork needs no
+  adapter change there.
+- Live probe: the fork's rollout counts 70,921 input tokens (43,264 cached)
+  where the SDK total says 126,420. The cache covers only the system prefix,
+  so each fork pays once for the copied history at the uncached rate.
+
+**Metadata that a live writer keeps in motion is source contention.** On a
+starved Windows runner, 6 of 200 attach loops failed with `source metadata
+did not stabilize`. `source_stamp` takes 8 samples of size, LastWriteTime
+and ChangeTime. When a writer moves them on every sample, it raises an
+`OSError`. That error had no contention mark, so it escaped every retry
+path. In the parent, attach raised it at once. In the helper, the session
+ended with `source changed or unavailable`. A worker then exited 1, not 75,
+so the supervisor did not respawn it and the job failed.
+
+- The error now carries `source_open_contention`, like a share violation.
+  Attach and launch bindings retry it inside their budget. Ordinary reads
+  still fail fast.
+- `_transient_attach_failure` counts source contention as transient, so a
+  worker that still meets it at the end of the budget exits 75.
+- The helper retries source contention only before its session opens.
+  After the open, the parent sends statements and `release`, not a new
+  `open`. Before, a share violation after the open made the helper wait for
+  an `open` and crash with `KeyError` on the next request.
+- The other failures on that runner were correct results after the 25 s
+  attach budget: 57 `ReadTimeout` (Windows admits one reader per store at a
+  time) and 21 `source changed` that the helper could not prove to be a
+  write. A worker respawns on both. Synthetic CPU, disk-flush and parallel
+  load (5 lanes, 0 failures) did not reproduce that runner.
+
+**Two Windows CI tests wait like the clients they model.** Product code is
+unchanged.
+
+- `test_concurrent_replay` failed on a Windows CI run with
+  `StoreMetadataDrift`. The first open saw a write and retried. On the retry
+  the ChangeTime of `state.sqlite3` moved, but its size and LastWriteTime did
+  not, and the metadata fence refused the binding. A Windows probe saw the same
+  ChangeTime-only move under live writers, with no rename or chmod. The fence
+  cannot tell this move from a rename away and back, so it stays. A worker
+  that hits it exits 75, and the supervisor respawns it (1.27.40). The test
+  runs 8 workers in one process, so each writer now respawns its attach like
+  the supervisor does (`_ATTACH_RESPAWN_LIMIT`).
+- `test_cli_json_defaults_to_the_mcp_compact_body` got `status: unavailable`
+  after `--timeout-seconds 1`: no store read was available in 1 s on a loaded
+  runner. The CLI await tests now wait 10 s, like the MCP await tests (1.33.5).
+  The job is complete, so the read returns at once.
+- The compact body of a job that is not terminal keeps `summary: ""`. The
+  TypeScript client types `summary` as a string and reads it on a timeout.
+- An unproven `source changed` still fails closed. A proven same-store write
+  already has a bounded retry in the helper.
+
 ## v1.45.1 — 2026-10-17
 
 **A map item's builder owns only its own verdict.** In the Codex R163 study

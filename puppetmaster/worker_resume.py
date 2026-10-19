@@ -6,6 +6,11 @@ reused. The request lives on the task payload as ``resume_from`` (a prior
 job/task/role in the same store) or ``resume_session_id`` (an id the caller
 kept itself). Resolution is stamped back as ``payload["resume"]`` once, so
 retries reuse the same record instead of re-resolving.
+
+``fork_from`` (same shape as ``resume_from``) asks for a new session that
+starts from a copy of the prior one: the record carries ``mode: "fork"``.
+Codex forks with ``codex exec fork`` and leaves the source thread as it was,
+so any number of tasks can fork one session. Claude Code always forks.
 """
 from __future__ import annotations
 
@@ -22,7 +27,11 @@ _SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 
 def resume_requested(payload: Optional[dict]) -> bool:
     payload = payload or {}
-    return bool(payload.get("resume_from") or payload.get("resume_session_id"))
+    return bool(payload.get("resume_from") or payload.get("resume_session_id") or payload.get("fork_from"))
+
+
+def is_fork(record: Optional[dict]) -> bool:
+    return isinstance(record, dict) and record.get("mode") == "fork"
 
 
 def task_resume_record(payload: Optional[dict], adapter: str) -> Optional[dict]:
@@ -48,8 +57,9 @@ def task_resume_record(payload: Optional[dict], adapter: str) -> Optional[dict]:
 
 
 def claim_resumed_session(record: Optional[dict], claimed: dict, role: str) -> Optional[dict]:
-    """Allow one task per job to continue a codex thread; ``codex exec resume`` has no fork."""
-    if not isinstance(record, dict) or record.get("status") != "resolved" or record.get("adapter") != "codex":
+    """Allow one task per job to continue a codex thread in place; any number can fork it."""
+    if (not isinstance(record, dict) or record.get("status") != "resolved" or record.get("adapter") != "codex"
+            or is_fork(record)):
         return record
     session_id = str(record.get("session_id"))
     holder = claimed.get(session_id)
@@ -139,10 +149,13 @@ def resolve_worker_resume(store: Any, payload: Optional[dict], adapter: str) -> 
         return existing
     if not resume_requested(payload):
         return None
+    fork = bool(payload.get("fork_from")) and not (payload.get("resume_from") or payload.get("resume_session_id"))
+    request = {**payload, "resume_from": payload["fork_from"]} if fork else payload
     try:
-        return _resolve(store, payload, str(adapter or ""))
+        record = _resolve(store, request, str(adapter or ""))
     except Exception as exc:
-        return _unavailable(payload, f"resume lookup failed: {type(exc).__name__}: {exc}")
+        record = _unavailable(request, f"resume lookup failed: {type(exc).__name__}: {exc}")
+    return {**record, "mode": "fork"} if fork else record
 
 
 def _request_echo(payload: dict) -> dict:

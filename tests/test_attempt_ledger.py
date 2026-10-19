@@ -18,7 +18,9 @@ import hermetic_env  # noqa: F401
 from puppetmaster.attempts import (
     ExecutionAttempt, UsageObservation, LedgerConflictError, canonical_record,
 )
+from puppetmaster.identity import StoreMetadataDrift
 from puppetmaster.models import AgentRun, Task, TaskStatus
+from puppetmaster.orchestrator import _ATTACH_RESPAWN_LIMIT
 from puppetmaster.sqlite_store import SQLiteSwarmStore, SqliteSchemaError
 from puppetmaster.store import SwarmStore
 
@@ -146,9 +148,18 @@ class SQLiteLedgerTests(LedgerContract, unittest.TestCase):
 
     def test_concurrent_replay(self):
         def write(_):
-            store = SQLiteSwarmStore(self.root)
-            store.attach()
-            return store.record_attempt(self.attempt)
+            # Each writer is a worker. Windows can move ChangeTime alone under
+            # live writers. Attach then raises StoreMetadataDrift, and the
+            # supervisor respawns the worker.
+            for respawn in range(_ATTACH_RESPAWN_LIMIT + 1):
+                store = SQLiteSwarmStore(self.root)
+                try:
+                    store.attach()
+                except StoreMetadataDrift:
+                    if respawn == _ATTACH_RESPAWN_LIMIT:
+                        raise
+                    continue
+                return store.record_attempt(self.attempt)
         with ThreadPoolExecutor(max_workers=4) as pool:
             inserted = list(pool.map(write, range(8)))
         self.assertEqual(sum(inserted), 1)

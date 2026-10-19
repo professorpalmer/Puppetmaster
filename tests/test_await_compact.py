@@ -294,8 +294,11 @@ class CliAwaitSummaryTests(_AwaitFixture):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             rc = cli_main(
+                # Same patience as the MCP helper: the job is complete, so a
+                # read returns at once. A loaded Windows runner needed more than
+                # 1 s before the store read was available.
                 ["--state-dir", str(self.store.root), "--backend", "sqlite", "await", job_id,
-                 "--timeout-seconds", "1", *extra]
+                 "--timeout-seconds", "10", *extra]
             )
         return rc, out.getvalue()
 

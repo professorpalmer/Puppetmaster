@@ -882,15 +882,16 @@ def _transient_attach_failure(exc: BaseException) -> bool:
     """Attach failures a fresh process can expect to get past.
 
     Metadata-only drift (macOS provenance xattr, same-mode chmod), lock or
-    busy contention and helper timeouts are transient. A replaced store or a
-    missing schema is not: respawning would only bind the wrong store or fail
-    again.
+    busy contention, source contention (a share violation, or metadata that
+    a live writer kept in motion) and helper timeouts are transient. A
+    replaced store or a missing schema is not: respawning would only bind the
+    wrong store or fail again.
     """
     import sqlite3
 
     from puppetmaster.identity import StoreMetadataDrift
 
-    if isinstance(exc, StoreMetadataDrift):
+    if isinstance(exc, StoreMetadataDrift) or getattr(exc, "source_open_contention", False):
         return True
     return isinstance(exc, (sqlite3.OperationalError, TimeoutError, BlockingIOError, PermissionError))
 
