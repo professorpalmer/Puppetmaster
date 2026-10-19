@@ -14,6 +14,8 @@ the builder passed.
 - A nested map without its own `fork` passes the outer map's fork source to
   its items. Region builders under a forking group map fork the shared
   session; before, they started fresh.
+- Test only: the dashboard port test accepts the next free port, not always
+  port + 1 (another process held port + 1 on an Ubuntu 3.9 runner).
 
 ## v1.46.0 — 2026-10-18
 
