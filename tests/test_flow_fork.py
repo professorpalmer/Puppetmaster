@@ -138,11 +138,11 @@ class CodexForkTests(unittest.TestCase):
         stdout = _codex_events({"type": "thread.started", "thread_id": FORKED})
         with patch.object(codex_module.codex_rollout, "rollout_path", side_effect=rollout_path), \
                 patch.object(codex_module.codex_rollout, "attempt_usage",
-                             side_effect=lambda path, base: {"path": str(path), "base": sorted(base)}):
+                             side_effect=lambda path, base: {"path": path, "base": sorted(base)}):
             found = codex_module._rollout_attempt_usage(Path("/home"), self.record(),
                                                         frozenset({"source-turn"}), stdout)
         self.assertEqual(seen, [FORKED])
-        self.assertEqual(found, {"path": f"/rollouts/{FORKED}.jsonl", "base": ["source-turn"]})
+        self.assertEqual(found, {"path": Path(f"/rollouts/{FORKED}.jsonl"), "base": ["source-turn"]})
 
 
 ITEM = {"entry": "build",
