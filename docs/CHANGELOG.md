@@ -17,6 +17,16 @@ reuse ("its item graph reads the request"), so 8 extra region builders ran.
   could be reused against a new request.
 - `{{input}}` anywhere still counts.
 
+**A worker no longer starts git about three times a second while it builds.**
+The edit-claim renewal runs each `ttl/3` (about 0.7 s), and each renewal
+asked git twice for the repository identity. A 4-worker probe counted 57-62
+subprocesses per worker, and the count grew with build time.
+
+- The worktree root is cached for each directory in a process
+  (`file_claims._identity_of`). The unused `--git-common-dir` call is gone.
+- Probe after the fix: 24 subprocesses per worker. The count no longer grows
+  with build time. Claim identity and claim behavior do not change.
+
 ## v1.46.1 — 2026-10-19
 
 **A map inside a map item knows the outer items' writers.** R179 replica,
