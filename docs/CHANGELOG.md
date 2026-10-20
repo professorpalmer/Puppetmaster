@@ -1,3 +1,22 @@
+## v1.46.2 — 2026-10-19
+
+**A nested builder's `revise` no longer blocks follow-up reuse.** Codex R196
+(PM 1.46.1, one builder per region inside each group, map `reuse` on): the
+follow-up named regions in groups 01 and 03 only. Groups 00 and 02 did not
+reuse ("its item graph reads the request"), so 8 extra region builders ran.
+
+- `_reads_request` removed `revise` only from the entry node itself. When the
+  entry is a map, the inner builder's `revise` (with `{{prev}}`) stayed in
+  the searched text, and the item counted as one that reads the request.
+- `{{prev}}` now counts only in a node that gets the request as its `prev`:
+  the entry node, the branches of an entry `parallel`, and the same nodes
+  inside an entry `map`. Later nodes in a nested graph read their own
+  previous node, and their `{{prev}}` no longer counts.
+- An entry `parallel` whose branch task reads `{{prev}}` now counts as
+  reading the request. Before, the branch was not searched and the item
+  could be reused against a new request.
+- `{{input}}` anywhere still counts.
+
 ## v1.46.1 — 2026-10-19
 
 **A map inside a map item knows the outer items' writers.** R179 replica,

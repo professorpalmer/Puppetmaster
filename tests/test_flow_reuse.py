@@ -296,6 +296,25 @@ class ReuseTests(unittest.TestCase):
         self.assertTrue(flow._reads_request(shape(task="Do {{prev}}")))
         self.assertTrue(flow._reads_request(shape(revise="Fix {{input}}")))
 
+    def test_prev_inside_an_entry_map_or_parallel(self):
+        def entry_map(**fields):
+            inner = {"entry": "build", "edges": [{"from": "build", "to": "check"}],
+                     "nodes": [{"id": "build", "kind": "agent", "task": "t", **fields},
+                               {"id": "check", "kind": "judge", "task": "Review {{prev}}"}]}
+            return {"entry": "regions", "edges": [],
+                    "nodes": [{"id": "regions", "kind": "map", "items": "{{item.regions}}", "graph": inner}]}
+        # R196: a nested builder's revise made every group "read the request".
+        self.assertFalse(flow._reads_request(entry_map(revise="Fix: {{prev}}")))
+        self.assertTrue(flow._reads_request(entry_map(task="Do {{prev}}")))
+        self.assertTrue(flow._reads_request(entry_map(revise="Fix {{input}}")))
+        both = {"entry": "both", "edges": [],
+                "nodes": [{"id": "both", "kind": "parallel", "branches": ["a", "b"]},
+                          {"id": "a", "kind": "agent", "task": "t", "revise": "Fix: {{prev}}"},
+                          {"id": "b", "kind": "agent", "task": "Do {{prev}}"}]}
+        self.assertTrue(flow._reads_request(both))
+        both["nodes"][2]["task"] = "t"
+        self.assertFalse(flow._reads_request(both))
+
     def test_an_item_a_request_cannot_name_runs(self):
         decisions = flow._reuse_decisions(
             {"id": "m", "kind": "map", "reuse": {"inputs": ["rubric.json"]},
@@ -340,6 +359,7 @@ def nested_graph():
         "id": "regions", "kind": "map", "items": "{{item.regions}}", "concurrency": 4,
         "graph": {"entry": "build",
                   "nodes": [{"id": "build", "kind": "agent", "task": "Build {{item}}.",
+                             "revise": "Apply this to {{item}}: {{prev}}",
                              "files": ["regions/{{item}}.py"]},
                             {"id": "done", "kind": "end", "status": "pass"}],
                   "edges": [{"from": "build", "to": "done"}]}}
