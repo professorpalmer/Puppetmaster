@@ -2641,17 +2641,41 @@ _READS_REQUEST = re.compile(r"\{\{\s*input\b")
 def _reads_request(child_graph: dict) -> bool:
     """An item graph whose templates read the request: its result follows each new request.
 
-    ``{{input}}`` anywhere, or ``{{prev}}`` in the entry node's task, puts the
-    request into the item's own task. ``revise`` does not count: it is the
-    message to a resumed session (a repair, or a follow-up where its ``prev``
-    carries the request), and every builder that runs on a follow-up gets the
-    request in some form. Which items the request concerns is the naming rule.
+    ``{{input}}`` anywhere, or ``{{prev}}`` in a node that gets the request as
+    its ``prev``, puts the request into the item's own task. ``revise`` does not
+    count: it is the message to a resumed session (a repair, or a follow-up
+    where its ``prev`` carries the request), and every builder that runs on a
+    follow-up gets the request in some form. Which items the request concerns
+    is the naming rule.
     """
-    entry = next((node for node in child_graph.get("nodes") or [] if node.get("id") == child_graph.get("entry")),
-                 {})
-    first = {name: value for name, value in entry.items() if name != "revise"}
     return bool(_READS_REQUEST.search(json.dumps(child_graph.get("nodes"), default=str))
-                or re.search(r"\{\{\s*prev\b", json.dumps(first, default=str)))
+                or _entry_reads_prev(child_graph))
+
+
+_READS_PREV = re.compile(r"\{\{\s*prev\b")
+
+
+def _entry_reads_prev(graph: Any) -> bool:
+    """``{{prev}}`` outside ``revise`` in a node that gets the request as ``prev``.
+
+    That is the entry node, the branches of an entry ``parallel``, and the same
+    nodes inside an entry ``map`` (its items get the request as their input on
+    a first visit). Later nodes inside a nested graph read their own previous
+    node, so the nested graph is not searched as one text.
+    """
+    if not isinstance(graph, dict):
+        return False
+    nodes = {node.get("id"): node for node in graph.get("nodes") or [] if isinstance(node, dict)}
+    entry = nodes.get(graph.get("entry")) or {}
+    own = {name: value for name, value in entry.items() if name not in ("revise", "graph", "node")}
+    if _READS_PREV.search(json.dumps(own, default=str)):
+        return True
+    if entry.get("kind") == "parallel":
+        branches = [nodes.get(branch) or {} for branch in entry.get("branches") or []]
+        return any(_entry_reads_prev({"entry": branch.get("id"), "nodes": [branch]}) for branch in branches)
+    if entry.get("kind") == "map":
+        return _entry_reads_prev(_child_graph_shape(entry))
+    return False
 
 
 def _missing_files(cwd: str, scope: list[str]) -> list[str]:

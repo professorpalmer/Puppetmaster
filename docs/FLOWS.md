@@ -366,8 +366,10 @@ of its own files. On the first map visit of a follow-up run:
    unchanged, it has at least one review, and each review is a PASS whose
    files are unchanged. Otherwise it runs. An item without a recorded
    fingerprint runs.
-4. An item never reuses when its item graph reads the request (`{{input}}`,
-   or `{{prev}}` in its entry node). An item never reuses when a request
+4. An item never reuses when its item graph reads the request: `{{input}}`
+   anywhere, or `{{prev}}` outside `revise` in a node that gets the request
+   (the entry node, the branches of an entry `parallel`, and the same nodes
+   inside an entry `map`). An item never reuses when a request
    cannot name it: a one-character or all-digit key with no `names` alias
    and no files.
 

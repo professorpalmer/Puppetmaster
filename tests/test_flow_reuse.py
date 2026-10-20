@@ -296,6 +296,25 @@ class ReuseTests(unittest.TestCase):
         self.assertTrue(flow._reads_request(shape(task="Do {{prev}}")))
         self.assertTrue(flow._reads_request(shape(revise="Fix {{input}}")))
 
+    def test_prev_inside_an_entry_map_or_parallel(self):
+        def entry_map(**fields):
+            inner = {"entry": "build", "edges": [{"from": "build", "to": "check"}],
+                     "nodes": [{"id": "build", "kind": "agent", "task": "t", **fields},
+                               {"id": "check", "kind": "judge", "task": "Review {{prev}}"}]}
+            return {"entry": "regions", "edges": [],
+                    "nodes": [{"id": "regions", "kind": "map", "items": "{{item.regions}}", "graph": inner}]}
+        # R196: a nested builder's revise made every group "read the request".
+        self.assertFalse(flow._reads_request(entry_map(revise="Fix: {{prev}}")))
+        self.assertTrue(flow._reads_request(entry_map(task="Do {{prev}}")))
+        self.assertTrue(flow._reads_request(entry_map(revise="Fix {{input}}")))
+        both = {"entry": "both", "edges": [],
+                "nodes": [{"id": "both", "kind": "parallel", "branches": ["a", "b"]},
+                          {"id": "a", "kind": "agent", "task": "t", "revise": "Fix: {{prev}}"},
+                          {"id": "b", "kind": "agent", "task": "Do {{prev}}"}]}
+        self.assertTrue(flow._reads_request(both))
+        both["nodes"][2]["task"] = "t"
+        self.assertFalse(flow._reads_request(both))
+
     def test_an_item_a_request_cannot_name_runs(self):
         decisions = flow._reuse_decisions(
             {"id": "m", "kind": "map", "reuse": {"inputs": ["rubric.json"]},
@@ -330,6 +349,74 @@ class ReuseTests(unittest.TestCase):
         bad["nodes"][0]["reuse"] = {"inputs": "x", "extra": 1}
         self.assertIn("map 'groups' reuse must be an object with inputs and optional names",
                       flow.validate_graph(bad))
+
+
+def nested_graph():
+    """One builder per region inside each group: the group's build is an inner map."""
+    shaped = graph()
+    item_graph = shaped["nodes"][0]["graph"]
+    item_graph["nodes"][0] = {
+        "id": "regions", "kind": "map", "items": "{{item.regions}}", "concurrency": 4,
+        "graph": {"entry": "build",
+                  "nodes": [{"id": "build", "kind": "agent", "task": "Build {{item}}.",
+                             "revise": "Apply this to {{item}}: {{prev}}",
+                             "files": ["regions/{{item}}.py"]},
+                            {"id": "done", "kind": "end", "status": "pass"}],
+                  "edges": [{"from": "build", "to": "done"}]}}
+    item_graph["entry"] = "regions"
+    for edge in item_graph["edges"]:
+        for end in ("from", "to"):
+            if edge[end] == "build":
+                edge[end] = "regions"
+    return shaped
+
+
+class NestedReuseTests(unittest.TestCase):
+    """The regions treatment: a group is reused although its builders sit in an inner map."""
+
+    setUp, write, revise, built = ReuseTests.setUp, ReuseTests.write, ReuseTests.revise, ReuseTests.built
+
+    def execute(self, node, run, prev):
+        if node["kind"] != "agent":
+            return ReuseTests.execute(self, node, run, prev)
+        key = run.state.get("key")
+        with self.lock:
+            self.calls.append((key, node["id"]))
+        return NodeOutcome(ok=True, verdict="PASS", output="built", files=[f"regions/{key}.py"],
+                           usage={"input_tokens": 100})
+
+    def executor(self):
+        route = {}
+
+        def spawn(state_dir, run_id):
+            thread = threading.Thread(target=flow.walk, args=(state_dir, run_id), kwargs={"execute": route["map"]})
+            thread.start()
+            self.addCleanup(thread.join, 10)
+
+        executor = JobNodeExecutor(self.state, spawn=spawn, poll_seconds=0.02)
+        route["map"] = lambda node, run, prev: (executor(node, run, prev) if node["kind"] == "map"
+                                                else self.execute(node, run, prev))
+        return route["map"]
+
+    def nested_run(self, text="", prior=None):
+        self.calls.clear()
+        run = flow.new_run(self.state, nested_graph(), text, cwd=str(self.work),
+                           continue_from=prior.run_id if prior else None)
+        return flow.walk(self.state, run.run_id, execute=self.executor())
+
+    def test_unchanged_groups_reuse_and_named_regions_rebuild(self):
+        cold = self.nested_run()
+        self.assertEqual(cold.status, "done", cold.reason)
+        self.revise("region_001", "region_007")
+        run = self.nested_run(FOLLOW_UP, prior=cold)
+        self.assertEqual(run.status, "done", run.reason)
+        found = run.results["groups"]["items"]
+        self.assertEqual({key: found[key]["reuse"]["reused"] for key in GROUPS},
+                         {"group_00": True, "group_01": False, "group_02": True, "group_03": False})
+        # Inside a named group, only the regions the request names build again.
+        self.assertEqual(self.built(), ["region_001", "region_007"])
+        self.assertEqual(sorted({key for key, node in self.calls if node == "review"}), ["group_01", "group_03"])
+        self.assertEqual(found["group_01"]["files"], ["regions/region_001.py", "regions/region_005.py"])
 
 
 if __name__ == "__main__":

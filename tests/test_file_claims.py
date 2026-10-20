@@ -105,6 +105,24 @@ class FileClaimRegistryTests(unittest.TestCase):
         self.assertEqual(self.registry.repository_identity(self.root),
                          self.registry.repository_identity(subdirectory))
 
+    def test_renewals_ask_git_for_the_root_once(self) -> None:
+        # A worker renews each ttl/3; two git processes per renewal was about
+        # three a second per worker for the whole build.
+        claim = self.registry.acquire(self.root, "file.txt", "worker", 60)
+        real = subprocess.check_output
+        calls = []
+
+        def counted(*args, **kwargs):
+            calls.append(args[0])
+            return real(*args, **kwargs)
+
+        from unittest import mock
+        with mock.patch("puppetmaster.file_claims.subprocess.check_output", counted):
+            for _ in range(5):
+                self.assertTrue(self.registry.renew(self.root, "file.txt", claim.claim_id, 60))
+                self.registry.repository_identity(self.root)
+        self.assertEqual([], calls)
+
     def test_root_and_git_internal_claims(self) -> None:
         root_claim = self.registry.acquire(self.root, ".", "worker-a", 60)
         with self.assertRaises(FileClaimConflict):

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import functools
 import math
 import os
 from pathlib import Path
@@ -220,7 +221,7 @@ class FileClaimRegistry:
         return [(str(row["path"]), str(row["owner"])) for row in rows]
 
     def repository_identity(self, repo: PathLike) -> tuple[str, Path]:
-        """Return canonical Git common-dir identity and this worktree's root."""
+        """Return this worktree's root as its identity, and the root."""
         return _repository_identity(repo)
 
     def _claim_keys(self, repo: PathLike, paths: Iterable[PathLike]) -> tuple[str, list[str]]:
@@ -370,21 +371,24 @@ def _git(directory: Path, *args: str) -> str:
 
 
 def _repository_identity(repo: PathLike) -> tuple[str, Path]:
-    candidate = Path(repo).expanduser().resolve()
+    return _identity_of(str(Path(repo).expanduser().resolve()))
+
+
+@functools.lru_cache(maxsize=256)
+def _identity_of(candidate_text: str) -> tuple[str, Path]:
+    # A worker renews its claims each ttl/3 (about 0.7 s), and each renewal
+    # asks for this identity. A worktree root does not move while a process
+    # runs, so one git call per directory is enough.
+    candidate = Path(candidate_text)
     try:
         root_text = _git(candidate, "rev-parse", "--show-toplevel")
-        common_text = _git(candidate, "rev-parse", "--git-common-dir")
     except (OSError, subprocess.CalledProcessError) as exc:
         # Non-Git workspaces still need a stable, canonical admission scope.
         if not candidate.exists() or not candidate.is_dir():
             raise ValueError("repo must be an existing workspace directory") from exc
         return str(candidate), candidate
+    # The physical worktree is the isolation boundary, not the common Git dir.
     root = Path(root_text).resolve()
-    common = Path(common_text)
-    if not common.is_absolute():
-        common = candidate / common
-    # The physical worktree is the isolation boundary. The common Git
-    # directory is shared metadata, not a shared write target.
     return str(root), root
 
 
