@@ -47,6 +47,7 @@ import json
 import os
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -134,6 +135,8 @@ def validate_graph(graph: Any, *, child: bool = False, depth: int = 0,
         problems.append("defaults.payload must be an object")
         own_defaults = {key: value for key, value in own_defaults.items() if key != "payload"}
     problems.extend(_effort_problems(own_defaults, "defaults"))
+    if "codex_host" in own_defaults and not isinstance(own_defaults["codex_host"], bool):
+        problems.append("defaults.codex_host must be true or false")
     lanes = own_defaults.get("lanes")
     if lanes is not None:
         if not isinstance(lanes, dict) or not set(lanes) <= set(LANES):
@@ -879,6 +882,7 @@ def walk(state_dir: Path, run_id: str, *, execute: Optional[NodeExecutor] = None
         lock.acquire()
     except TimeoutError:
         raise FlowError(f"flow run {run_id} is already being walked") from None
+    host: Optional[dict] = None
     try:
         run = load_run(state_dir, run_id)
         if not _prepare(state_dir, run, answer=answer, restart=restart,
@@ -888,12 +892,45 @@ def walk(state_dir: Path, run_id: str, *, execute: Optional[NodeExecutor] = None
         save_run(state_dir, run)
         if run.parent is None:
             _mark_walking(state_dir, run)
+            host = _start_codex_host(state_dir, run)
         executor = execute or JobNodeExecutor(state_dir, backend=run.backend, worker_mode=run.worker_mode)
         return _walk(state_dir, run, executor)
     finally:
+        _stop_codex_host(host)
         _clear_marker(state_dir, run_id, "walker.pid")
         _unmark_walking(run_id)
         lock.release()
+
+
+def _start_codex_host(state_dir: Path, run: FlowRun) -> Optional[dict]:
+    """Start the walk's shared Codex host when the graph or the operator asks for it.
+
+    Child walkers and workers find it through the inherited record path. A
+    host that does not start leaves every worker on ``codex exec``.
+    """
+    from puppetmaster import codex_host
+    from puppetmaster.adapters._base import command_parts
+
+    if not codex_host.requested(run.graph) or codex_host.current() is not None:
+        return None
+    command = command_parts(os.environ.get("CODEX_COMMAND") or "codex")
+    resolved = shutil.which(command[0])
+    if resolved is None:
+        return None
+    record = codex_host.start(run_path(state_dir, run.run_id).parent, [resolved, *command[1:]])
+    if record is not None:
+        os.environ[codex_host.RECORD_ENV] = record["record"]
+    return record
+
+
+def _stop_codex_host(record: Optional[dict]) -> None:
+    if record is None:
+        return
+    from puppetmaster import codex_host
+
+    if os.environ.get(codex_host.RECORD_ENV) == record.get("record"):
+        os.environ.pop(codex_host.RECORD_ENV, None)
+    codex_host.stop(record)
 
 
 def _mark_walking(state_dir: Path, run: FlowRun) -> None:

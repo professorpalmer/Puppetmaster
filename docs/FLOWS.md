@@ -444,5 +444,33 @@ a resumed walker kills the command the dead walker left running (when the pid
 still names that command) and runs it again. A pid that now names another
 process is left alone.
 
+### One shared Codex host
+
+A Codex worker usually starts its own `codex exec` process: the launcher, the
+native binary, a login-shell snapshot and git probes. Native Codex runs its
+subagents as threads in one process. With the host on, the top walker starts
+one `codex app-server` on a Unix socket. Every Codex agent and judge of the
+walk, in map items too, then runs as a thread on that host.
+
+- Turn it on with `"defaults": {"codex_host": true}` in the graph, or set
+  `PUPPETMASTER_CODEX_HOST=1` for the walker. A graph value wins over the
+  environment. `false` turns it off.
+- A repair resumes its thread on the host. A cut stops only its own turn.
+- Each worker gets its own shell environment (ports, worker flags) through the
+  thread's `shell_environment_policy`.
+- The write-scope gate, rollout usage and session resume work as with
+  `codex exec`. The adapter reports the host's file changes and commands as
+  `codex exec --json` items.
+- These runs use `codex exec`: a fork (`fork`), a bypass run, a native-steer
+  run, a custom `executable`, extra arguments other than `-c key=value`, and
+  a thread that another Codex home holds.
+- When the host does not start, or a connection fails before the turn, the
+  worker runs `codex exec`. The walker stops the host at walk end, and the
+  next walk of the run stops a host that a dead walker left.
+- POSIX only. Windows runs `codex exec`.
+
+Each host turn writes `codex_host_turn.json` in its capture directory: host
+start and ready times, the request time, the thread start and the turn start.
+
 Runs live under `<state_dir>/flows/runs/<run_id>/`. Pass `--cwd` (CLI) or
 `cwd` (MCP) so the run's state follows the workspace.
