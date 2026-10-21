@@ -78,7 +78,8 @@ def _usage(params: Any) -> Tuple[Optional[int], Optional[int], Optional[int]]:
 
 def run_codex_session(
     command_prefix: Union[str, Sequence[str]], cwd: Union[str, Path], prompt: str,
-    model: Optional[str] = None, sandbox: str = "workspace-write", config: Optional[Dict[str, Any]] = None,
+    model: Optional[str] = None, sandbox: str = "workspace-write", approval_policy: str = "never",
+    config: Optional[Dict[str, Any]] = None,
     effort: Optional[str] = None, ephemeral: bool = True, timeout: float = 600, env: Optional[Dict[str, str]] = None,
     log: Optional[Callable[[str], None]] = None, event_sink: Optional[Callable[[Dict[str, Any]], None]] = None,
     cancellation_check: Optional[Callable[[], bool]] = None,
@@ -235,6 +236,189 @@ def run_codex_session(
             if stream is not None:
                 try: stream.close()
                 except OSError: pass
+        result.raw_protocol = "\n".join(captured)
+        if protocol_log_path:
+            Path(protocol_log_path).write_text(result.raw_protocol, encoding="utf-8")
+    return result
+
+
+@dataclass
+class HostTurnResult(CodexSessionResult):
+    """One thread turn on a shared host, with the items the write-scope gate reads."""
+    items: List[Dict[str, Any]] = field(default_factory=list)
+    rollout_path: Optional[str] = None
+    thread_started_at: Optional[float] = None
+    turn_started_at: Optional[float] = None
+
+
+def _exec_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """An app-server item in the ``codex exec --json`` item shape, or None."""
+    kind = item.get("type")
+    if kind == "fileChange":
+        changes = [{"path": change.get("path"), "kind": (change.get("kind") or {}).get("type")}
+                   for change in item.get("changes") or [] if isinstance(change, dict)]
+        return {"type": "file_change", "changes": changes, "status": item.get("status")}
+    if kind == "commandExecution":
+        return {"type": "command_execution", "command": item.get("command"),
+                "exit_code": item.get("exitCode"), "status": item.get("status")}
+    return None
+
+
+def run_host_turn(
+    connect: Callable[[], Any], cwd: Union[str, Path], prompt: str, *,
+    model: Optional[str] = None, sandbox: str = "workspace-write", approval_policy: str = "never",
+    config: Optional[Dict[str, Any]] = None,
+    effort: Optional[str] = None, ephemeral: bool = False, resume_thread: Optional[str] = None,
+    timeout: float = 600, cancellation_check: Optional[Callable[[], bool]] = None,
+    protocol_log_path: Optional[Union[str, Path]] = None, max_output_bytes: Optional[int] = None,
+) -> HostTurnResult:
+    """Run one turn as a thread on a shared ``codex app-server`` host.
+
+    ``connect`` returns a connected :class:`codex_ws.HostSocket`. A fresh run
+    starts a thread; a repair resumes ``resume_thread``. A cut or the deadline
+    interrupts only this thread's turn: the host and its other threads go on.
+    An approval request is declined and fails the turn, as in
+    :func:`run_codex_session`. Notifications for another thread are ignored.
+    """
+    import socket
+
+    from puppetmaster.adapters.codex_ws import HostClosed
+
+    result = HostTurnResult(status="failed",
+                            protocol_log_path=str(protocol_log_path) if protocol_log_path else None)
+    captured: List[str] = []
+    deadline = time.monotonic() + max(0.01, timeout)
+    try:
+        conn = connect()
+    except OSError as exc:
+        result.error = f"host connect failed: {exc}"
+        return result
+    next_id = [0]
+    waiting: Dict[int, str] = {}
+    output_bytes = 0
+    interrupted = ""
+
+    def request(method: str, params: Dict[str, Any], tag: str) -> None:
+        next_id[0] += 1
+        message = {"jsonrpc": "2.0", "id": next_id[0], "method": method, "params": params}
+        _bounded(captured, "> " + json.dumps(message, separators=(",", ":")))
+        conn.send(message)
+        waiting[next_id[0]] = tag
+
+    def interrupt(reason: str) -> None:
+        nonlocal interrupted
+        if not interrupted and result.thread_id and result.turn_id:
+            request("turn/interrupt", {"threadId": result.thread_id, "turnId": result.turn_id}, "interrupt")
+        interrupted = interrupted or reason
+
+    try:
+        request("initialize", {"clientInfo": {"name": "puppetmaster", "version": "1"}, "capabilities": {}},
+                "initialize")
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                if interrupted:
+                    result.status, result.error = "timeout", "host turn timeout"
+                    break
+                interrupt("timeout")
+                deadline = now + 10
+            if not interrupted and cancellation_check and cancellation_check():
+                interrupt("cancelled")
+            conn.settimeout(max(0.05, min(0.5, deadline - time.monotonic())))
+            try:
+                obj = conn.recv()
+            except socket.timeout:
+                continue
+            line = json.dumps(obj, separators=(",", ":"))
+            output_bytes += len(line)
+            _bounded(captured, "< " + line)
+            if max_output_bytes and output_bytes > max_output_bytes and not interrupted:
+                interrupt("output_limit")
+            if not isinstance(obj, dict):
+                continue
+            if "id" in obj and "method" in obj:
+                # The run never approves: refuse, then fail like the stdio session.
+                conn.send({"jsonrpc": "2.0", "id": obj["id"], "result": {"decision": "decline"}})
+                result.error = "unexpected approval/server request"
+                interrupt("approval")
+                continue
+            if "id" in obj:
+                tag = waiting.pop(obj["id"], "")
+                payload = obj.get("result") if isinstance(obj.get("result"), dict) else {}
+                if "error" in obj:
+                    if tag != "interrupt":
+                        result.error = str(obj["error"])
+                        break
+                    continue
+                if tag == "initialize":
+                    conn.send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+                    if resume_thread:
+                        request("thread/resume", {"threadId": resume_thread, "cwd": str(Path(cwd).resolve()),
+                                                  "sandbox": sandbox, "approvalPolicy": approval_policy,
+                                                  "config": config or {}}, "thread")
+                    else:
+                        request("thread/start", {"model": model, "cwd": str(Path(cwd).resolve()),
+                                                 "sandbox": sandbox, "approvalPolicy": approval_policy,
+                                                 "ephemeral": bool(ephemeral), "config": config or {}}, "thread")
+                elif tag == "thread":
+                    thread = payload.get("thread") if isinstance(payload.get("thread"), dict) else {}
+                    result.thread_id = thread.get("id") or payload.get("threadId")
+                    result.rollout_path = thread.get("path")
+                    result.thread_started_at = time.time()
+                    if not result.thread_id:
+                        result.error = "thread response missing thread id"
+                        break
+                    params: Dict[str, Any] = {"threadId": result.thread_id,
+                                              "input": [{"type": "text", "text": prompt}]}
+                    if model:
+                        params["model"] = model
+                    if effort:
+                        params["effort"] = effort
+                    request("turn/start", params, "turn")
+                elif tag == "turn":
+                    turn = payload.get("turn") if isinstance(payload.get("turn"), dict) else {}
+                    result.turn_id = result.turn_id or turn.get("id") or payload.get("turnId")
+                continue
+            method, params = obj.get("method"), obj.get("params")
+            if not isinstance(params, dict):
+                continue
+            if params.get("threadId") not in (None, result.thread_id):
+                continue
+            if method == "turn/started":
+                turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
+                result.turn_id = result.turn_id or turn.get("id") or params.get("turnId")
+                result.turn_started_at = result.turn_started_at or time.time()
+            elif method == "thread/tokenUsage/updated":
+                result.input_tokens, result.output_tokens, result.cached_input_tokens = _usage(params)
+            elif method == "item/completed":
+                result.messages.extend(_text_from(params))
+                item = params.get("item")
+                mapped = _exec_item(item) if isinstance(item, dict) else None
+                if mapped is not None:
+                    result.items.append(mapped)
+            elif method == "turn/completed":
+                turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
+                state = str(turn.get("status") or "completed")
+                if interrupted:
+                    result.status = {"cancelled": "cancelled", "timeout": "timeout",
+                                     "output_limit": "output_limit"}.get(interrupted, "failed")
+                    result.error = result.error or f"turn interrupted: {interrupted}"
+                elif state in ("failed", "interrupted"):
+                    result.status, result.error = "failed", str(turn.get("error") or state)
+                else:
+                    result.status = "completed"
+                break
+            elif method in ("turn/failed", "error") and not params.get("willRetry"):
+                result.status, result.error = "failed", str(params)[:2000]
+                break
+    except (HostClosed, OSError, ValueError) as exc:
+        result.status = "failed"
+        result.error = f"host connection lost: {exc}"
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
         result.raw_protocol = "\n".join(captured)
         if protocol_log_path:
             Path(protocol_log_path).write_text(result.raw_protocol, encoding="utf-8")

@@ -1,3 +1,39 @@
+## v1.47.0 — 2026-10-21
+
+**Opt-in: one shared Codex host for a flow walk.** A Codex worker starts its
+own `codex exec` process: the launcher, the native binary, a login-shell
+snapshot and git probes. Native Codex runs its subagents as threads in one
+process. Codex lab R200 measured about 114 s from `codex exec` launch to the
+first model turn for each cold builder, because the lab guards every process.
+R202 measured 0.05 s from a native subagent spawn to its own turn.
+
+- Set `"defaults": {"codex_host": true}` in the graph, or
+  `PUPPETMASTER_CODEX_HOST=1` for the walker. A graph value wins. Off by
+  default.
+- The top walker starts one `codex app-server` on a Unix socket
+  (`codex_host.py`) and stops it at walk end. Child walkers and workers find
+  it through `PUPPETMASTER_CODEX_HOST_RECORD`. The next walk of the run stops
+  a host that a dead walker left.
+- Each Codex agent and judge runs as a thread on the host
+  (`codex_session.run_host_turn`, stdlib WebSocket client `codex_ws.py`). A
+  repair resumes its thread. A cut interrupts only its own turn. An approval
+  request is declined and fails the turn.
+- The adapter reports file changes and commands as `codex exec --json`
+  items, so the write-scope gate, rollout usage and resume do not change.
+  Each worker gets its own shell environment through the thread's
+  `shell_environment_policy`.
+- These runs use `codex exec`: a fork, a bypass run, a native-steer run, a
+  custom `executable`, extra arguments other than `-c key=value`, a thread in
+  another Codex home, and Windows (no Unix sockets). A host that does not
+  start, or a connection that fails before the turn, also falls back.
+- Each host turn writes `codex_host_turn.json`: host start and ready times,
+  the request time, the thread start and the turn start.
+- Replica (R179 regions graph, Sol 6.1 high, 3 interleaved pairs): host on
+  548.6 / 292.2 / 370.6 s, host off 345.4 / 600.4 / 372.8 s. All runs
+  passed the judge. Host runs: 69 of 69 turns on the host, 0 `codex exec`
+  dispatches, request to own-turn start median 1.13 s. A local `codex exec`
+  start is about 1.7 s, so the wall time does not change on this Mac.
+
 ## v1.46.2 — 2026-10-19
 
 **A nested builder's `revise` no longer blocks follow-up reuse.** Codex R196

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any, Mapping, Optional, Union
 
@@ -314,6 +315,14 @@ class CodexAdapter(CliWorkerAdapter):
         cwd: Path,
         timeout_seconds: int,
     ) -> StreamedProcess:
+        host = _host_for(task, prepared)
+        if host is not None:
+            from puppetmaster.invocation import check_external_dispatch
+
+            check_external_dispatch()
+            hosted = self._invoke_host(task, prepared, cwd, timeout_seconds, host)
+            if hosted is not None:
+                return hosted
         if prepared.extras.get("resumed") or not bool((task.payload or {}).get("native_steer")):
             home = self._worker_home(prepared)
             from puppetmaster import codex_home
@@ -345,6 +354,92 @@ class CodexAdapter(CliWorkerAdapter):
             raise
         except Exception:
             return super()._invoke_cli(task, prepared, cwd, timeout_seconds)
+
+    def _invoke_host(self, task: Task, prepared: CliInvocation, cwd: Path,
+                     timeout_seconds: int, host: dict) -> Optional[StreamedProcess]:
+        """Run the turn as a thread on the flow's shared host (see codex_host).
+
+        Returns None when the host fails before the turn starts: the caller
+        then runs ``codex exec``. The turn is reported as ``codex exec --json``
+        events, with the file changes and commands Codex made.
+        """
+        from puppetmaster.adapters.codex_session import run_host_turn
+        from puppetmaster.adapters.codex_ws import HostSocket
+        from puppetmaster.cancellation import JobCancelled, is_cancelled
+        from puppetmaster.fs_permissions import mkdir_private, write_private_text
+        from puppetmaster.invocation import current_attempt
+        from puppetmaster.swarm_reasoning import caller_pinned_effort
+        from ._streaming import _resolve_sidecar_state_dir, _write_dispatch_receipt, capture_dir
+
+        config = _host_config(task.payload.get("extra_args"))
+        prompt = str(prepared.extras.get("prompt") or task.instruction or "")
+        env = prepared.env
+        if env is None:
+            env = inject_worker_cli_env(apply_worktree_ports(os.environ.copy(), cwd))
+        config["shell_environment_policy"] = _host_shell_policy(env)
+        resume_record = prepared.extras.get("resume") if prepared.extras.get("resumed") else None
+        session_id = _resumed_session_id(resume_record)
+        home = Path(host["home"]) if host.get("home") else _codex_home().user_home(env)
+        baseline = _rollout_baseline(home, resume_record)
+        state_dir = _resolve_sidecar_state_dir()
+        log_dir = capture_dir(state_dir, task) if state_dir is not None else None
+        log_path = None
+        if log_dir is not None:
+            mkdir_private(log_dir)
+            log_path = log_dir / "codex_host.log"
+        receipt = _write_dispatch_receipt(
+            log_dir, task=task, sidecar_name="codex_host",
+            command=["codex-host", str(host.get("socket")), "resume" if session_id else "start"],
+            cwd=str(cwd), env=env, stdin_data=prompt, pid=int(host["pid"]))
+        budget = task.payload.get("max_output_bytes")
+        requested_at = time.time()
+        result = run_host_turn(
+            lambda: HostSocket(str(host["socket"]), timeout=10.0),
+            cwd, prompt,
+            model=str(prepared.extras.get("model") or "") or None,
+            sandbox=str(prepared.extras.get("sandbox") or "workspace-write"),
+            approval_policy=str(prepared.extras.get("approval_policy") or "never"),
+            config=config,
+            effort=caller_pinned_effort(task.payload),
+            ephemeral=bool(prepared.extras.get("ephemeral", True)),
+            resume_thread=session_id,
+            timeout=float(timeout_seconds),
+            cancellation_check=lambda: is_cancelled(task.job_id),
+            protocol_log_path=log_path,
+            max_output_bytes=budget if isinstance(budget, int) and not isinstance(budget, bool) and budget > 0 else None,
+        )
+        if result.thread_id is None and result.status == "failed":
+            return None
+        if log_dir is not None:
+            # Lab observation: host start, this request and its own turn start.
+            write_private_text(log_dir / "codex_host_turn.json", json.dumps({
+                "host_pid": host.get("pid"), "host_started_at": host.get("started_at"),
+                "host_ready_at": host.get("ready_at"), "requested_at": requested_at,
+                "thread_started_at": result.thread_started_at,
+                "turn_started_at": result.turn_started_at, "finished_at": time.time(),
+                "thread_id": result.thread_id, "resumed": session_id is not None,
+                "status": result.status}), lock=False)
+        if result.status == "cancelled":
+            raise JobCancelled(task.job_id)
+        stdout = _app_server_events(result)
+        usage = None
+        if session_id is not None or not prepared.extras.get("ephemeral", True):
+            usage = _rollout_attempt_usage(home, resume_record, baseline, stdout)
+        if usage is None and session_id is None:
+            usage = _app_server_attempt_usage(result)
+        output_limit = result.status == "output_limit"
+        return StreamedProcess(
+            returncode=0 if result.status == "completed" else 1,
+            stdout=stdout,
+            stderr=result.error or "",
+            timed_out=result.status == "timeout" or output_limit,
+            live_log_path=str(log_path) if log_path is not None else None,
+            spawn_error=None,
+            output_limit_hit=output_limit,
+            attempt_id=current_attempt(task),
+            dispatch_receipt=receipt,
+            attempt_usage=usage,
+        )
 
     def _invoke_app_server(self, task: Task, prepared: CliInvocation, cwd: Path,
                            timeout_seconds: int, cancelled) -> StreamedProcess:
@@ -734,6 +829,7 @@ def _app_server_events(result: Any) -> str:
     if result.thread_id:
         events.append({"type": "thread.started", "thread_id": result.thread_id})
     events.append({"type": "turn.started"})
+    events.extend({"type": "item.completed", "item": item} for item in getattr(result, "items", ()))
     events.extend({"type": "item.completed", "item": {"type": "agent_message", "text": text}}
                   for text in result.messages)
     if result.status == "failed":
@@ -741,6 +837,58 @@ def _app_server_events(result: Any) -> str:
     elif result.status == "completed":
         events.append({"type": "turn.completed"})
     return "\n".join(json.dumps(event) for event in events) + "\n"
+
+
+def _host_for(task: Task, prepared: CliInvocation) -> Optional[dict]:
+    """The flow's live shared host when this run can be a thread on it, else None.
+
+    A fork, a native-steer run, a bypass run, extra arguments other than
+    ``-c key=value`` and a thread held in another home run ``codex exec``.
+    """
+    from puppetmaster import codex_host
+
+    host = codex_host.current()
+    if host is None or prepared.extras.get("fork") or prepared.extras.get("bypass") \
+            or (task.payload or {}).get("executable"):
+        return None
+    if bool((task.payload or {}).get("native_steer")) or _host_config(task.payload.get("extra_args")) is None:
+        return None
+    resume = prepared.extras.get("resume") if prepared.extras.get("resumed") else None
+    session_id = _resumed_session_id(resume)
+    if session_id is not None:
+        home = _codex_home().home_for_session(session_id)
+        if home is None or str(home) != str(host.get("home")):
+            return None
+    return host
+
+
+def _host_config(extra_args: object) -> Optional[dict]:
+    """``-c key=value`` arguments as a thread config, or None for any other argument."""
+    parts = command_parts(extra_args) if extra_args else []
+    config: dict = {}
+    index = 0
+    while index < len(parts):
+        if parts[index] != "-c" or index + 1 >= len(parts) or "=" not in parts[index + 1]:
+            return None
+        key, raw = parts[index + 1].split("=", 1)
+        try:
+            value: Any = json.loads(raw)
+        except ValueError:
+            value = raw.strip("'")
+        config[key.strip()] = value
+        index += 2
+    return config
+
+
+def _host_shell_policy(env: Mapping[str, str]) -> dict:
+    """The thread shell environment: this worker's env where it differs from the host's."""
+    host_env = inject_worker_cli_env(os.environ.copy())
+    changed = {key: value for key, value in env.items() if host_env.get(key) != value}
+    policy: dict = {"inherit": "all", "set": changed}
+    dropped = sorted(key for key in host_env if key not in env)
+    if dropped:
+        policy["exclude"] = dropped
+    return policy
 
 
 def _app_server_attempt_usage(result: Any) -> Optional[dict]:
