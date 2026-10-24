@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import contextlib
 import os
 import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +25,7 @@ from puppetmaster.models import (
     now_iso,
 )
 from puppetmaster.stitcher import Stitcher
+from puppetmaster.state import bind_state_dir
 from puppetmaster.store import SwarmStore
 from puppetmaster.swarm_reasoning import NO_EFFORT_ADAPTERS, apply_swarm_reasoning
 from puppetmaster.worker_fence import stamp_worker_env
@@ -182,19 +183,6 @@ def _env_int(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         return default
-
-
-@contextlib.contextmanager
-def _temporary_env_var(name: str, value: str):
-    previous = os.environ.get(name)
-    os.environ[name] = value
-    try:
-        yield
-    finally:
-        if previous is None:
-            os.environ.pop(name, None)
-        else:
-            os.environ[name] = previous
 
 
 def merge_routing_payload(
@@ -2818,7 +2806,7 @@ class Orchestrator:
         allowed_task_ids: Optional[set[str]] = None,
     ) -> None:
         allowed_task_ids = allowed_task_ids or {task.id for task in tasks}
-        with _temporary_env_var("PUPPETMASTER_STATE_DIR", str(self.store.root)):
+        with bind_state_dir(self.store.root):
             while True:
                 record_orchestrator_heartbeat(self.store, job.id)
                 self.store.recover_stale_tasks(job.id)
@@ -2882,7 +2870,7 @@ class Orchestrator:
 
         pool_size = min(len(roles), _INLINE_ROLE_WORKER_POOL_CAP)
         with ThreadPoolExecutor(max_workers=pool_size) as executor:
-            futures = [executor.submit(_run_role, role) for role in roles]
+            futures = [executor.submit(copy_context().run, _run_role, role) for role in roles]
             completed = 0
             errors: list[BaseException] = []
             for future in futures:

@@ -48,6 +48,7 @@ import re
 import subprocess
 import tempfile
 import time
+from contextvars import copy_context
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -78,7 +79,7 @@ from puppetmaster.providers import (
 from puppetmaster.redaction import redact_secrets
 from puppetmaster.usage import selected_token_usage
 from puppetmaster.swarm_reasoning import DEFAULT_SWARM_REASONING_EFFORT
-from puppetmaster.state import resolve_state_dir
+from puppetmaster.state import export_state_dir, resolve_state_dir
 from puppetmaster.hashline import (
     SnapshotStore,
     apply_patch,
@@ -2260,7 +2261,8 @@ class AgenticAdapter(FullEditWorkerAdapter):
             # Segmentation / barrier rules are unchanged; only pool size is bounded.
             worker_count = parallel_executor_max_workers(len(calls))
             with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
-                futures = {executor.submit(_execute_one, call): idx for idx, call in enumerate(calls)}
+                futures = {executor.submit(copy_context().run, _execute_one, call): idx
+                           for idx, call in enumerate(calls)}
                 results = [None] * len(calls)
                 for future in concurrent.futures.as_completed(futures):
                     idx = futures[future]
@@ -2731,7 +2733,7 @@ def _run_owned_shell(
 
     owner = new_id("process")
     env = {
-        **os.environ,
+        **export_state_dir(dict(os.environ)),
         "GIT_PAGER": "cat",
         "PAGER": "cat",
         "GIT_TERMINAL_PROMPT": "0",

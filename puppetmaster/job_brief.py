@@ -171,12 +171,12 @@ def resolve_job_brief_for_task(task) -> str:
         if isinstance(inline, str) and inline.strip():
             return inline.strip() + ("\n" if not inline.endswith("\n") else "")
         from puppetmaster.adapters._streaming import _resolve_sidecar_state_dir
-        from puppetmaster.state import STATE_DIR_ENV, find_state_dir_for_job, resolve_state_dir
+        from puppetmaster.state import find_state_dir_for_job, resolve_state_dir, state_dir_from_env
 
         state_dir = _resolve_sidecar_state_dir()
         if state_dir is None:
             state_dir = find_state_dir_for_job(job_id)
-        if state_dir is None and os.environ.get(STATE_DIR_ENV):
+        if state_dir is None and state_dir_from_env():
             # Explicit env pin — resolve_state_dir short-circuits before git.
             try:
                 state_dir = resolve_state_dir()

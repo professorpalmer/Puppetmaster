@@ -11,6 +11,8 @@ import os
 from pathlib import Path
 from typing import Optional
 
+from puppetmaster.state import state_dir_from_env
+
 # Caches and tool state that no task owns. The gate also skips bytecode.
 SKIP_DIRS = frozenset({
     ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
@@ -23,7 +25,7 @@ Manifest = dict  # relative posix path -> [size, mtime_ns]
 
 def _excluded_roots(root: Path) -> list[Path]:
     """The live Puppetmaster state dir changes during every run; it is not the worker's."""
-    raw = os.environ.get("PUPPETMASTER_STATE_DIR")
+    raw = state_dir_from_env()
     if not raw:
         return []
     try:
