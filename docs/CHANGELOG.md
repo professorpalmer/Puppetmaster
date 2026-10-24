@@ -1,3 +1,30 @@
+## v1.48.0 — 2026-10-24
+
+**An inline run binds its store per context, not in the process env.**
+`_run_inline_workers` set `PUPPETMASTER_STATE_DIR` in `os.environ` for the
+whole run. Two inline runs on different stores in one process (Marionette
+runs swarms inline in its backend) then saw each other's state dir. A worker
+of one run wrote its deltas, stdout sidecars and tool offloads into the
+other run's store, and the restore order could leave the wrong value.
+
+- `state.bind_state_dir` sets a context variable. `state.state_dir_from_env`
+  reads it first, then the env. Every in-process reader uses it.
+- The inline role pool and the agentic parallel tool pool copy the context
+  into their threads.
+- `stamp_worker_env` and the agentic shell env give child processes the
+  bound dir, so children see the same value as before.
+- A subprocess worker still sets the env in its own process.
+- Repro: two concurrent inline runs, held inside their workers with a
+  barrier. Before, one run's worker resolved the other store. Now each run
+  resolves its own, and `os.environ` does not change.
+
+**Opt-in: map items as threads of the walker.** Set
+`"defaults": {"inprocess": true}` or `PUPPETMASTER_FLOW_INPROCESS=1` to walk
+map items as threads of the parent walker, not as new walker processes. Run
+locks, markers, stop, cut, resume and reuse do not change. A thread walk that
+raises leaves its run interrupted, and the map starts it again. See
+`docs/FLOWS.md`.
+
 ## v1.47.0 — 2026-10-21
 
 **Opt-in: one shared Codex host for a flow walk.** A Codex worker starts its
