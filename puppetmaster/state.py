@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 from collections import OrderedDict
+from contextlib import contextmanager
+from contextvars import ContextVar
 import threading
 import os
 import re
@@ -9,12 +11,39 @@ import sqlite3
 import subprocess
 import sys
 from pathlib import Path
-from typing import Optional, Union
+from typing import Iterator, Optional, Union
 
 from puppetmaster.readonly import ReadUnavailable
 
 
 STATE_DIR_ENV = "PUPPETMASTER_STATE_DIR"
+
+# An in-process run binds its store here, not in os.environ: two inline runs
+# on different stores in one process must not see each other's state dir.
+_BOUND_STATE_DIR: ContextVar[Optional[str]] = ContextVar("puppetmaster_state_dir", default=None)
+
+
+@contextmanager
+def bind_state_dir(path: Union[Path, str]) -> Iterator[None]:
+    """Make ``path`` the state dir of this context and of the threads it copies to."""
+    token = _BOUND_STATE_DIR.set(str(path))
+    try:
+        yield
+    finally:
+        _BOUND_STATE_DIR.reset(token)
+
+
+def state_dir_from_env() -> Optional[str]:
+    """The state dir bound by an in-process run, else ``PUPPETMASTER_STATE_DIR``."""
+    return _BOUND_STATE_DIR.get() or os.environ.get(STATE_DIR_ENV) or None
+
+
+def export_state_dir(env: dict) -> dict:
+    """Give a child process the bound state dir. Mutates and returns ``env``."""
+    bound = _BOUND_STATE_DIR.get()
+    if bound:
+        env[STATE_DIR_ENV] = bound
+    return env
 
 
 def state_identity(path: Union[Path, str]) -> str:
@@ -28,7 +57,7 @@ def resolve_state_dir(value: Optional[Union[Path, str]] = None, cwd: Optional[Pa
     root = cwd or Path.cwd()
     if value:
         return _resolve_user_path(value, root)
-    env_value = os.environ.get(STATE_DIR_ENV)
+    env_value = state_dir_from_env()
     if env_value:
         return _resolve_user_path(env_value, root)
     return default_state_dir(root)

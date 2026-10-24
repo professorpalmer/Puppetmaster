@@ -444,6 +444,19 @@ a resumed walker kills the command the dead walker left running (when the pid
 still names that command) and runs it again. A pid that now names another
 process is left alone.
 
+### Map items in the walker process
+
+By default a map starts one walker process for each item, and a nested map
+does the same again for its own items. Set `"defaults": {"inprocess": true}`,
+or `PUPPETMASTER_FLOW_INPROCESS=1` for the walker, to walk the items as
+threads of the parent walker instead. A graph value wins.
+
+- Run locks, markers, stop, cut, resume and reuse work as with processes.
+- A thread walk that raises leaves its run interrupted, and the map starts
+  it again (at most 4 times), as for a walker process that exits.
+- It saves one process start for each item. That is about 0.2 s on a plain
+  machine, but more where each process start is checked or guarded.
+
 ### One shared Codex host
 
 A Codex worker usually starts its own `codex exec` process: the launcher, the

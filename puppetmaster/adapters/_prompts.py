@@ -609,19 +609,17 @@ def _open_store_for_task(task: Task, *, discover: bool = True):
     so worker subprocesses see the same store the orchestrator wrote into.
     Returns ``None`` on any miss or error.
     """
-    import os
-
     job_id = getattr(task, "job_id", None) or ""
     if not job_id:
         return None
     from puppetmaster.adapters._streaming import _resolve_sidecar_state_dir
-    from puppetmaster.state import STATE_DIR_ENV, find_state_dir_for_job, resolve_state_dir
+    from puppetmaster.state import find_state_dir_for_job, resolve_state_dir, state_dir_from_env
     from puppetmaster.store_factory import create_store
 
     state_dir = _resolve_sidecar_state_dir()
     if state_dir is None and discover:
         state_dir = find_state_dir_for_job(job_id)
-    if state_dir is None and os.environ.get(STATE_DIR_ENV):
+    if state_dir is None and state_dir_from_env():
         try:
             state_dir = resolve_state_dir()
         except Exception:

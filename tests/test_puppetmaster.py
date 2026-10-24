@@ -28159,7 +28159,9 @@ class AuditFixTests(unittest.TestCase):
             seen = []
 
             def complete_task(runtime):
-                seen.append(os.environ.get("PUPPETMASTER_STATE_DIR"))
+                from puppetmaster.state import state_dir_from_env
+
+                seen.append((state_dir_from_env(), os.environ.get("PUPPETMASTER_STATE_DIR")))
                 stored = store.get_task_by_id(task.id)
                 store.update_task_status(stored, TaskStatus.COMPLETE)
                 return 1
@@ -28173,7 +28175,8 @@ class AuditFixTests(unittest.TestCase):
                     Orchestrator(store)._run_inline_workers(job, [task])
                 self.assertEqual(os.environ["PUPPETMASTER_STATE_DIR"], "parent-state")
 
-            self.assertEqual(seen, [str(store.root)])
+            # The run binds its store; the process env keeps the parent value.
+            self.assertEqual(seen, [(str(store.root), "parent-state")])
 
     def test_redact_secrets_scrubs_argument_supplied_keys(self) -> None:
         from puppetmaster.redaction import (

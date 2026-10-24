@@ -50,7 +50,9 @@ import signal
 import shutil
 import subprocess
 import sys
+import threading
 import time
+import traceback
 import unicodedata
 import uuid
 from dataclasses import dataclass, field
@@ -137,6 +139,8 @@ def validate_graph(graph: Any, *, child: bool = False, depth: int = 0,
     problems.extend(_effort_problems(own_defaults, "defaults"))
     if "codex_host" in own_defaults and not isinstance(own_defaults["codex_host"], bool):
         problems.append("defaults.codex_host must be true or false")
+    if "inprocess" in own_defaults and not isinstance(own_defaults["inprocess"], bool):
+        problems.append("defaults.inprocess must be true or false")
     lanes = own_defaults.get("lanes")
     if lanes is not None:
         if not isinstance(lanes, dict) or not set(lanes) <= set(LANES):
@@ -1558,6 +1562,42 @@ def spawn_background_walk(state_dir: Path, run_id: str, *, answer: Optional[str]
     return process.pid
 
 
+INPROCESS_ENV = "PUPPETMASTER_FLOW_INPROCESS"
+
+
+def inprocess_requested(graph: dict, env: Optional[dict] = None) -> bool:
+    """Whether map items walk as threads of the parent walker, not as new processes."""
+    env = os.environ if env is None else env
+    defaults = graph.get("defaults") if isinstance(graph.get("defaults"), dict) else {}
+    if "inprocess" in defaults:
+        return defaults.get("inprocess") is True
+    return str(env.get(INPROCESS_ENV, "")).strip().lower() in ("1", "true", "on", "yes")
+
+
+def walk_in_thread(state_dir: Path, run_id: str) -> threading.Thread:
+    """Walk ``run_id`` on a thread of this process.
+
+    The run lock, markers, stop and resume work as for a walker process. Each
+    walker process pays its own start (interpreter, imports, guards); a thread
+    does not. A walk that raises leaves the run ``running`` with a free lock,
+    so the map sees it as interrupted and starts it again.
+    """
+    def target() -> None:
+        try:
+            walk(state_dir, run_id)
+        except FlowError:
+            pass  # another walker holds the run
+        except Exception:
+            try:
+                with open(run_path(state_dir, run_id).with_name("walker.log"), "a", encoding="utf-8") as log:
+                    log.write(traceback.format_exc())
+            except OSError:
+                pass
+    thread = threading.Thread(target=target, name=f"flow-walk-{run_id}", daemon=True)
+    thread.start()
+    return thread
+
+
 def _fail_unwalked(state_dir: Path, run_id: str, reason: str) -> None:
     """Fail a run only if no walker holds it; never race a slow-starting walker's writes."""
     lock = _lock(state_dir, run_id, timeout=0)
@@ -1614,6 +1654,7 @@ class JobNodeExecutor:
         self.backend = backend
         self.worker_mode = worker_mode
         self.popen = popen or subprocess.Popen
+        self.custom_spawn = spawn is not None
         self.spawn = spawn or (lambda state_dir, run_id: spawn_background_walk(
             state_dir, run_id, popen=self.popen))
         self.poll_seconds = poll_seconds
@@ -2041,6 +2082,7 @@ class JobNodeExecutor:
 
     def _drive_children(self, run: FlowRun, node: dict, children: dict[str, str]) -> None:
         concurrency = int(node.get("concurrency", DEFAULT_MAP_CONCURRENCY))
+        spawn = self.spawn if self.custom_spawn or not inprocess_requested(run.graph) else walk_in_thread
         started: dict[str, float] = {}
         spawns: dict[str, int] = {}
         finished: dict[str, str] = {}
@@ -2073,7 +2115,7 @@ class JobNodeExecutor:
                     continue
                 spawns[child_id] = spawns.get(child_id, 0) + 1
                 started[child_id] = now
-                self.spawn(self.state_dir, child_id)
+                spawn(self.state_dir, child_id)
                 live.add(child_id)
             time.sleep(self.poll_seconds)
 

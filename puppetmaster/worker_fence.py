@@ -11,6 +11,8 @@ from __future__ import annotations
 import os
 from typing import Mapping, Optional
 
+from puppetmaster.state import export_state_dir
+
 WORKER_ENV = "PUPPETMASTER_WORKER"
 WORKER_VALUE = "1"
 ALLOW_NESTED_ENV = "PUPPETMASTER_ALLOW_NESTED"
@@ -71,6 +73,7 @@ def stamp_worker_env(
     role: str = "",
 ) -> dict:
     """Mark ``env`` as a Puppetmaster worker. Mutates and returns ``env``."""
+    export_state_dir(env)
     env[WORKER_ENV] = WORKER_VALUE
     if job_id:
         env[JOB_ID_ENV] = str(job_id)

@@ -28,16 +28,17 @@ from typing import Optional
 from puppetmaster.fs_permissions import mkdir_private, open_private
 from puppetmaster.models import Task
 from puppetmaster.redaction import redact_secrets
+from puppetmaster.state import state_dir_from_env
 
 _DELTA_FILE = "agentic_deltas.ndjson"
 
 
 def _resolve_state_dir() -> Optional[Path]:
-    """The active state dir from ``PUPPETMASTER_STATE_DIR`` (exported by
-    ``worker_runtime`` after resolving --state-dir), or ``None`` when no state
-    dir is in scope -- mirroring :func:`_streaming._resolve_sidecar_state_dir`.
+    """The active state dir (bound by an inline run, or ``PUPPETMASTER_STATE_DIR``
+    exported by ``worker_runtime``), or ``None`` when no state dir is in scope --
+    mirroring :func:`_streaming._resolve_sidecar_state_dir`.
     """
-    raw = os.environ.get("PUPPETMASTER_STATE_DIR")
+    raw = state_dir_from_env()
     if not raw:
         return None
     try:

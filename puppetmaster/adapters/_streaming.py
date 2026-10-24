@@ -12,6 +12,7 @@ from puppetmaster.fs_permissions import mkdir_private, open_private, write_priva
 from puppetmaster.invocation import current_attempt
 from puppetmaster.models import Task, new_id
 from puppetmaster.redaction import redact_secrets
+from puppetmaster.state import state_dir_from_env
 from puppetmaster.worker_fence import stamp_worker_env
 
 _STDOUT_HEAD_CHARS = 1000
@@ -46,10 +47,11 @@ def _resolve_sidecar_state_dir() -> Optional[Path]:
     Returns ``None`` if no state dir is in scope (e.g. direct adapter unit
     tests). Falling back to the default state dir would write logs into a
     workspace-hashed path that may not own the job, so we only honor an
-    explicit ``PUPPETMASTER_STATE_DIR`` env var (which ``worker_runtime``
-    exports after resolving its --state-dir flag).
+    explicit state dir: the one an inline run bound, or the
+    ``PUPPETMASTER_STATE_DIR`` env var (which ``worker_runtime`` exports after
+    resolving its --state-dir flag).
     """
-    raw = os.environ.get("PUPPETMASTER_STATE_DIR")
+    raw = state_dir_from_env()
     if not raw:
         return None
     try:
