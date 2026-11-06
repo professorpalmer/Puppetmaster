@@ -1525,7 +1525,7 @@ class AgenticAdapter(FullEditWorkerAdapter):
                 "role": "assistant",
                 "content": turn.text or "",
                 "tool_calls": [
-                    {"id": c["id"], "type": "function",
+                    {**(c.get("replay") or {}), "id": c["id"], "type": "function",
                      "function": {"name": c["name"], "arguments": json.dumps(c["arguments"])}}
                     for c in turn.tool_calls
                 ],
