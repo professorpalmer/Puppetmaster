@@ -2824,6 +2824,107 @@ class AgenticLoopTests(unittest.TestCase):
         self.assertEqual(assistant.get("reasoning_content"), "  keep bytes  ")
         self.assertEqual(assistant.get("reasoning"), "keep bytes")
 
+    def test_gemini_tool_call_extra_content_replays_on_next_turn(self) -> None:
+        # Issue #296: Gemini 3 returns 400 "Function call is missing a
+        # thought_signature" when the replayed tool call drops extra_content.
+        from puppetmaster.adapters import agentic
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cwd = Path(tmp.name)
+        (cwd / "a.py").write_text("x = 1\n", encoding="utf-8")
+        extra_content = {"google": {"thought_signature": "sig-AAA"}}
+        captured_bodies = []
+        responses = iter([
+            {"choices": [{"message": {
+                "role": "assistant", "content": "",
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "extra_content": extra_content,
+                     "function": {"name": "read_file", "arguments": '{"path":"a.py"}'}},
+                    {"id": "c2", "type": "function",
+                     "function": {"name": "read_file", "arguments": '{"path":"a.py"}'}},
+                ],
+            }}]},
+            {"choices": [{"message": {
+                "role": "assistant", "content": "done", "tool_calls": [{
+                    "id": "s1", "type": "function", "function": {
+                        "name": "submit_findings", "arguments": '{"artifacts":[]}',
+                    },
+                }],
+            }}]},
+        ])
+
+        def fake_post_json(url, *, headers, body, timeout):
+            captured_bodies.append(json.loads(json.dumps(body)))
+            return next(responses)
+
+        def parse_provider_turn(*, provider, model, messages, tools, extra, timeout):
+            return providers._openai_chat(
+                base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+                api_key="test-key", model=model, messages=messages, tools=tools,
+                extra=extra, headers={}, timeout=timeout,
+            )
+
+        task = Task(
+            job_id="gemini-thought-signature", role="explore", instruction="analyze",
+            payload={"cwd": str(cwd), "provider": "gemini", "model": "gemini-3.1-pro",
+                     "disable_codegraph": True},
+        )
+        with mock.patch.object(providers, "_post_json", side_effect=fake_post_json), \
+                mock.patch.object(agentic, "provider_chat", side_effect=parse_provider_turn):
+            self.adapter().run(task, task.instruction, "w1")
+
+        self.assertGreaterEqual(len(captured_bodies), 2)
+        assistant = next(m for m in captured_bodies[1]["messages"]
+                         if m.get("role") == "assistant" and m.get("tool_calls"))
+        first, second = assistant["tool_calls"]
+        self.assertEqual(first["extra_content"], extra_content)
+        self.assertEqual(first["id"], "c1")
+        self.assertEqual(first["function"]["name"], "read_file")
+        # A call without vendor fields replays with the standard keys only.
+        self.assertEqual(set(second), {"id", "type", "function"})
+
+    def test_openai_stream_merges_split_tool_call_extra_content(self) -> None:
+        chunks = [
+            {"choices": [{"delta": {"tool_calls": [{
+                "index": 0, "id": "c1", "type": "function",
+                "extra_content": {"google": {"thought_signature": "sig-AAA"}},
+                "function": {"name": "read_file", "arguments": '{"pa'},
+            }]}}]},
+            {"choices": [{"delta": {"tool_calls": [{
+                "index": 0, "extra_content": {"google": {"other": 1}},
+                "function": {"arguments": 'th":"a.py"}'},
+            }]}}]},
+            {"choices": [{"delta": {"tool_calls": [{
+                "index": 1, "id": "c2", "type": "function",
+                "function": {"name": "read_file", "arguments": "{}"},
+            }]}}]},
+            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+        ]
+
+        class Response:
+            def __iter__(self):
+                lines = [b"data: " + json.dumps(c).encode() + b"\n" for c in chunks]
+                return iter(lines + [b"data: [DONE]\n"])
+
+            def close(self):
+                pass
+
+        with mock.patch.object(providers, "_open_stream", return_value=Response()):
+            turn = providers._openai_chat_stream(
+                base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+                api_key="test-key", model="gemini-3.8-flash",
+                messages=[{"role": "user", "content": "hi"}], tools=None, extra={},
+                headers={}, timeout=30, on_delta=None,
+            )
+        first, second = turn.tool_calls
+        self.assertEqual(first["arguments"], {"path": "a.py"})
+        self.assertEqual(
+            first["replay"],
+            {"extra_content": {"google": {"thought_signature": "sig-AAA", "other": 1}}},
+        )
+        self.assertNotIn("replay", second)
+
     def test_openai_stream_preserves_reasoning_content_identity_and_empty_value(self) -> None:
         class Response:
             def __iter__(self):
