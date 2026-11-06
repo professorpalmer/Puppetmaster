@@ -1,3 +1,27 @@
+## v1.49.0 — 2026-11-06
+
+**Agentic: vendor tool-call fields go back to the provider (#296).**
+Gemini 3 returns a thought signature on each tool call at
+`extra_content.google.thought_signature`. The Chat Completions parsers kept
+only the call id, name and arguments. The agentic loop sent the call back
+without the signature, and Gemini gave HTTP 400 on the second request of
+every run. Reported by @swf1996120.
+
+- `_openai_chat` and `_openai_chat_stream` keep every top-level tool-call
+  field except `id`, `type`, `function` and `index` as `replay`.
+- The stream parser merges a dict field that comes in more than one chunk.
+- The agentic loop puts `replay` back on the assistant tool call. A call
+  without vendor fields goes back with the standard keys only.
+- The Anthropic and Responses translators build their own blocks, so
+  `replay` does not go to them.
+
+**Flow: `escalate_model` runs code repairs on a stronger model.** A code
+agent's repair visits (visit > 1) run on `escalate_model` (node or
+`defaults`). The first build runs on the node model. Judges and explore
+agents keep their model. Sessions record the model, and a session resumes
+only on the adapter and model it ran on. The first escalated visit starts
+fresh with the full task and the feedback. See `docs/FLOWS.md`.
+
 ## v1.48.0 — 2026-10-24
 
 **An inline run binds its store per context, not in the process env.**
