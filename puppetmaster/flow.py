@@ -205,6 +205,8 @@ def _effort_problems(obj: dict, where: str) -> list[str]:
         problems.append(f"{where} effort must be one of {', '.join(EFFORTS)}")
     if "escalate" in obj and not isinstance(obj["escalate"], bool):
         problems.append(f"{where} escalate must be true or false")
+    if "escalate_model" in obj and not (isinstance(obj["escalate_model"], str) and obj["escalate_model"]):
+        problems.append(f"{where} escalate_model must be a model name")
     try:
         profile = operator_effort_profile()
     except WorkerEffortError as exc:
@@ -222,6 +224,25 @@ def _effort_problems(obj: dict, where: str) -> list[str]:
     return problems
 
 
+def _lane(node: dict) -> str:
+    if node.get("kind") == "judge":
+        return "judge"
+    return "explore" if node.get("role") == "explore" else "code"
+
+
+def node_model(node: dict, defaults: dict, visit: int) -> Optional[str]:
+    """Model for one visit of an agent or judge node, or None (adapter default).
+
+    With ``escalate_model``, a code agent's repair visits run on that model, so
+    a cheap model takes the first build and only work that failed a check or a
+    judge pays for the strong one. Judges and explore agents keep their model.
+    """
+    model = node.get("model") or defaults.get("model")
+    if visit > 1 and node.get("kind") == "agent" and _lane(node) == "code":
+        model = node.get("escalate_model") or defaults.get("escalate_model") or model
+    return model
+
+
 def node_effort(node: dict, defaults: dict, visit: int) -> Optional[str]:
     """Reasoning effort for one visit of an agent or judge node, or None (adapter default).
 
@@ -230,8 +251,7 @@ def node_effort(node: dict, defaults: dict, visit: int) -> Optional[str]:
     each repair visit thinks one step harder than the last, so a first attempt
     can run cheap and only work that failed a check pays for more.
     """
-    lane = "judge" if node.get("kind") == "judge" else (
-        "explore" if node.get("role") == "explore" else "code")
+    lane = _lane(node)
     lanes = defaults.get("lanes") if isinstance(defaults.get("lanes"), dict) else {}
     effort = node.get("effort") or lanes.get(lane) or defaults.get("effort")
     escalate = node.get("escalate", defaults.get("escalate", False))
@@ -1712,7 +1732,8 @@ class JobNodeExecutor:
                         outcome.logs = _startup_logs(store, job_id, spec.role)
                     if outcome.task_id:
                         run.sessions[key] = {"job_id": job_id, "task_id": outcome.task_id,
-                                             "adapter": spec.adapter, "run_id": run.run_id,
+                                             "adapter": spec.adapter, "model": spec.payload.get("model"),
+                                             "run_id": run.run_id,
                                              "visit": visit, "attempt": attempt,
                                              "task_sha": _task_digest(render(node["task"], run, prev))}
                     scope = spec.payload.get("write_scope")
@@ -1805,7 +1826,7 @@ class JobNodeExecutor:
             if (node.get("finish") or defaults.get("finish")) == "criteria":
                 payload["finish"] = "criteria"
         payload["cwd"] = run.graph["cwd"]
-        model = node.get("model") or defaults.get("model")
+        model = node_model(node, defaults, visit)
         if model:
             payload["model"] = model
         timeout = node.get("timeout_seconds") or defaults.get("timeout_seconds")
@@ -1817,19 +1838,24 @@ class JobNodeExecutor:
         # Keep provider sessions so a later visit or a follow-up run can resume them.
         payload["ephemeral"] = False
         payload["flow"] = {"run_id": run.run_id, "node": key, "visit": visit}
+        adapter = node.get("adapter") or defaults["adapter"]
         session = run.sessions.get(key)
-        if session and node.get("resume", True) is not False:
+        # A session resumes only on the adapter and model it ran on. Another
+        # model (escalate_model, an edited node) starts fresh; the task above
+        # already carries what to fix.
+        moved = bool(session) and any(field in session and session[field] != value
+                                      for field, value in (("adapter", adapter), ("model", model)))
+        if session and not moved and node.get("resume", True) is not False:
             payload["resume_from"] = {"job_id": session["job_id"], "task_id": session["task_id"]}
             payload["resume_prompt"] = self._delta(node, run, prev, visit, task, session=session)
             frame = "" if read_only else _item_frame(run)
             if frame and frame not in payload["resume_prompt"]:
                 payload["resume_prompt"] = f"{frame}\n\n{payload['resume_prompt']}"
-        elif not read_only and (run.parent or {}).get("fork_from") and node.get("role", "code") == "code":
+        elif not moved and not read_only and (run.parent or {}).get("fork_from") and node.get("role", "code") == "code":
             # A builder starts from the map's shared session (inputs already read);
             # judges stay fresh, so a review never shares a builder's context.
             payload["fork_from"] = dict(run.parent["fork_from"])
-        return WorkerSpec(role=key, instruction=task,
-                          adapter=node.get("adapter") or defaults["adapter"], payload=payload)
+        return WorkerSpec(role=key, instruction=task, adapter=adapter, payload=payload)
 
     @staticmethod
     def _revision_context(run: FlowRun, prev: str, visit: int) -> str:

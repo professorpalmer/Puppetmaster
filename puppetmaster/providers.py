@@ -542,7 +542,10 @@ class AssistantTurn:
 
     ``tool_calls`` is a list of ``{"id", "name", "arguments"}`` where
     ``arguments`` is a parsed dict. ``text`` is the assistant's prose (may be
-    empty when the turn is purely tool calls).
+    empty when the turn is purely tool calls). A Chat Completions call can
+    also carry ``replay``: the call's other top-level fields (for example
+    Gemini 3 ``extra_content.google.thought_signature``), which the provider
+    requires back unchanged on the next request.
 
     ``reasoning`` / ``reasoning_content`` / ``reasoning_details`` carry provider reasoning blocks that
     some models (notably Meta Muse Spark) require echoed back on later turns so
@@ -756,6 +759,27 @@ def _openai_usage_fields(usage: dict) -> dict:
     return out
 
 
+_CALL_WIRE_KEYS = frozenset({"id", "type", "function", "index"})
+
+
+def _merge_call_replay(dst: dict, call: dict) -> dict:
+    """Merge a Chat Completions tool call's vendor fields into ``dst``.
+
+    Everything except ``id``/``type``/``function``/``index`` is opaque to us and
+    goes back to the provider on the next turn. Stream chunks can split a dict
+    field, so dict values merge key by key.
+    """
+    def merge(into: dict, src: dict) -> None:
+        for key, value in src.items():
+            if isinstance(value, dict) and isinstance(into.get(key), dict):
+                merge(into[key], value)
+            else:
+                into[key] = value
+
+    merge(dst, {k: v for k, v in call.items() if k not in _CALL_WIRE_KEYS and v is not None})
+    return dst
+
+
 def _openai_chat(
     *, base_url: str, api_key: Optional[str], model: str, messages: list[dict],
     tools: Optional[list[dict]], extra: dict, headers: dict, timeout: int,
@@ -796,7 +820,11 @@ def _openai_chat(
             args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
         except (json.JSONDecodeError, TypeError):
             args = {"__raw__": raw_args}
-        tool_calls.append({"id": call.get("id") or "", "name": fn.get("name") or "", "arguments": args})
+        parsed = {"id": call.get("id") or "", "name": fn.get("name") or "", "arguments": args}
+        replay = _merge_call_replay({}, call)
+        if replay:
+            parsed["replay"] = replay
+        tool_calls.append(parsed)
     usage = data.get("usage") or {}
     reasoning_content = message.get("reasoning_content") if "reasoning_content" in message else None
     if reasoning_content is not None:
@@ -1282,7 +1310,8 @@ def _openai_chat_stream(
                     reasoning_details_acc.append(details)
                 for call in delta.get("tool_calls") or []:
                     idx = int(call.get("index") or 0)
-                    slot = tool_acc.setdefault(idx, {"id": "", "name": "", "args": ""})
+                    slot = tool_acc.setdefault(idx, {"id": "", "name": "", "args": "", "replay": {}})
+                    _merge_call_replay(slot["replay"], call)
                     if call.get("id"):
                         slot["id"] = call["id"]
                     fn = call.get("function") or {}
@@ -1302,7 +1331,10 @@ def _openai_chat_stream(
             args = json.loads(raw_args) if raw_args.strip() else {}
         except json.JSONDecodeError:
             args = {"__raw__": raw_args}
-        tool_calls.append({"id": slot["id"] or "", "name": slot["name"] or "", "arguments": args})
+        parsed = {"id": slot["id"] or "", "name": slot["name"] or "", "arguments": args}
+        if slot["replay"]:
+            parsed["replay"] = slot["replay"]
+        tool_calls.append(parsed)
     return AssistantTurn(
         text="".join(text_parts).strip(),
         tool_calls=tool_calls,

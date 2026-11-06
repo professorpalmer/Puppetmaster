@@ -28,7 +28,10 @@ jobs:
   test:
     needs: reuse-green-tree
     if: needs.reuse-green-tree.outputs.skip_suite != 'true'
-    runs-on: ${{ matrix.os }}
+    # The name stays "test (<os>, <python>)": the main ruleset requires these
+    # check names, so a runner pin must not change them.
+    name: test (${{ matrix.os }}, ${{ matrix.python-version }})
+    runs-on: ${{ matrix.runner || matrix.os }}
     # Linux and macOS stay unsharded here. Windows is the sharded
     # test-windows job below and remains a required green leg.
     strategy:
@@ -42,6 +45,11 @@ jobs:
           # transitively by 3.12 on macOS and 3.9 on Linux.)
           - os: macos-latest
             python-version: "3.9"
+        include:
+          # ubuntu-latest (26.04) has no Python 3.9 in the setup-python manifest.
+          - os: ubuntu-latest
+            python-version: "3.9"
+            runner: ubuntu-24.04
     defaults:
       run:
         # GitHub provides bash on macOS/Linux; Windows shards use Git Bash

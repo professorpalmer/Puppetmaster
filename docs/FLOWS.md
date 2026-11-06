@@ -125,6 +125,14 @@ lane. A node's own `effort` wins over its lane, and a lane over
 repair visit, so a cheap first build gets more reasoning only when a check or
 judge sends it back.
 
+`escalate_model` (on a node or in `defaults`) names the model for a code
+agent's repair visits. The first build runs on the node's `model` (for example
+`gpt-6-luna`), and only work that a check or judge sends back runs on the
+escalated model (for example `gpt-6.1-sol`). Judges and explore agents keep
+their model. A session resumes only on the adapter and model it ran on, so the
+first escalated visit starts a fresh session with the full task and the
+feedback. Later repairs resume that session.
+
 A node with no effort (from itself, its lane or `defaults`) runs the worker
 default: `medium`, or the operator's `PUPPETMASTER_WORKER_EFFORT` (`low`,
 `medium`, `high`, `xhigh`) when the MCP server or CLI that creates the tasks

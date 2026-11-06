@@ -462,6 +462,39 @@ class SpecTests(Base):
         run.sessions = {"build": {"job_id": "j", "task_id": "t"}}
         self.assertNotIn("resume_from", self.spec(run, "build", visit=2).payload)
 
+    def test_escalated_repair_starts_fresh_on_the_strong_model(self):
+        g = graph([agent("build", model="gpt-6-luna", escalate_model="gpt-6.1-sol"), judge("review")],
+                  [{"from": "build", "to": "review"}], defaults={"adapter": "codex", "model": "gpt-6.1-sol"})
+        run = self.make_run(g)
+        self.assertEqual(self.spec(run, "build").payload["model"], "gpt-6-luna")
+        run.sessions = {"build": {"job_id": "j", "task_id": "t", "adapter": "codex", "model": "gpt-6-luna"},
+                        "review": {"job_id": "j", "task_id": "u", "adapter": "codex", "model": "gpt-6.1-sol"}}
+        repair = self.spec(run, "build", visit=2, prev="x.py:3 off by one")
+        self.assertEqual(repair.payload["model"], "gpt-6.1-sol")
+        self.assertNotIn("resume_from", repair.payload)
+        self.assertIn("do build", repair.instruction)
+        self.assertIn("x.py:3 off by one", repair.instruction)
+        review = self.spec(run, "review", visit=2)
+        self.assertEqual(review.payload["model"], "gpt-6.1-sol")
+        self.assertEqual(review.payload["resume_from"]["task_id"], "u")
+
+    def test_escalated_session_resumes_on_its_own_model(self):
+        g = graph([agent("build", model="gpt-6-luna")], defaults={"adapter": "codex", "escalate_model": "gpt-6.1-sol"})
+        run = self.make_run(g)
+        run.sessions = {"build": {"job_id": "j", "task_id": "t2", "adapter": "codex", "model": "gpt-6.1-sol"}}
+        third = self.spec(run, "build", visit=3, prev="still off")
+        self.assertEqual(third.payload["model"], "gpt-6.1-sol")
+        self.assertEqual(third.payload["resume_from"]["task_id"], "t2")
+
+    def test_session_from_another_adapter_or_model_does_not_resume(self):
+        run = self.make_run(graph([agent("build", model="gpt-6.1-sol")]))
+        run.sessions = {"build": {"job_id": "j", "task_id": "t", "adapter": "claude-code", "model": "gpt-6.1-sol"}}
+        self.assertNotIn("resume_from", self.spec(run, "build", visit=2).payload)
+        run.sessions = {"build": {"job_id": "j", "task_id": "t", "adapter": "codex", "model": "gpt-6-luna"}}
+        self.assertNotIn("resume_from", self.spec(run, "build", visit=2).payload)
+        run.sessions = {"build": {"job_id": "j", "task_id": "t", "adapter": "codex"}}
+        self.assertEqual(self.spec(run, "build", visit=2).payload["resume_from"]["task_id"], "t")
+
 
 class TaskOutcomeTests(Base):
     def test_latest_attempt_verdict_report_files_and_usage(self):
@@ -1343,6 +1376,19 @@ class EffortLaneTests(Base):
         executor = JobNodeExecutor(self.state)
         self.assertEqual(executor._spec("build", run.graph["nodes"][0], run, "", 1).payload["reasoning_effort"], "low")
         self.assertEqual(executor._spec("build", run.graph["nodes"][0], run, "fix x", 2).payload["reasoning_effort"], "medium")
+
+    def test_node_model_escalates_code_repairs_only(self):
+        defaults = {"model": "gpt-6-luna", "escalate_model": "gpt-6.1-sol"}
+        self.assertEqual(flow.node_model({"kind": "agent"}, defaults, 1), "gpt-6-luna")
+        self.assertEqual(flow.node_model({"kind": "agent"}, defaults, 2), "gpt-6.1-sol")
+        self.assertEqual(flow.node_model({"kind": "agent", "role": "explore"}, defaults, 2), "gpt-6-luna")
+        self.assertEqual(flow.node_model({"kind": "judge"}, defaults, 2), "gpt-6-luna")
+        self.assertEqual(flow.node_model({"kind": "agent", "escalate_model": "x"}, defaults, 2), "x")
+        self.assertIsNone(flow.node_model({"kind": "agent"}, {}, 2))
+        bad = graph([agent("a", escalate_model="")], defaults={"adapter": "codex", "escalate_model": 5})
+        problems = flow.validate_graph(bad)
+        self.assertTrue(any("node 'a' escalate_model must be a model name" in p for p in problems))
+        self.assertTrue(any("defaults escalate_model must be a model name" in p for p in problems))
 
     def test_effort_validation(self):
         bad = graph([agent("a", effort="max", escalate="yes")],
