@@ -15,6 +15,36 @@ flowchart TD
   Stitcher --> Memory["Promoted Memory"]
 ```
 
+## Pilots and workers
+
+A *pilot* is the agent tool you talk to. It calls the Puppetmaster MCP tools.
+A *worker* runs through an *adapter*. The supervisor leases each task to one
+worker.
+
+```text
+pilots (MCP):  Cursor Agent / Grok Bot / Claude Desktop / Pi / OMP
+workers:       cursor / claude-code / codex / hermes / antigravity / fx / agentic
+                                |
+                                v
+      supervisor -> model router -> independent workers -> SQLite artifacts
+                                                                |
+                                                                v
+                                                         stitched summary
+```
+
+- Workers claim tasks and write artifacts with payloads and evidence. They do
+  not share one transcript that grows.
+- A follow-up read is a SQLite read. It costs no model tokens.
+- A later model reads that stored working set. It does not get the provider
+  KV cache of another model.
+- The pilot gets the stitched summary. It can read the stored artifacts with
+  `puppetmaster artifacts <job_id>` or the dashboard.
+- A host pane (for example Marionette) can load a job view without chrome at
+  `http://127.0.0.1:<port>/?job=<id>&embed=1`.
+
+[CodeGraph](CODEGRAPH.md) is optional. When it is installed, Puppetmaster
+adds code context for the task before each worker call.
+
 ## Core Objects
 
 - `Job`: one swarm run and user goal.

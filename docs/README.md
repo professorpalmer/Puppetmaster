@@ -1,73 +1,82 @@
 # Puppetmaster docs
 
-The full documentation set. Start at the [project README](../README.md) for the 60-second tour and install; come here when you want depth.
+This is the full documentation set. For the short tour and install, start at
+the [project README](../README.md). For the changes in each release, see
+[CHANGELOG.md](CHANGELOG.md).
 
-**Current release:** [v1.27.33](CHANGELOG.md#v12733--2026-09-30) — The warm CodeGraph helper no longer holds the workspace directory. See [CHANGELOG.md](CHANGELOG.md) for upgrade details.
+## Get started
 
-## Start here
-
-| Doc | What's in it |
+| Doc | What it covers |
 |---|---|
-| [GROK_BOT.md](GROK_BOT.md) | Cursor Grok Bot as the chat; Puppetmaster as the remote-MCP worker runtime (not a `grok-bot` adapter) |
-| [WHY.md](WHY.md) | Design rationale: what shared-transcript subagents get wrong, what durable state fixes |
-| [CLAIMS.md](CLAIMS.md) | The four headline claims with reproducible receipts from [`bench/`](../bench/) |
-| [FEATURES.md](FEATURES.md) | Pilots (including Grok Bot remote MCP), adapters, and the full feature matrix |
-- [FLOWS.md](FLOWS.md) — flow graphs: one graph, one wake; resumable nodes and `map` fan-out
-| [COMPARISON.md](COMPARISON.md) | How it differs from LangGraph / CrewAI / Claude Agent SDK / native subagents + "pick X instead if…" |
-| [SECURITY.md](SECURITY.md) | Threat model: what it can do, what it touches, network egress, and how to run it safely |
-| [DAILY_DRIVER.md](DAILY_DRIVER.md) | Prompt recipes for review, swarm, implement, post-job inspection |
-| [CONCURRENT_SESSIONS.md](CONCURRENT_SESSIONS.md) | Concurrent agent/CLI operations: project state, dashboard URLs, explicit overrides, and isolated worktrees |
-| [DASHBOARD.md](DASHBOARD.md) | The live, zero-dependency web board: jobs index, routing rollup, and per-job detail |
-| [MOBILE.md](MOBILE.md) | Watch swarms from your phone: Tailscale setup, agent/CLI start, QR handoff, troubleshooting |
+| [SETUP.md](SETUP.md) | Install, select platforms, run a first job, uninstall |
+| [DAILY_DRIVER.md](DAILY_DRIVER.md) | Prompts for review, swarm, implement, and inspection |
+| [GROK_BOT.md](GROK_BOT.md) | Grok Bot as a pilot over remote MCP. It is not a worker adapter |
+| [PI.md](PI.md) | Pi as a pilot over stdio MCP. It is not a worker adapter |
+| [OMP.md](OMP.md) | OMP (oh-my-pi) as a pilot. It is not a worker adapter |
 
-## Research & external results
+## Run work
 
-Reproducible evidence behind the durable-state thesis, including an independent third-party benchmark.
-
-| Source | What's in it |
+| Doc | What it covers |
 |---|---|
-| [State, Not Tokens (paper site)](https://professorpalmer.github.io/durable-state-vs-context/) | The controlled JS→TS migration study + NL2Repo-Bench external validation: **91.1% mean test-pass, ~2.28× the ~40% published SOTA**, with honest limits (the K≈10–12 concurrency cap is a serving-platform property, not durable state) |
-| [Zenodo record (citable, DOI)](https://doi.org/10.5281/zenodo.20709565) | Archived paper + self-contained source; concept DOI resolves to the latest version. Carries the model-attribution caveat and keeps packaging-bound tasks in the denominator |
-| [SWE-bench Lite study](https://github.com/professorpalmer/swebench-pm) | 3-arm controlled cost/quality study on SWE-bench Lite (routing + CodeGraph + durable retries vs a frontier baseline) |
-| [RESEARCH.md](RESEARCH.md) | Durable autoresearch protocol: fingerprinted claims, lease-backed runs, typed publishing, leaderboard recall, and verification by re-run |
+| [FLOWS.md](FLOWS.md) | Flow graphs: one graph, one wake, resumable nodes, and `map` fan-out |
+| [ADAPTERS.md](ADAPTERS.md) | Worker adapters (cursor, claude-code, openai, codex, hermes, antigravity, fx, agentic, shell) and how to add one |
+| [MODEL_ROUTING.md](MODEL_ROUTING.md) | Router policies, classifier, registry schema, and starter tiers |
+| [CONCURRENT_SESSIONS.md](CONCURRENT_SESSIONS.md) | Many sessions at once: project state, dashboard URLs, overrides, and isolated worktrees |
+| [CODEGRAPH.md](CODEGRAPH.md) | Optional CodeGraph index, its MCP tools, and cost |
+| [BUDGET_RESERVATIONS.md](BUDGET_RESERVATIONS.md) | Spend limits, CLI and MCP inputs, reservation lifecycle, and limits of enforcement |
+| [FAILURE_POLICY.md](FAILURE_POLICY.md) | Task failure edges: `abort`, `continue`, `retry(n)` |
+| [OUTPUT_STYLE.md](OUTPUT_STYLE.md) | Optional worker output style presets |
+| [COMPRESSION.md](COMPRESSION.md) | Why input compression is not bundled, and a recipe to add your own |
 
-## Concepts & reference
+## Watch and inspect
 
-| Doc | What's in it |
+| Doc | What it covers |
 |---|---|
-| [ARCHITECTURE.md](ARCHITECTURE.md) | Job / Task / Worker / Artifact / Stitcher / Memory object model |
-| [STORE_CONTRACTS.md](STORE_CONTRACTS.md) | Embedded metadata, identity, completion, cancellation, and effect APIs; migration guarantees |
-| [ATTEMPT_LEDGER.md](ATTEMPT_LEDGER.md) | Immutable invocation facts, usage observations, and consumption reports |
-| [BUDGET_RESERVATIONS.md](BUDGET_RESERVATIONS.md) | Cumulative limits, CLI/MCP inputs, reservation lifecycle, and enforcement limits |
-| [ARTIFACT_STATUS.md](ARTIFACT_STATUS.md) | #88 inventory: confidence vs execution/grounding/claim-support/criterion status |
-| [MODEL_ROUTING.md](MODEL_ROUTING.md) | Router policies, classifier, registry schema, the starter tiers |
-| [ADAPTERS.md](ADAPTERS.md) | All production adapters (cursor, claude-code, openai, codex, hermes, antigravity, fx, agentic) + shell + how to add a new one |
-| [CLI_REFERENCE.md](CLI_REFERENCE.md) | Every CLI subcommand, workflow config schema, daemon mode |
+| [DASHBOARD.md](DASHBOARD.md) | Live job board with no dependencies: job index, routing rollup, job detail |
+| [MOBILE.md](MOBILE.md) | Watch jobs from a phone: Tailscale, start, QR handoff, troubleshooting |
+| [CLI_REFERENCE.md](CLI_REFERENCE.md) | Every CLI command, workflow config schema, and daemon mode |
 | [CURSOR_AGENT_MCP.md](CURSOR_AGENT_MCP.md) | The MCP tool surface in detail |
-| [GROK_BOT.md](GROK_BOT.md) | Grok Bot as remote MCP pilot (streamable HTTP; supervise-first; not a worker adapter) |
-| [PI.md](PI.md) | Pi TUI/pilot package (stdio MCP + pi-package; not a worker adapter) |
-| [CODEGRAPH.md](CODEGRAPH.md) | CodeGraph integration, bundled MCP tools, cost comparison |
-| [OUTPUT_STYLE.md](OUTPUT_STYLE.md) | Optional Signal-maximizer worker output tiers (`terse` / `lithic`) |
-| [COMPRESSION.md](COMPRESSION.md) | Why input-side compression isn't bundled + a bring-your-own recipe |
 
-## Operate & contribute
+## How it works
 
-| Doc | What's in it |
+| Doc | What it covers |
 |---|---|
-| [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | `Tool execution error. Not connected`, CodeGraph SQLite ABI, state-dir auto-pivot, safety model |
-| [PRODUCTION.md](PRODUCTION.md) | Operating notes for non-toy use |
-| [SECURITY.md](SECURITY.md) | Secret handling + reporting |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Pilots, workers, and the job, task, artifact, stitcher, and memory objects |
+| [WHY.md](WHY.md) | Why durable state, not one shared transcript |
+| [COMPARISON.md](COMPARISON.md) | How it differs from LangGraph, CrewAI, the Claude Agent SDK, and native subagents |
+| [FEATURES.md](FEATURES.md) | Pilots, adapters, and the full feature matrix |
+| [STORE_CONTRACTS.md](STORE_CONTRACTS.md) | Embedding APIs for metadata, identity, completion, cancellation, and effects. Migration guarantees |
+| [ATTEMPT_LEDGER.md](ATTEMPT_LEDGER.md) | Invocation facts, usage observations, and consumption reports |
+| [ARTIFACT_STATUS.md](ARTIFACT_STATUS.md) | Artifact confidence against execution, grounding, claim support, and criterion status |
+
+## Evidence
+
+| Source | What it covers |
+|---|---|
+| [CLAIMS.md](CLAIMS.md) | The headline claims, with receipts you can run again from [`bench/`](../bench/) |
+| [State, Not Tokens](https://professorpalmer.github.io/durable-state-vs-context/) | JS to TS migration study and NL2Repo-Bench: 91.1% mean test pass rate against a published baseline of about 40%. The page states the limits |
+| [Zenodo record](https://doi.org/10.5281/zenodo.20709565) | Archived paper and source with a DOI |
+| [SWE-bench Lite study](https://github.com/professorpalmer/swebench-pm) | Three-arm cost and quality study: routing, CodeGraph, and durable retries against a frontier baseline |
+| [RESEARCH.md](RESEARCH.md) | Durable autoresearch: claims, leased runs, typed publication, and verification by a new run |
+
+## Operate and contribute
+
+| Doc | What it covers |
+|---|---|
+| [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Common errors: `Not connected`, CodeGraph SQLite ABI, state directory pivot |
+| [PRODUCTION.md](PRODUCTION.md) | Notes for use past a local trial |
+| [SECURITY.md](SECURITY.md) | Threat model, network egress, secret handling, and how to report an issue |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | How to land a patch |
-| [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md) | Cutting a tagged release + PyPI upload |
-| [CHANGELOG.md](CHANGELOG.md) | Versioned changes |
-| [ROADMAP.md](ROADMAP.md) | What's next |
+| [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md) | How to cut a tagged release and upload to PyPI |
+| [CHANGELOG.md](CHANGELOG.md) | Changes in each release |
+| [ROADMAP.md](ROADMAP.md) | Planned work |
 
-## Per-directory guides
+## Directory guides
 
-| Directory | README |
+| Directory | Guide |
 |---|---|
 | Source package | [`puppetmaster/`](../puppetmaster/README.md) |
 | Benchmarks | [`bench/`](../bench/README.md) |
 | Example workflow configs | [`examples/`](../examples/README.md) |
-| Demo + GIF scripts | [`scripts/`](../scripts/README.md) |
+| Demo and GIF scripts | [`scripts/`](../scripts/README.md) |
 | TypeScript await client | [`clients/typescript/`](../clients/typescript/README.md) |
