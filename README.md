@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/professorpalmer/Puppetmaster/blob/main/LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://github.com/professorpalmer/Puppetmaster/blob/main/pyproject.toml)
 
-Puppetmaster runs multi-step engineering work through the agent tools you already use: Cursor, Grok Bot, Claude Code, Codex, Hermes, Antigravity (Gemini 3.7 / 3.6 / 3.5 / 3.1 Pro), or a provider API. It starts independent workers, routes tasks to an available model, and stores their typed results in SQLite so jobs can be inspected and resumed. It is aimed at developers who want durable state and reviewable output for repository investigations, audits, refactors, and implementations.
+Puppetmaster runs multi-step engineering work through the agent tools you already use. It is universal for any harness or CLI, or a plain provider API. It starts independent workers, routes tasks to an available model, and stores their typed results in SQLite so jobs can be inspected and resumed. It is aimed at developers who want durable state and reviewable output for repository investigations, audits, refactors, and implementations.
 
 **Grok Bot:** only remote MCP, not the stdio server Cursor Agent uses. Puppetmaster is the durable worker runtime behind that chat — same jobs, artifacts, and `effort-index`, over streamable HTTP. See [Grok Bot](#grok-bot).
 
