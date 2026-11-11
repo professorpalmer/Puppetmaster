@@ -1,7 +1,8 @@
 """puppetmaster-learn: turn a finished Puppetmaster swarm into a Hermes skill candidate.
 
-When a Hermes session ends (``on_session_finalize``), the plugin asks the
-Puppetmaster CLI for the latest job of the session's project. If that job
+When a Hermes session ends (``on_session_finalize``), the plugin reads the
+session's working directory and start time from the Hermes session store and
+asks the Puppetmaster CLI for the latest job of that directory. If that job
 completed during the session and produced findings or a patch, the plugin
 writes a skill CANDIDATE under ``<hermes home>/skills-candidates/`` and tells
 the user where it is. It never writes a live skill and never starts an agent.
@@ -28,8 +29,9 @@ logger = logging.getLogger(__name__)
 _SOURCE = "puppetmaster-auto-learn"
 _CLI_TIMEOUT_SECONDS = 15
 
-# Jobs that completed before this time belong to an earlier session. It starts
-# at plugin load (process start) and moves to "now" after each finalize.
+# Fallback for a session with no stored row: jobs that completed before this
+# time belong to an earlier session. It starts at plugin load and moves to
+# "now" after each finalize.
 _session_started = time.time()
 
 
@@ -40,9 +42,9 @@ def register(ctx) -> None:
 def _on_session_finalize(session_id=None, platform=None, **kwargs) -> Optional[str]:
     """Write a candidate for this session's durable swarm. Never raises."""
     global _session_started
-    since, _session_started = _session_started, time.time()
+    fallback_since, _session_started = _session_started, time.time()
     try:
-        cwd = os.environ.get("TERMINAL_CWD") or os.getcwd()
+        cwd, since = _session_scope(session_id, fallback_since)
         path = distill_latest_job(cwd, since=since)
     except Exception:
         logger.debug("puppetmaster-learn: distillation failed", exc_info=True)
@@ -84,14 +86,48 @@ def distill_latest_job(cwd: str, *, since: float) -> Optional[str]:
     if not produced or not _completed_since(job.get("completed_at"), since):
         return None
 
-    summary = _run_text(command, cwd, ["show", job_id])
+    findings = _findings(_run_json_list(command, cwd, ["artifacts", job_id]))
     candidate = build_skill_candidate(
-        {"id": job_id, "goal": job.get("goal") or "", "summary": summary, "cwd": cwd}
+        {"id": job_id, "goal": job.get("goal") or "", "findings": findings, "cwd": cwd}
     )
     path = _write_candidate(candidate["slug"], candidate["skill_md"], candidate["meta"], home=home)
     if path is not None:
         logger.info("puppetmaster-learn: wrote skill candidate %s from job %s", path, job_id)
     return path
+
+
+def _session_scope(session_id, fallback_since: float) -> tuple:
+    """Return ``(cwd, since)`` for the session that ends.
+
+    A Hermes gateway runs the hook for many sessions, so its own cwd is not the
+    session's. The session row in the Hermes session store has the session's
+    cwd and start time. The process cwd and ``fallback_since`` are the fallback.
+    """
+    row = _session_row(session_id)
+    cwd = row.get("cwd")
+    if not isinstance(cwd, str) or not os.path.isdir(cwd):
+        cwd = os.environ.get("TERMINAL_CWD") or os.getcwd()
+    started = row.get("started_at")
+    since = float(started) if isinstance(started, (int, float)) else fallback_since
+    return cwd, since
+
+
+def _session_row(session_id) -> dict:
+    if not session_id:
+        return {}
+    try:
+        from hermes_state import SessionDB
+
+        db = SessionDB(read_only=True)
+    except Exception:
+        return {}
+    try:
+        row = db.get_session(str(session_id))
+    except Exception:
+        row = None
+    finally:
+        db.close()
+    return row if isinstance(row, dict) else {}
 
 
 def _hermes_home() -> Path:
@@ -155,6 +191,60 @@ def _run_json(command: list, cwd: str, args: list) -> Optional[dict]:
     return loaded if isinstance(loaded, dict) else None
 
 
+def _run_json_list(command: list, cwd: str, args: list) -> list:
+    text = _run_text(command, cwd, args)
+    try:
+        loaded = json.loads(text) if text else []
+    except json.JSONDecodeError:
+        return []
+    return loaded if isinstance(loaded, list) else []
+
+
+_FENCED_JSON = re.compile(r"```json\s*(\{.*?\})\s*```", re.S)
+_MAX_FINDINGS = 12
+_MAX_DETAIL = 1200
+_FINDING_KINDS = {"FINDING", "RISK"}
+
+
+def _findings(artifacts: list) -> list:
+    """Findings from the job's ``finding`` artifacts, as dicts.
+
+    A worker report can hold a JSON block with the findings themselves, in the
+    Puppetmaster shape (``{"artifacts": [{"title", "body"}]}``) or as a list
+    under ``content``. Use those items. Otherwise use the artifact's claim.
+    """
+    found = []
+    for artifact in artifacts:
+        if not isinstance(artifact, dict) or artifact.get("type") != "finding":
+            continue
+        payload = artifact.get("payload") if isinstance(artifact.get("payload"), dict) else {}
+        items = _report_items(str(payload.get("report") or ""))
+        if not items and payload.get("claim"):
+            items = [{"title": str(payload["claim"])}]
+        found.extend(items)
+    return found[:_MAX_FINDINGS]
+
+
+def _report_items(report: str) -> list:
+    items = []
+    for block in _FENCED_JSON.findall(report):
+        try:
+            data = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        groups = data.get("artifacts") if isinstance(data, dict) else None
+        for group in groups if isinstance(groups, list) else []:
+            if not isinstance(group, dict):
+                continue
+            content = group.get("content")
+            for item in content if isinstance(content, list) else [group]:
+                if not isinstance(item, dict) or not (item.get("title") or item.get("summary")):
+                    continue
+                if str(item.get("kind") or "FINDING").upper() in _FINDING_KINDS:
+                    items.append(item)
+    return items
+
+
 def _completed_since(completed_at: object, since: float) -> bool:
     if not isinstance(completed_at, str):
         return False
@@ -171,11 +261,11 @@ def build_skill_candidate(job: dict) -> dict:
     """Build ``{"slug", "skill_md", "meta"}`` from a job dict. Pure."""
     job_id = str(job.get("id") or job.get("job_id") or "unknown")
     goal = (job.get("goal") or "").strip() or "Untitled Puppetmaster swarm"
-    summary = (job.get("summary") or "").strip()
+    findings = [f for f in job.get("findings") or [] if isinstance(f, dict)]
     slug = _slugify(goal)
     description = _describe(goal)
     skill_md = _render_skill_md(
-        name=slug, description=description, goal=goal, summary=summary, job_id=job_id
+        name=slug, description=description, goal=goal, findings=findings, job_id=job_id
     )
     meta = {
         "job_id": job_id,
@@ -205,8 +295,28 @@ def _describe(goal: str, *, max_len: int = 200) -> str:
     return collapsed
 
 
-def _render_skill_md(*, name: str, description: str, goal: str, summary: str, job_id: str) -> str:
-    body_summary = summary or "_No stitched summary was captured for this swarm._"
+def _render_finding(index: int, finding: dict) -> str:
+    title = re.sub(r"\s+", " ", str(finding.get("title") or finding.get("summary"))).strip()
+    where = finding.get("file")
+    if where and finding.get("line"):
+        where = f"{where}:{finding['line']}"
+    tags = ", ".join(str(v) for v in (f"`{where}`" if where else None, finding.get("severity")) if v)
+    lines = [f"{index}. **{title}**" + (f" ({tags})" if tags else "")]
+    details = [("", finding.get("body")), ("Failure: ", finding.get("failure_scenario")),
+               ("Evidence: ", finding.get("evidence"))]
+    for label, text in details:
+        text = str(text or "").strip()
+        if text:
+            if len(text) > _MAX_DETAIL:
+                text = text[: _MAX_DETAIL - 1].rstrip() + "…"
+            lines.append("   " + (label + text).replace("\n", "\n   "))
+    return "\n".join(line.rstrip() for line in "\n".join(lines).split("\n"))
+
+
+def _render_skill_md(*, name: str, description: str, goal: str, findings: list, job_id: str) -> str:
+    body_summary = "\n\n".join(
+        _render_finding(i, f) for i, f in enumerate(findings, 1)
+    ) or "_The swarm stored no finding text._"
     # A JSON string is a valid YAML double-quoted scalar, so any goal text is safe here.
     return (
         "---\n"

@@ -14771,7 +14771,8 @@ class PuppetmasterLearnPluginTests(unittest.TestCase):
         job = {
             "id": "job-abc123",
             "goal": "Fix the flaky retry backoff in the network client",
-            "summary": "The backoff used a fixed delay; switched to exponential with jitter.",
+            "findings": [{"title": "Backoff used a fixed delay", "file": "net.py", "line": 7, "severity": "high",
+                          "failure_scenario": "retries stampede", "evidence": "sleep(1)"}],
             "cwd": "/tmp/project",
         }
         candidate = mod.build_skill_candidate(job)
@@ -14788,6 +14789,8 @@ class PuppetmasterLearnPluginTests(unittest.TestCase):
         self.assertIn("name:", skill_md)
         self.assertTrue(skill_md.startswith("---\n"))
 
+        self.assertIn("1. **Backoff used a fixed delay** (`net.py:7`, high)\n   Failure: retries stampede\n"
+                      "   Evidence: sleep(1)", skill_md)
         meta = candidate["meta"]
         self.assertEqual(meta["job_id"], "job-abc123")
         self.assertEqual(meta["source"], "puppetmaster-auto-learn")
@@ -14798,7 +14801,7 @@ class PuppetmasterLearnPluginTests(unittest.TestCase):
         job = {
             "id": "job-xyz789",
             "goal": "Add structured logging to the ingest pipeline",
-            "summary": "Introduced a JSON formatter and request-id propagation.",
+            "findings": [{"title": "Logs had no request id"}],
             "cwd": "/tmp/project",
         }
         candidate = mod.build_skill_candidate(job)
@@ -14825,14 +14828,22 @@ class PuppetmasterLearnPluginTests(unittest.TestCase):
 
     def _fake_cli(self, mod, *, completed_at, finding_count=2, patch_emitted=False, status="complete",
                   last_has_completed_at=False):
-        """Patch the plugin's CLI calls with canned `last` / `status` / `show` output."""
+        """Patch the plugin's CLI calls with canned `last` / `status` / `artifacts` output."""
         responses = {
             "last": {"job_id": "job_fake1", "status": status, "finding_count": finding_count},
             "status": {
                 "job": {"goal": "Audit the retry path. Then fix it.", "completed_at": completed_at},
                 "outcome": {"patch_artifact_emitted": patch_emitted},
             },
-            "show": "# Puppetmaster Stitched Summary\n\n## Findings\n- retry ignored jitter\n",
+            "artifacts": [
+                {"type": "routing", "payload": {}},
+                {"type": "finding", "payload": {"claim": "Two bugs.", "report": "Two bugs.\n```json\n" + json.dumps(
+                    {"artifacts": [{"kind": "FINDING", "title": "retry ignored jitter", "body": "**Location**: net.py:7"},
+                                   {"kind": "VERIFICATION", "title": "read net.py"},
+                                   {"name": "FINDINGS", "content": [{"summary": "timeout never reset",
+                                                                     "file": "net.py", "line": 9}]}]}) + "\n```"}},
+                {"type": "finding", "payload": {"claim": "Cache key drops the tenant."}},
+            ],
         }
         if last_has_completed_at:
             responses["last"]["completed_at"] = completed_at
@@ -14864,8 +14875,11 @@ class PuppetmasterLearnPluginTests(unittest.TestCase):
             self.assertIsNotNone(path)
             skill_md = (Path(path) / "SKILL.md").read_text(encoding="utf-8")
             self.assertIn('description: "Audit the retry path"', skill_md)
-            self.assertIn("retry ignored jitter", skill_md)
-            self.assertEqual(calls, ["last", "status", "show"])
+            self.assertIn("1. **retry ignored jitter**\n   **Location**: net.py:7", skill_md)
+            self.assertIn("2. **timeout never reset** (`net.py:9`)", skill_md)
+            self.assertIn("3. **Cache key drops the tenant.**", skill_md)
+            self.assertNotIn("read net.py", skill_md)
+            self.assertEqual(calls, ["last", "status", "artifacts"])
             # The same job a second time stops after `last` and writes nothing.
             self.assertIsNone(mod.distill_latest_job(tmp, since=time.time() - 60))
             self.assertEqual(calls[3:], ["last"])
@@ -14903,17 +14917,52 @@ class PuppetmasterLearnPluginTests(unittest.TestCase):
             self.assertIsNone(mod.distill_latest_job(tmp, since=time.time() - 60))
         self.assertEqual(calls, ["last"])
 
+    def test_finalize_uses_the_session_row_not_the_gateway_cwd(self):
+        # A Hermes gateway finalizes many sessions; its own cwd is not the session's.
+        import types
+
+        mod = self._load_plugin_module()
+        with TemporaryDirectory() as project:
+            rows = {"s1": {"cwd": project, "started_at": 1794428360.5}, "gone": {"cwd": "/no/such/dir"}}
+
+            class FakeSessionDB:
+                closed = 0
+
+                def __init__(self, read_only=False):
+                    assert read_only
+
+                def get_session(self, sid):
+                    return rows.get(sid)
+
+                def close(self):
+                    FakeSessionDB.closed += 1
+
+            state = types.ModuleType("hermes_state")
+            state.SessionDB = FakeSessionDB
+            with patch.dict(sys.modules, {"hermes_state": state}), \
+                    patch.object(mod, "distill_latest_job", return_value=None) as d:
+                mod._on_session_finalize(session_id="s1", platform="cli")
+                self.assertEqual(d.call_args.args[0], project)
+                self.assertEqual(d.call_args.kwargs["since"], 1794428360.5)
+                mod._on_session_finalize(session_id="gone", platform="cli")
+                self.assertEqual(d.call_args.args[0], os.environ.get("TERMINAL_CWD") or os.getcwd())
+                self.assertNotEqual(d.call_args.kwargs["since"], 1794428360.5)
+            self.assertEqual(FakeSessionDB.closed, 2)
+        with patch.dict(sys.modules, {"hermes_state": None}):
+            self.assertEqual(mod._session_scope("s1", 5.0)[1], 5.0)
+
     def test_finalize_returns_notice_and_moves_the_session_window(self):
         mod = self._load_plugin_module()
-        with patch.object(mod, "distill_latest_job", return_value="/h/skills-candidates/20261111-x") as d:
-            notice = mod._on_session_finalize(session_id="s1", platform="cli")
-        self.assertIn("promote-candidate 20261111-x", notice)
-        first_since = d.call_args.kwargs["since"]
-        with patch.object(mod, "distill_latest_job", return_value=None) as d:
-            self.assertIsNone(mod._on_session_finalize(session_id="s2", platform="cli"))
-        self.assertGreater(d.call_args.kwargs["since"], first_since)
-        with patch.object(mod, "distill_latest_job", side_effect=RuntimeError("boom")):
-            self.assertIsNone(mod._on_session_finalize(session_id="s3", platform="cli"))
+        with patch.object(mod, "_session_row", return_value={}):
+            with patch.object(mod, "distill_latest_job", return_value="/h/skills-candidates/20261111-x") as d:
+                notice = mod._on_session_finalize(session_id="s1", platform="cli")
+            self.assertIn("promote-candidate 20261111-x", notice)
+            first_since = d.call_args.kwargs["since"]
+            with patch.object(mod, "distill_latest_job", return_value=None) as d:
+                self.assertIsNone(mod._on_session_finalize(session_id="s2", platform="cli"))
+            self.assertGreater(d.call_args.kwargs["since"], first_since)
+            with patch.object(mod, "distill_latest_job", side_effect=RuntimeError("boom")):
+                self.assertIsNone(mod._on_session_finalize(session_id="s3", platform="cli"))
 
     def test_puppetmaster_command_skips_a_missing_mcp_interpreter(self):
         import types

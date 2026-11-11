@@ -13,13 +13,18 @@ that swarm's goal and findings as a `SKILL.md` that you can review and promote.
 When the session ends (`on_session_finalize`: quit, `/new`, a `-z` run, or a
 gateway reset), the plugin:
 
-1. Asks the Puppetmaster CLI for the latest job of the session's working
-   directory (`puppetmaster last --json`).
-2. Continues only when that job is `complete`, finished during this session,
+1. Reads the session's working directory and start time from the Hermes
+   session store. This is correct in the gateway too, where one process ends
+   many sessions.
+2. Asks the Puppetmaster CLI for the latest job of that directory
+   (`puppetmaster last --json`).
+3. Continues only when that job is `complete`, finished during this session,
    produced findings or a patch, and has no candidate yet.
-3. Reads the job goal (`puppetmaster status <job>`) and the stitched summary
-   (`puppetmaster show <job>`).
-4. Writes a candidate and tells you where it is:
+4. Reads the job goal (`puppetmaster status <job>`) and its finding artifacts
+   (`puppetmaster artifacts <job>`). Each finding keeps its title, location,
+   severity, failure scenario and evidence.
+5. Writes a candidate. Where Hermes shows plugin session-end messages, it
+   also tells you where the candidate is:
 
 ```
 ~/.hermes/skills-candidates/<YYYYMMDD>-<slug>/
@@ -50,11 +55,12 @@ plugin uses the interpreter in the `mcp_servers.puppetmaster` entry of Hermes
 ## Disclosure
 
 - **Child processes.** At session end it runs up to three Puppetmaster CLI
-  commands (`last --json`, `status`, `show`) in the session's working
+  commands (`last --json`, `status`, `artifacts`) in the session's working
   directory, each with a 15 second limit. These commands only read job state.
-- **Reads outside its own data.** It reads Puppetmaster's local job store
-  (through the CLI) and the `mcp_servers.puppetmaster` entry of Hermes
-  `config.yaml`. It reads no credentials.
+- **Reads outside its own data.** It reads the ending session's `cwd` and
+  `started_at` from the Hermes session store (read-only), Puppetmaster's local
+  job store (through the CLI), and the `mcp_servers.puppetmaster` entry of
+  Hermes `config.yaml`. It reads no messages and no credentials.
 - **Writes.** It writes only under `<hermes home>/skills-candidates/`. The
   home follows the active Hermes profile.
 - **No network, no background process, no telemetry.** The plugin makes no

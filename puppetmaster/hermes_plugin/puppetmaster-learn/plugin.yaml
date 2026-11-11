@@ -1,5 +1,5 @@
 name: puppetmaster-learn
-version: "0.2.0"
+version: "0.2.1"
 description: "When a Hermes session ends, turn a Puppetmaster swarm that finished in it (with findings or a patch) into a skill CANDIDATE under ~/.hermes/skills-candidates/ for you to review and promote. Never writes a live skill or starts an agent."
 author: "professorpalmer"
 homepage: "https://github.com/professorpalmer/Puppetmaster"
