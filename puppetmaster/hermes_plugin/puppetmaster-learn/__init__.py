@@ -69,10 +69,6 @@ def distill_latest_job(cwd: str, *, since: float) -> Optional[str]:
     job_id = latest.get("job_id")
     if not isinstance(job_id, str) or not job_id:
         return None
-    # Newer Puppetmaster puts completed_at in `last --json`, which saves the
-    # `status` call for a job from an earlier session.
-    if "completed_at" in latest and not _completed_since(latest["completed_at"], since):
-        return None
     home = _hermes_home()
     if _candidate_exists_for_job(home / "skills-candidates", job_id):
         return None
@@ -211,7 +207,7 @@ def _findings(artifacts: list) -> list:
 
     A worker report often holds a JSON block whose shape the worker chose.
     Every object in it with a title (or summary) and a finding or risk kind
-    is a finding. Without such a block, the artifact's claim is the finding.
+    is a finding. Without such a block, the artifact payload is the finding.
     """
     found = []
     for artifact in artifacts:
@@ -226,7 +222,7 @@ def _findings(artifacts: list) -> list:
                 continue
         claim = str(payload.get("claim") or "").strip()
         if not items and len(claim) > 3 and not claim.startswith(("{", "[", "`")):
-            items = [{"title": claim}]
+            items = [{**payload, "title": claim}]
         found.extend(items)
     return found[:_MAX_FINDINGS]
 
@@ -304,8 +300,9 @@ def _render_finding(index: int, finding: dict) -> str:
         where = f"{where}:{finding['line']}"
     tags = ", ".join(str(v) for v in (f"`{where}`" if where else None, finding.get("severity")) if v)
     lines = [f"{index}. **{title}**" + (f" ({tags})" if tags else "")]
-    details = [("", finding.get("body")), ("Failure: ", finding.get("failure_scenario")),
-               ("Evidence: ", finding.get("evidence"))]
+    details = [("", finding.get("body")), ("", finding.get("description")),
+               ("Failure: ", finding.get("failure_scenario")), ("Evidence: ", finding.get("evidence")),
+               ("Fix: ", finding.get("fix") or finding.get("recommendation"))]
     for label, text in details:
         text = str(text or "").strip()
         if text:

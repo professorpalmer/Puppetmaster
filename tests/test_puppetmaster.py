@@ -364,7 +364,6 @@ class PuppetmasterTests(unittest.TestCase):
             self.assertNotIn("Conversation.tsx", payload["goal_preview"])
             self.assertIn("THIS state_dir only", payload["store_scope"])
             self.assertIn("role_count", payload)
-            self.assertIn("completed_at", payload)
             self.assertIn("finding_count", payload)
 
     def test_mcp_start_tool_returns_job_id_without_waiting_for_completion(self) -> None:
@@ -14826,8 +14825,7 @@ class PuppetmasterLearnPluginTests(unittest.TestCase):
             dirs = [p for p in (home / "skills-candidates").iterdir() if p.is_dir()]
             self.assertEqual(len(dirs), 1)
 
-    def _fake_cli(self, mod, *, completed_at, finding_count=2, patch_emitted=False, status="complete",
-                  last_has_completed_at=False):
+    def _fake_cli(self, mod, *, completed_at, finding_count=2, patch_emitted=False, status="complete"):
         """Patch the plugin's CLI calls with canned `last` / `status` / `artifacts` output."""
         responses = {
             "last": {"job_id": "job_fake1", "status": status, "finding_count": finding_count},
@@ -14847,11 +14845,10 @@ class PuppetmasterLearnPluginTests(unittest.TestCase):
                         {"title": "lock held across await", "file": "pool.py", "line": 3, "severity": "high"}]}}]})
                     + "\n```"}},
                 {"type": "finding", "payload": {"claim": "{"}},
-                {"type": "finding", "payload": {"claim": "Cache key drops the tenant."}},
+                {"type": "finding", "payload": {"claim": "Cache key drops the tenant.", "file": "cache.py", "line": 4,
+                                                "description": "Two tenants share one entry.", "fix": "Key on tenant."}},
             ],
         }
-        if last_has_completed_at:
-            responses["last"]["completed_at"] = completed_at
         calls = []
 
         def run(argv, **kwargs):
@@ -14883,7 +14880,8 @@ class PuppetmasterLearnPluginTests(unittest.TestCase):
             self.assertIn("1. **retry ignored jitter**\n   **Location**: net.py:7", skill_md)
             self.assertIn("2. **timeout never reset** (`net.py:9`)", skill_md)
             self.assertIn("3. **lock held across await** (`pool.py:3`, high)", skill_md)
-            self.assertIn("4. **Cache key drops the tenant.**", skill_md)
+            self.assertIn("4. **Cache key drops the tenant.** (`cache.py:4`)\n   Two tenants share one entry.\n"
+                          "   Fix: Key on tenant.", skill_md)
             self.assertNotIn("**{**", skill_md)
             self.assertNotIn("read net.py", skill_md)
             self.assertEqual(calls, ["last", "status", "artifacts"])
@@ -14913,16 +14911,6 @@ class PuppetmasterLearnPluginTests(unittest.TestCase):
             _, patched = self._fake_cli(mod, completed_at=now.isoformat(), finding_count=0, patch_emitted=True)
             with patched, patch.object(mod, "_hermes_home", return_value=Path(tmp)):
                 self.assertIsNotNone(mod.distill_latest_job(tmp, since=time.time() - 60))
-
-    def test_completed_at_in_last_skips_the_status_call_for_an_old_job(self):
-        from datetime import datetime, timedelta, timezone
-
-        mod = self._load_plugin_module()
-        old = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
-        calls, patched = self._fake_cli(mod, completed_at=old, last_has_completed_at=True)
-        with TemporaryDirectory() as tmp, patched, patch.object(mod, "_hermes_home", return_value=Path(tmp)):
-            self.assertIsNone(mod.distill_latest_job(tmp, since=time.time() - 60))
-        self.assertEqual(calls, ["last"])
 
     def test_finalize_uses_the_session_row_not_the_gateway_cwd(self):
         # A Hermes gateway finalizes many sessions; its own cwd is not the session's.
