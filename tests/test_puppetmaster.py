@@ -14825,6 +14825,13 @@ class PuppetmasterLearnPluginTests(unittest.TestCase):
             dirs = [p for p in (home / "skills-candidates").iterdir() if p.is_dir()]
             self.assertEqual(len(dirs), 1)
 
+            # Another job with the same goal on the same day gets its own folder.
+            other = dict(candidate["meta"], job_id="job-second1")
+            second = mod._write_candidate(candidate["slug"], candidate["skill_md"], other, home=home)
+            self.assertEqual(Path(second).name, f"{written.name}-bsecond1")
+            self.assertEqual(json.loads((written / "candidate.json").read_text(encoding="utf-8"))["job_id"],
+                             "job-xyz789")
+
     def _fake_cli(self, mod, *, completed_at, finding_count=2, patch_emitted=False, status="complete"):
         """Patch the plugin's CLI calls with canned `last` / `status` / `artifacts` output."""
         responses = {

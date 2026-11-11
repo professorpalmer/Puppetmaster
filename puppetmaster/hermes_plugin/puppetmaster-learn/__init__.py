@@ -351,8 +351,11 @@ def _write_candidate(slug: str, skill_md: str, meta: dict, *, home: Path) -> Opt
     if _candidate_exists_for_job(base, str(meta.get("job_id") or "unknown")):
         return None
     target = base / f"{datetime.now(timezone.utc):%Y%m%d}-{slug}"
+    if target.exists():  # same goal, same day, another job
+        suffix = re.sub(r"[^a-z0-9]", "", str(meta.get("job_id")).lower())[-8:]
+        target = target.with_name(f"{target.name}-{suffix}")
     try:
-        target.mkdir(parents=True, exist_ok=True)
+        target.mkdir(parents=True, exist_ok=False)
         (target / "SKILL.md").write_text(skill_md, encoding="utf-8")
         (target / "candidate.json").write_text(
             json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8"
