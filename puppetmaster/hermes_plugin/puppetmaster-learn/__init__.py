@@ -209,40 +209,42 @@ _FINDING_KINDS = {"FINDING", "RISK"}
 def _findings(artifacts: list) -> list:
     """Findings from the job's ``finding`` artifacts, as dicts.
 
-    A worker report can hold a JSON block with the findings themselves, in the
-    Puppetmaster shape (``{"artifacts": [{"title", "body"}]}``) or as a list
-    under ``content``. Use those items. Otherwise use the artifact's claim.
+    A worker report often holds a JSON block whose shape the worker chose.
+    Every object in it with a title (or summary) and a finding or risk kind
+    is a finding. Without such a block, the artifact's claim is the finding.
     """
     found = []
     for artifact in artifacts:
         if not isinstance(artifact, dict) or artifact.get("type") != "finding":
             continue
         payload = artifact.get("payload") if isinstance(artifact.get("payload"), dict) else {}
-        items = _report_items(str(payload.get("report") or ""))
-        if not items and payload.get("claim"):
-            items = [{"title": str(payload["claim"])}]
+        items = []
+        for block in _FENCED_JSON.findall(str(payload.get("report") or "")):
+            try:
+                _collect_findings(json.loads(block), items)
+            except json.JSONDecodeError:
+                continue
+        claim = str(payload.get("claim") or "").strip()
+        if not items and len(claim) > 3 and not claim.startswith(("{", "[", "`")):
+            items = [{"title": claim}]
         found.extend(items)
     return found[:_MAX_FINDINGS]
 
 
-def _report_items(report: str) -> list:
-    items = []
-    for block in _FENCED_JSON.findall(report):
-        try:
-            data = json.loads(block)
-        except json.JSONDecodeError:
-            continue
-        groups = data.get("artifacts") if isinstance(data, dict) else None
-        for group in groups if isinstance(groups, list) else []:
-            if not isinstance(group, dict):
-                continue
-            content = group.get("content")
-            for item in content if isinstance(content, list) else [group]:
-                if not isinstance(item, dict) or not (item.get("title") or item.get("summary")):
-                    continue
-                if str(item.get("kind") or "FINDING").upper() in _FINDING_KINDS:
-                    items.append(item)
-    return items
+def _collect_findings(node, out: list) -> None:
+    if isinstance(node, list):
+        for value in node:
+            _collect_findings(value, out)
+        return
+    if not isinstance(node, dict):
+        return
+    title = node.get("title") or node.get("summary")
+    if isinstance(title, str) and title.strip():
+        if str(node.get("kind") or "finding").upper().rstrip("S") in _FINDING_KINDS:
+            out.append(node)
+        return
+    for value in node.values():
+        _collect_findings(value, out)
 
 
 def _completed_since(completed_at: object, since: float) -> bool:

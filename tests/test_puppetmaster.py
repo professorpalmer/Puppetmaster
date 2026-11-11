@@ -14842,6 +14842,11 @@ class PuppetmasterLearnPluginTests(unittest.TestCase):
                                    {"kind": "VERIFICATION", "title": "read net.py"},
                                    {"name": "FINDINGS", "content": [{"summary": "timeout never reset",
                                                                      "file": "net.py", "line": 9}]}]}) + "\n```"}},
+                {"type": "finding", "payload": {"claim": "{", "report": "```json\n" + json.dumps(
+                    {"artifacts": [{"kind": "findings", "body": {"findings": [
+                        {"title": "lock held across await", "file": "pool.py", "line": 3, "severity": "high"}]}}]})
+                    + "\n```"}},
+                {"type": "finding", "payload": {"claim": "{"}},
                 {"type": "finding", "payload": {"claim": "Cache key drops the tenant."}},
             ],
         }
@@ -14877,7 +14882,9 @@ class PuppetmasterLearnPluginTests(unittest.TestCase):
             self.assertIn('description: "Audit the retry path"', skill_md)
             self.assertIn("1. **retry ignored jitter**\n   **Location**: net.py:7", skill_md)
             self.assertIn("2. **timeout never reset** (`net.py:9`)", skill_md)
-            self.assertIn("3. **Cache key drops the tenant.**", skill_md)
+            self.assertIn("3. **lock held across await** (`pool.py:3`, high)", skill_md)
+            self.assertIn("4. **Cache key drops the tenant.**", skill_md)
+            self.assertNotIn("**{**", skill_md)
             self.assertNotIn("read net.py", skill_md)
             self.assertEqual(calls, ["last", "status", "artifacts"])
             # The same job a second time stops after `last` and writes nothing.
