@@ -364,6 +364,7 @@ class PuppetmasterTests(unittest.TestCase):
             self.assertNotIn("Conversation.tsx", payload["goal_preview"])
             self.assertIn("THIS state_dir only", payload["store_scope"])
             self.assertIn("role_count", payload)
+            self.assertIn("completed_at", payload)
             self.assertIn("finding_count", payload)
 
     def test_mcp_start_tool_returns_job_id_without_waiting_for_completion(self) -> None:
@@ -14205,7 +14206,7 @@ class HermesNextStepsGuidanceTests(unittest.TestCase):
     def test_guidance_covers_learn_promote_and_injection(self):
         from puppetmaster.installers import HERMES_NEXT_STEPS_GUIDANCE
 
-        self.assertIn("PUPPETMASTER_LEARN", HERMES_NEXT_STEPS_GUIDANCE)
+        self.assertIn("hermes plugins enable puppetmaster-learn", HERMES_NEXT_STEPS_GUIDANCE)
         self.assertIn("promote-candidate", HERMES_NEXT_STEPS_GUIDANCE)
         self.assertIn("PUPPETMASTER_INJECT_HERMES_SKILLS", HERMES_NEXT_STEPS_GUIDANCE)
         self.assertIn("PUPPETMASTER_SKILL_TOKEN_BUDGET", HERMES_NEXT_STEPS_GUIDANCE)
@@ -14782,7 +14783,7 @@ class PuppetmasterLearnPluginTests(unittest.TestCase):
 
         skill_md = candidate["skill_md"]
         # Provenance line names the source job.
-        self.assertIn("from job job-abc123", skill_md)
+        self.assertIn("Puppetmaster job job-abc123", skill_md)
         # Frontmatter carries a name.
         self.assertIn("name:", skill_md)
         self.assertTrue(skill_md.startswith("---\n"))
@@ -14822,46 +14823,135 @@ class PuppetmasterLearnPluginTests(unittest.TestCase):
             dirs = [p for p in (home / "skills-candidates").iterdir() if p.is_dir()]
             self.assertEqual(len(dirs), 1)
 
-    def test_normalize_detail_reads_full_status_snapshot(self):
-        """`status <job>` (full JSON, not --compact) carries goal/status/tasks.
+    def _fake_cli(self, mod, *, completed_at, finding_count=2, patch_emitted=False, status="complete",
+                  last_has_completed_at=False):
+        """Patch the plugin's CLI calls with canned `last` / `status` / `show` output."""
+        responses = {
+            "last": {"job_id": "job_fake1", "status": status, "finding_count": finding_count},
+            "status": {
+                "job": {"goal": "Audit the retry path. Then fix it.", "completed_at": completed_at},
+                "outcome": {"patch_artifact_emitted": patch_emitted},
+            },
+            "show": "# Puppetmaster Stitched Summary\n\n## Findings\n- retry ignored jitter\n",
+        }
+        if last_has_completed_at:
+            responses["last"]["completed_at"] = completed_at
+        calls = []
 
-        Regression guard: `status --compact` strips prompt bodies including the
-        goal, which silently produced empty "Untitled" candidates.
-        """
+        def run(argv, **kwargs):
+            verb = argv[1]
+            calls.append(verb)
+            body = responses[verb]
+            stdout = body if isinstance(body, str) else json.dumps(body)
+            return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+        return calls, patch.multiple(
+            mod,
+            _puppetmaster_command=MagicMock(return_value=["puppetmaster"]),
+            subprocess=MagicMock(run=run, DEVNULL=subprocess.DEVNULL,
+                                 TimeoutExpired=subprocess.TimeoutExpired),
+        )
+
+    def test_distill_writes_one_candidate_per_durable_job(self):
         from datetime import datetime, timezone
 
         mod = self._load_plugin_module()
-        # Durability requires a *recent* completion (30-min window), so generate
-        # the timestamp dynamically — a hardcoded one silently goes stale within
-        # the hour and turns this into a clock-dependent time-bomb.
-        payload = {
-            "job": {
-                "goal": "Build the auto-/learn flywheel",
-                "status": "complete",
-                "completed_at": datetime.now(timezone.utc).isoformat(),
-            },
-            "tasks": [{"id": "task_1"}, {"id": "task_2"}],
-        }
-        detail = mod._normalize_detail(payload)
-        self.assertEqual(detail["goal"], "Build the auto-/learn flywheel")
-        self.assertEqual(detail["status"], "complete")
-        self.assertEqual(detail["task_count"], 2)
-        # A completed swarm with tasks is durable enough for a candidate.
-        self.assertTrue(mod._is_durable(detail))
+        calls, patched = self._fake_cli(mod, completed_at=datetime.now(timezone.utc).isoformat())
+        with TemporaryDirectory() as tmp, patched, patch.object(
+            mod, "_hermes_home", return_value=Path(tmp)
+        ):
+            path = mod.distill_latest_job(tmp, since=time.time() - 60)
+            self.assertIsNotNone(path)
+            skill_md = (Path(path) / "SKILL.md").read_text(encoding="utf-8")
+            self.assertIn('description: "Audit the retry path"', skill_md)
+            self.assertIn("retry ignored jitter", skill_md)
+            self.assertEqual(calls, ["last", "status", "show"])
+            # The same job a second time stops after `last` and writes nothing.
+            self.assertIsNone(mod.distill_latest_job(tmp, since=time.time() - 60))
+            self.assertEqual(calls[3:], ["last"])
 
-    def test_goal_from_summary_parses_goal_line(self):
+    def test_distill_skips_jobs_outside_the_session_or_without_results(self):
+        from datetime import datetime, timedelta, timezone
+
         mod = self._load_plugin_module()
-        summary = (
-            "# Puppetmaster Stitched Summary\n\n"
-            "Goal: Wire the Hermes SOUL.md reflexive-routing rule\n\n"
-            "## Findings\n- did the thing\n"
-        )
-        self.assertEqual(
-            mod._goal_from_summary(summary),
-            "Wire the Hermes SOUL.md reflexive-routing rule",
-        )
-        self.assertEqual(mod._goal_from_summary(""), "")
-        self.assertEqual(mod._goal_from_summary("no goal here"), "")
+        now = datetime.now(timezone.utc)
+        cases = {
+            "completed before the session": dict(completed_at=(now - timedelta(hours=1)).isoformat()),
+            "no findings and no patch": dict(completed_at=now.isoformat(), finding_count=0),
+            "not complete": dict(completed_at=now.isoformat(), status="failed"),
+            "no completion time": dict(completed_at=None),
+        }
+        for label, kwargs in cases.items():
+            with self.subTest(label), TemporaryDirectory() as tmp:
+                _, patched = self._fake_cli(mod, **kwargs)
+                with patched, patch.object(mod, "_hermes_home", return_value=Path(tmp)):
+                    self.assertIsNone(mod.distill_latest_job(tmp, since=time.time() - 60))
+                    self.assertFalse((Path(tmp) / "skills-candidates").exists())
+        # A patch with no findings still counts.
+        with TemporaryDirectory() as tmp:
+            _, patched = self._fake_cli(mod, completed_at=now.isoformat(), finding_count=0, patch_emitted=True)
+            with patched, patch.object(mod, "_hermes_home", return_value=Path(tmp)):
+                self.assertIsNotNone(mod.distill_latest_job(tmp, since=time.time() - 60))
+
+    def test_completed_at_in_last_skips_the_status_call_for_an_old_job(self):
+        from datetime import datetime, timedelta, timezone
+
+        mod = self._load_plugin_module()
+        old = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+        calls, patched = self._fake_cli(mod, completed_at=old, last_has_completed_at=True)
+        with TemporaryDirectory() as tmp, patched, patch.object(mod, "_hermes_home", return_value=Path(tmp)):
+            self.assertIsNone(mod.distill_latest_job(tmp, since=time.time() - 60))
+        self.assertEqual(calls, ["last"])
+
+    def test_finalize_returns_notice_and_moves_the_session_window(self):
+        mod = self._load_plugin_module()
+        with patch.object(mod, "distill_latest_job", return_value="/h/skills-candidates/20261111-x") as d:
+            notice = mod._on_session_finalize(session_id="s1", platform="cli")
+        self.assertIn("promote-candidate 20261111-x", notice)
+        first_since = d.call_args.kwargs["since"]
+        with patch.object(mod, "distill_latest_job", return_value=None) as d:
+            self.assertIsNone(mod._on_session_finalize(session_id="s2", platform="cli"))
+        self.assertGreater(d.call_args.kwargs["since"], first_since)
+        with patch.object(mod, "distill_latest_job", side_effect=RuntimeError("boom")):
+            self.assertIsNone(mod._on_session_finalize(session_id="s3", platform="cli"))
+
+    def test_puppetmaster_command_skips_a_missing_mcp_interpreter(self):
+        import types
+
+        mod = self._load_plugin_module()
+        with TemporaryDirectory() as tmp:
+            python = Path(tmp) / "python"
+            python.write_text("", encoding="utf-8")
+            entries = {
+                "missing": {"command": str(Path(tmp) / "gone" / "python"), "args": ["-m", "puppetmaster", "mcp"]},
+                "present": {"command": str(python), "args": ["-m", "puppetmaster", "mcp"]},
+            }
+            for label, entry in entries.items():
+                config = types.ModuleType("hermes_cli.config")
+                config.load_config_readonly = lambda entry=entry: {"mcp_servers": {"puppetmaster": entry}}
+                with self.subTest(label), patch.object(mod.shutil, "which", return_value=None), \
+                        patch.dict(sys.modules, {"hermes_cli": types.ModuleType("hermes_cli"),
+                                                      "hermes_cli.config": config}):
+                    expected = None if label == "missing" else [str(python), "-m", "puppetmaster"]
+                    self.assertEqual(mod._puppetmaster_command(), expected)
+
+class EnableHermesLearnPluginTests(unittest.TestCase):
+    """`puppetmaster setup` turns the learn flywheel on through Hermes' own plugin switch."""
+
+    def test_enable_runs_hermes_plugins_enable(self):
+        from puppetmaster.cli import commands_install as ci
+
+        self.assertTrue(ci._enable_hermes_learn_plugin(dry_run=True)[0])
+        with patch.object(ci.shutil, "which", return_value=None):
+            ok, detail = ci._enable_hermes_learn_plugin(dry_run=False)
+        self.assertFalse(ok)
+        self.assertIn("hermes plugins enable puppetmaster-learn", detail)
+        done = subprocess.CompletedProcess([], 0, stdout="enabled", stderr="")
+        with patch.object(ci.shutil, "which", return_value="/bin/hermes"), \
+                patch.object(ci.subprocess, "run", return_value=done) as run:
+            self.assertTrue(ci._enable_hermes_learn_plugin(dry_run=False)[0])
+        self.assertEqual(run.call_args.args[0], ["/bin/hermes", "plugins", "enable", "puppetmaster-learn"])
+
 
 class HermesRegistryCredentialTests(unittest.TestCase):
     """Credential-aware filtering of the curated Hermes catalog.

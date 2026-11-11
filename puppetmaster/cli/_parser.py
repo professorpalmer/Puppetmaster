@@ -712,8 +712,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--json",
         action="store_true",
         help=(
-            "Print a bind object (job_id, status, state_dir, goal_preview, "
-            "role_count, finding_count). Default stays id-only."
+            "Print a bind object (job_id, status, completed_at, state_dir, "
+            "goal_preview, role_count, finding_count). Default stays id-only."
         ),
     )
     subcommands.add_parser(

@@ -108,6 +108,7 @@ def last_job_bind(store, job, state_dir=None):
     return {
         "job_id": job_id,
         "status": str(getattr(job, "status", "") or ""),
+        "completed_at": getattr(job, "completed_at", None),
         "state_dir": str(root),
         "goal_preview": goal[:_LAST_GOAL_PREVIEW_CHARS],
         "role_count": len(tasks),

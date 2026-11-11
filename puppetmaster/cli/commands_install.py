@@ -5,6 +5,7 @@ import dataclasses
 import json
 import subprocess
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -476,7 +477,7 @@ def _run_install_hermes(args) -> int:
         )
         # Bundle the opt-in auto-/learn plugin so a finished swarm can distill
         # itself into a Hermes skill candidate. Non-destructive (won't clobber a
-        # customized plugin without --force); inert until PUPPETMASTER_LEARN=1.
+        # customized plugin without --force); inert until `hermes plugins enable`.
         plugin_outcome = install_hermes_plugin(
             force=getattr(args, "force", False),
             dry_run=getattr(args, "dry_run", False),
@@ -779,6 +780,30 @@ def _setup_platform_step(args) -> int:
         _show_state()
         return 0
 
+def _enable_hermes_learn_plugin(*, dry_run: bool) -> tuple:
+    """Run ``hermes plugins enable puppetmaster-learn``. Returns (ok, detail)."""
+    command = ["hermes", "plugins", "enable", "puppetmaster-learn"]
+    if dry_run:
+        return True, "DRY RUN — would run `" + " ".join(command) + "`"
+    hermes = shutil.which("hermes")
+    if hermes is None:
+        return False, "hermes not on PATH — run `" + " ".join(command) + "` yourself"
+    try:
+        result = subprocess.run(
+            [hermes, *command[1:]], capture_output=True, text=True, timeout=60,
+            check=False, stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"`{' '.join(command)}` failed: {exc}"
+    if result.returncode != 0:
+        tail = (result.stderr or result.stdout).strip().splitlines()[-1:] or [""]
+        return False, f"`{' '.join(command)}` exited {result.returncode}: {tail[0]}"
+    return True, (
+        "enabled — when a Hermes session ends, a swarm that finished in it becomes a "
+        "skill CANDIDATE under ~/.hermes/skills-candidates/ (never auto-promoted)."
+    )
+
+
 def _setup_hermes_advanced(args) -> int:
     """Optional Hermes flywheel + skill-injection knobs (setup step 7 extension).
 
@@ -790,14 +815,15 @@ def _setup_hermes_advanced(args) -> int:
         return 0
 
     guidance = [
-        "PUPPETMASTER_LEARN=1 — finished swarms distill into Hermes skill CANDIDATES "
-        "(never auto-promoted). Review: `puppetmaster skills list-candidates`; promote: "
+        "`hermes plugins enable puppetmaster-learn` — when a Hermes session ends, a swarm "
+        "that finished in it becomes a skill CANDIDATE (never auto-promoted). Review: "
+        "`puppetmaster skills list-candidates`; promote: "
         "`puppetmaster skills promote-candidate <slug>`.",
         "PUPPETMASTER_INJECT_HERMES_SKILLS=1 — routed Hermes workers inherit your "
         "curated live skill bodies (per-turn token cost on every worker turn; tune with "
         "PUPPETMASTER_SKILL_TOKEN_BUDGET, default 1200).",
-        "Set these on mcp_servers.puppetmaster.env in Hermes config.yaml, or re-run "
-        "`puppetmaster setup` interactively.",
+        "Set the skill injection knob on mcp_servers.puppetmaster.env in Hermes "
+        "config.yaml, or re-run `puppetmaster setup` interactively.",
     ]
 
     if not sys.stdin.isatty():
@@ -806,28 +832,27 @@ def _setup_hermes_advanced(args) -> int:
             print(f"    {line}")
         return 0
 
-    print("  [hermes-advanced] Optional Hermes flywheel (writes to mcp_servers.puppetmaster.env)")
+    print("  [hermes-advanced] Optional Hermes flywheel")
     env_updates: dict[str, str] = {}
 
     try:
         learn_answer = input(
-            "  Enable learn flywheel (PUPPETMASTER_LEARN=1)? [y/N] "
+            "  Enable learn flywheel (hermes plugins enable puppetmaster-learn)? [y/N] "
         ).strip().lower()
     except (EOFError, KeyboardInterrupt):
         print("\n  [hermes-advanced] skipped — no input")
         return 0
     if learn_answer in {"y", "yes"}:
-        env_updates["PUPPETMASTER_LEARN"] = "1"
-        print(
-            "  learn  enabled — finished swarms write skill CANDIDATES under "
-            "~/.hermes/skills-candidates/ (never auto-promoted)."
-        )
+        enabled, detail = _enable_hermes_learn_plugin(dry_run=getattr(args, "dry_run", False))
+        print(f"  learn  {detail}")
+        if not enabled:
+            return 1
         print(
             "  review  `puppetmaster skills list-candidates` then "
             "`puppetmaster skills promote-candidate <slug>` to promote a keeper."
         )
     else:
-        print("  learn  left off (enable later via Hermes MCP env or re-run setup)")
+        print("  learn  left off (enable later: `hermes plugins enable puppetmaster-learn`)")
 
     try:
         inject_answer = input(

@@ -87,7 +87,7 @@ def _run_skills_subcommand(args) -> int:
         if not candidates:
             print(
                 "No skill candidates yet. They appear here after a durable "
-                "Puppetmaster swarm with PUPPETMASTER_LEARN enabled."
+                "Puppetmaster swarm with the puppetmaster-learn Hermes plugin enabled."
             )
             return 0
         print(f"{len(candidates)} skill candidate(s) — promote with "
