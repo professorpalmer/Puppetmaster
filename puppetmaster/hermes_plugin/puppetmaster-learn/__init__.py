@@ -160,11 +160,28 @@ def _puppetmaster_command() -> Optional[list]:
     return None
 
 
+# The read-only CLI calls get no provider keys; the names below let Python, git and the state dir lookup work.
+_CHILD_ENV_NAMES = (
+    "PATH", "HOME", "LANG", "LC_ALL", "USER", "TMPDIR", "XDG_STATE_HOME",
+    "SYSTEMROOT", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP", "PATHEXT", "COMSPEC",
+)
+
+
+def _child_env() -> dict:
+    """The environment for the Puppetmaster CLI child: a fixed allow list plus ``PUPPETMASTER_*``."""
+    return {
+        name: value
+        for name, value in os.environ.items()
+        if name.upper() in _CHILD_ENV_NAMES or name.upper().startswith("PUPPETMASTER_")
+    }
+
+
 def _run_text(command: list, cwd: str, args: list) -> str:
     try:
         result = subprocess.run(
             [*command, *args],
             cwd=cwd,
+            env=_child_env(),
             capture_output=True,
             text=True,
             timeout=_CLI_TIMEOUT_SECONDS,
