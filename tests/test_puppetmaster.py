@@ -14966,6 +14966,19 @@ class PuppetmasterLearnPluginTests(unittest.TestCase):
             with patch.object(mod, "distill_latest_job", side_effect=RuntimeError("boom")):
                 self.assertIsNone(mod._on_session_finalize(session_id="s3", platform="cli"))
 
+    def test_cli_child_gets_no_provider_keys(self):
+        mod = self._load_plugin_module()
+        parent = {"OPENAI_API_KEY": "sk-openai", "ANTHROPIC_API_KEY": "sk-ant", "OPENROUTER_API_KEY": "sk-or",
+                  "PUPPETMASTER_STATE_DIR": "/pm/state", "PATH": os.environ.get("PATH", "/usr/bin")}
+        completed = subprocess.CompletedProcess(["puppetmaster"], 0, stdout='{"job_id": "j1"}', stderr="")
+        with patch.dict(os.environ, parent), patch.object(mod.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(mod._run_json(["puppetmaster"], ".", ["last", "--json"]), {"job_id": "j1"})
+        env = run.call_args.kwargs["env"]
+        for key in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY"):
+            self.assertNotIn(key, env)
+        self.assertEqual(env["PATH"], parent["PATH"])
+        self.assertEqual(env["PUPPETMASTER_STATE_DIR"], "/pm/state")
+
     def test_puppetmaster_command_skips_a_missing_mcp_interpreter(self):
         import types
 
