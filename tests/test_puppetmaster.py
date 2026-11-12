@@ -14956,13 +14956,14 @@ class PuppetmasterLearnPluginTests(unittest.TestCase):
     def test_finalize_returns_notice_and_moves_the_session_window(self):
         mod = self._load_plugin_module()
         with patch.object(mod, "_session_row", return_value={}):
-            with patch.object(mod, "distill_latest_job", return_value="/h/skills-candidates/20261111-x") as d:
+            with patch.object(mod, "distill_latest_job", return_value="/h/skills-candidates/20261111-x"), \
+                    patch.object(mod.time, "time", return_value=100.0):
                 notice = mod._on_session_finalize(session_id="s1", platform="cli")
             self.assertIn("promote-candidate 20261111-x", notice)
-            first_since = d.call_args.kwargs["since"]
-            with patch.object(mod, "distill_latest_job", return_value=None) as d:
+            with patch.object(mod, "distill_latest_job", return_value=None) as d, \
+                    patch.object(mod.time, "time", return_value=200.0):
                 self.assertIsNone(mod._on_session_finalize(session_id="s2", platform="cli"))
-            self.assertGreater(d.call_args.kwargs["since"], first_since)
+            self.assertEqual(d.call_args.kwargs["since"], 100.0)
             with patch.object(mod, "distill_latest_job", side_effect=RuntimeError("boom")):
                 self.assertIsNone(mod._on_session_finalize(session_id="s3", platform="cli"))
 
