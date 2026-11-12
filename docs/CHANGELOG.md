@@ -1,3 +1,29 @@
+## v1.50.0 — 2026-11-12
+
+**Hermes: `puppetmaster-learn` is a catalog plugin that fires on session end.**
+The plugin is in the Hermes plugin catalog (NousResearch/hermes-agent#153891).
+On Hermes v0.23 the `on_session_finalize` hook runs in the gateway, not in
+the session process. The plugin used the gateway's cwd and found no swarm.
+
+- The plugin reads `cwd` and `started_at` from the Hermes session store
+  (`SessionDB(read_only=True)`). It falls back to `TERMINAL_CWD` and the load
+  time.
+- A swarm that finished in the session becomes a skill candidate under
+  `~/.hermes/skills-candidates/`. Each finding has its location, severity,
+  failure scenario, evidence and fix, read from `puppetmaster artifacts`.
+- The finding parser reads the worker JSON shapes seen live (fenced report
+  JSON, parsed fields, plain claims). It skips JSON debris and caps at 12.
+- Two jobs with the same goal get two folders (job id suffix). No candidate
+  overwrites another.
+- The `puppetmaster` child process gets a minimal env (PATH, HOME, LANG, the
+  Python and git variables, `PUPPETMASTER_*`). Provider keys from the Hermes
+  env do not go to it (#300).
+- The plugin is on when `hermes plugins enable puppetmaster-learn` runs.
+  `PUPPETMASTER_LEARN` is gone. `puppetmaster setup` offers the enable step.
+
+**Docs.** README is a short blurb, a quick setup and an index by task. New
+`docs/SETUP.md`. `docs/ARCHITECTURE.md` adds the Hermes plugin.
+
 ## v1.49.0 — 2026-11-06
 
 **Agentic: vendor tool-call fields go back to the provider (#296).**
