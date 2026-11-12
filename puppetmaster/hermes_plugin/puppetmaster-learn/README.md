@@ -1,43 +1,70 @@
 # puppetmaster-learn
 
-A Hermes plugin that turns finished Puppetmaster swarms into reusable skills —
-the Puppetmaster auto-/learn flywheel.
+A Hermes plugin that turns a finished [Puppetmaster](https://github.com/professorpalmer/Puppetmaster)
+swarm into a Hermes skill candidate.
 
-On `on_session_end`, it looks for the most recent **durable** Puppetmaster
-swarm for the session's working directory (a job that reached `COMPLETE` and
-produced at least one finding or patch artifact, finishing within ~30 minutes)
-and distills it into a Hermes **skill candidate**.
+Puppetmaster runs durable worker jobs (swarms and flow graphs) for an agent.
+A swarm that finds something or produces a patch holds knowledge that is
+worth keeping. This plugin keeps it: when a Hermes session ends, it writes
+that swarm's goal and findings as a `SKILL.md` that you can review and promote.
 
-## Opt-in
+## What it does
 
-The plugin does nothing unless you opt in:
+When the session ends (`on_session_finalize`: quit, `/new`, a `-z` run, or a
+gateway reset), the plugin:
 
-```sh
-export PUPPETMASTER_LEARN=1   # also accepts: true, yes, on
-```
-
-## What it writes
-
-It writes **candidates**, not live skills, to:
+1. Reads the session's working directory and start time from the Hermes
+   session store. This is correct in the gateway too, where one process ends
+   many sessions.
+2. Asks the Puppetmaster CLI for the latest job of that directory
+   (`puppetmaster last --json`).
+3. Continues only when that job is `complete`, finished during this session,
+   produced findings or a patch, and has no candidate yet.
+4. Reads the job goal (`puppetmaster status <job>`) and its finding artifacts
+   (`puppetmaster artifacts <job>`). Each finding keeps its title, location,
+   severity, failure scenario and evidence.
+5. Writes a candidate. Where Hermes shows plugin session-end messages, it
+   also tells you where the candidate is:
 
 ```
 ~/.hermes/skills-candidates/<YYYYMMDD>-<slug>/
-  SKILL.md         # YAML frontmatter + distilled body, ready to review
-  candidate.json   # provenance: job_id, goal, cwd, created_iso, source
+  SKILL.md         # frontmatter (name, description), goal, findings, source job
+  candidate.json   # job_id, goal, cwd, created_iso, source
 ```
 
-(Honors `$HERMES_HOME` like the rest of Hermes.) Review a candidate, edit it,
-and move it into `~/.hermes/skills/` yourself when you want it live. The plugin
-never promotes candidates automatically.
+The plugin never writes a live skill. To use a candidate, review it, then run
+`puppetmaster skills promote-candidate <slug>` (or move the folder into
+`~/.hermes/skills/` yourself). `puppetmaster skills list-candidates` lists them.
 
-## Guarantees
+## Install
 
-- **Best-effort.** All work runs in a background daemon thread and is wrapped
-  so the hook can never raise or block session teardown.
-- **No agent loop.** v1 only detects, distills deterministically, and logs —
-  it never spawns an agent.
-- **Idempotent.** A second session won't re-emit a candidate for a job that
-  already has one.
-- **Cross-interpreter safe.** The plugin runs in Hermes' Python and talks to
-  Puppetmaster by shelling out to Puppetmaster's own interpreter; it never
-  imports `puppetmaster`.
+You need Puppetmaster (`pip install puppetmaster-ai` or `uv tool install puppetmaster-ai`)
+with the `puppetmaster` command on `PATH`.
+
+```sh
+hermes plugins install puppetmaster-learn
+hermes plugins enable puppetmaster-learn
+```
+
+`puppetmaster setup` can also copy and enable the plugin for you.
+
+If Hermes starts with a short `PATH` (for example from a desktop launcher), the
+plugin uses the interpreter in the `mcp_servers.puppetmaster` entry of Hermes
+`config.yaml`, if that file exists. If it finds no Puppetmaster, it does nothing.
+
+## Disclosure
+
+- **Child processes.** At session end it runs up to three Puppetmaster CLI
+  commands (`last --json`, `status`, `artifacts`) in the session's working
+  directory, each with a 15 second limit. These commands only read job state.
+- **Reads outside its own data.** It reads the ending session's `cwd` and
+  `started_at` from the Hermes session store (read-only), Puppetmaster's local
+  job store (through the CLI), and the `mcp_servers.puppetmaster` entry of
+  Hermes `config.yaml`. It reads no messages and no credentials.
+- **Writes.** It writes only under `<hermes home>/skills-candidates/`. The
+  home follows the active Hermes profile.
+- **No network, no background process, no telemetry.** The plugin makes no
+  network calls and starts no thread or daemon. It does not start an agent or
+  a Puppetmaster job.
+- **Failures are silent.** Any error ends the hook with no message. Session
+  teardown continues.

@@ -1,20 +1,14 @@
-"""puppetmaster-learn — the auto-/learn flywheel for Hermes.
+"""puppetmaster-learn: turn a finished Puppetmaster swarm into a Hermes skill candidate.
 
-On ``on_session_end`` this plugin distills the most recent *durable*
-Puppetmaster swarm — one that COMPLETEd and produced a finding or patch
-artifact — into a reusable Hermes skill CANDIDATE. Candidates are written to
-``~/.hermes/skills-candidates/`` for a human to review and promote; this plugin
-NEVER writes a live skill and NEVER starts an agent loop.
+When a Hermes session ends (``on_session_finalize``), the plugin reads the
+session's working directory and start time from the Hermes session store and
+asks the Puppetmaster CLI for the latest job of that directory. If that job
+completed during the session and produced findings or a patch, the plugin
+writes a skill CANDIDATE under ``<hermes home>/skills-candidates/`` and tells
+the user where it is. It never writes a live skill and never starts an agent.
 
-Conservative v1 design constraints (all deliberate):
-
-* OPT-IN. Does nothing unless ``PUPPETMASTER_LEARN`` is truthy.
-* BACKGROUNDED. All work runs in a daemon thread so session teardown is never
-  blocked, even though Hermes already swallows hook exceptions.
-* BEST-EFFORT. Every code path is wrapped so the hook can never raise.
-* NO ``import puppetmaster``. This plugin runs in Hermes' interpreter (3.11),
-  which is a different interpreter from the one that runs Puppetmaster (3.9).
-  We talk to Puppetmaster by shelling out to *its* interpreter's CLI.
+The plugin runs in the Hermes interpreter and does not import ``puppetmaster``.
+It runs the Puppetmaster CLI as a child process instead.
 """
 
 from __future__ import annotations
@@ -23,367 +17,276 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
-import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-_OPT_IN_VALUES = {"1", "true", "yes", "on"}
-# Only a swarm that finished in the recent past belongs to "this" session; an
-# older COMPLETE job is unrelated work we must not re-distill.
-_RECENT_WINDOW_SECONDS = 30 * 60
 _SOURCE = "puppetmaster-auto-learn"
+_CLI_TIMEOUT_SECONDS = 15
+
+# Fallback for a session with no stored row: jobs that completed before this
+# time belong to an earlier session. It starts at plugin load and moves to
+# "now" after each finalize.
+_session_started = time.time()
 
 
 def register(ctx) -> None:
-    ctx.register_hook("on_session_end", _on_session_end)
+    ctx.register_hook("on_session_finalize", _on_session_finalize)
 
 
-def _on_session_end(
-    session_id=None,
-    completed=None,
-    interrupted=None,
-    model=None,
-    platform=None,
-    **kwargs,
-) -> None:
-    """Opt-in, backgrounded entrypoint. Never raises."""
+def _on_session_finalize(session_id=None, platform=None, **kwargs) -> Optional[str]:
+    """Write a candidate for this session's durable swarm. Never raises."""
+    global _session_started
+    fallback_since, _session_started = _session_started, time.time()
     try:
-        if os.environ.get("PUPPETMASTER_LEARN", "").strip().lower() not in _OPT_IN_VALUES:
-            return
-        cwd = os.environ.get("TERMINAL_CWD") or os.getcwd()
-        thread = threading.Thread(
-            target=_distill_recent_swarm,
-            args=(cwd,),
-            name="puppetmaster-learn",
-            daemon=True,
-        )
-        thread.start()
-    except Exception:  # pragma: no cover - hook must never raise into Hermes
-        logger.debug("puppetmaster-learn: on_session_end gate failed", exc_info=True)
-
-
-# ---------------------------------------------------------------------------
-# Distillation (background thread)
-# ---------------------------------------------------------------------------
-
-def _distill_recent_swarm(cwd: Optional[str] = None) -> Optional[str]:
-    """Find the most recent durable PM swarm for ``cwd`` and write a candidate.
-
-    Returns the candidate path it wrote (or ``None`` when nothing qualified).
-    Wrapped end-to-end so a background thread can never crash the host.
-    """
-    try:
-        cwd = cwd or os.environ.get("TERMINAL_CWD") or os.getcwd()
-        pyexe = _find_pm_interpreter()
-        job_id = _query_latest_job_id(pyexe, cwd)
-        if not job_id:
-            return None
-        detail = _query_job_detail(pyexe, cwd, job_id)
-        if detail is None or not _is_durable(detail):
-            return None
-
-        summary = _query_job_summary(pyexe, cwd, job_id)
-        goal = detail.get("goal") or _goal_from_summary(summary)
-        job = {
-            "id": job_id,
-            "goal": goal,
-            "summary": summary,
-            "cwd": cwd,
-        }
-        candidate = build_skill_candidate(job)
-        home = _hermes_home()
-        path = _write_candidate(
-            candidate["slug"],
-            candidate["skill_md"],
-            candidate["meta"],
-            home=home,
-        )
-        if path is not None:
-            logger.info("puppetmaster-learn: wrote skill candidate %s from job %s", path, job_id)
-        return path
-    except Exception:  # pragma: no cover - best-effort background work
+        cwd, since = _session_scope(session_id, fallback_since)
+        path = distill_latest_job(cwd, since=since)
+    except Exception:
         logger.debug("puppetmaster-learn: distillation failed", exc_info=True)
         return None
+    if path is None:
+        return None
+    slug = Path(path).name
+    return (
+        f"Puppetmaster saved a skill candidate from this session's swarm: {path}\n"
+        f"Review it, then promote it with `puppetmaster skills promote-candidate {slug}`."
+    )
+
+
+def distill_latest_job(cwd: str, *, since: float) -> Optional[str]:
+    """Write a candidate for the latest durable job in ``cwd``. Returns its dir or None."""
+    command = _puppetmaster_command()
+    if command is None:
+        return None
+    latest = _run_json(command, cwd, ["last", "--json"])
+    if not latest or str(latest.get("status")).lower() != "complete":
+        return None
+    job_id = latest.get("job_id")
+    if not isinstance(job_id, str) or not job_id:
+        return None
+    home = _hermes_home()
+    if _candidate_exists_for_job(home / "skills-candidates", job_id):
+        return None
+
+    snapshot = _run_json(command, cwd, ["status", job_id])
+    if not snapshot:
+        return None
+    job = snapshot.get("job") if isinstance(snapshot.get("job"), dict) else {}
+    outcome = snapshot.get("outcome") if isinstance(snapshot.get("outcome"), dict) else {}
+    produced = int(latest.get("finding_count") or 0) > 0 or bool(outcome.get("patch_artifact_emitted"))
+    if not produced or not _completed_since(job.get("completed_at"), since):
+        return None
+
+    findings = _findings(_run_json_list(command, cwd, ["artifacts", job_id]))
+    candidate = build_skill_candidate(
+        {"id": job_id, "goal": job.get("goal") or "", "findings": findings, "cwd": cwd}
+    )
+    path = _write_candidate(candidate["slug"], candidate["skill_md"], candidate["meta"], home=home)
+    if path is not None:
+        logger.info("puppetmaster-learn: wrote skill candidate %s from job %s", path, job_id)
+    return path
+
+
+def _session_scope(session_id, fallback_since: float) -> tuple:
+    """Return ``(cwd, since)`` for the session that ends.
+
+    A Hermes gateway runs the hook for many sessions, so its own cwd is not the
+    session's. The session row in the Hermes session store has the session's
+    cwd and start time. The process cwd and ``fallback_since`` are the fallback.
+    """
+    row = _session_row(session_id)
+    cwd = row.get("cwd")
+    if not isinstance(cwd, str) or not os.path.isdir(cwd):
+        cwd = os.environ.get("TERMINAL_CWD") or os.getcwd()
+    started = row.get("started_at")
+    since = float(started) if isinstance(started, (int, float)) else fallback_since
+    return cwd, since
+
+
+def _session_row(session_id) -> dict:
+    if not session_id:
+        return {}
+    try:
+        from hermes_state import SessionDB
+
+        db = SessionDB(read_only=True)
+    except Exception:
+        return {}
+    try:
+        row = db.get_session(str(session_id))
+    except Exception:
+        row = None
+    finally:
+        db.close()
+    return row if isinstance(row, dict) else {}
 
 
 def _hermes_home() -> Path:
-    home = os.environ.get("HERMES_HOME")
-    return Path(home).expanduser() if home else Path("~/.hermes").expanduser()
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home()
 
 
-def _find_pm_interpreter() -> str:
-    """Resolve the interpreter that can run Puppetmaster's CLI.
+def _puppetmaster_command() -> Optional[list]:
+    """Return the argv prefix that runs the Puppetmaster CLI, or None.
 
-    Reads ``mcp_servers.puppetmaster.command`` from ``~/.hermes/config.yaml``
-    (the entry Puppetmaster's own installer writes), preferring PyYAML when it
-    happens to be importable and otherwise doing a tiny line-scoped parse so we
-    never add a hard PyYAML dependency to Hermes' interpreter. Falls back to
-    ``python3`` when the config or key is absent.
+    The ``puppetmaster`` executable on PATH comes first. When Hermes runs
+    with a short PATH (a desktop launch), fall back to the interpreter in the
+    ``mcp_servers.puppetmaster`` entry that ``puppetmaster setup`` writes, if
+    that file still exists.
     """
-    config_path = _hermes_home() / "config.yaml"
+    found = shutil.which("puppetmaster")
+    if found:
+        return [found]
     try:
-        text = config_path.read_text(encoding="utf-8")
-    except OSError:
-        return "python3"
+        from hermes_cli.config import load_config_readonly
 
-    command = _read_puppetmaster_command_with_yaml(text)
-    if command is None:
-        command = _read_puppetmaster_command_minimal(text)
-    return command or "python3"
-
-
-def _read_puppetmaster_command_with_yaml(text: str) -> Optional[str]:
-    try:
-        import yaml  # type: ignore
+        entry = (load_config_readonly().get("mcp_servers") or {}).get("puppetmaster") or {}
     except Exception:
         return None
-    try:
-        loaded = yaml.safe_load(text)
-    except Exception:
+    command = entry.get("command") if isinstance(entry, dict) else None
+    args = entry.get("args") if isinstance(entry, dict) else None
+    if not isinstance(command, str) or not Path(command).is_file():
         return None
-    if not isinstance(loaded, dict):
-        return None
-    servers = loaded.get("mcp_servers")
-    if not isinstance(servers, dict):
-        return None
-    entry = servers.get("puppetmaster")
-    if not isinstance(entry, dict):
-        return None
-    command = entry.get("command")
-    return command if isinstance(command, str) and command else None
-
-
-def _read_puppetmaster_command_minimal(text: str) -> Optional[str]:
-    """YAML-free fallback: find ``command:`` inside the puppetmaster MCP block.
-
-    Tracks indentation so we only read the command belonging to
-    ``mcp_servers.puppetmaster`` and not some other server's command line.
-    """
-    lines = text.splitlines()
-    in_mcp_servers = False
-    in_puppetmaster = False
-    puppetmaster_indent = -1
-    for raw in lines:
-        stripped = raw.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        indent = len(raw) - len(raw.lstrip())
-        if not in_mcp_servers:
-            if stripped.rstrip().rstrip(":") == "mcp_servers":
-                in_mcp_servers = True
-            continue
-        if not in_puppetmaster:
-            if indent == 0 and stripped.endswith(":"):
-                # Left the mcp_servers block entirely.
-                in_mcp_servers = False
-                continue
-            if stripped.rstrip().rstrip(":") == "puppetmaster":
-                in_puppetmaster = True
-                puppetmaster_indent = indent
-            continue
-        # Inside the puppetmaster entry: a sibling/parent key ends the block.
-        if indent <= puppetmaster_indent:
-            in_puppetmaster = False
-            if stripped.rstrip().rstrip(":") == "puppetmaster":
-                in_puppetmaster = True
-                puppetmaster_indent = indent
-            continue
-        match = re.match(r"command\s*:\s*(.+)$", stripped)
-        if match:
-            return match.group(1).strip().strip("'\"") or None
+    if isinstance(args, list) and args[:2] == ["-m", "puppetmaster"]:
+        return [command, "-m", "puppetmaster"]
+    if Path(command).name.startswith("puppetmaster"):
+        return [command]
     return None
 
 
-def _run_pm(pyexe: str, cwd: str, args: list) -> Optional[subprocess.CompletedProcess]:
-    """Run ``<pyexe> -m puppetmaster <args>`` in ``cwd``. Returns None on failure."""
+# The read-only CLI calls get no provider keys; the names below let Python, git and the state dir lookup work.
+_CHILD_ENV_NAMES = (
+    "PATH", "HOME", "LANG", "LC_ALL", "USER", "TMPDIR", "XDG_STATE_HOME",
+    "SYSTEMROOT", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP", "PATHEXT", "COMSPEC",
+)
+
+
+def _child_env() -> dict:
+    """The environment for the Puppetmaster CLI child: a fixed allow list plus ``PUPPETMASTER_*``."""
+    return {
+        name: value
+        for name, value in os.environ.items()
+        if name.upper() in _CHILD_ENV_NAMES or name.upper().startswith("PUPPETMASTER_")
+    }
+
+
+def _run_text(command: list, cwd: str, args: list) -> str:
     try:
-        return subprocess.run(
-            [pyexe, "-m", "puppetmaster", *args],
+        result = subprocess.run(
+            [*command, *args],
             cwd=cwd,
+            env=_child_env(),
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=_CLI_TIMEOUT_SECONDS,
             check=False,
+            stdin=subprocess.DEVNULL,
         )
     except (subprocess.TimeoutExpired, OSError):
-        return None
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
 
 
-def _extract_json(stdout: str) -> Optional[dict]:
-    """Pull the first JSON object out of CLI stdout, tolerating prose lines."""
-    if not stdout:
+def _run_json(command: list, cwd: str, args: list) -> Optional[dict]:
+    text = _run_text(command, cwd, args)
+    if not text:
         return None
-    text = stdout.strip()
     try:
         loaded = json.loads(text)
-        return loaded if isinstance(loaded, dict) else None
-    except json.JSONDecodeError:
-        pass
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end <= start:
-        return None
-    try:
-        loaded = json.loads(text[start : end + 1])
     except json.JSONDecodeError:
         return None
     return loaded if isinstance(loaded, dict) else None
 
 
-def _query_latest_job_id(pyexe: str, cwd: str) -> Optional[str]:
-    """Resolve the latest job id for ``cwd``'s project.
-
-    Prefers ``last --json`` if that flag ever lands; otherwise ``last`` prints
-    a bare job id, which is exactly what we need.
-    """
-    result = _run_pm(pyexe, cwd, ["last", "--json"])
-    if result is not None and result.returncode == 0:
-        payload = _extract_json(result.stdout)
-        if payload:
-            job_id = payload.get("id") or payload.get("job_id")
-            if isinstance(job_id, str) and job_id:
-                return job_id
-    result = _run_pm(pyexe, cwd, ["last"])
-    if result is None or result.returncode != 0:
-        return None
-    for line in result.stdout.splitlines():
-        candidate = line.strip()
-        if candidate.startswith("job"):
-            return candidate
-    first = result.stdout.strip().splitlines()
-    return first[0].strip() if first else None
-
-
-def _query_job_detail(pyexe: str, cwd: str, job_id: str) -> Optional[dict]:
-    """Return the status snapshot dict for ``job_id`` (or None).
-
-    Uses ``status <job>`` (full JSON) — NOT ``--compact``, which strips the
-    goal/prompt bodies we need. The full snapshot carries ``job.goal``,
-    ``job.status``, ``job.completed_at`` and the ``tasks`` list.
-    """
-    result = _run_pm(pyexe, cwd, ["status", job_id])
-    if result is None or result.returncode != 0:
-        return None
-    payload = _extract_json(result.stdout)
-    return _normalize_detail(payload) if payload else None
-
-
-def _normalize_detail(payload: dict) -> dict:
-    """Flatten a status snapshot into the keys the durability heuristic reads."""
-    job = payload.get("job") if isinstance(payload.get("job"), dict) else payload
-    outcome = payload.get("outcome") if isinstance(payload.get("outcome"), dict) else {}
-    tasks = payload.get("tasks") if isinstance(payload.get("tasks"), list) else []
-    return {
-        "goal": job.get("goal") or "",
-        "status": job.get("status") or "",
-        "completed_at": job.get("completed_at"),
-        "task_count": len(tasks),
-        "artifact_count": payload.get("artifact_count") or outcome.get("artifact_count") or 0,
-        "patch_artifact_emitted": bool(outcome.get("patch_artifact_emitted")),
-    }
-
-
-def _query_job_summary(pyexe: str, cwd: str, job_id: str) -> str:
-    """Best-effort stitched summary markdown for ``job_id`` (empty on failure)."""
-    result = _run_pm(pyexe, cwd, ["show", job_id])
-    if result is None or result.returncode != 0:
-        return ""
-    return (result.stdout or "").strip()
-
-
-def _goal_from_summary(summary: str) -> str:
-    """Pull the goal out of a stitched summary's ``Goal:`` line (empty if none).
-
-    The stitched summary begins with a ``Goal: <text>`` line; this is the
-    fallback when the status snapshot omits the goal.
-    """
-    for line in (summary or "").splitlines():
-        stripped = line.strip()
-        if stripped.lower().startswith("goal:"):
-            return stripped[len("goal:"):].strip()
-    return ""
-
-
-def _is_durable(detail: dict) -> bool:
-    """Durable = COMPLETE, finished recently, and produced something concrete."""
-    if str(detail.get("status")).lower() != "complete":
-        return False
-    if not _finished_recently(detail.get("completed_at")):
-        return False
-    produced_artifact = (
-        detail.get("patch_artifact_emitted")
-        or int(detail.get("artifact_count") or 0) > 0
-        or int(detail.get("task_count") or 0) > 0
-    )
-    return bool(produced_artifact)
-
-
-def _finished_recently(completed_at: Optional[str]) -> bool:
-    """True when ``completed_at`` is missing or within the recent window.
-
-    A missing timestamp is treated as recent: the job is the project's latest
-    COMPLETE swarm, and we'd rather distill a borderline-stale candidate (which
-    a human reviews anyway) than silently drop a fresh one over a clock quirk.
-    """
-    if not completed_at:
-        return True
-    parsed = _parse_iso(completed_at)
-    if parsed is None:
-        return True
-    now = datetime.now(timezone.utc)
-    delta = (now - parsed).total_seconds()
-    return -60 <= delta <= _RECENT_WINDOW_SECONDS
-
-
-def _parse_iso(value: str) -> Optional[datetime]:
+def _run_json_list(command: list, cwd: str, args: list) -> list:
+    text = _run_text(command, cwd, args)
     try:
-        text = value.strip().replace("Z", "+00:00")
-        parsed = datetime.fromisoformat(text)
-    except (ValueError, AttributeError):
-        return None
+        loaded = json.loads(text) if text else []
+    except json.JSONDecodeError:
+        return []
+    return loaded if isinstance(loaded, list) else []
+
+
+_FENCED_JSON = re.compile(r"```json\s*(\{.*?\})\s*```", re.S)
+_MAX_FINDINGS = 12
+_MAX_DETAIL = 1200
+_FINDING_KINDS = {"FINDING", "RISK"}
+
+
+def _findings(artifacts: list) -> list:
+    """Findings from the job's ``finding`` artifacts, as dicts.
+
+    A worker report often holds a JSON block whose shape the worker chose.
+    Every object in it with a title (or summary) and a finding or risk kind
+    is a finding. Without such a block, the artifact payload is the finding.
+    """
+    found = []
+    for artifact in artifacts:
+        if not isinstance(artifact, dict) or artifact.get("type") != "finding":
+            continue
+        payload = artifact.get("payload") if isinstance(artifact.get("payload"), dict) else {}
+        items = []
+        for block in _FENCED_JSON.findall(str(payload.get("report") or "")):
+            try:
+                _collect_findings(json.loads(block), items)
+            except json.JSONDecodeError:
+                continue
+        claim = str(payload.get("claim") or "").strip()
+        if not items and len(claim) > 3 and not claim.startswith(("{", "[", "`")):
+            items = [{**payload, "title": claim}]
+        found.extend(items)
+    return found[:_MAX_FINDINGS]
+
+
+def _collect_findings(node, out: list) -> None:
+    if isinstance(node, list):
+        for value in node:
+            _collect_findings(value, out)
+        return
+    if not isinstance(node, dict):
+        return
+    title = node.get("title") or node.get("summary")
+    if isinstance(title, str) and title.strip():
+        if str(node.get("kind") or "finding").upper().rstrip("S") in _FINDING_KINDS:
+            out.append(node)
+        return
+    for value in node.values():
+        _collect_findings(value, out)
+
+
+def _completed_since(completed_at: object, since: float) -> bool:
+    if not isinstance(completed_at, str):
+        return False
+    try:
+        parsed = datetime.fromisoformat(completed_at.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return False
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed
+    return parsed.timestamp() >= since
 
-
-# ---------------------------------------------------------------------------
-# Pure, testable candidate builder
-# ---------------------------------------------------------------------------
 
 def build_skill_candidate(job: dict) -> dict:
-    """Build a skill candidate from a job dict. Pure and deterministic.
-
-    ``job`` carries ``id``/``job_id``, ``goal``, an optional stitched
-    ``summary``, and an optional ``cwd``. Returns ``{"slug", "skill_md",
-    "meta"}`` where ``skill_md`` is a valid SKILL.md (YAML frontmatter +
-    body) and ``meta`` records provenance.
-    """
+    """Build ``{"slug", "skill_md", "meta"}`` from a job dict. Pure."""
     job_id = str(job.get("id") or job.get("job_id") or "unknown")
     goal = (job.get("goal") or "").strip() or "Untitled Puppetmaster swarm"
-    summary = (job.get("summary") or "").strip()
-    cwd = job.get("cwd") or ""
-
+    findings = [f for f in job.get("findings") or [] if isinstance(f, dict)]
     slug = _slugify(goal)
-    name = slug
     description = _describe(goal)
-    created_iso = datetime.now(timezone.utc).isoformat()
-
     skill_md = _render_skill_md(
-        name=name,
-        description=description,
-        goal=goal,
-        summary=summary,
-        job_id=job_id,
+        name=slug, description=description, goal=goal, findings=findings, job_id=job_id
     )
     meta = {
         "job_id": job_id,
         "goal": goal,
-        "cwd": cwd,
-        "created_iso": created_iso,
+        "cwd": job.get("cwd") or "",
+        "created_iso": datetime.now(timezone.utc).isoformat(),
         "source": _SOURCE,
     }
     return {"slug": slug, "skill_md": skill_md, "meta": meta}
@@ -397,32 +300,50 @@ def _slugify(text: str, *, max_len: int = 60) -> str:
 
 
 def _describe(goal: str, *, max_len: int = 200) -> str:
-    """First sentence/line of the goal, collapsed to a single descriptive line."""
+    """The goal's first sentence on one line, at most ``max_len`` characters."""
     collapsed = re.sub(r"\s+", " ", goal).strip()
-    for terminator in (". ", "\n"):
-        idx = collapsed.find(terminator)
-        if 0 < idx < max_len:
-            collapsed = collapsed[:idx]
-            break
+    end = collapsed.find(". ")
+    if 0 < end < max_len:
+        collapsed = collapsed[:end]
     if len(collapsed) > max_len:
-        collapsed = collapsed[: max_len - 1].rstrip() + "\u2026"
+        collapsed = collapsed[: max_len - 1].rstrip() + "…"
     return collapsed
 
 
-def _render_skill_md(*, name: str, description: str, goal: str, summary: str, job_id: str) -> str:
-    body_summary = summary if summary else "_No stitched summary was captured for this swarm._"
-    provenance = f"Generated by Puppetmaster auto-/learn from job {job_id}"
-    safe_description = description.replace('"', "'")
+def _render_finding(index: int, finding: dict) -> str:
+    title = re.sub(r"\s+", " ", str(finding.get("title") or finding.get("summary"))).strip()
+    where = finding.get("file")
+    if where and finding.get("line"):
+        where = f"{where}:{finding['line']}"
+    tags = ", ".join(str(v) for v in (f"`{where}`" if where else None, finding.get("severity")) if v)
+    lines = [f"{index}. **{title}**" + (f" ({tags})" if tags else "")]
+    details = [("", finding.get("body")), ("", finding.get("description")),
+               ("Failure: ", finding.get("failure_scenario")), ("Evidence: ", finding.get("evidence")),
+               ("Fix: ", finding.get("fix") or finding.get("recommendation"))]
+    for label, text in details:
+        text = str(text or "").strip()
+        if text:
+            if len(text) > _MAX_DETAIL:
+                text = text[: _MAX_DETAIL - 1].rstrip() + "…"
+            lines.append("   " + (label + text).replace("\n", "\n   "))
+    return "\n".join(line.rstrip() for line in "\n".join(lines).split("\n"))
+
+
+def _render_skill_md(*, name: str, description: str, goal: str, findings: list, job_id: str) -> str:
+    body_summary = "\n\n".join(
+        _render_finding(i, f) for i, f in enumerate(findings, 1)
+    ) or "_The swarm stored no finding text._"
+    # A JSON string is a valid YAML double-quoted scalar, so any goal text is safe here.
     return (
         "---\n"
         f"name: {name}\n"
-        f'description: "{safe_description}"\n'
+        f"description: {json.dumps(description, ensure_ascii=False)}\n"
         "---\n"
         "\n"
         f"# {description}\n"
         "\n"
-        "> Skill CANDIDATE auto-distilled by Puppetmaster. Review and edit before promoting\n"
-        "> it into a live Hermes skill.\n"
+        "> Skill CANDIDATE distilled by Puppetmaster. Review and edit it before you\n"
+        "> promote it to a live Hermes skill.\n"
         "\n"
         "## Goal\n"
         "\n"
@@ -434,27 +355,24 @@ def _render_skill_md(*, name: str, description: str, goal: str, summary: str, jo
         "\n"
         "## Provenance\n"
         "\n"
-        f"{provenance}\n"
+        f"Puppetmaster job {job_id}\n"
     )
 
 
 def _write_candidate(slug: str, skill_md: str, meta: dict, *, home: Path) -> Optional[str]:
     """Write SKILL.md + candidate.json under ``<home>/skills-candidates/``.
 
-    Idempotent: if any existing candidate's ``candidate.json`` already records
-    this ``job_id``, we skip and return ``None``. Returns the candidate dir path
-    on a fresh write.
+    Returns None when a candidate for this job already exists or the write fails.
     """
-    job_id = str(meta.get("job_id") or "unknown")
     base = Path(home).expanduser() / "skills-candidates"
-
-    if _candidate_exists_for_job(base, job_id):
+    if _candidate_exists_for_job(base, str(meta.get("job_id") or "unknown")):
         return None
-
-    date_prefix = datetime.now(timezone.utc).strftime("%Y%m%d")
-    target = base / f"{date_prefix}-{slug}"
+    target = base / f"{datetime.now(timezone.utc):%Y%m%d}-{slug}"
+    if target.exists():  # same goal, same day, another job
+        suffix = re.sub(r"[^a-z0-9]", "", str(meta.get("job_id")).lower())[-8:]
+        target = target.with_name(f"{target.name}-{suffix}")
     try:
-        target.mkdir(parents=True, exist_ok=True)
+        target.mkdir(parents=True, exist_ok=False)
         (target / "SKILL.md").write_text(skill_md, encoding="utf-8")
         (target / "candidate.json").write_text(
             json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8"
