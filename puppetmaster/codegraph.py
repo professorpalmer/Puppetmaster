@@ -18,6 +18,7 @@ import hashlib
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -73,6 +74,65 @@ CODEGRAPH_NATIVE_SQLITE_HINT = (
     "npm rebuild better-sqlite3` with the right Node first on PATH. "
     "Restart the Puppetmaster MCP server in your harness afterwards."
 )
+
+
+def _kill_process_tree(process: "subprocess.Popen") -> None:
+    """End a CodeGraph command and each process that it started."""
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    try:
+        process.kill()
+    except OSError:
+        pass
+
+
+def _run_cli(command: list, *, timeout: Optional[float] = None, check: bool = False,
+             capture_output: bool = False, **kwargs: Any) -> "subprocess.CompletedProcess":
+    """``subprocess.run`` for a CodeGraph command, with one difference at a timeout.
+
+    The npm shim starts the real Node binary as a child. ``subprocess.run`` ends
+    only the shim at a timeout, so the real process stayed alive with no reader
+    and could grow to gigabytes. This call starts the command in its own process
+    group and ends the whole group.
+    """
+    if capture_output:
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE
+    if os.name != "nt":
+        kwargs.setdefault("start_new_session", True)
+    process = subprocess.Popen(command, **kwargs)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        _kill_process_tree(process)
+        try:
+            stdout, stderr = process.communicate(timeout=10)
+        except (subprocess.SubprocessError, OSError, ValueError):
+            stdout, stderr = exc.output, exc.stderr
+        raise subprocess.TimeoutExpired(command, timeout, output=stdout, stderr=stderr)
+    except BaseException:
+        _kill_process_tree(process)
+        raise
+    completed = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    if check:
+        completed.check_returncode()
+    return completed
 
 
 def _npx_disabled() -> bool:
@@ -367,7 +427,7 @@ def ensure_codegraph_provisioned() -> bool:
             npm = shutil.which("npm")
             if npm is not None:
                 try:
-                    completed = subprocess.run(
+                    completed = _run_cli(
                         [npm, "install", "-g", CODEGRAPH_PACKAGE],
                         stdin=subprocess.DEVNULL,
                         capture_output=True,
@@ -389,7 +449,7 @@ def ensure_codegraph_provisioned() -> bool:
         # cold download + native build. Exit code is irrelevant — the point is
         # the fetch+build side effect.
         try:
-            subprocess.run(
+            _run_cli(
                 npx_invocation + ["--help"],
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
@@ -456,7 +516,7 @@ def _codegraph_context_cached(
             output = None
     if output is None:
         try:
-            completed = subprocess.run(
+            completed = _run_cli(
                 invocation + context_args,
                 cwd=cwd_key or None,
                 stdin=subprocess.DEVNULL,
@@ -805,7 +865,7 @@ def _run_codegraph_once(
     """Invoke codegraph once via the resolved (Cursor-Node) invocation."""
     started = time.monotonic()
     try:
-        completed = subprocess.run(
+        completed = _run_cli(
             resolve_codegraph_invocation() + cli_args,
             cwd=cwd_str or None,
             stdin=subprocess.DEVNULL,
@@ -1588,7 +1648,7 @@ def _run_git(
     if not git:
         return None
     try:
-        completed = subprocess.run(
+        completed = _run_cli(
             [git, "-C", str(cwd), *git_args],
             stdin=subprocess.DEVNULL,
             capture_output=True,

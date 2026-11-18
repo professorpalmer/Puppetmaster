@@ -144,7 +144,7 @@ class CodegraphUtf8ProvisionTests(unittest.TestCase):
         ), patch(
             "puppetmaster.codegraph.shutil.which", side_effect=fake_which
         ), patch(
-            "puppetmaster.codegraph.subprocess.run", side_effect=fake_run
+            "puppetmaster.codegraph._run_cli", side_effect=fake_run
         ), patch.dict(os.environ, {}, clear=False):
             for var in (
                 "PUPPETMASTER_CODEGRAPH_NO_NPX",
