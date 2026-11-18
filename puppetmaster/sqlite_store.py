@@ -46,6 +46,7 @@ from puppetmaster.store import (
     _coerce_confidence,
     _memory_created_at_sort_key,
     _memory_is_older_than_days,
+    _memory_query_terms,
     _memory_retrieval_score,
     _memory_within_max_age,
     _normalize_memory_statement,
@@ -2188,7 +2189,7 @@ class SQLiteSwarmStore(SwarmStore):
         min_overlap: float = 0.0,
     ) -> list[dict[str, Any]]:
         self._ensure_attached()
-        terms = {term.lower() for term in query.split() if len(term) > 2}
+        terms = _memory_query_terms(query)
         filter_clauses: list[str] = []
         term_clauses: list[str] = []
         params: list[Any] = []

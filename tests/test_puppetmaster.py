@@ -8631,6 +8631,7 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
             unrelated_repo.mkdir()
             fake_package_root = Path(tmp) / "Puppetmaster"
             (fake_package_root / "node_modules" / "@cursor" / "sdk").mkdir(parents=True)
+            (fake_package_root / "node_modules" / "@cursor" / "sdk" / "package.json").write_text("{}", encoding="utf-8")
             fake_diagnostics_file = fake_package_root / "puppetmaster" / "diagnostics.py"
             fake_diagnostics_file.parent.mkdir()
             fake_diagnostics_file.write_text("# stub", encoding="utf-8")
@@ -8658,6 +8659,7 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
             package_dir = site_packages / "puppetmaster"
             sdk = package_dir / "node_modules" / "@cursor" / "sdk"
             sdk.mkdir(parents=True)
+            (sdk / "package.json").write_text("{}", encoding="utf-8")
             fake_diagnostics_file = package_dir / "diagnostics.py"
             fake_diagnostics_file.write_text("# stub", encoding="utf-8")
             with patch("puppetmaster.cursor_sdk_home.PACKAGED_RUNNER", fake_diagnostics_file.with_name("cursor_sdk_runner.mjs")):
@@ -8673,6 +8675,7 @@ print(json.dumps({"result": "ok", "usage": {"input_tokens": 321, "output_tokens"
         with TemporaryDirectory() as tmp:
             workspace = Path(tmp) / "workspace"
             (workspace / "node_modules" / "@cursor" / "sdk").mkdir(parents=True)
+            (workspace / "node_modules" / "@cursor" / "sdk" / "package.json").write_text("{}", encoding="utf-8")
             fake_pkg_root = Path(tmp) / "nowhere"  # no SDK here
             fake_diagnostics_file = fake_pkg_root / "puppetmaster" / "diagnostics.py"
             fake_diagnostics_file.parent.mkdir(parents=True)

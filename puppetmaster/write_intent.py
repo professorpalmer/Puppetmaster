@@ -77,10 +77,9 @@ def adapter_may_write(
         bypass = bool(payload.get("dangerously_bypass_approvals_and_sandbox"))
         return sandbox != "read-only" or bypass
     if name in {"antigravity", "agy"}:
-        default = (
-            "plan"
-            if (payload.get("read_only") or payload.get("sandbox") == "read-only")
-            else "accept-edits"
-        )
-        return str(payload.get("mode", default)) != "plan"
+        # Use the adapter's own mode map, so "analyze" (run as agy --mode
+        # plan) is read-only here too. Imported late to avoid an import cycle.
+        from puppetmaster.adapters.antigravity import resolve_antigravity_mode
+
+        return resolve_antigravity_mode(payload) != "plan"
     return True

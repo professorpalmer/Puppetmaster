@@ -266,12 +266,15 @@ def append_allowed_models_cli_flags(
     command: list[str], allowed_models: Optional[list[str]]
 ) -> None:
     """Append repeatable ``--allowed-models`` flags to a CLI argv list."""
-    if not allowed_models:
+    if allowed_models is None:
         return
-    for item in allowed_models:
-        text = str(item).strip()
-        if text:
-            command.extend(["--allowed-models", text])
+    texts = [str(item).strip() for item in allowed_models if str(item).strip()]
+    if not texts:
+        # An explicit empty allowlist must fail closed in the child process.
+        command.extend(["--allowed-models", ""])
+        return
+    for text in texts:
+        command.extend(["--allowed-models", text])
 
 
 def allowed_model_ids_from_mapping(mapping) -> Optional[frozenset[str]]:
@@ -313,10 +316,13 @@ def routing_payload_from_args(args, *, adapter: str) -> dict:
     *model* within that platform — a direct ``cursor`` run never silently hops
     to claude-code."""
     allowed_models = allowed_models_cli_list(args)
+    # A flag given with only blank values is an empty allowlist, which must
+    # fail closed in the router, not drop the restriction.
+    allowlist_given = bool(getattr(args, "allowed_models", None))
     # An allowlist is a constraint, not a hint: without routing, a direct
     # adapter run ignored it and used the adapter's default model (a run
     # allowed only claude-code/opus-5-5 ran claude-opus-5).
-    if not getattr(args, "auto_route", False) and not allowed_models:
+    if not getattr(args, "auto_route", False) and not allowlist_given:
         return {}
     payload: dict[str, Any] = {"auto_route": True, "allowed_adapters": [adapter]}
     if getattr(args, "routing_policy", None):
@@ -325,7 +331,7 @@ def routing_payload_from_args(args, *, adapter: str) -> dict:
         payload["max_cost_usd"] = args.max_cost_usd
     if getattr(args, "min_capability", None) is not None:
         payload["min_capability"] = args.min_capability
-    if allowed_models:
+    if allowlist_given:
         payload["allowed_model_ids"] = allowed_models
     return payload
 

@@ -4,6 +4,7 @@ import hashlib
 import itertools
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -195,6 +196,12 @@ def _memory_haystack(memory: dict[str, Any]) -> str:
         str(memory.get(key, ""))
         for key in ["scope", "statement", "evidence", "adapter", "role", "topic"]
     ).lower()
+
+
+def _memory_query_terms(query: str) -> set[str]:
+    # Split on word characters so a goal word with punctuation ("zebra,")
+    # still matches the stored word by substring. \w keeps non-ASCII letters.
+    return {term for term in re.findall(r"\w+", query.lower()) if len(term) > 2}
 
 
 def _memory_term_overlap(terms: set[str], haystack: str) -> float:
@@ -3576,7 +3583,7 @@ class SwarmStore(StoreContracts):
         max_age_days: Optional[int] = None,
         min_overlap: float = 0.0,
     ) -> list[dict[str, Any]]:
-        terms = {term.lower() for term in query.split() if len(term) > 2}
+        terms = _memory_query_terms(query)
         scored = []
         for memory in self.list_memory():
             if not _memory_within_max_age(memory, max_age_days):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -707,7 +708,7 @@ def cursor_artifact_from_item(
         )
         if wrapped_type:
             wrapped = item[wrapped_type]
-            item = {**wrapped, "type": wrapped.get("type", wrapped_type)}
+            item = {**wrapped, "type": wrapped.get("type") or wrapped_type}
         elif adapter == "codex":
             inferred = _infer_codex_flat_semantic_type(item)
             if inferred:
@@ -828,6 +829,10 @@ def _json_prefix_decode(text: str) -> Optional[Any]:
             decoded, _ = decoder.raw_decode(text[index:])
         except json.JSONDecodeError:
             continue
+        # A list with no object, such as a prose citation "[1]", holds no
+        # artifact, so the scan continues to the real payload after it.
+        if isinstance(decoded, list) and not any(isinstance(item, dict) for item in decoded):
+            continue
         if isinstance(decoded, (dict, list)):
             return decoded
     return None
@@ -893,12 +898,15 @@ def _infer_codex_flat_semantic_type(item: dict[str, Any]) -> Optional[str]:
 def _string_list(value: object) -> list[str]:
     if not isinstance(value, list):
         return []
-    return [str(item) for item in value if str(item).strip()]
+    return [str(item) for item in value if item is not None and str(item).strip()]
 
 
 def _confidence(value: object) -> float:
     try:
         parsed = float(value)
     except (TypeError, ValueError):
+        return 0.75
+    # NaN and infinity carry no score, so they get the default too.
+    if not math.isfinite(parsed):
         return 0.75
     return min(1.0, max(0.0, parsed))

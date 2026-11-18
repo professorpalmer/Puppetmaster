@@ -902,8 +902,10 @@ def _find_cursor_sdk_install(root: Optional[Path]) -> Optional[Path]:
     env_root = os.environ.get("PUPPETMASTER_HOME")
     if env_root:
         candidates.append(Path(env_root).expanduser() / "node_modules" / "@cursor" / "sdk")
+    # A directory without package.json is a partial npm install that Node
+    # cannot import; it must not stop the bootstrap from a repair.
     for candidate in candidates:
-        if candidate.exists():
+        if (candidate / "package.json").is_file():
             return candidate
     return None
 
