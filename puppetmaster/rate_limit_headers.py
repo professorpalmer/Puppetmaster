@@ -145,6 +145,17 @@ def reset_at(value: Any, *, now: Optional[float] = None) -> Optional[float]:
             delta = hours * 3600.0 + minutes * 60.0 + seconds
         return clock + delta
 
+    # Anthropic sends RFC 3339 resets. Python 3.9 fromisoformat does not take "Z".
+    try:
+        from datetime import datetime, timezone
+
+        iso = datetime.fromisoformat(re.sub(r"[zZ]$", "+00:00", text))
+        if iso.tzinfo is None:
+            iso = iso.replace(tzinfo=timezone.utc)
+        return iso.timestamp()
+    except ValueError:
+        pass
+
     try:
         from email.utils import parsedate_to_datetime
 

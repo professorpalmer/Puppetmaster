@@ -30,9 +30,14 @@ def sdk_home() -> Path:
 def _sdk_beside(directory: Path) -> Optional[Path]:
     for ancestor in [directory, *directory.parents]:
         candidate = ancestor / "node_modules" / "@cursor" / "sdk"
-        if candidate.exists():
+        if _is_installed(candidate):
             return candidate
     return None
+
+
+def _is_installed(candidate: Path) -> bool:
+    # A partial npm install leaves the directory without package.json.
+    return (candidate / "package.json").is_file()
 
 
 def packaged_sdk() -> Optional[Path]:
@@ -42,7 +47,7 @@ def packaged_sdk() -> Optional[Path]:
 
 def home_sdk() -> Optional[Path]:
     candidate = sdk_home() / "node_modules" / "@cursor" / "sdk"
-    return candidate if candidate.exists() else None
+    return candidate if _is_installed(candidate) else None
 
 
 def cursor_runner() -> Path:

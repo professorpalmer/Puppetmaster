@@ -1038,8 +1038,18 @@ def adapter_cli_present(
     cli = adapter_cli_executable(adapter, env)
     if cli is None:
         return True
+    from puppetmaster.adapters import command_parts
+
+    # The adapters split a multi-word command (for example
+    # "npx -y @anthropic-ai/claude-code") and launch only its first word.
+    try:
+        parts = command_parts(cli)
+    except ValueError:
+        return False
+    if not parts:
+        return False
     resolve = resolver or _default_command_resolver
-    return resolve(cli) is not None
+    return resolve(parts[0]) is not None
 
 
 class DispatchReadiness:

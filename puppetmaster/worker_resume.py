@@ -252,7 +252,13 @@ def _resolve(store: Any, payload: dict, adapter: str) -> dict:
     ]
     if not verifications:
         return _unavailable(payload, f"prior task {prior.id!r} has no {adapter} verification receipt")
-    latest = max(verifications, key=lambda artifact: str(artifact.created_at or ""))
+    key = RESUMABLE_ADAPTERS[adapter]
+    # A later attempt that failed before its session started records no id;
+    # it must not hide an earlier receipt of the same task that has one.
+    with_session = [
+        artifact for artifact in verifications if str((artifact.payload or {}).get(key) or "").strip()
+    ]
+    latest = max(with_session or verifications, key=lambda artifact: str(artifact.created_at or ""))
     receipt = latest.payload or {}
     if adapter == "codex" and receipt.get("ephemeral") is True:
         return _unavailable(

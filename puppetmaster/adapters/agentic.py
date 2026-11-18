@@ -99,7 +99,7 @@ from puppetmaster.tool_offload import offload_tool_output, read_offload_blob
 from puppetmaster.worker_attribution import (
     path_references,
     attribution_payload,
-    normalize_path,
+    RepoFrame,
     path_tokens,
 )
 from ._base import (
@@ -954,8 +954,9 @@ class AgenticAdapter(FullEditWorkerAdapter):
         after = facade("git_snapshot")(
             cwd, base_tree=str(before.get("tree") or "") or None, base_manifest=before.get("manifest"),
         )
+        frame = RepoFrame(cwd)
         attribution = attribution_payload(path_references([
-            normalize_path(path, cwd) for path in self._referenced_paths.pop(task.id, [])
+            frame.canonical(path) for path in self._referenced_paths.pop(task.id, [])
         ]), before)
         has_work = _should_emit_patch_artifact(before, after)
         # A change that fails the repo's own verification (in gating mode) is not
