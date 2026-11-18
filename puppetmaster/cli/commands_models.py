@@ -580,7 +580,7 @@ def _run_models_setup(args, path: Path) -> int:
 def _run_models_subcommand(args) -> int:
     """Dispatch `python -m puppetmaster models ...`.
 
-    Subcommands: init, list, path, discover, recommend, setup, set,
+    Subcommands: init, sync, list, path, discover, recommend, setup, set,
     import-baseline.
     """
     from puppetmaster.model_registry import (
@@ -607,6 +607,9 @@ def _run_models_subcommand(args) -> int:
         print(f"wrote starter model registry to {path}")
         print("Edit capability_score / prices to match your subscriptions.")
         return 0
+
+    if args.models_command == "sync":
+        return _run_models_sync(args, path)
 
     if args.models_command == "list":
         try:
@@ -662,6 +665,95 @@ def _run_models_subcommand(args) -> int:
         return _run_models_import_observations(args)
 
     raise SystemExit(f"unknown models subcommand: {args.models_command}")
+
+
+def _run_models_sync(args, path: Path) -> int:
+    """List or append the starter entries that the registry at ``path`` lacks."""
+    from puppetmaster.registry_sync import SYNC_COMMAND, sync_starter_registry
+
+    try:
+        plan = sync_starter_registry(path, apply=args.apply, enable=args.enable)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if not plan.registry_exists:
+        print(
+            f"error: no model registry at {path}; run `puppetmaster models init`",
+            file=sys.stderr,
+        )
+        return 1
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "path": str(path),
+                    "applied": plan.applied,
+                    "absent": [
+                        {
+                            "id": addition.spec.id,
+                            "adapter": addition.spec.adapter,
+                            "capability_score": addition.spec.capability_score,
+                            "enabled": addition.spec.enabled,
+                            "adapter_locked": addition.adapter_locked,
+                        }
+                        for addition in plan.additions
+                    ],
+                    "covered": [
+                        {"id": starter_id, "existing_id": existing_id}
+                        for starter_id, existing_id in plan.covered
+                    ],
+                    "locked_adapters": plan.locked_adapters,
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    for starter_id, existing_id in plan.covered:
+        print(f"skip {starter_id}: {existing_id} is the same adapter and model")
+    if not plan.additions:
+        print(f"Registry has every starter entry  ({path})")
+        return 0
+    count = len(plan.additions)
+    if plan.applied:
+        print(f"Added {count} starter entry(ies) to {path}")
+    else:
+        print(f"{count} starter entry(ies) are absent from {path}")
+    for adapter, additions in plan.by_adapter().items():
+        locked = "  [disabled by the platform lock]" if additions[0].adapter_locked else ""
+        print(f"  {adapter} ({len(additions)}){locked}")
+        for addition in additions:
+            spec = addition.spec
+            state = "enabled" if spec.enabled else "enabled=false"
+            print(
+                f"    {spec.id:<30}  cap {spec.capability_score:>3}  "
+                f"{spec.input_per_mtok_usd:>7.3f}/{spec.output_per_mtok_usd:<7.3f}  {state}"
+            )
+    if plan.locked_adapters:
+        print(
+            "Platform lock disables: "
+            + ", ".join(plan.locked_adapters)
+            + ". An entry on these adapters always gets enabled=false."
+        )
+    if plan.applied:
+        print("Each entry that was in the registry before is the same.")
+        if any(not addition.spec.enabled for addition in plan.additions):
+            print(
+                "To make one entry routable: puppetmaster models set <id> "
+                "enabled=true disabled_reason= disabled_authority="
+            )
+        print(
+            "A task with a model pin that was queued before this write fails at "
+            "dispatch, because the registry digest changed. Start it again."
+        )
+        return 0
+    print("Dry run. The registry did not change. The state column shows what --apply writes.")
+    print(f"  {SYNC_COMMAND} --apply           append the entries with enabled=false")
+    print(
+        f"  {SYNC_COMMAND} --apply --enable  append them enabled, except on "
+        "locked adapters"
+    )
+    return 0
 
 
 def _run_models_recommend(args, path: Path) -> int:

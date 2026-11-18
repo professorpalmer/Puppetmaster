@@ -213,6 +213,36 @@ With the starter registry, balanced-policy routing lands roughly:
 | `OCR every detail of the diagram`               | `claude-code/opus-4-7` (detailed-vision; right-sized below the flagship) |
 | `refactor every callsite of foo() and add tests` | `openai/gpt-5-4` (API workhorse — cheaper than frontier, capable enough for cross-file refactor) |
 
+## Add new starter entries to an old registry
+
+`models init` writes the starter registry one time. A later release can
+add starter entries, and your registry does not get them. A pin on one of
+those ids then fails at launch. `models init --force` replaces the whole
+file, so it deletes your scores, prices and disabled flags.
+
+`models sync` adds only the entries that your registry lacks:
+
+```bash
+python -m puppetmaster models sync            # dry run: list the absent ids for each adapter
+python -m puppetmaster models sync --apply    # append them with enabled=false
+python -m puppetmaster models set claude-code/haiku-5-5 enabled=true disabled_reason= disabled_authority=
+```
+
+- An entry that is in your registry stays as it is. Its fields, its
+  position and its unknown fields do not change.
+- New entries go to the end of the file.
+- Without `--enable`, each new entry has `enabled: false`. Its
+  `disabled_reason` names `puppetmaster models sync` and its
+  `disabled_authority` is `models_sync`. Auto-routing does not change.
+- With `--enable`, each new entry keeps the starter state. An entry on an
+  adapter that the platform lock disables always gets `enabled: false`.
+- A starter entry is not added when your registry has the same adapter and
+  model below a different id.
+- `puppetmaster doctor` gives the warning `registry-starter-sync` with the
+  count of absent ids.
+- A write changes the registry digest. A task with a model pin that was
+  queued before the write fails at dispatch. Start it again.
+
 ## Quick start
 
 ```bash

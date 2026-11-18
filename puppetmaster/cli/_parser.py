@@ -2666,6 +2666,31 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Overwrite an existing registry file.",
     )
+    models_sync = models_sub.add_parser(
+        "sync",
+        help=(
+            "List the starter registry entries that this registry lacks. "
+            "With --apply, append them and leave each existing entry as it is."
+        ),
+    )
+    models_sync.add_argument("--registry-path", help="Override the registry path.")
+    models_sync.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "Append the absent entries. Without --enable, each new entry is "
+            "written with enabled=false, so auto-routing does not change."
+        ),
+    )
+    models_sync.add_argument(
+        "--enable",
+        action="store_true",
+        help=(
+            "Write the new entries enabled. An entry on an adapter that the "
+            "platform lock disables is always written with enabled=false."
+        ),
+    )
+    models_sync.add_argument("--json", action="store_true", help="Emit JSON.")
     models_list = models_sub.add_parser(
         "list",
         help="Print the model registry.",
