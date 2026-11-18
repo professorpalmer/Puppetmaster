@@ -268,9 +268,4 @@ def _same_path(left: str, right: str) -> bool:
         return False
     if left == right:
         return True
-    # Repo-relative paths are equal or different files: a suffix match made
-    # root README.md the same file as docs/README.md. Only an absolute path
-    # that normalize_path could not make repo-relative can end in one.
-    if left.startswith("/") and left.endswith("/" + right):
-        return True
-    return right.startswith("/") and right.endswith("/" + left)
+    return left.endswith("/" + right) or right.endswith("/" + left)
