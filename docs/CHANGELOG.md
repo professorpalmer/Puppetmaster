@@ -1,3 +1,30 @@
+## v1.51.0 — 2026-11-17
+
+**`puppetmaster models sync` adds new starter models to an old registry.**
+A registry keeps the starter entries of the release that wrote it. A later
+release adds models, and the old registry does not get them. A flow with the
+pin `claude-haiku-5-5` failed at launch with `RegistryAuthorityError`.
+`models init --force` replaces the whole file, so it deletes local scores,
+prices and disabled flags.
+
+- `puppetmaster models sync` lists the starter ids that the registry lacks,
+  for each adapter. It names the adapters that the platform lock disables.
+  Without `--apply` it is a dry run.
+- `--apply` appends the absent entries under the registry lock, with the
+  atomic writer. Each row that is in the file stays as it is: fields, key
+  order, position and unknown fields.
+- A new entry gets `enabled: false`, a `disabled_reason` that names
+  `puppetmaster models sync`, and `disabled_authority: models_sync`.
+  Auto-routing does not change. `--enable` keeps the starter state, but an
+  entry on an adapter that the platform lock disables always gets
+  `enabled: false`.
+- A starter entry is not added when the registry has the same adapter and
+  model below a different id.
+- `doctor` has the check `registry-starter-sync`: a warning with the count of
+  absent ids and the fix command.
+- The error for an unresolved pin that the starter registry knows now names
+  the cause: the entry is absent (run `models sync`), disabled, or retired.
+
 ## v1.50.0 — 2026-11-12
 
 **Hermes: `puppetmaster-learn` is a catalog plugin that fires on session end.**
