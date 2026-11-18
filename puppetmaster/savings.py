@@ -107,6 +107,7 @@ def collect_routing_records(
     # guards against a re-dispatched task emitting multiple created_by=="router"
     # artifacts, which would otherwise inflate the savings dollars and counts.
     seen_router_tasks: set = set()
+    seen_heal_tasks: set = set()
     for store in stores:
         try:
             job_list = store.list_jobs()
@@ -148,11 +149,19 @@ def collect_routing_records(
         for a in routing_artifacts:
             if getattr(a, "job_id", None) not in window_job_ids:
                 continue
-            if a.created_by == "router-fallback":
-                self_heal.fallbacks += 1
-                continue
-            if a.created_by == "router-escalation":
-                self_heal.escalations += 1
+            # The orchestrator writes one artifact per attempt, so count each
+            # task once: the levers report tasks, not attempts.
+            if a.created_by in ("router-fallback", "router-escalation"):
+                tid = getattr(a, "task_id", None)
+                if tid:
+                    key = (a.created_by, a.job_id, tid)
+                    if key in seen_heal_tasks:
+                        continue
+                    seen_heal_tasks.add(key)
+                if a.created_by == "router-fallback":
+                    self_heal.fallbacks += 1
+                else:
+                    self_heal.escalations += 1
                 continue
             if a.created_by != "router":
                 continue
