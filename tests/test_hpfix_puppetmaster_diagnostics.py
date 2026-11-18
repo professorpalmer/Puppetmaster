@@ -104,7 +104,7 @@ class BareCommandInCwdTests(unittest.TestCase):
     def test_explicit_relative_path_still_counts(self) -> None:
         Path("zzcli").write_text("", encoding="utf-8")
         env = {"PATH": str(self.tmp / "empty")}
-        command = os.path.join(".", "zzcli")
+        command = "./zzcli"
         for var, probe in self.CASES:
             with self.subTest(var=var), mock.patch.dict(os.environ, {**env, var: command}):
                 self.assertTrue(probe())
@@ -112,10 +112,10 @@ class BareCommandInCwdTests(unittest.TestCase):
     def test_bare_name_on_path_still_counts(self) -> None:
         bindir = self.tmp / "bin"
         bindir.mkdir()
-        exe = bindir / "zzcli"
+        exe = bindir / ("zzcli.exe" if os.name == "nt" else "zzcli")
         exe.write_text("#!/bin/sh\n", encoding="utf-8")
         exe.chmod(0o755)
-        env = {"PATH": str(bindir), "PATHEXT": ""}
+        env = {"PATH": str(bindir), "PATHEXT": ".EXE"}
         for var, probe in self.CASES:
             with self.subTest(var=var), mock.patch.dict(os.environ, {**env, var: "zzcli"}):
                 self.assertTrue(probe())
