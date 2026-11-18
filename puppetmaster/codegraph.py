@@ -376,7 +376,8 @@ def _provision_timeout_seconds() -> int:
     if raw:
         try:
             return max(30, int(float(raw)))
-        except ValueError:
+        except (ValueError, OverflowError):
+            # "inf" or "1e999" parse as float but cannot become an int.
             pass
     return 300
 
