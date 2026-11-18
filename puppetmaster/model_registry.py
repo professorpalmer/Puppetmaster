@@ -243,6 +243,8 @@ def load_registry(path: Optional[Path] = None) -> list[ModelSpec]:
         raw = json.loads(resolved.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"models registry at {resolved} is not valid JSON: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(f"models registry at {resolved} is not UTF-8: {exc}") from exc
     if isinstance(raw, list):
         entries = raw
     elif isinstance(raw, dict):
