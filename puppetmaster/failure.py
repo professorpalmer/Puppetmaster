@@ -116,7 +116,8 @@ def _classify(output: str, rules: Sequence[Rule], *, default: str = UNKNOWN) -> 
 _BASE_RULES: Tuple[Rule, ...] = (
     (_any("command not found"), MISSING_CLI),
     (_any("not logged in", "codex login", "missing bearer", "unauthorized"), NOT_AUTHENTICATED),
-    (_matches(r"(?<![\w.])401(?![\w.])"), NOT_AUTHENTICATED),
+    # A dot after 401 can end a sentence; only a dot that a digit follows makes a longer number.
+    (_matches(r"(?<![\w.])401(?!\w|\.\d)"), NOT_AUTHENTICATED),
     (_any("not authenticated", "please login", "hermes login", "missing credentials"), NOT_AUTHENTICATED),
     (_any("cursor_api_key"), NOT_AUTHENTICATED),
     (_matches(_AUTH_DIAGNOSIS), NOT_AUTHENTICATED),
