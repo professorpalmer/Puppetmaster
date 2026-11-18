@@ -131,7 +131,12 @@ def is_coordination_protocol_payload(value: Any) -> bool:
         return is_coordination_protocol_text(value)
     payload = _payload_of(value)
     role = _role_of(value) or _lower_text(payload.get("role"))
-    if role.replace("_", "-") in PROTOCOL_ROLES or role in PROTOCOL_ROLES:
+    # PROTOCOL_ROLES mixes separators, so try both spellings of the role.
+    if (
+        role in PROTOCOL_ROLES
+        or role.replace("_", "-") in PROTOCOL_ROLES
+        or role.replace("-", "_") in PROTOCOL_ROLES
+    ):
         return True
     keys = {str(key).strip().lower().replace("-", "_") for key in payload.keys()}
     if keys & PROTOCOL_KEYS:

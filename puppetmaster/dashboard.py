@@ -1670,10 +1670,15 @@ def _port_taken(exc: OSError) -> bool:
     return getattr(exc, "winerror", None) == 10013
 
 
-def _dashboard_server_class():
+def _dashboard_server_class(host: str = ""):
+    import socket
     from http.server import ThreadingHTTPServer
 
     class _DashboardServer(ThreadingHTTPServer):
+        # serve() accepts "::1" as a loopback host, and an IPv6 literal
+        # cannot bind on the default AF_INET socket.
+        address_family = socket.AF_INET6 if ":" in host else socket.AF_INET
+
         # SO_REUSEADDR has inverted semantics on Windows: when both the
         # incumbent and the newcomer set it, bind() succeeds *over a live
         # listener* and the first binder silently keeps every connection — a
@@ -1709,13 +1714,15 @@ def bind_dashboard_server(
         # own `candidate > 65535` guard breaks out on the very first
         # iteration without ever calling bind().
         raise OSError(f"port {port} is not a valid TCP port (must be 0-65535).")
-    server_class = _dashboard_server_class()
+    server_class = _dashboard_server_class(host)
     last: Optional[OSError] = None
     attempts = max_attempts if auto_port else 1
+    last_tried = port
     for offset in range(attempts):
         candidate = port + offset
         if candidate > 65535:
             break
+        last_tried = candidate
         try:
             return server_class((host, candidate), handler)
         except OSError as exc:
@@ -1729,7 +1736,7 @@ def bind_dashboard_server(
             f"port, or pass --port-search to start searching from {port}."
         ) from last
     raise OSError(
-        f"no free port for the dashboard in {port}-{port + attempts - 1} on {host}. "
+        f"no free port for the dashboard in {port}-{last_tried} on {host}. "
         f"Stop an old dashboard (`puppetmaster dashboard --stop`) or pass an "
         f"explicit --port."
     ) from last

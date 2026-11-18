@@ -151,10 +151,21 @@ def validate_pinned_dispatch(payload: dict, *, adapter: str) -> dict:
     expected_wire = str((payload or {}).get("pinned_adapter_model_name") or "")
     executable_wire = str((payload or {}).get("model") or "")
     routed_id = str((payload or {}).get("router_model_id") or "")
+    registry_wire = pin.adapter_model_name
+    if (
+        adapter == "agentic"
+        and registry_wire != expected_wire
+        and (payload or {}).get("codex_pro_remapped_from") == registry_wire
+    ):
+        # Binding hardened a Codex -pro wire name to its base id. Compare the
+        # payload against that same hardened name.
+        from puppetmaster.openai_codex import remap_codex_pro_model
+
+        registry_wire = remap_codex_pro_model(registry_wire)[0]
     if (
         not expected_wire
         or executable_wire != expected_wire
-        or pin.adapter_model_name != expected_wire
+        or registry_wire != expected_wire
     ):
         raise RegistryAuthorityError(
             f"registry authority invalid for model pin {pinned!r}: executable "

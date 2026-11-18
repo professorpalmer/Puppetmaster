@@ -1686,11 +1686,32 @@ class Orchestrator:
 
         Keeping the first artifact seen meant a stale failure reason could win
         after a retry produced a newer one; compare created_at so the most
-        recent recoverable failure per task is the one reported."""
+        recent recoverable failure per task is the one reported.
+
+        A failure from an attempt before the task's last auto-fallback re-queue
+        does not explain the current status, so only failures after the
+        matching ``router-fallback`` ROUTING artifact count."""
         latest: dict[str, tuple[str, int, object]] = {}
         if artifacts is None:
             artifacts = self.store.list_artifacts(job.id)
+        current_attempt = {
+            task.id: int((task.payload or {}).get("fallback_attempts", 0) or 0)
+            for task in self.store.list_tasks(job.id)
+        }
+        attempt_start: dict[str, tuple[str, int]] = {}
         for index, artifact in enumerate(artifacts):
+            if artifact.created_by != "router-fallback":
+                continue
+            attempt = current_attempt.get(artifact.task_id, 0)
+            if attempt and (artifact.payload or {}).get("fallback_attempt") == attempt:
+                attempt_start[artifact.task_id] = (artifact.created_at, index)
+        for index, artifact in enumerate(artifacts):
+            if current_attempt.get(artifact.task_id, 0):
+                start = attempt_start.get(artifact.task_id)
+                # No re-queue marker for the current attempt: no failure can
+                # be placed in it, so none is recoverable.
+                if start is None or (artifact.created_at, index) <= start:
+                    continue
             failure = (artifact.payload or {}).get("failure")
             # A RISK artifact (agentic auth_failed:401) explains the failure; it
             # must not hide the attempt's recoverable class.

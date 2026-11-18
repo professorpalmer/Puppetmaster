@@ -24,6 +24,8 @@ reported as a concurrent change.
 from __future__ import annotations
 
 import json
+import os
+import posixpath
 import re
 from pathlib import Path
 from typing import Any, Optional
@@ -75,31 +77,93 @@ class WorkerReferences:
         self.truncated = truncated
 
 
-def normalize_path(path: object, cwd: Optional[Path] = None) -> str:
-    """A worker-reported path as a repo-relative POSIX path, best effort."""
+def normalize_path(path: object) -> str:
+    """A repo-relative path from git or a baseline entry, in POSIX form."""
     text = str(path or "").strip().replace("\\", "/")
     if not text:
         return ""
-    if cwd is not None:
-        candidate = Path(text)
-        if candidate.is_absolute():
-            try:
-                text = candidate.resolve().relative_to(Path(cwd).resolve()).as_posix()
-            except (ValueError, OSError):
-                text = candidate.as_posix()
-    while text.startswith("./"):
-        text = text[2:]
-    return text.rstrip("/")
+    text = posixpath.normpath(text)
+    return "" if text == "." else text.rstrip("/")
+
+
+class RepoFrame:
+    """The worker cwd and the git top level, both as POSIX text.
+
+    Event paths are relative to the worker cwd. Git paths are relative to the
+    top level. ``canonical`` puts an event path in the git form, so the gate
+    can compare exact paths.
+    """
+
+    __slots__ = ("cwd", "root")
+
+    def __init__(self, cwd: Optional[Path] = None, root: Optional[Path] = None) -> None:
+        # The adapters run a task without a cwd in ".".
+        base = Path(cwd) if cwd is not None else Path(".").resolve()
+        self.cwd = posixpath.normpath(str(base).replace("\\", "/"))
+        top = Path(root) if root is not None else _git_top_level(base)
+        self.root = posixpath.normpath(str(top).replace("\\", "/"))
+
+    def canonical(self, path: object) -> str:
+        """``path`` relative to the top level, or absolute when outside it."""
+        text = str(path or "").strip().replace("\\", "/")
+        if not text:
+            return ""
+        if not _is_absolute(text):
+            text = self.cwd.rstrip("/") + "/" + text
+        text = posixpath.normpath(text)
+        inside = self._below_root(text)
+        if inside is None:
+            # A linked folder (macOS /var is /private/var) can hide the top
+            # level. Resolve the nearest folder that exists, never the file.
+            inside = self._below_root(_resolve_folder(text))
+        return text if inside is None else inside
+
+    def _below_root(self, text: str) -> Optional[str]:
+        prefix = self.root.rstrip("/") + "/"
+        folded, folded_prefix = (text, prefix)
+        if os.name == "nt":
+            folded, folded_prefix = text.lower(), prefix.lower()
+        if folded.startswith(folded_prefix):
+            return text[len(prefix):]
+        return "" if folded + "/" == folded_prefix else None
+
+
+def _resolve_folder(text: str) -> str:
+    folder, rest = text, ""
+    while folder and not os.path.isdir(folder):
+        parent = posixpath.dirname(folder)
+        if parent == folder:
+            return text
+        rest = posixpath.join(posixpath.basename(folder), rest) if rest else posixpath.basename(folder)
+        folder = parent
+    if not folder:
+        return text
+    real = str(Path(folder).resolve()).replace("\\", "/")
+    return posixpath.normpath(posixpath.join(real, rest)) if rest else posixpath.normpath(real)
+
+
+def _is_absolute(text: str) -> bool:
+    return text.startswith("/") or re.match(r"^[A-Za-z]:/", text) is not None
+
+
+def _git_top_level(cwd: Path) -> Path:
+    # The nearest folder that holds a .git entry (a worktree has a .git file).
+    # Outside Git the snapshot judges paths relative to the cwd.
+    for folder in [cwd, *cwd.parents]:
+        if (folder / ".git").exists():
+            return folder
+    return cwd
 
 
 def codex_event_references(
-    events: list[dict[str, Any]], cwd: Optional[Path] = None
+    events: list[dict[str, Any]], cwd: Optional[Path] = None, root: Optional[Path] = None
 ) -> Optional[WorkerReferences]:
     """Paths a Codex ``--json`` event stream says this run touched.
 
     Returns ``None`` when the stream carried no structured items at all — an
     adapter with nothing to consult keeps the gate's existing behavior.
     """
+    frame = RepoFrame(cwd, root)
     structured = False
     paths: list[str] = []
     for event in events or []:
@@ -113,18 +177,16 @@ def codex_event_references(
             continue
         item_type = str(item.get("type") or "")
         if item_type == "file_change":
-            paths.extend(_file_change_paths(item, cwd))
+            paths.extend(_file_change_paths(item, frame))
         elif item_type == "command_execution":
-            paths.extend(
-                normalize_path(token, cwd) for token in path_tokens(item.get("command"))
-            )
+            paths.extend(frame.canonical(token) for token in path_tokens(item.get("command")))
     if not structured:
         return None
     return path_references(paths)
 
 
 def claude_tool_use_references(
-    stdout: object, cwd: Optional[Path] = None
+    stdout: object, cwd: Optional[Path] = None, root: Optional[Path] = None
 ) -> Optional[WorkerReferences]:
     """Paths Claude Code's ``tool_use`` blocks say this run touched.
 
@@ -132,6 +194,7 @@ def claude_tool_use_references(
     default ``--output-format json`` reports only the final result, which is no
     evidence about who wrote what.
     """
+    frame = RepoFrame(cwd, root)
     paths: list[str] = []
     found = False
     for block in _claude_tool_use_blocks(stdout):
@@ -142,10 +205,8 @@ def claude_tool_use_references(
         for key in ("file_path", "path", "notebook_path", "filePath"):
             value = payload.get(key)
             if isinstance(value, str):
-                paths.append(normalize_path(value, cwd))
-        paths.extend(
-            normalize_path(token, cwd) for token in path_tokens(payload.get("command"))
-        )
+                paths.append(frame.canonical(value))
+        paths.extend(frame.canonical(token) for token in path_tokens(payload.get("command")))
     if not found:
         return None
     return path_references(paths)
@@ -175,7 +236,7 @@ def path_is_referenced(path: str, references: WorkerReferences) -> bool:
     target = normalize_path(path)
     if not target:
         return False
-    return any(_same_path(target, known) for known in references.paths)
+    return target in references.paths
 
 
 def path_was_dirty_before(path: str, baseline: list[str]) -> bool:
@@ -189,7 +250,7 @@ def path_was_dirty_before(path: str, baseline: list[str]) -> bool:
         known = normalize_path(raw)
         if not known:
             continue
-        if _same_path(target, known) or target.startswith(known + "/"):
+        if target == known or target.startswith(known + "/"):
             return True
     return False
 
@@ -202,7 +263,7 @@ def path_references(paths: list[str]) -> WorkerReferences:
     )
 
 
-def _file_change_paths(item: dict[str, Any], cwd: Optional[Path]) -> list[str]:
+def _file_change_paths(item: dict[str, Any], frame: RepoFrame) -> list[str]:
     changes = item.get("changes")
     if isinstance(changes, dict):
         candidates: list[object] = list(changes.keys())
@@ -216,7 +277,7 @@ def _file_change_paths(item: dict[str, Any], cwd: Optional[Path]) -> list[str]:
     for key in ("path", "file_path"):
         if isinstance(item.get(key), str):
             candidates.append(item[key])
-    return [normalize_path(candidate, cwd) for candidate in candidates]
+    return [frame.canonical(candidate) for candidate in candidates]
 
 
 def _command_text(command: object) -> str:
@@ -261,11 +322,3 @@ def _collect_tool_use(node: Any, blocks: list[dict[str, Any]]) -> None:
     elif isinstance(node, list):
         for value in node:
             _collect_tool_use(value, blocks)
-
-
-def _same_path(left: str, right: str) -> bool:
-    if not left or not right:
-        return False
-    if left == right:
-        return True
-    return left.endswith("/" + right) or right.endswith("/" + left)

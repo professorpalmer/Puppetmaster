@@ -265,8 +265,11 @@ def _is_concrete_evidence(evidence: str) -> bool:
 def _normalize_reported_criterion(entry: dict[str, Any]) -> Optional[dict[str, Any]]:
     """Normalize one worker-reported criterion row."""
     key = str(entry.get("criterion") or entry.get("text") or "").strip()
-    if not key:
+    # Workers echo the prompt line with its marker; match the criteria form.
+    keys = normalize_acceptance_criteria([key])
+    if not keys:
         return None
+    key = keys[0]
     status = str(entry.get("status") or "unknown").strip().lower()
     if status not in {"passed", "failed", "unknown", "not_reported"}:
         status = "unknown"
