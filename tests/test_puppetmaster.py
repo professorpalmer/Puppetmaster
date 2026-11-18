@@ -3484,7 +3484,7 @@ class PuppetmasterTests(unittest.TestCase):
                 "puppetmaster.codegraph.shutil.which",
                 return_value="/usr/local/bin/codegraph",
             ), patch(
-                "puppetmaster.codegraph.subprocess.run",
+                "puppetmaster.codegraph._run_cli",
                 return_value=completed,
             ) as run:
                 context = codegraph_context("map auth", tmp)
@@ -3562,7 +3562,7 @@ class PuppetmasterTests(unittest.TestCase):
                 "puppetmaster.codegraph.shutil.which",
                 return_value="/usr/local/bin/codegraph",
             ), patch(
-                "puppetmaster.codegraph.subprocess.run",
+                "puppetmaster.codegraph._run_cli",
                 return_value=completed,
             ) as run:
                 payload = run_codegraph_cli(["query", "Foo", "--json"], tmp)
@@ -3585,7 +3585,7 @@ class PuppetmasterTests(unittest.TestCase):
                 "puppetmaster.codegraph.shutil.which",
                 return_value="/usr/local/bin/codegraph",
             ), patch(
-                "puppetmaster.codegraph.subprocess.run",
+                "puppetmaster.codegraph._run_cli",
                 return_value=completed,
             ) as run:
                 codegraph_query("UserService", tmp, kind="class", limit=5)
@@ -3622,7 +3622,7 @@ class PuppetmasterTests(unittest.TestCase):
                 "puppetmaster.codegraph.shutil.which",
                 return_value="/usr/local/bin/codegraph",
             ), patch(
-                "puppetmaster.codegraph.subprocess.run",
+                "puppetmaster.codegraph._run_cli",
                 return_value=completed,
             ) as run:
                 payload = codegraph_affected(
@@ -3655,7 +3655,7 @@ class PuppetmasterTests(unittest.TestCase):
                 "puppetmaster.codegraph.shutil.which",
                 return_value="/usr/local/bin/codegraph",
             ), patch(
-                "puppetmaster.codegraph.subprocess.run",
+                "puppetmaster.codegraph._run_cli",
                 return_value=completed,
             ) as run:
                 codegraph_files_listing(
@@ -3699,7 +3699,7 @@ class PuppetmasterTests(unittest.TestCase):
                 "puppetmaster.codegraph.shutil.which",
                 return_value="/usr/local/bin/codegraph",
             ), patch(
-                "puppetmaster.codegraph.subprocess.run",
+                "puppetmaster.codegraph._run_cli",
                 return_value=completed,
             ):
                 result = call_tool(
@@ -3749,7 +3749,7 @@ class PuppetmasterTests(unittest.TestCase):
                 "puppetmaster.codegraph.shutil.which",
                 return_value="/usr/local/bin/codegraph",
             ), patch(
-                "puppetmaster.codegraph.subprocess.run",
+                "puppetmaster.codegraph._run_cli",
                 return_value=completed,
             ) as run:
                 result = call_tool(
@@ -3794,7 +3794,7 @@ class PuppetmasterTests(unittest.TestCase):
                 "puppetmaster.codegraph.shutil.which",
                 return_value="/usr/local/bin/codegraph",
             ), patch(
-                "puppetmaster.codegraph.subprocess.run",
+                "puppetmaster.codegraph._run_cli",
                 return_value=completed,
             ):
                 measurement = measure_enrichment("map streaming", tmp)
@@ -3978,7 +3978,7 @@ class PuppetmasterTests(unittest.TestCase):
                     "puppetmaster.codegraph.shutil.which",
                     return_value="/usr/local/bin/codegraph",
                 ), patch(
-                    "puppetmaster.codegraph.subprocess.run",
+                    "puppetmaster.codegraph._run_cli",
                     return_value=completed,
                 ) as run, patch(
                     "puppetmaster.mcp_server.subprocess.Popen",
@@ -4085,7 +4085,7 @@ class PuppetmasterTests(unittest.TestCase):
                 "puppetmaster.codegraph.shutil.which",
                 return_value="/usr/local/bin/codegraph",
             ), patch(
-                "puppetmaster.codegraph.subprocess.run",
+                "puppetmaster.codegraph._run_cli",
                 return_value=broken,
             ):
                 result = call_tool("puppetmaster_codegraph_status", {"cwd": tmp})
@@ -5595,7 +5595,7 @@ class PuppetmasterTests(unittest.TestCase):
         with patch.object(
             codegraph_mod, "_cursor_codegraph_invocation", return_value=None
         ), patch("puppetmaster.codegraph.shutil.which", side_effect=fake_which), patch(
-            "puppetmaster.codegraph.subprocess.run"
+            "puppetmaster.codegraph._run_cli"
         ) as run_mock:
             self.assertFalse(codegraph_mod.codegraph_available())
             run_mock.assert_not_called()
@@ -5628,7 +5628,7 @@ class PuppetmasterTests(unittest.TestCase):
 
         with patch.object(codegraph_mod, "_cursor_codegraph_invocation", return_value=None), patch(
             "puppetmaster.codegraph.shutil.which", side_effect=fake_which
-        ), patch("puppetmaster.codegraph.subprocess.run", side_effect=fake_run) as run_mock, patch.dict(
+        ), patch("puppetmaster.codegraph._run_cli", side_effect=fake_run) as run_mock, patch.dict(
             os.environ, {}, clear=False
         ):
             for var in ("PUPPETMASTER_CODEGRAPH_NO_NPX", "PUPPETMASTER_CODEGRAPH_NO_GLOBAL_INSTALL",

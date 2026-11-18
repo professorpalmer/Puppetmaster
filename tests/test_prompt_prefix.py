@@ -205,7 +205,7 @@ class CodegraphMemoizationTests(unittest.TestCase):
             with mock.patch.object(codegraph, "codegraph_ready", return_value=True), mock.patch.object(
                 codegraph, "resolve_codegraph_invocation", return_value=["codegraph"]
             ), mock.patch.object(
-                codegraph.subprocess, "run", return_value=completed
+                codegraph, "_run_cli", return_value=completed
             ) as run, mock.patch.object(codegraph, "_record_codegraph_usage"):
                 first = codegraph.codegraph_context("map auth", tmp, max_nodes=15)
                 second = codegraph.codegraph_context("map auth", tmp, max_nodes=15)
