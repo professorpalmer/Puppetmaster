@@ -420,6 +420,14 @@ def _credential_env_checks() -> list[Check]:
     return checks
 
 
+def _home_relative(path: Path) -> str:
+    # A string prefix test is wrong for a sibling such as /x/ab of home /x/a.
+    home = Path.home()
+    if path.is_relative_to(home):
+        return str(path.relative_to(home))
+    return str(path)
+
+
 def _agent_rules_check(root: Path) -> Check:
     """Warn when MCP is wired but no agent rule file is present.
 
@@ -454,10 +462,7 @@ def _agent_rules_check(root: Path) -> Check:
         except OSError:
             continue
     if rule_present_paths:
-        rel = ", ".join(
-            str(p.relative_to(Path.home())) if str(p).startswith(str(Path.home())) else str(p)
-            for p in rule_present_paths[:2]
-        )
+        rel = ", ".join(_home_relative(p) for p in rule_present_paths[:2])
         return Check("agent-rules", "ok", f"agent rule present ({rel})")
     cursor_mcp = (root / ".cursor" / "mcp.json").is_file() or (Path.home() / ".cursor" / "mcp.json").is_file()
     if not cursor_mcp:
@@ -919,12 +924,21 @@ def _claude_code_check() -> Check:
     )
 
 
+def _command_path_exists(first: str) -> bool:
+    # A bare name is resolved on PATH only. A path test on it would look in
+    # the current directory and accept a file or folder with that name.
+    seps = [sep for sep in (os.sep, os.altsep) if sep]
+    if not first.startswith("~") and not any(sep in first for sep in seps):
+        return False
+    return Path(first).expanduser().exists()
+
+
 def _claude_code_installed() -> bool:
     command = shlex.split(_claude_code_command())
     if not command:
         return False
     first = command[0]
-    if Path(first).expanduser().exists():
+    if _command_path_exists(first):
         return True
     return shutil.which(first) is not None
 
@@ -938,7 +952,7 @@ def _codex_cli_installed() -> bool:
     if not command:
         return False
     first = command[0]
-    if Path(first).expanduser().exists():
+    if _command_path_exists(first):
         return True
     return shutil.which(first) is not None
 
@@ -952,7 +966,7 @@ def _hermes_cli_installed() -> bool:
     if not command:
         return False
     first = command[0]
-    if Path(first).expanduser().exists():
+    if _command_path_exists(first):
         return True
     return shutil.which(first) is not None
 
@@ -977,7 +991,7 @@ def _fx_cli_installed() -> bool:
     if not command:
         return False
     first = command[0]
-    if Path(first).expanduser().exists():
+    if _command_path_exists(first):
         return True
     return shutil.which(first) is not None
 
@@ -1002,7 +1016,7 @@ def _antigravity_installed() -> bool:
     if not command:
         return False
     first = command[0]
-    if Path(first).expanduser().exists():
+    if _command_path_exists(first):
         return True
     return shutil.which(first) is not None
 

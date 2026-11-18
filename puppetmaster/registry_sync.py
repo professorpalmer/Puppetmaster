@@ -192,9 +192,23 @@ def unroutable_pin_hint(
         return ""
     if starter_pin is None:
         return ""
+    specs = list(registry)
     present = next(
-        (spec for spec in registry if spec.id == starter_pin.registry_id), None
+        (spec for spec in specs if spec.id == starter_pin.registry_id), None
     )
+    if present is None:
+        # `models sync` skips a starter id that another entry covers, so the
+        # covering entry is the one the owner must fix.
+        starter_spec = next(
+            (s for s in starter_registry() if s.id == starter_pin.registry_id),
+            None,
+        )
+        if starter_spec is not None:
+            identity = _execution_identity(starter_spec)
+            present = next(
+                (spec for spec in specs if _execution_identity(spec) == identity),
+                None,
+            )
     if present is None:
         return (
             f"{starter_pin.registry_id!r} is a starter registry entry that this "
