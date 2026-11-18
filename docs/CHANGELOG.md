@@ -1,3 +1,20 @@
+## v1.51.1 — 2026-11-18
+
+**A CodeGraph command that times out no longer leaves a process alive.**
+Puppetmaster calls the CodeGraph CLI with a timeout for the task of each
+worker. The CLI is an npm shim that starts the real Node binary as a child.
+At the timeout, only the shim ended. The real process stayed alive with no
+reader, and it could grow to more than 2 GB. A fan-out of workers in new
+folders left one such process for each worker start. On a 48 GB machine, 120
+of them held 93 GB.
+
+- Each CodeGraph command now starts in its own process group. At the timeout
+  the whole group ends. On Windows the process tree ends through `taskkill`.
+- The five callers in `puppetmaster/codegraph.py` use one function,
+  `_run_cli`, which has the signature of `subprocess.run`.
+- `tests/test_codegraph_process_group.py` starts a shim with a child that
+  sleeps and checks that the child is gone after the timeout.
+
 ## v1.51.0 — 2026-11-17
 
 **`puppetmaster models sync` adds new starter models to an old registry.**
