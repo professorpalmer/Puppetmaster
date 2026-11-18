@@ -38,6 +38,15 @@ def _coerce_int(value: Any) -> Optional[int]:
     return int(value)
 
 
+def _count(value: Any) -> int:
+    """A stored token count as an int. Text that is not a number counts as 0,
+    and ``_billable_presence`` reports that field as unknown."""
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def usage_from_sdk(sdk_usage: Any) -> Optional[dict[str, Optional[int]]]:
     """Normalize a Cursor/Claude SDK usage object into in/out token counts.
 
@@ -147,8 +156,8 @@ def usage_record_score(payload: dict) -> tuple:
         real_cost = float(payload.get("real_cost_usd") or 0.0)
     except (TypeError, ValueError):
         real_cost = 0.0
-    tin = int(payload.get("tokens_in") or 0)
-    tout = int(payload.get("tokens_out") or 0)
+    tin = _count(payload.get("tokens_in"))
+    tout = _count(payload.get("tokens_out"))
     estimated = bool(payload.get("tokens_estimated"))
     return (
         0 if failed else 1,
@@ -188,11 +197,11 @@ def select_usage_records(artifacts: Iterable[Artifact]) -> dict:
             continue
         scores[task_id] = score
         records[task_id] = {
-            "tokens_in": int(payload.get("tokens_in") or 0),
-            "tokens_out": int(payload.get("tokens_out") or 0),
+            "tokens_in": _count(payload.get("tokens_in")),
+            "tokens_out": _count(payload.get("tokens_out")),
             # Codex and Antigravity name the input-inclusive cache hit
             # cached_input_tokens; unread, every cache hit priced as fresh input.
-            "tokens_cached": int(payload.get("tokens_cached") or payload.get("cached_input_tokens") or 0),
+            "tokens_cached": _count(payload.get("tokens_cached") or payload.get("cached_input_tokens")),
             "real_cost_usd": payload.get("real_cost_usd"),
             "tokens_estimated": bool(payload.get("tokens_estimated")),
             "model": payload.get("model"),
@@ -211,7 +220,7 @@ def select_usage_records(artifacts: Iterable[Artifact]) -> dict:
         # tokens_cached (a subset of input). Do not synthesize absent keys.
         for key in ("cache_read_tokens", "cache_write_tokens"):
             if key in payload:
-                records[task_id][key] = int(payload.get(key) or 0)
+                records[task_id][key] = _count(payload.get(key))
         records[task_id].update(_billable_presence(payload))
     return records
 

@@ -137,7 +137,9 @@ def catalog_to_specs(
     Capability/price/context are inherited from an existing registry entry for
     the same adapter+model (the registry is a tuning overlay), then from any
     same-named entry on a sibling adapter, and finally a conservative seed the
-    user edits. ``billing`` is the caller-provided posture for the adapter."""
+    user edits. ``billing`` is the caller-provided posture for the adapter: a
+    new entry and an existing entry with billing ``unknown`` get it, and an
+    existing entry with a known billing keeps its own."""
     same_adapter = {
         spec.adapter_model_name: spec for spec in existing if spec.adapter == adapter
     }
