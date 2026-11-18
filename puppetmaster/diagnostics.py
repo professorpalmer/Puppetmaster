@@ -78,6 +78,7 @@ def run_doctor(root: Path, state_dir: Optional[Path] = None) -> list[Check]:
     checks.extend(_guard_many(_credential_env_checks))
     checks.extend(_guard_many(_billing_checks))
     checks.append(_guard("catalog-freshness", _catalog_freshness_check))
+    checks.append(_guard("registry-starter-sync", _registry_starter_sync_check))
     checks.append(_guard("platform-lock", _platform_lock_check))
     checks.append(_guard("grok-bot-path", lambda: grok_bot_path_check(root)))
     checks.append(_guard("pi-pilot", lambda: pi_pilot_check()))
@@ -184,6 +185,40 @@ def _platform_lock_check() -> Check:
     if (os.environ.get(pl.ONLY_ENV) or "").strip():
         detail += f"; via ${pl.ONLY_ENV}"
     return Check("platform-lock", "ok", detail)
+
+
+def _registry_starter_sync_check(registry_path: Optional[Path] = None) -> Check:
+    """Warn when the registry lacks entries that the starter registry has.
+
+    A registry that an old release wrote does not get the starter entries of
+    later releases. A pin on one of those ids then fails at launch."""
+    from puppetmaster.registry_sync import SYNC_COMMAND, sync_starter_registry
+
+    name = "registry-starter-sync"
+    try:
+        plan = sync_starter_registry(registry_path)
+    except RuntimeError as exc:
+        return Check(name, "warn", f"registry unreadable: {exc}")
+    if not plan.registry_exists:
+        return Check(
+            name,
+            "optional",
+            f"no model registry at {plan.path} — run `puppetmaster models init`.",
+        )
+    if not plan.additions:
+        return Check(name, "ok", "registry has every starter entry")
+    counts = ", ".join(
+        f"{adapter} {len(additions)}"
+        for adapter, additions in plan.by_adapter().items()
+    )
+    return Check(
+        name,
+        "warn",
+        f"{len(plan.additions)} starter model id(s) are absent from {plan.path} "
+        f"({counts}). Run `{SYNC_COMMAND}` to list them, then "
+        f"`{SYNC_COMMAND} --apply` to add them with enabled=false.",
+        evidence=[addition.spec.id for addition in plan.additions],
+    )
 
 
 def _catalog_freshness_check() -> Check:

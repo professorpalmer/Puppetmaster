@@ -169,6 +169,7 @@ python -m puppetmaster observe-scm <job_id> [--cwd] [--json] [--no-enqueue]
                                                               # one-shot host CI/review/conflict observe + same-job follow-ups
 python -m puppetmaster models init                            # write starter registry
 python -m puppetmaster models list                            # show registered models
+python -m puppetmaster models sync [--apply] [--enable]       # list starter entries the registry lacks; --apply appends them with enabled=false
 python -m puppetmaster models discover --probe                 # snapshot reachable catalogs without changing models.json
 python -m puppetmaster doctor                                  # report stale catalogs and pending registry drift
 python -m puppetmaster models discover --source agentic --write   # seed keys-only agentic catalog (filtered by visible provider keys)

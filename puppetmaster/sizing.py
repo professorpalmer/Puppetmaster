@@ -24,11 +24,13 @@ DELEGATE_UPFRONT = "delegate_upfront"
 DONE_STATUSES = frozenset(("done", "completed", "complete"))
 PARALLEL_TAG = "[parallel]"
 
-# Provisional until the falloff sweep writes a calibration file. The sealed
-# Sol 6.1 high voxel study (153 cells, PM 1.27.39) puts the first consistent
-# crossover at 16 regions, and it is a quality crossover: solo often finishes
-# in time but under the floor (64 grouped: solo 403 s, 0/3 qualified; native
-# 494 s, 3/3). A time projection cannot see that, so upfront_units carries it.
+# Two Sol 6.1 high voxel studies put the quality crossover at 16 regions.
+# The sealed study (153 cells, PM 1.27.39) saw solo under the floor at 64
+# grouped (0/3 qualified). The blind-judge study (PM 1.49.0, 3 reps per arm)
+# saw every solo world pass the floor at 4, 16 and 64, but judges preferred
+# crew worlds from 16 up (64: 43 crew scenes, 0 solo). A time projection
+# cannot see either effect, so upfront_units carries it. per_unit_s stays
+# unset: the measured solo pace is mostly fixed work and is task-specific.
 DEFAULT_CALIBRATION: dict[str, Any] = {
     "solo_horizon_s": 1200.0,
     "solo_context_frac": 0.6,
@@ -37,7 +39,7 @@ DEFAULT_CALIBRATION: dict[str, Any] = {
     "min_unit_s": 20.0,
     "handoff_overhead_s": 90.0,
     "late_fraction": 0.8,
-    "source": "provisional: sealed sol61 voxel study, quality crossover at 16 regions",
+    "source": "sol61 voxel studies: quality crossover at 16 regions",
 }
 
 
