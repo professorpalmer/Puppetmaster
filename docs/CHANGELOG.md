@@ -1,3 +1,34 @@
+## v1.52.0 — 2026-11-19
+
+**Claude Code workers start with a lean profile: the project, not the person.**
+Claude Code loads the personal memory files of the user (`~/.claude/CLAUDE.md`,
+`~/.claude/rules/`), the skills of the user and the MCP servers of the user
+into each session. A worker paid for that context on each start. On the
+measured machine it was 75,000 of 108,700 start tokens, and three MCP servers
+started for each worker.
+
+- Each Claude Code worker now starts with `--setting-sources project,local`,
+  `--settings <user settings.json>` and `--strict-mcp-config`. The worker reads
+  the `CLAUDE.md` and the settings of the repository. The environment block,
+  the credential helpers, the permission rules and the hooks of the user
+  settings file stay active. No MCP server starts for the worker.
+- Measured (Claude Code 2.1.316): the context of a worker start went from
+  108,700 to 33,500 tokens. One small edit task had an API-equivalent cost of
+  $0.362 before and $0.049 after, with the same tool calls and the same result.
+  A session of a lean worker resumes with the lean profile.
+- Changes that you can see: a convention that is only in your personal memory
+  files does not reach a worker (put it in the `CLAUDE.md` of the repository).
+  A value in your `settings.json` has priority over the same key in a project
+  settings file. A worker has no MCP tools unless `payload.extra_args` names a
+  server with `--mcp-config`.
+- To turn the profile off: `PUPPETMASTER_CLAUDE_LEAN=0` for all workers, or
+  `payload.lean_profile: false` for one task. An argument in
+  `payload.extra_args` wins over the profile.
+- The verification artifact of a lean worker has `profile:lean` in its
+  evidence. A settings file that is not a JSON object is not passed, because
+  the CLI stops on such a file.
+- Docs: `docs/ADAPTERS.md`, section `claude-code`.
+
 ## v1.51.4 — 2026-11-18
 
 **`models sync --apply` no longer changes auto-routing, and seven smaller fixes.**
