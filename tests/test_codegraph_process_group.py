@@ -82,7 +82,11 @@ class CodegraphProcessGroupTests(unittest.TestCase):
                 started.append(self)
 
             def communicate(self, *args, **kwargs):
-                raise KeyboardInterrupt()
+                # Only the command under test gets the interrupt. On Windows the
+                # end of the process tree starts taskkill through Popen too.
+                if self is started[0]:
+                    raise KeyboardInterrupt()
+                return super().communicate(*args, **kwargs)
 
         with mock.patch.object(codegraph.subprocess, "Popen", Interrupted):
             with self.assertRaises(KeyboardInterrupt):
