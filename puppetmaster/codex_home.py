@@ -127,9 +127,10 @@ def _toml_unescape(match: "re.Match[str]") -> str:
     return match.group(0)
 
 
-def _first_key(text: str) -> Optional[str]:
-    """The first part of the TOML key at the start of ``text``: ``a`` for ``a = 1``,
-    ``a.b = 1``, ``"a".b = 1`` and ``'a' = 1``. None when the text does not start with a key.
+def _split_key(text: str) -> Tuple[Optional[str], str]:
+    """The first part of the TOML key at the start of ``text``, and the text after that
+    part: ``a`` for ``a = 1``, ``a.b = 1``, ``"a".b = 1`` and ``'a' = 1``. The key is
+    None when the text does not start with a key.
     """
     text = text.lstrip(" \t")
     if text.startswith('"'):
@@ -137,13 +138,44 @@ def _first_key(text: str) -> Optional[str]:
         while i < len(text) and text[i] != '"':
             i += 2 if text[i] == "\\" else 1
         if i >= len(text):
-            return None
-        return _TOML_ESCAPE.sub(_toml_unescape, text[1:i])
+            return None, ""
+        return _TOML_ESCAPE.sub(_toml_unescape, text[1:i]), text[i + 1:]
     if text.startswith("'"):
         end = text.find("'", 1)
-        return None if end == -1 else text[1:end]
+        return (None, "") if end == -1 else (text[1:end], text[end + 1:])
     match = _BARE_KEY.match(text)
-    return match.group(0) if match else None
+    return (match.group(0), text[match.end():]) if match else (None, "")
+
+
+def _first_key(text: str) -> Optional[str]:
+    return _split_key(text)[0]
+
+
+def _toml_string(text: str) -> str:
+    """The value of the TOML string at the start of ``text``, or '' when the text does
+    not start with a string that ends on the same line.
+    """
+    for delimiter in ('"""', "'''", '"', "'"):
+        if text.startswith(delimiter):
+            break
+    else:
+        return ""
+    basic = delimiter[0] == '"'
+    body = text[len(delimiter):]
+    i = 0
+    while i < len(body):
+        if basic and body[i] == "\\":
+            i += 2
+        elif body.startswith(delimiter, i):
+            if len(delimiter) == 3:
+                # The content can end with one or two quote characters.
+                extra = 0
+                while extra < 2 and body.startswith(delimiter[0], i + 3):
+                    i, extra = i + 1, extra + 1
+            return _TOML_ESCAPE.sub(_toml_unescape, body[:i]) if basic else body[:i]
+        else:
+            i += 1
+    return ""
 
 
 def lean_config(text: str) -> str:
@@ -233,6 +265,12 @@ def prepare(env: Optional[dict] = None, *, root: Optional[Path] = None) -> Optio
                 data = raw  # not UTF-8 (a cp1252 file on Windows): copy it as is
             if _digest(home / "AGENTS.md") != hashlib.sha256(data).hexdigest():
                 _write_atomic(home / "AGENTS.md", data, 0o644)
+        else:
+            # The user removed their AGENTS.md, so the worker must not keep the old copy.
+            try:
+                (home / "AGENTS.md").unlink()
+            except FileNotFoundError:
+                pass
         user_auth = _digest(source / "auth.json")
         synced = _read(home / ".auth.synced")
         if user_auth != synced:
@@ -396,6 +434,8 @@ def home_for_session(session_id: str, env: Optional[dict] = None) -> Optional[Pa
 def configured_model(env: Optional[dict] = None) -> str:
     """The top-level ``model`` in the user's Codex config, or ''.
 
+    The value is a TOML string on one line. Each other value gives ''.
+
     An unpinned Codex worker runs the model the user's own Codex would pick;
     a hard-coded fallback went stale (gpt-5.4-mini returned model_unavailable
     and failed every node of an unpinned flow).
@@ -404,11 +444,17 @@ def configured_model(env: Optional[dict] = None) -> str:
         text = (user_home(env) / "config.toml").read_text(encoding="utf-8-sig")
     except (OSError, ValueError):
         return ""
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("["):
-            break
-        match = re.match(r'model\s*=\s*"([^"]+)"', stripped)
-        if match:
-            return match.group(1)
+    depth = 0
+    quote: Optional[str] = None
+    for line in text.split("\n"):
+        if depth == 0 and quote is None:
+            # A new statement. The first table header ends the top level.
+            stripped = line.strip(" \t")
+            if stripped.startswith("["):
+                break
+            key, rest = _split_key(stripped)
+            rest = rest.lstrip(" \t")
+            if key == "model" and rest.startswith("="):
+                return _toml_string(rest[1:].lstrip(" \t"))
+        depth, quote = _toml_scan(line, depth, quote)
     return ""

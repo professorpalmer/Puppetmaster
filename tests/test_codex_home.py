@@ -179,6 +179,33 @@ class ConfiguredModelTests(unittest.TestCase):
             self.assertEqual(codex_home.configured_model({"CODEX_HOME": tmp}), "")
             self.assertEqual(codex_home.configured_model({"CODEX_HOME": tmp + "/missing"}), "")
 
+    def _model(self, config: str) -> str:
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "config.toml").write_text(config, encoding="utf-8")
+            return codex_home.configured_model({"CODEX_HOME": tmp})
+
+    def test_each_form_of_a_top_level_model_is_read(self):
+        for config in ("model = 'gpt-6.1-sol'\n", '"model" = "gpt-6.1-sol"\n', "'model'='gpt-6.1-sol'  # the default\n",
+                       'model = "gpt-6\\u002e1-sol"\n', 'model = """gpt-6.1-sol"""\n', "model = '''gpt-6.1-sol'''\n",
+                       'ids = [\n[1],\n]\nmodel = "gpt-6.1-sol"\n',
+                       'note = """\nmodel = "fake"\n[profiles.x]\n"""\nmodel = "gpt-6.1-sol"\n',
+                       'model_provider = "p"\nmodel-x = "q"\nmodel = "gpt-6.1-sol"\n'):
+            self.assertEqual(self._model(config), "gpt-6.1-sol", config)
+
+    def test_a_text_that_is_not_the_top_level_model_is_not_read(self):
+        for config in ('x = { model = "inline" }\n[t]\nmodel = "table"\n', 'model.name = "dotted"\n', "model = 5\n",
+                       'models = "other key"\n', '# model = "comment"\n', 'x = [\n  "a",\n  model = "broken"\n'):
+            self.assertEqual(self._model(config), "", config)
+
+    def test_the_model_agrees_with_a_toml_parser(self):
+        try:
+            import tomllib
+        except ImportError:  # Python < 3.11
+            self.skipTest("tomllib starts with Python 3.11")
+        for config in (CONFIG, 'a = [\n  [1],\n]\n"model" = \'m"1\'\n[t]\nmodel = "no"\n',
+                       'model = "a\\"b#c"  # d\n', 'note = \'\'\'\nmodel = "fake"\n\'\'\'\nmodel = "m"\n', "x = 1\n"):
+            self.assertEqual(self._model(config), tomllib.loads(config).get("model", ""), config)
+
     def test_a_config_with_a_byte_order_mark_is_read(self):
         # Codex reads a config.toml that starts with a byte order mark.
         with tempfile.TemporaryDirectory() as tmp:
@@ -207,6 +234,14 @@ class AuthSyncTests(unittest.TestCase):
         self.assertFalse((home / "auth.json").is_symlink())
         self.assertEqual((home / "AGENTS.md").read_text().strip(), "no emojis")
         self.assertNotIn("mcp_servers", (home / "config.toml").read_text())
+
+    def test_a_removed_agents_file_leaves_the_worker_home(self):
+        home = codex_home.prepare(self.env, root=self.worker)
+        self.assertEqual((home / "AGENTS.md").read_text(), "no emojis")
+        (self.user / "AGENTS.md").unlink()
+        codex_home.prepare(self.env, root=self.worker)
+        self.assertFalse((home / "AGENTS.md").exists())
+        codex_home.prepare(self.env, root=self.worker)
 
     def test_a_config_with_a_byte_order_mark_loses_its_first_dropped_statement(self):
         for first in ('notify = ["prog"]\n', '[mcp_servers.one]\ncommand = "c"\n'):

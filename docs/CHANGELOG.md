@@ -1,7 +1,8 @@
 ## v1.52.1 — 2026-11-19
 
-**The lean Codex config filter reads TOML statements, and three smaller fixes.**
-The Hard Proof audit ladder found these faults. Each one has a repro and a test.
+**The lean Codex home reads `config.toml` as TOML statements, and four smaller fixes.**
+The Hard Proof audit ladder and the release audit gate (`hpf gate`) found these
+faults. Each one has a repro and a test.
 
 - Lean Codex home, `config.toml` filter (`codex_home.lean_config`): the filter
   read the file line by line with a pattern. It now reads TOML statements. A
@@ -20,6 +21,16 @@ The Hard Proof audit ladder found these faults. Each one has a repro and a test.
   an unpinned Codex worker did not get the `model` of its first line. Codex
   reads such a file (probed with Codex 0.160.0), so Puppetmaster now reads it
   too.
+- Model of an unpinned Codex worker (`codex_home.configured_model`): the
+  reader used the same line pattern. It now reads TOML statements too. A model
+  in single quotes (`model = 'gpt-6.1-sol'`) or with a quoted key is read.
+  Before, the worker got no model. A `model = "..."` line inside a multi-line
+  string is text. Before, it was the model of the worker. An array with nested
+  arrays before the `model` key does not end the search. The release audit
+  gate found these three faults.
+- Lean Codex home, `AGENTS.md`: when the user removes `~/.codex/AGENTS.md`,
+  the copy in the worker home goes too. Before, each later Codex worker kept
+  the removed rules. The release audit gate found this fault.
 - Lean Claude Code profile: a user `settings.json` that starts with a byte
   order mark did not parse, so the worker got no `--settings` file and lost
   the environment block, the permission rules and the hooks of the user.
