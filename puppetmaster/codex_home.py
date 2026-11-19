@@ -28,6 +28,7 @@ Workers then find a current marker and skip the install.
 """
 from __future__ import annotations
 
+import glob
 import hashlib
 import json
 import os
@@ -275,10 +276,27 @@ def session_homes(env: Optional[dict] = None) -> list[Path]:
     return homes + [user_home(env)]
 
 
+_ROLLOUT_STAMP = re.compile(r"rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-")
+
+
+def rollout_file(root: Path, session_id: str) -> Optional[Path]:
+    """The rollout file of exactly ``session_id`` below a ``sessions`` folder.
+
+    A rollout is ``rollout-<timestamp>-<session id>.jsonl``. The glob alone
+    also accepts an id that is only the end of a different session id, so the
+    part before the id must be a timestamp. The id is not a glob pattern.
+    """
+    name_end = f"-{session_id}.jsonl"
+    for path in root.glob(f"*/*/*/rollout-*{glob.escape(name_end)}"):
+        if _ROLLOUT_STAMP.fullmatch(path.name[: len(path.name) - len(name_end) + 1]):
+            return path
+    return None
+
+
 def home_for_session(session_id: str, env: Optional[dict] = None) -> Optional[Path]:
     for home in session_homes(env):
         root = home / "sessions"
-        if root.is_dir() and next(root.glob(f"*/*/*/rollout-*-{session_id}.jsonl"), None) is not None:
+        if root.is_dir() and rollout_file(root, session_id) is not None:
             return home
     return None
 
