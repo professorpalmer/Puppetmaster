@@ -102,6 +102,21 @@ def _kill_process_tree(process: "subprocess.Popen") -> None:
         pass
 
 
+def _reap(process: "subprocess.Popen") -> None:
+    """Wait for an ended CodeGraph command and close its pipes, as ``subprocess.run`` does."""
+    try:
+        process.wait(timeout=10)
+    except (subprocess.SubprocessError, OSError):
+        # The command is not ended. A close can block on a pipe that a reader holds.
+        return
+    for pipe in (process.stdin, process.stdout, process.stderr):
+        if pipe is not None:
+            try:
+                pipe.close()
+            except OSError:
+                pass
+
+
 def _run_cli(command: list, *, timeout: Optional[float] = None, check: bool = False,
              capture_output: bool = False, **kwargs: Any) -> "subprocess.CompletedProcess":
     """``subprocess.run`` for a CodeGraph command, with one difference at a timeout.
@@ -128,6 +143,7 @@ def _run_cli(command: list, *, timeout: Optional[float] = None, check: bool = Fa
         raise subprocess.TimeoutExpired(command, timeout, output=stdout, stderr=stderr)
     except BaseException:
         _kill_process_tree(process)
+        _reap(process)
         raise
     completed = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
     if check:

@@ -37,13 +37,19 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 from puppetmaster.interprocess_lock import InterProcessFileLock
 
 # Tables a bounded worker must not inherit: they cost context or reach out.
-_DROPPED_TABLE = re.compile(r"^\[\[?\s*(mcp_servers|plugins|marketplaces|memories|hooks)\b")
+_DROPPED_TABLES = ("mcp_servers", "plugins", "marketplaces", "memories", "hooks")
 _DROPPED_TOP_KEYS = ("notify",)
+# The header of a dropped table with a bare name. No value of an array or of an inline table has this form.
+_DROPPED_BARE_HEADER = re.compile(r"^\[\[?[ \t]*(" + "|".join(_DROPPED_TABLES) + r")[ \t]*[.\]]")
+_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
+# The escapes of a basic TOML string (TOML 1.0, and `\e` and `\xHH` of TOML 1.1).
+_TOML_ESCAPE = re.compile(r"\\(u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}|x[0-9A-Fa-f]{2}|.)")
+_TOML_SIMPLE = {"b": "\b", "t": "\t", "n": "\n", "f": "\f", "r": "\r", "e": "\x1b", '"': '"', "\\": "\\"}
 _LOCK_STALE_SECONDS = 30.0
 
 
@@ -64,33 +70,150 @@ def worker_home_root() -> Path:
     return puppetmaster_home() / "codex-worker-home"
 
 
+def _toml_scan(line: str, depth: int, quote: Optional[str]) -> Tuple[int, Optional[str]]:
+    """The state after one line of TOML: the depth of open arrays and inline tables, and
+    the delimiter of an open multi-line string (or None).
+
+    Brackets in a string or a comment do not count. A statement ends where the depth is 0
+    and no string is open, so a line that starts with "[" is a table header only at such
+    a point.
+    """
+    i, n = 0, len(line)
+    while i < n:
+        if quote:
+            if quote == '"""' and line[i] == "\\":
+                # In a basic multi-line string a backslash escapes the next character.
+                i += 2
+            elif line.startswith(quote, i):
+                # The content of a multi-line string can end with one or two quote
+                # characters, so the string closes at the end of a run of three to five.
+                i += 3
+                extra = 0
+                while extra < 2 and i < n and line[i] == quote[0]:
+                    i, extra = i + 1, extra + 1
+                quote = None
+            else:
+                i += 1
+            continue
+        ch = line[i]
+        if ch == "#":
+            break
+        if line.startswith('"""', i) or line.startswith("'''", i):
+            quote = line[i:i + 3]
+            i += 3
+            continue
+        if ch == '"':
+            i += 1
+            while i < n and line[i] != '"':
+                i += 2 if line[i] == "\\" else 1
+        elif ch == "'":
+            end = line.find("'", i + 1)
+            i = n if end == -1 else end
+        elif ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            depth = max(depth - 1, 0)
+        i += 1
+    return depth, quote
+
+
+def _toml_unescape(match: "re.Match[str]") -> str:
+    """The character of one escape. An escape that TOML does not have stays as it is."""
+    code = match.group(1)
+    if code in _TOML_SIMPLE:
+        return _TOML_SIMPLE[code]
+    if len(code) > 1 and int(code[1:], 16) <= 0x10FFFF:
+        return chr(int(code[1:], 16))
+    return match.group(0)
+
+
+def _split_key(text: str) -> Tuple[Optional[str], str]:
+    """The first part of the TOML key at the start of ``text``, and the text after that
+    part: ``a`` for ``a = 1``, ``a.b = 1``, ``"a".b = 1`` and ``'a' = 1``. The key is
+    None when the text does not start with a key.
+    """
+    text = text.lstrip(" \t")
+    if text.startswith('"'):
+        i = 1
+        while i < len(text) and text[i] != '"':
+            i += 2 if text[i] == "\\" else 1
+        if i >= len(text):
+            return None, ""
+        return _TOML_ESCAPE.sub(_toml_unescape, text[1:i]), text[i + 1:]
+    if text.startswith("'"):
+        end = text.find("'", 1)
+        return (None, "") if end == -1 else (text[1:end], text[end + 1:])
+    match = _BARE_KEY.match(text)
+    return (match.group(0), text[match.end():]) if match else (None, "")
+
+
+def _first_key(text: str) -> Optional[str]:
+    return _split_key(text)[0]
+
+
+def _toml_string(text: str) -> str:
+    """The value of the TOML string at the start of ``text``, or '' when the text does
+    not start with a string that ends on the same line.
+    """
+    for delimiter in ('"""', "'''", '"', "'"):
+        if text.startswith(delimiter):
+            break
+    else:
+        return ""
+    basic = delimiter[0] == '"'
+    body = text[len(delimiter):]
+    i = 0
+    while i < len(body):
+        if basic and body[i] == "\\":
+            i += 2
+        elif body.startswith(delimiter, i):
+            if len(delimiter) == 3:
+                # The content can end with one or two quote characters.
+                extra = 0
+                while extra < 2 and body.startswith(delimiter[0], i + 3):
+                    i, extra = i + 1, extra + 1
+            return _TOML_ESCAPE.sub(_toml_unescape, body[:i]) if basic else body[:i]
+        else:
+            i += 1
+    return ""
+
+
 def lean_config(text: str) -> str:
-    """The user's config.toml without the tables and keys a worker must not inherit."""
+    """The user's config.toml without the tables and keys a worker must not inherit.
+
+    A dropped table goes in each form that TOML has for it: a header
+    (``[mcp_servers.x]``, ``[[hooks]]``, ``["mcp_servers".x]``), a key with dots at the
+    top level (``mcp_servers.x.command = "c"``) and an inline table at the top level
+    (``mcp_servers = { x = { command = "c" } }``). A table that only starts with such a
+    name (``[mcp_servers-old]``) is another table and stays.
+    """
     out: list[str] = []
-    dropping_table = False
-    skipping_key_depth = 0
-    for line in text.splitlines():
-        stripped = line.strip()
-        if skipping_key_depth:
-            skipping_key_depth += stripped.count("[") - stripped.count("]")
-            continue
-        if stripped.startswith("["):
-            dropping_table = bool(_DROPPED_TABLE.match(stripped))
-            if dropping_table:
-                continue
-        if dropping_table:
-            continue
-        key = stripped.split("=", 1)[0].strip() if "=" in stripped else ""
-        if key in _DROPPED_TOP_KEYS and not out_in_table(out):
-            depth = stripped.count("[") - stripped.count("]")
-            skipping_key_depth = depth if depth > 0 else 0
-            continue
-        out.append(line)
+    depth = 0
+    quote: Optional[str] = None
+    in_table = dropped_table = dropped_key = False
+    # Only "\n" ends a line. ``str.splitlines`` also ends a line at a form feed and at
+    # U+2028, which are content of a TOML string.
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    for line in lines:
+        stripped = line.strip(" \t")
+        if depth and quote is None and _DROPPED_BARE_HEADER.match(stripped):
+            # The file has an open bracket that never closes. The header of a dropped
+            # table ends that value: a damaged file must not keep the table.
+            depth = 0
+        if depth == 0 and quote is None:
+            # A new statement: a table header, a key, a comment or an empty line.
+            dropped_key = False
+            if stripped.startswith("["):
+                in_table = True
+                dropped_table = _first_key(stripped.lstrip("[")) in _DROPPED_TABLES
+            elif not in_table:
+                dropped_key = _first_key(stripped) in _DROPPED_TOP_KEYS + _DROPPED_TABLES
+        depth, quote = _toml_scan(line, depth, quote)
+        if not (dropped_table or dropped_key):
+            out.append(line)
     return "\n".join(out) + "\n"
-
-
-def out_in_table(lines: list[str]) -> bool:
-    return any(line.strip().startswith("[") for line in lines)
 
 
 def _digest(path: Path) -> Optional[str]:
@@ -121,7 +244,8 @@ def prepare(env: Optional[dict] = None, *, root: Optional[Path] = None) -> Optio
     home.mkdir(parents=True, exist_ok=True)
     with _sync_lock(home):
         try:
-            config = (source / "config.toml").read_text(encoding="utf-8")
+            # utf-8-sig: Codex reads a config.toml that starts with a byte order mark.
+            config = (source / "config.toml").read_text(encoding="utf-8-sig")
         except OSError:
             config = ""
         lean = lean_config(config).encode("utf-8")
@@ -141,6 +265,12 @@ def prepare(env: Optional[dict] = None, *, root: Optional[Path] = None) -> Optio
                 data = raw  # not UTF-8 (a cp1252 file on Windows): copy it as is
             if _digest(home / "AGENTS.md") != hashlib.sha256(data).hexdigest():
                 _write_atomic(home / "AGENTS.md", data, 0o644)
+        else:
+            # The user removed their AGENTS.md, so the worker must not keep the old copy.
+            try:
+                (home / "AGENTS.md").unlink()
+            except FileNotFoundError:
+                pass
         user_auth = _digest(source / "auth.json")
         synced = _read(home / ".auth.synced")
         if user_auth != synced:
@@ -304,19 +434,27 @@ def home_for_session(session_id: str, env: Optional[dict] = None) -> Optional[Pa
 def configured_model(env: Optional[dict] = None) -> str:
     """The top-level ``model`` in the user's Codex config, or ''.
 
+    The value is a TOML string on one line. Each other value gives ''.
+
     An unpinned Codex worker runs the model the user's own Codex would pick;
     a hard-coded fallback went stale (gpt-5.4-mini returned model_unavailable
     and failed every node of an unpinned flow).
     """
     try:
-        text = (user_home(env) / "config.toml").read_text(encoding="utf-8")
+        text = (user_home(env) / "config.toml").read_text(encoding="utf-8-sig")
     except (OSError, ValueError):
         return ""
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("["):
-            break
-        match = re.match(r'model\s*=\s*"([^"]+)"', stripped)
-        if match:
-            return match.group(1)
+    depth = 0
+    quote: Optional[str] = None
+    for line in text.split("\n"):
+        if depth == 0 and quote is None:
+            # A new statement. The first table header ends the top level.
+            stripped = line.strip(" \t")
+            if stripped.startswith("["):
+                break
+            key, rest = _split_key(stripped)
+            rest = rest.lstrip(" \t")
+            if key == "model" and rest.startswith("="):
+                return _toml_string(rest[1:].lstrip(" \t"))
+        depth, quote = _toml_scan(line, depth, quote)
     return ""

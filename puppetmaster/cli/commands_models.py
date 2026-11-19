@@ -710,7 +710,7 @@ def _run_models_sync(args, path: Path) -> int:
 
     try:
         plan = sync_starter_registry(path, apply=args.apply, enable=args.enable)
-    except RuntimeError as exc:
+    except (RuntimeError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     if not plan.registry_exists:
