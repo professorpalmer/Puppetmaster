@@ -35,6 +35,12 @@ v1.51.3. Each one has a repro and a test.
 - Flow shell nodes: a stop or a timeout of a shell node also ends a child
   that leads its own session, such as a `puppetmaster codegraph` command
   (`flow._kill_tree` reads the process tree before the group kill).
+- Second round: the audit gate ran on these fixes before the release and
+  confirmed three more faults, which are corrected here. A registry path in
+  the advice is quoted for a shell. A file name with a space at its start or
+  its end keeps the space in the drift check. With `npx` off, a second caller
+  of the CodeGraph setup waits for the install of the first caller, so it
+  does not report that CodeGraph is missing.
 - Tests: `tests/test_hpfix_release_gate_leads.py`,
   `tests/test_hpfix_puppetmaster_cli_commands_models.py`,
   `tests/test_hpfix_puppetmaster_codegraph.py`.

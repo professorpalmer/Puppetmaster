@@ -81,6 +81,40 @@ class PinHintTests(unittest.TestCase):
         self.assertNotIn("platform enable", message)
 
 
+class SecondRoundTests(unittest.TestCase):
+    def test_a_path_with_a_space_at_its_end_keeps_it(self) -> None:
+        self.assertEqual(codegraph._porcelain_path("?? foo "), "foo ")
+        self.assertEqual(codegraph._porcelain_path(" M  lead.txt"), " lead.txt")
+        self.assertEqual(codegraph._porcelain_path("R  old.txt -> new.txt"), "new.txt")
+
+    def test_the_registry_path_in_the_advice_is_quoted_for_a_shell(self) -> None:
+        from puppetmaster.registry_sync import _registry_arg
+
+        self.assertEqual(_registry_arg(Path("/tmp/my registries/models.json")).split(" --registry-path ")[1][0], "'")
+        plain = _registry_arg(Path("/tmp/plain/models.json"))
+        self.assertTrue(plain.endswith("/tmp/plain/models.json"), plain)
+
+    def test_effort_text_in_other_forms_is_replaced(self) -> None:
+        from puppetmaster.cli.commands_models import _strip_effort_extra_args
+
+        self.assertEqual(_strip_effort_extra_args(["--verbose", "--effort"]), ["--verbose"])
+        self.assertEqual(_strip_effort_extra_args(["model_reasoning_effort=low", "-c", "n=2"]), ["-c", "n=2"])
+
+    def test_a_disabled_successor_among_the_candidates_is_not_a_successor(self) -> None:
+        gpt5 = _spec("codex/gpt-5", "gpt-5")
+        luna_off = _spec("codex/gpt-5.6-luna", "gpt-5.6-luna", enabled=False)
+        kept, _ = filter_prior_generation([gpt5, luna_off])
+        self.assertIn(gpt5.id, [s.id for s in kept])
+
+    def test_a_pinned_model_of_only_spaces_does_not_hide_the_model(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp).resolve() / "models.json"
+            save_registry(starter_registry(), path)
+            bound = resolve_and_bind_explicit_pin({"pinned_model": "   ", "model": "claude-code/opus-5-5"},
+                                                  adapter="claude-code", registry_path=path)
+            self.assertTrue(bound.get("registry_digest"))
+
+
 class ProvisionWithoutNpxTests(unittest.TestCase):
     def setUp(self) -> None:
         codegraph.reset_codegraph_provisioning_state()
@@ -116,6 +150,41 @@ class ProvisionWithoutNpxTests(unittest.TestCase):
         first, second, calls = self.run_with(install_lands=True)
         self.assertEqual((first, second), (True, True))
         self.assertEqual(calls, [["/usr/bin/npm", "install", "-g", codegraph.CODEGRAPH_PACKAGE]])
+
+    def test_a_second_caller_with_no_npx_waits_for_the_install(self) -> None:
+        import threading
+
+        started, release, results = threading.Event(), threading.Event(), []
+        landed = {"yes": False}
+
+        def which(name, *args, **kwargs):
+            if name == "npm":
+                return "/usr/bin/npm"
+            return "/usr/bin/codegraph" if name == codegraph.CODEGRAPH_COMMAND and landed["yes"] else None
+
+        def run_cli(command, **kwargs):
+            started.set()
+            release.wait(10)
+            landed["yes"] = True
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with mock.patch.dict(os.environ, {"PUPPETMASTER_CODEGRAPH_NO_NPX": "1"}), \
+                mock.patch.object(codegraph.shutil, "which", side_effect=which), \
+                mock.patch.object(codegraph, "_cursor_codegraph_invocation", return_value=None), \
+                mock.patch.object(codegraph, "_run_cli", side_effect=run_cli):
+            os.environ.pop("PUPPETMASTER_CODEGRAPH_NO_GLOBAL_INSTALL", None)
+            os.environ.pop("PUPPETMASTER_CODEGRAPH_NODE", None)
+            first = threading.Thread(target=lambda: results.append(("first", codegraph.ensure_codegraph_provisioned())))
+            first.start()
+            self.assertTrue(started.wait(10))
+            second = threading.Thread(target=lambda: results.append(("second", codegraph.ensure_codegraph_provisioned())))
+            second.start()
+            time.sleep(0.2)
+            self.assertEqual(results, [], "the second caller did not wait for the install")
+            release.set()
+            first.join(10)
+            second.join(10)
+        self.assertEqual(sorted(results), [("first", True), ("second", True)])
 
     def test_no_install_and_no_npx_is_false_each_time(self) -> None:
         first, second, calls = self.run_with(install_lands=False)

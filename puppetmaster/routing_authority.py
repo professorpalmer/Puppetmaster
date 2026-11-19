@@ -86,11 +86,11 @@ def resolve_and_bind_explicit_pin(
     registry_path: Optional[Path] = None,
 ) -> dict:
     """Resolve one live explicit pin and bind the registry authority used."""
-    source = str(
-        (payload or {}).get("pinned_model")
-        or (payload or {}).get("model")
-        or ""
-    ).strip()
+    # Strip each field first: a pinned_model of only spaces must not hide `model`.
+    source = (
+        str((payload or {}).get("pinned_model") or "").strip()
+        or str((payload or {}).get("model") or "").strip()
+    )
     if not source:
         return dict(payload or {})
     path = registry_path or registry_path_from_payload(payload, allow_default=True)

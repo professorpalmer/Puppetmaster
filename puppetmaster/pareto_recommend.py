@@ -219,11 +219,11 @@ def filter_prior_generation(
     rules = prior_generation_rules(snapshot)
     if not rules:
         return list(candidates), []
-    inventory = (
-        [spec for spec in presence if spec.is_routable]
-        if presence is not None
-        else list(candidates)
-    )
+    inventory = [
+        spec
+        for spec in (presence if presence is not None else candidates)
+        if spec.is_routable
+    ]
     present_by_lane: dict[tuple[str, str], set[str]] = {}
     for spec in inventory:
         present_by_lane.setdefault(spec_lane(spec), set()).update(

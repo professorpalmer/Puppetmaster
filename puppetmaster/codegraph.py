@@ -420,12 +420,16 @@ def ensure_codegraph_provisioned() -> bool:
     if npx_invocation is None and npm is None:
         return False  # no Node, or each way to get CodeGraph is off
 
-    if _PROVISION_DONE:
-        # The shim is not on PATH (checked above), so only npx can run it now.
-        return npx_invocation is not None
+    if _PROVISION_DONE and npx_invocation is not None:
+        return True
     with _PROVISION_LOCK:
         if _PROVISION_DONE:
-            return npx_invocation is not None
+            # A caller with no npx waited here for the install of another
+            # caller. Only the shim can run CodeGraph for it.
+            return (
+                npx_invocation is not None
+                or shutil.which(CODEGRAPH_COMMAND) is not None
+            )
         _PROVISION_DONE = True
 
         if npm is not None:
@@ -1767,7 +1771,8 @@ def _porcelain_path(line: str) -> Optional[str]:
         rest = rest[end + 4:]
     elif " -> " in rest:
         rest = rest.split(" -> ", 1)[1]
-    rest = rest.strip()
+    # No strip: the path starts at a fixed column, and git does not quote a
+    # name that only has a space at its start or its end.
     if len(rest) >= 2 and rest[0] == '"' and rest[-1] == '"':
         rest = _git_unquote(rest)[0]
     return rest or None

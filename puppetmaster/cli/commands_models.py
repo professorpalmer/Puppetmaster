@@ -164,8 +164,9 @@ def _strip_effort_extra_args(extra_args: list[Any]) -> list[Any]:
     while i < len(extra_args):
         arg = extra_args[i]
         nxt = extra_args[i + 1] if i + 1 < len(extra_args) else None
-        if arg == "--effort" and nxt is not None:
-            i += 2
+        if arg == "--effort":
+            # The level follows it. A flag at the end of the list has none.
+            i += 2 if nxt is not None else 1
             continue
         if isinstance(arg, str) and arg.startswith("--effort="):
             i += 1
@@ -176,6 +177,10 @@ def _strip_effort_extra_args(extra_args: list[Any]) -> list[Any]:
             and nxt.startswith("model_reasoning_effort=")
         ):
             i += 2
+            continue
+        if isinstance(arg, str) and arg.startswith("model_reasoning_effort="):
+            # The effort parser also reads this text with no `-c` before it.
+            i += 1
             continue
         kept.append(arg)
         i += 1
