@@ -1,3 +1,31 @@
+## v1.51.3 — 2026-11-18
+
+**Usage counts and the Codex session lookup accept bad stored values.**
+No caller reaches these faults today. They came from two audits: the audit of
+the proof conflicts of the Hard Proof study, and the first run of the release
+audit gate (`hpf`) on the range v1.51.2 to `dev`. That gate run had 7 changed
+functions, 9 findings with a repro, and no confirmed bug.
+
+- `select_usage_records` and `usage_record_score` in `puppetmaster/usage.py`:
+  a token field with text that is not a number raised `ValueError`, and an
+  infinite value raised `OverflowError`. One such artifact stopped the cost
+  selection for the job. `_count` gives 0 for text, for an infinite value and
+  for a negative value. `_billable_presence` reports such a field as unknown,
+  as before.
+- `usage_record_score`: a result with spaces at its ends, such as
+  `" Failed "`, did not count as failed. The result is stripped before the
+  compare.
+- `codex_home.rollout_file` (new; used by `home_for_session` and
+  `codex_rollout.rollout_path`): the lookup of a Codex session file used the
+  glob `rollout-*-<id>.jsonl`. It accepted an id that is only the end of a
+  different session id, and it read glob characters in the id as a pattern.
+  The lookup accepts only `rollout-<timestamp>-<id>.jsonl` for exactly that
+  id.
+- `api_discovery.catalog_to_specs`: the docstring is correct now. An existing
+  entry with a known billing keeps its own billing, and a same-named entry on
+  a sibling adapter gives capability and context, not price. No code change.
+- Tests: `tests/test_hpfix_conflict_audit.py`.
+
 ## v1.51.2 — 2026-11-18
 
 **28 bug fixes from an audit of small functions.**
