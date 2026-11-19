@@ -14,6 +14,8 @@ import json
 from pathlib import Path
 from typing import Optional
 
+from puppetmaster import codex_home
+
 FIELDS = (
     "input_tokens",
     "cached_input_tokens",
@@ -29,7 +31,7 @@ def rollout_path(home: Optional[Path], session_id: Optional[str]) -> Optional[Pa
     root = Path(home) / "sessions"
     if not root.is_dir():
         return None
-    return next(root.glob(f"*/*/*/rollout-*-{session_id}.jsonl"), None)
+    return codex_home.rollout_file(root, session_id)
 
 
 def _records(path: Path):
