@@ -103,6 +103,28 @@ A headless `acceptEdits` run cannot answer permission prompts, so any shell comm
 
 If Claude Code edits tracked files, Puppetmaster records a `patch` artifact containing the resulting unified diff, changed files, base SHA, and revert guidance.
 
+#### Lean worker profile (default since v1.52.0)
+
+A worker gets the project, not the person. Claude Code loads your personal memory files (`~/.claude/CLAUDE.md`, `~/.claude/rules/`), your skills and your MCP servers into each session. That context is for you as the pilot. A worker has its own brief, and it pays for that context on each start.
+
+By default, Puppetmaster starts each Claude Code worker with these arguments:
+
+| Argument | Effect |
+| --- | --- |
+| `--setting-sources project,local` | The worker reads the `CLAUDE.md` and the settings of the repository. It does not read your personal memory files, skills or MCP servers. |
+| `--settings <your settings.json>` | Your environment block, credential helpers, permission rules and hooks stay active. |
+| `--strict-mcp-config` | No MCP server starts for the worker, unless you name one with `--mcp-config` in `payload.extra_args`. |
+
+What changes for you:
+
+- A convention that a worker must obey belongs in the `CLAUDE.md` of the repository. A convention that is only in your personal memory files does not reach a worker.
+- A value in your `settings.json` now has priority over the same key in a project settings file. Permission rules of all files still add together.
+- An argument in `payload.extra_args` wins. Puppetmaster adds no second `--setting-sources` or `--settings`.
+
+To turn the profile off, set `PUPPETMASTER_CLAUDE_LEAN=0` for all workers, or `payload.lean_profile: false` for one task. A worker that ran with the profile has `profile:lean` in the evidence of its verification artifact.
+
+Measured on one machine (Claude Code 2.1.316, about 155 KB of personal rules, three MCP servers): the context of a worker start went from 108,700 to 33,500 tokens. One small edit task had an API-equivalent cost of $0.362 without the profile and $0.049 with it, with the same tool calls and the same result. Your numbers depend on the size of your personal memory files.
+
 ### `openai`
 
 Calls the OpenAI Chat Completions API directly with `OPENAI_API_KEY` (or `OPENAI_BASE_URL` for compatible providers). Returns the same finding / risk / decision / verification artifact shape as the other adapters, plus `tokens_in` / `tokens_out` / `tokens_total` captured from the API's `usage` payload — the only adapter besides `codex` that gives you billing-grade token telemetry.

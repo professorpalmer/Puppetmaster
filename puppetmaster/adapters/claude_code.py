@@ -238,6 +238,7 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
         # its session for a follow-up. The resolver checks it is on disk.
         session_id = str(uuid.uuid4())
         command_kwargs: dict[str, Any] = {"session_id": session_id}
+        lean_args = claude_lean_args(task.payload)
         if resume is not None:
             command_kwargs["resume_session_id"] = str(resume["session_id"])
         # A write-capable run streams its tool use, which the write_scope gate
@@ -253,7 +254,7 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
             permission_mode=cli_permission_mode(effective_permission_mode),
             allowed_tools=implement_allowed_tools(task.payload, write_capable=write_capable),
             disallowed_tools=read_only_disallowed_tools(task.payload, write_capable=write_capable),
-            extra_args=task.payload.get("extra_args", []),
+            extra_args=[*lean_args, *command_parts(task.payload.get("extra_args") or [])],
             **command_kwargs,
         )
         return CliInvocation(
@@ -266,6 +267,7 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
                 "codegraph_used": codegraph_used,
                 "model_note": model_note,
                 "permission_mode": effective_permission_mode,
+                "lean_profile": bool(lean_args),
                 "resume": resume_record,
                 "resumed": resume is not None,
                 "session_id": session_id,
@@ -353,7 +355,11 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
                     check=task.instruction,
                     result="failed",
                     confidence=0.6,
-                    evidence=["adapter:claude-code", "timeout"] + (["context:resumed"] if resumed else []),
+                    evidence=(
+                        ["adapter:claude-code", "timeout"]
+                        + (["context:resumed"] if resumed else [])
+                        + (["profile:lean"] if prepared.extras.get("lean_profile") else [])
+                    ),
                     payload={
                         "failure": "timeout",
                         "returncode": None,
@@ -441,6 +447,7 @@ class ClaudeCodeAdapter(CliWorkerAdapter):
                 ]
                 + (["context:codegraph"] if codegraph_used else [])
                 + (["context:resumed"] if resumed else [])
+                + (["profile:lean"] if prepared.extras.get("lean_profile") else [])
                 + (["bedrock:model-omitted"] if model_note else [])
             ),
             payload={
@@ -655,8 +662,101 @@ def build_claude_code_command(
     return command
 
 
+LEAN_PROFILE_ENV = "PUPPETMASTER_CLAUDE_LEAN"
+LEAN_SETTING_SOURCES = "project,local"
+_LEAN_OFF_WORDS = ("0", "false", "off", "no")
+
+
+def claude_lean_enabled(payload: dict, env: "Optional[Any]" = None) -> bool:
+    """True when a worker runs with the lean profile.
+
+    ``payload.lean_profile`` wins, then ``PUPPETMASTER_CLAUDE_LEAN``. The text
+    0, false, off or no in one of them turns the profile off. The default is on.
+    """
+    explicit = payload.get("lean_profile")
+    if explicit is None:
+        env = os.environ if env is None else env
+        explicit = env.get(LEAN_PROFILE_ENV, "1")
+    if isinstance(explicit, str):
+        return explicit.strip().lower() not in _LEAN_OFF_WORDS
+    return bool(explicit)
+
+
+def claude_user_settings_file(
+    env: "Optional[Any]" = None,
+    home: Optional[Path] = None,
+    cwd: "Optional[Union[str, Path]]" = None,
+) -> Optional[Path]:
+    """The user's Claude Code ``settings.json`` when it holds a JSON object.
+
+    The path is absolute. A relative ``CLAUDE_CONFIG_DIR`` is read from
+    ``cwd``, the directory of the worker, because the CLI of the worker reads
+    it from there.
+    """
+    env = os.environ if env is None else env
+    config_dir = env.get("CLAUDE_CONFIG_DIR")
+    root = Path(config_dir) if config_dir else (home if home is not None else Path.home()) / ".claude"
+    path = Path(os.path.abspath(Path(cwd or Path.cwd()) / root / "settings.json"))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return path if isinstance(data, dict) else None
+
+
+def _flag_value(args: "list[str]", flag: str) -> Optional[str]:
+    """The value of ``flag`` in ``args`` (both ``--f v`` and ``--f=v``), or None when absent."""
+    for index, arg in enumerate(args):
+        if arg == flag:
+            return args[index + 1] if index + 1 < len(args) else ""
+        if arg.startswith(flag + "="):
+            return arg[len(flag) + 1:]
+    return None
+
+
+def claude_lean_args(
+    payload: dict,
+    *,
+    env: "Optional[Any]" = None,
+    home: Optional[Path] = None,
+) -> "list[str]":
+    """CLI arguments of the lean worker profile, or ``[]`` when it is off.
+
+    A worker gets the project, not the person. Claude Code loads the user's
+    memory files (``CLAUDE.md``, ``rules/``), skills and MCP servers into each
+    session by default. That context is for the pilot. On a measured machine
+    it was 75,000 of 109,000 start tokens, and three MCP servers started for
+    each worker.
+
+    The profile loads the project and local setting sources only and no MCP
+    server that the caller did not name. It passes the user's ``settings.json``
+    with ``--settings``, so the environment block, the credential helpers, the
+    permission rules and the hooks stay active. A value from that file then has
+    priority over the same key in a project settings file.
+
+    An argument that the caller gives in ``payload.extra_args`` wins: the
+    profile adds no second ``--setting-sources`` or ``--settings``.
+    """
+    if not claude_lean_enabled(payload, env):
+        return []
+    given = command_parts(payload.get("extra_args") or [])
+    args: list[str] = []
+    sources = _flag_value(given, "--setting-sources")
+    if sources is None:
+        sources = LEAN_SETTING_SOURCES
+        args.extend(["--setting-sources", sources])
+    user_loaded = "user" in [name.strip() for name in sources.split(",")]
+    if not user_loaded and _flag_value(given, "--settings") is None:
+        settings = claude_user_settings_file(env, home, payload.get("cwd"))
+        if settings is not None:
+            args.extend(["--settings", str(settings)])
+    if "--strict-mcp-config" not in given:
+        args.append("--strict-mcp-config")
+    return args
+
+
 def _claude_permission_mode(payload: dict) -> str:
-    if "permission_mode" in payload:
+    if payload.get("permission_mode") is not None:
         return str(payload["permission_mode"])
     if payload.get("read_only") or payload.get("sandbox") == "read-only":
         return "plan"
