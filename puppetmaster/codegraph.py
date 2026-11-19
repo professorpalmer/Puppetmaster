@@ -399,8 +399,10 @@ def ensure_codegraph_provisioned() -> bool:
       cache once (the native build happens here, off the timed call path) so the
       universal fallback is fast.
 
-    Returns True when CodeGraph is invocable afterward. The only False is a host
-    with no Node at all — a Node CLI cannot run without Node.
+    Returns True when CodeGraph is invocable afterward. False means that no
+    path is left: a host with no Node at all, or a host where the global
+    install did not land and ``npx`` is absent or off
+    (``PUPPETMASTER_CODEGRAPH_NO_NPX=1`` turns off only the ``npx`` fallback).
     """
     global _PROVISION_DONE
     if (
@@ -414,37 +416,40 @@ def ensure_codegraph_provisioned() -> bool:
         return True
 
     npx_invocation = _npx_codegraph_invocation()
-    if npx_invocation is None:
-        return False  # no Node — the one floor we cannot cross
+    npm = None if _global_install_disabled() else shutil.which("npm")
+    if npx_invocation is None and npm is None:
+        return False  # no Node, or each way to get CodeGraph is off
 
     if _PROVISION_DONE:
-        return True
+        # The shim is not on PATH (checked above), so only npx can run it now.
+        return npx_invocation is not None
     with _PROVISION_LOCK:
         if _PROVISION_DONE:
-            return True
+            return npx_invocation is not None
         _PROVISION_DONE = True
 
-        if not _global_install_disabled():
-            npm = shutil.which("npm")
-            if npm is not None:
-                try:
-                    completed = _run_cli(
-                        [npm, "install", "-g", CODEGRAPH_PACKAGE],
-                        stdin=subprocess.DEVNULL,
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                        timeout=_provision_timeout_seconds(),
-                        check=False,
-                    )
-                    if (
-                        completed.returncode == 0
-                        and shutil.which(CODEGRAPH_COMMAND) is not None
-                    ):
-                        return True
-                except (OSError, subprocess.SubprocessError):
-                    pass  # fall through to npx warm
+        if npm is not None:
+            try:
+                completed = _run_cli(
+                    [npm, "install", "-g", CODEGRAPH_PACKAGE],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=_provision_timeout_seconds(),
+                    check=False,
+                )
+                if (
+                    completed.returncode == 0
+                    and shutil.which(CODEGRAPH_COMMAND) is not None
+                ):
+                    return True
+            except (OSError, subprocess.SubprocessError):
+                pass  # fall through to npx warm
+
+        if npx_invocation is None:
+            return False  # the global install did not land, and npx is off or absent
 
         # Warm the npx cache so the first real (timed) call doesn't pay the
         # cold download + native build. Exit code is irrelevant — the point is
@@ -1714,16 +1719,57 @@ def _census_walk_files(root: Path) -> list[str]:
     return found
 
 
+_GIT_QUOTE_ESCAPES = {
+    "a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92,
+}
+
+
+def _git_unquote(text: str) -> tuple[str, int]:
+    """Decode a git C-quoted path at the start of ``text``.
+
+    Returns the decoded path and the index just past the closing quote.
+    Git emits non-ASCII bytes as octal escapes, so they are gathered as bytes
+    and decoded as UTF-8 together.
+    """
+    out = bytearray()
+    i = 1
+    while i < len(text):
+        ch = text[i]
+        if ch == '"':
+            return out.decode("utf-8", "surrogateescape"), i + 1
+        if ch == "\\" and i + 1 < len(text):
+            nxt = text[i + 1]
+            octal = text[i + 1:i + 4]
+            if len(octal) == 3 and all(c in "01234567" for c in octal):
+                out.append(int(octal, 8) & 0xFF)
+                i += 4
+                continue
+            if nxt in _GIT_QUOTE_ESCAPES:
+                out.append(_GIT_QUOTE_ESCAPES[nxt])
+                i += 2
+                continue
+        out.extend(ch.encode("utf-8", "surrogateescape"))
+        i += 1
+    return out.decode("utf-8", "surrogateescape"), len(text)
+
+
 def _porcelain_path(line: str) -> Optional[str]:
     """Extract the path from a `git status --porcelain` line (dest on rename)."""
     if len(line) < 4:
         return None
     rest = line[3:]
-    if " -> " in rest:
+    if rest.startswith('"'):
+        # A quoted source may itself contain " -> ", so skip past its closing
+        # quote before looking for the rename arrow.
+        src, end = _git_unquote(rest)
+        if not rest[end:].startswith(" -> "):
+            return src or None
+        rest = rest[end + 4:]
+    elif " -> " in rest:
         rest = rest.split(" -> ", 1)[1]
     rest = rest.strip()
     if len(rest) >= 2 and rest[0] == '"' and rest[-1] == '"':
-        rest = rest[1:-1]
+        rest = _git_unquote(rest)[0]
     return rest or None
 
 

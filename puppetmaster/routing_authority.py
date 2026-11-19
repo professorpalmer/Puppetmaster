@@ -20,9 +20,13 @@ class RegistryAuthorityError(RuntimeError):
     """Raised when persisted model authority is missing, stale, or unusable."""
 
 
-def _pin_failure_detail(source: str, registry: list, adapter: str) -> str:
+def _pin_failure_detail(
+    source: str, registry: list, adapter: str, registry_path: Optional[Path] = None
+) -> str:
     """Name the cause of an unresolved pin when the starter registry knows it."""
-    hint = unroutable_pin_hint(source, registry, adapter=adapter)
+    hint = unroutable_pin_hint(
+        source, registry, adapter=adapter, registry_path=registry_path
+    )
     if hint:
         return f": {hint}"
     return "; it may be disabled, retired, or absent"
@@ -96,7 +100,7 @@ def resolve_and_bind_explicit_pin(
         raise RegistryAuthorityError(
             f"model pin {source!r} for adapter {adapter!r} is not enabled and "
             f"routable in registry {path}"
-            + _pin_failure_detail(source, registry, adapter)
+            + _pin_failure_detail(source, registry, adapter, path)
         )
     stamped = stamp_resolved_model_pin(dict(payload or {}), pin, registry=registry)
     if adapter == "agentic":
@@ -127,7 +131,7 @@ def validate_pinned_dispatch(payload: dict, *, adapter: str) -> dict:
                 raise RegistryAuthorityError(
                     f"legacy model pin {legacy_model!r} is not enabled and "
                     f"routable in registry {path}"
-                    + _pin_failure_detail(legacy_model, registry, adapter)
+                    + _pin_failure_detail(legacy_model, registry, adapter, path)
                 )
             stamped = stamp_resolved_model_pin(dict(payload or {}), pin, registry=registry)
             if adapter == "agentic":
@@ -146,7 +150,7 @@ def validate_pinned_dispatch(payload: dict, *, adapter: str) -> dict:
     if pin is None:
         raise RegistryAuthorityError(
             f"model pin {pinned!r} is not enabled and routable in registry {path}"
-            + _pin_failure_detail(pinned, registry, adapter)
+            + _pin_failure_detail(pinned, registry, adapter, path)
         )
     expected_wire = str((payload or {}).get("pinned_adapter_model_name") or "")
     executable_wire = str((payload or {}).get("model") or "")

@@ -78,6 +78,16 @@ def enable_command(model_id: str) -> str:
     )
 
 
+def _registry_arg(registry_path: Optional[Path]) -> str:
+    """The `--registry-path` text for advice about a registry that is not the default one."""
+    if registry_path is None:
+        return ""
+    path = Path(registry_path).expanduser().resolve()
+    if path == default_registry_path().expanduser().resolve():
+        return ""
+    return f" --registry-path {path}"
+
+
 def _synced_spec(spec: ModelSpec, *, adapter_locked: bool, enable: bool) -> ModelSpec:
     if not spec.is_routable or (enable and not adapter_locked):
         return spec
@@ -180,11 +190,18 @@ def sync_starter_registry(
 
 
 def unroutable_pin_hint(
-    source: str, registry: Iterable[ModelSpec], *, adapter: str
+    source: str,
+    registry: Iterable[ModelSpec],
+    *,
+    adapter: str,
+    registry_path: Optional[Path] = None,
 ) -> str:
     """Say why a pin did not resolve when the starter registry knows the id.
 
     Returns an empty string when the starter registry does not have the pin.
+    ``registry_path`` is the file that ``registry`` came from. With it, the
+    advice names a registry file that does not exist, and each command acts
+    on that registry and not on the default one.
     """
     try:
         starter_pin = resolve_model_pin(source, starter_registry(), adapter=adapter)
@@ -192,6 +209,12 @@ def unroutable_pin_hint(
         return ""
     if starter_pin is None:
         return ""
+    where = _registry_arg(registry_path)
+    if registry_path is not None and not Path(registry_path).expanduser().is_file():
+        return (
+            f"no model registry file is at {registry_path}. Run "
+            f"`puppetmaster models init{where}` to make it."
+        )
     specs = list(registry)
     present = next(
         (spec for spec in specs if spec.id == starter_pin.registry_id), None
@@ -212,15 +235,29 @@ def unroutable_pin_hint(
     if present is None:
         return (
             f"{starter_pin.registry_id!r} is a starter registry entry that this "
-            f"registry does not have. Run `{SYNC_COMMAND}` to list the absent "
-            f"entries and `{SYNC_COMMAND} --apply` to add them."
+            f"registry does not have. Run `{SYNC_COMMAND}{where}` to list the absent "
+            f"entries and `{SYNC_COMMAND} --apply{where}` to add them."
         )
     if present.retired:
         return f"{present.id!r} is retired: {present.retirement_reason}"
     if not present.enabled:
         detail = f": {present.disabled_reason}" if present.disabled_reason else ""
-        return (
-            f"{present.id!r} is disabled{detail}. To enable it, run "
-            f"`{enable_command(present.id)}`."
+        enable = f"{enable_command(present.id)}{where}"
+        locked = (
+            present.adapter in platform_lock.KNOWN_ADAPTERS
+            and present.adapter not in platform_lock.enabled_adapters(registry_path)
         )
+        if locked:
+            # An enabled entry on a locked adapter still fails at dispatch.
+            lock = (
+                ""
+                if "platform lock" in (present.disabled_reason or "")
+                else f" The platform lock disables adapter {present.adapter}."
+            )
+            return (
+                f"{present.id!r} is disabled{detail}.{lock} To use this model, "
+                f"first run `puppetmaster platform enable {present.adapter}`, "
+                f"then `{enable}`."
+            )
+        return f"{present.id!r} is disabled{detail}. To enable it, run `{enable}`."
     return ""

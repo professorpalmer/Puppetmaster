@@ -358,7 +358,10 @@ class RegistrySyncPinErrorTests(_SyncCase):
         self.assertIn("model pin 'claude-haiku-5-5' for adapter 'claude-code'", message)
         self.assertIn("'claude-code/haiku-5-5' is a starter registry entry", message)
         self.assertIn("this registry does not have", message)
-        self.assertIn(f"`{SYNC_COMMAND} --apply`", message)
+        # The registry of this test is not the default one, so the advice names it.
+        self.assertIn(
+            f"`{SYNC_COMMAND} --apply --registry-path {self.path.resolve()}`", message
+        )
 
     def test_pin_the_starter_does_not_have_keeps_the_general_text(self) -> None:
         self._write_stale_registry()

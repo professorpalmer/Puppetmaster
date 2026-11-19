@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from puppetmaster import codegraph as cg
@@ -53,6 +57,50 @@ class ProvisionTimeoutTests(unittest.TestCase):
                 self.assertEqual(call.kwargs.get("timeout"), 300)
         finally:
             cg.reset_codegraph_provisioning_state()
+
+
+class PorcelainQuotedPathTests(unittest.TestCase):
+    def test_quoted_non_ascii_path_is_decoded(self) -> None:
+        self.assertEqual(cg._porcelain_path('?? "caf\\303\\251.txt"'), "café.txt")
+
+    def test_quoted_escaped_quote_backslash_and_tab_are_decoded(self) -> None:
+        self.assertEqual(cg._porcelain_path('?? "a\\"b\\\\c.txt"'), 'a"b\\c.txt')
+        self.assertEqual(cg._porcelain_path('?? "new\\tfile.txt"'), "new\tfile.txt")
+
+    def test_plain_path_keeps_old_result(self) -> None:
+        self.assertEqual(cg._porcelain_path("?? cafe.txt"), "cafe.txt")
+        self.assertEqual(cg._porcelain_path(" M src/app.py"), "src/app.py")
+        self.assertEqual(cg._porcelain_path('?? "plain.txt"'), "plain.txt")
+
+    @unittest.skipIf(shutil.which("git") is None, "git not installed")
+    def test_fresh_non_ascii_untracked_file_is_not_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            target = root / "café.txt"
+            target.write_text("x")
+            old = target.stat().st_mtime - 1000
+            os.utime(target, (old, old))
+            result = cg._git_changes_since(root, old + 500, 0.0)
+        self.assertIsNotNone(result)
+        sample, count, _capped, _commits = result
+        self.assertEqual(count, 0)
+        self.assertEqual(sample, [])
+
+
+class PorcelainRenameTests(unittest.TestCase):
+    def test_arrow_inside_quoted_source_returns_destination(self) -> None:
+        self.assertEqual(cg._porcelain_path('R  "a -> b.txt" -> c.txt'), "c.txt")
+
+    def test_both_sides_quoted_returns_decoded_destination(self) -> None:
+        self.assertEqual(
+            cg._porcelain_path('R  "a -> b.txt" -> "caf\\303\\251.txt"'),
+            "café.txt",
+        )
+
+    def test_plain_rename_keeps_old_result(self) -> None:
+        self.assertEqual(cg._porcelain_path("R  old.txt -> new.txt"), "new.txt")
+        self.assertEqual(cg._porcelain_path('R  "old.txt" -> new.txt'), "new.txt")
 
 
 if __name__ == "__main__":

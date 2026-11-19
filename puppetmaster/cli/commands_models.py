@@ -156,6 +156,32 @@ def _replace_model_spec(spec, **updates):
     data.update(updates)
     return ModelSpec(**data)
 
+
+def _strip_effort_extra_args(extra_args: list[Any]) -> list[Any]:
+    """Drop `--effort X` and `-c model_reasoning_effort=X` pairs from extra_args."""
+    kept: list[Any] = []
+    i = 0
+    while i < len(extra_args):
+        arg = extra_args[i]
+        nxt = extra_args[i + 1] if i + 1 < len(extra_args) else None
+        if arg == "--effort" and nxt is not None:
+            i += 2
+            continue
+        if isinstance(arg, str) and arg.startswith("--effort="):
+            i += 1
+            continue
+        if (
+            arg == "-c"
+            and isinstance(nxt, str)
+            and nxt.startswith("model_reasoning_effort=")
+        ):
+            i += 2
+            continue
+        kept.append(arg)
+        i += 1
+    return kept
+
+
 def _updated_spec_for_assignment(spec, key: str, value: str):
     if key == "capability_score":
         return _replace_model_spec(spec, capability_score=int(value))
@@ -173,6 +199,12 @@ def _updated_spec_for_assignment(spec, key: str, value: str):
         # Merge so unrelated defaults (e.g. temperature) survive an effort change,
         # and swap the effort:* tag to keep CLI and wizard entries consistent.
         payload_defaults = {**(spec.payload_defaults or {}), **effort_defaults}
+        old_extra_args = (spec.payload_defaults or {}).get("extra_args")
+        if "extra_args" in effort_defaults and isinstance(old_extra_args, list):
+            # Keep other CLI flags; only the previous effort flags are replaced.
+            payload_defaults["extra_args"] = (
+                _strip_effort_extra_args(old_extra_args) + effort_defaults["extra_args"]
+            )
         tags = [tag for tag in spec.tags if not tag.startswith("effort:")]
         tags.append(f"effort:{level}")
         return _replace_model_spec(spec, payload_defaults=payload_defaults, tags=tags)

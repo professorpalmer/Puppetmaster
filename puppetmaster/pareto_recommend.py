@@ -210,14 +210,20 @@ def filter_prior_generation(
     ``presence`` is the lane inventory (usually the bound registry). Fallback
     routing shrinks ``candidates`` after a failed Luna run; successor presence
     must still see Luna or GPT-5 comes back. Fail-open only when that lane
-    has no successor in ``presence``.
+    has no successor in ``presence``. A disabled or retired entry of
+    ``presence`` is not a successor: routing cannot use it, so it must not
+    remove the entry that routing can use.
     """
     if not generation_filter_enabled() or not candidates:
         return list(candidates), []
     rules = prior_generation_rules(snapshot)
     if not rules:
         return list(candidates), []
-    inventory = list(presence) if presence is not None else list(candidates)
+    inventory = (
+        [spec for spec in presence if spec.is_routable]
+        if presence is not None
+        else list(candidates)
+    )
     present_by_lane: dict[tuple[str, str], set[str]] = {}
     for spec in inventory:
         present_by_lane.setdefault(spec_lane(spec), set()).update(
