@@ -698,7 +698,9 @@ def claude_user_settings_file(
     root = Path(config_dir) if config_dir else (home if home is not None else Path.home()) / ".claude"
     path = Path(os.path.abspath(Path(cwd or Path.cwd()) / root / "settings.json"))
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        # utf-8-sig: an editor on Windows can save the file with a byte order
+        # mark, and Claude Code reads such a file.
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return None
     return path if isinstance(data, dict) else None

@@ -63,6 +63,20 @@ class LeanArgsTests(unittest.TestCase):
         self.assertEqual(claude_lean_args({}, env={}, home=_home("{not json")), expected)
         self.assertEqual(claude_lean_args({}, env={}, home=_home("[1, 2]")), expected)
 
+    def test_a_settings_file_with_a_byte_order_mark_is_usable(self) -> None:
+        # An editor on Windows can save the file with a byte order mark. Claude Code reads such a file.
+        home = _home()
+        (home / ".claude").mkdir()
+        path = home / ".claude" / "settings.json"
+        path.write_bytes(b"\xef\xbb\xbf" + b'{"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}}')
+        self.assertEqual(claude_user_settings_file({}, home), path)
+        self.assertEqual(
+            claude_lean_args({}, env={}, home=home),
+            ["--setting-sources", "project,local", "--settings", str(path), "--strict-mcp-config"],
+        )
+        path.write_bytes(b"\xef\xbb\xbf" + b"[1, 2]")
+        self.assertIsNone(claude_user_settings_file({}, home))
+
     def test_config_dir_names_the_settings_file(self) -> None:
         other = _home()
         (other / "settings.json").write_text("{}", encoding="utf-8")

@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from puppetmaster import codegraph
 
@@ -71,6 +72,35 @@ class CodegraphProcessGroupTests(unittest.TestCase):
     def test_check_raises_on_a_failed_command(self):
         with self.assertRaises(subprocess.CalledProcessError):
             codegraph._run_cli([sys.executable, "-c", "raise SystemExit(3)"], check=True, timeout=30)
+
+    def test_an_interrupt_leaves_no_child_and_no_open_pipe(self):
+        started = []
+
+        class Interrupted(subprocess.Popen):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                started.append(self)
+
+            def communicate(self, *args, **kwargs):
+                raise KeyboardInterrupt()
+
+        with mock.patch.object(codegraph.subprocess, "Popen", Interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                codegraph._run_cli(
+                    [sys.executable, "-c", "import time; time.sleep(120)"],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                )
+        process = started[0]
+        try:
+            self.assertIsNotNone(process.returncode, "nobody waited for the child")
+            self.assertTrue(process.stdout.closed, "the stdout pipe is open")
+            self.assertTrue(process.stderr.closed, "the stderr pipe is open")
+        finally:
+            process.kill()
+            process.wait()
+            process.stdout.close()
+            process.stderr.close()
 
 
 if __name__ == "__main__":

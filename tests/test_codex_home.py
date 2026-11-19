@@ -57,6 +57,119 @@ class LeanConfigTests(unittest.TestCase):
         tomllib.loads(lean)
 
 
+class LeanConfigScanTests(unittest.TestCase):
+    """The filter reads the config as TOML statements, not as lines with a pattern."""
+
+    def test_brackets_in_strings_and_comments_are_not_structure(self):
+        cfg = """model = "x"
+notify = ["a", "b[c"]
+arr = [
+  [1, 2],
+  ["]", "#"],
+]
+[mcp_servers.one]
+command = "run[this"
+args = ["a[b", "c"]  # [not a table]
+env = { K = "v]" }
+lit = 'it[s'
+[profiles.p]
+model = "y"
+[[plugins]]
+x = 1
+[model_providers.z]
+name = "z"
+"""
+        self.assertEqual(codex_home.lean_config(cfg), """model = "x"
+arr = [
+  [1, 2],
+  ["]", "#"],
+]
+[profiles.p]
+model = "y"
+[model_providers.z]
+name = "z"
+""")
+
+    def test_a_bracket_in_a_comment_after_a_dropped_key_ends_nothing(self):
+        cfg = 'notify = ["a"]  # [\nmodel = "m"\n[profiles.p]\ny = 2\n'
+        self.assertEqual(codex_home.lean_config(cfg), 'model = "m"\n[profiles.p]\ny = 2\n')
+
+    def test_a_table_header_inside_a_multi_line_string_is_text(self):
+        cfg = ('note = """a [ b\n[mcp_servers.fake]\n"""\nkeep = 1\n[hooks]\nx = """\n[profiles.q]\n"""\n'
+               "[profiles.p]\ny = 2\n")
+        self.assertEqual(codex_home.lean_config(cfg),
+                         'note = """a [ b\n[mcp_servers.fake]\n"""\nkeep = 1\n[profiles.p]\ny = 2\n')
+
+    def test_a_multi_line_value_of_a_dropped_top_key_is_dropped_whole(self):
+        cfg = 'notify = [\n  "prog",\n  ["x", "y"],\n]\nmodel = "m"\n[t]\nnotify = ["kept: a key of a table"]\n'
+        self.assertEqual(codex_home.lean_config(cfg), 'model = "m"\n[t]\nnotify = ["kept: a key of a table"]\n')
+
+    def test_a_dropped_top_key_after_a_nested_array_is_dropped(self):
+        cfg = 'arr = [\n  [1, 2],\n]\nnotify = ["prog"]\nmodel = "m"\n'
+        self.assertEqual(codex_home.lean_config(cfg), 'arr = [\n  [1, 2],\n]\nmodel = "m"\n')
+
+    def test_a_multi_line_string_can_end_with_one_or_two_quote_characters(self):
+        for q in ('"', "'"):
+            for extra in (0, 1, 2):
+                line = f"a = [{q * 3}x{q * (3 + extra)}]"
+                self.assertEqual(codex_home._toml_scan(line, 0, None), (0, None), line)
+                self.assertEqual(codex_home._toml_scan(f"x{q * (3 + extra)}]", 1, q * 3), (0, None), line)
+            cfg = f'a = [{q * 3}x{q * 4}]\n[mcp_servers.one]\ncommand = "c"\n[profiles.p]\ny = 2\n'
+            self.assertEqual(codex_home.lean_config(cfg), f'a = [{q * 3}x{q * 4}]\n[profiles.p]\ny = 2\n')
+
+    def test_a_dropped_table_goes_in_each_form(self):
+        keep = 'model = "m"\n[profiles.p]\ny = 2\n'
+        for form in ('mcp_servers = { one = { command = "c" } }\n',
+                     'mcp_servers.one.command = "c"\n',
+                     '"mcp_servers".one.command = "c"\n',
+                     "'hooks' = { a = 1 }\n",
+                     'mcp_servers = {\n  one = { command = "c" },\n}\n',
+                     '"notify" = ["prog"]\n',
+                     "'notify' = [\n  \"prog\",\n]\n",
+                     ' \t"notify" = ["prog"]\n'):
+            self.assertEqual(codex_home.lean_config('model = "m"\n' + form + "[profiles.p]\ny = 2\n"), keep, form)
+        for header in ('["mcp_servers".one]', "['mcp_servers'.one]", "[ mcp_servers . one ]", "[[hooks]]",
+                       '[["hooks"]]', "[mcp_servers]", '["mcp\\u005fservers"]'):
+            cfg = f'model = "m"\n{header}\ncommand = "c"\n[profiles.p]\ny = 2\n'
+            self.assertEqual(codex_home.lean_config(cfg), keep, header)
+
+    def test_another_table_or_key_with_a_name_that_starts_the_same_stays(self):
+        for cfg in ('[mcp_servers-old]\ncommand = "c"\n', "[hooks_2]\na = 1\n", '["mcp_servers x"]\na = 1\n',
+                    "notify-all = 1\n", "notifyx = 1\n", "[a]\nmcp_servers = 1\nnotify = 2\n",
+                    'x = [\n  ["mcp_servers"],\n  ["hooks", "y"],\n]\n[profiles.p]\ny = 2\n'):
+            self.assertEqual(codex_home.lean_config(cfg), cfg, cfg)
+
+    def test_each_escape_of_a_quoted_key_is_read(self):
+        for text, key in ((r'"\U0000006dcp_servers" = 1', "mcp_servers"), (r'"mcp\u005fservers" = 1', "mcp_servers"),
+                          (r'"\x6dcp_servers" = 1', "mcp_servers"), (r'"a\tb" = 1', "a\tb"), (r'"a\"b" = 1', 'a"b'),
+                          (r'"a\\u005fb" = 1', r"a\u005fb"), (r'"a\qb" = 1', r"a\qb"), (r'"\e" = 1', "\x1b"),
+                          (r'"\UFFFFFFFF" = 1', r"\UFFFFFFFF")):
+            self.assertEqual(codex_home._first_key(text), key, text)
+        cfg = ('model = "m"\n["\\U0000006dcp_servers".one]\ncommand = "c"\n"\\U0000006eotify" = ["p"]\n'
+               "[profiles.p]\ny = 2\n")
+        self.assertEqual(codex_home.lean_config(cfg), 'model = "m"\n[profiles.p]\ny = 2\n')
+        # A literal string has no escape.
+        self.assertEqual(codex_home._first_key(r"'mcp\u005fservers' = 1"), r"mcp\u005fservers")
+
+    def test_the_first_part_of_a_key(self):
+        for text, key in (("a = 1", "a"), ("a.b = 1", "a"), ('"a b".c = 1', "a b"), ("'a'.b = 1", "a"),
+                          ("  a-b_1 = 1", "a-b_1"), ("# a comment", None), ("", None), ("= 1", None),
+                          ('"open', None), ("'open", None)):
+            self.assertEqual(codex_home._first_key(text), key, text)
+
+    def test_an_escaped_quote_does_not_close_a_basic_multi_line_string(self):
+        self.assertEqual(codex_home._toml_scan('a\\"""b', 0, '"""'), (0, '"""'))
+        self.assertEqual(codex_home._toml_scan('a\\\\"""] [', 1, '"""'), (1, None))
+        # A literal multi-line string has no escape.
+        self.assertEqual(codex_home._toml_scan("a\\'''] [", 1, "'''"), (1, None))
+
+    def test_the_scanner_reads_escapes(self):
+        self.assertEqual(codex_home._toml_scan('s = "a\\" [', 0, None), (0, None))
+        self.assertEqual(codex_home._toml_scan('s = "a\\\\" [', 0, None), (1, None))
+        self.assertEqual(codex_home._toml_scan('s = """a', 0, None), (0, '"""'))
+        self.assertEqual(codex_home._toml_scan('b""" [', 0, '"""'), (1, None))
+
+
 class ConfiguredModelTests(unittest.TestCase):
     def test_reads_top_level_model_only(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -65,6 +178,12 @@ class ConfiguredModelTests(unittest.TestCase):
             Path(tmp, "config.toml").write_text('[profiles.x]\nmodel = "other"\n')
             self.assertEqual(codex_home.configured_model({"CODEX_HOME": tmp}), "")
             self.assertEqual(codex_home.configured_model({"CODEX_HOME": tmp + "/missing"}), "")
+
+    def test_a_config_with_a_byte_order_mark_is_read(self):
+        # Codex reads a config.toml that starts with a byte order mark.
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "config.toml").write_bytes(b"\xef\xbb\xbf" + b'model = "gpt-6.1-sol"\n')
+            self.assertEqual(codex_home.configured_model({"CODEX_HOME": tmp}), "gpt-6.1-sol")
 
 
 class AuthSyncTests(unittest.TestCase):
@@ -88,6 +207,12 @@ class AuthSyncTests(unittest.TestCase):
         self.assertFalse((home / "auth.json").is_symlink())
         self.assertEqual((home / "AGENTS.md").read_text().strip(), "no emojis")
         self.assertNotIn("mcp_servers", (home / "config.toml").read_text())
+
+    def test_a_config_with_a_byte_order_mark_loses_its_first_dropped_statement(self):
+        for first in ('notify = ["prog"]\n', '[mcp_servers.one]\ncommand = "c"\n'):
+            (self.user / "config.toml").write_bytes(b"\xef\xbb\xbf" + first.encode() + b'[profiles.p]\ny = 2\n')
+            home = codex_home.prepare(self.env, root=self.worker)
+            self.assertEqual((home / "config.toml").read_bytes(), b"[profiles.p]\ny = 2\n", first)
 
     def test_refreshed_worker_login_syncs_back_only_if_user_unchanged(self):
         home = codex_home.prepare(self.env, root=self.worker)
