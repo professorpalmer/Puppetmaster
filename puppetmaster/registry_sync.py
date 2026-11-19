@@ -22,7 +22,9 @@ Rule for an appended entry (one rule, used by the CLI and the tests):
 from __future__ import annotations
 
 import json
+import os
 import shlex
+import subprocess
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterable, Optional
@@ -86,7 +88,10 @@ def _registry_arg(registry_path: Optional[Path]) -> str:
     path = Path(registry_path).expanduser().resolve()
     if path == default_registry_path().expanduser().resolve():
         return ""
-    return f" --registry-path {shlex.quote(str(path))}"
+    # One argument for the shell of this platform. POSIX quoting of a Windows
+    # path gives single quotes, which cmd.exe does not read as quotes.
+    text = subprocess.list2cmdline([str(path)]) if os.name == "nt" else shlex.quote(str(path))
+    return f" --registry-path {text}"
 
 
 def _synced_spec(spec: ModelSpec, *, adapter_locked: bool, enable: bool) -> ModelSpec:

@@ -90,9 +90,11 @@ class SecondRoundTests(unittest.TestCase):
     def test_the_registry_path_in_the_advice_is_quoted_for_a_shell(self) -> None:
         from puppetmaster.registry_sync import _registry_arg
 
-        self.assertEqual(_registry_arg(Path("/tmp/my registries/models.json")).split(" --registry-path ")[1][0], "'")
-        plain = _registry_arg(Path("/tmp/plain/models.json"))
-        self.assertTrue(plain.endswith("/tmp/plain/models.json"), plain)
+        spaced = _registry_arg(Path("/tmp/my registries/models.json")).split(" --registry-path ", 1)[1]
+        self.assertIn(spaced[0], ("'", '"'))
+        self.assertEqual(spaced[0], spaced[-1])
+        plain = Path("/tmp/plain/models.json").resolve()
+        self.assertEqual(_registry_arg(plain), f" --registry-path {plain}")
 
     def test_effort_text_in_other_forms_is_replaced(self) -> None:
         from puppetmaster.cli.commands_models import _strip_effort_extra_args
