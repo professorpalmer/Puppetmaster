@@ -1,3 +1,38 @@
+## v1.52.1 — 2026-11-19
+
+**The lean Codex config filter reads TOML statements, and three smaller fixes.**
+The Hard Proof audit ladder found these faults. Each one has a repro and a test.
+
+- Lean Codex home, `config.toml` filter (`codex_home.lean_config`): the filter
+  read the file line by line with a pattern. It now reads TOML statements. A
+  bracket in a string or in a comment is not structure. A table header inside a
+  multi-line string is text. A dropped table (`mcp_servers`, `plugins`,
+  `marketplaces`, `memories`, `hooks`) goes in each form: a header, a header
+  with a quoted key (`["mcp_servers".x]`), a key with dots
+  (`mcp_servers.x.command = "c"`) and an inline table (`mcp_servers = {...}`).
+  A table with a longer name (`[mcp_servers-old]`) stays. Before, it was
+  dropped. A top-level `notify` after an array with nested arrays is dropped.
+  Before, it stayed. A check against a TOML parser on 101,000 generated files
+  showed no difference. The earlier filter gave a different result for 79% of
+  the same files.
+- Lean Codex home, byte order mark: a `config.toml` that starts with a byte
+  order mark kept its first statement (a `notify` key or a dropped table), and
+  an unpinned Codex worker did not get the `model` of its first line. Codex
+  reads such a file (probed with Codex 0.160.0), so Puppetmaster now reads it
+  too.
+- Lean Claude Code profile: a user `settings.json` that starts with a byte
+  order mark did not parse, so the worker got no `--settings` file and lost
+  the environment block, the permission rules and the hooks of the user.
+  Claude Code reads such a file (probed with Claude Code 2.1.316), so
+  Puppetmaster now reads it too.
+- `puppetmaster models sync --apply` on a registry in a folder that is not
+  writable showed a traceback (`PermissionError`). It now prints
+  `error: ...` and gives exit code 1.
+- CodeGraph command interrupt (`codegraph._run_cli`): after an interrupt
+  (Ctrl-C) the command and its process group were ended, but nobody waited for
+  the command and its pipes stayed open. The call now waits for the ended
+  command and closes the pipes.
+
 ## v1.52.0 — 2026-11-19
 
 **Claude Code workers start with a lean profile: the project, not the person.**
