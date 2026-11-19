@@ -27,6 +27,15 @@ class UsageTextCountTests(unittest.TestCase):
     def test_score_of_a_payload_with_text_counts(self) -> None:
         self.assertEqual(usage_record_score({"tokens_in": "a", "tokens_out": "b"})[-1], 0)
 
+    def test_an_infinite_count_and_a_negative_count_are_zero(self) -> None:
+        records = select_usage_records([_usage("t", {"tokens_in": float("inf"), "tokens_out": -5})])
+        self.assertEqual((records["t"]["tokens_in"], records["t"]["tokens_out"]), (0, 0))
+        self.assertEqual(usage_record_score({"tokens_in": float("inf"), "tokens_out": 2})[-1], 2)
+
+    def test_a_result_with_spaces_at_the_ends_is_failed(self) -> None:
+        self.assertEqual(usage_record_score({"result": " Failed ", "tokens_in": 1})[0], 0)
+        self.assertEqual(usage_record_score({"result": "ok", "tokens_in": 1})[0], 1)
+
     def test_a_numeric_text_keeps_its_value(self) -> None:
         self.assertEqual(select_usage_records([_usage("t", {"tokens_in": "12", "tokens_out": 1})])["t"]["tokens_in"], 12)
 
@@ -45,6 +54,13 @@ class RolloutExactIdTests(unittest.TestCase):
             self.assertIsNone(codex_home.rollout_file(root, "5"))
             self.assertIsNone(codex_home.rollout_file(root, "eeeeeeeeeeee"))
             self.assertIsNone(codex_rollout.rollout_path(Path(tmp), "5"))
+
+    def test_the_id_is_not_a_glob_pattern(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = self._sessions(tmp, "abcdef5", "a[b]c")
+            for pattern in ("abcdef?", "abc*", "abcdef[0-9]"):
+                self.assertIsNone(codex_home.rollout_file(root, pattern), pattern)
+            self.assertIsNotNone(codex_home.rollout_file(root, "a[b]c"))
 
     def test_the_exact_id_is_a_match(self) -> None:
         with TemporaryDirectory() as tmp:

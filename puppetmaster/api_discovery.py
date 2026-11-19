@@ -135,9 +135,10 @@ def catalog_to_specs(
     """Turn a discovered API catalog into :class:`ModelSpec`s for ``adapter``.
 
     Capability/price/context are inherited from an existing registry entry for
-    the same adapter+model (the registry is a tuning overlay), then from any
-    same-named entry on a sibling adapter, and finally a conservative seed the
-    user edits. ``billing`` is the caller-provided posture for the adapter: a
+    the same adapter+model (the registry is a tuning overlay). With no such
+    entry, capability and context (not price) come from any same-named entry
+    on a sibling adapter, and finally a conservative seed the user edits.
+    ``billing`` is the caller-provided posture for the adapter: a
     new entry and an existing entry with billing ``unknown`` get it, and an
     existing entry with a known billing keeps its own."""
     same_adapter = {

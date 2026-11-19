@@ -39,11 +39,12 @@ def _coerce_int(value: Any) -> Optional[int]:
 
 
 def _count(value: Any) -> int:
-    """A stored token count as an int. Text that is not a number counts as 0,
-    and ``_billable_presence`` reports that field as unknown."""
+    """A stored token count as an int that is 0 or more. Text that is not a
+    number, an infinite value and a negative value count as 0, and
+    ``_billable_presence`` reports that field as unknown."""
     try:
-        return int(value or 0)
-    except (TypeError, ValueError):
+        return max(0, int(value or 0))
+    except (TypeError, ValueError, OverflowError):
         return 0
 
 
@@ -150,7 +151,7 @@ def usage_record_score(payload: dict) -> tuple:
     Order: non-failed result, reported real cost, measured (not estimated)
     tokens, then token volume as a tiebreak.
     """
-    result = str(payload.get("result") or "").lower()
+    result = str(payload.get("result") or "").strip().lower()
     failed = result in ("failed", "blocked", "error", "cancelled")
     try:
         real_cost = float(payload.get("real_cost_usd") or 0.0)
