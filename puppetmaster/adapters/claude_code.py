@@ -664,27 +664,39 @@ def build_claude_code_command(
 
 LEAN_PROFILE_ENV = "PUPPETMASTER_CLAUDE_LEAN"
 LEAN_SETTING_SOURCES = "project,local"
+_LEAN_OFF_WORDS = ("0", "false", "off", "no")
 
 
 def claude_lean_enabled(payload: dict, env: "Optional[Any]" = None) -> bool:
     """True when a worker runs with the lean profile.
 
-    ``payload.lean_profile`` wins. Without it, ``PUPPETMASTER_CLAUDE_LEAN``
-    set to 0, false, off or no turns the profile off. The default is on.
+    ``payload.lean_profile`` wins, then ``PUPPETMASTER_CLAUDE_LEAN``. The text
+    0, false, off or no in one of them turns the profile off. The default is on.
     """
     explicit = payload.get("lean_profile")
-    if explicit is not None:
-        return bool(explicit)
-    env = os.environ if env is None else env
-    return str(env.get(LEAN_PROFILE_ENV, "1")).strip().lower() not in ("0", "false", "off", "no")
+    if explicit is None:
+        env = os.environ if env is None else env
+        explicit = env.get(LEAN_PROFILE_ENV, "1")
+    if isinstance(explicit, str):
+        return explicit.strip().lower() not in _LEAN_OFF_WORDS
+    return bool(explicit)
 
 
-def claude_user_settings_file(env: "Optional[Any]" = None, home: Optional[Path] = None) -> Optional[Path]:
-    """The user's Claude Code ``settings.json`` when it holds a JSON object."""
+def claude_user_settings_file(
+    env: "Optional[Any]" = None,
+    home: Optional[Path] = None,
+    cwd: "Optional[Union[str, Path]]" = None,
+) -> Optional[Path]:
+    """The user's Claude Code ``settings.json`` when it holds a JSON object.
+
+    The path is absolute. A relative ``CLAUDE_CONFIG_DIR`` is read from
+    ``cwd``, the directory of the worker, because the CLI of the worker reads
+    it from there.
+    """
     env = os.environ if env is None else env
     config_dir = env.get("CLAUDE_CONFIG_DIR")
     root = Path(config_dir) if config_dir else (home if home is not None else Path.home()) / ".claude"
-    path = root / "settings.json"
+    path = Path(os.path.abspath(Path(cwd or Path.cwd()) / root / "settings.json"))
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -735,7 +747,7 @@ def claude_lean_args(
         args.extend(["--setting-sources", sources])
     user_loaded = "user" in [name.strip() for name in sources.split(",")]
     if not user_loaded and _flag_value(given, "--settings") is None:
-        settings = claude_user_settings_file(env, home)
+        settings = claude_user_settings_file(env, home, payload.get("cwd"))
         if settings is not None:
             args.extend(["--settings", str(settings)])
     if "--strict-mcp-config" not in given:
@@ -744,7 +756,7 @@ def claude_lean_args(
 
 
 def _claude_permission_mode(payload: dict) -> str:
-    if "permission_mode" in payload:
+    if payload.get("permission_mode") is not None:
         return str(payload["permission_mode"])
     if payload.get("read_only") or payload.get("sandbox") == "read-only":
         return "plan"

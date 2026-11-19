@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -82,6 +83,23 @@ class LeanArgsTests(unittest.TestCase):
         # A payload value of None is no decision.
         self.assertFalse(claude_lean_enabled({"lean_profile": None}, {"PUPPETMASTER_CLAUDE_LEAN": "0"}))
 
+    def test_payload_text_reads_like_the_environment(self) -> None:
+        for value in ("false", "0", "Off", " no "):
+            self.assertFalse(claude_lean_enabled({"lean_profile": value}, {}))
+        self.assertTrue(claude_lean_enabled({"lean_profile": "true"}, {"PUPPETMASTER_CLAUDE_LEAN": "0"}))
+
+    def test_relative_config_dir_is_read_from_the_worker_directory(self) -> None:
+        worker = _home()
+        (worker / "cfg").mkdir()
+        (worker / "cfg" / "settings.json").write_text("{}", encoding="utf-8")
+        env = {"CLAUDE_CONFIG_DIR": "cfg"}
+        expected = Path(os.path.abspath(worker / "cfg" / "settings.json"))
+        found = claude_user_settings_file(env, _home(), worker)
+        self.assertEqual(found, expected)
+        self.assertTrue(found.is_absolute())
+        args = claude_lean_args({"cwd": str(worker)}, env=env, home=_home())
+        self.assertEqual(args[args.index("--settings") + 1], str(expected))
+
     def test_caller_setting_sources_win(self) -> None:
         home = _home("{}")
         settings = str(home / ".claude" / "settings.json")
@@ -145,6 +163,10 @@ class LeanAdapterTests(unittest.TestCase):
         for flag in ("--setting-sources", "--settings", "--strict-mcp-config"):
             self.assertNotIn(flag, command)
         self.assertNotIn("profile:lean", verification.evidence)
+
+    def test_permission_mode_without_a_value_is_no_decision(self) -> None:
+        command, _, _ = self._run({}, permission_mode=None, read_only=True)
+        self.assertEqual(command[command.index("--permission-mode") + 1], "dontAsk")
 
     def test_payload_turns_the_profile_off_for_one_task(self) -> None:
         command, _, _ = self._run({}, lean_profile=False)

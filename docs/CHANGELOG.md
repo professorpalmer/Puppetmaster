@@ -27,6 +27,14 @@ started for each worker.
 - The verification artifact of a lean worker has `profile:lean` in its
   evidence. A settings file that is not a JSON object is not passed, because
   the CLI stops on such a file.
+- The path of the settings file is absolute. A relative `CLAUDE_CONFIG_DIR` is
+  read from the directory of the worker, where the CLI of the worker reads it.
+  The text `false`, `0`, `off` or `no` in `payload.lean_profile` turns the
+  profile off, the same as in the environment variable. The release audit
+  gate found these two faults before the release.
+- A payload with `permission_mode: null` is now the same as a payload with no
+  `permission_mode`. Before, the adapter sent the text `None` to the CLI and a
+  `read_only` task was not read-only. No caller sent that value.
 - Docs: `docs/ADAPTERS.md`, section `claude-code`.
 
 ## v1.51.4 — 2026-11-18
