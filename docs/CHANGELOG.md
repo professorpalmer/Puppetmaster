@@ -1,3 +1,50 @@
+## v1.51.4 — 2026-11-18
+
+**`models sync --apply` no longer changes auto-routing, and seven smaller fixes.**
+The release audit gate (`hpf gate`) and a second review found these faults in
+v1.51.3. Each one has a repro and a test.
+
+- Auto-routing after `models sync --apply`: the notes of v1.51.0 said that a
+  default `--apply` does not change auto-routing. It did. The prior-generation
+  filter read each row of the registry as present, so a new row with
+  `enabled: false` removed an enabled older row of the same lane (for example
+  `gpt-5` when a disabled `gpt-5.6` row was added), and a task could have no
+  eligible model. `pareto_recommend.filter_prior_generation` now counts only
+  an entry that routing can use. A disabled or retired entry is not a
+  successor.
+- Pin error, registry file absent: the error said that the starter entry is
+  absent and named `models sync`, which refuses a missing registry. It now
+  says that no registry file is at the path and names `models init`.
+- Pin error, registry that is not the default one: each command in the advice
+  now has `--registry-path <path>`. Before, the advice acted on the default
+  registry and the pin failed again.
+- Pin error, entry on an adapter that the platform lock disables: the advice
+  names `puppetmaster platform enable <adapter>` first. Before, it named only
+  `models set ... enabled=true`, which made an enabled entry on a locked
+  adapter, and the task then failed at the platform lock.
+- `puppetmaster models set <id> effort=<level>` keeps the other `extra_args`
+  of the entry. Before, the effort flags replaced the whole list.
+- CodeGraph drift check (`_porcelain_path`): a path that git prints in quotes
+  (a name with non-ASCII bytes, a quote, a backslash or a tab) is decoded, and
+  a rename with ` -> ` inside a quoted source name gives the destination.
+  Before, such a file was counted as changed on each check.
+- `PUPPETMASTER_CODEGRAPH_NO_NPX=1` turns off only the `npx` fallback. With
+  `npm` present, the one-time global install still runs. Before, the function
+  returned at once and each CodeGraph command reported that CodeGraph is
+  missing.
+- Flow shell nodes: a stop or a timeout of a shell node also ends a child
+  that leads its own session, such as a `puppetmaster codegraph` command
+  (`flow._kill_tree` reads the process tree before the group kill).
+- Second round: the audit gate ran on these fixes before the release and
+  confirmed three more faults, which are corrected here. A registry path in
+  the advice is quoted for a shell. A file name with a space at its start or
+  its end keeps the space in the drift check. With `npx` off, a second caller
+  of the CodeGraph setup waits for the install of the first caller, so it
+  does not report that CodeGraph is missing.
+- Tests: `tests/test_hpfix_release_gate_leads.py`,
+  `tests/test_hpfix_puppetmaster_cli_commands_models.py`,
+  `tests/test_hpfix_puppetmaster_codegraph.py`.
+
 ## v1.51.3 — 2026-11-18
 
 **Usage counts and the Codex session lookup accept bad stored values.**

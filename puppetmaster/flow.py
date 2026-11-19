@@ -2292,17 +2292,49 @@ def _cut_jobs(state_dir: Path, backend: str, job_ids: list[str]) -> None:
                       file=sys.stderr)
 
 
+def _descendants(pid: int) -> list[int]:
+    """The live processes below ``pid`` in the process tree, from one ``ps`` call."""
+    try:
+        listing = subprocess.run(
+            ["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True, timeout=5, check=False
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    children: dict[int, list[int]] = {}
+    for line in listing.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            children.setdefault(int(parts[1]), []).append(int(parts[0]))
+    found: list[int] = []
+    stack = [pid]
+    while stack:
+        for child in children.get(stack.pop(), []):
+            found.append(child)
+            stack.append(child)
+    return found
+
+
 def _kill_tree(pid: int) -> bool:
     """Kill a shell node's command and everything it started; it leads its own group."""
     if os.name == "nt":
         from puppetmaster.win_process import kill_process_tree
 
         return kill_process_tree(pid)
+    # A child can lead its own session (the CodeGraph command runner does), and
+    # the group kill does not reach it. Read the tree before the kill: after it,
+    # the children have a new parent.
+    below = _descendants(pid)
     try:
         os.killpg(pid, signal.SIGKILL)
-        return True
+        killed = True
     except (ProcessLookupError, PermissionError):
-        return False
+        killed = False
+    for child in below:
+        try:
+            os.kill(child, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    return killed
 
 
 def item_key(node: dict, item: Any, index: int) -> str:
