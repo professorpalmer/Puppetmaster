@@ -15,6 +15,11 @@ Cost:
 - No worker, judge or pilot prompt changes. The prompt builders read node outputs and results, not the new step fields (`via`, `children`, `approval`), and `run_summary` keeps its key allowlist. The new CLI actions are not in the MCP tool schema.
 - Measured on this Mac (201-step scripted walk, median of 5): 0.26 ms for each step, about 480 bytes of log for each step.
 
+Other fixes:
+
+- Read helper (`readonly.connect`): a WAL cohort that closes during a helper open is contention, not a changed source. Each store call closes its own connection, and the last close deletes the `-wal`/`-shm` pair. A helper that saw the pair in its first stamps and took its lock after the close reported `source changed` with `launch_topology_change`, and the read failed (`ReadUnavailable`, seen on macOS CI in `test_stop_receipt`). Ordinary and reuse reads now retry it after 10 ms, like live sidecars. A changed main file still fails. Stress on this Mac: 18 failures in 9,000 reads before, 0 after; 4 in 30,000 before, 0 after.
+- Test `test_the_judge_waits_for_a_live_writer`: the writer releases its claim after the judge records its wait, not after a fixed 0.4 s (a slow Windows runner started the judge after the release).
+
 Release audit (`hpf audit` on `v1.52.1..de4ed0ac`: 20 functions, 11 confirmed bugs, $4.34 API-equivalent on the Claude plan). All 11 are fixed, each with a test in `tests/test_hpfix_flow_1_53.py` that fails before the fix:
 
 - `flow events --children` follows nested maps (it printed one level only).
