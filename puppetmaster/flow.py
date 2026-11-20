@@ -42,8 +42,10 @@ What the runtime adds beyond walking:
 from __future__ import annotations
 
 import copy
+import getpass
 import hashlib
 import json
+import math
 import os
 import re
 import signal
@@ -59,6 +61,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from puppetmaster import flow_events
 from puppetmaster.adapters._prompts import FINISH_INSTRUCTIONS
 from puppetmaster.conflicts import path_in_scope
 from puppetmaster.models import ArtifactType, JobStatus, TaskStatus, now_iso
@@ -673,13 +676,20 @@ def _norm(text: str) -> str:
     return unicodedata.normalize("NFC", text).strip().casefold()
 
 
+_DECIMAL = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?")
+
+
 def _number(value: Any) -> Optional[float]:
+    """A finite number, or None. Text counts only when it is a plain decimal:
+    ``float()`` also reads "nan", "inf" and "1_0", which then compared wrong."""
     if isinstance(value, bool):
         return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+    if isinstance(value, (int, float)):
+        return float(value) if math.isfinite(value) else None
+    if isinstance(value, str) and _DECIMAL.fullmatch(value.strip()):
+        number = float(value)
+        return number if math.isfinite(number) else None
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -708,6 +718,8 @@ class FlowRun:
     usage: dict[str, Any] = field(default_factory=dict)
     answer: Optional[str] = None
     gate: Optional[dict] = None
+    # The edge that led to ``current``: from node, when label, edge index.
+    arrived: Optional[dict] = None
     # The node visit in progress: launch attempts, jobs and child runs, so a
     # restarted walker adopts them instead of starting them again.
     inflight: Optional[dict] = None
@@ -840,8 +852,10 @@ def load_graph(state_dir: Path, ref: Any, *, base: Optional[str] = None) -> dict
 def new_run(state_dir: Path, graph: dict, input_text: str = "", *,
             state: Optional[dict] = None, parent: Optional[dict] = None,
             continue_from: Optional[str] = None, cwd: Optional[str] = None,
-            backend: str = "sqlite", worker_mode: str = "inline") -> FlowRun:
-    """Create a run. ``continue_from`` carries a prior run's sessions so its nodes resume."""
+            backend: str = "sqlite", worker_mode: Optional[str] = None) -> FlowRun:
+    """Create a run. ``continue_from`` carries a prior run's sessions so its nodes resume.
+
+    ``worker_mode`` None means: the continued run's mode, else ``inline``."""
     child = parent is not None
     depth = int((parent or {}).get("depth", 0))
     problems = validate_graph(graph, child=child, depth=depth)
@@ -869,13 +883,14 @@ def new_run(state_dir: Path, graph: dict, input_text: str = "", *,
             # not evidence about this run's files. Chains keep the first origin.
             result.setdefault("inherited_from", prior.run_id)
         seeded.update(prior.state)
-        backend, worker_mode = prior.backend, prior.worker_mode
+        backend, worker_mode = prior.backend, worker_mode or prior.worker_mode
     seeded.update(state or {})
     run = FlowRun(run_id="flow_" + uuid.uuid4().hex[:12], graph=graph, input=input_text,
                   current=graph["entry"], state=seeded, sessions=sessions, results=results,
                   parent=parent, continued_from=continue_from, backend=backend,
-                  worker_mode=worker_mode)
+                  worker_mode=worker_mode or "inline")
     save_run(state_dir, run)
+    flow_events.sync(state_dir, run)
     return run
 
 
@@ -894,7 +909,7 @@ def _lock(state_dir: Path, run_id: str, timeout: float):
 
 def walk(state_dir: Path, run_id: str, *, execute: Optional[NodeExecutor] = None,
          answer: Optional[str] = None, restart: bool = False, reset_loops: bool = False,
-         extra_steps: int = 0) -> FlowRun:
+         extra_steps: int = 0, answered_by: Optional[str] = None) -> FlowRun:
     """Advance ``run_id`` until it finishes, gets stuck, or waits at a gate.
 
     Resumable and single-walker: the run lock admits one walker, state is
@@ -910,7 +925,8 @@ def walk(state_dir: Path, run_id: str, *, execute: Optional[NodeExecutor] = None
     try:
         run = load_run(state_dir, run_id)
         if not _prepare(state_dir, run, answer=answer, restart=restart,
-                        reset_loops=reset_loops, extra_steps=extra_steps):
+                        reset_loops=reset_loops, extra_steps=extra_steps,
+                        answered_by=answered_by):
             return run
         run.pid = os.getpid()
         save_run(state_dir, run)
@@ -980,7 +996,7 @@ def _unmark_walking(run_id: str) -> None:
 
 def prepare_resume(state_dir: Path, run_id: str, *, answer: Optional[str] = None,
                    restart: bool = False, reset_loops: bool = False,
-                   extra_steps: int = 0) -> tuple[FlowRun, bool]:
+                   extra_steps: int = 0, answered_by: Optional[str] = None) -> tuple[FlowRun, bool]:
     """Apply a gate answer or restart now, before a detached walker is spawned.
 
     Returns ``(run, should_walk)``. Doing the transition synchronously means a
@@ -995,7 +1011,8 @@ def prepare_resume(state_dir: Path, run_id: str, *, answer: Optional[str] = None
     try:
         run = load_run(state_dir, run_id)
         should_walk = _prepare(state_dir, run, answer=answer, restart=restart,
-                               reset_loops=reset_loops, extra_steps=extra_steps)
+                               reset_loops=reset_loops, extra_steps=extra_steps,
+                               answered_by=answered_by)
         if should_walk:
             run.pid = None
             save_run(state_dir, run)
@@ -1005,7 +1022,7 @@ def prepare_resume(state_dir: Path, run_id: str, *, answer: Optional[str] = None
 
 
 def _prepare(state_dir: Path, run: FlowRun, *, answer: Optional[str], restart: bool,
-             reset_loops: bool, extra_steps: int) -> bool:
+             reset_loops: bool, extra_steps: int, answered_by: Optional[str] = None) -> bool:
     """Move a run to ``running`` if it may walk now; persist a rejected answer's reason."""
     if run.status == "waiting":
         if answer is None:
@@ -1015,7 +1032,8 @@ def _prepare(state_dir: Path, run: FlowRun, *, answer: Optional[str], restart: b
             run.reason = f'answer "{answer}" is not one of: {", ".join(map(str, options))}'
             save_run(state_dir, run)
             return False
-        run.gate = {**(run.gate or {}), "answer": answer}
+        run.gate = {**(run.gate or {}), "answer": answer, "answered_at": now_iso(),
+                    "answered_by": answered_by or _whoami()}
         _clear_marker(state_dir, run.run_id, "stop")
     elif run.status in TERMINAL_STATUSES:
         if not restart or run.status not in RESTARTABLE_STATUSES:
@@ -1033,6 +1051,13 @@ def _prepare(state_dir: Path, run: FlowRun, *, answer: Optional[str], restart: b
         _clear_marker(state_dir, run.run_id, "stop")
         _clear_marker(state_dir, run.run_id, "cut")
     elif restart:
+        # An interrupted run keeps its in-flight record (its jobs are adopted),
+        # but the limits the caller raises apply as for any restart.
+        if run.status in RESTARTABLE_STATUSES:
+            if extra_steps:
+                run.graph.setdefault("limits", {})["maxSteps"] = len(run.steps) + int(extra_steps)
+            if reset_loops:
+                run.edge_counts = {}
         _clear_marker(state_dir, run.run_id, "stop")
     run.status, run.reason = "running", ""
     return True
@@ -1055,6 +1080,8 @@ def _walk(state_dir: Path, run: FlowRun, execute: NodeExecutor) -> FlowRun:
             return _finish(state_dir, run, "failed", f'node "{run.current}" vanished')
         kind, prev = node["kind"], _prev(run)
         step: dict[str, Any] = {"node": node["id"], "kind": kind, "started_at": now_iso()}
+        if run.arrived is not None:
+            step["via"] = run.arrived
         if kind == "gate":
             pending = run.gate if (run.gate or {}).get("node") == node["id"] else None
             if pending is None or pending.get("answer") is None:
@@ -1063,7 +1090,15 @@ def _walk(state_dir: Path, run: FlowRun, execute: NodeExecutor) -> FlowRun:
                 run.status, run.pid = "waiting", None
                 run.reason = f'waiting at gate "{node["id"]}"'
                 save_run(state_dir, run)
+                flow_events.sync(state_dir, run)
                 return run
+            step["approval"] = {
+                "answer": str(pending["answer"]),
+                "answered_by": pending.get("answered_by"),
+                "answered_at": pending.get("answered_at"),
+                "question_digest": flow_events.question_digest(pending.get("question")),
+                "options": [str(option) for option in pending.get("options") or []],
+            }
             run.answer, run.gate = str(pending["answer"]), None
             outcome = NodeOutcome(ok=True, output=run.answer, answer=run.answer)
         elif kind in _CONTROL_KINDS:
@@ -1091,6 +1126,7 @@ def _walk(state_dir: Path, run: FlowRun, execute: NodeExecutor) -> FlowRun:
                      "usage": outcome.usage, "preview": (outcome.output or "")[:300]})
         if outcome.items is not None:
             step["items"] = _item_counts(outcome.items)
+            step["children"] = {key: (item or {}).get("run_id") for key, item in outcome.items.items()}
         if outcome.logs:
             step["logs"] = outcome.logs
         run.steps.append(step)
@@ -1116,12 +1152,20 @@ def _walk(state_dir: Path, run: FlowRun, execute: NodeExecutor) -> FlowRun:
                            render(node.get("summary") or status, run, prev))
         nxt = _pick_edge(graph, node, outcome, run, max_loops, loops)
         if isinstance(nxt, tuple):
-            failed = _stale_reviews(run) + _stale_reuse(run) if nxt[0] == "done" else []
+            # The last node's own verdict is its result (a map reads it); an
+            # earlier failure that an ``always`` edge carried on is not.
+            failed = (_failed_work(run, unhandled=True, skip=node["id"]) + _stale_reviews(run)
+                      + _stale_reuse(run) if nxt[0] == "done" else [])
             if failed:
                 return _finish(state_dir, run, "failed", "; ".join(failed)[:600])
             return _finish(state_dir, run, *nxt)
+        if (run.arrived or {}).get("when") != "always":
+            # A conditional edge (fail, FAIL, a state test) routed on this
+            # result: a failure here is handled, not carried on unseen.
+            run.results[node["id"]]["routed"] = (run.arrived or {}).get("when")
         run.current = nxt
         save_run(state_dir, run)
+        flow_events.sync(state_dir, run)
 
 
 def _pick_edge(graph: dict, node: dict, outcome: NodeOutcome, run: FlowRun,
@@ -1147,6 +1191,7 @@ def _pick_edge(graph: dict, node: dict, outcome: NodeOutcome, run: FlowRun,
         if limit is not None and run.edge_counts.get(key, 0) >= limit:
             return ("stuck", f'edge {edge["from"]}->{edge["to"]} taken {limit} times')
         run.edge_counts[key] = run.edge_counts.get(key, 0) + 1
+        run.arrived = {"from": node["id"], "when": str(edge.get("when", "always")), "edge": index}
         return edge["to"]
     if not outcome.ok:
         return ("failed", f'node-failed "{node["id"]}": {outcome.error or "failed"}')
@@ -1210,7 +1255,15 @@ def _add_usage(total: dict, part: dict) -> None:
 def _finish(state_dir: Path, run: FlowRun, status: str, reason: str) -> FlowRun:
     run.status, run.reason, run.pid = status, reason, None
     save_run(state_dir, run)
+    flow_events.sync(state_dir, run)
     return run
+
+
+def _whoami() -> Optional[str]:
+    try:
+        return getpass.getuser()
+    except Exception:  # no login name (a container with no passwd entry)
+        return None
 
 
 def _marker(state_dir: Path, run_id: str, name: str) -> Path:
@@ -1507,7 +1560,9 @@ def run_summary(run: FlowRun, *, since: int = 0) -> dict:
         "usage": run.usage,
     }
     if run.gate:
-        summary["gate"] = run.gate
+        # The approval record (who, when) is for the event log, not the pilot.
+        summary["gate"] = {key: value for key, value in run.gate.items()
+                           if key not in ("answered_at", "answered_by")}
     inherited = _inherited_results(run)
     if inherited:
         summary["inherited"] = inherited
@@ -2956,14 +3011,18 @@ def _stale_reuse(run: FlowRun) -> list[str]:
     return stale
 
 
-def _failed_work(run: FlowRun) -> list[str]:
+def _failed_work(run: FlowRun, *, unhandled: bool = False, skip: Optional[str] = None) -> list[str]:
     """Work nodes whose latest result failed. An earlier visit's FAIL that a
-    later visit superseded does not count; a final FAIL or PARTIAL verdict does."""
+    later visit superseded does not count; a final FAIL or PARTIAL verdict does.
+
+    ``unhandled`` leaves out a failure that a conditional edge routed on (a
+    ``fail`` edge to a fallback): only one an ``always`` edge carried on counts."""
     kinds = {node["id"]: node.get("kind") for node in run.graph.get("nodes") or []}
     return [f"{node_id}: {(result.get('error') or result.get('reason') or result.get('verdict') or 'failed')[:160]}"
             for node_id, result in run.results.items()
             if kinds.get(node_id) in _WORK_KINDS
-            and (not result.get("ok") or result.get("verdict") in ("FAIL", "PARTIAL"))]
+            and (not result.get("ok") or result.get("verdict") in ("FAIL", "PARTIAL"))
+            and not (unhandled and result.get("routed")) and node_id != skip]
 
 
 def _item_result(child: FlowRun) -> dict:

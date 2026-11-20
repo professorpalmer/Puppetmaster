@@ -5011,6 +5011,7 @@ def run_flow_tool(args: JsonObject) -> JsonObject:
     params.setdefault("cwd", cwd(args))
     params["timeout"] = params.get("timeout_seconds")
     action = str(params.get("action") or "")
+    params["answered_via"] = "mcp"
     # The MCP turn cannot block on a whole walk: walks always run detached.
     params["background"] = True
     params["foreground"] = False

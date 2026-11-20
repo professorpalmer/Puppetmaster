@@ -1,3 +1,36 @@
+## v1.53.0 — 2026-11-20
+
+**Flow runs write an event log with lineage and gate approval records. New CLI
+actions read the log, check it against a published schema, and compare runs.**
+No worker, judge or pilot prompt changes.
+
+- Flow event log. Each run writes `events.jsonl` next to `run.json`: `run.started`, one `step` for each node visit, `gate.waiting` and `run.finished`. Each event names its parent event. A step records the edge that led to it (`via`: from node, `when`, edge index), so a repair step points back at the failed check. A map step lists its item runs (`children`); an item run names its parent run, node and key. Events have deterministic keys: the walker appends only missing keys, so a walker that dies between a save and an append fills the gap later and writes no event two times. A torn last line is cut before the next append. A failed append is logged and never fails the walk.
+- Gate approval record. A gate answer stores who answered (`cli:<login>` or `mcp:<login>`), when, the options and the SHA-256 digest of the question text. It is in the gate step of `run.json` and in the event log. The pilot summary leaves out the who and when.
+- `puppetmaster flow events <run> [--since] [--follow] [--timeout] [--children]`: a read-only tap that prints the log as JSON lines. It reads the log file and `run.json` only, never the job store.
+- `puppetmaster flow schema` prints the JSON Schema of an event (`puppetmaster/schemas/flow-event.v1.json`, shipped in the wheel). `puppetmaster flow check-events <file|run>` checks a log against it. The checker reads the schema file, so the two cannot drift.
+- `puppetmaster flow compare <base> <run>...`: graph digest match, path shape score (`1 - edit distance / longer path`), revisits, visit change for each node, usage and wall-time ratios. It reads run records only.
+
+Cost:
+
+- No worker, judge or pilot prompt changes. The prompt builders read node outputs and results, not the new step fields (`via`, `children`, `approval`), and `run_summary` keeps its key allowlist. The new CLI actions are not in the MCP tool schema.
+- Measured on this Mac (201-step scripted walk, median of 5): 0.26 ms for each step, about 480 bytes of log for each step.
+
+Other fixes:
+
+- Read helper (`readonly.connect`): a WAL cohort that closes during a helper open is contention, not a changed source. Each store call closes its own connection, and the last close deletes the `-wal`/`-shm` pair. A helper that saw the pair in its first stamps and took its lock after the close reported `source changed` with `launch_topology_change`, and the read failed (`ReadUnavailable`, seen on macOS CI in `test_stop_receipt`). Ordinary and reuse reads now retry it after 10 ms, like live sidecars. A changed main file still fails. Stress on this Mac: 18 failures in 9,000 reads before, 0 after; 4 in 30,000 before, 0 after.
+- Test `test_the_judge_waits_for_a_live_writer`: the writer releases its claim after the judge records its wait, not after a fixed 0.4 s (a slow Windows runner started the judge after the release).
+
+Release audit (`hpf audit` on `v1.52.1..de4ed0ac`: 20 functions, 11 confirmed bugs, $4.34 API-equivalent on the Claude plan). All 11 are fixed, each with a test in `tests/test_hpfix_flow_1_53.py` that fails before the fix:
+
+- `flow events --children` follows nested maps (it printed one level only).
+- `flow check-events`: a boolean is not the integer 1 (`"v": true` passed). The schema gives `v` the type `integer`.
+- Edge conditions: only plain decimal text compares as a number. `float()` also read `nan` (so `state.v = nan` was false for the text `nan`) and `1_0` (equal to 10).
+- A run that ends at a node with no edges is `failed` when an earlier work node failed and an `always` edge carried the run on (it ended `done`, so the failure was hidden). A failure that a conditional edge routed (a `fail` edge to a fallback) is still handled, and the last node's own verdict is still its result.
+- `flow resume --restart` on an `interrupted` run applies `--extra-steps` and `--reset-loops` (they were ignored). Its in-flight jobs are still adopted.
+- `flow run --continue X --worker-mode M` uses `M` (the continued run's mode won). With no `--worker-mode`, the continued run's mode applies.
+- `flow` with `-` and bad JSON on stdin, or an unreadable `--input-file`, exits 2 with `error: ...`. `validate`, `save` and `run` with no graph raise a usage error (MCP gave a bare `'graph'`).
+- Smaller faults the audit found real but not reachable, in the new code: a usage value of NaN or infinity is dropped from an event, a log line with a bad `seq` is skipped, a timestamp with no offset counts as UTC in `flow compare`, and `check-events` splits lines on newline only.
+
 ## v1.52.1 — 2026-11-19
 
 **The lean Codex home reads `config.toml` as TOML statements, and four smaller fixes.**

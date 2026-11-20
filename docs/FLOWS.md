@@ -155,13 +155,18 @@ wins. `when` is one of:
 - `PASS`, `FAIL`, `PARTIAL`: the node's verdict
 - `answer=X`: a gate's answer (case- and Unicode-insensitive)
 - `out~=text`: the node's output contains the text
-- `state.k OP v` with `= != >= <= > < ~=`; numbers compare numerically
+- `state.k OP v` with `= != >= <= > < ~=`. Two plain decimal numbers compare
+  as numbers (`10` and `10.0` are equal). Other text compares as text, so
+  `nan`, `inf` and `1_0` are not numbers.
 
 A back-edge (an edge that closes a cycle) may be taken at most `max` times,
 default `limits.maxLoops` (3). Past that the run is `stuck`. Forward edges are
 bounded only by `limits.maxSteps` (60). A failed node with no matching edge
 fails the run. A node with edges but no match makes the run `stuck`. A node
-with no edges ends the run.
+with no edges ends the run. The run is `failed` when an earlier work node
+failed and an `always` edge carried the run on. A failure that a conditional
+edge (such as `fail` to a fallback) routed is handled, and the last node's own
+verdict is its result.
 
 ## Templates
 
@@ -410,6 +415,7 @@ works as before, and drops reuse records from earlier runs.
 | `flow stop <run>` | `stop` |
 | `flow cut <run> [--reason]` | `cut` |
 | `flow list` | `list` |
+| `flow events <run> [--follow]` | (CLI only; see Event log) |
 
 Every action returns the same compact summary: status, reason, the steps since
 `since`, the last problem, usage, and `next_since` for the next call. Exit
@@ -451,6 +457,52 @@ Shell nodes are at-least-once. A command's exit status dies with its walker, so
 a resumed walker kills the command the dead walker left running (when the pid
 still names that command) and runs it again. A pid that now names another
 process is left alone.
+
+### Event log and run history
+
+Each run writes `events.jsonl` next to its `run.json`. The log is for people
+and tools outside the walk: a dashboard, CI, Marionette, a script. No worker
+or judge prompt reads it, and the pilot summary does not change. A reader
+opens this file and `run.json` only, never the job store, so a tap adds no
+load to a running fan-out.
+
+| Event | When |
+| --- | --- |
+| `run.started` | The run exists. A map item run names its parent run, map node and item key in `parent_run`. |
+| `step` | A node visit ended. It has the verdict, reason, jobs, usage, the edge that led to it (`via`), the item runs of a map (`children`), and for a gate the approval record. |
+| `gate.waiting` | The run waits at a gate. It has a digest of the question. |
+| `run.finished` | The run reached `done`, `failed`, `stuck` or `stopped`. |
+
+Each event names its `parent` event. A repair step names the failed check
+before it, and `via` gives the edge (`from`, `when`, index). To find why a
+repair happened, follow `parent` up from the repair step.
+
+A gate answer records who answered (`cli:<login>` or `mcp:<login>`), when,
+the answer, the options, and the SHA-256 digest of the question as the
+person saw it. A later change of the question text gives a different digest.
+
+Each event has a deterministic `key`. The walker appends only the keys that
+the file does not hold, so a walker that dies between a save and an append
+fills the gap on its next sync, and no event is written two times. An append
+that fails is logged and dropped. It never fails the walk.
+
+| CLI | Does |
+| --- | --- |
+| `flow events <run> [--since SEQ] [--follow] [--timeout S] [--children]` | Print the log as JSON lines. `--follow` stays open until the run ends; a gate keeps it open. `--children` adds each map item log after its map step. |
+| `flow schema` | Print the JSON Schema of an event (`puppetmaster/schemas/flow-event.v1.json`). |
+| `flow check-events <file\|run>` | Check a log against the schema. Exit 0 when each line is valid. |
+| `flow compare <base> <run>...` | Compare runs of one flow (below). |
+
+`flow compare` reads the run records. For each run after the first it gives:
+
+- `same_graph`: the graph digests match (the resolved `cwd` is left out).
+- `shape_score`: `1 - edit_distance / longer_path` over the node paths. 1.0 is the same path.
+- `revisits`: extra node visits against the baseline (repair loops and re-reviews).
+- `visits`: the change of visit count for each node.
+- `usage_ratio` and `wall_ratio`: the run against the baseline.
+
+Use it to check that a change to a graph, a model or a prompt did not change
+how the flow runs, before you compare cost.
 
 ### Map items in the walker process
 
