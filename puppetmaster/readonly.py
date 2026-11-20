@@ -488,8 +488,7 @@ class ReadConnection:
                         getattr(exc, 'source_open_contention', False)
                     )
                     locked = _locked(exc)
-                    unavailable = isinstance(exc, ReadUnavailable) and any(
-                        reason in str(exc) for reason in ('live sidecars', 'active reader'))
+                    unavailable = _sidecar_contention(exc)
                     launch_transient = launch_binding and _launch_transient(exc)
                     if not (write_race or topology_race or source_open_contention or locked or
                             (launch_transient if launch_binding else unavailable)):
@@ -512,7 +511,10 @@ class ReadConnection:
                         not launch_binding and os.name == 'nt' and
                         getattr(exc, 'wal_snapshot', False))
                     self._release_permit()
-                    time.sleep(min(.01 if write_race else .05, remaining))
+                    # A write race or a cohort turnover means the writer is
+                    # done. A long wait would spend a reuse read's 100 ms.
+                    turnover = getattr(exc, 'launch_topology_change', False)
+                    time.sleep(min(.01 if write_race or turnover else .05, remaining))
                     remaining = retry_deadline - time.monotonic()
                     if remaining <= 0:
                         raise
@@ -729,6 +731,20 @@ def _locked(exc):
             str(exc) in ('database is locked', 'database table is locked', 'database schema is locked'))
 
 
+def _sidecar_contention(exc):
+    """A live WAL cohort, or one that turned over beside an unchanged main file.
+
+    Each store call closes its connection, and the last close deletes the
+    -wal/-shm pair. A helper whose first stamps saw the pair and whose lock
+    came after the close reports source changed with launch_topology_change:
+    the main file kept its inode, size and times. That is the same contention
+    as live sidecars. The retry evaluates the source again from the start.
+    """
+    return isinstance(exc, ReadUnavailable) and (
+        any(reason in str(exc) for reason in ('live sidecars', 'active reader')) or
+        getattr(exc, 'launch_topology_change', False))
+
+
 def _launch_transient(exc):
     code = getattr(exc, 'sqlite_errorcode', None)
     return ((code is None or _locked(exc)) and isinstance(exc, ReadUnavailable) and (
@@ -857,8 +873,7 @@ def connect(store, *, timeout=5, reuse=False, launch_binding=False, attach_bindi
                 continue
             # Admission survives incomplete teardown. Codes take precedence over messages.
             locked = _locked(exc)
-            unavailable = isinstance(exc, ReadUnavailable) and any(
-                reason in str(exc) for reason in ('live sidecars', 'active reader'))
+            unavailable = _sidecar_contention(exc)
             launch_transient = launch_binding and _launch_transient(exc)
             if launch_binding:
                 unavailable = launch_transient
