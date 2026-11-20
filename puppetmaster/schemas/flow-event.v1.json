@@ -1,0 +1,455 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://puppetmaster.gg/schemas/flow-event.v1.json",
+  "title": "Puppetmaster flow event, version 1",
+  "description": "One line of a flow run's events.jsonl. Each event has a deterministic key; parent names the event that came before it in causal order.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/run_started"
+    },
+    {
+      "$ref": "#/$defs/step"
+    },
+    {
+      "$ref": "#/$defs/gate_waiting"
+    },
+    {
+      "$ref": "#/$defs/run_finished"
+    }
+  ],
+  "$defs": {
+    "usage": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "number"
+      }
+    },
+    "run_started": {
+      "type": "object",
+      "required": [
+        "v",
+        "id",
+        "seq",
+        "run_id",
+        "type",
+        "key",
+        "at",
+        "parent",
+        "graph_id",
+        "entry",
+        "parent_run",
+        "continued_from"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "v": {
+          "const": 1
+        },
+        "id": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "run.started"
+        },
+        "key": {
+          "type": "string"
+        },
+        "at": {
+          "type": "string"
+        },
+        "parent": {
+          "type": "null"
+        },
+        "graph_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "entry": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parent_run": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "required": [
+            "run_id",
+            "node",
+            "key"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "run_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "node": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "key": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "continued_from": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "step": {
+      "type": "object",
+      "required": [
+        "v",
+        "id",
+        "seq",
+        "run_id",
+        "type",
+        "key",
+        "at",
+        "parent",
+        "index",
+        "node",
+        "kind",
+        "visit",
+        "ok",
+        "verdict",
+        "reason",
+        "error",
+        "job_ids",
+        "usage",
+        "via",
+        "items",
+        "children",
+        "approval",
+        "started_at",
+        "finished_at"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "v": {
+          "const": 1
+        },
+        "id": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "step"
+        },
+        "key": {
+          "type": "string"
+        },
+        "at": {
+          "type": "string"
+        },
+        "parent": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "node": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "visit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "verdict": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "type": "string"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "job_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "usage": {
+          "$ref": "#/$defs/usage"
+        },
+        "via": {
+          "description": "The edge that led to this step: source node, its when label and its index in the graph's edges.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "required": [
+            "from",
+            "when",
+            "edge"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "from": {
+              "type": "string"
+            },
+            "when": {
+              "type": "string"
+            },
+            "edge": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "items": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "type": "integer"
+          }
+        },
+        "children": {
+          "description": "Map steps: item key to the item's own flow run id.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "approval": {
+          "description": "Gate steps: the answer, who gave it, when, and a digest of the question they saw.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "required": [
+            "answer",
+            "answered_by",
+            "answered_at",
+            "question_digest",
+            "options"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "answer": {
+              "type": "string"
+            },
+            "answered_by": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "answered_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "question_digest": {
+              "type": "string"
+            },
+            "options": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "started_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "finished_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "gate_waiting": {
+      "type": "object",
+      "required": [
+        "v",
+        "id",
+        "seq",
+        "run_id",
+        "type",
+        "key",
+        "at",
+        "parent",
+        "node",
+        "question_digest",
+        "options"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "v": {
+          "const": 1
+        },
+        "id": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "gate.waiting"
+        },
+        "key": {
+          "type": "string"
+        },
+        "at": {
+          "type": "string"
+        },
+        "parent": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "node": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "question_digest": {
+          "type": "string"
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "run_finished": {
+      "type": "object",
+      "required": [
+        "v",
+        "id",
+        "seq",
+        "run_id",
+        "type",
+        "key",
+        "at",
+        "parent",
+        "status",
+        "reason",
+        "steps",
+        "usage"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "v": {
+          "const": 1
+        },
+        "id": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "type": {
+          "const": "run.finished"
+        },
+        "key": {
+          "type": "string"
+        },
+        "at": {
+          "type": "string"
+        },
+        "parent": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "enum": [
+            "done",
+            "failed",
+            "stuck",
+            "stopped"
+          ]
+        },
+        "reason": {
+          "type": "string"
+        },
+        "steps": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "usage": {
+          "$ref": "#/$defs/usage"
+        }
+      }
+    }
+  }
+}

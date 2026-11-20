@@ -84,6 +84,7 @@ puppetmaster = [
   "hermes_plugin/**/*",
   "pi_package/**/*",
   "baselines/**/*.json",
+  "schemas/*.json",
 ]
 
 [tool.setuptools.exclude-package-data]
