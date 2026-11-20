@@ -1,3 +1,20 @@
+## v1.53.0 — 2026-11-20
+
+**Flow runs write an event log with lineage and gate approval records. New CLI
+actions read the log, check it against a published schema, and compare runs.**
+No worker, judge or pilot prompt changes.
+
+- Flow event log. Each run writes `events.jsonl` next to `run.json`: `run.started`, one `step` for each node visit, `gate.waiting` and `run.finished`. Each event names its parent event. A step records the edge that led to it (`via`: from node, `when`, edge index), so a repair step points back at the failed check. A map step lists its item runs (`children`); an item run names its parent run, node and key. Events have deterministic keys: the walker appends only missing keys, so a walker that dies between a save and an append fills the gap later and writes no event two times. A torn last line is cut before the next append. A failed append is logged and never fails the walk.
+- Gate approval record. A gate answer stores who answered (`cli:<login>` or `mcp:<login>`), when, the options and the SHA-256 digest of the question text. It is in the gate step of `run.json` and in the event log. The pilot summary leaves out the who and when.
+- `puppetmaster flow events <run> [--since] [--follow] [--timeout] [--children]`: a read-only tap that prints the log as JSON lines. It reads the log file and `run.json` only, never the job store.
+- `puppetmaster flow schema` prints the JSON Schema of an event (`puppetmaster/schemas/flow-event.v1.json`, shipped in the wheel). `puppetmaster flow check-events <file|run>` checks a log against it. The checker reads the schema file, so the two cannot drift.
+- `puppetmaster flow compare <base> <run>...`: graph digest match, path shape score (`1 - edit distance / longer path`), revisits, visit change for each node, usage and wall-time ratios. It reads run records only.
+
+Cost:
+
+- No worker, judge or pilot prompt changes. The prompt builders read node outputs and results, not the new step fields (`via`, `children`, `approval`), and `run_summary` keeps its key allowlist. The new CLI actions are not in the MCP tool schema.
+- Measured on this Mac (201-step scripted walk, median of 5): 0.26 ms for each step, about 480 bytes of log for each step.
+
 ## v1.52.1 — 2026-11-19
 
 **The lean Codex home reads `config.toml` as TOML statements, and four smaller fixes.**
