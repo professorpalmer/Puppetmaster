@@ -15,6 +15,17 @@ Cost:
 - No worker, judge or pilot prompt changes. The prompt builders read node outputs and results, not the new step fields (`via`, `children`, `approval`), and `run_summary` keeps its key allowlist. The new CLI actions are not in the MCP tool schema.
 - Measured on this Mac (201-step scripted walk, median of 5): 0.26 ms for each step, about 480 bytes of log for each step.
 
+Release audit (`hpf audit` on `v1.52.1..de4ed0ac`: 20 functions, 11 confirmed bugs, $4.34 API-equivalent on the Claude plan). All 11 are fixed, each with a test in `tests/test_hpfix_flow_1_53.py` that fails before the fix:
+
+- `flow events --children` follows nested maps (it printed one level only).
+- `flow check-events`: a boolean is not the integer 1 (`"v": true` passed). The schema gives `v` the type `integer`.
+- Edge conditions: only plain decimal text compares as a number. `float()` also read `nan` (so `state.v = nan` was false for the text `nan`) and `1_0` (equal to 10).
+- A run that ends at a node with no edges is `failed` when an earlier work node failed and an `always` edge carried the run on (it ended `done`, so the failure was hidden). A failure that a conditional edge routed (a `fail` edge to a fallback) is still handled, and the last node's own verdict is still its result.
+- `flow resume --restart` on an `interrupted` run applies `--extra-steps` and `--reset-loops` (they were ignored). Its in-flight jobs are still adopted.
+- `flow run --continue X --worker-mode M` uses `M` (the continued run's mode won). With no `--worker-mode`, the continued run's mode applies.
+- `flow` with `-` and bad JSON on stdin, or an unreadable `--input-file`, exits 2 with `error: ...`. `validate`, `save` and `run` with no graph raise a usage error (MCP gave a bare `'graph'`).
+- Smaller faults the audit found real but not reachable, in the new code: a usage value of NaN or infinity is dropped from an event, a log line with a bad `seq` is skipped, a timestamp with no offset counts as UTC in `flow compare`, and `check-events` splits lines on newline only.
+
 ## v1.52.1 — 2026-11-19
 
 **The lean Codex home reads `config.toml` as TOML statements, and four smaller fixes.**

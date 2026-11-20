@@ -41,7 +41,7 @@ def add_flow_parser(subcommands: Any) -> None:
     run.add_argument("--wait", action="store_true", help="Block until the run wakes the pilot.")
     run.add_argument("--timeout", type=float, default=0.0, help="With --wait: give up after N seconds.")
     run.add_argument("--foreground", action="store_true", help="Walk in this process instead of a detached one.")
-    run.add_argument("--worker-mode", choices=["subprocess", "inline"], default="inline",
+    run.add_argument("--worker-mode", choices=["subprocess", "inline"], default=None,
                      help="inline (default): workers run as threads in the walker. subprocess: one process per worker.")
 
     status = with_cwd(actions.add_parser("status", help="Compact run summary."))
@@ -99,14 +99,13 @@ def run_flow_command(args: argparse.Namespace, state_dir: Path) -> int:
     if args.flow_action == "events":
         return _print_events(args, Path(state_dir))
     params = {key: value for key, value in vars(args).items() if value is not None}
-    graph = params.get("graph")
-    if graph == "-":
-        params["graph"] = json.loads(sys.stdin.read())
-    if params.get("input_file"):
-        params["input"] = Path(params["input_file"]).read_text(encoding="utf-8")
     try:
+        if params.get("graph") == "-":
+            params["graph"] = json.loads(sys.stdin.read())
+        if params.get("input_file"):
+            params["input"] = Path(params["input_file"]).read_text(encoding="utf-8")
         body, code = flow_action(state_dir, args.flow_action, params, backend=args.backend)
-    except ValueError as exc:
+    except (ValueError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_USAGE
     print(json.dumps(body, indent=2, default=str))
@@ -128,6 +127,8 @@ def flow_action(state_dir: Path, action: str, params: dict, *, backend: str = "s
     if action == "claim" and is_worker_process():
         raise ValueError("a Puppetmaster worker cannot claim paths; claims are the pilot's own writes")
     base = params.get("cwd")
+    if action in ("validate", "save", "run") and not params.get("graph"):
+        raise ValueError(f"flow {action} needs a graph (a JSON file, a saved graph id, or the graph)")
     if action == "schema":
         from puppetmaster import flow_events
 
@@ -154,7 +155,7 @@ def flow_action(state_dir: Path, action: str, params: dict, *, backend: str = "s
         graph = flow.load_graph(state_dir, params["graph"], base=base)
         run = flow.new_run(state_dir, graph, str(params.get("input") or ""),
                            continue_from=params.get("continue_from"), cwd=params.get("cwd"),
-                           backend=backend, worker_mode=str(params.get("worker_mode") or "inline"))
+                           backend=backend, worker_mode=params.get("worker_mode") or None)
         if params.get("foreground"):
             run = flow.walk(state_dir, run.run_id)
         else:
@@ -223,12 +224,22 @@ def _print_events(args: argparse.Namespace, state_dir: Path) -> int:
               if args.follow else flow_events.read(state_dir, args.run_id, since=args.since))
     for event in source:
         _emit_line(event)
-        if args.children and event.get("type") == "step":
-            for child in (event.get("children") or {}).values():
-                if child:
-                    for item in flow_events.read(state_dir, child):
-                        _emit_line(item)
+        if args.children:
+            _emit_children(state_dir, event)
     return EXIT_DONE
+
+
+def _emit_children(state_dir: Path, event: dict) -> None:
+    """Each item run's log after its map step, down through nested maps."""
+    from puppetmaster import flow_events
+
+    if event.get("type") != "step":
+        return
+    for child in (event.get("children") or {}).values():
+        if child:
+            for item in flow_events.read(state_dir, child):
+                _emit_line(item)
+                _emit_children(state_dir, item)
 
 
 def _emit_line(event: dict) -> None:
@@ -244,7 +255,7 @@ def _check_events(state_dir: Path, source: str) -> tuple[dict, int]:
         path = flow_events.events_path(state_dir, source)
         if not path.is_file():
             raise ValueError(f"no events file at {source!r} and no run with that id")
-    lines = path.read_text(encoding="utf-8").splitlines()
+    lines = path.read_text(encoding="utf-8").split("\n")
     rows = flow_events.check_lines(lines)
     body = {"source": str(path), "events": sum(1 for line in lines if line.strip()),
             "valid": not rows, "problems": rows[:50]}

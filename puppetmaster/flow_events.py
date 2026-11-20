@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import time
 from pathlib import Path
@@ -140,8 +141,10 @@ def _step_fields(index: int, step: dict) -> dict:
 
 
 def _numbers(usage: Any) -> dict:
+    # NaN and infinity are not JSON numbers: json.dumps would write bare NaN.
     return {str(key): value for key, value in (usage or {}).items()
-            if isinstance(value, (int, float)) and not isinstance(value, bool)}
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value)}
 
 
 def _load(path: Path) -> tuple[dict[str, str], int]:
@@ -169,7 +172,10 @@ def _load(path: Path) -> tuple[dict[str, str], int]:
             continue
         if isinstance(event, dict) and isinstance(event.get("key"), str):
             ids[event["key"]] = str(event.get("id"))
-            seq = max(seq, int(event.get("seq") or 0))
+            try:
+                seq = max(seq, int(event.get("seq") or 0))
+            except (ValueError, TypeError):
+                pass
     _CACHE[str(path)] = (len(data), dict(ids), seq)
     return ids, seq
 
@@ -205,9 +211,10 @@ def _parse(path: Path, since: int) -> Iterator[dict]:
             continue
         try:
             event = json.loads(line)
-        except ValueError:
-            continue  # a torn last line; the next sync drops it
-        if isinstance(event, dict) and int(event.get("seq") or 0) > since:
+            seq = int(event.get("seq") or 0) if isinstance(event, dict) else 0
+        except (ValueError, TypeError):
+            continue  # a torn last line (the next sync drops it) or a foreign line
+        if seq > since:
             yield event
 
 
@@ -297,9 +304,9 @@ def _check(value: Any, node: dict, root: dict, where: str) -> list[str]:
         names = types if isinstance(types, list) else [types]
         if not any(_TYPES[name](value) for name in names):
             return [f"{where}: expected {' or '.join(names)}"]
-    if "const" in node and value != node["const"]:
+    if "const" in node and not _json_equal(value, node["const"]):
         problems.append(f"{where}: expected {node['const']!r}")
-    if "enum" in node and value not in node["enum"]:
+    if "enum" in node and not any(_json_equal(value, option) for option in node["enum"]):
         problems.append(f"{where}: {value!r} is not one of {node['enum']}")
     if "minimum" in node and _TYPES["number"](value) and value < node["minimum"]:
         problems.append(f"{where}: below {node['minimum']}")
@@ -319,6 +326,13 @@ def _check(value: Any, node: dict, root: dict, where: str) -> list[str]:
         for index, item in enumerate(value):
             problems.extend(_check(item, node["items"], root, f"{where}[{index}]"))
     return problems
+
+
+def _json_equal(left: Any, right: Any) -> bool:
+    """JSON Schema equality: a boolean equals only a boolean (Python has True == 1)."""
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left == right
+    return left == right
 
 
 def check_lines(lines: list[str]) -> list[dict]:
