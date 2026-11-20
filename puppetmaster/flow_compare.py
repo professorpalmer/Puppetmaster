@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 
 def compare(runs: list[Any]) -> dict:
     """The first run is the baseline; every other run is compared with it."""
+    if not runs:
+        raise ValueError("compare needs at least one run")
     profiles = [profile(run) for run in runs]
     base = profiles[0]
     return {
@@ -116,6 +118,8 @@ def _time(value: Any) -> Optional[datetime]:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        moment = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return None
+    # Run records write UTC; a stamp with no offset is UTC too.
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)

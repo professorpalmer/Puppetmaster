@@ -155,13 +155,18 @@ wins. `when` is one of:
 - `PASS`, `FAIL`, `PARTIAL`: the node's verdict
 - `answer=X`: a gate's answer (case- and Unicode-insensitive)
 - `out~=text`: the node's output contains the text
-- `state.k OP v` with `= != >= <= > < ~=`; numbers compare numerically
+- `state.k OP v` with `= != >= <= > < ~=`. Two plain decimal numbers compare
+  as numbers (`10` and `10.0` are equal). Other text compares as text, so
+  `nan`, `inf` and `1_0` are not numbers.
 
 A back-edge (an edge that closes a cycle) may be taken at most `max` times,
 default `limits.maxLoops` (3). Past that the run is `stuck`. Forward edges are
 bounded only by `limits.maxSteps` (60). A failed node with no matching edge
 fails the run. A node with edges but no match makes the run `stuck`. A node
-with no edges ends the run.
+with no edges ends the run. The run is `failed` when an earlier work node
+failed and an `always` edge carried the run on. A failure that a conditional
+edge (such as `fail` to a fallback) routed is handled, and the last node's own
+verdict is its result.
 
 ## Templates
 

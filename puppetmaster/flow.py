@@ -45,6 +45,7 @@ import copy
 import getpass
 import hashlib
 import json
+import math
 import os
 import re
 import signal
@@ -675,13 +676,20 @@ def _norm(text: str) -> str:
     return unicodedata.normalize("NFC", text).strip().casefold()
 
 
+_DECIMAL = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?")
+
+
 def _number(value: Any) -> Optional[float]:
+    """A finite number, or None. Text counts only when it is a plain decimal:
+    ``float()`` also reads "nan", "inf" and "1_0", which then compared wrong."""
     if isinstance(value, bool):
         return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+    if isinstance(value, (int, float)):
+        return float(value) if math.isfinite(value) else None
+    if isinstance(value, str) and _DECIMAL.fullmatch(value.strip()):
+        number = float(value)
+        return number if math.isfinite(number) else None
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -844,8 +852,10 @@ def load_graph(state_dir: Path, ref: Any, *, base: Optional[str] = None) -> dict
 def new_run(state_dir: Path, graph: dict, input_text: str = "", *,
             state: Optional[dict] = None, parent: Optional[dict] = None,
             continue_from: Optional[str] = None, cwd: Optional[str] = None,
-            backend: str = "sqlite", worker_mode: str = "inline") -> FlowRun:
-    """Create a run. ``continue_from`` carries a prior run's sessions so its nodes resume."""
+            backend: str = "sqlite", worker_mode: Optional[str] = None) -> FlowRun:
+    """Create a run. ``continue_from`` carries a prior run's sessions so its nodes resume.
+
+    ``worker_mode`` None means: the continued run's mode, else ``inline``."""
     child = parent is not None
     depth = int((parent or {}).get("depth", 0))
     problems = validate_graph(graph, child=child, depth=depth)
@@ -873,12 +883,12 @@ def new_run(state_dir: Path, graph: dict, input_text: str = "", *,
             # not evidence about this run's files. Chains keep the first origin.
             result.setdefault("inherited_from", prior.run_id)
         seeded.update(prior.state)
-        backend, worker_mode = prior.backend, prior.worker_mode
+        backend, worker_mode = prior.backend, worker_mode or prior.worker_mode
     seeded.update(state or {})
     run = FlowRun(run_id="flow_" + uuid.uuid4().hex[:12], graph=graph, input=input_text,
                   current=graph["entry"], state=seeded, sessions=sessions, results=results,
                   parent=parent, continued_from=continue_from, backend=backend,
-                  worker_mode=worker_mode)
+                  worker_mode=worker_mode or "inline")
     save_run(state_dir, run)
     flow_events.sync(state_dir, run)
     return run
@@ -1041,6 +1051,13 @@ def _prepare(state_dir: Path, run: FlowRun, *, answer: Optional[str], restart: b
         _clear_marker(state_dir, run.run_id, "stop")
         _clear_marker(state_dir, run.run_id, "cut")
     elif restart:
+        # An interrupted run keeps its in-flight record (its jobs are adopted),
+        # but the limits the caller raises apply as for any restart.
+        if run.status in RESTARTABLE_STATUSES:
+            if extra_steps:
+                run.graph.setdefault("limits", {})["maxSteps"] = len(run.steps) + int(extra_steps)
+            if reset_loops:
+                run.edge_counts = {}
         _clear_marker(state_dir, run.run_id, "stop")
     run.status, run.reason = "running", ""
     return True
@@ -1135,10 +1152,17 @@ def _walk(state_dir: Path, run: FlowRun, execute: NodeExecutor) -> FlowRun:
                            render(node.get("summary") or status, run, prev))
         nxt = _pick_edge(graph, node, outcome, run, max_loops, loops)
         if isinstance(nxt, tuple):
-            failed = _stale_reviews(run) + _stale_reuse(run) if nxt[0] == "done" else []
+            # The last node's own verdict is its result (a map reads it); an
+            # earlier failure that an ``always`` edge carried on is not.
+            failed = (_failed_work(run, unhandled=True, skip=node["id"]) + _stale_reviews(run)
+                      + _stale_reuse(run) if nxt[0] == "done" else [])
             if failed:
                 return _finish(state_dir, run, "failed", "; ".join(failed)[:600])
             return _finish(state_dir, run, *nxt)
+        if (run.arrived or {}).get("when") != "always":
+            # A conditional edge (fail, FAIL, a state test) routed on this
+            # result: a failure here is handled, not carried on unseen.
+            run.results[node["id"]]["routed"] = (run.arrived or {}).get("when")
         run.current = nxt
         save_run(state_dir, run)
         flow_events.sync(state_dir, run)
@@ -2987,14 +3011,18 @@ def _stale_reuse(run: FlowRun) -> list[str]:
     return stale
 
 
-def _failed_work(run: FlowRun) -> list[str]:
+def _failed_work(run: FlowRun, *, unhandled: bool = False, skip: Optional[str] = None) -> list[str]:
     """Work nodes whose latest result failed. An earlier visit's FAIL that a
-    later visit superseded does not count; a final FAIL or PARTIAL verdict does."""
+    later visit superseded does not count; a final FAIL or PARTIAL verdict does.
+
+    ``unhandled`` leaves out a failure that a conditional edge routed on (a
+    ``fail`` edge to a fallback): only one an ``always`` edge carried on counts."""
     kinds = {node["id"]: node.get("kind") for node in run.graph.get("nodes") or []}
     return [f"{node_id}: {(result.get('error') or result.get('reason') or result.get('verdict') or 'failed')[:160]}"
             for node_id, result in run.results.items()
             if kinds.get(node_id) in _WORK_KINDS
-            and (not result.get("ok") or result.get("verdict") in ("FAIL", "PARTIAL"))]
+            and (not result.get("ok") or result.get("verdict") in ("FAIL", "PARTIAL"))
+            and not (unhandled and result.get("routed")) and node_id != skip]
 
 
 def _item_result(child: FlowRun) -> dict:

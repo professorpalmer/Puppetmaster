@@ -43,6 +43,7 @@
       "additionalProperties": false,
       "properties": {
         "v": {
+          "type": "integer",
           "const": 1
         },
         "id": {
@@ -150,6 +151,7 @@
       "additionalProperties": false,
       "properties": {
         "v": {
+          "type": "integer",
           "const": 1
         },
         "id": {
@@ -341,6 +343,7 @@
       "additionalProperties": false,
       "properties": {
         "v": {
+          "type": "integer",
           "const": 1
         },
         "id": {
@@ -404,6 +407,7 @@
       "additionalProperties": false,
       "properties": {
         "v": {
+          "type": "integer",
           "const": 1
         },
         "id": {
