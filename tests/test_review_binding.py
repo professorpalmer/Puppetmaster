@@ -76,9 +76,19 @@ class ReviewBindingTests(Base):
         registry = FileClaimRegistry(self.claims_db)
         claims = registry.acquire_many(self.work, ["."], "worker-repair", 30)
         released_at = {}
+        waiting = threading.Event()
+        save_run = flow.save_run
+
+        def watched_save(state_dir, run):
+            save_run(state_dir, run)
+            if (run.inflight or {}).get("review_waits_for"):
+                waiting.set()
 
         def finish_writing():
-            time.sleep(0.4)
+            # Release only after the judge records that it waits: a fixed
+            # sleep raced a slow setup on Windows CI (the judge then saw no
+            # live writer at all).
+            released_at["judge_waited"] = waiting.wait(30)
             (self.work / "src" / "a.py").write_text("final\n", encoding="utf-8")
             registry.release_many(self.work, [(c.path, c.claim_id) for c in claims])
             released_at["t"] = time.monotonic()
@@ -86,8 +96,10 @@ class ReviewBindingTests(Base):
         writer = threading.Thread(target=finish_writing)
         writer.start()
         launched_at = {}
-        run, outcome = self.judge_run(on_launch=lambda: launched_at.setdefault("t", time.monotonic()))
+        with patch.object(flow, "save_run", watched_save):
+            run, outcome = self.judge_run(on_launch=lambda: launched_at.setdefault("t", time.monotonic()))
         writer.join()
+        self.assertTrue(released_at["judge_waited"], "the judge never waited for the writer")
         self.assertGreaterEqual(launched_at["t"], released_at["t"])
         self.assertEqual(outcome.verdict, "PASS")
         self.assertEqual(run.inflight["review_waits_for"][0]["owner"], "worker-repair")
